@@ -1,0 +1,116 @@
+{
+  "fetched": [
+    "A",
+    "AAPL",
+    "AMZN",
+    "GOOGL",
+    "MSFT"
+  ],
+  "partial_or_stub": [
+    "AA",
+    "AACB",
+    "AACG",
+    "AACI",
+    "AACT"
+  ],
+  "failed": [],
+  "remaining_count": 5497,
+  "total_tickers": 5502,
+  "last_update": "2026-04-27T01:48:29Z",
+  "attempt_log": [
+    {
+      "timestamp": "2026-04-26T05:07:05Z",
+      "outcome": "blocked",
+      "reason": "No Polygon API credentials / MCP available; direct REST returned 401",
+      "rows_added": 0
+    },
+    {
+      "timestamp": "2026-04-26T05:12:34Z",
+      "outcome": "blocked",
+      "reason": "Re-verified: no Polygon MCP loaded, no POLYGON_API_KEY in env or workspace, direct REST still returns 401",
+      "rows_added": 0
+    },
+    {
+      "timestamp": "2026-04-27T01:48:29Z",
+      "outcome": "blocked",
+      "reason": "Third autonomous run; same blocker — no Polygon MCP in deferred tool list, no POLYGON_API_KEY in env, no key files in workspace, direct REST GET /v2/aggs/ticker/AAPL/... still returns 401, polygon-api-client not installed. No CSV writes performed.",
+      "rows_added": 0
+    }
+  ],
+  "fetched_threshold_rows": 100,
+  "csv_path": "/Users/geoffplymale/Documents/Claude/Projects/All Stock/historical_stock_data.csv",
+  "ticker_list_path": "/Users/geoffplymale/Documents/Claude/Projects/All Stock/tickers.txt",
+  "ticker_coverage": {
+    "A": {
+      "rows": 2000,
+      "date_range": [
+        "2024-04-01",
+        "2026-03-27"
+      ]
+    },
+    "AA": {
+      "rows": 1,
+      "date_range": [
+        "2024-04-01",
+        "2024-04-01"
+      ]
+    },
+    "AACB": {
+      "rows": 1,
+      "date_range": [
+        "2025-04-07",
+        "2025-04-07"
+      ]
+    },
+    "AACG": {
+      "rows": 1,
+      "date_range": [
+        "2024-04-01",
+        "2024-04-01"
+      ]
+    },
+    "AACI": {
+      "rows": 1,
+      "date_range": [
+        "2024-04-01",
+        "2024-04-01"
+      ]
+    },
+    "AACT": {
+      "rows": 1,
+      "date_range": [
+        "2024-04-01",
+        "2024-04-01"
+      ]
+    },
+    "AAPL": {
+      "rows": 1000,
+      "date_range": [
+        "2024-04-01",
+        "2026-03-27"
+      ]
+    },
+    "AMZN": {
+      "rows": 1000,
+      "date_range": [
+        "2024-04-01",
+        "2026-03-27"
+      ]
+    },
+    "GOOGL": {
+      "rows": 1000,
+      "date_range": [
+        "2024-04-01",
+        "2026-03-27"
+      ]
+    },
+    "MSFT": {
+      "rows": 1000,
+      "date_range": [
+        "2024-04-01",
+        "2026-03-27"
+      ]
+    }
+  },
+  "blocker": "No Polygon API credentials available in this session. See FETCH_BLOCKER_REPORT.md."
+}
