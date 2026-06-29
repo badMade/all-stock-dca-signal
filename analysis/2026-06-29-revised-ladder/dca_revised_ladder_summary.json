@@ -1,0 +1,21 @@
+{
+  "active_symbols": 45,
+  "start_date": "2026-05-14",
+  "end_date": "2026-06-26",
+  "trading_days": 30,
+  "graded_capital": 1015.5,
+  "flat_capital": 1330.0,
+  "graded_shares": 18.572891878762107,
+  "flat_shares": 22.67339851935278,
+  "budget_capped_rows": 0,
+  "today_signals": 13,
+  "today_planned_dollars": 17.0,
+  "today_budgeted_dollars": 17.0,
+  "today_tier_distribution": {
+    "0x": 32,
+    "1x": 7,
+    "1.5x": 4,
+    "2x": 2,
+    "3x": 0
+  }
+}
