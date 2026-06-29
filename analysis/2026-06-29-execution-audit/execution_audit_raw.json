@@ -1,0 +1,102 @@
+{
+  "last_10_weekdays": [
+    {
+      "date": "2026-06-16",
+      "status": "MISS_NO_ARTIFACTS",
+      "artifact_count": 0,
+      "summary_artifact_count": 0,
+      "details": []
+    },
+    {
+      "date": "2026-06-17",
+      "status": "MISS_NO_ARTIFACTS",
+      "artifact_count": 0,
+      "summary_artifact_count": 0,
+      "details": []
+    },
+    {
+      "date": "2026-06-18",
+      "status": "MISS_NO_ARTIFACTS",
+      "artifact_count": 0,
+      "summary_artifact_count": 0,
+      "details": []
+    },
+    {
+      "date": "2026-06-19",
+      "status": "MISS_NO_ARTIFACTS",
+      "artifact_count": 0,
+      "summary_artifact_count": 0,
+      "details": []
+    },
+    {
+      "date": "2026-06-22",
+      "status": "MISS_NO_ARTIFACTS",
+      "artifact_count": 0,
+      "summary_artifact_count": 0,
+      "details": []
+    },
+    {
+      "date": "2026-06-23",
+      "status": "PARTIAL_OR_FULL_ARTIFACTS",
+      "artifact_count": 41,
+      "summary_artifact_count": 0,
+      "details": [
+        "41 dated artifacts, 0 summary/state/signal artifacts"
+      ]
+    },
+    {
+      "date": "2026-06-24",
+      "status": "PARTIAL_OR_FULL_ARTIFACTS",
+      "artifact_count": 126,
+      "summary_artifact_count": 3,
+      "details": [
+        "126 dated artifacts, 3 summary/state/signal artifacts",
+        "dca_buys_20260624_190236.json: [{\"ticker\":\"AMAT\",\"decision_price\":586.56,\"prior_close\":589.28,\"drop_pct\":0.4615802335,\"look_price\":588.3,\"trend_pct\":-0.2957674656,\"mult\":1.0,\"notional\":1.0,\"buy\":true,\"skip\":false},{\"ticker\":\"AMD\",\"decision_price\":517.13,\"prior_close\":527.53,\"drop_pct\":1.9714518606,\"look_price\":519.39,\"trend_pct\":-0.4351258207,\"mult\":1.0,\"notional\":1.0,\"buy\":true,\"skip\":false},{\"ticker\":\"BTX\",\"decision_price\":8.85,\"prior_close\":9.08,\"drop_pct\":2.5330396476,\"look_price\":8.86,\"trend_pct\":-0.1128668172,\"mult\":1.5",
+        "dca_signals_20260624_190236.csv: ticker,decision_price,prior_close,drop_pct,look_price,trend_pct,mult,notional,buy,skip AAPL,297.47,298.18,0.23811120799516386,294.86,0.8851658414162699,1.0,1.0,False,False AMAT,586.56,589.28,0.46158023350529925,588.3,-0.29576746557878786,1.0,1.0,True,False AMD,517.13,527.53,1.9714518605576892,519.39,-0.43512582067425076,1.0,1.0,True,False AMZN,241.79,234.49,-3.11313915305556,237.54,1.7891723499200134,0.0,0.0,False,True ASML,1757.99,1788.44,1.702601149605245,1748.9,0.5197552747441202,1.0,1.0,Fals",
+        "last_run_summary_20260624_1901ET.txt: Run time: 2026-06-24 15:01 ET (scheduled 3:45 PM ET summer slot; decision bar 15:00 ET) Universe: 40 tickers Buys: 9 (AMAT, AMD, BTX, CBRS, MU, NFLX, QBTS, SATA, SNDK) Notification sent: yes (in_app + email) Data files: csv_20260624/today and csv_20260624/prev; signals saved as dca_signals_*.csv and dca_buys_*.json "
+      ]
+    },
+    {
+      "date": "2026-06-25",
+      "status": "PARTIAL_OR_FULL_ARTIFACTS",
+      "artifact_count": 1,
+      "summary_artifact_count": 1,
+      "details": [
+        "1 dated artifacts, 1 summary/state/signal artifacts",
+        "state_20260625_190250Z.json: {   \"run_utc\": \"2026-06-25T19:02:50Z\",   \"asof_note\": \"Used latest regular-session data available at/near 3:00pm ET; quotes were ~3:01-3:02pm ET\",   \"account_number\": \"562057042\",   \"buying_power_start_usd\": 300.0,   \"agentic_orders_today\": [],   \"finance_not_found\": [\"AAAU\", \"SPCX\"],   \"eligible_buy_candidates\": [     {\"symbol\":\"AAPL\",\"multiplier\":1.5,\"dollar_amount\":2.0,\"drop_pct_vs_prev_close\":-4.8,\"trend_60m\":\"down\"},     {\"symbol\":\"MSFT\",\"multiplier\":1.5,\"dollar_amount\":1.5,\"drop_pct_vs_pre"
+      ]
+    },
+    {
+      "date": "2026-06-26",
+      "status": "PARTIAL_OR_FULL_ARTIFACTS",
+      "artifact_count": 1,
+      "summary_artifact_count": 1,
+      "details": [
+        "1 dated artifacts, 1 summary/state/signal artifacts",
+        "run_20260626_1500.json: {   \"run_time_local\": \"2026-06-26T15:00:00-04:00\",   \"account_number\": \"562057042\",   \"buying_power\": 300.0,   \"same_day_agentic_orders\": [],   \"signals\": {     \"robinhood_buy\": [],     \"finance_buy\": [],     \"eligible_buys\": [],     \"robinhood_only_buy\": [],     \"disagreements\": [],     \"no_buy\": [       \"DFTX\",       \"TRIN\",       \"AAAU\",       \"SPCX\",       \"TRLV\",       \"RVI\",       \"VCX\",       \"EVR\",       \"LUNR\",       \"IRDM\",       \"DXYZ\",       \"LITE\",       \"ASML\",       \"DRAM\",       "
+      ]
+    },
+    {
+      "date": "2026-06-29",
+      "status": "MISS_NO_ARTIFACTS",
+      "artifact_count": 0,
+      "summary_artifact_count": 0,
+      "details": []
+    }
+  ],
+  "scheduled_task": {
+    "id": "ce16ba6b",
+    "name": "Graded DCA automatic live test - 3:45 PM ET through Jul 10",
+    "cron_expression": "45 19 * * 1-5",
+    "requested_cron_expression": "45 19 * * 1-5",
+    "task": "LIVE ROBINHOOD AGENTIC TRADING TEST \u2014 AUTOMATIC 3:45 PM ET SUMMER SLOT ONLY. The user approved automatic order placement on Sat Jun 27 2026 at 1:02 AM EDT, approved extending the test through Fri Jul 10 2026 on Sat Jun 27 2026 at 11:08 AM EDT, approved adding IBM to the active universe on Sat Jun 27 2026 at 7:15 PM EDT, approved applying reserve-budget logic on Sat Jun 27 2026 at 7:19 PM EDT, approved signal-only notification behavior on Sat Jun 27 2026 at 9:15 PM EDT, approved treating the additional account cash as expanded reserve/weekly budget on Mon Jun 29 2026 at 11:10 AM EDT, and approved increasing the hard daily cap to $120 on Mon Jun 29 2026 at 11:14 AM EDT. This task is approved to run automatically and place real equity buy orders with real money without per-order confirmation, but only under the exact constraints below.\n\nAccount: use Robinhood Agentic account number 562057042 only; never trade any other Robinhood account.\n\nTest dates only: Mon Jun 29 2026, Tue Jun 30 2026, Wed Jul 1 2026, Thu Jul 2 2026, Fri Jul 3 2026, Mon Jul 6 2026, Tue Jul 7 2026, Wed Jul 8 2026, Thu Jul 9 2026, Fri Jul 10 2026. If outside those dates, do not trade and end silently unless there is an error requiring notification.\n\nTime: this is the only active summer live-test task and is scheduled for 3:45 PM America/New_York on weekdays. Use the latest completed regular-session market data available at or before the scheduled 3:45 PM America/New_York decision time. Do not use an in-progress bar as if it were complete. Do not gate execution on exact wall-clock equality; tolerate normal scheduled-task startup latency and use the scheduled run intent/time window.\n\nUniverse: DFTX, TRIN, AAAU, SPCX, TRLV, RVI, VCX, EVR, LUNR, IRDM, DXYZ, LITE, ASML, DRAM, STX, MSFT, AAPL, AMAT, AMD, CBRS, MRVL, BTX, STM, SNDK, WDC, TSM, AVGO, NVDA, QBTS, FLKR, INTC, GOOGL, GOOG, AMZN, GLW, MA, GS, MU, NFLX, XLG, TOPT, QTOP, SATA, RGTI, IBM. Excluded: BYDDY per user instruction. Corrected symbols: IRDMI -> IRDM; GLWR -> GLW. IBM added per user instruction.\n\nNo Slack: do not use Slack and do not attempt Slack connection. Notifications should be in-app/message-center and email only.\n\nSignal logic: calculate finance-side and Robinhood-side signals using the same completed-bar convention. Use only completed regular-session bars. For a 3:45 PM ET decision, a completed 15-minute bar should be at or before 3:30 PM ET if bars are start-stamped; a completed 30-minute bar should be at or before 3:30 PM ET. If using 5-minute or 1-minute Robinhood bars, aggregate or compare using completed bars only. Previous close should be the prior completed regular-session close. Record the exact bar timestamp and previous-close source used for every ticker.\n\nBuy condition: decision price below previous regular-session close, 60-minute intraday trend down, and multiplier > 0. Skip condition: decision price above previous close and 60-minute trend up. Else no action.\n\nSizing ladder based on drop from prior close: down <0.1% = 0x/no buy; down 0.1% to <2.0% = 1x; down 2.0% to <5.0% = 1.5x; down 5.0% to <8.0% = 2x; down >=8.0% = 3x. Base amount is $1, so order sizes are $1.00, $1.50, $2.00, or $3.00. For every signal, report the exact dollar amount to execute per ticker before and after budget constraints.\n\nTwo-source reconciliation: if both finance and Robinhood are available and agree on BUY, the ticker is eligible for automatic order review and submission. If finance says BUY and Robinhood historical signal disagrees because of previous-close/feed-lag/threshold-boundary/trend-definition differences, do not auto-buy; label as manual review with the divergence cause. If finance says BUY but Robinhood data is unavailable, do not buy; report broker verification unavailable. If Robinhood says BUY but finance is unavailable, allow Robinhood-only BUY only for symbols finance fails to resolve, and only after Robinhood quote, tradability, and order review all pass. If both sources are available but disagree on BUY vs non-BUY for any reason, do not place an order; report data-source disagreement/manual review.\n\nReserve-budget execution limits: daily base cap is $60. Carry-forward reserve max is $420. Hard daily max with reserve is $120. Weekly hard cap is $600, bounded by actual available buying power. Persist reserve state between scheduled runs in /home/user/workspace/cron_tracking/ce16ba6b/reserve_budget_state.json or an equivalent task-local tracking file. If the tracking file is missing, initialize reserve to $0 and recreate it.\n\nAt the start of each run, load reserve state and calculate remaining weekly submitted notional from same-week strategy orders plus the tracking file. Compute allowed_spend_today = min($120, $60 + available_reserve, remaining_weekly_cap, available_buying_power). During the run, submit eligible reviewed orders only while total same-day strategy notional remains <= allowed_spend_today. If signals exceed allowed_spend_today, prioritize higher multiplier first, then larger percent drop.\n\nAt the end of each run, update reserve based on actual strategy notional submitted in this run plus any same-day strategy orders already found. If actual same-day strategy spend is below $60, add ($60 - actual_spend) to reserve, capped at $420. If actual same-day strategy spend is above $60, draw (actual_spend - $60) from reserve, never below $0. Save the updated reserve, date, same-day spend, same-week spend, and any order IDs to the tracking file.\n\nExecution: before ordering, call get_portfolio for buying power, get_equity_orders for same-day strategy/agentic orders, and get_equity_tradability for each candidate. Place at most one strategy order per ticker per day. Use regular_hours only. Use market buy orders with dollar_amount notional and time_in_force gfd. For each candidate buy, call review_equity_order first. Place_equity_order automatically only if review shows no blocking issue such as insufficient buying power, halted/untradable instrument, fractional ineligibility, rejection alert, account mismatch, or budget-limit breach. Generate a UUID ref_id per logical order and reuse it only on retry of that same order.\n\nProhibited actions: no sells, no options, no margin expansion, no crypto, no order replacement, no trading outside regular hours, no trades in any account except Robinhood Agentic account number 562057042.\n\nSignal-only notification behavior: notify only if one or more DCA signals, order-review candidates, placed orders, rejected/skipped candidate orders, source disagreements/manual-review candidates, or connector/auth/order errors occur. If no signal is generated and no error occurs, end silently with no notification. When notifying, send both in-app/message-center and email using send_notification channels [\"in_app\", \"email\"] with email_args {\"template\":\"generic\", \"subject\":\"Robinhood graded DCA signal and budget summary\"}. Include ticker-by-ticker signal list, exact dollar amount per ticker, multiplier, price vs previous close, completed-bar timestamps used, data-source status, orders reviewed, orders placed with order IDs if returned, skipped/rejected orders, reserve_before, allowed_spend_today, actual_spend, reserve_used, reserve_added, reserve_after, remaining weekly cap, and remaining buying power if available. Do not include claim links/citations in notification content.\n\nFailure handling: if two consecutive scheduled runs fail because of connector/auth/order errors, stop live trading by deleting this scheduled task and notify the user.",
+    "state": "active",
+    "next_run": "Tuesday, June 30, 2026 at 3:45 PM EDT",
+    "last_run": "Friday, June 26, 2026 at 3:00 PM EDT",
+    "run_count": 3,
+    "background": true,
+    "subagent_type": "cron_hard",
+    "exact": true,
+    "session_id": "2bb23a9f-5ce4-4466-ad2c-01267797f9e5"
+  }
+}
