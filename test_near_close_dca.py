@@ -11,17 +11,23 @@ from near_close_dca import ACTIVE_TICKERS, EXCLUDED_TICKERS, StrategyConfig, gra
 # (drop percent from prior close, expected multiplier).
 LADDER_BOUNDARY_CASES = [
     (0.09, 0.0),   # below the 0.1% minimum -> no buy
-    (0.1, 1.0),    # first tier begins
-    (1.999, 1.0),  # still 1x just under 2.0%
-    (2.0, 1.5),    # 1.5x tier begins
-    (3.999, 1.5),  # still 1.5x just under 4.0%
-    (4.0, 2.0),    # 2x tier begins
-    (5.999, 2.0),  # still 2x just under 6.0%
-    (6.0, 3.0),    # 3x tier begins
-    (7.999, 3.0),  # still 3x just under 8.0%
-    (8.0, 4.0),    # 4x tier begins
-    (9.999, 4.0),  # still 4x just under 10.0%
-    (10.0, 5.0),   # 5x tier begins
+    (0.1, 1.0),    # 1x tier begins
+    (0.999, 1.0),  # still 1x just under 1.0%
+    (1.0, 1.5),    # 1.5x tier begins
+    (1.999, 1.5),  # still 1.5x just under 2.0%
+    (2.0, 2.0),    # 2x tier begins
+    (2.999, 2.0),  # still 2x just under 3.0%
+    (3.0, 2.5),    # 2.5x tier begins
+    (3.999, 2.5),  # still 2.5x just under 4.0%
+    (4.0, 3.0),    # 3x tier begins
+    (4.999, 3.0),  # still 3x just under 5.0%
+    (5.0, 3.5),    # 3.5x tier begins
+    (5.999, 3.5),  # still 3.5x just under 6.0%
+    (6.0, 4.0),    # 4x tier begins
+    (6.999, 4.0),  # still 4x just under 7.0%
+    (7.0, 4.5),    # 4.5x tier begins
+    (7.999, 4.5),  # still 4.5x just under 8.0%
+    (8.0, 5.0),    # 5x tier begins
     (12.0, 5.0),   # no upper cutoff, still 5x
 ]
 

@@ -125,21 +125,27 @@ class StrategyConfig:
     # Graded sizing ladder mapping the drop from prior close to a buy multiplier.
     # Thresholds are fractions of the previous close (0.001 == 0.1%). The largest
     # threshold less than or equal to the actual drop wins; a drop below the first
-    # threshold yields no buy (0x). There is no upper cutoff: any drop >= 10.0% is 5x.
+    # threshold yields no buy (0x). There is no upper cutoff: any drop >= 8.0% is 5x.
     #     drop < 0.1%             -> 0x  (no buy)
-    #     0.1% <= drop < 2.0%     -> 1x
-    #     2.0% <= drop < 4.0%     -> 1.5x
-    #     4.0% <= drop < 6.0%     -> 2x
-    #     6.0% <= drop < 8.0%     -> 3x
-    #     8.0% <= drop < 10.0%    -> 4x
-    #     drop >= 10.0%           -> 5x
+    #     0.1% <= drop < 1.0%     -> 1x
+    #     1.0% <= drop < 2.0%     -> 1.5x
+    #     2.0% <= drop < 3.0%     -> 2x
+    #     3.0% <= drop < 4.0%     -> 2.5x
+    #     4.0% <= drop < 5.0%     -> 3x
+    #     5.0% <= drop < 6.0%     -> 3.5x
+    #     6.0% <= drop < 7.0%     -> 4x
+    #     7.0% <= drop < 8.0%     -> 4.5x
+    #     drop >= 8.0%            -> 5x
     sizing_tiers: tuple[tuple[float, float], ...] = (
-        (0.001, 1.0),  # down 0.1% to <2.0%
-        (0.020, 1.5),  # down 2.0% to <4.0%
-        (0.040, 2.0),  # down 4.0% to <6.0%
-        (0.060, 3.0),  # down 6.0% to <8.0%
-        (0.080, 4.0),  # down 8.0% to <10.0%
-        (0.100, 5.0),  # down 10.0% or more (no upper cutoff)
+        (0.001, 1.0),  # down 0.1% to <1.0%
+        (0.010, 1.5),  # down 1.0% to <2.0%
+        (0.020, 2.0),  # down 2.0% to <3.0%
+        (0.030, 2.5),  # down 3.0% to <4.0%
+        (0.040, 3.0),  # down 4.0% to <5.0%
+        (0.050, 3.5),  # down 5.0% to <6.0%
+        (0.060, 4.0),  # down 6.0% to <7.0%
+        (0.070, 4.5),  # down 7.0% to <8.0%
+        (0.080, 5.0),  # down 8.0% or more (no upper cutoff)
     )
 
 
