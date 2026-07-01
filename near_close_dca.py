@@ -105,9 +105,9 @@ class StrategyConfig:
     trend_lookback_minutes: int = 60
     base_buy_amount_usd: float = 1.0
     daily_base_cap_usd: float = 60.0
-    reserve_cap_usd: float = 120.0
-    hard_daily_max_usd: float = 100.0
-    weekly_notional_cap_usd: float = 300.0
+    reserve_cap_usd: float = 420.0
+    hard_daily_max_usd: float = 120.0
+    weekly_notional_cap_usd: float = 600.0
     # Backward-compatible alias for older callers. New budget logic uses
     # daily_base_cap_usd + carry_forward_reserve_usd, capped by hard_daily_max_usd.
     daily_notional_cap_usd: float = 60.0
@@ -122,12 +122,20 @@ class StrategyConfig:
     finance_interval_minutes: int = 15
     robinhood_interval_minutes: int = 5
 
-    # Largest threshold less than or equal to actual drop wins.
+    # Graded sizing ladder mapping the drop from prior close to a buy multiplier.
+    # Thresholds are fractions of the previous close (0.001 == 0.1%). The largest
+    # threshold less than or equal to the actual drop wins; a drop below the first
+    # threshold yields no buy (0x). There is no upper cutoff: any drop >= 8.0% is 3x.
+    #     drop < 0.1%            -> 0x  (no buy)
+    #     0.1% <= drop < 2.0%    -> 1x
+    #     2.0% <= drop < 5.0%    -> 1.5x
+    #     5.0% <= drop < 8.0%    -> 2x
+    #     drop >= 8.0%           -> 3x
     sizing_tiers: tuple[tuple[float, float], ...] = (
         (0.001, 1.0),  # down 0.1% to <2.0%
         (0.020, 1.5),  # down 2.0% to <5.0%
         (0.050, 2.0),  # down 5.0% to <8.0%
-        (0.080, 3.0),  # down 8.0% or more
+        (0.080, 3.0),  # down 8.0% or more (no upper cutoff)
     )
 
 
@@ -268,6 +276,12 @@ def latest_bar_at_or_before(bars: Iterable[Bar], target: datetime) -> Optional[B
 
 
 def graded_buy_multiplier(drop_vs_previous_close: float, config: StrategyConfig) -> float:
+    """Map a drop from prior close to a buy multiplier via the graded ladder.
+
+    ``drop_vs_previous_close`` is a fraction (0.02 == 2.0% down). The largest tier
+    threshold less than or equal to the drop determines the multiplier; a drop below
+    the first threshold returns 0.0 (no buy). See StrategyConfig.sizing_tiers.
+    """
     multiplier = 0.0
     for threshold, tier_multiplier in sorted(config.sizing_tiers):
         if drop_vs_previous_close >= threshold:
