@@ -14,11 +14,15 @@ LADDER_BOUNDARY_CASES = [
     (0.1, 1.0),    # first tier begins
     (1.999, 1.0),  # still 1x just under 2.0%
     (2.0, 1.5),    # 1.5x tier begins
-    (4.999, 1.5),  # still 1.5x just under 5.0%
-    (5.0, 2.0),    # 2x tier begins
-    (7.999, 2.0),  # still 2x just under 8.0%
-    (8.0, 3.0),    # 3x tier begins
-    (12.0, 3.0),   # no upper cutoff, still 3x
+    (3.999, 1.5),  # still 1.5x just under 4.0%
+    (4.0, 2.0),    # 2x tier begins
+    (5.999, 2.0),  # still 2x just under 6.0%
+    (6.0, 3.0),    # 3x tier begins
+    (7.999, 3.0),  # still 3x just under 8.0%
+    (8.0, 4.0),    # 4x tier begins
+    (9.999, 4.0),  # still 4x just under 10.0%
+    (10.0, 5.0),   # 5x tier begins
+    (12.0, 5.0),   # no upper cutoff, still 5x
 ]
 
 

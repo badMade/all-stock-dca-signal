@@ -125,17 +125,21 @@ class StrategyConfig:
     # Graded sizing ladder mapping the drop from prior close to a buy multiplier.
     # Thresholds are fractions of the previous close (0.001 == 0.1%). The largest
     # threshold less than or equal to the actual drop wins; a drop below the first
-    # threshold yields no buy (0x). There is no upper cutoff: any drop >= 8.0% is 3x.
-    #     drop < 0.1%            -> 0x  (no buy)
-    #     0.1% <= drop < 2.0%    -> 1x
-    #     2.0% <= drop < 5.0%    -> 1.5x
-    #     5.0% <= drop < 8.0%    -> 2x
-    #     drop >= 8.0%           -> 3x
+    # threshold yields no buy (0x). There is no upper cutoff: any drop >= 10.0% is 5x.
+    #     drop < 0.1%             -> 0x  (no buy)
+    #     0.1% <= drop < 2.0%     -> 1x
+    #     2.0% <= drop < 4.0%     -> 1.5x
+    #     4.0% <= drop < 6.0%     -> 2x
+    #     6.0% <= drop < 8.0%     -> 3x
+    #     8.0% <= drop < 10.0%    -> 4x
+    #     drop >= 10.0%           -> 5x
     sizing_tiers: tuple[tuple[float, float], ...] = (
         (0.001, 1.0),  # down 0.1% to <2.0%
-        (0.020, 1.5),  # down 2.0% to <5.0%
-        (0.050, 2.0),  # down 5.0% to <8.0%
-        (0.080, 3.0),  # down 8.0% or more (no upper cutoff)
+        (0.020, 1.5),  # down 2.0% to <4.0%
+        (0.040, 2.0),  # down 4.0% to <6.0%
+        (0.060, 3.0),  # down 6.0% to <8.0%
+        (0.080, 4.0),  # down 8.0% to <10.0%
+        (0.100, 5.0),  # down 10.0% or more (no upper cutoff)
     )
 
 
@@ -286,7 +290,7 @@ def graded_buy_multiplier(drop_vs_previous_close: float, config: StrategyConfig)
     for threshold, tier_multiplier in sorted(config.sizing_tiers):
         if drop_vs_previous_close >= threshold:
             multiplier = tier_multiplier
-    return min(multiplier, 3.0)
+    return min(multiplier, 5.0)
 
 
 def evaluate_source_signal(
