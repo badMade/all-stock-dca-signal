@@ -56,8 +56,22 @@ def compute_slippage_rows(
     fills_by_ticker: Dict[str, Dict[str, Any]] = {}
     for fill in fills:
         ticker = fill.get("ticker") or fill.get("symbol")
-        if ticker:
-            fills_by_ticker[ticker] = fill
+        if not ticker:
+            continue
+
+        qty = _to_float(fill.get("filled_qty")) or 0.0
+        price = _to_float(fill.get("fill_price") or fill.get("filled_avg_price")) or 0.0
+
+        if ticker not in fills_by_ticker:
+            fills_by_ticker[ticker] = {"filled_qty": 0.0, "total_cost": 0.0, "order_id": fill.get("order_id")}
+        
+        entry = fills_by_ticker[ticker]
+        entry["filled_qty"] += qty
+        entry["total_cost"] += qty * price
+
+    for ticker, data in fills_by_ticker.items():
+        if data["filled_qty"] > 0:
+            data["filled_avg_price"] = data["total_cost"] / data["filled_qty"]
 
     rows: List[Dict[str, Any]] = []
     for candidate in buy_candidates:
