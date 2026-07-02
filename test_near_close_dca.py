@@ -24,6 +24,8 @@ from near_close_dca import (
 
 # (drop percent from prior close, expected multiplier).
 LADDER_BOUNDARY_CASES = [
+    (-1.0, 0.0),   # negative drop (price went up) -> no buy
+    (0.0, 0.0),    # flat price -> no buy
     (0.09, 0.0),   # below the 0.1% minimum -> no buy
     (0.1, 1.0),    # 1x tier begins
     (0.999, 1.0),  # still 1x just under 1.0%
