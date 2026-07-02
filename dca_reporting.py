@@ -220,9 +220,11 @@ def build_coverage_report_md(
         lines.append("| --- | --- | --- | --- | --- |")
         for row in rank_slippage(slippage_rows):
             note = "target_price_missing" if row["target_price_missing"] else ""
+            target = row["target_price"] if row["target_price"] is not None else "n/a"
+            fill = row["fill_price"] if row["fill_price"] is not None else "n/a"
+            slip = f"{row['slippage_pct']}%" if row["slippage_pct"] is not None else "n/a"
             lines.append(
-                f"| {row['ticker']} | {row['target_price']} | {row['fill_price']} | "
-                f"{row['slippage_pct']} | {note} |"
+                f"| {row['ticker']} | {target} | {fill} | {slip} | {note} |"
             )
     else:
         lines.append("_No fills to rank._")
