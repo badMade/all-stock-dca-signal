@@ -271,8 +271,8 @@ def test_build_report_metrics_and_ranking():
 # --- Artifact / state-file fields --------------------------------------------
 
 def test_generate_report_and_state_artifacts(tmp_path=None):
-    with tempfile.TemporaryDirectory() as tmpdir:
-        workdir = str(tmp_path) if tmp_path is not None else tmpdir
+    tmpdir_obj = tempfile.TemporaryDirectory()
+    workdir = str(tmp_path) if tmp_path is not None else tmpdir_obj.name
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(dry_run=True)
     state = StrategyState()
