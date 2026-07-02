@@ -36,16 +36,16 @@ def _num(value: Any) -> float:
 
 def build_performance_snapshot(run_states: Sequence[Dict[str, Any]]) -> str:
     days = len(run_states)
-    total_candidates = sum(_num(rs.get("counts", {}).get("buy_candidates")) for rs in run_states)
-    total_submitted = sum(_num(rs.get("counts", {}).get("submitted")) for rs in run_states)
-    total_notional = sum(_num(rs.get("budget", {}).get("day_notional_usd")) for rs in run_states)
+    total_candidates = sum(_num((rs.get("counts") or {}).get("buy_candidates")) for rs in run_states)
+    total_submitted = sum(_num((rs.get("counts") or {}).get("submitted")) for rs in run_states)
+    total_notional = sum(_num((rs.get("budget") or {}).get("day_notional_usd")) for rs in run_states)
     planned_notional = sum(
         _num(c.get("planned_amount_usd"))
         for rs in run_states
-        for c in rs.get("buy_candidates", [])
+        for c in rs.get("buy_candidates") or []
     )
-    week_notional = max((_num(rs.get("budget", {}).get("week_notional_usd")) for rs in run_states), default=0.0)
-    weekly_cap = max((_num(rs.get("budget", {}).get("weekly_notional_cap_usd")) for rs in run_states), default=0.0)
+    week_notional = max((_num((rs.get("budget") or {}).get("week_notional_usd")) for rs in run_states), default=0.0)
+    weekly_cap = max((_num((rs.get("budget") or {}).get("weekly_notional_cap_usd")) for rs in run_states), default=0.0)
 
     lines = ["## Performance snapshot", ""]
     lines.append("| Metric | Value |")
