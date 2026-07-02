@@ -143,7 +143,7 @@ def build_latest_run_summary(
     computed slippage rows. Slippage aggregates count only rows with a present
     target price; ``target_price_missing`` rows are surfaced separately.
     """
-    buy_candidates = run_state.get("buy_candidates", [])
+    buy_candidates = run_state.get("buy_candidates") or []
     priced = [r for r in slippage_rows if not r["target_price_missing"] and r["slippage_pct"] is not None]
     missing_target = [r for r in slippage_rows if r["target_price_missing"]]
 
@@ -156,7 +156,7 @@ def build_latest_run_summary(
     filled_count = len(slippage_rows)
     coverage_pct = round(filled_count / candidate_count * 100.0, 2) if candidate_count else None
 
-    budget = run_state.get("budget", {})
+    budget = run_state.get("budget") or {}
     return {
         "run_id": run_state.get("run_id"),
         "trading_day": run_state.get("trading_day"),
