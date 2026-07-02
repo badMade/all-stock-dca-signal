@@ -1012,7 +1012,10 @@ def run_once(
         ref_id = f"graded-dca-{trading_day.isoformat()}-{ticker}"
         if config.dry_run:
             print(f"[DRY RUN] Would buy {ticker}: ${decision.suggested_amount_usd:.2f} ({decision.reason})")
-            order_id = broker.place_market_buy(ticker, decision.suggested_amount_usd, ref_id=ref_id)
+            if isinstance(broker, DryRunBroker):
+                order_id = broker.place_market_buy(ticker, decision.suggested_amount_usd, ref_id=ref_id)
+            else:
+                order_id = f"DRY-RUN-SIM-{ticker}-{decision.suggested_amount_usd:.2f}-{ref_id}"
         else:
             order_id = broker.place_market_buy(ticker, decision.suggested_amount_usd, ref_id=ref_id)
             state.record_buy(ticker, trading_day, decision.suggested_amount_usd)
