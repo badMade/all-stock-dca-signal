@@ -5,7 +5,21 @@ percentages are converted to fractions before calling graded_buy_multiplier, whi
 expects a fraction of the previous close (2.0% down == 0.02).
 """
 
-from near_close_dca import ACTIVE_TICKERS, EXCLUDED_TICKERS, StrategyConfig, graded_buy_multiplier
+from near_close_dca import (
+    ACTIVE_TICKERS,
+    ALPACA_PLACE_ORDER_TOOL,
+    ALPACA_SOURCE_ID,
+    EXCLUDED_TICKERS,
+    AlpacaBroker,
+    AlpacaConfig,
+    BrokerName,
+    DryRunBroker,
+    StrategyConfig,
+    build_alpaca_market_buy_payload,
+    build_broker,
+    format_notional,
+    graded_buy_multiplier,
+)
 
 
 # (drop percent from prior close, expected multiplier).
@@ -58,6 +72,77 @@ def test_ticker_universe():
     assert "GLW" in ACTIVE_TICKERS
     assert "BYDDY" in EXCLUDED_TICKERS
     assert "BYDDY" not in ACTIVE_TICKERS
+
+
+def test_default_broker_is_robinhood():
+    assert StrategyConfig().broker == BrokerName.ROBINHOOD
+
+
+def test_broker_selection_robinhood():
+    config = StrategyConfig(broker=BrokerName.ROBINHOOD)
+    broker = build_broker(config)
+    assert isinstance(broker, DryRunBroker)
+    assert broker.account_number() == config.target_account_number
+
+
+def test_broker_selection_alpaca():
+    config = StrategyConfig(broker=BrokerName.ALPACA)
+    broker = build_broker(config)
+    assert isinstance(broker, AlpacaBroker)
+    assert broker.account_number() == config.target_account_number
+
+
+def test_alpaca_notional_payload_for_3_50_buy():
+    payload = build_alpaca_market_buy_payload("AAPL", 3.50, is_paper_api=True)
+    assert payload["source_id"] == ALPACA_SOURCE_ID
+    assert payload["tool"] == ALPACA_PLACE_ORDER_TOOL
+    order = payload["input"]
+    assert order["symbol"] == "AAPL"
+    assert order["side"] == "buy"
+    assert order["type"] == "market"
+    assert order["timeInForce"] == "day"
+    assert order["extendedHours"] is False
+    assert order["isPaperAPI"] is True
+    # Notional must be a string of the calculated dollar amount.
+    assert order["notional"] == "3.50"
+    assert isinstance(order["notional"], str)
+
+
+def test_format_notional_is_two_decimal_string():
+    assert format_notional(3.5) == "3.50"
+    assert format_notional(1) == "1.00"
+    assert format_notional(12) == "12.00"
+
+
+def test_alpaca_default_guards_dry_run():
+    # Defaults must never place a live order.
+    config = AlpacaConfig()
+    assert config.enable_live_orders is False
+    assert config.is_paper_api is True
+
+    broker = AlpacaBroker(config=config)
+    order_id = broker.place_market_buy("AAPL", 3.50, ref_id="t")
+    assert order_id.startswith("ALPACA-DRYRUN")
+    assert "3.50" in order_id
+
+
+def test_alpaca_live_gate_requires_flag_and_fn():
+    calls = []
+
+    def fake_place(payload):
+        calls.append(payload)
+        return "LIVE-ORDER-1"
+
+    # enable_live_orders False -> callable is ignored, stays dry-run.
+    gated = AlpacaBroker(config=AlpacaConfig(enable_live_orders=False), place_order_fn=fake_place)
+    assert gated.place_market_buy("AAPL", 3.50, ref_id="t").startswith("ALPACA-DRYRUN")
+    assert calls == []
+
+    # enable_live_orders True + callable -> payload submitted.
+    live = AlpacaBroker(config=AlpacaConfig(enable_live_orders=True), place_order_fn=fake_place)
+    assert live.place_market_buy("AAPL", 3.50, ref_id="t") == "LIVE-ORDER-1"
+    assert len(calls) == 1
+    assert calls[0]["input"]["notional"] == "3.50"
 
 
 def _run_all():

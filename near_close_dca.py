@@ -1,16 +1,23 @@
 """
 Near-close graded DCA strategy skeleton.
 
-This mirrors the scheduled Robinhood live-test rules:
+This mirrors the scheduled live-test rules:
     - Run at 3:45 PM America/New_York.
     - Use completed regular-session bars only.
     - Compare finance-side and Robinhood-side signals before auto-ordering.
     - Place real orders only through a broker adapter that reviews first.
     - Never trade outside the explicit caps, account, universe, and test dates.
 
-The file is adapter-based and dry-run by default. Fill in the FinanceDataProvider,
-RobinhoodDataProvider, and RobinhoodBrokerAdapter implementations with your MCP/API
-calls before using it live.
+The file is adapter-based and dry-run by default. The sizing, budget, and signal
+logic is broker-agnostic: select a backend with ``StrategyConfig.broker`` (either
+``BrokerName.ROBINHOOD`` or ``BrokerName.ALPACA``) and the matching adapter is used
+without touching any of the strategy math.
+
+Fill in the FinanceDataProvider / RobinhoodDataProvider implementations with your
+MCP/API calls before using it live. The Alpaca adapter builds connector-ready
+payloads for the ``alpaca__pipedream`` source and keeps live placement gated behind
+``AlpacaConfig.enable_live_orders`` (False by default). Paper trading is the safest
+mode for connection testing; toggle it with ``AlpacaConfig.is_paper_api``.
 """
 
 from __future__ import annotations
@@ -18,7 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from enum import Enum
-from typing import Dict, Iterable, List, Optional, Protocol, Sequence, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Set
 from zoneinfo import ZoneInfo
 
 
@@ -54,6 +61,22 @@ class Action(str, Enum):
 class SourceName(str, Enum):
     FINANCE = "finance"
     ROBINHOOD = "robinhood"
+
+
+class BrokerName(str, Enum):
+    """Selectable broker backends. Strategy math is identical across backends."""
+
+    ROBINHOOD = "robinhood"
+    ALPACA = "alpaca"
+
+
+# Alpaca connector (Pipedream) identifiers and tool names. These describe the
+# adapter-compatible payloads the strategy builds; they are never executed here.
+ALPACA_SOURCE_ID = "alpaca__pipedream"
+ALPACA_ACCOUNT_INFO_TOOL = "alpaca-get-account-info"
+ALPACA_LIST_ORDERS_TOOL = "alpaca-list-orders"
+ALPACA_LIST_POSITIONS_TOOL = "alpaca-list-positions"
+ALPACA_PLACE_ORDER_TOOL = "alpaca-place-order"
 
 
 @dataclass(frozen=True)
@@ -114,6 +137,7 @@ class StrategyConfig:
     minimum_drop_vs_previous_close: float = 0.001
     max_buys_per_ticker_per_day: int = 1
     target_account_number: str = ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+    broker: BrokerName = BrokerName.ROBINHOOD
     dry_run: bool = True
 
     # Bars from many market-data APIs are start-stamped. At a 3:45 PM decision,
@@ -267,6 +291,178 @@ class DryRunBroker:
 
     def place_market_buy(self, ticker: str, notional_usd: float, ref_id: str) -> str:
         return f"DRY-RUN-{ticker}-{notional_usd:.2f}-{ref_id}"
+
+
+def format_notional(amount_usd: float) -> str:
+    """Format a dollar amount as the string Alpaca expects for notional orders."""
+    return f"{amount_usd:.2f}"
+
+
+@dataclass(frozen=True)
+class AlpacaConfig:
+    """Alpaca backend settings.
+
+    ``is_paper_api`` selects paper vs. live at the connector; paper is safest for
+    connection testing. ``enable_live_orders`` is the hard gate on real placement:
+    while False (default), the adapter builds the order payload but never submits it.
+    """
+
+    is_paper_api: bool = True
+    enable_live_orders: bool = False
+    time_in_force: str = "day"
+    extended_hours: bool = False
+    # Dry-run buying power used when no live account-info callable is wired in.
+    simulated_buying_power_usd: float = 300.0
+
+
+def build_alpaca_account_info_payload(is_paper_api: bool) -> Dict[str, Any]:
+    return {
+        "source_id": ALPACA_SOURCE_ID,
+        "tool": ALPACA_ACCOUNT_INFO_TOOL,
+        "input": {"isPaperAPI": is_paper_api},
+    }
+
+
+def build_alpaca_list_orders_payload(
+    is_paper_api: bool,
+    symbols: Sequence[str],
+    side: str = "buy",
+    status: str = "all",
+    after: Optional[str] = None,
+    until: Optional[str] = None,
+    nested: str = "",
+) -> Dict[str, Any]:
+    order_input: Dict[str, Any] = {
+        "isPaperAPI": is_paper_api,
+        "symbols": list(symbols),
+        "side": side,
+        "status": status,
+        "nested": nested,
+    }
+    if after is not None:
+        order_input["after"] = after
+    if until is not None:
+        order_input["until"] = until
+    return {
+        "source_id": ALPACA_SOURCE_ID,
+        "tool": ALPACA_LIST_ORDERS_TOOL,
+        "input": order_input,
+    }
+
+
+def build_alpaca_list_positions_payload(is_paper_api: bool) -> Dict[str, Any]:
+    return {
+        "source_id": ALPACA_SOURCE_ID,
+        "tool": ALPACA_LIST_POSITIONS_TOOL,
+        "input": {"isPaperAPI": is_paper_api},
+    }
+
+
+def build_alpaca_market_buy_payload(
+    symbol: str,
+    notional_usd: float,
+    is_paper_api: bool = True,
+    time_in_force: str = "day",
+    extended_hours: bool = False,
+) -> Dict[str, Any]:
+    """Build a regular-hours market buy payload using notional as a string."""
+    return {
+        "source_id": ALPACA_SOURCE_ID,
+        "tool": ALPACA_PLACE_ORDER_TOOL,
+        "input": {
+            "symbol": symbol,
+            "side": "buy",
+            "type": "market",
+            "timeInForce": time_in_force,
+            "notional": format_notional(notional_usd),
+            "extendedHours": extended_hours,
+            "isPaperAPI": is_paper_api,
+        },
+    }
+
+
+class AlpacaBroker:
+    """BrokerAdapter for Alpaca via the ``alpaca__pipedream`` connector.
+
+    The adapter is a skeleton: it builds connector-ready payloads and only submits
+    a real order when ``AlpacaConfig.enable_live_orders`` is True and a ``place_order_fn``
+    is wired in. With the defaults it is entirely dry-run and never calls the network.
+    Inject callables to connect it to the live connector without changing the strategy.
+    """
+
+    def __init__(
+        self,
+        config: Optional[AlpacaConfig] = None,
+        account: str = ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
+        place_order_fn: Optional[Callable[[Dict[str, Any]], str]] = None,
+        account_info_fn: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        list_orders_fn: Optional[Callable[[Dict[str, Any]], List[Dict[str, Any]]]] = None,
+    ) -> None:
+        self.config = config or AlpacaConfig()
+        self._account = account
+        self._place_order_fn = place_order_fn
+        self._account_info_fn = account_info_fn
+        self._list_orders_fn = list_orders_fn
+
+    def account_number(self) -> str:
+        return self._account
+
+    def available_buying_power(self) -> float:
+        if self._account_info_fn is not None:
+            info = self._account_info_fn(build_alpaca_account_info_payload(self.config.is_paper_api))
+            return float(info.get("buying_power", info.get("cash", 0.0)))
+        return self.config.simulated_buying_power_usd
+
+    def same_day_strategy_order_exists(self, ticker: str, trading_day: date) -> bool:
+        if self._list_orders_fn is None:
+            return False
+        day_iso = trading_day.isoformat()
+        payload = build_alpaca_list_orders_payload(
+            is_paper_api=self.config.is_paper_api,
+            symbols=[ticker],
+            side="buy",
+            status="all",
+            after=f"{day_iso}T00:00:00Z",
+            until=f"{day_iso}T23:59:59Z",
+        )
+        return bool(self._list_orders_fn(payload))
+
+    def is_tradable_for_fractional_buy(self, ticker: str) -> bool:
+        return True
+
+    def review_market_buy(self, ticker: str, notional_usd: float) -> tuple[bool, str]:
+        return True, "alpaca dry-run review approved"
+
+    def build_market_buy_payload(self, ticker: str, notional_usd: float) -> Dict[str, Any]:
+        return build_alpaca_market_buy_payload(
+            symbol=ticker,
+            notional_usd=notional_usd,
+            is_paper_api=self.config.is_paper_api,
+            time_in_force=self.config.time_in_force,
+            extended_hours=self.config.extended_hours,
+        )
+
+    def place_market_buy(self, ticker: str, notional_usd: float, ref_id: str) -> str:
+        payload = self.build_market_buy_payload(ticker, notional_usd)
+        if self.config.enable_live_orders and self._place_order_fn is not None:
+            return self._place_order_fn(payload)
+        mode = "PAPER" if self.config.is_paper_api else "LIVE"
+        return f"ALPACA-DRYRUN-{mode}-{ticker}-{payload['input']['notional']}-{ref_id}"
+
+
+def build_broker(
+    config: StrategyConfig,
+    alpaca_config: Optional[AlpacaConfig] = None,
+    **adapter_kwargs: Any,
+) -> BrokerAdapter:
+    """Return the BrokerAdapter for ``config.broker`` without changing strategy logic."""
+    if config.broker == BrokerName.ALPACA:
+        return AlpacaBroker(
+            config=alpaca_config or AlpacaConfig(),
+            account=config.target_account_number,
+            **adapter_kwargs,
+        )
+    return DryRunBroker(account=config.target_account_number)
 
 
 def iso_week_key(day: date) -> tuple[int, int]:
@@ -551,6 +747,8 @@ def run_once(
 
 if __name__ == "__main__":
     raise SystemExit(
-        "Wire FinanceDataProvider, RobinhoodDataProvider, and RobinhoodBrokerAdapter "
-        "before running. Keep dry_run=True until adapter tests pass."
+        "Wire FinanceDataProvider and RobinhoodDataProvider, then select a broker with "
+        "StrategyConfig.broker (BrokerName.ROBINHOOD or BrokerName.ALPACA) and build it via "
+        "build_broker(config). Keep dry_run=True and AlpacaConfig.enable_live_orders=False "
+        "until adapter tests pass."
     )
