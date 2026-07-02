@@ -26,7 +26,7 @@ import csv
 import json
 import os
 import statistics
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from enum import Enum
 from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Set
