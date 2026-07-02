@@ -222,8 +222,14 @@ def build_coverage_report_md(
     lines.append(
         f"- Priced fills: {exq['priced_fills']}  |  target_price_missing: {exq['target_price_missing']}"
     )
+    avg_slip = exq.get("avg_slippage_pct")
+    max_slip = exq.get("max_slippage_pct")
+    min_slip = exq.get("min_slippage_pct")
+    avg_slip_str = f"{avg_slip}%" if avg_slip is not None else "n/a"
+    max_slip_str = f"{max_slip}%" if max_slip is not None else "n/a"
+    min_slip_str = f"{min_slip}%" if min_slip is not None else "n/a"
     lines.append(
-        f"- Slippage %: avg {exq['avg_slippage_pct']}  |  max {exq['max_slippage_pct']}  |  min {exq['min_slippage_pct']}"
+        f"- Slippage %: avg {avg_slip_str}  |  max {max_slip_str}  |  min {min_slip_str}"
     )
     lines.append("")
 
