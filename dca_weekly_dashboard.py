@@ -165,27 +165,25 @@ def build_execution_quality(summaries: Sequence[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def build_coverage_missed(
-    run_states: Sequence[Dict[str, Any]],
-    summaries: Sequence[Dict[str, Any]],
-) -> str:
-    lines = ["## Coverage and missed opportunities", ""]
-    lines.append("| Day | Candidates | Fills | Coverage % | Missing | Manual review |")
-    lines.append("| --- | --- | --- | --- | --- | --- |")
-    summary_by_day = {s.get("trading_day"): s for s in summaries}
     for rs in run_states:
         day = rs.get("trading_day")
-        summary = summary_by_day.get(day, {})
-        cov = summary.get("coverage", {})
-        manual = rs.get("manual_review_tickers", [])
+        summary = summary_by_day.get(day) or {}
+        cov = summary.get("coverage") or {}
+        manual = rs.get("manual_review_tickers") or []
+        
+        candidates = cov.get("buy_candidates", (rs.get("counts") or {}).get("buy_candidates", 0))
+        fills = cov.get("fills")
+        fills_str = str(fills) if fills is not None else "n/a"
+        coverage = cov.get("coverage_pct")
+        coverage_str = f"{coverage}%" if coverage is not None else "n/a"
+        missing = cov.get("missing_fills")
+        missing_str = str(missing) if missing is not None else "n/a"
+        
         lines.append(
-            f"| {day or '?'} | {cov.get('buy_candidates', rs.get('counts', {}).get('buy_candidates', 0))} | "
-            f"{cov.get('fills', 'n/a')} | {cov.get('coverage_pct', 'n/a')} | "
-            f"{cov.get('missing_fills', 'n/a')} | {len(manual)} |"
+            f"| {day or '?'} | {candidates} | "
+            f"{fills_str} | {coverage_str} | "
+            f"{missing_str} | {len(manual)} |"
         )
-    lines.append("")
-    return "\n".join(lines)
-
 
 def build_weekly_review_notes(
     run_states: Sequence[Dict[str, Any]],
