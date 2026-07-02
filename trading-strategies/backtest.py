@@ -9,6 +9,7 @@ Strategies implemented:
   2. RSI Mean Reversion (Oversold/Overbought)
 
 Requirements:
+    alpaca-py>=0.8.0
     vectorbt>=0.25.0
     yfinance>=0.2.0
     pandas>=1.5.0
@@ -23,10 +24,16 @@ Usage examples:
     python task1_backtest.py --strategy both --start 2020-01-01 --end 2025-01-01 --commission 0.001 --slippage 0.0005
 """
 
+# Alpaca API credentials (set these env vars for real-time-ready data)
+# export ALPACA_API_KEY=your_key
+# export ALPACA_SECRET_KEY=your_secret
+# Falls back to yfinance if not set.
+
 # ---------------------------------------------------------------------------
 # Standard library
 # ---------------------------------------------------------------------------
 import argparse
+import os
 import sys
 import warnings
 from datetime import datetime, timedelta
@@ -37,7 +44,9 @@ from typing import Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 import numpy as np
 import pandas as pd
-import yfinance as yf
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
 
 # Suppress noisy deprecation warnings from vectorbt / pandas internals
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -91,7 +100,11 @@ def fetch_data(
     end: str,
 ) -> Dict[str, pd.DataFrame]:
     """
-    Download daily OHLCV data from Yahoo Finance for each ticker.
+    Download daily OHLCV data for each ticker.
+
+    Uses Alpaca Historical Data API (free tier, no key required for IEX feed;
+    SIP feed requires paid subscription). Falls back to yfinance if
+    ALPACA_API_KEY/ALPACA_SECRET_KEY env vars are not set.
 
     Parameters
     ----------
@@ -108,42 +121,87 @@ def fetch_data(
         Mapping of ticker -> DataFrame with columns [Open, High, Low, Close, Volume].
         Tickers that fail to download are omitted with a warning.
     """
-    _print_section("Fetching price data via yfinance")
-
     # Ensure the benchmark is always included for comparison
     all_tickers = list(set(tickers + [BENCHMARK_TICKER]))
 
-    raw = yf.download(
-        tickers=all_tickers,
-        start=start,
-        end=end,
-        auto_adjust=True,   # Adjust for splits and dividends
-        progress=False,
-        threads=True,
-    )
+    api_key    = os.environ.get("ALPACA_API_KEY")
+    secret_key = os.environ.get("ALPACA_SECRET_KEY")
 
-    data: Dict[str, pd.DataFrame] = {}
+    if not api_key or not secret_key:
+        print("  [WARN] ALPACA_API_KEY / ALPACA_SECRET_KEY not set — falling back to yfinance.")
+        _print_section("Fetching price data via yfinance (fallback)")
 
-    if isinstance(raw.columns, pd.MultiIndex):
-        # Multiple tickers: columns are (field, ticker)
-        for ticker in all_tickers:
-            try:
-                df = raw.xs(ticker, level=1, axis=1)[["Open", "High", "Low", "Close", "Volume"]]
-                df = df.dropna(how="all")
-                if df.empty:
-                    print(f"  [WARN] No data returned for {ticker} — skipping.")
-                    continue
+        import yfinance as yf
+
+        raw = yf.download(
+            tickers=all_tickers,
+            start=start,
+            end=end,
+            auto_adjust=True,   # Adjust for splits and dividends
+            progress=False,
+            threads=True,
+        )
+
+        data: Dict[str, pd.DataFrame] = {}
+
+        if isinstance(raw.columns, pd.MultiIndex):
+            # Multiple tickers: columns are (field, ticker)
+            for ticker in all_tickers:
+                try:
+                    df = raw.xs(ticker, level=1, axis=1)[["Open", "High", "Low", "Close", "Volume"]]
+                    df = df.dropna(how="all")
+                    if df.empty:
+                        print(f"  [WARN] No data returned for {ticker} — skipping.")
+                        continue
+                    data[ticker] = df
+                    print(f"  {ticker}: {len(df)} rows  ({df.index[0].date()} → {df.index[-1].date()})")
+                except KeyError:
+                    print(f"  [WARN] {ticker} not found in downloaded data — skipping.")
+        else:
+            # Single ticker returned as flat DataFrame
+            ticker = all_tickers[0]
+            df = raw[["Open", "High", "Low", "Close", "Volume"]].dropna(how="all")
+            if not df.empty:
                 data[ticker] = df
                 print(f"  {ticker}: {len(df)} rows  ({df.index[0].date()} → {df.index[-1].date()})")
-            except KeyError:
-                print(f"  [WARN] {ticker} not found in downloaded data — skipping.")
-    else:
-        # Single ticker returned as flat DataFrame
-        ticker = all_tickers[0]
-        df = raw[["Open", "High", "Low", "Close", "Volume"]].dropna(how="all")
-        if not df.empty:
+
+        return data
+
+    # -----------------------------------------------------------------------
+    # Alpaca path
+    # -----------------------------------------------------------------------
+    _print_section("Fetching price data via Alpaca")
+
+    client = StockHistoricalDataClient(api_key, secret_key)
+
+    start_dt = datetime.strptime(start, "%Y-%m-%d")
+    end_dt   = datetime.strptime(end,   "%Y-%m-%d")
+
+    request = StockBarsRequest(
+        symbol_or_symbols=all_tickers,
+        timeframe=TimeFrame.Day,
+        start=start_dt,
+        end=end_dt,
+        adjustment="all",   # split + dividend adjusted (equivalent to yfinance auto_adjust=True)
+    )
+
+    bars = client.get_stock_bars(request)
+    df_all = bars.df  # MultiIndex: (symbol, timestamp)
+
+    data: Dict[str, pd.DataFrame] = {}
+    for ticker in all_tickers:
+        try:
+            df = df_all.loc[ticker].copy()
+            df.index = pd.to_datetime(df.index).tz_localize(None)
+            df = df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"})
+            df = df[["Open", "High", "Low", "Close", "Volume"]].dropna(how="all")
+            if df.empty:
+                print(f"  [WARN] No data returned for {ticker} — skipping.")
+                continue
             data[ticker] = df
             print(f"  {ticker}: {len(df)} rows  ({df.index[0].date()} → {df.index[-1].date()})")
+        except KeyError:
+            print(f"  [WARN] {ticker} not found in Alpaca response — skipping.")
 
     return data
 

@@ -5,7 +5,7 @@ Weekly quantitative strategy performance monitoring with HTML email alerting
 and CSV report export.
 
 Requirements:
-    pip install yfinance vectorbt pandas numpy requests scipy jinja2
+    pip install yfinance alpaca-py>=0.8.0 vectorbt pandas numpy requests scipy jinja2
 
 Usage:
     python task3_monitor.py                          # normal run
@@ -23,6 +23,11 @@ Environment variables:
     GOOGLE_SHEET_ID         Override the default Sheet ID (optional)
     GOOGLE_SHEET_URL        Override the default Sheet URL (optional)
 """
+
+# Alpaca credentials — set for real-time-ready data ingestion
+# export ALPACA_API_KEY=your_key
+# export ALPACA_SECRET_KEY=your_secret
+# Falls back to yfinance if not set.
 
 # ---------------------------------------------------------------------------
 # Standard-library imports
@@ -46,6 +51,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+import os as _os
+_ALPACA_KEY    = _os.environ.get("ALPACA_API_KEY", "")
+_ALPACA_SECRET = _os.environ.get("ALPACA_SECRET_KEY", "")
+_USE_ALPACA    = bool(_ALPACA_KEY and _ALPACA_SECRET)
 
 # vectorbt – signal generation and portfolio simulation
 import vectorbt as vbt
@@ -503,16 +515,12 @@ class StrategyRunner:
         for strat in self.cfg["STRATEGIES"]:
             all_tickers.update(strat["tickers"])
 
-        logger.info("Fetching price data for: %s", sorted(all_tickers))
-        raw = yf.download(
-            list(all_tickers),
-            start=start.strftime("%Y-%m-%d"),
-            end=end.strftime("%Y-%m-%d"),
-            auto_adjust=True,
-            progress=False,
+        logger.info(
+            "Fetching price data via %s for: %s",
+            "Alpaca" if _USE_ALPACA else "yfinance",
+            sorted(all_tickers),
         )
-
-        self._price_cache = self._extract_close(raw, all_tickers)
+        self._price_cache = self._fetch_prices(all_tickers, start, end)
 
         results: dict[str, pd.Series] = {}
         cutoff = end - timedelta(days=int(self.cfg["LOOKBACK_YEARS"] * 365))
@@ -546,6 +554,47 @@ class StrategyRunner:
         return spy.pct_change().dropna()
 
     # ── Private helpers ─────────────────────────────────────────────────────
+
+    def _fetch_prices(
+        self, tickers: set[str], start: datetime, end: datetime
+    ) -> dict[str, pd.Series]:
+        """Fetch OHLCV data and return {ticker: close pd.Series}."""
+        logger.info("Data source: %s", "Alpaca" if _USE_ALPACA else "yfinance (fallback)")
+        if _USE_ALPACA:
+            client = StockHistoricalDataClient(_ALPACA_KEY, _ALPACA_SECRET)
+            request = StockBarsRequest(
+                symbol_or_symbols=list(tickers),
+                timeframe=TimeFrame.Day,
+                start=start,
+                end=end,
+                adjustment="all",
+            )
+            bars = client.get_stock_bars(request)
+            bars_df = bars.df
+            return self._extract_close_alpaca(bars_df, tickers)
+        else:
+            raw = yf.download(
+                list(tickers),
+                start=start.strftime("%Y-%m-%d"),
+                end=end.strftime("%Y-%m-%d"),
+                auto_adjust=True,
+                progress=False,
+            )
+            return self._extract_close(raw, tickers)
+
+    def _extract_close_alpaca(
+        self, bars_df: pd.DataFrame, tickers: set[str]
+    ) -> dict[str, pd.Series]:
+        """Extract close series per ticker from an Alpaca BarSet MultiIndex DataFrame."""
+        close = {}
+        for ticker in tickers:
+            try:
+                s = bars_df.loc[ticker]["close"]
+                s.index = pd.to_datetime(s.index).tz_localize(None)
+                close[ticker] = s.dropna()
+            except KeyError:
+                logger.warning("No Alpaca price data for: %s", ticker)
+        return close
 
     def _extract_close(
         self, raw: pd.DataFrame, tickers: set[str]
