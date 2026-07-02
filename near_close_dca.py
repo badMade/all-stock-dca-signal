@@ -29,6 +29,7 @@ import statistics
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Set
 from zoneinfo import ZoneInfo
 
@@ -734,6 +735,172 @@ def within_caps(decision: ReconciledDecision, state: StrategyState, trading_day:
     return True
 
 
+def _signal_target_price(decision: ReconciledDecision) -> Optional[float]:
+    """Return the decision-bar close used as the buy target price at signal time.
+
+    Prefer the finance decision price, falling back to Robinhood. Returns None when
+    neither source carried a usable decision price so downstream slippage math can
+    flag ``target_price_missing`` instead of computing against a fabricated value.
+    """
+    for signal in (decision.finance_signal, decision.robinhood_signal):
+        if signal is not None and signal.decision_price > 0:
+            return signal.decision_price
+    return None
+
+
+def _signal_row(ticker: str, source: str, signal: Optional[SourceSignal]) -> Dict[str, Any]:
+    if signal is None:
+        return {
+            "ticker": ticker,
+            "source": source,
+            "action": Action.NO_DATA.value,
+            "reason": "no signal produced",
+            "decision_bar_close": None,
+            "previous_close": None,
+            "lookback_price": None,
+            "price_vs_previous_close_pct": None,
+            "intraday_trend_pct": None,
+            "drop_vs_previous_close_pct": None,
+            "buy_multiplier": None,
+            "decision_bar_timestamp": None,
+            "previous_close_timestamp": None,
+            "lookback_bar_timestamp": None,
+        }
+    return {
+        "ticker": ticker,
+        "source": source,
+        "action": signal.action.value,
+        "reason": signal.reason,
+        "decision_bar_close": signal.decision_price,
+        "previous_close": signal.previous_close,
+        "lookback_price": signal.lookback_price,
+        "price_vs_previous_close_pct": signal.price_vs_previous_close_pct,
+        "intraday_trend_pct": signal.intraday_trend_pct,
+        "drop_vs_previous_close_pct": signal.drop_vs_previous_close_pct,
+        "buy_multiplier": signal.buy_multiplier,
+        "decision_bar_timestamp": _iso_or_none(signal.decision_bar_timestamp),
+        "previous_close_timestamp": _iso_or_none(signal.previous_close_timestamp),
+        "lookback_bar_timestamp": _iso_or_none(signal.lookback_bar_timestamp),
+    }
+
+
+def _iso_or_none(value: Optional[datetime]) -> Optional[str]:
+    return value.isoformat() if value is not None else None
+
+
+def build_run_artifacts(
+    now: datetime,
+    config: StrategyConfig,
+    state: StrategyState,
+    decisions: Sequence[ReconciledDecision],
+    candidate_outcomes: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Build the structured run-state dict written by the daily live-run path.
+
+    The artifact captures everything downstream reporting needs: per-source signal
+    rows, buy candidates with the target price at signal time and the per-symbol
+    planned dollar amount, order ids, skip/block reasons, and budget/reserve fields.
+    """
+    now_et = now.astimezone(EASTERN)
+    trading_day = now_et.date()
+    run_id = f"{trading_day.isoformat()}-{now_et.strftime('%H%M%S')}"
+
+    signal_rows: List[Dict[str, Any]] = []
+    for decision in decisions:
+        signal_rows.append(_signal_row(decision.ticker, SourceName.FINANCE.value, decision.finance_signal))
+        signal_rows.append(_signal_row(decision.ticker, SourceName.ROBINHOOD.value, decision.robinhood_signal))
+
+    buy_candidates: List[Dict[str, Any]] = []
+    for decision in decisions:
+        if decision.action != Action.BUY:
+            continue
+        outcome = candidate_outcomes.get(decision.ticker, {})
+        target_price = _signal_target_price(decision)
+        buy_candidates.append(
+            {
+                "ticker": decision.ticker,
+                "reason": decision.reason,
+                "buy_multiplier": decision.buy_multiplier,
+                "planned_amount_usd": round(decision.suggested_amount_usd, 2),
+                "target_price": target_price,
+                "target_price_missing": target_price is None,
+                "decision_bar_close": target_price,
+                "previous_close": (
+                    decision.finance_signal.previous_close
+                    if decision.finance_signal is not None
+                    else (decision.robinhood_signal.previous_close if decision.robinhood_signal else None)
+                ),
+                "order_id": outcome.get("order_id"),
+                "status": outcome.get("status", "not_submitted"),
+                "skip_reason": outcome.get("skip_reason"),
+            }
+        )
+
+    return {
+        "run_id": run_id,
+        "generated_at": now_et.isoformat(),
+        "trading_day": trading_day.isoformat(),
+        "iso_week": list(iso_week_key(trading_day)),
+        "broker": config.broker.value,
+        "dry_run": config.dry_run,
+        "account_number": None,
+        "budget": {
+            "base_buy_amount_usd": config.base_buy_amount_usd,
+            "daily_base_cap_usd": config.daily_base_cap_usd,
+            "reserve_cap_usd": config.reserve_cap_usd,
+            "hard_daily_max_usd": config.hard_daily_max_usd,
+            "weekly_notional_cap_usd": config.weekly_notional_cap_usd,
+            "carry_forward_reserve_usd": round(state.carry_forward_reserve_usd, 2),
+            "allowed_spend_today_usd": round(state.allowed_spend_today(trading_day, config), 2),
+            "remaining_spend_today_usd": round(state.remaining_spend_today(trading_day, config), 2),
+            "day_notional_usd": round(state.day_notional(trading_day), 2),
+            "week_notional_usd": round(state.week_notional(trading_day), 2),
+        },
+        "counts": {
+            "evaluated": len(decisions),
+            "buy_candidates": len(buy_candidates),
+            "submitted": sum(1 for c in buy_candidates if c["status"] == "submitted"),
+            "skipped": sum(1 for c in buy_candidates if c["status"] not in {"submitted"}),
+            "manual_review": sum(1 for d in decisions if d.action == Action.MANUAL_REVIEW),
+        },
+        "signal_rows": signal_rows,
+        "buy_candidates": buy_candidates,
+        "manual_review_tickers": [d.ticker for d in decisions if d.action == Action.MANUAL_REVIEW],
+    }
+
+
+def write_run_artifacts(artifacts: Dict[str, Any], output_dir: str | Path) -> Dict[str, str]:
+    """Write the run-state JSON plus signal and candidate CSVs; return their paths."""
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    run_state_path = out / "run_state.json"
+    run_state_path.write_text(json.dumps(artifacts, indent=2, sort_keys=True))
+
+    signals_path = out / "signals.csv"
+    _write_csv(signals_path, artifacts["signal_rows"])
+
+    candidates_path = out / "buy_candidates.csv"
+    _write_csv(candidates_path, artifacts["buy_candidates"])
+
+    return {
+        "run_state": str(run_state_path),
+        "signals": str(signals_path),
+        "buy_candidates": str(candidates_path),
+    }
+
+
+def _write_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
+    if not rows:
+        path.write_text("")
+        return
+    fieldnames = list(rows[0].keys())
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 # Mutually exclusive reasons an active-universe ticker did not produce a filled order.
 MISSING_FILL_FAILED_TRIGGER = "failed DCA trigger"
 MISSING_FILL_BUDGET_CAPPED = "budget capped"
@@ -1124,6 +1291,7 @@ def run_once(
     finance_data: MarketDataProvider,
     robinhood_data: MarketDataProvider,
     broker: BrokerAdapter,
+    artifacts_dir: Optional[str | Path] = None,
     run_result: Optional[RunResult] = None,
 ) -> List[ReconciledDecision]:
     now_et = now.astimezone(EASTERN)
@@ -1182,27 +1350,35 @@ def run_once(
         reverse=True,
     )
 
+    candidate_outcomes: Dict[str, Dict[str, Any]] = {}
+
     for decision in buy_candidates:
         ticker = decision.ticker
 
         if state.buys_today(ticker, trading_day) >= config.max_buys_per_ticker_per_day:
+            candidate_outcomes[ticker] = {"status": "skipped", "skip_reason": "already bought today"}
             _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: already bought today; skipping")
             continue
         if broker.same_day_strategy_order_exists(ticker, trading_day):
+            candidate_outcomes[ticker] = {"status": "skipped", "skip_reason": "same-day broker order exists"}
             _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: same-day broker order already exists; skipping")
             continue
         if not within_caps(decision, state, trading_day, config):
+            candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "cap would be exceeded"}
             _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: cap would be exceeded; skipping")
             continue
         if broker.available_buying_power() < decision.suggested_amount_usd:
+            candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "insufficient buying power"}
             _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: insufficient buying power; skipping")
             continue
         if not broker.is_tradable_for_fractional_buy(ticker):
+            candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "not tradable for fractional buy"}
             _block(ticker, MISSING_FILL_BROKER_BLOCKED, f"{ticker}: not tradable for fractional/notional buy; skipping")
             continue
 
         review_ok, review_reason = broker.review_market_buy(ticker, decision.suggested_amount_usd)
         if not review_ok:
+            candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": f"review blocked: {review_reason}"}
             _block(ticker, MISSING_FILL_BROKER_BLOCKED, f"{ticker}: review blocked order: {review_reason}")
             continue
 
@@ -1213,10 +1389,16 @@ def run_once(
                 order_id = broker.place_market_buy(ticker, decision.suggested_amount_usd, ref_id=ref_id)
             else:
                 order_id = f"DRY-RUN-SIM-{ticker}-{decision.suggested_amount_usd:.2f}-{ref_id}"
+            candidate_outcomes[ticker] = {
+                "status": "dry_run",
+                "order_id": order_id,
+                "skip_reason": "dry_run: order not placed",
+            }
         else:
             order_id = broker.place_market_buy(ticker, decision.suggested_amount_usd, ref_id=ref_id)
             state.record_buy(ticker, trading_day, decision.suggested_amount_usd)
             print(f"Placed buy for {ticker}: ${decision.suggested_amount_usd:.2f}, order_id={order_id}")
+            candidate_outcomes[ticker] = {"status": "submitted", "order_id": order_id, "skip_reason": None}
 
         if run_result is not None:
             _log_execution(run_result, decision, order_id, broker)
@@ -1231,6 +1413,11 @@ def run_once(
         f"reserve now ${state.carry_forward_reserve_usd:.2f}; "
         f"weekly spent ${state.week_notional(trading_day):.2f}."
     )
+
+    if artifacts_dir is not None:
+        artifacts = build_run_artifacts(now, config, state, decisions, candidate_outcomes)
+        paths = write_run_artifacts(artifacts, artifacts_dir)
+        print(f"Wrote run artifacts: {paths['run_state']}")
 
     return decisions
 
