@@ -187,9 +187,9 @@ def build_weekly_review_notes(
 ) -> str:
     """Auto-generate review prompts from the week's aggregates."""
     lines = ["## Weekly review notes", ""]
-    total_missing = sum(_num(s.get("coverage", {}).get("missing_fills")) for s in summaries)
-    total_manual = sum(len(rs.get("manual_review_tickers", [])) for rs in run_states)
-    missing_targets = sum(_num(s.get("execution_quality", {}).get("target_price_missing")) for s in summaries)
+    total_missing = sum(_num((s.get("coverage") or {}).get("missing_fills")) for s in summaries)
+    total_manual = sum(len(rs.get("manual_review_tickers") or []) for rs in run_states)
+    missing_targets = sum(_num((s.get("execution_quality") or {}).get("target_price_missing")) for s in summaries)
 
     lines.append(f"- Runs analyzed: {len(run_states)} day(s).")
     if total_missing:
