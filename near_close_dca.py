@@ -852,11 +852,12 @@ def _log_execution(
     broker: BrokerAdapter,
 ) -> None:
     """Fetch fill details for a placed order and append a durable execution record."""
+    get_fill = getattr(broker, "get_order_fill", None)
+    fill: Optional[OrderFill] = None
     if callable(get_fill):
         res = get_fill(order_id)
         if isinstance(res, OrderFill):
             fill = res
-
     record = build_execution_record(
         ticker=decision.ticker,
         target_price=decision.target_price,
