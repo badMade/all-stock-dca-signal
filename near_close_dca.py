@@ -758,7 +758,7 @@ def build_run_artifacts(
         "iso_week": list(iso_week_key(trading_day)),
         "broker": config.broker.value,
         "dry_run": config.dry_run,
-        "account_number": config.target_account_number,
+        "account_number": None,
         "budget": {
             "base_buy_amount_usd": config.base_buy_amount_usd,
             "daily_base_cap_usd": config.daily_base_cap_usd,
