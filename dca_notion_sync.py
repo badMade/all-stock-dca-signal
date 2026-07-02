@@ -31,10 +31,10 @@ def _fmt(value: Any, suffix: str = "") -> str:
 
 def build_compact_sync_markdown(summary: Dict[str, Any]) -> str:
     """Render the compact "Latest Run — Compact Sync" markdown from a run summary."""
-    cov = summary.get("coverage", {})
-    exq = summary.get("execution_quality", {})
-    budget = summary.get("budget", {})
-    manual = summary.get("manual_review_tickers", [])
+    cov = summary.get("coverage") or {}
+    exq = summary.get("execution_quality") or {}
+    budget = summary.get("budget") or {}
+    manual = summary.get("manual_review_tickers") or []
 
     lines = []
     lines.append(f"## {COMPACT_SYNC_TITLE}")
