@@ -144,17 +144,23 @@ def build_execution_quality(summaries: Sequence[Dict[str, Any]]) -> str:
     lines.append("| --- | --- | --- | --- | --- | --- |")
     all_slips: List[float] = []
     for summary in summaries:
-        exq = summary.get("execution_quality", {})
+        exq = summary.get("execution_quality") or {}
         avg = exq.get("avg_slippage_pct")
         if avg is not None:
             all_slips.append(avg)
+        avg_str = f"{avg}%" if avg is not None else "n/a"
+        max_slip = exq.get("max_slippage_pct")
+        max_slip_str = f"{max_slip}%" if max_slip is not None else "n/a"
+        worst = exq.get("worst_ticker")
+        worst_str = worst if worst is not None else "n/a"
         lines.append(
             f"| {summary.get('trading_day', '?')} | {exq.get('priced_fills', 0)} | "
-            f"{exq.get('target_price_missing', 0)} | {avg if avg is not None else 'n/a'} | "
-            f"{exq.get('max_slippage_pct', 'n/a')} | {exq.get('worst_ticker', 'n/a')} |"
+            f"{exq.get('target_price_missing', 0)} | {avg_str} | "
+            f"{max_slip_str} | {worst_str} |"
         )
-    week_avg = round(sum(all_slips) / len(all_slips), 4) if all_slips else "n/a"
-    lines.append(f"| **Week avg** | | | **{week_avg}** | | |")
+    week_avg = round(sum(all_slips) / len(all_slips), 4) if all_slips else None
+    week_avg_str = f"{week_avg}%" if week_avg is not None else "n/a"
+    lines.append(f"| **Week avg** | | | **{week_avg_str}** | | |")
     lines.append("")
     return "\n".join(lines)
 
