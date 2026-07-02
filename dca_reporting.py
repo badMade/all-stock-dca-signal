@@ -218,7 +218,8 @@ def build_coverage_report_md(
     lines.append("")
     lines.append(f"- Run: `{summary.get('run_id')}` (broker: {summary.get('broker')}, dry_run: {summary.get('dry_run')})")
     lines.append(f"- Buy candidates: {cov['buy_candidates']}")
-    lines.append(f"- Fills: {cov['fills']}  |  Missing fills: {cov['missing_fills']}  |  Coverage: {cov['coverage_pct']}%")
+    coverage = f"{cov['coverage_pct']}%" if cov["coverage_pct"] is not None else "n/a"
+    lines.append(f"- Fills: {cov['fills']}  |  Missing fills: {cov['missing_fills']}  |  Coverage: {coverage}")
     lines.append(
         f"- Priced fills: {exq['priced_fills']}  |  target_price_missing: {exq['target_price_missing']}"
     )
