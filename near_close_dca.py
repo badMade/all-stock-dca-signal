@@ -398,7 +398,7 @@ def evaluate_source_signal(
     get_quote = getattr(data, "get_quote", None)
     if callable(get_quote):
         quote = get_quote(ticker, decision_dt)
-        if quote is not None:
+        if quote is not None and isinstance(quote, (tuple, list)) and len(quote) >= 2:
             quote_price = float(quote[0])
             quote_time = quote[1]
     price_vs_previous_close_pct = (decision_price / previous_close - 1.0) * 100.0
