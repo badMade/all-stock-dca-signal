@@ -1,0 +1,27 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "sizing_ladder.schema.json",
+  "title": "Graded sizing ladder",
+  "type": "object",
+  "required": ["tiers", "base_amount_usd"],
+  "additionalProperties": true,
+  "properties": {
+    "version": { "type": "string" },
+    "status": { "type": "string", "enum": ["active", "historical"] },
+    "base_amount_usd": { "type": "number", "minimum": 0 },
+    "no_buy_below_pct": { "type": "number" },
+    "tiers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["min_drop_pct", "multiplier"],
+        "additionalProperties": true,
+        "properties": {
+          "min_drop_pct": { "type": "number" },
+          "max_drop_pct": { "type": ["number", "null"] },
+          "multiplier": { "type": "number", "minimum": 0 }
+        }
+      }
+    }
+  }
+}

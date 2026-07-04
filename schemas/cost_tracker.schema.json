@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "cost_tracker.schema.json",
+  "title": "Automation cost tracker (usage proxies)",
+  "description": "Written by monthly cost review task bec4a6ee. Uses usage proxies, not exact credit/billing figures.",
+  "type": "object",
+  "required": ["schema_version", "period", "proxies"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": { "type": "string" },
+    "period": { "type": "string", "description": "e.g. 2026-07" },
+    "generated_at_utc": { "type": "string", "format": "date-time" },
+    "proxies": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "task_runs": { "type": "integer" },
+        "heavy_analysis_runs": { "type": "integer" },
+        "manual_runs": { "type": "integer" },
+        "approx_tokens": { "type": ["integer", "null"] },
+        "notes": { "type": "string" }
+      }
+    },
+    "flags": { "type": "array", "items": { "type": "string" } }
+  }
+}

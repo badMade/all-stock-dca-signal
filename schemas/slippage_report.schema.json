@@ -1,0 +1,41 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "slippage_report.schema.json",
+  "title": "Post-trade slippage report",
+  "description": "Written by analytics task 67aa802b. Compares decision-time signal price to actual fill price.",
+  "type": "object",
+  "required": ["schema_version", "run_date_et", "rows"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": { "type": "string" },
+    "run_date_et": { "type": "string", "format": "date" },
+    "generated_at_utc": { "type": "string", "format": "date-time" },
+    "source": { "type": "string", "description": "e.g. robinhood_order_history + live run_state artifact" },
+    "rows": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["ticker", "signal_price", "fill_price", "slippage_pct"],
+        "additionalProperties": true,
+        "properties": {
+          "ticker": { "type": "string" },
+          "signal_price": { "type": "number" },
+          "fill_price": { "type": ["number", "null"] },
+          "dollar_amount": { "type": "number" },
+          "filled_shares": { "type": ["number", "null"] },
+          "slippage_pct": { "type": ["number", "null"], "description": "(fill - signal) / signal * 100" },
+          "broker_order_id": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "orders": { "type": "integer" },
+        "mean_slippage_pct": { "type": ["number", "null"] },
+        "max_abs_slippage_pct": { "type": ["number", "null"] }
+      }
+    }
+  }
+}

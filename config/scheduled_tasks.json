@@ -1,0 +1,89 @@
+{
+  "$schema": "../schemas/scheduled_tasks.schema.json",
+  "version": "2026-07-04",
+  "timezone_note": "Cron expressions are in UTC. ET equivalents are during US Eastern Daylight Time (EDT, UTC-4). Confirm around DST transitions.",
+  "tasks": [
+    {
+      "id": "ce16ba6b",
+      "name": "Live graded DCA task",
+      "type": "trading",
+      "status": "active",
+      "cron_utc": "30 19 * * 1-5",
+      "et_equivalent": "3:30 PM ET weekdays (EDT)",
+      "trades": true,
+      "broker_account": "robinhood:562057042",
+      "trigger_gate": "programmatic_trigger_check.sh",
+      "trigger_window": "Weekdays 2026-07-02 through 2026-08-28, 3:20-3:55 PM ET",
+      "notes": "Approved live trading task. Stale display name may say 3:45/Jul 10 - authoritative schedule is 3:30 PM ET. Writes standardized same-day state file; places real market buy orders automatically within safeguards; must not fall back to interactive confirmation."
+    },
+    {
+      "id": "a46bf007",
+      "name": "Live-run watchdog",
+      "type": "monitoring",
+      "status": "active",
+      "cron_utc": "40 19 * * 1-5",
+      "et_equivalent": "3:40 PM ET weekdays (EDT)",
+      "trades": false,
+      "notes": "Read-only. Alerts on missed run, error, or discrepancy. No trading."
+    },
+    {
+      "id": "67aa802b",
+      "name": "Post-trade slippage + compact Notion latest-run sync",
+      "type": "analytics",
+      "status": "active",
+      "cron_utc": "45 19 * * 1-5",
+      "et_equivalent": "3:45 PM ET weekdays (EDT)",
+      "trades": false,
+      "notes": "Analytics only. Reads live artifacts and Robinhood order history, writes slippage artifacts, updates the compact Notion Latest Run section only."
+    },
+    {
+      "id": "cd45e95b",
+      "name": "Compact volatility outlier scan",
+      "type": "analytics",
+      "status": "active",
+      "cron_utc": "45 13 * * 1-5",
+      "et_equivalent": "9:45 AM ET weekdays (EDT)",
+      "trades": false,
+      "notes": "Analytics only. Alerts only for >5% outliers or actionable errors; no full 41+ ticker narrative on no-outlier days."
+    },
+    {
+      "id": "041d9d90",
+      "name": "Weekly DCA Notion performance dashboard refresh",
+      "type": "analytics",
+      "status": "active",
+      "cron_utc": "0 21 * * 5",
+      "et_equivalent": "Fridays 5:00 PM ET (EDT)",
+      "trades": false,
+      "notes": "Analytics only. Refreshes full Notion performance dashboard. No routine email."
+    },
+    {
+      "id": "0656657a",
+      "name": "Monthly graded DCA dashboard refresh",
+      "type": "analytics",
+      "status": "active",
+      "cron_utc": "45 12 1-7 * 1-5",
+      "et_equivalent": "First weekday of month 8:45 AM ET (EDT)",
+      "trades": false,
+      "notes": "Analytics only. No-op if the day is not the first weekday of the month."
+    },
+    {
+      "id": "bec4a6ee",
+      "name": "Monthly DCA automation cost review",
+      "type": "analytics",
+      "status": "active",
+      "cron_utc": "55 13 1-7 * 1-5",
+      "et_equivalent": "First weekday of month; next_run observed 9:55 AM ET despite a requested 9:15 AM ET",
+      "trades": false,
+      "notes": "Analytics only. Usage proxies, no exact credits. Discrepancy: requested 9:15 AM ET but observed next_run 9:55 AM ET - flagged for reconciliation."
+    },
+    {
+      "id": "f7411889",
+      "name": "One-time reminder: evaluate continuing past Aug 28",
+      "type": "reminder",
+      "status": "active",
+      "fires_at_et": "2026-08-15 11:45 AM ET",
+      "trades": false,
+      "notes": "Reminder only. Evaluate whether to continue live testing past the 2026-08-28 approved window."
+    }
+  ]
+}

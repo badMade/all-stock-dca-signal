@@ -1,0 +1,16 @@
+{
+  "$schema": "../schemas/notifications.schema.json",
+  "version": "2026-07-04",
+  "channels": {
+    "slack": { "enabled": false, "note": "No Slack. Explicitly disabled." },
+    "in_app_message_center": { "enabled": true, "note": "Primary notification channel." },
+    "email": { "enabled": true, "scope": "Only where a task explicitly says to email; no routine dashboard emails." }
+  },
+  "routing": {
+    "live_run_alerts": ["in_app_message_center"],
+    "watchdog_alerts": ["in_app_message_center"],
+    "volatility_outliers": ["in_app_message_center"],
+    "weekly_dashboard": [],
+    "cost_review": ["in_app_message_center"]
+  }
+}
