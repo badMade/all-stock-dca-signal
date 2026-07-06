@@ -107,6 +107,8 @@ def load_approved_dates(config_dir: Path) -> Dict[str, Any]:
     data = _read_json(config_dir / "trading_window.json")
     if data is None:
         return {}
+    if "start_date" not in data or "end_date" not in data:
+        raise ValueError("trading_window.json must contain both 'start_date' and 'end_date'")
     start = date.fromisoformat(str(data["start_date"]))
     end = date.fromisoformat(str(data["end_date"]))
     if end < start:
