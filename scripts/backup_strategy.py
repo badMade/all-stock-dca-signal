@@ -86,9 +86,17 @@ def extract_tickers(text: str) -> Dict[str, object]:
             if re.fullmatch(r"[A-Z.]{1,6}", sym) and sym not in _TICKER_STOPWORDS:
                 active.append(sym)
 
-    # De-dupe preserving order; drop excluded symbols from active.
+    # De-dupe preserving order; apply corrections; drop excluded symbols from active.
     active = _dedupe(active)
     excluded = _dedupe(excluded)
+
+    # Apply symbol corrections (e.g. IRDMI -> IRDM) so the extracted universe is canonical.
+    if corrections:
+        active = [corrections.get(s, s) for s in active]
+        excluded = [corrections.get(s, s) for s in excluded]
+        active = _dedupe(active)
+        excluded = _dedupe(excluded)
+
     active = [s for s in active if s not in set(excluded)]
 
     return {"active": active, "excluded": excluded, "symbol_corrections": corrections}
