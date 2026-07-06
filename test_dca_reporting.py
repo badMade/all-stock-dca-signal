@@ -24,6 +24,7 @@ from dca_weekly_dashboard import (
     build_graded_vs_fixed,
     build_sector_matrix,
     build_weekly_dashboard,
+    load_json_files,
 )
 
 
@@ -254,10 +255,33 @@ def test_build_run_artifacts_captures_target_price():
     assert artifacts["budget"]["weekly_notional_cap_usd"] == 600.0
 
 
+def test_load_json_files_skips_blocked_stubs(tmp_path):
+    real = tmp_path / "run_state.json"
+    real.write_text(json.dumps(_run_state()), encoding="utf-8")
+    blocked = tmp_path / "blocked_run_state.json"
+    blocked.write_text(
+        json.dumps({"trading_day": "2026-06-30", "status": "blocked"}), encoding="utf-8"
+    )
+
+    loaded = load_json_files([real, blocked])
+    # Date-gated stubs must not count as run days in the weekly dashboard.
+    assert len(loaded) == 1
+    assert loaded[0]["trading_day"] == "2026-06-29"
+
+
 def _run_all():
+    import inspect
+    import tempfile
+    from pathlib import Path
+
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
-            fn()
+            if inspect.signature(fn).parameters:
+                # tmp_path-style tests get a throwaway directory outside pytest.
+                with tempfile.TemporaryDirectory() as tmp:
+                    fn(Path(tmp))
+            else:
+                fn()
             print(f"PASS {name}")
     print("All reporting self-tests passed.")
 

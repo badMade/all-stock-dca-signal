@@ -38,6 +38,35 @@ EASTERN = ZoneInfo("America/New_York")
 
 ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = "562057042"
 
+# Lightweight usage-proxy fields logged to each live run's run_state so the monthly
+# cost tracker can aggregate automation load without any exact credit accounting.
+# All numbers are activity proxies (call/row/byte counts), never real credit spend.
+USAGE_PROXY_FIELDS = (
+    "tickers_scanned",
+    "finance_calls_attempted",
+    "robinhood_calls_attempted",
+    "signal_rows_written",
+    "buy_candidates_written",
+    "order_reviews_attempted",
+    "orders_placed_count",
+    "state_file_bytes",
+    "csv_artifact_count",
+    "total_artifact_bytes",
+    "notifications_sent",
+    "errors_count",
+    "manual_recovery_required",
+    "cost_control_notes",
+)
+
+# Default cost-control notes recorded on the compact daily live path. They document
+# the work deliberately NOT done daily so the choice is auditable from the artifact.
+DAILY_COST_CONTROL_NOTES = (
+    "daily compact mode: structured JSON/CSV + compact summary only",
+    "narrative slippage report deferred to manual/Friday runs",
+    "weekly matrix, historical backtest, and full Notion dashboard not run on daily path",
+    "Notion daily sync limited to the compact Latest Run section",
+)
+
 ACTIVE_TICKERS = [
     "DFTX", "TRIN", "AAAU", "SPCX", "TRLV", "RVI", "VCX", "EVR", "LUNR", "IRDM",
     "DXYZ", "LITE", "ASML", "DRAM", "STX", "MSFT", "AAPL", "AMAT", "AMD", "CBRS",
@@ -118,6 +147,9 @@ class SourceSignal:
     quote_price: float = 0.0
     quote_time: Optional[datetime] = None
     decision_bar_close: float = 0.0
+    # True when this signal stands in for a provider exception rather than a
+    # genuine "no data" answer. Reconciliation must never auto-buy past it.
+    provider_error: bool = False
 
 
 @dataclass(frozen=True)
@@ -671,6 +703,21 @@ def reconcile_signals(
     finance_action = finance_signal.action if finance_signal else Action.NO_DATA
     robinhood_action = robinhood_signal.action if robinhood_signal else Action.NO_DATA
 
+    if Action.BUY in {finance_action, robinhood_action}:
+        errored = [
+            name
+            for name, signal in (("finance", finance_signal), ("robinhood", robinhood_signal))
+            if signal is not None and signal.provider_error
+        ]
+        if errored:
+            return ReconciledDecision(
+                ticker=ticker,
+                action=Action.MANUAL_REVIEW,
+                reason=f"provider error on {', '.join(errored)}; do not auto-buy",
+                finance_signal=finance_signal,
+                robinhood_signal=robinhood_signal,
+            )
+
     if finance_action == Action.BUY and robinhood_action == Action.BUY:
         amount = min(
             finance_signal.suggested_amount_usd,
@@ -755,6 +802,7 @@ def _signal_row(ticker: str, source: str, signal: Optional[SourceSignal]) -> Dic
             "source": source,
             "action": Action.NO_DATA.value,
             "reason": "no signal produced",
+            "provider_error": None,
             "decision_bar_close": None,
             "previous_close": None,
             "lookback_price": None,
@@ -771,6 +819,7 @@ def _signal_row(ticker: str, source: str, signal: Optional[SourceSignal]) -> Dic
         "source": source,
         "action": signal.action.value,
         "reason": signal.reason,
+        "provider_error": signal.provider_error,
         "decision_bar_close": signal.decision_price,
         "previous_close": signal.previous_close,
         "lookback_price": signal.lookback_price,
@@ -788,12 +837,75 @@ def _iso_or_none(value: Optional[datetime]) -> Optional[str]:
     return value.isoformat() if value is not None else None
 
 
+def build_usage_proxy(
+    *,
+    decisions: Sequence[ReconciledDecision],
+    signal_rows: Sequence[Dict[str, Any]],
+    buy_candidates: Sequence[Dict[str, Any]],
+    candidate_outcomes: Dict[str, Dict[str, Any]],
+    order_reviews_attempted: Optional[int] = None,
+    finance_calls_attempted: Optional[int] = None,
+    robinhood_calls_attempted: Optional[int] = None,
+    errors_count: int = 0,
+    notifications_sent: Optional[int] = None,
+    cost_control_notes: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    """Assemble the lightweight usage-proxy block for a run's run_state.
+
+    Every value is an activity proxy (counts of calls/rows/orders/bytes), never an
+    exact credit or dollar figure. ``*_calls_attempted`` default to the number of
+    scanned tickers because the daily path evaluates one finance and one Robinhood
+    signal per ticker; pass explicit values when the provider count is known. The
+    byte/count-of-file fields are left ``None`` here and filled by
+    ``write_run_artifacts`` once the files exist on disk.
+    """
+    tickers_scanned = len(decisions)
+    manual_review_count = sum(1 for d in decisions if d.action == Action.MANUAL_REVIEW)
+    orders_placed_count = sum(
+        1
+        for outcome in candidate_outcomes.values()
+        if outcome.get("order_id") and outcome.get("status") in {"submitted", "dry_run"}
+    )
+    return {
+        "tickers_scanned": tickers_scanned,
+        "finance_calls_attempted": (
+            finance_calls_attempted if finance_calls_attempted is not None else tickers_scanned
+        ),
+        "robinhood_calls_attempted": (
+            robinhood_calls_attempted if robinhood_calls_attempted is not None else tickers_scanned
+        ),
+        "signal_rows_written": len(signal_rows),
+        "buy_candidates_written": len(buy_candidates),
+        "order_reviews_attempted": (
+            order_reviews_attempted if order_reviews_attempted is not None else len(buy_candidates)
+        ),
+        "orders_placed_count": orders_placed_count,
+        # Filled in write_run_artifacts once files are written (approximate proxy).
+        "state_file_bytes": None,
+        "csv_artifact_count": None,
+        "total_artifact_bytes": None,
+        "notifications_sent": notifications_sent,
+        "errors_count": errors_count,
+        "manual_recovery_required": manual_review_count > 0 or errors_count > 0,
+        "cost_control_notes": list(cost_control_notes)
+        if cost_control_notes is not None
+        else list(DAILY_COST_CONTROL_NOTES),
+    }
+
+
 def build_run_artifacts(
     now: datetime,
     config: StrategyConfig,
     state: StrategyState,
     decisions: Sequence[ReconciledDecision],
     candidate_outcomes: Dict[str, Dict[str, Any]],
+    *,
+    order_reviews_attempted: Optional[int] = None,
+    finance_calls_attempted: Optional[int] = None,
+    robinhood_calls_attempted: Optional[int] = None,
+    errors_count: int = 0,
+    notifications_sent: Optional[int] = None,
+    cost_control_notes: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """Build the structured run-state dict written by the daily live-run path.
 
@@ -866,7 +978,54 @@ def build_run_artifacts(
         "signal_rows": signal_rows,
         "buy_candidates": buy_candidates,
         "manual_review_tickers": [d.ticker for d in decisions if d.action == Action.MANUAL_REVIEW],
+        "usage_proxy": build_usage_proxy(
+            decisions=decisions,
+            signal_rows=signal_rows,
+            buy_candidates=buy_candidates,
+            candidate_outcomes=candidate_outcomes,
+            order_reviews_attempted=order_reviews_attempted,
+            finance_calls_attempted=finance_calls_attempted,
+            robinhood_calls_attempted=robinhood_calls_attempted,
+            errors_count=errors_count,
+            notifications_sent=notifications_sent,
+            cost_control_notes=cost_control_notes,
+        ),
     }
+
+
+# CSV artifacts a run may leave beside run_state.json, and the status recorded in
+# the minimal run_state stub written when the date gate blocks execution.
+_RUN_CSV_NAMES = ("signals.csv", "buy_candidates.csv", "orders.csv")
+RUN_STATUS_BLOCKED = "blocked"
+
+
+def _existing_csv_artifacts(out: Path) -> List[Path]:
+    return [out / name for name in _RUN_CSV_NAMES if (out / name).exists()]
+
+
+def _serialize_run_state(run_state: Dict[str, Any]) -> str:
+    return json.dumps(run_state, indent=2, sort_keys=True)
+
+
+def _settle_usage_bytes(run_state: Dict[str, Any], usage: Dict[str, Any], csv_bytes: int) -> str:
+    """Set state_file_bytes/total_artifact_bytes to match the payload written to disk.
+
+    The serialized size only shifts when a counter changes digit count, so this
+    settles in a pass or two; the values are documented usage *proxies*, so a
+    pathological digit-boundary case exiting one byte off is tolerable.
+    """
+    serialized = _serialize_run_state(run_state)
+    for _ in range(4):
+        state_bytes = len(serialized.encode("utf-8"))
+        if (
+            usage.get("state_file_bytes") == state_bytes
+            and usage.get("total_artifact_bytes") == state_bytes + csv_bytes
+        ):
+            break
+        usage["state_file_bytes"] = state_bytes
+        usage["total_artifact_bytes"] = state_bytes + csv_bytes
+        serialized = _serialize_run_state(run_state)
+    return serialized
 
 
 def write_run_artifacts(artifacts: Dict[str, Any], output_dir: str | Path) -> Dict[str, str]:
@@ -874,20 +1033,52 @@ def write_run_artifacts(artifacts: Dict[str, Any], output_dir: str | Path) -> Di
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    run_state_path = out / "run_state.json"
-    run_state_path.write_text(json.dumps(artifacts, indent=2, sort_keys=True))
-
     signals_path = out / "signals.csv"
     _write_csv(signals_path, artifacts["signal_rows"])
 
     candidates_path = out / "buy_candidates.csv"
     _write_csv(candidates_path, artifacts["buy_candidates"])
 
+    # Count only the CSVs this run just wrote. orders.csv (written afterwards on
+    # the compact path) is folded in by _backfill_orders_csv_usage; a stale
+    # orders.csv left in a reused directory must not be attributed to this run.
+    csv_paths = [signals_path, candidates_path]
+    csv_bytes = sum(path.stat().st_size for path in csv_paths)
+
+    usage = artifacts.get("usage_proxy")
+    if isinstance(usage, dict):
+        usage["csv_artifact_count"] = len(csv_paths)
+        serialized = _settle_usage_bytes(artifacts, usage, csv_bytes)
+    else:
+        serialized = _serialize_run_state(artifacts)
+
+    run_state_path = out / "run_state.json"
+    run_state_path.write_text(serialized, encoding="utf-8")
+
     return {
         "run_state": str(run_state_path),
         "signals": str(signals_path),
         "buy_candidates": str(candidates_path),
     }
+
+
+def _backfill_orders_csv_usage(run_state_path: Path) -> None:
+    """Re-derive the CSV usage-proxy counters from disk after orders.csv is written.
+
+    ``orders.csv`` lands after ``write_run_artifacts`` has already finalized
+    ``run_state.json``, so without this pass the daily compact path would
+    undercount ``csv_artifact_count``/``total_artifact_bytes``.
+    """
+    if not run_state_path.exists():
+        return
+    run_state = json.loads(run_state_path.read_text(encoding="utf-8"))
+    usage = run_state.get("usage_proxy")
+    if not isinstance(usage, dict):
+        return
+    csv_paths = _existing_csv_artifacts(run_state_path.parent)
+    usage["csv_artifact_count"] = len(csv_paths)
+    csv_bytes = sum(path.stat().st_size for path in csv_paths)
+    run_state_path.write_text(_settle_usage_bytes(run_state, usage, csv_bytes), encoding="utf-8")
 
 
 def _write_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
@@ -1055,10 +1246,20 @@ def classify_missing_fill(decision: Optional[ReconciledDecision], loop_reason: O
     if loop_reason:
         return loop_reason
     action = decision.action if decision else Action.NO_DATA
-    if action == Action.NO_DATA:
+    if action == Action.NO_DATA or (decision is not None and _decision_had_provider_error(decision)):
+        # A provider exception is a data problem even when reconciliation degraded
+        # it to MANUAL_REVIEW instead of NO_DATA; report it as such so outages
+        # surface in the "data error" bucket rather than "failed DCA trigger".
         return MISSING_FILL_DATA_ERROR
     # SKIP / NO_ACTION / MANUAL_REVIEW: no reconciled auto-buy was triggered.
     return MISSING_FILL_FAILED_TRIGGER
+
+
+def _decision_had_provider_error(decision: ReconciledDecision) -> bool:
+    return any(
+        signal is not None and signal.provider_error
+        for signal in (decision.finance_signal, decision.robinhood_signal)
+    )
 
 
 @dataclass
@@ -1293,14 +1494,32 @@ def run_once(
     broker: BrokerAdapter,
     artifacts_dir: Optional[str | Path] = None,
     run_result: Optional[RunResult] = None,
+    notifications_sent: Optional[int] = None,
+    cost_control_notes: Optional[Sequence[str]] = None,
 ) -> List[ReconciledDecision]:
     now_et = now.astimezone(EASTERN)
     trading_day = now_et.date()
     if run_result is not None:
         run_result.trading_day = trading_day
 
+    errors_count = 0
+    order_reviews_attempted = 0
+
     if trading_day not in config.approved_test_dates:
         print(f"Date gate blocked execution for {trading_day}. No trades.")
+        if artifacts_dir:
+            out = Path(artifacts_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            state_path = out / "run_state.json"
+            # Never clobber a previously recorded run when a directory is reused;
+            # the stub only marks days that produced no artifact at all.
+            if not state_path.exists():
+                state_path.write_text(
+                    _serialize_run_state(
+                        {"trading_day": trading_day.isoformat(), "status": RUN_STATUS_BLOCKED}
+                    ),
+                    encoding="utf-8",
+                )
         return []
 
     if broker.account_number() != config.target_account_number:
@@ -1313,21 +1532,29 @@ def run_once(
     if run_result is not None:
         run_result.active_universe = list(tradable_tickers)
 
+    def _safe_signal(ticker: str, data: MarketDataProvider, interval_minutes: int) -> SourceSignal:
+        nonlocal errors_count
+        try:
+            return evaluate_source_signal(
+                ticker=ticker,
+                now=now,
+                config=config,
+                data=data,
+                interval_minutes=interval_minutes,
+            )
+        except Exception as exc:  # noqa: BLE001 - count and degrade to NO_DATA
+            errors_count += 1
+            return SourceSignal(
+                ticker=ticker,
+                source=getattr(data, "source", SourceName.FINANCE),
+                action=Action.NO_DATA,
+                reason=f"provider error: {exc}",
+                provider_error=True,
+            )
+
     for ticker in tradable_tickers:
-        finance_signal = evaluate_source_signal(
-            ticker=ticker,
-            now=now,
-            config=config,
-            data=finance_data,
-            interval_minutes=config.finance_interval_minutes,
-        )
-        robinhood_signal = evaluate_source_signal(
-            ticker=ticker,
-            now=now,
-            config=config,
-            data=robinhood_data,
-            interval_minutes=config.robinhood_interval_minutes,
-        )
+        finance_signal = _safe_signal(ticker, finance_data, config.finance_interval_minutes)
+        robinhood_signal = _safe_signal(ticker, robinhood_data, config.robinhood_interval_minutes)
         decisions.append(reconcile_signals(ticker, finance_signal, robinhood_signal))
 
     if run_result is not None:
@@ -1376,6 +1603,7 @@ def run_once(
             _block(ticker, MISSING_FILL_BROKER_BLOCKED, f"{ticker}: not tradable for fractional/notional buy; skipping")
             continue
 
+        order_reviews_attempted += 1
         review_ok, review_reason = broker.review_market_buy(ticker, decision.suggested_amount_usd)
         if not review_ok:
             candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": f"review blocked: {review_reason}"}
@@ -1415,7 +1643,17 @@ def run_once(
     )
 
     if artifacts_dir is not None:
-        artifacts = build_run_artifacts(now, config, state, decisions, candidate_outcomes)
+        artifacts = build_run_artifacts(
+            now,
+            config,
+            state,
+            decisions,
+            candidate_outcomes,
+            order_reviews_attempted=order_reviews_attempted,
+            errors_count=errors_count,
+            notifications_sent=notifications_sent,
+            cost_control_notes=cost_control_notes,
+        )
         paths = write_run_artifacts(artifacts, artifacts_dir)
         print(f"Wrote run artifacts: {paths['run_state']}")
 
@@ -1435,11 +1673,14 @@ def run_and_report(
     run_label: str = "manual",
     scheduled: bool = False,
 ) -> Dict[str, object]:
-    """Execute one DCA run and always emit a slippage/coverage report + state file.
+    """Execute one DCA run and emit the full slippage/coverage narrative + state file.
 
-    Used by both manual and scheduled runs. This path is fully non-interactive: it
-    never prompts for confirmation, so scheduled/background execution is unaffected.
-    Returns the artifact paths and summary metrics.
+    This is the heavier path intended for manual and Friday/monthly reviews: it
+    renders the narrative markdown report in addition to the CSV log. For the daily
+    live path use ``run_daily_compact`` instead, which writes structured JSON/CSV and
+    a compact summary only. This path is fully non-interactive: it never prompts for
+    confirmation, so scheduled/background execution is unaffected. Returns the
+    artifact paths and summary metrics.
     """
     run_result = RunResult(trading_day=now.astimezone(EASTERN).date(), decisions=[])
     run_once(now, config, state, finance_data, robinhood_data, broker, run_result=run_result)
@@ -1463,6 +1704,79 @@ def run_and_report(
         "state_path": written_state,
         "summary_metrics": report.metrics,
     }
+
+
+def run_daily_compact(
+    now: datetime,
+    config: StrategyConfig,
+    state: StrategyState,
+    finance_data: MarketDataProvider,
+    robinhood_data: MarketDataProvider,
+    broker: BrokerAdapter,
+    *,
+    artifacts_dir: str | Path,
+    run_label: str = "daily",
+    scheduled: bool = True,
+    notifications_sent: Optional[int] = None,
+) -> Dict[str, object]:
+    """Run one DCA scan and write only compact, structured daily artifacts.
+
+    This is the token/credit-lean daily live path. It deliberately does NOT:
+        - render the long narrative slippage/coverage markdown report,
+        - build the weekly performance matrix,
+        - run any historical backtest,
+        - generate the full Notion dashboard.
+
+    Those heavier rollups belong to Friday/monthly reviews (see ``run_and_report``
+    and ``dca_weekly_dashboard``). Daily output is:
+        - ``run_state.json``    structured run state incl. the usage-proxy block,
+        - ``signals.csv``       per-(ticker, source) signal rows,
+        - ``buy_candidates.csv``per-candidate rows,
+        - ``orders.csv``        durable per-order execution/slippage log.
+
+    The compact Notion "Latest Run" sync is produced downstream from
+    ``latest_run_summary.json`` (see ``dca_reporting``/``dca_notion_sync``); this
+    function only writes local artifacts and does not contact Notion directly.
+    It may interact with the passed-in broker adapter (dry-run by default).
+    """
+    trading_day = now.astimezone(EASTERN).date()
+    run_result = RunResult(trading_day=trading_day, decisions=[])
+    run_once(
+        now,
+        config,
+        state,
+        finance_data,
+        robinhood_data,
+        broker,
+        artifacts_dir=artifacts_dir,
+        run_result=run_result,
+        notifications_sent=notifications_sent,
+    )
+
+    out = Path(artifacts_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    result: Dict[str, object] = {
+        "run_label": run_label,
+        "scheduled": scheduled,
+        "compact": True,
+        "blocked": trading_day not in config.approved_test_dates,
+        "artifacts_dir": str(out),
+        "run_state_path": str(out / "run_state.json"),
+    }
+    if result["blocked"]:
+        # Date gate tripped inside run_once: only the blocked run_state stub was
+        # written, so return no CSV paths rather than paths to missing files.
+        return result
+
+    orders_csv = out / "orders.csv"
+    write_execution_csv(run_result.execution_records, str(orders_csv))
+    _backfill_orders_csv_usage(out / "run_state.json")
+    result.update(
+        signals_path=str(out / "signals.csv"),
+        buy_candidates_path=str(out / "buy_candidates.csv"),
+        orders_csv_path=str(orders_csv),
+    )
+    return result
 
 
 if __name__ == "__main__":
