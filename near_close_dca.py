@@ -984,8 +984,14 @@ def write_run_artifacts(artifacts: Dict[str, Any], output_dir: str | Path) -> Di
     candidates_path = out / "buy_candidates.csv"
     _write_csv(candidates_path, artifacts["buy_candidates"])
 
-    csv_paths = [signals_path, candidates_path]
-    csv_bytes = sum(path.stat().st_size for path in csv_paths)
+    candidates_path = out / "buy_candidates.csv"
+    _write_csv(candidates_path, artifacts["buy_candidates"])
+
+    orders_path = out / "orders.csv"
+    csv_paths = [signals_path, candidates_path, orders_path]
+    csv_bytes = sum(path.stat().st_size for path in csv_paths if path.exists())
+
+    run_state_path = out / "run_state.json"
 
     run_state_path = out / "run_state.json"
     usage = artifacts.get("usage_proxy")
