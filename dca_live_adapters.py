@@ -249,7 +249,7 @@ class RobinhoodDataProvider:
                 return quote
         return None
 
-    def _previous_close_from_quote(self, ticker: str) -> Optional[Bar]:
+    def _previous_close_from_quote(self, ticker: str, as_of: datetime) -> Optional[Bar]:
         quote = self._quote_for(ticker)
         if quote is None:
             return None
@@ -258,7 +258,7 @@ class RobinhoodDataProvider:
         if price <= 0:
             return None
         close_date_str = official.get("date") or quote.get("previous_close_date")
-        close_date = _parse_iso_date(close_date_str) or (datetime.now(tz=EASTERN).date() - timedelta(days=1))
+        close_date = _parse_iso_date(close_date_str) or (as_of.astimezone(EASTERN).date() - timedelta(days=1))
         # Stamp the prior-session close bar at the 4pm ET regular-session close.
         timestamp = datetime.combine(close_date, time(16, 0), tzinfo=EASTERN)
         return Bar(timestamp=timestamp, open=price, high=price, low=price, close=price, volume=0.0)
