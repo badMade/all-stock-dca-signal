@@ -21,13 +21,20 @@ secret manager.
    [`docs/safeguards.md`](safeguards.md).
 2. Confirm the config files match the docs:
    ```bash
-   python -c "import json,sys; [json.load(open(f)) for f in ['config/tickers.json','config/sizing_ladder.json','config/budgets.json','config/scheduled_tasks.json','config/notifications.json','config/reporting.json']]; print('config JSON valid')"
+   python -c "import json,sys; [json.load(open(f)) for f in ['config/tickers.json','config/sizing_ladder.json','config/budgets.json','config/scheduled_tasks.json','config/notifications.json','config/reporting.json','config/run_classification.json']]; print('config JSON valid')"
    ```
 3. Recreate the scheduled tasks from
    [`config/scheduled_tasks.json`](../config/scheduled_tasks.json), preserving
    each cron (UTC) and the trading/analytics/monitoring/reminder type.
    - **Only `ce16ba6b` trades.** All others must remain read-only/analytics.
    - Re-attach the trigger gate `programmatic_trigger_check.sh` to `ce16ba6b`.
+   - Wire the **run-classification contract** ([run_classification.md](run_classification.md),
+     [`config/run_classification.json`](../config/run_classification.json)):
+     `ce16ba6b` writes scheduled vs manual artifacts to the correct paths and
+     updates `latest_scheduled_run.json` only for scheduled runs; the slippage,
+     watchdog, weekly, and monthly tasks exclude manual runs/order IDs from
+     scheduled-live metrics. `scripts/run_classification.py` is the reference
+     implementation.
 4. Re-provision secrets **outside** the repo:
    - Robinhood account `562057042` execution credentials.
    - `NOTION_TOKEN` for the dashboard sync (see
@@ -57,6 +64,7 @@ Then diff and review before committing. See [`scripts/README.md`](../scripts/REA
 - [ ] Base amount $3; tiered daily/weekly caps and $900 weekly rollover reserve cap intact.
 - [ ] Only `ce16ba6b` can trade; it uses only account `562057042`; Alpaca read-only.
 - [ ] Live task at 3:20 PM ET; slippage/Notion sync at 3:35 PM ET (not merged).
+- [ ] Run-classification contract wired: every run_state has a `run_classification` block; scheduled runs update `latest_scheduled_run.json`, manual runs don't; reporting excludes manual runs/order IDs (`python scripts/tests/test_run_classification.py`).
 - [ ] All 11 tasks present, including `b7961407` (9:00 AM buying-power) and `d72aa525` (3:25 PM briefing).
 - [ ] Afternoon tasks complete by 3:40 PM ET, except Fri 5:00 PM Notion refresh.
 - [ ] Signal rules recorded: below prior close + 60-min trend down + multiplier > 0.

@@ -1,0 +1,454 @@
+#!/usr/bin/env python3
+"""Run-classification contract for the graded DCA live test (task ce16ba6b).
+
+This module is the enforcement layer that keeps *scheduled* live runs of the
+graded DCA task from being confused with *manual* runs. It encodes the contract
+described in ``config/run_classification.json`` / ``docs/run_classification.md``
+and validated by ``schemas/run_classification.schema.json``.
+
+Responsibilities:
+  * Build the ``run_classification`` block for a scheduled or manual run.
+  * Choose the correct artifact directory per origin.
+  * Write run_state artifacts, updating ``latest_scheduled_run.json`` ONLY for
+    scheduled runs.
+  * Validate a run_state's classification block (required fields, origin/flag
+    agreement, run_id patterns).
+  * Collect manual order IDs and exclude them from scheduled-live metrics.
+  * Select the scheduled state for reporting, applying the narrow broker
+    time-window fallback rule.
+
+Standard library only. No secrets, tokens, or network calls. The concrete live
+trading code (near_close_dca) should call these helpers rather than
+re-implementing the path/pointer/exclusion logic; the reporting/watchdog/weekly
+tasks should route every scheduled-vs-manual decision through here.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Set
+
+# --- Contract constants (mirror config/run_classification.json) --------------
+
+STATE_SCHEMA_VERSION = "run-classification-v1"
+CRON_ID = "ce16ba6b"
+SCHEDULED_RUN_TYPE = "scheduled_live_test"
+SCHEDULED_FOR_ET = "15:20"
+SCHEDULED_WINDOW_START_ET = "15:15"
+SCHEDULED_WINDOW_END_ET = "15:35"
+
+STATE_ROOT = "/home/user/workspace/cron_tracking/ce16ba6b"
+RUN_STATE_FILENAME = "run_state.json"
+LATEST_SCHEDULED_RUN_FILENAME = "latest_scheduled_run.json"
+
+SCHEDULED_RUN_ID_RE = re.compile(r"^scheduled_[0-9]{8}_1520ET$")
+
+SCHEDULED_REQUIRED_FIELDS = (
+    "run_origin",
+    "run_type",
+    "cron_id",
+    "scheduled_for_et",
+    "scheduled_window_start_et",
+    "scheduled_window_end_et",
+    "manual_run",
+    "run_id",
+    "triggered_at_utc",
+    "state_schema_version",
+)
+
+MANUAL_REQUIRED_FIELDS = (
+    "run_origin",
+    "manual_run",
+    "cron_id",
+    "run_id",
+    "triggered_at_utc",
+    "state_schema_version",
+)
+
+
+# --- Building classification blocks ------------------------------------------
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def scheduled_run_id(trading_day: str) -> str:
+    """'2026-07-06' -> 'scheduled_20260706_1520ET'."""
+    compact = trading_day.replace("-", "")
+    if not re.fullmatch(r"[0-9]{8}", compact):
+        raise ValueError(f"trading_day must be YYYY-MM-DD, got {trading_day!r}")
+    return f"scheduled_{compact}_1520ET"
+
+
+def manual_run_id(triggered_at_utc: Optional[str] = None) -> str:
+    """Distinct id that can never match the scheduled pattern."""
+    ts = triggered_at_utc or _utc_now_iso()
+    compact = re.sub(r"[^0-9]", "", ts)[:14] or "00000000000000"
+    return f"manual_{compact[:8]}_{compact[8:14]}Z"
+
+
+def build_scheduled_classification(
+    trading_day: str, triggered_at_utc: Optional[str] = None
+) -> Dict[str, object]:
+    """Return a fully-populated scheduled run_classification block."""
+    return {
+        "run_origin": "scheduled",
+        "run_type": SCHEDULED_RUN_TYPE,
+        "cron_id": CRON_ID,
+        "scheduled_for_et": SCHEDULED_FOR_ET,
+        "scheduled_window_start_et": SCHEDULED_WINDOW_START_ET,
+        "scheduled_window_end_et": SCHEDULED_WINDOW_END_ET,
+        "manual_run": False,
+        "run_id": scheduled_run_id(trading_day),
+        "triggered_at_utc": triggered_at_utc or _utc_now_iso(),
+        "state_schema_version": STATE_SCHEMA_VERSION,
+    }
+
+
+def build_manual_classification(
+    triggered_at_utc: Optional[str] = None, run_id: Optional[str] = None
+) -> Dict[str, object]:
+    """Return a manual run_classification block with a distinct run_id."""
+    ts = triggered_at_utc or _utc_now_iso()
+    return {
+        "run_origin": "manual",
+        "run_type": "manual_test",
+        "cron_id": CRON_ID,
+        "manual_run": True,
+        "run_id": run_id or manual_run_id(ts),
+        "triggered_at_utc": ts,
+        "state_schema_version": STATE_SCHEMA_VERSION,
+    }
+
+
+# --- Path helpers ------------------------------------------------------------
+
+def state_root(base: Optional[Path] = None) -> Path:
+    return Path(base) if base is not None else Path(STATE_ROOT)
+
+
+def scheduled_run_dir(trading_day: str, base: Optional[Path] = None) -> Path:
+    compact = trading_day.replace("-", "")
+    return state_root(base) / "scheduled_runs" / f"{compact}_1520ET"
+
+
+def manual_run_dir(timestamp: str, base: Optional[Path] = None) -> Path:
+    safe = re.sub(r"[^0-9A-Za-z_-]", "", timestamp) or "unknown"
+    return state_root(base) / "manual_runs" / safe
+
+
+def latest_scheduled_run_path(base: Optional[Path] = None) -> Path:
+    return state_root(base) / LATEST_SCHEDULED_RUN_FILENAME
+
+
+# --- Validation --------------------------------------------------------------
+
+@dataclass
+class ValidationResult:
+    ok: bool
+    errors: List[str] = field(default_factory=list)
+
+    def __bool__(self) -> bool:  # allow `if validate(...):`
+        return self.ok
+
+
+def validate_classification(rc: Dict[str, object]) -> ValidationResult:
+    """Validate a run_classification block against the contract.
+
+    Mirrors run_classification.schema.json but usable at runtime with no
+    third-party dependency.
+    """
+    errors: List[str] = []
+    if not isinstance(rc, dict):
+        return ValidationResult(False, ["run_classification is missing or not an object"])
+
+    origin = rc.get("run_origin")
+    if origin not in ("scheduled", "manual"):
+        errors.append(f"run_origin must be 'scheduled' or 'manual', got {origin!r}")
+
+    if rc.get("state_schema_version") != STATE_SCHEMA_VERSION:
+        errors.append(
+            f"state_schema_version must be {STATE_SCHEMA_VERSION!r}, "
+            f"got {rc.get('state_schema_version')!r}"
+        )
+
+    required = SCHEDULED_REQUIRED_FIELDS if origin == "scheduled" else MANUAL_REQUIRED_FIELDS
+    for f_name in required:
+        if rc.get(f_name) in (None, ""):
+            errors.append(f"missing required field: {f_name}")
+
+    manual_flag = rc.get("manual_run")
+    if origin == "scheduled":
+        if manual_flag is not False:
+            errors.append("scheduled run must have manual_run=false")
+        if rc.get("run_type") != SCHEDULED_RUN_TYPE:
+            errors.append(f"scheduled run_type must be {SCHEDULED_RUN_TYPE!r}")
+        if rc.get("cron_id") != CRON_ID:
+            errors.append(f"scheduled cron_id must be {CRON_ID!r}")
+        if rc.get("scheduled_for_et") != SCHEDULED_FOR_ET:
+            errors.append(f"scheduled_for_et must be {SCHEDULED_FOR_ET!r}")
+        if rc.get("scheduled_window_start_et") != SCHEDULED_WINDOW_START_ET:
+            errors.append(f"scheduled_window_start_et must be {SCHEDULED_WINDOW_START_ET!r}")
+        if rc.get("scheduled_window_end_et") != SCHEDULED_WINDOW_END_ET:
+            errors.append(f"scheduled_window_end_et must be {SCHEDULED_WINDOW_END_ET!r}")
+        run_id = rc.get("run_id")
+        if isinstance(run_id, str) and not SCHEDULED_RUN_ID_RE.match(run_id):
+            errors.append(f"scheduled run_id must match scheduled_YYYYMMDD_1520ET, got {run_id!r}")
+    elif origin == "manual":
+        if manual_flag is not True:
+            errors.append("manual run must have manual_run=true")
+        run_id = rc.get("run_id")
+        if isinstance(run_id, str) and SCHEDULED_RUN_ID_RE.match(run_id):
+            errors.append("manual run_id must not match the scheduled_YYYYMMDD_1520ET pattern")
+
+    return ValidationResult(not errors, errors)
+
+
+def is_manual_state(state: Dict[str, object]) -> bool:
+    """True if a run_state is manual by EITHER origin or flag (defensive OR)."""
+    rc = state.get("run_classification") if isinstance(state, dict) else None
+    if not isinstance(rc, dict):
+        return False
+    return rc.get("run_origin") == "manual" or rc.get("manual_run") is True
+
+
+def is_scheduled_state(state: Dict[str, object]) -> bool:
+    """True only if a run_state is a *valid* scheduled run.
+
+    A manual flag anywhere wins: a state that is both marked scheduled and
+    carries manual_run=true is treated as NOT scheduled.
+    """
+    rc = state.get("run_classification") if isinstance(state, dict) else None
+    if not isinstance(rc, dict):
+        return False
+    if is_manual_state(state):
+        return False
+    return rc.get("run_origin") == "scheduled" and bool(validate_classification(rc))
+
+
+# --- Writing artifacts -------------------------------------------------------
+
+def write_run_artifacts(
+    run_state: Dict[str, object], base: Optional[Path] = None
+) -> Dict[str, str]:
+    """Persist a run_state to the correct directory for its origin.
+
+    Scheduled runs also (atomically enough for this backup) update
+    latest_scheduled_run.json. Manual runs NEVER touch that pointer.
+
+    Returns a dict of the paths written.
+    """
+    rc = run_state.get("run_classification")
+    result = validate_classification(rc if isinstance(rc, dict) else {})
+    if not result:
+        raise ValueError("refusing to write invalid run_classification: " + "; ".join(result.errors))
+
+    origin = rc["run_origin"]
+    written: Dict[str, str] = {}
+
+    if origin == "scheduled":
+        day = str(run_state.get("trading_day", "")).strip()
+        out_dir = scheduled_run_dir(day, base)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        state_path = out_dir / RUN_STATE_FILENAME
+        state_path.write_text(json.dumps(run_state, indent=2) + "\n")
+        written["run_state"] = str(state_path)
+
+        pointer = latest_scheduled_run_path(base)
+        pointer.parent.mkdir(parents=True, exist_ok=True)
+        pointer.write_text(
+            json.dumps(
+                {
+                    "run_id": rc["run_id"],
+                    "trading_day": day,
+                    "run_state_path": str(state_path),
+                    "triggered_at_utc": rc["triggered_at_utc"],
+                    "updated_at_utc": _utc_now_iso(),
+                    "state_schema_version": STATE_SCHEMA_VERSION,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        written["latest_scheduled_run"] = str(pointer)
+    else:  # manual
+        ts = re.sub(r"[^0-9]", "", str(rc.get("triggered_at_utc", ""))) or rc["run_id"]
+        out_dir = manual_run_dir(ts, base)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        state_path = out_dir / RUN_STATE_FILENAME
+        state_path.write_text(json.dumps(run_state, indent=2) + "\n")
+        written["run_state"] = str(state_path)
+        # Explicitly NOT updating latest_scheduled_run.json.
+
+    return written
+
+
+# --- Manual order exclusion --------------------------------------------------
+
+def _iter_run_state_files(root: Path) -> Iterable[Path]:
+    if not root.exists():
+        return []
+    return sorted(root.rglob("run_state*.json"))
+
+
+def _order_ids_from_state(state: Dict[str, object]) -> Set[str]:
+    ids: Set[str] = set()
+    for cand in state.get("buy_candidates", []) or []:
+        if isinstance(cand, dict):
+            oid = cand.get("order_id")
+            if isinstance(oid, str) and oid:
+                ids.add(oid)
+    # Some artifacts also carry a flat orders list.
+    for order in state.get("orders", []) or []:
+        if isinstance(order, dict):
+            oid = order.get("order_id") or order.get("broker_order_id")
+            if isinstance(oid, str) and oid:
+                ids.add(oid)
+    return ids
+
+
+def collect_manual_order_ids(base: Optional[Path] = None) -> Set[str]:
+    """Union of every order_id found in manual_runs/**/run_state*.json.
+
+    These IDs must be excluded from all scheduled-live metrics.
+    """
+    manual_root = state_root(base) / "manual_runs"
+    ids: Set[str] = set()
+    for path in _iter_run_state_files(manual_root):
+        try:
+            state = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        ids |= _order_ids_from_state(state)
+    return ids
+
+
+def exclude_manual_orders(
+    order_ids: Iterable[str], base: Optional[Path] = None
+) -> List[str]:
+    """Filter an iterable of broker order IDs, dropping any manual-run IDs."""
+    manual = collect_manual_order_ids(base)
+    return [oid for oid in order_ids if oid not in manual]
+
+
+# --- Scheduled-state selection for reporting ---------------------------------
+
+@dataclass
+class ScheduledSelection:
+    state: Optional[Dict[str, object]]
+    state_path: Optional[str]
+    order_ids: List[str]
+    used_broker_fallback: bool
+    fallback_reason: Optional[str]
+    excluded_manual_order_ids: List[str]
+    errors: List[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return self.state is not None and not self.errors
+
+
+def select_scheduled_state_for_reporting(
+    trading_day: str,
+    base: Optional[Path] = None,
+    broker_window_order_ids: Optional[Iterable[str]] = None,
+    scheduled_state_write_failed: bool = False,
+) -> ScheduledSelection:
+    """Pick the scheduled run_state for a trading day and derive its order IDs.
+
+    Enforces the reporting rules:
+      * Only a validated scheduled run_state may be used.
+      * Manual order IDs are always excluded.
+      * Never infer scheduled status from broker orders alone.
+      * Broker time-window fallback is allowed ONLY when a valid scheduled
+        state exists but lacks order IDs due to a known write failure; even
+        then manual order IDs are excluded.
+    """
+    manual_ids = collect_manual_order_ids(base)
+    out_dir = scheduled_run_dir(trading_day, base)
+    state_path = out_dir / RUN_STATE_FILENAME
+
+    if not state_path.exists():
+        return ScheduledSelection(
+            state=None,
+            state_path=None,
+            order_ids=[],
+            used_broker_fallback=False,
+            fallback_reason=None,
+            excluded_manual_order_ids=sorted(manual_ids),
+            errors=[f"no scheduled run_state at {state_path}"],
+        )
+
+    try:
+        state = json.loads(state_path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        return ScheduledSelection(
+            state=None,
+            state_path=str(state_path),
+            order_ids=[],
+            used_broker_fallback=False,
+            fallback_reason=None,
+            excluded_manual_order_ids=sorted(manual_ids),
+            errors=[f"could not read scheduled run_state: {exc}"],
+        )
+
+    if not is_scheduled_state(state):
+        rc = state.get("run_classification", {}) if isinstance(state, dict) else {}
+        detail = validate_classification(rc if isinstance(rc, dict) else {}).errors
+        return ScheduledSelection(
+            state=None,
+            state_path=str(state_path),
+            order_ids=[],
+            used_broker_fallback=False,
+            fallback_reason=None,
+            excluded_manual_order_ids=sorted(manual_ids),
+            errors=["run_state is not a valid scheduled run"] + detail,
+        )
+
+    scheduled_ids = _order_ids_from_state(state)
+    kept = [oid for oid in sorted(scheduled_ids) if oid not in manual_ids]
+
+    used_fallback = False
+    fallback_reason: Optional[str] = None
+    if not kept and scheduled_state_write_failed and broker_window_order_ids is not None:
+        # Valid scheduled state exists but has no usable order IDs due to a known
+        # write failure: attribute in-window broker orders, still excluding manual.
+        used_fallback = True
+        fallback_reason = "scheduled state present but order IDs missing (known write failure)"
+        kept = [oid for oid in broker_window_order_ids if oid not in manual_ids]
+
+    return ScheduledSelection(
+        state=state,
+        state_path=str(state_path),
+        order_ids=kept,
+        used_broker_fallback=used_fallback,
+        fallback_reason=fallback_reason,
+        excluded_manual_order_ids=sorted(manual_ids),
+        errors=[],
+    )
+
+
+__all__ = [
+    "STATE_SCHEMA_VERSION",
+    "CRON_ID",
+    "build_scheduled_classification",
+    "build_manual_classification",
+    "scheduled_run_id",
+    "manual_run_id",
+    "scheduled_run_dir",
+    "manual_run_dir",
+    "latest_scheduled_run_path",
+    "validate_classification",
+    "is_manual_state",
+    "is_scheduled_state",
+    "write_run_artifacts",
+    "collect_manual_order_ids",
+    "exclude_manual_orders",
+    "select_scheduled_state_for_reporting",
+    "ScheduledSelection",
+    "ValidationResult",
+]

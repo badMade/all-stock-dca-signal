@@ -14,6 +14,15 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 > post-trade slippage / Notion sync runs at **3:35 PM ET**. These are two
 > different tasks. Do not merge them or move the live trade off 3:20 PM ET.
 
+> **Run-classification note:** the live task (`ce16ba6b`) classifies every
+> run as scheduled or manual. Scheduled runs write under
+> `cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/` and update
+> `latest_scheduled_run.json`; manual runs write under `manual_runs/<timestamp>/`
+> and never touch that pointer. The slippage (`67aa802b`), watchdog
+> (`a46bf007`), weekly (`041d9d90`), and monthly (`0656657a`) tasks consume only
+> validated scheduled runs and exclude manual runs/order IDs. See
+> [run_classification.md](run_classification.md).
+
 | ID | Name | Type | Trades | Cron (UTC) | ET (EDT) | Status |
 |---|---|---|---|---|---|---|
 | `b7961407` | Pre-market DCA buying-power dashboard | analytics | no | `00 13 * * 1-5` | 9:00 AM weekdays | active |
@@ -47,6 +56,7 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 - Uses **only** Robinhood account `562057042`; Alpaca is read-only.
 - Trigger gate: `programmatic_trigger_check.sh`, allowing weekdays **2026-07-02 through 2026-08-28**, **3:20–3:55 PM ET**.
 - Writes standardized same-day state files under `/home/user/workspace/cron_tracking/ce16ba6b` ([`schemas/run_state.schema.json`](../schemas/run_state.schema.json)); must **not** fall back to interactive confirmation.
+- **Run classification:** a scheduled run writes `scheduled_runs/YYYYMMDD_1520ET/run_state.json` (`run_origin='scheduled'`, `run_id='scheduled_YYYYMMDD_1520ET'`) and updates `latest_scheduled_run.json`; a manual run writes `manual_runs/<timestamp>/run_state.json` (`run_origin='manual'`, `manual_run=true`) and never updates that pointer. See [run_classification.md](run_classification.md).
 - **Manual runs do not count as scheduled-run evidence.** Any stale stored display name is superseded by the authoritative **3:20 PM ET** schedule.
 
 ### `d72aa525` — Capital-priority briefing
@@ -55,15 +65,18 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 
 ### `67aa802b` — Post-trade slippage + compact Notion latest-run sync
 - Analytics only, **no trading**. Runs **3:35 PM ET weekdays**.
-- Reads live task artifacts and Robinhood order history, writes slippage/coverage artifacts, updates the compact Notion **Latest Run** section only.
+- Reads the **scheduled** live-run state and Robinhood order history, writes slippage/coverage artifacts, updates the compact Notion **Latest Run** section only.
+- **Run classification:** scheduled-live rows exclude all manual order IDs and any `run_origin='manual'`/`manual_run=true` state; manual fills go only in the labeled **Manual Test Runs** section. See [run_classification.md](run_classification.md).
 
 ### `a46bf007` — Live-run watchdog
 - Read-only, **no trading**. Runs **3:40 PM ET weekdays** — the **final scheduled afternoon event**.
 - Alerts only on missed, incomplete, error, or discrepancy conditions.
+- **Run classification:** validates that a scheduled run_state exists and `latest_scheduled_run.json` points at it; a manual-only or broker-orders-only day is a discrepancy, not a scheduled run.
 
 ### `041d9d90` — Weekly Notion performance dashboard refresh
 - Analytics only, **no trading**. Runs **Fridays 5:00 PM ET** — the only approved post-3:40 PM exception.
 - Recalculates and refreshes the full Notion performance dashboard. No routine email.
+- **Run classification:** weekly scheduled-live metrics use only validated scheduled runs with manual runs/order IDs excluded; manual fills, if shown, are confined to a labeled **Manual Test Runs** section. See [run_classification.md](run_classification.md).
 
 ### `0656657a` — Monthly graded DCA dashboard refresh
 - Analytics only, **no trading**. First weekday of the month **8:45 AM ET**. No-op otherwise.

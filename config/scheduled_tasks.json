@@ -3,6 +3,13 @@
   "version": "2026-07-06",
   "timezone_note": "Cron expressions are in UTC. ET equivalents are during US Eastern Daylight Time (EDT, UTC-4). Confirm around DST transitions.",
   "afternoon_completion_rule": "All afternoon tasks complete no later than 3:40 PM ET, except the Friday weekly Notion performance refresh at 5:00 PM ET (the only approved post-3:40 PM DCA-related exception).",
+  "run_classification_policy": {
+    "policy_file": "config/run_classification.json",
+    "schema": "schemas/run_classification.schema.json",
+    "doc": "docs/run_classification.md",
+    "state_schema_version": "run-classification-v1",
+    "summary": "Every run_state artifact carries a run_classification block. Scheduled runs of ce16ba6b write under scheduled_runs/YYYYMMDD_1520ET/ and update latest_scheduled_run.json; manual runs write under manual_runs/<timestamp>/ and never touch that pointer. Downstream analytics validate scheduled state, exclude all manual order IDs and any run_origin='manual'/manual_run=true state, and never infer scheduled status from broker orders alone."
+  },
   "tasks": [
     {
       "id": "b7961407",
@@ -46,7 +53,17 @@
       "trigger_gate": "programmatic_trigger_check.sh",
       "trigger_window": "Weekdays 2026-07-02 through 2026-08-28, 3:20-3:55 PM ET",
       "state_dir": "/home/user/workspace/cron_tracking/ce16ba6b",
-      "notes": "The only trading task. Approved live Robinhood execution using the $3 base 0x-to-5x ladder with tiered daily/weekly caps. Robinhood account 562057042 only; Alpaca read-only. Writes standardized same-day state files under /home/user/workspace/cron_tracking/ce16ba6b; places real market buy orders automatically within safeguards; must not fall back to interactive confirmation. Test window through Fri Aug 28 2026 inclusive. Manual runs do not count as scheduled-run evidence. Any stale stored display name is superseded by this authoritative 3:20 PM ET schedule."
+      "run_classification": {
+        "role": "writer",
+        "scheduled_window_et": "15:15-15:35",
+        "scheduled_for_et": "15:20",
+        "scheduled_run_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/",
+        "manual_run_dir": "/home/user/workspace/cron_tracking/ce16ba6b/manual_runs/<timestamp>/",
+        "latest_scheduled_run_pointer": "/home/user/workspace/cron_tracking/ce16ba6b/latest_scheduled_run.json",
+        "scheduled_run_id_pattern": "scheduled_YYYYMMDD_1520ET",
+        "policy_file": "config/run_classification.json"
+      },
+      "notes": "The only trading task. Approved live Robinhood execution using the $3 base 0x-to-5x ladder with tiered daily/weekly caps. Robinhood account 562057042 only; Alpaca read-only. Places real market buy orders automatically within safeguards; must not fall back to interactive confirmation. A SCHEDULED run writes run_state.json (with run_classification run_origin='scheduled', run_type='scheduled_live_test', run_id='scheduled_YYYYMMDD_1520ET') under scheduled_runs/YYYYMMDD_1520ET/ AND updates latest_scheduled_run.json. A MANUAL run writes run_state.json (run_origin='manual', manual_run=true, distinct run_id) under manual_runs/<timestamp>/ and MUST NOT update latest_scheduled_run.json. All run_state files carry state_schema_version='run-classification-v1'. Test window through Fri Aug 28 2026 inclusive. Manual runs do not count as scheduled-run evidence. Any stale stored display name is superseded by this authoritative 3:20 PM ET schedule."
     },
     {
       "id": "d72aa525",
@@ -66,7 +83,12 @@
       "cron_utc": "35 19 * * 1-5",
       "et_equivalent": "3:35 PM ET weekdays (EDT)",
       "trades": false,
-      "notes": "Analytics only, no trading. Reads live task artifacts and Robinhood order history, writes slippage/coverage artifacts, and updates the compact Notion Latest Run section only."
+      "run_classification": {
+        "role": "consumer",
+        "policy_file": "config/run_classification.json",
+        "rules": "Validate the scheduled run_state, exclude all order IDs from manual_runs/**/run_state*.json, exclude any run_state with run_origin='manual' or manual_run=true, and never infer scheduled status from same-day broker orders alone. Broker time-window fallback only if a valid scheduled state exists but lacks order IDs due to a known write failure. Report manual fills only under a 'Manual Test Runs' section; manual fills never affect scheduled-live cost basis, slippage, reliability, or order-count metrics."
+      },
+      "notes": "Analytics only, no trading. Reads the scheduled live-run state and Robinhood order history, writes slippage/coverage artifacts, and updates the compact Notion Latest Run section only. Honors the run-classification policy (config/run_classification.json): scheduled-live metrics use only validated scheduled runs with manual order IDs excluded."
     },
     {
       "id": "a46bf007",
@@ -76,7 +98,12 @@
       "cron_utc": "40 19 * * 1-5",
       "et_equivalent": "3:40 PM ET weekdays (EDT)",
       "trades": false,
-      "notes": "Read-only, no trading. Final scheduled afternoon event. Alerts only on missed, incomplete, error, or discrepancy conditions."
+      "run_classification": {
+        "role": "consumer",
+        "policy_file": "config/run_classification.json",
+        "rules": "Confirms a valid scheduled run_state exists (run_origin='scheduled', passes run_classification.schema.json) and that latest_scheduled_run.json points at it. Treats any run_origin='manual'/manual_run=true state as NOT scheduled-run evidence regardless of path. Never infers a scheduled run from same-day broker orders alone; alerts if the scheduled state is missing/invalid even when broker orders exist."
+      },
+      "notes": "Read-only, no trading. Final scheduled afternoon event. Alerts only on missed, incomplete, error, or discrepancy conditions. Validates the run-classification contract: a missing/invalid scheduled run_state is a discrepancy even if manual runs or broker orders exist that day."
     },
     {
       "id": "041d9d90",
@@ -86,7 +113,12 @@
       "cron_utc": "0 21 * * 5",
       "et_equivalent": "Fridays 5:00 PM ET (EDT)",
       "trades": false,
-      "notes": "Analytics only, no trading. Recalculates and refreshes the full Notion performance dashboard. The only approved post-3:40 PM DCA-related exception. No routine email."
+      "run_classification": {
+        "role": "consumer",
+        "policy_file": "config/run_classification.json",
+        "rules": "Weekly scheduled-live cost basis, slippage, reliability, and order-count metrics are computed only from validated scheduled runs with all manual order IDs excluded. Manual fills, if shown at all, appear only in a clearly labeled 'Manual Test Runs' section and never affect scheduled-live metrics."
+      },
+      "notes": "Analytics only, no trading. Recalculates and refreshes the full Notion performance dashboard. The only approved post-3:40 PM DCA-related exception. No routine email. Scheduled-live metrics exclude manual runs per config/run_classification.json; manual fills are confined to a labeled Manual Test Runs section."
     },
     {
       "id": "0656657a",

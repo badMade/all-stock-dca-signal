@@ -57,7 +57,16 @@ on the day's planned spend and the count of 3x-or-greater signals (multiplier
 
 - The live task **must write standardized same-day state files** and **must not
   fall back to interactive confirmation** — it runs unattended.
-- **Manual runs do not count as scheduled-run evidence.**
+- **Manual runs do not count as scheduled-run evidence.** Every run_state
+  artifact must carry a `run_classification` block distinguishing scheduled from
+  manual runs. Scheduled runs write under
+  `cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/` and update
+  `latest_scheduled_run.json`; manual runs write under `manual_runs/<timestamp>/`
+  and **never** update that pointer. Downstream reporting excludes all manual
+  order IDs and any `run_origin='manual'` / `manual_run=true` state, and never
+  infers scheduled status from broker orders alone. See
+  [run_classification.md](run_classification.md) and
+  [`config/run_classification.json`](../config/run_classification.json).
 - **Afternoon completion rule:** all afternoon tasks complete **no later than
   3:40 PM ET**, except the Friday weekly Notion performance refresh at
   **5:00 PM ET** (the only approved post-3:40 PM exception).

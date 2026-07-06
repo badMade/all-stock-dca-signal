@@ -15,9 +15,29 @@
     "secrets_note": "Do not commit Drive tokens or private share links."
   },
   "artifacts": {
-    "run_state": "Standardized same-day state file written by the live task (see schemas/run_state.schema.json).",
+    "run_state": "Standardized same-day state file written by the live task (see schemas/run_state.schema.json). Every run_state carries a run_classification block (see schemas/run_classification.schema.json).",
     "slippage": "Slippage artifacts written by task 67aa802b (see schemas/slippage_report.schema.json).",
-    "cost_tracker": "Usage proxy artifacts from task bec4a6ee (see schemas/cost_tracker.schema.json)."
+    "cost_tracker": "Usage proxy artifacts from task bec4a6ee (see schemas/cost_tracker.schema.json).",
+    "run_classification_policy": "config/run_classification.json — the scheduled-vs-manual contract every reporting task must honor."
+  },
+  "run_classification": {
+    "policy_file": "config/run_classification.json",
+    "schema": "schemas/run_classification.schema.json",
+    "doc": "docs/run_classification.md",
+    "helper": "scripts/run_classification.py",
+    "applies_to_tasks": ["67aa802b", "a46bf007", "041d9d90", "0656657a"],
+    "rules": [
+      "Validate scheduled state files against schemas/run_classification.schema.json before use.",
+      "Collect every order_id in manual_runs/**/run_state*.json and exclude them from all scheduled-live metrics.",
+      "Exclude any run_state with run_origin='manual' or manual_run=true, regardless of file path.",
+      "Never infer scheduled status from same-day broker orders alone; a valid scheduled run_state must exist.",
+      "Broker time-window fallback (15:15-15:35 ET) is allowed only when a valid scheduled state exists but lacks order IDs due to a known write failure; manual order IDs stay excluded.",
+      "Scheduled-live cost basis, slippage, reliability, and order-count metrics come only from validated scheduled runs."
+    ],
+    "manual_reporting": {
+      "section_label": "Manual Test Runs",
+      "rule": "Manual fills may appear only in a clearly labeled 'Manual Test Runs' section and must not affect scheduled-live cost basis, slippage, reliability, or order-count metrics."
+    }
   },
   "requirements": {
     "local_first": "Daily live runs write structured JSON/CSV locally first.",
