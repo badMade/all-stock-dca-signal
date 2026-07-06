@@ -57,9 +57,9 @@ def _write_runs(root, run_states):
         (run_dir / "run_state.json").write_text(json.dumps(rs))
 
 
-def test_collect_filters_by_month():
-    tmp = tempfile.TemporaryDirectory()
+def test_collect_filters_by_month(tmp_path):
     _write_runs(
+        tmp_path,
         tmp.name,
         [
             _run_state("2026-06-29"),
