@@ -172,27 +172,71 @@ def extract_sizing_ladder(text: str) -> Dict[str, object]:
 
     return {
         "status": "active",
-        "base_amount_usd": 1.0,
+        "base_amount_usd": 3.0,
         "no_buy_below_pct": no_buy_below,
         "tiers": tiers,
     }
 
 
+# A currency amount, tolerating thousands separators ("1,800") and decimals.
+_NUMBER = r"[0-9][0-9,]*(?:\.[0-9]+)?"
+
+
+def _to_float(raw: str) -> float:
+    """Parse a captured numeric token, stripping any thousands separators."""
+    return float(raw.replace(",", ""))
+
+
 _BUDGET_PATTERNS = {
-    "base_amount_usd": r"base\s+amount[^$]*\$\s*([0-9]+(?:\.[0-9]+)?)",
-    "daily_base_cap_usd": r"daily\s+base\s+cap[^$]*\$\s*([0-9]+(?:\.[0-9]+)?)",
-    "carry_forward_reserve_cap_usd": r"carry[- ]forward\s+reserve[^$]*\$\s*([0-9]+(?:\.[0-9]+)?)",
-    "hard_daily_max_usd": r"hard\s+daily\s+max[^$]*\$\s*([0-9]+(?:\.[0-9]+)?)",
-    "weekly_hard_cap_usd": r"weekly\s+hard\s+cap[^$]*\$\s*([0-9]+(?:\.[0-9]+)?)",
+    "base_amount_usd": rf"base\s+amount[^$]*\$\s*({_NUMBER})",
+    "weekly_rollover_reserve_cap_usd": rf"weekly\s+rollover\s+reserve[^$]*\$\s*({_NUMBER})",
 }
 
+# Tier lines look like "Normal: ... daily cap $180, weekly cap $900".
+_TIER_PATTERN = re.compile(
+    rf"\b(normal|elevated|high[- ]?volatility|stress)\b[^\n]*?"
+    rf"daily\s+cap\s*\$?\s*({_NUMBER})[^\n]*?"
+    rf"weekly\s+cap\s*\$?\s*({_NUMBER})",
+    re.IGNORECASE,
+)
 
-def extract_budgets(text: str) -> Dict[str, float]:
-    out: Dict[str, float] = {}
+
+def extract_budget_tiers(text: str) -> List[Dict[str, object]]:
+    """Extract tiered daily/weekly caps from lines naming a tier and its caps.
+
+    The stress tier's capacity depends on the weekly rollover reserve, so when the
+    transcript mentions that reserve the ``requires_rollover_reserve`` safeguard is
+    carried on the stress tier. Note that ``write_configs`` also preserves this and
+    any other existing per-tier metadata when merging into an existing config.
+    """
+    mentions_rollover_reserve = bool(re.search(r"rollover\s+reserve", text, re.IGNORECASE))
+    tiers: List[Dict[str, object]] = []
+    seen: set = set()
+    for m in _TIER_PATTERN.finditer(text):
+        name = re.sub(r"[- ]", "_", m.group(1).lower())
+        if name in seen:
+            continue
+        seen.add(name)
+        tier: Dict[str, object] = {
+            "name": name,
+            "daily_cap_usd": _to_float(m.group(2)),
+            "weekly_cap_usd": _to_float(m.group(3)),
+        }
+        if name == "stress" and mentions_rollover_reserve:
+            tier["requires_rollover_reserve"] = True
+        tiers.append(tier)
+    return tiers
+
+
+def extract_budgets(text: str) -> Dict[str, object]:
+    out: Dict[str, object] = {}
     for key, pat in _BUDGET_PATTERNS.items():
         m = re.search(pat, text, re.IGNORECASE)
         if m:
-            out[key] = float(m.group(1))
+            out[key] = _to_float(m.group(1))
+    tiers = extract_budget_tiers(text)
+    if tiers:
+        out["budget_tiers"] = tiers
     return out
 
 
@@ -259,10 +303,40 @@ def extract_all(text: str) -> Dict[str, object]:
     }
 
 
+def _is_named_dict_list(value: object) -> bool:
+    return isinstance(value, list) and bool(value) and all(
+        isinstance(item, dict) and "name" in item for item in value
+    )
+
+
+def _merge_named_list(existing: list, incoming: list) -> list:
+    """Merge two lists of dicts keyed by ``name``, preserving existing-only fields.
+
+    Used for ``budget_tiers`` so a refresh updates the extracted caps without
+    dropping metadata that lives only in the config (e.g. the stress tier's
+    ``requires_rollover_reserve`` safeguard, ``note``, and ``select_when``).
+    """
+    order: List[str] = []
+    by_name: Dict[str, dict] = {}
+    for item in existing:
+        by_name[item["name"]] = dict(item)
+        order.append(item["name"])
+    for item in incoming:
+        name = item["name"]
+        if name in by_name:
+            by_name[name].update(item)
+        else:
+            by_name[name] = dict(item)
+            order.append(name)
+    return [by_name[name] for name in order]
+
+
 def _deep_merge(dst: dict, src: dict) -> None:
     for k, v in src.items():
         if isinstance(v, dict) and isinstance(dst.get(k), dict):
             _deep_merge(dst[k], v)
+        elif _is_named_dict_list(v) and _is_named_dict_list(dst.get(k)):
+            dst[k] = _merge_named_list(dst[k], v)
         else:
             dst[k] = v
 

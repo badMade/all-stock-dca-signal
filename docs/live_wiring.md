@@ -40,12 +40,26 @@ broker = build_broker(
     # enable_live_orders=True,    # <- the second gate; leave off until validated
 )
 
+state = load_strategy_state()   # <- see "State persistence" below; NOT a fresh StrategyState()
 run_pipeline(
-    datetime.now(tz=EASTERN), config, StrategyState(),
+    datetime.now(tz=EASTERN), config, state,
     finance, robinhood, broker,
     artifacts_dir="artifacts/2026-07-06", generate_full_reports=False,
 )
+save_strategy_state(state)
 ```
+
+## State persistence (required for the budget safeguards)
+
+`StrategyState` holds the counters the daily/weekly/reserve caps depend on —
+`submitted_notional_by_day`, `submitted_notional_by_week`, `weekly_rollover_reserve_usd`,
+`reserve_week_key`, `finalized_budget_days`, and per-ticker buy counts. These live only in
+memory, and `run_pipeline` does **not** load or save them. Each scheduled invocation is a
+fresh process, so the caller **must** persist `StrategyState` across runs — passing a fresh
+`StrategyState()` every day silently resets the reserve/weekly accounting and defeats the
+documented budget caps. Persist it however the scheduler prefers (e.g. a JSON blob written
+next to the daily artifacts and reloaded at the start of the next run); the `run_state.json`
+artifact records the same figures for audit but is not auto-rehydrated into `StrategyState`.
 
 ## Safety gates (both must be flipped to place real orders)
 

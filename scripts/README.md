@@ -14,7 +14,7 @@ it whenever the strategy changes so the backup stays current.
 |---|---|---|
 | Ticker universe | `config/tickers.json` | active, excluded, `X -> Y` corrections |
 | Sizing ladder | `config/sizing_ladder.json` | drop-% tiers → multiplier; keeps the latest ladder |
-| Budget rules | `config/budgets.json` | base amount, daily/hard/weekly caps, reserve |
+| Budget rules | `config/budgets.json` | base amount, tiered daily/weekly caps, weekly rollover reserve cap |
 | Schedule | `config/schedule_extracted.json` | cron → ET, task ids, weekday-only flag |
 
 Writes are **merges**: existing keys in a target file are preserved; extracted
@@ -48,7 +48,8 @@ The extractors key off natural phrasings, e.g.:
   `Excluded: BYDDY` and `Corrected symbols: IRDMI -> IRDM`.
 - Ladder lines like `0.1% to <1% = 1x`, `>=8% = 5x`. A `drop <0.1% = 0x` line
   sets the no-buy threshold.
-- Budget lines like `Base amount $1.`, `Daily base cap $60.`, `Weekly hard cap $600.`.
+- Budget lines like `Base amount $3.`, `Weekly rollover reserve max $900.`, and
+  tier lines like `Normal: daily cap $180, weekly cap $900.`.
 - Schedule lines like `ce16ba6b ... schedule 30 19 * * 1-5 UTC = 3:30 PM ET weekdays`.
 
 ## Tests

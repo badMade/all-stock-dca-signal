@@ -1,24 +1,46 @@
 {
   "$schema": "../schemas/budgets.schema.json",
-  "version": "2026-07-04",
+  "version": "2026-07-06",
   "currency": "USD",
-  "base_amount_usd": 1.0,
-  "daily_base_cap_usd": 60.0,
-  "carry_forward_reserve_cap_usd": 420.0,
-  "hard_daily_max_usd": 120.0,
-  "weekly_hard_cap_usd": 600.0,
-  "reserve_logic": {
-    "description": "Once per trading day: unused base carries forward into the reserve; spend above the base cap draws from the reserve. Never above hard_daily_max or weekly cap.",
-    "unused_base": "max(0, daily_base_cap - actual_spend)",
-    "reserve_draw": "min(current_reserve, max(0, actual_spend - daily_base_cap))",
-    "reserve_next": "min(reserve_cap, max(0, reserve_start - reserve_draw + unused_base))",
-    "allowed_today": "max(0, min(hard_daily_max, daily_base_cap + current_reserve, weekly_cap - week_spend))"
-  },
+  "base_amount_usd": 3.0,
+  "high_multiplier_threshold": 3.0,
+  "weekly_rollover_reserve_cap_usd": 900.0,
+  "budget_tiers": [
+    {
+      "name": "normal",
+      "daily_cap_usd": 180.0,
+      "weekly_cap_usd": 900.0,
+      "select_when": "planned spend <= $129 and 3x-or-greater signals <= 5"
+    },
+    {
+      "name": "elevated",
+      "daily_cap_usd": 240.0,
+      "weekly_cap_usd": 1200.0,
+      "select_when": "planned spend > $129 or 3x-or-greater signals 6-10"
+    },
+    {
+      "name": "high_volatility",
+      "daily_cap_usd": 300.0,
+      "weekly_cap_usd": 1500.0,
+      "select_when": "planned spend > $213 or 3x-or-greater signals 11-17"
+    },
+    {
+      "name": "stress",
+      "daily_cap_usd": 360.0,
+      "weekly_cap_usd": 1800.0,
+      "requires_rollover_reserve": true,
+      "select_when": "planned spend > $272 or 3x-or-greater signals > 17",
+      "note": "Usable only to the extent prior unused weekly rollover reserve is available."
+    }
+  ],
+  "selection_rule": "Pick the highest tier triggered by EITHER planned spend or the count of 3x-or-greater signals. A 3x-or-greater signal is a buy candidate whose ladder multiplier is >= 3.0.",
+  "allocation_priority": "Prioritize allocations by higher multiplier first, then larger percent drop.",
   "order_rules": {
     "one_order_per_ticker_per_day": true,
     "order_type": "market",
     "notional_field": "dollar_amount",
     "time_in_force": "gfd",
     "requires_review_before_submit": "review_equity_order must pass first"
-  }
+  },
+  "hard_limits": "Never exceed the selected daily cap, the selected weekly cap, available buying power, or the broker/order-review limit. Caps are absolute ceilings; when a rule and an order conflict, the order is skipped."
 }

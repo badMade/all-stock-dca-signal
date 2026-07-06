@@ -14,13 +14,36 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from datetime import date, timedelta
+import logging
+import os
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from near_close_dca import StrategyConfig
 
-DEFAULT_CONFIG_DIR = Path(__file__).resolve().parent / "config"
+logger = logging.getLogger("near_close_dca.config")
+
+
+def _default_config_dir() -> Path:
+    """Resolve the default config directory, tolerant of installed-wheel layouts.
+
+    Order: ``$DCA_CONFIG_DIR`` env var -> the ``config/`` beside this module (checkout
+    layout) -> ``./config`` in the current working directory. The flat single-module
+    packaging does not ship ``config/*.json`` inside the wheel, so an installed CLI relies
+    on the env var or a checkout; ``load_strategy_config`` warns if none resolves.
+    """
+    env = os.environ.get("DCA_CONFIG_DIR")
+    if env:
+        return Path(env)
+    sibling = Path(__file__).resolve().parent / "config"
+    if sibling.is_dir():
+        return sibling
+    cwd = Path.cwd() / "config"
+    return cwd if cwd.is_dir() else sibling
+
+
+DEFAULT_CONFIG_DIR = _default_config_dir()
 
 
 def _read_json(path: Path) -> Optional[Dict[str, Any]]:
@@ -51,24 +74,25 @@ def load_tickers(config_dir: Path) -> Dict[str, Any]:
 
 
 def load_budgets(config_dir: Path) -> Dict[str, Any]:
-    """Map budgets.json onto the StrategyConfig budget fields."""
+    """Map budgets.json onto the surviving StrategyConfig budget fields.
+
+    The daily/weekly caps are governed by the module-level ``BUDGET_TIERS`` ladder
+    (see ``near_close_dca.select_budget_tier``), not by flat StrategyConfig fields, so
+    only the base buy amount and the weekly rollover-reserve cap are overlaid here. The
+    ``budget_tiers`` block in budgets.json is documentation of that ladder; it is not a
+    StrategyConfig field and is intentionally not applied.
+    """
     data = _read_json(config_dir / "budgets.json")
     if data is None:
         return {}
     field_map = {
         "base_amount_usd": "base_buy_amount_usd",
-        "daily_base_cap_usd": "daily_base_cap_usd",
-        "carry_forward_reserve_cap_usd": "reserve_cap_usd",
-        "hard_daily_max_usd": "hard_daily_max_usd",
-        "weekly_hard_cap_usd": "weekly_notional_cap_usd",
+        "weekly_rollover_reserve_cap_usd": "weekly_rollover_reserve_cap_usd",
     }
     out: Dict[str, Any] = {}
     for json_key, config_field in field_map.items():
         if json_key in data:
             out[config_field] = float(data[json_key])
-    # Keep the backward-compatible alias in lockstep with the base cap.
-    if "daily_base_cap_usd" in out:
-        out["daily_notional_cap_usd"] = out["daily_base_cap_usd"]
     return out
 
 
@@ -103,6 +127,11 @@ def load_approved_dates(config_dir: Path) -> Dict[str, Any]:
     Weekdays (Mon–Fri) in the inclusive ``[start_date, end_date]`` range are approved.
     An absent window file leaves the hardcoded defaults in place, so callers who do not
     ship a window keep the exact prior behaviour.
+
+    The optional ``decision_time_et`` field (``"HH:MM"``, 24-hour ET) overlays
+    ``StrategyConfig.decision_time_et`` so the scheduled task and the strategy agree on the
+    decision anchor. It is omitted by default, leaving the 3:45 PM ET default in place; set
+    it explicitly if the live task decides at a different time (e.g. ``"15:30"``).
     """
     data = _read_json(config_dir / "trading_window.json")
     if data is None:
@@ -120,7 +149,15 @@ def load_approved_dates(config_dir: Path) -> Dict[str, Any]:
         if not weekdays_only or current.weekday() < 5:
             approved.add(current)
         current += timedelta(days=1)
-    return {"approved_test_dates": frozenset(approved)}
+    out: Dict[str, Any] = {"approved_test_dates": frozenset(approved)}
+    if "decision_time_et" in data:
+        try:
+            out["decision_time_et"] = datetime.strptime(str(data["decision_time_et"]), "%H:%M").time()
+        except ValueError as exc:
+            raise ValueError(
+                f"trading_window.json decision_time_et must be 'HH:MM', got {data['decision_time_et']!r}"
+            ) from exc
+    return out
 
 
 def load_strategy_config(
@@ -138,6 +175,17 @@ def load_strategy_config(
     """
     config_dir = Path(config_dir)
     base = base or StrategyConfig()
+
+    # Surface the fallback-to-defaults case loudly. If the strategy is installed as a
+    # wheel and run outside a checkout, the bundled config/ may be absent; without this
+    # warning the CLI would silently use the hardcoded approved-date window.
+    if not config_dir.is_dir():
+        logger.warning(
+            "config dir %s not found; using hardcoded StrategyConfig defaults "
+            "(approved trading window falls back to the built-in dates). "
+            "Pass --config-dir or run from a checkout that contains config/*.json.",
+            config_dir,
+        )
 
     merged: Dict[str, Any] = {}
     merged.update(load_tickers(config_dir))

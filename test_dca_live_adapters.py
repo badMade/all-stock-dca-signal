@@ -159,6 +159,18 @@ def test_finance_provider_previous_close_scalar():
     assert bar is not None and bar.close == pytest.approx(42.0)
 
 
+def test_finance_provider_coerces_date_objects():
+    # yfinance/pandas often yield a bare datetime.date; it must not be dropped.
+    from datetime import date as _date
+
+    raw = [{"date": _date(2026, 7, 2), "open": 10, "high": 11, "low": 9, "close": 10.5, "volume": 100}]
+    prov = FinanceDataProvider(bars_fn=lambda *a: raw, previous_close_fn=lambda *a: 100.0)
+    bars = prov.get_intraday_bars("AAPL", _decision_dt(), _decision_dt(), 15)
+    assert len(bars) == 1
+    assert bars[0].close == pytest.approx(10.5)
+    assert bars[0].timestamp.astimezone(EASTERN).hour == 16
+
+
 # -- RobinhoodBroker -------------------------------------------------------------
 
 
@@ -177,6 +189,27 @@ def test_broker_place_live_when_gated_on():
         place_fn=lambda **k: {"data": {"order": {"id": "ORD-42"}}},
     )
     assert broker.place_market_buy("AAPL", 1.0, "ref1") == "ORD-42"
+
+
+def test_broker_place_live_raises_on_missing_order_id():
+    # A live placement that returns no id must fail fast, not report false success —
+    # otherwise run_once books the notional against budget with no order to reconcile.
+    broker = RobinhoodBroker(
+        account="562057042",
+        enable_live_orders=True,
+        place_fn=lambda **k: {"data": {"order": {"status": "rejected"}}},
+    )
+    with pytest.raises(RuntimeError, match="no order id"):
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+
+
+def test_broker_review_fails_closed_when_live_without_review_fn():
+    # enable_live_orders + no review_fn must refuse, so a real order is never placed unreviewed.
+    live = RobinhoodBroker(enable_live_orders=True)
+    ok, reason = live.review_market_buy("AAPL", 1.0)
+    assert ok is False and "no review callable" in reason
+    # Dry-run without a review_fn stays permissive.
+    assert RobinhoodBroker(enable_live_orders=False).review_market_buy("AAPL", 1.0)[0] is True
 
 
 def test_broker_review_blocks_on_error_alert():
@@ -215,10 +248,21 @@ def test_broker_same_day_order_detection():
     assert RobinhoodBroker().same_day_strategy_order_exists("AAPL", day) is False
 
 
-def test_broker_buying_power_fallback_and_failure():
+def test_broker_buying_power_keyword_call_and_failure():
     assert RobinhoodBroker(simulated_buying_power_usd=250.0).available_buying_power() == 250.0
 
-    def boom(_account):
+    # The wrapper is invoked by keyword (account_number=...), consistent with the other
+    # Robinhood callables — a keyword-only wrapper must work, not raise.
+    seen = {}
+
+    def kw_only(*, account_number):
+        seen["acct"] = account_number
+        return 137.0
+
+    assert RobinhoodBroker(account="562057042", buying_power_fn=kw_only).available_buying_power() == 137.0
+    assert seen["acct"] == "562057042"
+
+    def boom(*, account_number):
         raise RuntimeError("network down")
 
     assert RobinhoodBroker(buying_power_fn=boom).available_buying_power() == 0.0

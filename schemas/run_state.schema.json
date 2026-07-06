@@ -1,52 +1,102 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "run_state.schema.json",
-  "title": "Graded DCA same-day run state",
-  "description": "Standardized state file written by the live graded DCA task (ce16ba6b) each trading day. No secrets.",
+  "title": "Graded DCA same-day run state artifact",
+  "description": "Structure of the run_state.json artifact written by near_close_dca.build_run_artifacts() / write_run_artifacts() each trading day and consumed by the reporting/dashboard code. Contains no secrets.",
   "type": "object",
-  "required": ["schema_version", "run_date_et", "broker_account", "status", "orders", "budget"],
+  "required": ["run_id", "generated_at", "trading_day", "broker", "budget", "counts"],
   "additionalProperties": true,
   "properties": {
-    "schema_version": { "type": "string" },
-    "run_date_et": { "type": "string", "format": "date", "description": "Trading day in America/New_York." },
-    "generated_at_utc": { "type": "string", "format": "date-time" },
-    "broker_account": { "type": "string", "const": "robinhood:562057042" },
-    "dry_run": { "type": "boolean" },
-    "status": { "type": "string", "enum": ["success", "partial", "skipped", "error"] },
-    "trigger_gate_passed": { "type": "boolean" },
-    "orders": {
+    "run_id": { "type": "string", "description": "Trading day plus HHMMSS, e.g. 2026-07-06-153005." },
+    "generated_at": { "type": "string", "description": "ISO-8601 timestamp (America/New_York) when the artifact was built." },
+    "trading_day": { "type": "string", "format": "date", "description": "Trading day in America/New_York." },
+    "iso_week": {
       "type": "array",
+      "description": "[iso_year, iso_week] for the trading day.",
+      "items": { "type": "integer" },
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "broker": { "type": "string", "description": "Execution broker for the run (e.g. robinhood)." },
+    "dry_run": { "type": "boolean" },
+    "account_number": {
+      "type": ["string", "null"],
+      "description": "Target broker account number, or null when not bound (e.g. dry-run). No secrets."
+    },
+    "budget": {
+      "type": "object",
+      "required": ["budget_tier", "daily_cap_usd", "weekly_cap_usd"],
+      "additionalProperties": true,
+      "properties": {
+        "base_amount_usd": { "type": "number" },
+        "base_buy_amount_usd": { "type": "number", "description": "Legacy alias of base_amount_usd; both are written for backward compatibility." },
+        "budget_tier": { "type": "string", "enum": ["normal", "elevated", "high_volatility", "stress"] },
+        "planned_spend_usd": { "type": "number" },
+        "high_multiplier_signal_count": { "type": "integer" },
+        "daily_cap_usd": { "type": "number" },
+        "weekly_cap_usd": { "type": "number" },
+        "weekly_rollover_reserve_usd": { "type": "number" },
+        "weekly_rollover_reserve_cap_usd": { "type": "number" },
+        "allowed_spend_today_usd": { "type": "number" },
+        "remaining_spend_today_usd": { "type": "number" },
+        "day_notional_usd": { "type": "number" },
+        "week_notional_usd": { "type": "number" }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "evaluated": { "type": "integer" },
+        "buy_candidates": { "type": "integer" },
+        "submitted": { "type": "integer" },
+        "skipped": { "type": "integer" },
+        "manual_review": { "type": "integer" }
+      }
+    },
+    "signal_rows": {
+      "type": "array",
+      "description": "One row per (ticker, source) evaluated during the run.",
       "items": {
         "type": "object",
-        "required": ["ticker", "action", "drop_pct", "multiplier", "dollar_amount"],
+        "required": ["ticker", "source", "action"],
         "additionalProperties": true,
         "properties": {
           "ticker": { "type": "string" },
-          "action": { "type": "string", "enum": ["BUY", "SKIP"] },
-          "drop_pct": { "type": "number" },
-          "multiplier": { "type": "number", "enum": [0, 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5] },
-          "dollar_amount": { "type": "number", "minimum": 0 },
-          "time_in_force": { "type": "string", "enum": ["gfd"] },
-          "order_type": { "type": "string", "enum": ["market"] },
-          "review_passed": { "type": "boolean" },
-          "broker_order_id": { "type": ["string", "null"] },
+          "source": { "type": "string" },
+          "action": { "type": "string" },
+          "reason": { "type": ["string", "null"] },
+          "decision_bar_close": { "type": ["number", "null"] },
+          "previous_close": { "type": ["number", "null"] },
+          "buy_multiplier": { "type": ["number", "null"] },
+          "drop_vs_previous_close_pct": { "type": ["number", "null"] }
+        }
+      }
+    },
+    "buy_candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["ticker", "buy_multiplier", "planned_amount_usd", "status"],
+        "additionalProperties": true,
+        "properties": {
+          "ticker": { "type": "string" },
+          "reason": { "type": ["string", "null"] },
+          "buy_multiplier": { "type": ["number", "null"] },
+          "planned_amount_usd": { "type": "number", "minimum": 0 },
+          "target_price": { "type": ["number", "null"] },
+          "target_price_missing": { "type": "boolean" },
+          "decision_bar_close": { "type": ["number", "null"] },
+          "previous_close": { "type": ["number", "null"] },
+          "order_id": { "type": ["string", "null"] },
+          "status": { "type": "string", "enum": ["submitted", "not_submitted", "skipped", "blocked", "dry_run"] },
           "skip_reason": { "type": ["string", "null"] }
         }
       }
     },
-    "budget": {
-      "type": "object",
-      "required": ["daily_base_cap_usd", "hard_daily_max_usd", "weekly_hard_cap_usd", "spent_today_usd"],
-      "additionalProperties": true,
-      "properties": {
-        "daily_base_cap_usd": { "type": "number" },
-        "hard_daily_max_usd": { "type": "number" },
-        "weekly_hard_cap_usd": { "type": "number" },
-        "carry_forward_reserve_usd": { "type": "number" },
-        "spent_today_usd": { "type": "number" },
-        "week_spent_usd": { "type": "number" }
-      }
-    },
-    "errors": { "type": "array", "items": { "type": "string" } }
+    "manual_review_tickers": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
   }
 }

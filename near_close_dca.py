@@ -189,20 +189,68 @@ class ReconciledDecision:
 
 
 @dataclass(frozen=True)
+class BudgetTier:
+    """A budget tier with its absolute daily and weekly notional ceilings."""
+
+    name: str
+    daily_cap_usd: float
+    weekly_cap_usd: float
+    uses_rollover_reserve: bool = False
+
+
+# Ordered low-to-high. The live $3-allocation policy selects the highest tier
+# triggered by EITHER the day's planned spend or the count of 3x-or-greater
+# signals. These tier values are NOT loaded from config at runtime; they must be
+# kept in sync with config/budgets.json, which documents the same policy.
+BUDGET_TIERS: tuple[BudgetTier, ...] = (
+    BudgetTier("normal", 180.0, 900.0),
+    BudgetTier("elevated", 240.0, 1200.0),
+    BudgetTier("high_volatility", 300.0, 1500.0),
+    BudgetTier("stress", 360.0, 1800.0, uses_rollover_reserve=True),
+)
+
+NORMAL_WEEKLY_CAP_USD = BUDGET_TIERS[0].weekly_cap_usd
+
+
+def select_budget_tier(planned_spend_usd: float, high_multiplier_signal_count: int) -> BudgetTier:
+    """Select the budget tier for a run from planned spend and 3x+ signal count.
+
+    Each dimension maps to a tier index; the higher of the two wins:
+        spend:   <=129 -> 0, >129 -> 1, >213 -> 2, >272 -> 3
+        signals: <=5   -> 0, 6-10 -> 1, 11-17 -> 2, >17 -> 3
+    """
+    if planned_spend_usd > 272.0:
+        spend_idx = 3
+    elif planned_spend_usd > 213.0:
+        spend_idx = 2
+    elif planned_spend_usd > 129.0:
+        spend_idx = 1
+    else:
+        spend_idx = 0
+
+    n = high_multiplier_signal_count
+    if n > 17:
+        signal_idx = 3
+    elif n >= 11:
+        signal_idx = 2
+    elif n >= 6:
+        signal_idx = 1
+    else:
+        signal_idx = 0
+
+    return BUDGET_TIERS[max(spend_idx, signal_idx)]
+
+
+@dataclass(frozen=True)
 class StrategyConfig:
     tickers: Sequence[str] = tuple(ACTIVE_TICKERS)
     excluded_tickers: frozenset[str] = frozenset(EXCLUDED_TICKERS)
     approved_test_dates: frozenset[date] = frozenset(APPROVED_TEST_DATES)
     decision_time_et: time = time(15, 45)
     trend_lookback_minutes: int = 60
-    base_buy_amount_usd: float = 1.0
-    daily_base_cap_usd: float = 60.0
-    reserve_cap_usd: float = 420.0
-    hard_daily_max_usd: float = 120.0
-    weekly_notional_cap_usd: float = 600.0
-    # Backward-compatible alias for older callers. New budget logic uses
-    # daily_base_cap_usd + carry_forward_reserve_usd, capped by hard_daily_max_usd.
-    daily_notional_cap_usd: float = 60.0
+    base_buy_amount_usd: float = 3.0
+    weekly_rollover_reserve_cap_usd: float = 900.0
+    high_multiplier_threshold: float = 3.0
     minimum_drop_vs_previous_close: float = 0.001
     max_buys_per_ticker_per_day: int = 1
     target_account_number: str = ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
@@ -247,8 +295,14 @@ class StrategyState:
     buys_by_ticker_by_day: Dict[str, Dict[date, int]] = field(default_factory=dict)
     submitted_notional_by_day: Dict[date, float] = field(default_factory=dict)
     submitted_notional_by_week: Dict[tuple[int, int], float] = field(default_factory=dict)
-    carry_forward_reserve_usd: float = 0.0
+    weekly_rollover_reserve_usd: float = 0.0
+    selected_tier: Optional[BudgetTier] = None
     finalized_budget_days: Set[date] = field(default_factory=set)
+    # ISO-week key the current ``weekly_rollover_reserve_usd`` was computed for.
+    # Guards the roll-forward so it runs exactly once per week, independent of the
+    # order in which days are finalized vs. queried (a quiet week with no BUY
+    # candidates must still roll the reserve before that day is finalized).
+    reserve_week_key: Optional[tuple[int, int]] = None
 
     def buys_today(self, ticker: str, trading_day: date) -> int:
         return self.buys_by_ticker_by_day.get(ticker, {}).get(trading_day, 0)
@@ -267,38 +321,93 @@ class StrategyState:
     def week_notional(self, trading_day: date) -> float:
         return self.submitted_notional_by_week.get(iso_week_key(trading_day), 0.0)
 
+    def current_tier(self) -> BudgetTier:
+        """Return the tier selected for the current run, defaulting to Normal."""
+        return self.selected_tier or BUDGET_TIERS[0]
+
+    def select_daily_budget(
+        self, planned_spend_usd: float, high_multiplier_signal_count: int, config: StrategyConfig
+    ) -> BudgetTier:
+        """Choose and store the budget tier for the run from the day's plan."""
+        tier = select_budget_tier(planned_spend_usd, high_multiplier_signal_count)
+        self.selected_tier = tier
+        return tier
+
+    def roll_weekly_reserve(self, trading_day: date, config: StrategyConfig) -> None:
+        """Roll the weekly rollover reserve forward for ``trading_day``'s week.
+
+        The reserve reflects the *prior* week's unused Normal-cap capacity (itself
+        capped by ``weekly_rollover_reserve_cap_usd``) and stays constant for the
+        whole week. It is computed exactly once per week, keyed by
+        ``reserve_week_key``, so the result does not depend on whether the day has
+        already been finalized or how many times this is called -- a quiet week
+        with no BUY candidates still rolls the reserve before the day is finalized.
+        """
+        week_key = iso_week_key(trading_day)
+        if self.reserve_week_key == week_key:
+            return
+        # Base the reserve on the most recent *earlier* week that saw activity.
+        prior_weeks = [
+            iso_week_key(day)
+            for day in self.finalized_budget_days
+            if iso_week_key(day) < week_key
+        ]
+        if prior_weeks:
+            last_week_key = max(prior_weeks)
+            unused_prev = max(
+                0.0,
+                NORMAL_WEEKLY_CAP_USD
+                - self.submitted_notional_by_week.get(last_week_key, 0.0),
+            )
+            self.weekly_rollover_reserve_usd = min(
+                config.weekly_rollover_reserve_cap_usd, unused_prev
+            )
+        else:
+            self.weekly_rollover_reserve_usd = 0.0
+        self.reserve_week_key = week_key
+
+    def effective_weekly_cap(self) -> float:
+        """Return the weekly notional ceiling the selected tier will actually allow.
+
+        For the stress tier this is the Normal weekly cap plus the current rollover
+        reserve (bounded by the tier's nominal weekly cap); with only a partial
+        reserve it is below the nominal $1,800 tier cap. All other tiers allow
+        their nominal weekly cap.
+        """
+        tier = self.current_tier()
+        if tier.uses_rollover_reserve:
+            return min(
+                tier.weekly_cap_usd, NORMAL_WEEKLY_CAP_USD + self.weekly_rollover_reserve_usd
+            )
+        return tier.weekly_cap_usd
+
     def allowed_spend_today(self, trading_day: date, config: StrategyConfig) -> float:
-        """Return the max strategy spend allowed today under reserve + weekly caps."""
-        remaining_weekly = max(0.0, config.weekly_notional_cap_usd - self.week_notional(trading_day))
-        budget_with_reserve = config.daily_base_cap_usd + self.carry_forward_reserve_usd
-        return max(0.0, min(config.hard_daily_max_usd, budget_with_reserve, remaining_weekly))
+        """Return the max strategy spend allowed today under the selected tier caps.
+
+        The weekly ceiling is the selected tier's weekly cap. Stress tier capacity
+        above the Normal weekly cap is available only to the extent of the prior
+        unused weekly rollover reserve (itself capped by
+        ``weekly_rollover_reserve_cap_usd``).
+        """
+        self.roll_weekly_reserve(trading_day, config)
+        effective_weekly = self.effective_weekly_cap()
+        remaining_weekly = max(0.0, effective_weekly - self.week_notional(trading_day))
+        return max(0.0, min(self.current_tier().daily_cap_usd, remaining_weekly))
 
     def remaining_spend_today(self, trading_day: date, config: StrategyConfig) -> float:
         """Return remaining strategy spend after same-day submitted notional."""
         return max(0.0, self.allowed_spend_today(trading_day, config) - self.day_notional(trading_day))
 
     def finalize_daily_budget(self, trading_day: date, config: StrategyConfig) -> None:
-        """Carry unused base capacity forward and draw reserve used above the base cap.
+        """Mark the current trading day as finalized.
 
-        The reserve bucket is updated once per trading day:
-            reserve_next = min(reserve_cap, reserve_start - reserve_draw + unused_base)
-
-        where:
-            unused_base = max(0, daily_base_cap - actual_spend)
-            reserve_draw = max(0, actual_spend - daily_base_cap)
-
-        This lets calm days build reserve while red days spend above the $60 base,
-        but never above the hard daily max or weekly cap.
+        The weekly rollover reserve is rolled forward at the start of a new week in
+        ``allowed_spend_today``, so it stays constant during the week and correctly
+        reflects the *prior* week's unused Normal-cap capacity. This method only
+        records that the day's budget has been finalized.
         """
         if trading_day in self.finalized_budget_days:
             return
-        day_spend = self.day_notional(trading_day)
-        unused_base = max(0.0, config.daily_base_cap_usd - day_spend)
-        reserve_draw = min(self.carry_forward_reserve_usd, max(0.0, day_spend - config.daily_base_cap_usd))
-        self.carry_forward_reserve_usd = min(
-            config.reserve_cap_usd,
-            max(0.0, self.carry_forward_reserve_usd - reserve_draw + unused_base),
-        )
         self.finalized_budget_days.add(trading_day)
 
 
@@ -981,6 +1090,17 @@ def build_run_artifacts(
             }
         )
 
+    planned_spend = sum(c["planned_amount_usd"] for c in buy_candidates)
+    high_multiplier_signals = sum(
+        1 for c in buy_candidates if (c["buy_multiplier"] or 0.0) >= config.high_multiplier_threshold
+    )
+    if state.selected_tier is None:
+        state.selected_tier = select_budget_tier(planned_spend, high_multiplier_signals)
+    tier = state.selected_tier
+    # Ensure the rollover reserve reflects this trading day's week before the
+    # effective weekly cap is reported.
+    state.roll_weekly_reserve(trading_day, config)
+
     return {
         "run_id": run_id,
         "generated_at": now_et.isoformat(),
@@ -990,12 +1110,15 @@ def build_run_artifacts(
         "dry_run": config.dry_run,
         "account_number": None,
         "budget": {
+            "base_amount_usd": config.base_buy_amount_usd,
             "base_buy_amount_usd": config.base_buy_amount_usd,
-            "daily_base_cap_usd": config.daily_base_cap_usd,
-            "reserve_cap_usd": config.reserve_cap_usd,
-            "hard_daily_max_usd": config.hard_daily_max_usd,
-            "weekly_notional_cap_usd": config.weekly_notional_cap_usd,
-            "carry_forward_reserve_usd": round(state.carry_forward_reserve_usd, 2),
+            "budget_tier": tier.name,
+            "planned_spend_usd": round(planned_spend, 2),
+            "high_multiplier_signal_count": high_multiplier_signals,
+            "daily_cap_usd": tier.daily_cap_usd,
+            "weekly_cap_usd": round(state.effective_weekly_cap(), 2),
+            "weekly_rollover_reserve_usd": round(state.weekly_rollover_reserve_usd, 2),
+            "weekly_rollover_reserve_cap_usd": config.weekly_rollover_reserve_cap_usd,
             "allowed_spend_today_usd": round(state.allowed_spend_today(trading_day, config), 2),
             "remaining_spend_today_usd": round(state.remaining_spend_today(trading_day, config), 2),
             "day_notional_usd": round(state.day_notional(trading_day), 2),
@@ -1506,9 +1629,10 @@ def write_run_state(
             "orders_csv_path": report.csv_path,
         },
         "budget": {
+            "budget_tier": state.current_tier().name,
             "day_spend": state.day_notional(trading_day),
             "week_spend": state.week_notional(trading_day),
-            "reserve": state.carry_forward_reserve_usd,
+            "weekly_rollover_reserve_usd": state.weekly_rollover_reserve_usd,
         },
         "summary_metrics": report.metrics,
     }
@@ -1610,6 +1734,16 @@ def run_once(
         reverse=True,
     )
 
+    planned_spend = sum(d.suggested_amount_usd for d in buy_candidates)
+    high_multiplier_signals = sum(
+        1 for d in buy_candidates if d.buy_multiplier >= config.high_multiplier_threshold
+    )
+    state.select_daily_budget(planned_spend, high_multiplier_signals, config)
+    # Roll the reserve forward now, before any budget query or day finalization,
+    # so a quiet week (no BUY candidates) still carries prior unused Normal-cap
+    # capacity into the stress tier's ceiling.
+    state.roll_weekly_reserve(trading_day, config)
+
     candidate_outcomes: Dict[str, Dict[str, Any]] = {}
 
     for decision in buy_candidates:
@@ -1678,12 +1812,17 @@ def run_once(
     if manual_review:
         logger.info("Manual review tickers: %s", ", ".join(d.ticker for d in manual_review))
 
+    tier = state.current_tier()
     state.finalize_daily_budget(trading_day, config)
     logger.info(
-        "Budget summary: spent $%.2f; reserve now $%.2f; weekly spent $%.2f.",
+        "Budget summary [%s]: spent $%.2f (daily cap $%.2f); weekly spent $%.2f / $%.2f; "
+        "rollover reserve now $%.2f.",
+        tier.name,
         state.day_notional(trading_day),
-        state.carry_forward_reserve_usd,
+        tier.daily_cap_usd,
         state.week_notional(trading_day),
+        state.effective_weekly_cap(),
+        state.weekly_rollover_reserve_usd,
     )
 
     if artifacts_dir is not None:

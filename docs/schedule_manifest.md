@@ -13,7 +13,8 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 
 | ID | Name | Type | Trades | Cron (UTC) | ET (EDT) | Status |
 |---|---|---|---|---|---|---|
-| `ce16ba6b` | Live graded DCA task | trading | **yes** | `30 19 * * 1-5` | 3:30 PM weekdays | active |
+| `ce16ba6b` | Graded DCA automatic live test - $3 allocation | trading | **yes** | `30 19 * * 1-5` | 3:30 PM weekdays | active |
+| `e3e6f09e` | Monitor-only graded DCA $3 allocation | monitoring | no | `29 19 * * 1-5` | 3:29 PM weekdays | active |
 | `a46bf007` | Live-run watchdog | monitoring | no | `40 19 * * 1-5` | 3:40 PM weekdays | active |
 | `67aa802b` | Post-trade slippage + compact Notion latest-run sync | analytics | no | `45 19 * * 1-5` | 3:45 PM weekdays | active |
 | `cd45e95b` | Compact volatility outlier scan | analytics | no | `45 13 * * 1-5` | 9:45 AM weekdays | active |
@@ -24,12 +25,16 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 
 ## Task details
 
-### `ce16ba6b` — Live graded DCA task (the only trading task)
-- Approved live trading task. Places real market buy orders automatically within safeguards.
+### `ce16ba6b` — Graded DCA automatic live test - $3 allocation (the only trading task)
+- Approved live trading task running the **$3 base allocation with tiered caps**. Places real market buy orders automatically within safeguards.
 - Uses **only** Robinhood account `562057042`.
 - Trigger gate: `programmatic_trigger_check.sh`, allowing weekdays **2026-07-02 through 2026-08-28**, **3:20–3:55 PM ET**.
-- Writes the standardized same-day state file ([`schemas/run_state.schema.json`](../schemas/run_state.schema.json)); must **not** fall back to interactive confirmation.
+- Writes standardized same-day state files under `/home/user/workspace/cron_tracking/ce16ba6b` ([`schemas/run_state.schema.json`](../schemas/run_state.schema.json)); must **not** fall back to interactive confirmation.
 - The task's stored display name may be stale (references 3:45 / Jul 10). The authoritative schedule is **3:30 PM ET weekdays**.
+
+### `e3e6f09e` — Monitor-only graded DCA $3 allocation
+- Analytics and notifications only for the $3 allocation policy; **no trades**.
+- Runs at **3:29 PM ET weekdays**, one minute before the live task, to surface the planned allocation and tier selection.
 
 ### `a46bf007` — Live-run watchdog
 - Read-only, no trading. Alerts on missed run, error, or discrepancy.

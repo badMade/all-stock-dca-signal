@@ -82,8 +82,13 @@ def _parse_rfc3339(value: Any) -> Optional[datetime]:
 
     Robinhood returns timestamps like ``2026-07-06T18:31:29.201412148Z`` (9 fractional
     digits). ``datetime.fromisoformat`` accepts at most microsecond precision, so trim
-    the fractional part to 6 digits and normalise the trailing ``Z`` first. Returns an
-    aware UTC datetime, or ``None`` when the value is missing/unparseable.
+    the fractional part to 6 digits and normalise the trailing ``Z`` first.
+
+    Returns a timezone-*aware* datetime, or ``None`` when the value is missing/unparseable.
+    The instant is preserved exactly: an explicit offset (``Z`` or ``±HH:MM``) is kept as
+    given; a naive string (no zone suffix) is assumed to be Eastern, since that is the
+    market timezone the strategy operates in. Downstream callers convert via
+    ``astimezone(EASTERN)``, so any correctly-zoned input yields the right wall-clock time.
     """
     if not value or not isinstance(value, str):
         return None
@@ -105,9 +110,9 @@ def _parse_rfc3339(value: Any) -> Optional[datetime]:
         parsed = datetime.fromisoformat(text)
     except ValueError:
         return None
-if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=_UTC)
-    return parsed.astimezone(_UTC)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=EASTERN)
+    return parsed
 
 
 def _rh_interval(interval_minutes: int) -> str:
@@ -368,7 +373,7 @@ class RobinhoodBroker:
         if self._buying_power_fn is None:
             return self._simulated_buying_power_usd
         try:
-            return float(self._buying_power_fn(self._account))
+            return float(self._buying_power_fn(account_number=self._account))
         except Exception:  # noqa: BLE001 - never let buying-power lookup crash a scan
             logger.exception("buying-power lookup failed; treating as 0")
             return 0.0
@@ -401,7 +406,11 @@ class RobinhoodBroker:
 
     def review_market_buy(self, ticker: str, notional_usd: float) -> Tuple[bool, str]:
         if self._review_fn is None:
-            return True, "no review callable wired; skipping broker-side review"
+            # Fail closed on the live path: a real order must never be placed without a
+            # broker-side review. Only the dry-run/simulated path may skip it.
+            if self.enable_live_orders:
+                return False, "live orders enabled but no review callable wired; refusing to place unreviewed order"
+            return True, "no review callable wired; skipping broker-side review (dry-run)"
         response = self._review_fn(
             account_number=self._account,
             symbol=ticker,
@@ -425,9 +434,13 @@ class RobinhoodBroker:
         )
         data = _unwrap(response)
         order = data.get("order") or data
-order_id = order.get("id") or order.get("order_id")
+        order_id = order.get("id") or order.get("order_id")
         if not order_id:
-            raise RuntimeError(f"place_equity_order returned no order id for {ticker}: {data}")
+            # Fail fast: run_once treats any returned id as a submitted order and records
+            # the notional against daily/weekly budgets. Returning "" would book a phantom
+            # buy with no order to reconcile, so raise instead of reporting false success.
+            logger.error("place_equity_order returned no order id for %s: %s", ticker, data)
+            raise RuntimeError(f"live placement for {ticker} returned no order id; response={data}")
         return str(order_id)
 
     def get_order_fill(self, order_id: str) -> Optional[OrderFill]:

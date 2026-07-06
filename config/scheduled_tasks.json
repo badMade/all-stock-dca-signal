@@ -1,11 +1,11 @@
 {
   "$schema": "../schemas/scheduled_tasks.schema.json",
-  "version": "2026-07-04",
+  "version": "2026-07-06",
   "timezone_note": "Cron expressions are in UTC. ET equivalents are during US Eastern Daylight Time (EDT, UTC-4). Confirm around DST transitions.",
   "tasks": [
     {
       "id": "ce16ba6b",
-      "name": "Live graded DCA task",
+      "name": "Graded DCA automatic live test - $3 allocation",
       "type": "trading",
       "status": "active",
       "cron_utc": "30 19 * * 1-5",
@@ -14,7 +14,18 @@
       "broker_account": "robinhood:562057042",
       "trigger_gate": "programmatic_trigger_check.sh",
       "trigger_window": "Weekdays 2026-07-02 through 2026-08-28, 3:20-3:55 PM ET",
-      "notes": "Approved live trading task. Stale display name may say 3:45/Jul 10 - authoritative schedule is 3:30 PM ET. Writes standardized same-day state file; places real market buy orders automatically within safeguards; must not fall back to interactive confirmation."
+      "state_dir": "/home/user/workspace/cron_tracking/ce16ba6b",
+      "notes": "Approved live trading task using the $3 base allocation with tiered daily/weekly caps. Stale display name may say 3:45/Jul 10 - authoritative schedule is 3:30 PM ET. Writes standardized same-day state files under /home/user/workspace/cron_tracking/ce16ba6b; places real market buy orders automatically within safeguards; must not fall back to interactive confirmation."
+    },
+    {
+      "id": "e3e6f09e",
+      "name": "Monitor-only graded DCA $3 allocation",
+      "type": "monitoring",
+      "status": "active",
+      "cron_utc": "29 19 * * 1-5",
+      "et_equivalent": "3:29 PM ET weekdays (EDT)",
+      "trades": false,
+      "notes": "Analytics and notifications only for the $3 allocation policy. Places no trades. Runs one minute before the live task (ce16ba6b) to surface the planned allocation and tier selection."
     },
     {
       "id": "a46bf007",

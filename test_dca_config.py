@@ -30,10 +30,7 @@ def test_bundled_config_matches_hardcoded_defaults():
     assert loaded.excluded_tickers == default.excluded_tickers
     assert loaded.sizing_tiers == default.sizing_tiers
     assert loaded.base_buy_amount_usd == default.base_buy_amount_usd
-    assert loaded.daily_base_cap_usd == default.daily_base_cap_usd
-    assert loaded.reserve_cap_usd == default.reserve_cap_usd
-    assert loaded.hard_daily_max_usd == default.hard_daily_max_usd
-    assert loaded.weekly_notional_cap_usd == default.weekly_notional_cap_usd
+    assert loaded.weekly_rollover_reserve_cap_usd == default.weekly_rollover_reserve_cap_usd
 
 
 def test_missing_dir_returns_base_defaults(tmp_path):
@@ -82,6 +79,22 @@ def test_trading_window_bad_range_raises(tmp_path):
         load_approved_dates(tmp_path)
 
 
+def test_trading_window_optional_decision_time(tmp_path):
+    from datetime import time
+
+    _write(tmp_path, "trading_window.json", {"start_date": "2026-07-02", "end_date": "2026-07-08", "decision_time_et": "15:30"})
+    assert load_approved_dates(tmp_path)["decision_time_et"] == time(15, 30)
+    # Absent -> not set, so the StrategyConfig default (15:45) is kept.
+    _write(tmp_path, "trading_window.json", {"start_date": "2026-07-02", "end_date": "2026-07-08"})
+    assert "decision_time_et" not in load_approved_dates(tmp_path)
+
+
+def test_trading_window_bad_decision_time_raises(tmp_path):
+    _write(tmp_path, "trading_window.json", {"start_date": "2026-07-02", "end_date": "2026-07-08", "decision_time_et": "3:30pm"})
+    with pytest.raises(ValueError, match="decision_time_et must be"):
+        load_approved_dates(tmp_path)
+
+
 def test_sizing_tiers_converted_from_percent(tmp_path):
     _write(tmp_path, "sizing_ladder.json", {
         "base_amount_usd": 2.0,
@@ -102,11 +115,16 @@ def test_sizing_tiers_malformed_raises(tmp_path):
         load_sizing_tiers(tmp_path)
 
 
-def test_budgets_alias_kept_in_lockstep(tmp_path):
-    _write(tmp_path, "budgets.json", {"daily_base_cap_usd": 75.0})
+def test_budgets_maps_surviving_fields_only(tmp_path):
+    # Daily/weekly caps live in the BUDGET_TIERS ladder, not StrategyConfig; only the
+    # base amount and rollover-reserve cap are overlaid. The budget_tiers block is ignored.
+    _write(tmp_path, "budgets.json", {
+        "base_amount_usd": 3.0,
+        "weekly_rollover_reserve_cap_usd": 900.0,
+        "budget_tiers": [{"name": "normal", "daily_cap_usd": 180.0}],
+    })
     out = load_budgets(tmp_path)
-    assert out["daily_base_cap_usd"] == 75.0
-    assert out["daily_notional_cap_usd"] == 75.0
+    assert out == {"base_buy_amount_usd": 3.0, "weekly_rollover_reserve_cap_usd": 900.0}
 
 
 def test_tickers_loaded(tmp_path):

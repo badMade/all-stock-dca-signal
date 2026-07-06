@@ -49,7 +49,18 @@ def build_performance_snapshot(run_states: Sequence[Dict[str, Any]]) -> str:
         for c in rs.get("buy_candidates") or []
     )
     week_notional = max((_num((rs.get("budget") or {}).get("week_notional_usd")) for rs in run_states), default=0.0)
-    weekly_cap = max((_num((rs.get("budget") or {}).get("weekly_notional_cap_usd")) for rs in run_states), default=0.0)
+    # Fall back to the pre-policy key so historical run_state artifacts (which
+    # named the cap ``weekly_notional_cap_usd``) still populate the snapshot.
+    weekly_cap = max(
+        (
+            _num(
+                (rs.get("budget") or {}).get("weekly_cap_usd")
+                or (rs.get("budget") or {}).get("weekly_notional_cap_usd")
+            )
+            for rs in run_states
+        ),
+        default=0.0,
+    )
 
     lines = ["## Performance snapshot", ""]
     lines.append("| Metric | Value |")
@@ -78,7 +89,7 @@ def build_graded_vs_fixed(run_states: Sequence[Dict[str, Any]]) -> str:
     fixed_total = 0.0
     for rs in run_states:
         candidates = rs.get("buy_candidates", [])
-        base = _num(rs.get("budget", {}).get("base_buy_amount_usd")) or 1.0
+        base = _num(rs.get("budget", {}).get("base_amount_usd") or rs.get("budget", {}).get("base_buy_amount_usd")) or 3.0
         graded = sum(_num(c.get("planned_amount_usd")) for c in candidates)
         fixed = base * len(candidates)
         graded_total += graded
@@ -128,14 +139,24 @@ def build_sector_matrix(
 
 def build_budget_reserve_effectiveness(run_states: Sequence[Dict[str, Any]]) -> str:
     lines = ["## Budget and reserve effectiveness", ""]
-    lines.append("| Day | Spent $ | Base cap $ | Reserve carry $ | Remaining $ |")
-    lines.append("| --- | --- | --- | --- | --- |")
+    lines.append("| Day | Tier | Spent $ | Daily cap $ | Rollover reserve $ | Remaining $ |")
+    lines.append("| --- | --- | --- | --- | --- | --- |")
     for rs in run_states:
         budget = rs.get("budget", {})
+        # Fall back to the pre-policy keys so historical run_state artifacts (which
+        # named these ``daily_base_cap_usd`` / ``carry_forward_reserve_usd``) still
+        # render populated caps and reserve figures.
+        daily_cap = budget.get("daily_cap_usd")
+        if daily_cap is None:
+            daily_cap = budget.get("daily_base_cap_usd")
+        reserve = budget.get("weekly_rollover_reserve_usd")
+        if reserve is None:
+            reserve = budget.get("carry_forward_reserve_usd")
         lines.append(
-            f"| {rs.get('trading_day', '?')} | ${_num(budget.get('day_notional_usd')):.2f} | "
-            f"${_num(budget.get('daily_base_cap_usd')):.2f} | "
-            f"${_num(budget.get('carry_forward_reserve_usd')):.2f} | "
+            f"| {rs.get('trading_day', '?')} | {budget.get('budget_tier') or 'n/a'} | "
+            f"${_num(budget.get('day_notional_usd')):.2f} | "
+            f"${_num(daily_cap):.2f} | "
+            f"${_num(reserve):.2f} | "
             f"${_num(budget.get('remaining_spend_today_usd')):.2f} |"
         )
     lines.append("")
