@@ -350,10 +350,21 @@ def _compact_setup(workdir):
     return now, config, state, broker, fin, rh
 
 
-def test_usage_proxy_logged_in_run_state():
-    tmpdir = tempfile.TemporaryDirectory()
-    artifacts_dir = os.path.join(tmpdir.name, "runs", "2026-06-29")
-    now, config, state, broker, fin, rh = _compact_setup(tmpdir.name)
+def test_usage_proxy_logged_in_run_state(tmp_path):
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+...
+
+def test_usage_proxy_counts_provider_errors(tmp_path):
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    now, config, state, broker, _fin, rh = _compact_setup(tmp_path)
+
+...
+
+def test_run_daily_compact_writes_structured_only(tmp_path):
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
 
     run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir,
                       notifications_sent=1)
