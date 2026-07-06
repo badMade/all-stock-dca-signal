@@ -90,7 +90,9 @@ def collect_month_run_states(
     """Load run_state artifacts under ``root`` whose trading_day is in the month.
 
     Files that cannot be parsed as JSON or lack a matching ``trading_day`` are
-    skipped so a single bad artifact never breaks the monthly rollup.
+    skipped so a single bad artifact never breaks the monthly rollup. Minimal
+    ``status: "blocked"`` stubs written for date-gated days are also skipped —
+    they carry no usage data and are not analyzed runs.
     """
     prefix = _month_prefix(year, month)
     run_states: List[Dict[str, Any]] = []
@@ -98,6 +100,8 @@ def collect_month_run_states(
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
+            continue
+        if data.get("status") == "blocked":
             continue
         trading_day = data.get("trading_day")
         if isinstance(trading_day, str) and trading_day.startswith(prefix):

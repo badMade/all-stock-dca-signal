@@ -74,6 +74,20 @@ def test_collect_filters_by_month(tmp_path):
     assert [rs["trading_day"] for rs in july] == ["2026-07-01"]
 
 
+def test_collect_skips_blocked_stubs(tmp_path):
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    blocked_dir = tmp_path / "runs/2026-06-30-blocked"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    (blocked_dir / "run_state.json").write_text(
+        json.dumps({"trading_day": "2026-06-30", "status": "blocked"}), encoding="utf-8"
+    )
+
+    states = collect_month_run_states(tmp_path, 2026, 6)
+    assert len(states) == 1  # the date-gated stub is not an analyzed run
+    agg = aggregate_usage(states, month_label="2026-06")
+    assert agg["run_count"] == 1
+
+
 def test_collect_skips_unparseable_files(tmp_path):
     _write_runs(tmp_path, [_run_state("2026-06-29")])
     bad_dir = tmp_path / "runs/bad"

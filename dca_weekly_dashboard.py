@@ -24,7 +24,11 @@ from typing import Any, Dict, List, Optional, Sequence
 
 
 def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
-    return [json.loads(Path(p).read_text()) for p in paths]
+    """Load artifacts, skipping the minimal ``status: "blocked"`` run_state stubs
+    written for date-gated days — they are not run days and would otherwise be
+    counted into the weekly snapshot/table denominators."""
+    loaded = [json.loads(Path(p).read_text(encoding="utf-8")) for p in paths]
+    return [data for data in loaded if data.get("status") != "blocked"]
 
 
 def _num(value: Any) -> float:
