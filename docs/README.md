@@ -10,7 +10,7 @@ workflow, and Notion template. **No credentials or secrets are stored here.**
 |---|---|
 | [strategy.md](strategy.md) | Strategy overview, ticker universe, latest sizing ladder, budgets |
 | [safeguards.md](safeguards.md) | Broker/account, trading constraints, budget caps, test window |
-| [schedule_manifest.md](schedule_manifest.md) | All scheduled tasks (only `ce16ba6b` trades) |
+| [schedule_manifest.md](schedule_manifest.md) | All 11 scheduled tasks (only `ce16ba6b` trades) |
 | [reporting_workflow.md](reporting_workflow.md) | Daily/periodic artifact + Notion flow |
 | [notion_dashboard_template.md](notion_dashboard_template.md) | Notion page template + conceptual API sync |
 | [cost_tracking.md](cost_tracking.md) | Cost-control policy and usage proxies |
@@ -31,6 +31,8 @@ workflow, and Notion template. **No credentials or secrets are stored here.**
   signal count — Normal $180/$900 · Elevated $240/$1,200 · High-vol $300/$1,500 ·
   Stress $360/$1,800 (daily/weekly); weekly rollover reserve capped at $900.
 - **Only trading task:** `ce16ba6b` ("Graded DCA automatic live test - $3
-  allocation"), **3:30 PM ET** weekdays, Robinhood account `562057042` only. The
-  **3:45 PM ET** task is analytics (slippage + Notion sync).
+  allocation"), **3:20 PM ET** weekdays, Robinhood account `562057042` only;
+  Alpaca read-only. The **3:35 PM ET** task is analytics (slippage + Notion sync).
+- **Afternoon completion:** all afternoon tasks finish by **3:40 PM ET**, except
+  the Friday weekly Notion refresh at **5:00 PM ET**.
 - **Test window:** through **2026-08-28** inclusive.

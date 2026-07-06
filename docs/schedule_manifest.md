@@ -6,54 +6,71 @@ Backup of the current scheduled tasks. Machine-readable source:
 **Timezone note:** cron expressions are in **UTC**. ET equivalents below are for
 US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 
-> **Schedule integrity note:** the live trading task runs at **3:30 PM ET**;
-> the post-trade slippage / Notion sync runs at **3:45 PM ET**. These are two
-> different tasks. Do not move the live trade schedule to 3:45 — the 3:45 slot
-> is analytics only.
+> **Afternoon completion rule:** all afternoon tasks complete **no later than
+> 3:40 PM ET**, except the Friday weekly Notion performance refresh at
+> **5:00 PM ET** (the only approved post-3:40 PM DCA-related exception).
+
+> **Schedule integrity note:** the live trading task runs at **3:20 PM ET**; the
+> post-trade slippage / Notion sync runs at **3:35 PM ET**. These are two
+> different tasks. Do not merge them or move the live trade off 3:20 PM ET.
 
 | ID | Name | Type | Trades | Cron (UTC) | ET (EDT) | Status |
 |---|---|---|---|---|---|---|
-| `ce16ba6b` | Graded DCA automatic live test - $3 allocation | trading | **yes** | `30 19 * * 1-5` | 3:30 PM weekdays | active |
-| `e3e6f09e` | Monitor-only graded DCA $3 allocation | monitoring | no | `29 19 * * 1-5` | 3:29 PM weekdays | active |
+| `b7961407` | Pre-market DCA buying-power dashboard | analytics | no | `00 13 * * 1-5` | 9:00 AM weekdays | active |
+| `cd45e95b` | Compact DCA volatility outlier scan | analytics | no | `45 13 * * 1-5` | 9:45 AM weekdays | active |
+| `e3e6f09e` | Monitor-only graded DCA signal check | monitoring | no | `5 19 * * 1-5` | 3:05 PM weekdays | active |
+| `ce16ba6b` | Graded DCA automatic live test - $3 allocation | trading | **yes** | `20 19 * * 1-5` | 3:20 PM weekdays | active |
+| `d72aa525` | Capital-priority briefing | analytics | no | `25 19 * * 1-5` | 3:25 PM weekdays | active |
+| `67aa802b` | Post-trade slippage + compact Notion latest-run sync | analytics | no | `35 19 * * 1-5` | 3:35 PM weekdays | active |
 | `a46bf007` | Live-run watchdog | monitoring | no | `40 19 * * 1-5` | 3:40 PM weekdays | active |
-| `67aa802b` | Post-trade slippage + compact Notion latest-run sync | analytics | no | `45 19 * * 1-5` | 3:45 PM weekdays | active |
-| `cd45e95b` | Compact volatility outlier scan | analytics | no | `45 13 * * 1-5` | 9:45 AM weekdays | active |
 | `041d9d90` | Weekly DCA Notion performance dashboard refresh | analytics | no | `0 21 * * 5` | Fri 5:00 PM | active |
 | `0656657a` | Monthly graded DCA dashboard refresh | analytics | no | `45 12 1-7 * 1-5` | 1st weekday/mo 8:45 AM | active |
-| `bec4a6ee` | Monthly DCA automation cost review | analytics | no | `55 13 1-7 * 1-5` | 1st weekday/mo (see note) | active |
+| `bec4a6ee` | Monthly DCA automation cost review | analytics | no | `55 13 1-7 * 1-5` | 1st weekday/mo 9:55 AM | active |
 | `f7411889` | One-time reminder: evaluate past Aug 28 | reminder | no | one-shot | 2026-08-15 11:45 AM | active |
 
 ## Task details
 
+### `b7961407` — Pre-market DCA buying-power dashboard
+- Analytics only, **no trading**. Runs **9:00 AM ET weekdays**.
+- Pre-market buying-power dashboard using the current **$3 base 0x-to-5x ladder**.
+
+### `cd45e95b` — Compact DCA volatility outlier scan
+- Analytics only, **no trading**. Runs **9:45 AM ET weekdays**.
+- Scans only **>5% outliers**; no full 41+ ticker narrative on no-outlier days. Uses the current $3 base 0x-to-5x ladder.
+
+### `e3e6f09e` — Monitor-only graded DCA signal check
+- Analytics and notifications only; **no trades**. Runs **3:05 PM ET weekdays**.
+- Monitor-only signal check that surfaces the planned allocation and tier selection using the current $3 base 0x-to-5x ladder.
+
 ### `ce16ba6b` — Graded DCA automatic live test - $3 allocation (the only trading task)
-- Approved live trading task running the **$3 base allocation with tiered caps**. Places real market buy orders automatically within safeguards.
-- Uses **only** Robinhood account `562057042`.
+- Approved live trading task running the **$3 base 0x-to-5x ladder with tiered caps**. Places real market buy orders automatically within safeguards. Runs **3:20 PM ET weekdays**.
+- Uses **only** Robinhood account `562057042`; Alpaca is read-only.
 - Trigger gate: `programmatic_trigger_check.sh`, allowing weekdays **2026-07-02 through 2026-08-28**, **3:20–3:55 PM ET**.
 - Writes standardized same-day state files under `/home/user/workspace/cron_tracking/ce16ba6b` ([`schemas/run_state.schema.json`](../schemas/run_state.schema.json)); must **not** fall back to interactive confirmation.
-- The task's stored display name may be stale (references 3:45 / Jul 10). The authoritative schedule is **3:30 PM ET weekdays**.
+- **Manual runs do not count as scheduled-run evidence.** Any stale stored display name is superseded by the authoritative **3:20 PM ET** schedule.
 
-### `e3e6f09e` — Monitor-only graded DCA $3 allocation
-- Analytics and notifications only for the $3 allocation policy; **no trades**.
-- Runs at **3:29 PM ET weekdays**, one minute before the live task, to surface the planned allocation and tier selection.
-
-### `a46bf007` — Live-run watchdog
-- Read-only, no trading. Alerts on missed run, error, or discrepancy.
+### `d72aa525` — Capital-priority briefing
+- Analytics only, **no trading**. Runs **3:25 PM ET weekdays**.
+- Uses the current $3 base 0x-to-5x ladder. Sends **email/in-app notification only if at least one ticker triggers 1.5x or higher**; otherwise silent.
 
 ### `67aa802b` — Post-trade slippage + compact Notion latest-run sync
-- Analytics only. Reads live artifacts and Robinhood order history, writes slippage artifacts, updates the compact Notion **Latest Run** section only.
+- Analytics only, **no trading**. Runs **3:35 PM ET weekdays**.
+- Reads live task artifacts and Robinhood order history, writes slippage/coverage artifacts, updates the compact Notion **Latest Run** section only.
 
-### `cd45e95b` — Compact volatility outlier scan
-- Analytics only. Alerts only for **>5% outliers** or actionable errors; no full 41+ ticker narrative on no-outlier days.
+### `a46bf007` — Live-run watchdog
+- Read-only, **no trading**. Runs **3:40 PM ET weekdays** — the **final scheduled afternoon event**.
+- Alerts only on missed, incomplete, error, or discrepancy conditions.
 
 ### `041d9d90` — Weekly Notion performance dashboard refresh
-- Analytics only. Refreshes the full Notion performance dashboard. No routine email.
+- Analytics only, **no trading**. Runs **Fridays 5:00 PM ET** — the only approved post-3:40 PM exception.
+- Recalculates and refreshes the full Notion performance dashboard. No routine email.
 
 ### `0656657a` — Monthly graded DCA dashboard refresh
-- Analytics only. No-op if the day is not the first weekday of the month.
+- Analytics only, **no trading**. First weekday of the month **8:45 AM ET**. No-op otherwise.
 
 ### `bec4a6ee` — Monthly DCA automation cost review
-- Analytics only. Usage proxies, no exact credits.
-- **Known discrepancy:** requested 9:15 AM ET but observed `next_run` at 9:55 AM ET — flagged for reconciliation.
+- Analytics only, **no trading**. First weekday of the month **9:55 AM ET**.
+- Reports **usage proxies only**; exact Perplexity credit consumption is not exposed, so do not claim exact credits.
 
 ### `f7411889` — One-time reminder
-- Reminder only. Fires 2026-08-15 11:45 AM ET to evaluate continuing live testing past 2026-08-28.
+- Reminder only, **no trading**. Fires **2026-08-15 11:45 AM ET** to evaluate continuing live testing past 2026-08-28.

@@ -50,7 +50,7 @@ The extractors key off natural phrasings, e.g.:
   sets the no-buy threshold.
 - Budget lines like `Base amount $3.`, `Weekly rollover reserve max $900.`, and
   tier lines like `Normal: daily cap $180, weekly cap $900.`.
-- Schedule lines like `ce16ba6b ... schedule 30 19 * * 1-5 UTC = 3:30 PM ET weekdays`.
+- Schedule lines like `ce16ba6b ... schedule 20 19 * * 1-5 UTC = 3:20 PM ET weekdays`.
 
 ## Tests
 
@@ -61,8 +61,8 @@ python scripts/tests/test_backup_strategy.py
 ```
 
 The tests assert the 45-ticker universe, the latest ladder (max 5x, no 12x-era
-tiers), the budget caps, and that the **3:30 PM ET live task** stays distinct
-from the **3:45 PM ET slippage/Notion sync**.
+tiers), the budget caps, and that the **3:20 PM ET live task** stays distinct
+from the **3:35 PM ET slippage/Notion sync**.
 
 ## Notion sync
 

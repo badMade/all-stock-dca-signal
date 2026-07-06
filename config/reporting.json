@@ -1,6 +1,6 @@
 {
   "$schema": "../schemas/reporting.schema.json",
-  "version": "2026-07-04",
+  "version": "2026-07-06",
   "notion": {
     "dashboard_url": "https://app.notion.com/p/391202e5e677812f9ce4c9bc0904d412",
     "sections": {
@@ -18,6 +18,13 @@
     "run_state": "Standardized same-day state file written by the live task (see schemas/run_state.schema.json).",
     "slippage": "Slippage artifacts written by task 67aa802b (see schemas/slippage_report.schema.json).",
     "cost_tracker": "Usage proxy artifacts from task bec4a6ee (see schemas/cost_tracker.schema.json)."
+  },
+  "requirements": {
+    "local_first": "Daily live runs write structured JSON/CSV locally first.",
+    "coverage_report": "Every manual or scheduled run produces a DCA Manual Run Slippage and Coverage Report where fills exist, or a compact run artifact explaining no fills.",
+    "slippage_tracking": "Track target_price and slippage for every future trade.",
+    "notion_updates": "The post-trade task (67aa802b) updates only the compact Notion Latest Run section; the weekly Friday task (041d9d90) recalculates and refreshes the full performance dashboard.",
+    "cost_tracker_proxy": "The cost tracker is a proxy-based tracker in Notion/dashboard docs/config; exact Perplexity credit consumption is not exposed, so do not claim exact credits."
   },
   "cost_control": {
     "daily": "Compact / local-first analytics.",

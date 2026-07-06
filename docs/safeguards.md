@@ -16,12 +16,13 @@ should skip rather than trade. Machine-readable copies live in
 ## Trading constraints
 
 - **No sells.** Buys only.
-- **No options, no crypto, no margin expansion.**
-- **No order replacement, no account changes.**
+- **No options, no crypto, no margin changes.**
+- **No order replacement, no order cancellations, no account modifications.**
 - **No trading outside regular market hours.**
 - **One strategy order per ticker per day.**
 - Orders are **market buys** with a `dollar_amount` notional and
   `time_in_force = gfd`, submitted **only after `review_equity_order` passes**.
+- None of the above may change unless the user explicitly requests it later.
 
 ## Budget caps
 
@@ -39,7 +40,9 @@ on the day's planned spend and the count of 3x-or-greater signals (multiplier
 - The selected daily and weekly caps are absolute ceilings.
 - **Stress** tier capacity is usable only to the extent prior unused weekly
   rollover reserve is available. The **weekly rollover reserve is capped at $900.**
-- Allocations are prioritized by higher multiplier first, then larger percent drop.
+- Allocations are prioritized by higher multiplier first, then larger percent
+  drop, then ticker (alphabetical) for a deterministic tie-break; capped tickers
+  are flagged.
 - A run never exceeds the selected daily cap, the selected weekly cap, available
   buying power, or the broker/order-review limit.
 
@@ -54,6 +57,10 @@ on the day's planned spend and the count of 3x-or-greater signals (multiplier
 
 - The live task **must write standardized same-day state files** and **must not
   fall back to interactive confirmation** — it runs unattended.
+- **Manual runs do not count as scheduled-run evidence.**
+- **Afternoon completion rule:** all afternoon tasks complete **no later than
+  3:40 PM ET**, except the Friday weekly Notion performance refresh at
+  **5:00 PM ET** (the only approved post-3:40 PM exception).
 - **Cost-control policy:** daily tasks are compact / local-first; heavy analysis
   runs Fridays and monthly; avoid manual full runs unless automation fails.
 

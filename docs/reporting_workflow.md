@@ -6,17 +6,30 @@ private links are stored in this repo.**
 
 ## Daily flow (weekdays, EDT)
 
-1. **3:30 PM ET — Live graded DCA task (`ce16ba6b`)**
+1. **9:00 AM ET — Pre-market buying-power dashboard (`b7961407`)**
+   Analytics only. Pre-market buying-power view using the $3 base 0x-to-5x ladder.
+2. **9:45 AM ET — Volatility outlier scan (`cd45e95b`)**
+   Alerts only for >5% outliers or actionable errors.
+3. **3:05 PM ET — Monitor-only signal check (`e3e6f09e`)**
+   Analytics only. Surfaces the planned allocation and tier selection.
+4. **3:20 PM ET — Live graded DCA task (`ce16ba6b`)**
    Places buys (Robinhood `562057042`) and writes the standardized same-day
    **run state** artifact ([`schemas/run_state.schema.json`](../schemas/run_state.schema.json)).
-2. **3:40 PM ET — Watchdog (`a46bf007`)**
-   Read-only. Verifies the run happened and flags missing/error/discrepancy.
-3. **3:45 PM ET — Post-trade slippage + Notion sync (`67aa802b`)**
+5. **3:25 PM ET — Capital-priority briefing (`d72aa525`)**
+   Analytics only. Emails/notifies **only if at least one ticker triggers 1.5x or higher**.
+6. **3:35 PM ET — Post-trade slippage + Notion sync (`67aa802b`)**
    Reads the run-state artifact and Robinhood order history, computes slippage
    ([`schemas/slippage_report.schema.json`](../schemas/slippage_report.schema.json)),
-   and updates the **compact Notion "Latest Run" section only**.
-4. **9:45 AM ET — Volatility outlier scan (`cd45e95b`)**
-   Alerts only for >5% outliers or actionable errors.
+   writes slippage/coverage artifacts, and updates the **compact Notion "Latest
+   Run" section only**.
+7. **3:40 PM ET — Watchdog (`a46bf007`)**
+   Read-only, the final scheduled afternoon event. Verifies the run happened and
+   flags missing/incomplete/error/discrepancy.
+
+Every manual or scheduled run produces a **DCA Manual Run Slippage and Coverage
+Report** where fills exist, or a compact run artifact explaining no fills.
+`target_price` and slippage are tracked for every future trade, and daily live
+runs write structured JSON/CSV locally first.
 
 ## Periodic flow
 

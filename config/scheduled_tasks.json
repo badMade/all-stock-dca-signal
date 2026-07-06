@@ -2,30 +2,71 @@
   "$schema": "../schemas/scheduled_tasks.schema.json",
   "version": "2026-07-06",
   "timezone_note": "Cron expressions are in UTC. ET equivalents are during US Eastern Daylight Time (EDT, UTC-4). Confirm around DST transitions.",
+  "afternoon_completion_rule": "All afternoon tasks complete no later than 3:40 PM ET, except the Friday weekly Notion performance refresh at 5:00 PM ET (the only approved post-3:40 PM DCA-related exception).",
   "tasks": [
+    {
+      "id": "b7961407",
+      "name": "Pre-market DCA buying-power dashboard",
+      "type": "analytics",
+      "status": "active",
+      "cron_utc": "00 13 * * 1-5",
+      "et_equivalent": "9:00 AM ET weekdays (EDT)",
+      "trades": false,
+      "notes": "Analytics only, no trading. Pre-market buying-power dashboard using the current $3 base 0x-to-5x ladder."
+    },
+    {
+      "id": "cd45e95b",
+      "name": "Compact DCA volatility outlier scan",
+      "type": "analytics",
+      "status": "active",
+      "cron_utc": "45 13 * * 1-5",
+      "et_equivalent": "9:45 AM ET weekdays (EDT)",
+      "trades": false,
+      "notes": "Analytics only, no trading. Compact scan of >5% outliers only; no full 41+ ticker narrative on no-outlier days. Uses the current $3 base 0x-to-5x ladder."
+    },
+    {
+      "id": "e3e6f09e",
+      "name": "Monitor-only graded DCA signal check",
+      "type": "monitoring",
+      "status": "active",
+      "cron_utc": "5 19 * * 1-5",
+      "et_equivalent": "3:05 PM ET weekdays (EDT)",
+      "trades": false,
+      "notes": "Analytics and notifications only; places no trades. Monitor-only signal check that surfaces the planned allocation and tier selection using the current $3 base 0x-to-5x ladder."
+    },
     {
       "id": "ce16ba6b",
       "name": "Graded DCA automatic live test - $3 allocation",
       "type": "trading",
       "status": "active",
-      "cron_utc": "30 19 * * 1-5",
-      "et_equivalent": "3:30 PM ET weekdays (EDT)",
+      "cron_utc": "20 19 * * 1-5",
+      "et_equivalent": "3:20 PM ET weekdays (EDT)",
       "trades": true,
       "broker_account": "robinhood:562057042",
       "trigger_gate": "programmatic_trigger_check.sh",
       "trigger_window": "Weekdays 2026-07-02 through 2026-08-28, 3:20-3:55 PM ET",
       "state_dir": "/home/user/workspace/cron_tracking/ce16ba6b",
-      "notes": "Approved live trading task using the $3 base allocation with tiered daily/weekly caps. Stale display name may say 3:45/Jul 10 - authoritative schedule is 3:30 PM ET. Writes standardized same-day state files under /home/user/workspace/cron_tracking/ce16ba6b; places real market buy orders automatically within safeguards; must not fall back to interactive confirmation."
+      "notes": "The only trading task. Approved live Robinhood execution using the $3 base 0x-to-5x ladder with tiered daily/weekly caps. Robinhood account 562057042 only; Alpaca read-only. Writes standardized same-day state files under /home/user/workspace/cron_tracking/ce16ba6b; places real market buy orders automatically within safeguards; must not fall back to interactive confirmation. Test window through Fri Aug 28 2026 inclusive. Manual runs do not count as scheduled-run evidence. Any stale stored display name is superseded by this authoritative 3:20 PM ET schedule."
     },
     {
-      "id": "e3e6f09e",
-      "name": "Monitor-only graded DCA $3 allocation",
-      "type": "monitoring",
+      "id": "d72aa525",
+      "name": "Capital-priority briefing",
+      "type": "analytics",
       "status": "active",
-      "cron_utc": "29 19 * * 1-5",
-      "et_equivalent": "3:29 PM ET weekdays (EDT)",
+      "cron_utc": "25 19 * * 1-5",
+      "et_equivalent": "3:25 PM ET weekdays (EDT)",
       "trades": false,
-      "notes": "Analytics and notifications only for the $3 allocation policy. Places no trades. Runs one minute before the live task (ce16ba6b) to surface the planned allocation and tier selection."
+      "notes": "Analytics only, no trading. Capital-priority briefing using the current $3 base 0x-to-5x ladder. Sends email/in-app notification only if at least one ticker triggers 1.5x or higher."
+    },
+    {
+      "id": "67aa802b",
+      "name": "Post-trade slippage + compact Notion latest-run sync",
+      "type": "analytics",
+      "status": "active",
+      "cron_utc": "35 19 * * 1-5",
+      "et_equivalent": "3:35 PM ET weekdays (EDT)",
+      "trades": false,
+      "notes": "Analytics only, no trading. Reads live task artifacts and Robinhood order history, writes slippage/coverage artifacts, and updates the compact Notion Latest Run section only."
     },
     {
       "id": "a46bf007",
@@ -35,27 +76,7 @@
       "cron_utc": "40 19 * * 1-5",
       "et_equivalent": "3:40 PM ET weekdays (EDT)",
       "trades": false,
-      "notes": "Read-only. Alerts on missed run, error, or discrepancy. No trading."
-    },
-    {
-      "id": "67aa802b",
-      "name": "Post-trade slippage + compact Notion latest-run sync",
-      "type": "analytics",
-      "status": "active",
-      "cron_utc": "45 19 * * 1-5",
-      "et_equivalent": "3:45 PM ET weekdays (EDT)",
-      "trades": false,
-      "notes": "Analytics only. Reads live artifacts and Robinhood order history, writes slippage artifacts, updates the compact Notion Latest Run section only."
-    },
-    {
-      "id": "cd45e95b",
-      "name": "Compact volatility outlier scan",
-      "type": "analytics",
-      "status": "active",
-      "cron_utc": "45 13 * * 1-5",
-      "et_equivalent": "9:45 AM ET weekdays (EDT)",
-      "trades": false,
-      "notes": "Analytics only. Alerts only for >5% outliers or actionable errors; no full 41+ ticker narrative on no-outlier days."
+      "notes": "Read-only, no trading. Final scheduled afternoon event. Alerts only on missed, incomplete, error, or discrepancy conditions."
     },
     {
       "id": "041d9d90",
@@ -65,7 +86,7 @@
       "cron_utc": "0 21 * * 5",
       "et_equivalent": "Fridays 5:00 PM ET (EDT)",
       "trades": false,
-      "notes": "Analytics only. Refreshes full Notion performance dashboard. No routine email."
+      "notes": "Analytics only, no trading. Recalculates and refreshes the full Notion performance dashboard. The only approved post-3:40 PM DCA-related exception. No routine email."
     },
     {
       "id": "0656657a",
@@ -75,7 +96,7 @@
       "cron_utc": "45 12 1-7 * 1-5",
       "et_equivalent": "First weekday of month 8:45 AM ET (EDT)",
       "trades": false,
-      "notes": "Analytics only. No-op if the day is not the first weekday of the month."
+      "notes": "Analytics only, no trading. No-op if the day is not the first weekday of the month."
     },
     {
       "id": "bec4a6ee",
@@ -83,9 +104,9 @@
       "type": "analytics",
       "status": "active",
       "cron_utc": "55 13 1-7 * 1-5",
-      "et_equivalent": "First weekday of month; next_run observed 9:55 AM ET despite a requested 9:15 AM ET",
+      "et_equivalent": "First weekday of month 9:55 AM ET (EDT)",
       "trades": false,
-      "notes": "Analytics only. Usage proxies, no exact credits. Discrepancy: requested 9:15 AM ET but observed next_run 9:55 AM ET - flagged for reconciliation."
+      "notes": "Analytics only, no trading. Reports usage proxies only; exact Perplexity credit consumption is not exposed, so do not claim exact credits."
     },
     {
       "id": "f7411889",
@@ -94,7 +115,7 @@
       "status": "active",
       "fires_at_et": "2026-08-15 11:45 AM ET",
       "trades": false,
-      "notes": "Reminder only. Evaluate whether to continue live testing past the 2026-08-28 approved window."
+      "notes": "Reminder only, no trading. Evaluate whether to continue live testing past the 2026-08-28 approved window."
     }
   ]
 }

@@ -1,6 +1,6 @@
 {
   "$schema": "../schemas/notifications.schema.json",
-  "version": "2026-07-04",
+  "version": "2026-07-06",
   "channels": {
     "slack": { "enabled": false, "note": "No Slack. Explicitly disabled." },
     "in_app_message_center": { "enabled": true, "note": "Primary notification channel." },
@@ -10,7 +10,14 @@
     "live_run_alerts": ["in_app_message_center"],
     "watchdog_alerts": ["in_app_message_center"],
     "volatility_outliers": ["in_app_message_center"],
+    "premarket_buying_power": [],
+    "capital_priority_briefing": ["in_app_message_center", "email"],
     "weekly_dashboard": [],
     "cost_review": ["in_app_message_center"]
+  },
+  "routing_conditions": {
+    "capital_priority_briefing": "Notify (in-app + email) only if at least one ticker triggers a 1.5x or higher multiplier; otherwise silent.",
+    "premarket_buying_power": "Analytics dashboard only; no routine notification.",
+    "volatility_outliers": "Alert only for >5% outliers or actionable errors."
   }
 }

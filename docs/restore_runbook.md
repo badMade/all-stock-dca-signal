@@ -35,7 +35,8 @@ secret manager.
 5. Verify safeguards are enforced: $3 base with tiered caps (Normal $180/$900,
    Elevated $240/$1,200, High-vol $300/$1,500, Stress $360/$1,800 daily/weekly;
    weekly rollover reserve capped at $900), one order per ticker per day, market +
-   `gfd` + `review_equity_order`, no sells/options/crypto/margin, regular hours only.
+   `gfd` + `review_equity_order`, no sells/options/crypto/margin/cancellations,
+   regular hours only.
 6. Confirm the test window (through **2026-08-28**) is still active before
    enabling live trading.
 
@@ -54,7 +55,10 @@ Then diff and review before committing. See [`scripts/README.md`](../scripts/REA
 - [ ] Active universe = 45 symbols; `BYDDY` excluded; `IRDMI→IRDM`, `GLWR→GLW` applied.
 - [ ] Ladder is the latest (0.1%–8%+, max 5x, no upper cutoff). No 12x-era tiers.
 - [ ] Base amount $3; tiered daily/weekly caps and $900 weekly rollover reserve cap intact.
-- [ ] Only `ce16ba6b` can trade; it uses only account `562057042`.
-- [ ] Live task at 3:30 PM ET; slippage/Notion sync at 3:45 PM ET (not merged).
+- [ ] Only `ce16ba6b` can trade; it uses only account `562057042`; Alpaca read-only.
+- [ ] Live task at 3:20 PM ET; slippage/Notion sync at 3:35 PM ET (not merged).
+- [ ] All 11 tasks present, including `b7961407` (9:00 AM buying-power) and `d72aa525` (3:25 PM briefing).
+- [ ] Afternoon tasks complete by 3:40 PM ET, except Fri 5:00 PM Notion refresh.
+- [ ] Signal rules recorded: below prior close + 60-min trend down + multiplier > 0.
 - [ ] No secrets committed (`git grep` for tokens/keys before pushing).
 - [ ] Notifications: no Slack; in-app + email-where-specified only.
