@@ -347,7 +347,7 @@ class StrategyState:
             self.weekly_rollover_reserve_usd = 0.0
         self.reserve_week_key = week_key
 
-    def effective_weekly_cap(self, config: StrategyConfig) -> float:
+    def effective_weekly_cap(self) -> float:
         """Return the weekly notional ceiling the selected tier will actually allow.
 
         For the stress tier this is the Normal weekly cap plus the current rollover
@@ -371,7 +371,7 @@ class StrategyState:
         ``weekly_rollover_reserve_cap_usd``).
         """
         self.roll_weekly_reserve(trading_day, config)
-        effective_weekly = self.effective_weekly_cap(config)
+        effective_weekly = self.effective_weekly_cap()
         remaining_weekly = max(0.0, effective_weekly - self.week_notional(trading_day))
         return max(0.0, min(self.current_tier().daily_cap_usd, remaining_weekly))
 
@@ -1083,7 +1083,7 @@ def build_run_artifacts(
             "planned_spend_usd": round(planned_spend, 2),
             "high_multiplier_signal_count": high_multiplier_signals,
             "daily_cap_usd": tier.daily_cap_usd,
-            "weekly_cap_usd": round(state.effective_weekly_cap(config), 2),
+            "weekly_cap_usd": round(state.effective_weekly_cap(), 2),
             "weekly_rollover_reserve_usd": round(state.weekly_rollover_reserve_usd, 2),
             "weekly_rollover_reserve_cap_usd": config.weekly_rollover_reserve_cap_usd,
             "allowed_spend_today_usd": round(state.allowed_spend_today(trading_day, config), 2),
@@ -1774,7 +1774,7 @@ def run_once(
     print(
         f"Budget summary [{tier.name}]: spent ${state.day_notional(trading_day):.2f} "
         f"(daily cap ${tier.daily_cap_usd:.2f}); "
-        f"weekly spent ${state.week_notional(trading_day):.2f} / ${state.effective_weekly_cap(config):.2f}; "
+        f"weekly spent ${state.week_notional(trading_day):.2f} / ${state.effective_weekly_cap():.2f}; "
         f"rollover reserve now ${state.weekly_rollover_reserve_usd:.2f}."
     )
 
