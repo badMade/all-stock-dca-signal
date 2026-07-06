@@ -74,7 +74,7 @@ def build_graded_vs_fixed(run_states: Sequence[Dict[str, Any]]) -> str:
     fixed_total = 0.0
     for rs in run_states:
         candidates = rs.get("buy_candidates", [])
-        base = _num(rs.get("budget", {}).get("base_buy_amount_usd")) or 3.0
+        base = _num(rs.get("budget", {}).get("base_amount_usd") or rs.get("budget", {}).get("base_buy_amount_usd")) or 3.0
         graded = sum(_num(c.get("planned_amount_usd")) for c in candidates)
         fixed = base * len(candidates)
         graded_total += graded
