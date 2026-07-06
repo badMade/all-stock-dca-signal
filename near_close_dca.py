@@ -988,18 +988,17 @@ def write_run_artifacts(artifacts: Dict[str, Any], output_dir: str | Path) -> Di
     csv_bytes = sum(path.stat().st_size for path in csv_paths)
 
     run_state_path = out / "run_state.json"
-    run_state_path.write_text(json.dumps(artifacts, indent=2, sort_keys=True))
-
-    # Backfill the on-disk usage proxies now that the files exist. Sizes are
-    # approximate: the state file grows slightly when these numbers are written
-    # back into it, which is acceptable for a cost proxy.
     usage = artifacts.get("usage_proxy")
     if isinstance(usage, dict):
-        state_bytes = run_state_path.stat().st_size
         usage["csv_artifact_count"] = len(csv_paths)
+        # Estimate the state file size in memory to avoid writing to disk twice
+        temp_json = json.dumps(artifacts, indent=2, sort_keys=True)
+        state_bytes = len(temp_json.encode("utf-8"))
         usage["state_file_bytes"] = state_bytes
         usage["total_artifact_bytes"] = state_bytes + csv_bytes
-        run_state_path.write_text(json.dumps(artifacts, indent=2, sort_keys=True))
+        run_state_path.write_text(json.dumps(artifacts, indent=2, sort_keys=True), encoding="utf-8")
+    else:
+        run_state_path.write_text(json.dumps(artifacts, indent=2, sort_keys=True), encoding="utf-8")
 
     return {
         "run_state": str(run_state_path),
