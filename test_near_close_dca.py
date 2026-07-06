@@ -9,17 +9,22 @@ import json
 import os
 import tempfile
 from datetime import date, datetime, time, timedelta
-from typing import List, Optional
 
 from near_close_dca import (
     ACTIVE_TICKERS,
     EASTERN,
     EXCLUDED_TICKERS,
+    MISSING_FILL_BROKER_BLOCKED,
+    MISSING_FILL_BUDGET_CAPPED,
+    MISSING_FILL_DATA_ERROR,
+    MISSING_FILL_EXECUTION_GAP,
+    MISSING_FILL_FAILED_TRIGGER,
+    USAGE_PROXY_FIELDS,
     Action,
     Bar,
     DryRunBroker,
-    OrderFill,
     ReconciledDecision,
+    RunResult,
     SourceName,
     SourceSignal,
     StrategyConfig,
@@ -30,22 +35,12 @@ from near_close_dca import (
     classify_execution_quality,
     classify_missing_fill,
     evaluate_source_signal,
-    generate_slippage_report,
     graded_buy_multiplier,
     reconcile_signals,
     run_and_report,
     run_daily_compact,
     write_run_artifacts,
-    write_run_state,
-    RunResult,
-    USAGE_PROXY_FIELDS,
-    MISSING_FILL_BUDGET_CAPPED,
-    MISSING_FILL_BROKER_BLOCKED,
-    MISSING_FILL_DATA_ERROR,
-    MISSING_FILL_EXECUTION_GAP,
-    MISSING_FILL_FAILED_TRIGGER,
 )
-
 
 # (drop percent from prior close, expected multiplier).
 LADDER_BOUNDARY_CASES = [

@@ -7,3 +7,13 @@ venv/
 .env.*
 *.log
 cron_tracking/
+
+# Python build / tooling
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# Local run output
+artifacts/

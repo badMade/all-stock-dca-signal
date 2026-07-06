@@ -1,0 +1,4 @@
+# Development / CI tooling for the core DCA strategy (which itself has no runtime
+# third-party dependencies). Install with:  pip install -r requirements-dev.txt
+pytest>=7.4
+ruff>=0.5

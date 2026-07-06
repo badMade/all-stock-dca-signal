@@ -1,0 +1,8 @@
+{
+  "$schema": "../schemas/trading_window.schema.json",
+  "version": "2026-07-04",
+  "description": "Authoritative approved live-trading window for the graded DCA task (ce16ba6b). Weekdays in [start_date, end_date] inclusive are the approved_test_dates; outside them run_once's date gate blocks all execution. Sourced from scheduled_tasks.json trigger_window.",
+  "start_date": "2026-07-02",
+  "end_date": "2026-08-28",
+  "weekdays_only": true
+}

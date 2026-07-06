@@ -31,7 +31,6 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
-
 # Tokens that look like tickers but are noise we never want in the universe.
 _TICKER_STOPWORDS = {
     "ET", "UTC", "EDT", "EST", "USD", "PM", "AM", "DCA", "API", "JSON", "YAML",

@@ -9,6 +9,7 @@ workflow, and Notion template. **No credentials or secrets are stored here.**
 | File | Contents |
 |---|---|
 | [strategy.md](strategy.md) | Strategy overview, ticker universe, latest sizing ladder, budgets |
+| [live_wiring.md](live_wiring.md) | Live providers/broker adapters, orchestrator/CLI, and the two placement safety gates |
 | [safeguards.md](safeguards.md) | Broker/account, trading constraints, budget caps, test window |
 | [schedule_manifest.md](schedule_manifest.md) | All scheduled tasks (only `ce16ba6b` trades) |
 | [reporting_workflow.md](reporting_workflow.md) | Daily/periodic artifact + Notion flow |

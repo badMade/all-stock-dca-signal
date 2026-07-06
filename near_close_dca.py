@@ -13,28 +13,47 @@ logic is broker-agnostic: select a backend with ``StrategyConfig.broker`` (eithe
 ``BrokerName.ROBINHOOD`` or ``BrokerName.ALPACA``) and the matching adapter is used
 without touching any of the strategy math.
 
-Fill in the FinanceDataProvider / RobinhoodDataProvider implementations with your
-MCP/API calls before using it live. The Alpaca adapter builds connector-ready
-payloads for the ``alpaca__pipedream`` source and keeps live placement gated behind
-``AlpacaConfig.enable_live_orders`` (False by default). Paper trading is the safest
-mode for connection testing; toggle it with ``AlpacaConfig.is_paper_api``.
+Live Robinhood market-data providers and a Robinhood broker adapter live in
+``dca_live_adapters`` (``RobinhoodDataProvider``, ``FinanceDataProvider``,
+``RobinhoodBroker``); they take injected MCP callables so this module needs no
+credentials or network access. ``run_dca`` is the runnable orchestrator/CLI that wires
+config -> providers/broker -> ``run_daily_compact`` -> reports. The Alpaca adapter
+builds connector-ready payloads for the ``alpaca__pipedream`` source and keeps live
+placement gated behind ``AlpacaConfig.enable_live_orders`` (False by default). Paper
+trading is the safest mode for connection testing; toggle it with
+``AlpacaConfig.is_paper_api``.
 """
 
 from __future__ import annotations
 
 import csv
 import json
+import logging
 import os
 import statistics
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Set
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Protocol,
+    Sequence,
+    Set,
+)
 from zoneinfo import ZoneInfo
 
-
 EASTERN = ZoneInfo("America/New_York")
+
+# Module logger. Library code never configures handlers (that is the entry point's job
+# in run_dca.py / the scheduler); operator-facing run output goes through this logger so
+# an unattended live task can route it to files/alerting instead of bare stdout.
+logger = logging.getLogger("near_close_dca")
 
 ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = "562057042"
 
@@ -543,13 +562,27 @@ def build_broker(
     alpaca_config: Optional[AlpacaConfig] = None,
     **adapter_kwargs: Any,
 ) -> BrokerAdapter:
-    """Return the BrokerAdapter for ``config.broker`` without changing strategy logic."""
+    """Return the BrokerAdapter for ``config.broker`` without changing strategy logic.
+
+    For ``BrokerName.ROBINHOOD`` a live :class:`RobinhoodBroker` is returned when any
+    Robinhood MCP callable is supplied via ``adapter_kwargs`` (e.g. ``review_fn=...``,
+    ``place_fn=...``); otherwise a :class:`DryRunBroker` is used so unwired callers keep
+    the safe simulator. For ``BrokerName.ALPACA`` an :class:`AlpacaBroker` is returned.
+    Live placement stays gated behind ``config.dry_run`` and the adapter's own
+    ``enable_live_orders`` flag regardless of which backend is selected.
+    """
     if config.broker == BrokerName.ALPACA:
         return AlpacaBroker(
             config=alpaca_config or AlpacaConfig(),
             account=config.target_account_number,
             **adapter_kwargs,
         )
+    if config.broker == BrokerName.ROBINHOOD and adapter_kwargs:
+        # Imported lazily so the core strategy module has no hard dependency on the
+        # live-adapter layer (keeps import graph and tests light when unused).
+        from dca_live_adapters import RobinhoodBroker
+
+        return RobinhoodBroker(account=config.target_account_number, **adapter_kwargs)
     return DryRunBroker(account=config.target_account_number)
 
 
@@ -1506,7 +1539,7 @@ def run_once(
     order_reviews_attempted = 0
 
     if trading_day not in config.approved_test_dates:
-        print(f"Date gate blocked execution for {trading_day}. No trades.")
+        logger.warning("Date gate blocked execution for %s. No trades.", trading_day)
         if artifacts_dir:
             out = Path(artifacts_dir)
             out.mkdir(parents=True, exist_ok=True)
@@ -1563,7 +1596,7 @@ def run_once(
     def _block(ticker: str, reason: str, message: str) -> None:
         if run_result is not None:
             run_result.loop_block_reasons[ticker] = reason
-        print(message)
+        logger.info(message)
 
     buy_candidates = [decision for decision in decisions if decision.action == Action.BUY]
     buy_candidates.sort(
@@ -1612,7 +1645,12 @@ def run_once(
 
         ref_id = f"graded-dca-{trading_day.isoformat()}-{ticker}"
         if config.dry_run:
-            print(f"[DRY RUN] Would buy {ticker}: ${decision.suggested_amount_usd:.2f} ({decision.reason})")
+            logger.info(
+                "[DRY RUN] Would buy %s: $%.2f (%s)",
+                ticker,
+                decision.suggested_amount_usd,
+                decision.reason,
+            )
             if isinstance(broker, DryRunBroker):
                 order_id = broker.place_market_buy(ticker, decision.suggested_amount_usd, ref_id=ref_id)
             else:
@@ -1625,7 +1663,12 @@ def run_once(
         else:
             order_id = broker.place_market_buy(ticker, decision.suggested_amount_usd, ref_id=ref_id)
             state.record_buy(ticker, trading_day, decision.suggested_amount_usd)
-            print(f"Placed buy for {ticker}: ${decision.suggested_amount_usd:.2f}, order_id={order_id}")
+            logger.info(
+                "Placed buy for %s: $%.2f, order_id=%s",
+                ticker,
+                decision.suggested_amount_usd,
+                order_id,
+            )
             candidate_outcomes[ticker] = {"status": "submitted", "order_id": order_id, "skip_reason": None}
 
         if run_result is not None:
@@ -1633,13 +1676,14 @@ def run_once(
 
     manual_review = [d for d in decisions if d.action == Action.MANUAL_REVIEW]
     if manual_review:
-        print("Manual review tickers:", ", ".join(d.ticker for d in manual_review))
+        logger.info("Manual review tickers: %s", ", ".join(d.ticker for d in manual_review))
 
     state.finalize_daily_budget(trading_day, config)
-    print(
-        f"Budget summary: spent ${state.day_notional(trading_day):.2f}; "
-        f"reserve now ${state.carry_forward_reserve_usd:.2f}; "
-        f"weekly spent ${state.week_notional(trading_day):.2f}."
+    logger.info(
+        "Budget summary: spent $%.2f; reserve now $%.2f; weekly spent $%.2f.",
+        state.day_notional(trading_day),
+        state.carry_forward_reserve_usd,
+        state.week_notional(trading_day),
     )
 
     if artifacts_dir is not None:
@@ -1655,7 +1699,7 @@ def run_once(
             cost_control_notes=cost_control_notes,
         )
         paths = write_run_artifacts(artifacts, artifacts_dir)
-        print(f"Wrote run artifacts: {paths['run_state']}")
+        logger.info("Wrote run artifacts: %s", paths["run_state"])
 
     return decisions
 
@@ -1781,8 +1825,9 @@ def run_daily_compact(
 
 if __name__ == "__main__":
     raise SystemExit(
-        "Wire FinanceDataProvider and RobinhoodDataProvider, then select a broker with "
-        "StrategyConfig.broker (BrokerName.ROBINHOOD or BrokerName.ALPACA) and build it via "
-        "build_broker(config). Keep dry_run=True and AlpacaConfig.enable_live_orders=False "
-        "until adapter tests pass."
+        "near_close_dca is the strategy library, not a runnable entry point. "
+        "Run the orchestrator instead: `python run_dca.py --demo` for a local dry-run, "
+        "or drive a live/scheduled run via run_dca.run_pipeline() with providers/broker "
+        "built from dca_live_adapters (wire Robinhood MCP callables). Live placement stays "
+        "gated behind StrategyConfig.dry_run and the adapter's enable_live_orders flag."
     )
