@@ -479,6 +479,8 @@ def _coerce_bar(raw: Any) -> Optional[Bar]:
     ts_value = raw.get("timestamp") or raw.get("begins_at") or raw.get("t") or raw.get("date")
     if isinstance(ts_value, datetime):
         timestamp: Optional[datetime] = ts_value if ts_value.tzinfo else ts_value.replace(tzinfo=EASTERN)
+    elif isinstance(ts_value, date):
+        timestamp = datetime.combine(ts_value, time(16, 0), tzinfo=EASTERN)
     else:
         timestamp = _parse_rfc3339(ts_value)
     if timestamp is None:
