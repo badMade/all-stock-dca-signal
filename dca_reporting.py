@@ -192,14 +192,16 @@ def build_latest_run_summary(
             "worst_ticker": rank_slippage(priced)[0]["ticker"] if priced else None,
         },
         "budget": {
+            "budget_tier": budget.get("budget_tier"),
             "day_notional_usd": budget.get("day_notional_usd"),
             "planned_notional_usd": round(
                 sum(_to_float(c.get("planned_amount_usd")) or 0.0 for c in buy_candidates), 2
             ),
-            "carry_forward_reserve_usd": budget.get("carry_forward_reserve_usd"),
+            "daily_cap_usd": budget.get("daily_cap_usd"),
+            "weekly_rollover_reserve_usd": budget.get("weekly_rollover_reserve_usd"),
             "remaining_spend_today_usd": budget.get("remaining_spend_today_usd"),
             "week_notional_usd": budget.get("week_notional_usd"),
-            "weekly_notional_cap_usd": budget.get("weekly_notional_cap_usd"),
+            "weekly_cap_usd": budget.get("weekly_cap_usd"),
         },
         "manual_review_tickers": run_state.get("manual_review_tickers", []),
     }

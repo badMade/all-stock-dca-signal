@@ -153,8 +153,10 @@ Ladder (drop vs previous close → multiplier): `<0.1% = 0x`, `0.1–<1% = 1x`,
 `1–<2% = 1.5x`, `2–<3% = 2x`, `3–<4% = 2.5x`, `4–<5% = 3x`, `5–<6% = 3.5x`,
 `6–<7% = 4x`, `7–<8% = 4.5x`, `>=8% = 5x`.
 
-Budget/risk: `$1` base amount, `$60` daily base, `$420` reserve max, `$120` hard
-daily cap, `$600` weekly cap.
+Budget/risk: `$3` base amount with per-run tiered caps (daily/weekly) —
+Normal `$180`/`$900`, Elevated `$240`/`$1,200`, High-volatility `$300`/`$1,500`,
+Stress `$360`/`$1,800`. Weekly rollover reserve capped at `$900`. The tier is the
+highest triggered by either planned spend or the count of 3x-or-greater signals.
 
 ## Tests
 

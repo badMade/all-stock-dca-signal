@@ -13,11 +13,13 @@ from typing import List, Optional
 
 from near_close_dca import (
     ACTIVE_TICKERS,
+    BUDGET_TIERS,
     EASTERN,
     EXCLUDED_TICKERS,
     Action,
     Bar,
     DryRunBroker,
+    select_budget_tier,
     OrderFill,
     ReconciledDecision,
     SourceName,
@@ -79,16 +81,64 @@ def test_ladder_boundaries():
         assert actual == expected, f"drop {drop_pct}% -> {actual}, expected {expected}"
 
 
-def test_base_amount_is_one_dollar():
-    assert StrategyConfig().base_buy_amount_usd == 1.0
+def test_base_amount_is_three_dollars():
+    assert StrategyConfig().base_buy_amount_usd == 3.0
 
 
-def test_budget_caps():
+def test_weekly_rollover_reserve_cap():
+    assert StrategyConfig().weekly_rollover_reserve_cap_usd == 900.0
+
+
+def test_budget_tier_selection():
+    # Normal when both planned spend and 3x+ signal count are low.
+    normal = select_budget_tier(0.0, 0)
+    assert (normal.name, normal.daily_cap_usd, normal.weekly_cap_usd) == ("normal", 180.0, 900.0)
+    assert select_budget_tier(129.0, 5).name == "normal"
+
+    # Either dimension can escalate the tier; the higher wins.
+    assert select_budget_tier(130.0, 0).name == "elevated"
+    assert select_budget_tier(0.0, 6).name == "elevated"
+    assert select_budget_tier(214.0, 0).name == "high_volatility"
+    assert select_budget_tier(0.0, 11).name == "high_volatility"
+    assert select_budget_tier(273.0, 0).name == "stress"
+    assert select_budget_tier(0.0, 18).name == "stress"
+
+    # Highest triggered tier wins across dimensions.
+    assert select_budget_tier(130.0, 18).name == "stress"
+
+    stress = BUDGET_TIERS[-1]
+    assert (stress.daily_cap_usd, stress.weekly_cap_usd) == (360.0, 1800.0)
+    assert stress.uses_rollover_reserve is True
+
+
+def test_weekly_rollover_reserve_rolls_at_week_boundary():
     config = StrategyConfig()
-    assert config.daily_base_cap_usd == 60.0
-    assert config.reserve_cap_usd == 420.0
-    assert config.hard_daily_max_usd == 120.0
-    assert config.weekly_notional_cap_usd == 600.0
+    state = StrategyState()
+    state.selected_tier = BUDGET_TIERS[-1]  # stress tier (uses rollover reserve)
+
+    # Week 1: Monday and Tuesday. Spending within the week must NOT create a
+    # rollover reserve for the same week -- the reserve reflects the PRIOR week.
+    monday = date(2026, 7, 6)
+    tuesday = date(2026, 7, 7)
+    state.record_buy("AAA", monday, 100.0)
+    state.finalize_daily_budget(monday, config)
+    # On Tuesday (same week) the reserve is still 0: Monday's spend did not
+    # leak into the current-week rollover.
+    state.allowed_spend_today(tuesday, config)
+    assert state.weekly_rollover_reserve_usd == 0.0
+    state.record_buy("BBB", tuesday, 200.0)
+    state.finalize_daily_budget(tuesday, config)
+
+    # Week 2: Monday. Now the reserve rolls forward from week 1's unused Normal
+    # capacity: $900 normal cap - $300 spent = $600 (under the $900 reserve cap).
+    next_monday = date(2026, 7, 13)
+    state.allowed_spend_today(next_monday, config)
+    assert state.weekly_rollover_reserve_usd == 600.0
+    # And it stays constant for the rest of the week.
+    state.record_buy("CCC", next_monday, 50.0)
+    state.finalize_daily_budget(next_monday, config)
+    state.allowed_spend_today(date(2026, 7, 14), config)
+    assert state.weekly_rollover_reserve_usd == 600.0
 
 
 def test_ticker_universe():

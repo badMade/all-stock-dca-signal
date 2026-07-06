@@ -12,8 +12,8 @@ those files in prose.
 Each trading weekday, near the close, the strategy inspects the drop of each
 active ticker versus its previous regular-session close and, if the drop clears
 the ladder's minimum, places a single market buy sized by a graded multiplier of
-a $1 base amount. All buys pass a review gate and respect daily/weekly budget
-caps. It never sells.
+a **$3 base amount**. All buys pass a review gate and respect the selected
+tiered daily/weekly budget caps. It never sells.
 
 ## Active ticker universe
 
@@ -30,22 +30,22 @@ INTC GOOGL GOOG AMZN GLW MA GS MU NFLX XLG TOPT QTOP SATA RGTI IBM
 
 ## Sizing ladder (latest, active)
 
-Maps the drop vs. previous close to a buy multiplier of the $1 base amount.
+Maps the drop vs. previous close to a buy multiplier of the $3 base amount.
 Boundaries are min-inclusive, max-exclusive. There is **no upper cutoff**: any
 drop of 8% or more is 5x. See [`config/sizing_ladder.json`](../config/sizing_ladder.json).
 
-| Drop vs. prior close | Multiplier | Dollars (base $1) |
+| Drop vs. prior close | Multiplier | Dollars (base $3) |
 |---|---|---|
 | < 0.1%          | 0x (no buy) | $0.00 |
-| 0.1% to < 1%    | 1x   | $1.00 |
-| 1% to < 2%      | 1.5x | $1.50 |
-| 2% to < 3%      | 2x   | $2.00 |
-| 3% to < 4%      | 2.5x | $2.50 |
-| 4% to < 5%      | 3x   | $3.00 |
-| 5% to < 6%      | 3.5x | $3.50 |
-| 6% to < 7%      | 4x   | $4.00 |
-| 7% to < 8%      | 4.5x | $4.50 |
-| >= 8%           | 5x   | $5.00 |
+| 0.1% to < 1%    | 1x   | $3.00 |
+| 1% to < 2%      | 1.5x | $4.50 |
+| 2% to < 3%      | 2x   | $6.00 |
+| 3% to < 4%      | 2.5x | $7.50 |
+| 4% to < 5%      | 3x   | $9.00 |
+| 5% to < 6%      | 3.5x | $10.50 |
+| 6% to < 7%      | 4x   | $12.00 |
+| 7% to < 8%      | 4.5x | $13.50 |
+| >= 8%           | 5x   | $15.00 |
 
 ### Historical / superseded ladders
 
@@ -54,24 +54,31 @@ Older ladder variants — **including the 0.1%-to-12% sizing ladders** — are
 upper cutoff) is the only one in force. If a request references the "0.1% to 12%
 ladder," treat it as background context, not the current rule.
 
-## Budget & reserve rules
+## Budget & tiered cap rules
 
-See [`config/budgets.json`](../config/budgets.json).
+Base amount is **$3**. See [`config/budgets.json`](../config/budgets.json).
 
-| Rule | Value |
-|---|---|
-| Base amount | $1 |
-| Daily base cap | $60 |
-| Carry-forward reserve (max) | $420 |
-| Hard daily max | $120 |
-| Weekly hard cap | $600 |
+The daily and weekly caps are not fixed: each run selects a budget tier from the
+day's planned spend and the number of **3x-or-greater signals** (buy candidates
+whose ladder multiplier is >= 3.0). Pick the highest tier triggered by **either**
+dimension.
 
-Reserve logic (applied once per trading day):
+| Tier | Select when | Daily cap | Weekly cap |
+|---|---|---|---|
+| Normal | planned spend <= $129 **and** 3x+ signals <= 5 | $180 | $900 |
+| Elevated | planned spend > $129 **or** 3x+ signals 6-10 | $240 | $1,200 |
+| High-volatility | planned spend > $213 **or** 3x+ signals 11-17 | $300 | $1,500 |
+| Stress | planned spend > $272 **or** 3x+ signals > 17 | $360 | $1,800 |
 
-- `unused_base = max(0, daily_base_cap - actual_spend)` — calm days build reserve.
-- `reserve_draw = min(current_reserve, max(0, actual_spend - daily_base_cap))` — red days draw reserve.
-- `reserve_next = min(reserve_cap, max(0, reserve_start - reserve_draw + unused_base))`.
-- `allowed_today = max(0, min(hard_daily_max, daily_base_cap + current_reserve, weekly_cap - week_spend))`.
+- **Stress** capacity is usable only to the extent prior unused weekly rollover
+  reserve is available.
+- The **weekly rollover reserve is capped at $900**.
+- Allocations are prioritized by **higher multiplier first, then larger percent
+  drop**.
+- **One strategy order per ticker per day.**
+
+Caps are absolute ceilings: a run never exceeds the selected daily cap, the
+selected weekly cap, available buying power, or the broker/order-review limit.
 
 ## Execution constraints
 

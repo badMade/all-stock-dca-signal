@@ -25,9 +25,12 @@ workflow, and Notion template. **No credentials or secrets are stored here.**
 ## Key facts (quick reference)
 
 - **Active universe:** 45 tickers; `BYDDY` excluded; `IRDMI→IRDM`, `GLWR→GLW`.
-- **Latest ladder:** 0.1%→8%+, base $1, max **5x** (no upper cutoff). Older
+- **Latest ladder:** 0.1%→8%+, base $3, max **5x** (no upper cutoff). Older
   0.1%–12% ladders are **superseded**.
-- **Budgets:** $1 base · $60 daily base · $120 hard daily · $600 weekly · $420 reserve.
-- **Only trading task:** `ce16ba6b`, **3:30 PM ET** weekdays, Robinhood account
-  `562057042` only. The **3:45 PM ET** task is analytics (slippage + Notion sync).
+- **Budgets:** $3 base · tiered caps selected per run by planned spend and 3x+
+  signal count — Normal $180/$900 · Elevated $240/$1,200 · High-vol $300/$1,500 ·
+  Stress $360/$1,800 (daily/weekly); weekly rollover reserve capped at $900.
+- **Only trading task:** `ce16ba6b` ("Graded DCA automatic live test - $3
+  allocation"), **3:30 PM ET** weekdays, Robinhood account `562057042` only. The
+  **3:45 PM ET** task is analytics (slippage + Notion sync).
 - **Test window:** through **2026-08-28** inclusive.

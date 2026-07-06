@@ -25,16 +25,23 @@ should skip rather than trade. Machine-readable copies live in
 
 ## Budget caps
 
-| Rule | Value |
-|---|---|
-| Base amount | $1 |
-| Daily base cap | $60 |
-| Carry-forward reserve (max) | $420 |
-| Hard daily max | $120 |
-| Weekly hard cap | $600 |
+Base amount is **$3**. Daily and weekly caps are selected per run by tier, based
+on the day's planned spend and the count of 3x-or-greater signals (multiplier
+>= 3.0). Pick the highest tier triggered by **either** dimension.
 
-The hard daily max and weekly cap are absolute ceilings. Reserve carry-forward
-never pushes a day above the hard daily max or the week above the weekly cap.
+| Tier | Select when | Daily cap | Weekly cap |
+|---|---|---|---|
+| Normal | planned spend <= $129 **and** 3x+ signals <= 5 | $180 | $900 |
+| Elevated | planned spend > $129 **or** 3x+ signals 6-10 | $240 | $1,200 |
+| High-volatility | planned spend > $213 **or** 3x+ signals 11-17 | $300 | $1,500 |
+| Stress | planned spend > $272 **or** 3x+ signals > 17 | $360 | $1,800 |
+
+- The selected daily and weekly caps are absolute ceilings.
+- **Stress** tier capacity is usable only to the extent prior unused weekly
+  rollover reserve is available. The **weekly rollover reserve is capped at $900.**
+- Allocations are prioritized by higher multiplier first, then larger percent drop.
+- A run never exceeds the selected daily cap, the selected weekly cap, available
+  buying power, or the broker/order-review limit.
 
 ## Test window
 
