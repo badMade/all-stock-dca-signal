@@ -1,6 +1,6 @@
 {
   "$schema": "../schemas/sizing_ladder.schema.json",
-  "version": "2026-06-29-revised",
+  "version": "2026-07-06",
   "status": "active",
   "description": "Latest active graded sizing ladder. Maps the drop vs. previous close to a buy multiplier. Base amount is multiplied by the tier multiplier. No upper cutoff: any drop >= 8% is 5x.",
   "drop_metric": "fraction_down_vs_previous_close",

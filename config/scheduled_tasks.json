@@ -2,7 +2,7 @@
   "$schema": "../schemas/scheduled_tasks.schema.json",
   "version": "2026-07-06",
   "timezone_note": "Cron expressions are in UTC. ET equivalents are during US Eastern Daylight Time (EDT, UTC-4). Confirm around DST transitions.",
-  "afternoon_completion_rule": "All afternoon tasks complete no later than 3:40 PM ET, except the Friday weekly Notion performance refresh at 5:00 PM ET (the only approved post-3:40 PM DCA-related exception).",
+  "afternoon_completion_rule": "All afternoon trading and artifact-writing tasks complete no later than 3:40 PM ET, when the read-only live-run watchdog (a46bf007) begins its final verification. The watchdog's own post-3:40 PM verification and the Friday weekly Notion performance refresh at 5:00 PM ET are the only approved post-3:40 PM DCA-related exceptions.",
   "run_classification_policy": {
     "policy_file": "config/run_classification.json",
     "schema": "schemas/run_classification.schema.json",

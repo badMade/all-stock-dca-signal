@@ -41,6 +41,8 @@ workflow, and Notion template. **No credentials or secrets are stored here.**
   manual runs write under `manual_runs/<timestamp>/` and never do. Reporting
   excludes manual runs/order IDs from scheduled-live metrics. See
   [run_classification.md](run_classification.md).
-- **Afternoon completion:** all afternoon tasks finish by **3:40 PM ET**, except
-  the Friday weekly Notion refresh at **5:00 PM ET**.
+- **Afternoon completion:** all afternoon trading/artifact-writing tasks finish
+  by **3:40 PM ET**, when the read-only watchdog starts its final verification;
+  the watchdog's own check and the Friday weekly Notion refresh at **5:00 PM ET**
+  are the only exceptions.
 - **Test window:** through **2026-08-28** inclusive.

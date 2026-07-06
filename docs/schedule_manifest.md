@@ -6,9 +6,11 @@ Backup of the current scheduled tasks. Machine-readable source:
 **Timezone note:** cron expressions are in **UTC**. ET equivalents below are for
 US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 
-> **Afternoon completion rule:** all afternoon tasks complete **no later than
-> 3:40 PM ET**, except the Friday weekly Notion performance refresh at
-> **5:00 PM ET** (the only approved post-3:40 PM DCA-related exception).
+> **Afternoon completion rule:** all afternoon **trading and artifact-writing**
+> tasks complete **no later than 3:40 PM ET**, when the read-only watchdog
+> (`a46bf007`) begins its final verification. The watchdog's own post-3:40 PM
+> verification and the Friday weekly Notion performance refresh at **5:00 PM ET**
+> are the only approved post-3:40 PM DCA-related exceptions.
 
 > **Schedule integrity note:** the live trading task runs at **3:20 PM ET**; the
 > post-trade slippage / Notion sync runs at **3:35 PM ET**. These are two

@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple
 from zoneinfo import ZoneInfo
 
 
@@ -858,6 +858,21 @@ def within_caps(decision: ReconciledDecision, state: StrategyState, trading_day:
     return True
 
 
+def allocation_sort_key(decision: ReconciledDecision) -> Tuple[float, float, str]:
+    """Deterministic allocation priority for buy candidates.
+
+    Orders by higher multiplier first, then larger percent drop, then ticker
+    alphabetical (A->Z) as the final tie-break so a capped run always fills the
+    same names the strategy state promises. Numeric keys are negated (rather than
+    sorting with ``reverse=True``) so ticker still sorts ascending.
+    """
+    drop = max(
+        decision.finance_signal.drop_vs_previous_close_pct if decision.finance_signal else 0.0,
+        decision.robinhood_signal.drop_vs_previous_close_pct if decision.robinhood_signal else 0.0,
+    )
+    return (-decision.buy_multiplier, -drop, decision.ticker)
+
+
 def _signal_target_price(decision: ReconciledDecision) -> Optional[float]:
     """Return the decision-bar close used as the buy target price at signal time.
 
@@ -1654,16 +1669,8 @@ def run_once(
         print(message)
 
     buy_candidates = [decision for decision in decisions if decision.action == Action.BUY]
-    buy_candidates.sort(
-        key=lambda d: (
-            d.buy_multiplier,
-            max(
-                d.finance_signal.drop_vs_previous_close_pct if d.finance_signal else 0.0,
-                d.robinhood_signal.drop_vs_previous_close_pct if d.robinhood_signal else 0.0,
-            ),
-        ),
-        reverse=True,
-    )
+    # Higher multiplier -> larger drop -> ticker alphabetical (see allocation_sort_key).
+    buy_candidates.sort(key=allocation_sort_key)
 
     planned_spend = sum(d.suggested_amount_usd for d in buy_candidates)
     high_multiplier_signals = sum(

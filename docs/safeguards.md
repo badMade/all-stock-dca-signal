@@ -67,9 +67,11 @@ on the day's planned spend and the count of 3x-or-greater signals (multiplier
   infers scheduled status from broker orders alone. See
   [run_classification.md](run_classification.md) and
   [`config/run_classification.json`](../config/run_classification.json).
-- **Afternoon completion rule:** all afternoon tasks complete **no later than
-  3:40 PM ET**, except the Friday weekly Notion performance refresh at
-  **5:00 PM ET** (the only approved post-3:40 PM exception).
+- **Afternoon completion rule:** all afternoon **trading and artifact-writing**
+  tasks complete **no later than 3:40 PM ET**, when the read-only watchdog
+  (`a46bf007`) begins its final verification. The watchdog's own post-3:40 PM
+  verification and the Friday weekly Notion performance refresh at **5:00 PM ET**
+  are the only approved post-3:40 PM exceptions.
 - **Cost-control policy:** daily tasks are compact / local-first; heavy analysis
   runs Fridays and monthly; avoid manual full runs unless automation fails.
 
