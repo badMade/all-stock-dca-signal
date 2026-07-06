@@ -4,7 +4,7 @@
   "status": "active",
   "description": "Latest active graded sizing ladder. Maps the drop vs. previous close to a buy multiplier. Base amount is multiplied by the tier multiplier. No upper cutoff: any drop >= 8% is 5x.",
   "drop_metric": "fraction_down_vs_previous_close",
-  "base_amount_usd": 1.0,
+  "base_amount_usd": 3.0,
   "no_buy_below_pct": 0.1,
   "tiers": [
     { "min_drop_pct": 0.1, "max_drop_pct": 1.0, "multiplier": 1.0 },

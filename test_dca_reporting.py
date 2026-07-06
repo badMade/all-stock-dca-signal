@@ -37,13 +37,14 @@ def _run_state():
         "counts": {"buy_candidates": 3, "submitted": 3, "manual_review": 1},
         "manual_review_tickers": ["MSFT"],
         "budget": {
-            "base_buy_amount_usd": 1.0,
-            "daily_base_cap_usd": 60.0,
+            "base_buy_amount_usd": 3.0,
+            "budget_tier": "normal",
+            "daily_cap_usd": 180.0,
             "day_notional_usd": 6.5,
-            "carry_forward_reserve_usd": 53.5,
-            "remaining_spend_today_usd": 53.5,
+            "weekly_rollover_reserve_usd": 893.5,
+            "remaining_spend_today_usd": 173.5,
             "week_notional_usd": 6.5,
-            "weekly_notional_cap_usd": 600.0,
+            "weekly_cap_usd": 900.0,
         },
         "buy_candidates": [
             {"ticker": "AAPL", "planned_amount_usd": 2.0, "buy_multiplier": 2.0,
@@ -171,8 +172,8 @@ def test_weekly_dashboard_section_generation():
 def test_weekly_graded_vs_fixed_delta():
     run_states = [_run_state()]
     md = build_graded_vs_fixed(run_states)
-    # Graded total 6.5 vs fixed 1x * 3 candidates = 3.0 -> delta +3.50.
-    assert "+3.50" in md
+    # Graded total 6.5 vs fixed 3x base * 3 candidates = 9.0 -> delta -2.50.
+    assert "-2.50" in md
 
 
 def test_weekly_sector_matrix_buckets_unclassified():
@@ -251,7 +252,9 @@ def test_build_run_artifacts_captures_target_price():
     assert by_ticker["AAPL"]["order_id"] == "O1"
     assert by_ticker["AMD"]["target_price"] is None
     assert by_ticker["AMD"]["target_price_missing"] is True
-    assert artifacts["budget"]["weekly_notional_cap_usd"] == 600.0
+    assert artifacts["budget"]["weekly_cap_usd"] == 900.0
+    assert artifacts["budget"]["budget_tier"] == "normal"
+    assert artifacts["budget"]["base_buy_amount_usd"] == 3.0
 
 
 def _run_all():

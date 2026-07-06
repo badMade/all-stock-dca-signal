@@ -55,10 +55,11 @@ def build_compact_sync_markdown(summary: Dict[str, Any]) -> str:
     lines.append(f"| Max slippage | {_fmt(exq.get('max_slippage_pct'), '%')} |")
     lines.append(f"| target_price_missing | {_fmt(exq.get('target_price_missing'))} |")
     lines.append(f"| Worst ticker | {_fmt(exq.get('worst_ticker'))} |")
+    lines.append(f"| Budget tier | {budget.get('budget_tier') or 'n/a'} |")
     lines.append(f"| Spent today | {_fmt(budget.get('day_notional_usd'), ' USD')} |")
     lines.append(f"| Planned notional | {_fmt(budget.get('planned_notional_usd'), ' USD')} |")
-    lines.append(f"| Reserve carry-forward | {_fmt(budget.get('carry_forward_reserve_usd'), ' USD')} |")
-    lines.append(f"| Week notional / cap | {_fmt(budget.get('week_notional_usd'), ' USD')} / {_fmt(budget.get('weekly_notional_cap_usd'), ' USD')} |")
+    lines.append(f"| Weekly rollover reserve | {_fmt(budget.get('weekly_rollover_reserve_usd'), ' USD')} |")
+    lines.append(f"| Week notional / cap | {_fmt(budget.get('week_notional_usd'), ' USD')} / {_fmt(budget.get('weekly_cap_usd'), ' USD')} |")
     lines.append("")
     if manual:
         lines.append(f"**Manual review:** {', '.join(manual)}")

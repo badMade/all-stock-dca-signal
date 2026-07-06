@@ -32,9 +32,10 @@ secret manager.
    - Robinhood account `562057042` execution credentials.
    - `NOTION_TOKEN` for the dashboard sync (see
      [`notion_dashboard_template.md`](notion_dashboard_template.md)).
-5. Verify safeguards are enforced: caps ($60 daily base / $120 hard / $600
-   weekly / $420 reserve), one order per ticker per day, market + `gfd` +
-   `review_equity_order`, no sells/options/crypto/margin, regular hours only.
+5. Verify safeguards are enforced: $3 base with tiered caps (Normal $180/$900,
+   Elevated $240/$1,200, High-vol $300/$1,500, Stress $360/$1,800 daily/weekly;
+   weekly rollover reserve capped at $900), one order per ticker per day, market +
+   `gfd` + `review_equity_order`, no sells/options/crypto/margin, regular hours only.
 6. Confirm the test window (through **2026-08-28**) is still active before
    enabling live trading.
 
@@ -52,7 +53,7 @@ Then diff and review before committing. See [`scripts/README.md`](../scripts/REA
 
 - [ ] Active universe = 45 symbols; `BYDDY` excluded; `IRDMI→IRDM`, `GLWR→GLW` applied.
 - [ ] Ladder is the latest (0.1%–8%+, max 5x, no upper cutoff). No 12x-era tiers.
-- [ ] Budget caps unchanged; reserve logic intact.
+- [ ] Base amount $3; tiered daily/weekly caps and $900 weekly rollover reserve cap intact.
 - [ ] Only `ce16ba6b` can trade; it uses only account `562057042`.
 - [ ] Live task at 3:30 PM ET; slippage/Notion sync at 3:45 PM ET (not merged).
 - [ ] No secrets committed (`git grep` for tokens/keys before pushing).

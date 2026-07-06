@@ -36,13 +36,17 @@
     },
     "budget": {
       "type": "object",
-      "required": ["daily_base_cap_usd", "hard_daily_max_usd", "weekly_hard_cap_usd", "spent_today_usd"],
+      "required": ["budget_tier", "daily_cap_usd", "weekly_cap_usd", "spent_today_usd"],
       "additionalProperties": true,
       "properties": {
-        "daily_base_cap_usd": { "type": "number" },
-        "hard_daily_max_usd": { "type": "number" },
-        "weekly_hard_cap_usd": { "type": "number" },
-        "carry_forward_reserve_usd": { "type": "number" },
+        "base_amount_usd": { "type": "number" },
+        "budget_tier": { "type": "string", "enum": ["normal", "elevated", "high_volatility", "stress"] },
+        "planned_spend_usd": { "type": "number" },
+        "high_multiplier_signal_count": { "type": "integer" },
+        "daily_cap_usd": { "type": "number" },
+        "weekly_cap_usd": { "type": "number" },
+        "weekly_rollover_reserve_usd": { "type": "number" },
+        "weekly_rollover_reserve_cap_usd": { "type": "number" },
         "spent_today_usd": { "type": "number" },
         "week_spent_usd": { "type": "number" }
       }

@@ -173,7 +173,7 @@ def extract_sizing_ladder(text: str) -> Dict[str, object]:
 
     return {
         "status": "active",
-        "base_amount_usd": 1.0,
+        "base_amount_usd": 3.0,
         "no_buy_below_pct": no_buy_below,
         "tiers": tiers,
     }
@@ -181,19 +181,46 @@ def extract_sizing_ladder(text: str) -> Dict[str, object]:
 
 _BUDGET_PATTERNS = {
     "base_amount_usd": r"base\s+amount[^$]*\$\s*([0-9]+(?:\.[0-9]+)?)",
-    "daily_base_cap_usd": r"daily\s+base\s+cap[^$]*\$\s*([0-9]+(?:\.[0-9]+)?)",
-    "carry_forward_reserve_cap_usd": r"carry[- ]forward\s+reserve[^$]*\$\s*([0-9]+(?:\.[0-9]+)?)",
-    "hard_daily_max_usd": r"hard\s+daily\s+max[^$]*\$\s*([0-9]+(?:\.[0-9]+)?)",
-    "weekly_hard_cap_usd": r"weekly\s+hard\s+cap[^$]*\$\s*([0-9]+(?:\.[0-9]+)?)",
+    "weekly_rollover_reserve_cap_usd": r"weekly\s+rollover\s+reserve[^$]*\$\s*([0-9]+(?:\.[0-9]+)?)",
 }
 
+# Tier lines look like "Normal: ... daily cap $180, weekly cap $900".
+_TIER_PATTERN = re.compile(
+    r"\b(normal|elevated|high[- ]?volatility|stress)\b[^\n]*?"
+    r"daily\s+cap\s*\$?\s*([0-9]+(?:\.[0-9]+)?)[^\n]*?"
+    r"weekly\s+cap\s*\$?\s*([0-9]+(?:\.[0-9]+)?)",
+    re.IGNORECASE,
+)
 
-def extract_budgets(text: str) -> Dict[str, float]:
-    out: Dict[str, float] = {}
+
+def extract_budget_tiers(text: str) -> List[Dict[str, object]]:
+    """Extract tiered daily/weekly caps from lines naming a tier and its caps."""
+    tiers: List[Dict[str, object]] = []
+    seen: set = set()
+    for m in _TIER_PATTERN.finditer(text):
+        name = re.sub(r"[- ]", "_", m.group(1).lower())
+        if name in seen:
+            continue
+        seen.add(name)
+        tiers.append(
+            {
+                "name": name,
+                "daily_cap_usd": float(m.group(2)),
+                "weekly_cap_usd": float(m.group(3)),
+            }
+        )
+    return tiers
+
+
+def extract_budgets(text: str) -> Dict[str, object]:
+    out: Dict[str, object] = {}
     for key, pat in _BUDGET_PATTERNS.items():
         m = re.search(pat, text, re.IGNORECASE)
         if m:
             out[key] = float(m.group(1))
+    tiers = extract_budget_tiers(text)
+    if tiers:
+        out["budget_tiers"] = tiers
     return out
 
 

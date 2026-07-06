@@ -45,12 +45,13 @@ drop <0.1% = 0x
 7% to <8% = 4.5x
 >=8% = 5x, no upper cutoff
 
-Budget/reserve rules:
-- Base amount $1.
-- Daily base cap $60.
-- Carry-forward reserve max $420.
-- Hard daily max $120.
-- Weekly hard cap $600.
+Budget rules ($3 allocation policy):
+- Base amount $3.
+- Weekly rollover reserve max $900.
+- Normal: daily cap $180, weekly cap $900.
+- Elevated: daily cap $240, weekly cap $1200.
+- High-volatility: daily cap $300, weekly cap $1500.
+- Stress: daily cap $360, weekly cap $1800.
 
 Schedules:
 ce16ba6b - live graded DCA task, schedule 30 19 * * 1-5 UTC = 3:30 PM ET weekdays
@@ -87,11 +88,13 @@ def test_extract_latest_ladder():
 
 def test_extract_budgets():
     b = extract_budgets(SAMPLE)
-    assert b["base_amount_usd"] == 1.0
-    assert b["daily_base_cap_usd"] == 60.0
-    assert b["carry_forward_reserve_cap_usd"] == 420.0
-    assert b["hard_daily_max_usd"] == 120.0
-    assert b["weekly_hard_cap_usd"] == 600.0
+    assert b["base_amount_usd"] == 3.0
+    assert b["weekly_rollover_reserve_cap_usd"] == 900.0
+    tiers = {t["name"]: t for t in b["budget_tiers"]}
+    assert tiers["normal"] == {"name": "normal", "daily_cap_usd": 180.0, "weekly_cap_usd": 900.0}
+    assert tiers["elevated"]["daily_cap_usd"] == 240.0
+    assert tiers["high_volatility"]["weekly_cap_usd"] == 1500.0
+    assert tiers["stress"] == {"name": "stress", "daily_cap_usd": 360.0, "weekly_cap_usd": 1800.0}
 
 
 def test_schedule_weekday_logic_330_and_345_et():
