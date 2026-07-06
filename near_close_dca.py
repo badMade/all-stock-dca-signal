@@ -149,7 +149,8 @@ class BudgetTier:
 
 # Ordered low-to-high. The live $3-allocation policy selects the highest tier
 # triggered by EITHER the day's planned spend or the count of 3x-or-greater
-# signals. See config/budgets.json for the authoritative source.
+# signals. These tier values are NOT loaded from config at runtime; they must be
+# kept in sync with config/budgets.json, which documents the same policy.
 BUDGET_TIERS: tuple[BudgetTier, ...] = (
     BudgetTier("normal", 180.0, 900.0),
     BudgetTier("elevated", 240.0, 1200.0),
