@@ -197,6 +197,7 @@ def extract_schedule(text: str) -> Dict[str, object]:
     and standalone cron expressions with ET annotations.
     """
     tasks = []
+    seen_ids = set()
     seen_crons = set()
     # id + cron together on a line.
     for line in text.splitlines():
@@ -204,9 +205,24 @@ def extract_schedule(text: str) -> Dict[str, object]:
         if not cron_m:
             continue
         cron = cron_m.group(1).strip()
-        if cron in seen_crons:
-            continue
-        seen_crons.add(cron)
+        id_m = re.search(r"\b([0-9a-f]{8})\b", line)
+        task_id = id_m.group(1) if id_m else None
+        if task_id:
+            if task_id in seen_ids:
+                continue
+            seen_ids.add(task_id)
+        else:
+            if cron in seen_crons:
+                continue
+            seen_crons.add(cron)
+        et_m = re.search(r"=\s*([^=]*?ET[^=]*)", line)
+        weekday = _is_weekday_cron(cron)
+        tasks.append({
+            "id": task_id,
+            "cron_utc": cron,
+            "et_equivalent": et_m.group(1).strip() if et_m else None,
+            "weekday_only": weekday,
+        })
         id_m = re.search(r"\b([0-9a-f]{8})\b", line)
         et_m = re.search(r"=\s*([^=]*?ET[^=]*)", line)
         weekday = _is_weekday_cron(cron)
