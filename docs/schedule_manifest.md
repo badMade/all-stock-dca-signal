@@ -14,7 +14,9 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 > post-trade slippage / Notion sync runs at **3:35 PM ET**. These are two
 > different tasks. Do not merge them or move the live trade off 3:20 PM ET.
 
-> **Run-classification note:** the live task (`ce16ba6b`) classifies every
+> **Run-classification note:** the live task (`10ce362c`, the repaired task
+> that supersedes the deleted `ce16ba6b`; artifact root stays under
+> `.../ce16ba6b` for continuity) classifies every
 > run as scheduled or manual. Scheduled runs write under
 > `cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/` and update
 > `latest_scheduled_run.json`; manual runs write under `manual_runs/<timestamp>/`
@@ -28,7 +30,7 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 | `b7961407` | Pre-market DCA buying-power dashboard | analytics | no | `00 13 * * 1-5` | 9:00 AM weekdays | active |
 | `cd45e95b` | Compact DCA volatility outlier scan | analytics | no | `45 13 * * 1-5` | 9:45 AM weekdays | active |
 | `e3e6f09e` | Monitor-only graded DCA signal check | monitoring | no | `5 19 * * 1-5` | 3:05 PM weekdays | active |
-| `ce16ba6b` | Graded DCA automatic live test - $3 allocation | trading | **yes** | `20 19 * * 1-5` | 3:20 PM weekdays | active |
+| `10ce362c` | Graded DCA automatic live test - $3 allocation (supersedes `ce16ba6b`) | trading | **yes** | `20 19 * * 1-5` | 3:20 PM weekdays | active |
 | `d72aa525` | Capital-priority briefing | analytics | no | `25 19 * * 1-5` | 3:25 PM weekdays | active |
 | `67aa802b` | Post-trade slippage + compact Notion latest-run sync | analytics | no | `35 19 * * 1-5` | 3:35 PM weekdays | active |
 | `a46bf007` | Live-run watchdog | monitoring | no | `40 19 * * 1-5` | 3:40 PM weekdays | active |
@@ -51,12 +53,13 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 - Analytics and notifications only; **no trades**. Runs **3:05 PM ET weekdays**.
 - Monitor-only signal check that surfaces the planned allocation and tier selection using the current $3 base 0x-to-5x ladder.
 
-### `ce16ba6b` — Graded DCA automatic live test - $3 allocation (the only trading task)
+### `10ce362c` — Graded DCA automatic live test - $3 allocation (the only trading task)
+- Repaired live task `10ce362c`, which **supersedes the deleted `ce16ba6b`**; the artifact root stays under `.../ce16ba6b` for continuity.
 - Approved live trading task running the **$3 base 0x-to-5x ladder with tiered caps**. Places real market buy orders automatically within safeguards. Runs **3:20 PM ET weekdays**.
 - Uses **only** Robinhood account `562057042`; Alpaca is read-only.
 - Trigger gate: `programmatic_trigger_check.sh`, allowing weekdays **2026-07-02 through 2026-08-28**, **3:20–3:55 PM ET**.
 - Writes standardized same-day state files under `/home/user/workspace/cron_tracking/ce16ba6b` ([`schemas/run_state.schema.json`](../schemas/run_state.schema.json)); must **not** fall back to interactive confirmation.
-- **Run classification:** a scheduled run writes `scheduled_runs/YYYYMMDD_1520ET/run_state.json` (`run_origin='scheduled'`, `run_id='scheduled_YYYYMMDD_1520ET'`) and updates `latest_scheduled_run.json`; a manual run writes `manual_runs/<timestamp>/run_state.json` (`run_origin='manual'`, `manual_run=true`) and never updates that pointer. See [run_classification.md](run_classification.md).
+- **Run classification:** a scheduled run writes `scheduled_runs/YYYYMMDD_1520ET/run_state.json` (`run_origin='scheduled'`, `run_id='scheduled_YYYYMMDD_1520ET'`, and `cron_id='10ce362c'` OR `supersedes_cron_id='ce16ba6b'`) and updates `latest_scheduled_run.json`; a manual run writes `manual_runs/<timestamp>/run_state.json` (`run_origin='manual'`, `manual_run=true`) and never updates that pointer. See [run_classification.md](run_classification.md).
 - **Manual runs do not count as scheduled-run evidence.** Any stale stored display name is superseded by the authoritative **3:20 PM ET** schedule.
 
 ### `d72aa525` — Capital-priority briefing

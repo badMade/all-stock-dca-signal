@@ -35,12 +35,16 @@ from typing import Dict, Iterable, List, Optional, Set
 # --- Contract constants (mirror config/run_classification.json) --------------
 
 STATE_SCHEMA_VERSION = "run-classification-v1"
-CRON_ID = "ce16ba6b"
+# Repaired live task id. The deleted ce16ba6b is superseded by 10ce362c; the
+# artifact root stays under .../ce16ba6b for continuity (see STATE_ROOT).
+CRON_ID = "10ce362c"
+SUPERSEDES_CRON_ID = "ce16ba6b"
 SCHEDULED_RUN_TYPE = "scheduled_live_test"
 SCHEDULED_FOR_ET = "15:20"
 SCHEDULED_WINDOW_START_ET = "15:15"
 SCHEDULED_WINDOW_END_ET = "15:35"
 
+# Artifact root remains the ce16ba6b path for continuity across the task repair.
 STATE_ROOT = "/home/user/workspace/cron_tracking/ce16ba6b"
 RUN_STATE_FILENAME = "run_state.json"
 LATEST_SCHEDULED_RUN_FILENAME = "latest_scheduled_run.json"
@@ -99,6 +103,7 @@ def build_scheduled_classification(
         "run_origin": "scheduled",
         "run_type": SCHEDULED_RUN_TYPE,
         "cron_id": CRON_ID,
+        "supersedes_cron_id": SUPERSEDES_CRON_ID,
         "scheduled_for_et": SCHEDULED_FOR_ET,
         "scheduled_window_start_et": SCHEDULED_WINDOW_START_ET,
         "scheduled_window_end_et": SCHEDULED_WINDOW_END_ET,
@@ -118,6 +123,7 @@ def build_manual_classification(
         "run_origin": "manual",
         "run_type": "manual_test",
         "cron_id": CRON_ID,
+        "supersedes_cron_id": SUPERSEDES_CRON_ID,
         "manual_run": True,
         "run_id": run_id or manual_run_id(ts),
         "triggered_at_utc": ts,
@@ -187,8 +193,13 @@ def validate_classification(rc: Dict[str, object]) -> ValidationResult:
             errors.append("scheduled run must have manual_run=false")
         if rc.get("run_type") != SCHEDULED_RUN_TYPE:
             errors.append(f"scheduled run_type must be {SCHEDULED_RUN_TYPE!r}")
-        if rc.get("cron_id") != CRON_ID:
-            errors.append(f"scheduled cron_id must be {CRON_ID!r}")
+        # Lineage of the repaired live task: accept the current task id OR the
+        # superseded-task marker so continuity artifacts stay valid.
+        if rc.get("cron_id") != CRON_ID and rc.get("supersedes_cron_id") != SUPERSEDES_CRON_ID:
+            errors.append(
+                f"scheduled run must have cron_id={CRON_ID!r} "
+                f"OR supersedes_cron_id={SUPERSEDES_CRON_ID!r}"
+            )
         if rc.get("scheduled_for_et") != SCHEDULED_FOR_ET:
             errors.append(f"scheduled_for_et must be {SCHEDULED_FOR_ET!r}")
         if rc.get("scheduled_window_start_et") != SCHEDULED_WINDOW_START_ET:
@@ -266,6 +277,8 @@ def write_run_artifacts(
                     "run_id": rc["run_id"],
                     "trading_day": day,
                     "run_state_path": str(state_path),
+                    "cron_id": rc.get("cron_id"),
+                    "supersedes_cron_id": rc.get("supersedes_cron_id"),
                     "triggered_at_utc": rc["triggered_at_utc"],
                     "updated_at_utc": _utc_now_iso(),
                     "state_schema_version": STATE_SCHEMA_VERSION,
@@ -435,6 +448,7 @@ def select_scheduled_state_for_reporting(
 __all__ = [
     "STATE_SCHEMA_VERSION",
     "CRON_ID",
+    "SUPERSEDES_CRON_ID",
     "build_scheduled_classification",
     "build_manual_classification",
     "scheduled_run_id",

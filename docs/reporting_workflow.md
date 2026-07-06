@@ -12,7 +12,7 @@ private links are stored in this repo.**
    Alerts only for >5% outliers or actionable errors.
 3. **3:05 PM ET — Monitor-only signal check (`e3e6f09e`)**
    Analytics only. Surfaces the planned allocation and tier selection.
-4. **3:20 PM ET — Live graded DCA task (`ce16ba6b`)**
+4. **3:20 PM ET — Live graded DCA task (`10ce362c`, supersedes deleted `ce16ba6b`)**
    Places buys (Robinhood `562057042`) and writes the standardized same-day
    **run state** artifact ([`schemas/run_state.schema.json`](../schemas/run_state.schema.json)).
    A **scheduled** run writes under

@@ -236,7 +236,7 @@ def extract_schedule(text: str) -> Dict[str, object]:
     """Extract cron schedules and derive weekday-check ET times.
 
     Recognizes patterns like:
-        ce16ba6b - live graded DCA ... schedule 20 19 * * 1-5 UTC = 3:20 PM ET weekdays
+        10ce362c - live graded DCA ... schedule 20 19 * * 1-5 UTC = 3:20 PM ET weekdays
     and standalone cron expressions with ET annotations.
     """
     tasks = []

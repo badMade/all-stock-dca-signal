@@ -81,7 +81,8 @@ def test_scheduled_classification_fields():
     rc = build_scheduled_classification(TRADING_DAY, "2026-07-06T19:20:01Z")
     assert rc["run_origin"] == "scheduled"
     assert rc["run_type"] == "scheduled_live_test"
-    assert rc["cron_id"] == "ce16ba6b"
+    assert rc["cron_id"] == "10ce362c"
+    assert rc["supersedes_cron_id"] == "ce16ba6b"
     assert rc["scheduled_for_et"] == "15:20"
     assert rc["scheduled_window_start_et"] == "15:15"
     assert rc["scheduled_window_end_et"] == "15:35"
@@ -96,10 +97,38 @@ def test_manual_classification_fields():
     rc = build_manual_classification("2026-07-06T11:00:00Z")
     assert rc["run_origin"] == "manual"
     assert rc["manual_run"] is True
-    assert rc["cron_id"] == "ce16ba6b"
+    assert rc["cron_id"] == "10ce362c"
+    assert rc["supersedes_cron_id"] == "ce16ba6b"
     assert rc["state_schema_version"] == STATE_SCHEMA_VERSION
     assert not scheduled_run_id(TRADING_DAY) == rc["run_id"]
     assert validate_classification(rc).ok
+
+
+def test_scheduled_valid_by_supersedes_only():
+    # A continuity artifact whose cron_id is not the repaired id is still valid
+    # scheduled evidence as long as it carries the superseded-task marker.
+    rc = build_scheduled_classification(TRADING_DAY)
+    rc["cron_id"] = "someothertask"
+    assert rc["supersedes_cron_id"] == "ce16ba6b"
+    assert validate_classification(rc).ok
+
+
+def test_scheduled_valid_by_cron_id_only():
+    # cron_id of the repaired task alone (no supersedes marker) is valid too.
+    rc = build_scheduled_classification(TRADING_DAY)
+    rc.pop("supersedes_cron_id")
+    assert rc["cron_id"] == "10ce362c"
+    assert validate_classification(rc).ok
+
+
+def test_scheduled_rejected_without_lineage():
+    # Neither the current cron_id nor the supersedes marker -> not valid.
+    rc = build_scheduled_classification(TRADING_DAY)
+    rc["cron_id"] = "deadbeef"
+    rc.pop("supersedes_cron_id")
+    res = validate_classification(rc)
+    assert not res.ok
+    assert any("supersedes_cron_id" in e for e in res.errors)
 
 
 def test_validation_rejects_mismatched_flag():
@@ -162,7 +191,9 @@ def test_manual_write_does_not_overwrite_existing_pointer():
 
 def test_write_rejects_invalid_classification():
     bad = _scheduled_state()
+    # Break both lineage signals so neither cron_id nor supersedes_cron_id holds.
     bad["run_classification"]["cron_id"] = "deadbeef"
+    bad["run_classification"].pop("supersedes_cron_id", None)
     with tempfile.TemporaryDirectory() as d:
         try:
             write_run_artifacts(bad, base=Path(d))

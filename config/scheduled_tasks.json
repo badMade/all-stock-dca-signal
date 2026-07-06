@@ -8,7 +8,7 @@
     "schema": "schemas/run_classification.schema.json",
     "doc": "docs/run_classification.md",
     "state_schema_version": "run-classification-v1",
-    "summary": "Every run_state artifact carries a run_classification block. Scheduled runs of ce16ba6b write under scheduled_runs/YYYYMMDD_1520ET/ and update latest_scheduled_run.json; manual runs write under manual_runs/<timestamp>/ and never touch that pointer. Downstream analytics validate scheduled state, exclude all manual order IDs and any run_origin='manual'/manual_run=true state, and never infer scheduled status from broker orders alone."
+    "summary": "Every run_state artifact carries a run_classification block. Scheduled runs of the repaired live task 10ce362c (which supersedes the deleted ce16ba6b; artifact root stays under .../ce16ba6b for continuity) write under scheduled_runs/YYYYMMDD_1520ET/ and update latest_scheduled_run.json; manual runs write under manual_runs/<timestamp>/ and never touch that pointer. A scheduled run is valid evidence when cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b'. Downstream analytics validate scheduled state, exclude all manual order IDs and any run_origin='manual'/manual_run=true state, and never infer scheduled status from broker orders alone."
   },
   "tasks": [
     {
@@ -42,7 +42,8 @@
       "notes": "Analytics and notifications only; places no trades. Monitor-only signal check that surfaces the planned allocation and tier selection using the current $3 base 0x-to-5x ladder."
     },
     {
-      "id": "ce16ba6b",
+      "id": "10ce362c",
+      "supersedes_cron_id": "ce16ba6b",
       "name": "Graded DCA automatic live test - $3 allocation",
       "type": "trading",
       "status": "active",
@@ -55,6 +56,8 @@
       "state_dir": "/home/user/workspace/cron_tracking/ce16ba6b",
       "run_classification": {
         "role": "writer",
+        "cron_id": "10ce362c",
+        "supersedes_cron_id": "ce16ba6b",
         "scheduled_window_et": "15:15-15:35",
         "scheduled_for_et": "15:20",
         "scheduled_run_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/",
@@ -63,7 +66,7 @@
         "scheduled_run_id_pattern": "scheduled_YYYYMMDD_1520ET",
         "policy_file": "config/run_classification.json"
       },
-      "notes": "The only trading task. Approved live Robinhood execution using the $3 base 0x-to-5x ladder with tiered daily/weekly caps. Robinhood account 562057042 only; Alpaca read-only. Places real market buy orders automatically within safeguards; must not fall back to interactive confirmation. A SCHEDULED run writes run_state.json (with run_classification run_origin='scheduled', run_type='scheduled_live_test', run_id='scheduled_YYYYMMDD_1520ET') under scheduled_runs/YYYYMMDD_1520ET/ AND updates latest_scheduled_run.json. A MANUAL run writes run_state.json (run_origin='manual', manual_run=true, distinct run_id) under manual_runs/<timestamp>/ and MUST NOT update latest_scheduled_run.json. All run_state files carry state_schema_version='run-classification-v1'. Test window through Fri Aug 28 2026 inclusive. Manual runs do not count as scheduled-run evidence. Any stale stored display name is superseded by this authoritative 3:20 PM ET schedule."
+      "notes": "The only trading task. This is the repaired live task 10ce362c, which supersedes the deleted ce16ba6b; the artifact root stays under .../ce16ba6b for continuity. Approved live Robinhood execution using the $3 base 0x-to-5x ladder with tiered daily/weekly caps. Robinhood account 562057042 only; Alpaca read-only. Places real market buy orders automatically within safeguards; must not fall back to interactive confirmation. A SCHEDULED run writes run_state.json (with run_classification run_origin='scheduled', run_type='scheduled_live_test', manual_run=false, scheduled_for_et='15:20', run_id='scheduled_YYYYMMDD_1520ET', and cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b') under scheduled_runs/YYYYMMDD_1520ET/ AND updates latest_scheduled_run.json. A MANUAL run writes run_state.json (run_origin='manual', manual_run=true, distinct run_id) under manual_runs/<timestamp>/ and MUST NOT update latest_scheduled_run.json. All run_state files carry state_schema_version='run-classification-v1'. Test window through Fri Aug 28 2026 inclusive. Manual runs do not count as scheduled-run evidence. Any stale stored display name is superseded by this authoritative 3:20 PM ET schedule."
     },
     {
       "id": "d72aa525",

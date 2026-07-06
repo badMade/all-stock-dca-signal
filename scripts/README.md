@@ -8,8 +8,9 @@ This directory holds two standard-library-only utilities:
 
 ## `run_classification.py`
 
-Keeps manual runs of the live task (`ce16ba6b`) from being counted as scheduled
-runs. It builds/validates the required `run_classification` block, writes
+Keeps manual runs of the live task (`10ce362c`, which supersedes the deleted
+`ce16ba6b`; artifact root stays under `.../ce16ba6b` for continuity) from being
+counted as scheduled runs. It builds/validates the required `run_classification` block, writes
 run_state artifacts to the correct path (updating `latest_scheduled_run.json`
 **only** for scheduled runs), collects and excludes manual order IDs, and
 selects the scheduled state for reporting with the narrow broker time-window
@@ -74,7 +75,7 @@ The extractors key off natural phrasings, e.g.:
   sets the no-buy threshold.
 - Budget lines like `Base amount $3.`, `Weekly rollover reserve max $900.`, and
   tier lines like `Normal: daily cap $180, weekly cap $900.`.
-- Schedule lines like `ce16ba6b ... schedule 20 19 * * 1-5 UTC = 3:20 PM ET weekdays`.
+- Schedule lines like `10ce362c ... schedule 20 19 * * 1-5 UTC = 3:20 PM ET weekdays`.
 
 ## Tests
 

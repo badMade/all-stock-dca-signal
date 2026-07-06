@@ -16,10 +16,16 @@ must declare its origin, and every downstream reporting task must honor it.
 
 | Field | Value |
 |---|---|
-| Cron id | `ce16ba6b` |
+| Cron id | `10ce362c` (repaired live task) |
+| Supersedes | `ce16ba6b` (deleted) |
 | Schedule | **3:20 PM ET** weekdays (`20 19 * * 1-5` UTC) |
 | Accepted window | **3:15–3:35 PM ET** |
 | Broker/account | Robinhood `562057042` only (Alpaca read-only) |
+
+The repaired live task `10ce362c` supersedes the deleted `ce16ba6b`. The
+artifact root stays under `.../ce16ba6b` for continuity across the repair. A
+scheduled run is valid evidence when **`cron_id='10ce362c'` OR
+`supersedes_cron_id='ce16ba6b'`**, so continuity artifacts remain valid.
 
 ## Artifact layout
 
@@ -47,7 +53,8 @@ must declare its origin, and every downstream reporting task must honor it.
 {
   "run_origin": "scheduled",
   "run_type": "scheduled_live_test",
-  "cron_id": "ce16ba6b",
+  "cron_id": "10ce362c",
+  "supersedes_cron_id": "ce16ba6b",
   "scheduled_for_et": "15:20",
   "scheduled_window_start_et": "15:15",
   "scheduled_window_end_et": "15:35",
@@ -64,7 +71,8 @@ must declare its origin, and every downstream reporting task must honor it.
 {
   "run_origin": "manual",
   "manual_run": true,
-  "cron_id": "ce16ba6b",
+  "cron_id": "10ce362c",
+  "supersedes_cron_id": "ce16ba6b",
   "run_id": "manual_YYYYMMDD_HHMMSSZ",
   "triggered_at_utc": "2026-07-06T14:05:00Z",
   "state_schema_version": "run-classification-v1"

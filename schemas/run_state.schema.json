@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "run_state.schema.json",
   "title": "Graded DCA same-day run state artifact",
-  "description": "Structure of the run_state.json artifact written by near_close_dca.build_run_artifacts() / write_run_artifacts() each trading day and consumed by the reporting/dashboard code. Contains no secrets. Every run_state MUST carry a run_classification block (see run_classification.schema.json) so scheduled live runs of task ce16ba6b are never confused with manual runs.",
+  "description": "Structure of the run_state.json artifact written by near_close_dca.build_run_artifacts() / write_run_artifacts() each trading day and consumed by the reporting/dashboard code. Contains no secrets. Every run_state MUST carry a run_classification block (see run_classification.schema.json) so scheduled live runs of the repaired live task 10ce362c (which supersedes the deleted ce16ba6b) are never confused with manual runs.",
   "type": "object",
   "required": ["run_id", "generated_at", "trading_day", "broker", "budget", "counts", "run_classification"],
   "additionalProperties": true,

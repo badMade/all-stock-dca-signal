@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "run_classification.schema.json",
   "title": "Graded DCA run classification block",
-  "description": "The run_classification object embedded in every run_state artifact. It is the single authoritative signal that distinguishes a scheduled live run of task ce16ba6b from an ad-hoc manual run so downstream slippage/watchdog/weekly reporting never confuses the two. Contains no secrets.",
+  "description": "The run_classification object embedded in every run_state artifact. It is the single authoritative signal that distinguishes a scheduled live run of the repaired live task 10ce362c (which supersedes the deleted ce16ba6b) from an ad-hoc manual run so downstream slippage/watchdog/weekly reporting never confuses the two. Contains no secrets.",
   "type": "object",
   "required": [
     "run_origin",
@@ -17,7 +17,7 @@
     "run_origin": {
       "type": "string",
       "enum": ["scheduled", "manual"],
-      "description": "Authoritative origin of the run. 'scheduled' is reserved for the live cron task ce16ba6b firing inside its window; everything else is 'manual'."
+      "description": "Authoritative origin of the run. 'scheduled' is reserved for the live cron task 10ce362c firing inside its window; everything else is 'manual'."
     },
     "manual_run": {
       "type": "boolean",
@@ -29,7 +29,11 @@
     },
     "cron_id": {
       "type": "string",
-      "description": "Live scheduled task id. Always 'ce16ba6b' for this strategy, on both scheduled and manual runs, so manual runs can be attributed to the task they emulate."
+      "description": "Live scheduled task id. '10ce362c' for the repaired live task (the deleted ce16ba6b is superseded). Carried on both scheduled and manual runs so manual runs can be attributed to the task they emulate."
+    },
+    "supersedes_cron_id": {
+      "type": ["string", "null"],
+      "description": "Prior task id this run's task replaced, for lineage/continuity. 'ce16ba6b' for the repaired live task. A scheduled run is valid if cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b'."
     },
     "scheduled_for_et": {
       "type": ["string", "null"],
@@ -72,12 +76,21 @@
         "properties": {
           "manual_run": { "const": false },
           "run_type": { "const": "scheduled_live_test" },
-          "cron_id": { "const": "ce16ba6b" },
           "scheduled_for_et": { "const": "15:20" },
           "scheduled_window_start_et": { "const": "15:15" },
           "scheduled_window_end_et": { "const": "15:35" },
           "run_id": { "pattern": "^scheduled_[0-9]{8}_1520ET$" }
-        }
+        },
+        "anyOf": [
+          {
+            "required": ["cron_id"],
+            "properties": { "cron_id": { "const": "10ce362c" } }
+          },
+          {
+            "required": ["supersedes_cron_id"],
+            "properties": { "supersedes_cron_id": { "const": "ce16ba6b" } }
+          }
+        ]
       }
     },
     {
