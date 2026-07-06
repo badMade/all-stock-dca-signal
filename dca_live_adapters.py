@@ -425,9 +425,9 @@ class RobinhoodBroker:
         )
         data = _unwrap(response)
         order = data.get("order") or data
-        order_id = order.get("id") or order.get("order_id") or ""
+order_id = order.get("id") or order.get("order_id")
         if not order_id:
-            logger.error("place_equity_order returned no order id for %s: %s", ticker, data)
+            raise RuntimeError(f"place_equity_order returned no order id for {ticker}: {data}")
         return str(order_id)
 
     def get_order_fill(self, order_id: str) -> Optional[OrderFill]:
