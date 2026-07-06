@@ -81,9 +81,8 @@ def test_extract_latest_ladder():
     # Top tier: >=8% = 5x with no upper cutoff.
     assert tiers[-1]["min_drop_pct"] == 8.0
     assert tiers[-1]["max_drop_pct"] is None
-    assert tiers[-1]["multiplier"] == 5.0
     # Max multiplier is 5x (confirms the 12x-era ladder is not present).
-    assert max(t["multiplier"] for t in tiers) == 5.0
+    assert max(tier["multiplier"] for tier in tiers) == 5.0
 
 
 def test_extract_budgets():
