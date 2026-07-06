@@ -179,16 +179,25 @@ def extract_sizing_ladder(text: str) -> Dict[str, object]:
     }
 
 
+# A currency amount, tolerating thousands separators ("1,800") and decimals.
+_NUMBER = r"[0-9][0-9,]*(?:\.[0-9]+)?"
+
+
+def _to_float(raw: str) -> float:
+    """Parse a captured numeric token, stripping any thousands separators."""
+    return float(raw.replace(",", ""))
+
+
 _BUDGET_PATTERNS = {
-    "base_amount_usd": r"base\s+amount[^$]*\$\s*([0-9]+(?:\.[0-9]+)?)",
-    "weekly_rollover_reserve_cap_usd": r"weekly\s+rollover\s+reserve[^$]*\$\s*([0-9]+(?:\.[0-9]+)?)",
+    "base_amount_usd": rf"base\s+amount[^$]*\$\s*({_NUMBER})",
+    "weekly_rollover_reserve_cap_usd": rf"weekly\s+rollover\s+reserve[^$]*\$\s*({_NUMBER})",
 }
 
 # Tier lines look like "Normal: ... daily cap $180, weekly cap $900".
 _TIER_PATTERN = re.compile(
-    r"\b(normal|elevated|high[- ]?volatility|stress)\b[^\n]*?"
-    r"daily\s+cap\s*\$?\s*([0-9]+(?:\.[0-9]+)?)[^\n]*?"
-    r"weekly\s+cap\s*\$?\s*([0-9]+(?:\.[0-9]+)?)",
+    rf"\b(normal|elevated|high[- ]?volatility|stress)\b[^\n]*?"
+    rf"daily\s+cap\s*\$?\s*({_NUMBER})[^\n]*?"
+    rf"weekly\s+cap\s*\$?\s*({_NUMBER})",
     re.IGNORECASE,
 )
 
@@ -211,8 +220,8 @@ def extract_budget_tiers(text: str) -> List[Dict[str, object]]:
         seen.add(name)
         tier: Dict[str, object] = {
             "name": name,
-            "daily_cap_usd": float(m.group(2)),
-            "weekly_cap_usd": float(m.group(3)),
+            "daily_cap_usd": _to_float(m.group(2)),
+            "weekly_cap_usd": _to_float(m.group(3)),
         }
         if name == "stress" and mentions_rollover_reserve:
             tier["requires_rollover_reserve"] = True
@@ -225,7 +234,7 @@ def extract_budgets(text: str) -> Dict[str, object]:
     for key, pat in _BUDGET_PATTERNS.items():
         m = re.search(pat, text, re.IGNORECASE)
         if m:
-            out[key] = float(m.group(1))
+            out[key] = _to_float(m.group(1))
     tiers = extract_budget_tiers(text)
     if tiers:
         out["budget_tiers"] = tiers
