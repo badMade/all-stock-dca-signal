@@ -914,6 +914,7 @@ def build_run_artifacts(
         "dry_run": config.dry_run,
         "account_number": None,
         "budget": {
+            "base_amount_usd": config.base_buy_amount_usd,
             "base_buy_amount_usd": config.base_buy_amount_usd,
             "budget_tier": tier.name,
             "planned_spend_usd": round(planned_spend, 2),
