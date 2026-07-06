@@ -1664,6 +1664,16 @@ def run_daily_compact(
         artifacts_dir=artifacts_dir,
         run_result=run_result,
         notifications_sent=notifications_sent,
+    run_once(
+        now,
+        config,
+        state,
+        finance_data,
+        robinhood_data,
+        broker,
+        artifacts_dir=artifacts_dir,
+        run_result=run_result,
+        notifications_sent=notifications_sent,
     )
 
     candidates_path = out / "buy_candidates.csv"
