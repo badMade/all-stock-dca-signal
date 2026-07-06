@@ -178,7 +178,7 @@ class RobinhoodDataProvider:
 
     def get_previous_close_bar(self, ticker: str, as_of: datetime) -> Optional[Bar]:
         if self._quotes_fn is not None:
-            bar = self._previous_close_from_quote(ticker)
+            bar = self._previous_close_from_quote(ticker, as_of)
             if bar is not None:
                 return bar
         # Fallback: pull daily bars over the trailing two weeks and take the last
