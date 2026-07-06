@@ -139,8 +139,10 @@ class RobinhoodDataProvider:
     Parameters
     ----------
     historicals_fn:
-        ``fn(symbols=[...], start_time=iso, end_time=iso, interval=str, bounds=str) -> dict``
-        returning the raw ``get_equity_historicals`` response.
+        ``fn(symbols=[...], start_time=iso, end_time=iso, interval=str, bounds=str,
+        adjustment_type=str) -> dict`` returning the raw ``get_equity_historicals``
+        response. All six keywords are always passed (they mirror the MCP tool inputs),
+        so a wrapper must accept them — declare ``**kwargs`` if it ignores some.
     quotes_fn:
         Optional ``fn(symbols=[...]) -> dict`` returning the raw ``get_equity_quotes``
         response. Required for the previous-close and signal-time quote; without it
@@ -312,9 +314,17 @@ class FinanceDataProvider:
             return None
         if isinstance(result, Bar):
             return result
+        price = 0.0
         if isinstance(result, dict):
-            return _coerce_bar(result)
-        price = _to_float(result)
+            bar = _coerce_bar(result)
+            if bar is not None:
+                return bar
+            # A price-only mapping (e.g. {"price": "100"} / {"close": "100"}) has no bar
+            # timestamp; fall through to the scalar path rather than dropping it, so the
+            # finance source still confirms and the reconciliation stays two-sided.
+            price = _to_float(result.get("price") or result.get("close") or result.get("previous_close"))
+        else:
+            price = _to_float(result)
         if price <= 0:
             return None
         timestamp = datetime.combine(
@@ -447,9 +457,12 @@ class RobinhoodBroker:
         if not order_id or self._order_fill_fn is None:
             return None
         data = _unwrap(self._order_fill_fn(account_number=self._account, order_id=order_id))
-        orders = data.get("orders") or ([data] if data.get("id") else [])
+        orders = data.get("orders") or ([data] if (data.get("id") or data.get("order_id")) else [])
         for order in orders:
-            if str(order.get("id")) != str(order_id):
+            # place_market_buy accepts either "id" or "order_id"; match on both here so a
+            # history wrapper that keys fills by "order_id" is not misread as an unfilled gap.
+            oid = order.get("id") or order.get("order_id")
+            if str(oid) != str(order_id):
                 continue
             filled_qty = _to_float(order.get("cumulative_quantity") or order.get("quantity"))
             avg_price = _to_float(order.get("average_price") or order.get("price"))
@@ -514,21 +527,41 @@ def _coerce_bar(raw: Any) -> Optional[Bar]:
 def _interpret_review(response: Any) -> Tuple[bool, str]:
     """Interpret a ``review_equity_order`` response into ``(approved, reason)``.
 
-    Robinhood's review returns a live quote plus pre-trade *alerts*. We approve only
-    when there are no blocking alerts. The alert container name varies across gateway
-    versions, so we scan the common keys and treat any alert flagged as an error /
-    blocking / reject as a hard stop; warning-level alerts do not block.
+    Robinhood's review returns a live quote plus pre-trade *alerts*. Approval requires no
+    blocking signal. Blocking comes from **structured** evidence only, so that neither a
+    harmless warning nor a happy-path quote flips the result the wrong way:
+
+    * explicit failure fields — ``error`` truthy, or ``success``/``ok``/``approved`` is
+      ``False`` — fail closed (a wrapper that reports failure as data, not an exception);
+    * ``state`` in ``{rejected, failed}`` or ``tradeable is False``;
+    * a dict alert (in any container) flagged error/blocking/reject/critical;
+    * a non-empty string in an explicitly error-named container (``errors`` …).
+
+    Plain-string entries under ``warnings``/``messages``/``alerts`` are treated as
+    informational and never block on their own (they carry no severity). An empty
+    response approves — it is genuinely empty, not a reported failure.
     """
     data = _unwrap(response)
     if not data:
         return True, "empty review response; no blocking alerts reported"
     blocking: List[str] = []
+
+    # Explicit failure signals: fail closed when the wrapper reports failure as data.
+    if data.get("error"):
+        blocking.append(f"error: {data.get('error')}")
+    for flag in ("success", "ok", "approved"):
+        if data.get(flag) is False:
+            blocking.append(f"{flag}=false")
+    if str(data.get("state", "")).lower() in {"rejected", "failed"}:
+        blocking.append(f"review state={data.get('state')}")
+    if data.get("tradeable") is False:
+        blocking.append("instrument not tradeable")
+
+    # Structured alerts: block only on error/blocking severity, regardless of container.
     for key in ("alerts", "warnings", "pre_trade_alerts", "messages", "checks"):
         for alert in _as_list(data.get(key)):
             if not isinstance(alert, dict):
-                if alert:
-                    blocking.append(str(alert))
-                continue
+                continue  # plain strings here are informational, not blockers
             severity = str(alert.get("severity") or alert.get("level") or alert.get("type") or "").lower()
             is_blocking = (
                 alert.get("blocking") is True
@@ -537,11 +570,13 @@ def _interpret_review(response: Any) -> Tuple[bool, str]:
             )
             if is_blocking:
                 blocking.append(str(alert.get("message") or alert.get("reason") or alert.get("code") or severity))
-    # An explicit top-level rejection/tradability flag also blocks.
-    if str(data.get("state", "")).lower() in {"rejected", "failed"}:
-        blocking.append(f"review state={data.get('state')}")
-    if data.get("tradeable") is False:
-        blocking.append("instrument not tradeable")
+
+    # Non-empty strings in explicitly error-named containers do block.
+    for key in ("errors", "error_messages", "rejections"):
+        for item in _as_list(data.get(key)):
+            if item:
+                blocking.append(str(item))
+
     if blocking:
         return False, "; ".join(dict.fromkeys(blocking))
     return True, "review passed with no blocking alerts"

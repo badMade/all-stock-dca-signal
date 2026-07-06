@@ -1,8 +1,9 @@
 {
   "$schema": "../schemas/trading_window.schema.json",
   "version": "2026-07-04",
-  "description": "Authoritative approved live-trading window for the graded DCA task (ce16ba6b). Weekdays in [start_date, end_date] inclusive are the approved_test_dates; outside them run_once's date gate blocks all execution. Sourced from scheduled_tasks.json trigger_window.",
+  "description": "Authoritative approved live-trading window for the graded DCA task (ce16ba6b). Weekdays in [start_date, end_date] inclusive are the approved_test_dates; outside them run_once's date gate blocks all execution. Sourced from scheduled_tasks.json trigger_window. decision_time_et aligns the strategy's decision anchor with ce16ba6b's authoritative 3:30 PM ET (15:30) run time (scheduled_tasks.json marks the 3:45 display as stale); change it if the live run time changes.",
   "start_date": "2026-07-02",
   "end_date": "2026-08-28",
-  "weekdays_only": true
+  "weekdays_only": true,
+  "decision_time_et": "15:30"
 }

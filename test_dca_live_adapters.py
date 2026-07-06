@@ -276,10 +276,40 @@ def test_broker_order_fill_parsing():
     assert fill.quantity_filled == pytest.approx(0.5)
 
 
+def test_broker_order_fill_matches_order_id_key():
+    # A history wrapper keyed by "order_id" (not "id") must still match the fill.
+    resp = {"data": {"orders": [{"order_id": "ORD-9", "cumulative_quantity": "1", "average_price": "50.0"}]}}
+    fill = RobinhoodBroker(order_fill_fn=lambda **k: resp).get_order_fill("ORD-9")
+    assert isinstance(fill, OrderFill)
+    assert fill.avg_fill_price == pytest.approx(50.0)
+
+
 def test_interpret_review_empty_and_state_rejection():
     assert _interpret_review({})[0] is True
     ok, reason = _interpret_review({"data": {"state": "rejected"}})
     assert ok is False and "rejected" in reason
+
+
+def test_interpret_review_fails_closed_on_error_shaped_dict():
+    # A wrapper reporting failure as data (not an exception) must block, not fall through.
+    assert _interpret_review({"data": {"error": "server exploded"}})[0] is False
+    assert _interpret_review({"data": {"success": False}})[0] is False
+    assert _interpret_review({"data": {"approved": False}})[0] is False
+
+
+def test_interpret_review_plain_warning_string_does_not_block():
+    # A harmless string under "warnings" must not reject an otherwise valid candidate.
+    ok, _ = _interpret_review({"data": {"warnings": ["wide spread"], "quote": {"ask": "1.00"}}})
+    assert ok is True
+    # But a string in an explicitly error-named container does block.
+    assert _interpret_review({"data": {"errors": ["hard stop"]}})[0] is False
+
+
+def test_finance_previous_close_price_only_mapping():
+    # A price-only mapping (no bar timestamp) must not degrade to no-data.
+    prov = FinanceDataProvider(bars_fn=lambda *a: [], previous_close_fn=lambda *a: {"price": "123.45"})
+    bar = prov.get_previous_close_bar("AAPL", _decision_dt())
+    assert bar is not None and bar.close == pytest.approx(123.45)
 
 
 # -- build_broker routing --------------------------------------------------------

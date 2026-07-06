@@ -52,6 +52,20 @@ py-modules = [
     "run_dca",
 ]
 
+# Ship the version-controlled config so an installed `run-dca` (outside a checkout) finds
+# the live trading window instead of falling back to the hardcoded defaults. dca_config
+# resolves these via sys.prefix/share/all-stock-dca/config.
+[tool.setuptools.data-files]
+"share/all-stock-dca/config" = [
+    "config/budgets.json",
+    "config/tickers.json",
+    "config/sizing_ladder.json",
+    "config/trading_window.json",
+    "config/scheduled_tasks.json",
+    "config/notifications.json",
+    "config/reporting.json",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["."]
 python_files = ["test_*.py"]

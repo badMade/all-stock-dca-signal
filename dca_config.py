@@ -16,6 +16,7 @@ import dataclasses
 import json
 import logging
 import os
+import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -24,23 +25,25 @@ from near_close_dca import StrategyConfig
 
 logger = logging.getLogger("near_close_dca.config")
 
+# Where a wheel install places the bundled config (see pyproject [tool.setuptools.data-files]).
+_INSTALLED_CONFIG_DIR = Path(sys.prefix) / "share" / "all-stock-dca" / "config"
+
 
 def _default_config_dir() -> Path:
-    """Resolve the default config directory, tolerant of installed-wheel layouts.
+    """Resolve the default config directory across checkout and installed-wheel layouts.
 
-    Order: ``$DCA_CONFIG_DIR`` env var -> the ``config/`` beside this module (checkout
-    layout) -> ``./config`` in the current working directory. The flat single-module
-    packaging does not ship ``config/*.json`` inside the wheel, so an installed CLI relies
-    on the env var or a checkout; ``load_strategy_config`` warns if none resolves.
+    Order: ``$DCA_CONFIG_DIR`` -> ``config/`` beside this module (checkout) -> the wheel's
+    installed ``share/all-stock-dca/config`` -> ``./config`` in the working directory. The
+    wheel ships ``config/*.json`` as data files (so an installed ``run-dca`` finds the live
+    window); ``load_strategy_config`` still warns if none of these resolve.
     """
     env = os.environ.get("DCA_CONFIG_DIR")
     if env:
         return Path(env)
-    sibling = Path(__file__).resolve().parent / "config"
-    if sibling.is_dir():
-        return sibling
-    cwd = Path.cwd() / "config"
-    return cwd if cwd.is_dir() else sibling
+    for candidate in (Path(__file__).resolve().parent / "config", _INSTALLED_CONFIG_DIR, Path.cwd() / "config"):
+        if candidate.is_dir():
+            return candidate
+    return Path(__file__).resolve().parent / "config"
 
 
 DEFAULT_CONFIG_DIR = _default_config_dir()
