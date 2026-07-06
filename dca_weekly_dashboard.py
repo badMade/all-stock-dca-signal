@@ -143,11 +143,20 @@ def build_budget_reserve_effectiveness(run_states: Sequence[Dict[str, Any]]) -> 
     lines.append("| --- | --- | --- | --- | --- | --- |")
     for rs in run_states:
         budget = rs.get("budget", {})
+        # Fall back to the pre-policy keys so historical run_state artifacts (which
+        # named these ``daily_base_cap_usd`` / ``carry_forward_reserve_usd``) still
+        # render populated caps and reserve figures.
+        daily_cap = budget.get("daily_cap_usd")
+        if daily_cap is None:
+            daily_cap = budget.get("daily_base_cap_usd")
+        reserve = budget.get("weekly_rollover_reserve_usd")
+        if reserve is None:
+            reserve = budget.get("carry_forward_reserve_usd")
         lines.append(
             f"| {rs.get('trading_day', '?')} | {budget.get('budget_tier') or 'n/a'} | "
             f"${_num(budget.get('day_notional_usd')):.2f} | "
-            f"${_num(budget.get('daily_cap_usd')):.2f} | "
-            f"${_num(budget.get('weekly_rollover_reserve_usd')):.2f} | "
+            f"${_num(daily_cap):.2f} | "
+            f"${_num(reserve):.2f} | "
             f"${_num(budget.get('remaining_spend_today_usd')):.2f} |"
         )
     lines.append("")
