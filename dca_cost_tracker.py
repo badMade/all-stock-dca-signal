@@ -96,7 +96,7 @@ def collect_month_run_states(
     run_states: List[Dict[str, Any]] = []
     for path in find_run_state_files(root):
         try:
-            data = json.loads(path.read_text())
+            data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             continue
         trading_day = data.get("trading_day")
