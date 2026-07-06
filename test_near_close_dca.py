@@ -409,7 +409,8 @@ def test_usage_proxy_logged_in_run_state(tmp_path):
     assert usage["orders_placed_count"] == 3
     # signals.csv, buy_candidates.csv, and orders.csv all count toward the proxy.
     assert usage["csv_artifact_count"] == 3
-    assert usage["state_file_bytes"] > 0
+    # The backfill re-serializes until the recorded size matches what is on disk.
+    assert usage["state_file_bytes"] == os.path.getsize(os.path.join(artifacts_dir, "run_state.json"))
     assert usage["total_artifact_bytes"] >= usage["state_file_bytes"]
     assert usage["notifications_sent"] == 1
     assert usage["errors_count"] == 0
@@ -455,6 +456,23 @@ def test_run_daily_compact_writes_structured_only(tmp_path):
     files = set(os.listdir(artifacts_dir))
     assert "run_state.json" in files
     assert "orders.csv" in files
+
+
+def test_run_daily_compact_date_gated_short_circuits(tmp_path):
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-07-01")
+    _now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    gated_now = datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN)  # not an approved date
+
+    result = run_daily_compact(gated_now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir)
+
+    assert result["blocked"] is True
+    assert os.path.exists(result["run_state_path"])
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        assert json.load(handle)["status"] == "blocked"
+    # No paths to CSVs that were never written, and no stray artifacts on disk.
+    for key in ["signals_path", "buy_candidates_path", "orders_csv_path"]:
+        assert key not in result
+    assert set(os.listdir(artifacts_dir)) == {"run_state.json"}
 
 
 def test_build_usage_proxy_defaults_and_overrides():

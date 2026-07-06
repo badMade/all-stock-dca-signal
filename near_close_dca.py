@@ -1040,9 +1040,19 @@ def _backfill_orders_csv_usage(run_state_path: Path) -> None:
     csv_names = ("signals.csv", "buy_candidates.csv", "orders.csv")
     csv_paths = [out / name for name in csv_names if (out / name).exists()]
     usage["csv_artifact_count"] = len(csv_paths)
-    state_bytes = int(usage.get("state_file_bytes") or 0)
-    usage["total_artifact_bytes"] = state_bytes + sum(path.stat().st_size for path in csv_paths)
-    run_state_path.write_text(json.dumps(run_state, indent=2, sort_keys=True), encoding="utf-8")
+    csv_bytes = sum(path.stat().st_size for path in csv_paths)
+    # Fold the updated counters into state_file_bytes as well: re-serialize until
+    # the recorded size matches the payload that will actually hit disk (the size
+    # only shifts when a counter changes digit count, so this settles immediately).
+    serialized = json.dumps(run_state, indent=2, sort_keys=True)
+    for _ in range(3):
+        state_bytes = len(serialized.encode("utf-8"))
+        if usage.get("state_file_bytes") == state_bytes:
+            break
+        usage["state_file_bytes"] = state_bytes
+        usage["total_artifact_bytes"] = state_bytes + csv_bytes
+        serialized = json.dumps(run_state, indent=2, sort_keys=True)
+    run_state_path.write_text(serialized, encoding="utf-8")
 
 
 def _write_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
@@ -1706,16 +1716,34 @@ def run_daily_compact(
 
     out = Path(artifacts_dir)
     out.mkdir(parents=True, exist_ok=True)
+    run_state_path = out / "run_state.json"
+
+    run_state: Dict[str, Any] = {}
+    if run_state_path.exists():
+        run_state = json.loads(run_state_path.read_text(encoding="utf-8"))
+    if run_state.get("status") == "blocked":
+        # Date gate tripped: run_once wrote only the minimal blocked run_state.
+        # Return no CSV paths rather than paths to files that were never written.
+        return {
+            "run_label": run_label,
+            "scheduled": scheduled,
+            "compact": True,
+            "blocked": True,
+            "artifacts_dir": str(out),
+            "run_state_path": str(run_state_path),
+        }
+
     orders_csv = out / "orders.csv"
     write_execution_csv(run_result.execution_records, str(orders_csv))
-    _backfill_orders_csv_usage(out / "run_state.json")
+    _backfill_orders_csv_usage(run_state_path)
 
     return {
         "run_label": run_label,
         "scheduled": scheduled,
         "compact": True,
+        "blocked": False,
         "artifacts_dir": str(out),
-        "run_state_path": str(out / "run_state.json"),
+        "run_state_path": str(run_state_path),
         "signals_path": str(out / "signals.csv"),
         "buy_candidates_path": str(out / "buy_candidates.csv"),
         "orders_csv_path": str(orders_csv),
