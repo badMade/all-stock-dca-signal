@@ -1648,7 +1648,13 @@ def run_daily_compact(
     It may interact with the passed-in broker adapter (dry-run by default).
     """
     run_result = RunResult(trading_day=now.astimezone(EASTERN).date(), decisions=[])
-    run_once(
+    if trading_day not in config.approved_test_dates:
+        print(f"Date gate blocked execution for {trading_day}. No trades.")
+        if artifacts_dir:
+            out = Path(artifacts_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "run_state.json").write_text(json.dumps({"trading_day": str(trading_day), "status": "blocked"}))
+        return []
         now,
         config,
         state,
