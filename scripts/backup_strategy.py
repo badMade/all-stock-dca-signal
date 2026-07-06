@@ -239,8 +239,8 @@ def _is_weekday_cron(cron: str) -> bool:
     parts = cron.split()
     if len(parts) != 5:
         return False
-    dow = parts[4]
-    return dow in {"1-5", "1,2,3,4,5"}
+    dow = parts[4].lower()
+    return dow in {"1-5", "1,2,3,4,5", "mon-fri"}
 
 
 def extract_all(text: str) -> Dict[str, object]:
