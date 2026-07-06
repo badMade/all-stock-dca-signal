@@ -106,6 +106,36 @@ def test_budget_tier_selection():
     assert stress.uses_rollover_reserve is True
 
 
+def test_weekly_rollover_reserve_rolls_at_week_boundary():
+    config = StrategyConfig()
+    state = StrategyState()
+    state.selected_tier = BUDGET_TIERS[-1]  # stress tier (uses rollover reserve)
+
+    # Week 1: Monday and Tuesday. Spending within the week must NOT create a
+    # rollover reserve for the same week -- the reserve reflects the PRIOR week.
+    monday = date(2026, 7, 6)
+    tuesday = date(2026, 7, 7)
+    state.record_buy("AAA", monday, 100.0)
+    state.finalize_daily_budget(monday, config)
+    # On Tuesday (same week) the reserve is still 0: Monday's spend did not
+    # leak into the current-week rollover.
+    state.allowed_spend_today(tuesday, config)
+    assert state.weekly_rollover_reserve_usd == 0.0
+    state.record_buy("BBB", tuesday, 200.0)
+    state.finalize_daily_budget(tuesday, config)
+
+    # Week 2: Monday. Now the reserve rolls forward from week 1's unused Normal
+    # capacity: $900 normal cap - $300 spent = $600 (under the $900 reserve cap).
+    next_monday = date(2026, 7, 13)
+    state.allowed_spend_today(next_monday, config)
+    assert state.weekly_rollover_reserve_usd == 600.0
+    # And it stays constant for the rest of the week.
+    state.record_buy("CCC", next_monday, 50.0)
+    state.finalize_daily_budget(next_monday, config)
+    state.allowed_spend_today(date(2026, 7, 14), config)
+    assert state.weekly_rollover_reserve_usd == 600.0
+
+
 def test_ticker_universe():
     assert "IBM" in ACTIVE_TICKERS
     assert "IRDM" in ACTIVE_TICKERS

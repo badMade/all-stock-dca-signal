@@ -284,6 +284,21 @@ class StrategyState:
         unused weekly rollover reserve (itself capped by
         ``weekly_rollover_reserve_cap_usd``).
         """
+        # Roll the reserve forward once, on the first day of a new week: it must
+        # reflect the *prior* week's unused Normal-cap capacity and stay constant
+        # for the remainder of the week.
+        if self.finalized_budget_days:
+            last_finalized_day = max(self.finalized_budget_days)
+            if iso_week_key(last_finalized_day) != iso_week_key(trading_day):
+                last_week_key = iso_week_key(last_finalized_day)
+                unused_prev = max(
+                    0.0,
+                    NORMAL_WEEKLY_CAP_USD
+                    - self.submitted_notional_by_week.get(last_week_key, 0.0),
+                )
+                self.weekly_rollover_reserve_usd = min(
+                    config.weekly_rollover_reserve_cap_usd, unused_prev
+                )
         tier = self.current_tier()
         if tier.uses_rollover_reserve:
             effective_weekly = min(
@@ -299,16 +314,15 @@ class StrategyState:
         return max(0.0, self.allowed_spend_today(trading_day, config) - self.day_notional(trading_day))
 
     def finalize_daily_budget(self, trading_day: date, config: StrategyConfig) -> None:
-        """Recompute the weekly rollover reserve once per trading day.
+        """Mark the current trading day as finalized.
 
-        The reserve tracks unused weekly capacity under the Normal weekly cap and is
-        capped by ``weekly_rollover_reserve_cap_usd``. It is read at the start of a
-        later day to gate Stress-tier capacity, so it reflects prior unused budget.
+        The weekly rollover reserve is rolled forward at the start of a new week in
+        ``allowed_spend_today``, so it stays constant during the week and correctly
+        reflects the *prior* week's unused Normal-cap capacity. This method only
+        records that the day's budget has been finalized.
         """
         if trading_day in self.finalized_budget_days:
             return
-        unused_weekly = max(0.0, NORMAL_WEEKLY_CAP_USD - self.week_notional(trading_day))
-        self.weekly_rollover_reserve_usd = min(config.weekly_rollover_reserve_cap_usd, unused_weekly)
         self.finalized_budget_days.add(trading_day)
 
 
