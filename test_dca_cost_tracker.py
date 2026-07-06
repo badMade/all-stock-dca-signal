@@ -60,7 +60,15 @@ def _write_runs(root, run_states):
 def test_collect_filters_by_month(tmp_path):
     _write_runs(
         tmp_path,
-        tmp.name,
+    _write_runs(
+        tmp_path,
+        [
+            _run_state("2026-06-29"),
+            _run_state("2026-06-30"),
+            _run_state("2026-07-01"),  # different month, excluded
+        ],
+    )
+    june = collect_month_run_states(tmp_path, 2026, 6)
         [
             _run_state("2026-06-29"),
             _run_state("2026-06-30"),
