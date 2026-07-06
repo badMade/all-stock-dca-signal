@@ -1654,11 +1654,15 @@ def run_daily_compact(
         notifications_sent=notifications_sent,
     )
 
-    out = Path(artifacts_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    orders_csv = out / "orders.csv"
-    write_execution_csv(run_result.execution_records, str(orders_csv))
+    candidates_path = out / "buy_candidates.csv"
+    _write_csv(candidates_path, artifacts["buy_candidates"])
 
+    csv_paths = [signals_path, candidates_path]
+    orders_path = out / "orders.csv"
+    if orders_path.exists():
+        csv_paths.append(orders_path)
+
+    csv_bytes = sum(path.stat().st_size for path in csv_paths)
     return {
         "run_label": run_label,
         "scheduled": scheduled,
