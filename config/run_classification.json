@@ -1,5 +1,5 @@
 {
-  "$schema": "../schemas/run_classification.schema.json",
+  "$schema": "../schemas/run_classification_policy.schema.json",
   "policy_id": "run-classification-v1",
   "version": "2026-07-06",
   "purpose": "Single source of truth for distinguishing scheduled live runs of the graded DCA task from manual runs, so downstream slippage/watchdog/weekly reporting never confuses the two. Every run_state artifact must carry a run_classification block matching this policy.",

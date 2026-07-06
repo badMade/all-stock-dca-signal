@@ -2,14 +2,14 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "run_state.schema.json",
   "title": "Graded DCA same-day run state artifact",
-  "description": "Structure of the run_state.json artifact written by near_close_dca.build_run_artifacts() / write_run_artifacts() each trading day and consumed by the reporting/dashboard code. Contains no secrets. Every run_state MUST carry a run_classification block (see run_classification.schema.json) so scheduled live runs of the repaired live task 10ce362c (which supersedes the deleted ce16ba6b) are never confused with manual runs.",
+  "description": "Structure of the run_state.json artifact written by near_close_dca.build_run_artifacts() / write_run_artifacts() each trading day and consumed by the reporting/dashboard code. Contains no secrets. A run_classification block (see run_classification.schema.json) SHOULD accompany live scheduled runs of the repaired live task 10ce362c (which supersedes the deleted ce16ba6b) so they are never confused with manual runs; it is validated here when present. It is not listed in `required` because the current writer path does not yet emit it, and legacy/compact artifacts must still validate.",
   "type": "object",
-  "required": ["run_id", "generated_at", "trading_day", "broker", "budget", "counts", "run_classification"],
+  "required": ["run_id", "generated_at", "trading_day", "broker", "budget", "counts"],
   "additionalProperties": true,
   "properties": {
     "run_classification": {
       "$ref": "run_classification.schema.json",
-      "description": "Authoritative scheduled-vs-manual classification. Required on every run_state. See docs/run_classification.md and config/run_classification.json."
+      "description": "Authoritative scheduled-vs-manual classification. Validated against run_classification.schema.json when present. Emitted for live scheduled runs; see docs/run_classification.md and config/run_classification.json."
     },
     "run_id": { "type": "string", "description": "Trading day plus HHMMSS, e.g. 2026-07-06-153005. This is the artifact build id; run_classification.run_id is the origin-scoped id used by reporting to include/exclude runs." },
     "generated_at": { "type": "string", "description": "ISO-8601 timestamp (America/New_York) when the artifact was built." },

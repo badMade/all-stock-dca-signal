@@ -154,6 +154,54 @@ def test_validation_rejects_manual_run_id_matching_scheduled():
     assert not res.ok
 
 
+def test_validation_rejects_non_string_scheduled_run_id():
+    rc = build_scheduled_classification(TRADING_DAY)
+    rc["run_id"] = 20260706  # non-string sneaks past the required-field presence check
+    res = validate_classification(rc)
+    assert not res.ok
+    assert any("run_id must be a string" in e for e in res.errors)
+
+
+def test_validation_rejects_manual_for_other_cron_id():
+    rc = build_manual_classification()
+    rc["cron_id"] = "deadbeef"
+    rc.pop("supersedes_cron_id", None)
+    res = validate_classification(rc)
+    assert not res.ok
+    assert any("cron_id" in e and "supersedes_cron_id" in e for e in res.errors)
+
+
+def test_validation_manual_accepts_lineage_by_supersedes_only():
+    rc = build_manual_classification()
+    rc["cron_id"] = "someothertask"
+    assert rc["supersedes_cron_id"] == "ce16ba6b"
+    assert validate_classification(rc).ok
+
+
+def test_collect_manual_ids_reads_referenced_orders_csv():
+    # Manual run in the run_and_report style: order IDs live only in the CSV named
+    # by artifacts.orders_csv_path, not embedded in the run_state.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        state = _manual_state(order_ids=())  # no embedded order IDs
+        written = write_run_artifacts(state, base=base)
+        run_dir = Path(written["run_state"]).parent
+        csv_path = run_dir / "dca_manual_orders.csv"
+        csv_path.write_text(
+            "ticker,status,order_id,notional_usd\n"
+            "AAPL,filled,MAN-CSV-1,3.0\n"
+            "MSFT,filled,MAN-CSV-2,3.0\n"
+            "GOOG,not_submitted,-,0\n"
+        )
+        state["artifacts"] = {"orders_csv_path": str(csv_path)}
+        Path(written["run_state"]).write_text(json.dumps(state, indent=2))
+
+        manual_ids = collect_manual_order_ids(base)
+        assert manual_ids == {"MAN-CSV-1", "MAN-CSV-2"}  # '-' placeholder ignored
+        kept = exclude_manual_orders(["SCHED-1", "MAN-CSV-1", "MAN-CSV-2"], base=base)
+        assert kept == ["SCHED-1"]
+
+
 def test_scheduled_write_updates_pointer():
     with tempfile.TemporaryDirectory() as d:
         base = Path(d)

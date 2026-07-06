@@ -25,6 +25,7 @@ tasks should route every scheduled-vs-manual decision through here.
 
 from __future__ import annotations
 
+import csv
 import json
 import re
 from dataclasses import dataclass, field
@@ -207,13 +208,26 @@ def validate_classification(rc: Dict[str, object]) -> ValidationResult:
         if rc.get("scheduled_window_end_et") != SCHEDULED_WINDOW_END_ET:
             errors.append(f"scheduled_window_end_et must be {SCHEDULED_WINDOW_END_ET!r}")
         run_id = rc.get("run_id")
-        if isinstance(run_id, str) and not SCHEDULED_RUN_ID_RE.match(run_id):
+        if not isinstance(run_id, str):
+            errors.append(f"scheduled run_id must be a string, got {run_id!r}")
+        elif not SCHEDULED_RUN_ID_RE.match(run_id):
             errors.append(f"scheduled run_id must match scheduled_YYYYMMDD_1520ET, got {run_id!r}")
     elif origin == "manual":
         if manual_flag is not True:
             errors.append("manual run must have manual_run=true")
+        # Manual runs for this contract must belong to the live task's lineage
+        # (same check as scheduled) so a stray manual state for another task
+        # cannot be written under ce16ba6b/manual_runs and silently exclude its
+        # order IDs from scheduled-live metrics.
+        if rc.get("cron_id") != CRON_ID and rc.get("supersedes_cron_id") != SUPERSEDES_CRON_ID:
+            errors.append(
+                f"manual run must have cron_id={CRON_ID!r} "
+                f"OR supersedes_cron_id={SUPERSEDES_CRON_ID!r}"
+            )
         run_id = rc.get("run_id")
-        if isinstance(run_id, str) and SCHEDULED_RUN_ID_RE.match(run_id):
+        if not isinstance(run_id, str):
+            errors.append(f"manual run_id must be a string, got {run_id!r}")
+        elif SCHEDULED_RUN_ID_RE.match(run_id):
             errors.append("manual run_id must not match the scheduled_YYYYMMDD_1520ET pattern")
 
     return ValidationResult(not errors, errors)
@@ -324,10 +338,57 @@ def _order_ids_from_state(state: Dict[str, object]) -> Set[str]:
     return ids
 
 
-def collect_manual_order_ids(base: Optional[Path] = None) -> Set[str]:
-    """Union of every order_id found in manual_runs/**/run_state*.json.
+def _order_ids_from_orders_csv(csv_path: Path) -> Set[str]:
+    """Collect order IDs from an execution/slippage CSV's ``order_id`` column."""
+    ids: Set[str] = set()
+    try:
+        with csv_path.open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                oid = (row.get("order_id") or "").strip()
+                if oid and oid != "-":
+                    ids.add(oid)
+    except (OSError, csv.Error, UnicodeDecodeError):
+        return set()
+    return ids
 
-    These IDs must be excluded from all scheduled-live metrics.
+
+def _referenced_orders_csvs(state: Dict[str, object], run_dir: Path) -> List[Path]:
+    """Resolve the orders CSV(s) a run_state points at or sits beside.
+
+    Manual runs from ``near_close_dca.run_and_report()`` keep their order IDs only
+    in the CSV named by ``artifacts.orders_csv_path`` (the state itself has no
+    embedded candidates/orders), so scanning embedded fields alone misses them.
+    The recorded path may be stale/absolute, so we also try its basename inside
+    the run directory and any sibling ``*orders.csv``.
+    """
+    candidates: List[Path] = []
+    artifacts = state.get("artifacts") if isinstance(state, dict) else None
+    if isinstance(artifacts, dict):
+        recorded = artifacts.get("orders_csv_path")
+        if isinstance(recorded, str) and recorded:
+            candidates.append(Path(recorded))
+            candidates.append(run_dir / Path(recorded).name)
+    candidates.extend(sorted(run_dir.glob("*orders.csv")))
+
+    seen: Set[str] = set()
+    resolved: List[Path] = []
+    for path in candidates:
+        key = str(path)
+        if key in seen or not path.is_file():
+            continue
+        seen.add(key)
+        resolved.append(path)
+    return resolved
+
+
+def collect_manual_order_ids(base: Optional[Path] = None) -> Set[str]:
+    """Union of every order_id found under manual_runs/.
+
+    Reads both the embedded ``buy_candidates``/``orders`` in each
+    ``run_state*.json`` and the ``order_id`` column of any orders CSV the state
+    references or sits beside, so manual fills from the heavier
+    ``run_and_report`` path are excluded too. These IDs must never appear in
+    scheduled-live metrics.
     """
     manual_root = state_root(base) / "manual_runs"
     ids: Set[str] = set()
@@ -337,6 +398,8 @@ def collect_manual_order_ids(base: Optional[Path] = None) -> Set[str]:
         except (json.JSONDecodeError, OSError):
             continue
         ids |= _order_ids_from_state(state)
+        for csv_path in _referenced_orders_csvs(state, path.parent):
+            ids |= _order_ids_from_orders_csv(csv_path)
     return ids
 
 

@@ -101,7 +101,17 @@
         "properties": {
           "manual_run": { "const": true },
           "run_id": { "not": { "pattern": "^scheduled_[0-9]{8}_1520ET$" } }
-        }
+        },
+        "anyOf": [
+          {
+            "required": ["cron_id"],
+            "properties": { "cron_id": { "const": "10ce362c" } }
+          },
+          {
+            "required": ["supersedes_cron_id"],
+            "properties": { "supersedes_cron_id": { "const": "ce16ba6b" } }
+          }
+        ]
       }
     }
   ]

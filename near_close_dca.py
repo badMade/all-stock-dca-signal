@@ -2,7 +2,7 @@
 Near-close graded DCA strategy skeleton.
 
 This mirrors the scheduled live-test rules:
-    - Run at 3:45 PM America/New_York.
+    - Run at 3:20 PM America/New_York (the canonical live schedule).
     - Use completed regular-session bars only.
     - Compare finance-side and Robinhood-side signals before auto-ordering.
     - Place real orders only through a broker adapter that reviews first.
@@ -227,7 +227,7 @@ class StrategyConfig:
     tickers: Sequence[str] = tuple(ACTIVE_TICKERS)
     excluded_tickers: frozenset[str] = frozenset(EXCLUDED_TICKERS)
     approved_test_dates: frozenset[date] = frozenset(APPROVED_TEST_DATES)
-    decision_time_et: time = time(15, 45)
+    decision_time_et: time = time(15, 20)  # matches the 3:20 PM ET canonical live schedule
     trend_lookback_minutes: int = 60
     base_buy_amount_usd: float = 3.0
     weekly_rollover_reserve_cap_usd: float = 900.0
@@ -238,8 +238,8 @@ class StrategyConfig:
     broker: BrokerName = BrokerName.ROBINHOOD
     dry_run: bool = True
 
-    # Bars from many market-data APIs are start-stamped. At a 3:45 PM decision,
-    # the latest completed 15-minute or 30-minute start-stamped bar is 3:30 PM.
+    # Bars from many market-data APIs are start-stamped. At a 3:20 PM decision,
+    # the latest completed 15-minute start-stamped bar is 3:05 PM.
     assume_bar_timestamps_are_start_times: bool = True
     finance_interval_minutes: int = 15
     robinhood_interval_minutes: int = 5
