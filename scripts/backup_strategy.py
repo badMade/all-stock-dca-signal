@@ -132,7 +132,7 @@ def extract_sizing_ladder(text: str) -> Dict[str, object]:
         low = line.lower()
         if "%" not in low or "x" not in low:
             continue
-        mult_m = re.search(r"=\s*([0-9]+(?:\.[0-9]+)?)\s*x", low)
+        mult_m = re.search(r"(?:=|\bis\b|->|:|\s)\s*([0-9]+(?:\.[0-9]+)?)\s*x", low)
         if not mult_m:
             continue
         multiplier = float(mult_m.group(1))
