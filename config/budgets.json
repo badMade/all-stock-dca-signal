@@ -1,0 +1,24 @@
+{
+  "$schema": "../schemas/budgets.schema.json",
+  "version": "2026-07-04",
+  "currency": "USD",
+  "base_amount_usd": 1.0,
+  "daily_base_cap_usd": 60.0,
+  "carry_forward_reserve_cap_usd": 420.0,
+  "hard_daily_max_usd": 120.0,
+  "weekly_hard_cap_usd": 600.0,
+  "reserve_logic": {
+    "description": "Once per trading day: unused base carries forward into the reserve; spend above the base cap draws from the reserve. Never above hard_daily_max or weekly cap.",
+    "unused_base": "max(0, daily_base_cap - actual_spend)",
+    "reserve_draw": "min(current_reserve, max(0, actual_spend - daily_base_cap))",
+    "reserve_next": "min(reserve_cap, max(0, reserve_start - reserve_draw + unused_base))",
+    "allowed_today": "max(0, min(hard_daily_max, daily_base_cap + current_reserve, weekly_cap - week_spend))"
+  },
+  "order_rules": {
+    "one_order_per_ticker_per_day": true,
+    "order_type": "market",
+    "notional_field": "dollar_amount",
+    "time_in_force": "gfd",
+    "requires_review_before_submit": "review_equity_order must pass first"
+  }
+}

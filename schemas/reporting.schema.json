@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "reporting.schema.json",
+  "title": "Reporting configuration",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "version": { "type": "string" },
+    "notion": { "type": "object" },
+    "google_drive": { "type": "object" },
+    "artifacts": { "type": "object" },
+    "cost_control": { "type": "object" }
+  }
+}

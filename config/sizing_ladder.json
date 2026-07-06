@@ -1,0 +1,22 @@
+{
+  "$schema": "../schemas/sizing_ladder.schema.json",
+  "version": "2026-06-29-revised",
+  "status": "active",
+  "description": "Latest active graded sizing ladder. Maps the drop vs. previous close to a buy multiplier. Base amount is multiplied by the tier multiplier. No upper cutoff: any drop >= 8% is 5x.",
+  "drop_metric": "fraction_down_vs_previous_close",
+  "base_amount_usd": 1.0,
+  "no_buy_below_pct": 0.1,
+  "tiers": [
+    { "min_drop_pct": 0.1, "max_drop_pct": 1.0, "multiplier": 1.0 },
+    { "min_drop_pct": 1.0, "max_drop_pct": 2.0, "multiplier": 1.5 },
+    { "min_drop_pct": 2.0, "max_drop_pct": 3.0, "multiplier": 2.0 },
+    { "min_drop_pct": 3.0, "max_drop_pct": 4.0, "multiplier": 2.5 },
+    { "min_drop_pct": 4.0, "max_drop_pct": 5.0, "multiplier": 3.0 },
+    { "min_drop_pct": 5.0, "max_drop_pct": 6.0, "multiplier": 3.5 },
+    { "min_drop_pct": 6.0, "max_drop_pct": 7.0, "multiplier": 4.0 },
+    { "min_drop_pct": 7.0, "max_drop_pct": 8.0, "multiplier": 4.5 },
+    { "min_drop_pct": 8.0, "max_drop_pct": null, "multiplier": 5.0 }
+  ],
+  "tier_boundary_rule": "min inclusive, max exclusive; the largest tier threshold <= actual drop wins; drop < 0.1% = 0x (no buy).",
+  "historical_note": "Older ladder variants, including the 0.1%-to-12% sizing ladders, are HISTORICAL/SUPERSEDED. This 0.1%-to-8%+ ladder (max 5x, no upper cutoff) is the current active ladder."
+}

@@ -1,0 +1,34 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "scheduled_tasks.schema.json",
+  "title": "Scheduled tasks manifest",
+  "type": "object",
+  "required": ["version", "tasks"],
+  "additionalProperties": true,
+  "properties": {
+    "version": { "type": "string" },
+    "timezone_note": { "type": "string" },
+    "tasks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "type", "status", "trades"],
+        "additionalProperties": true,
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "type": { "type": "string", "enum": ["trading", "monitoring", "analytics", "reminder"] },
+          "status": { "type": "string", "enum": ["active", "paused", "disabled"] },
+          "cron_utc": { "type": "string" },
+          "et_equivalent": { "type": "string" },
+          "fires_at_et": { "type": "string" },
+          "trades": { "type": "boolean" },
+          "broker_account": { "type": "string" },
+          "trigger_gate": { "type": "string" },
+          "trigger_window": { "type": "string" },
+          "notes": { "type": "string" }
+        }
+      }
+    }
+  }
+}

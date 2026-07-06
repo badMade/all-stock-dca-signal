@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "notifications.schema.json",
+  "title": "Notification routing",
+  "type": "object",
+  "required": ["channels"],
+  "additionalProperties": true,
+  "properties": {
+    "version": { "type": "string" },
+    "channels": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "scope": { "type": "string" },
+          "note": { "type": "string" }
+        }
+      }
+    },
+    "routing": { "type": "object" }
+  }
+}

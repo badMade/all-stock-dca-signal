@@ -1,0 +1,16 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "tickers.schema.json",
+  "title": "Ticker universe",
+  "type": "object",
+  "required": ["active"],
+  "additionalProperties": true,
+  "properties": {
+    "version": { "type": "string" },
+    "description": { "type": "string" },
+    "active": { "type": "array", "items": { "type": "string", "pattern": "^[A-Z.]{1,6}$" }, "uniqueItems": true },
+    "excluded": { "type": "array", "items": { "type": "string" } },
+    "symbol_corrections": { "type": "object", "additionalProperties": { "type": "string" } },
+    "notes": { "type": "string" }
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "$schema": "../schemas/reporting.schema.json",
+  "version": "2026-07-04",
+  "notion": {
+    "dashboard_url": "https://app.notion.com/p/391202e5e677812f9ce4c9bc0904d412",
+    "sections": {
+      "latest_run": "Compact per-day sync updated by task 67aa802b (post-trade).",
+      "performance_dashboard": "Full refresh by weekly task 041d9d90 (Fri) and monthly task 0656657a."
+    },
+    "api_note": "Notion API credentials are NOT stored here. See docs/reporting_workflow.md for how to configure NOTION_TOKEN via environment/secret manager."
+  },
+  "google_drive": {
+    "report_pack": "A report pack exists in Google Drive.",
+    "links_source": "Exact links may live in cloud_links.json in the workspace (not committed; may contain private links).",
+    "secrets_note": "Do not commit Drive tokens or private share links."
+  },
+  "artifacts": {
+    "run_state": "Standardized same-day state file written by the live task (see schemas/run_state.schema.json).",
+    "slippage": "Slippage artifacts written by task 67aa802b (see schemas/slippage_report.schema.json).",
+    "cost_tracker": "Usage proxy artifacts from task bec4a6ee (see schemas/cost_tracker.schema.json)."
+  },
+  "cost_control": {
+    "daily": "Compact / local-first analytics.",
+    "heavy_analysis": "Fridays and monthly only.",
+    "manual_runs": "Avoid manual full runs unless automation fails."
+  }
+}

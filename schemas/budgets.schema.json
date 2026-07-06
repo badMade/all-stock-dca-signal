@@ -1,0 +1,17 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "budgets.schema.json",
+  "title": "Budget and reserve rules",
+  "type": "object",
+  "required": ["base_amount_usd", "daily_base_cap_usd", "hard_daily_max_usd", "weekly_hard_cap_usd"],
+  "additionalProperties": true,
+  "properties": {
+    "base_amount_usd": { "type": "number", "minimum": 0 },
+    "daily_base_cap_usd": { "type": "number", "minimum": 0 },
+    "carry_forward_reserve_cap_usd": { "type": "number", "minimum": 0 },
+    "hard_daily_max_usd": { "type": "number", "minimum": 0 },
+    "weekly_hard_cap_usd": { "type": "number", "minimum": 0 },
+    "reserve_logic": { "type": "object" },
+    "order_rules": { "type": "object" }
+  }
+}
