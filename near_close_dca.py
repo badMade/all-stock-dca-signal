@@ -1637,8 +1637,9 @@ def run_daily_compact(
         - ``orders.csv``        durable per-order execution/slippage log.
 
     The compact Notion "Latest Run" sync is produced downstream from
-    ``latest_run_summary.json`` (see ``dca_reporting``/``dca_notion_sync``); nothing
-    here contacts Notion or a broker execution tool.
+    ``latest_run_summary.json`` (see ``dca_reporting``/``dca_notion_sync``); this
+    function only writes local artifacts and does not contact Notion directly.
+    It may interact with the passed-in broker adapter (dry-run by default).
     """
     run_result = RunResult(trading_day=now.astimezone(EASTERN).date(), decisions=[])
     run_once(
