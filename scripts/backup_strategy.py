@@ -236,6 +236,14 @@ def extract_all(text: str) -> Dict[str, object]:
     }
 
 
+def _deep_merge(dst: dict, src: dict) -> None:
+    for k, v in src.items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            _deep_merge(dst[k], v)
+        else:
+            dst[k] = v
+
+
 def _merge_into_file(path: Path, updates: Dict[str, object]) -> None:
     """Merge extracted values into an existing config file, preserving keys."""
     existing: Dict[str, object] = {}
@@ -244,7 +252,8 @@ def _merge_into_file(path: Path, updates: Dict[str, object]) -> None:
             existing = json.loads(path.read_text())
         except json.JSONDecodeError:
             existing = {}
-    existing.update({k: v for k, v in updates.items() if v not in (None, [], {})})
+    filtered_updates = {k: v for k, v in updates.items() if v not in (None, [], {})}
+    _deep_merge(existing, filtered_updates)
     path.write_text(json.dumps(existing, indent=2) + "\n")
 
 
