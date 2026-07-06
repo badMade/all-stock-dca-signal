@@ -60,8 +60,6 @@ def _write_runs(root, run_states):
 def test_collect_filters_by_month(tmp_path):
     _write_runs(
         tmp_path,
-    _write_runs(
-        tmp_path,
         [
             _run_state("2026-06-29"),
             _run_state("2026-06-30"),
@@ -69,28 +67,34 @@ def test_collect_filters_by_month(tmp_path):
         ],
     )
     june = collect_month_run_states(tmp_path, 2026, 6)
-        [
-            _run_state("2026-06-29"),
-            _run_state("2026-06-30"),
-            _run_state("2026-07-01"),  # different month, excluded
-        ],
-    )
-    june = collect_month_run_states(tmp.name, 2026, 6)
     days = sorted(rs["trading_day"] for rs in june)
     assert days == ["2026-06-29", "2026-06-30"]
 
-    july = collect_month_run_states(tmp.name, 2026, 7)
+    july = collect_month_run_states(tmp_path, 2026, 7)
     assert [rs["trading_day"] for rs in july] == ["2026-07-01"]
 
 
-def test_collect_skips_unparseable_files():
-    tmp = tempfile.TemporaryDirectory()
-    _write_runs(tmp.name, [_run_state("2026-06-29")])
-    bad_dir = Path(tmp.name) / "runs/bad"
+def test_collect_skips_blocked_stubs(tmp_path):
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    blocked_dir = tmp_path / "runs/2026-06-30-blocked"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    (blocked_dir / "run_state.json").write_text(
+        json.dumps({"trading_day": "2026-06-30", "status": "blocked"}), encoding="utf-8"
+    )
+
+    states = collect_month_run_states(tmp_path, 2026, 6)
+    assert len(states) == 1  # the date-gated stub is not an analyzed run
+    agg = aggregate_usage(states, month_label="2026-06")
+    assert agg["run_count"] == 1
+
+
+def test_collect_skips_unparseable_files(tmp_path):
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    bad_dir = tmp_path / "runs/bad"
     bad_dir.mkdir(parents=True, exist_ok=True)
     (bad_dir / "run_state.json").write_text("{not valid json")
 
-    states = collect_month_run_states(tmp.name, 2026, 6)
+    states = collect_month_run_states(tmp_path, 2026, 6)
     assert len(states) == 1  # bad file skipped, good one kept
 
 
@@ -152,11 +156,10 @@ def test_payload_is_connector_agnostic():
     assert with_page["page_id"] == "PAGE123"
 
 
-def test_generate_cost_tracker_writes_files():
-    tmp = tempfile.TemporaryDirectory()
-    _write_runs(tmp.name, [_run_state("2026-06-29"), _run_state("2026-06-30")])
-    out_dir = Path(tmp.name) / "cost"
-    paths = generate_cost_tracker(tmp.name, 2026, 6, out_dir)
+def test_generate_cost_tracker_writes_files(tmp_path):
+    _write_runs(tmp_path, [_run_state("2026-06-29"), _run_state("2026-06-30")])
+    out_dir = tmp_path / "cost"
+    paths = generate_cost_tracker(tmp_path, 2026, 6, out_dir)
 
     assert Path(paths["markdown"]).exists()
     assert Path(paths["payload"]).exists()
@@ -166,9 +169,16 @@ def test_generate_cost_tracker_writes_files():
 
 
 def _run_all():
+    import inspect
+
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
-            fn()
+            if inspect.signature(fn).parameters:
+                # tmp_path-style tests get a throwaway directory outside pytest.
+                with tempfile.TemporaryDirectory() as tmp:
+                    fn(Path(tmp))
+            else:
+                fn()
             print(f"PASS {name}")
     print("All cost-tracker self-tests passed.")
 

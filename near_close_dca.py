@@ -147,6 +147,9 @@ class SourceSignal:
     quote_price: float = 0.0
     quote_time: Optional[datetime] = None
     decision_bar_close: float = 0.0
+    # True when this signal stands in for a provider exception rather than a
+    # genuine "no data" answer. Reconciliation must never auto-buy past it.
+    provider_error: bool = False
 
 
 @dataclass(frozen=True)
@@ -700,6 +703,21 @@ def reconcile_signals(
     finance_action = finance_signal.action if finance_signal else Action.NO_DATA
     robinhood_action = robinhood_signal.action if robinhood_signal else Action.NO_DATA
 
+    if Action.BUY in {finance_action, robinhood_action}:
+        errored = [
+            name
+            for name, signal in (("finance", finance_signal), ("robinhood", robinhood_signal))
+            if signal is not None and signal.provider_error
+        ]
+        if errored:
+            return ReconciledDecision(
+                ticker=ticker,
+                action=Action.MANUAL_REVIEW,
+                reason=f"provider error on {', '.join(errored)}; do not auto-buy",
+                finance_signal=finance_signal,
+                robinhood_signal=robinhood_signal,
+            )
+
     if finance_action == Action.BUY and robinhood_action == Action.BUY:
         amount = min(
             finance_signal.suggested_amount_usd,
@@ -784,6 +802,7 @@ def _signal_row(ticker: str, source: str, signal: Optional[SourceSignal]) -> Dic
             "source": source,
             "action": Action.NO_DATA.value,
             "reason": "no signal produced",
+            "provider_error": None,
             "decision_bar_close": None,
             "previous_close": None,
             "lookback_price": None,
@@ -800,6 +819,7 @@ def _signal_row(ticker: str, source: str, signal: Optional[SourceSignal]) -> Dic
         "source": source,
         "action": signal.action.value,
         "reason": signal.reason,
+        "provider_error": signal.provider_error,
         "decision_bar_close": signal.decision_price,
         "previous_close": signal.previous_close,
         "lookback_price": signal.lookback_price,
@@ -973,6 +993,41 @@ def build_run_artifacts(
     }
 
 
+# CSV artifacts a run may leave beside run_state.json, and the status recorded in
+# the minimal run_state stub written when the date gate blocks execution.
+_RUN_CSV_NAMES = ("signals.csv", "buy_candidates.csv", "orders.csv")
+RUN_STATUS_BLOCKED = "blocked"
+
+
+def _existing_csv_artifacts(out: Path) -> List[Path]:
+    return [out / name for name in _RUN_CSV_NAMES if (out / name).exists()]
+
+
+def _serialize_run_state(run_state: Dict[str, Any]) -> str:
+    return json.dumps(run_state, indent=2, sort_keys=True)
+
+
+def _settle_usage_bytes(run_state: Dict[str, Any], usage: Dict[str, Any], csv_bytes: int) -> str:
+    """Set state_file_bytes/total_artifact_bytes to match the payload written to disk.
+
+    The serialized size only shifts when a counter changes digit count, so this
+    settles in a pass or two; the values are documented usage *proxies*, so a
+    pathological digit-boundary case exiting one byte off is tolerable.
+    """
+    serialized = _serialize_run_state(run_state)
+    for _ in range(4):
+        state_bytes = len(serialized.encode("utf-8"))
+        if (
+            usage.get("state_file_bytes") == state_bytes
+            and usage.get("total_artifact_bytes") == state_bytes + csv_bytes
+        ):
+            break
+        usage["state_file_bytes"] = state_bytes
+        usage["total_artifact_bytes"] = state_bytes + csv_bytes
+        serialized = _serialize_run_state(run_state)
+    return serialized
+
+
 def write_run_artifacts(artifacts: Dict[str, Any], output_dir: str | Path) -> Dict[str, str]:
     """Write the run-state JSON plus signal and candidate CSVs; return their paths."""
     out = Path(output_dir)
@@ -984,33 +1039,46 @@ def write_run_artifacts(artifacts: Dict[str, Any], output_dir: str | Path) -> Di
     candidates_path = out / "buy_candidates.csv"
     _write_csv(candidates_path, artifacts["buy_candidates"])
 
-    candidates_path = out / "buy_candidates.csv"
-    _write_csv(candidates_path, artifacts["buy_candidates"])
+    # Count only the CSVs this run just wrote. orders.csv (written afterwards on
+    # the compact path) is folded in by _backfill_orders_csv_usage; a stale
+    # orders.csv left in a reused directory must not be attributed to this run.
+    csv_paths = [signals_path, candidates_path]
+    csv_bytes = sum(path.stat().st_size for path in csv_paths)
 
-    orders_path = out / "orders.csv"
-    csv_paths = [signals_path, candidates_path, orders_path]
-    csv_bytes = sum(path.stat().st_size for path in csv_paths if path.exists())
-
-    run_state_path = out / "run_state.json"
-
-    run_state_path = out / "run_state.json"
     usage = artifacts.get("usage_proxy")
     if isinstance(usage, dict):
         usage["csv_artifact_count"] = len(csv_paths)
-        # Estimate the state file size in memory to avoid writing to disk twice
-        temp_json = json.dumps(artifacts, indent=2, sort_keys=True)
-        state_bytes = len(temp_json.encode("utf-8"))
-        usage["state_file_bytes"] = state_bytes
-        usage["total_artifact_bytes"] = state_bytes + csv_bytes
-        run_state_path.write_text(json.dumps(artifacts, indent=2, sort_keys=True), encoding="utf-8")
+        serialized = _settle_usage_bytes(artifacts, usage, csv_bytes)
     else:
-        run_state_path.write_text(json.dumps(artifacts, indent=2, sort_keys=True), encoding="utf-8")
+        serialized = _serialize_run_state(artifacts)
+
+    run_state_path = out / "run_state.json"
+    run_state_path.write_text(serialized, encoding="utf-8")
 
     return {
         "run_state": str(run_state_path),
         "signals": str(signals_path),
         "buy_candidates": str(candidates_path),
     }
+
+
+def _backfill_orders_csv_usage(run_state_path: Path) -> None:
+    """Re-derive the CSV usage-proxy counters from disk after orders.csv is written.
+
+    ``orders.csv`` lands after ``write_run_artifacts`` has already finalized
+    ``run_state.json``, so without this pass the daily compact path would
+    undercount ``csv_artifact_count``/``total_artifact_bytes``.
+    """
+    if not run_state_path.exists():
+        return
+    run_state = json.loads(run_state_path.read_text(encoding="utf-8"))
+    usage = run_state.get("usage_proxy")
+    if not isinstance(usage, dict):
+        return
+    csv_paths = _existing_csv_artifacts(run_state_path.parent)
+    usage["csv_artifact_count"] = len(csv_paths)
+    csv_bytes = sum(path.stat().st_size for path in csv_paths)
+    run_state_path.write_text(_settle_usage_bytes(run_state, usage, csv_bytes), encoding="utf-8")
 
 
 def _write_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
@@ -1178,10 +1246,20 @@ def classify_missing_fill(decision: Optional[ReconciledDecision], loop_reason: O
     if loop_reason:
         return loop_reason
     action = decision.action if decision else Action.NO_DATA
-    if action == Action.NO_DATA:
+    if action == Action.NO_DATA or (decision is not None and _decision_had_provider_error(decision)):
+        # A provider exception is a data problem even when reconciliation degraded
+        # it to MANUAL_REVIEW instead of NO_DATA; report it as such so outages
+        # surface in the "data error" bucket rather than "failed DCA trigger".
         return MISSING_FILL_DATA_ERROR
     # SKIP / NO_ACTION / MANUAL_REVIEW: no reconciled auto-buy was triggered.
     return MISSING_FILL_FAILED_TRIGGER
+
+
+def _decision_had_provider_error(decision: ReconciledDecision) -> bool:
+    return any(
+        signal is not None and signal.provider_error
+        for signal in (decision.finance_signal, decision.robinhood_signal)
+    )
 
 
 @dataclass
@@ -1429,6 +1507,19 @@ def run_once(
 
     if trading_day not in config.approved_test_dates:
         print(f"Date gate blocked execution for {trading_day}. No trades.")
+        if artifacts_dir:
+            out = Path(artifacts_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            state_path = out / "run_state.json"
+            # Never clobber a previously recorded run when a directory is reused;
+            # the stub only marks days that produced no artifact at all.
+            if not state_path.exists():
+                state_path.write_text(
+                    _serialize_run_state(
+                        {"trading_day": trading_day.isoformat(), "status": RUN_STATUS_BLOCKED}
+                    ),
+                    encoding="utf-8",
+                )
         return []
 
     if broker.account_number() != config.target_account_number:
@@ -1441,7 +1532,7 @@ def run_once(
     if run_result is not None:
         run_result.active_universe = list(tradable_tickers)
 
-    def _safe_signal(data: MarketDataProvider, interval_minutes: int) -> SourceSignal:
+    def _safe_signal(ticker: str, data: MarketDataProvider, interval_minutes: int) -> SourceSignal:
         nonlocal errors_count
         try:
             return evaluate_source_signal(
@@ -1458,11 +1549,12 @@ def run_once(
                 source=getattr(data, "source", SourceName.FINANCE),
                 action=Action.NO_DATA,
                 reason=f"provider error: {exc}",
+                provider_error=True,
             )
 
     for ticker in tradable_tickers:
-        finance_signal = _safe_signal(finance_data, config.finance_interval_minutes)
-        robinhood_signal = _safe_signal(robinhood_data, config.robinhood_interval_minutes)
+        finance_signal = _safe_signal(ticker, finance_data, config.finance_interval_minutes)
+        robinhood_signal = _safe_signal(ticker, robinhood_data, config.robinhood_interval_minutes)
         decisions.append(reconcile_signals(ticker, finance_signal, robinhood_signal))
 
     if run_result is not None:
@@ -1647,23 +1739,8 @@ def run_daily_compact(
     function only writes local artifacts and does not contact Notion directly.
     It may interact with the passed-in broker adapter (dry-run by default).
     """
-    run_result = RunResult(trading_day=now.astimezone(EASTERN).date(), decisions=[])
-    if trading_day not in config.approved_test_dates:
-        print(f"Date gate blocked execution for {trading_day}. No trades.")
-        if artifacts_dir:
-            out = Path(artifacts_dir)
-            out.mkdir(parents=True, exist_ok=True)
-            (out / "run_state.json").write_text(json.dumps({"trading_day": str(trading_day), "status": "blocked"}))
-        return []
-        now,
-        config,
-        state,
-        finance_data,
-        robinhood_data,
-        broker,
-        artifacts_dir=artifacts_dir,
-        run_result=run_result,
-        notifications_sent=notifications_sent,
+    trading_day = now.astimezone(EASTERN).date()
+    run_result = RunResult(trading_day=trading_day, decisions=[])
     run_once(
         now,
         config,
@@ -1676,25 +1753,30 @@ def run_daily_compact(
         notifications_sent=notifications_sent,
     )
 
-    candidates_path = out / "buy_candidates.csv"
-    _write_csv(candidates_path, artifacts["buy_candidates"])
-
-    csv_paths = [signals_path, candidates_path]
-    orders_path = out / "orders.csv"
-    if orders_path.exists():
-        csv_paths.append(orders_path)
-
-    csv_bytes = sum(path.stat().st_size for path in csv_paths)
-    return {
+    out = Path(artifacts_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    result: Dict[str, object] = {
         "run_label": run_label,
         "scheduled": scheduled,
         "compact": True,
+        "blocked": trading_day not in config.approved_test_dates,
         "artifacts_dir": str(out),
         "run_state_path": str(out / "run_state.json"),
-        "signals_path": str(out / "signals.csv"),
-        "buy_candidates_path": str(out / "buy_candidates.csv"),
-        "orders_csv_path": str(orders_csv),
     }
+    if result["blocked"]:
+        # Date gate tripped inside run_once: only the blocked run_state stub was
+        # written, so return no CSV paths rather than paths to missing files.
+        return result
+
+    orders_csv = out / "orders.csv"
+    write_execution_csv(run_result.execution_records, str(orders_csv))
+    _backfill_orders_csv_usage(out / "run_state.json")
+    result.update(
+        signals_path=str(out / "signals.csv"),
+        buy_candidates_path=str(out / "buy_candidates.csv"),
+        orders_csv_path=str(orders_csv),
+    )
+    return result
 
 
 if __name__ == "__main__":
