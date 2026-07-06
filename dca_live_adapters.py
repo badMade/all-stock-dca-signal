@@ -105,9 +105,9 @@ def _parse_rfc3339(value: Any) -> Optional[datetime]:
         parsed = datetime.fromisoformat(text)
     except ValueError:
         return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=EASTERN)
-    return parsed
+if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_UTC)
+    return parsed.astimezone(_UTC)
 
 
 def _rh_interval(interval_minutes: int) -> str:
