@@ -116,11 +116,12 @@ def aggregate_usage(
     proxy units, the count of runs that required manual recovery, and the proxy
     disclaimer. Runs missing a ``usage_proxy`` block contribute nothing.
     """
-    usage_blocks = [rs.get("usage_proxy") or {} for rs in run_states]
-
     totals: Dict[str, float] = {field: 0.0 for field in _NUMERIC_PROXY_FIELDS}
     manual_recovery_runs = 0
-    for usage in usage_blocks:
+    for rs in run_states:
+        usage = rs.get("usage_proxy")
+        if not isinstance(usage, dict):
+            continue
         for field in _NUMERIC_PROXY_FIELDS:
             totals[field] += _num(usage.get(field))
         if usage.get("manual_recovery_required"):
