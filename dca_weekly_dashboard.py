@@ -45,7 +45,18 @@ def build_performance_snapshot(run_states: Sequence[Dict[str, Any]]) -> str:
         for c in rs.get("buy_candidates") or []
     )
     week_notional = max((_num((rs.get("budget") or {}).get("week_notional_usd")) for rs in run_states), default=0.0)
-    weekly_cap = max((_num((rs.get("budget") or {}).get("weekly_cap_usd")) for rs in run_states), default=0.0)
+    # Fall back to the pre-policy key so historical run_state artifacts (which
+    # named the cap ``weekly_notional_cap_usd``) still populate the snapshot.
+    weekly_cap = max(
+        (
+            _num(
+                (rs.get("budget") or {}).get("weekly_cap_usd")
+                or (rs.get("budget") or {}).get("weekly_notional_cap_usd")
+            )
+            for rs in run_states
+        ),
+        default=0.0,
+    )
 
     lines = ["## Performance snapshot", ""]
     lines.append("| Metric | Value |")

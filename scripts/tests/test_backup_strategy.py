@@ -94,7 +94,54 @@ def test_extract_budgets():
     assert tiers["normal"] == {"name": "normal", "daily_cap_usd": 180.0, "weekly_cap_usd": 900.0}
     assert tiers["elevated"]["daily_cap_usd"] == 240.0
     assert tiers["high_volatility"]["weekly_cap_usd"] == 1500.0
-    assert tiers["stress"] == {"name": "stress", "daily_cap_usd": 360.0, "weekly_cap_usd": 1800.0}
+    # The stress tier carries the rollover-reserve safeguard when the transcript
+    # references the weekly rollover reserve.
+    assert tiers["stress"] == {
+        "name": "stress",
+        "daily_cap_usd": 360.0,
+        "weekly_cap_usd": 1800.0,
+        "requires_rollover_reserve": True,
+    }
+
+
+def test_write_configs_preserves_existing_tier_metadata():
+    extracted = extract_all(SAMPLE)
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d)
+        # Pre-existing budgets.json carries per-tier metadata that the transcript
+        # does not spell out and must survive a refresh.
+        (out / "budgets.json").write_text(
+            json.dumps(
+                {
+                    "version": "keep-me",
+                    "budget_tiers": [
+                        {
+                            "name": "stress",
+                            "daily_cap_usd": 999.0,
+                            "weekly_cap_usd": 999.0,
+                            "requires_rollover_reserve": True,
+                            "note": "Usable only to the extent prior unused rollover reserve is available.",
+                            "select_when": "planned spend > $272 or 3x+ signals > 17",
+                        }
+                    ],
+                }
+            )
+        )
+        write_configs(extracted, out, only=["budgets"])
+        budgets = json.loads((out / "budgets.json").read_text())
+        assert budgets["version"] == "keep-me"  # top-level key preserved
+        stress = {t["name"]: t for t in budgets["budget_tiers"]}["stress"]
+        # Caps refreshed from the transcript...
+        assert stress["daily_cap_usd"] == 360.0
+        assert stress["weekly_cap_usd"] == 1800.0
+        # ...while the safeguard, note, and selection rule are preserved.
+        assert stress["requires_rollover_reserve"] is True
+        assert "rollover reserve" in stress["note"]
+        assert stress["select_when"].startswith("planned spend > $272")
+        # The other extracted tiers are merged in too.
+        assert {"normal", "elevated", "high_volatility"} <= {
+            t["name"] for t in budgets["budget_tiers"]
+        }
 
 
 def test_schedule_weekday_logic_330_and_345_et():
