@@ -21,6 +21,7 @@ from near_close_dca import (
     OrderFill,
     ReconciledDecision,
     SourceName,
+    SourceSignal,
     StrategyConfig,
     StrategyState,
     build_execution_record,
@@ -162,6 +163,41 @@ def test_reconciled_decision_carries_target_fields():
     assert decision.target_price == 97.5
     assert decision.target_price_source == "finance:signal_quote"
     assert decision.decision_bar_close == 98.0
+
+
+def _no_data_signal(source, provider_error):
+    return SourceSignal(
+        ticker="AAPL",
+        source=source,
+        action=Action.NO_DATA,
+        reason="provider error: boom" if provider_error else "missing completed bar or previous close",
+        provider_error=provider_error,
+    )
+
+
+def test_provider_error_forces_manual_review_instead_of_auto_buy():
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+    rs = evaluate_source_signal("AAPL", now, StrategyConfig(), rh, 5)
+    assert rs.action == Action.BUY
+
+    fs = _no_data_signal(SourceName.FINANCE, provider_error=True)
+    decision = reconcile_signals("AAPL", fs, rs)
+    assert decision.action == Action.MANUAL_REVIEW
+    assert "provider error" in decision.reason
+    assert decision.suggested_amount_usd == 0.0
+
+
+def test_plain_no_data_still_allows_robinhood_only_buy():
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+    rs = evaluate_source_signal("AAPL", now, StrategyConfig(), rh, 5)
+
+    # Genuine missing data (no exception) keeps the documented Robinhood-only path.
+    fs = _no_data_signal(SourceName.FINANCE, provider_error=False)
+    decision = reconcile_signals("AAPL", fs, rs)
+    assert decision.action == Action.BUY
+    assert decision.reason == "Robinhood-only BUY because finance source is unavailable"
 
 
 # --- Slippage calculations ---------------------------------------------------
@@ -354,18 +390,6 @@ def test_usage_proxy_logged_in_run_state(tmp_path):
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
 
-...
-
-def test_usage_proxy_counts_provider_errors(tmp_path):
-    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
-    now, config, state, broker, _fin, rh = _compact_setup(tmp_path)
-
-...
-
-def test_run_daily_compact_writes_structured_only(tmp_path):
-    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
-    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
-
     run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir,
                       notifications_sent=1)
 
@@ -383,7 +407,8 @@ def test_run_daily_compact_writes_structured_only(tmp_path):
     assert usage["buy_candidates_written"] == 3
     assert usage["order_reviews_attempted"] == 3
     assert usage["orders_placed_count"] == 3
-    assert usage["csv_artifact_count"] == 2
+    # signals.csv, buy_candidates.csv, and orders.csv all count toward the proxy.
+    assert usage["csv_artifact_count"] == 3
     assert usage["state_file_bytes"] > 0
     assert usage["total_artifact_bytes"] >= usage["state_file_bytes"]
     assert usage["notifications_sent"] == 1
@@ -392,26 +417,30 @@ def test_run_daily_compact_writes_structured_only(tmp_path):
     assert isinstance(usage["cost_control_notes"], list) and usage["cost_control_notes"]
 
 
-def test_usage_proxy_counts_provider_errors():
-    tmpdir = tempfile.TemporaryDirectory()
-    artifacts_dir = os.path.join(tmpdir.name, "runs", "2026-06-29")
-    now, config, state, broker, _fin, rh = _compact_setup(tmpdir.name)
+def test_usage_proxy_counts_provider_errors(tmp_path):
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    now, config, state, broker, _fin, rh = _compact_setup(tmp_path)
     raising = _RaisingData(SourceName.FINANCE)
 
     run_daily_compact(now, config, state, raising, rh, broker, artifacts_dir=artifacts_dir)
 
     with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
-        usage = json.load(handle)["usage_proxy"]
+        run_state = json.load(handle)
+    usage = run_state["usage_proxy"]
 
     # Finance raises once per ticker; run degrades to NO_DATA instead of crashing.
     assert usage["errors_count"] == 3
     assert usage["manual_recovery_required"] is True
+    # Provider errors must never fall through to a Robinhood-only auto-buy.
+    assert usage["orders_placed_count"] == 0
+    assert usage["buy_candidates_written"] == 0
+    assert run_state["counts"]["manual_review"] == 3
+    assert sorted(run_state["manual_review_tickers"]) == ["AAPL", "MSFT", "NVDA"]
 
 
-def test_run_daily_compact_writes_structured_only():
-    tmpdir = tempfile.TemporaryDirectory()
-    artifacts_dir = os.path.join(tmpdir.name, "runs", "2026-06-29")
-    now, config, state, broker, fin, rh = _compact_setup(tmpdir.name)
+def test_run_daily_compact_writes_structured_only(tmp_path):
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
 
     result = run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir)
 
@@ -453,9 +482,17 @@ def test_build_usage_proxy_defaults_and_overrides():
 
 
 def _run_all():
+    import inspect
+    from pathlib import Path
+
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
-            fn()
+            if inspect.signature(fn).parameters:
+                # tmp_path-style tests get a throwaway directory outside pytest.
+                with tempfile.TemporaryDirectory() as tmp:
+                    fn(Path(tmp))
+            else:
+                fn()
             print(f"PASS {name}")
     print("All self-tests passed.")
 

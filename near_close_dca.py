@@ -147,6 +147,9 @@ class SourceSignal:
     quote_price: float = 0.0
     quote_time: Optional[datetime] = None
     decision_bar_close: float = 0.0
+    # True when this signal stands in for a provider exception rather than a
+    # genuine "no data" answer. Reconciliation must never auto-buy past it.
+    provider_error: bool = False
 
 
 @dataclass(frozen=True)
@@ -700,6 +703,20 @@ def reconcile_signals(
     finance_action = finance_signal.action if finance_signal else Action.NO_DATA
     robinhood_action = robinhood_signal.action if robinhood_signal else Action.NO_DATA
 
+    errored_sources = ", ".join(
+        name
+        for name, signal in (("finance", finance_signal), ("robinhood", robinhood_signal))
+        if signal is not None and signal.provider_error
+    )
+    if errored_sources and Action.BUY in {finance_action, robinhood_action}:
+        return ReconciledDecision(
+            ticker=ticker,
+            action=Action.MANUAL_REVIEW,
+            reason=f"provider error on {errored_sources}; do not auto-buy",
+            finance_signal=finance_signal,
+            robinhood_signal=robinhood_signal,
+        )
+
     if finance_action == Action.BUY and robinhood_action == Action.BUY:
         amount = min(
             finance_signal.suggested_amount_usd,
@@ -984,33 +1001,48 @@ def write_run_artifacts(artifacts: Dict[str, Any], output_dir: str | Path) -> Di
     candidates_path = out / "buy_candidates.csv"
     _write_csv(candidates_path, artifacts["buy_candidates"])
 
-    candidates_path = out / "buy_candidates.csv"
-    _write_csv(candidates_path, artifacts["buy_candidates"])
-
     orders_path = out / "orders.csv"
-    csv_paths = [signals_path, candidates_path, orders_path]
-    csv_bytes = sum(path.stat().st_size for path in csv_paths if path.exists())
+    csv_paths = [path for path in (signals_path, candidates_path, orders_path) if path.exists()]
+    csv_bytes = sum(path.stat().st_size for path in csv_paths)
 
-    run_state_path = out / "run_state.json"
-
-    run_state_path = out / "run_state.json"
     usage = artifacts.get("usage_proxy")
     if isinstance(usage, dict):
         usage["csv_artifact_count"] = len(csv_paths)
         # Estimate the state file size in memory to avoid writing to disk twice
-        temp_json = json.dumps(artifacts, indent=2, sort_keys=True)
-        state_bytes = len(temp_json.encode("utf-8"))
+        state_bytes = len(json.dumps(artifacts, indent=2, sort_keys=True).encode("utf-8"))
         usage["state_file_bytes"] = state_bytes
         usage["total_artifact_bytes"] = state_bytes + csv_bytes
-        run_state_path.write_text(json.dumps(artifacts, indent=2, sort_keys=True), encoding="utf-8")
-    else:
-        run_state_path.write_text(json.dumps(artifacts, indent=2, sort_keys=True), encoding="utf-8")
+
+    run_state_path = out / "run_state.json"
+    run_state_path.write_text(json.dumps(artifacts, indent=2, sort_keys=True), encoding="utf-8")
 
     return {
         "run_state": str(run_state_path),
         "signals": str(signals_path),
         "buy_candidates": str(candidates_path),
     }
+
+
+def _backfill_orders_csv_usage(run_state_path: Path) -> None:
+    """Re-derive the CSV usage-proxy counters from disk after orders.csv is written.
+
+    ``orders.csv`` lands after ``write_run_artifacts`` has already finalized
+    ``run_state.json``, so without this pass the daily compact path would
+    undercount ``csv_artifact_count``/``total_artifact_bytes``.
+    """
+    if not run_state_path.exists():
+        return
+    run_state = json.loads(run_state_path.read_text(encoding="utf-8"))
+    usage = run_state.get("usage_proxy")
+    if not isinstance(usage, dict):
+        return
+    out = run_state_path.parent
+    csv_names = ("signals.csv", "buy_candidates.csv", "orders.csv")
+    csv_paths = [out / name for name in csv_names if (out / name).exists()]
+    usage["csv_artifact_count"] = len(csv_paths)
+    state_bytes = int(usage.get("state_file_bytes") or 0)
+    usage["total_artifact_bytes"] = state_bytes + sum(path.stat().st_size for path in csv_paths)
+    run_state_path.write_text(json.dumps(run_state, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def _write_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
@@ -1429,6 +1461,17 @@ def run_once(
 
     if trading_day not in config.approved_test_dates:
         print(f"Date gate blocked execution for {trading_day}. No trades.")
+        if artifacts_dir is not None:
+            out = Path(artifacts_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "run_state.json").write_text(
+                json.dumps(
+                    {"trading_day": trading_day.isoformat(), "status": "blocked"},
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
         return []
 
     if broker.account_number() != config.target_account_number:
@@ -1441,7 +1484,7 @@ def run_once(
     if run_result is not None:
         run_result.active_universe = list(tradable_tickers)
 
-    def _safe_signal(data: MarketDataProvider, interval_minutes: int) -> SourceSignal:
+    def _safe_signal(ticker: str, data: MarketDataProvider, interval_minutes: int) -> SourceSignal:
         nonlocal errors_count
         try:
             return evaluate_source_signal(
@@ -1458,11 +1501,12 @@ def run_once(
                 source=getattr(data, "source", SourceName.FINANCE),
                 action=Action.NO_DATA,
                 reason=f"provider error: {exc}",
+                provider_error=True,
             )
 
     for ticker in tradable_tickers:
-        finance_signal = _safe_signal(finance_data, config.finance_interval_minutes)
-        robinhood_signal = _safe_signal(robinhood_data, config.robinhood_interval_minutes)
+        finance_signal = _safe_signal(ticker, finance_data, config.finance_interval_minutes)
+        robinhood_signal = _safe_signal(ticker, robinhood_data, config.robinhood_interval_minutes)
         decisions.append(reconcile_signals(ticker, finance_signal, robinhood_signal))
 
     if run_result is not None:
@@ -1648,13 +1692,7 @@ def run_daily_compact(
     It may interact with the passed-in broker adapter (dry-run by default).
     """
     run_result = RunResult(trading_day=now.astimezone(EASTERN).date(), decisions=[])
-    if trading_day not in config.approved_test_dates:
-        print(f"Date gate blocked execution for {trading_day}. No trades.")
-        if artifacts_dir:
-            out = Path(artifacts_dir)
-            out.mkdir(parents=True, exist_ok=True)
-            (out / "run_state.json").write_text(json.dumps({"trading_day": str(trading_day), "status": "blocked"}))
-        return []
+    run_once(
         now,
         config,
         state,
@@ -1666,15 +1704,12 @@ def run_daily_compact(
         notifications_sent=notifications_sent,
     )
 
-    candidates_path = out / "buy_candidates.csv"
-    _write_csv(candidates_path, artifacts["buy_candidates"])
+    out = Path(artifacts_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    orders_csv = out / "orders.csv"
+    write_execution_csv(run_result.execution_records, str(orders_csv))
+    _backfill_orders_csv_usage(out / "run_state.json")
 
-    csv_paths = [signals_path, candidates_path]
-    orders_path = out / "orders.csv"
-    if orders_path.exists():
-        csv_paths.append(orders_path)
-
-    csv_bytes = sum(path.stat().st_size for path in csv_paths)
     return {
         "run_label": run_label,
         "scheduled": scheduled,
