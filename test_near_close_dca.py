@@ -25,6 +25,7 @@ from near_close_dca import (
     SourceName,
     SourceSignal,
     StrategyConfig,
+    allocation_sort_key,
     StrategyState,
     build_execution_record,
     build_report,
@@ -214,6 +215,54 @@ def test_reconciled_decision_carries_target_fields():
     assert decision.target_price == 97.5
     assert decision.target_price_source == "finance:signal_quote"
     assert decision.decision_bar_close == 98.0
+
+
+def test_approved_dates_cover_window_and_exclude_holidays():
+    from near_close_dca import APPROVED_TEST_DATES
+
+    # Full canonical window is covered...
+    assert date(2026, 7, 2) in APPROVED_TEST_DATES
+    assert date(2026, 8, 28) in APPROVED_TEST_DATES
+    # ...weekends are excluded...
+    assert date(2026, 7, 4) not in APPROVED_TEST_DATES  # Saturday
+    # ...and the observed Independence Day holiday (Fri 2026-07-03) is excluded.
+    assert date(2026, 7, 3) not in APPROVED_TEST_DATES
+
+
+def test_allocation_sort_key_tie_break_is_alphabetical():
+    from types import SimpleNamespace
+
+    def cand(ticker, mult, drop, rh_drop=None):
+        return SimpleNamespace(
+            ticker=ticker,
+            buy_multiplier=mult,
+            finance_signal=SimpleNamespace(drop_vs_previous_close_pct=drop),
+            robinhood_signal=(
+                None if rh_drop is None
+                else SimpleNamespace(drop_vs_previous_close_pct=rh_drop)
+            ),
+        )
+
+    order = lambda cs: [c.ticker for c in sorted(cs, key=allocation_sort_key)]
+
+    # Equal multiplier and drop -> ticker alphabetical breaks the tie (A->Z),
+    # not the input/universe order.
+    assert order([cand("MSFT", 2.0, 3.0), cand("AAPL", 2.0, 3.0), cand("GOOG", 2.0, 3.0)]) == [
+        "AAPL", "GOOG", "MSFT",
+    ]
+
+    # Higher multiplier dominates both drop and alphabetical.
+    assert order([cand("AAPL", 1.0, 9.0), cand("ZZZ", 3.0, 0.5), cand("MSFT", 2.0, 5.0)]) == [
+        "ZZZ", "MSFT", "AAPL",
+    ]
+
+    # Same multiplier -> larger drop first, then ticker.
+    assert order([cand("BBB", 2.0, 1.0), cand("AAA", 2.0, 4.0), cand("CCC", 2.0, 4.0)]) == [
+        "AAA", "CCC", "BBB",
+    ]
+
+    # Drop is the max across sources: a bigger Robinhood drop outranks finance-only.
+    assert order([cand("FN", 2.0, 3.0), cand("RH", 2.0, 1.0, rh_drop=6.0)]) == ["RH", "FN"]
 
 
 def _no_data_signal(source, provider_error):

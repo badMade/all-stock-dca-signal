@@ -12,11 +12,10 @@ shape: [`schemas/cost_tracker.schema.json`](../schemas/cost_tracker.schema.json)
 
 ## Monthly cost review (`bec4a6ee`)
 
-- Runs the first weekday of the month.
+- Runs the first weekday of the month at **9:55 AM ET**.
 - Reports **usage proxies** (task-run counts, heavy-analysis counts, manual
-  runs, approximate tokens). **No exact credit/billing figures.**
-- **Known discrepancy:** requested 9:15 AM ET but observed `next_run` at
-  9:55 AM ET — flagged for reconciliation.
+  runs, approximate tokens). **No exact credit/billing figures** — exact
+  Perplexity credit consumption is not exposed, so do not claim exact credits.
 
 ## Proxy metrics
 

@@ -6,17 +6,53 @@ private links are stored in this repo.**
 
 ## Daily flow (weekdays, EDT)
 
-1. **3:30 PM ET — Live graded DCA task (`ce16ba6b`)**
+1. **9:00 AM ET — Pre-market buying-power dashboard (`b7961407`)**
+   Analytics only. Pre-market buying-power view using the $3 base 0x-to-5x ladder.
+2. **9:45 AM ET — Volatility outlier scan (`cd45e95b`)**
+   Alerts only for >5% outliers or actionable errors.
+3. **3:05 PM ET — Monitor-only signal check (`e3e6f09e`)**
+   Analytics only. Surfaces the planned allocation and tier selection.
+4. **3:20 PM ET — Live graded DCA task (`10ce362c`, supersedes deleted `ce16ba6b`)**
    Places buys (Robinhood `562057042`) and writes the standardized same-day
    **run state** artifact ([`schemas/run_state.schema.json`](../schemas/run_state.schema.json)).
-2. **3:40 PM ET — Watchdog (`a46bf007`)**
-   Read-only. Verifies the run happened and flags missing/error/discrepancy.
-3. **3:45 PM ET — Post-trade slippage + Notion sync (`67aa802b`)**
-   Reads the run-state artifact and Robinhood order history, computes slippage
+   A **scheduled** run writes under
+   `cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/` with
+   `run_classification.run_origin='scheduled'` and updates
+   `latest_scheduled_run.json`. Manual runs write under `manual_runs/<timestamp>/`
+   and never update that pointer. See
+   [run_classification.md](run_classification.md).
+5. **3:25 PM ET — Capital-priority briefing (`d72aa525`)**
+   Analytics only. Emails/notifies **only if at least one ticker triggers 1.5x or higher**.
+6. **3:35 PM ET — Post-trade slippage + Notion sync (`67aa802b`)**
+   Reads the **scheduled** run-state artifact and Robinhood order history,
+   computes slippage
    ([`schemas/slippage_report.schema.json`](../schemas/slippage_report.schema.json)),
-   and updates the **compact Notion "Latest Run" section only**.
-4. **9:45 AM ET — Volatility outlier scan (`cd45e95b`)**
-   Alerts only for >5% outliers or actionable errors.
+   writes slippage/coverage artifacts, and updates the **compact Notion "Latest
+   Run" section only**. Scheduled-live rows exclude all manual order IDs and any
+   `run_origin='manual'` / `manual_run=true` state; manual fills go only in the
+   labeled **Manual Test Runs** section.
+7. **3:40 PM ET — Watchdog (`a46bf007`)**
+   Read-only, the final scheduled afternoon event. Confirms a valid **scheduled**
+   run_state exists and that `latest_scheduled_run.json` points at it; flags
+   missing/incomplete/error/discrepancy. Never infers a scheduled run from
+   same-day broker orders or manual runs alone.
+
+Every manual or scheduled run produces a **DCA Manual Run Slippage and Coverage
+Report** where fills exist, or a compact run artifact explaining no fills.
+`target_price` and slippage are tracked for every future trade, and daily live
+runs write structured JSON/CSV locally first.
+
+### Scheduled vs manual runs
+
+All reporting honors the **run-classification contract**
+([run_classification.md](run_classification.md),
+[`config/run_classification.json`](../config/run_classification.json)):
+scheduled-live cost basis, slippage, reliability, and order-count metrics are
+computed only from validated scheduled runs, with every manual order ID excluded.
+A broker time-window fallback (3:15–3:35 PM ET) is used only when a valid
+scheduled state exists but lacks order IDs due to a known write failure — manual
+IDs stay excluded. Manual fills appear only under a labeled **Manual Test Runs**
+section and never affect scheduled-live metrics.
 
 ## Periodic flow
 

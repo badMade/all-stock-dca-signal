@@ -22,12 +22,30 @@ from __future__ import annotations
 import csv
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 
 def load_run_state(path: str | Path) -> Dict[str, Any]:
     """Load a ``run_state.json`` artifact produced by the live-run path."""
     return json.loads(Path(path).read_text())
+
+
+def _is_manual_run_state(run_state: Dict[str, Any]) -> bool:
+    """True if a run_state is a manual run per its run_classification block."""
+    rc = run_state.get("run_classification") if isinstance(run_state, dict) else None
+    if not isinstance(rc, dict):
+        return False
+    return rc.get("run_origin") == "manual" or rc.get("manual_run") is True
+
+
+def _drop_excluded_fills(
+    fills: Sequence[Dict[str, Any]], exclude_order_ids: Optional[Iterable[str]]
+) -> List[Dict[str, Any]]:
+    """Return fills minus any whose order_id is a known manual-run order."""
+    exclude = {oid for oid in (exclude_order_ids or ()) if oid}
+    if not exclude:
+        return list(fills)
+    return [f for f in fills if (f.get("order_id") or f.get("broker_order_id")) not in exclude]
 
 
 def _to_float(value: Any) -> Optional[float]:
@@ -280,8 +298,25 @@ def generate_reports(
     run_state: Dict[str, Any],
     fills: Sequence[Dict[str, Any]],
     output_dir: str | Path,
+    *,
+    exclude_order_ids: Optional[Iterable[str]] = None,
+    require_scheduled: bool = False,
 ) -> Dict[str, str]:
-    """Generate all four post-trade report files; return a map of their paths."""
+    """Generate all four post-trade report files; return a map of their paths.
+
+    Run-classification policy (task 67aa802b): the scheduled post-trade sync
+    passes ``require_scheduled=True`` so a manual ``run_state`` is refused rather
+    than published as scheduled-live metrics, and ``exclude_order_ids`` (e.g.
+    ``scripts.run_classification.collect_manual_order_ids()``) drops any fills
+    whose order_id belongs to a manual run so same-day manual fills in broker
+    history cannot leak into the scheduled-live slippage/coverage numbers.
+    """
+    if require_scheduled and _is_manual_run_state(run_state):
+        raise ValueError(
+            "refusing to generate scheduled-live reports from a manual run_state"
+        )
+    fills = _drop_excluded_fills(fills, exclude_order_ids)
+
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -338,3 +373,54 @@ def generate_reports(
         "slippage_and_coverage_report": str(report_path),
         "latest_run_summary": str(summary_path),
     }
+
+
+def _run_classification_helpers():
+    """Import the run-classification contract helpers, tolerating either import
+    layout (repo-root namespace package ``scripts`` or ``scripts/`` on sys.path)."""
+    try:
+        from scripts.run_classification import (  # type: ignore
+            collect_manual_order_ids,
+            select_scheduled_state_for_reporting,
+        )
+    except ImportError:  # scripts/ directly on sys.path
+        from run_classification import (  # type: ignore
+            collect_manual_order_ids,
+            select_scheduled_state_for_reporting,
+        )
+    return collect_manual_order_ids, select_scheduled_state_for_reporting
+
+
+def generate_scheduled_reports(
+    trading_day: str,
+    fills: Sequence[Dict[str, Any]],
+    output_dir: str | Path,
+    base: Optional[str | Path] = None,
+) -> Dict[str, str]:
+    """Task 67aa802b entry point: post-trade reports for the SCHEDULED run only.
+
+    Routes the whole flow through the run-classification contract:
+      * selects and validates the day's scheduled run_state (never infers a
+        scheduled run from broker orders alone),
+      * excludes every manual-run order ID from the broker ``fills``,
+      * refuses to emit reports unless a valid scheduled state exists.
+
+    ``fills`` is the same broker fill list ``generate_reports`` takes; ``base``
+    overrides the artifact root (defaults to the contract's STATE_ROOT).
+    """
+    collect_manual_order_ids, select_scheduled = _run_classification_helpers()
+    base_path = Path(base) if base is not None else None
+    selection = select_scheduled(trading_day, base=base_path)
+    if not selection.ok:
+        raise ValueError(
+            f"no valid scheduled run_state for {trading_day}: "
+            + "; ".join(selection.errors)
+        )
+    manual_ids = collect_manual_order_ids(base_path)
+    return generate_reports(
+        selection.state,
+        fills,
+        output_dir,
+        exclude_order_ids=manual_ids,
+        require_scheduled=True,
+    )

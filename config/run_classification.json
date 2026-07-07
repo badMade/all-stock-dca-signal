@@ -1,0 +1,112 @@
+{
+  "$schema": "../schemas/run_classification_policy.schema.json",
+  "policy_id": "run-classification-v1",
+  "version": "2026-07-06",
+  "purpose": "Single source of truth for distinguishing scheduled live runs of the graded DCA task from manual runs, so downstream slippage/watchdog/weekly reporting never confuses the two. Every run_state artifact must carry a run_classification block matching this policy.",
+  "state_schema_version": "run-classification-v1",
+  "live_task": {
+    "cron_id": "10ce362c",
+    "supersedes_cron_id": "ce16ba6b",
+    "lineage_note": "10ce362c is the repaired live task; it supersedes the deleted ce16ba6b. The artifact root stays under .../ce16ba6b for continuity across the repair.",
+    "name": "Graded DCA automatic live test - $3 allocation",
+    "schedule_et": "15:20",
+    "schedule_human": "3:20 PM ET weekdays",
+    "cron_utc": "20 19 * * 1-5",
+    "window_start_et": "15:15",
+    "window_end_et": "15:35",
+    "broker_account": "robinhood:562057042"
+  },
+  "artifact_paths": {
+    "state_root": "/home/user/workspace/cron_tracking/ce16ba6b",
+    "scheduled_run_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/",
+    "manual_run_dir": "/home/user/workspace/cron_tracking/ce16ba6b/manual_runs/<timestamp>/",
+    "latest_scheduled_run_pointer": "/home/user/workspace/cron_tracking/ce16ba6b/latest_scheduled_run.json",
+    "run_state_filename": "run_state.json"
+  },
+  "scheduled_run_classification": {
+    "run_origin": "scheduled",
+    "run_type": "scheduled_live_test",
+    "cron_id": "10ce362c",
+    "supersedes_cron_id": "ce16ba6b",
+    "scheduled_for_et": "15:20",
+    "scheduled_window_start_et": "15:15",
+    "scheduled_window_end_et": "15:35",
+    "manual_run": false,
+    "run_id_pattern": "scheduled_YYYYMMDD_1520ET",
+    "run_id_regex": "^scheduled_[0-9]{8}_1520ET$",
+    "lineage_rule": "A scheduled run is valid evidence when cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b', so continuity artifacts written before/after the repair both remain valid.",
+    "required_fields": [
+      "run_origin",
+      "run_type",
+      "cron_id",
+      "scheduled_for_et",
+      "scheduled_window_start_et",
+      "scheduled_window_end_et",
+      "manual_run",
+      "run_id",
+      "triggered_at_utc",
+      "state_schema_version"
+    ]
+  },
+  "manual_run_classification": {
+    "run_origin": "manual",
+    "manual_run": true,
+    "cron_id": "10ce362c",
+    "supersedes_cron_id": "ce16ba6b",
+    "run_id_pattern": "manual_YYYYMMDD_HHMMSSZ",
+    "run_id_must_not_match_scheduled": true,
+    "required_fields": [
+      "run_origin",
+      "manual_run",
+      "cron_id",
+      "run_id",
+      "triggered_at_utc",
+      "state_schema_version"
+    ]
+  },
+  "write_rules": {
+    "scheduled": [
+      "Write run_state.json under scheduled_runs/YYYYMMDD_1520ET/.",
+      "Update latest_scheduled_run.json to point at the just-written scheduled run.",
+      "run_classification.run_origin must be 'scheduled' and manual_run must be false."
+    ],
+    "manual": [
+      "Write run_state.json under manual_runs/<timestamp>/.",
+      "NEVER update latest_scheduled_run.json from a manual run.",
+      "run_classification.run_origin must be 'manual' and manual_run must be true with a distinct run_id."
+    ]
+  },
+  "downstream_reporting_rules": {
+    "applies_to_tasks": ["67aa802b", "a46bf007", "041d9d90", "0656657a"],
+    "rules": [
+      "Validate scheduled state files against run_classification.schema.json before use.",
+      "Collect every order_id found in manual_runs/**/run_state*.json and exclude them from all scheduled-live metrics.",
+      "Exclude any run_state whose run_classification has run_origin='manual' or manual_run=true, regardless of where the file is located on disk.",
+      "Never infer scheduled status from same-day broker orders alone; a valid scheduled run_state must exist.",
+      "Scheduled-live cost basis, slippage, reliability, and order-count metrics must be computed only from validated scheduled runs with manual order IDs excluded."
+    ]
+  },
+  "broker_time_window_fallback": {
+    "allowed": true,
+    "conditions": [
+      "A valid scheduled run_state exists (run_origin='scheduled', passes schema validation).",
+      "The scheduled run_state lacks order IDs due to a known/recorded write failure.",
+      "Only broker orders inside the scheduled window (15:15-15:35 ET) on the scheduled trading day may be attributed."
+    ],
+    "constraints": [
+      "Manual order IDs (from manual_runs/**/run_state*.json) must still be excluded even under fallback.",
+      "Fallback is never allowed when no valid scheduled run_state exists.",
+      "Fallback must not attribute orders from a run classified as manual."
+    ]
+  },
+  "manual_reporting": {
+    "section_label": "Manual Test Runs",
+    "rules": [
+      "Manual fills may be reported only inside a clearly labeled 'Manual Test Runs' section.",
+      "Manual fills must not affect scheduled-live cost basis.",
+      "Manual fills must not affect scheduled-live slippage.",
+      "Manual fills must not affect scheduled-live reliability.",
+      "Manual fills must not affect scheduled-live order-count metrics."
+    ]
+  }
+}
