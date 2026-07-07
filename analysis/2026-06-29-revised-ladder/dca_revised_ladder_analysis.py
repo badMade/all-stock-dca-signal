@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 from pathlib import Path
 
 import pandas as pd
 
 
-BASE = Path("/home/user/workspace/finance_data/dca_revised_ladder_2026_06_29")
+# Data/output directory. Override with DCA_LADDER_DIR; defaults to this script's own
+# folder so the analysis is portable rather than tied to one machine's absolute path.
+BASE = Path(os.environ.get("DCA_LADDER_DIR", Path(__file__).resolve().parent))
 OUT = BASE
 ACTIVE_TICKERS = [
     "DFTX", "TRIN", "AAAU", "SPCX", "TRLV", "RVI", "VCX", "EVR", "LUNR", "IRDM",

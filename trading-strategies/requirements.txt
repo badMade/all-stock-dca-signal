@@ -1,0 +1,15 @@
+# Third-party dependencies for the trading-strategies research tools
+# (backtest.py, strategy_monitor.py, sentiment_monitor.py, monday-sentiment/).
+# These are NOT required to run the core near-close graded DCA strategy.
+pandas
+numpy
+scipy
+requests
+jinja2
+yfinance
+vectorbt
+alpaca-py
+newsapi-python
+# Sentiment monitor only; large ML stack.
+transformers
+torch

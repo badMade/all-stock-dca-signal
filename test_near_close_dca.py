@@ -9,46 +9,41 @@ import json
 import os
 import tempfile
 from datetime import date, datetime, time, timedelta
-from typing import List, Optional
 
 from near_close_dca import (
     ACTIVE_TICKERS,
     BUDGET_TIERS,
     EASTERN,
     EXCLUDED_TICKERS,
+    MISSING_FILL_BROKER_BLOCKED,
+    MISSING_FILL_BUDGET_CAPPED,
+    MISSING_FILL_DATA_ERROR,
+    MISSING_FILL_EXECUTION_GAP,
+    MISSING_FILL_FAILED_TRIGGER,
+    USAGE_PROXY_FIELDS,
     Action,
     Bar,
     DryRunBroker,
-    select_budget_tier,
-    OrderFill,
     ReconciledDecision,
+    RunResult,
     SourceName,
     SourceSignal,
     StrategyConfig,
-    allocation_sort_key,
     StrategyState,
+    allocation_sort_key,
     build_execution_record,
     build_report,
     build_usage_proxy,
     classify_execution_quality,
     classify_missing_fill,
     evaluate_source_signal,
-    generate_slippage_report,
     graded_buy_multiplier,
     reconcile_signals,
     run_and_report,
     run_daily_compact,
+    select_budget_tier,
     write_run_artifacts,
-    write_run_state,
-    RunResult,
-    USAGE_PROXY_FIELDS,
-    MISSING_FILL_BUDGET_CAPPED,
-    MISSING_FILL_BROKER_BLOCKED,
-    MISSING_FILL_DATA_ERROR,
-    MISSING_FILL_EXECUTION_GAP,
-    MISSING_FILL_FAILED_TRIGGER,
 )
-
 
 # (drop percent from prior close, expected multiplier).
 LADDER_BOUNDARY_CASES = [
@@ -243,7 +238,8 @@ def test_allocation_sort_key_tie_break_is_alphabetical():
             ),
         )
 
-    order = lambda cs: [c.ticker for c in sorted(cs, key=allocation_sort_key)]
+    def order(cs):
+        return [c.ticker for c in sorted(cs, key=allocation_sort_key)]
 
     # Equal multiplier and drop -> ticker alphabetical breaks the tie (A->Z),
     # not the input/universe order.

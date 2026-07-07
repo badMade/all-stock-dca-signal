@@ -1,0 +1,82 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "all-stock-dca"
+version = "0.1.0"
+description = "Near-close graded dollar-cost-averaging strategy: signal logic, budgets, safeguards, reporting, and broker-agnostic adapters."
+readme = "docs/README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+# The core strategy, config loader, live adapters, reporting, and CLI are
+# standard-library only — no runtime third-party dependencies. Optional extras
+# (below) cover the separate trading-strategies research tools.
+dependencies = []
+
+[project.optional-dependencies]
+# Test/lint tooling.
+dev = [
+    "pytest>=7.4",
+    "ruff>=0.5",
+]
+# Heavy, undeclared-elsewhere deps used only by the trading-strategies/ research
+# tools (backtester, sentiment monitor). Not needed to run the DCA strategy.
+strategies = [
+    "pandas",
+    "numpy",
+    "scipy",
+    "requests",
+    "jinja2",
+    "yfinance",
+    "vectorbt",
+    "alpaca-py",
+    "newsapi-python",
+    "transformers",
+    "torch",
+]
+
+[project.scripts]
+run-dca = "run_dca:main"
+
+[tool.setuptools]
+# Flat single-file modules rather than a package tree; list them explicitly.
+py-modules = [
+    "near_close_dca",
+    "dca_config",
+    "dca_live_adapters",
+    "dca_reporting",
+    "dca_cost_tracker",
+    "dca_notion_sync",
+    "dca_weekly_dashboard",
+    "run_dca",
+]
+
+# Ship the version-controlled config so an installed `run-dca` (outside a checkout) finds
+# the live trading window instead of falling back to the hardcoded defaults. dca_config
+# resolves these via sys.prefix/share/all-stock-dca/config.
+[tool.setuptools.data-files]
+"share/all-stock-dca/config" = [
+    "config/budgets.json",
+    "config/tickers.json",
+    "config/sizing_ladder.json",
+    "config/trading_window.json",
+    "config/scheduled_tasks.json",
+    "config/notifications.json",
+    "config/reporting.json",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+# Third-party research tools and one-off analysis scripts are out of scope for the
+# core lint gate (they carry their own heavy deps and looser conventions).
+extend-exclude = ["trading-strategies", "analysis"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+ignore = ["E501"]

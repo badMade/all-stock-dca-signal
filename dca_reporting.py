@@ -87,7 +87,7 @@ def compute_slippage_rows(
         entry["filled_qty"] += qty
         entry["total_cost"] += qty * price
 
-    for ticker, data in fills_by_ticker.items():
+    for data in fills_by_ticker.values():
         if data["filled_qty"] > 0:
             data["filled_avg_price"] = data["total_cost"] / data["filled_qty"]
 

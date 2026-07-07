@@ -21,7 +21,6 @@ from backup_strategy import (  # noqa: E402
     write_configs,
 )
 
-
 SAMPLE = """
 Notes from the DCA thread (messy paste).
 

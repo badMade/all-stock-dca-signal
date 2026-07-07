@@ -21,8 +21,11 @@ the caller/scheduler.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
+
+logger = logging.getLogger("near_close_dca.cost_tracker")
 
 COST_TRACKER_TITLE = "Automation Cost Tracker"
 
@@ -99,7 +102,8 @@ def collect_month_run_states(
     for path in find_run_state_files(root):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("skipping unreadable run-state artifact %s: %s", path, exc)
             continue
         if data.get("status") == "blocked":
             continue
