@@ -23,9 +23,16 @@ must declare its origin, and every downstream reporting task must honor it.
 | Broker/account | Robinhood `562057042` only (Alpaca read-only) |
 
 The repaired live task `10ce362c` supersedes the deleted `ce16ba6b`. The
-artifact root stays under `.../ce16ba6b` for continuity across the repair. A
-scheduled run is valid evidence when **`cron_id='10ce362c'` OR
-`supersedes_cron_id='ce16ba6b'`**, so continuity artifacts remain valid.
+artifact root stays under `.../ce16ba6b` for continuity across the repair.
+
+**Writer contract:** every scheduled 3:20 PM ET run_state must be written with
+**both** `cron_id='10ce362c'` **and** `supersedes_cron_id='ce16ba6b'`.
+Placeholder or ambiguous ids such as `ce16ba6b_replacement` are **forbidden**
+(`supersedes_cron_id` must be exactly `ce16ba6b` or omitted).
+
+**Consumer acceptance:** for continuity, a scheduled run is valid evidence when
+**`cron_id='10ce362c'` OR `supersedes_cron_id='ce16ba6b'`**, so continuity
+artifacts written before/after the repair both remain valid.
 
 ## Artifact layout
 

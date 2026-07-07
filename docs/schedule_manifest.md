@@ -19,13 +19,23 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 > **Run-classification note:** the live task (`10ce362c`, the repaired task
 > that supersedes the deleted `ce16ba6b`; artifact root stays under
 > `.../ce16ba6b` for continuity) classifies every
-> run as scheduled or manual. Scheduled runs write under
+> run as scheduled or manual. Every scheduled 3:20 PM ET run_state must be
+> written with **both** `cron_id='10ce362c'` **and**
+> `supersedes_cron_id='ce16ba6b'`; placeholder/ambiguous ids such as
+> `ce16ba6b_replacement` are **forbidden**. Scheduled runs write under
 > `cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/` and update
 > `latest_scheduled_run.json`; manual runs write under `manual_runs/<timestamp>/`
 > and never touch that pointer. The slippage (`67aa802b`), watchdog
 > (`a46bf007`), weekly (`041d9d90`), and monthly (`0656657a`) tasks consume only
 > validated scheduled runs and exclude manual runs/order IDs. See
 > [run_classification.md](run_classification.md).
+
+> **Base-amount note:** the graded DCA base amount is exactly **$3.00**; every
+> candidate dollar amount is **`$3.00 × multiplier`**. The automation must never
+> infer, discover, or fall back to **$50.00** or any broker/account default. If
+> the base-amount config (`config/budgets.json`) is missing or unreadable,
+> continue using **$3.00** and record
+> `base_amount_source='hardcoded_user_confirmed_3_usd'`.
 
 | ID | Name | Type | Trades | Cron (UTC) | ET (EDT) | Status |
 |---|---|---|---|---|---|---|
@@ -61,7 +71,7 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 - Uses **only** Robinhood account `562057042`; Alpaca is read-only.
 - Trigger gate: `programmatic_trigger_check.sh`, allowing weekdays **2026-07-02 through 2026-08-28**, **3:20–3:55 PM ET**.
 - Writes standardized same-day state files under `/home/user/workspace/cron_tracking/ce16ba6b` ([`schemas/run_state.schema.json`](../schemas/run_state.schema.json)); must **not** fall back to interactive confirmation.
-- **Run classification:** a scheduled run writes `scheduled_runs/YYYYMMDD_1520ET/run_state.json` (`run_origin='scheduled'`, `run_id='scheduled_YYYYMMDD_1520ET'`, and `cron_id='10ce362c'` OR `supersedes_cron_id='ce16ba6b'`) and updates `latest_scheduled_run.json`; a manual run writes `manual_runs/<timestamp>/run_state.json` (`run_origin='manual'`, `manual_run=true`) and never updates that pointer. See [run_classification.md](run_classification.md).
+- **Run classification:** a scheduled run writes `scheduled_runs/YYYYMMDD_1520ET/run_state.json` (`run_origin='scheduled'`, `manual_run=false`, `scheduled_for_et='15:20'`, `state_schema_version='run-classification-v1'`, `run_id='scheduled_YYYYMMDD_1520ET'`, and **both** `cron_id='10ce362c'` **and** `supersedes_cron_id='ce16ba6b'`) and updates `latest_scheduled_run.json`; a manual run writes `manual_runs/<timestamp>/run_state.json` (`run_origin='manual'`, `manual_run=true`) and never updates that pointer. Placeholder/ambiguous ids such as `ce16ba6b_replacement` are forbidden; for continuity, consumers still accept `cron_id='10ce362c'` OR `supersedes_cron_id='ce16ba6b'` as valid evidence. See [run_classification.md](run_classification.md).
 - **Manual runs do not count as scheduled-run evidence.** Any stale stored display name is superseded by the authoritative **3:20 PM ET** schedule.
 
 ### `d72aa525` — Capital-priority briefing
