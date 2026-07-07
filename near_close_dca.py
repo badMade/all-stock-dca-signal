@@ -77,6 +77,7 @@ ACTIVE_TICKERS = [
 
 EXCLUDED_TICKERS = {"BYDDY"}
 
+
 def _weekday_range(start: date, end: date) -> set:
     """All Mon-Fri dates in [start, end] inclusive."""
     days = set()
@@ -88,15 +89,21 @@ def _weekday_range(start: date, end: date) -> set:
     return days
 
 
+# US equity-market full closures that fall inside the live window (weekdays only,
+# so weekend holidays are already excluded). 2026-07-03 is the observed
+# Independence Day (Jul 4 2026 is a Saturday). Labor Day (2026-09-07) is past the
+# window. Excluding these keeps the date gate meaning "an actual trading day."
+MARKET_HOLIDAYS = frozenset({date(2026, 7, 3)})
+
 # Approved live-test window. The original pilot dates (Jun 29 - Jul 1 2026) plus
-# the canonical live window of weekdays 2026-07-02 through 2026-08-28 inclusive,
-# matching the ce16ba6b/10ce362c trigger_window in config/scheduled_tasks.json.
-# Without this, run_once()'s date gate would mark every scheduled run in the live
-# window blocked/no-trade.
+# the canonical live window of weekdays 2026-07-02 through 2026-08-28 inclusive
+# (minus market holidays), matching the ce16ba6b/10ce362c trigger_window in
+# config/scheduled_tasks.json. Without this, run_once()'s date gate would mark
+# every scheduled run in the live window blocked/no-trade.
 APPROVED_TEST_DATES = (
     {date(2026, 6, 29), date(2026, 6, 30), date(2026, 7, 1)}
     | _weekday_range(date(2026, 7, 2), date(2026, 8, 28))
-)
+) - MARKET_HOLIDAYS
 
 
 class Action(str, Enum):

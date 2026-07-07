@@ -346,6 +346,22 @@ def test_broker_fallback_excludes_out_of_window_orders():
         assert sel.order_ids == ["IN-1", "IN-2"]  # out-of-window and untimed dropped
 
 
+def test_broker_fallback_converts_utc_timestamps_to_et():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        write_run_artifacts(_scheduled_state(order_ids=()), base=base)
+        sel = select_scheduled_state_for_reporting(
+            TRADING_DAY, base=base,
+            broker_window_orders=[
+                {"order_id": "UTC-IN", "submitted_at_et": "2026-07-06T19:20:00Z"},   # 15:20 EDT -> in
+                {"order_id": "UTC-OUT", "submitted_at_et": "2026-07-06T19:50:00Z"},  # 15:50 EDT -> out
+            ],
+            scheduled_state_write_failed=True,
+        )
+        assert sel.ok and sel.used_broker_fallback
+        assert sel.order_ids == ["UTC-IN"]  # UTC correctly converted; out-of-window dropped
+
+
 def test_no_fallback_when_not_flagged_write_failure():
     with tempfile.TemporaryDirectory() as d:
         base = Path(d)

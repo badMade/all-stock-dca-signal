@@ -31,6 +31,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from typing import Dict, Iterable, List, Mapping, Optional, Set
 
 # --- Contract constants (mirror config/run_classification.json) --------------
@@ -53,10 +54,35 @@ LATEST_SCHEDULED_RUN_FILENAME = "latest_scheduled_run.json"
 SCHEDULED_RUN_ID_RE = re.compile(r"^scheduled_[0-9]{8}_1520ET$")
 
 
+_EASTERN = ZoneInfo("America/New_York")
+
+
+def _parse_iso_datetime(text: str) -> Optional[datetime]:
+    """Parse an ISO-8601 datetime, tolerating a trailing 'Z'. None if not a
+    full datetime (a bare 'HH:MM' wall-clock is handled separately)."""
+    text = text.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
 def _et_minutes(value: object) -> Optional[int]:
-    """Minutes-since-midnight from an ET wall-clock like '15:20', '15:20:33', or
-    an ISO timestamp whose time part is ET ('...T15:20:00-04:00'). None if
-    unparseable. Callers must supply ET-local times (the field is *_et)."""
+    """Minutes-since-midnight in **ET** for an order timestamp.
+
+    Accepts a bare ET wall-clock ('15:20', '15:20:33'), a naive ISO datetime
+    (assumed already ET), or a tz-aware ISO string / ``datetime`` — which is
+    converted to America/New_York first, so a UTC ``'...T19:20:00Z'`` correctly
+    reads as 15:20 ET rather than being dropped. Returns None if unparseable.
+    """
+    dt = value if isinstance(value, datetime) else _parse_iso_datetime(str(value))
+    if dt is not None:
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(_EASTERN)
+        return dt.hour * 60 + dt.minute
+    # Bare 'HH:MM[:SS]' wall-clock with no date -> treated as ET.
     match = re.search(r"(\d{1,2}):(\d{2})", str(value))
     if not match:
         return None
@@ -471,9 +497,11 @@ def select_scheduled_state_for_reporting(
         timestamp lands inside the 15:15-15:35 scheduled window are attributed.
 
     ``broker_window_orders`` items are mappings carrying at least ``order_id``
-    (or ``broker_order_id``) and ``submitted_at_et`` (ET wall-clock, e.g.
-    ``"15:20"`` or an ET ISO timestamp). Orders with no parseable in-window ET
-    time are dropped rather than attributed.
+    (or ``broker_order_id``) and ``submitted_at_et``: a bare ET wall-clock
+    (``"15:20"``), a naive ET ISO timestamp, or a tz-aware ISO timestamp /
+    ``datetime`` (converted to ET before the window compare, so UTC order history
+    is handled correctly). Orders with no parseable in-window time are dropped
+    rather than attributed.
     """
     manual_ids = collect_manual_order_ids(base)
     out_dir = scheduled_run_dir(trading_day, base)

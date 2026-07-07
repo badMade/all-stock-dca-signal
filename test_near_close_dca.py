@@ -217,6 +217,18 @@ def test_reconciled_decision_carries_target_fields():
     assert decision.decision_bar_close == 98.0
 
 
+def test_approved_dates_cover_window_and_exclude_holidays():
+    from near_close_dca import APPROVED_TEST_DATES
+
+    # Full canonical window is covered...
+    assert date(2026, 7, 2) in APPROVED_TEST_DATES
+    assert date(2026, 8, 28) in APPROVED_TEST_DATES
+    # ...weekends are excluded...
+    assert date(2026, 7, 4) not in APPROVED_TEST_DATES  # Saturday
+    # ...and the observed Independence Day holiday (Fri 2026-07-03) is excluded.
+    assert date(2026, 7, 3) not in APPROVED_TEST_DATES
+
+
 def test_allocation_sort_key_tie_break_is_alphabetical():
     from types import SimpleNamespace
 
