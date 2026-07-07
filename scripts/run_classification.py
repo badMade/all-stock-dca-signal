@@ -31,7 +31,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Dict, Iterable, List, Mapping, Optional, Set
 
 # --- Contract constants (mirror config/run_classification.json) --------------
 
@@ -51,6 +51,31 @@ RUN_STATE_FILENAME = "run_state.json"
 LATEST_SCHEDULED_RUN_FILENAME = "latest_scheduled_run.json"
 
 SCHEDULED_RUN_ID_RE = re.compile(r"^scheduled_[0-9]{8}_1520ET$")
+
+
+def _et_minutes(value: object) -> Optional[int]:
+    """Minutes-since-midnight from an ET wall-clock like '15:20', '15:20:33', or
+    an ISO timestamp whose time part is ET ('...T15:20:00-04:00'). None if
+    unparseable. Callers must supply ET-local times (the field is *_et)."""
+    match = re.search(r"(\d{1,2}):(\d{2})", str(value))
+    if not match:
+        return None
+    hh, mm = int(match.group(1)), int(match.group(2))
+    if not (0 <= hh < 24 and 0 <= mm < 60):
+        return None
+    return hh * 60 + mm
+
+
+_WINDOW_START_MIN = _et_minutes(SCHEDULED_WINDOW_START_ET)  # 15:15
+_WINDOW_END_MIN = _et_minutes(SCHEDULED_WINDOW_END_ET)      # 15:35
+
+
+def _in_scheduled_window_et(submitted_at_et: object) -> bool:
+    """True only if an ET timestamp falls within the scheduled window (inclusive)."""
+    minutes = _et_minutes(submitted_at_et)
+    if minutes is None:
+        return False
+    return _WINDOW_START_MIN <= minutes <= _WINDOW_END_MIN
 
 SCHEDULED_REQUIRED_FIELDS = (
     "run_origin",
@@ -431,7 +456,7 @@ class ScheduledSelection:
 def select_scheduled_state_for_reporting(
     trading_day: str,
     base: Optional[Path] = None,
-    broker_window_order_ids: Optional[Iterable[str]] = None,
+    broker_window_orders: Optional[Iterable[Mapping[str, object]]] = None,
     scheduled_state_write_failed: bool = False,
 ) -> ScheduledSelection:
     """Pick the scheduled run_state for a trading day and derive its order IDs.
@@ -442,7 +467,13 @@ def select_scheduled_state_for_reporting(
       * Never infer scheduled status from broker orders alone.
       * Broker time-window fallback is allowed ONLY when a valid scheduled
         state exists but lacks order IDs due to a known write failure; even
-        then manual order IDs are excluded.
+        then manual order IDs are excluded AND only broker orders whose ET
+        timestamp lands inside the 15:15-15:35 scheduled window are attributed.
+
+    ``broker_window_orders`` items are mappings carrying at least ``order_id``
+    (or ``broker_order_id``) and ``submitted_at_et`` (ET wall-clock, e.g.
+    ``"15:20"`` or an ET ISO timestamp). Orders with no parseable in-window ET
+    time are dropped rather than attributed.
     """
     manual_ids = collect_manual_order_ids(base)
     out_dir = scheduled_run_dir(trading_day, base)
@@ -490,12 +521,24 @@ def select_scheduled_state_for_reporting(
 
     used_fallback = False
     fallback_reason: Optional[str] = None
-    if not kept and scheduled_state_write_failed and broker_window_order_ids is not None:
+    if not kept and scheduled_state_write_failed and broker_window_orders is not None:
         # Valid scheduled state exists but has no usable order IDs due to a known
-        # write failure: attribute in-window broker orders, still excluding manual.
+        # write failure: attribute broker orders that fall inside the scheduled
+        # ET window, still excluding manual IDs.
         used_fallback = True
         fallback_reason = "scheduled state present but order IDs missing (known write failure)"
-        kept = [oid for oid in broker_window_order_ids if oid not in manual_ids]
+        seen_fallback: Set[str] = set()
+        kept = []
+        for order in broker_window_orders:
+            if not isinstance(order, Mapping):
+                continue
+            oid = order.get("order_id") or order.get("broker_order_id")
+            if not (isinstance(oid, str) and oid) or oid in manual_ids or oid in seen_fallback:
+                continue
+            if not _in_scheduled_window_et(order.get("submitted_at_et")):
+                continue
+            seen_fallback.add(oid)
+            kept.append(oid)
 
     return ScheduledSelection(
         state=state,

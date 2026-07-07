@@ -23,12 +23,31 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 
+def _is_manual_run_state(data: Dict[str, Any]) -> bool:
+    """True if a run_state is a manual run per its run_classification block.
+
+    The weekly Friday dashboard is scheduled-live only, so manual runs must be
+    dropped before aggregation (run-classification contract). Defensive OR:
+    either run_origin='manual' or manual_run=true marks it manual.
+    """
+    rc = data.get("run_classification") if isinstance(data, dict) else None
+    if not isinstance(rc, dict):
+        return False
+    return rc.get("run_origin") == "manual" or rc.get("manual_run") is True
+
+
 def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     """Load artifacts, skipping the minimal ``status: "blocked"`` run_state stubs
     written for date-gated days — they are not run days and would otherwise be
-    counted into the weekly snapshot/table denominators."""
+    counted into the weekly snapshot/table denominators — and skipping any
+    manual run_states so manual candidates/notional never enter the
+    scheduled-live weekly cost basis, reliability, or order-count metrics."""
     loaded = [json.loads(Path(p).read_text(encoding="utf-8")) for p in paths]
-    return [data for data in loaded if data.get("status") != "blocked"]
+    return [
+        data
+        for data in loaded
+        if data.get("status") != "blocked" and not _is_manual_run_state(data)
+    ]
 
 
 def _num(value: Any) -> float:

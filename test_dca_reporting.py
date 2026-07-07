@@ -206,6 +206,34 @@ def test_generate_reports_writes_all_files(tmp_path=None):
     assert "target_price_missing" in report
 
 
+def test_generate_reports_excludes_manual_order_ids(tmp_path=None):
+    import tempfile
+    from pathlib import Path
+
+    directory = tmp_path or Path(tempfile.mkdtemp())
+    # O2 (NVDA) is a manual-run order that leaked into same-day broker fills.
+    paths = generate_reports(_run_state(), _fills(), directory, exclude_order_ids={"O2"})
+    summary = json.loads(Path(paths["latest_run_summary"]).read_text())
+    # AAPL + AMD remain filled; NVDA's excluded fill becomes a missing fill.
+    assert summary["coverage"]["fills"] == 2
+    assert "NVDA" not in Path(paths["slippage_ranked"]).read_text()
+
+
+def test_generate_reports_rejects_manual_state_when_scheduled_required(tmp_path=None):
+    import tempfile
+    from pathlib import Path
+
+    directory = tmp_path or Path(tempfile.mkdtemp())
+    manual = _run_state()
+    manual["run_classification"] = {"run_origin": "manual", "manual_run": True}
+    try:
+        generate_reports(manual, _fills(), directory, require_scheduled=True)
+    except ValueError as exc:
+        assert "manual run_state" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for a manual run_state")
+
+
 def test_build_run_artifacts_captures_target_price():
     from datetime import date, datetime, time
     from zoneinfo import ZoneInfo
@@ -268,6 +296,21 @@ def test_load_json_files_skips_blocked_stubs(tmp_path):
 
     loaded = load_json_files([real, blocked])
     # Date-gated stubs must not count as run days in the weekly dashboard.
+    assert len(loaded) == 1
+    assert loaded[0]["trading_day"] == "2026-06-29"
+
+
+def test_load_json_files_skips_manual_states(tmp_path):
+    real = tmp_path / "run_state.json"
+    real.write_text(json.dumps(_run_state()), encoding="utf-8")
+    manual_state = _run_state()
+    manual_state["trading_day"] = "2026-06-30"
+    manual_state["run_classification"] = {"run_origin": "manual", "manual_run": True}
+    manual = tmp_path / "manual_run_state.json"
+    manual.write_text(json.dumps(manual_state), encoding="utf-8")
+
+    loaded = load_json_files([real, manual])
+    # The Friday dashboard is scheduled-live only: manual runs are dropped.
     assert len(loaded) == 1
     assert loaded[0]["trading_day"] == "2026-06-29"
 

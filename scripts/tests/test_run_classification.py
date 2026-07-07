@@ -297,7 +297,8 @@ def test_select_requires_valid_scheduled_state():
         write_run_artifacts(_manual_state(), base=base)
         sel = select_scheduled_state_for_reporting(
             TRADING_DAY, base=base,
-            broker_window_order_ids=["BRK-1"], scheduled_state_write_failed=True,
+            broker_window_orders=[{"order_id": "BRK-1", "submitted_at_et": "15:20"}],
+            scheduled_state_write_failed=True,
         )
         assert not sel.ok
         assert sel.state is None
@@ -313,12 +314,36 @@ def test_broker_fallback_only_with_scheduled_state_and_excludes_manual():
         write_run_artifacts(_manual_state(order_ids=("MAN-9",)), base=base)
         sel = select_scheduled_state_for_reporting(
             TRADING_DAY, base=base,
-            broker_window_order_ids=["BRK-1", "MAN-9", "BRK-2"],
+            broker_window_orders=[
+                {"order_id": "BRK-1", "submitted_at_et": "15:20"},
+                {"order_id": "MAN-9", "submitted_at_et": "15:21"},
+                {"order_id": "BRK-2", "submitted_at_et": "15:34"},
+            ],
             scheduled_state_write_failed=True,
         )
         assert sel.ok
         assert sel.used_broker_fallback
         assert sel.order_ids == ["BRK-1", "BRK-2"]  # MAN-9 still excluded
+
+
+def test_broker_fallback_excludes_out_of_window_orders():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        write_run_artifacts(_scheduled_state(order_ids=()), base=base)
+        sel = select_scheduled_state_for_reporting(
+            TRADING_DAY, base=base,
+            broker_window_orders=[
+                {"order_id": "EARLY", "submitted_at_et": "15:10"},   # before 15:15
+                {"order_id": "IN-1", "submitted_at_et": "15:15"},    # inclusive start
+                {"order_id": "IN-2", "submitted_at_et": "2026-07-06T15:35:00-04:00"},  # inclusive end, ISO
+                {"order_id": "LATE", "submitted_at_et": "15:50"},    # after 15:35
+                {"order_id": "NOTIME"},                              # no timestamp -> dropped
+            ],
+            scheduled_state_write_failed=True,
+        )
+        assert sel.ok
+        assert sel.used_broker_fallback
+        assert sel.order_ids == ["IN-1", "IN-2"]  # out-of-window and untimed dropped
 
 
 def test_no_fallback_when_not_flagged_write_failure():
@@ -327,7 +352,8 @@ def test_no_fallback_when_not_flagged_write_failure():
         write_run_artifacts(_scheduled_state(order_ids=()), base=base)
         sel = select_scheduled_state_for_reporting(
             TRADING_DAY, base=base,
-            broker_window_order_ids=["BRK-1"], scheduled_state_write_failed=False,
+            broker_window_orders=[{"order_id": "BRK-1", "submitted_at_et": "15:20"}],
+            scheduled_state_write_failed=False,
         )
         # Valid scheduled state, but no write-failure flag -> no fallback, no orders.
         assert sel.ok

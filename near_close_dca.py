@@ -77,11 +77,26 @@ ACTIVE_TICKERS = [
 
 EXCLUDED_TICKERS = {"BYDDY"}
 
-APPROVED_TEST_DATES = {
-    date(2026, 6, 29),
-    date(2026, 6, 30),
-    date(2026, 7, 1),
-}
+def _weekday_range(start: date, end: date) -> set:
+    """All Mon-Fri dates in [start, end] inclusive."""
+    days = set()
+    cursor = start
+    while cursor <= end:
+        if cursor.weekday() < 5:  # 0=Mon .. 4=Fri
+            days.add(cursor)
+        cursor += timedelta(days=1)
+    return days
+
+
+# Approved live-test window. The original pilot dates (Jun 29 - Jul 1 2026) plus
+# the canonical live window of weekdays 2026-07-02 through 2026-08-28 inclusive,
+# matching the ce16ba6b/10ce362c trigger_window in config/scheduled_tasks.json.
+# Without this, run_once()'s date gate would mark every scheduled run in the live
+# window blocked/no-trade.
+APPROVED_TEST_DATES = (
+    {date(2026, 6, 29), date(2026, 6, 30), date(2026, 7, 1)}
+    | _weekday_range(date(2026, 7, 2), date(2026, 8, 28))
+)
 
 
 class Action(str, Enum):

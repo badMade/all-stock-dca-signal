@@ -22,12 +22,30 @@ from __future__ import annotations
 import csv
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 
 def load_run_state(path: str | Path) -> Dict[str, Any]:
     """Load a ``run_state.json`` artifact produced by the live-run path."""
     return json.loads(Path(path).read_text())
+
+
+def _is_manual_run_state(run_state: Dict[str, Any]) -> bool:
+    """True if a run_state is a manual run per its run_classification block."""
+    rc = run_state.get("run_classification") if isinstance(run_state, dict) else None
+    if not isinstance(rc, dict):
+        return False
+    return rc.get("run_origin") == "manual" or rc.get("manual_run") is True
+
+
+def _drop_excluded_fills(
+    fills: Sequence[Dict[str, Any]], exclude_order_ids: Optional[Iterable[str]]
+) -> List[Dict[str, Any]]:
+    """Return fills minus any whose order_id is a known manual-run order."""
+    exclude = {oid for oid in (exclude_order_ids or ()) if oid}
+    if not exclude:
+        return list(fills)
+    return [f for f in fills if (f.get("order_id") or f.get("broker_order_id")) not in exclude]
 
 
 def _to_float(value: Any) -> Optional[float]:
@@ -280,8 +298,25 @@ def generate_reports(
     run_state: Dict[str, Any],
     fills: Sequence[Dict[str, Any]],
     output_dir: str | Path,
+    *,
+    exclude_order_ids: Optional[Iterable[str]] = None,
+    require_scheduled: bool = False,
 ) -> Dict[str, str]:
-    """Generate all four post-trade report files; return a map of their paths."""
+    """Generate all four post-trade report files; return a map of their paths.
+
+    Run-classification policy (task 67aa802b): the scheduled post-trade sync
+    passes ``require_scheduled=True`` so a manual ``run_state`` is refused rather
+    than published as scheduled-live metrics, and ``exclude_order_ids`` (e.g.
+    ``scripts.run_classification.collect_manual_order_ids()``) drops any fills
+    whose order_id belongs to a manual run so same-day manual fills in broker
+    history cannot leak into the scheduled-live slippage/coverage numbers.
+    """
+    if require_scheduled and _is_manual_run_state(run_state):
+        raise ValueError(
+            "refusing to generate scheduled-live reports from a manual run_state"
+        )
+    fills = _drop_excluded_fills(fills, exclude_order_ids)
+
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
