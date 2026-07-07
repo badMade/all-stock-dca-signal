@@ -100,6 +100,42 @@ def _execution_targets_from_orders_csv(orders_csv: Path) -> Dict[str, Optional[f
     return targets
 
 
+def _refresh_fills_from_broker(
+    orders_csv: Path, broker: BrokerAdapter, fills: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Re-query the broker for submitted-but-unfilled orders and append any fresh fills.
+
+    The immediate post-trade fill lookup can miss a fill that settles moments later; by the
+    3:45 reporting step it is available. Only orders not already recorded as filled are
+    re-queried, and lookup failures are swallowed so reporting never crashes.
+    """
+    if not orders_csv.exists():
+        return fills
+    known = {f.get("order_id") for f in fills}
+    refreshed = list(fills)
+    with orders_csv.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            order_id = row.get("order_id")
+            if not order_id or order_id in known or (row.get("status") or "").lower() == "filled":
+                continue
+            try:
+                fill = broker.get_order_fill(order_id)
+            except Exception:  # noqa: BLE001 - a fill re-query must never crash reporting
+                logger.exception("fill refresh failed for %s", order_id)
+                continue
+            if fill is not None and fill.quantity_filled > 0 and fill.avg_fill_price > 0:
+                refreshed.append(
+                    {
+                        "ticker": row.get("ticker"),
+                        "fill_price": fill.avg_fill_price,
+                        "filled_qty": fill.quantity_filled,
+                        "order_id": order_id,
+                    }
+                )
+                known.add(order_id)
+    return refreshed
+
+
 def run_pipeline(
     now: datetime,
     config: StrategyConfig,
@@ -145,6 +181,9 @@ def run_pipeline(
     run_state = json.loads((out / "run_state.json").read_text(encoding="utf-8"))
     orders_csv = out / "orders.csv"
     fills = _fills_from_orders_csv(orders_csv)
+    # A fill can land between placement and this (later) reporting step; re-query the broker
+    # for any submitted-but-unfilled order so it is not reported as a missing execution gap.
+    fills = _refresh_fills_from_broker(orders_csv, broker, fills)
     # Align candidate target prices with the durable execution records so the slippage
     # report ranks against the same target the orders CSV uses (the signal-time quote).
     targets = _execution_targets_from_orders_csv(orders_csv)

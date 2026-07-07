@@ -87,6 +87,31 @@ def test_execution_targets_from_orders_csv(tmp_path):
     assert targets["MU"] is None
 
 
+def test_refresh_fills_from_broker(tmp_path):
+    from near_close_dca import OrderFill
+    from run_dca import _refresh_fills_from_broker
+
+    csv_path = tmp_path / "orders.csv"
+    csv_path.write_text(
+        "ticker,status,order_id\n"
+        "AAPL,submitted,O1\n"
+        "NVDA,filled,O2\n",
+        encoding="utf-8",
+    )
+
+    class _Broker:
+        def get_order_fill(self, order_id):
+            # A fill has since settled for the previously-submitted order.
+            if order_id == "O1":
+                return OrderFill(avg_fill_price=100.0, quantity_filled=0.5)
+            return None
+
+    fills = _refresh_fills_from_broker(csv_path, _Broker(), [])
+    assert len(fills) == 1
+    assert fills[0]["ticker"] == "AAPL"
+    assert fills[0]["fill_price"] == 100.0
+
+
 def test_fills_from_missing_csv_is_empty(tmp_path):
     assert _fills_from_orders_csv(tmp_path / "nope.csv") == []
 

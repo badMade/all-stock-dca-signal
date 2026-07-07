@@ -80,6 +80,13 @@ def test_to_float_defaults():
     assert _to_float("garbage", default=0.0) == 0.0
 
 
+def test_to_float_rejects_non_finite():
+    # NaN/inf must collapse to the default so they can't bypass a numeric gate.
+    assert _to_float("NaN", default=0.0) == 0.0
+    assert _to_float("inf", default=0.0) == 0.0
+    assert _to_float(float("nan"), default=-1.0) == -1.0
+
+
 def test_rh_interval_mapping_and_rejection():
     assert _rh_interval(5) == "5minute"
     assert _rh_interval(30) == "30minute"
@@ -217,6 +224,17 @@ def test_broker_place_live_when_gated_on():
         place_fn=lambda **k: {"data": {"order": {"id": "ORD-42"}}},
     )
     assert broker.place_market_buy("AAPL", 1.0, "ref1") == "ORD-42"
+
+
+def test_broker_place_raises_on_outer_failure_envelope():
+    # A failure envelope carrying an inner order id must not be read as a successful submit.
+    broker = RobinhoodBroker(
+        account="562057042",
+        enable_live_orders=True,
+        place_fn=lambda **k: {"success": False, "data": {"order": {"id": "ORD-9"}}},
+    )
+    with pytest.raises(RuntimeError, match="failed"):
+        broker.place_market_buy("AAPL", 1.0, "ref1")
 
 
 def test_broker_place_live_raises_on_terminal_state():
@@ -371,6 +389,11 @@ def test_interpret_review_fails_closed_on_error_shaped_dict():
     assert _interpret_review({"data": {"approved": False}})[0] is False
 
 
+def test_interpret_review_fails_closed_on_outer_failure_envelope():
+    # Failure flag at the outer envelope with inner data must still block.
+    assert _interpret_review({"success": False, "data": {"quote": {"ask": "1.0"}}})[0] is False
+
+
 def test_interpret_review_plain_warning_string_does_not_block():
     # A harmless string under "warnings" must not reject an otherwise valid candidate.
     ok, _ = _interpret_review({"data": {"warnings": ["wide spread"], "quote": {"ask": "1.00"}}})
@@ -399,3 +422,11 @@ def test_build_broker_robinhood_when_wired():
     assert isinstance(broker, RobinhoodBroker)
     assert broker.account_number() == StrategyConfig().target_account_number
     assert broker.enable_live_orders is False
+
+
+def test_build_broker_refuses_simulator_on_live_run():
+    # dry_run=False without live callables must not silently hand back the DryRunBroker.
+    with pytest.raises(RuntimeError, match="dry_run is False"):
+        build_broker(StrategyConfig(broker=BrokerName.ROBINHOOD, dry_run=False))
+    # dry_run=True is fine (returns the simulator).
+    assert isinstance(build_broker(StrategyConfig(broker=BrokerName.ROBINHOOD, dry_run=True)), DryRunBroker)

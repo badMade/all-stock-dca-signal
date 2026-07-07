@@ -692,6 +692,15 @@ def build_broker(
         from dca_live_adapters import RobinhoodBroker
 
         return RobinhoodBroker(account=config.target_account_number, **adapter_kwargs)
+    if not config.dry_run:
+        # A live run (dry_run=False) must never fall through to the DryRunBroker: run_once's
+        # live branch would call its place_market_buy, record the buy, and mark it submitted
+        # with a DRY-RUN id though no order was sent. Refuse the unwired build instead.
+        raise RuntimeError(
+            "build_broker: config.dry_run is False but no live broker could be constructed "
+            f"for {config.broker.value} (no adapter callables supplied). Wire the broker "
+            "callables or set dry_run=True."
+        )
     return DryRunBroker(account=config.target_account_number)
 
 
@@ -1795,7 +1804,21 @@ def run_once(
                 "skip_reason": "dry_run: order not placed",
             }
         else:
-            order_id = broker.place_market_buy(ticker, decision.suggested_amount_usd, ref_id=ref_id)
+            try:
+                order_id = broker.place_market_buy(ticker, decision.suggested_amount_usd, ref_id=ref_id)
+            except Exception as exc:  # noqa: BLE001 - isolate one bad placement from the rest
+                # A failed placement (no order id, terminal/failed state, wrapper error) must
+                # not abort the whole run: earlier successful orders would then lose their
+                # durable run_state/orders.csv record. Record the failure and keep going so
+                # artifacts are always written and other candidates still get a chance.
+                errors_count += 1
+                candidate_outcomes[ticker] = {
+                    "status": "failed",
+                    "order_id": None,
+                    "skip_reason": f"placement failed: {exc}",
+                }
+                logger.error("Placement failed for %s: %s", ticker, exc)
+                continue
             state.record_buy(ticker, trading_day, decision.suggested_amount_usd)
             logger.info(
                 "Placed buy for %s: $%.2f, order_id=%s",

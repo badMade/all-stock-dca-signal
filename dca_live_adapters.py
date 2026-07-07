@@ -25,6 +25,7 @@ Safety posture
 from __future__ import annotations
 
 import logging
+import math
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -68,13 +69,19 @@ def _unwrap(payload: Any) -> Dict[str, Any]:
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
-    """Best-effort float parse for Robinhood's stringified numbers; ``None`` -> default."""
+    """Best-effort float parse for Robinhood's stringified numbers; ``None`` -> default.
+
+    Non-finite values (``NaN``/``inf`` from e.g. ``"NaN"``) collapse to ``default`` so they
+    can never slip through a numeric comparison — a NaN buying power would make
+    ``buying_power < amount`` false and bypass the gate.
+    """
     if value is None:
         return default
     try:
-        return float(value)
+        result = float(value)
     except (TypeError, ValueError):
         return default
+    return result if math.isfinite(result) else default
 
 
 def _is_error_response(data: Dict[str, Any]) -> Optional[str]:
@@ -92,6 +99,20 @@ def _is_error_response(data: Dict[str, Any]) -> Optional[str]:
         if data.get(flag) is False:
             return f"{flag}=false"
     return None
+
+
+def _response_failure(response: Any) -> Optional[str]:
+    """Detect a wrapper failure reported at the outer envelope OR inside ``data``.
+
+    ``_unwrap`` strips the ``{"data": ...}`` layer, which would hide a failure envelope
+    like ``{"success": false, "data": {...}}``. Check both levels so a failure that still
+    carries inner data is never mistaken for success.
+    """
+    if isinstance(response, dict):
+        outer = _is_error_response(response)
+        if outer:
+            return outer
+    return _is_error_response(_unwrap(response))
 
 
 def _parse_rfc3339(value: Any) -> Optional[datetime]:
@@ -429,12 +450,12 @@ class RobinhoodBroker:
             symbol=ticker,
             created_at_gte=trading_day.isoformat(),
         )
-        data = _unwrap(response)
-        error = _is_error_response(data)
+        error = _response_failure(response)
         if error is not None:
             # Fail closed: an error-shaped lookup ("no orders" by omission) must not let
             # the one-order-per-ticker-per-day guard pass and allow a duplicate buy.
             raise RuntimeError(f"same-day order lookup for {ticker} failed: {error}")
+        data = _unwrap(response)
         for order in data.get("orders") or []:
             if str(order.get("state", "")).lower() in _LIVE_ORDER_STATES:
                 return True
@@ -488,6 +509,12 @@ class RobinhoodBroker:
             time_in_force=self._time_in_force,
             ref_id=ref_id,
         )
+        outer_failure = _response_failure(response)
+        if outer_failure is not None:
+            # A failure envelope that still carries an inner order id (e.g.
+            # {"success": false, "data": {"order": {...}}}) must not be read as success.
+            logger.error("place_equity_order for %s reported failure: %s", ticker, response)
+            raise RuntimeError(f"live placement for {ticker} failed: {outer_failure}")
         data = _unwrap(response)
         order = data.get("order") or data
         order_id = order.get("id") or order.get("order_id")
@@ -612,12 +639,13 @@ def _interpret_review(response: Any) -> Tuple[bool, str]:
         return True, "empty review response; no blocking alerts reported"
     blocking: List[str] = []
 
-    # Explicit failure signals: fail closed when the wrapper reports failure as data.
-    if data.get("error"):
-        blocking.append(f"error: {data.get('error')}")
-    for flag in ("success", "ok", "approved"):
-        if data.get(flag) is False:
-            blocking.append(f"{flag}=false")
+    # Explicit failure signals, at the outer envelope or inside data: fail closed when the
+    # wrapper reports failure as data (e.g. {"success": false, "data": {...}}).
+    outer_failure = _response_failure(response)
+    if outer_failure is not None:
+        blocking.append(outer_failure)
+    if data.get("approved") is False:
+        blocking.append("approved=false")
     if str(data.get("state", "")).lower() in {"rejected", "failed"}:
         blocking.append(f"review state={data.get('state')}")
     if data.get("tradeable") is False:
