@@ -373,3 +373,54 @@ def generate_reports(
         "slippage_and_coverage_report": str(report_path),
         "latest_run_summary": str(summary_path),
     }
+
+
+def _run_classification_helpers():
+    """Import the run-classification contract helpers, tolerating either import
+    layout (repo-root namespace package ``scripts`` or ``scripts/`` on sys.path)."""
+    try:
+        from scripts.run_classification import (  # type: ignore
+            collect_manual_order_ids,
+            select_scheduled_state_for_reporting,
+        )
+    except ImportError:  # scripts/ directly on sys.path
+        from run_classification import (  # type: ignore
+            collect_manual_order_ids,
+            select_scheduled_state_for_reporting,
+        )
+    return collect_manual_order_ids, select_scheduled_state_for_reporting
+
+
+def generate_scheduled_reports(
+    trading_day: str,
+    fills: Sequence[Dict[str, Any]],
+    output_dir: str | Path,
+    base: Optional[str | Path] = None,
+) -> Dict[str, str]:
+    """Task 67aa802b entry point: post-trade reports for the SCHEDULED run only.
+
+    Routes the whole flow through the run-classification contract:
+      * selects and validates the day's scheduled run_state (never infers a
+        scheduled run from broker orders alone),
+      * excludes every manual-run order ID from the broker ``fills``,
+      * refuses to emit reports unless a valid scheduled state exists.
+
+    ``fills`` is the same broker fill list ``generate_reports`` takes; ``base``
+    overrides the artifact root (defaults to the contract's STATE_ROOT).
+    """
+    collect_manual_order_ids, select_scheduled = _run_classification_helpers()
+    base_path = Path(base) if base is not None else None
+    selection = select_scheduled(trading_day, base=base_path)
+    if not selection.ok:
+        raise ValueError(
+            f"no valid scheduled run_state for {trading_day}: "
+            + "; ".join(selection.errors)
+        )
+    manual_ids = collect_manual_order_ids(base_path)
+    return generate_reports(
+        selection.state,
+        fills,
+        output_dir,
+        exclude_order_ids=manual_ids,
+        require_scheduled=True,
+    )

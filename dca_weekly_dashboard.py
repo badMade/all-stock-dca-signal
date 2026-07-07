@@ -36,6 +36,21 @@ def _is_manual_run_state(data: Dict[str, Any]) -> bool:
     return rc.get("run_origin") == "manual" or rc.get("manual_run") is True
 
 
+def load_scheduled_run_states(base: str | Path) -> List[Dict[str, Any]]:
+    """Task 041d9d90 (weekly) entry point: load only SCHEDULED run_states.
+
+    Globs ``<base>/scheduled_runs/**/run_state*.json`` — the ``manual_runs/``
+    tree is never traversed — then routes the results through
+    :func:`load_json_files`, which additionally drops any blocked stub or
+    defensively manual-classified state. The Friday performance dashboard is
+    scheduled-live only, so this keeps manual candidates/notional out of the
+    cost-basis, reliability, and order-count metrics.
+    """
+    root = Path(base) / "scheduled_runs"
+    paths = sorted(root.rglob("run_state*.json")) if root.exists() else []
+    return load_json_files(paths)
+
+
 def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     """Load artifacts, skipping the minimal ``status: "blocked"`` run_state stubs
     written for date-gated days — they are not run days and would otherwise be

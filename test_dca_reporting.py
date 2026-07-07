@@ -234,6 +234,102 @@ def test_generate_reports_rejects_manual_state_when_scheduled_required(tmp_path=
         raise AssertionError("expected ValueError for a manual run_state")
 
 
+def _classification_helpers():
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
+    from run_classification import (  # noqa: E402
+        build_manual_classification,
+        build_scheduled_classification,
+        write_run_artifacts,
+    )
+    return build_scheduled_classification, build_manual_classification, write_run_artifacts
+
+
+def _sched_state(day, order_ids, rc):
+    return {
+        "run_id": f"{day}-152001", "generated_at": f"{day}T15:20:01",
+        "trading_day": day, "broker": "robinhood",
+        "budget": {"budget_tier": "normal", "daily_cap_usd": 180, "weekly_cap_usd": 900},
+        "counts": {"submitted": len(order_ids)},
+        "run_classification": rc,
+        "buy_candidates": [
+            {"ticker": t, "buy_multiplier": 2.0, "planned_amount_usd": 3.0,
+             "target_price": 100.0, "target_price_missing": False,
+             "status": "submitted", "order_id": oid}
+            for t, oid in order_ids
+        ],
+    }
+
+
+def test_generate_scheduled_reports_routes_through_classification(tmp_path=None):
+    import tempfile
+    from pathlib import Path
+
+    from dca_reporting import generate_scheduled_reports
+
+    build_sched, build_manual, write_run_artifacts = _classification_helpers()
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-06"
+
+    write_run_artifacts(
+        _sched_state(day, [("AAPL", "O1"), ("NVDA", "O2")], build_sched(day, f"{day}T19:20:01Z")),
+        base=base,
+    )
+    # A manual run that also touched O2 -> that fill must be excluded.
+    manual = _sched_state(day, [("NVDA", "O2")], build_manual(f"{day}T15:00:00Z"))
+    manual["run_id"] = f"{day}-110000"
+    write_run_artifacts(manual, base=base)
+
+    fills = [
+        {"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 0.03, "order_id": "O1"},
+        {"ticker": "NVDA", "fill_price": 49.5, "filled_qty": 0.06, "order_id": "O2"},
+    ]
+    paths = generate_scheduled_reports(day, fills, base / "reports", base=base)
+    summary = json.loads(Path(paths["latest_run_summary"]).read_text())
+    assert summary["coverage"]["fills"] == 1  # only AAPL; NVDA's O2 fill excluded as manual
+    assert "NVDA" not in Path(paths["slippage_ranked"]).read_text()
+
+
+def test_generate_scheduled_reports_requires_scheduled_state(tmp_path=None):
+    import tempfile
+    from pathlib import Path
+
+    from dca_reporting import generate_scheduled_reports
+
+    build_sched, build_manual, write_run_artifacts = _classification_helpers()
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-06"
+    # Only a manual run exists -> no scheduled inference allowed.
+    write_run_artifacts(_sched_state(day, [("NVDA", "O2")], build_manual(f"{day}T15:00:00Z")), base=base)
+    try:
+        generate_scheduled_reports(day, [], base / "reports", base=base)
+    except ValueError as exc:
+        assert "no valid scheduled run_state" in str(exc)
+    else:
+        raise AssertionError("expected ValueError when no scheduled state exists")
+
+
+def test_load_scheduled_run_states_only_scheduled(tmp_path=None):
+    import tempfile
+    from pathlib import Path
+
+    from dca_weekly_dashboard import load_scheduled_run_states
+
+    build_sched, build_manual, write_run_artifacts = _classification_helpers()
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-06"
+    write_run_artifacts(_sched_state(day, [("AAPL", "O1")], build_sched(day, f"{day}T19:20:01Z")), base=base)
+    manual = _sched_state(day, [("NVDA", "O2")], build_manual(f"{day}T15:00:00Z"))
+    manual["run_id"] = f"{day}-110000"
+    write_run_artifacts(manual, base=base)
+
+    loaded = load_scheduled_run_states(base)
+    assert len(loaded) == 1  # manual_runs/ never traversed
+    assert loaded[0]["run_classification"]["run_origin"] == "scheduled"
+
+
 def test_build_run_artifacts_captures_target_price():
     from datetime import date, datetime, time
     from zoneinfo import ZoneInfo
