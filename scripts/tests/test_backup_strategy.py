@@ -2,7 +2,7 @@
 
 Runnable with either ``pytest scripts/tests`` or ``python scripts/tests/test_backup_strategy.py``.
 Verifies extraction of the ticker list, the latest sizing ladder, budget rules,
-and the 3:30 / 3:45 PM ET weekday schedule logic from an imperfect sample text.
+and the 3:20 / 3:35 PM ET weekday schedule logic from an imperfect sample text.
 """
 
 import json
@@ -53,8 +53,8 @@ Budget rules ($3 allocation policy):
 - Stress: daily cap $360, weekly cap $1800.
 
 Schedules:
-ce16ba6b - live graded DCA task, schedule 30 19 * * 1-5 UTC = 3:30 PM ET weekdays
-67aa802b - post-trade slippage + Notion sync, schedule 45 19 * * 1-5 UTC = 3:45 PM ET weekdays
+ce16ba6b - live graded DCA task, schedule 20 19 * * 1-5 UTC = 3:20 PM ET weekdays
+67aa802b - post-trade slippage + Notion sync, schedule 35 19 * * 1-5 UTC = 3:35 PM ET weekdays
 041d9d90 - weekly dashboard, schedule 0 21 * * 5 UTC = Fridays 5:00 PM ET
 """
 
@@ -143,22 +143,25 @@ def test_write_configs_preserves_existing_tier_metadata():
         }
 
 
-def test_schedule_weekday_logic_330_and_345_et():
+def test_schedule_weekday_logic_320_and_335_et():
     sched = extract_schedule(SAMPLE)
     by_id = {t["id"]: t for t in sched["tasks"]}
 
     live = by_id["ce16ba6b"]
-    assert live["cron_utc"] == "30 19 * * 1-5"
+    assert live["cron_utc"] == "20 19 * * 1-5"
     assert live["weekday_only"] is True
-    assert "3:30 PM ET" in live["et_equivalent"]
+    assert "3:20 PM ET" in live["et_equivalent"]
 
     post = by_id["67aa802b"]
-    assert post["cron_utc"] == "45 19 * * 1-5"
+    assert post["cron_utc"] == "35 19 * * 1-5"
     assert post["weekday_only"] is True
-    assert "3:45 PM ET" in post["et_equivalent"]
+    assert "3:35 PM ET" in post["et_equivalent"]
 
-    # Live trade schedule (3:30) must be distinct from the slippage/Notion sync (3:45).
+    # Live trade schedule (3:20) must be distinct from the slippage/Notion sync (3:35).
     assert live["cron_utc"] != post["cron_utc"]
+
+    # Each parsed task appears exactly once (no duplicate-append).
+    assert [t["id"] for t in sched["tasks"]].count("ce16ba6b") == 1
 
     weekly = by_id["041d9d90"]
     assert weekly["weekday_only"] is False  # Fridays only, not 1-5

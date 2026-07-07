@@ -2,7 +2,7 @@
 Near-close graded DCA strategy skeleton.
 
 This mirrors the scheduled live-test rules:
-    - Run at 3:45 PM America/New_York.
+    - Run at 3:20 PM America/New_York (the canonical live schedule).
     - Use completed regular-session bars only.
     - Compare finance-side and Robinhood-side signals before auto-ordering.
     - Place real orders only through a broker adapter that reviews first.
@@ -96,11 +96,33 @@ ACTIVE_TICKERS = [
 
 EXCLUDED_TICKERS = {"BYDDY"}
 
-APPROVED_TEST_DATES = {
-    date(2026, 6, 29),
-    date(2026, 6, 30),
-    date(2026, 7, 1),
-}
+
+def _weekday_range(start: date, end: date) -> set:
+    """All Mon-Fri dates in [start, end] inclusive."""
+    days = set()
+    cursor = start
+    while cursor <= end:
+        if cursor.weekday() < 5:  # 0=Mon .. 4=Fri
+            days.add(cursor)
+        cursor += timedelta(days=1)
+    return days
+
+
+# US equity-market full closures that fall inside the live window (weekdays only,
+# so weekend holidays are already excluded). 2026-07-03 is the observed
+# Independence Day (Jul 4 2026 is a Saturday). Labor Day (2026-09-07) is past the
+# window. Excluding these keeps the date gate meaning "an actual trading day."
+MARKET_HOLIDAYS = frozenset({date(2026, 7, 3)})
+
+# Approved live-test window. The original pilot dates (Jun 29 - Jul 1 2026) plus
+# the canonical live window of weekdays 2026-07-02 through 2026-08-28 inclusive
+# (minus market holidays), matching the ce16ba6b/10ce362c trigger_window in
+# config/scheduled_tasks.json. Without this, run_once()'s date gate would mark
+# every scheduled run in the live window blocked/no-trade.
+APPROVED_TEST_DATES = (
+    {date(2026, 6, 29), date(2026, 6, 30), date(2026, 7, 1)}
+    | _weekday_range(date(2026, 7, 2), date(2026, 8, 28))
+) - MARKET_HOLIDAYS
 
 
 class Action(str, Enum):
@@ -246,7 +268,7 @@ class StrategyConfig:
     tickers: Sequence[str] = tuple(ACTIVE_TICKERS)
     excluded_tickers: frozenset[str] = frozenset(EXCLUDED_TICKERS)
     approved_test_dates: frozenset[date] = frozenset(APPROVED_TEST_DATES)
-    decision_time_et: time = time(15, 45)
+    decision_time_et: time = time(15, 20)  # matches the 3:20 PM ET canonical live schedule
     trend_lookback_minutes: int = 60
     base_buy_amount_usd: float = 3.0
     weekly_rollover_reserve_cap_usd: float = 900.0
@@ -257,8 +279,8 @@ class StrategyConfig:
     broker: BrokerName = BrokerName.ROBINHOOD
     dry_run: bool = True
 
-    # Bars from many market-data APIs are start-stamped. At a 3:45 PM decision,
-    # the latest completed 15-minute or 30-minute start-stamped bar is 3:30 PM.
+    # Bars from many market-data APIs are start-stamped. At a 3:20 PM decision,
+    # the latest completed 15-minute start-stamped bar is 3:05 PM.
     assume_bar_timestamps_are_start_times: bool = True
     finance_interval_minutes: int = 15
     robinhood_interval_minutes: int = 5
@@ -931,6 +953,21 @@ def within_caps(decision: ReconciledDecision, state: StrategyState, trading_day:
     if decision.suggested_amount_usd > state.remaining_spend_today(trading_day, config):
         return False
     return True
+
+
+def allocation_sort_key(decision: ReconciledDecision) -> Tuple[float, float, str]:
+    """Deterministic allocation priority for buy candidates.
+
+    Orders by higher multiplier first, then larger percent drop, then ticker
+    alphabetical (A->Z) as the final tie-break so a capped run always fills the
+    same names the strategy state promises. Numeric keys are negated (rather than
+    sorting with ``reverse=True``) so ticker still sorts ascending.
+    """
+    drop = max(
+        decision.finance_signal.drop_vs_previous_close_pct if decision.finance_signal else 0.0,
+        decision.robinhood_signal.drop_vs_previous_close_pct if decision.robinhood_signal else 0.0,
+    )
+    return (-decision.buy_multiplier, -drop, decision.ticker)
 
 
 def _signal_target_price(decision: ReconciledDecision) -> Optional[float]:
@@ -1732,16 +1769,8 @@ def run_once(
         logger.info(message)
 
     buy_candidates = [decision for decision in decisions if decision.action == Action.BUY]
-    buy_candidates.sort(
-        key=lambda d: (
-            d.buy_multiplier,
-            max(
-                d.finance_signal.drop_vs_previous_close_pct if d.finance_signal else 0.0,
-                d.robinhood_signal.drop_vs_previous_close_pct if d.robinhood_signal else 0.0,
-            ),
-        ),
-        reverse=True,
-    )
+    # Higher multiplier -> larger drop -> ticker alphabetical (see allocation_sort_key).
+    buy_candidates.sort(key=allocation_sort_key)
 
     planned_spend = sum(d.suggested_amount_usd for d in buy_candidates)
     high_multiplier_signals = sum(

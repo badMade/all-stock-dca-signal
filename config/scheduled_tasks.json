@@ -2,30 +2,96 @@
   "$schema": "../schemas/scheduled_tasks.schema.json",
   "version": "2026-07-06",
   "timezone_note": "Cron expressions are in UTC. ET equivalents are during US Eastern Daylight Time (EDT, UTC-4). Confirm around DST transitions.",
+  "afternoon_completion_rule": "All afternoon trading and artifact-writing tasks complete no later than 3:40 PM ET, when the read-only live-run watchdog (a46bf007) begins its final verification. The watchdog's own post-3:40 PM verification and the Friday weekly Notion performance refresh at 5:00 PM ET are the only approved post-3:40 PM DCA-related exceptions.",
+  "run_classification_policy": {
+    "policy_file": "config/run_classification.json",
+    "schema": "schemas/run_classification.schema.json",
+    "doc": "docs/run_classification.md",
+    "state_schema_version": "run-classification-v1",
+    "summary": "Every run_state artifact carries a run_classification block. Scheduled runs of the repaired live task 10ce362c (which supersedes the deleted ce16ba6b; artifact root stays under .../ce16ba6b for continuity) write under scheduled_runs/YYYYMMDD_1520ET/ and update latest_scheduled_run.json; manual runs write under manual_runs/<timestamp>/ and never touch that pointer. A scheduled run is valid evidence when cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b'. Downstream analytics validate scheduled state, exclude all manual order IDs and any run_origin='manual'/manual_run=true state, and never infer scheduled status from broker orders alone."
+  },
   "tasks": [
     {
-      "id": "ce16ba6b",
-      "name": "Graded DCA automatic live test - $3 allocation",
-      "type": "trading",
+      "id": "b7961407",
+      "name": "Pre-market DCA buying-power dashboard",
+      "type": "analytics",
       "status": "active",
-      "cron_utc": "30 19 * * 1-5",
-      "et_equivalent": "3:30 PM ET weekdays (EDT)",
-      "trades": true,
-      "broker_account": "robinhood:562057042",
-      "trigger_gate": "programmatic_trigger_check.sh",
-      "trigger_window": "Weekdays 2026-07-02 through 2026-08-28, 3:20-3:55 PM ET",
-      "state_dir": "/home/user/workspace/cron_tracking/ce16ba6b",
-      "notes": "Approved live trading task using the $3 base allocation with tiered daily/weekly caps. Stale display name may say 3:45/Jul 10 - authoritative schedule is 3:30 PM ET. Writes standardized same-day state files under /home/user/workspace/cron_tracking/ce16ba6b; places real market buy orders automatically within safeguards; must not fall back to interactive confirmation."
+      "cron_utc": "00 13 * * 1-5",
+      "et_equivalent": "9:00 AM ET weekdays (EDT)",
+      "trades": false,
+      "notes": "Analytics only, no trading. Pre-market buying-power dashboard using the current $3 base 0x-to-5x ladder."
+    },
+    {
+      "id": "cd45e95b",
+      "name": "Compact DCA volatility outlier scan",
+      "type": "analytics",
+      "status": "active",
+      "cron_utc": "45 13 * * 1-5",
+      "et_equivalent": "9:45 AM ET weekdays (EDT)",
+      "trades": false,
+      "notes": "Analytics only, no trading. Compact scan of >5% outliers only; no full 41+ ticker narrative on no-outlier days. Uses the current $3 base 0x-to-5x ladder."
     },
     {
       "id": "e3e6f09e",
-      "name": "Monitor-only graded DCA $3 allocation",
+      "name": "Monitor-only graded DCA signal check",
       "type": "monitoring",
       "status": "active",
-      "cron_utc": "29 19 * * 1-5",
-      "et_equivalent": "3:29 PM ET weekdays (EDT)",
+      "cron_utc": "5 19 * * 1-5",
+      "et_equivalent": "3:05 PM ET weekdays (EDT)",
       "trades": false,
-      "notes": "Analytics and notifications only for the $3 allocation policy. Places no trades. Runs one minute before the live task (ce16ba6b) to surface the planned allocation and tier selection."
+      "notes": "Analytics and notifications only; places no trades. Monitor-only signal check that surfaces the planned allocation and tier selection using the current $3 base 0x-to-5x ladder."
+    },
+    {
+      "id": "10ce362c",
+      "supersedes_cron_id": "ce16ba6b",
+      "name": "Graded DCA automatic live test - $3 allocation",
+      "type": "trading",
+      "status": "active",
+      "cron_utc": "20 19 * * 1-5",
+      "et_equivalent": "3:20 PM ET weekdays (EDT)",
+      "trades": true,
+      "broker_account": "robinhood:562057042",
+      "trigger_gate": "programmatic_trigger_check.sh",
+      "trigger_window": "Weekdays 2026-07-02 through 2026-08-28, 3:20-3:35 PM ET (aligned to the 15:15-15:35 ET scheduled classification window so a late-but-permitted start cannot place buys after the 3:35 PM post-trade sync or outside the attributable window).",
+      "state_dir": "/home/user/workspace/cron_tracking/ce16ba6b",
+      "run_classification": {
+        "role": "writer",
+        "cron_id": "10ce362c",
+        "supersedes_cron_id": "ce16ba6b",
+        "scheduled_window_et": "15:15-15:35",
+        "scheduled_for_et": "15:20",
+        "scheduled_run_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/",
+        "manual_run_dir": "/home/user/workspace/cron_tracking/ce16ba6b/manual_runs/<timestamp>/",
+        "latest_scheduled_run_pointer": "/home/user/workspace/cron_tracking/ce16ba6b/latest_scheduled_run.json",
+        "scheduled_run_id_pattern": "scheduled_YYYYMMDD_1520ET",
+        "policy_file": "config/run_classification.json"
+      },
+      "notes": "The only trading task. This is the repaired live task 10ce362c, which supersedes the deleted ce16ba6b; the artifact root stays under .../ce16ba6b for continuity. Approved live Robinhood execution using the $3 base 0x-to-5x ladder with tiered daily/weekly caps. Robinhood account 562057042 only; Alpaca read-only. Places real market buy orders automatically within safeguards; must not fall back to interactive confirmation. A SCHEDULED run writes run_state.json (with run_classification run_origin='scheduled', run_type='scheduled_live_test', manual_run=false, scheduled_for_et='15:20', run_id='scheduled_YYYYMMDD_1520ET', and cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b') under scheduled_runs/YYYYMMDD_1520ET/ AND updates latest_scheduled_run.json. A MANUAL run writes run_state.json (run_origin='manual', manual_run=true, distinct run_id) under manual_runs/<timestamp>/ and MUST NOT update latest_scheduled_run.json. All run_state files carry state_schema_version='run-classification-v1'. Test window through Fri Aug 28 2026 inclusive. Manual runs do not count as scheduled-run evidence. Any stale stored display name is superseded by this authoritative 3:20 PM ET schedule."
+    },
+    {
+      "id": "d72aa525",
+      "name": "Capital-priority briefing",
+      "type": "analytics",
+      "status": "active",
+      "cron_utc": "25 19 * * 1-5",
+      "et_equivalent": "3:25 PM ET weekdays (EDT)",
+      "trades": false,
+      "notes": "Analytics only, no trading. Capital-priority briefing using the current $3 base 0x-to-5x ladder. Sends email/in-app notification only if at least one ticker triggers 1.5x or higher."
+    },
+    {
+      "id": "67aa802b",
+      "name": "Post-trade slippage + compact Notion latest-run sync",
+      "type": "analytics",
+      "status": "active",
+      "cron_utc": "35 19 * * 1-5",
+      "et_equivalent": "3:35 PM ET weekdays (EDT)",
+      "trades": false,
+      "run_classification": {
+        "role": "consumer",
+        "policy_file": "config/run_classification.json",
+        "rules": "Validate the scheduled run_state, exclude all order IDs from manual_runs/**/run_state*.json, exclude any run_state with run_origin='manual' or manual_run=true, and never infer scheduled status from same-day broker orders alone. Broker time-window fallback only if a valid scheduled state exists but lacks order IDs due to a known write failure. Report manual fills only under a 'Manual Test Runs' section; manual fills never affect scheduled-live cost basis, slippage, reliability, or order-count metrics."
+      },
+      "notes": "Analytics only, no trading. Reads the scheduled live-run state and Robinhood order history, writes slippage/coverage artifacts, and updates the compact Notion Latest Run section only. Honors the run-classification policy (config/run_classification.json): scheduled-live metrics use only validated scheduled runs with manual order IDs excluded."
     },
     {
       "id": "a46bf007",
@@ -35,27 +101,12 @@
       "cron_utc": "40 19 * * 1-5",
       "et_equivalent": "3:40 PM ET weekdays (EDT)",
       "trades": false,
-      "notes": "Read-only. Alerts on missed run, error, or discrepancy. No trading."
-    },
-    {
-      "id": "67aa802b",
-      "name": "Post-trade slippage + compact Notion latest-run sync",
-      "type": "analytics",
-      "status": "active",
-      "cron_utc": "45 19 * * 1-5",
-      "et_equivalent": "3:45 PM ET weekdays (EDT)",
-      "trades": false,
-      "notes": "Analytics only. Reads live artifacts and Robinhood order history, writes slippage artifacts, updates the compact Notion Latest Run section only."
-    },
-    {
-      "id": "cd45e95b",
-      "name": "Compact volatility outlier scan",
-      "type": "analytics",
-      "status": "active",
-      "cron_utc": "45 13 * * 1-5",
-      "et_equivalent": "9:45 AM ET weekdays (EDT)",
-      "trades": false,
-      "notes": "Analytics only. Alerts only for >5% outliers or actionable errors; no full 41+ ticker narrative on no-outlier days."
+      "run_classification": {
+        "role": "consumer",
+        "policy_file": "config/run_classification.json",
+        "rules": "Confirms a valid scheduled run_state exists (run_origin='scheduled', passes run_classification.schema.json) and that latest_scheduled_run.json points at it. Treats any run_origin='manual'/manual_run=true state as NOT scheduled-run evidence regardless of path. Never infers a scheduled run from same-day broker orders alone; alerts if the scheduled state is missing/invalid even when broker orders exist."
+      },
+      "notes": "Read-only, no trading. Final scheduled afternoon event. Alerts only on missed, incomplete, error, or discrepancy conditions. Validates the run-classification contract: a missing/invalid scheduled run_state is a discrepancy even if manual runs or broker orders exist that day."
     },
     {
       "id": "041d9d90",
@@ -65,7 +116,12 @@
       "cron_utc": "0 21 * * 5",
       "et_equivalent": "Fridays 5:00 PM ET (EDT)",
       "trades": false,
-      "notes": "Analytics only. Refreshes full Notion performance dashboard. No routine email."
+      "run_classification": {
+        "role": "consumer",
+        "policy_file": "config/run_classification.json",
+        "rules": "Weekly scheduled-live cost basis, slippage, reliability, and order-count metrics are computed only from validated scheduled runs with all manual order IDs excluded. Manual fills, if shown at all, appear only in a clearly labeled 'Manual Test Runs' section and never affect scheduled-live metrics."
+      },
+      "notes": "Analytics only, no trading. Recalculates and refreshes the full Notion performance dashboard. The only approved post-3:40 PM DCA-related exception. No routine email. Scheduled-live metrics exclude manual runs per config/run_classification.json; manual fills are confined to a labeled Manual Test Runs section."
     },
     {
       "id": "0656657a",
@@ -75,7 +131,7 @@
       "cron_utc": "45 12 1-7 * 1-5",
       "et_equivalent": "First weekday of month 8:45 AM ET (EDT)",
       "trades": false,
-      "notes": "Analytics only. No-op if the day is not the first weekday of the month."
+      "notes": "Analytics only, no trading. No-op if the day is not the first weekday of the month."
     },
     {
       "id": "bec4a6ee",
@@ -83,9 +139,9 @@
       "type": "analytics",
       "status": "active",
       "cron_utc": "55 13 1-7 * 1-5",
-      "et_equivalent": "First weekday of month; next_run observed 9:55 AM ET despite a requested 9:15 AM ET",
+      "et_equivalent": "First weekday of month 9:55 AM ET (EDT)",
       "trades": false,
-      "notes": "Analytics only. Usage proxies, no exact credits. Discrepancy: requested 9:15 AM ET but observed next_run 9:55 AM ET - flagged for reconciliation."
+      "notes": "Analytics only, no trading. Reports usage proxies only; exact Perplexity credit consumption is not exposed, so do not claim exact credits."
     },
     {
       "id": "f7411889",
@@ -94,7 +150,7 @@
       "status": "active",
       "fires_at_et": "2026-08-15 11:45 AM ET",
       "trades": false,
-      "notes": "Reminder only. Evaluate whether to continue live testing past the 2026-08-28 approved window."
+      "notes": "Reminder only, no trading. Evaluate whether to continue live testing past the 2026-08-28 approved window."
     }
   ]
 }

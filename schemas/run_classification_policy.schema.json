@@ -1,0 +1,44 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "run_classification_policy.schema.json",
+  "title": "Graded DCA run-classification policy document",
+  "description": "Shape of config/run_classification.json, the human/machine policy that governs how scheduled live runs of the repaired live task 10ce362c (which supersedes the deleted ce16ba6b) are distinguished from manual runs. This is the POLICY document; the run_classification block embedded in each run_state artifact is validated by run_classification.schema.json instead. Contains no secrets.",
+  "type": "object",
+  "required": [
+    "policy_id",
+    "version",
+    "state_schema_version",
+    "live_task"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "policy_id": { "type": "string", "description": "Stable id of this policy, e.g. 'run-classification-v1'." },
+    "version": { "type": "string", "description": "Snapshot date/version of the policy document." },
+    "purpose": { "type": "string" },
+    "state_schema_version": {
+      "type": "string",
+      "const": "run-classification-v1",
+      "description": "Version tag shared with the embedded run_classification block; pinned to 'run-classification-v1'."
+    },
+    "live_task": {
+      "type": "object",
+      "required": ["cron_id"],
+      "additionalProperties": true,
+      "properties": {
+        "cron_id": { "type": "string", "description": "Repaired live task id ('10ce362c')." },
+        "supersedes_cron_id": { "type": ["string", "null"], "description": "Prior task id superseded ('ce16ba6b')." },
+        "schedule_et": { "type": "string" },
+        "cron_utc": { "type": "string" },
+        "window_start_et": { "type": "string" },
+        "window_end_et": { "type": "string" }
+      }
+    },
+    "artifact_paths": { "type": "object", "additionalProperties": true },
+    "scheduled_run_classification": { "type": "object", "additionalProperties": true },
+    "manual_run_classification": { "type": "object", "additionalProperties": true },
+    "write_rules": { "type": "object", "additionalProperties": true },
+    "downstream_reporting_rules": { "type": "object", "additionalProperties": true },
+    "broker_time_window_fallback": { "type": "object", "additionalProperties": true },
+    "manual_reporting": { "type": "object", "additionalProperties": true }
+  }
+}

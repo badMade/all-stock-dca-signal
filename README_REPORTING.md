@@ -25,7 +25,7 @@ IDs live in this repo.
 The daily live path is deliberately cheap so scheduled runs burn as little
 token/credit as possible:
 
-- Use `near_close_dca.run_daily_compact(...)` for the scheduled 3:45 PM run. It
+- Use `near_close_dca.run_daily_compact(...)` for the scheduled 3:20 PM run. It
   writes structured JSON/CSV plus a compact summary and **nothing else** — no long
   narrative markdown, no weekly performance matrix, no historical backtest, and no
   full Notion dashboard.

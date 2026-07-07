@@ -1,4 +1,29 @@
-# Strategy backup utility
+# Strategy backup utilities
+
+This directory holds two standard-library-only utilities:
+
+- `backup_strategy.py` — re-extract strategy config from a transcript (below).
+- `run_classification.py` — enforce the scheduled-vs-manual **run-classification
+  contract** (see [`../docs/run_classification.md`](../docs/run_classification.md)).
+
+## `run_classification.py`
+
+Keeps manual runs of the live task (`10ce362c`, which supersedes the deleted
+`ce16ba6b`; artifact root stays under `.../ce16ba6b` for continuity) from being
+counted as scheduled runs. It builds/validates the required `run_classification` block, writes
+run_state artifacts to the correct path (updating `latest_scheduled_run.json`
+**only** for scheduled runs), collects and excludes manual order IDs, and
+selects the scheduled state for reporting with the narrow broker time-window
+fallback. The live trading code and the reporting/watchdog/weekly tasks should
+route their scheduled-vs-manual decisions through this module.
+
+```bash
+python -m pytest scripts/tests/test_run_classification.py -q
+# or, without pytest:
+python scripts/tests/test_run_classification.py
+```
+
+## `backup_strategy.py`
 
 `backup_strategy.py` extracts the current graded DCA strategy state from a
 conversation/export transcript and writes/updates the `config/` JSON files. Use
@@ -50,7 +75,7 @@ The extractors key off natural phrasings, e.g.:
   sets the no-buy threshold.
 - Budget lines like `Base amount $3.`, `Weekly rollover reserve max $900.`, and
   tier lines like `Normal: daily cap $180, weekly cap $900.`.
-- Schedule lines like `ce16ba6b ... schedule 30 19 * * 1-5 UTC = 3:30 PM ET weekdays`.
+- Schedule lines like `10ce362c ... schedule 20 19 * * 1-5 UTC = 3:20 PM ET weekdays`.
 
 ## Tests
 
@@ -61,8 +86,8 @@ python scripts/tests/test_backup_strategy.py
 ```
 
 The tests assert the 45-ticker universe, the latest ladder (max 5x, no 12x-era
-tiers), the budget caps, and that the **3:30 PM ET live task** stays distinct
-from the **3:45 PM ET slippage/Notion sync**.
+tiers), the budget caps, and that the **3:20 PM ET live task** stays distinct
+from the **3:35 PM ET slippage/Notion sync**.
 
 ## Notion sync
 

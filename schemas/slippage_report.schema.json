@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "slippage_report.schema.json",
   "title": "Post-trade slippage report",
-  "description": "Written by analytics task 67aa802b. Compares decision-time signal price to actual fill price.",
+  "description": "Written by analytics task 67aa802b. Compares decision-time signal price to actual fill price. Per the run-classification contract (config/run_classification.json), the top-level rows/summary cover SCHEDULED-live fills only; manual fills are confined to the separate manual_test_runs section and never affect scheduled-live metrics.",
   "type": "object",
   "required": ["schema_version", "run_date_et", "rows"],
   "additionalProperties": true,
@@ -11,6 +11,36 @@
     "run_date_et": { "type": "string", "format": "date" },
     "generated_at_utc": { "type": "string", "format": "date-time" },
     "source": { "type": "string", "description": "e.g. robinhood_order_history + live run_state artifact" },
+    "run_scope": {
+      "type": "string",
+      "enum": ["scheduled_live"],
+      "description": "The top-level rows/summary are scheduled-live only. Fixed to 'scheduled_live' to make the scope explicit."
+    },
+    "scheduled_run_id": {
+      "type": ["string", "null"],
+      "description": "run_classification.run_id of the scheduled run these rows were derived from (scheduled_YYYYMMDD_1520ET)."
+    },
+    "excluded_manual_order_ids": {
+      "type": "array",
+      "description": "Order IDs collected from manual_runs/**/run_state*.json and excluded from the scheduled-live rows/summary.",
+      "items": { "type": "string" }
+    },
+    "used_broker_time_window_fallback": {
+      "type": "boolean",
+      "description": "True only when a valid scheduled state existed but lacked order IDs due to a known write failure and in-window broker orders were attributed instead (manual IDs still excluded)."
+    },
+    "manual_test_runs": {
+      "type": "object",
+      "description": "Clearly labeled 'Manual Test Runs' section. Manual fills are reported here only and never affect scheduled-live cost basis, slippage, reliability, or order-count metrics.",
+      "additionalProperties": true,
+      "properties": {
+        "label": { "type": "string", "const": "Manual Test Runs" },
+        "rows": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": true }
+        }
+      }
+    },
     "rows": {
       "type": "array",
       "items": {

@@ -10,10 +10,25 @@ those files in prose.
 ## Overview
 
 Each trading weekday, near the close, the strategy inspects the drop of each
-active ticker versus its previous regular-session close and, if the drop clears
-the ladder's minimum, places a single market buy sized by a graded multiplier of
-a **$3 base amount**. All buys pass a review gate and respect the selected
-tiered daily/weekly budget caps. It never sells.
+active ticker versus its previous regular-session close and, if the buy signal
+fires, places a single market buy sized by a graded multiplier of a **$3 base
+amount**. All buys pass a review gate and respect the selected tiered
+daily/weekly budget caps. It never sells.
+
+The strategy identity is the **All Stock graded DCA live test**. Live execution
+is on **Robinhood account `562057042` only**; Alpaca is read-only validation /
+account context only.
+
+## Signal rules
+
+A buy signal fires for a ticker only when **all three** conditions hold:
+
+1. The decision price is **below the previous regular-session close**.
+2. The **60-minute intraday trend is down**.
+3. The ladder **multiplier is > 0** (i.e. the drop is at least 0.1%).
+
+The order dollar amount before budget constraints is
+`base_amount_usd × multiplier` = `$3 × multiplier`.
 
 ## Active ticker universe
 
@@ -74,7 +89,8 @@ dimension.
   reserve is available.
 - The **weekly rollover reserve is capped at $900**.
 - Allocations are prioritized by **higher multiplier first, then larger percent
-  drop**.
+  drop, then ticker** (alphabetical) for a deterministic tie-break. Capped
+  tickers are flagged.
 - **One strategy order per ticker per day.**
 
 Caps are absolute ceilings: a run never exceeds the selected daily cap, the

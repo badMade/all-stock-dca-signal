@@ -1,6 +1,6 @@
 {
   "$schema": "../schemas/sizing_ladder.schema.json",
-  "version": "2026-06-29-revised",
+  "version": "2026-07-06",
   "status": "active",
   "description": "Latest active graded sizing ladder. Maps the drop vs. previous close to a buy multiplier. Base amount is multiplied by the tier multiplier. No upper cutoff: any drop >= 8% is 5x.",
   "drop_metric": "fraction_down_vs_previous_close",
@@ -18,5 +18,14 @@
     { "min_drop_pct": 8.0, "max_drop_pct": null, "multiplier": 5.0 }
   ],
   "tier_boundary_rule": "min inclusive, max exclusive; the largest tier threshold <= actual drop wins; drop < 0.1% = 0x (no buy).",
+  "signal_rules": {
+    "requirements": [
+      "Decision price is below the previous regular-session close.",
+      "60-minute intraday trend is down.",
+      "Ladder multiplier is > 0 (drop >= 0.1%)."
+    ],
+    "note": "A buy signal fires only when all three requirements hold together."
+  },
+  "order_dollar_formula": "order_dollar_amount_before_budget = base_amount_usd * multiplier",
   "historical_note": "Older ladder variants, including the 0.1%-to-12% sizing ladders, are HISTORICAL/SUPERSEDED. This 0.1%-to-8%+ ladder (max 5x, no upper cutoff) is the current active ladder."
 }
