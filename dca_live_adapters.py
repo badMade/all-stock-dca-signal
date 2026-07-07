@@ -407,10 +407,19 @@ class RobinhoodBroker:
         if self._buying_power_fn is None:
             return self._simulated_buying_power_usd
         try:
-            return float(self._buying_power_fn(account_number=self._account))
+            result = self._buying_power_fn(account_number=self._account)
         except Exception:  # noqa: BLE001 - never let buying-power lookup crash a scan
             logger.exception("buying-power lookup failed; treating as 0")
             return 0.0
+        # Accept either a scalar or a raw MCP dict (per the module-level callable contract).
+        if isinstance(result, dict):
+            data = _unwrap(result)
+            for key in ("buying_power", "cash", "unallocated_buying_power", "portfolio_cash", "withdrawable_amount"):
+                if key in data:
+                    return _to_float(data.get(key))
+            logger.warning("buying-power response had no recognizable amount field: %s", data)
+            return 0.0
+        return _to_float(result)
 
     def same_day_strategy_order_exists(self, ticker: str, trading_day: date) -> bool:
         if self._orders_fn is None:
@@ -488,6 +497,12 @@ class RobinhoodBroker:
             # buy with no order to reconcile, so raise instead of reporting false success.
             logger.error("place_equity_order returned no order id for %s: %s", ticker, data)
             raise RuntimeError(f"live placement for {ticker} returned no order id; response={data}")
+        state = str(order.get("state", "")).lower()
+        if state in {"rejected", "failed", "cancelled", "canceled", "voided"}:
+            # An id in a terminal-failure state means no live order exists; reporting it as
+            # submitted would consume budget and block a retry, so raise instead.
+            logger.error("place_equity_order for %s returned terminal state %s: %s", ticker, state, data)
+            raise RuntimeError(f"live placement for {ticker} came back in terminal state {state}; response={data}")
         return str(order_id)
 
     def get_order_fill(self, order_id: str) -> Optional[OrderFill]:
@@ -501,7 +516,12 @@ class RobinhoodBroker:
             # not crash run_once before the durable artifacts are written.
             logger.exception("order-fill lookup failed for %s; recording as unfilled", order_id)
             return None
-        orders = data.get("orders") or ([data] if (data.get("id") or data.get("order_id")) else [])
+        # Accept list mode ({"orders": [...]}), a single-order envelope ({"order": {...}},
+        # the same nesting place_market_buy accepts), or a bare top-level order object.
+        single = data.get("order") if isinstance(data.get("order"), dict) else None
+        if single is None and (data.get("id") or data.get("order_id")):
+            single = data
+        orders = data.get("orders") or ([single] if single else [])
         for order in orders:
             # place_market_buy accepts either "id" or "order_id"; match on both here so a
             # history wrapper that keys fills by "order_id" is not misread as an unfilled gap.
@@ -555,15 +575,17 @@ def _coerce_bar(raw: Any) -> Optional[Bar]:
         timestamp = _parse_rfc3339(ts_value)
     if timestamp is None:
         return None
-    close = raw.get("close", raw.get("close_price", raw.get("c")))
-    if close is None:
+    close = _to_float(raw.get("close", raw.get("close_price", raw.get("c"))), default=-1.0)
+    if close <= 0:
+        # Reject placeholder/non-numeric closes (e.g. "N/A") like the Robinhood parser: a
+        # 0.0 close would read as a ~100% drop and trigger a spurious max BUY.
         return None
     return Bar(
         timestamp=timestamp,
         open=_to_float(raw.get("open", raw.get("open_price", raw.get("o")))),
         high=_to_float(raw.get("high", raw.get("high_price", raw.get("h")))),
         low=_to_float(raw.get("low", raw.get("low_price", raw.get("l")))),
-        close=_to_float(close),
+        close=close,
         volume=_to_float(raw.get("volume", raw.get("v"))),
     )
 

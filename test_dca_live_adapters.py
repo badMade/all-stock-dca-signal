@@ -173,6 +173,18 @@ def test_finance_provider_previous_close_scalar():
     assert bar is not None and bar.close == pytest.approx(42.0)
 
 
+def test_finance_provider_drops_nonnumeric_close():
+    # A placeholder close ("N/A") must be dropped, not zeroed into a ~100%-drop bar.
+    raw = [
+        {"timestamp": "2026-07-02T13:30:00Z", "open": 10, "high": 11, "low": 9, "close": "N/A", "volume": 1},
+        {"timestamp": "2026-07-02T13:45:00Z", "open": 10, "high": 11, "low": 9, "close": 10.2, "volume": 1},
+    ]
+    prov = FinanceDataProvider(bars_fn=lambda *a: raw, previous_close_fn=lambda *a: 100.0)
+    bars = prov.get_intraday_bars("AAPL", _decision_dt(), _decision_dt(), 15)
+    assert len(bars) == 1
+    assert bars[0].close == pytest.approx(10.2)
+
+
 def test_finance_provider_coerces_date_objects():
     # yfinance/pandas often yield a bare datetime.date; it must not be dropped.
     from datetime import date as _date
@@ -205,6 +217,17 @@ def test_broker_place_live_when_gated_on():
         place_fn=lambda **k: {"data": {"order": {"id": "ORD-42"}}},
     )
     assert broker.place_market_buy("AAPL", 1.0, "ref1") == "ORD-42"
+
+
+def test_broker_place_live_raises_on_terminal_state():
+    # An id in a terminal-failure state means no live order exists -> must not report success.
+    broker = RobinhoodBroker(
+        account="562057042",
+        enable_live_orders=True,
+        place_fn=lambda **k: {"data": {"order": {"id": "ORD-7", "state": "rejected"}}},
+    )
+    with pytest.raises(RuntimeError, match="terminal state"):
+        broker.place_market_buy("AAPL", 1.0, "ref1")
 
 
 def test_broker_place_live_raises_on_missing_order_id():
@@ -316,6 +339,23 @@ def test_broker_order_fill_matches_order_id_key():
     fill = RobinhoodBroker(order_fill_fn=lambda **k: resp).get_order_fill("ORD-9")
     assert isinstance(fill, OrderFill)
     assert fill.avg_fill_price == pytest.approx(50.0)
+
+
+def test_broker_order_fill_nested_single_order_envelope():
+    # A single-order lookup nested as {"data": {"order": {...}}} must be matched, not missed.
+    resp = {"data": {"order": {"id": "ORD-5", "cumulative_quantity": "2", "average_price": "25.0"}}}
+    fill = RobinhoodBroker(order_fill_fn=lambda **k: resp).get_order_fill("ORD-5")
+    assert isinstance(fill, OrderFill)
+    assert fill.quantity_filled == pytest.approx(2.0)
+    assert fill.avg_fill_price == pytest.approx(25.0)
+
+
+def test_broker_buying_power_parses_dict_response():
+    # A raw MCP dict (per the module callable contract) must be unwrapped, not cast to 0.0.
+    resp = {"data": {"buying_power": "137.00"}}
+    assert RobinhoodBroker(buying_power_fn=lambda **k: resp).available_buying_power() == pytest.approx(137.0)
+    # A dict with no recognizable amount field degrades to 0.0 (blocked), not a crash.
+    assert RobinhoodBroker(buying_power_fn=lambda **k: {"data": {}}).available_buying_power() == 0.0
 
 
 def test_interpret_review_empty_and_state_rejection():
