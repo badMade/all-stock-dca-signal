@@ -45,6 +45,7 @@ from typing import (
     Protocol,
     Sequence,
     Set,
+    Tuple,
 )
 from zoneinfo import ZoneInfo
 

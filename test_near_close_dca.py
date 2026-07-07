@@ -29,8 +29,8 @@ from near_close_dca import (
     SourceName,
     SourceSignal,
     StrategyConfig,
-    allocation_sort_key,
     StrategyState,
+    allocation_sort_key,
     build_execution_record,
     build_report,
     build_usage_proxy,
@@ -238,7 +238,8 @@ def test_allocation_sort_key_tie_break_is_alphabetical():
             ),
         )
 
-    order = lambda cs: [c.ticker for c in sorted(cs, key=allocation_sort_key)]
+    def order(cs):
+        return [c.ticker for c in sorted(cs, key=allocation_sort_key)]
 
     # Equal multiplier and drop -> ticker alphabetical breaks the tie (A->Z),
     # not the input/universe order.
