@@ -77,6 +77,23 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _is_error_response(data: Dict[str, Any]) -> Optional[str]:
+    """Return a reason string if a wrapper reported failure as data, else ``None``.
+
+    MCP wrappers sometimes surface an outage as a payload (``{"error": ...}`` /
+    ``{"success": false}``) rather than raising. Broker safeguards must treat these as
+    failures (fail closed), not as "no data / nothing found".
+    """
+    if not isinstance(data, dict):
+        return None
+    if data.get("error"):
+        return f"error: {data.get('error')}"
+    for flag in ("success", "ok"):
+        if data.get(flag) is False:
+            return f"{flag}=false"
+    return None
+
+
 def _parse_rfc3339(value: Any) -> Optional[datetime]:
     """Parse an RFC3339/ISO-8601 timestamp (incl. ``Z`` and nanosecond precision).
 
@@ -233,13 +250,20 @@ class RobinhoodDataProvider:
                 timestamp = _parse_rfc3339(raw.get("begins_at"))
                 if timestamp is None:
                     continue
+                close = _to_float(raw.get("close_price"), default=-1.0)
+                if close <= 0:
+                    # A missing/non-numeric close during an API gap or partial bar would
+                    # otherwise become 0.0 and read as a ~100% drop -> spurious max BUY.
+                    # Drop it so the strategy degrades to NO_DATA instead.
+                    logger.warning("dropping %s bar with invalid close_price=%r", ticker, raw.get("close_price"))
+                    continue
                 bars.append(
                     Bar(
                         timestamp=timestamp,
                         open=_to_float(raw.get("open_price")),
                         high=_to_float(raw.get("high_price")),
                         low=_to_float(raw.get("low_price")),
-                        close=_to_float(raw.get("close_price")),
+                        close=close,
                         volume=_to_float(raw.get("volume")),
                     )
                 )
@@ -397,6 +421,11 @@ class RobinhoodBroker:
             created_at_gte=trading_day.isoformat(),
         )
         data = _unwrap(response)
+        error = _is_error_response(data)
+        if error is not None:
+            # Fail closed: an error-shaped lookup ("no orders" by omission) must not let
+            # the one-order-per-ticker-per-day guard pass and allow a duplicate buy.
+            raise RuntimeError(f"same-day order lookup for {ticker} failed: {error}")
         for order in data.get("orders") or []:
             if str(order.get("state", "")).lower() in _LIVE_ORDER_STATES:
                 return True
@@ -432,7 +461,15 @@ class RobinhoodBroker:
 
     def place_market_buy(self, ticker: str, notional_usd: float, ref_id: str) -> str:
         if not (self.enable_live_orders and self._place_fn is not None):
-            return f"RH-DRYRUN-{ticker}-{notional_usd:.2f}-{ref_id}"
+            # run_once only calls a live broker's place_market_buy on the non-dry-run path
+            # (dry-run uses a DRY-RUN-SIM sentinel without touching the broker). Reaching
+            # here with the live gate disabled is a misconfiguration; returning a
+            # success-like id would make run_once record a phantom buy and consume budget.
+            raise RuntimeError(
+                f"place_market_buy called for {ticker} with the live gate disabled "
+                f"(enable_live_orders={self.enable_live_orders}, "
+                f"place_fn={'set' if self._place_fn else 'None'}); use dry_run=True for simulated runs"
+            )
         response = self._place_fn(
             account_number=self._account,
             symbol=ticker,
@@ -456,7 +493,14 @@ class RobinhoodBroker:
     def get_order_fill(self, order_id: str) -> Optional[OrderFill]:
         if not order_id or self._order_fill_fn is None:
             return None
-        data = _unwrap(self._order_fill_fn(account_number=self._account, order_id=order_id))
+        try:
+            data = _unwrap(self._order_fill_fn(account_number=self._account, order_id=order_id))
+        except Exception:  # noqa: BLE001 - a fill-lookup outage must not abort the run
+            # The order is already placed by the time we look up its fill; a transient
+            # get_equity_orders failure should leave it recorded as submitted/unfilled,
+            # not crash run_once before the durable artifacts are written.
+            logger.exception("order-fill lookup failed for %s; recording as unfilled", order_id)
+            return None
         orders = data.get("orders") or ([data] if (data.get("id") or data.get("order_id")) else [])
         for order in orders:
             # place_market_buy accepts either "id" or "order_id"; match on both here so a

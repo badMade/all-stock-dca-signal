@@ -70,6 +70,23 @@ def test_fills_from_orders_csv(tmp_path):
     assert fills[0]["order_id"] == "O1"
 
 
+def test_execution_targets_from_orders_csv(tmp_path):
+    from run_dca import _execution_targets_from_orders_csv
+
+    csv_path = tmp_path / "orders.csv"
+    csv_path.write_text(
+        "ticker,status,order_id,target_price\n"
+        "AAPL,filled,O1,97.50\n"
+        "NVDA,submitted,O2,\n"
+        "MU,submitted,O3,-\n",
+        encoding="utf-8",
+    )
+    targets = _execution_targets_from_orders_csv(csv_path)
+    assert targets["AAPL"] == 97.50
+    assert targets["NVDA"] is None
+    assert targets["MU"] is None
+
+
 def test_fills_from_missing_csv_is_empty(tmp_path):
     assert _fills_from_orders_csv(tmp_path / "nope.csv") == []
 

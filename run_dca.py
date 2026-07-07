@@ -76,6 +76,30 @@ def _fills_from_orders_csv(orders_csv: Path) -> List[Dict[str, Any]]:
     return fills
 
 
+def _execution_targets_from_orders_csv(orders_csv: Path) -> Dict[str, Optional[float]]:
+    """Map ticker -> the execution-record target price (signal-time quote) from orders.csv.
+
+    The durable orders.csv records ``decision.target_price`` (the signal-time quote),
+    while run_state's ``buy_candidates`` store the decision-bar close. Reconciling to the
+    execution target keeps the full slippage report/Notion summary consistent with the
+    orders CSV instead of ranking against a different price.
+    """
+    targets: Dict[str, Optional[float]] = {}
+    if not orders_csv.exists():
+        return targets
+    with orders_csv.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            ticker = row.get("ticker")
+            if not ticker:
+                continue
+            raw = row.get("target_price")
+            try:
+                targets[ticker] = float(raw) if raw not in (None, "", "-") else None
+            except (TypeError, ValueError):
+                targets[ticker] = None
+    return targets
+
+
 def run_pipeline(
     now: datetime,
     config: StrategyConfig,
@@ -119,7 +143,16 @@ def run_pipeline(
 
     out = Path(artifacts_dir)
     run_state = json.loads((out / "run_state.json").read_text(encoding="utf-8"))
-    fills = _fills_from_orders_csv(out / "orders.csv")
+    orders_csv = out / "orders.csv"
+    fills = _fills_from_orders_csv(orders_csv)
+    # Align candidate target prices with the durable execution records so the slippage
+    # report ranks against the same target the orders CSV uses (the signal-time quote).
+    targets = _execution_targets_from_orders_csv(orders_csv)
+    for candidate in run_state.get("buy_candidates") or []:
+        target = targets.get(candidate.get("ticker"))
+        if target is not None:
+            candidate["target_price"] = target
+            candidate["target_price_missing"] = False
     report_paths = generate_reports(run_state, fills, out)
     summary = json.loads(Path(report_paths["latest_run_summary"]).read_text(encoding="utf-8"))
     sync_paths = write_compact_sync(summary, out)

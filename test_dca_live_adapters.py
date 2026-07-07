@@ -99,6 +99,20 @@ def test_provider_parses_bars_and_skips_interpolated():
     assert bars[-1].close == pytest.approx(308.24)
 
 
+def test_provider_drops_bars_with_invalid_close():
+    # A missing/non-numeric close would become 0.0 and read as a ~100% drop -> spurious BUY.
+    bad = {"data": {"results": [{"symbol": "AAPL", "bars": [
+        {"begins_at": "2026-07-02T13:30:00Z", "open_price": "300", "close_price": "301", "high_price": "302", "low_price": "299", "volume": 1},
+        {"begins_at": "2026-07-02T14:00:00Z", "open_price": "300", "close_price": None, "high_price": "302", "low_price": "299", "volume": 1},
+        {"begins_at": "2026-07-02T14:30:00Z", "open_price": "300", "close_price": "0", "high_price": "302", "low_price": "299", "volume": 1},
+    ]}]}}
+    prov = RobinhoodDataProvider(historicals_fn=lambda **k: bad)
+    start = datetime.combine(datetime(2026, 7, 2).date(), time(9, 30), tzinfo=EASTERN)
+    bars = prov.get_intraday_bars("AAPL", start, _decision_dt(), 30)
+    assert len(bars) == 1  # only the valid bar survives
+    assert bars[0].close == pytest.approx(301.0)
+
+
 def test_provider_previous_close_from_quote():
     prov = RobinhoodDataProvider(historicals_fn=lambda **k: HISTORICALS, quotes_fn=lambda **k: QUOTES)
     bar = prov.get_previous_close_bar("AAPL", _decision_dt())
@@ -174,11 +188,13 @@ def test_finance_provider_coerces_date_objects():
 # -- RobinhoodBroker -------------------------------------------------------------
 
 
-def test_broker_place_is_dry_run_without_live_gate():
+def test_broker_place_raises_when_live_gate_disabled():
+    # run_once only reaches a live broker's place_market_buy on the non-dry-run path, so a
+    # disabled gate here is a misconfiguration that must fail loudly, not book a phantom buy.
     calls = []
     broker = RobinhoodBroker(account="562057042", place_fn=lambda **k: calls.append(k) or {"data": {"order": {"id": "X"}}})
-    order_id = broker.place_market_buy("AAPL", 1.0, "ref1")
-    assert order_id.startswith("RH-DRYRUN-")
+    with pytest.raises(RuntimeError, match="live gate disabled"):
+        broker.place_market_buy("AAPL", 1.0, "ref1")
     assert calls == []  # place_fn never invoked while disabled
 
 
@@ -246,6 +262,24 @@ def test_broker_same_day_order_detection():
     assert RobinhoodBroker(orders_fn=lambda **k: live).same_day_strategy_order_exists("AAPL", day) is True
     assert RobinhoodBroker(orders_fn=lambda **k: cancelled).same_day_strategy_order_exists("AAPL", day) is False
     assert RobinhoodBroker().same_day_strategy_order_exists("AAPL", day) is False
+
+
+def test_broker_same_day_fails_closed_on_error_response():
+    # An error-shaped lookup must not read as "no order exists" and allow a duplicate buy.
+    day = datetime(2026, 7, 6).date()
+    err = {"data": {"error": "orders service unavailable"}}
+    with pytest.raises(RuntimeError, match="same-day order lookup"):
+        RobinhoodBroker(orders_fn=lambda **k: err).same_day_strategy_order_exists("AAPL", day)
+    with pytest.raises(RuntimeError, match="same-day order lookup"):
+        RobinhoodBroker(orders_fn=lambda **k: {"data": {"success": False}}).same_day_strategy_order_exists("AAPL", day)
+
+
+def test_broker_order_fill_swallows_lookup_failure():
+    # A transient fill-lookup outage after placement must not crash the run.
+    def boom(**k):
+        raise RuntimeError("get_equity_orders timeout")
+
+    assert RobinhoodBroker(order_fill_fn=boom).get_order_fill("ORD-1") is None
 
 
 def test_broker_buying_power_keyword_call_and_failure():
