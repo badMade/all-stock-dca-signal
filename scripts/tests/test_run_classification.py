@@ -144,6 +144,11 @@ def test_validation_rejects_placeholder_supersedes():
     manual["supersedes_cron_id"] = "ce16ba6b_replacement"
     assert not validate_classification(manual).ok
 
+    # A placeholder/ambiguous cron_id is also forbidden.
+    rc_bad_cron = build_scheduled_classification(TRADING_DAY)
+    rc_bad_cron["cron_id"] = "ce16ba6b_replacement"
+    assert not validate_classification(rc_bad_cron).ok
+
 
 def test_validation_rejects_mismatched_flag():
     rc = build_scheduled_classification(TRADING_DAY)
