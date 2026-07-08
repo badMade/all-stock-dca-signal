@@ -2141,7 +2141,7 @@ def run_once(
                 )
                 continue
 
-        if state.buys_today(ticker, trading_day) >= config.max_buys_per_ticker_per_day:
+        if not guard_active and state.buys_today(ticker, trading_day) >= config.max_buys_per_ticker_per_day:
             candidate_outcomes[ticker] = {"status": "skipped", "skip_reason": "already bought today"}
             _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: already bought today; skipping")
             continue
