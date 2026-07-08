@@ -117,6 +117,30 @@ def test_missing_fills_reported_when_no_fill():
     assert missing[0]["skip_reason"]
 
 
+def test_missing_fills_excludes_top_up_skipped_candidates():
+    run_state = _run_state()
+    # NVDA's afternoon buy was fully offset by an earlier same-day run; the guard
+    # intentionally ordered $0 for it, so it must not surface as a missing fill.
+    run_state["buy_candidates"][1]["top_up_skipped"] = True
+    fills = [f for f in _fills() if f["ticker"] != "NVDA"]
+    missing = build_missing_fills(run_state["buy_candidates"], fills)
+    assert {m["ticker"] for m in missing} == set()
+
+
+def test_latest_run_summary_excludes_top_up_skipped_from_coverage():
+    run_state = _run_state()
+    run_state["buy_candidates"][1]["top_up_skipped"] = True
+    fills = [f for f in _fills() if f["ticker"] != "NVDA"]
+    rows = compute_slippage_rows(run_state["buy_candidates"], fills)
+    missing = build_missing_fills(run_state["buy_candidates"], fills)
+    summary = build_latest_run_summary(run_state, rows, missing)
+
+    # Only AAPL and AMD count toward the coverage universe; both filled.
+    assert summary["coverage"]["buy_candidates"] == 2
+    assert summary["coverage"]["missing_fills"] == 0
+    assert summary["coverage"]["coverage_pct"] == 100.0
+
+
 def test_compact_notion_markdown_generation():
     run_state = _run_state()
     rows = compute_slippage_rows(run_state["buy_candidates"], _fills())
@@ -380,6 +404,51 @@ def test_build_run_artifacts_captures_target_price():
     assert artifacts["budget"]["weekly_cap_usd"] == 900.0
     assert artifacts["budget"]["budget_tier"] == "normal"
     assert artifacts["budget"]["base_buy_amount_usd"] == 3.0
+
+
+def test_build_run_artifacts_surfaces_top_up_manual_review():
+    from datetime import date, datetime, time
+    from zoneinfo import ZoneInfo
+
+    from near_close_dca import (
+        Action,
+        ReconciledDecision,
+        SourceName,
+        SourceSignal,
+        StrategyConfig,
+        StrategyState,
+        TopUpGuardOutcome,
+        build_run_artifacts,
+    )
+
+    eastern = ZoneInfo("America/New_York")
+    now = datetime.combine(date(2026, 6, 29), time(15, 45), tzinfo=eastern)
+
+    finance = SourceSignal(
+        ticker="AAPL", source=SourceName.FINANCE, action=Action.BUY, reason="buy",
+        decision_price=100.0, previous_close=104.0, buy_multiplier=1.0, suggested_amount_usd=6.0,
+    )
+    decision = ReconciledDecision(
+        ticker="AAPL", action=Action.BUY, reason="agree", finance_signal=finance,
+        robinhood_signal=None, buy_multiplier=1.0, suggested_amount_usd=6.0,
+    )
+    # Known prior amount but no comparable reference price -> guard buys $0 and
+    # flags manual review, even though the decision itself was a plain BUY.
+    guard_outcome = TopUpGuardOutcome(
+        ticker="AAPL", afternoon_desired_amount=6.0, afternoon_decision_price=100.0,
+        prior_same_day_amount=3.0, prior_same_day_reference_price=None,
+        prior_same_day_run_id="manual_am", prior_same_day_source="manual",
+        incremental_order_amount=0.0, top_up_guard_result="missing_prior_price",
+        skipped=True, manual_review=True,
+    )
+
+    artifacts = build_run_artifacts(
+        now, StrategyConfig(), StrategyState(), [decision],
+        {"AAPL": {"status": "not_submitted", "skip_reason": "missing_prior_price"}},
+        top_up_outcomes={"AAPL": guard_outcome},
+    )
+    assert artifacts["manual_review_tickers"] == ["AAPL"]
+    assert artifacts["usage_proxy"]["manual_recovery_required"] is True
 
 
 def test_load_json_files_skips_blocked_stubs(tmp_path):

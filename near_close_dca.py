@@ -1176,6 +1176,7 @@ def build_usage_proxy(
     """
     tickers_scanned = len(decisions)
     manual_review_count = sum(1 for d in decisions if d.action == Action.MANUAL_REVIEW)
+    top_up_manual_review_count = sum(1 for c in buy_candidates if c.get("top_up_manual_review"))
     orders_placed_count = sum(
         1
         for outcome in candidate_outcomes.values()
@@ -1201,7 +1202,7 @@ def build_usage_proxy(
         "total_artifact_bytes": None,
         "notifications_sent": notifications_sent,
         "errors_count": errors_count,
-        "manual_recovery_required": manual_review_count > 0 or errors_count > 0,
+        "manual_recovery_required": manual_review_count > 0 or top_up_manual_review_count > 0 or errors_count > 0,
         "cost_control_notes": list(cost_control_notes)
         if cost_control_notes is not None
         else list(DAILY_COST_CONTROL_NOTES),
@@ -1282,6 +1283,11 @@ def build_run_artifacts(
             )
         buy_candidates.append(candidate_row)
 
+    manual_review_tickers = [d.ticker for d in decisions if d.action == Action.MANUAL_REVIEW]
+    for candidate in buy_candidates:
+        if candidate.get("top_up_manual_review") and candidate["ticker"] not in manual_review_tickers:
+            manual_review_tickers.append(candidate["ticker"])
+
     planned_spend = sum(c["planned_amount_usd"] for c in buy_candidates)
     high_multiplier_signals = sum(
         1 for c in buy_candidates if (c["buy_multiplier"] or 0.0) >= config.high_multiplier_threshold
@@ -1325,7 +1331,7 @@ def build_run_artifacts(
         },
         "signal_rows": signal_rows,
         "buy_candidates": buy_candidates,
-        "manual_review_tickers": [d.ticker for d in decisions if d.action == Action.MANUAL_REVIEW],
+        "manual_review_tickers": manual_review_tickers,
         "usage_proxy": build_usage_proxy(
             decisions=decisions,
             signal_rows=signal_rows,

@@ -142,10 +142,17 @@ def build_missing_fills(
     buy_candidates: Sequence[Dict[str, Any]],
     fills: Sequence[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Return buy candidates that never produced a fill."""
+    """Return buy candidates that never produced a fill.
+
+    Candidates flagged ``top_up_skipped`` are excluded: the same-day top-up guard
+    intentionally ordered $0 for them because an earlier same-day run already
+    covered the ticker, so a missing fill there is expected, not a coverage gap.
+    """
     filled_tickers = {f.get("ticker") or f.get("symbol") for f in fills}
     missing: List[Dict[str, Any]] = []
     for candidate in buy_candidates:
+        if candidate.get("top_up_skipped"):
+            continue
         ticker = candidate.get("ticker")
         if ticker in filled_tickers:
             continue
@@ -176,6 +183,10 @@ def build_latest_run_summary(
     target price; ``target_price_missing`` rows are surfaced separately.
     """
     buy_candidates = run_state.get("buy_candidates") or []
+    # Top-up-guard candidates intentionally bought $0 (already covered by an earlier
+    # same-day run) are excluded from the coverage universe; otherwise a fully
+    # offset scheduled run would report every offset ticker as a missing fill.
+    coverage_candidates = [c for c in buy_candidates if not c.get("top_up_skipped")]
     priced = [r for r in slippage_rows if not r["target_price_missing"] and r["slippage_pct"] is not None]
     missing_target = [r for r in slippage_rows if r["target_price_missing"]]
 
@@ -184,7 +195,7 @@ def build_latest_run_summary(
     max_slippage = round(max(slippage_values), 4) if slippage_values else None
     min_slippage = round(min(slippage_values), 4) if slippage_values else None
 
-    candidate_count = len(buy_candidates)
+    candidate_count = len(coverage_candidates)
     filled_count = len(slippage_rows)
     coverage_pct = round(filled_count / candidate_count * 100.0, 2) if candidate_count else None
 
