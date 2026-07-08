@@ -53,6 +53,11 @@ py-modules = [
     "dca_risk",
     "run_dca",
 ]
+# scripts/run_classification.py is the run-classification contract used by both
+# the live artifact writer (near_close_dca.build_run_artifacts) and readers
+# (dca_risk, dca_reporting) -- it must ship with the installed package, not just
+# exist in a checkout, or those imports fail at runtime (see scripts/__init__.py).
+packages = ["scripts"]
 
 # Ship the version-controlled config so an installed `run-dca` (outside a checkout) finds
 # the live trading window instead of falling back to the hardcoded defaults. dca_config
