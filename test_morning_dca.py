@@ -137,6 +137,38 @@ def test_fresh_quote_at_or_before_decision_is_used():
     assert sig.current_price == 91.0
 
 
+def test_untimestamped_quote_falls_back_to_completed_bar():
+    # A quote with no usable timestamp cannot be proven to be at/before the
+    # decision anchor, so it must not be trusted for sizing.
+    decision_dt = _now()
+    data = FixedQuoteProvider(
+        SourceName.ROBINHOOD, 100.0, {"BIG": 0.10},
+        quote_price=50.0, quote_time=None,
+    )
+    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
+    sig = ex.evaluate(decision_dt, data)[0]
+    assert sig.current_price == 90.0
+    assert any("no usable timestamp" in w for w in sig.warnings)
+
+
+def test_future_previous_close_bar_rejected():
+    # A previous-close lookup that returns a bar at/after the decision anchor
+    # (e.g. same-day 16:00 close from a live-quote-backed provider) must be
+    # rejected rather than used to compute the morning drop.
+    decision_dt = _now()
+
+    class FuturePrevCloseProvider(FixedDropProvider):
+        def get_previous_close_bar(self, ticker, as_of):
+            p = self._prev
+            return Bar(timestamp=as_of, open=p, high=p, low=p, close=p, volume=0.0)
+
+    data = FuturePrevCloseProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
+    sig = ex.evaluate(decision_dt, data)[0]
+    assert sig.action == Action.NO_DATA
+    assert any("rejecting" in w for w in sig.warnings)
+
+
 def test_in_progress_bar_excluded_from_sizing():
     # The 09:45-09:50 bar is not yet complete at the 09:45 decision anchor; a
     # provider that only supplies that bar (no completed 09:40 bar) must yield

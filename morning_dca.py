@@ -326,6 +326,12 @@ class MorningDCAExecutor(DCAExecutor):
         except Exception as exc:  # noqa: BLE001 - degrade to NO_DATA with a warning
             prev_bar = None
             warnings.append(f"previous_close provider error: {exc}")
+        if prev_bar is not None and prev_bar.timestamp >= decision_dt:
+            warnings.append(
+                f"previous_close timestamp {prev_bar.timestamp.isoformat()} is not before "
+                "the 09:45 ET decision anchor; rejecting"
+            )
+            prev_bar = None
         if prev_bar is not None:
             previous_close = prev_bar.close
         else:
@@ -402,12 +408,17 @@ class MorningDCAExecutor(DCAExecutor):
                 quote = get_quote(ticker, decision_dt)
                 if quote is not None and isinstance(quote, (tuple, list)) and len(quote) >= 1:
                     quote_time = quote[1] if len(quote) >= 2 else None
-                    if quote_time is None or quote_time <= decision_dt:
+                    if isinstance(quote_time, datetime) and quote_time <= decision_dt:
                         return float(quote[0])
-                    warnings.append(
-                        f"quote timestamp {quote_time.isoformat()} is after the 09:45 ET "
-                        "decision anchor; falling back to completed bar"
-                    )
+                    if quote_time is None:
+                        warnings.append(
+                            "quote has no usable timestamp; falling back to completed bar"
+                        )
+                    else:
+                        warnings.append(
+                            f"quote timestamp {quote_time!r} is after the 09:45 ET "
+                            "decision anchor; falling back to completed bar"
+                        )
             except Exception as exc:  # noqa: BLE001
                 warnings.append(f"quote provider error: {exc}")
         bar_anchor = completed_bar_anchor(decision_dt, self.config.interval_minutes, self._sizing_config)
