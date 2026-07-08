@@ -1442,7 +1442,10 @@ def _write_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
 
 # Buy-candidate statuses that mean an order was actually placed (and therefore
 # count as prior same-day allocation for the top-up guard).
-_PRIOR_ALLOCATION_STATUSES = frozenset({"submitted", "dry_run", "filled"})
+# "dry_run" is deliberately excluded: its own skip_reason ("dry_run: order not
+# placed") means no real capital moved, so a manual dry-run test earlier the
+# same day must never reduce the scheduled run's real buy.
+_PRIOR_ALLOCATION_STATUSES = frozenset({"submitted", "filled"})
 
 
 def _prior_run_is_scheduled(run_state: Dict[str, Any]) -> bool:
@@ -1478,9 +1481,16 @@ def _prior_run_before_boundary(run_state: Dict[str, Any], boundary_et: time) -> 
     return parsed.astimezone(EASTERN).timetz().replace(tzinfo=None) < boundary_et
 
 
-def _orders_csv_fill_prices(run_dir: Path) -> Dict[str, float]:
-    """Map ticker -> average fill price from a prior run's orders.csv (filled rows only)."""
-    fills: Dict[str, float] = {}
+def _orders_csv_fills(run_dir: Path) -> Dict[str, Dict[str, Any]]:
+    """Map ticker -> {order_id, avg_fill_price, quantity_filled} for filled rows only.
+
+    Used to reconcile a prior run's ``buy_candidates`` (whose status is fixed at
+    order-submission time) against what the broker actually confirmed: a candidate
+    recorded ``status='submitted'`` in run_state.json only means an order_id was
+    obtained, not that it filled. A submission that never filled (execution gap,
+    reject, cancel) must not count as prior-allocation capital.
+    """
+    fills: Dict[str, Dict[str, Any]] = {}
     orders_csv = run_dir / "orders.csv"
     if not orders_csv.exists():
         return fills
@@ -1490,13 +1500,23 @@ def _orders_csv_fill_prices(run_dir: Path) -> Dict[str, float]:
                 ticker = row.get("ticker")
                 if not ticker or (row.get("status") or "").lower() != "filled":
                     continue
-                raw = row.get("avg_fill_price")
+                raw_price = row.get("avg_fill_price")
                 try:
-                    price = float(raw) if raw not in (None, "", "-") else None
+                    price = float(raw_price) if raw_price not in (None, "", "-") else None
                 except (TypeError, ValueError):
                     price = None
-                if price and price > 0:
-                    fills[ticker] = price
+                if not price or price <= 0:
+                    continue
+                raw_qty = row.get("quantity_filled")
+                try:
+                    qty = float(raw_qty) if raw_qty not in (None, "", "-") else None
+                except (TypeError, ValueError):
+                    qty = None
+                fills[ticker] = {
+                    "order_id": row.get("order_id"),
+                    "avg_fill_price": price,
+                    "quantity_filled": qty if qty and qty > 0 else None,
+                }
     except Exception:
         return fills
     return fills
@@ -1552,15 +1572,30 @@ def load_prior_same_day_allocations(
         run_id = run_id or run_state.get("run_id")
         source = source or "manual"
 
-        fill_prices = _orders_csv_fill_prices(run_state_path.parent)
+        orders_csv_path = run_state_path.parent / "orders.csv"
+        fills = _orders_csv_fills(run_state_path.parent)
         for candidate in run_state.get("buy_candidates") or []:
             if not isinstance(candidate, dict):
                 continue
-            if (candidate.get("status") or "") not in _PRIOR_ALLOCATION_STATUSES:
+            status = candidate.get("status") or ""
+            if status not in _PRIOR_ALLOCATION_STATUSES:
                 continue
             ticker = candidate.get("ticker")
             if not ticker:
                 continue
+
+            # A "submitted" candidate in run_state.json only means an order_id was
+            # obtained at submission time, not that it filled. When orders.csv is
+            # available for this run, require it to confirm the fill before
+            # counting the dollars as prior allocation -- an order that never
+            # filled (execution gap, reject, cancel) must not silently reduce the
+            # scheduled run's real buy. If orders.csv is absent entirely (e.g. an
+            # older artifact layout), fall back to trusting run_state.json as
+            # before rather than losing all prior context.
+            fill = fills.get(ticker)
+            if orders_csv_path.exists() and fill is None:
+                continue
+
             amount = candidate.get("incremental_order_amount")
             if amount is None:
                 amount = candidate.get("planned_amount_usd")
@@ -1568,10 +1603,14 @@ def load_prior_same_day_allocations(
                 amount = float(amount)
             except (TypeError, ValueError):
                 continue
+            if fill is not None and fill["quantity_filled"]:
+                # Prefer the actual filled notional over the planned amount so a
+                # partial fill doesn't overstate prior allocation.
+                amount = fill["avg_fill_price"] * fill["quantity_filled"]
             if amount <= 0:
                 continue
 
-            reference_price = fill_prices.get(ticker)
+            reference_price = fill["avg_fill_price"] if fill is not None else None
             if reference_price is None:
                 for key in ("target_price", "decision_bar_close"):
                     value = candidate.get(key)
@@ -2021,6 +2060,7 @@ def run_once(
     notifications_sent: Optional[int] = None,
     cost_control_notes: Optional[Sequence[str]] = None,
     prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]] = None,
+    scheduled: bool = True,
 ) -> List[ReconciledDecision]:
     now_et = now.astimezone(EASTERN)
     trading_day = now_et.date()
@@ -2105,15 +2145,23 @@ def run_once(
     state.roll_weekly_reserve(trading_day, config)
 
     candidate_outcomes: Dict[str, Dict[str, Any]] = {}
-    # When prior same-day allocations are supplied this is the scheduled afternoon run:
-    # apply the top-up guard so a morning/manual run never blocks it, and only the
-    # incremental dollar difference (into a lower price) is bought.
-    guard_active = prior_same_day_allocations is not None
+    # The top-up guard (and its same-day-order-check bypass) is only for the
+    # scheduled afternoon run: a manual run must still be blocked by its own
+    # same-day-order/max-buys checks even if a caller happens to also pass
+    # prior_same_day_allocations (e.g. an auto-loaded state root shared across
+    # call sites), or a manual run could unintentionally double-buy.
+    guard_active = scheduled and prior_same_day_allocations is not None
     top_up_outcomes: Dict[str, TopUpGuardOutcome] = {}
 
     for decision in buy_candidates:
         ticker = decision.ticker
         order_amount = decision.suggested_amount_usd
+        # Only bypass the same-day duplicate-order checks below for a ticker whose
+        # prior allocation was actually loaded: if the guard is active but this
+        # ticker has no scanned prior allocation (missing/malformed artifact,
+        # boundary-excluded run, etc.), the broker/state duplicate checks must
+        # still apply so a real same-day order is never placed twice.
+        ticker_guarded = guard_active and prior_same_day_allocations.get(ticker) is not None
 
         if guard_active:
             outcome = evaluate_top_up_guard(
@@ -2141,14 +2189,15 @@ def run_once(
                 )
                 continue
 
-        if not guard_active and state.buys_today(ticker, trading_day) >= config.max_buys_per_ticker_per_day:
+        if not ticker_guarded and state.buys_today(ticker, trading_day) >= config.max_buys_per_ticker_per_day:
             candidate_outcomes[ticker] = {"status": "skipped", "skip_reason": "already bought today"}
             _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: already bought today; skipping")
             continue
         # A morning/manual run must NOT block the scheduled afternoon run: when the
-        # top-up guard is active the earlier same-day allocation is handled above, so
-        # the broker's same-day-order block is intentionally bypassed here.
-        if not guard_active and broker.same_day_strategy_order_exists(ticker, trading_day):
+        # top-up guard has a loaded prior allocation for this ticker, the earlier
+        # same-day allocation is handled above, so the broker's same-day-order
+        # block is intentionally bypassed here.
+        if not ticker_guarded and broker.same_day_strategy_order_exists(ticker, trading_day):
             candidate_outcomes[ticker] = {"status": "skipped", "skip_reason": "same-day broker order exists"}
             _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: same-day broker order already exists; skipping")
             continue
@@ -2346,6 +2395,7 @@ def run_daily_compact(
         run_result=run_result,
         notifications_sent=notifications_sent,
         prior_same_day_allocations=prior_same_day_allocations,
+        scheduled=scheduled,
     )
 
     out = Path(artifacts_dir)

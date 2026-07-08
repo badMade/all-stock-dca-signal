@@ -53,6 +53,45 @@ def test_run_pipeline_blocked_day_skips_reports(tmp_path):
     )
     assert result["blocked"] is True
     assert "reports" not in result
+
+
+def test_run_pipeline_scheduled_run_auto_loads_prior_allocations(tmp_path):
+    import json
+
+    # Seed a manual same-day allocation as a sibling directory of the scheduled
+    # run's artifacts_dir, mimicking the live cron_tracking layout, WITHOUT
+    # passing prior_same_day_allocations or prior_allocation_state_root -- the
+    # scheduled run must auto-derive the state root from artifacts_dir's parent.
+    manual_dir = tmp_path / "manual_runs" / "0900"
+    manual_dir.mkdir(parents=True)
+    (manual_dir / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": _now().date().isoformat(),
+            "generated_at": f"{_now().date().isoformat()}T09:00:00-04:00",
+            "run_classification": {"run_origin": "manual", "run_id": "manual_am"},
+            # A very low reference price guarantees the afternoon price is never
+            # below it, so this ticker's guard result proves the allocation was
+            # loaded (top_up_guard_result != "no_prior_run") without depending
+            # on the demo provider's exact drop-derived price.
+            "buy_candidates": [
+                {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0, "target_price": 0.01},
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    config = _demo_config()
+    scheduled_dir = tmp_path / "scheduled"
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=scheduled_dir,
+    )
+    assert result["blocked"] is False
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    assert by_ticker["AAPL"]["top_up_guard_result"] != "no_prior_run"
     assert not (tmp_path / "latest_run_summary.json").exists()
 
 

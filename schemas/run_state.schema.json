@@ -93,7 +93,7 @@
           "decision_bar_close": { "type": ["number", "null"] },
           "previous_close": { "type": ["number", "null"] },
           "order_id": { "type": ["string", "null"] },
-          "status": { "type": "string", "enum": ["submitted", "not_submitted", "skipped", "blocked", "dry_run"] },
+          "status": { "type": "string", "enum": ["submitted", "not_submitted", "skipped", "blocked", "dry_run", "failed"] },
           "skip_reason": { "type": ["string", "null"] },
           "afternoon_desired_amount": { "type": "number", "minimum": 0, "description": "Same-day top-up guard (scheduled afternoon run only): the full afternoon desired dollar amount before the prior-run offset." },
           "afternoon_decision_price": { "type": ["number", "null"], "description": "Same-day top-up guard: the afternoon decision price compared against the earlier same-day run's reference price." },

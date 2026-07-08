@@ -160,13 +160,17 @@ def run_pipeline(
     slippage/coverage reports and the compact Notion sync from the run artifacts
     (heavier work reserved for Friday/manual runs).
 
-    To enable the same-day prior-run offset/top-up guard on the scheduled afternoon
-    run, either pass ``prior_same_day_allocations`` directly or pass
-    ``prior_allocation_state_root`` (the cron_tracking state root) and let this
-    function load the same-day morning/manual allocations via
-    :func:`near_close_dca.load_prior_same_day_allocations`.
+    The same-day prior-run offset/top-up guard is scheduled-run-only. For a
+    scheduled run, ``prior_allocation_state_root`` defaults to ``artifacts_dir``'s
+    parent (the live task's per-day directories are its siblings) so the guard
+    activates without every caller having to wire it explicitly; pass
+    ``prior_same_day_allocations`` directly to override, or an explicit
+    ``prior_allocation_state_root`` to scan a different tree. Manual runs never
+    auto-load prior allocations, so a manual invocation is never guard-active.
     """
-    if prior_same_day_allocations is None and prior_allocation_state_root is not None:
+    if scheduled and prior_same_day_allocations is None:
+        if prior_allocation_state_root is None:
+            prior_allocation_state_root = Path(artifacts_dir).parent
         trading_day = now.astimezone(EASTERN).date()
         prior_same_day_allocations = load_prior_same_day_allocations(
             prior_allocation_state_root, trading_day

@@ -810,6 +810,36 @@ def test_load_prior_same_day_prefers_orders_csv_fill_price(tmp_path):
     assert allocations["AAPL"].reference_price == 97.5
 
 
+def test_load_prior_same_day_excludes_unconfirmed_submitted_order(tmp_path):
+    # status="submitted" in run_state.json only means an order_id was obtained,
+    # not that it filled; when orders.csv contradicts that (still "submitted",
+    # never confirmed filled), it must not count as prior allocation.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    _write_prior_run(
+        root,
+        "manual_runs/0900",
+        _manual_run_state([
+            {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0, "target_price": 99.0},
+        ]),
+        orders_rows=[{"ticker": "AAPL", "status": "submitted", "avg_fill_price": ""}],
+    )
+    assert load_prior_same_day_allocations(root, date(2026, 6, 29)) == {}
+
+
+def test_load_prior_same_day_excludes_dry_run_candidates(tmp_path):
+    # A dry-run smoke test never places a real order (its own skip_reason says
+    # so); it must never reduce the scheduled run's real buy.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    _write_prior_run(
+        root,
+        "manual_runs/0900",
+        _manual_run_state([
+            {"ticker": "AAPL", "status": "dry_run", "planned_amount_usd": 3.0, "target_price": 99.0},
+        ]),
+    )
+    assert load_prior_same_day_allocations(root, date(2026, 6, 29)) == {}
+
+
 def test_load_prior_same_day_excludes_scheduled_and_after_boundary(tmp_path):
     root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
     # Scheduled run -> never prior context.
@@ -946,10 +976,15 @@ def test_run_daily_compact_manual_run_does_not_block_scheduled(tmp_path):
 
     with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
-    aapl = {c["ticker"]: c for c in run_state["buy_candidates"]}["AAPL"]
-    # Guard bypassed the same-day broker block and still topped up.
-    assert aapl["status"] == "dry_run"
-    assert aapl["incremental_order_amount"] == 3.0
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # Guard bypassed the same-day broker block and still topped up AAPL, which
+    # has a loaded prior allocation.
+    assert by_ticker["AAPL"]["status"] == "dry_run"
+    assert by_ticker["AAPL"]["incremental_order_amount"] == 3.0
+    # NVDA has NO loaded prior allocation, so the broker's same-day-order check
+    # must still apply -- the guard bypass is scoped per-ticker, not blanket.
+    assert by_ticker["NVDA"]["status"] == "skipped"
+    assert by_ticker["NVDA"]["skip_reason"] == "same-day broker order exists"
 
 
 def _run_all():
