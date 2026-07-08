@@ -71,7 +71,12 @@ ladder," treat it as background context, not the current rule.
 
 ## Budget & tiered cap rules
 
-Base amount is **$3**. See [`config/budgets.json`](../config/budgets.json).
+Base amount is exactly **$3.00**. See
+[`config/budgets.json`](../config/budgets.json) (`base_amount_policy`). Every
+candidate dollar amount is **`$3.00 × multiplier`**. The automation must never
+infer, discover, or fall back to **$50.00** or any broker/account default base
+amount. If the base-amount config is missing or unreadable, continue using
+**$3.00** and record `base_amount_source='hardcoded_user_confirmed_3_usd'`.
 
 The daily and weekly caps are not fixed: each run selects a budget tier from the
 day's planned spend and the number of **3x-or-greater signals** (buy candidates

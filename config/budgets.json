@@ -1,8 +1,16 @@
 {
   "$schema": "../schemas/budgets.schema.json",
-  "version": "2026-07-06",
+  "version": "2026-07-07",
   "currency": "USD",
   "base_amount_usd": 3.0,
+  "base_amount_policy": {
+    "base_amount_usd": 3.0,
+    "exact": true,
+    "candidate_dollar_formula": "candidate_dollar_amount = base_amount_usd * multiplier = $3.00 * multiplier",
+    "source_of_truth": "config/budgets.json:base_amount_usd (mirrored in config/sizing_ladder.json:base_amount_usd)",
+    "no_fallback": "Never infer, discover, or fall back to $50.00 or any broker/account default base amount. The base is fixed at exactly $3.00.",
+    "forbidden_fallback_values_usd": [50.0]
+  },
   "high_multiplier_threshold": 3.0,
   "weekly_rollover_reserve_cap_usd": 900.0,
   "budget_tiers": [

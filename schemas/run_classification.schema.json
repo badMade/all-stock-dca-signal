@@ -29,11 +29,13 @@
     },
     "cron_id": {
       "type": "string",
-      "description": "Live scheduled task id. '10ce362c' for the repaired live task (the deleted ce16ba6b is superseded). Carried on both scheduled and manual runs so manual runs can be attributed to the task they emulate."
+      "not": { "const": "ce16ba6b_replacement" },
+      "description": "Live scheduled task id. Canonical value is '10ce362c' (the repaired live task; the deleted ce16ba6b is superseded). Placeholder or ambiguous values such as 'ce16ba6b_replacement' are forbidden. Carried on both scheduled and manual runs so manual runs can be attributed to the task they emulate."
     },
     "supersedes_cron_id": {
       "type": ["string", "null"],
-      "description": "Prior task id this run's task replaced, for lineage/continuity. 'ce16ba6b' for the repaired live task. A scheduled run is valid if cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b'."
+      "enum": ["ce16ba6b", null],
+      "description": "Prior task id this run's task replaced, for lineage/continuity. Must be exactly 'ce16ba6b' (or null/omitted). Placeholder or ambiguous values such as 'ce16ba6b_replacement' are forbidden. This schema validates consumer acceptance/continuity: a scheduled run is accepted as valid evidence when cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b' (see the anyOf below). The stricter writer contract — every newly written scheduled 3:20 PM ET run_state carries BOTH cron_id='10ce362c' AND supersedes_cron_id='ce16ba6b' — is enforced by the writer (scripts/run_classification.py) and documented in docs/run_classification.md, not by this schema."
     },
     "scheduled_for_et": {
       "type": ["string", "null"],
