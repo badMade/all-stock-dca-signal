@@ -374,12 +374,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    from dca_config import load_strategy_config
     overrides: Dict[str, Any] = {}
     if args.monthly_allocation_usd is not None:
         overrides["monthly_cash_allocation_usd"] = args.monthly_allocation_usd
     if args.kill_switch_fraction is not None:
         overrides["kill_switch_7d_deploy_fraction"] = args.kill_switch_fraction
-    config = dataclasses.replace(StrategyConfig(), **overrides) if overrides else StrategyConfig()
+    config = load_strategy_config(**overrides)
 
     as_of = date.fromisoformat(args.as_of)
     states = _load_states(args.state_root)
