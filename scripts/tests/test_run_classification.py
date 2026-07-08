@@ -131,6 +131,25 @@ def test_scheduled_rejected_without_lineage():
     assert any("supersedes_cron_id" in e for e in res.errors)
 
 
+def test_validation_rejects_placeholder_supersedes():
+    # A placeholder/ambiguous supersedes marker (e.g. 'ce16ba6b_replacement') is
+    # forbidden even though the canonical cron_id is present.
+    rc = build_scheduled_classification(TRADING_DAY)
+    rc["supersedes_cron_id"] = "ce16ba6b_replacement"
+    res = validate_classification(rc)
+    assert not res.ok
+    assert any("supersedes_cron_id" in e and "forbidden" in e for e in res.errors)
+
+    manual = build_manual_classification()
+    manual["supersedes_cron_id"] = "ce16ba6b_replacement"
+    assert not validate_classification(manual).ok
+
+    # A placeholder/ambiguous cron_id is also forbidden.
+    rc_bad_cron = build_scheduled_classification(TRADING_DAY)
+    rc_bad_cron["cron_id"] = "ce16ba6b_replacement"
+    assert not validate_classification(rc_bad_cron).ok
+
+
 def test_validation_rejects_mismatched_flag():
     rc = build_scheduled_classification(TRADING_DAY)
     rc["manual_run"] = True  # contradiction
