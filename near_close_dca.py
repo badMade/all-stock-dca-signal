@@ -1477,11 +1477,11 @@ def _prior_run_before_boundary(run_state: Dict[str, Any], boundary_et: time) -> 
     """
     raw = run_state.get("generated_at")
     if not isinstance(raw, str):
-        return True
+        return False
     try:
         parsed = datetime.fromisoformat(raw)
     except ValueError:
-        return True
+        return False
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=EASTERN)
     return parsed.astimezone(EASTERN).timetz().replace(tzinfo=None) < boundary_et
