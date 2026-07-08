@@ -237,6 +237,27 @@ def test_over_cap_emits_warning(tmp_path):
     assert any("exceeds morning daily cap" in w for w in res["artifacts"]["warnings"])
 
 
+def test_build_artifacts_does_not_double_count_ledger(tmp_path):
+    # build_artifacts must be side-effect-free: calling it more than once (e.g.
+    # inspecting artifacts before writing) must not re-record spend against the
+    # ledger. Only run()'s single record_buy_candidates() call should count.
+    cfg = MorningConfig(
+        tickers=("BIG",), base_buy_amount_usd=3.0, morning_run_state_root=str(tmp_path),
+    )
+    ex = MorningDCAExecutor(cfg)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+    now = _now()
+    day = now.astimezone(EASTERN).date()
+
+    signals = ex.evaluate(now, data)
+    ex.build_artifacts(now, signals, "robinhood")
+    ex.build_artifacts(now, signals, "robinhood")
+    assert ex.ledger.day_planned(day) == 0.0  # build_artifacts alone never mutates the ledger
+
+    ex.run(now, data)
+    assert ex.ledger.day_planned(day) == 9.0  # exactly one run recorded once
+
+
 # --- Run-state path + classification ----------------------------------------
 def test_run_state_path_and_classification(tmp_path):
     cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))

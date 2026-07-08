@@ -433,6 +433,22 @@ class MorningDCAExecutor(DCAExecutor):
         tickers = [t for t in self.config.tickers if t not in self.config.excluded_tickers]
         return [self.evaluate_signal(t, now, data) for t in tickers]
 
+    @staticmethod
+    def _buy_candidates(signals: Sequence[MorningSignal]) -> List[MorningSignal]:
+        return [s for s in signals if s.action == Action.BUY and s.multiplier > 0]
+
+    def record_buy_candidates(
+        self, trading_day: date, buy_candidates: Sequence[MorningSignal]
+    ) -> None:
+        """Record this run's buy candidates against the morning ledger.
+
+        Call exactly once per run (``run()`` does this before building
+        artifacts) -- ``build_artifacts`` itself is side-effect-free, so
+        inspecting/rebuilding artifacts never double-counts hypothetical spend.
+        """
+        for candidate in buy_candidates:
+            self.ledger.record_hypothetical(trading_day, candidate.hypothetical_amount_usd)
+
     # -- Artifacts -----------------------------------------------------------
     def build_artifacts(
         self,
@@ -442,14 +458,18 @@ class MorningDCAExecutor(DCAExecutor):
         *,
         manual: bool = False,
     ) -> Dict[str, Any]:
-        """Assemble the morning run_state dict (dry-run / analytics only)."""
+        """Assemble the morning run_state dict (dry-run / analytics only).
+
+        Pure/side-effect-free: reads the ledger but never mutates it. Callers
+        must record buy candidates via :meth:`record_buy_candidates` beforehand
+        for the ledger-derived fields (caps, remaining budget) to reflect this
+        run.
+        """
         now_et = now.astimezone(EASTERN)
         trading_day = now_et.date()
 
         signal_rows = [s.to_row() for s in signals]
-        buy_candidates = [s for s in signals if s.action == Action.BUY and s.multiplier > 0]
-        for candidate in buy_candidates:
-            self.ledger.record_hypothetical(trading_day, candidate.hypothetical_amount_usd)
+        buy_candidates = self._buy_candidates(signals)
 
         hypothetical_spend = round(sum(c.hypothetical_amount_usd for c in buy_candidates), 2)
 
@@ -563,6 +583,8 @@ class MorningDCAExecutor(DCAExecutor):
         """
         signals = self.evaluate(now, data)
         source = data_source or getattr(getattr(data, "source", None), "value", "unknown")
+        trading_day = now.astimezone(EASTERN).date()
+        self.record_buy_candidates(trading_day, self._buy_candidates(signals))
         artifacts = self.build_artifacts(now, signals, source, manual=manual)
         paths = self.write_artifacts(artifacts, now)
         return {"artifacts": artifacts, "paths": paths}
