@@ -1,5 +1,4 @@
 {
-  "$schema": "../schemas/morning_run_classification.schema.json",
   "policy_id": "morning-dca-dryrun-v1",
   "version": "2026-07-08",
   "purpose": "Configuration and separation policy for the MORNING graded-DCA dry-run analytics stream. The morning stream evaluates morning price weakness vs. yesterday's regular-session close on its own 0x-to-3x ladder, tracks a separate morning budget ledger, and writes its own run-state artifacts. It is dry-run/analytics only: no orders, no Robinhood order review, no broker placement. It is INDEPENDENT of, and never valid evidence for, the afternoon live task 10ce362c (which supersedes the deleted ce16ba6b).",
