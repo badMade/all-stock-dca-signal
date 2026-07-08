@@ -242,6 +242,12 @@ def validate_classification(rc: Dict[str, object]) -> ValidationResult:
     # Lineage values must be canonical. A supersedes marker, when present, must be
     # exactly SUPERSEDES_CRON_ID; placeholder/ambiguous values such as
     # 'ce16ba6b_replacement' are forbidden regardless of origin.
+    cron_id = rc.get("cron_id")
+    if cron_id == "ce16ba6b_replacement":
+        errors.append(
+            "cron_id cannot be 'ce16ba6b_replacement'; placeholder/ambiguous values are forbidden"
+        )
+
     supersedes = rc.get("supersedes_cron_id")
     if supersedes not in (None, "", SUPERSEDES_CRON_ID):
         errors.append(
