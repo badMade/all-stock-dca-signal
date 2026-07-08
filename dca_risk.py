@@ -177,7 +177,13 @@ def deployed_usd(state: Dict[str, Any]) -> float:
             if isinstance(c, dict) and c.get("status") == "submitted"
         ]
         if submitted:
-            return round(sum(float(c.get("planned_amount_usd") or 0.0) for c in submitted), 2)
+            total = 0.0
+            for c in submitted:
+                try:
+                    total += float(c.get("planned_amount_usd") or 0.0)
+                except (TypeError, ValueError):
+                    pass
+            return round(total, 2)
         # Candidates present but none submitted -> genuinely nothing deployed.
         if any(isinstance(c, dict) and "status" in c for c in candidates):
             return 0.0
