@@ -617,6 +617,12 @@ def select_scheduled_state_for_reporting(
 
     oss = order_submit_status(state)
     confirmation_blocked = oss == ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED
+    if confirmation_blocked:
+        # By contract a confirmation-blocked run has zero scheduled orders. A
+        # malformed/stale artifact could still carry a stray order_id (e.g. a
+        # partial write before the status field was finalized); never let that
+        # leak through as scheduled order-id evidence.
+        kept = []
 
     used_fallback = False
     fallback_reason: Optional[str] = None

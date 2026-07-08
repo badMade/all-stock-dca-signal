@@ -491,6 +491,23 @@ def test_confirmation_blocked_reports_no_fills_and_no_fallback():
         assert not sel.used_broker_fallback
 
 
+def test_confirmation_blocked_clears_stray_order_ids():
+    # Defense in depth against a malformed/stale artifact: even if a candidate
+    # somehow still carries an order_id despite the top-level status being
+    # confirmation-required (e.g. a partial write before the status field was
+    # finalized), the contract of zero scheduled orders for a confirmation-
+    # blocked run must hold regardless.
+    state = _confirmation_blocked_state()
+    state["buy_candidates"][0]["order_id"] = "STRAY-1"
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        write_run_artifacts(state, base=base)
+        sel = select_scheduled_state_for_reporting(TRADING_DAY, base=base)
+        assert sel.ok
+        assert sel.confirmation_blocked
+        assert sel.order_ids == []
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
