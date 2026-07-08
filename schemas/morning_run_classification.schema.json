@@ -1,0 +1,107 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "morning_run_classification.schema.json",
+  "title": "Morning DCA dry-run classification block",
+  "description": "The run_classification object embedded in every MORNING run_state artifact. The morning stream is a dry-run/analytics-only stream that is INDEPENDENT of the afternoon live task 10ce362c (which supersedes ce16ba6b). This block makes the separation explicit so afternoon slippage/watchdog/weekly reporting never treats a morning artifact as afternoon scheduled evidence. Contains no secrets.",
+  "type": "object",
+  "required": [
+    "run_origin",
+    "run_type",
+    "stream",
+    "manual_run",
+    "cron_id",
+    "run_id",
+    "triggered_at_utc",
+    "state_schema_version",
+    "valid_afternoon_evidence"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "run_origin": {
+      "type": "string",
+      "enum": ["scheduled", "manual"],
+      "description": "Origin of the morning run. 'scheduled' is the 9:45 AM ET morning dry-run task; everything else is 'manual'."
+    },
+    "run_type": {
+      "type": "string",
+      "const": "morning_dca_dry_run",
+      "description": "Always 'morning_dca_dry_run'. Deliberately not the afternoon 'scheduled_live_test'."
+    },
+    "stream": {
+      "type": "string",
+      "const": "morning",
+      "description": "Stream marker. Always 'morning' so this artifact is never confused with the afternoon stream."
+    },
+    "manual_run": {
+      "type": "boolean",
+      "description": "true for manual morning runs, false for scheduled morning runs. Must agree with run_origin."
+    },
+    "cron_id": {
+      "type": "string",
+      "const": "morning-dca-0945",
+      "description": "Morning stream task id. Distinct from the afternoon live task '10ce362c'."
+    },
+    "supersedes_cron_id": {
+      "type": ["string", "null"],
+      "description": "Always null: the morning stream is new and supersedes nothing."
+    },
+    "scheduled_for_et": {
+      "type": ["string", "null"],
+      "description": "Nominal ET fire time, HH:MM. '09:45' for scheduled morning runs; null for manual runs."
+    },
+    "scheduled_window_start_et": {
+      "type": ["string", "null"],
+      "description": "Inclusive start of the accepted morning window in ET, HH:MM ('09:40')."
+    },
+    "scheduled_window_end_et": {
+      "type": ["string", "null"],
+      "description": "Inclusive end of the accepted morning window in ET, HH:MM ('09:50')."
+    },
+    "run_id": {
+      "type": "string",
+      "description": "Unique run id. Scheduled: 'morning_YYYYMMDD_0945ET'. Manual: 'manual_morning_YYYYMMDD_HHMMSSZ'."
+    },
+    "triggered_at_utc": {
+      "type": "string",
+      "description": "ISO-8601 UTC timestamp when the run was triggered."
+    },
+    "state_schema_version": {
+      "type": "string",
+      "const": "run-classification-v1",
+      "description": "Shared contract version tag, pinned to 'run-classification-v1'."
+    },
+    "valid_afternoon_evidence": {
+      "type": "boolean",
+      "const": false,
+      "description": "Always false. A morning artifact is NEVER valid afternoon scheduled-live evidence."
+    },
+    "afternoon_live_cron_id": {
+      "type": "string",
+      "description": "The afternoon live task id ('10ce362c') recorded for cross-reference only."
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "run_origin": { "const": "scheduled" } } },
+      "then": {
+        "required": ["scheduled_for_et", "scheduled_window_start_et", "scheduled_window_end_et"],
+        "properties": {
+          "manual_run": { "const": false },
+          "scheduled_for_et": { "const": "09:45" },
+          "scheduled_window_start_et": { "const": "09:40" },
+          "scheduled_window_end_et": { "const": "09:50" },
+          "run_id": { "pattern": "^morning_[0-9]{8}_0945ET$" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "run_origin": { "const": "manual" } } },
+      "then": {
+        "properties": {
+          "manual_run": { "const": true },
+          "run_id": { "not": { "pattern": "^morning_[0-9]{8}_0945ET$" } }
+        }
+      }
+    }
+  ]
+}

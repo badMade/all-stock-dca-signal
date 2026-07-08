@@ -43,6 +43,7 @@ run-dca = "run_dca:main"
 # Flat single-file modules rather than a package tree; list them explicitly.
 py-modules = [
     "near_close_dca",
+    "morning_dca",
     "dca_config",
     "dca_live_adapters",
     "dca_reporting",
@@ -64,6 +65,7 @@ py-modules = [
     "config/scheduled_tasks.json",
     "config/notifications.json",
     "config/reporting.json",
+    "config/morning_dca.json",
 ]
 
 [tool.pytest.ini_options]
