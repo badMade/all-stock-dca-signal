@@ -141,7 +141,7 @@ def is_afternoon_scheduled_evidence(state: Dict[str, Any]) -> bool:
     dt = run_timestamp_et(state)
     if dt is None:
         return False
-    return dt.timetz().replace(tzinfo=None) >= AFTERNOON_EVIDENCE_FLOOR_ET
+    return dt.time() >= AFTERNOON_EVIDENCE_FLOOR_ET
 
 
 def deployed_usd(state: Dict[str, Any]) -> float:
