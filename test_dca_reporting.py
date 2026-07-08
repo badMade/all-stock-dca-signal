@@ -292,6 +292,33 @@ def test_generate_scheduled_reports_routes_through_classification(tmp_path=None)
     assert "NVDA" not in Path(paths["slippage_ranked"]).read_text()
 
 
+def test_generate_scheduled_reports_excludes_fills_for_confirmation_blocked_run(tmp_path=None):
+    import tempfile
+    from pathlib import Path
+
+    from dca_reporting import generate_scheduled_reports
+
+    build_sched, _build_manual, write_run_artifacts = _classification_helpers()
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-06"
+
+    state = _sched_state(day, [], build_sched(day, f"{day}T19:20:01Z"))
+    state["order_submit_status"] = "not_submitted_confirmation_required"
+    state["buy_candidates"] = [
+        {"ticker": "AAPL", "buy_multiplier": 2.0, "planned_amount_usd": 3.0,
+         "target_price": 100.0, "target_price_missing": False,
+         "status": "not_submitted_confirmation_required", "order_id": None},
+    ]
+    write_run_artifacts(state, base=base)
+
+    # A same-ticker broker fill unrelated to this run must never be attributed
+    # to a confirmation-blocked run, which placed zero orders by contract.
+    fills = [{"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 0.03, "order_id": "UNRELATED-1"}]
+    paths = generate_scheduled_reports(day, fills, base / "reports", base=base)
+    summary = json.loads(Path(paths["latest_run_summary"]).read_text())
+    assert summary["coverage"]["fills"] == 0
+
+
 def test_generate_scheduled_reports_requires_scheduled_state(tmp_path=None):
     import tempfile
     from pathlib import Path

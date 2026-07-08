@@ -417,6 +417,15 @@ def generate_scheduled_reports(
             + "; ".join(selection.errors)
         )
     manual_ids = collect_manual_order_ids(base_path)
+    # Restrict fills to order IDs the classification contract actually attributed
+    # to this scheduled run (selection.order_ids is already manual-id-excluded,
+    # and is forced empty for a confirmation-blocked run). Without this,
+    # compute_slippage_rows joins fills to candidates by ticker alone, so any
+    # same-ticker broker fill unrelated to this run -- or any fill at all on a
+    # confirmation-blocked run, which by contract placed zero orders -- could be
+    # published as scheduled evidence.
+    scheduled_ids = set(selection.order_ids)
+    fills = [f for f in fills if (f.get("order_id") or f.get("broker_order_id")) in scheduled_ids]
     return generate_reports(
         selection.state,
         fills,
