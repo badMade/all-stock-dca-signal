@@ -318,7 +318,7 @@ def is_scheduled_state(state: Dict[str, object]) -> bool:
     return rc.get("run_origin") == "scheduled" and bool(validate_classification(rc))
 
 
-def order_submit_status(state: Dict[str, object]) -> Optional[str]:
+def order_submit_status(state: Optional[Dict[str, object]]) -> Optional[str]:
     """Return the run_state's top-level order_submit_status, or None if absent."""
     if not isinstance(state, dict):
         return None
@@ -326,7 +326,7 @@ def order_submit_status(state: Dict[str, object]) -> Optional[str]:
     return value if isinstance(value, str) and value else None
 
 
-def is_confirmation_blocked(state: Dict[str, object]) -> bool:
+def is_confirmation_blocked(state: Optional[Dict[str, object]]) -> bool:
     """True if the run passed review but submission was blocked awaiting confirmation.
 
     Such a run is valid scheduled-run evidence that the task fired but carries no
