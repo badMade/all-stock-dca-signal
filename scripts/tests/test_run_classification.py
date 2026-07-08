@@ -284,6 +284,30 @@ def test_manual_write_does_not_overwrite_existing_pointer():
         assert before == after  # manual run left the scheduled pointer untouched
 
 
+def test_update_latest_scheduled_run_pointer_uses_given_path():
+    # A caller (e.g. near_close_dca's live path) that already wrote run_state.json
+    # to its own artifacts_dir can update the pointer to point at that exact path
+    # without update_latest_scheduled_run_pointer recomputing/rewriting a second
+    # copy anywhere else.
+    from run_classification import update_latest_scheduled_run_pointer
+
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        state = _scheduled_state()
+        external_path = base / "external" / "run_state.json"
+        external_path.parent.mkdir(parents=True)
+        external_path.write_text(json.dumps(state))
+
+        pointer = update_latest_scheduled_run_pointer(state, external_path, base)
+
+        assert pointer == latest_scheduled_run_path(base)
+        ptr = json.loads(pointer.read_text())
+        assert ptr["run_state_path"] == str(external_path)
+        assert ptr["run_id"] == "scheduled_20260706_1520ET"
+        # No second copy of run_state.json was created anywhere under base.
+        assert list(base.rglob("run_state.json")) == [external_path]
+
+
 def test_write_rejects_invalid_classification():
     bad = _scheduled_state()
     # Break both lineage signals so neither cron_id nor supersedes_cron_id holds.

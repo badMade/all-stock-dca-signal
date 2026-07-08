@@ -355,6 +355,42 @@ def is_confirmation_blocked(state: Optional[Dict[str, object]]) -> bool:
 
 # --- Writing artifacts -------------------------------------------------------
 
+def update_latest_scheduled_run_pointer(
+    run_state: Dict[str, object], run_state_path: str | Path, base: Optional[Path] = None
+) -> Path:
+    """Write/refresh latest_scheduled_run.json to point at an already-written scheduled run_state.
+
+    Extracted from :func:`write_run_artifacts` so a caller that writes
+    run_state.json to its own already-correct artifacts directory (e.g.
+    near_close_dca's live path, whose ``artifacts_dir`` the scheduler already
+    points at the canonical ``scheduled_runs/...`` directory per
+    config/scheduled_tasks.json) can update the pointer without a second,
+    potentially differently-located copy of run_state.json being written.
+    Callers must validate ``run_state["run_classification"]`` themselves first.
+    """
+    rc = run_state.get("run_classification") or {}
+    day = str(run_state.get("trading_day", "")).strip()
+    pointer = latest_scheduled_run_path(base)
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    pointer.write_text(
+        json.dumps(
+            {
+                "run_id": rc.get("run_id"),
+                "trading_day": day,
+                "run_state_path": str(run_state_path),
+                "cron_id": rc.get("cron_id"),
+                "supersedes_cron_id": rc.get("supersedes_cron_id"),
+                "triggered_at_utc": rc.get("triggered_at_utc"),
+                "updated_at_utc": _utc_now_iso(),
+                "state_schema_version": STATE_SCHEMA_VERSION,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    return pointer
+
+
 def write_run_artifacts(
     run_state: Dict[str, object], base: Optional[Path] = None
 ) -> Dict[str, str]:
@@ -381,24 +417,7 @@ def write_run_artifacts(
         state_path.write_text(json.dumps(run_state, indent=2) + "\n")
         written["run_state"] = str(state_path)
 
-        pointer = latest_scheduled_run_path(base)
-        pointer.parent.mkdir(parents=True, exist_ok=True)
-        pointer.write_text(
-            json.dumps(
-                {
-                    "run_id": rc["run_id"],
-                    "trading_day": day,
-                    "run_state_path": str(state_path),
-                    "cron_id": rc.get("cron_id"),
-                    "supersedes_cron_id": rc.get("supersedes_cron_id"),
-                    "triggered_at_utc": rc["triggered_at_utc"],
-                    "updated_at_utc": _utc_now_iso(),
-                    "state_schema_version": STATE_SCHEMA_VERSION,
-                },
-                indent=2,
-            )
-            + "\n"
-        )
+        pointer = update_latest_scheduled_run_pointer(run_state, state_path, base)
         written["latest_scheduled_run"] = str(pointer)
     else:  # manual
         ts = re.sub(r"[^0-9]", "", str(rc.get("triggered_at_utc", ""))) or rc["run_id"]
@@ -670,6 +689,7 @@ __all__ = [
     "is_manual_state",
     "is_scheduled_state",
     "write_run_artifacts",
+    "update_latest_scheduled_run_pointer",
     "collect_manual_order_ids",
     "exclude_manual_orders",
     "select_scheduled_state_for_reporting",

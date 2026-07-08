@@ -148,6 +148,7 @@ def run_pipeline(
     run_label: str = "daily",
     scheduled: bool = True,
     generate_full_reports: bool = False,
+    classification_state_root: Optional[str | Path] = None,
 ) -> Dict[str, Any]:
     """Run one compact DCA cycle and (optionally) the full post-trade report set.
 
@@ -155,6 +156,12 @@ def run_pipeline(
     daily path always runs; ``generate_full_reports=True`` additionally renders the
     slippage/coverage reports and the compact Notion sync from the run artifacts
     (heavier work reserved for Friday/manual runs).
+
+    ``classification_state_root`` is passed through to
+    ``near_close_dca.run_once`` for a scheduled run: it is where
+    ``latest_scheduled_run.json`` is written/updated (see
+    ``scripts.run_classification``). Defaults to that module's own production
+    state root when not given; pass an explicit root in tests.
     """
     result = run_daily_compact(
         now,
@@ -166,6 +173,7 @@ def run_pipeline(
         artifacts_dir=artifacts_dir,
         run_label=run_label,
         scheduled=scheduled,
+        classification_state_root=classification_state_root,
     )
     if result.get("blocked"):
         logger.warning("run blocked by date gate for %s; skipping reports", result.get("run_state_path"))

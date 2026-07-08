@@ -597,6 +597,115 @@ def test_run_daily_compact_date_gate_does_not_clobber_prior_artifacts(tmp_path):
     assert preserved == original
 
 
+# --- run_classification wiring on the live path (task ce16ba6b state guarantee) ---
+
+
+def test_build_run_artifacts_stamps_scheduled_classification(tmp_path):
+    from scripts.run_classification import validate_classification
+
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    rc = run_state["run_classification"]
+    assert validate_classification(rc).ok
+    assert rc["run_origin"] == "scheduled"
+    assert rc["manual_run"] is False
+    # This run is a dry run (config.dry_run=True in _compact_setup), so no real
+    # order can have been submitted regardless of buy candidates.
+    assert run_state["order_submit_status"] == "dry_run"
+
+
+def test_build_run_artifacts_stamps_manual_classification(tmp_path):
+    from scripts.run_classification import validate_classification
+
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    artifacts_dir = os.path.join(tmp_path, "runs", "manual-am")
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=False)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    rc = run_state["run_classification"]
+    assert validate_classification(rc).ok
+    assert rc["run_origin"] == "manual"
+    assert rc["manual_run"] is True
+
+
+def test_scheduled_run_updates_latest_scheduled_run_pointer(tmp_path):
+    from pathlib import Path
+
+    from scripts.run_classification import latest_scheduled_run_path
+
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    classification_root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    run_daily_compact(
+        now, config, state, fin, rh, broker,
+        artifacts_dir=artifacts_dir, scheduled=True,
+        classification_state_root=classification_root,
+    )
+
+    pointer = latest_scheduled_run_path(classification_root)
+    assert pointer.exists()
+    ptr = json.loads(pointer.read_text())
+    # Points at the run_state.json this run actually wrote to artifacts_dir, not
+    # a second, separately-computed copy under classification_root.
+    assert ptr["run_state_path"] == os.path.join(artifacts_dir, "run_state.json")
+    assert not (Path(classification_root) / "scheduled_runs").exists()
+
+
+def test_manual_run_does_not_touch_latest_scheduled_run_pointer(tmp_path):
+    from scripts.run_classification import latest_scheduled_run_path
+
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    artifacts_dir = os.path.join(tmp_path, "runs", "manual-am")
+    classification_root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    run_daily_compact(
+        now, config, state, fin, rh, broker,
+        artifacts_dir=artifacts_dir, scheduled=False,
+        classification_state_root=classification_root,
+    )
+
+    assert not latest_scheduled_run_path(classification_root).exists()
+
+
+def test_confirmation_required_broker_response_recorded_distinctly(tmp_path):
+    from near_close_dca import OrderConfirmationRequiredError
+
+    class _ConfirmationRequiredBroker(DryRunBroker):
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise OrderConfirmationRequiredError("broker requires step-up confirmation")
+
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
+    )
+    broker = _ConfirmationRequiredBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    assert run_state["order_submit_status"] == "not_submitted_confirmation_required"
+    for candidate in run_state["buy_candidates"]:
+        assert candidate["status"] == "not_submitted_confirmation_required"
+        assert candidate["order_id"] is None
+        # Reviewed order details are still recorded even though nothing submitted.
+        assert candidate["reviewed_order"]["review_passed"] is True
+        assert candidate["reviewed_order"]["notional_usd"] == candidate["planned_amount_usd"]
+    # Not counted as an error: the broker responded normally, just requiring
+    # confirmation, so nothing needs retrying and no alert should fire on this basis.
+    assert run_state["usage_proxy"]["errors_count"] == 0
+
+
 def test_write_run_artifacts_ignores_stale_orders_csv(tmp_path):
     out = os.path.join(tmp_path, "runs", "reused-day")
     os.makedirs(out)

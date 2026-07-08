@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "run_state.schema.json",
   "title": "Graded DCA same-day run state artifact",
-  "description": "Structure of the run_state.json artifact written by near_close_dca.build_run_artifacts() / write_run_artifacts() each trading day and consumed by the reporting/dashboard code. Contains no secrets. A run_classification block (see run_classification.schema.json) SHOULD accompany live scheduled runs of the repaired live task 10ce362c (which supersedes the deleted ce16ba6b) so they are never confused with manual runs; it is validated here when present. It is not listed in `required` because the current writer path does not yet emit it, and legacy/compact artifacts must still validate.",
+  "description": "Structure of the run_state.json artifact written by near_close_dca.build_run_artifacts() / write_run_artifacts() each trading day and consumed by the reporting/dashboard code. Contains no secrets. A run_classification block (see run_classification.schema.json) accompanies every run of the repaired live task 10ce362c (which supersedes the deleted ce16ba6b) so scheduled and manual runs are never confused; it is validated here when present. It is not listed in `required` so legacy/compact artifacts written before this was stamped still validate.",
   "type": "object",
   "required": ["run_id", "generated_at", "trading_day", "broker", "budget", "counts"],
   "additionalProperties": true,
@@ -105,7 +105,7 @@
           "decision_bar_close": { "type": ["number", "null"] },
           "previous_close": { "type": ["number", "null"] },
           "order_id": { "type": ["string", "null"] },
-          "status": { "type": "string", "enum": ["submitted", "not_submitted", "not_submitted_confirmation_required", "skipped", "blocked", "dry_run"] },
+          "status": { "type": "string", "enum": ["submitted", "not_submitted", "not_submitted_confirmation_required", "skipped", "blocked", "dry_run", "failed"] },
           "skip_reason": { "type": ["string", "null"] },
           "reviewed_order": {
             "type": ["object", "null"],
