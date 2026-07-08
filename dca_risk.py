@@ -366,6 +366,8 @@ def build_risk_report(
 # --- CLI ---------------------------------------------------------------------
 
 def _load_states(root: str | Path) -> List[Dict[str, Any]]:
+    from near_close_dca import RUN_STATUS_BLOCKED
+
     states: List[Dict[str, Any]] = []
     for path in find_run_state_files(root):
         try:
@@ -374,7 +376,7 @@ def _load_states(root: str | Path) -> List[Dict[str, Any]]:
         except (ValueError, OSError) as exc:
             logger.warning("skipping unreadable run_state %s: %s", path, exc)
             continue
-        if isinstance(data, dict) and data.get("status") != "blocked":
+        if isinstance(data, dict) and data.get("status") != RUN_STATUS_BLOCKED:
             states.append(data)
     return states
 
