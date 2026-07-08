@@ -30,7 +30,11 @@
     "cron_id": {
       "type": "string",
       "not": { "const": "ce16ba6b_replacement" },
+    "cron_id": {
+      "type": "string",
+      "enum": ["10ce362c"],
       "description": "Live scheduled task id. Canonical value is '10ce362c' (the repaired live task; the deleted ce16ba6b is superseded). Placeholder or ambiguous values such as 'ce16ba6b_replacement' are forbidden. Carried on both scheduled and manual runs so manual runs can be attributed to the task they emulate."
+    },
     },
     "supersedes_cron_id": {
       "type": ["string", "null"],
