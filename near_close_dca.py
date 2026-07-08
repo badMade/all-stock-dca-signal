@@ -1787,8 +1787,9 @@ def run_once(
         prior_states = []
         for path in find_run_state_files(deployment_history_root):
             try:
-                data = json.loads(Path(path).read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
+                with path.open(encoding="utf-8") as f:
+                    data = json.load(f)
+            except (ValueError, OSError):
                 continue
             if isinstance(data, dict) and data.get("status") != RUN_STATUS_BLOCKED:
                 prior_states.append(data)
