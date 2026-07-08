@@ -53,6 +53,18 @@ LATEST_SCHEDULED_RUN_FILENAME = "latest_scheduled_run.json"
 
 SCHEDULED_RUN_ID_RE = re.compile(r"^scheduled_[0-9]{8}_1520ET$")
 
+# order_submit_status values (mirror schemas/run_state.schema.json). The scheduled
+# 3:20 task always writes a run_state (and updates the pointer) even when nothing is
+# submitted; this field records why.
+ORDER_SUBMIT_STATUS_SUBMITTED = "submitted"
+ORDER_SUBMIT_STATUS_NO_CANDIDATES = "not_submitted_no_candidates"
+# Robinhood review passed but submission was blocked by required post-review user
+# confirmation: valid scheduled-run evidence the task ran, but NOT an order/fill.
+ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED = "not_submitted_confirmation_required"
+ORDER_SUBMIT_STATUS_ERROR = "not_submitted_error"
+ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED = "not_submitted_budget_exhausted"
+ORDER_SUBMIT_STATUS_DRY_RUN = "dry_run"
+
 
 _EASTERN = ZoneInfo("America/New_York")
 
@@ -306,6 +318,24 @@ def is_scheduled_state(state: Dict[str, object]) -> bool:
     return rc.get("run_origin") == "scheduled" and bool(validate_classification(rc))
 
 
+def order_submit_status(state: Dict[str, object]) -> Optional[str]:
+    """Return the run_state's top-level order_submit_status, or None if absent."""
+    if not isinstance(state, dict):
+        return None
+    value = state.get("order_submit_status")
+    return value if isinstance(value, str) and value else None
+
+
+def is_confirmation_blocked(state: Dict[str, object]) -> bool:
+    """True if the run passed review but submission was blocked awaiting confirmation.
+
+    Such a run is valid scheduled-run evidence that the task fired but carries no
+    order/fill: reporting must report zero scheduled fills/order IDs, and neither
+    slippage nor the watchdog may mark the scheduled state invalid on this basis.
+    """
+    return order_submit_status(state) == ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED
+
+
 # --- Writing artifacts -------------------------------------------------------
 
 def write_run_artifacts(
@@ -472,6 +502,8 @@ class ScheduledSelection:
     used_broker_fallback: bool
     fallback_reason: Optional[str]
     excluded_manual_order_ids: List[str]
+    order_submit_status: Optional[str] = None
+    confirmation_blocked: bool = False
     errors: List[str] = field(default_factory=list)
 
     @property
@@ -547,9 +579,20 @@ def select_scheduled_state_for_reporting(
     scheduled_ids = _order_ids_from_state(state)
     kept = [oid for oid in sorted(scheduled_ids) if oid not in manual_ids]
 
+    oss = order_submit_status(state)
+    confirmation_blocked = is_confirmation_blocked(state)
+
     used_fallback = False
     fallback_reason: Optional[str] = None
-    if not kept and scheduled_state_write_failed and broker_window_orders is not None:
+    # A confirmation-blocked run has no orders by design (review passed but
+    # submission awaited confirmation), so it is not a write failure and must
+    # never trigger the broker time-window fallback.
+    if (
+        not kept
+        and scheduled_state_write_failed
+        and broker_window_orders is not None
+        and not confirmation_blocked
+    ):
         # Valid scheduled state exists but has no usable order IDs due to a known
         # write failure: attribute broker orders that fall inside the scheduled
         # ET window, still excluding manual IDs.
@@ -575,6 +618,8 @@ def select_scheduled_state_for_reporting(
         used_broker_fallback=used_fallback,
         fallback_reason=fallback_reason,
         excluded_manual_order_ids=sorted(manual_ids),
+        order_submit_status=oss,
+        confirmation_blocked=confirmation_blocked,
         errors=[],
     )
 
@@ -583,6 +628,14 @@ __all__ = [
     "STATE_SCHEMA_VERSION",
     "CRON_ID",
     "SUPERSEDES_CRON_ID",
+    "ORDER_SUBMIT_STATUS_SUBMITTED",
+    "ORDER_SUBMIT_STATUS_NO_CANDIDATES",
+    "ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED",
+    "ORDER_SUBMIT_STATUS_ERROR",
+    "ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED",
+    "ORDER_SUBMIT_STATUS_DRY_RUN",
+    "order_submit_status",
+    "is_confirmation_blocked",
     "build_scheduled_classification",
     "build_manual_classification",
     "scheduled_run_id",

@@ -82,6 +82,72 @@ scheduled run is valid evidence when **`cron_id='10ce362c'` OR
 The manual `run_id` must be **distinct** and must never match the scheduled
 pattern `scheduled_YYYYMMDD_1520ET`.
 
+## Scheduled state-file guarantee (always write, even with no order)
+
+The 3:20 PM live task (`10ce362c`) **always** writes a scheduled
+`run_state.json` under `scheduled_runs/YYYYMMDD_1520ET/` **and** updates
+`latest_scheduled_run.json` every time it fires — **even when no order is
+placed**. A run that fired but placed no order is still proof the task ran; it
+is just not proof of an order or fill.
+
+The top-level `order_submit_status` field on the run_state records the outcome:
+
+| `order_submit_status` | Meaning |
+|---|---|
+| `submitted` | One or more orders submitted; `order_id`(s) on the buy_candidates. |
+| `not_submitted_no_candidates` | No ticker qualified; valid scheduled run, no orders. |
+| `not_submitted_confirmation_required` | Robinhood review **passed** but submission was **blocked by required post-review user confirmation**. Valid scheduled evidence the task ran; **no `order_id`**, **not** evidence of an order/fill. |
+| `not_submitted_error` | An error prevented submission; valid scheduled run, error recorded. |
+| `not_submitted_budget_exhausted` | Caps/budget left no room; valid scheduled run, no orders. |
+| `dry_run` | Dry-run; no live orders. |
+
+### Confirmation-blocked scheduled run (required fields)
+
+When review passes but confirmation blocks submission, the run_state still
+carries a **valid scheduled** `run_classification` block and adds:
+
+```json
+{
+  "order_submit_status": "not_submitted_confirmation_required",
+  "run_classification": {
+    "run_origin": "scheduled",
+    "manual_run": false,
+    "state_schema_version": "run-classification-v1",
+    "cron_id": "10ce362c",
+    "supersedes_cron_id": "ce16ba6b",
+    "scheduled_for_et": "15:20"
+  },
+  "buy_candidates": [
+    {
+      "ticker": "AAPL",
+      "buy_multiplier": 1.0,
+      "planned_amount_usd": 3.0,
+      "status": "not_submitted_confirmation_required",
+      "order_id": null,
+      "reviewed_order": { "notional_usd": 3.0, "side": "buy", "review_passed": true }
+    }
+  ]
+}
+```
+
+It **must include** the valid scheduled classification block,
+`order_submit_status='not_submitted_confirmation_required'`, `reviewed_order`
+details on each affected candidate where available, and the candidate details of
+what would have been placed. It **must not include** any `order_id` or a
+submitted/filled status.
+
+**Downstream treatment of a confirmation-blocked run:**
+
+- **Watchdog (`a46bf007`)** — treat it as a valid scheduled run that fired.
+  Alert that **no order was placed**, but do **not** mark the lineage/scheduled
+  state invalid when the required fields are present.
+- **Slippage (`67aa802b`)** — report **no scheduled fills and no scheduled
+  order IDs**. Do **not** invalidate the run_state because confirmation blocked
+  submission, and the broker time-window fallback does **not** apply (there was
+  no write failure).
+- **Weekly/monthly** — count the scheduled run as having occurred; it
+  contributes **zero** scheduled fills/orders.
+
 ## Downstream reporting rules
 
 Applies to slippage (`67aa802b`), watchdog (`a46bf007`), weekly dashboard

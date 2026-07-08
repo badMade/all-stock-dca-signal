@@ -18,15 +18,18 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from run_classification import (  # noqa: E402
+    ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED,
     STATE_SCHEMA_VERSION,
     build_manual_classification,
     build_scheduled_classification,
     collect_manual_order_ids,
     exclude_manual_orders,
+    is_confirmation_blocked,
     is_manual_state,
     is_scheduled_state,
     latest_scheduled_run_path,
     manual_run_id,
+    order_submit_status,
     scheduled_run_id,
     select_scheduled_state_for_reporting,
     validate_classification,
@@ -66,6 +69,31 @@ def _manual_state(order_ids=("MAN-9",), ts="2026-07-06T11:00:00Z"):
             {"ticker": f"M{i}", "buy_multiplier": 1.0, "planned_amount_usd": 3.0,
              "status": "submitted", "order_id": oid}
             for i, oid in enumerate(order_ids)
+        ],
+    }
+
+
+def _confirmation_blocked_state():
+    """Scheduled run whose review passed but submission was blocked awaiting
+    confirmation: valid scheduled classification, order_submit_status set, no order_id."""
+    return {
+        "run_id": "2026-07-06-152001",
+        "generated_at": "2026-07-06T15:20:01",
+        "trading_day": TRADING_DAY,
+        "broker": "robinhood",
+        "budget": {"budget_tier": "normal", "daily_cap_usd": 180, "weekly_cap_usd": 900},
+        "counts": {"submitted": 0, "buy_candidates": 1},
+        "order_submit_status": ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED,
+        "run_classification": build_scheduled_classification(TRADING_DAY, "2026-07-06T19:20:01Z"),
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "buy_multiplier": 1.0,
+                "planned_amount_usd": 3.0,
+                "status": "not_submitted_confirmation_required",
+                "order_id": None,
+                "reviewed_order": {"notional_usd": 3.0, "side": "buy", "review_passed": True},
+            }
         ],
     }
 
@@ -374,6 +402,49 @@ def test_no_fallback_when_not_flagged_write_failure():
         # Valid scheduled state, but no write-failure flag -> no fallback, no orders.
         assert sel.ok
         assert sel.order_ids == []
+        assert not sel.used_broker_fallback
+
+
+def test_confirmation_blocked_is_valid_scheduled_evidence():
+    state = _confirmation_blocked_state()
+    # Still a valid scheduled run (the classification block is unchanged).
+    assert is_scheduled_state(state)
+    assert not is_manual_state(state)
+    # order_submit_status accessors surface the confirmation-blocked outcome.
+    assert order_submit_status(state) == ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED
+    assert is_confirmation_blocked(state)
+    # No order was placed: no order_id on any candidate.
+    assert all(c["order_id"] is None for c in state["buy_candidates"])
+
+
+def test_confirmation_blocked_write_updates_pointer():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        written = write_run_artifacts(_confirmation_blocked_state(), base=base)
+        state_path = Path(written["run_state"])
+        assert state_path.exists()
+        assert "scheduled_runs" in str(state_path)
+        pointer = latest_scheduled_run_path(base)
+        assert pointer.exists()
+        ptr = json.loads(pointer.read_text())
+        assert ptr["run_id"] == "scheduled_20260706_1520ET"
+
+
+def test_confirmation_blocked_reports_no_fills_and_no_fallback():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        write_run_artifacts(_confirmation_blocked_state(), base=base)
+        # Even with in-window broker orders and the write-failure flag, a
+        # confirmation-blocked run must NOT attribute any orders via fallback.
+        sel = select_scheduled_state_for_reporting(
+            TRADING_DAY, base=base,
+            broker_window_orders=[{"order_id": "BRK-1", "submitted_at_et": "15:20"}],
+            scheduled_state_write_failed=True,
+        )
+        assert sel.ok  # run_state stays valid; confirmation-block is not an error
+        assert sel.confirmation_blocked
+        assert sel.order_submit_status == ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED
+        assert sel.order_ids == []  # no scheduled fills / order IDs
         assert not sel.used_broker_fallback
 
 
