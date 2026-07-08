@@ -40,6 +40,7 @@ from near_close_dca import (
     ACTIVE_TICKERS,
     EASTERN,
     EXCLUDED_TICKERS,
+    MARKET_HOLIDAYS,
     Action,
     Bar,
     StrategyConfig,
@@ -417,8 +418,13 @@ class MorningDCAExecutor(DCAExecutor):
                 if quote is not None and isinstance(quote, (tuple, list)) and len(quote) >= 1:
                     quote_time = quote[1] if len(quote) >= 2 else None
                     if isinstance(quote_time, datetime) and bar_anchor <= quote_time <= decision_dt:
-                        return float(quote[0])
-                    if quote_time is None:
+                        quote_price = float(quote[0])
+                        if quote_price > 0:
+                            return quote_price
+                        warnings.append(
+                            f"quote price {quote_price!r} is not positive; falling back to completed bar"
+                        )
+                    elif quote_time is None:
                         warnings.append(
                             "quote has no usable timestamp; falling back to completed bar"
                         )
@@ -592,6 +598,28 @@ class MorningDCAExecutor(DCAExecutor):
         Returns ``{"artifacts": <run_state dict>, "paths": <written paths>}``. No
         orders are placed and no broker is contacted.
         """
+        trading_day = now.astimezone(EASTERN).date()
+        if not manual and trading_day in MARKET_HOLIDAYS:
+            # A weekday cron fire on a full market closure (see
+            # near_close_dca.MARKET_HOLIDAYS) has no real session to evaluate.
+            # Write a blocked stub -- mirroring near_close_dca's date-gate
+            # pattern -- and never advance latest_morning_run.json, so the
+            # scheduled pointer keeps referring to the last real session
+            # instead of a non-trading placeholder.
+            out = self.run_state_dir(now)
+            out.mkdir(parents=True, exist_ok=True)
+            state_path = out / "run_state.json"
+            if not state_path.exists():
+                state_path.write_text(
+                    json.dumps(
+                        {"trading_day": trading_day.isoformat(), "status": "blocked",
+                         "block_reason": "market holiday", "stream": self.stream},
+                        indent=2, sort_keys=True,
+                    ),
+                    encoding="utf-8",
+                )
+            return {"artifacts": {"trading_day": trading_day.isoformat(), "status": "blocked"},
+                    "paths": {"run_state": str(state_path)}}
         signals = self.evaluate(now, data)
         source = data_source or getattr(getattr(data, "source", None), "value", "unknown")
         trading_day = now.astimezone(EASTERN).date()

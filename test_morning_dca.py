@@ -153,6 +153,23 @@ def test_quote_older_than_completed_bar_anchor_falls_back_to_bar():
     assert any("older than the completed bar anchor" in w for w in sig.warnings)
 
 
+def test_non_positive_quote_price_falls_back_to_completed_bar():
+    # A fresh, well-timestamped quote of $0 or negative must not be trusted --
+    # evaluate_signal would otherwise treat it as a 100%+ drop and size a
+    # max-multiplier buy off a clearly-bad price.
+    decision_dt = _now()
+    fresh_quote_time = decision_dt - timedelta(minutes=1)
+    for bad_price in (0.0, -5.0):
+        data = FixedQuoteProvider(
+            SourceName.ROBINHOOD, 100.0, {"BIG": 0.10},
+            quote_price=bad_price, quote_time=fresh_quote_time,
+        )
+        ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
+        sig = ex.evaluate(decision_dt, data)[0]
+        assert sig.current_price == 90.0  # completed-bar close, not the bad quote
+        assert any("is not positive" in w for w in sig.warnings)
+
+
 def test_untimestamped_quote_falls_back_to_completed_bar():
     # A quote with no usable timestamp cannot be proven to be at/before the
     # decision anchor, so it must not be trusted for sizing.
@@ -272,6 +289,40 @@ def test_build_artifacts_does_not_double_count_ledger(tmp_path):
 
     ex.run(now, data)
     assert ex.ledger.day_planned(day) == 9.0  # exactly one run recorded once
+
+
+def test_scheduled_run_skips_artifacts_on_market_holiday(tmp_path):
+    from near_close_dca import MARKET_HOLIDAYS
+
+    holiday = next(iter(MARKET_HOLIDAYS))
+    now = datetime.combine(holiday, time(9, 45), tzinfo=EASTERN)
+    cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
+    ex = MorningDCAExecutor(cfg)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    res = ex.run(now, data)
+
+    assert res["artifacts"]["status"] == "blocked"
+    run_state_path = Path(res["paths"]["run_state"])
+    assert run_state_path.exists()
+    assert json.loads(run_state_path.read_text())["status"] == "blocked"
+    # The scheduled pointer must never advance to a non-trading-day placeholder.
+    assert not (Path(tmp_path) / "latest_morning_run.json").exists()
+
+
+def test_manual_run_ignores_market_holiday_gate(tmp_path):
+    from near_close_dca import MARKET_HOLIDAYS
+
+    holiday = next(iter(MARKET_HOLIDAYS))
+    now = datetime.combine(holiday, time(9, 45), tzinfo=EASTERN)
+    cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
+    ex = MorningDCAExecutor(cfg)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    res = ex.run(now, data, manual=True)
+
+    assert "status" not in res["artifacts"] or res["artifacts"].get("status") != "blocked"
+    assert res["artifacts"]["signal_rows"]
 
 
 # --- Run-state path + classification ----------------------------------------
