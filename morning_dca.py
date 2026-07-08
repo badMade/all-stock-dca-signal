@@ -263,9 +263,9 @@ class MorningDCAExecutor(DCAExecutor):
 
     def run_state_dir(self, now: datetime) -> Path:
         now_et = now.astimezone(EASTERN)
-        folder = f"{now_et.strftime('%Y%m%d')}_0945ET"
+        hhmm = MORNING_SCHEDULED_FOR_ET.replace(":", "")
+        folder = f"{now_et.strftime('%Y%m%d')}_{hhmm}ET"
         return Path(self.config.morning_run_state_root) / folder
-
     def run_id(self, now: datetime, *, manual: bool) -> str:
         now_et = now.astimezone(EASTERN)
         if manual:
