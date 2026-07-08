@@ -38,12 +38,14 @@ strategies = [
 
 [project.scripts]
 run-dca = "run_dca:main"
+run-dca-risk = "dca_risk:main"
 
 [tool.setuptools]
 # Flat single-file modules rather than a package tree; list them explicitly.
 py-modules = [
     "near_close_dca",
     "dca_config",
+    "dca_risk",
     "dca_live_adapters",
     "dca_reporting",
     "dca_cost_tracker",

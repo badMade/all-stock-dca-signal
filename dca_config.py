@@ -91,11 +91,21 @@ def load_budgets(config_dir: Path) -> Dict[str, Any]:
     field_map = {
         "base_amount_usd": "base_buy_amount_usd",
         "weekly_rollover_reserve_cap_usd": "weekly_rollover_reserve_cap_usd",
+        "monthly_cash_allocation_usd": "monthly_cash_allocation_usd",
     }
     out: Dict[str, Any] = {}
     for json_key, config_field in field_map.items():
         if json_key in data:
             out[config_field] = float(data[json_key])
+    # The risk_guard block may override the monthly allocation and the 7-day
+    # deploy fraction that engages the kill-switch. deployed_last_7d_usd is a
+    # runtime-only field and is never loaded from config.
+    guard = data.get("risk_guard")
+    if isinstance(guard, dict):
+        if "monthly_cash_allocation_usd" in guard:
+            out["monthly_cash_allocation_usd"] = float(guard["monthly_cash_allocation_usd"])
+        if "kill_switch_7d_deploy_fraction" in guard:
+            out["kill_switch_7d_deploy_fraction"] = float(guard["kill_switch_7d_deploy_fraction"])
     return out
 
 
