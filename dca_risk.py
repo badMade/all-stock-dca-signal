@@ -357,7 +357,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--state-root", required=True, help="Directory containing run_state*.json artifacts")
     parser.add_argument(
         "--as-of",
-        default=date.today().isoformat(),
+        default=datetime.now(EASTERN).date().isoformat(),
         help="Report date (YYYY-MM-DD); defaults to today",
     )
     parser.add_argument(
