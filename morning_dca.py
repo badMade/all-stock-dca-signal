@@ -269,7 +269,8 @@ class MorningDCAExecutor(DCAExecutor):
     def run_id(self, now: datetime, *, manual: bool) -> str:
         now_et = now.astimezone(EASTERN)
         if manual:
-            return f"manual_morning_{now_et.strftime('%Y%m%d_%H%M%S')}Z"
+            now_utc = now.astimezone(timezone.utc)
+            return f"manual_morning_{now_utc.strftime('%Y%m%d_%H%M%S')}Z"
         return f"morning_{now_et.strftime('%Y%m%d')}_0945ET"
 
     def run_classification(self, now: datetime, *, manual: bool = False) -> Dict[str, Any]:
