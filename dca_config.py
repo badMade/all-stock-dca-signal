@@ -103,9 +103,22 @@ def load_budgets(config_dir: Path) -> Dict[str, Any]:
     risk = data.get("risk_guard")
     if isinstance(risk, dict):
         if "monthly_cash_allocation_usd" in risk:
-            out["monthly_cash_allocation_usd"] = float(risk["monthly_cash_allocation_usd"])
+            nested_allocation = float(risk["monthly_cash_allocation_usd"])
+            if (
+                "monthly_cash_allocation_usd" in out
+                and out["monthly_cash_allocation_usd"] != nested_allocation
+            ):
+                raise ValueError(
+                    "budgets.json monthly_cash_allocation_usd differs between top-level and risk_guard"
+                )
+            out["monthly_cash_allocation_usd"] = nested_allocation
         if "kill_switch_7d_deploy_fraction" in risk:
-            out["kill_switch_7d_deploy_fraction"] = float(risk["kill_switch_7d_deploy_fraction"])
+            fraction = float(risk["kill_switch_7d_deploy_fraction"])
+            if not 0 <= fraction <= 1:
+                raise ValueError(
+                    f"kill_switch_7d_deploy_fraction must be between 0 and 1, got {fraction}"
+                )
+            out["kill_switch_7d_deploy_fraction"] = fraction
     return out
 
 
