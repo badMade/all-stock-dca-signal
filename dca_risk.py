@@ -343,8 +343,9 @@ def _load_states(root: str | Path) -> List[Dict[str, Any]]:
     states: List[Dict[str, Any]] = []
     for path in find_run_state_files(root):
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
+            with path.open(encoding="utf-8") as f:
+                data = json.load(f)
+        except (ValueError, OSError) as exc:
             logger.warning("skipping unreadable run_state %s: %s", path, exc)
             continue
         if isinstance(data, dict) and data.get("status") != "blocked":
