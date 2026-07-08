@@ -396,11 +396,10 @@ class MorningDCAExecutor(DCAExecutor):
         if callable(get_quote):
             try:
                 quote = get_quote(ticker, decision_dt)
+                if quote is not None and isinstance(quote, (tuple, list)) and len(quote) >= 1:
+                    return float(quote[0])
             except Exception as exc:  # noqa: BLE001
                 warnings.append(f"quote provider error: {exc}")
-                quote = None
-            if quote is not None and isinstance(quote, (tuple, list)) and len(quote) >= 1:
-                return float(quote[0])
         bar = latest_bar_at_or_before(bars, decision_dt)
         if bar is None:
             warnings.append("missing intraday bar at/or before 09:45 ET")
