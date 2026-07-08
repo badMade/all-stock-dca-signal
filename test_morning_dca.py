@@ -108,12 +108,16 @@ def test_ledger_namespace_and_caps():
     assert ledger.over_weekly_cap(day) is False
 
 
-def test_morning_ledger_does_not_touch_afternoon_state():
+def test_morning_ledger_does_not_touch_afternoon_state(tmp_path):
     from near_close_dca import StrategyState
 
     afternoon = StrategyState()
     day = date(2026, 7, 8)
-    cfg = MorningConfig(tickers=("SMALL", "BIG"), base_buy_amount_usd=3.0)
+    cfg = MorningConfig(
+        tickers=("SMALL", "BIG"),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path),
+    )
     ex = MorningDCAExecutor(cfg)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03, "BIG": 0.10})
     ex.run(_now(), data)
