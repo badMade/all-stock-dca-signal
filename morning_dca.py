@@ -436,7 +436,7 @@ class MorningDCAExecutor(DCAExecutor):
             warnings.extend(f"{sig.ticker}: {w}" for w in sig.warnings)
         if self.ledger.over_daily_cap(trading_day):
             warnings.append(
-                f"hypothetical morning spend {hypothetical_spend:.2f} exceeds morning daily cap "
+                f"hypothetical morning day spend {self.ledger.day_planned(trading_day):.2f} exceeds morning daily cap "
                 f"{self.ledger.daily_cap_usd:.2f}"
             )
         if self.ledger.over_weekly_cap(trading_day):
