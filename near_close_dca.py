@@ -1578,7 +1578,6 @@ def load_prior_same_day_allocations(
         run_id = run_id or run_state.get("run_id")
         source = source or "manual"
 
-        orders_csv_path = run_state_path.parent / "orders.csv"
         fills = _orders_csv_fills(run_state_path.parent)
         for candidate in run_state.get("buy_candidates") or []:
             if not isinstance(candidate, dict):
@@ -1591,17 +1590,16 @@ def load_prior_same_day_allocations(
                 continue
 
             # A "submitted" candidate in run_state.json only means an order_id was
-            # obtained at submission time, not that it filled. When orders.csv is
-            # available for this run, require it to confirm the fill before
-            # counting the dollars as prior allocation -- an order that never
-            # filled (execution gap, reject, cancel) must not silently reduce the
-            # scheduled run's real buy. If orders.csv is absent entirely (e.g. an
-            # older artifact layout), fall back to trusting run_state.json as
-            # before rather than losing all prior context.
+            # obtained at submission time, not that it filled. When orders.csv
+            # confirms a fill, use the actual filled notional/price. When
+            # orders.csv exists but doesn't confirm a fill for this ticker (still
+            # "submitted", rejected, canceled, or never refreshed), we can't tell
+            # whether real capital moved -- dropping the ticker outright would
+            # treat an unrefreshed-but-actually-filled order as "no_prior_run"
+            # and risk a double-buy, so instead keep the known planned amount but
+            # with no reference price (see below), which routes the guard to its
+            # conservative manual-review $0 path rather than a blind top-up.
             fill = fills.get(ticker)
-            if orders_csv_path.exists() and fill is None:
-                continue
-
             amount = candidate.get("incremental_order_amount")
             if amount is None:
                 amount = candidate.get("planned_amount_usd")
@@ -1616,13 +1614,15 @@ def load_prior_same_day_allocations(
             if amount <= 0:
                 continue
 
+            # reference_price is only ever a confirmed fill price. The
+            # candidate's target_price/decision_bar_close is the price of the
+            # completed decision bar at signal time, not a proven execution
+            # price -- using it as a stand-in reference risks comparing the
+            # afternoon quote against a price nothing actually traded at, which
+            # can wrongly look like (or hide) a real top-up opportunity. No
+            # confirmed fill price means "unknown", which the guard already
+            # handles conservatively (missing_prior_price -> $0 + manual review).
             reference_price = fill["avg_fill_price"] if fill is not None else None
-            if reference_price is None:
-                for key in ("target_price", "decision_bar_close"):
-                    value = candidate.get(key)
-                    if isinstance(value, (int, float)) and value > 0:
-                        reference_price = float(value)
-                        break
 
             entry = aggregated.setdefault(
                 ticker,
@@ -2227,7 +2227,19 @@ def run_once(
             _block(ticker, MISSING_FILL_BROKER_BLOCKED, f"{ticker}: review blocked order: {review_reason}")
             continue
 
-        ref_id = f"graded-dca-{trading_day.isoformat()}-{ticker}"
+        # A guarded top-up reuses the plain ref_id formula only when it isn't a
+        # top-up: for a ticker whose earlier same-day amount came from a
+        # separate manual/morning run, the plain ref_id would collide with that
+        # earlier run's own ref_id for the same (trading_day, ticker), and a
+        # broker that treats ref_id as an idempotency key could silently resolve
+        # this placement to the earlier order instead of buying the incremental
+        # amount. The "-topup" suffix is still stable across retries of this same
+        # scheduled run, so retry idempotency for the top-up itself is preserved.
+        ref_id = (
+            f"graded-dca-topup-{trading_day.isoformat()}-{ticker}"
+            if ticker_guarded
+            else f"graded-dca-{trading_day.isoformat()}-{ticker}"
+        )
         if config.dry_run:
             logger.info(
                 "[DRY RUN] Would buy %s: $%.2f (%s)",

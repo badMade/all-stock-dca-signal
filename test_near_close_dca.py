@@ -780,6 +780,11 @@ def _manual_run_state(candidates, generated_at="2026-06-29T10:00:00-04:00", run_
 
 
 def test_load_prior_same_day_reads_morning_manual_allocation(tmp_path):
+    # No orders.csv at all (legacy/older artifact layout) -- the amount is still
+    # read from run_state.json, but reference_price is None rather than falling
+    # back to target_price/decision_bar_close: that's the decision bar's price at
+    # signal time, not a proven execution price, so using it as a stand-in risks
+    # comparing the afternoon quote against a price nothing actually traded at.
     root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
     _write_prior_run(
         root,
@@ -791,7 +796,7 @@ def test_load_prior_same_day_reads_morning_manual_allocation(tmp_path):
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
     assert set(allocations) == {"AAPL"}
     assert allocations["AAPL"].amount_usd == 3.0
-    assert allocations["AAPL"].reference_price == 99.0
+    assert allocations["AAPL"].reference_price is None
     assert allocations["AAPL"].source == "manual"
 
 
@@ -810,10 +815,15 @@ def test_load_prior_same_day_prefers_orders_csv_fill_price(tmp_path):
     assert allocations["AAPL"].reference_price == 97.5
 
 
-def test_load_prior_same_day_excludes_unconfirmed_submitted_order(tmp_path):
+def test_load_prior_same_day_unconfirmed_submitted_order_has_no_reference_price(tmp_path):
     # status="submitted" in run_state.json only means an order_id was obtained,
-    # not that it filled; when orders.csv contradicts that (still "submitted",
-    # never confirmed filled), it must not count as prior allocation.
+    # not that it filled; when orders.csv doesn't confirm a fill (still
+    # "submitted"), we can't tell whether real capital moved. Dropping the
+    # ticker entirely would risk a double-buy if it actually filled but was
+    # never refreshed, so it stays as prior allocation context with the known
+    # planned amount but no reference price -- which routes the afternoon guard
+    # to its conservative missing_prior_price / manual-review $0 path rather
+    # than either a blind top-up or a blind full re-buy.
     root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
     _write_prior_run(
         root,
@@ -823,7 +833,9 @@ def test_load_prior_same_day_excludes_unconfirmed_submitted_order(tmp_path):
         ]),
         orders_rows=[{"ticker": "AAPL", "status": "submitted", "avg_fill_price": ""}],
     )
-    assert load_prior_same_day_allocations(root, date(2026, 6, 29)) == {}
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert allocations["AAPL"].amount_usd == 3.0
+    assert allocations["AAPL"].reference_price is None
 
 
 def test_load_prior_same_day_excludes_dry_run_candidates(tmp_path):
@@ -865,22 +877,27 @@ def test_load_prior_same_day_excludes_scheduled_and_after_boundary(tmp_path):
 
 
 def test_load_prior_same_day_aggregates_amount_and_takes_min_price(tmp_path):
+    # Reference prices only ever come from confirmed orders.csv fills (never
+    # target_price/decision_bar_close -- see test_load_prior_same_day_reads_
+    # morning_manual_allocation), so both runs here confirm a real fill price.
     root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
     _write_prior_run(
         root,
         "manual_runs/0900",
         _manual_run_state(
-            [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0, "target_price": 99.0}],
+            [{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0, "target_price": 99.0}],
             generated_at="2026-06-29T09:00:00-04:00",
         ),
+        orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "99.0"}],
     )
     _write_prior_run(
         root,
         "manual_runs/1000",
         _manual_run_state(
-            [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 4.5, "target_price": 98.0}],
+            [{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 4.5, "target_price": 98.0}],
             generated_at="2026-06-29T10:00:00-04:00",
         ),
+        orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "98.0"}],
     )
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
     assert allocations["AAPL"].amount_usd == 7.5
@@ -924,9 +941,18 @@ def test_run_daily_compact_top_up_records_incremental(tmp_path):
     assert aapl["prior_same_day_reference_price"] == 99.0
     assert aapl["prior_same_day_run_id"] == "manual_am"
     assert aapl["status"] == "dry_run"
-    # A ticker with no prior allocation still buys its full amount.
+    # AAPL's placement used a "-topup-" ref_id, distinct from the plain
+    # graded-dca-<day>-<ticker> formula the morning run used for the same
+    # ticker/day -- otherwise a broker treating ref_id as an idempotency key
+    # could resolve this afternoon placement to the earlier morning order
+    # instead of buying the incremental amount.
+    assert "graded-dca-topup-2026-06-29-AAPL" in aapl["order_id"]
+    # A ticker with no prior allocation still buys its full amount, using the
+    # plain (non-topup) ref_id formula.
     assert by_ticker["NVDA"]["top_up_guard_result"] == TOP_UP_NO_PRIOR_RUN
     assert by_ticker["NVDA"]["incremental_order_amount"] == 6.0
+    assert "graded-dca-topup" not in by_ticker["NVDA"]["order_id"]
+    assert "graded-dca-2026-06-29-NVDA" in by_ticker["NVDA"]["order_id"]
 
 
 def test_run_daily_compact_fully_offset_still_writes_valid_state(tmp_path):

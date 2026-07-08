@@ -58,11 +58,15 @@ def test_run_pipeline_blocked_day_skips_reports(tmp_path):
 def test_run_pipeline_scheduled_run_auto_loads_prior_allocations(tmp_path):
     import json
 
-    # Seed a manual same-day allocation as a sibling directory of the scheduled
-    # run's artifacts_dir, mimicking the live cron_tracking layout, WITHOUT
-    # passing prior_same_day_allocations or prior_allocation_state_root -- the
-    # scheduled run must auto-derive the state root from artifacts_dir's parent.
-    manual_dir = tmp_path / "manual_runs" / "0900"
+    # Seed a manual same-day allocation under the cron task root's manual_runs/,
+    # mirroring the real production layout from config/scheduled_tasks.json:
+    # <task_root>/scheduled_runs/YYYYMMDD_1520ET/ (artifacts_dir) as a sibling of
+    # <task_root>/manual_runs/<timestamp>/. This is nested two levels below the
+    # task root, unlike a flat "scheduled" directory -- a naive
+    # artifacts_dir.parent would land on scheduled_runs/ itself and never see
+    # manual_runs/, so the auto-derived root must walk up past scheduled_runs/.
+    task_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    manual_dir = task_root / "manual_runs" / "0900"
     manual_dir.mkdir(parents=True)
     (manual_dir / "run_state.json").write_text(
         json.dumps({
@@ -81,7 +85,7 @@ def test_run_pipeline_scheduled_run_auto_loads_prior_allocations(tmp_path):
     )
 
     config = _demo_config()
-    scheduled_dir = tmp_path / "scheduled"
+    scheduled_dir = task_root / "scheduled_runs" / "20260706_1520ET"
     result = run_pipeline(
         _now(), config, StrategyState(),
         DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
@@ -92,7 +96,28 @@ def test_run_pipeline_scheduled_run_auto_loads_prior_allocations(tmp_path):
         run_state = json.load(handle)
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
     assert by_ticker["AAPL"]["top_up_guard_result"] != "no_prior_run"
-    assert not (tmp_path / "latest_run_summary.json").exists()
+    assert not (task_root / "latest_run_summary.json").exists()
+
+
+def test_default_prior_allocation_state_root_walks_past_scheduled_runs():
+    from pathlib import Path
+
+    from run_dca import _default_prior_allocation_state_root
+
+    task_root = Path("/cron_tracking/ce16ba6b")
+    artifacts_dir = task_root / "scheduled_runs" / "20260706_1520ET"
+    assert _default_prior_allocation_state_root(artifacts_dir) == task_root
+
+
+def test_default_prior_allocation_state_root_falls_back_to_parent():
+    from pathlib import Path
+
+    from run_dca import _default_prior_allocation_state_root
+
+    # No scheduled_runs/ segment in the path (e.g. a flat test/demo layout) ->
+    # fall back to the immediate parent.
+    artifacts_dir = Path("/tmp/some_root/scheduled")
+    assert _default_prior_allocation_state_root(artifacts_dir) == Path("/tmp/some_root")
 
 
 def test_fills_from_orders_csv(tmp_path):
