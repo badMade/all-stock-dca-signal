@@ -27,6 +27,14 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 > validated scheduled runs and exclude manual runs/order IDs. See
 > [run_classification.md](run_classification.md).
 
+> **Morning dry-run note:** a separate **dry-run / analytics-only** morning
+> stream (`MorningDCAExecutor`) grades morning weakness vs. yesterday's close on
+> its own **0x-to-3x** ladder and its own `morning` budget ledger, writing under
+> `cron_tracking/morning_dca/YYYYMMDD_0945ET/` (run_type `morning_dca_dry_run`,
+> `valid_afternoon_evidence=false`). It places **no trades**, never updates
+> `latest_scheduled_run.json`, and is never afternoon scheduled evidence. See
+> [morning_dca.md](morning_dca.md).
+
 | ID | Name | Type | Trades | Cron (UTC) | ET (EDT) | Status |
 |---|---|---|---|---|---|---|
 | `b7961407` | Pre-market DCA buying-power dashboard | analytics | no | `00 13 * * 1-5` | 9:00 AM weekdays | active |
