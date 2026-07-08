@@ -218,10 +218,11 @@ def deployed_by_day(
 
 def total_deployed(deploy_by_day: Dict[date, float], as_of: date, window_days: int) -> float:
     """Sum deployment over the trailing ``window_days`` ending on ``as_of`` (inclusive)."""
-    start_ordinal = as_of.toordinal() - (window_days - 1)
+    from datetime import timedelta
+    start_date = as_of - timedelta(days=window_days - 1)
     total = sum(
         amount for day, amount in deploy_by_day.items()
-        if start_ordinal <= day.toordinal() <= as_of.toordinal()
+        if start_date <= day <= as_of
     )
     return round(total, 2)
 
