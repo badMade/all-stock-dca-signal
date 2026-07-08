@@ -32,7 +32,7 @@ import logging
 import os
 import statistics
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import (
@@ -1133,16 +1133,33 @@ def build_run_artifacts(
     errors_count: int = 0,
     notifications_sent: Optional[int] = None,
     cost_control_notes: Optional[Sequence[str]] = None,
+    manual: bool = False,
 ) -> Dict[str, Any]:
     """Build the structured run-state dict written by the daily live-run path.
 
     The artifact captures everything downstream reporting needs: per-source signal
     rows, buy candidates with the target price at signal time and the per-symbol
     planned dollar amount, order ids, skip/block reasons, and budget/reserve fields.
+
+    Also stamps a ``run_classification`` block (via ``scripts/run_classification``)
+    so downstream consumers -- ``dca_reporting``'s manual-order exclusion and
+    ``dca_risk``'s scheduled-stream deployment accounting -- can tell a scheduled
+    live run from a manual one from the artifact content alone.
     """
     now_et = now.astimezone(EASTERN)
     trading_day = now_et.date()
     run_id = f"{trading_day.isoformat()}-{now_et.strftime('%H%M%S')}"
+
+    triggered_at_utc = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        from scripts.run_classification import build_manual_classification, build_scheduled_classification
+    except ImportError:
+        from run_classification import build_manual_classification, build_scheduled_classification
+    run_classification = (
+        build_manual_classification(triggered_at_utc=triggered_at_utc)
+        if manual
+        else build_scheduled_classification(trading_day.isoformat(), triggered_at_utc=triggered_at_utc)
+    )
 
     signal_rows: List[Dict[str, Any]] = []
     for decision in decisions:
@@ -1191,6 +1208,7 @@ def build_run_artifacts(
         "generated_at": now_et.isoformat(),
         "trading_day": trading_day.isoformat(),
         "iso_week": list(iso_week_key(trading_day)),
+        "run_classification": run_classification,
         "broker": config.broker.value,
         "dry_run": config.dry_run,
         "account_number": None,
@@ -1747,6 +1765,8 @@ def run_once(
     run_result: Optional[RunResult] = None,
     notifications_sent: Optional[int] = None,
     cost_control_notes: Optional[Sequence[str]] = None,
+    deployment_history_root: Optional[str | Path] = None,
+    manual: bool = False,
 ) -> List[ReconciledDecision]:
     now_et = now.astimezone(EASTERN)
     trading_day = now_et.date()
@@ -1777,6 +1797,23 @@ def run_once(
         raise RuntimeError(
             f"Refusing to trade account {broker.account_number()}; expected {config.target_account_number}"
         )
+
+    # Inject the trailing-7-day scheduled-live deployment from history so the
+    # kill-switch in graded_buy_multiplier reflects real cash burn. Imported
+    # lazily to avoid a circular import (dca_risk imports from this module).
+    if deployment_history_root is not None:
+        from dca_risk import apply_risk_guard, deployed_by_day, find_run_state_files
+
+        prior_states = []
+        for path in find_run_state_files(deployment_history_root):
+            try:
+                with path.open(encoding="utf-8") as f:
+                    data = json.load(f)
+            except (ValueError, OSError):
+                continue
+            if isinstance(data, dict) and data.get("status") != RUN_STATUS_BLOCKED:
+                prior_states.append(data)
+        config = apply_risk_guard(config, deployed_by_day(prior_states), trading_day)
 
     decisions: List[ReconciledDecision] = []
     tradable_tickers = [ticker for ticker in config.tickers if ticker not in config.excluded_tickers]
@@ -1936,6 +1973,7 @@ def run_once(
             errors_count=errors_count,
             notifications_sent=notifications_sent,
             cost_control_notes=cost_control_notes,
+            manual=manual,
         )
         paths = write_run_artifacts(artifacts, artifacts_dir)
         logger.info("Wrote run artifacts: %s", paths["run_state"])
@@ -2001,6 +2039,7 @@ def run_daily_compact(
     run_label: str = "daily",
     scheduled: bool = True,
     notifications_sent: Optional[int] = None,
+    deployment_history_root: Optional[str | Path] = None,
 ) -> Dict[str, object]:
     """Run one DCA scan and write only compact, structured daily artifacts.
 
@@ -2034,6 +2073,8 @@ def run_daily_compact(
         artifacts_dir=artifacts_dir,
         run_result=run_result,
         notifications_sent=notifications_sent,
+        deployment_history_root=deployment_history_root,
+        manual=not scheduled,
     )
 
     out = Path(artifacts_dir)

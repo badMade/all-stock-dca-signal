@@ -115,8 +115,10 @@ def classify_stream(state: Dict[str, Any]) -> str:
 
     A manual origin/flag anywhere wins (defensive OR), matching the
     run-classification contract: a state marked scheduled but also carrying
-    ``manual_run=true`` is treated as manual, never scheduled. Anything that is
-    not an unambiguous scheduled run is ``STREAM_OTHER``.
+    ``manual_run=true`` is treated as manual, never scheduled. A scheduled-looking
+    block must also pass ``scripts.run_classification.validate_classification``
+    (required fields, run_id pattern, lineage) before counting as scheduled;
+    anything that is not an unambiguous, *valid* scheduled run is ``STREAM_OTHER``.
     """
     rc = state.get("run_classification") if isinstance(state, dict) else None
     if not isinstance(rc, dict):
@@ -125,7 +127,12 @@ def classify_stream(state: Dict[str, Any]) -> str:
     if origin == "manual" or rc.get("manual_run") is True:
         return STREAM_MANUAL
     if origin == "scheduled" and rc.get("manual_run") is False:
-        return STREAM_SCHEDULED
+        try:
+            from scripts.run_classification import validate_classification
+        except ImportError:
+            from run_classification import validate_classification
+        if validate_classification(rc).ok:
+            return STREAM_SCHEDULED
     return STREAM_OTHER
 
 

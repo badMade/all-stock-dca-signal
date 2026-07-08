@@ -381,6 +381,30 @@ def test_build_run_artifacts_captures_target_price():
     assert artifacts["budget"]["budget_tier"] == "normal"
     assert artifacts["budget"]["base_buy_amount_usd"] == 3.0
 
+    from scripts.run_classification import validate_classification
+
+    rc = artifacts["run_classification"]
+    assert rc["run_origin"] == "scheduled"
+    assert rc["manual_run"] is False
+    assert validate_classification(rc).ok
+
+
+def test_build_run_artifacts_manual_classification():
+    from datetime import date, datetime, time
+    from zoneinfo import ZoneInfo
+
+    from near_close_dca import StrategyConfig, StrategyState, build_run_artifacts
+    from scripts.run_classification import validate_classification
+
+    eastern = ZoneInfo("America/New_York")
+    now = datetime.combine(date(2026, 6, 29), time(15, 45), tzinfo=eastern)
+
+    artifacts = build_run_artifacts(now, StrategyConfig(), StrategyState(), [], {}, manual=True)
+    rc = artifacts["run_classification"]
+    assert rc["run_origin"] == "manual"
+    assert rc["manual_run"] is True
+    assert validate_classification(rc).ok
+
 
 def test_load_json_files_skips_blocked_stubs(tmp_path):
     real = tmp_path / "run_state.json"

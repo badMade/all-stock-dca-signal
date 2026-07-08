@@ -22,6 +22,7 @@ from dca_risk import (
     seven_day_deployed,
 )
 from near_close_dca import StrategyConfig, graded_buy_multiplier, kill_switch_engaged
+from scripts.run_classification import build_manual_classification, build_scheduled_classification
 
 # Monthly allocation used across tests: 40% threshold => $1,440.
 ALLOCATION = 3600.0
@@ -33,10 +34,7 @@ def _scheduled_state(trading_day: str, deployed: float, *, et_time: str = "15:20
     return {
         "trading_day": trading_day,
         "generated_at": f"{trading_day}T{et_time}-04:00",
-        "run_classification": {
-            "run_origin": "scheduled",
-            "manual_run": False,
-        },
+        "run_classification": build_scheduled_classification(trading_day),
         "buy_candidates": [
             {"ticker": "AAA", "planned_amount_usd": deployed, "status": "submitted"},
         ],
@@ -47,7 +45,7 @@ def _manual_state(trading_day: str, deployed: float) -> dict:
     return {
         "trading_day": trading_day,
         "generated_at": f"{trading_day}T15:22:00-04:00",
-        "run_classification": {"run_origin": "manual", "manual_run": True},
+        "run_classification": build_manual_classification(),
         "buy_candidates": [
             {"ticker": "BBB", "planned_amount_usd": deployed, "status": "submitted"},
         ],
@@ -199,7 +197,7 @@ def test_utc_timestamp_converted_to_et_for_floor():
     state = {
         "trading_day": "2026-07-07",
         "generated_at": "2026-07-07T19:20:00Z",
-        "run_classification": {"run_origin": "scheduled", "manual_run": False},
+        "run_classification": build_scheduled_classification("2026-07-07"),
         "buy_candidates": [{"ticker": "AAA", "planned_amount_usd": 10.0, "status": "submitted"}],
     }
     assert is_afternoon_scheduled_evidence(state) is True
