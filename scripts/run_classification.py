@@ -580,7 +580,7 @@ def select_scheduled_state_for_reporting(
     kept = [oid for oid in sorted(scheduled_ids) if oid not in manual_ids]
 
     oss = order_submit_status(state)
-    confirmation_blocked = is_confirmation_blocked(state)
+    confirmation_blocked = oss == ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED
 
     used_fallback = False
     fallback_reason: Optional[str] = None
