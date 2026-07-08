@@ -30,16 +30,21 @@ from __future__ import annotations
 
 import csv
 import json
+import math
+import uuid
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from near_close_dca import (
+    ACTIVE_TICKERS,
     EASTERN,
+    EXCLUDED_TICKERS,
     Action,
     Bar,
     StrategyConfig,
+    completed_bar_anchor,
     graded_buy_multiplier,
     iso_week_key,
     latest_bar_at_or_before,
@@ -82,6 +87,84 @@ MORNING_SIZING_TIERS: Tuple[Tuple[float, float], ...] = (
 
 MORNING_MINIMUM_DROP = 0.001
 
+
+def _nth_weekday_of_month(year: int, month: int, weekday: int, n: int) -> date:
+    """Return the date of the ``n``-th ``weekday`` (0=Mon..6=Sun) in ``year``/``month``."""
+    first = date(year, month, 1)
+    offset = (weekday - first.weekday()) % 7
+    return first + timedelta(days=offset + 7 * (n - 1))
+
+
+def _last_weekday_of_month(year: int, month: int, weekday: int) -> date:
+    """Return the date of the last ``weekday`` (0=Mon..6=Sun) in ``year``/``month``."""
+    if month == 12:
+        next_month_first = date(year + 1, 1, 1)
+    else:
+        next_month_first = date(year, month + 1, 1)
+    last_day = next_month_first - timedelta(days=1)
+    offset = (last_day.weekday() - weekday) % 7
+    return last_day - timedelta(days=offset)
+
+
+def _easter_sunday(year: int) -> date:
+    """Return Easter Sunday for ``year`` via the Anonymous Gregorian algorithm."""
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    ll = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * ll) // 451
+    month = (h + ll - 7 * m + 114) // 31
+    day = ((h + ll - 7 * m + 114) % 31) + 1
+    return date(year, month, day)
+
+
+def _observed(holiday: date) -> date:
+    """Shift a fixed-date holiday off a weekend per standard US observance rules."""
+    if holiday.weekday() == 5:  # Saturday -> observed Friday
+        return holiday - timedelta(days=1)
+    if holiday.weekday() == 6:  # Sunday -> observed Monday
+        return holiday + timedelta(days=1)
+    return holiday
+
+
+def nyse_holidays(year: int) -> frozenset[date]:
+    """Return the NYSE's full-market-closure dates for ``year``.
+
+    Computed from the exchange's long-standing, publicly documented holiday
+    rules (fixed dates with weekend observance shifts, or Nth-weekday-of-month
+    rules) rather than a hardcoded per-year list, so the morning stream's
+    holiday gate (unlike :data:`near_close_dca.MARKET_HOLIDAYS`, which is
+    scoped to the afternoon live-test window) stays correct indefinitely into
+    the future without manual updates. Good Friday is included; NYSE has
+    observed it as a full closure every year on record.
+    """
+    holidays = {
+        _observed(date(year, 1, 1)),  # New Year's Day
+        _nth_weekday_of_month(year, 1, 0, 3),  # MLK Day: 3rd Monday of January
+        _nth_weekday_of_month(year, 2, 0, 3),  # Washington's Birthday: 3rd Monday of February
+        _easter_sunday(year) - timedelta(days=2),  # Good Friday
+        _last_weekday_of_month(year, 5, 0),  # Memorial Day: last Monday of May
+        _observed(date(year, 6, 19)),  # Juneteenth
+        _observed(date(year, 7, 4)),  # Independence Day
+        _nth_weekday_of_month(year, 9, 0, 1),  # Labor Day: 1st Monday of September
+        _nth_weekday_of_month(year, 11, 3, 4),  # Thanksgiving: 4th Thursday of November
+        _observed(date(year, 12, 25)),  # Christmas
+    }
+    # When Jan 1 of the *next* year falls on a Saturday, NYSE observes it on the
+    # preceding Friday (Dec 31 of *this* year).  That observed date belongs to
+    # this year's holiday set but would otherwise only appear in nyse_holidays(year+1).
+    next_new_year = date(year + 1, 1, 1)
+    if next_new_year.weekday() == 5:  # Saturday -> observed Friday Dec 31
+        holidays.add(date(year, 12, 31))
+    return frozenset(holidays)
+
 # Morning budget caps. The morning stream owns these; they are intentionally not
 # the afternoon BUDGET_TIERS caps so morning activity is budgeted independently.
 DEFAULT_MORNING_DAILY_CAP_USD = 90.0
@@ -98,8 +181,8 @@ class MorningConfig:
     base by default so the hypothetical dollar figures are comparable.
     """
 
-    tickers: Sequence[str] = ()
-    excluded_tickers: frozenset[str] = frozenset()
+    tickers: Sequence[str] = field(default_factory=lambda: tuple(ACTIVE_TICKERS))
+    excluded_tickers: frozenset[str] = field(default_factory=lambda: frozenset(EXCLUDED_TICKERS))
     base_buy_amount_usd: float = 3.0
     sizing_tiers: Tuple[Tuple[float, float], ...] = MORNING_SIZING_TIERS
     minimum_drop_vs_previous_close: float = MORNING_MINIMUM_DROP
@@ -198,6 +281,72 @@ class MorningSignal:
         }
 
 
+def load_morning_config(config_dir=None):
+    """Read ``config/morning_dca.json`` and return a :class:`MorningConfig`.
+
+    Looks for ``morning_dca.json`` in ``config_dir`` (default: a ``config/``
+    directory next to this module, falling back to ``./config``).  If the file
+    is absent or unreadable the function logs a warning and returns
+    ``MorningConfig()`` with hardcoded defaults -- the same graceful-fallback
+    pattern used by :func:`dca_config.load_strategy_config`.
+    """
+    import logging
+    _log = logging.getLogger(__name__)
+
+    if config_dir is None:
+        _here = Path(__file__).resolve().parent
+        for candidate in (_here / "config", Path.cwd() / "config"):
+            if candidate.is_dir():
+                config_dir_path = candidate
+                break
+        else:
+            config_dir_path = _here / "config"
+    else:
+        config_dir_path = Path(config_dir)
+
+    cfg_path = config_dir_path / "morning_dca.json"
+    if not cfg_path.exists():
+        _log.warning(
+            "morning_dca.json not found at %s; using MorningConfig defaults", cfg_path
+        )
+        return MorningConfig()
+
+    try:
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        _log.warning("could not parse %s (%s); using MorningConfig defaults", cfg_path, exc)
+        return MorningConfig()
+
+    kwargs = {}
+
+    sizing = raw.get("sizing_ladder", {})
+    if "base_amount_usd" in sizing:
+        kwargs["base_buy_amount_usd"] = float(sizing["base_amount_usd"])
+    if "no_buy_below_pct" in sizing:
+        kwargs["minimum_drop_vs_previous_close"] = float(sizing["no_buy_below_pct"]) / 100.0
+    if "tiers" in sizing:
+        tiers = tuple(
+            (
+                float(t["min_drop_pct"]) / 100.0,
+                float(t["max_drop_pct"]) / 100.0 if t.get("max_drop_pct") is not None else float("inf"),
+            )
+            for t in sizing["tiers"]
+        )
+        kwargs["sizing_tiers"] = tiers
+
+    budget = raw.get("budget_ledger", {})
+    if "morning_daily_cap_usd" in budget:
+        kwargs["morning_daily_cap_usd"] = float(budget["morning_daily_cap_usd"])
+    if "morning_weekly_cap_usd" in budget:
+        kwargs["morning_weekly_cap_usd"] = float(budget["morning_weekly_cap_usd"])
+
+    artifact_paths = raw.get("artifact_paths", {})
+    if "morning_run_state_root" in artifact_paths:
+        kwargs["morning_run_state_root"] = artifact_paths["morning_run_state_root"]
+
+    return MorningConfig(**kwargs)
+
+
 class DCAExecutor:
     """Base class for class-based DCA executors over the strategy library.
 
@@ -248,8 +397,10 @@ class MorningDCAExecutor(DCAExecutor):
         self,
         config: Optional[MorningConfig] = None,
         ledger: Optional[MorningLedger] = None,
+        *,
+        config_dir: Optional[str] = None,
     ) -> None:
-        self.config = config or MorningConfig()
+        self.config = config if config is not None else load_morning_config(config_dir)
         self.ledger = ledger or MorningLedger(
             daily_cap_usd=self.config.morning_daily_cap_usd,
             weekly_cap_usd=self.config.morning_weekly_cap_usd,
@@ -263,16 +414,20 @@ class MorningDCAExecutor(DCAExecutor):
 
     def run_state_dir(self, now: datetime) -> Path:
         now_et = now.astimezone(EASTERN)
-        hhmm = MORNING_SCHEDULED_FOR_ET.replace(":", "")
-        folder = f"{now_et.strftime('%Y%m%d')}_{hhmm}ET"
+        folder = f"{now_et.strftime('%Y%m%d')}_0945ET"
         return Path(self.config.morning_run_state_root) / folder
+
     def run_id(self, now: datetime, *, manual: bool) -> str:
         now_et = now.astimezone(EASTERN)
         if manual:
             now_utc = now.astimezone(timezone.utc)
-            return f"manual_morning_{now_utc.strftime('%Y%m%d_%H%M%S')}Z"
-        hhmm = MORNING_SCHEDULED_FOR_ET.replace(":", "")
-        return f"morning_{now_et.strftime('%Y%m%d')}_{hhmm}ET"
+            # A short random suffix guarantees uniqueness even when two manual
+            # replays share the same decision timestamp (down to the second),
+            # so write_artifacts never silently overwrites a prior manual run.
+            unique = uuid.uuid4().hex[:6]
+            return f"manual_morning_{now_utc.strftime('%Y%m%d_%H%M%S')}Z_{unique}"
+        return f"morning_{now_et.strftime('%Y%m%d')}_0945ET"
+
     def run_classification(self, now: datetime, *, manual: bool = False) -> Dict[str, Any]:
         """Build the morning run-classification block.
 
@@ -323,8 +478,17 @@ class MorningDCAExecutor(DCAExecutor):
         except Exception as exc:  # noqa: BLE001 - degrade to NO_DATA with a warning
             prev_bar = None
             warnings.append(f"previous_close provider error: {exc}")
+        if prev_bar is not None and prev_bar.timestamp >= decision_dt:
+            warnings.append(
+                f"previous_close timestamp {prev_bar.timestamp.isoformat()} is not before "
+                "the 09:45 ET decision anchor; rejecting"
+            )
+            prev_bar = None
         if prev_bar is not None:
-            previous_close = prev_bar.close
+            if not math.isfinite(prev_bar.close) or prev_bar.close <= 0:
+                warnings.append(f"previous close {prev_bar.close} is non-positive; rejecting")
+            else:
+                previous_close = prev_bar.close
         else:
             warnings.append("missing previous close")
 
@@ -393,26 +557,43 @@ class MorningDCAExecutor(DCAExecutor):
         bars: Sequence[Bar],
         warnings: List[str],
     ) -> Optional[float]:
+        bar_anchor = completed_bar_anchor(decision_dt, self.config.interval_minutes, self._sizing_config)
+        bar = latest_bar_at_or_before(bars, bar_anchor)
+
         get_quote = getattr(data, "get_quote", None)
         if callable(get_quote):
             try:
                 quote = get_quote(ticker, decision_dt)
                 if quote is not None and isinstance(quote, (tuple, list)) and len(quote) >= 1:
-                    return float(quote[0])
+                    quote_time = quote[1] if len(quote) >= 2 else None
+                    if isinstance(quote_time, datetime) and bar_anchor <= quote_time <= decision_dt:
+                        quote_price = float(quote[0])
+                        if quote_price > 0:
+                            return quote_price
+                        warnings.append(
+                            f"quote price {quote_price!r} is not positive; falling back to completed bar"
+                        )
+                    elif quote_time is None:
+                        warnings.append(
+                            "quote has no usable timestamp; falling back to completed bar"
+                        )
+                    elif quote_time > decision_dt:
+                        warnings.append(
+                            f"quote timestamp {quote_time!r} is after the 09:45 ET "
+                            "decision anchor; falling back to completed bar"
+                        )
+                    else:
+                        warnings.append(
+                            f"quote timestamp {quote_time!r} is older than the completed bar "
+                            "anchor; falling back to completed bar"
+                        )
             except Exception as exc:  # noqa: BLE001
                 warnings.append(f"quote provider error: {exc}")
-        from datetime import timedelta
-
-        decision_anchor = (
-            decision_dt - timedelta(minutes=self.config.interval_minutes)
-            if self.sizing_config.assume_bar_timestamps_are_start_times
-            else decision_dt
-        )
-        bar = latest_bar_at_or_before(bars, decision_anchor)
         if bar is None:
-            warnings.append(
-                f"missing intraday bar at/or before {decision_anchor.astimezone(EASTERN).strftime('%H:%M')} ET"
-            )
+            warnings.append("missing completed intraday bar at/or before 09:45 ET")
+            return None
+        if not math.isfinite(bar.close) or bar.close <= 0:
+            warnings.append(f"completed bar close {bar.close!r} is not positive; rejecting")
             return None
         return bar.close
 
@@ -420,6 +601,22 @@ class MorningDCAExecutor(DCAExecutor):
         """Evaluate every non-excluded ticker for the morning stream."""
         tickers = [t for t in self.config.tickers if t not in self.config.excluded_tickers]
         return [self.evaluate_signal(t, now, data) for t in tickers]
+
+    @staticmethod
+    def _buy_candidates(signals: Sequence[MorningSignal]) -> List[MorningSignal]:
+        return [s for s in signals if s.action == Action.BUY and s.multiplier > 0]
+
+    def record_buy_candidates(
+        self, trading_day: date, buy_candidates: Sequence[MorningSignal]
+    ) -> None:
+        """Record this run's buy candidates against the morning ledger.
+
+        Call exactly once per run (``run()`` does this before building
+        artifacts) -- ``build_artifacts`` itself is side-effect-free, so
+        inspecting/rebuilding artifacts never double-counts hypothetical spend.
+        """
+        for candidate in buy_candidates:
+            self.ledger.record_hypothetical(trading_day, candidate.hypothetical_amount_usd)
 
     # -- Artifacts -----------------------------------------------------------
     def build_artifacts(
@@ -430,14 +627,18 @@ class MorningDCAExecutor(DCAExecutor):
         *,
         manual: bool = False,
     ) -> Dict[str, Any]:
-        """Assemble the morning run_state dict (dry-run / analytics only)."""
+        """Assemble the morning run_state dict (dry-run / analytics only).
+
+        Pure/side-effect-free: reads the ledger but never mutates it. Callers
+        must record buy candidates via :meth:`record_buy_candidates` beforehand
+        for the ledger-derived fields (caps, remaining budget) to reflect this
+        run.
+        """
         now_et = now.astimezone(EASTERN)
         trading_day = now_et.date()
 
         signal_rows = [s.to_row() for s in signals]
-        buy_candidates = [s for s in signals if s.action == Action.BUY and s.multiplier > 0]
-        for candidate in buy_candidates:
-            self.ledger.record_hypothetical(trading_day, candidate.hypothetical_amount_usd)
+        buy_candidates = self._buy_candidates(signals)
 
         hypothetical_spend = round(sum(c.hypothetical_amount_usd for c in buy_candidates), 2)
 
@@ -549,8 +750,35 @@ class MorningDCAExecutor(DCAExecutor):
         Returns ``{"artifacts": <run_state dict>, "paths": <written paths>}``. No
         orders are placed and no broker is contacted.
         """
+        trading_day = now.astimezone(EASTERN).date()
+        if not manual and trading_day in nyse_holidays(trading_day.year):
+            # A weekday cron fire on a full market closure has no real session
+            # to evaluate. Unlike near_close_dca.MARKET_HOLIDAYS (scoped to the
+            # afternoon live-test window and hand-maintained), the morning
+            # stream runs indefinitely with no end date, so it uses the
+            # computed nyse_holidays() calendar to stay correct into future
+            # years without manual updates. Write a blocked stub -- mirroring
+            # near_close_dca's date-gate pattern -- and never advance
+            # latest_morning_run.json, so the scheduled pointer keeps referring
+            # to the last real session instead of a non-trading placeholder.
+            out = self.run_state_dir(now)
+            out.mkdir(parents=True, exist_ok=True)
+            state_path = out / "run_state.json"
+            if not state_path.exists():
+                state_path.write_text(
+                    json.dumps(
+                        {"trading_day": trading_day.isoformat(), "status": "blocked",
+                         "block_reason": "market holiday", "stream": self.stream},
+                        indent=2, sort_keys=True,
+                    ),
+                    encoding="utf-8",
+                )
+            return {"artifacts": {"trading_day": trading_day.isoformat(), "status": "blocked"},
+                    "paths": {"run_state": str(state_path)}}
         signals = self.evaluate(now, data)
         source = data_source or getattr(getattr(data, "source", None), "value", "unknown")
+        trading_day = now.astimezone(EASTERN).date()
+        self.record_buy_candidates(trading_day, self._buy_candidates(signals))
         artifacts = self.build_artifacts(now, signals, source, manual=manual)
         paths = self.write_artifacts(artifacts, now)
         return {"artifacts": artifacts, "paths": paths}
