@@ -32,7 +32,7 @@ import csv
 import json
 import uuid
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -40,7 +40,6 @@ from near_close_dca import (
     ACTIVE_TICKERS,
     EASTERN,
     EXCLUDED_TICKERS,
-    MARKET_HOLIDAYS,
     Action,
     Bar,
     StrategyConfig,
@@ -86,6 +85,79 @@ MORNING_SIZING_TIERS: Tuple[Tuple[float, float], ...] = (
 )
 
 MORNING_MINIMUM_DROP = 0.001
+
+
+def _nth_weekday_of_month(year: int, month: int, weekday: int, n: int) -> date:
+    """Return the date of the ``n``-th ``weekday`` (0=Mon..6=Sun) in ``year``/``month``."""
+    first = date(year, month, 1)
+    offset = (weekday - first.weekday()) % 7
+    return first + timedelta(days=offset + 7 * (n - 1))
+
+
+def _last_weekday_of_month(year: int, month: int, weekday: int) -> date:
+    """Return the date of the last ``weekday`` (0=Mon..6=Sun) in ``year``/``month``."""
+    if month == 12:
+        next_month_first = date(year + 1, 1, 1)
+    else:
+        next_month_first = date(year, month + 1, 1)
+    last_day = next_month_first - timedelta(days=1)
+    offset = (last_day.weekday() - weekday) % 7
+    return last_day - timedelta(days=offset)
+
+
+def _easter_sunday(year: int) -> date:
+    """Return Easter Sunday for ``year`` via the Anonymous Gregorian algorithm."""
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    ll = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * ll) // 451
+    month = (h + ll - 7 * m + 114) // 31
+    day = ((h + ll - 7 * m + 114) % 31) + 1
+    return date(year, month, day)
+
+
+def _observed(holiday: date) -> date:
+    """Shift a fixed-date holiday off a weekend per standard US observance rules."""
+    if holiday.weekday() == 5:  # Saturday -> observed Friday
+        return holiday - timedelta(days=1)
+    if holiday.weekday() == 6:  # Sunday -> observed Monday
+        return holiday + timedelta(days=1)
+    return holiday
+
+
+def nyse_holidays(year: int) -> frozenset[date]:
+    """Return the NYSE's full-market-closure dates for ``year``.
+
+    Computed from the exchange's long-standing, publicly documented holiday
+    rules (fixed dates with weekend observance shifts, or Nth-weekday-of-month
+    rules) rather than a hardcoded per-year list, so the morning stream's
+    holiday gate (unlike :data:`near_close_dca.MARKET_HOLIDAYS`, which is
+    scoped to the afternoon live-test window) stays correct indefinitely into
+    the future without manual updates. Good Friday is included; NYSE has
+    observed it as a full closure every year on record.
+    """
+    return frozenset(
+        {
+            _observed(date(year, 1, 1)),  # New Year's Day
+            _nth_weekday_of_month(year, 1, 0, 3),  # MLK Day: 3rd Monday of January
+            _nth_weekday_of_month(year, 2, 0, 3),  # Washington's Birthday: 3rd Monday of February
+            _easter_sunday(year) - timedelta(days=2),  # Good Friday
+            _last_weekday_of_month(year, 5, 0),  # Memorial Day: last Monday of May
+            _observed(date(year, 6, 19)),  # Juneteenth
+            _observed(date(year, 7, 4)),  # Independence Day
+            _nth_weekday_of_month(year, 9, 0, 1),  # Labor Day: 1st Monday of September
+            _nth_weekday_of_month(year, 11, 3, 4),  # Thanksgiving: 4th Thursday of November
+            _observed(date(year, 12, 25)),  # Christmas
+        }
+    )
 
 # Morning budget caps. The morning stream owns these; they are intentionally not
 # the afternoon BUDGET_TIERS caps so morning activity is budgeted independently.
@@ -339,7 +411,10 @@ class MorningDCAExecutor(DCAExecutor):
             )
             prev_bar = None
         if prev_bar is not None:
-            previous_close = prev_bar.close
+            if prev_bar.close <= 0:
+                warnings.append(f"previous close {prev_bar.close} is non-positive; rejecting")
+            else:
+                previous_close = prev_bar.close
         else:
             warnings.append("missing previous close")
 
@@ -602,13 +677,16 @@ class MorningDCAExecutor(DCAExecutor):
         orders are placed and no broker is contacted.
         """
         trading_day = now.astimezone(EASTERN).date()
-        if not manual and trading_day in MARKET_HOLIDAYS:
-            # A weekday cron fire on a full market closure (see
-            # near_close_dca.MARKET_HOLIDAYS) has no real session to evaluate.
-            # Write a blocked stub -- mirroring near_close_dca's date-gate
-            # pattern -- and never advance latest_morning_run.json, so the
-            # scheduled pointer keeps referring to the last real session
-            # instead of a non-trading placeholder.
+        if not manual and trading_day in nyse_holidays(trading_day.year):
+            # A weekday cron fire on a full market closure has no real session
+            # to evaluate. Unlike near_close_dca.MARKET_HOLIDAYS (scoped to the
+            # afternoon live-test window and hand-maintained), the morning
+            # stream runs indefinitely with no end date, so it uses the
+            # computed nyse_holidays() calendar to stay correct into future
+            # years without manual updates. Write a blocked stub -- mirroring
+            # near_close_dca's date-gate pattern -- and never advance
+            # latest_morning_run.json, so the scheduled pointer keeps referring
+            # to the last real session instead of a non-trading placeholder.
             out = self.run_state_dir(now)
             out.mkdir(parents=True, exist_ok=True)
             state_path = out / "run_state.json"

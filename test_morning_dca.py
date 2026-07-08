@@ -19,6 +19,7 @@ from morning_dca import (
     MorningConfig,
     MorningDCAExecutor,
     MorningLedger,
+    nyse_holidays,
 )
 from near_close_dca import EASTERN, Action, Bar, SourceName
 
@@ -50,6 +51,30 @@ class FixedDropProvider:
 
 def _now():
     return datetime.combine(date(2026, 7, 8), time(9, 45), tzinfo=EASTERN)
+
+
+# --- NYSE holiday calendar ---------------------------------------------------
+def test_nyse_holidays_2026_matches_documented_observed_dates():
+    holidays = nyse_holidays(2026)
+    assert date(2026, 1, 1) in holidays  # New Year's Day
+    assert date(2026, 1, 19) in holidays  # MLK Day
+    assert date(2026, 2, 16) in holidays  # Washington's Birthday
+    assert date(2026, 4, 3) in holidays  # Good Friday
+    assert date(2026, 5, 25) in holidays  # Memorial Day
+    assert date(2026, 6, 19) in holidays  # Juneteenth
+    # Independence Day (Jul 4) falls on a Saturday in 2026 -> observed Friday,
+    # matching near_close_dca.MARKET_HOLIDAYS' hand-documented value.
+    assert date(2026, 7, 3) in holidays
+    assert date(2026, 9, 7) in holidays  # Labor Day
+    assert date(2026, 11, 26) in holidays  # Thanksgiving
+    assert date(2026, 12, 25) in holidays  # Christmas
+    assert len(holidays) == 10
+
+
+def test_nyse_holidays_shifts_weekend_fixed_dates():
+    # 2027: Jul 4 falls on a Sunday -> observed Monday Jul 5.
+    assert date(2027, 7, 5) in nyse_holidays(2027)
+    assert date(2027, 7, 4) not in nyse_holidays(2027)
 
 
 # --- Threshold brackets -----------------------------------------------------
@@ -183,6 +208,27 @@ def test_non_positive_completed_bar_close_is_rejected():
     assert sig.current_price is None
     assert sig.action == Action.NO_DATA
     assert any("is not positive" in w for w in sig.warnings)
+
+
+def test_negative_previous_close_bar_rejected():
+    # A provider-backed previous-close bar with a negative close must not be
+    # trusted for sizing -- current_price=90 vs. previous_close=-100 would
+    # otherwise compute a nonsensical 190% "drop" and size a 3x BUY.
+    decision_dt = _now()
+
+    class NegativePrevCloseProvider(FixedDropProvider):
+        def get_previous_close_bar(self, ticker, as_of):
+            ts = datetime.combine(
+                as_of.astimezone(EASTERN).date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN
+            )
+            return Bar(timestamp=ts, open=-100.0, high=-100.0, low=-100.0, close=-100.0, volume=0.0)
+
+    data = NegativePrevCloseProvider(SourceName.ROBINHOOD, 90.0, {"BIG": 0.0})
+    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
+    sig = ex.evaluate(decision_dt, data)[0]
+    assert sig.action == Action.NO_DATA
+    assert sig.previous_close is None
+    assert any("non-positive" in w for w in sig.warnings)
 
 
 def test_untimestamped_quote_falls_back_to_completed_bar():
@@ -322,6 +368,24 @@ def test_scheduled_run_skips_artifacts_on_market_holiday(tmp_path):
     assert run_state_path.exists()
     assert json.loads(run_state_path.read_text())["status"] == "blocked"
     # The scheduled pointer must never advance to a non-trading-day placeholder.
+    assert not (Path(tmp_path) / "latest_morning_run.json").exists()
+
+
+def test_scheduled_run_skips_artifacts_on_future_holiday_beyond_afternoon_window(tmp_path):
+    # near_close_dca.MARKET_HOLIDAYS is hand-maintained and scoped to the
+    # afternoon live-test window (2026-06-29 through 2026-08-28), so it does
+    # NOT include Labor Day 2026-09-07. The morning stream runs indefinitely
+    # with no end date, so it must catch this via the computed nyse_holidays()
+    # calendar instead of the narrower afternoon list.
+    holiday = date(2026, 9, 7)  # Labor Day: 1st Monday of September
+    now = datetime.combine(holiday, time(9, 45), tzinfo=EASTERN)
+    cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
+    ex = MorningDCAExecutor(cfg)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    res = ex.run(now, data)
+
+    assert res["artifacts"]["status"] == "blocked"
     assert not (Path(tmp_path) / "latest_morning_run.json").exists()
 
 
