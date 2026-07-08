@@ -401,9 +401,18 @@ class MorningDCAExecutor(DCAExecutor):
                     return float(quote[0])
             except Exception as exc:  # noqa: BLE001
                 warnings.append(f"quote provider error: {exc}")
-        bar = latest_bar_at_or_before(bars, decision_dt)
+        from datetime import timedelta
+
+        decision_anchor = (
+            decision_dt - timedelta(minutes=self.config.interval_minutes)
+            if self.sizing_config.assume_bar_timestamps_are_start_times
+            else decision_dt
+        )
+        bar = latest_bar_at_or_before(bars, decision_anchor)
         if bar is None:
-            warnings.append("missing intraday bar at/or before 09:45 ET")
+            warnings.append(
+                f"missing intraday bar at/or before {decision_anchor.astimezone(EASTERN).strftime('%H:%M')} ET"
+            )
             return None
         return bar.close
 
