@@ -255,11 +255,6 @@ def validate_classification(rc: Dict[str, object]) -> ValidationResult:
             f"placeholder/ambiguous values like 'ce16ba6b_replacement' are forbidden, "
             f"got {supersedes!r}"
         )
-        errors.append(
-            f"supersedes_cron_id must be {SUPERSEDES_CRON_ID!r} or absent; "
-            f"placeholder/ambiguous values like 'ce16ba6b_replacement' are forbidden, "
-            f"got {supersedes!r}"
-        )
 
     manual_flag = rc.get("manual_run")
     if origin == "scheduled":
