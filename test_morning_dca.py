@@ -40,7 +40,12 @@ class FixedDropProvider:
 
     def get_intraday_bars(self, ticker, start, end, interval_minutes):
         price = self._prev * (1.0 - self._drops.get(ticker, 0.0))
-        return [Bar(timestamp=end, open=price, high=price, low=price, close=price, volume=100.0)]
+        bars = []
+        cursor = start
+        while cursor <= end:
+            bars.append(Bar(timestamp=cursor, open=price, high=price, low=price, close=price, volume=100.0))
+            cursor += timedelta(minutes=interval_minutes)
+        return bars
 
 
 def _now():
@@ -92,6 +97,62 @@ def test_signal_amounts_and_actions():
     assert sigs["SMALL"].hypothetical_amount_usd == 4.5
     assert sigs["BIG"].multiplier == 3.0
     assert sigs["BIG"].hypothetical_amount_usd == 9.0
+
+
+class FixedQuoteProvider(FixedDropProvider):
+    """FixedDropProvider that also exposes a live quote at a fixed timestamp."""
+
+    def __init__(self, source, previous_close, drops, *, quote_price, quote_time):
+        super().__init__(source, previous_close, drops)
+        self._quote_price = quote_price
+        self._quote_time = quote_time
+
+    def get_quote(self, ticker, as_of):
+        return (self._quote_price, self._quote_time)
+
+
+def test_stale_quote_falls_back_to_completed_bar():
+    # A quote captured after the 09:45 decision anchor must not size the run.
+    decision_dt = _now()
+    stale_quote_time = decision_dt + timedelta(minutes=5)
+    data = FixedQuoteProvider(
+        SourceName.ROBINHOOD, 100.0, {"BIG": 0.10},
+        quote_price=50.0, quote_time=stale_quote_time,
+    )
+    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
+    sig = ex.evaluate(decision_dt, data)[0]
+    assert sig.current_price == 90.0  # completed-bar close, not the stale live quote
+    assert any("falling back to completed bar" in w for w in sig.warnings)
+
+
+def test_fresh_quote_at_or_before_decision_is_used():
+    decision_dt = _now()
+    fresh_quote_time = decision_dt - timedelta(minutes=1)
+    data = FixedQuoteProvider(
+        SourceName.ROBINHOOD, 100.0, {"BIG": 0.10},
+        quote_price=91.0, quote_time=fresh_quote_time,
+    )
+    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
+    sig = ex.evaluate(decision_dt, data)[0]
+    assert sig.current_price == 91.0
+
+
+def test_in_progress_bar_excluded_from_sizing():
+    # The 09:45-09:50 bar is not yet complete at the 09:45 decision anchor; a
+    # provider that only supplies that bar (no completed 09:40 bar) must yield
+    # NO_DATA rather than sizing off the in-progress bar.
+    decision_dt = _now()
+
+    class InProgressBarProvider(FixedDropProvider):
+        def get_intraday_bars(self, ticker, start, end, interval_minutes):
+            price = self._prev * (1.0 - self._drops.get(ticker, 0.0))
+            return [Bar(timestamp=end, open=price, high=price, low=price, close=price, volume=100.0)]
+
+    data = InProgressBarProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
+    sig = ex.evaluate(decision_dt, data)[0]
+    assert sig.action == Action.NO_DATA
+    assert any("missing completed intraday bar" in w for w in sig.warnings)
 
 
 # --- Separate ledger namespace ----------------------------------------------
@@ -236,6 +297,14 @@ def test_does_not_write_afternoon_artifacts(tmp_path):
 def test_default_root_is_separate_from_afternoon():
     assert "morning_dca" in DEFAULT_MORNING_STATE_ROOT
     assert "ce16ba6b" not in DEFAULT_MORNING_STATE_ROOT
+
+
+def test_default_tickers_mirror_active_universe():
+    from near_close_dca import ACTIVE_TICKERS, EXCLUDED_TICKERS
+
+    cfg = MorningConfig()
+    assert tuple(cfg.tickers) == tuple(ACTIVE_TICKERS)
+    assert cfg.excluded_tickers == frozenset(EXCLUDED_TICKERS)
 
 
 def test_base_executor_is_abstract():

@@ -36,10 +36,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from near_close_dca import (
+    ACTIVE_TICKERS,
     EASTERN,
+    EXCLUDED_TICKERS,
     Action,
     Bar,
     StrategyConfig,
+    completed_bar_anchor,
     graded_buy_multiplier,
     iso_week_key,
     latest_bar_at_or_before,
@@ -98,8 +101,8 @@ class MorningConfig:
     base by default so the hypothetical dollar figures are comparable.
     """
 
-    tickers: Sequence[str] = ()
-    excluded_tickers: frozenset[str] = frozenset()
+    tickers: Sequence[str] = field(default_factory=lambda: tuple(ACTIVE_TICKERS))
+    excluded_tickers: frozenset[str] = field(default_factory=lambda: frozenset(EXCLUDED_TICKERS))
     base_buy_amount_usd: float = 3.0
     sizing_tiers: Tuple[Tuple[float, float], ...] = MORNING_SIZING_TIERS
     minimum_drop_vs_previous_close: float = MORNING_MINIMUM_DROP
@@ -398,12 +401,19 @@ class MorningDCAExecutor(DCAExecutor):
             try:
                 quote = get_quote(ticker, decision_dt)
                 if quote is not None and isinstance(quote, (tuple, list)) and len(quote) >= 1:
-                    return float(quote[0])
+                    quote_time = quote[1] if len(quote) >= 2 else None
+                    if quote_time is None or quote_time <= decision_dt:
+                        return float(quote[0])
+                    warnings.append(
+                        f"quote timestamp {quote_time.isoformat()} is after the 09:45 ET "
+                        "decision anchor; falling back to completed bar"
+                    )
             except Exception as exc:  # noqa: BLE001
                 warnings.append(f"quote provider error: {exc}")
-        bar = latest_bar_at_or_before(bars, decision_dt)
+        bar_anchor = completed_bar_anchor(decision_dt, self.config.interval_minutes, self._sizing_config)
+        bar = latest_bar_at_or_before(bars, bar_anchor)
         if bar is None:
-            warnings.append("missing intraday bar at/or before 09:45 ET")
+            warnings.append("missing completed intraday bar at/or before 09:45 ET")
             return None
         return bar.close
 
