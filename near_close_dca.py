@@ -1497,7 +1497,7 @@ def _orders_csv_fill_prices(run_dir: Path) -> Dict[str, float]:
                     price = None
                 if price and price > 0:
                     fills[ticker] = price
-    except OSError:
+    except Exception:
         return fills
     return fills
 
