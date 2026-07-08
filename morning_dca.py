@@ -271,8 +271,8 @@ class MorningDCAExecutor(DCAExecutor):
         if manual:
             now_utc = now.astimezone(timezone.utc)
             return f"manual_morning_{now_utc.strftime('%Y%m%d_%H%M%S')}Z"
-        return f"morning_{now_et.strftime('%Y%m%d')}_0945ET"
-
+        hhmm = MORNING_SCHEDULED_FOR_ET.replace(":", "")
+        return f"morning_{now_et.strftime('%Y%m%d')}_{hhmm}ET"
     def run_classification(self, now: datetime, *, manual: bool = False) -> Dict[str, Any]:
         """Build the morning run-classification block.
 
