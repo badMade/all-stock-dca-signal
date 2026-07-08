@@ -137,6 +137,22 @@ def test_fresh_quote_at_or_before_decision_is_used():
     assert sig.current_price == 91.0
 
 
+def test_quote_older_than_completed_bar_anchor_falls_back_to_bar():
+    # A quote at/before the decision anchor but *older* than the completed-bar
+    # anchor (e.g. a stale prior-session or 09:31 quote) is not fresher than
+    # the completed bar, so it must not be trusted for sizing.
+    decision_dt = _now()
+    stale_quote_time = decision_dt - timedelta(minutes=10)  # older than the 5-min bar anchor
+    data = FixedQuoteProvider(
+        SourceName.ROBINHOOD, 100.0, {"BIG": 0.10},
+        quote_price=50.0, quote_time=stale_quote_time,
+    )
+    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
+    sig = ex.evaluate(decision_dt, data)[0]
+    assert sig.current_price == 90.0  # completed-bar close, not the stale quote
+    assert any("older than the completed bar anchor" in w for w in sig.warnings)
+
+
 def test_untimestamped_quote_falls_back_to_completed_bar():
     # A quote with no usable timestamp cannot be proven to be at/before the
     # decision anchor, so it must not be trusted for sizing.
@@ -309,6 +325,26 @@ def test_manual_run_id_and_no_pointer(tmp_path):
     run_state_path = Path(res["paths"]["run_state"])
     assert "manual_runs" in run_state_path.parts
     assert rc["run_id"] in run_state_path.parts
+
+
+def test_manual_runs_at_same_timestamp_do_not_collide(tmp_path):
+    # Two manual replays sharing the same decision timestamp (down to the
+    # second) must get distinct run_ids/paths so the second never overwrites
+    # the first's artifact.
+    cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
+    ex = MorningDCAExecutor(cfg)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    now = _now()
+
+    res1 = ex.run(now, data, manual=True)
+    res2 = ex.run(now, data, manual=True)
+
+    run_id_1 = res1["artifacts"]["run_classification"]["run_id"]
+    run_id_2 = res2["artifacts"]["run_classification"]["run_id"]
+    assert run_id_1 != run_id_2
+    assert Path(res1["paths"]["run_state"]) != Path(res2["paths"]["run_state"])
+    assert Path(res1["paths"]["run_state"]).exists()
+    assert Path(res2["paths"]["run_state"]).exists()
 
 
 def test_classification_matches_morning_schema(tmp_path):

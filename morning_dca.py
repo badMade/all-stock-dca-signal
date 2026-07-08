@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import csv
 import json
+import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timezone
 from pathlib import Path
@@ -273,7 +274,11 @@ class MorningDCAExecutor(DCAExecutor):
         now_et = now.astimezone(EASTERN)
         if manual:
             now_utc = now.astimezone(timezone.utc)
-            return f"manual_morning_{now_utc.strftime('%Y%m%d_%H%M%S')}Z"
+            # A short random suffix guarantees uniqueness even when two manual
+            # replays share the same decision timestamp (down to the second),
+            # so write_artifacts never silently overwrites a prior manual run.
+            unique = uuid.uuid4().hex[:6]
+            return f"manual_morning_{now_utc.strftime('%Y%m%d_%H%M%S')}Z_{unique}"
         return f"morning_{now_et.strftime('%Y%m%d')}_0945ET"
 
     def run_classification(self, now: datetime, *, manual: bool = False) -> Dict[str, Any]:
@@ -402,27 +407,33 @@ class MorningDCAExecutor(DCAExecutor):
         bars: Sequence[Bar],
         warnings: List[str],
     ) -> Optional[float]:
+        bar_anchor = completed_bar_anchor(decision_dt, self.config.interval_minutes, self._sizing_config)
+        bar = latest_bar_at_or_before(bars, bar_anchor)
+
         get_quote = getattr(data, "get_quote", None)
         if callable(get_quote):
             try:
                 quote = get_quote(ticker, decision_dt)
                 if quote is not None and isinstance(quote, (tuple, list)) and len(quote) >= 1:
                     quote_time = quote[1] if len(quote) >= 2 else None
-                    if isinstance(quote_time, datetime) and quote_time <= decision_dt:
+                    if isinstance(quote_time, datetime) and bar_anchor <= quote_time <= decision_dt:
                         return float(quote[0])
                     if quote_time is None:
                         warnings.append(
                             "quote has no usable timestamp; falling back to completed bar"
                         )
-                    else:
+                    elif quote_time > decision_dt:
                         warnings.append(
                             f"quote timestamp {quote_time!r} is after the 09:45 ET "
                             "decision anchor; falling back to completed bar"
                         )
+                    else:
+                        warnings.append(
+                            f"quote timestamp {quote_time!r} is older than the completed bar "
+                            "anchor; falling back to completed bar"
+                        )
             except Exception as exc:  # noqa: BLE001
                 warnings.append(f"quote provider error: {exc}")
-        bar_anchor = completed_bar_anchor(decision_dt, self.config.interval_minutes, self._sizing_config)
-        bar = latest_bar_at_or_before(bars, bar_anchor)
         if bar is None:
             warnings.append("missing completed intraday bar at/or before 09:45 ET")
             return None
