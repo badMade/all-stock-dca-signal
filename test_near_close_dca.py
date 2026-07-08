@@ -639,7 +639,13 @@ def test_deployment_history_root_engages_kill_switch_on_later_run(tmp_path):
     with open(os.path.join(day2_dir, "run_state.json"), encoding="utf-8") as handle:
         day2_state = json.load(handle)
     assert day2_state["risk_guard"]["kill_switch_engaged"] is True
-    assert day2_state["risk_guard"]["deployed_last_7d_usd"] == day1_deployed
+    # The risk_guard audit block reflects the FINAL guard state after this run's
+    # own submissions, not just the pre-run history figure -- day2's own capped
+    # submissions add to day1's history rather than replacing it in the report.
+    day2_deployed = sum(
+        c["planned_amount_usd"] for c in day2_state["buy_candidates"] if c["status"] == "submitted"
+    )
+    assert day2_state["risk_guard"]["deployed_last_7d_usd"] == round(day1_deployed + day2_deployed, 2)
     submitted = [c for c in day2_state["buy_candidates"] if c["status"] == "submitted"]
     assert submitted  # the guard caps sizing, it doesn't block buying entirely
     assert all(c["buy_multiplier"] == 1.0 for c in submitted)
@@ -683,6 +689,36 @@ def test_kill_switch_caps_later_candidates_within_the_same_batch(tmp_path):
     # rewrite.
     assert by_ticker["BBB"]["planned_amount_usd"] == 3.0
     assert by_ticker["BBB"]["buy_multiplier"] == 2.0
+
+
+def test_manual_run_submissions_do_not_advance_in_batch_burn(tmp_path):
+    # Same setup as test_kill_switch_caps_later_candidates_within_the_same_batch,
+    # but scheduled=False: the in-batch running total must mirror the scheduled-
+    # live stream only, so a manual run's own submissions must NOT cap its own
+    # later candidates -- BBB keeps its full 2x amount, unlike the scheduled case.
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=("AAA", "BBB"),
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
+        monthly_cash_allocation_usd=10.0,
+    )
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=False)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    submitted = [c for c in run_state["buy_candidates"] if c["status"] == "submitted"]
+    assert len(submitted) == 2
+    assert by_ticker["AAA"]["planned_amount_usd"] == 6.0
+    assert by_ticker["BBB"]["planned_amount_usd"] == 6.0
+    assert run_state["risk_guard"]["kill_switch_engaged"] is False
 
 
 def test_run_daily_compact_date_gated_short_circuits(tmp_path):

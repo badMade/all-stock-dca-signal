@@ -1003,10 +1003,17 @@ def reconcile_signals(
     )
 
 
-def within_caps(decision: ReconciledDecision, state: StrategyState, trading_day: date, config: StrategyConfig) -> bool:
-    if decision.suggested_amount_usd <= 0:
+def within_caps(amount: float, state: StrategyState, trading_day: date, config: StrategyConfig) -> bool:
+    """Check ``amount`` against the remaining daily/weekly caps.
+
+    Takes the amount explicitly rather than reading it off a decision so a caller
+    that reduced a candidate's amount (e.g. the kill-switch's mid-batch cap in
+    run_once) checks caps against what will really be submitted, not the pre-cap
+    ladder amount.
+    """
+    if amount <= 0:
         return False
-    if decision.suggested_amount_usd > state.remaining_spend_today(trading_day, config):
+    if amount > state.remaining_spend_today(trading_day, config):
         return False
     return True
 
@@ -1554,8 +1561,15 @@ def _log_execution(
     decision: ReconciledDecision,
     order_id: str,
     broker: BrokerAdapter,
+    *,
+    notional_usd: Optional[float] = None,
 ) -> None:
-    """Fetch fill details for a placed order and append a durable execution record."""
+    """Fetch fill details for a placed order and append a durable execution record.
+
+    ``notional_usd`` overrides ``decision.suggested_amount_usd`` when the caller
+    actually submitted a capped amount (e.g. the kill-switch's mid-batch cap in
+    run_once), so the durable execution record matches what was really submitted.
+    """
     get_fill = getattr(broker, "get_order_fill", None)
     fill: Optional[OrderFill] = None
     if callable(get_fill):
@@ -1568,7 +1582,7 @@ def _log_execution(
         target_price_source=decision.target_price_source,
         target_quote_time=decision.target_quote_time,
         decision_bar_close=decision.decision_bar_close,
-        notional_usd=decision.suggested_amount_usd,
+        notional_usd=notional_usd if notional_usd is not None else decision.suggested_amount_usd,
         action_reason=decision.reason,
         order_id=order_id,
         order_submitted_at=fill.order_submitted_at if fill else None,
@@ -1968,7 +1982,7 @@ def run_once(
             candidate_outcomes[ticker] = {"status": "skipped", "skip_reason": "same-day broker order exists"}
             _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: same-day broker order already exists; skipping")
             continue
-        if not within_caps(decision, state, trading_day, config):
+        if not within_caps(order_amount, state, trading_day, config):
             candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "cap would be exceeded"}
             _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: cap would be exceeded; skipping")
             continue
@@ -2056,7 +2070,11 @@ def run_once(
                 logger.error("Placement failed for %s: %s", ticker, exc)
                 continue
             state.record_buy(ticker, trading_day, order_amount)
-            running_deployed_7d += order_amount
+            if scheduled:
+                # Mirrors dca_risk.deployed_by_day(..., stream=STREAM_SCHEDULED),
+                # which excludes manual states -- a manual run's own submissions
+                # must not advance the scheduled-live in-batch burn total.
+                running_deployed_7d += order_amount
             logger.info(
                 "Placed buy for %s: $%.2f, order_id=%s",
                 ticker,
@@ -2072,7 +2090,7 @@ def run_once(
             }
 
         if run_result is not None:
-            _log_execution(run_result, decision, order_id, broker)
+            _log_execution(run_result, decision, order_id, broker, notional_usd=order_amount)
 
     manual_review = [d for d in decisions if d.action == Action.MANUAL_REVIEW]
     if manual_review:
@@ -2090,6 +2108,11 @@ def run_once(
         state.effective_weekly_cap(),
         state.weekly_rollover_reserve_usd,
     )
+
+    # Reflect any mid-batch kill-switch cap into the config before the audit
+    # artifact is built, so risk_guard.deployed_last_7d_usd/kill_switch_engaged
+    # reflect what the run actually did, not the pre-run history figure.
+    config = replace(config, deployed_last_7d_usd=running_deployed_7d)
 
     if artifacts_dir is not None:
         artifacts = build_run_artifacts(
