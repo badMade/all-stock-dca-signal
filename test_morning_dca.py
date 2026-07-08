@@ -170,6 +170,21 @@ def test_non_positive_quote_price_falls_back_to_completed_bar():
         assert any("is not positive" in w for w in sig.warnings)
 
 
+def test_non_positive_completed_bar_close_is_rejected():
+    # A provider passing through a placeholder/bad completed bar with a
+    # non-positive close (e.g. a 100%+ synthetic drop) must not be trusted as
+    # the current price either -- evaluate_signal only checks
+    # current_price is None, so an unrejected $0 close would read as a 100%
+    # drop and size a max-multiplier BUY off a clearly-bad price.
+    decision_dt = _now()
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 1.0})  # 100% drop -> close 0.0
+    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
+    sig = ex.evaluate(decision_dt, data)[0]
+    assert sig.current_price is None
+    assert sig.action == Action.NO_DATA
+    assert any("is not positive" in w for w in sig.warnings)
+
+
 def test_untimestamped_quote_falls_back_to_completed_bar():
     # A quote with no usable timestamp cannot be proven to be at/before the
     # decision anchor, so it must not be trusted for sizing.

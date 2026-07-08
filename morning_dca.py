@@ -443,6 +443,9 @@ class MorningDCAExecutor(DCAExecutor):
         if bar is None:
             warnings.append("missing completed intraday bar at/or before 09:45 ET")
             return None
+        if bar.close <= 0:
+            warnings.append(f"completed bar close {bar.close!r} is not positive; rejecting")
+            return None
         return bar.close
 
     def evaluate(self, now: datetime, data: Any) -> List[MorningSignal]:
