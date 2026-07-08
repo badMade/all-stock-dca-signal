@@ -2015,13 +2015,20 @@ def run_once(
         paths = write_run_artifacts(artifacts, artifacts_dir)
         logger.info("Wrote run artifacts: %s", paths["run_state"])
 
-        if scheduled:
+        if scheduled and classification_state_root is not None:
             # Update the latest_scheduled_run.json pointer that reporting/the
             # watchdog rely on to find the scheduled run -- without this, a
             # correctly-classified run_state is still invisible to them. Reuse
             # write_run_artifacts' own directory (rather than recomputing one
             # from classification_state_root) so this never creates a second
             # copy of run_state.json in a different location.
+            #
+            # Gated on an explicit classification_state_root (mirroring the
+            # deployment_history_root pattern used elsewhere in this module)
+            # rather than defaulting to scripts.run_classification's own
+            # production STATE_ROOT: a caller that doesn't pass one (including
+            # every existing test that predates this feature) must never
+            # silently write to a real absolute filesystem path.
             try:
                 from scripts.run_classification import (
                     update_latest_scheduled_run_pointer,

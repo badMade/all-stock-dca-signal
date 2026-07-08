@@ -157,11 +157,11 @@ def run_pipeline(
     slippage/coverage reports and the compact Notion sync from the run artifacts
     (heavier work reserved for Friday/manual runs).
 
-    ``classification_state_root`` is passed through to
-    ``near_close_dca.run_once`` for a scheduled run: it is where
-    ``latest_scheduled_run.json`` is written/updated (see
-    ``scripts.run_classification``). Defaults to that module's own production
-    state root when not given; pass an explicit root in tests.
+    ``classification_state_root`` is passed through to ``near_close_dca.run_once``
+    for a scheduled run: it is where ``latest_scheduled_run.json`` is
+    written/updated (see ``scripts.run_classification``). Opt-in only: when not
+    given, no ``latest_scheduled_run.json`` write is attempted at all, so a
+    caller must pass the real cron_tracking root explicitly to enable it.
     """
     result = run_daily_compact(
         now,
