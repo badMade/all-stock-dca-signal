@@ -48,6 +48,7 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 |---|---|---|---|---|---|---|
 | `b7961407` | Pre-market DCA buying-power dashboard | analytics | no | `00 13 * * 1-5` | 9:00 AM weekdays | active |
 | `cd45e95b` | Compact DCA volatility outlier scan | analytics | no | `45 13 * * 1-5` | 9:45 AM weekdays | active |
+| `morning-dca-0945` | Morning graded DCA dry-run analytics (`MorningDCAExecutor`) | analytics | no | `45 13 * * 1-5` | 9:45 AM weekdays | active |
 | `e3e6f09e` | Monitor-only graded DCA signal check | monitoring | no | `5 19 * * 1-5` | 3:05 PM weekdays | active |
 | `10ce362c` | Graded DCA automatic live test - $3 allocation (supersedes `ce16ba6b`) | trading | **yes** | `20 19 * * 1-5` | 3:20 PM weekdays | active |
 | `d72aa525` | Capital-priority briefing | analytics | no | `25 19 * * 1-5` | 3:25 PM weekdays | active |
@@ -67,6 +68,11 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 ### `cd45e95b` — Compact DCA volatility outlier scan
 - Analytics only, **no trading**. Runs **9:45 AM ET weekdays**.
 - Scans only **>5% outliers**; no full 41+ ticker narrative on no-outlier days. Uses the current $3 base 0x-to-5x ladder.
+
+### `morning-dca-0945` — Morning graded DCA dry-run analytics (`MorningDCAExecutor`)
+- Analytics only, **no trading**. Runs **9:45 AM ET weekdays**.
+- Evaluates morning price weakness vs. yesterday’s regular-session close on the **morning 0x-to-3x ladder** (`config/morning_dca.json`). Writes dry-run artifacts under `/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_0945ET/`.
+- `stream='morning'`, `run_type='morning_dca_dry_run'`, `valid_afternoon_evidence=false`. Never writes into the afternoon `ce16ba6b` tree or updates `latest_scheduled_run.json`.
 
 ### `e3e6f09e` — Monitor-only graded DCA signal check
 - Analytics and notifications only; **no trades**. Runs **3:05 PM ET weekdays**.

@@ -540,6 +540,131 @@ def test_base_executor_is_abstract():
         raise AssertionError("expected NotImplementedError from abstract base hook")
 
 
+
+# --- Thread fixes (PR #13 review comments) -----------------------------------
+
+def test_nyse_holidays_includes_observed_next_years_new_year_in_current_year():
+    """When Jan 1 of year+1 falls on Saturday, Dec 31 of year must be in nyse_holidays(year).
+
+    2027-12-31 is the NYSE-observed closure for New Year's Day 2028 (Jan 1 2028
+    is a Saturday).  nyse_holidays(2027) must include it even though the
+    'canonical' New Year's Day is in 2028.
+    """
+    from datetime import date as _date
+
+    # Verify the premise: Jan 1 2028 is indeed a Saturday.
+    assert _date(2028, 1, 1).weekday() == 5, "test premise: 2028-01-01 should be Saturday"
+
+    holidays_2027 = nyse_holidays(2027)
+    assert _date(2027, 12, 31) in holidays_2027, (
+        "nyse_holidays(2027) must include 2027-12-31 (observed New Year\'s Day 2028)"
+    )
+
+    # Sanity: a year whose next Jan 1 is not Saturday should NOT include Dec 31
+    # (unless Christmas observance lands there, which it doesn't for 2025).
+    assert _date(2026, 1, 1).weekday() != 5
+    holidays_2025 = nyse_holidays(2025)
+    assert _date(2025, 12, 31) not in holidays_2025
+
+
+class _NaNCloseProvider:
+    """Provider that returns a bar with NaN close for testing non-finite rejection."""
+
+    def __init__(self, nan_prev=False, nan_intraday=False):
+        self.source = SourceName.ROBINHOOD
+        self._nan_prev = nan_prev
+        self._nan_intraday = nan_intraday
+
+    def get_previous_close_bar(self, ticker, as_of):
+        ts = datetime.combine(
+            as_of.astimezone(EASTERN).date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN
+        )
+        close = float("nan") if self._nan_prev else 100.0
+        return Bar(timestamp=ts, open=close, high=close, low=close, close=close, volume=0.0)
+
+    def get_intraday_bars(self, ticker, start, end, interval_minutes):
+        close = float("nan") if self._nan_intraday else 97.0
+        bars = []
+        cursor = start
+        while cursor <= end:
+            bars.append(Bar(timestamp=cursor, open=close, high=close, low=close, close=close, volume=100.0))
+            cursor += timedelta(minutes=interval_minutes)
+        return bars
+
+
+def test_nan_previous_close_bar_rejected():
+    """A NaN previous-close must be rejected and signal NO_DATA."""
+    cfg = MorningConfig(tickers=("AAPL",))
+    ex = MorningDCAExecutor(cfg)
+    sig = ex.evaluate_signal("AAPL", _now(), _NaNCloseProvider(nan_prev=True))
+    assert sig.action == Action.NO_DATA, f"expected NO_DATA, got {sig.action}"
+    assert any("non-positive" in w.lower() or "nan" in w.lower() for w in sig.warnings), (
+        f"expected a rejection warning for NaN close; got: {sig.warnings}"
+    )
+
+
+def test_nan_completed_bar_close_is_rejected():
+    """A NaN completed-bar close must be rejected and signal NO_DATA."""
+    cfg = MorningConfig(tickers=("AAPL",))
+    ex = MorningDCAExecutor(cfg)
+    sig = ex.evaluate_signal("AAPL", _now(), _NaNCloseProvider(nan_prev=False, nan_intraday=True))
+    assert sig.action == Action.NO_DATA, f"expected NO_DATA, got {sig.action}"
+    assert any("non-positive" in w.lower() or "nan" in w.lower() for w in sig.warnings), (
+        f"expected a rejection warning for NaN completed bar close; got: {sig.warnings}"
+    )
+
+
+def test_load_morning_config_reads_config_file(tmp_path):
+    """load_morning_config reads config/morning_dca.json and maps fields to MorningConfig."""
+    from morning_dca import load_morning_config
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "morning_dca.json").write_text(
+        json.dumps({
+            "sizing_ladder": {
+                "base_amount_usd": 5.0,
+                "no_buy_below_pct": 0.2,
+                "tiers": [
+                    {"min_drop_pct": 0.2, "max_drop_pct": 3.0, "multiplier": 1.0},
+                    {"min_drop_pct": 3.0, "max_drop_pct": None, "multiplier": 2.0},
+                ],
+            },
+            "budget_ledger": {
+                "morning_daily_cap_usd": 60.0,
+                "morning_weekly_cap_usd": 300.0,
+            },
+            "artifact_paths": {
+                "morning_run_state_root": "/custom/morning/root",
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    cfg = load_morning_config(str(cfg_dir))
+    assert cfg.base_buy_amount_usd == 5.0
+    assert abs(cfg.minimum_drop_vs_previous_close - 0.002) < 1e-9
+    assert cfg.morning_daily_cap_usd == 60.0
+    assert cfg.morning_weekly_cap_usd == 300.0
+    assert cfg.morning_run_state_root == "/custom/morning/root"
+
+
+def test_load_morning_config_falls_back_to_defaults_if_missing(tmp_path):
+    """load_morning_config gracefully falls back when file is absent."""
+    from morning_dca import load_morning_config
+
+    cfg = load_morning_config(str(tmp_path / "nonexistent"))
+    defaults = MorningConfig()
+    assert cfg.base_buy_amount_usd == defaults.base_buy_amount_usd
+    assert cfg.morning_daily_cap_usd == defaults.morning_daily_cap_usd
+
+
+def test_morning_executor_default_init_loads_config_file():
+    """MorningDCAExecutor() with no args loads from the shipped config/morning_dca.json."""
+    ex = MorningDCAExecutor()
+    assert ex.config.base_buy_amount_usd == 3.0
+    assert ex.config.morning_daily_cap_usd == 90.0
+
 if __name__ == "__main__":
     import sys
     import tempfile

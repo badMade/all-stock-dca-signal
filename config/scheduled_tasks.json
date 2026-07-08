@@ -37,6 +37,29 @@
       "notes": "Analytics only, no trading. Compact scan of >5% outliers only; no full 41+ ticker narrative on no-outlier days. Uses the current $3 base 0x-to-5x ladder."
     },
     {
+      "id": "morning-dca-0945",
+      "name": "Morning graded DCA dry-run analytics",
+      "type": "analytics",
+      "status": "active",
+      "cron_utc": "45 13 * * 1-5",
+      "et_equivalent": "9:45 AM ET weekdays (EDT)",
+      "trades": false,
+      "executor": "MorningDCAExecutor",
+      "config_file": "config/morning_dca.json",
+      "state_dir": "/home/user/workspace/cron_tracking/morning_dca",
+      "run_classification": {
+        "run_origin": "scheduled",
+        "run_type": "morning_dca_dry_run",
+        "stream": "morning",
+        "cron_id": "morning-dca-0945",
+        "supersedes_cron_id": null,
+        "scheduled_for_et": "09:45",
+        "valid_afternoon_evidence": false,
+        "policy_file": "config/morning_dca.json"
+      },
+      "notes": "Analytics only, no trading. Evaluates morning price weakness vs. yesterday's close using the 0x-to-3x morning ladder. Writes dry-run artifacts under the morning root only; never touches the afternoon ce16ba6b artifact tree or latest_scheduled_run.json. stream='morning', valid_afternoon_evidence=false."
+    },
+    {
       "id": "e3e6f09e",
       "name": "Monitor-only graded DCA signal check",
       "type": "monitoring",

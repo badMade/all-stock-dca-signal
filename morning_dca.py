@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
@@ -144,20 +145,25 @@ def nyse_holidays(year: int) -> frozenset[date]:
     the future without manual updates. Good Friday is included; NYSE has
     observed it as a full closure every year on record.
     """
-    return frozenset(
-        {
-            _observed(date(year, 1, 1)),  # New Year's Day
-            _nth_weekday_of_month(year, 1, 0, 3),  # MLK Day: 3rd Monday of January
-            _nth_weekday_of_month(year, 2, 0, 3),  # Washington's Birthday: 3rd Monday of February
-            _easter_sunday(year) - timedelta(days=2),  # Good Friday
-            _last_weekday_of_month(year, 5, 0),  # Memorial Day: last Monday of May
-            _observed(date(year, 6, 19)),  # Juneteenth
-            _observed(date(year, 7, 4)),  # Independence Day
-            _nth_weekday_of_month(year, 9, 0, 1),  # Labor Day: 1st Monday of September
-            _nth_weekday_of_month(year, 11, 3, 4),  # Thanksgiving: 4th Thursday of November
-            _observed(date(year, 12, 25)),  # Christmas
-        }
-    )
+    holidays = {
+        _observed(date(year, 1, 1)),  # New Year's Day
+        _nth_weekday_of_month(year, 1, 0, 3),  # MLK Day: 3rd Monday of January
+        _nth_weekday_of_month(year, 2, 0, 3),  # Washington's Birthday: 3rd Monday of February
+        _easter_sunday(year) - timedelta(days=2),  # Good Friday
+        _last_weekday_of_month(year, 5, 0),  # Memorial Day: last Monday of May
+        _observed(date(year, 6, 19)),  # Juneteenth
+        _observed(date(year, 7, 4)),  # Independence Day
+        _nth_weekday_of_month(year, 9, 0, 1),  # Labor Day: 1st Monday of September
+        _nth_weekday_of_month(year, 11, 3, 4),  # Thanksgiving: 4th Thursday of November
+        _observed(date(year, 12, 25)),  # Christmas
+    }
+    # When Jan 1 of the *next* year falls on a Saturday, NYSE observes it on the
+    # preceding Friday (Dec 31 of *this* year).  That observed date belongs to
+    # this year's holiday set but would otherwise only appear in nyse_holidays(year+1).
+    next_new_year = date(year + 1, 1, 1)
+    if next_new_year.weekday() == 5:  # Saturday -> observed Friday Dec 31
+        holidays.add(date(year, 12, 31))
+    return frozenset(holidays)
 
 # Morning budget caps. The morning stream owns these; they are intentionally not
 # the afternoon BUDGET_TIERS caps so morning activity is budgeted independently.
@@ -275,6 +281,72 @@ class MorningSignal:
         }
 
 
+def load_morning_config(config_dir=None):
+    """Read ``config/morning_dca.json`` and return a :class:`MorningConfig`.
+
+    Looks for ``morning_dca.json`` in ``config_dir`` (default: a ``config/``
+    directory next to this module, falling back to ``./config``).  If the file
+    is absent or unreadable the function logs a warning and returns
+    ``MorningConfig()`` with hardcoded defaults -- the same graceful-fallback
+    pattern used by :func:`dca_config.load_strategy_config`.
+    """
+    import logging
+    _log = logging.getLogger(__name__)
+
+    if config_dir is None:
+        _here = Path(__file__).resolve().parent
+        for candidate in (_here / "config", Path.cwd() / "config"):
+            if candidate.is_dir():
+                config_dir_path = candidate
+                break
+        else:
+            config_dir_path = _here / "config"
+    else:
+        config_dir_path = Path(config_dir)
+
+    cfg_path = config_dir_path / "morning_dca.json"
+    if not cfg_path.exists():
+        _log.warning(
+            "morning_dca.json not found at %s; using MorningConfig defaults", cfg_path
+        )
+        return MorningConfig()
+
+    try:
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        _log.warning("could not parse %s (%s); using MorningConfig defaults", cfg_path, exc)
+        return MorningConfig()
+
+    kwargs = {}
+
+    sizing = raw.get("sizing_ladder", {})
+    if "base_amount_usd" in sizing:
+        kwargs["base_buy_amount_usd"] = float(sizing["base_amount_usd"])
+    if "no_buy_below_pct" in sizing:
+        kwargs["minimum_drop_vs_previous_close"] = float(sizing["no_buy_below_pct"]) / 100.0
+    if "tiers" in sizing:
+        tiers = tuple(
+            (
+                float(t["min_drop_pct"]) / 100.0,
+                float(t["max_drop_pct"]) / 100.0 if t.get("max_drop_pct") is not None else float("inf"),
+            )
+            for t in sizing["tiers"]
+        )
+        kwargs["sizing_tiers"] = tiers
+
+    budget = raw.get("budget_ledger", {})
+    if "morning_daily_cap_usd" in budget:
+        kwargs["morning_daily_cap_usd"] = float(budget["morning_daily_cap_usd"])
+    if "morning_weekly_cap_usd" in budget:
+        kwargs["morning_weekly_cap_usd"] = float(budget["morning_weekly_cap_usd"])
+
+    artifact_paths = raw.get("artifact_paths", {})
+    if "morning_run_state_root" in artifact_paths:
+        kwargs["morning_run_state_root"] = artifact_paths["morning_run_state_root"]
+
+    return MorningConfig(**kwargs)
+
+
 class DCAExecutor:
     """Base class for class-based DCA executors over the strategy library.
 
@@ -325,8 +397,10 @@ class MorningDCAExecutor(DCAExecutor):
         self,
         config: Optional[MorningConfig] = None,
         ledger: Optional[MorningLedger] = None,
+        *,
+        config_dir: Optional[str] = None,
     ) -> None:
-        self.config = config or MorningConfig()
+        self.config = config if config is not None else load_morning_config(config_dir)
         self.ledger = ledger or MorningLedger(
             daily_cap_usd=self.config.morning_daily_cap_usd,
             weekly_cap_usd=self.config.morning_weekly_cap_usd,
@@ -411,7 +485,7 @@ class MorningDCAExecutor(DCAExecutor):
             )
             prev_bar = None
         if prev_bar is not None:
-            if prev_bar.close <= 0:
+            if not math.isfinite(prev_bar.close) or prev_bar.close <= 0:
                 warnings.append(f"previous close {prev_bar.close} is non-positive; rejecting")
             else:
                 previous_close = prev_bar.close
@@ -518,7 +592,7 @@ class MorningDCAExecutor(DCAExecutor):
         if bar is None:
             warnings.append("missing completed intraday bar at/or before 09:45 ET")
             return None
-        if bar.close <= 0:
+        if not math.isfinite(bar.close) or bar.close <= 0:
             warnings.append(f"completed bar close {bar.close!r} is not positive; rejecting")
             return None
         return bar.close
