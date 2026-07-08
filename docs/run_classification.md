@@ -28,7 +28,7 @@ artifact root stays under `.../ce16ba6b` for continuity across the repair.
 **Writer contract:** every scheduled 3:20 PM ET run_state must be written with
 **both** `cron_id='10ce362c'` **and** `supersedes_cron_id='ce16ba6b'`.
 Placeholder or ambiguous ids such as `ce16ba6b_replacement` are **forbidden**
-(`supersedes_cron_id` must be exactly `ce16ba6b` or omitted).
+(`supersedes_cron_id` must be exactly `ce16ba6b` when present; consumers may omit it only for continuity with older artifacts).
 
 **Consumer acceptance:** for continuity, a scheduled run is valid evidence when
 **`cron_id='10ce362c'` OR `supersedes_cron_id='ce16ba6b'`**, so continuity
