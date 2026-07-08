@@ -105,7 +105,6 @@
           "decision_bar_close": { "type": ["number", "null"] },
           "previous_close": { "type": ["number", "null"] },
           "order_id": { "type": ["string", "null"] },
-          "order_id": { "type": ["string", "null"] },
           "status": { "type": "string", "enum": ["submitted", "not_submitted", "not_submitted_confirmation_required", "skipped", "blocked", "dry_run"] },
           "skip_reason": { "type": ["string", "null"] },
           "reviewed_order": {
@@ -128,21 +127,6 @@
         },
         "then": {
           "properties": { "order_id": { "type": "null" } }
-        }
-          "skip_reason": { "type": ["string", "null"] },
-          "reviewed_order": {
-            "type": ["object", "null"],
-            "additionalProperties": true,
-            "description": "Broker order-review result captured before submission, present when Robinhood review passed. Populated even when the order was not submitted (e.g. status 'not_submitted_confirmation_required'), so a confirmation-blocked scheduled run still records the reviewed order details it would have placed. Carries no order_id (nothing was submitted). No secrets.",
-            "properties": {
-              "notional_usd": { "type": ["number", "null"] },
-              "side": { "type": ["string", "null"] },
-              "order_type": { "type": ["string", "null"] },
-              "time_in_force": { "type": ["string", "null"] },
-              "estimated_price": { "type": ["number", "null"] },
-              "review_passed": { "type": ["boolean", "null"] }
-            }
-          }
         }
       }
     },

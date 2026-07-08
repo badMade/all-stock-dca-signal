@@ -584,16 +584,9 @@ def select_scheduled_state_for_reporting(
 
     used_fallback = False
     fallback_reason: Optional[str] = None
-    # A confirmation-blocked run has no orders by design (review passed but
-    # submission awaited confirmation), so it is not a write failure and must
-    # never trigger the broker time-window fallback.
-    if (
-        not kept
-        and scheduled_state_write_failed
-        and broker_window_orders is not None
-    # A confirmation-blocked run has no orders by design (review passed but
-    # submission awaited confirmation), so it is not a write failure and must
-    # never trigger the broker time-window fallback.
+    # A confirmation-blocked run (and any other explicit no-submit status) has
+    # no orders by design, so it is not a write failure and must never trigger
+    # the broker time-window fallback.
     if (
         not kept
         and scheduled_state_write_failed
@@ -605,7 +598,6 @@ def select_scheduled_state_for_reporting(
             ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED,
             ORDER_SUBMIT_STATUS_DRY_RUN,
         }
-    ):
     ):
         # Valid scheduled state exists but has no usable order IDs due to a known
         # write failure: attribute broker orders that fall inside the scheduled
