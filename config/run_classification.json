@@ -1,7 +1,7 @@
 {
   "$schema": "../schemas/run_classification_policy.schema.json",
   "policy_id": "run-classification-v1",
-  "version": "2026-07-07",
+  "version": "2026-07-08",
   "purpose": "Single source of truth for distinguishing scheduled live runs of the graded DCA task from manual runs, so downstream slippage/watchdog/weekly reporting never confuses the two. Every run_state artifact must carry a run_classification block matching this policy.",
   "state_schema_version": "run-classification-v1",
   "live_task": {
@@ -70,11 +70,51 @@
       "state_schema_version"
     ]
   },
+  "scheduled_state_file_guarantee": {
+    "summary": "The 3:20 PM live task (10ce362c) MUST always write a scheduled run_state.json under scheduled_runs/YYYYMMDD_1520ET/ and update latest_scheduled_run.json every time it fires, even when no order is placed. A confirmation-blocked run is a valid scheduled run that proves the task ran; it is NOT evidence of an order or fill.",
+    "always_write": true,
+    "order_submit_status_field": "order_submit_status",
+    "order_submit_status_values": {
+      "submitted": "One or more orders were submitted; order_id(s) present on the corresponding buy_candidates.",
+      "not_submitted_no_candidates": "No ticker qualified for a buy; run_state is valid scheduled evidence with no orders.",
+      "not_submitted_confirmation_required": "Robinhood review passed but order submission was blocked by required post-review user confirmation. Valid scheduled evidence that the task ran; carries no order_id and is NOT evidence of an order/fill.",
+      "not_submitted_error": "An error prevented submission; run_state is still valid scheduled evidence and records the error.",
+      "not_submitted_budget_exhausted": "Budget/cap left no room to submit; valid scheduled evidence with no orders.",
+      "dry_run": "Dry-run; no live orders."
+    },
+    "confirmation_blocked_run_state": {
+      "run_classification": {
+        "run_origin": "scheduled",
+        "manual_run": false,
+        "state_schema_version": "run-classification-v1",
+        "cron_id": "10ce362c",
+        "supersedes_cron_id": "ce16ba6b",
+        "scheduled_for_et": "15:20"
+      },
+      "order_submit_status": "not_submitted_confirmation_required",
+      "must_include": [
+        "A valid scheduled run_classification block (passes run_classification.schema.json).",
+        "order_submit_status='not_submitted_confirmation_required'.",
+        "reviewed_order details on each affected buy_candidate where the review result is available.",
+        "candidate details (ticker, buy_multiplier, planned_amount_usd, status) for what would have been placed."
+      ],
+      "must_not_include": [
+        "Any order_id (nothing was submitted).",
+        "Any submitted/filled status implying an order was placed."
+      ],
+      "downstream_treatment": [
+        "Watchdog (a46bf007): treat as a valid scheduled run that fired. Alert that no order was placed, but do NOT mark the lineage/scheduled state invalid when the required fields are present.",
+        "Slippage (67aa802b): report no scheduled fills and no scheduled order IDs. Do NOT invalidate the run_state just because confirmation blocked order submission; the broker time-window fallback does NOT apply (there was no write failure).",
+        "Weekly/monthly: count the scheduled run as having occurred; contribute zero scheduled fills/orders."
+      ]
+    }
+  },
   "write_rules": {
     "scheduled": [
-      "Write run_state.json under scheduled_runs/YYYYMMDD_1520ET/.",
+      "Write run_state.json under scheduled_runs/YYYYMMDD_1520ET/ every time the task fires, even when no order is placed.",
       "Update latest_scheduled_run.json to point at the just-written scheduled run.",
-      "run_classification.run_origin must be 'scheduled' and manual_run must be false."
+      "run_classification.run_origin must be 'scheduled' and manual_run must be false.",
+      "Set order_submit_status to the true outcome; a confirmation-blocked run uses 'not_submitted_confirmation_required' and carries no order_id."
     ],
     "manual": [
       "Write run_state.json under manual_runs/<timestamp>/.",
@@ -89,7 +129,8 @@
       "Collect every order_id found in manual_runs/**/run_state*.json and exclude them from all scheduled-live metrics.",
       "Exclude any run_state whose run_classification has run_origin='manual' or manual_run=true, regardless of where the file is located on disk.",
       "Never infer scheduled status from same-day broker orders alone; a valid scheduled run_state must exist.",
-      "Scheduled-live cost basis, slippage, reliability, and order-count metrics must be computed only from validated scheduled runs with manual order IDs excluded."
+      "Scheduled-live cost basis, slippage, reliability, and order-count metrics must be computed only from validated scheduled runs with manual order IDs excluded.",
+      "A scheduled run_state with order_submit_status='not_submitted_confirmation_required' is valid scheduled-run evidence that the task ran but is NOT evidence of an order/fill: it contributes zero scheduled fills/order IDs and must not be marked invalid because confirmation blocked submission."
     ]
   },
   "broker_time_window_fallback": {

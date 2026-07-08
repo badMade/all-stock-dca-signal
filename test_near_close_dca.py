@@ -573,6 +573,165 @@ def test_run_daily_compact_writes_structured_only(tmp_path):
     assert "orders.csv" in files
 
 
+def test_run_daily_compact_stamps_scheduled_run_classification(tmp_path):
+    from scripts.run_classification import validate_classification
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    rc = run_state["run_classification"]
+    assert rc["run_origin"] == "scheduled"
+    assert rc["manual_run"] is False
+    assert validate_classification(rc).ok
+
+
+def test_run_daily_compact_manual_stamps_manual_run_classification(tmp_path):
+    from scripts.run_classification import validate_classification
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "manual_2026-06-29")
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=False)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    rc = run_state["run_classification"]
+    assert rc["run_origin"] == "manual"
+    assert rc["manual_run"] is True
+    assert validate_classification(rc).ok
+
+
+def test_deployment_history_root_engages_kill_switch_on_later_run(tmp_path):
+    # Day 1: a scheduled run deploys real capital under a small monthly allocation
+    # so its total trivially exceeds the 40% kill-switch threshold.
+    history_root = os.path.join(tmp_path, "runs")
+    day1_dir = os.path.join(history_root, "2026-06-29")
+    day1_dates = frozenset({date(2026, 6, 29), date(2026, 7, 3)})
+
+    now1 = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        # dry_run=False so candidates land as status="submitted" (deployed_usd only
+        # counts submitted candidates) -- DryRunBroker still simulates the fill.
+        dry_run=False,
+        tickers=("AAPL", "NVDA", "MSFT"),
+        approved_test_dates=day1_dates,
+        monthly_cash_allocation_usd=10.0,  # tiny allocation -> trivial to exceed 40%
+    )
+    state1 = StrategyState()
+    broker1 = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    fin1 = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now1))
+    rh1 = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now1))
+    run_daily_compact(now1, config, state1, fin1, rh1, broker1, artifacts_dir=day1_dir)
+
+    with open(os.path.join(day1_dir, "run_state.json"), encoding="utf-8") as handle:
+        day1_state = json.load(handle)
+    day1_deployed = sum(
+        c["planned_amount_usd"] for c in day1_state["buy_candidates"] if c["status"] == "submitted"
+    )
+    assert day1_deployed > 0.4 * config.monthly_cash_allocation_usd  # sanity: threshold is crossed
+
+    # Day 2 (within the trailing 7 days): the kill-switch must engage from day 1's
+    # history alone, capping every buy multiplier to 1x.
+    day2_dir = os.path.join(history_root, "2026-07-03")
+    now2 = datetime(2026, 7, 3, 15, 45, tzinfo=EASTERN)
+    state2 = StrategyState()
+    broker2 = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    fin2 = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now2))
+    rh2 = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now2))
+    run_daily_compact(
+        now2, config, state2, fin2, rh2, broker2,
+        artifacts_dir=day2_dir, deployment_history_root=history_root,
+    )
+
+    with open(os.path.join(day2_dir, "run_state.json"), encoding="utf-8") as handle:
+        day2_state = json.load(handle)
+    assert day2_state["risk_guard"]["kill_switch_engaged"] is True
+    submitted = [c for c in day2_state["buy_candidates"] if c["status"] == "submitted"]
+    assert submitted  # the guard caps sizing, it doesn't block buying entirely
+    assert all(c["buy_multiplier"] == 1.0 for c in submitted)
+    day2_deployed = sum(c["planned_amount_usd"] for c in submitted)
+    # The reported trailing-7-day figure reflects day 1's history PLUS day 2's
+    # own submissions as they were made (see
+    # test_kill_switch_caps_later_candidates_within_the_same_batch for the
+    # narrower in-batch behavior) -- not just the pre-run historical figure.
+    assert day2_state["risk_guard"]["deployed_last_7d_usd"] == round(day1_deployed + day2_deployed, 2)
+
+
+def test_kill_switch_caps_later_candidates_within_the_same_batch(tmp_path):
+    # No prior-day history is needed: two same-day candidates each priced at
+    # $6 (2x the $3 base) with a $10 monthly allocation (40% threshold = $4)
+    # mean the FIRST submitted order alone already crosses the threshold. The
+    # SECOND candidate in the same run must then be capped to the $3 base
+    # instead of keeping its uncapped 2x amount -- otherwise a volatile day
+    # could overshoot the guard well beyond the base amount before the guard
+    # is even visible to tomorrow's run.
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=("AAA", "BBB"),
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
+        monthly_cash_allocation_usd=10.0,
+    )
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    submitted = [c for c in run_state["buy_candidates"] if c["status"] == "submitted"]
+    assert len(submitted) == 2
+    # AAA is filled first (alphabetical tiebreak at equal multiplier/drop) at
+    # its full 2x amount, which alone crosses the $4 threshold.
+    assert by_ticker["AAA"]["planned_amount_usd"] == 6.0
+    assert by_ticker["AAA"]["buy_multiplier"] == 2.0
+    # BBB, priced after the threshold is crossed, is capped to the $3 base --
+    # even though its ladder multiplier (still reported for audit purposes)
+    # remains 2.0, showing the cap is a dollar-amount guard, not a multiplier
+    # rewrite.
+    assert by_ticker["BBB"]["planned_amount_usd"] == 3.0
+    assert by_ticker["BBB"]["buy_multiplier"] == 2.0
+
+
+def test_manual_run_submissions_do_not_advance_in_batch_burn(tmp_path):
+    # Same setup as the scheduled in-batch test above (AAA/BBB, $10 monthly
+    # allocation), but scheduled=False: a manual run's own submissions must
+    # never advance the scheduled-live 7-day figure the kill-switch reads, so
+    # neither candidate is capped even though AAA's amount alone would cross
+    # the $4 threshold if counted.
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-manual")
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=("AAA", "BBB"),
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
+        monthly_cash_allocation_usd=10.0,
+    )
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+
+    run_daily_compact(
+        now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=False,
+    )
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    assert by_ticker["AAA"]["planned_amount_usd"] == 6.0
+    assert by_ticker["BBB"]["planned_amount_usd"] == 6.0  # NOT capped to the $3 base
+    assert run_state["risk_guard"]["kill_switch_engaged"] is False
+
+
 def test_run_daily_compact_date_gated_short_circuits(tmp_path):
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-07-01")
     _now, config, state, broker, fin, rh = _compact_setup(tmp_path)
@@ -606,6 +765,115 @@ def test_run_daily_compact_date_gate_does_not_clobber_prior_artifacts(tmp_path):
         preserved = json.load(handle)
     # The blocked stub must never overwrite a previously recorded run.
     assert preserved == original
+
+
+# --- run_classification wiring on the live path (task ce16ba6b state guarantee) ---
+
+
+def test_build_run_artifacts_stamps_scheduled_classification(tmp_path):
+    from scripts.run_classification import validate_classification
+
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    rc = run_state["run_classification"]
+    assert validate_classification(rc).ok
+    assert rc["run_origin"] == "scheduled"
+    assert rc["manual_run"] is False
+    # This run is a dry run (config.dry_run=True in _compact_setup), so no real
+    # order can have been submitted regardless of buy candidates.
+    assert run_state["order_submit_status"] == "dry_run"
+
+
+def test_build_run_artifacts_stamps_manual_classification(tmp_path):
+    from scripts.run_classification import validate_classification
+
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    artifacts_dir = os.path.join(tmp_path, "runs", "manual-am")
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=False)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    rc = run_state["run_classification"]
+    assert validate_classification(rc).ok
+    assert rc["run_origin"] == "manual"
+    assert rc["manual_run"] is True
+
+
+def test_scheduled_run_updates_latest_scheduled_run_pointer(tmp_path):
+    from pathlib import Path
+
+    from scripts.run_classification import latest_scheduled_run_path
+
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    classification_root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    run_daily_compact(
+        now, config, state, fin, rh, broker,
+        artifacts_dir=artifacts_dir, scheduled=True,
+        classification_state_root=classification_root,
+    )
+
+    pointer = latest_scheduled_run_path(classification_root)
+    assert pointer.exists()
+    ptr = json.loads(pointer.read_text())
+    # Points at the run_state.json this run actually wrote to artifacts_dir, not
+    # a second, separately-computed copy under classification_root.
+    assert ptr["run_state_path"] == os.path.join(artifacts_dir, "run_state.json")
+    assert not (Path(classification_root) / "scheduled_runs").exists()
+
+
+def test_manual_run_does_not_touch_latest_scheduled_run_pointer(tmp_path):
+    from scripts.run_classification import latest_scheduled_run_path
+
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    artifacts_dir = os.path.join(tmp_path, "runs", "manual-am")
+    classification_root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    run_daily_compact(
+        now, config, state, fin, rh, broker,
+        artifacts_dir=artifacts_dir, scheduled=False,
+        classification_state_root=classification_root,
+    )
+
+    assert not latest_scheduled_run_path(classification_root).exists()
+
+
+def test_confirmation_required_broker_response_recorded_distinctly(tmp_path):
+    from near_close_dca import OrderConfirmationRequiredError
+
+    class _ConfirmationRequiredBroker(DryRunBroker):
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise OrderConfirmationRequiredError("broker requires step-up confirmation")
+
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
+    )
+    broker = _ConfirmationRequiredBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    assert run_state["order_submit_status"] == "not_submitted_confirmation_required"
+    for candidate in run_state["buy_candidates"]:
+        assert candidate["status"] == "not_submitted_confirmation_required"
+        assert candidate["order_id"] is None
+        # Reviewed order details are still recorded even though nothing submitted.
+        assert candidate["reviewed_order"]["review_passed"] is True
+        assert candidate["reviewed_order"]["notional_usd"] == candidate["planned_amount_usd"]
+    # Not counted as an error: the broker responded normally, just requiring
+    # confirmation, so nothing needs retrying and no alert should fire on this basis.
+    assert run_state["usage_proxy"]["errors_count"] == 0
 
 
 def test_write_run_artifacts_ignores_stale_orders_csv(tmp_path):

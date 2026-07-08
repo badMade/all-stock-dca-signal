@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "run_state.schema.json",
   "title": "Graded DCA same-day run state artifact",
-  "description": "Structure of the run_state.json artifact written by near_close_dca.build_run_artifacts() / write_run_artifacts() each trading day and consumed by the reporting/dashboard code. Contains no secrets. A run_classification block (see run_classification.schema.json) SHOULD accompany live scheduled runs of the repaired live task 10ce362c (which supersedes the deleted ce16ba6b) so they are never confused with manual runs; it is validated here when present. It is not listed in `required` because the current writer path does not yet emit it, and legacy/compact artifacts must still validate.",
+  "description": "Structure of the run_state.json artifact written by near_close_dca.build_run_artifacts() / write_run_artifacts() each trading day and consumed by the reporting/dashboard code. Contains no secrets. A run_classification block (see run_classification.schema.json) accompanies every run of the repaired live task 10ce362c (which supersedes the deleted ce16ba6b) so scheduled and manual runs are never confused; it is validated here when present. It is not listed in `required` so legacy/compact artifacts written before this was stamped still validate.",
   "type": "object",
   "required": ["run_id", "generated_at", "trading_day", "broker", "budget", "counts"],
   "additionalProperties": true,
@@ -23,6 +23,18 @@
     },
     "broker": { "type": "string", "description": "Execution broker for the run (e.g. robinhood)." },
     "dry_run": { "type": "boolean" },
+    "order_submit_status": {
+      "type": "string",
+      "enum": [
+        "submitted",
+        "not_submitted_no_candidates",
+        "not_submitted_confirmation_required",
+        "not_submitted_error",
+        "not_submitted_budget_exhausted",
+        "dry_run"
+      ],
+      "description": "Overall order-submission outcome for the run. 'not_submitted_confirmation_required' means Robinhood review passed but submission was blocked by required post-review user confirmation: the run_state is still valid scheduled-run evidence that the task ran, but carries no order_id and is NOT evidence of an order/fill. The scheduled 3:20 PM live task always writes a run_state (and updates latest_scheduled_run.json) even when this is not 'submitted'. See docs/run_classification.md and config/run_classification.json."
+    },
     "account_number": {
       "type": ["string", "null"],
       "description": "Target broker account number, or null when not bound (e.g. dry-run). No secrets."
@@ -93,8 +105,21 @@
           "decision_bar_close": { "type": ["number", "null"] },
           "previous_close": { "type": ["number", "null"] },
           "order_id": { "type": ["string", "null"] },
-          "status": { "type": "string", "enum": ["submitted", "not_submitted", "skipped", "blocked", "dry_run", "failed"] },
+          "status": { "type": "string", "enum": ["submitted", "not_submitted", "not_submitted_confirmation_required", "skipped", "blocked", "dry_run", "failed"] },
           "skip_reason": { "type": ["string", "null"] },
+          "reviewed_order": {
+            "type": ["object", "null"],
+            "additionalProperties": true,
+            "description": "Broker order-review result captured before submission, present when Robinhood review passed. Populated even when the order was not submitted (e.g. status 'not_submitted_confirmation_required'), so a confirmation-blocked scheduled run still records the reviewed order details it would have placed. Carries no order_id (nothing was submitted). No secrets.",
+            "properties": {
+              "notional_usd": { "type": ["number", "null"] },
+              "side": { "type": ["string", "null"] },
+              "order_type": { "type": ["string", "null"] },
+              "time_in_force": { "type": ["string", "null"] },
+              "estimated_price": { "type": ["number", "null"] },
+              "review_passed": { "type": ["boolean", "null"] }
+            }
+          },
           "afternoon_desired_amount": { "type": "number", "minimum": 0, "description": "Same-day top-up guard (scheduled afternoon run only): the full afternoon desired dollar amount before the prior-run offset." },
           "afternoon_decision_price": { "type": ["number", "null"], "description": "Same-day top-up guard: the afternoon decision price compared against the earlier same-day run's reference price." },
           "prior_same_day_amount": { "type": "number", "minimum": 0, "description": "Same-day top-up guard: dollars already bought earlier the same day by a morning/manual run for this ticker." },
@@ -105,6 +130,13 @@
           "top_up_guard_result": { "type": "string", "enum": ["no_prior_run", "incremental_top_up", "price_not_below_prior_run", "no_incremental_difference", "missing_prior_price"], "description": "Same-day top-up guard outcome code for this candidate." },
           "top_up_skipped": { "type": "boolean", "description": "Same-day top-up guard: true when the guard produced no incremental buy." },
           "top_up_manual_review": { "type": "boolean", "description": "Same-day top-up guard: true when a known prior amount lacked a comparable price so the run conservatively bought $0 and flagged manual review." }
+        },
+        "if": {
+          "properties": { "status": { "const": "not_submitted_confirmation_required" } },
+          "required": ["status"]
+        },
+        "then": {
+          "properties": { "order_id": { "type": "null" } }
         }
       }
     },

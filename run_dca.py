@@ -169,6 +169,8 @@ def run_pipeline(
     generate_full_reports: bool = False,
     prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]] = None,
     prior_allocation_state_root: Optional[str | Path] = None,
+    deployment_history_root: Optional[str | Path] = None,
+    classification_state_root: Optional[str | Path] = None,
 ) -> Dict[str, Any]:
     """Run one compact DCA cycle and (optionally) the full post-trade report set.
 
@@ -184,6 +186,17 @@ def run_pipeline(
     pass ``prior_same_day_allocations`` directly to override, or an explicit
     ``prior_allocation_state_root`` to scan a different tree. Manual runs never
     auto-load prior allocations, so a manual invocation is never guard-active.
+
+    ``deployment_history_root`` feeds the trailing-7-day kill-switch (see
+    ``dca_risk.apply_risk_guard``): it should point at the directory containing
+    prior days' ``run_state.json`` artifacts. Defaults to ``artifacts_dir``'s
+    parent, since the live task's per-day directories are its siblings.
+
+    ``classification_state_root`` is passed through to ``near_close_dca.run_once``
+    for a scheduled run: it is where ``latest_scheduled_run.json`` is
+    written/updated (see ``scripts.run_classification``). Opt-in only: when not
+    given, no ``latest_scheduled_run.json`` write is attempted at all, so a
+    caller must pass the real cron_tracking root explicitly to enable it.
     """
     if scheduled and prior_same_day_allocations is None:
         if prior_allocation_state_root is None:
@@ -192,6 +205,8 @@ def run_pipeline(
         prior_same_day_allocations = load_prior_same_day_allocations(
             prior_allocation_state_root, trading_day
         )
+    if deployment_history_root is None:
+        deployment_history_root = Path(artifacts_dir).parent
     result = run_daily_compact(
         now,
         config,
@@ -203,6 +218,8 @@ def run_pipeline(
         run_label=run_label,
         scheduled=scheduled,
         prior_same_day_allocations=prior_same_day_allocations,
+        deployment_history_root=deployment_history_root,
+        classification_state_root=classification_state_root,
     )
     if result.get("blocked"):
         logger.warning("run blocked by date gate for %s; skipping reports", result.get("run_state_path"))

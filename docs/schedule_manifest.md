@@ -16,6 +16,17 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 > post-trade slippage / Notion sync runs at **3:35 PM ET**. These are two
 > different tasks. Do not merge them or move the live trade off 3:20 PM ET.
 
+> **3:20 PM state-file guarantee:** the live task (`10ce362c`) **always** writes
+> a scheduled `run_state.json` under
+> `cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/` and updates
+> `latest_scheduled_run.json` every time it fires, **even when no order is
+> placed**. If Robinhood review passes but submission is blocked by required
+> post-review user confirmation, the run_state stays valid and carries
+> `order_submit_status='not_submitted_confirmation_required'`, `reviewed_order`
+> details where available, candidate details, and **no `order_id`**. That is
+> valid scheduled-run evidence the task ran — **not** evidence of an order/fill.
+> See [run_classification.md](run_classification.md).
+
 > **Run-classification note:** the live task (`10ce362c`, the repaired task
 > that supersedes the deleted `ce16ba6b`; artifact root stays under
 > `.../ce16ba6b` for continuity) classifies every
@@ -42,6 +53,13 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 > The scheduled run still writes a valid scheduled run_state even when every buy
 > is fully offset to $0. See [strategy.md](strategy.md#same-day-prior-run-offset--top-up-guard).
 >
+> **Morning dry-run note:** a separate **dry-run / analytics-only** morning
+> stream (`MorningDCAExecutor`) grades morning weakness vs. yesterday's close on
+> its own **0x-to-3x** ladder and its own `morning` budget ledger, writing under
+> `cron_tracking/morning_dca/YYYYMMDD_0945ET/` (run_type `morning_dca_dry_run`,
+> `valid_afternoon_evidence=false`). It places **no trades**, never updates
+> `latest_scheduled_run.json`, and is never afternoon scheduled evidence. See
+> [morning_dca.md](morning_dca.md).
 > **Base-amount note:** the graded DCA base amount is exactly **$3.00**; every
 > candidate dollar amount is **`$3.00 × multiplier`**. The automation must never
 > infer, discover, or fall back to **$50.00** or any broker/account default. If
@@ -53,6 +71,7 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 |---|---|---|---|---|---|---|
 | `b7961407` | Pre-market DCA buying-power dashboard | analytics | no | `00 13 * * 1-5` | 9:00 AM weekdays | active |
 | `cd45e95b` | Compact DCA volatility outlier scan | analytics | no | `45 13 * * 1-5` | 9:45 AM weekdays | active |
+| `morning-dca-0945` | Morning graded DCA dry-run analytics (`MorningDCAExecutor`) | analytics | no | `45 13 * * 1-5` | 9:45 AM weekdays | active |
 | `e3e6f09e` | Monitor-only graded DCA signal check | monitoring | no | `5 19 * * 1-5` | 3:05 PM weekdays | active |
 | `10ce362c` | Graded DCA automatic live test - $3 allocation (supersedes `ce16ba6b`) | trading | **yes** | `20 19 * * 1-5` | 3:20 PM weekdays | active |
 | `d72aa525` | Capital-priority briefing | analytics | no | `25 19 * * 1-5` | 3:25 PM weekdays | active |
@@ -73,6 +92,11 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 - Analytics only, **no trading**. Runs **9:45 AM ET weekdays**.
 - Scans only **>5% outliers**; no full 41+ ticker narrative on no-outlier days. Uses the current $3 base 0x-to-5x ladder.
 
+### `morning-dca-0945` — Morning graded DCA dry-run analytics (`MorningDCAExecutor`)
+- Analytics only, **no trading**. Runs **9:45 AM ET weekdays**.
+- Evaluates morning price weakness vs. yesterday’s regular-session close on the **morning 0x-to-3x ladder** (`config/morning_dca.json`). Writes dry-run artifacts under `/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_0945ET/`.
+- `stream='morning'`, `run_type='morning_dca_dry_run'`, `valid_afternoon_evidence=false`. Never writes into the afternoon `ce16ba6b` tree or updates `latest_scheduled_run.json`.
+
 ### `e3e6f09e` — Monitor-only graded DCA signal check
 - Analytics and notifications only; **no trades**. Runs **3:05 PM ET weekdays**.
 - Monitor-only signal check that surfaces the planned allocation and tier selection using the current $3 base 0x-to-5x ladder.
@@ -81,8 +105,9 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 - Repaired live task `10ce362c`, which **supersedes the deleted `ce16ba6b`**; the artifact root stays under `.../ce16ba6b` for continuity.
 - Approved live trading task running the **$3 base 0x-to-5x ladder with tiered caps**. Places real market buy orders automatically within safeguards. Runs **3:20 PM ET weekdays**.
 - Uses **only** Robinhood account `562057042`; Alpaca is read-only.
-- Trigger gate: `programmatic_trigger_check.sh`, allowing weekdays **2026-07-02 through 2026-08-28**, **3:20–3:55 PM ET**.
+- Trigger gate: `programmatic_trigger_check.sh`, allowing weekdays **2026-07-02 through 2026-08-28**, **3:20–3:35 PM ET** (aligned to the 15:15–15:35 ET scheduled classification window so a late-but-permitted start cannot place buys after the 3:35 PM post-trade sync).
 - Writes standardized same-day state files under `/home/user/workspace/cron_tracking/ce16ba6b` ([`schemas/run_state.schema.json`](../schemas/run_state.schema.json)); must **not** fall back to interactive confirmation.
+- **State-file guarantee:** **always** writes the scheduled `run_state.json` and updates `latest_scheduled_run.json` on every fire, **even when no order is placed**. A confirmation-blocked run (review passed, submission blocked by required post-review confirmation) records `order_submit_status='not_submitted_confirmation_required'`, `reviewed_order` details where available, candidate details, and **no `order_id`** — valid scheduled-run evidence, not order/fill evidence.
 - **Run classification:** a scheduled run writes `scheduled_runs/YYYYMMDD_1520ET/run_state.json` (`run_origin='scheduled'`, `manual_run=false`, `scheduled_for_et='15:20'`, `state_schema_version='run-classification-v1'`, `run_id='scheduled_YYYYMMDD_1520ET'`, and **both** `cron_id='10ce362c'` **and** `supersedes_cron_id='ce16ba6b'`) and updates `latest_scheduled_run.json`; a manual run writes `manual_runs/<timestamp>/run_state.json` (`run_origin='manual'`, `manual_run=true`) and never updates that pointer. Placeholder/ambiguous ids such as `ce16ba6b_replacement` are forbidden; for continuity, consumers still accept `cron_id='10ce362c'` OR `supersedes_cron_id='ce16ba6b'` as valid evidence. See [run_classification.md](run_classification.md).
 - **Manual runs do not count as scheduled-run evidence.** Any stale stored display name is superseded by the authoritative **3:20 PM ET** schedule.
 - **Same-day top-up guard:** loads earlier same-day (before **2:30 PM ET**, non-scheduled) allocations from the artifact root and offsets each ticker so it buys only the incremental amount into a lower price; per-candidate the run_state records `prior_same_day_amount`, `prior_same_day_reference_price`, `prior_same_day_run_id`/`prior_same_day_source`, `afternoon_desired_amount`, `afternoon_decision_price`, `incremental_order_amount`, `top_up_guard_result`, `top_up_skipped`, and `top_up_manual_review`. A fully-offset day still writes a valid scheduled run_state. See [strategy.md](strategy.md#same-day-prior-run-offset--top-up-guard).
@@ -95,11 +120,13 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 - Analytics only, **no trading**. Runs **3:35 PM ET weekdays**.
 - Reads the **scheduled** live-run state and Robinhood order history, writes slippage/coverage artifacts, updates the compact Notion **Latest Run** section only.
 - **Run classification:** scheduled-live rows exclude all manual order IDs and any `run_origin='manual'`/`manual_run=true` state; manual fills go only in the labeled **Manual Test Runs** section. See [run_classification.md](run_classification.md).
+- **Confirmation-blocked run:** when the scheduled state has `order_submit_status='not_submitted_confirmation_required'`, report **no scheduled fills and no scheduled order IDs**; do **not** invalidate the run_state and do **not** apply the broker time-window fallback (no write failure occurred).
 
 ### `a46bf007` — Live-run watchdog
 - Read-only, **no trading**. Runs **3:40 PM ET weekdays** — the **final scheduled afternoon event**.
 - Alerts only on missed, incomplete, error, or discrepancy conditions.
 - **Run classification:** validates that a scheduled run_state exists and `latest_scheduled_run.json` points at it; a manual-only or broker-orders-only day is a discrepancy, not a scheduled run.
+- **Confirmation-blocked run:** when `order_submit_status='not_submitted_confirmation_required'`, alert that **no order was placed**, but do **not** mark the lineage/scheduled state invalid — a confirmation-blocked run with the required fields present is a valid scheduled run that fired.
 
 ### `041d9d90` — Weekly Notion performance dashboard refresh
 - Analytics only, **no trading**. Runs **Fridays 5:00 PM ET** — the only approved post-3:40 PM exception.

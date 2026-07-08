@@ -38,19 +38,28 @@ strategies = [
 
 [project.scripts]
 run-dca = "run_dca:main"
+run-dca-risk = "dca_risk:main"
 
 [tool.setuptools]
 # Flat single-file modules rather than a package tree; list them explicitly.
 py-modules = [
     "near_close_dca",
+    "morning_dca",
     "dca_config",
+    "dca_risk",
     "dca_live_adapters",
     "dca_reporting",
     "dca_cost_tracker",
     "dca_notion_sync",
     "dca_weekly_dashboard",
+    "dca_risk",
     "run_dca",
 ]
+# scripts/run_classification.py is the run-classification contract used by both
+# the live artifact writer (near_close_dca.build_run_artifacts) and readers
+# (dca_risk, dca_reporting) -- it must ship with the installed package, not just
+# exist in a checkout, or those imports fail at runtime (see scripts/__init__.py).
+packages = ["scripts"]
 
 # Ship the version-controlled config so an installed `run-dca` (outside a checkout) finds
 # the live trading window instead of falling back to the hardcoded defaults. dca_config
@@ -60,10 +69,12 @@ py-modules = [
     "config/budgets.json",
     "config/tickers.json",
     "config/sizing_ladder.json",
+    "config/backtest_sizing_ladder.json",
     "config/trading_window.json",
     "config/scheduled_tasks.json",
     "config/notifications.json",
     "config/reporting.json",
+    "config/morning_dca.json",
 ]
 
 [tool.pytest.ini_options]

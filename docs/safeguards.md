@@ -45,18 +45,38 @@ on the day's planned spend and the count of 3x-or-greater signals (multiplier
   are flagged.
 - A run never exceeds the selected daily cap, the selected weekly cap, available
   buying power, or the broker/order-review limit.
+- **Dynamic risk kill-switch:** when capital deployed by the scheduled-live
+  afternoon stream in any trailing 7-day window exceeds **40% of the monthly
+  cash allocation** (`monthly_cash_allocation_usd`, default $3,600), the graded
+  ladder is **capped at 1x** — the strategy keeps buying dips at the $3 base but
+  stops scaling up until the window rolls back under the threshold. A rolling
+  30-day cash-burn rate is tracked for visibility. Manual and other streams are
+  never counted toward this guard. See [risk_management.md](risk_management.md)
+  and the `risk_guard` block in [`config/budgets.json`](../config/budgets.json).
 
 ## Test window
 
 - Live testing is approved **through Fri Aug 28, 2026, inclusive.**
 - The live task's trigger gate (`programmatic_trigger_check.sh`) enforces
-  weekdays **2026-07-02 → 2026-08-28**, **3:20–3:55 PM ET**.
+  weekdays **2026-07-02 → 2026-08-28**, **3:20–3:35 PM ET** (aligned to the
+  15:15–15:35 ET scheduled classification window and the 3:40 PM completion rule).
 - A one-time reminder (`f7411889`) fires 2026-08-15 to decide on continuation.
 
 ## Operational rules
 
 - The live task **must write standardized same-day state files** and **must not
   fall back to interactive confirmation** — it runs unattended.
+- **3:20 PM state-file guarantee:** the live task **always** writes the scheduled
+  `run_state.json` under `scheduled_runs/YYYYMMDD_1520ET/` and updates
+  `latest_scheduled_run.json` on every fire, **even when no order is placed**. If
+  Robinhood review passes but submission is blocked by required post-review user
+  confirmation, the run_state stays valid and carries
+  `order_submit_status='not_submitted_confirmation_required'`, `reviewed_order`
+  details where available, candidate details, and **no `order_id`**. Such a run
+  is valid scheduled-run evidence that the task ran but **not** evidence of an
+  order/fill: slippage reports no scheduled fills/order IDs (and does not
+  invalidate the run), and the watchdog alerts on no order placed without marking
+  the lineage invalid. See [run_classification.md](run_classification.md).
 - **Manual runs do not count as scheduled-run evidence.** Every run_state
   artifact must carry a `run_classification` block distinguishing scheduled from
   manual runs. Scheduled runs write under
