@@ -35,7 +35,8 @@ import argparse
 import dataclasses
 import json
 import logging
-from datetime import date, datetime, time
+import time as _time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 from zoneinfo import ZoneInfo
@@ -54,6 +55,10 @@ AFTERNOON_EVIDENCE_FLOOR_ET = time(14, 30)
 # Rolling windows (calendar days).
 BURN_WINDOW_DAYS = 30
 KILL_SWITCH_WINDOW_DAYS = 7
+# Bound the run_state file scan to a generous multiple of the longest rolling
+# window so this stays O(recent history) instead of O(all-time artifacts) as
+# the cron_tracking tree accumulates months/years of run states.
+HISTORY_SCAN_WINDOW_DAYS = BURN_WINDOW_DAYS + 15
 
 # Recognized deployment streams. Only SCHEDULED (afternoon live) is the trading
 # stream that funds the kill-switch; the others are tracked separately so they
@@ -66,13 +71,27 @@ STREAM_OTHER = "other"
 # --- run_state parsing -------------------------------------------------------
 
 def find_run_state_files(root: str | Path) -> List[Path]:
-    """Return every ``run_state*.json`` at or below ``root`` (sorted)."""
+    """Return every ``run_state*.json`` at or below ``root`` (sorted).
+
+    Skips files last modified more than :data:`HISTORY_SCAN_WINDOW_DAYS` ago so
+    a single-file ``root`` (used directly by tests) and a real cron_tracking
+    tree accumulating years of artifacts both stay cheap to scan on every run.
+    A file whose mtime can't be read is kept rather than silently dropped.
+    """
     root_path = Path(root)
     if root_path.is_file():
         return [root_path]
     if not root_path.exists():
         return []
-    return sorted(root_path.rglob("run_state*.json"))
+    cutoff = _time.time() - (HISTORY_SCAN_WINDOW_DAYS * 86400)
+    files: List[Path] = []
+    for candidate in root_path.rglob("run_state*.json"):
+        try:
+            if candidate.stat().st_mtime >= cutoff:
+                files.append(candidate)
+        except OSError:
+            files.append(candidate)
+    return sorted(files)
 
 
 def _parse_iso_et(text: object) -> Optional[datetime]:
@@ -218,7 +237,6 @@ def deployed_by_day(
 
 def total_deployed(deploy_by_day: Dict[date, float], as_of: date, window_days: int) -> float:
     """Sum deployment over the trailing ``window_days`` ending on ``as_of`` (inclusive)."""
-    from datetime import timedelta
     start_date = as_of - timedelta(days=window_days - 1)
     total = sum(
         amount for day, amount in deploy_by_day.items()
@@ -244,9 +262,10 @@ def rolling_cash_burn(
     does not spike just because trades cluster on a few days.
     """
     total = total_deployed(deploy_by_day, as_of, window_days)
+    start_date = as_of - timedelta(days=window_days - 1)
     active = {
         day: amt for day, amt in deploy_by_day.items()
-        if as_of.toordinal() - (window_days - 1) <= day.toordinal() <= as_of.toordinal()
+        if start_date <= day <= as_of
     }
     return {
         "as_of": as_of.isoformat(),
