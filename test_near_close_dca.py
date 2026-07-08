@@ -645,6 +645,46 @@ def test_deployment_history_root_engages_kill_switch_on_later_run(tmp_path):
     assert all(c["buy_multiplier"] == 1.0 for c in submitted)
 
 
+def test_kill_switch_caps_later_candidates_within_the_same_batch(tmp_path):
+    # No prior-day history is needed: two same-day candidates each priced at
+    # $6 (2x the $3 base) with a $10 monthly allocation (40% threshold = $4)
+    # mean the FIRST submitted order alone already crosses the threshold. The
+    # SECOND candidate in the same run must then be capped to the $3 base
+    # instead of keeping its uncapped 2x amount -- otherwise a volatile day
+    # could overshoot the guard well beyond the base amount before the guard
+    # is even visible to tomorrow's run.
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=("AAA", "BBB"),
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
+        monthly_cash_allocation_usd=10.0,
+    )
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    submitted = [c for c in run_state["buy_candidates"] if c["status"] == "submitted"]
+    assert len(submitted) == 2
+    # AAA is filled first (alphabetical tiebreak at equal multiplier/drop) at
+    # its full 2x amount, which alone crosses the $4 threshold.
+    assert by_ticker["AAA"]["planned_amount_usd"] == 6.0
+    assert by_ticker["AAA"]["buy_multiplier"] == 2.0
+    # BBB, priced after the threshold is crossed, is capped to the $3 base --
+    # even though its ladder multiplier (still reported for audit purposes)
+    # remains 2.0, showing the cap is a dollar-amount guard, not a multiplier
+    # rewrite.
+    assert by_ticker["BBB"]["planned_amount_usd"] == 3.0
+    assert by_ticker["BBB"]["buy_multiplier"] == 2.0
+
+
 def test_run_daily_compact_date_gated_short_circuits(tmp_path):
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-07-01")
     _now, config, state, broker, fin, rh = _compact_setup(tmp_path)

@@ -31,7 +31,7 @@ import json
 import logging
 import os
 import statistics
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
 from pathlib import Path
@@ -1239,12 +1239,22 @@ def build_run_artifacts(
             continue
         outcome = candidate_outcomes.get(decision.ticker, {})
         target_price = _signal_target_price(decision)
+        # A candidate whose amount was reduced by the mid-batch kill-switch cap
+        # (see run_once) records the amount actually attempted/submitted, not
+        # the pre-cap ladder amount -- dca_risk.deployed_by_day() sums this
+        # field from historical artifacts, so an uncapped figure here would
+        # both misreport this run and inflate every later run's trailing-7-day
+        # deployment total.
+        submitted_amount = outcome.get("submitted_amount_usd")
+        planned_amount_usd = (
+            submitted_amount if submitted_amount is not None else decision.suggested_amount_usd
+        )
         buy_candidates.append(
             {
                 "ticker": decision.ticker,
                 "reason": decision.reason,
                 "buy_multiplier": decision.buy_multiplier,
-                "planned_amount_usd": round(decision.suggested_amount_usd, 2),
+                "planned_amount_usd": round(planned_amount_usd, 2),
                 "target_price": target_price,
                 "target_price_missing": target_price is None,
                 "decision_bar_close": target_price,
@@ -1938,9 +1948,18 @@ def run_once(
     state.roll_weekly_reserve(trading_day, config)
 
     candidate_outcomes: Dict[str, Dict[str, Any]] = {}
+    # Tracks the trailing-7-day scheduled-live deployment total live as orders
+    # are submitted within this batch (starting from the prior-history figure
+    # injected above), so a volatile day that crosses the kill-switch threshold
+    # mid-run caps the REMAINING candidates in the same batch to the 1x base
+    # amount instead of only affecting tomorrow's run.
+    running_deployed_7d = config.deployed_last_7d_usd
 
     for decision in buy_candidates:
         ticker = decision.ticker
+        order_amount = decision.suggested_amount_usd
+        if kill_switch_engaged(replace(config, deployed_last_7d_usd=running_deployed_7d)):
+            order_amount = min(order_amount, config.base_buy_amount_usd)
 
         if state.buys_today(ticker, trading_day) >= config.max_buys_per_ticker_per_day:
             candidate_outcomes[ticker] = {"status": "skipped", "skip_reason": "already bought today"}
@@ -1954,7 +1973,7 @@ def run_once(
             candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "cap would be exceeded"}
             _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: cap would be exceeded; skipping")
             continue
-        if broker.available_buying_power() < decision.suggested_amount_usd:
+        if broker.available_buying_power() < order_amount:
             candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "insufficient buying power"}
             _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: insufficient buying power; skipping")
             continue
@@ -1964,7 +1983,7 @@ def run_once(
             continue
 
         order_reviews_attempted += 1
-        review_ok, review_reason = broker.review_market_buy(ticker, decision.suggested_amount_usd)
+        review_ok, review_reason = broker.review_market_buy(ticker, order_amount)
         if not review_ok:
             candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": f"review blocked: {review_reason}"}
             _block(ticker, MISSING_FILL_BROKER_BLOCKED, f"{ticker}: review blocked order: {review_reason}")
@@ -1974,7 +1993,7 @@ def run_once(
         # outcome, so a confirmation-blocked or failed placement still records
         # the order details that were reviewed (schemas/run_state.schema.json).
         reviewed_order = {
-            "notional_usd": round(decision.suggested_amount_usd, 2),
+            "notional_usd": round(order_amount, 2),
             "side": "buy",
             "order_type": "market",
             "time_in_force": None,
@@ -1987,22 +2006,23 @@ def run_once(
             logger.info(
                 "[DRY RUN] Would buy %s: $%.2f (%s)",
                 ticker,
-                decision.suggested_amount_usd,
+                order_amount,
                 decision.reason,
             )
             if isinstance(broker, DryRunBroker):
-                order_id = broker.place_market_buy(ticker, decision.suggested_amount_usd, ref_id=ref_id)
+                order_id = broker.place_market_buy(ticker, order_amount, ref_id=ref_id)
             else:
-                order_id = f"DRY-RUN-SIM-{ticker}-{decision.suggested_amount_usd:.2f}-{ref_id}"
+                order_id = f"DRY-RUN-SIM-{ticker}-{order_amount:.2f}-{ref_id}"
             candidate_outcomes[ticker] = {
                 "status": "dry_run",
                 "order_id": order_id,
                 "skip_reason": "dry_run: order not placed",
                 "reviewed_order": reviewed_order,
+                "submitted_amount_usd": order_amount,
             }
         else:
             try:
-                order_id = broker.place_market_buy(ticker, decision.suggested_amount_usd, ref_id=ref_id)
+                order_id = broker.place_market_buy(ticker, order_amount, ref_id=ref_id)
             except OrderConfirmationRequiredError:
                 # Review passed but the broker requires additional post-review
                 # confirmation before it will submit -- not an error: no order
@@ -2013,6 +2033,7 @@ def run_once(
                     "order_id": None,
                     "skip_reason": "broker requires post-review confirmation before submission",
                     "reviewed_order": reviewed_order,
+                    "submitted_amount_usd": order_amount,
                 }
                 _block(
                     ticker,
@@ -2031,14 +2052,16 @@ def run_once(
                     "order_id": None,
                     "skip_reason": f"placement failed: {exc}",
                     "reviewed_order": reviewed_order,
+                    "submitted_amount_usd": order_amount,
                 }
                 logger.error("Placement failed for %s: %s", ticker, exc)
                 continue
-            state.record_buy(ticker, trading_day, decision.suggested_amount_usd)
+            state.record_buy(ticker, trading_day, order_amount)
+            running_deployed_7d += order_amount
             logger.info(
                 "Placed buy for %s: $%.2f, order_id=%s",
                 ticker,
-                decision.suggested_amount_usd,
+                order_amount,
                 order_id,
             )
             candidate_outcomes[ticker] = {
@@ -2046,6 +2069,7 @@ def run_once(
                 "order_id": order_id,
                 "skip_reason": None,
                 "reviewed_order": reviewed_order,
+                "submitted_amount_usd": order_amount,
             }
 
         if run_result is not None:
@@ -2135,6 +2159,7 @@ def run_and_report(
     state_path: str,
     run_label: str = "manual",
     scheduled: bool = False,
+    deployment_history_root: Optional[str | Path] = None,
 ) -> Dict[str, object]:
     """Execute one DCA run and emit the full slippage/coverage narrative + state file.
 
@@ -2144,9 +2169,22 @@ def run_and_report(
     a compact summary only. This path is fully non-interactive: it never prompts for
     confirmation, so scheduled/background execution is unaffected. Returns the
     artifact paths and summary metrics.
+
+    ``deployment_history_root`` feeds the trailing-7-day kill-switch (see
+    ``dca_risk.apply_risk_guard``), same as ``run_daily_compact``/``run_pipeline``;
+    defaults to ``output_dir``'s parent when not given, so a manual/full-report run
+    during a period where scheduled-live deployment exceeded the threshold is
+    capped the same as the compact daily path instead of silently using the
+    full 2x-5x ladder.
     """
+    if deployment_history_root is None:
+        deployment_history_root = Path(output_dir).parent
     run_result = RunResult(trading_day=now.astimezone(EASTERN).date(), decisions=[])
-    run_once(now, config, state, finance_data, robinhood_data, broker, run_result=run_result)
+    run_once(
+        now, config, state, finance_data, robinhood_data, broker,
+        run_result=run_result, deployment_history_root=deployment_history_root,
+        scheduled=scheduled,
+    )
     report = generate_slippage_report(
         run_result, run_label=run_label, output_dir=output_dir, now=now
     )
