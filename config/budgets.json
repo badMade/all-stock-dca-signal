@@ -10,10 +10,15 @@
     "source_of_truth": "config/budgets.json:base_amount_usd (mirrored in config/sizing_ladder.json:base_amount_usd)",
     "no_fallback": "Never infer, discover, or fall back to $50.00 or any broker/account default base amount. The base is fixed at exactly $3.00.",
     "forbidden_fallback_values_usd": [50.0],
-    "on_missing_or_unreadable_config": {
-      "base_amount_usd": 3.0,
-      "base_amount_source": "hardcoded_user_confirmed_3_usd",
-      "rule": "If this config is missing or unreadable, continue using $3.00 and record base_amount_source='hardcoded_user_confirmed_3_usd'. Do NOT substitute $50.00 or any broker/account default."
+def load_budget_config(path: str) -> Dict[str, Any]:
+    try:
+        with open(path, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {
+            "base_amount_usd": 3.0,
+            "base_amount_source": "hardcoded_user_confirmed_3_usd"
+        }
     }
   },
   "high_multiplier_threshold": 3.0,
