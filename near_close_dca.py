@@ -31,7 +31,7 @@ import json
 import logging
 import os
 import statistics
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
 from pathlib import Path
@@ -311,6 +311,18 @@ class StrategyConfig:
         (0.070, 4.5),  # down 7.0% to <8.0%
         (0.080, 5.0),  # down 8.0% or more (no upper cutoff)
     )
+
+    # --- Dynamic risk guard (rolling deployment kill-switch) -----------------
+    # The monthly cash allocation the strategy is funded with, and the fraction
+    # of it that, once deployed within any rolling 7-day window, engages the
+    # kill-switch. When engaged, the graded ladder is capped at 1x so the
+    # strategy keeps participating in dips at the base amount but stops scaling
+    # up. deployed_last_7d_usd is a *runtime* field injected per run from the
+    # deployment history (see dca_risk.apply_risk_guard); it is never read from
+    # config JSON, so loading config can never by itself change sizing.
+    monthly_cash_allocation_usd: float = 3600.0
+    kill_switch_7d_deploy_fraction: float = 0.40
+    deployed_last_7d_usd: float = 0.0
 
 
 @dataclass
@@ -761,18 +773,44 @@ def latest_bar_at_or_before(bars: Iterable[Bar], target: datetime) -> Optional[B
     return max(eligible, key=lambda bar: bar.timestamp) if eligible else None
 
 
+def kill_switch_engaged(config: StrategyConfig) -> bool:
+    """Return True when the rolling-deployment kill-switch should cap sizing.
+
+    Engaged when capital deployed in the trailing 7 days
+    (``config.deployed_last_7d_usd``, injected at runtime from the deployment
+    history) exceeds ``kill_switch_7d_deploy_fraction`` of the configured monthly
+    cash allocation. A non-positive allocation disables the guard so a
+    mis-/unconfigured allocation can never wedge the ladder to 1x.
+    """
+    allocation = config.monthly_cash_allocation_usd
+    if allocation <= 0:
+        return False
+    fraction = config.kill_switch_7d_deploy_fraction
+    if not 0 <= fraction <= 1:
+        return False
+    threshold = fraction * allocation
+    return config.deployed_last_7d_usd > threshold
+
+
 def graded_buy_multiplier(drop_vs_previous_close: float, config: StrategyConfig) -> float:
     """Map a drop from prior close to a buy multiplier via the graded ladder.
 
     ``drop_vs_previous_close`` is a fraction (0.02 == 2.0% down). The largest tier
     threshold less than or equal to the drop determines the multiplier; a drop below
     the first threshold returns 0.0 (no buy). See StrategyConfig.sizing_tiers.
+
+    When the dynamic risk kill-switch is engaged (see ``kill_switch_engaged``) any
+    positive multiplier is capped to 1x: the strategy still participates in a dip
+    at the base amount but stops scaling up. A 0x (no-buy) stays 0x.
     """
     multiplier = 0.0
     for threshold, tier_multiplier in sorted(config.sizing_tiers):
         if drop_vs_previous_close >= threshold:
             multiplier = tier_multiplier
-    return min(multiplier, 5.0)
+    multiplier = min(multiplier, 5.0)
+    if kill_switch_engaged(config):
+        multiplier = min(multiplier, 1.0)
+    return multiplier
 
 
 def evaluate_source_signal(
@@ -966,10 +1004,17 @@ def reconcile_signals(
     )
 
 
-def within_caps(decision: ReconciledDecision, state: StrategyState, trading_day: date, config: StrategyConfig) -> bool:
-    if decision.suggested_amount_usd <= 0:
+def within_caps(amount: float, state: StrategyState, trading_day: date, config: StrategyConfig) -> bool:
+    """True if ``amount`` (the amount actually about to be ordered) fits the remaining cap.
+
+    Takes the amount explicitly rather than reading it off a decision so a
+    caller that reduced a candidate's amount (e.g. the kill-switch's mid-batch
+    cap in ``run_once``) checks caps against what will really be submitted,
+    not the pre-cap ladder amount.
+    """
+    if amount <= 0:
         return False
-    if decision.suggested_amount_usd > state.remaining_spend_today(trading_day, config):
+    if amount > state.remaining_spend_today(trading_day, config):
         return False
     return True
 
@@ -1168,22 +1213,26 @@ def build_run_artifacts(
     The artifact captures everything downstream reporting needs: per-source signal
     rows, buy candidates with the target price at signal time and the per-symbol
     planned dollar amount, order ids, skip/block reasons, and budget/reserve fields.
-    ``manual`` selects which run_classification block is stamped (see
-    scripts/run_classification.py): False (default) is the scheduled 3:20 PM ET
+
+    Also stamps a ``run_classification`` block (via ``scripts/run_classification``)
+    so downstream consumers -- ``dca_reporting``'s manual-order exclusion and
+    ``dca_risk``'s scheduled-stream deployment accounting -- can tell a scheduled
+    live run from a manual one from the artifact content alone. ``manual``
+    selects which block is stamped: False (default) is the scheduled 3:20 PM ET
     live task, True is a manual/ad hoc invocation.
     """
     now_et = now.astimezone(EASTERN)
     trading_day = now_et.date()
     run_id = f"{trading_day.isoformat()}-{now_et.strftime('%H%M%S')}"
-    triggered_at_utc = now.astimezone(timezone.utc).isoformat()
+    triggered_at_utc = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
         from scripts.run_classification import build_manual_classification, build_scheduled_classification
     except ImportError:
         from run_classification import build_manual_classification, build_scheduled_classification
     run_classification = (
-        build_manual_classification(triggered_at_utc)
+        build_manual_classification(triggered_at_utc=triggered_at_utc)
         if manual
-        else build_scheduled_classification(trading_day.isoformat(), triggered_at_utc)
+        else build_scheduled_classification(trading_day.isoformat(), triggered_at_utc=triggered_at_utc)
     )
 
     signal_rows: List[Dict[str, Any]] = []
@@ -1197,12 +1246,22 @@ def build_run_artifacts(
             continue
         outcome = candidate_outcomes.get(decision.ticker, {})
         target_price = _signal_target_price(decision)
+        # A candidate whose amount was reduced by the mid-batch kill-switch cap
+        # (see run_once) records the amount actually attempted/submitted, not
+        # the pre-cap ladder amount -- dca_risk.deployed_by_day() sums this
+        # field from historical artifacts, so an uncapped figure here would
+        # both misreport this run and inflate every later run's trailing-7-day
+        # deployment total.
+        submitted_amount = outcome.get("submitted_amount_usd")
+        planned_amount_usd = (
+            submitted_amount if submitted_amount is not None else decision.suggested_amount_usd
+        )
         buy_candidates.append(
             {
                 "ticker": decision.ticker,
                 "reason": decision.reason,
                 "buy_multiplier": decision.buy_multiplier,
-                "planned_amount_usd": round(decision.suggested_amount_usd, 2),
+                "planned_amount_usd": round(planned_amount_usd, 2),
                 "target_price": target_price,
                 "target_price_missing": target_price is None,
                 "decision_bar_close": target_price,
@@ -1253,6 +1312,15 @@ def build_run_artifacts(
             "remaining_spend_today_usd": round(state.remaining_spend_today(trading_day, config), 2),
             "day_notional_usd": round(state.day_notional(trading_day), 2),
             "week_notional_usd": round(state.week_notional(trading_day), 2),
+        },
+        "risk_guard": {
+            "monthly_cash_allocation_usd": config.monthly_cash_allocation_usd,
+            "kill_switch_7d_deploy_fraction": config.kill_switch_7d_deploy_fraction,
+            "kill_switch_7d_threshold_usd": round(
+                config.kill_switch_7d_deploy_fraction * config.monthly_cash_allocation_usd, 2
+            ),
+            "deployed_last_7d_usd": round(config.deployed_last_7d_usd, 2),
+            "kill_switch_engaged": kill_switch_engaged(config),
         },
         "counts": {
             "evaluated": len(decisions),
@@ -1494,8 +1562,16 @@ def _log_execution(
     decision: ReconciledDecision,
     order_id: str,
     broker: BrokerAdapter,
+    *,
+    notional_usd: Optional[float] = None,
 ) -> None:
-    """Fetch fill details for a placed order and append a durable execution record."""
+    """Fetch fill details for a placed order and append a durable execution record.
+
+    ``notional_usd`` overrides ``decision.suggested_amount_usd`` when the actual
+    submitted amount differs (e.g. the kill-switch's mid-batch cap in
+    ``run_once``), so the durable orders.csv/execution record matches what was
+    really ordered rather than the pre-cap ladder amount.
+    """
     get_fill = getattr(broker, "get_order_fill", None)
     fill: Optional[OrderFill] = None
     if callable(get_fill):
@@ -1508,7 +1584,7 @@ def _log_execution(
         target_price_source=decision.target_price_source,
         target_quote_time=decision.target_quote_time,
         decision_bar_close=decision.decision_bar_close,
-        notional_usd=decision.suggested_amount_usd,
+        notional_usd=notional_usd if notional_usd is not None else decision.suggested_amount_usd,
         action_reason=decision.reason,
         order_id=order_id,
         order_submitted_at=fill.order_submitted_at if fill else None,
@@ -1783,6 +1859,7 @@ def run_once(
     run_result: Optional[RunResult] = None,
     notifications_sent: Optional[int] = None,
     cost_control_notes: Optional[Sequence[str]] = None,
+    deployment_history_root: Optional[str | Path] = None,
     scheduled: bool = True,
     classification_state_root: Optional[str | Path] = None,
 ) -> List[ReconciledDecision]:
@@ -1815,6 +1892,23 @@ def run_once(
         raise RuntimeError(
             f"Refusing to trade account {broker.account_number()}; expected {config.target_account_number}"
         )
+
+    # Inject the trailing-7-day scheduled-live deployment from history so the
+    # kill-switch in graded_buy_multiplier reflects real cash burn. Imported
+    # lazily to avoid a circular import (dca_risk imports from this module).
+    if deployment_history_root is not None:
+        from dca_risk import apply_risk_guard, deployed_by_day, find_run_state_files
+
+        prior_states = []
+        for path in find_run_state_files(deployment_history_root):
+            try:
+                with path.open(encoding="utf-8") as f:
+                    data = json.load(f)
+            except (ValueError, OSError):
+                continue
+            if isinstance(data, dict) and data.get("status") != RUN_STATUS_BLOCKED:
+                prior_states.append(data)
+        config = apply_risk_guard(config, deployed_by_day(prior_states), trading_day)
 
     decisions: List[ReconciledDecision] = []
     tradable_tickers = [ticker for ticker in config.tickers if ticker not in config.excluded_tickers]
@@ -1869,9 +1963,18 @@ def run_once(
     state.roll_weekly_reserve(trading_day, config)
 
     candidate_outcomes: Dict[str, Dict[str, Any]] = {}
+    # Tracks the trailing-7-day scheduled-live deployment total live as orders
+    # are submitted within this batch (starting from the prior-history figure
+    # injected above), so a volatile day that crosses the kill-switch threshold
+    # mid-run caps the REMAINING candidates in the same batch to the 1x base
+    # amount instead of only affecting tomorrow's run.
+    running_deployed_7d = config.deployed_last_7d_usd
 
     for decision in buy_candidates:
         ticker = decision.ticker
+        order_amount = decision.suggested_amount_usd
+        if kill_switch_engaged(replace(config, deployed_last_7d_usd=running_deployed_7d)):
+            order_amount = min(order_amount, config.base_buy_amount_usd)
 
         if state.buys_today(ticker, trading_day) >= config.max_buys_per_ticker_per_day:
             candidate_outcomes[ticker] = {"status": "skipped", "skip_reason": "already bought today"}
@@ -1881,11 +1984,11 @@ def run_once(
             candidate_outcomes[ticker] = {"status": "skipped", "skip_reason": "same-day broker order exists"}
             _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: same-day broker order already exists; skipping")
             continue
-        if not within_caps(decision, state, trading_day, config):
+        if not within_caps(order_amount, state, trading_day, config):
             candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "cap would be exceeded"}
             _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: cap would be exceeded; skipping")
             continue
-        if broker.available_buying_power() < decision.suggested_amount_usd:
+        if broker.available_buying_power() < order_amount:
             candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "insufficient buying power"}
             _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: insufficient buying power; skipping")
             continue
@@ -1895,7 +1998,7 @@ def run_once(
             continue
 
         order_reviews_attempted += 1
-        review_ok, review_reason = broker.review_market_buy(ticker, decision.suggested_amount_usd)
+        review_ok, review_reason = broker.review_market_buy(ticker, order_amount)
         if not review_ok:
             candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": f"review blocked: {review_reason}"}
             _block(ticker, MISSING_FILL_BROKER_BLOCKED, f"{ticker}: review blocked order: {review_reason}")
@@ -1905,7 +2008,7 @@ def run_once(
         # outcome, so a confirmation-blocked or failed placement still records
         # the order details that were reviewed (schemas/run_state.schema.json).
         reviewed_order = {
-            "notional_usd": round(decision.suggested_amount_usd, 2),
+            "notional_usd": round(order_amount, 2),
             "side": "buy",
             "order_type": "market",
             "time_in_force": None,
@@ -1918,22 +2021,23 @@ def run_once(
             logger.info(
                 "[DRY RUN] Would buy %s: $%.2f (%s)",
                 ticker,
-                decision.suggested_amount_usd,
+                order_amount,
                 decision.reason,
             )
             if isinstance(broker, DryRunBroker):
-                order_id = broker.place_market_buy(ticker, decision.suggested_amount_usd, ref_id=ref_id)
+                order_id = broker.place_market_buy(ticker, order_amount, ref_id=ref_id)
             else:
-                order_id = f"DRY-RUN-SIM-{ticker}-{decision.suggested_amount_usd:.2f}-{ref_id}"
+                order_id = f"DRY-RUN-SIM-{ticker}-{order_amount:.2f}-{ref_id}"
             candidate_outcomes[ticker] = {
                 "status": "dry_run",
                 "order_id": order_id,
                 "skip_reason": "dry_run: order not placed",
                 "reviewed_order": reviewed_order,
+                "submitted_amount_usd": order_amount,
             }
         else:
             try:
-                order_id = broker.place_market_buy(ticker, decision.suggested_amount_usd, ref_id=ref_id)
+                order_id = broker.place_market_buy(ticker, order_amount, ref_id=ref_id)
             except OrderConfirmationRequiredError:
                 # Review passed but the broker requires additional post-review
                 # confirmation before it will submit -- not an error: no order
@@ -1944,6 +2048,7 @@ def run_once(
                     "order_id": None,
                     "skip_reason": "broker requires post-review confirmation before submission",
                     "reviewed_order": reviewed_order,
+                    "submitted_amount_usd": order_amount,
                 }
                 _block(
                     ticker,
@@ -1962,14 +2067,21 @@ def run_once(
                     "order_id": None,
                     "skip_reason": f"placement failed: {exc}",
                     "reviewed_order": reviewed_order,
+                    "submitted_amount_usd": order_amount,
                 }
                 logger.error("Placement failed for %s: %s", ticker, exc)
                 continue
-            state.record_buy(ticker, trading_day, decision.suggested_amount_usd)
+            state.record_buy(ticker, trading_day, order_amount)
+            if scheduled:
+                # Mirrors dca_risk.deployed_by_day(..., stream=STREAM_SCHEDULED),
+                # which excludes manual states: a manual run's own submissions
+                # must never advance the scheduled-live 7-day figure that later
+                # candidates (in this run or a future one) are capped against.
+                running_deployed_7d += order_amount
             logger.info(
                 "Placed buy for %s: $%.2f, order_id=%s",
                 ticker,
-                decision.suggested_amount_usd,
+                order_amount,
                 order_id,
             )
             candidate_outcomes[ticker] = {
@@ -1977,10 +2089,18 @@ def run_once(
                 "order_id": order_id,
                 "skip_reason": None,
                 "reviewed_order": reviewed_order,
+                "submitted_amount_usd": order_amount,
             }
 
         if run_result is not None:
-            _log_execution(run_result, decision, order_id, broker)
+            _log_execution(run_result, decision, order_id, broker, notional_usd=order_amount)
+
+    # Reflect any in-batch kill-switch engagement in the config used to build
+    # this run's artifacts, so the risk_guard audit block (and
+    # kill_switch_engaged) shows the guard actually having engaged during the
+    # run when later candidates were capped, instead of only the pre-run
+    # trailing-7-day figure.
+    config = replace(config, deployed_last_7d_usd=running_deployed_7d)
 
     manual_review = [d for d in decisions if d.action == Action.MANUAL_REVIEW]
     if manual_review:
@@ -2066,6 +2186,7 @@ def run_and_report(
     state_path: str,
     run_label: str = "manual",
     scheduled: bool = False,
+    deployment_history_root: Optional[str | Path] = None,
 ) -> Dict[str, object]:
     """Execute one DCA run and emit the full slippage/coverage narrative + state file.
 
@@ -2075,9 +2196,22 @@ def run_and_report(
     a compact summary only. This path is fully non-interactive: it never prompts for
     confirmation, so scheduled/background execution is unaffected. Returns the
     artifact paths and summary metrics.
+
+    ``deployment_history_root`` feeds the trailing-7-day kill-switch (see
+    ``dca_risk.apply_risk_guard``), same as ``run_daily_compact``/``run_pipeline``;
+    defaults to ``output_dir``'s parent when not given, so a manual/full-report run
+    during a period where scheduled-live deployment exceeded the threshold is
+    capped the same as the compact daily path instead of silently using the
+    full 2x-5x ladder.
     """
+    if deployment_history_root is None:
+        deployment_history_root = Path(output_dir).parent
     run_result = RunResult(trading_day=now.astimezone(EASTERN).date(), decisions=[])
-    run_once(now, config, state, finance_data, robinhood_data, broker, run_result=run_result)
+    run_once(
+        now, config, state, finance_data, robinhood_data, broker,
+        run_result=run_result, deployment_history_root=deployment_history_root,
+        scheduled=scheduled,
+    )
     report = generate_slippage_report(
         run_result, run_label=run_label, output_dir=output_dir, now=now
     )
@@ -2112,6 +2246,7 @@ def run_daily_compact(
     run_label: str = "daily",
     scheduled: bool = True,
     notifications_sent: Optional[int] = None,
+    deployment_history_root: Optional[str | Path] = None,
     classification_state_root: Optional[str | Path] = None,
 ) -> Dict[str, object]:
     """Run one DCA scan and write only compact, structured daily artifacts.
@@ -2146,6 +2281,7 @@ def run_daily_compact(
         artifacts_dir=artifacts_dir,
         run_result=run_result,
         notifications_sent=notifications_sent,
+        deployment_history_root=deployment_history_root,
         scheduled=scheduled,
         classification_state_root=classification_state_root,
     )

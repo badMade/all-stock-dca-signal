@@ -45,6 +45,14 @@ on the day's planned spend and the count of 3x-or-greater signals (multiplier
   are flagged.
 - A run never exceeds the selected daily cap, the selected weekly cap, available
   buying power, or the broker/order-review limit.
+- **Dynamic risk kill-switch:** when capital deployed by the scheduled-live
+  afternoon stream in any trailing 7-day window exceeds **40% of the monthly
+  cash allocation** (`monthly_cash_allocation_usd`, default $3,600), the graded
+  ladder is **capped at 1x** — the strategy keeps buying dips at the $3 base but
+  stops scaling up until the window rolls back under the threshold. A rolling
+  30-day cash-burn rate is tracked for visibility. Manual and other streams are
+  never counted toward this guard. See [risk_management.md](risk_management.md)
+  and the `risk_guard` block in [`config/budgets.json`](../config/budgets.json).
 
 ## Test window
 

@@ -13,6 +13,12 @@
   },
   "high_multiplier_threshold": 3.0,
   "weekly_rollover_reserve_cap_usd": 900.0,
+  "monthly_cash_allocation_usd": 3600.0,
+  "risk_guard": {
+    "monthly_cash_allocation_usd": 3600.0,
+    "kill_switch_7d_deploy_fraction": 0.40,
+    "description": "Dynamic risk guard. A rolling 30-day cash-burn rate is tracked for visibility. When capital deployed in any trailing 7-day window exceeds kill_switch_7d_deploy_fraction (40%) of monthly_cash_allocation_usd, the graded ladder is capped at 1x: the strategy keeps buying dips at the base amount but stops scaling up until the 7-day window rolls back under the threshold. Deployment is counted only from scheduled-live afternoon evidence (run_origin='scheduled', manual_run=false, timestamp at/after 2:30 PM ET); manual and other streams are excluded. See docs/risk_management.md and dca_risk.py."
+  },
   "budget_tiers": [
     {
       "name": "normal",

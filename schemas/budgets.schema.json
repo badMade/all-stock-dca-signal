@@ -9,6 +9,16 @@
     "base_amount_usd": { "type": "number", "minimum": 0 },
     "high_multiplier_threshold": { "type": "number", "minimum": 0 },
     "weekly_rollover_reserve_cap_usd": { "type": "number", "minimum": 0 },
+    "monthly_cash_allocation_usd": { "type": "number", "minimum": 0 },
+    "risk_guard": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "monthly_cash_allocation_usd": { "type": "number", "minimum": 0 },
+        "kill_switch_7d_deploy_fraction": { "type": "number", "minimum": 0, "maximum": 1 },
+        "description": { "type": "string" }
+      }
+    },
     "budget_tiers": {
       "type": "array",
       "minItems": 1,
