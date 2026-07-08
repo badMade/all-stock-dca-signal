@@ -490,7 +490,12 @@ class MorningDCAExecutor(DCAExecutor):
         morning-only ``latest_morning_run.json`` pointer. It never writes into the
         afternoon ce16ba6b tree or touches ``latest_scheduled_run.json``.
         """
-        out = self.run_state_dir(now)
+        manual_run = artifacts["run_classification"]["manual_run"]
+        out = (
+            Path(self.config.morning_run_state_root) / "manual_runs" / artifacts["run_id"]
+            if manual_run
+            else self.run_state_dir(now)
+        )
         out.mkdir(parents=True, exist_ok=True)
 
         run_state_path = out / "run_state.json"
