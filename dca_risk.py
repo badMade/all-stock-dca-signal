@@ -35,7 +35,6 @@ import argparse
 import dataclasses
 import json
 import logging
-import time as _time
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -55,10 +54,6 @@ AFTERNOON_EVIDENCE_FLOOR_ET = time(14, 30)
 # Rolling windows (calendar days).
 BURN_WINDOW_DAYS = 30
 KILL_SWITCH_WINDOW_DAYS = 7
-# Bound the run_state file scan to a generous multiple of the longest rolling
-# window so this stays O(recent history) instead of O(all-time artifacts) as
-# the cron_tracking tree accumulates months/years of run states.
-HISTORY_SCAN_WINDOW_DAYS = BURN_WINDOW_DAYS + 15
 
 # Recognized deployment streams. Only SCHEDULED (afternoon live) is the trading
 # stream that funds the kill-switch; the others are tracked separately so they
@@ -73,25 +68,18 @@ STREAM_OTHER = "other"
 def find_run_state_files(root: str | Path) -> List[Path]:
     """Return every ``run_state*.json`` at or below ``root`` (sorted).
 
-    Skips files last modified more than :data:`HISTORY_SCAN_WINDOW_DAYS` ago so
-    a single-file ``root`` (used directly by tests) and a real cron_tracking
-    tree accumulating years of artifacts both stay cheap to scan on every run.
-    A file whose mtime can't be read is kept rather than silently dropped.
+    No date/mtime bound: callers may report retrospectively (``--as-of`` for a
+    past date) or read a restored artifact tree whose file mtimes don't match
+    the trading days they contain, so filtering here by wall-clock recency
+    would silently undercount. Callers that need to bound cost by relevance
+    should filter the returned states by their own ``trading_day``/``as_of``.
     """
     root_path = Path(root)
     if root_path.is_file():
         return [root_path]
     if not root_path.exists():
         return []
-    cutoff = _time.time() - (HISTORY_SCAN_WINDOW_DAYS * 86400)
-    files: List[Path] = []
-    for candidate in root_path.rglob("run_state*.json"):
-        try:
-            if candidate.stat().st_mtime >= cutoff:
-                files.append(candidate)
-        except OSError:
-            files.append(candidate)
-    return sorted(files)
+    return sorted(root_path.rglob("run_state*.json"))
 
 
 def _parse_iso_et(text: object) -> Optional[datetime]:
@@ -134,8 +122,10 @@ def classify_stream(state: Dict[str, Any]) -> str:
 
     A manual origin/flag anywhere wins (defensive OR), matching the
     run-classification contract: a state marked scheduled but also carrying
-    ``manual_run=true`` is treated as manual, never scheduled. Anything that is
-    not an unambiguous scheduled run is ``STREAM_OTHER``.
+    ``manual_run=true`` is treated as manual, never scheduled. A scheduled-looking
+    block must also pass ``scripts.run_classification.validate_classification``
+    (required fields, run_id pattern, lineage) before counting as scheduled;
+    anything that is not an unambiguous, *valid* scheduled run is ``STREAM_OTHER``.
     """
     rc = state.get("run_classification") if isinstance(state, dict) else None
     if not isinstance(rc, dict):
@@ -144,7 +134,12 @@ def classify_stream(state: Dict[str, Any]) -> str:
     if origin == "manual" or rc.get("manual_run") is True:
         return STREAM_MANUAL
     if origin == "scheduled" and rc.get("manual_run") is False:
-        return STREAM_SCHEDULED
+        try:
+            from scripts.run_classification import validate_classification
+        except ImportError:
+            from run_classification import validate_classification
+        if validate_classification(rc).ok:
+            return STREAM_SCHEDULED
     return STREAM_OTHER
 
 
@@ -384,10 +379,11 @@ def _load_states(root: str | Path) -> List[Dict[str, Any]]:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Graded DCA rolling cash-burn / kill-switch report")
     parser.add_argument("--state-root", required=True, help="Directory containing run_state*.json artifacts")
+    parser.add_argument("--config-dir", default=None, help="config/ directory to load risk thresholds from")
     parser.add_argument(
         "--as-of",
-        default=date.today().isoformat(),
-        help="Report date (YYYY-MM-DD); defaults to today",
+        default=None,
+        help="Report date (YYYY-MM-DD); defaults to today in America/New_York",
     )
     parser.add_argument(
         "--monthly-allocation-usd",
@@ -403,14 +399,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    from dca_config import DEFAULT_CONFIG_DIR, load_strategy_config
+
     overrides: Dict[str, Any] = {}
     if args.monthly_allocation_usd is not None:
         overrides["monthly_cash_allocation_usd"] = args.monthly_allocation_usd
     if args.kill_switch_fraction is not None:
         overrides["kill_switch_7d_deploy_fraction"] = args.kill_switch_fraction
-    config = dataclasses.replace(StrategyConfig(), **overrides) if overrides else StrategyConfig()
+    config = load_strategy_config(args.config_dir or DEFAULT_CONFIG_DIR, **overrides)
 
-    as_of = date.fromisoformat(args.as_of)
+    as_of = date.fromisoformat(args.as_of) if args.as_of else datetime.now(EASTERN).date()
     states = _load_states(args.state_root)
     report = build_risk_report(states, as_of, config)
     print(json.dumps(report, indent=2, sort_keys=True))

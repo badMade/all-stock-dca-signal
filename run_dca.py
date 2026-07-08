@@ -148,6 +148,7 @@ def run_pipeline(
     run_label: str = "daily",
     scheduled: bool = True,
     generate_full_reports: bool = False,
+    deployment_history_root: Optional[str | Path] = None,
 ) -> Dict[str, Any]:
     """Run one compact DCA cycle and (optionally) the full post-trade report set.
 
@@ -155,7 +156,14 @@ def run_pipeline(
     daily path always runs; ``generate_full_reports=True`` additionally renders the
     slippage/coverage reports and the compact Notion sync from the run artifacts
     (heavier work reserved for Friday/manual runs).
+
+    ``deployment_history_root`` feeds the trailing-7-day kill-switch (see
+    ``dca_risk.apply_risk_guard``): it should point at the directory containing
+    prior days' ``run_state.json`` artifacts. Defaults to ``artifacts_dir``'s
+    parent, since the live task's per-day directories are its siblings.
     """
+    if deployment_history_root is None:
+        deployment_history_root = Path(artifacts_dir).parent
     result = run_daily_compact(
         now,
         config,
@@ -166,6 +174,7 @@ def run_pipeline(
         artifacts_dir=artifacts_dir,
         run_label=run_label,
         scheduled=scheduled,
+        deployment_history_root=deployment_history_root,
     )
     if result.get("blocked"):
         logger.warning("run blocked by date gate for %s; skipping reports", result.get("run_state_path"))
