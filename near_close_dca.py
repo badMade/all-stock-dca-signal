@@ -88,14 +88,14 @@ DAILY_COST_CONTROL_NOTES = (
 )
 
 ACTIVE_TICKERS = [
-    "DFTX", "TRIN", "AAAU", "SPCX", "TRLV", "RVI", "VCX", "EVR", "LUNR", "IRDM",
+    "DFTX", "TRIN", "AAAU", "SPCX", "RVI", "EVR", "LUNR", "IRDM",
     "DXYZ", "LITE", "ASML", "DRAM", "STX", "MSFT", "AAPL", "AMAT", "AMD", "CBRS",
     "MRVL", "BTX", "STM", "SNDK", "WDC", "TSM", "AVGO", "NVDA", "QBTS", "FLKR",
     "INTC", "GOOGL", "GOOG", "AMZN", "GLW", "MA", "GS", "MU", "NFLX", "XLG",
     "TOPT", "QTOP", "SATA", "RGTI", "IBM",
 ]
 
-EXCLUDED_TICKERS = {"BYDDY"}
+EXCLUDED_TICKERS = {"BYDDY", "TRLV", "VCX"}
 
 
 def _weekday_range(start: date, end: date) -> set:

@@ -46,6 +46,7 @@ py-modules = [
     "near_close_dca",
     "morning_dca",
     "dca_config",
+    "dca_risk",
     "dca_live_adapters",
     "dca_reporting",
     "dca_cost_tracker",
