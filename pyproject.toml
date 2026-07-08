@@ -38,6 +38,7 @@ strategies = [
 
 [project.scripts]
 run-dca = "run_dca:main"
+run-dca-risk = "dca_risk:main"
 
 [tool.setuptools]
 # Flat single-file modules rather than a package tree; list them explicitly.
@@ -49,6 +50,7 @@ py-modules = [
     "dca_cost_tracker",
     "dca_notion_sync",
     "dca_weekly_dashboard",
+    "dca_risk",
     "run_dca",
 ]
 
@@ -60,6 +62,7 @@ py-modules = [
     "config/budgets.json",
     "config/tickers.json",
     "config/sizing_ladder.json",
+    "config/backtest_sizing_ladder.json",
     "config/trading_window.json",
     "config/scheduled_tasks.json",
     "config/notifications.json",

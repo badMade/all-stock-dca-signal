@@ -312,6 +312,18 @@ class StrategyConfig:
         (0.080, 5.0),  # down 8.0% or more (no upper cutoff)
     )
 
+    # --- Dynamic risk guard (rolling deployment kill-switch) -----------------
+    # The monthly cash allocation the strategy is funded with, and the fraction
+    # of it that, once deployed within any rolling 7-day window, engages the
+    # kill-switch. When engaged, the graded ladder is capped at 1x so the
+    # strategy keeps participating in dips at the base amount but stops scaling
+    # up. deployed_last_7d_usd is a *runtime* field injected per run from the
+    # deployment history (see dca_risk.apply_risk_guard); it is never read from
+    # config JSON, so loading config can never by itself change sizing.
+    monthly_cash_allocation_usd: float = 3600.0
+    kill_switch_7d_deploy_fraction: float = 0.40
+    deployed_last_7d_usd: float = 0.0
+
 
 @dataclass
 class StrategyState:
@@ -743,18 +755,41 @@ def latest_bar_at_or_before(bars: Iterable[Bar], target: datetime) -> Optional[B
     return max(eligible, key=lambda bar: bar.timestamp) if eligible else None
 
 
+def kill_switch_engaged(config: StrategyConfig) -> bool:
+    """Return True when the rolling-deployment kill-switch should cap sizing.
+
+    Engaged when capital deployed in the trailing 7 days
+    (``config.deployed_last_7d_usd``, injected at runtime from the deployment
+    history) exceeds ``kill_switch_7d_deploy_fraction`` of the configured monthly
+    cash allocation. A non-positive allocation disables the guard so a
+    mis-/unconfigured allocation can never wedge the ladder to 1x.
+    """
+    allocation = config.monthly_cash_allocation_usd
+    if allocation <= 0:
+        return False
+    threshold = config.kill_switch_7d_deploy_fraction * allocation
+    return config.deployed_last_7d_usd > threshold
+
+
 def graded_buy_multiplier(drop_vs_previous_close: float, config: StrategyConfig) -> float:
     """Map a drop from prior close to a buy multiplier via the graded ladder.
 
     ``drop_vs_previous_close`` is a fraction (0.02 == 2.0% down). The largest tier
     threshold less than or equal to the drop determines the multiplier; a drop below
     the first threshold returns 0.0 (no buy). See StrategyConfig.sizing_tiers.
+
+    When the dynamic risk kill-switch is engaged (see ``kill_switch_engaged``) any
+    positive multiplier is capped to 1x: the strategy still participates in a dip
+    at the base amount but stops scaling up. A 0x (no-buy) stays 0x.
     """
     multiplier = 0.0
     for threshold, tier_multiplier in sorted(config.sizing_tiers):
         if drop_vs_previous_close >= threshold:
             multiplier = tier_multiplier
-    return min(multiplier, 5.0)
+    multiplier = min(multiplier, 5.0)
+    if kill_switch_engaged(config):
+        multiplier = min(multiplier, 1.0)
+    return multiplier
 
 
 def evaluate_source_signal(
@@ -1170,6 +1205,15 @@ def build_run_artifacts(
             "remaining_spend_today_usd": round(state.remaining_spend_today(trading_day, config), 2),
             "day_notional_usd": round(state.day_notional(trading_day), 2),
             "week_notional_usd": round(state.week_notional(trading_day), 2),
+        },
+        "risk_guard": {
+            "monthly_cash_allocation_usd": config.monthly_cash_allocation_usd,
+            "kill_switch_7d_deploy_fraction": config.kill_switch_7d_deploy_fraction,
+            "kill_switch_7d_threshold_usd": round(
+                config.kill_switch_7d_deploy_fraction * config.monthly_cash_allocation_usd, 2
+            ),
+            "deployed_last_7d_usd": round(config.deployed_last_7d_usd, 2),
+            "kill_switch_engaged": kill_switch_engaged(config),
         },
         "counts": {
             "evaluated": len(decisions),
