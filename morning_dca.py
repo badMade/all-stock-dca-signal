@@ -543,10 +543,10 @@ class MorningDCAExecutor(DCAExecutor):
 
 def _write_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
     if not rows:
-        path.write_text("")
+        path.write_text("", encoding="utf-8")
         return
     fieldnames = list(rows[0].keys())
-    with path.open("w", newline="") as handle:
+    with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
