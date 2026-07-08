@@ -1,0 +1,94 @@
+{
+  "policy_id": "morning-dca-dryrun-v1",
+  "version": "2026-07-08",
+  "purpose": "Configuration and separation policy for the MORNING graded-DCA dry-run analytics stream. The morning stream evaluates morning price weakness vs. yesterday's regular-session close on its own 0x-to-3x ladder, tracks a separate morning budget ledger, and writes its own run-state artifacts. It is dry-run/analytics only: no orders, no Robinhood order review, no broker placement. It is INDEPENDENT of, and never valid evidence for, the afternoon live task 10ce362c (which supersedes the deleted ce16ba6b).",
+  "state_schema_version": "run-classification-v1",
+  "mode": "dry_run",
+  "trades": false,
+  "stream": "morning",
+  "morning_task": {
+    "cron_id": "morning-dca-0945",
+    "supersedes_cron_id": null,
+    "name": "Morning graded DCA dry-run analytics",
+    "schedule_et": "09:45",
+    "schedule_human": "9:45 AM ET weekdays",
+    "window_start_et": "09:40",
+    "window_end_et": "09:50",
+    "run_type": "morning_dca_dry_run",
+    "broker_account": "read_only",
+    "note": "Analytics only. Robinhood account 562057042 remains the sole execution broker for the afternoon live task; Alpaca stays read-only. The morning stream places no trades."
+  },
+  "sizing_ladder": {
+    "name": "morning_0x_to_3x",
+    "drop_metric": "fraction_down_vs_previous_regular_session_close",
+    "base_amount_usd": 3.0,
+    "no_buy_below_pct": 0.1,
+    "tiers": [
+      { "min_drop_pct": 0.1, "max_drop_pct": 2.0, "multiplier": 1.0 },
+      { "min_drop_pct": 2.0, "max_drop_pct": 5.0, "multiplier": 1.5 },
+      { "min_drop_pct": 5.0, "max_drop_pct": 8.0, "multiplier": 2.0 },
+      { "min_drop_pct": 8.0, "max_drop_pct": null, "multiplier": 3.0 }
+    ],
+    "tier_boundary_rule": "min inclusive, max exclusive; the largest tier threshold <= actual drop wins; drop < 0.1% = 0x (no buy).",
+    "separation_note": "This is the MORNING ladder and is intentionally distinct from the afternoon 0x-to-5x ladder in config/sizing_ladder.json."
+  },
+  "budget_ledger": {
+    "namespace": "morning",
+    "morning_daily_cap_usd": 90.0,
+    "morning_weekly_cap_usd": 450.0,
+    "separation_note": "The morning ledger is a separate session from the afternoon StrategyState / BUDGET_TIERS ledger. Morning dry-run (or any future morning buys) never consume or validate the afternoon 3:20/3:45 daily/weekly budget."
+  },
+  "artifact_paths": {
+    "morning_run_state_root": "/home/user/workspace/cron_tracking/morning_dca",
+    "scheduled_run_dir": "/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_0945ET/",
+    "latest_morning_run_pointer": "/home/user/workspace/cron_tracking/morning_dca/latest_morning_run.json",
+    "run_state_filename": "run_state.json",
+    "separation_note": "The morning stream writes ONLY under the morning root. It never writes into /home/user/workspace/cron_tracking/ce16ba6b/**, never updates latest_scheduled_run.json, and never touches afternoon scheduled_runs/ folders."
+  },
+  "scheduled_run_classification": {
+    "run_origin": "scheduled",
+    "run_type": "morning_dca_dry_run",
+    "stream": "morning",
+    "cron_id": "morning-dca-0945",
+    "supersedes_cron_id": null,
+    "scheduled_for_et": "09:45",
+    "scheduled_window_start_et": "09:40",
+    "scheduled_window_end_et": "09:50",
+    "manual_run": false,
+    "run_id_pattern": "morning_YYYYMMDD_0945ET",
+    "valid_afternoon_evidence": false,
+    "state_schema_version": "run-classification-v1"
+  },
+  "artifact_fields": {
+    "signal_row": [
+      "ticker",
+      "source",
+      "action",
+      "reason",
+      "current_price",
+      "previous_close",
+      "drop_pct",
+      "multiplier",
+      "hypothetical_amount_usd",
+      "warnings"
+    ],
+    "run_state_top_level": [
+      "run_id",
+      "stream",
+      "mode",
+      "trades",
+      "data_source",
+      "run_classification",
+      "ladder",
+      "budget",
+      "signal_rows",
+      "buy_candidates",
+      "warnings"
+    ]
+  },
+  "downstream_separation_rules": [
+    "Afternoon consumers glob only /home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/** and therefore never traverse the morning root.",
+    "A morning run_state has run_type='morning_dca_dry_run', stream='morning', and valid_afternoon_evidence=false; any consumer must exclude it from afternoon scheduled-live cost basis, slippage, reliability, and order-count metrics.",
+    "The morning stream never updates latest_scheduled_run.json and never writes into afternoon scheduled/manual folders."
+  ]
+}
