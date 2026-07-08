@@ -18,15 +18,18 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from run_classification import (  # noqa: E402
+    ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED,
     STATE_SCHEMA_VERSION,
     build_manual_classification,
     build_scheduled_classification,
     collect_manual_order_ids,
     exclude_manual_orders,
+    is_confirmation_blocked,
     is_manual_state,
     is_scheduled_state,
     latest_scheduled_run_path,
     manual_run_id,
+    order_submit_status,
     scheduled_run_id,
     select_scheduled_state_for_reporting,
     validate_classification,
@@ -66,6 +69,31 @@ def _manual_state(order_ids=("MAN-9",), ts="2026-07-06T11:00:00Z"):
             {"ticker": f"M{i}", "buy_multiplier": 1.0, "planned_amount_usd": 3.0,
              "status": "submitted", "order_id": oid}
             for i, oid in enumerate(order_ids)
+        ],
+    }
+
+
+def _confirmation_blocked_state():
+    """Scheduled run whose review passed but submission was blocked awaiting
+    confirmation: valid scheduled classification, order_submit_status set, no order_id."""
+    return {
+        "run_id": "2026-07-06-152001",
+        "generated_at": "2026-07-06T15:20:01",
+        "trading_day": TRADING_DAY,
+        "broker": "robinhood",
+        "budget": {"budget_tier": "normal", "daily_cap_usd": 180, "weekly_cap_usd": 900},
+        "counts": {"submitted": 0, "buy_candidates": 1},
+        "order_submit_status": ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED,
+        "run_classification": build_scheduled_classification(TRADING_DAY, "2026-07-06T19:20:01Z"),
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "buy_multiplier": 1.0,
+                "planned_amount_usd": 3.0,
+                "status": "not_submitted_confirmation_required",
+                "order_id": None,
+                "reviewed_order": {"notional_usd": 3.0, "side": "buy", "review_passed": True},
+            }
         ],
     }
 
@@ -129,6 +157,25 @@ def test_scheduled_rejected_without_lineage():
     res = validate_classification(rc)
     assert not res.ok
     assert any("supersedes_cron_id" in e for e in res.errors)
+
+
+def test_validation_rejects_placeholder_supersedes():
+    # A placeholder/ambiguous supersedes marker (e.g. 'ce16ba6b_replacement') is
+    # forbidden even though the canonical cron_id is present.
+    rc = build_scheduled_classification(TRADING_DAY)
+    rc["supersedes_cron_id"] = "ce16ba6b_replacement"
+    res = validate_classification(rc)
+    assert not res.ok
+    assert any("supersedes_cron_id" in e and "forbidden" in e for e in res.errors)
+
+    manual = build_manual_classification()
+    manual["supersedes_cron_id"] = "ce16ba6b_replacement"
+    assert not validate_classification(manual).ok
+
+    # A placeholder/ambiguous cron_id is also forbidden.
+    rc_bad_cron = build_scheduled_classification(TRADING_DAY)
+    rc_bad_cron["cron_id"] = "ce16ba6b_replacement"
+    assert not validate_classification(rc_bad_cron).ok
 
 
 def test_validation_rejects_mismatched_flag():
@@ -235,6 +282,30 @@ def test_manual_write_does_not_overwrite_existing_pointer():
         write_run_artifacts(_manual_state(), base=base)
         after = latest_scheduled_run_path(base).read_text()
         assert before == after  # manual run left the scheduled pointer untouched
+
+
+def test_update_latest_scheduled_run_pointer_uses_given_path():
+    # A caller (e.g. near_close_dca's live path) that already wrote run_state.json
+    # to its own artifacts_dir can update the pointer to point at that exact path
+    # without update_latest_scheduled_run_pointer recomputing/rewriting a second
+    # copy anywhere else.
+    from run_classification import update_latest_scheduled_run_pointer
+
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        state = _scheduled_state()
+        external_path = base / "external" / "run_state.json"
+        external_path.parent.mkdir(parents=True)
+        external_path.write_text(json.dumps(state))
+
+        pointer = update_latest_scheduled_run_pointer(state, external_path, base)
+
+        assert pointer == latest_scheduled_run_path(base)
+        ptr = json.loads(pointer.read_text())
+        assert ptr["run_state_path"] == str(external_path)
+        assert ptr["run_id"] == "scheduled_20260706_1520ET"
+        # No second copy of run_state.json was created anywhere under base.
+        assert list(base.rglob("run_state.json")) == [external_path]
 
 
 def test_write_rejects_invalid_classification():
@@ -375,6 +446,66 @@ def test_no_fallback_when_not_flagged_write_failure():
         assert sel.ok
         assert sel.order_ids == []
         assert not sel.used_broker_fallback
+
+
+def test_confirmation_blocked_is_valid_scheduled_evidence():
+    state = _confirmation_blocked_state()
+    # Still a valid scheduled run (the classification block is unchanged).
+    assert is_scheduled_state(state)
+    assert not is_manual_state(state)
+    # order_submit_status accessors surface the confirmation-blocked outcome.
+    assert order_submit_status(state) == ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED
+    assert is_confirmation_blocked(state)
+    # No order was placed: no order_id on any candidate.
+    assert all(c["order_id"] is None for c in state["buy_candidates"])
+
+
+def test_confirmation_blocked_write_updates_pointer():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        written = write_run_artifacts(_confirmation_blocked_state(), base=base)
+        state_path = Path(written["run_state"])
+        assert state_path.exists()
+        assert "scheduled_runs" in str(state_path)
+        pointer = latest_scheduled_run_path(base)
+        assert pointer.exists()
+        ptr = json.loads(pointer.read_text())
+        assert ptr["run_id"] == "scheduled_20260706_1520ET"
+
+
+def test_confirmation_blocked_reports_no_fills_and_no_fallback():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        write_run_artifacts(_confirmation_blocked_state(), base=base)
+        # Even with in-window broker orders and the write-failure flag, a
+        # confirmation-blocked run must NOT attribute any orders via fallback.
+        sel = select_scheduled_state_for_reporting(
+            TRADING_DAY, base=base,
+            broker_window_orders=[{"order_id": "BRK-1", "submitted_at_et": "15:20"}],
+            scheduled_state_write_failed=True,
+        )
+        assert sel.ok  # run_state stays valid; confirmation-block is not an error
+        assert sel.confirmation_blocked
+        assert sel.order_submit_status == ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED
+        assert sel.order_ids == []  # no scheduled fills / order IDs
+        assert not sel.used_broker_fallback
+
+
+def test_confirmation_blocked_clears_stray_order_ids():
+    # Defense in depth against a malformed/stale artifact: even if a candidate
+    # somehow still carries an order_id despite the top-level status being
+    # confirmation-required (e.g. a partial write before the status field was
+    # finalized), the contract of zero scheduled orders for a confirmation-
+    # blocked run must hold regardless.
+    state = _confirmation_blocked_state()
+    state["buy_candidates"][0]["order_id"] = "STRAY-1"
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        write_run_artifacts(state, base=base)
+        sel = select_scheduled_state_for_reporting(TRADING_DAY, base=base)
+        assert sel.ok
+        assert sel.confirmation_blocked
+        assert sel.order_ids == []
 
 
 def _run_all():

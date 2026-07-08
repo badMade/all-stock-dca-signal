@@ -1,6 +1,7 @@
 {
   "$schema": "../schemas/scheduled_tasks.schema.json",
-  "version": "2026-07-06",
+  "version": "2026-07-08",
+  "verified_on_et": "2026-07-08",
   "timezone_note": "Cron expressions are in UTC. ET equivalents are during US Eastern Daylight Time (EDT, UTC-4). Confirm around DST transitions.",
   "afternoon_completion_rule": "All afternoon trading and artifact-writing tasks complete no later than 3:40 PM ET, when the read-only live-run watchdog (a46bf007) begins its final verification. The watchdog's own post-3:40 PM verification and the Friday weekly Notion performance refresh at 5:00 PM ET are the only approved post-3:40 PM DCA-related exceptions.",
   "run_classification_policy": {
@@ -8,7 +9,12 @@
     "schema": "schemas/run_classification.schema.json",
     "doc": "docs/run_classification.md",
     "state_schema_version": "run-classification-v1",
-    "summary": "Every run_state artifact carries a run_classification block. Scheduled runs of the repaired live task 10ce362c (which supersedes the deleted ce16ba6b; artifact root stays under .../ce16ba6b for continuity) write under scheduled_runs/YYYYMMDD_1520ET/ and update latest_scheduled_run.json; manual runs write under manual_runs/<timestamp>/ and never touch that pointer. A scheduled run is valid evidence when cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b'. Downstream analytics validate scheduled state, exclude all manual order IDs and any run_origin='manual'/manual_run=true state, and never infer scheduled status from broker orders alone."
+    "summary": "Every run_state artifact carries a run_classification block. Scheduled runs of the repaired live task 10ce362c (which supersedes the deleted ce16ba6b; artifact root stays under .../ce16ba6b for continuity) write under scheduled_runs/YYYYMMDD_1520ET/ and update latest_scheduled_run.json; manual runs write under manual_runs/<timestamp>/ and never touch that pointer. Every scheduled 3:20 PM ET run_state MUST include BOTH run_classification.cron_id='10ce362c' AND run_classification.supersedes_cron_id='ce16ba6b'; placeholder/ambiguous ids like 'ce16ba6b_replacement' are forbidden. For continuity, downstream analytics accept a scheduled run as valid evidence when cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b'. Downstream analytics validate scheduled state, exclude all manual order IDs and any run_origin='manual'/manual_run=true state, and never infer scheduled status from broker orders alone."
+  },
+  "base_amount_policy": {
+    "policy_file": "config/budgets.json",
+    "base_amount_usd": 3.0,
+    "summary": "The graded DCA base amount is exactly $3.00; every candidate dollar amount equals $3.00 x multiplier. Never infer, discover, or fall back to $50.00 or any broker/account default base amount. If the base-amount config is missing or unreadable, continue using $3.00 and record base_amount_source='hardcoded_user_confirmed_3_usd'."
   },
   "tasks": [
     {
@@ -64,9 +70,10 @@
         "manual_run_dir": "/home/user/workspace/cron_tracking/ce16ba6b/manual_runs/<timestamp>/",
         "latest_scheduled_run_pointer": "/home/user/workspace/cron_tracking/ce16ba6b/latest_scheduled_run.json",
         "scheduled_run_id_pattern": "scheduled_YYYYMMDD_1520ET",
-        "policy_file": "config/run_classification.json"
+        "policy_file": "config/run_classification.json",
+        "state_file_guarantee": "Always writes a scheduled run_state.json under scheduled_runs/YYYYMMDD_1520ET/ and updates latest_scheduled_run.json every time it fires, even when no order is placed. If Robinhood review passes but submission is blocked by required post-review user confirmation, the run_state is still valid and carries order_submit_status='not_submitted_confirmation_required', reviewed_order details where available, candidate details, and NO order_id. Such a run is valid scheduled-run evidence that the task ran, but NOT evidence of an order/fill."
       },
-      "notes": "The only trading task. This is the repaired live task 10ce362c, which supersedes the deleted ce16ba6b; the artifact root stays under .../ce16ba6b for continuity. Approved live Robinhood execution using the $3 base 0x-to-5x ladder with tiered daily/weekly caps. Robinhood account 562057042 only; Alpaca read-only. Places real market buy orders automatically within safeguards; must not fall back to interactive confirmation. A SCHEDULED run writes run_state.json (with run_classification run_origin='scheduled', run_type='scheduled_live_test', manual_run=false, scheduled_for_et='15:20', run_id='scheduled_YYYYMMDD_1520ET', and cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b') under scheduled_runs/YYYYMMDD_1520ET/ AND updates latest_scheduled_run.json. A MANUAL run writes run_state.json (run_origin='manual', manual_run=true, distinct run_id) under manual_runs/<timestamp>/ and MUST NOT update latest_scheduled_run.json. All run_state files carry state_schema_version='run-classification-v1'. Test window through Fri Aug 28 2026 inclusive. Manual runs do not count as scheduled-run evidence. Any stale stored display name is superseded by this authoritative 3:20 PM ET schedule."
+      "notes": "The only trading task. This is the repaired live task 10ce362c, which supersedes the deleted ce16ba6b; the artifact root stays under .../ce16ba6b for continuity. Approved live Robinhood execution using the $3 base 0x-to-5x ladder with tiered daily/weekly caps. Robinhood account 562057042 only; Alpaca read-only. Places real market buy orders automatically within safeguards; must not fall back to interactive confirmation. A SCHEDULED run writes run_state.json (with run_classification run_origin='scheduled', run_type='scheduled_live_test', manual_run=false, scheduled_for_et='15:20', run_id='scheduled_YYYYMMDD_1520ET', and BOTH cron_id='10ce362c' AND supersedes_cron_id='ce16ba6b') under scheduled_runs/YYYYMMDD_1520ET/ AND updates latest_scheduled_run.json. Placeholder/ambiguous ids such as 'ce16ba6b_replacement' are forbidden; for continuity, consumers still accept cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b' as valid evidence. The scheduled run_state is ALWAYS written even when no order is placed; a confirmation-blocked run records order_submit_status='not_submitted_confirmation_required', reviewed_order details, candidate details, and no order_id, and remains valid scheduled-run evidence (but not order/fill evidence). A MANUAL run writes run_state.json (run_origin='manual', manual_run=true, distinct run_id) under manual_runs/<timestamp>/ and MUST NOT update latest_scheduled_run.json. All run_state files carry state_schema_version='run-classification-v1'. Test window through Fri Aug 28 2026 inclusive. Manual runs do not count as scheduled-run evidence. Any stale stored display name is superseded by this authoritative 3:20 PM ET schedule."
     },
     {
       "id": "d72aa525",
@@ -89,7 +96,7 @@
       "run_classification": {
         "role": "consumer",
         "policy_file": "config/run_classification.json",
-        "rules": "Validate the scheduled run_state, exclude all order IDs from manual_runs/**/run_state*.json, exclude any run_state with run_origin='manual' or manual_run=true, and never infer scheduled status from same-day broker orders alone. Broker time-window fallback only if a valid scheduled state exists but lacks order IDs due to a known write failure. Report manual fills only under a 'Manual Test Runs' section; manual fills never affect scheduled-live cost basis, slippage, reliability, or order-count metrics."
+        "rules": "Validate the scheduled run_state, exclude all order IDs from manual_runs/**/run_state*.json, exclude any run_state with run_origin='manual' or manual_run=true, and never infer scheduled status from same-day broker orders alone. Broker time-window fallback only if a valid scheduled state exists but lacks order IDs due to a known write failure. When the scheduled run_state has order_submit_status='not_submitted_confirmation_required', report no scheduled fills and no scheduled order IDs; do NOT invalidate the run_state because confirmation blocked submission, and do NOT apply the broker time-window fallback (there was no write failure). Report manual fills only under a 'Manual Test Runs' section; manual fills never affect scheduled-live cost basis, slippage, reliability, or order-count metrics."
       },
       "notes": "Analytics only, no trading. Reads the scheduled live-run state and Robinhood order history, writes slippage/coverage artifacts, and updates the compact Notion Latest Run section only. Honors the run-classification policy (config/run_classification.json): scheduled-live metrics use only validated scheduled runs with manual order IDs excluded."
     },
@@ -104,9 +111,9 @@
       "run_classification": {
         "role": "consumer",
         "policy_file": "config/run_classification.json",
-        "rules": "Confirms a valid scheduled run_state exists (run_origin='scheduled', passes run_classification.schema.json) and that latest_scheduled_run.json points at it. Treats any run_origin='manual'/manual_run=true state as NOT scheduled-run evidence regardless of path. Never infers a scheduled run from same-day broker orders alone; alerts if the scheduled state is missing/invalid even when broker orders exist."
+        "rules": "Confirms a valid scheduled run_state exists (run_origin='scheduled', passes run_classification.schema.json) and that latest_scheduled_run.json points at it. Treats any run_origin='manual'/manual_run=true state as NOT scheduled-run evidence regardless of path. Never infers a scheduled run from same-day broker orders alone; alerts if the scheduled state is missing/invalid even when broker orders exist. When order_submit_status='not_submitted_confirmation_required', alert that no order was placed, but do NOT mark the lineage/scheduled state invalid: a confirmation-blocked run with the required fields present is a valid scheduled run that fired."
       },
-      "notes": "Read-only, no trading. Final scheduled afternoon event. Alerts only on missed, incomplete, error, or discrepancy conditions. Validates the run-classification contract: a missing/invalid scheduled run_state is a discrepancy even if manual runs or broker orders exist that day."
+      "notes": "Read-only, no trading. Final scheduled afternoon event. Alerts only on missed, incomplete, error, or discrepancy conditions. Validates the run-classification contract: a missing/invalid scheduled run_state is a discrepancy even if manual runs or broker orders exist that day. A confirmation-blocked scheduled run (order_submit_status='not_submitted_confirmation_required') is a valid run that fired: alert on no order placed, but do not treat the lineage as invalid when the required fields are present."
     },
     {
       "id": "041d9d90",

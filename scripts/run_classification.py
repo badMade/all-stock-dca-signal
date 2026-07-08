@@ -53,6 +53,18 @@ LATEST_SCHEDULED_RUN_FILENAME = "latest_scheduled_run.json"
 
 SCHEDULED_RUN_ID_RE = re.compile(r"^scheduled_[0-9]{8}_1520ET$")
 
+# order_submit_status values (mirror schemas/run_state.schema.json). The scheduled
+# 3:20 task always writes a run_state (and updates the pointer) even when nothing is
+# submitted; this field records why.
+ORDER_SUBMIT_STATUS_SUBMITTED = "submitted"
+ORDER_SUBMIT_STATUS_NO_CANDIDATES = "not_submitted_no_candidates"
+# Robinhood review passed but submission was blocked by required post-review user
+# confirmation: valid scheduled-run evidence the task ran, but NOT an order/fill.
+ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED = "not_submitted_confirmation_required"
+ORDER_SUBMIT_STATUS_ERROR = "not_submitted_error"
+ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED = "not_submitted_budget_exhausted"
+ORDER_SUBMIT_STATUS_DRY_RUN = "dry_run"
+
 
 _EASTERN = ZoneInfo("America/New_York")
 
@@ -239,6 +251,23 @@ def validate_classification(rc: Dict[str, object]) -> ValidationResult:
         if rc.get(f_name) in (None, ""):
             errors.append(f"missing required field: {f_name}")
 
+    # Lineage values must be canonical. A supersedes marker, when present, must be
+    # exactly SUPERSEDES_CRON_ID; placeholder/ambiguous values such as
+    # 'ce16ba6b_replacement' are forbidden regardless of origin.
+    cron_id = rc.get("cron_id")
+    if cron_id == "ce16ba6b_replacement":
+        errors.append(
+            "cron_id cannot be 'ce16ba6b_replacement'; placeholder/ambiguous values are forbidden"
+        )
+
+    supersedes = rc.get("supersedes_cron_id")
+    if supersedes not in (None, SUPERSEDES_CRON_ID):
+        errors.append(
+            f"supersedes_cron_id must be {SUPERSEDES_CRON_ID!r} or absent; "
+            f"placeholder/ambiguous values like 'ce16ba6b_replacement' are forbidden, "
+            f"got {supersedes!r}"
+        )
+
     manual_flag = rc.get("manual_run")
     if origin == "scheduled":
         if manual_flag is not False:
@@ -306,7 +335,61 @@ def is_scheduled_state(state: Dict[str, object]) -> bool:
     return rc.get("run_origin") == "scheduled" and bool(validate_classification(rc))
 
 
+def order_submit_status(state: Optional[Dict[str, object]]) -> Optional[str]:
+    """Return the run_state's top-level order_submit_status, or None if absent."""
+    if not isinstance(state, dict):
+        return None
+    value = state.get("order_submit_status")
+    return value if isinstance(value, str) and value else None
+
+
+def is_confirmation_blocked(state: Optional[Dict[str, object]]) -> bool:
+    """True if the run passed review but submission was blocked awaiting confirmation.
+
+    Such a run is valid scheduled-run evidence that the task fired but carries no
+    order/fill: reporting must report zero scheduled fills/order IDs, and neither
+    slippage nor the watchdog may mark the scheduled state invalid on this basis.
+    """
+    return order_submit_status(state) == ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED
+
+
 # --- Writing artifacts -------------------------------------------------------
+
+def update_latest_scheduled_run_pointer(
+    run_state: Dict[str, object], run_state_path: str | Path, base: Optional[Path] = None
+) -> Path:
+    """Write/refresh latest_scheduled_run.json to point at an already-written scheduled run_state.
+
+    Extracted from :func:`write_run_artifacts` so a caller that writes
+    run_state.json to its own already-correct artifacts directory (e.g.
+    near_close_dca's live path, whose ``artifacts_dir`` the scheduler already
+    points at the canonical ``scheduled_runs/...`` directory per
+    config/scheduled_tasks.json) can update the pointer without a second,
+    potentially differently-located copy of run_state.json being written.
+    Callers must validate ``run_state["run_classification"]`` themselves first.
+    """
+    rc = run_state.get("run_classification") or {}
+    day = str(run_state.get("trading_day", "")).strip()
+    pointer = latest_scheduled_run_path(base)
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    pointer.write_text(
+        json.dumps(
+            {
+                "run_id": rc.get("run_id"),
+                "trading_day": day,
+                "run_state_path": str(run_state_path),
+                "cron_id": rc.get("cron_id"),
+                "supersedes_cron_id": rc.get("supersedes_cron_id"),
+                "triggered_at_utc": rc.get("triggered_at_utc"),
+                "updated_at_utc": _utc_now_iso(),
+                "state_schema_version": STATE_SCHEMA_VERSION,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    return pointer
+
 
 def write_run_artifacts(
     run_state: Dict[str, object], base: Optional[Path] = None
@@ -334,24 +417,7 @@ def write_run_artifacts(
         state_path.write_text(json.dumps(run_state, indent=2) + "\n")
         written["run_state"] = str(state_path)
 
-        pointer = latest_scheduled_run_path(base)
-        pointer.parent.mkdir(parents=True, exist_ok=True)
-        pointer.write_text(
-            json.dumps(
-                {
-                    "run_id": rc["run_id"],
-                    "trading_day": day,
-                    "run_state_path": str(state_path),
-                    "cron_id": rc.get("cron_id"),
-                    "supersedes_cron_id": rc.get("supersedes_cron_id"),
-                    "triggered_at_utc": rc["triggered_at_utc"],
-                    "updated_at_utc": _utc_now_iso(),
-                    "state_schema_version": STATE_SCHEMA_VERSION,
-                },
-                indent=2,
-            )
-            + "\n"
-        )
+        pointer = update_latest_scheduled_run_pointer(run_state, state_path, base)
         written["latest_scheduled_run"] = str(pointer)
     else:  # manual
         ts = re.sub(r"[^0-9]", "", str(rc.get("triggered_at_utc", ""))) or rc["run_id"]
@@ -472,6 +538,8 @@ class ScheduledSelection:
     used_broker_fallback: bool
     fallback_reason: Optional[str]
     excluded_manual_order_ids: List[str]
+    order_submit_status: Optional[str] = None
+    confirmation_blocked: bool = False
     errors: List[str] = field(default_factory=list)
 
     @property
@@ -547,9 +615,32 @@ def select_scheduled_state_for_reporting(
     scheduled_ids = _order_ids_from_state(state)
     kept = [oid for oid in sorted(scheduled_ids) if oid not in manual_ids]
 
+    oss = order_submit_status(state)
+    confirmation_blocked = oss == ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED
+    if confirmation_blocked:
+        # By contract a confirmation-blocked run has zero scheduled orders. A
+        # malformed/stale artifact could still carry a stray order_id (e.g. a
+        # partial write before the status field was finalized); never let that
+        # leak through as scheduled order-id evidence.
+        kept = []
+
     used_fallback = False
     fallback_reason: Optional[str] = None
-    if not kept and scheduled_state_write_failed and broker_window_orders is not None:
+    # A confirmation-blocked run (and any other explicit no-submit status) has
+    # no orders by design, so it is not a write failure and must never trigger
+    # the broker time-window fallback.
+    if (
+        not kept
+        and scheduled_state_write_failed
+        and broker_window_orders is not None
+        and oss not in {
+            ORDER_SUBMIT_STATUS_NO_CANDIDATES,
+            ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED,
+            ORDER_SUBMIT_STATUS_ERROR,
+            ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED,
+            ORDER_SUBMIT_STATUS_DRY_RUN,
+        }
+    ):
         # Valid scheduled state exists but has no usable order IDs due to a known
         # write failure: attribute broker orders that fall inside the scheduled
         # ET window, still excluding manual IDs.
@@ -575,6 +666,8 @@ def select_scheduled_state_for_reporting(
         used_broker_fallback=used_fallback,
         fallback_reason=fallback_reason,
         excluded_manual_order_ids=sorted(manual_ids),
+        order_submit_status=oss,
+        confirmation_blocked=confirmation_blocked,
         errors=[],
     )
 
@@ -583,6 +676,14 @@ __all__ = [
     "STATE_SCHEMA_VERSION",
     "CRON_ID",
     "SUPERSEDES_CRON_ID",
+    "ORDER_SUBMIT_STATUS_SUBMITTED",
+    "ORDER_SUBMIT_STATUS_NO_CANDIDATES",
+    "ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED",
+    "ORDER_SUBMIT_STATUS_ERROR",
+    "ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED",
+    "ORDER_SUBMIT_STATUS_DRY_RUN",
+    "order_submit_status",
+    "is_confirmation_blocked",
     "build_scheduled_classification",
     "build_manual_classification",
     "scheduled_run_id",
@@ -594,6 +695,7 @@ __all__ = [
     "is_manual_state",
     "is_scheduled_state",
     "write_run_artifacts",
+    "update_latest_scheduled_run_pointer",
     "collect_manual_order_ids",
     "exclude_manual_orders",
     "select_scheduled_state_for_reporting",

@@ -472,6 +472,20 @@ class OrderFill:
     order_filled_at: Optional[datetime] = None
 
 
+class OrderConfirmationRequiredError(Exception):
+    """Raised by a BrokerAdapter when review passed but submission needs confirmation.
+
+    Some brokers require additional post-review user confirmation (e.g. a
+    step-up/2FA gate) before a reviewed order will actually submit. This is a
+    normal, expected broker response, not a placement failure: no order was
+    attempted and nothing needs retrying by this run. Per
+    schemas/run_state.schema.json, a run that hits this is still valid
+    scheduled-run evidence that the task executed and passed review; it must be
+    recorded distinctly (``not_submitted_confirmation_required``) rather than
+    counted as an error.
+    """
+
+
 class BrokerAdapter(Protocol):
     def account_number(self) -> str:
         """Return the account number that will be used for orders."""
@@ -489,7 +503,11 @@ class BrokerAdapter(Protocol):
         """Return (approved, reason) from broker-side order review."""
 
     def place_market_buy(self, ticker: str, notional_usd: float, ref_id: str) -> str:
-        """Place a notional regular-hours market buy and return an order id."""
+        """Place a notional regular-hours market buy and return an order id.
+
+        May raise ``OrderConfirmationRequiredError`` when review passed but the
+        broker requires additional confirmation before it will submit.
+        """
 
     def get_order_fill(self, order_id: str) -> Optional[OrderFill]:
         """Return fill details for a placed order, or None if not yet filled."""
@@ -1120,6 +1138,54 @@ def build_usage_proxy(
     }
 
 
+def _derive_order_submit_status(
+    config: "StrategyConfig", buy_candidates: Sequence[Dict[str, Any]], errors_count: int
+) -> str:
+    """Classify the run's overall order-submission outcome for run_classification/reporting.
+
+    Precedence (most concrete evidence first): a dry run is always reported as
+    such regardless of individual candidate outcomes; any real submitted order
+    makes the whole run "submitted" evidence even if other candidates were
+    blocked; an empty candidate list (no BUY signals at all that cycle) is its
+    own explicit state rather than being confused with a blocked/error run; a
+    broker confirmation-required response is surfaced distinctly so
+    reporting/the watchdog know the task ran and passed review but placed
+    nothing; unexpected provider/placement errors are reported as such; any
+    other block (budget cap, buying power, tradability) falls back to
+    budget_exhausted, the closest existing category.
+    """
+    try:
+        from scripts.run_classification import (
+            ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED,
+            ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED,
+            ORDER_SUBMIT_STATUS_DRY_RUN,
+            ORDER_SUBMIT_STATUS_ERROR,
+            ORDER_SUBMIT_STATUS_NO_CANDIDATES,
+            ORDER_SUBMIT_STATUS_SUBMITTED,
+        )
+    except ImportError:
+        from run_classification import (
+            ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED,
+            ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED,
+            ORDER_SUBMIT_STATUS_DRY_RUN,
+            ORDER_SUBMIT_STATUS_ERROR,
+            ORDER_SUBMIT_STATUS_NO_CANDIDATES,
+            ORDER_SUBMIT_STATUS_SUBMITTED,
+        )
+
+    if config.dry_run:
+        return ORDER_SUBMIT_STATUS_DRY_RUN
+    if any(c.get("status") == "submitted" for c in buy_candidates):
+        return ORDER_SUBMIT_STATUS_SUBMITTED
+    if not buy_candidates:
+        return ORDER_SUBMIT_STATUS_NO_CANDIDATES
+    if any(c.get("status") == "not_submitted_confirmation_required" for c in buy_candidates):
+        return ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED
+    if errors_count > 0:
+        return ORDER_SUBMIT_STATUS_ERROR
+    return ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED
+
+
 def build_run_artifacts(
     now: datetime,
     config: StrategyConfig,
@@ -1144,12 +1210,13 @@ def build_run_artifacts(
     Also stamps a ``run_classification`` block (via ``scripts/run_classification``)
     so downstream consumers -- ``dca_reporting``'s manual-order exclusion and
     ``dca_risk``'s scheduled-stream deployment accounting -- can tell a scheduled
-    live run from a manual one from the artifact content alone.
+    live run from a manual one from the artifact content alone. ``manual``
+    selects which block is stamped: False (default) is the scheduled 3:20 PM ET
+    live task, True is a manual/ad hoc invocation.
     """
     now_et = now.astimezone(EASTERN)
     trading_day = now_et.date()
     run_id = f"{trading_day.isoformat()}-{now_et.strftime('%H%M%S')}"
-
     triggered_at_utc = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
         from scripts.run_classification import build_manual_classification, build_scheduled_classification
@@ -1189,6 +1256,7 @@ def build_run_artifacts(
                 "order_id": outcome.get("order_id"),
                 "status": outcome.get("status", "not_submitted"),
                 "skip_reason": outcome.get("skip_reason"),
+                "reviewed_order": outcome.get("reviewed_order"),
             }
         )
 
@@ -1205,10 +1273,11 @@ def build_run_artifacts(
 
     return {
         "run_id": run_id,
+        "run_classification": run_classification,
+        "order_submit_status": _derive_order_submit_status(config, buy_candidates, errors_count),
         "generated_at": now_et.isoformat(),
         "trading_day": trading_day.isoformat(),
         "iso_week": list(iso_week_key(trading_day)),
-        "run_classification": run_classification,
         "broker": config.broker.value,
         "dry_run": config.dry_run,
         "account_number": None,
@@ -1766,7 +1835,8 @@ def run_once(
     notifications_sent: Optional[int] = None,
     cost_control_notes: Optional[Sequence[str]] = None,
     deployment_history_root: Optional[str | Path] = None,
-    manual: bool = False,
+    scheduled: bool = True,
+    classification_state_root: Optional[str | Path] = None,
 ) -> List[ReconciledDecision]:
     now_et = now.astimezone(EASTERN)
     trading_day = now_et.date()
@@ -1900,6 +1970,18 @@ def run_once(
             _block(ticker, MISSING_FILL_BROKER_BLOCKED, f"{ticker}: review blocked order: {review_reason}")
             continue
 
+        # Populated whenever review passed, regardless of the eventual submission
+        # outcome, so a confirmation-blocked or failed placement still records
+        # the order details that were reviewed (schemas/run_state.schema.json).
+        reviewed_order = {
+            "notional_usd": round(decision.suggested_amount_usd, 2),
+            "side": "buy",
+            "order_type": "market",
+            "time_in_force": None,
+            "estimated_price": None,
+            "review_passed": review_ok,
+        }
+
         ref_id = f"graded-dca-{trading_day.isoformat()}-{ticker}"
         if config.dry_run:
             logger.info(
@@ -1916,10 +1998,28 @@ def run_once(
                 "status": "dry_run",
                 "order_id": order_id,
                 "skip_reason": "dry_run: order not placed",
+                "reviewed_order": reviewed_order,
             }
         else:
             try:
                 order_id = broker.place_market_buy(ticker, decision.suggested_amount_usd, ref_id=ref_id)
+            except OrderConfirmationRequiredError:
+                # Review passed but the broker requires additional post-review
+                # confirmation before it will submit -- not an error: no order
+                # was attempted, and this run remains valid scheduled-run
+                # evidence that it executed and passed review.
+                candidate_outcomes[ticker] = {
+                    "status": "not_submitted_confirmation_required",
+                    "order_id": None,
+                    "skip_reason": "broker requires post-review confirmation before submission",
+                    "reviewed_order": reviewed_order,
+                }
+                _block(
+                    ticker,
+                    MISSING_FILL_BROKER_BLOCKED,
+                    f"{ticker}: broker requires confirmation before submission; skipping",
+                )
+                continue
             except Exception as exc:  # noqa: BLE001 - isolate one bad placement from the rest
                 # A failed placement (no order id, terminal/failed state, wrapper error) must
                 # not abort the whole run: earlier successful orders would then lose their
@@ -1930,6 +2030,7 @@ def run_once(
                     "status": "failed",
                     "order_id": None,
                     "skip_reason": f"placement failed: {exc}",
+                    "reviewed_order": reviewed_order,
                 }
                 logger.error("Placement failed for %s: %s", ticker, exc)
                 continue
@@ -1940,7 +2041,12 @@ def run_once(
                 decision.suggested_amount_usd,
                 order_id,
             )
-            candidate_outcomes[ticker] = {"status": "submitted", "order_id": order_id, "skip_reason": None}
+            candidate_outcomes[ticker] = {
+                "status": "submitted",
+                "order_id": order_id,
+                "skip_reason": None,
+                "reviewed_order": reviewed_order,
+            }
 
         if run_result is not None:
             _log_execution(run_result, decision, order_id, broker)
@@ -1973,10 +2079,46 @@ def run_once(
             errors_count=errors_count,
             notifications_sent=notifications_sent,
             cost_control_notes=cost_control_notes,
-            manual=manual,
+            manual=not scheduled,
         )
         paths = write_run_artifacts(artifacts, artifacts_dir)
         logger.info("Wrote run artifacts: %s", paths["run_state"])
+
+        if scheduled and classification_state_root is not None:
+            # Update the latest_scheduled_run.json pointer that reporting/the
+            # watchdog rely on to find the scheduled run -- without this, a
+            # correctly-classified run_state is still invisible to them. Reuse
+            # write_run_artifacts' own directory (rather than recomputing one
+            # from classification_state_root) so this never creates a second
+            # copy of run_state.json in a different location.
+            #
+            # Gated on an explicit classification_state_root (mirroring the
+            # deployment_history_root pattern used elsewhere in this module)
+            # rather than defaulting to scripts.run_classification's own
+            # production STATE_ROOT: a caller that doesn't pass one (including
+            # every existing test that predates this feature) must never
+            # silently write to a real absolute filesystem path.
+            try:
+                from scripts.run_classification import (
+                    update_latest_scheduled_run_pointer,
+                    validate_classification,
+                )
+            except ImportError:
+                from run_classification import (
+                    update_latest_scheduled_run_pointer,
+                    validate_classification,
+                )
+            rc = artifacts.get("run_classification")
+            result = validate_classification(rc if isinstance(rc, dict) else {})
+            if result:
+                update_latest_scheduled_run_pointer(
+                    artifacts, paths["run_state"], classification_state_root
+                )
+            else:
+                logger.error(
+                    "Not updating latest_scheduled_run.json: invalid run_classification (%s)",
+                    "; ".join(result.errors),
+                )
 
     return decisions
 
@@ -2040,6 +2182,7 @@ def run_daily_compact(
     scheduled: bool = True,
     notifications_sent: Optional[int] = None,
     deployment_history_root: Optional[str | Path] = None,
+    classification_state_root: Optional[str | Path] = None,
 ) -> Dict[str, object]:
     """Run one DCA scan and write only compact, structured daily artifacts.
 
@@ -2074,7 +2217,8 @@ def run_daily_compact(
         run_result=run_result,
         notifications_sent=notifications_sent,
         deployment_history_root=deployment_history_root,
-        manual=not scheduled,
+        scheduled=scheduled,
+        classification_state_root=classification_state_root,
     )
 
     out = Path(artifacts_dir)
