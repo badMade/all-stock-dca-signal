@@ -94,23 +94,25 @@ The guard changes sizing only. It does **not** relax any standing constraint:
 - No sells, options, crypto, margin, cancellations; buys only, regular hours,
   one order per ticker per day.
 
-## Live vs. historical ladders
+## Live vs. backtest ladders
 
 - **Live / manual execution** always uses the active
   [`config/sizing_ladder.json`](../config/sizing_ladder.json) — the **$3-base
   0x-to-5x** ladder — unless the kill-switch above caps it to 1x.
-- Older ladder variants (including the 0.1%-to-12% sizing ladders) are
-  **HISTORICAL/SUPERSEDED**, as recorded in the `historical_note` of
-  `config/sizing_ladder.json`. They are never loaded into the live
-  `StrategyConfig`; only the current active ladder drives sizing.
+- **Analytics only**, the 12-month backtest uses the coarser
+  [`config/backtest_sizing_ladder.json`](../config/backtest_sizing_ladder.json):
 
-## Active ticker universe
+  | Drop vs. prior close | Multiplier |
+  |---|---|
+  | 0.1% – <2% | 1x |
+  | 2% – <5% | 1.5x |
+  | 5% – <8% | 2x |
+  | 8%+ | 3x |
 
-The kill-switch operates over the active universe in
-[`config/tickers.json`](../config/tickers.json) (mirrored by
-`near_close_dca.ACTIVE_TICKERS`). **VCX** and **TRLV** are **excluded** from the
-active universe (alongside the pre-existing `BYDDY` exclusion); the corrected
-symbols `IRDM` and `GLW` remain included.
+  This ladder is **never** loaded into the live `StrategyConfig`
+  (`dca_config.load_backtest_sizing_tiers` returns it in isolation); it exists
+  purely so analytics can be run against a simpler curve without touching what
+  the live task does.
 
 ## CLI
 

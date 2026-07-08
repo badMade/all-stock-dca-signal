@@ -16,10 +16,6 @@
       "properties": {
         "monthly_cash_allocation_usd": { "type": "number", "minimum": 0 },
         "kill_switch_7d_deploy_fraction": { "type": "number", "minimum": 0, "maximum": 1 },
-        "rolling_burn_window_days": { "type": "integer", "minimum": 1 },
-        "kill_switch_window_days": { "type": "integer", "minimum": 1 },
-        "cap_multiplier_when_engaged": { "type": "number", "minimum": 0 },
-        "deployment_stream": { "type": "string" },
         "description": { "type": "string" }
       }
     },

@@ -97,15 +97,28 @@ def load_budgets(config_dir: Path) -> Dict[str, Any]:
     for json_key, config_field in field_map.items():
         if json_key in data:
             out[config_field] = float(data[json_key])
-    # The risk_guard block may override the monthly allocation and the 7-day
-    # deploy fraction that engages the kill-switch. deployed_last_7d_usd is a
-    # runtime-only field and is never loaded from config.
-    guard = data.get("risk_guard")
-    if isinstance(guard, dict):
-        if "monthly_cash_allocation_usd" in guard:
-            out["monthly_cash_allocation_usd"] = float(guard["monthly_cash_allocation_usd"])
-        if "kill_switch_7d_deploy_fraction" in guard:
-            out["kill_switch_7d_deploy_fraction"] = float(guard["kill_switch_7d_deploy_fraction"])
+    # The dynamic risk guard's tunables live under a nested ``risk_guard`` block.
+    # deployed_last_7d_usd is intentionally never sourced from config — it is a
+    # runtime figure injected per run by dca_risk.apply_risk_guard.
+    risk = data.get("risk_guard")
+    if isinstance(risk, dict):
+        if "monthly_cash_allocation_usd" in risk:
+            nested_allocation = float(risk["monthly_cash_allocation_usd"])
+            if (
+                "monthly_cash_allocation_usd" in out
+                and out["monthly_cash_allocation_usd"] != nested_allocation
+            ):
+                raise ValueError(
+                    "budgets.json monthly_cash_allocation_usd differs between top-level and risk_guard"
+                )
+            out["monthly_cash_allocation_usd"] = nested_allocation
+        if "kill_switch_7d_deploy_fraction" in risk:
+            fraction = float(risk["kill_switch_7d_deploy_fraction"])
+            if not 0 <= fraction <= 1:
+                raise ValueError(
+                    f"kill_switch_7d_deploy_fraction must be between 0 and 1, got {fraction}"
+                )
+            out["kill_switch_7d_deploy_fraction"] = fraction
     return out
 
 
@@ -132,6 +145,33 @@ def load_sizing_tiers(config_dir: Path) -> Dict[str, Any]:
     if "base_amount_usd" in data:
         out["base_buy_amount_usd"] = float(data["base_amount_usd"])
     return out
+
+
+def load_backtest_sizing_tiers(config_dir: Path) -> tuple[tuple[float, float], ...]:
+    """Return the analytics-only backtest ladder tiers as (fraction, multiplier).
+
+    Read from ``backtest_sizing_ladder.json``. This ladder is for the 12-month
+    analytics backtest ONLY and is intentionally NOT overlaid onto StrategyConfig
+    — the live/manual execution ladder is always ``sizing_ladder.json``. Returns
+    an empty tuple when the file is absent.
+    """
+    data = _read_json(config_dir / "backtest_sizing_ladder.json")
+    if data is None:
+        return ()
+    tiers_raw = data.get("tiers")
+    if not isinstance(tiers_raw, list) or not tiers_raw:
+        return ()
+    tiers: List[tuple] = []
+    for tier in tiers_raw:
+        if "min_drop_pct" not in tier or "multiplier" not in tier:
+            raise ValueError(f"backtest sizing tier missing min_drop_pct/multiplier: {tier}")
+        threshold = float(tier["min_drop_pct"]) / 100.0
+        multiplier = float(tier["multiplier"])
+        if threshold < 0 or multiplier < 0:
+            raise ValueError(f"backtest sizing tier has negative threshold/multiplier: {tier}")
+        tiers.append((threshold, multiplier))
+    tiers.sort()
+    return tuple(tiers)
 
 
 def load_approved_dates(config_dir: Path) -> Dict[str, Any]:

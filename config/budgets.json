@@ -1,6 +1,6 @@
 {
   "$schema": "../schemas/budgets.schema.json",
-  "version": "2026-07-08",
+  "version": "2026-07-07",
   "currency": "USD",
   "base_amount_usd": 3.0,
   "base_amount_policy": {
@@ -17,11 +17,7 @@
   "risk_guard": {
     "monthly_cash_allocation_usd": 3600.0,
     "kill_switch_7d_deploy_fraction": 0.40,
-    "rolling_burn_window_days": 30,
-    "kill_switch_window_days": 7,
-    "cap_multiplier_when_engaged": 1.0,
-    "deployment_stream": "scheduled_live_afternoon",
-    "description": "Dynamic risk guard. A rolling 30-day cash-burn rate is tracked for visibility. When capital deployed in any trailing 7-day window exceeds kill_switch_7d_deploy_fraction (40%) of monthly_cash_allocation_usd, the graded ladder is capped at cap_multiplier_when_engaged (1x): the strategy keeps buying dips at the base amount but stops scaling up until the 7-day window rolls back under the threshold. Deployment is counted only from the scheduled-live afternoon stream (scheduled run_origin, timestamp at/after 2:30 PM ET); manual and other streams are excluded. See docs/risk_management.md and dca_risk.py."
+    "description": "Dynamic risk guard. A rolling 30-day cash-burn rate is tracked for visibility. When capital deployed in any trailing 7-day window exceeds kill_switch_7d_deploy_fraction (40%) of monthly_cash_allocation_usd, the graded ladder is capped at 1x: the strategy keeps buying dips at the base amount but stops scaling up until the 7-day window rolls back under the threshold. Deployment is counted only from scheduled-live afternoon evidence (run_origin='scheduled', manual_run=false, timestamp at/after 2:30 PM ET); manual and other streams are excluded. See docs/risk_management.md and dca_risk.py."
   },
   "budget_tiers": [
     {

@@ -35,7 +35,7 @@ import argparse
 import dataclasses
 import json
 import logging
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 from zoneinfo import ZoneInfo
@@ -66,14 +66,7 @@ STREAM_OTHER = "other"
 # --- run_state parsing -------------------------------------------------------
 
 def find_run_state_files(root: str | Path) -> List[Path]:
-    """Return every ``run_state*.json`` at or below ``root`` (sorted).
-
-    No date/mtime bound: callers may report retrospectively (``--as-of`` for a
-    past date) or read a restored artifact tree whose file mtimes don't match
-    the trading days they contain, so filtering here by wall-clock recency
-    would silently undercount. Callers that need to bound cost by relevance
-    should filter the returned states by their own ``trading_day``/``as_of``.
-    """
+    """Return every ``run_state*.json`` at or below ``root`` (sorted)."""
     root_path = Path(root)
     if root_path.is_file():
         return [root_path]
@@ -155,7 +148,7 @@ def is_afternoon_scheduled_evidence(state: Dict[str, Any]) -> bool:
     dt = run_timestamp_et(state)
     if dt is None:
         return False
-    return dt.time() >= AFTERNOON_EVIDENCE_FLOOR_ET
+    return dt.timetz().replace(tzinfo=None) >= AFTERNOON_EVIDENCE_FLOOR_ET
 
 
 def deployed_usd(state: Dict[str, Any]) -> float:
@@ -238,10 +231,10 @@ def deployed_by_day(
 
 def total_deployed(deploy_by_day: Dict[date, float], as_of: date, window_days: int) -> float:
     """Sum deployment over the trailing ``window_days`` ending on ``as_of`` (inclusive)."""
-    start_date = as_of - timedelta(days=window_days - 1)
+    start_ordinal = as_of.toordinal() - (window_days - 1)
     total = sum(
         amount for day, amount in deploy_by_day.items()
-        if start_date <= day <= as_of
+        if start_ordinal <= day.toordinal() <= as_of.toordinal()
     )
     return round(total, 2)
 
@@ -263,10 +256,9 @@ def rolling_cash_burn(
     does not spike just because trades cluster on a few days.
     """
     total = total_deployed(deploy_by_day, as_of, window_days)
-    start_date = as_of - timedelta(days=window_days - 1)
     active = {
         day: amt for day, amt in deploy_by_day.items()
-        if start_date <= day <= as_of
+        if as_of.toordinal() - (window_days - 1) <= day.toordinal() <= as_of.toordinal()
     }
     return {
         "as_of": as_of.isoformat(),
@@ -361,17 +353,14 @@ def build_risk_report(
 # --- CLI ---------------------------------------------------------------------
 
 def _load_states(root: str | Path) -> List[Dict[str, Any]]:
-    from near_close_dca import RUN_STATUS_BLOCKED
-
     states: List[Dict[str, Any]] = []
     for path in find_run_state_files(root):
         try:
-            with path.open(encoding="utf-8") as f:
-                data = json.load(f)
-        except (ValueError, OSError) as exc:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
             logger.warning("skipping unreadable run_state %s: %s", path, exc)
             continue
-        if isinstance(data, dict) and data.get("status") != RUN_STATUS_BLOCKED:
+        if isinstance(data, dict) and data.get("status") != "blocked":
             states.append(data)
     return states
 
@@ -379,11 +368,10 @@ def _load_states(root: str | Path) -> List[Dict[str, Any]]:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Graded DCA rolling cash-burn / kill-switch report")
     parser.add_argument("--state-root", required=True, help="Directory containing run_state*.json artifacts")
-    parser.add_argument("--config-dir", default=None, help="config/ directory to load risk thresholds from")
     parser.add_argument(
         "--as-of",
-        default=None,
-        help="Report date (YYYY-MM-DD); defaults to today in America/New_York",
+        default=datetime.now(EASTERN).date().isoformat(),
+        help="Report date (YYYY-MM-DD); defaults to today",
     )
     parser.add_argument(
         "--monthly-allocation-usd",
@@ -399,16 +387,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    from dca_config import DEFAULT_CONFIG_DIR, load_strategy_config
-
+    from dca_config import load_strategy_config
     overrides: Dict[str, Any] = {}
     if args.monthly_allocation_usd is not None:
         overrides["monthly_cash_allocation_usd"] = args.monthly_allocation_usd
     if args.kill_switch_fraction is not None:
         overrides["kill_switch_7d_deploy_fraction"] = args.kill_switch_fraction
-    config = load_strategy_config(args.config_dir or DEFAULT_CONFIG_DIR, **overrides)
+    config = load_strategy_config(**overrides)
 
-    as_of = date.fromisoformat(args.as_of) if args.as_of else datetime.now(EASTERN).date()
+    as_of = date.fromisoformat(args.as_of)
     states = _load_states(args.state_root)
     report = build_risk_report(states, as_of, config)
     print(json.dumps(report, indent=2, sort_keys=True))
