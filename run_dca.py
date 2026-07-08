@@ -38,10 +38,12 @@ from near_close_dca import (
     Bar,
     BrokerAdapter,
     MarketDataProvider,
+    PriorSameDayAllocation,
     SourceName,
     StrategyConfig,
     StrategyState,
     build_broker,
+    load_prior_same_day_allocations,
     run_daily_compact,
 )
 
@@ -148,6 +150,8 @@ def run_pipeline(
     run_label: str = "daily",
     scheduled: bool = True,
     generate_full_reports: bool = False,
+    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]] = None,
+    prior_allocation_state_root: Optional[str | Path] = None,
 ) -> Dict[str, Any]:
     """Run one compact DCA cycle and (optionally) the full post-trade report set.
 
@@ -155,7 +159,18 @@ def run_pipeline(
     daily path always runs; ``generate_full_reports=True`` additionally renders the
     slippage/coverage reports and the compact Notion sync from the run artifacts
     (heavier work reserved for Friday/manual runs).
+
+    To enable the same-day prior-run offset/top-up guard on the scheduled afternoon
+    run, either pass ``prior_same_day_allocations`` directly or pass
+    ``prior_allocation_state_root`` (the cron_tracking state root) and let this
+    function load the same-day morning/manual allocations via
+    :func:`near_close_dca.load_prior_same_day_allocations`.
     """
+    if prior_same_day_allocations is None and prior_allocation_state_root is not None:
+        trading_day = now.astimezone(EASTERN).date()
+        prior_same_day_allocations = load_prior_same_day_allocations(
+            prior_allocation_state_root, trading_day
+        )
     result = run_daily_compact(
         now,
         config,
@@ -166,6 +181,7 @@ def run_pipeline(
         artifacts_dir=artifacts_dir,
         run_label=run_label,
         scheduled=scheduled,
+        prior_same_day_allocations=prior_same_day_allocations,
     )
     if result.get("blocked"):
         logger.warning("run blocked by date gate for %s; skipping reports", result.get("run_state_path"))

@@ -20,10 +20,16 @@ from near_close_dca import (
     MISSING_FILL_DATA_ERROR,
     MISSING_FILL_EXECUTION_GAP,
     MISSING_FILL_FAILED_TRIGGER,
+    TOP_UP_INCREMENTAL,
+    TOP_UP_MISSING_PRIOR_PRICE,
+    TOP_UP_NO_INCREMENTAL,
+    TOP_UP_NO_PRIOR_RUN,
+    TOP_UP_PRICE_NOT_BELOW,
     USAGE_PROXY_FIELDS,
     Action,
     Bar,
     DryRunBroker,
+    PriorSameDayAllocation,
     ReconciledDecision,
     RunResult,
     SourceName,
@@ -37,7 +43,9 @@ from near_close_dca import (
     classify_execution_quality,
     classify_missing_fill,
     evaluate_source_signal,
+    evaluate_top_up_guard,
     graded_buy_multiplier,
+    load_prior_same_day_allocations,
     reconcile_signals,
     run_and_report,
     run_daily_compact,
@@ -145,6 +153,9 @@ def test_ticker_universe():
     assert "GLWR" not in ACTIVE_TICKERS
     assert "BYDDY" in EXCLUDED_TICKERS
     assert "BYDDY" not in ACTIVE_TICKERS
+    for excluded in ("VCX", "TRLV"):
+        assert excluded in EXCLUDED_TICKERS
+        assert excluded not in ACTIVE_TICKERS
 
 
 # --- Target price selection --------------------------------------------------
@@ -660,6 +671,285 @@ def test_build_usage_proxy_defaults_and_overrides():
     assert usage["orders_placed_count"] == 1
     # a MANUAL_REVIEW decision flags manual recovery even with zero errors.
     assert usage["manual_recovery_required"] is True
+
+
+# --- Same-day prior-run offset / top-up guard --------------------------------
+
+
+def _buy_decision(ticker, suggested_amount_usd, target_price):
+    """A minimal BUY ReconciledDecision for exercising the top-up guard directly."""
+    return ReconciledDecision(
+        ticker=ticker,
+        action=Action.BUY,
+        reason="test buy candidate",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=2.0,
+        suggested_amount_usd=suggested_amount_usd,
+        target_price=target_price,
+    )
+
+
+def test_top_up_guard_no_prior_run_allocates_full_amount():
+    decision = _buy_decision("AAPL", 6.0, target_price=98.0)
+    outcome = evaluate_top_up_guard(decision, None, StrategyConfig())
+    assert outcome.top_up_guard_result == TOP_UP_NO_PRIOR_RUN
+    assert outcome.incremental_order_amount == 6.0
+    assert outcome.skipped is False
+    assert outcome.manual_review is False
+
+
+def test_top_up_guard_lower_price_buys_incremental_difference():
+    # Morning bought $3 at 99.0; afternoon wants $6 and the price is below 99.0.
+    prior = PriorSameDayAllocation("AAPL", amount_usd=3.0, reference_price=99.0, run_id="manual_am", source="manual")
+    decision = _buy_decision("AAPL", 6.0, target_price=98.0)
+    outcome = evaluate_top_up_guard(decision, prior, StrategyConfig())
+    assert outcome.top_up_guard_result == TOP_UP_INCREMENTAL
+    assert outcome.incremental_order_amount == 3.0
+    assert outcome.skipped is False
+    assert outcome.prior_same_day_amount == 3.0
+    assert outcome.prior_same_day_reference_price == 99.0
+    assert outcome.afternoon_decision_price == 98.0
+
+
+def test_top_up_guard_price_not_below_prior_buys_zero():
+    prior = PriorSameDayAllocation("AAPL", amount_usd=3.0, reference_price=98.0, run_id="manual_am", source="manual")
+    # Equal price -> not strictly below -> $0.
+    equal = evaluate_top_up_guard(_buy_decision("AAPL", 6.0, target_price=98.0), prior, StrategyConfig())
+    assert equal.top_up_guard_result == TOP_UP_PRICE_NOT_BELOW
+    assert equal.incremental_order_amount == 0.0
+    assert equal.skipped is True
+    # Higher price -> also $0.
+    higher = evaluate_top_up_guard(_buy_decision("AAPL", 6.0, target_price=98.5), prior, StrategyConfig())
+    assert higher.top_up_guard_result == TOP_UP_PRICE_NOT_BELOW
+    assert higher.incremental_order_amount == 0.0
+    assert higher.skipped is True
+
+
+def test_top_up_guard_prior_exceeds_afternoon_desired_buys_zero():
+    # Morning bought $6; afternoon only wants $3, even into a lower price -> $0.
+    prior = PriorSameDayAllocation("AAPL", amount_usd=6.0, reference_price=99.0, run_id="manual_am", source="manual")
+    outcome = evaluate_top_up_guard(_buy_decision("AAPL", 3.0, target_price=98.0), prior, StrategyConfig())
+    assert outcome.top_up_guard_result == TOP_UP_NO_INCREMENTAL
+    assert outcome.incremental_order_amount == 0.0
+    assert outcome.skipped is True
+
+
+def test_top_up_guard_missing_prior_price_is_conservative_manual_review():
+    # Prior amount known but no comparable reference price -> conservative $0 + manual review.
+    prior = PriorSameDayAllocation("AAPL", amount_usd=3.0, reference_price=None, run_id="manual_am", source="manual")
+    outcome = evaluate_top_up_guard(_buy_decision("AAPL", 6.0, target_price=98.0), prior, StrategyConfig())
+    assert outcome.top_up_guard_result == TOP_UP_MISSING_PRIOR_PRICE
+    assert outcome.incremental_order_amount == 0.0
+    assert outcome.skipped is True
+    assert outcome.manual_review is True
+
+
+def test_top_up_guard_missing_afternoon_price_is_conservative():
+    # Known prior price but no afternoon price (no target, no signals) -> conservative $0.
+    prior = PriorSameDayAllocation("AAPL", amount_usd=3.0, reference_price=99.0, run_id="manual_am", source="manual")
+    outcome = evaluate_top_up_guard(_buy_decision("AAPL", 6.0, target_price=0.0), prior, StrategyConfig())
+    assert outcome.top_up_guard_result == TOP_UP_MISSING_PRIOR_PRICE
+    assert outcome.incremental_order_amount == 0.0
+    assert outcome.manual_review is True
+
+
+# --- load_prior_same_day_allocations -----------------------------------------
+
+
+def _write_prior_run(root, subdir, run_state, orders_rows=None):
+    run_dir = os.path.join(root, subdir)
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(run_state, handle)
+    if orders_rows is not None:
+        with open(os.path.join(run_dir, "orders.csv"), "w", encoding="utf-8") as handle:
+            handle.write("ticker,status,avg_fill_price\n")
+            for row in orders_rows:
+                handle.write(f"{row['ticker']},{row['status']},{row['avg_fill_price']}\n")
+    return run_dir
+
+
+def _manual_run_state(candidates, generated_at="2026-06-29T10:00:00-04:00", run_origin="manual"):
+    return {
+        "trading_day": "2026-06-29",
+        "generated_at": generated_at,
+        "run_classification": {"run_origin": run_origin, "run_id": f"{run_origin}_am"},
+        "buy_candidates": candidates,
+    }
+
+
+def test_load_prior_same_day_reads_morning_manual_allocation(tmp_path):
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    _write_prior_run(
+        root,
+        "manual_runs/0900",
+        _manual_run_state([
+            {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0, "target_price": 99.0},
+        ]),
+    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert set(allocations) == {"AAPL"}
+    assert allocations["AAPL"].amount_usd == 3.0
+    assert allocations["AAPL"].reference_price == 99.0
+    assert allocations["AAPL"].source == "manual"
+
+
+def test_load_prior_same_day_prefers_orders_csv_fill_price(tmp_path):
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    _write_prior_run(
+        root,
+        "manual_runs/0900",
+        _manual_run_state([
+            {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0, "target_price": 99.0},
+        ]),
+        orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "97.5"}],
+    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    # The actual fill price wins over the recorded signal-time target price.
+    assert allocations["AAPL"].reference_price == 97.5
+
+
+def test_load_prior_same_day_excludes_scheduled_and_after_boundary(tmp_path):
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    # Scheduled run -> never prior context.
+    _write_prior_run(
+        root,
+        "scheduled_runs/20260629_1520ET",
+        _manual_run_state(
+            [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0, "target_price": 99.0}],
+            run_origin="scheduled",
+        ),
+    )
+    # Manual run but after the 2:30 PM ET boundary -> excluded.
+    _write_prior_run(
+        root,
+        "manual_runs/1500",
+        _manual_run_state(
+            [{"ticker": "NVDA", "status": "submitted", "planned_amount_usd": 3.0, "target_price": 99.0}],
+            generated_at="2026-06-29T15:00:00-04:00",
+        ),
+    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert allocations == {}
+
+
+def test_load_prior_same_day_aggregates_amount_and_takes_min_price(tmp_path):
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    _write_prior_run(
+        root,
+        "manual_runs/0900",
+        _manual_run_state(
+            [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0, "target_price": 99.0}],
+            generated_at="2026-06-29T09:00:00-04:00",
+        ),
+    )
+    _write_prior_run(
+        root,
+        "manual_runs/1000",
+        _manual_run_state(
+            [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 4.5, "target_price": 98.0}],
+            generated_at="2026-06-29T10:00:00-04:00",
+        ),
+    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert allocations["AAPL"].amount_usd == 7.5
+    # The afternoon run must beat the best (lowest) earlier entry price.
+    assert allocations["AAPL"].reference_price == 98.0
+
+
+def test_load_prior_same_day_ignores_other_trading_days(tmp_path):
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    state = _manual_run_state(
+        [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0, "target_price": 99.0}]
+    )
+    state["trading_day"] = "2026-06-26"
+    _write_prior_run(root, "manual_runs/0900", state)
+    assert load_prior_same_day_allocations(root, date(2026, 6, 29)) == {}
+
+
+# --- Integration: top-up guard through run_daily_compact ----------------------
+
+
+def test_run_daily_compact_top_up_records_incremental(tmp_path):
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    # 100 -> 98 is a 2% drop -> 2x -> $6 desired. Morning bought $3 at 99.0; the
+    # afternoon quote is 98.0 (< 99.0) so only the $3 difference is bought.
+    prior = {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=3.0, reference_price=99.0, run_id="manual_am", source="manual")}
+
+    run_daily_compact(
+        now, config, state, fin, rh, broker,
+        artifacts_dir=artifacts_dir, prior_same_day_allocations=prior,
+    )
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    aapl = by_ticker["AAPL"]
+    assert aapl["top_up_guard_result"] == TOP_UP_INCREMENTAL
+    assert aapl["incremental_order_amount"] == 3.0
+    assert aapl["afternoon_desired_amount"] == 6.0
+    assert aapl["prior_same_day_amount"] == 3.0
+    assert aapl["prior_same_day_reference_price"] == 99.0
+    assert aapl["prior_same_day_run_id"] == "manual_am"
+    assert aapl["status"] == "dry_run"
+    # A ticker with no prior allocation still buys its full amount.
+    assert by_ticker["NVDA"]["top_up_guard_result"] == TOP_UP_NO_PRIOR_RUN
+    assert by_ticker["NVDA"]["incremental_order_amount"] == 6.0
+
+
+def test_run_daily_compact_fully_offset_still_writes_valid_state(tmp_path):
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-offset")
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    # Every ticker fully offset: prior price 97.0 is below the 98.0 afternoon quote
+    # (price not below prior) so each candidate tops up $0, yet a valid scheduled
+    # run_state must still be written.
+    prior = {
+        t: PriorSameDayAllocation(t, amount_usd=3.0, reference_price=97.0, run_id="manual_am", source="manual")
+        for t in config.tickers
+    }
+
+    result = run_daily_compact(
+        now, config, state, fin, rh, broker,
+        artifacts_dir=artifacts_dir, prior_same_day_allocations=prior,
+    )
+
+    assert result["blocked"] is False
+    assert os.path.exists(result["run_state_path"])
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    assert run_state["budget"]["day_notional_usd"] == 0.0
+    for candidate in run_state["buy_candidates"]:
+        assert candidate["top_up_guard_result"] == TOP_UP_PRICE_NOT_BELOW
+        assert candidate["incremental_order_amount"] == 0.0
+        assert candidate["top_up_skipped"] is True
+
+
+def test_run_daily_compact_manual_run_does_not_block_scheduled(tmp_path):
+    # With the guard active a same-day broker order must NOT block the scheduled run;
+    # a normal (guard-less) run would be blocked by same_day_strategy_order_exists.
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-noblock")
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    class _BlockingBroker(DryRunBroker):
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return True
+
+    blocking = _BlockingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    prior = {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=3.0, reference_price=99.0, run_id="manual_am", source="manual")}
+
+    run_daily_compact(
+        now, config, state, fin, rh, blocking,
+        artifacts_dir=artifacts_dir, prior_same_day_allocations=prior,
+    )
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    aapl = {c["ticker"]: c for c in run_state["buy_candidates"]}["AAPL"]
+    # Guard bypassed the same-day broker block and still topped up.
+    assert aapl["status"] == "dry_run"
+    assert aapl["incremental_order_amount"] == 3.0
 
 
 def _run_all():

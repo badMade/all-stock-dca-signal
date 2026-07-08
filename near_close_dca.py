@@ -88,14 +88,15 @@ DAILY_COST_CONTROL_NOTES = (
 )
 
 ACTIVE_TICKERS = [
-    "DFTX", "TRIN", "AAAU", "SPCX", "TRLV", "RVI", "VCX", "EVR", "LUNR", "IRDM",
+    "DFTX", "TRIN", "AAAU", "SPCX", "RVI", "EVR", "LUNR", "IRDM",
     "DXYZ", "LITE", "ASML", "DRAM", "STX", "MSFT", "AAPL", "AMAT", "AMD", "CBRS",
     "MRVL", "BTX", "STM", "SNDK", "WDC", "TSM", "AVGO", "NVDA", "QBTS", "FLKR",
     "INTC", "GOOGL", "GOOG", "AMZN", "GLW", "MA", "GS", "MU", "NFLX", "XLG",
     "TOPT", "QTOP", "SATA", "RGTI", "IBM",
 ]
 
-EXCLUDED_TICKERS = {"BYDDY"}
+# BYDDY (ADR wind-down), VCX, and TRLV are excluded from the active universe.
+EXCLUDED_TICKERS = {"BYDDY", "VCX", "TRLV"}
 
 
 def _weekday_range(start: date, end: date) -> set:
@@ -209,6 +210,55 @@ class ReconciledDecision:
     target_price_source: str = ""
     target_quote_time: Optional[datetime] = None
     decision_bar_close: float = 0.0
+
+
+# 2:30 PM ET boundary. Morning/manual (market-open recovery and future morning
+# session) runs happen before this time; the scheduled afternoon run happens after
+# it. Orders from before this boundary may be read ONLY as prior-allocation context
+# for the same-day top-up guard -- never as scheduled afternoon execution evidence,
+# slippage, watchdog confirmation, scheduled cost basis, or scheduled fill counts.
+MORNING_MANUAL_BOUNDARY_ET = time(14, 30)
+
+# top_up_guard_result values recorded per candidate on the scheduled afternoon run.
+TOP_UP_NO_PRIOR_RUN = "no_prior_run"  # normal allocation; nothing bought earlier today
+TOP_UP_INCREMENTAL = "incremental_top_up"  # buy only the incremental dollar difference
+TOP_UP_PRICE_NOT_BELOW = "price_not_below_prior_run"  # afternoon price >= prior ref -> $0
+TOP_UP_NO_INCREMENTAL = "no_incremental_difference"  # afternoon desired <= prior amount -> $0
+TOP_UP_MISSING_PRIOR_PRICE = "missing_prior_price"  # prior amount known but no ref price -> $0 (manual review)
+
+
+@dataclass(frozen=True)
+class PriorSameDayAllocation:
+    """Allocation already bought for a ticker by an earlier same-day (morning/manual) run.
+
+    Read as prior-allocation context ONLY by the scheduled afternoon top-up guard;
+    these runs are never counted as scheduled evidence/metrics. ``reference_price`` is
+    the earlier run's decision/fill/target price for the ticker (None when the earlier
+    artifact recorded an amount but no usable price).
+    """
+
+    ticker: str
+    amount_usd: float = 0.0
+    reference_price: Optional[float] = None
+    run_id: Optional[str] = None
+    source: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class TopUpGuardOutcome:
+    """Per-ticker result of the same-day prior-run offset/top-up guard."""
+
+    ticker: str
+    afternoon_desired_amount: float
+    afternoon_decision_price: Optional[float]
+    prior_same_day_amount: float
+    prior_same_day_reference_price: Optional[float]
+    prior_same_day_run_id: Optional[str]
+    prior_same_day_source: Optional[str]
+    incremental_order_amount: float
+    top_up_guard_result: str
+    skipped: bool
+    manual_review: bool = False
 
 
 @dataclass(frozen=True)
@@ -984,6 +1034,82 @@ def _signal_target_price(decision: ReconciledDecision) -> Optional[float]:
     return None
 
 
+def _afternoon_decision_price(decision: ReconciledDecision) -> Optional[float]:
+    """Return the current afternoon decision price used to compare against a prior run.
+
+    Prefer the reconciled execution target (the signal-time quote), falling back to the
+    decision-bar close derived from the source signals. Returns None when neither is
+    available so the top-up guard can behave conservatively rather than guess.
+    """
+    if decision.target_price and decision.target_price > 0:
+        return decision.target_price
+    return _signal_target_price(decision)
+
+
+def evaluate_top_up_guard(
+    decision: ReconciledDecision,
+    prior: Optional[PriorSameDayAllocation],
+    config: StrategyConfig,
+) -> TopUpGuardOutcome:
+    """Compute the same-day prior-run offset/top-up for one afternoon buy candidate.
+
+    A morning/manual run must never block the scheduled afternoon run; instead the
+    afternoon run only tops up, and only when it is buying into a lower price:
+
+      * No earlier same-day allocation for the ticker -> normal allocation (buy the
+        full afternoon desired amount).
+      * Earlier allocation exists and the afternoon decision price is *below* the
+        earlier run's reference price -> buy only the incremental dollar difference
+        (afternoon desired minus the amount already bought), and $0 if that is <= 0.
+      * Earlier allocation exists but the afternoon price is not below the reference
+        price -> buy $0.
+      * Earlier amount is known but its reference price (or the current afternoon
+        price) is missing -> conservative $0 with ``manual_review`` flagged, rather
+        than topping up blind.
+    """
+    desired = round(decision.suggested_amount_usd, 2)
+    afternoon_price = _afternoon_decision_price(decision)
+
+    def _outcome(
+        incremental: float,
+        result: str,
+        *,
+        skipped: bool,
+        manual_review: bool = False,
+    ) -> TopUpGuardOutcome:
+        return TopUpGuardOutcome(
+            ticker=decision.ticker,
+            afternoon_desired_amount=desired,
+            afternoon_decision_price=afternoon_price,
+            prior_same_day_amount=round(prior.amount_usd, 2) if prior else 0.0,
+            prior_same_day_reference_price=prior.reference_price if prior else None,
+            prior_same_day_run_id=prior.run_id if prior else None,
+            prior_same_day_source=prior.source if prior else None,
+            incremental_order_amount=round(max(0.0, incremental), 2),
+            top_up_guard_result=result,
+            skipped=skipped,
+            manual_review=manual_review,
+        )
+
+    # No earlier same-day allocation: behave exactly like a normal scheduled run.
+    if prior is None or prior.amount_usd <= 0:
+        return _outcome(desired, TOP_UP_NO_PRIOR_RUN, skipped=desired <= 0)
+
+    # Prior amount is known but we cannot establish a comparable price on either side.
+    # Prefer the conservative no-top-up path and flag the ticker for manual review.
+    if prior.reference_price is None or afternoon_price is None:
+        return _outcome(0.0, TOP_UP_MISSING_PRIOR_PRICE, skipped=True, manual_review=True)
+
+    # Only top up when buying into a lower price than the earlier same-day run.
+    if afternoon_price >= prior.reference_price:
+        return _outcome(0.0, TOP_UP_PRICE_NOT_BELOW, skipped=True)
+
+    incremental = desired - round(prior.amount_usd, 2)
+    if incremental <= 0:
+        return _outcome(0.0, TOP_UP_NO_INCREMENTAL, skipped=True)
+    return _outcome(incremental, TOP_UP_INCREMENTAL, skipped=False)
+
+
 def _signal_row(ticker: str, source: str, signal: Optional[SourceSignal]) -> Dict[str, Any]:
     if signal is None:
         return {
@@ -1095,12 +1221,16 @@ def build_run_artifacts(
     errors_count: int = 0,
     notifications_sent: Optional[int] = None,
     cost_control_notes: Optional[Sequence[str]] = None,
+    top_up_outcomes: Optional[Dict[str, "TopUpGuardOutcome"]] = None,
 ) -> Dict[str, Any]:
     """Build the structured run-state dict written by the daily live-run path.
 
     The artifact captures everything downstream reporting needs: per-source signal
     rows, buy candidates with the target price at signal time and the per-symbol
     planned dollar amount, order ids, skip/block reasons, and budget/reserve fields.
+    When ``top_up_outcomes`` is supplied (the scheduled afternoon run applied the
+    same-day prior-run offset/top-up guard), each candidate also records the guard's
+    prior-allocation context and the resulting incremental order amount.
     """
     now_et = now.astimezone(EASTERN)
     trading_day = now_et.date()
@@ -1117,25 +1247,40 @@ def build_run_artifacts(
             continue
         outcome = candidate_outcomes.get(decision.ticker, {})
         target_price = _signal_target_price(decision)
-        buy_candidates.append(
-            {
-                "ticker": decision.ticker,
-                "reason": decision.reason,
-                "buy_multiplier": decision.buy_multiplier,
-                "planned_amount_usd": round(decision.suggested_amount_usd, 2),
-                "target_price": target_price,
-                "target_price_missing": target_price is None,
-                "decision_bar_close": target_price,
-                "previous_close": (
-                    decision.finance_signal.previous_close
-                    if decision.finance_signal is not None
-                    else (decision.robinhood_signal.previous_close if decision.robinhood_signal else None)
-                ),
-                "order_id": outcome.get("order_id"),
-                "status": outcome.get("status", "not_submitted"),
-                "skip_reason": outcome.get("skip_reason"),
-            }
-        )
+        candidate_row = {
+            "ticker": decision.ticker,
+            "reason": decision.reason,
+            "buy_multiplier": decision.buy_multiplier,
+            "planned_amount_usd": round(decision.suggested_amount_usd, 2),
+            "target_price": target_price,
+            "target_price_missing": target_price is None,
+            "decision_bar_close": target_price,
+            "previous_close": (
+                decision.finance_signal.previous_close
+                if decision.finance_signal is not None
+                else (decision.robinhood_signal.previous_close if decision.robinhood_signal else None)
+            ),
+            "order_id": outcome.get("order_id"),
+            "status": outcome.get("status", "not_submitted"),
+            "skip_reason": outcome.get("skip_reason"),
+        }
+        guard = top_up_outcomes.get(decision.ticker) if top_up_outcomes else None
+        if guard is not None:
+            candidate_row.update(
+                {
+                    "afternoon_desired_amount": round(guard.afternoon_desired_amount, 2),
+                    "afternoon_decision_price": guard.afternoon_decision_price,
+                    "prior_same_day_amount": round(guard.prior_same_day_amount, 2),
+                    "prior_same_day_reference_price": guard.prior_same_day_reference_price,
+                    "prior_same_day_run_id": guard.prior_same_day_run_id,
+                    "prior_same_day_source": guard.prior_same_day_source,
+                    "incremental_order_amount": round(guard.incremental_order_amount, 2),
+                    "top_up_guard_result": guard.top_up_guard_result,
+                    "top_up_skipped": guard.skipped,
+                    "top_up_manual_review": guard.manual_review,
+                }
+            )
+        buy_candidates.append(candidate_row)
 
     planned_spend = sum(c["planned_amount_usd"] for c in buy_candidates)
     high_multiplier_signals = sum(
@@ -1295,12 +1440,181 @@ def _write_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+# Buy-candidate statuses that mean an order was actually placed (and therefore
+# count as prior same-day allocation for the top-up guard).
+_PRIOR_ALLOCATION_STATUSES = frozenset({"submitted", "dry_run", "filled"})
+
+
+def _prior_run_is_scheduled(run_state: Dict[str, Any]) -> bool:
+    """True when a run_state is classified as the scheduled afternoon run.
+
+    Scheduled runs are never read as prior morning/manual allocation context.
+    """
+    classification = run_state.get("run_classification")
+    if isinstance(classification, dict):
+        if classification.get("run_origin") == "scheduled":
+            return True
+        if classification.get("manual_run") is False and classification.get("run_origin") is None:
+            return True
+    return False
+
+
+def _prior_run_before_boundary(run_state: Dict[str, Any], boundary_et: time) -> bool:
+    """True when the run's generated_at (ET) is before the morning/manual boundary.
+
+    Runs with no parseable timestamp are treated as eligible prior context: the guard
+    is conservative (more prior context only ever reduces the afternoon buy), so an
+    unknown time should not silently disable the offset.
+    """
+    raw = run_state.get("generated_at")
+    if not isinstance(raw, str):
+        return True
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return True
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=EASTERN)
+    return parsed.astimezone(EASTERN).timetz().replace(tzinfo=None) < boundary_et
+
+
+def _orders_csv_fill_prices(run_dir: Path) -> Dict[str, float]:
+    """Map ticker -> average fill price from a prior run's orders.csv (filled rows only)."""
+    fills: Dict[str, float] = {}
+    orders_csv = run_dir / "orders.csv"
+    if not orders_csv.exists():
+        return fills
+    try:
+        with orders_csv.open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                ticker = row.get("ticker")
+                if not ticker or (row.get("status") or "").lower() != "filled":
+                    continue
+                raw = row.get("avg_fill_price")
+                try:
+                    price = float(raw) if raw not in (None, "", "-") else None
+                except (TypeError, ValueError):
+                    price = None
+                if price and price > 0:
+                    fills[ticker] = price
+    except OSError:
+        return fills
+    return fills
+
+
+def load_prior_same_day_allocations(
+    state_root: str | Path,
+    trading_day: date,
+    *,
+    boundary_et: time = MORNING_MANUAL_BOUNDARY_ET,
+) -> Dict[str, PriorSameDayAllocation]:
+    """Aggregate earlier same-day allocation context for the scheduled afternoon guard.
+
+    Scans ``state_root`` recursively for ``run_state*.json`` artifacts written earlier
+    the same ``trading_day`` by morning/manual runs (including manual market-open
+    recovery and any future morning session), and returns a per-ticker
+    :class:`PriorSameDayAllocation`. These artifacts are read as prior-allocation
+    context ONLY -- they are deliberately never surfaced as scheduled evidence,
+    slippage, watchdog confirmation, scheduled cost basis, or scheduled fill counts.
+
+    Eligibility mirrors the 2:30 PM ET boundary: only runs generated before
+    ``boundary_et`` on ``trading_day`` are read, scheduled runs are ignored, and only
+    buy candidates whose status shows an order was placed contribute. When multiple
+    earlier runs touched a ticker the dollar amounts are summed and the *lowest*
+    available reference price wins, so the afternoon run must beat the best earlier
+    entry price before it tops up.
+    """
+    root = Path(state_root)
+    if not root.exists():
+        return {}
+
+    aggregated: Dict[str, Dict[str, Any]] = {}
+    for run_state_path in sorted(root.rglob("run_state*.json")):
+        try:
+            run_state = json.loads(run_state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(run_state, dict):
+            continue
+        if run_state.get("trading_day") != trading_day.isoformat():
+            continue
+        if _prior_run_is_scheduled(run_state):
+            continue
+        if not _prior_run_before_boundary(run_state, boundary_et):
+            continue
+
+        classification = run_state.get("run_classification")
+        run_id = None
+        source = None
+        if isinstance(classification, dict):
+            run_id = classification.get("run_id")
+            source = classification.get("run_origin")
+        run_id = run_id or run_state.get("run_id")
+        source = source or "manual"
+
+        fill_prices = _orders_csv_fill_prices(run_state_path.parent)
+        for candidate in run_state.get("buy_candidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            if (candidate.get("status") or "") not in _PRIOR_ALLOCATION_STATUSES:
+                continue
+            ticker = candidate.get("ticker")
+            if not ticker:
+                continue
+            amount = candidate.get("incremental_order_amount")
+            if amount is None:
+                amount = candidate.get("planned_amount_usd")
+            try:
+                amount = float(amount)
+            except (TypeError, ValueError):
+                continue
+            if amount <= 0:
+                continue
+
+            reference_price = fill_prices.get(ticker)
+            if reference_price is None:
+                for key in ("target_price", "decision_bar_close"):
+                    value = candidate.get(key)
+                    if isinstance(value, (int, float)) and value > 0:
+                        reference_price = float(value)
+                        break
+
+            entry = aggregated.setdefault(
+                ticker,
+                {"amount": 0.0, "reference_price": None, "run_id": run_id, "source": source},
+            )
+            entry["amount"] += amount
+            if reference_price is not None:
+                if entry["reference_price"] is None:
+                    entry["reference_price"] = reference_price
+                else:
+                    entry["reference_price"] = min(entry["reference_price"], reference_price)
+            # Keep the most recently scanned run's identity (rglob is sorted, so later
+            # timestamped directories win) for auditability.
+            entry["run_id"] = run_id
+            entry["source"] = source
+
+    return {
+        ticker: PriorSameDayAllocation(
+            ticker=ticker,
+            amount_usd=round(entry["amount"], 2),
+            reference_price=entry["reference_price"],
+            run_id=entry["run_id"],
+            source=entry["source"],
+        )
+        for ticker, entry in aggregated.items()
+    }
+
+
 # Mutually exclusive reasons an active-universe ticker did not produce a filled order.
 MISSING_FILL_FAILED_TRIGGER = "failed DCA trigger"
 MISSING_FILL_BUDGET_CAPPED = "budget capped"
 MISSING_FILL_BROKER_BLOCKED = "broker/tradability/order review blocked"
 MISSING_FILL_DATA_ERROR = "data error"
 MISSING_FILL_EXECUTION_GAP = "execution gap"
+# The scheduled afternoon buy was fully offset by an earlier same-day (morning/manual)
+# allocation via the top-up guard; no incremental order was placed.
+MISSING_FILL_TOP_UP_OFFSET = "top-up offset"
 
 MISSING_FILL_REASONS = (
     MISSING_FILL_FAILED_TRIGGER,
@@ -1308,6 +1622,7 @@ MISSING_FILL_REASONS = (
     MISSING_FILL_BROKER_BLOCKED,
     MISSING_FILL_DATA_ERROR,
     MISSING_FILL_EXECUTION_GAP,
+    MISSING_FILL_TOP_UP_OFFSET,
 )
 
 
@@ -1411,8 +1726,13 @@ def _log_execution(
     decision: ReconciledDecision,
     order_id: str,
     broker: BrokerAdapter,
+    notional_usd: Optional[float] = None,
 ) -> None:
-    """Fetch fill details for a placed order and append a durable execution record."""
+    """Fetch fill details for a placed order and append a durable execution record.
+
+    ``notional_usd`` defaults to the decision's suggested amount but may be overridden
+    with the actual order amount (e.g. the top-up guard's incremental dollar amount).
+    """
     get_fill = getattr(broker, "get_order_fill", None)
     fill: Optional[OrderFill] = None
     if callable(get_fill):
@@ -1425,7 +1745,7 @@ def _log_execution(
         target_price_source=decision.target_price_source,
         target_quote_time=decision.target_quote_time,
         decision_bar_close=decision.decision_bar_close,
-        notional_usd=decision.suggested_amount_usd,
+        notional_usd=decision.suggested_amount_usd if notional_usd is None else notional_usd,
         action_reason=decision.reason,
         order_id=order_id,
         order_submitted_at=fill.order_submitted_at if fill else None,
@@ -1700,6 +2020,7 @@ def run_once(
     run_result: Optional[RunResult] = None,
     notifications_sent: Optional[int] = None,
     cost_control_notes: Optional[Sequence[str]] = None,
+    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]] = None,
 ) -> List[ReconciledDecision]:
     now_et = now.astimezone(EASTERN)
     trading_day = now_et.date()
@@ -1784,23 +2105,58 @@ def run_once(
     state.roll_weekly_reserve(trading_day, config)
 
     candidate_outcomes: Dict[str, Dict[str, Any]] = {}
+    # When prior same-day allocations are supplied this is the scheduled afternoon run:
+    # apply the top-up guard so a morning/manual run never blocks it, and only the
+    # incremental dollar difference (into a lower price) is bought.
+    guard_active = prior_same_day_allocations is not None
+    top_up_outcomes: Dict[str, TopUpGuardOutcome] = {}
 
     for decision in buy_candidates:
         ticker = decision.ticker
+        order_amount = decision.suggested_amount_usd
+
+        if guard_active:
+            outcome = evaluate_top_up_guard(
+                decision, prior_same_day_allocations.get(ticker), config
+            )
+            top_up_outcomes[ticker] = outcome
+            order_amount = outcome.incremental_order_amount
+            if outcome.skipped:
+                candidate_outcomes[ticker] = {
+                    "status": "skipped",
+                    "order_id": None,
+                    "skip_reason": outcome.top_up_guard_result,
+                }
+                if outcome.manual_review:
+                    logger.warning(
+                        "%s: prior same-day amount $%.2f but no comparable price; "
+                        "conservative $0 top-up, manual review required",
+                        ticker,
+                        outcome.prior_same_day_amount,
+                    )
+                _block(
+                    ticker,
+                    MISSING_FILL_TOP_UP_OFFSET,
+                    f"{ticker}: top-up guard offset ({outcome.top_up_guard_result}); no incremental buy",
+                )
+                continue
 
         if state.buys_today(ticker, trading_day) >= config.max_buys_per_ticker_per_day:
             candidate_outcomes[ticker] = {"status": "skipped", "skip_reason": "already bought today"}
             _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: already bought today; skipping")
             continue
-        if broker.same_day_strategy_order_exists(ticker, trading_day):
+        # A morning/manual run must NOT block the scheduled afternoon run: when the
+        # top-up guard is active the earlier same-day allocation is handled above, so
+        # the broker's same-day-order block is intentionally bypassed here.
+        if not guard_active and broker.same_day_strategy_order_exists(ticker, trading_day):
             candidate_outcomes[ticker] = {"status": "skipped", "skip_reason": "same-day broker order exists"}
             _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: same-day broker order already exists; skipping")
             continue
-        if not within_caps(decision, state, trading_day, config):
+        if order_amount <= 0 or order_amount > state.remaining_spend_today(trading_day, config):
             candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "cap would be exceeded"}
             _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: cap would be exceeded; skipping")
             continue
-        if broker.available_buying_power() < decision.suggested_amount_usd:
+        if broker.available_buying_power() < order_amount:
             candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "insufficient buying power"}
             _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: insufficient buying power; skipping")
             continue
@@ -1810,7 +2166,7 @@ def run_once(
             continue
 
         order_reviews_attempted += 1
-        review_ok, review_reason = broker.review_market_buy(ticker, decision.suggested_amount_usd)
+        review_ok, review_reason = broker.review_market_buy(ticker, order_amount)
         if not review_ok:
             candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": f"review blocked: {review_reason}"}
             _block(ticker, MISSING_FILL_BROKER_BLOCKED, f"{ticker}: review blocked order: {review_reason}")
@@ -1821,13 +2177,13 @@ def run_once(
             logger.info(
                 "[DRY RUN] Would buy %s: $%.2f (%s)",
                 ticker,
-                decision.suggested_amount_usd,
+                order_amount,
                 decision.reason,
             )
             if isinstance(broker, DryRunBroker):
-                order_id = broker.place_market_buy(ticker, decision.suggested_amount_usd, ref_id=ref_id)
+                order_id = broker.place_market_buy(ticker, order_amount, ref_id=ref_id)
             else:
-                order_id = f"DRY-RUN-SIM-{ticker}-{decision.suggested_amount_usd:.2f}-{ref_id}"
+                order_id = f"DRY-RUN-SIM-{ticker}-{order_amount:.2f}-{ref_id}"
             candidate_outcomes[ticker] = {
                 "status": "dry_run",
                 "order_id": order_id,
@@ -1835,7 +2191,7 @@ def run_once(
             }
         else:
             try:
-                order_id = broker.place_market_buy(ticker, decision.suggested_amount_usd, ref_id=ref_id)
+                order_id = broker.place_market_buy(ticker, order_amount, ref_id=ref_id)
             except Exception as exc:  # noqa: BLE001 - isolate one bad placement from the rest
                 # A failed placement (no order id, terminal/failed state, wrapper error) must
                 # not abort the whole run: earlier successful orders would then lose their
@@ -1849,17 +2205,17 @@ def run_once(
                 }
                 logger.error("Placement failed for %s: %s", ticker, exc)
                 continue
-            state.record_buy(ticker, trading_day, decision.suggested_amount_usd)
+            state.record_buy(ticker, trading_day, order_amount)
             logger.info(
                 "Placed buy for %s: $%.2f, order_id=%s",
                 ticker,
-                decision.suggested_amount_usd,
+                order_amount,
                 order_id,
             )
             candidate_outcomes[ticker] = {"status": "submitted", "order_id": order_id, "skip_reason": None}
 
         if run_result is not None:
-            _log_execution(run_result, decision, order_id, broker)
+            _log_execution(run_result, decision, order_id, broker, notional_usd=order_amount)
 
     manual_review = [d for d in decisions if d.action == Action.MANUAL_REVIEW]
     if manual_review:
@@ -1889,6 +2245,7 @@ def run_once(
             errors_count=errors_count,
             notifications_sent=notifications_sent,
             cost_control_notes=cost_control_notes,
+            top_up_outcomes=top_up_outcomes if guard_active else None,
         )
         paths = write_run_artifacts(artifacts, artifacts_dir)
         logger.info("Wrote run artifacts: %s", paths["run_state"])
@@ -1954,6 +2311,7 @@ def run_daily_compact(
     run_label: str = "daily",
     scheduled: bool = True,
     notifications_sent: Optional[int] = None,
+    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]] = None,
 ) -> Dict[str, object]:
     """Run one DCA scan and write only compact, structured daily artifacts.
 
@@ -1987,6 +2345,7 @@ def run_daily_compact(
         artifacts_dir=artifacts_dir,
         run_result=run_result,
         notifications_sent=notifications_sent,
+        prior_same_day_allocations=prior_same_day_allocations,
     )
 
     out = Path(artifacts_dir)
