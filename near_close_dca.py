@@ -767,7 +767,10 @@ def kill_switch_engaged(config: StrategyConfig) -> bool:
     allocation = config.monthly_cash_allocation_usd
     if allocation <= 0:
         return False
-    threshold = config.kill_switch_7d_deploy_fraction * allocation
+    fraction = config.kill_switch_7d_deploy_fraction
+    if not 0 <= fraction <= 1:
+        return False
+    threshold = fraction * allocation
     return config.deployed_last_7d_usd > threshold
 
 
