@@ -27,7 +27,6 @@
       "type": "string",
       "enum": [
         "submitted",
-        "partially_submitted",
         "not_submitted_no_candidates",
         "not_submitted_confirmation_required",
         "not_submitted_error",
