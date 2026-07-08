@@ -39,8 +39,11 @@ class FixedDropProvider:
         return Bar(timestamp=ts, open=p, high=p, low=p, close=p, volume=0.0)
 
     def get_intraday_bars(self, ticker, start, end, interval_minutes):
+        # Bars are start-stamped (like Robinhood begins_at). At a 09:45 decision with 5m bars,
+        # the latest completed bar begins at 09:40.
+        ts = end - timedelta(minutes=interval_minutes)
         price = self._prev * (1.0 - self._drops.get(ticker, 0.0))
-        return [Bar(timestamp=end, open=price, high=price, low=price, close=price, volume=100.0)]
+        return [Bar(timestamp=ts, open=price, high=price, low=price, close=price, volume=100.0)]
 
 
 def _now():
