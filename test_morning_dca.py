@@ -185,9 +185,12 @@ def test_manual_run_id_and_no_pointer(tmp_path):
     assert rc["run_origin"] == "manual"
     assert rc["manual_run"] is True
     assert rc["run_id"].startswith("manual_morning_")
-    # Manual runs never write the latest-morning pointer.
+    # Manual runs never write the latest-morning pointer and must not overwrite the scheduled folder.
     assert "latest_morning_run" not in res["paths"]
     assert not (Path(tmp_path) / "latest_morning_run.json").exists()
+    run_state_path = Path(res["paths"]["run_state"])
+    assert "manual_runs" in run_state_path.parts
+    assert rc["run_id"] in run_state_path.parts
 
 
 def test_classification_matches_morning_schema(tmp_path):
