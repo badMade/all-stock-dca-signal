@@ -975,7 +975,10 @@ def test_run_daily_compact_fully_offset_still_writes_valid_state(tmp_path):
     assert os.path.exists(result["run_state_path"])
     with open(result["run_state_path"], encoding="utf-8") as handle:
         run_state = json.load(handle)
-    assert run_state["budget"]["day_notional_usd"] == 0.0
+    # Fix 2: prior amounts are seeded into the ledger before the cap check,
+    # so day_notional reflects the 3 tickers x $3 prior spend even though the
+    # afternoon incremental is $0 for all (price not below prior).
+    assert run_state["budget"]["day_notional_usd"] == 9.0
     for candidate in run_state["buy_candidates"]:
         assert candidate["top_up_guard_result"] == TOP_UP_PRICE_NOT_BELOW
         assert candidate["incremental_order_amount"] == 0.0
@@ -1011,6 +1014,157 @@ def test_run_daily_compact_manual_run_does_not_block_scheduled(tmp_path):
     # must still apply -- the guard bypass is scoped per-ticker, not blanket.
     assert by_ticker["NVDA"]["status"] == "skipped"
     assert by_ticker["NVDA"]["skip_reason"] == "same-day broker order exists"
+
+
+
+
+# --- Fix 1: planned_amount_usd reflects the guarded incremental amount --------
+
+
+def test_build_run_artifacts_uses_guarded_amount_as_planned_notional(tmp_path):
+    """build_run_artifacts must set planned_amount_usd = incremental_order_amount
+    (not the full afternoon desired amount) when a top-up guard outcome is present.
+    The original desired amount must be preserved in afternoon_desired_amount_usd."""
+    from near_close_dca import build_run_artifacts, TopUpGuardOutcome, TOP_UP_INCREMENTAL
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
+    )
+    state = StrategyState()
+    decision = _buy_decision("AAPL", suggested_amount_usd=6.0, target_price=98.0)
+    # Guard says the incremental order is only $3 (prior $3 already spent today).
+    guard = TopUpGuardOutcome(
+        ticker="AAPL",
+        top_up_guard_result=TOP_UP_INCREMENTAL,
+        incremental_order_amount=3.0,
+        afternoon_desired_amount=6.0,
+        afternoon_decision_price=98.0,
+        prior_same_day_amount=3.0,
+        prior_same_day_reference_price=99.0,
+        prior_same_day_run_id="manual_am",
+        prior_same_day_source="manual",
+        skipped=False,
+        manual_review=False,
+    )
+    artifacts = build_run_artifacts(
+        now, config, state, [decision],
+        candidate_outcomes={"AAPL": {"order_id": "x", "status": "dry_run"}},
+        top_up_outcomes={"AAPL": guard},
+    )
+    candidates = {c["ticker"]: c for c in artifacts["buy_candidates"]}
+    assert candidates["AAPL"]["planned_amount_usd"] == 3.0, (
+        "planned_amount_usd must equal incremental_order_amount, not the full desired amount"
+    )
+    assert candidates["AAPL"]["afternoon_desired_amount_usd"] == 6.0, (
+        "original desired amount must be preserved in afternoon_desired_amount_usd"
+    )
+
+
+# --- Fix 2: prior same-day allocations count against the daily/weekly cap ----
+
+
+def test_prior_allocations_count_against_cap(tmp_path):
+    """When the guard is active, prior same-day amounts must be seeded into the
+    budget ledger so that prior + incremental spend together cannot exceed the cap.
+
+    Setup: 1 ticker (AAPL), base=$190, 2% drop -> 2x -> suggested=$380 each,
+    which triggers stress tier ($360/day). Prior=$200 at $99; afternoon=$98 (below
+    prior -> incremental = $380 - $200 = $180).
+
+    Without Fix 2: remaining = $360 (no seeding). $180 < $360 -> cap passes (BUG).
+    With    Fix 2: remaining = $360 - $200 = $160. $180 > $160 -> cap blocks (correct).
+    """
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
+        base_buy_amount_usd=190.0,  # 190 * 2x = $380 > $360 stress cap
+    )
+    state = StrategyState()
+    prior = {
+        "AAPL": PriorSameDayAllocation(
+            "AAPL", amount_usd=200.0, reference_price=99.0, run_id="manual_am", source="manual"
+        )
+    }
+    broker = DryRunBroker(cash=5000.0, reference_prices={"AAPL": 98.0})
+    fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+    artifacts_dir = str(tmp_path / "runs" / "2026-06-29-cap")
+
+    import json as _json
+    result = run_daily_compact(
+        now, config, state, fin, rh, broker,
+        artifacts_dir=artifacts_dir,
+        prior_same_day_allocations=prior,
+    )
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = _json.load(handle)
+
+    candidates = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # $200 prior seeded -> remaining = $360 - $200 = $160.
+    # Guard: $380 desired - $200 prior = $180 incremental.
+    # $180 > $160 remaining -> must be blocked.
+    # (Without Fix 2, remaining = $360 and $180 < $360 -> would slip through.)
+    aapl = candidates["AAPL"]
+    assert aapl["status"] in ("blocked", "skipped"), (
+        f"AAPL should be blocked by cap (prior + incremental > cap); "
+        f"got status={aapl['status']!r}, skip_reason={aapl.get('skip_reason')!r}"
+    )
+
+
+# --- Fix 3: load_prior_same_day_allocations reads full-report run_state ------
+
+
+def test_load_prior_same_day_reads_full_report_run_state_via_orders_csv(tmp_path):
+    """load_prior_same_day_allocations must handle full-report run_states that store
+    'artifacts.orders_csv_path' instead of a top-level 'buy_candidates' list.
+    The run must be a manual/non-scheduled run generated before the 2:30 PM ET
+    boundary to be eligible as prior allocation context."""
+    import csv as _csv
+    import json as _json
+
+    root = str(tmp_path / "state_root")
+    run_dir = os.path.join(root, "2026-06-29-full-report")
+    os.makedirs(run_dir, exist_ok=True)
+
+    # Write an orders.csv with a filled AAPL row.
+    orders_csv_path = os.path.join(run_dir, "orders.csv")
+    with open(orders_csv_path, "w", newline="", encoding="utf-8") as fh:
+        writer = _csv.DictWriter(
+            fh, fieldnames=["ticker", "status", "avg_fill_price", "quantity_filled", "order_id"]
+        )
+        writer.writeheader()
+        writer.writerow({
+            "ticker": "AAPL", "status": "filled",
+            "avg_fill_price": "99.0", "quantity_filled": "0.0303", "order_id": "ord1",
+        })
+
+    # Write a full-report run_state without buy_candidates but with artifacts block.
+    # Use run_origin="manual" and a morning time so it passes the boundary/schedule filters.
+    run_state = {
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T10:00:00-04:00",  # 10 AM ET: before 2:30 PM boundary
+        "run_classification": {"run_origin": "manual", "run_id": "manual_am"},
+        "artifacts": {
+            "orders_csv_path": orders_csv_path,
+        },
+        # Deliberately omit "buy_candidates" to simulate a full-report run_state.
+    }
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as fh:
+        _json.dump(run_state, fh)
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert "AAPL" in allocations, (
+        "full-report run_state without buy_candidates must produce an AAPL allocation via orders_csv_path"
+    )
+    alloc = allocations["AAPL"]
+    assert abs(alloc.reference_price - 99.0) < 0.001
+    assert abs(alloc.amount_usd - 99.0 * 0.0303) < 0.001
 
 
 def _run_all():

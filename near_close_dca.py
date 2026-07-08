@@ -1252,7 +1252,7 @@ def build_run_artifacts(
             "ticker": decision.ticker,
             "reason": decision.reason,
             "buy_multiplier": decision.buy_multiplier,
-            "planned_amount_usd": round(decision.suggested_amount_usd, 2),
+            "planned_amount_usd": round(guard.incremental_order_amount, 2) if (guard := (top_up_outcomes or {}).get(decision.ticker)) is not None else round(decision.suggested_amount_usd, 2),
             "target_price": target_price,
             "target_price_missing": target_price is None,
             "decision_bar_close": target_price,
@@ -1269,6 +1269,7 @@ def build_run_artifacts(
         if guard is not None:
             candidate_row.update(
                 {
+                    "afternoon_desired_amount_usd": round(decision.suggested_amount_usd, 2),
                     "afternoon_desired_amount": round(guard.afternoon_desired_amount, 2),
                     "afternoon_decision_price": guard.afternoon_decision_price,
                     "prior_same_day_amount": round(guard.prior_same_day_amount, 2),
@@ -1579,7 +1580,42 @@ def load_prior_same_day_allocations(
         source = source or "manual"
 
         fills = _orders_csv_fills(run_state_path.parent)
-        for candidate in run_state.get("buy_candidates") or []:
+        # A full-report run_state written by run_and_report()/write_run_state()
+        # stores artifact paths under "artifacts" and "summary_metrics" rather
+        # than a top-level "buy_candidates" array.  When buy_candidates is absent
+        # but an orders_csv_path is recorded, reconstruct prior allocations from
+        # that CSV directly (filled rows only).
+        buy_candidates_raw = run_state.get("buy_candidates")
+        if not buy_candidates_raw:
+            artifacts_block = run_state.get("artifacts")
+            if isinstance(artifacts_block, dict):
+                orders_csv_path = artifacts_block.get("orders_csv_path")
+                if orders_csv_path:
+                    orders_csv_file = Path(orders_csv_path)
+                    if not orders_csv_file.is_absolute():
+                        orders_csv_file = run_state_path.parent / orders_csv_file
+                    if orders_csv_file.exists():
+                        report_fills = _orders_csv_fills(orders_csv_file.parent)
+                        for _ticker, _fill in report_fills.items():
+                            if _fill["quantity_filled"]:
+                                _amount = _fill["avg_fill_price"] * _fill["quantity_filled"]
+                                _ref = _fill["avg_fill_price"]
+                            else:
+                                _amount = 0.0
+                                _ref = None
+                            _entry = aggregated.setdefault(
+                                _ticker,
+                                {"amount": 0.0, "reference_price": None, "run_id": run_id, "source": source},
+                            )
+                            _entry["amount"] += _amount
+                            if _ref is not None:
+                                if _entry["reference_price"] is None:
+                                    _entry["reference_price"] = _ref
+                                else:
+                                    _entry["reference_price"] = min(_entry["reference_price"], _ref)
+                            _entry["run_id"] = run_id
+                            _entry["source"] = source
+        for candidate in buy_candidates_raw or []:
             if not isinstance(candidate, dict):
                 continue
             status = candidate.get("status") or ""
@@ -2158,6 +2194,16 @@ def run_once(
     # call sites), or a manual run could unintentionally double-buy.
     guard_active = scheduled and prior_same_day_allocations is not None
     top_up_outcomes: Dict[str, TopUpGuardOutcome] = {}
+
+    # Seed the budget ledger with prior same-day amounts for guarded tickers so
+    # that the cap check (order_amount > state.remaining_spend_today) sees
+    # prior + incremental spend together and stops topping up when the combined
+    # total would exceed the daily/weekly cap.
+    if guard_active:
+        _buy_candidate_tickers = {d.ticker for d in buy_candidates}
+        for _ticker, _alloc in prior_same_day_allocations.items():
+            if _ticker in _buy_candidate_tickers and _alloc.amount_usd > 0:
+                state.record_buy(_ticker, trading_day, _alloc.amount_usd)
 
     for decision in buy_candidates:
         ticker = decision.ticker
