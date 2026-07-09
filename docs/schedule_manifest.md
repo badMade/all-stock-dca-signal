@@ -72,6 +72,21 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 > and are never afternoon scheduled evidence; live morning fills count only as
 > prior-allocation context for the afternoon same-day top-up guard. See
 > [morning_dca.md](morning_dca.md).
+>
+> **Midday stream note:** the midday `MiddayDCAExecutor` (`a6239dae`, run_type
+> `midday_dca_live`, `state_schema_version='midday-live-v1'`, **trades=yes**)
+> is a single **12:30 PM ET live Robinhood execution** on account `562057042`,
+> writing under `cron_tracking/midday_dca/YYYYMMDD_1230ET/`
+> (`run_id='midday_live_YYYYMMDD_1230ET'`). It reuses the **afternoon 0x-to-5x
+> ladder** and the same $3 base (not the morning 0x-to-3x ladder), the same
+> active universe (excluding BYDDY/VCX/TRLV/RVI), the same confidence rule, and
+> its own `midday` budget ledger. It carries `stream='midday'` and
+> `valid_afternoon_evidence=false`, never updates `latest_scheduled_run.json`,
+> and is never afternoon scheduled evidence. Morning/manual same-day fills are
+> **prior-allocation context only** for the midday top-up guard (midday buys the
+> incremental difference only when its decision price is strictly below the prior
+> reference price); midday fills in turn count only as prior-allocation context
+> for the afternoon 3:20 PM top-up guard. See [midday_dca.md](midday_dca.md).
 > **Base-amount note:** the graded DCA base amount is exactly **$3.00**; every
 > candidate dollar amount is **`$3.00 × multiplier`**. The automation must never
 > infer, discover, or fall back to **$50.00** or any broker/account default. If
@@ -85,6 +100,7 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 | `cd45e95b` | Compact DCA volatility outlier scan | analytics | no | `45 13 * * 1-5` | 9:45 AM weekdays | active |
 | `morning-dca-0945` | Morning graded DCA watchlist / early-warning scan (`MorningDCAExecutor`) | analytics | no | `45 13 * * 1-5` | 9:45 AM weekdays | active |
 | `42173154` | Weekday 10:30 AM morning DCA live Robinhood execution (`MorningDCAExecutor`) | trading | **yes** | `30 14 * * 1-5` | 10:30 AM weekdays | active |
+| `a6239dae` | Weekday 12:30 PM midday DCA live Robinhood execution (`MiddayDCAExecutor`) | trading | **yes** | `30 16 * * 1-5` | 12:30 PM weekdays | active |
 | `e3e6f09e` | Monitor-only graded DCA signal check | monitoring | no | `5 19 * * 1-5` | 3:05 PM weekdays | active |
 | `10ce362c` | Graded DCA automatic live test - $3 allocation (supersedes `ce16ba6b`) | trading | **yes** | `20 19 * * 1-5` | 3:20 PM weekdays | active |
 | `d72aa525` | Capital-priority briefing | analytics | no | `25 19 * * 1-5` | 3:25 PM weekdays | active |
@@ -116,6 +132,14 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 - **Confidence rule:** if a candidate's price/drop passes the ladder but the **intraday trend cannot be validated** (fewer than `trend_min_bars` usable intraday bars at/before the decision time), the run does **not** auto-buy; it classifies the candidate as `execution_status='manual_review_candidate'`. There is no loosened trend-unavailable execution path.
 - Writes live artifacts under `/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/` (`run_id='morning_live_YYYYMMDD_1030ET'`).
 - `stream='morning'`, `run_type='morning_dca_live'`, `state_schema_version='morning-live-v1'`, `valid_afternoon_evidence=false`. Never writes into the afternoon `ce16ba6b` tree or updates `latest_scheduled_run.json`. Morning fills count **only** as prior-allocation context for the afternoon same-day top-up guard — never afternoon scheduled evidence, slippage, watchdog confirmation, scheduled cost basis, or scheduled fill counts.
+
+### `a6239dae` — Weekday 12:30 PM midday DCA live Robinhood execution (`MiddayDCAExecutor`)
+- **Live trading** (executor mode `live`). Runs **12:30 PM ET weekdays** (window 12:25–12:35 PM ET).
+- Uses the **$3 base afternoon 0x-to-5x ladder** (`config/midday_dca.json`, same ladder as the afternoon 3:20 PM stream, intentionally distinct from the morning 0x-to-3x ladder) and its own `midday` budget ledger. **Robinhood account 562057042 only**; Alpaca is read-only for validation/context.
+- Same active universe (excludes BYDDY/VCX/TRLV/RVI). **Confidence rule:** if a candidate's price/drop passes the ladder but the **intraday trend cannot be validated** (fewer than `trend_min_bars` usable intraday bars at/before 12:30), the run does **not** auto-buy; it classifies the candidate as `execution_status='manual_review_candidate'`.
+- Writes live artifacts under `/home/user/workspace/cron_tracking/midday_dca/YYYYMMDD_1230ET/` (`run_id='midday_live_YYYYMMDD_1230ET'`) and updates its own `latest_midday_run.json` pointer.
+- `stream='midday'`, `run_type='midday_dca_live'`, `state_schema_version='midday-live-v1'`, `cron_id='a6239dae'`, `supersedes_cron_id=null`, `valid_afternoon_evidence=false`. Never writes into the morning or afternoon (`ce16ba6b`) trees or updates `latest_scheduled_run.json`.
+- **Same-day top-up guard:** morning/manual earlier same-day allocations (before **2:30 PM ET**, non-scheduled) are **prior-allocation context only** — never midday scheduled evidence. Per ticker, the run buys only the **incremental** dollar difference (midday desired minus amount already bought) and only when the midday decision price is **strictly below** the prior reference price; otherwise **$0**. The run_state records `prior_same_day_amount`, `prior_same_day_reference_price`, `prior_same_day_run_id`/`prior_same_day_source`, `midday_desired_amount`, `midday_decision_price`, `incremental_order_amount`, `top_up_guard_result`, `top_up_skipped`, and `top_up_manual_review`. Midday fills count only as prior-allocation context for the afternoon 3:20 PM top-up guard. See [midday_dca.md](midday_dca.md).
 
 ### `e3e6f09e` — Monitor-only graded DCA signal check
 - Analytics and notifications only; **no trades**. Runs **3:05 PM ET weekdays**.

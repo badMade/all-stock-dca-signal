@@ -517,6 +517,18 @@ class MorningDCAExecutor(DCAExecutor):
     """
 
     stream = MORNING_STREAM
+    # Stream-identity hooks. Subclasses (e.g. the midday executor) override these
+    # to reuse the whole evaluate/build/write pipeline under a different stream
+    # identity without duplicating it. The defaults reproduce the morning stream
+    # exactly, so morning behavior is unchanged.
+    PROFILES: Dict[str, Dict[str, Any]] = MORNING_PROFILES
+    ledger_namespace: str = MORNING_STREAM
+    ladder_name: str = "morning_0x_to_3x"
+    signals_csv_name: str = "morning_signals.csv"
+    latest_pointer_name: str = "latest_morning_run.json"
+    budget_daily_key: str = "morning_daily_cap_usd"
+    budget_weekly_key: str = "morning_weekly_cap_usd"
+    budget_label: str = "morning"
 
     def __init__(
         self,
@@ -526,20 +538,48 @@ class MorningDCAExecutor(DCAExecutor):
         mode: str = MORNING_WATCHLIST_MODE,
         config_dir: Optional[str] = None,
     ) -> None:
-        if mode not in MORNING_PROFILES:
-            raise ValueError(f"unknown morning mode {mode!r}; expected one of {sorted(MORNING_PROFILES)}")
+        if mode not in self.PROFILES:
+            raise ValueError(f"unknown mode {mode!r}; expected one of {sorted(self.PROFILES)}")
         self.mode = mode
-        self.profile = MORNING_PROFILES[mode]
+        self.profile = self.PROFILES[mode]
         self.run_type = self.profile["run_type"]
         self.trades = self.profile["trades"]
-        self.config = config if config is not None else load_morning_config(config_dir, mode=mode)
+        self.config = config if config is not None else self._load_default_config(config_dir, mode)
         self.ledger = ledger or MorningLedger(
+            namespace=self.ledger_namespace,
             daily_cap_usd=self.config.morning_daily_cap_usd,
             weekly_cap_usd=self.config.morning_weekly_cap_usd,
         )
         self._sizing_config = self.config.as_strategy_config()
         self.state_root = self.config.morning_run_state_root or self.profile["state_root"]
         self.decision_time = self.config.decision_time_et or self.profile["decision_time_et"]
+
+    def _load_default_config(self, config_dir: Optional[str], mode: str) -> MorningConfig:
+        """Load this executor's config when none is passed. Overridable per stream."""
+        return load_morning_config(config_dir, mode=mode)
+
+    # -- Reuse hooks (no-ops for the morning stream) -------------------------
+    def _compute_top_up(self, now: datetime, signals: Sequence["MorningSignal"]) -> Dict[str, Any]:
+        """Return per-ticker prior-allocation/top-up outcomes. Empty for morning."""
+        return {}
+
+    def _effective_buy_amount(
+        self, signal: "MorningSignal", top_up_outcomes: Optional[Dict[str, Any]]
+    ) -> float:
+        """Dollar amount actually planned for a buy candidate. Morning: the graded amount."""
+        return signal.hypothetical_amount_usd
+
+    def _augment_buy_candidate_row(
+        self, row: Dict[str, Any], signal: "MorningSignal", top_up_outcomes: Optional[Dict[str, Any]]
+    ) -> None:
+        """Attach stream-specific fields to a buy-candidate row. No-op for morning."""
+        return None
+
+    def _augment_artifacts(
+        self, artifacts: Dict[str, Any], top_up_outcomes: Optional[Dict[str, Any]]
+    ) -> None:
+        """Attach stream-specific top-level artifact fields. No-op for morning."""
+        return None
 
     # -- DCAExecutor hooks ---------------------------------------------------
     @property
@@ -786,16 +826,23 @@ class MorningDCAExecutor(DCAExecutor):
         return [s for s in signals if s.action == Action.BUY and s.multiplier > 0]
 
     def record_buy_candidates(
-        self, trading_day: date, buy_candidates: Sequence[MorningSignal]
+        self,
+        trading_day: date,
+        buy_candidates: Sequence[MorningSignal],
+        top_up_outcomes: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Record this run's buy candidates against the morning ledger.
 
         Call exactly once per run (``run()`` does this before building
         artifacts) -- ``build_artifacts`` itself is side-effect-free, so
         inspecting/rebuilding artifacts never double-counts hypothetical spend.
+        The effective amount (after any stream-specific top-up offset) is what is
+        recorded, so the ledger reflects what the stream actually plans to spend.
         """
         for candidate in buy_candidates:
-            self.ledger.record_hypothetical(trading_day, candidate.hypothetical_amount_usd)
+            self.ledger.record_hypothetical(
+                trading_day, self._effective_buy_amount(candidate, top_up_outcomes)
+            )
 
     # -- Artifacts -----------------------------------------------------------
     def build_artifacts(
@@ -805,6 +852,7 @@ class MorningDCAExecutor(DCAExecutor):
         data_source: str,
         *,
         manual: bool = False,
+        top_up_outcomes: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Assemble the morning run_state dict for the active mode.
 
@@ -824,23 +872,31 @@ class MorningDCAExecutor(DCAExecutor):
             c for c in buy_candidates if c.execution_status == EXEC_MANUAL_REVIEW_CANDIDATE
         ]
 
-        hypothetical_spend = round(sum(c.hypothetical_amount_usd for c in buy_candidates), 2)
+        hypothetical_spend = round(
+            sum(self._effective_buy_amount(c, top_up_outcomes) for c in buy_candidates), 2
+        )
 
         warnings: List[str] = []
         for sig in signals:
             warnings.extend(f"{sig.ticker}: {w}" for w in sig.warnings)
         if self.ledger.over_daily_cap(trading_day):
             warnings.append(
-                f"hypothetical morning day spend {self.ledger.day_planned(trading_day):.2f} exceeds morning daily cap "
-                f"{self.ledger.daily_cap_usd:.2f}"
+                f"hypothetical {self.budget_label} day spend {self.ledger.day_planned(trading_day):.2f} exceeds "
+                f"{self.budget_label} daily cap {self.ledger.daily_cap_usd:.2f}"
             )
         if self.ledger.over_weekly_cap(trading_day):
             warnings.append(
-                f"hypothetical morning week spend {self.ledger.week_planned(trading_day):.2f} exceeds "
-                f"morning weekly cap {self.ledger.weekly_cap_usd:.2f}"
+                f"hypothetical {self.budget_label} week spend {self.ledger.week_planned(trading_day):.2f} exceeds "
+                f"{self.budget_label} weekly cap {self.ledger.weekly_cap_usd:.2f}"
             )
 
         classification = self.run_classification(now, manual=manual)
+
+        buy_candidate_rows = []
+        for c in buy_candidates:
+            row = c.to_row()
+            self._augment_buy_candidate_row(row, c, top_up_outcomes)
+            buy_candidate_rows.append(row)
 
         artifacts = {
             "run_id": classification["run_id"],
@@ -852,15 +908,15 @@ class MorningDCAExecutor(DCAExecutor):
             "iso_week": list(iso_week_key(trading_day)),
             "data_source": data_source,
             "ladder": {
-                "name": "morning_0x_to_3x",
+                "name": self.ladder_name,
                 "base_amount_usd": self.config.base_buy_amount_usd,
                 "tiers": [list(t) for t in self.config.sizing_tiers],
                 "no_buy_below_pct": self.config.minimum_drop_vs_previous_close * 100.0,
             },
             "budget": {
                 "ledger_namespace": self.ledger.namespace,
-                "morning_daily_cap_usd": self.ledger.daily_cap_usd,
-                "morning_weekly_cap_usd": self.ledger.weekly_cap_usd,
+                self.budget_daily_key: self.ledger.daily_cap_usd,
+                self.budget_weekly_key: self.ledger.weekly_cap_usd,
                 "hypothetical_planned_spend_usd": hypothetical_spend,
                 "hypothetical_day_spend_usd": round(self.ledger.day_planned(trading_day), 2),
                 "hypothetical_week_spend_usd": round(self.ledger.week_planned(trading_day), 2),
@@ -875,7 +931,7 @@ class MorningDCAExecutor(DCAExecutor):
             },
             "run_classification": classification,
             "signal_rows": signal_rows,
-            "buy_candidates": [c.to_row() for c in buy_candidates],
+            "buy_candidates": buy_candidate_rows,
             "warnings": warnings,
         }
         if is_live:
@@ -883,6 +939,7 @@ class MorningDCAExecutor(DCAExecutor):
             # that were withheld from auto-buy for downstream manual review.
             artifacts["manual_review_candidates"] = [c.to_row() for c in manual_review]
             artifacts["manual_review_tickers"] = [c.ticker for c in manual_review]
+        self._augment_artifacts(artifacts, top_up_outcomes)
         return artifacts
 
     def write_artifacts(self, artifacts: Dict[str, Any], now: datetime) -> Dict[str, str]:
@@ -903,13 +960,13 @@ class MorningDCAExecutor(DCAExecutor):
         run_state_path = out / "run_state.json"
         run_state_path.write_text(json.dumps(artifacts, indent=2, sort_keys=True), encoding="utf-8")
 
-        signals_path = out / "morning_signals.csv"
+        signals_path = out / self.signals_csv_name
         _write_csv(signals_path, artifacts["signal_rows"])
 
         paths = {"run_state": str(run_state_path), "signals": str(signals_path)}
 
         if not artifacts["run_classification"]["manual_run"]:
-            pointer = Path(self.state_root) / "latest_morning_run.json"
+            pointer = Path(self.state_root) / self.latest_pointer_name
             pointer.parent.mkdir(parents=True, exist_ok=True)
             pointer.write_text(
                 json.dumps(
@@ -924,9 +981,40 @@ class MorningDCAExecutor(DCAExecutor):
                 ),
                 encoding="utf-8",
             )
-            paths["latest_morning_run"] = str(pointer)
+            paths[self.latest_pointer_name.replace(".json", "")] = str(pointer)
 
         return paths
+
+    def _maybe_block_for_holiday(self, now: datetime, *, manual: bool) -> Optional[Dict[str, Any]]:
+        """Return a blocked-run result when ``now`` falls on an NYSE holiday.
+
+        A weekday cron fire on a full market closure has no real session to
+        evaluate. Unlike near_close_dca.MARKET_HOLIDAYS (scoped to the afternoon
+        live-test window and hand-maintained), this stream runs indefinitely with
+        no end date, so it uses the computed nyse_holidays() calendar to stay
+        correct into future years without manual updates. Writes a blocked stub --
+        mirroring near_close_dca's date-gate pattern -- and never advances the
+        scheduled ``latest_*_run.json`` pointer, so it keeps referring to the last
+        real session instead of a non-trading placeholder. Returns None on a
+        normal trading day.
+        """
+        trading_day = now.astimezone(EASTERN).date()
+        if manual or trading_day not in nyse_holidays(trading_day.year):
+            return None
+        out = self.run_state_dir(now)
+        out.mkdir(parents=True, exist_ok=True)
+        state_path = out / "run_state.json"
+        if not state_path.exists():
+            state_path.write_text(
+                json.dumps(
+                    {"trading_day": trading_day.isoformat(), "status": "blocked",
+                     "block_reason": "market holiday", "stream": self.stream},
+                    indent=2, sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+        return {"artifacts": {"trading_day": trading_day.isoformat(), "status": "blocked"},
+                "paths": {"run_state": str(state_path)}}
 
     def run(
         self,
@@ -936,42 +1024,21 @@ class MorningDCAExecutor(DCAExecutor):
         data_source: Optional[str] = None,
         manual: bool = False,
     ) -> Dict[str, Any]:
-        """Evaluate the morning stream and write its artifacts for the active mode.
+        """Evaluate the stream and write its artifacts for the active mode.
 
         Returns ``{"artifacts": <run_state dict>, "paths": <written paths>}``.
         The watchlist scan places no orders; the live mode surfaces
         auto-buy-eligible vs. manual_review candidates per the confidence rule.
         """
-        trading_day = now.astimezone(EASTERN).date()
-        if not manual and trading_day in nyse_holidays(trading_day.year):
-            # A weekday cron fire on a full market closure has no real session
-            # to evaluate. Unlike near_close_dca.MARKET_HOLIDAYS (scoped to the
-            # afternoon live-test window and hand-maintained), the morning
-            # stream runs indefinitely with no end date, so it uses the
-            # computed nyse_holidays() calendar to stay correct into future
-            # years without manual updates. Write a blocked stub -- mirroring
-            # near_close_dca's date-gate pattern -- and never advance
-            # latest_morning_run.json, so the scheduled pointer keeps referring
-            # to the last real session instead of a non-trading placeholder.
-            out = self.run_state_dir(now)
-            out.mkdir(parents=True, exist_ok=True)
-            state_path = out / "run_state.json"
-            if not state_path.exists():
-                state_path.write_text(
-                    json.dumps(
-                        {"trading_day": trading_day.isoformat(), "status": "blocked",
-                         "block_reason": "market holiday", "stream": self.stream},
-                        indent=2, sort_keys=True,
-                    ),
-                    encoding="utf-8",
-                )
-            return {"artifacts": {"trading_day": trading_day.isoformat(), "status": "blocked"},
-                    "paths": {"run_state": str(state_path)}}
+        blocked = self._maybe_block_for_holiday(now, manual=manual)
+        if blocked is not None:
+            return blocked
         signals = self.evaluate(now, data)
         source = data_source or getattr(getattr(data, "source", None), "value", "unknown")
         trading_day = now.astimezone(EASTERN).date()
-        self.record_buy_candidates(trading_day, self._buy_candidates(signals))
-        artifacts = self.build_artifacts(now, signals, source, manual=manual)
+        top_up_outcomes = self._compute_top_up(now, signals)
+        self.record_buy_candidates(trading_day, self._buy_candidates(signals), top_up_outcomes)
+        artifacts = self.build_artifacts(now, signals, source, manual=manual, top_up_outcomes=top_up_outcomes)
         paths = self.write_artifacts(artifacts, now)
         return {"artifacts": artifacts, "paths": paths}
 

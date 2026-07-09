@@ -95,6 +95,35 @@
       "notes": "Live morning Robinhood execution moved from the former 9:45 AM slot to 10:30 AM ET to give a true 60-minute intraday trend window. Robinhood account 562057042 only; Alpaca read-only for validation/context. Uses the $3 base 0x-to-3x morning ladder and the morning budget ledger. CONFIDENCE RULE: if a candidate's price/drop passes but the intraday trend cannot be validated, it does NOT auto-buy; it is classified execution_status='manual_review_candidate' (no loosened trend-unavailable execution path). Writes live artifacts under the morning_dca root (YYYYMMDD_1030ET/, run_id='morning_live_YYYYMMDD_1030ET'); never touches the afternoon ce16ba6b tree or latest_scheduled_run.json. stream='morning', valid_afternoon_evidence=false. Morning fills count only as prior-allocation context for the afternoon same-day top-up guard."
     },
     {
+      "id": "a6239dae",
+      "name": "Weekday 12:30 PM midday DCA live Robinhood execution",
+      "type": "trading",
+      "status": "active",
+      "cron_utc": "30 16 * * 1-5",
+      "et_equivalent": "12:30 PM ET weekdays (EDT)",
+      "trades": true,
+      "broker_account": "robinhood:562057042",
+      "executor": "MiddayDCAExecutor",
+      "executor_mode": "live",
+      "config_file": "config/midday_dca.json",
+      "state_dir": "/home/user/workspace/cron_tracking/midday_dca",
+      "run_classification": {
+        "run_origin": "scheduled",
+        "run_type": "midday_dca_live",
+        "stream": "midday",
+        "cron_id": "a6239dae",
+        "supersedes_cron_id": null,
+        "scheduled_for_et": "12:30",
+        "scheduled_window_start_et": "12:25",
+        "scheduled_window_end_et": "12:35",
+        "state_schema_version": "midday-live-v1",
+        "trades": true,
+        "valid_afternoon_evidence": false,
+        "policy_file": "config/midday_dca.json"
+      },
+      "notes": "Live midday Robinhood execution at 12:30 PM ET. Robinhood account 562057042 only; Alpaca read-only for validation/context. Uses the SAME $3 base 0x-to-5x ladder as the afternoon stream (distinct from the morning 0x-to-3x ladder) and its own midday budget ledger. Same active universe (excludes BYDDY/VCX/TRLV/RVI). CONFIDENCE RULE: if a candidate's price/drop passes but the intraday trend cannot be validated, it does NOT auto-buy; it is classified execution_status='manual_review_candidate' (no loosened trend-unavailable execution path). TOP-UP RULE: morning/manual prior same-day buys are prior-allocation context only; the midday run buys only the incremental difference when the midday price is strictly below the prior reference, else $0. Writes live artifacts under the midday_dca root (YYYYMMDD_1230ET/, run_id='midday_live_YYYYMMDD_1230ET'); never touches the morning roots, the afternoon ce16ba6b tree, or latest_scheduled_run.json. stream='midday', valid_afternoon_evidence=false. Midday fills count only as prior-allocation context for the afternoon same-day top-up guard."
+    },
+    {
       "id": "e3e6f09e",
       "name": "Monitor-only graded DCA signal check",
       "type": "monitoring",

@@ -1,0 +1,137 @@
+{
+  "policy_id": "midday-dca-live-v1",
+  "version": "2026-07-09",
+  "purpose": "Configuration and separation policy for the MIDDAY graded-DCA stream: a single 12:30 PM ET live Robinhood execution (cron a6239dae, run_type='midday_dca_live', trades=true) on account 562057042. It uses the SAME afternoon 0x-to-5x ladder and $3 base, the same active universe (excluding BYDDY/VCX/TRLV/RVI), the same confidence rule, and the same balanced $3-base budget policy. It is INDEPENDENT of, and never valid evidence for, the afternoon live task 10ce362c (which supersedes the deleted ce16ba6b).",
+  "stream": "midday",
+  "confidence_rule": "A candidate whose price/drop passes the ladder is auto-bought ONLY when the intraday trend can be validated (>= trend_min_bars usable intraday bars at or before the 12:30 decision time). If price/drop passes but the intraday trend cannot be validated, the run must NOT auto-buy; it classifies the candidate as execution_status='manual_review_candidate'. There is no loosened trend-unavailable execution path.",
+  "trend_min_bars": 6,
+  "live_task": {
+    "mode": "live",
+    "cron_id": "a6239dae",
+    "cron_expression_edt": "30 16 * * 1-5",
+    "supersedes_cron_id": null,
+    "name": "Weekday 12:30 PM midday DCA live Robinhood execution",
+    "schedule_et": "12:30",
+    "schedule_human": "12:30 PM ET weekdays",
+    "window_start_et": "12:25",
+    "window_end_et": "12:35",
+    "run_type": "midday_dca_live",
+    "state_schema_version": "midday-live-v1",
+    "trades": true,
+    "broker_account": "562057042",
+    "note": "Live Robinhood execution using account 562057042 (Alpaca stays read-only for validation/context). Uses a true intraday trend window at 12:30. Subject to the confidence_rule: no auto-buy when the intraday trend cannot be validated."
+  },
+  "sizing_ladder": {
+    "name": "midday_0x_to_5x",
+    "drop_metric": "fraction_down_vs_previous_regular_session_close",
+    "base_amount_usd": 3.0,
+    "no_buy_below_pct": 0.1,
+    "tiers": [
+      { "min_drop_pct": 0.1, "max_drop_pct": 1.0, "multiplier": 1.0 },
+      { "min_drop_pct": 1.0, "max_drop_pct": 2.0, "multiplier": 1.5 },
+      { "min_drop_pct": 2.0, "max_drop_pct": 3.0, "multiplier": 2.0 },
+      { "min_drop_pct": 3.0, "max_drop_pct": 4.0, "multiplier": 2.5 },
+      { "min_drop_pct": 4.0, "max_drop_pct": 5.0, "multiplier": 3.0 },
+      { "min_drop_pct": 5.0, "max_drop_pct": 6.0, "multiplier": 3.5 },
+      { "min_drop_pct": 6.0, "max_drop_pct": 7.0, "multiplier": 4.0 },
+      { "min_drop_pct": 7.0, "max_drop_pct": 8.0, "multiplier": 4.5 },
+      { "min_drop_pct": 8.0, "max_drop_pct": null, "multiplier": 5.0 }
+    ],
+    "tier_boundary_rule": "min inclusive, max exclusive; the largest tier threshold <= actual drop wins; drop < 0.1% = 0x (no buy).",
+    "separation_note": "This is the SAME 0x-to-5x ladder the afternoon stream uses (config/sizing_ladder.json), intentionally distinct from the morning 0x-to-3x ladder."
+  },
+  "budget_ledger": {
+    "namespace": "midday",
+    "midday_daily_cap_usd": 90.0,
+    "midday_weekly_cap_usd": 450.0,
+    "separation_note": "The midday ledger is a separate session from both the morning ledger and the afternoon StrategyState / BUDGET_TIERS ledger. Midday buys never consume or validate the morning or afternoon 3:20 daily/weekly budget."
+  },
+  "top_up_rule": {
+    "description": "Morning/manual prior same-day buys are prior-allocation context only; they never block the midday run. The midday run tops up only when it is buying into a lower price.",
+    "boundary_et": "14:30",
+    "rules": [
+      "No earlier same-day allocation for the ticker -> normal allocation (buy the full midday desired amount).",
+      "Earlier allocation exists and the midday decision price is strictly below the earlier run's reference price -> buy only the incremental dollar difference (midday desired - amount already bought); $0 if that is <= 0.",
+      "Earlier allocation exists but the midday price is not below the reference price -> buy $0.",
+      "Earlier amount known but no comparable price (missing prior reference or current midday price) -> conservative $0 with top_up_manual_review flagged."
+    ],
+    "prior_allocation_sources": "Morning live and manual runs under the morning-live root; scheduled runs are ignored as prior context. Midday's own runs are eligible prior context for the afternoon guard."
+  },
+  "artifact_paths": {
+    "live_run_state_root": "/home/user/workspace/cron_tracking/midday_dca",
+    "live_scheduled_run_dir": "/home/user/workspace/cron_tracking/midday_dca/YYYYMMDD_1230ET/",
+    "live_latest_run_pointer": "/home/user/workspace/cron_tracking/midday_dca/latest_midday_run.json",
+    "run_state_filename": "run_state.json",
+    "prior_allocation_roots": [
+      "/home/user/workspace/cron_tracking/morning_dca"
+    ],
+    "separation_note": "The midday stream writes ONLY under its own root. It never writes into the morning roots, /home/user/workspace/cron_tracking/ce16ba6b/**, updates latest_scheduled_run.json, or touches afternoon scheduled_runs/ folders."
+  },
+  "scheduled_run_classification": {
+    "live": {
+      "run_origin": "scheduled",
+      "run_type": "midday_dca_live",
+      "stream": "midday",
+      "cron_id": "a6239dae",
+      "supersedes_cron_id": null,
+      "scheduled_for_et": "12:30",
+      "scheduled_window_start_et": "12:25",
+      "scheduled_window_end_et": "12:35",
+      "manual_run": false,
+      "run_id_pattern": "midday_live_YYYYMMDD_1230ET",
+      "trades": true,
+      "valid_afternoon_evidence": false,
+      "state_schema_version": "midday-live-v1"
+    }
+  },
+  "artifact_fields": {
+    "signal_row": [
+      "ticker",
+      "source",
+      "action",
+      "reason",
+      "current_price",
+      "previous_close",
+      "drop_pct",
+      "multiplier",
+      "hypothetical_amount_usd",
+      "execution_status",
+      "trend_validated",
+      "warnings"
+    ],
+    "buy_candidate_top_up": [
+      "prior_same_day_amount",
+      "prior_same_day_reference_price",
+      "prior_same_day_run_id",
+      "prior_same_day_source",
+      "midday_desired_amount",
+      "midday_decision_price",
+      "incremental_order_amount",
+      "top_up_guard_result",
+      "top_up_skipped",
+      "top_up_manual_review"
+    ],
+    "run_state_top_level": [
+      "run_id",
+      "stream",
+      "mode",
+      "trades",
+      "data_source",
+      "run_classification",
+      "ladder",
+      "budget",
+      "signal_rows",
+      "buy_candidates",
+      "top_up_manual_review_tickers",
+      "top_up_offset_tickers",
+      "warnings"
+    ]
+  },
+  "downstream_separation_rules": [
+    "Afternoon consumers glob only /home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/** and therefore never traverse the midday root.",
+    "A midday run_state has stream='midday' and valid_afternoon_evidence=false; any consumer must exclude it from afternoon scheduled-live cost basis, slippage, reliability, and order-count metrics.",
+    "The midday stream does not update latest_scheduled_run.json or write into afternoon scheduled/manual folders.",
+    "Midday fills count only as PRIOR-ALLOCATION CONTEXT for the afternoon same-day top-up guard; they are never afternoon scheduled evidence, slippage, watchdog confirmation, scheduled cost basis, or scheduled fill counts.",
+    "Morning/manual fills count only as PRIOR-ALLOCATION CONTEXT for the midday same-day top-up guard."
+  ]
+}

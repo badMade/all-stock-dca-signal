@@ -1,0 +1,134 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "midday_run_classification.schema.json",
+  "title": "Midday DCA run classification block (12:30 PM ET live execution)",
+  "description": "The run_classification object embedded in every MIDDAY run_state artifact. The midday stream is a single 12:30 PM ET live Robinhood execution (run_type='midday_dca_live', trades=true) on account 562057042. It uses the afternoon 0x-to-5x sizing ladder and the same $3 base. It is INDEPENDENT of the afternoon live task 10ce362c (which supersedes ce16ba6b): stream='midday' and valid_afternoon_evidence=false always, so afternoon slippage/watchdog/weekly reporting never treats a midday artifact as afternoon scheduled evidence. Midday fills count only as prior-allocation context for the afternoon same-day top-up guard, and morning/manual buys count only as prior-allocation context for the midday top-up guard. Contains no secrets.",
+  "type": "object",
+  "required": [
+    "run_origin",
+    "run_type",
+    "stream",
+    "trades",
+    "manual_run",
+    "cron_id",
+    "run_id",
+    "triggered_at_utc",
+    "state_schema_version",
+    "valid_afternoon_evidence"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "run_origin": {
+      "type": "string",
+      "enum": ["scheduled", "manual"],
+      "description": "Origin of the midday run. 'scheduled' is the 12:30 PM ET live execution; everything else is 'manual'."
+    },
+    "run_type": {
+      "type": "string",
+      "enum": ["midday_dca_live"],
+      "description": "'midday_dca_live' for the 12:30 PM ET live execution. Deliberately never the afternoon 'scheduled_live_test' or any morning run_type."
+    },
+    "stream": {
+      "type": "string",
+      "const": "midday",
+      "description": "Stream marker. Always 'midday' so this artifact is never confused with the morning or afternoon stream."
+    },
+    "trades": {
+      "type": "boolean",
+      "const": true,
+      "description": "Always true: the midday stream is a live Robinhood execution."
+    },
+    "manual_run": {
+      "type": "boolean",
+      "description": "true for manual midday runs, false for scheduled midday runs. Must agree with run_origin."
+    },
+    "cron_id": {
+      "type": "string",
+      "enum": ["a6239dae"],
+      "description": "Midday task id: 'a6239dae' for the 12:30 PM ET live execution. Distinct from the morning tasks and the afternoon live task '10ce362c'."
+    },
+    "supersedes_cron_id": {
+      "type": ["string", "null"],
+      "description": "Always null: the midday task supersedes nothing."
+    },
+    "scheduled_for_et": {
+      "type": ["string", "null"],
+      "description": "Nominal ET fire time, HH:MM. '12:30' for scheduled runs; null for manual runs."
+    },
+    "scheduled_window_start_et": {
+      "type": ["string", "null"],
+      "description": "Inclusive start of the accepted midday window in ET, HH:MM."
+    },
+    "scheduled_window_end_et": {
+      "type": ["string", "null"],
+      "description": "Inclusive end of the accepted midday window in ET, HH:MM."
+    },
+    "run_id": {
+      "type": "string",
+      "description": "Unique run id. Scheduled: 'midday_live_YYYYMMDD_1230ET'. Manual: 'manual_midday_live_YYYYMMDD_HHMMSSZ_<suffix>'."
+    },
+    "triggered_at_utc": {
+      "type": "string",
+      "description": "ISO-8601 UTC timestamp when the run was triggered."
+    },
+    "state_schema_version": {
+      "type": "string",
+      "enum": ["midday-live-v1"],
+      "description": "Contract version tag: 'midday-live-v1' for the live execution."
+    },
+    "valid_afternoon_evidence": {
+      "type": "boolean",
+      "const": false,
+      "description": "Always false. A midday artifact is NEVER valid afternoon scheduled-live evidence; it counts only as prior-allocation context for the afternoon same-day top-up guard."
+    },
+    "afternoon_live_cron_id": {
+      "type": "string",
+      "description": "The afternoon live task id ('10ce362c') recorded for cross-reference only."
+    }
+  },
+  "allOf": [
+    {
+      "comment": "Live execution (12:30 PM ET) invariants.",
+      "if": { "properties": { "run_type": { "const": "midday_dca_live" } }, "required": ["run_type"] },
+      "then": {
+        "properties": {
+          "cron_id": { "const": "a6239dae" },
+          "state_schema_version": { "const": "midday-live-v1" },
+          "trades": { "const": true }
+        }
+      }
+    },
+    {
+      "comment": "Scheduled live execution: pinned window and run_id pattern.",
+      "if": {
+        "properties": {
+          "run_origin": { "const": "scheduled" },
+          "run_type": { "const": "midday_dca_live" }
+        },
+        "required": ["run_origin", "run_type"]
+      },
+      "then": {
+        "required": ["scheduled_for_et", "scheduled_window_start_et", "scheduled_window_end_et"],
+        "properties": {
+          "manual_run": { "const": false },
+          "scheduled_for_et": { "const": "12:30" },
+          "scheduled_window_start_et": { "const": "12:25" },
+          "scheduled_window_end_et": { "const": "12:35" },
+          "run_id": { "pattern": "^midday_live_[0-9]{8}_1230ET$" }
+        }
+      }
+    },
+    {
+      "comment": "Manual runs never use a scheduled run_id and are always manual_run=true.",
+      "if": { "properties": { "run_origin": { "const": "manual" } }, "required": ["run_origin"] },
+      "then": {
+        "properties": {
+          "manual_run": { "const": true },
+          "run_id": {
+            "not": { "pattern": "^midday_live_[0-9]{8}_1230ET$" }
+          }
+        }
+      }
+    }
+  ]
+}

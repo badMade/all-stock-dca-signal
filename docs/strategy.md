@@ -139,6 +139,14 @@ Per candidate, the scheduled `run_state` records `prior_same_day_amount`,
 `top_up_guard_result`, `top_up_skipped`, and `top_up_manual_review` (see
 [`schemas/run_state.schema.json`](../schemas/run_state.schema.json)).
 
+The **midday** stream applies the same top-up guard against morning/manual prior
+same-day allocations (buying only the incremental difference into a lower price),
+and midday fills in turn become prior-allocation context for the afternoon guard.
+The morning stream ([morning_dca.md](morning_dca.md)) runs the 0x-to-3x ladder;
+the midday stream ([midday_dca.md](midday_dca.md)) is a 12:30 PM ET live
+execution on the same 0x-to-5x ladder as the afternoon run. Both are independent
+of the afternoon 3:20 PM task and never count as afternoon scheduled evidence.
+
 ## Execution constraints
 
 See [`docs/safeguards.md`](safeguards.md) for the full list. Summary:
