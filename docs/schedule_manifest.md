@@ -41,6 +41,18 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 > validated scheduled runs and exclude manual runs/order IDs. See
 > [run_classification.md](run_classification.md).
 
+> **Same-day top-up guard:** a morning/manual run must **never block** the
+> scheduled 3:20 PM ET run. Instead the scheduled run reads earlier same-day
+> morning/manual allocations (as prior-allocation context only — never as
+> scheduled evidence, slippage, watchdog confirmation, scheduled cost basis, or
+> scheduled fill counts) and, per ticker, buys only the **incremental** dollar
+> difference between the afternoon desired amount and the amount already bought,
+> and only when the afternoon decision price is **strictly below** the earlier
+> run's reference price. Otherwise it buys **$0** for that ticker. Only earlier
+> runs generated **before 2:30 PM ET** contribute; scheduled runs are excluded.
+> The scheduled run still writes a valid scheduled run_state even when every buy
+> is fully offset to $0. See [strategy.md](strategy.md#same-day-prior-run-offset--top-up-guard).
+>
 > **Morning dry-run note:** a separate **dry-run / analytics-only** morning
 > stream (`MorningDCAExecutor`) grades morning weakness vs. yesterday's close on
 > its own **0x-to-3x** ladder and its own `morning` budget ledger, writing under
@@ -98,6 +110,7 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 - **State-file guarantee:** **always** writes the scheduled `run_state.json` and updates `latest_scheduled_run.json` on every fire, **even when no order is placed**. A confirmation-blocked run (review passed, submission blocked by required post-review confirmation) records `order_submit_status='not_submitted_confirmation_required'`, `reviewed_order` details where available, candidate details, and **no `order_id`** — valid scheduled-run evidence, not order/fill evidence.
 - **Run classification:** a scheduled run writes `scheduled_runs/YYYYMMDD_1520ET/run_state.json` (`run_origin='scheduled'`, `manual_run=false`, `scheduled_for_et='15:20'`, `state_schema_version='run-classification-v1'`, `run_id='scheduled_YYYYMMDD_1520ET'`, and **both** `cron_id='10ce362c'` **and** `supersedes_cron_id='ce16ba6b'`) and updates `latest_scheduled_run.json`; a manual run writes `manual_runs/<timestamp>/run_state.json` (`run_origin='manual'`, `manual_run=true`) and never updates that pointer. Placeholder/ambiguous ids such as `ce16ba6b_replacement` are forbidden; for continuity, consumers still accept `cron_id='10ce362c'` OR `supersedes_cron_id='ce16ba6b'` as valid evidence. See [run_classification.md](run_classification.md).
 - **Manual runs do not count as scheduled-run evidence.** Any stale stored display name is superseded by the authoritative **3:20 PM ET** schedule.
+- **Same-day top-up guard:** loads earlier same-day (before **2:30 PM ET**, non-scheduled) allocations from the artifact root and offsets each ticker so it buys only the incremental amount into a lower price; per-candidate the run_state records `prior_same_day_amount`, `prior_same_day_reference_price`, `prior_same_day_run_id`/`prior_same_day_source`, `afternoon_desired_amount`, `afternoon_decision_price`, `incremental_order_amount`, `top_up_guard_result`, `top_up_skipped`, and `top_up_manual_review`. A fully-offset day still writes a valid scheduled run_state. See [strategy.md](strategy.md#same-day-prior-run-offset--top-up-guard).
 
 ### `d72aa525` — Capital-priority briefing
 - Analytics only, **no trading**. Runs **3:25 PM ET weekdays**.

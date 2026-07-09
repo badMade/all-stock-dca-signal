@@ -32,15 +32,15 @@ The order dollar amount before budget constraints is
 
 ## Active ticker universe
 
-45 active symbols (see [`config/tickers.json`](../config/tickers.json)):
+43 active symbols (see [`config/tickers.json`](../config/tickers.json)):
 
 ```
-DFTX TRIN AAAU SPCX TRLV RVI VCX EVR LUNR IRDM DXYZ LITE ASML DRAM STX
+DFTX TRIN AAAU SPCX RVI EVR LUNR IRDM DXYZ LITE ASML DRAM STX
 MSFT AAPL AMAT AMD CBRS MRVL BTX STM SNDK WDC TSM AVGO NVDA QBTS FLKR
 INTC GOOGL GOOG AMZN GLW MA GS MU NFLX XLG TOPT QTOP SATA RGTI IBM
 ```
 
-- **Excluded:** `BYDDY`
+- **Excluded:** `BYDDY`, `VCX`, `TRLV`
 - **Symbol corrections applied:** `IRDMI -> IRDM`, `GLWR -> GLW`
 
 ## Sizing ladder (latest, active)
@@ -100,6 +100,44 @@ dimension.
 
 Caps are absolute ceilings: a run never exceeds the selected daily cap, the
 selected weekly cap, available buying power, or the broker/order-review limit.
+
+## Same-day prior-run offset / top-up guard
+
+A morning or manual run must **never block** the scheduled afternoon (3:20 PM ET)
+run. Instead, the scheduled run treats any earlier same-day allocation as
+prior-allocation context and **tops up** only when it is buying into a lower
+price:
+
+- **No earlier same-day allocation** for the ticker → normal allocation (buy the
+  full afternoon desired amount).
+- **Earlier allocation exists** and the afternoon decision price is **strictly
+  below** the earlier run's reference price → buy only the **incremental** dollar
+  difference (afternoon desired − amount already bought); $0 if that is ≤ 0.
+- **Earlier allocation exists** but the afternoon price is **not below** the
+  reference price → buy **$0**.
+- **Earlier amount known but no comparable price** (missing prior reference or
+  current afternoon price) → conservative **$0** with `top_up_manual_review`
+  flagged, rather than topping up blind.
+
+Worked example: a morning run bought $3 of a ticker; the afternoon signal wants
+$6. If the afternoon price is below the morning reference, the afternoon run buys
+the **$3** difference. If the afternoon desired ≤ the morning amount, it buys
+**$0**. If the afternoon price is not below the morning reference, it buys **$0**
+even though the signal fired.
+
+Only earlier runs generated **before 2:30 PM ET** contribute, and scheduled runs
+are never read as prior context — so morning/manual orders before 2:30 PM ET are
+read for top-up only, never as afternoon scheduled execution evidence,
+slippage, watchdog confirmation, scheduled cost basis, or scheduled fill counts.
+When multiple earlier runs touched a ticker the dollar amounts are summed and the
+**lowest** available reference price wins. The scheduled run always writes a valid
+scheduled `run_state` even when every buy is fully offset to $0.
+
+Per candidate, the scheduled `run_state` records `prior_same_day_amount`,
+`prior_same_day_reference_price`, `prior_same_day_run_id`, `prior_same_day_source`,
+`afternoon_desired_amount`, `afternoon_decision_price`, `incremental_order_amount`,
+`top_up_guard_result`, `top_up_skipped`, and `top_up_manual_review` (see
+[`schemas/run_state.schema.json`](../schemas/run_state.schema.json)).
 
 ## Execution constraints
 

@@ -186,6 +186,25 @@ Even under fallback, manual order IDs are still excluded. Fallback is **never**
 allowed when no valid scheduled state exists, and never attributes orders from a
 manual-classified run.
 
+## Same-day top-up guard (prior-allocation context only)
+
+The scheduled 3:20 PM ET run may **read** earlier same-day manual/morning runs to
+offset its buys (the same-day prior-run offset/top-up guard; see
+[strategy.md](strategy.md#same-day-prior-run-offset--top-up-guard)). This reading
+does **not** reclassify anything:
+
+- Earlier manual/morning runs feed the guard as **prior-allocation context only**.
+  They are still excluded from every scheduled-live metric (evidence, slippage,
+  watchdog confirmation, scheduled cost basis, scheduled fill counts) per the
+  rules above.
+- Only earlier runs generated **before 2:30 PM ET** contribute, and any run
+  classified as scheduled is ignored as prior context — so a morning/manual order
+  before 2:30 PM ET is read for top-up only, never as afternoon scheduled
+  execution evidence.
+- A day whose afternoon buys are fully offset to $0 by the guard still produces a
+  valid scheduled run_state; the watchdog treats it as a completed scheduled run,
+  not a discrepancy.
+
 ## Manual Test Runs reporting
 
 Manual fills may be reported **only** in a clearly labeled **"Manual Test Runs"**

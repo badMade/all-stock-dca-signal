@@ -53,7 +53,71 @@ def test_run_pipeline_blocked_day_skips_reports(tmp_path):
     )
     assert result["blocked"] is True
     assert "reports" not in result
-    assert not (tmp_path / "latest_run_summary.json").exists()
+
+
+def test_run_pipeline_scheduled_run_auto_loads_prior_allocations(tmp_path):
+    import json
+
+    # Seed a manual same-day allocation under the cron task root's manual_runs/,
+    # mirroring the real production layout from config/scheduled_tasks.json:
+    # <task_root>/scheduled_runs/YYYYMMDD_1520ET/ (artifacts_dir) as a sibling of
+    # <task_root>/manual_runs/<timestamp>/. This is nested two levels below the
+    # task root, unlike a flat "scheduled" directory -- a naive
+    # artifacts_dir.parent would land on scheduled_runs/ itself and never see
+    # manual_runs/, so the auto-derived root must walk up past scheduled_runs/.
+    task_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    manual_dir = task_root / "manual_runs" / "0900"
+    manual_dir.mkdir(parents=True)
+    (manual_dir / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": _now().date().isoformat(),
+            "generated_at": f"{_now().date().isoformat()}T09:00:00-04:00",
+            "run_classification": {"run_origin": "manual", "run_id": "manual_am"},
+            # A very low reference price guarantees the afternoon price is never
+            # below it, so this ticker's guard result proves the allocation was
+            # loaded (top_up_guard_result != "no_prior_run") without depending
+            # on the demo provider's exact drop-derived price.
+            "buy_candidates": [
+                {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0, "target_price": 0.01},
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    config = _demo_config()
+    scheduled_dir = task_root / "scheduled_runs" / "20260706_1520ET"
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=scheduled_dir,
+    )
+    assert result["blocked"] is False
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    assert by_ticker["AAPL"]["top_up_guard_result"] != "no_prior_run"
+    assert not (task_root / "latest_run_summary.json").exists()
+
+
+def test_default_prior_allocation_state_root_walks_past_scheduled_runs():
+    from pathlib import Path
+
+    from run_dca import _default_prior_allocation_state_root
+
+    task_root = Path("/cron_tracking/ce16ba6b")
+    artifacts_dir = task_root / "scheduled_runs" / "20260706_1520ET"
+    assert _default_prior_allocation_state_root(artifacts_dir) == task_root
+
+
+def test_default_prior_allocation_state_root_falls_back_to_parent():
+    from pathlib import Path
+
+    from run_dca import _default_prior_allocation_state_root
+
+    # No scheduled_runs/ segment in the path (e.g. a flat test/demo layout) ->
+    # fall back to the immediate parent.
+    artifacts_dir = Path("/tmp/some_root/scheduled")
+    assert _default_prior_allocation_state_root(artifacts_dir) == Path("/tmp/some_root")
 
 
 def test_fills_from_orders_csv(tmp_path):

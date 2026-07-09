@@ -38,10 +38,12 @@ from near_close_dca import (
     Bar,
     BrokerAdapter,
     MarketDataProvider,
+    PriorSameDayAllocation,
     SourceName,
     StrategyConfig,
     StrategyState,
     build_broker,
+    load_prior_same_day_allocations,
     run_daily_compact,
 )
 
@@ -136,6 +138,23 @@ def _refresh_fills_from_broker(
     return refreshed
 
 
+def _default_prior_allocation_state_root(artifacts_dir: Path) -> Path:
+    """Derive the cron task root from a scheduled run's artifacts_dir.
+
+    Per config/scheduled_tasks.json the live scheduled path writes into
+    ``<task_root>/scheduled_runs/YYYYMMDD_1520ET/``, and prior same-day
+    manual/morning allocations live under the sibling
+    ``<task_root>/manual_runs/<timestamp>/``. A plain ``.parent`` would land on
+    ``scheduled_runs/`` itself (which never contains ``manual_runs/``), so walk
+    up looking for a ``scheduled_runs`` path segment and return its parent
+    instead; fall back to the immediate parent when the layout doesn't match.
+    """
+    for candidate in (artifacts_dir, *artifacts_dir.parents):
+        if candidate.name == "scheduled_runs":
+            return candidate.parent
+    return artifacts_dir.parent
+
+
 def run_pipeline(
     now: datetime,
     config: StrategyConfig,
@@ -148,6 +167,8 @@ def run_pipeline(
     run_label: str = "daily",
     scheduled: bool = True,
     generate_full_reports: bool = False,
+    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]] = None,
+    prior_allocation_state_root: Optional[str | Path] = None,
     deployment_history_root: Optional[str | Path] = None,
     classification_state_root: Optional[str | Path] = None,
 ) -> Dict[str, Any]:
@@ -157,6 +178,14 @@ def run_pipeline(
     daily path always runs; ``generate_full_reports=True`` additionally renders the
     slippage/coverage reports and the compact Notion sync from the run artifacts
     (heavier work reserved for Friday/manual runs).
+
+    The same-day prior-run offset/top-up guard is scheduled-run-only. For a
+    scheduled run, ``prior_allocation_state_root`` defaults to the cron task root
+    derived from ``artifacts_dir`` (see ``_default_prior_allocation_state_root``)
+    so the guard activates without every caller having to wire it explicitly;
+    pass ``prior_same_day_allocations`` directly to override, or an explicit
+    ``prior_allocation_state_root`` to scan a different tree. Manual runs never
+    auto-load prior allocations, so a manual invocation is never guard-active.
 
     ``deployment_history_root`` feeds the trailing-7-day kill-switch (see
     ``dca_risk.apply_risk_guard``): it should point at the directory containing
@@ -169,6 +198,13 @@ def run_pipeline(
     given, no ``latest_scheduled_run.json`` write is attempted at all, so a
     caller must pass the real cron_tracking root explicitly to enable it.
     """
+    if scheduled and prior_same_day_allocations is None:
+        if prior_allocation_state_root is None:
+            prior_allocation_state_root = _default_prior_allocation_state_root(Path(artifacts_dir))
+        trading_day = now.astimezone(EASTERN).date()
+        prior_same_day_allocations = load_prior_same_day_allocations(
+            prior_allocation_state_root, trading_day
+        )
     if deployment_history_root is None:
         deployment_history_root = Path(artifacts_dir).parent
     result = run_daily_compact(
@@ -181,6 +217,7 @@ def run_pipeline(
         artifacts_dir=artifacts_dir,
         run_label=run_label,
         scheduled=scheduled,
+        prior_same_day_allocations=prior_same_day_allocations,
         deployment_history_root=deployment_history_root,
         classification_state_root=classification_state_root,
     )
