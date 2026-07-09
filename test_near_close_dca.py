@@ -1293,7 +1293,7 @@ def test_build_run_artifacts_uses_guarded_amount_as_planned_notional(tmp_path):
     """build_run_artifacts must set planned_amount_usd = incremental_order_amount
     (not the full afternoon desired amount) when a top-up guard outcome is present.
     The original desired amount must be preserved in afternoon_desired_amount_usd."""
-    from near_close_dca import build_run_artifacts, TopUpGuardOutcome, TOP_UP_INCREMENTAL
+    from near_close_dca import TOP_UP_INCREMENTAL, TopUpGuardOutcome, build_run_artifacts
 
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
