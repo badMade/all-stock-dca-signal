@@ -1,8 +1,8 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "morning_run_classification.schema.json",
-  "title": "Morning DCA dry-run classification block",
-  "description": "The run_classification object embedded in every MORNING run_state artifact. The morning stream is a dry-run/analytics-only stream that is INDEPENDENT of the afternoon live task 10ce362c (which supersedes ce16ba6b). This block makes the separation explicit so afternoon slippage/watchdog/weekly reporting never treats a morning artifact as afternoon scheduled evidence. Contains no secrets.",
+  "title": "Morning DCA live classification block",
+  "description": "The run_classification object embedded in every MORNING run_state artifact. The morning stream is a LIVE Robinhood execution stream (account 562057042) that is INDEPENDENT of the afternoon live task 10ce362c (which supersedes ce16ba6b). This block makes the separation explicit so afternoon slippage/watchdog/reliability/weekly reporting never treats a morning artifact as afternoon scheduled evidence; morning fills feed the afternoon stream only as prior same-day allocation context for the top-up guard. Contains no secrets.",
   "type": "object",
   "required": [
     "run_origin",
@@ -13,19 +13,21 @@
     "run_id",
     "triggered_at_utc",
     "state_schema_version",
-    "valid_afternoon_evidence"
+    "valid_afternoon_evidence",
+    "execution_broker",
+    "account_number"
   ],
   "additionalProperties": true,
   "properties": {
     "run_origin": {
       "type": "string",
       "enum": ["scheduled", "manual"],
-      "description": "Origin of the morning run. 'scheduled' is the 9:45 AM ET morning dry-run task; everything else is 'manual'."
+      "description": "Origin of the morning run. 'scheduled' is the 9:45 AM ET morning live task; everything else is 'manual'."
     },
     "run_type": {
       "type": "string",
-      "const": "morning_dca_dry_run",
-      "description": "Always 'morning_dca_dry_run'. Deliberately not the afternoon 'scheduled_live_test'."
+      "const": "morning_dca_live",
+      "description": "Always 'morning_dca_live'. Deliberately not the afternoon 'scheduled_live_test'."
     },
     "stream": {
       "type": "string",
@@ -59,7 +61,7 @@
     },
     "run_id": {
       "type": "string",
-      "description": "Unique run id. Scheduled: 'morning_YYYYMMDD_0945ET'. Manual: 'manual_morning_YYYYMMDD_HHMMSSZ'."
+      "description": "Unique run id. Scheduled: 'morning_live_YYYYMMDD_0945ET'. Manual: 'manual_morning_live_YYYYMMDD_HHMMSSZ_<suffix>'."
     },
     "triggered_at_utc": {
       "type": "string",
@@ -67,13 +69,23 @@
     },
     "state_schema_version": {
       "type": "string",
-      "const": "run-classification-v1",
-      "description": "Shared contract version tag, pinned to 'run-classification-v1'."
+      "const": "morning-live-v1",
+      "description": "Morning live contract version tag, pinned to 'morning-live-v1'."
+    },
+    "execution_broker": {
+      "type": "string",
+      "const": "robinhood",
+      "description": "The sole execution broker for the morning live stream. Always 'robinhood'."
+    },
+    "account_number": {
+      "type": "string",
+      "const": "562057042",
+      "description": "The Robinhood account number used for morning live execution. Not a secret."
     },
     "valid_afternoon_evidence": {
       "type": "boolean",
       "const": false,
-      "description": "Always false. A morning artifact is NEVER valid afternoon scheduled-live evidence."
+      "description": "Always false. A morning artifact is NEVER valid afternoon scheduled-live evidence; morning fills feed the afternoon stream only as prior same-day allocation context for the top-up guard."
     },
     "afternoon_live_cron_id": {
       "type": "string",
@@ -90,7 +102,7 @@
           "scheduled_for_et": { "const": "09:45" },
           "scheduled_window_start_et": { "const": "09:40" },
           "scheduled_window_end_et": { "const": "09:50" },
-          "run_id": { "pattern": "^morning_[0-9]{8}_0945ET$" }
+          "run_id": { "pattern": "^morning_live_[0-9]{8}_0945ET$" }
         }
       }
     },
@@ -99,7 +111,7 @@
       "then": {
         "properties": {
           "manual_run": { "const": true },
-          "run_id": { "not": { "pattern": "^morning_[0-9]{8}_0945ET$" } }
+          "run_id": { "not": { "pattern": "^morning_live_[0-9]{8}_0945ET$" } }
         }
       }
     }

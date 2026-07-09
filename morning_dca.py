@@ -1,29 +1,31 @@
-"""Morning graded-DCA dry-run executor.
+"""Morning graded-DCA live executor.
 
-This module adds a *morning* analytics stream on top of the existing near-close
-strategy library (:mod:`near_close_dca`). It is deliberately isolated from the
-afternoon scheduled live task (cron ``10ce362c``, which supersedes the deleted
-``ce16ba6b``):
+This module adds a *morning* execution stream on top of the existing near-close
+strategy library (:mod:`near_close_dca`). As of the Jul 9 2026 approval the 9:45
+AM ET morning graded-DCA monitor is LIVE Robinhood execution (no longer a
+dry-run). It stays deliberately isolated from the afternoon scheduled live task
+(cron ``10ce362c``, which supersedes the deleted ``ce16ba6b``):
 
-    - It uses its OWN sizing ladder (a coarser 0x -> 3x morning ladder) rather
-      than the afternoon 0x -> 5x ladder.
+    - It uses the current shared $3 base 0x -> 5x graded ladder
+      (``config/sizing_ladder.json``), the same ladder as the afternoon live task.
     - It keeps its OWN budget ledger namespace (:class:`MorningLedger`) so morning
-      dry-run / future morning buys can never consume the afternoon 3:20/3:45
-      budget ledger.
+      buys can never consume the afternoon 3:20/3:45 budget ledger.
     - It writes artifacts under its OWN run-state root
       (``/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_0945ET/``) and
       NEVER touches ``.../ce16ba6b/latest_scheduled_run.json`` or the afternoon
       ``scheduled_runs/`` folders.
-    - Its run_classification carries ``run_type='morning_dca_dry_run'`` and a
-      distinct ``stream='morning'`` marker so downstream afternoon reporting (which
-      only globs ``.../ce16ba6b/scheduled_runs/**``) never mistakes it for
-      afternoon scheduled evidence.
+    - Its run_classification carries ``run_type='morning_dca_live'``,
+      ``state_schema_version='morning-live-v1'`` and a distinct ``stream='morning'``
+      marker so downstream afternoon reporting (which only globs
+      ``.../ce16ba6b/scheduled_runs/**``) never mistakes it for afternoon
+      scheduled evidence.
 
-The morning stream is DRY-RUN / ANALYTICS ONLY. It computes hypothetical dollar
-amounts and writes signal artifacts. It NEVER places orders, never runs a
-Robinhood order review, and never calls any broker placement path. Robinhood
-account 562057042 remains the only execution broker for the afternoon live task;
-Alpaca stays read-only.
+Morning orders/fills are NEVER afternoon scheduled execution evidence, afternoon
+slippage, afternoon fill counts, afternoon reliability, afternoon watchdog
+confirmation, or afternoon scheduled cost basis; they DO count as prior
+allocation context for the afternoon same-day top-up guard. Robinhood account
+562057042 is the sole execution broker for both the morning and afternoon live
+tasks; Alpaca stays read-only (validation/account context only).
 """
 
 from __future__ import annotations
@@ -58,31 +60,47 @@ from near_close_dca import (
 # two streams can never be confused (see docs/morning_dca.md).
 MORNING_STREAM = "morning"
 MORNING_CRON_ID = "morning-dca-0945"
-MORNING_RUN_TYPE = "morning_dca_dry_run"
+MORNING_RUN_TYPE = "morning_dca_live"
 MORNING_SCHEDULED_FOR_ET = "09:45"
 MORNING_WINDOW_START_ET = "09:40"
 MORNING_WINDOW_END_ET = "09:50"
-STATE_SCHEMA_VERSION = "run-classification-v1"
+STATE_SCHEMA_VERSION = "morning-live-v1"
+
+# The morning live stream executes on Robinhood only; Alpaca stays read-only.
+MORNING_EXECUTION_BROKER = "robinhood"
+MORNING_ACCOUNT_NUMBER = "562057042"
 
 # Default artifact root for the morning stream. Deliberately a sibling of, and
 # never nested under, the afternoon ce16ba6b root.
 DEFAULT_MORNING_STATE_ROOT = "/home/user/workspace/cron_tracking/morning_dca"
 
-# Morning sizing ladder: a coarser 0x -> 3x ladder keyed on the drop vs.
-# *yesterday's regular-session close*. Thresholds are fractions of the previous
-# close (0.02 == 2.0%). The largest threshold <= the actual drop wins; a drop
-# below the first threshold yields no buy (0x). This is SEPARATE from the
-# afternoon 0x -> 5x ladder in StrategyConfig.sizing_tiers.
+# Morning sizing ladder: the current shared $3 base 0x -> 5x graded ladder keyed
+# on the drop vs. *yesterday's regular-session close*. As of the Jul 9 2026 live
+# approval the morning stream uses the SAME current active ladder as the
+# afternoon task (config/sizing_ladder.json / StrategyConfig.sizing_tiers) rather
+# than a distinct morning ladder. Thresholds are fractions of the previous close
+# (0.02 == 2.0%). The largest threshold <= the actual drop wins; a drop below the
+# first threshold yields no buy (0x).
 #     drop < 0.1%           -> 0x  (no buy)
-#     0.1% <= drop < 2.0%   -> 1x
-#     2.0% <= drop < 5.0%   -> 1.5x
-#     5.0% <= drop < 8.0%   -> 2x
-#     drop >= 8.0%          -> 3x  (no upper cutoff)
+#     0.1% <= drop < 1.0%   -> 1x
+#     1.0% <= drop < 2.0%   -> 1.5x
+#     2.0% <= drop < 3.0%   -> 2x
+#     3.0% <= drop < 4.0%   -> 2.5x
+#     4.0% <= drop < 5.0%   -> 3x
+#     5.0% <= drop < 6.0%   -> 3.5x
+#     6.0% <= drop < 7.0%   -> 4x
+#     7.0% <= drop < 8.0%   -> 4.5x
+#     drop >= 8.0%          -> 5x  (no upper cutoff)
 MORNING_SIZING_TIERS: Tuple[Tuple[float, float], ...] = (
     (0.001, 1.0),
-    (0.020, 1.5),
-    (0.050, 2.0),
-    (0.080, 3.0),
+    (0.010, 1.5),
+    (0.020, 2.0),
+    (0.030, 2.5),
+    (0.040, 3.0),
+    (0.050, 3.5),
+    (0.060, 4.0),
+    (0.070, 4.5),
+    (0.080, 5.0),
 )
 
 MORNING_MINIMUM_DROP = 0.001
@@ -173,7 +191,7 @@ DEFAULT_MORNING_WEEKLY_CAP_USD = 450.0
 
 @dataclass(frozen=True)
 class MorningConfig:
-    """Configuration hooks for the morning dry-run stream.
+    """Configuration hooks for the morning live stream.
 
     Kept separate from :class:`~near_close_dca.StrategyConfig` so the morning
     ladder, caps, decision anchor, and run-state root can never leak into the
@@ -212,9 +230,8 @@ class MorningConfig:
 class MorningLedger:
     """A budget ledger namespaced to the morning stream.
 
-    This is a self-contained session that tracks only *hypothetical* morning
-    dry-run notional (and, if the morning stream ever executes in the future, its
-    real notional). It shares no state with the afternoon
+    This is a self-contained session that tracks the morning live stream's own
+    notional. It shares no state with the afternoon
     :class:`~near_close_dca.StrategyState`, so morning activity can never consume
     or validate the afternoon 3:20/3:45 daily/weekly budget ledger.
     """
@@ -253,7 +270,7 @@ class MorningLedger:
 
 @dataclass(frozen=True)
 class MorningSignal:
-    """One morning dry-run signal row for a single ticker."""
+    """One morning live signal row for a single ticker."""
 
     ticker: str
     source: str
@@ -354,8 +371,8 @@ class DCAExecutor:
     ``run_daily_compact``) and remains the authoritative live path. This base
     introduces the shared extension points a class-based executor needs — the
     sizing ladder, a run-state root, and a run-classification block — so new
-    streams (starting with the morning dry-run) can plug in without touching the
-    afternoon code.
+    streams (starting with the morning live stream) can plug in without touching
+    the afternoon code.
 
     Subclasses provide the concrete ladder via :attr:`sizing_config`, the artifact
     root via :meth:`run_state_dir`, and the classification via
@@ -381,13 +398,14 @@ class DCAExecutor:
 
 
 class MorningDCAExecutor(DCAExecutor):
-    """Morning dry-run executor: drop-vs-yesterday's-close analytics only.
+    """Morning live executor: drop-vs-yesterday's-close graded buying.
 
     Evaluates each ticker's morning price weakness relative to yesterday's
-    regular-session close, grades it on the morning 0x -> 3x ladder, and writes
-    dry-run artifacts under the morning run-state root. It NEVER places orders,
-    reviews orders, or contacts a broker, and it NEVER writes into the afternoon
-    ce16ba6b artifact tree.
+    regular-session close, grades it on the current shared $3 base 0x -> 5x
+    ladder, and writes live artifacts under the morning run-state root. Robinhood
+    account 562057042 is the sole execution broker; Alpaca stays read-only. It
+    NEVER writes into the afternoon ce16ba6b artifact tree and its orders/fills
+    are never afternoon scheduled evidence.
     """
 
     stream = MORNING_STREAM
@@ -425,16 +443,17 @@ class MorningDCAExecutor(DCAExecutor):
             # replays share the same decision timestamp (down to the second),
             # so write_artifacts never silently overwrites a prior manual run.
             unique = uuid.uuid4().hex[:6]
-            return f"manual_morning_{now_utc.strftime('%Y%m%d_%H%M%S')}Z_{unique}"
-        return f"morning_{now_et.strftime('%Y%m%d')}_0945ET"
+            return f"manual_morning_live_{now_utc.strftime('%Y%m%d_%H%M%S')}Z_{unique}"
+        return f"morning_live_{now_et.strftime('%Y%m%d')}_0945ET"
 
     def run_classification(self, now: datetime, *, manual: bool = False) -> Dict[str, Any]:
         """Build the morning run-classification block.
 
-        A real scheduled morning dry run is ``run_origin='scheduled'`` with
-        ``run_type='morning_dca_dry_run'`` and ``manual_run=false``. The
+        A real scheduled morning live run is ``run_origin='scheduled'`` with
+        ``run_type='morning_dca_live'`` and ``manual_run=false``. The
         ``stream='morning'`` marker and ``valid_afternoon_evidence=false`` flag
-        make it unambiguous that this artifact is NOT afternoon scheduled evidence.
+        make it unambiguous that this artifact is NOT afternoon scheduled evidence,
+        even though it is a live Robinhood execution.
         """
         triggered_iso = now.astimezone(timezone.utc).isoformat()
         classification: Dict[str, Any] = {
@@ -450,6 +469,9 @@ class MorningDCAExecutor(DCAExecutor):
             "run_id": self.run_id(now, manual=manual),
             "triggered_at_utc": triggered_iso,
             "state_schema_version": STATE_SCHEMA_VERSION,
+            # The only execution broker/account for the morning live stream.
+            "execution_broker": MORNING_EXECUTION_BROKER,
+            "account_number": MORNING_ACCOUNT_NUMBER,
             # Explicit, machine-checkable separation from the afternoon stream.
             "valid_afternoon_evidence": False,
             "afternoon_live_cron_id": "10ce362c",
@@ -458,7 +480,7 @@ class MorningDCAExecutor(DCAExecutor):
 
     # -- Evaluation ----------------------------------------------------------
     def evaluate_signal(self, ticker: str, now: datetime, data: Any) -> MorningSignal:
-        """Grade one ticker's morning weakness vs. yesterday's close (dry-run).
+        """Grade one ticker's morning weakness vs. yesterday's close.
 
         Uses the provider's previous-close bar and the latest completed intraday
         bar (or a live quote via ``get_quote`` when available) at/or before the
@@ -534,7 +556,7 @@ class MorningDCAExecutor(DCAExecutor):
             hypothetical = 0.0
         else:
             action = Action.BUY
-            reason = f"morning weakness {drop_pct:.2f}% vs prior close -> {multiplier:g}x (dry-run)"
+            reason = f"morning weakness {drop_pct:.2f}% vs prior close -> {multiplier:g}x (live)"
 
         return MorningSignal(
             ticker=ticker,
@@ -627,7 +649,7 @@ class MorningDCAExecutor(DCAExecutor):
         *,
         manual: bool = False,
     ) -> Dict[str, Any]:
-        """Assemble the morning run_state dict (dry-run / analytics only).
+        """Assemble the morning live run_state dict.
 
         Pure/side-effect-free: reads the ledger but never mutates it. Callers
         must record buy candidates via :meth:`record_buy_candidates` beforehand
@@ -661,14 +683,16 @@ class MorningDCAExecutor(DCAExecutor):
         return {
             "run_id": classification["run_id"],
             "stream": self.stream,
-            "mode": "dry_run",
-            "trades": False,
+            "mode": "live",
+            "trades": True,
+            "execution_broker": MORNING_EXECUTION_BROKER,
+            "account_number": MORNING_ACCOUNT_NUMBER,
             "generated_at": now_et.isoformat(),
             "trading_day": trading_day.isoformat(),
             "iso_week": list(iso_week_key(trading_day)),
             "data_source": data_source,
             "ladder": {
-                "name": "morning_0x_to_3x",
+                "name": "current_0x_to_5x",
                 "base_amount_usd": self.config.base_buy_amount_usd,
                 "tiers": [list(t) for t in self.config.sizing_tiers],
                 "no_buy_below_pct": self.config.minimum_drop_vs_previous_close * 100.0,
@@ -745,10 +769,10 @@ class MorningDCAExecutor(DCAExecutor):
         data_source: Optional[str] = None,
         manual: bool = False,
     ) -> Dict[str, Any]:
-        """Evaluate the morning stream and write dry-run artifacts.
+        """Evaluate the morning live stream and write its run artifacts.
 
-        Returns ``{"artifacts": <run_state dict>, "paths": <written paths>}``. No
-        orders are placed and no broker is contacted.
+        Returns ``{"artifacts": <run_state dict>, "paths": <written paths>}``.
+        Execution is Robinhood-only (account 562057042); Alpaca stays read-only.
         """
         trading_day = now.astimezone(EASTERN).date()
         if not manual and trading_day in nyse_holidays(trading_day.year):

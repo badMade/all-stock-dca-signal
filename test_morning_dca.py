@@ -1,4 +1,4 @@
-"""Self-tests for the morning graded-DCA dry-run executor.
+"""Self-tests for the morning graded-DCA live executor.
 
 Covers the morning ladder threshold brackets, the separate budget ledger
 namespace, the run-state path/classification, and the guarantee that a morning
@@ -83,26 +83,31 @@ def test_ladder_brackets():
     cases = {
         0.0005: 0.0,   # < 0.1% -> 0x
         0.001: 1.0,    # 0.1%   -> 1x
-        0.019: 1.0,    # < 2%   -> 1x
-        0.020: 1.5,    # 2%     -> 1.5x
-        0.049: 1.5,    # < 5%   -> 1.5x
-        0.050: 2.0,    # 5%     -> 2x
-        0.079: 2.0,    # < 8%   -> 2x
-        0.080: 3.0,    # 8%     -> 3x
-        0.20: 3.0,     # >= 8%  -> 3x (no upper cutoff)
+        0.009: 1.0,    # < 1%   -> 1x
+        0.010: 1.5,    # 1%     -> 1.5x
+        0.019: 1.5,    # < 2%   -> 1.5x
+        0.020: 2.0,    # 2%     -> 2x
+        0.030: 2.5,    # 3%     -> 2.5x
+        0.040: 3.0,    # 4%     -> 3x
+        0.050: 3.5,    # 5%     -> 3.5x
+        0.060: 4.0,    # 6%     -> 4x
+        0.070: 4.5,    # 7%     -> 4.5x
+        0.079: 4.5,    # < 8%   -> 4.5x
+        0.080: 5.0,    # 8%     -> 5x
+        0.20: 5.0,     # >= 8%  -> 5x (no upper cutoff)
     }
     for drop, expected in cases.items():
         assert ex.multiplier_for_drop(drop) == expected, (drop, expected)
 
 
-def test_ladder_is_distinct_from_afternoon():
-    # Morning tops out at 3x, afternoon at 5x. An 8% drop must differ.
+def test_ladder_matches_afternoon():
+    # The morning live stream now shares the afternoon 0x-to-5x ladder.
     from near_close_dca import StrategyConfig, graded_buy_multiplier
 
     morning = MorningDCAExecutor(MorningConfig())
-    assert morning.multiplier_for_drop(0.08) == 3.0
+    assert morning.multiplier_for_drop(0.08) == 5.0
     assert graded_buy_multiplier(0.08, StrategyConfig()) == 5.0
-    assert MORNING_SIZING_TIERS != StrategyConfig().sizing_tiers
+    assert MORNING_SIZING_TIERS == StrategyConfig().sizing_tiers
 
 
 def test_signal_amounts_and_actions():
@@ -118,10 +123,10 @@ def test_signal_amounts_and_actions():
     assert sigs["TINY"].action == Action.NO_ACTION  # below prior close but under 0.1% min drop
     assert sigs["TINY"].multiplier == 0.0
     assert sigs["SMALL"].action == Action.BUY
-    assert sigs["SMALL"].multiplier == 1.5
-    assert sigs["SMALL"].hypothetical_amount_usd == 4.5
-    assert sigs["BIG"].multiplier == 3.0
-    assert sigs["BIG"].hypothetical_amount_usd == 9.0
+    assert sigs["SMALL"].multiplier == 2.5
+    assert sigs["SMALL"].hypothetical_amount_usd == 7.5
+    assert sigs["BIG"].multiplier == 5.0
+    assert sigs["BIG"].hypothetical_amount_usd == 15.0
 
 
 class FixedQuoteProvider(FixedDropProvider):
@@ -325,7 +330,7 @@ def test_over_cap_emits_warning(tmp_path):
         morning_run_state_root=str(tmp_path),
     )
     ex = MorningDCAExecutor(cfg)
-    drops = {f"T{i}": 0.10 for i in range(5)}  # each 3x -> $9
+    drops = {f"T{i}": 0.10 for i in range(5)}  # each 5x -> $15
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, drops)
     res = ex.run(_now(), data)
     assert any("exceeds morning daily cap" in w for w in res["artifacts"]["warnings"])
@@ -349,7 +354,7 @@ def test_build_artifacts_does_not_double_count_ledger(tmp_path):
     assert ex.ledger.day_planned(day) == 0.0  # build_artifacts alone never mutates the ledger
 
     ex.run(now, data)
-    assert ex.ledger.day_planned(day) == 9.0  # exactly one run recorded once
+    assert ex.ledger.day_planned(day) == 15.0  # exactly one run recorded once
 
 
 def test_scheduled_run_skips_artifacts_on_market_holiday(tmp_path):
@@ -417,22 +422,23 @@ def test_run_state_path_and_classification(tmp_path):
 
     rc = res["artifacts"]["run_classification"]
     assert rc["run_origin"] == "scheduled"
-    assert rc["run_type"] == "morning_dca_dry_run"
+    assert rc["run_type"] == "morning_dca_live"
     assert rc["stream"] == "morning"
     assert rc["scheduled_for_et"] == "09:45"
     assert rc["manual_run"] is False
-    assert rc["state_schema_version"] == "run-classification-v1"
-    assert rc["run_id"] == "morning_20260708_0945ET"
+    assert rc["state_schema_version"] == "morning-live-v1"
+    assert rc["run_id"] == "morning_live_20260708_0945ET"
     assert rc["valid_afternoon_evidence"] is False
     assert rc["cron_id"] == MORNING_CRON_ID
     assert rc["supersedes_cron_id"] is None
+    assert rc["execution_broker"] == "robinhood"
+    assert rc["account_number"] == "562057042"
 
-    # Dry-run markers present; no order fields.
+    # Live markers present.
     art = res["artifacts"]
-    assert art["mode"] == "dry_run"
-    assert art["trades"] is False
+    assert art["mode"] == "live"
+    assert art["trades"] is True
     for row in art["signal_rows"]:
-        assert "order_id" not in row
         assert set(
             ["ticker", "current_price", "previous_close", "drop_pct", "multiplier",
              "hypothetical_amount_usd", "source", "warnings"]

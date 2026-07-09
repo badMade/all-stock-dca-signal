@@ -53,12 +53,19 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 > The scheduled run still writes a valid scheduled run_state even when every buy
 > is fully offset to $0. See [strategy.md](strategy.md#same-day-prior-run-offset--top-up-guard).
 >
-> **Morning dry-run note:** a separate **dry-run / analytics-only** morning
-> stream (`MorningDCAExecutor`) grades morning weakness vs. yesterday's close on
-> its own **0x-to-3x** ladder and its own `morning` budget ledger, writing under
-> `cron_tracking/morning_dca/YYYYMMDD_0945ET/` (run_type `morning_dca_dry_run`,
-> `valid_afternoon_evidence=false`). It places **no trades**, never updates
-> `latest_scheduled_run.json`, and is never afternoon scheduled evidence. See
+> **Morning live note:** a separate **live-execution** morning stream
+> (`MorningDCAExecutor`, approved 2026-07-09) grades morning weakness vs.
+> yesterday's close on the current **0x-to-5x** ladder and its own `morning`
+> budget ledger, writing under `cron_tracking/morning_dca/YYYYMMDD_0945ET/`
+> (run_type `morning_dca_live`, `state_schema_version='morning-live-v1'`,
+> `execution_broker='robinhood'`, `account_number='562057042'`,
+> `valid_afternoon_evidence=false`). It places **live Robinhood orders** through
+> account `562057042` (the sole execution broker; Alpaca stays read-only), never
+> updates `latest_scheduled_run.json`, never writes into the afternoon `ce16ba6b`
+> tree, and is **never** afternoon scheduled evidence, slippage, fill counts,
+> reliability, watchdog confirmation, or scheduled cost basis. Its **only**
+> afternoon linkage: morning fills count as **prior same-day allocation context**
+> for the afternoon (`10ce362c`) same-day top-up guard. See
 > [morning_dca.md](morning_dca.md).
 > **Base-amount note:** the graded DCA base amount is exactly **$3.00**; every
 > candidate dollar amount is **`$3.00 × multiplier`**. The automation must never
@@ -71,7 +78,7 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 |---|---|---|---|---|---|---|
 | `b7961407` | Pre-market DCA buying-power dashboard | analytics | no | `00 13 * * 1-5` | 9:00 AM weekdays | active |
 | `cd45e95b` | Compact DCA volatility outlier scan | analytics | no | `45 13 * * 1-5` | 9:45 AM weekdays | active |
-| `morning-dca-0945` | Morning graded DCA dry-run analytics (`MorningDCAExecutor`) | analytics | no | `45 13 * * 1-5` | 9:45 AM weekdays | active |
+| `morning-dca-0945` | Morning graded DCA live execution (`MorningDCAExecutor`) | trading | **yes** | `45 13 * * 1-5` | 9:45 AM weekdays | active |
 | `e3e6f09e` | Monitor-only graded DCA signal check | monitoring | no | `5 19 * * 1-5` | 3:05 PM weekdays | active |
 | `10ce362c` | Graded DCA automatic live test - $3 allocation (supersedes `ce16ba6b`) | trading | **yes** | `20 19 * * 1-5` | 3:20 PM weekdays | active |
 | `d72aa525` | Capital-priority briefing | analytics | no | `25 19 * * 1-5` | 3:25 PM weekdays | active |
@@ -92,10 +99,13 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 - Analytics only, **no trading**. Runs **9:45 AM ET weekdays**.
 - Scans only **>5% outliers**; no full 41+ ticker narrative on no-outlier days. Uses the current $3 base 0x-to-5x ladder.
 
-### `morning-dca-0945` — Morning graded DCA dry-run analytics (`MorningDCAExecutor`)
-- Analytics only, **no trading**. Runs **9:45 AM ET weekdays**.
-- Evaluates morning price weakness vs. yesterday’s regular-session close on the **morning 0x-to-3x ladder** (`config/morning_dca.json`). Writes dry-run artifacts under `/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_0945ET/`.
-- `stream='morning'`, `run_type='morning_dca_dry_run'`, `valid_afternoon_evidence=false`. Never writes into the afternoon `ce16ba6b` tree or updates `latest_scheduled_run.json`.
+### `morning-dca-0945` — Morning graded DCA live execution (`MorningDCAExecutor`)
+- **Live trading** approved **2026-07-09**. Runs **9:45 AM ET weekdays**.
+- Evaluates morning price weakness vs. yesterday’s regular-session close on the current **$3 base 0x-to-5x ladder** (`config/morning_dca.json`) and places real market buy orders. Writes live artifacts under `/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_0945ET/`.
+- Uses **only** Robinhood account `562057042` (the sole execution broker for both the morning and afternoon live streams); **Alpaca is read-only** validation/account context only.
+- `stream='morning'`, `run_type='morning_dca_live'`, `state_schema_version='morning-live-v1'`, `run_id='morning_live_YYYYMMDD_0945ET'`, `execution_broker='robinhood'`, `account_number='562057042'`, `valid_afternoon_evidence=false`. Never writes into the afternoon `ce16ba6b` tree or updates `latest_scheduled_run.json`.
+- Morning orders/fills are **never** afternoon scheduled-execution evidence, afternoon slippage, afternoon fill counts, afternoon reliability, afternoon watchdog confirmation, or afternoon scheduled cost basis. They **do** count as prior same-day allocation context for the afternoon (`10ce362c`) same-day top-up guard.
+- Distinct from the 9:45 AM volatility outlier scan (`cd45e95b`) and the 9:00 AM pre-market buying-power analysis (`b7961407`), which remain analytics-only and place no orders (so orders are never duplicated).
 
 ### `e3e6f09e` — Monitor-only graded DCA signal check
 - Analytics and notifications only; **no trades**. Runs **3:05 PM ET weekdays**.

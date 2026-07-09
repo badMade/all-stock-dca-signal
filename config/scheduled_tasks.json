@@ -1,7 +1,7 @@
 {
   "$schema": "../schemas/scheduled_tasks.schema.json",
-  "version": "2026-07-08",
-  "verified_on_et": "2026-07-08",
+  "version": "2026-07-09",
+  "verified_on_et": "2026-07-09",
   "timezone_note": "Cron expressions are in UTC. ET equivalents are during US Eastern Daylight Time (EDT, UTC-4). Confirm around DST transitions.",
   "afternoon_completion_rule": "All afternoon trading and artifact-writing tasks complete no later than 3:40 PM ET, when the read-only live-run watchdog (a46bf007) begins its final verification. The watchdog's own post-3:40 PM verification and the Friday weekly Notion performance refresh at 5:00 PM ET are the only approved post-3:40 PM DCA-related exceptions.",
   "run_classification_policy": {
@@ -39,26 +39,32 @@
     },
     {
       "id": "morning-dca-0945",
-      "name": "Morning graded DCA dry-run analytics",
-      "type": "analytics",
+      "name": "Morning graded DCA live execution",
+      "type": "trading",
       "status": "active",
       "cron_utc": "45 13 * * 1-5",
       "et_equivalent": "9:45 AM ET weekdays (EDT)",
-      "trades": false,
+      "trades": true,
+      "broker_account": "robinhood:562057042",
       "executor": "MorningDCAExecutor",
       "config_file": "config/morning_dca.json",
       "state_dir": "/home/user/workspace/cron_tracking/morning_dca",
       "run_classification": {
         "run_origin": "scheduled",
-        "run_type": "morning_dca_dry_run",
+        "run_type": "morning_dca_live",
         "stream": "morning",
         "cron_id": "morning-dca-0945",
         "supersedes_cron_id": null,
         "scheduled_for_et": "09:45",
+        "manual_run": false,
+        "run_id_pattern": "morning_live_YYYYMMDD_0945ET",
+        "state_schema_version": "morning-live-v1",
+        "execution_broker": "robinhood",
+        "account_number": "562057042",
         "valid_afternoon_evidence": false,
         "policy_file": "config/morning_dca.json"
       },
-      "notes": "Analytics only, no trading. Evaluates morning price weakness vs. yesterday's close using the 0x-to-3x morning ladder. Writes dry-run artifacts under the morning root only; never touches the afternoon ce16ba6b artifact tree or latest_scheduled_run.json. stream='morning', valid_afternoon_evidence=false."
+      "notes": "LIVE Robinhood execution approved 2026-07-09. Evaluates morning price weakness vs. yesterday's regular-session close using the current $3 base 0x-to-5x ladder and places real market buy orders through Robinhood account 562057042 (the sole execution broker); Alpaca is read-only validation/account context only. Writes live artifacts under the morning root only (/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_0945ET/); never writes under ce16ba6b/scheduled_runs/ and never updates latest_scheduled_run.json. stream='morning', valid_afternoon_evidence=false: morning orders/fills are NOT afternoon scheduled-execution evidence, afternoon slippage, afternoon fill counts, afternoon reliability, afternoon watchdog confirmation, or afternoon scheduled cost basis. Morning orders/fills DO count as prior same-day allocation context for the afternoon (10ce362c) same-day top-up guard. Separate from the 9:45 AM volatility outlier scan (cd45e95b) and 9:00 AM pre-market buying-power analysis (b7961407), which remain analytics-only and place no orders (avoiding duplicate orders)."
     },
     {
       "id": "e3e6f09e",
@@ -96,7 +102,7 @@
         "policy_file": "config/run_classification.json",
         "state_file_guarantee": "Always writes a scheduled run_state.json under scheduled_runs/YYYYMMDD_1520ET/ and updates latest_scheduled_run.json every time it fires, even when no order is placed. If Robinhood review passes but submission is blocked by required post-review user confirmation, the run_state is still valid and carries order_submit_status='not_submitted_confirmation_required', reviewed_order details where available, candidate details, and NO order_id. Such a run is valid scheduled-run evidence that the task ran, but NOT evidence of an order/fill."
       },
-      "notes": "The only trading task. This is the repaired live task 10ce362c, which supersedes the deleted ce16ba6b; the artifact root stays under .../ce16ba6b for continuity. Approved live Robinhood execution using the $3 base 0x-to-5x ladder with tiered daily/weekly caps. Robinhood account 562057042 only; Alpaca read-only. Places real market buy orders automatically within safeguards; must not fall back to interactive confirmation. A SCHEDULED run writes run_state.json (with run_classification run_origin='scheduled', run_type='scheduled_live_test', manual_run=false, scheduled_for_et='15:20', run_id='scheduled_YYYYMMDD_1520ET', and BOTH cron_id='10ce362c' AND supersedes_cron_id='ce16ba6b') under scheduled_runs/YYYYMMDD_1520ET/ AND updates latest_scheduled_run.json. Placeholder/ambiguous ids such as 'ce16ba6b_replacement' are forbidden; for continuity, consumers still accept cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b' as valid evidence. The scheduled run_state is ALWAYS written even when no order is placed; a confirmation-blocked run records order_submit_status='not_submitted_confirmation_required', reviewed_order details, candidate details, and no order_id, and remains valid scheduled-run evidence (but not order/fill evidence). A MANUAL run writes run_state.json (run_origin='manual', manual_run=true, distinct run_id) under manual_runs/<timestamp>/ and MUST NOT update latest_scheduled_run.json. All run_state files carry state_schema_version='run-classification-v1'. Test window through Fri Aug 28 2026 inclusive. Manual runs do not count as scheduled-run evidence. Any stale stored display name is superseded by this authoritative 3:20 PM ET schedule."
+      "notes": "The only trading task. This is the repaired live task 10ce362c, which supersedes the deleted ce16ba6b; the artifact root stays under .../ce16ba6b for continuity. Approved live Robinhood execution using the $3 base 0x-to-5x ladder with tiered daily/weekly caps. Robinhood account 562057042 only; Alpaca read-only. Places real market buy orders automatically within safeguards; must not fall back to interactive confirmation. A SCHEDULED run writes run_state.json (with run_classification run_origin='scheduled', run_type='scheduled_live_test', manual_run=false, scheduled_for_et='15:20', run_id='scheduled_YYYYMMDD_1520ET', and BOTH cron_id='10ce362c' AND supersedes_cron_id='ce16ba6b') under scheduled_runs/YYYYMMDD_1520ET/ AND updates latest_scheduled_run.json. Placeholder/ambiguous ids such as 'ce16ba6b_replacement' are forbidden; for continuity, consumers still accept cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b' as valid evidence. The scheduled run_state is ALWAYS written even when no order is placed; a confirmation-blocked run records order_submit_status='not_submitted_confirmation_required', reviewed_order details, candidate details, and no order_id, and remains valid scheduled-run evidence (but not order/fill evidence). A MANUAL run writes run_state.json (run_origin='manual', manual_run=true, distinct run_id) under manual_runs/<timestamp>/ and MUST NOT update latest_scheduled_run.json. All run_state files carry state_schema_version='run-classification-v1'. Test window through Fri Aug 28 2026 inclusive. Manual runs do not count as scheduled-run evidence. Same-day morning live fills (morning-dca-0945) are consumed only as prior same-day allocation context for this task's same-day top-up guard: incremental_order_amount=max(0, desired_amount - prior_same_day_amount), and when earlier same-day buys exist the task buys only if the current price is strictly below the prior-run reference price. Any stale stored display name is superseded by this authoritative 3:20 PM ET schedule."
     },
     {
       "id": "d72aa525",
