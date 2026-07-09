@@ -32,15 +32,15 @@ The order dollar amount before budget constraints is
 
 ## Active ticker universe
 
-43 active symbols (see [`config/tickers.json`](../config/tickers.json)):
+42 active symbols (see [`config/tickers.json`](../config/tickers.json)):
 
 ```
-DFTX TRIN AAAU SPCX RVI EVR LUNR IRDM DXYZ LITE ASML DRAM STX
+DFTX TRIN AAAU SPCX EVR LUNR IRDM DXYZ LITE ASML DRAM STX
 MSFT AAPL AMAT AMD CBRS MRVL BTX STM SNDK WDC TSM AVGO NVDA QBTS FLKR
 INTC GOOGL GOOG AMZN GLW MA GS MU NFLX XLG TOPT QTOP SATA RGTI IBM
 ```
 
-- **Excluded:** `BYDDY`, `VCX`, `TRLV`
+- **Excluded:** `BYDDY`, `VCX`, `TRLV`, `RVI`
 - **Symbol corrections applied:** `IRDMI -> IRDM`, `GLWR -> GLW`
 
 ## Sizing ladder (latest, active)
