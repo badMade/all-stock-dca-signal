@@ -1381,10 +1381,19 @@ def build_run_artifacts(
         # the incremental amount; otherwise use submitted_amount_usd (which
         # reflects any mid-batch kill-switch cap) or fall back to suggested_amount.
         guard = top_up_outcomes.get(decision.ticker) if top_up_outcomes else None
+        submitted_amount = outcome.get("submitted_amount_usd")
         if guard is not None:
-            planned_amount_usd = guard.incremental_order_amount
+            # When the kill-switch capped order_amount before the guard ran,
+            # submitted_amount_usd already reflects the actual capped spend.
+            # Use that when available so planned_amount_usd is never higher than
+            # what was really submitted (guard.incremental_order_amount was itself
+            # already capped in run_once, but submitted_amount_usd is the ground truth).
+            planned_amount_usd = (
+                min(guard.incremental_order_amount, submitted_amount)
+                if submitted_amount is not None
+                else guard.incremental_order_amount
+            )
         else:
-            submitted_amount = outcome.get("submitted_amount_usd")
             planned_amount_usd = (
                 submitted_amount if submitted_amount is not None else decision.suggested_amount_usd
             )
@@ -1629,11 +1638,11 @@ def _prior_run_before_boundary(run_state: Dict[str, Any], boundary_et: time) -> 
     """
     raw = run_state.get("generated_at")
     if not isinstance(raw, str):
-        return False
+        return True
     try:
         parsed = datetime.fromisoformat(raw)
     except ValueError:
-        return False
+        return True
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=EASTERN)
     return parsed.astimezone(EASTERN).timetz().replace(tzinfo=None) < boundary_et
@@ -1685,6 +1694,34 @@ def _orders_csv_fills(
     except Exception:
         return fills
     return fills
+
+
+def _orders_csv_submitted_notionals(orders_csv: Path) -> Dict[str, float]:
+    """Map ticker -> notional_usd for submitted-but-not-filled rows in an orders CSV.
+
+    Used in the full-report fallback to count submitted-but-unconfirmed orders as
+    prior allocation with an unknown reference price (the conservative path), matching
+    what the buy_candidates path does for status='submitted' candidates with no fill.
+    """
+    notionals: Dict[str, float] = {}
+    if not orders_csv.exists():
+        return notionals
+    try:
+        with orders_csv.open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                ticker = row.get("ticker")
+                if not ticker or (row.get("status") or "").lower() != "submitted":
+                    continue
+                raw = row.get("notional_usd")
+                try:
+                    notional = float(raw) if raw not in (None, "", "-") else None
+                except (TypeError, ValueError):
+                    notional = None
+                if notional and notional > 0:
+                    notionals[ticker] = notionals.get(ticker, 0.0) + notional
+    except Exception:
+        pass
+    return notionals
 
 
 def load_prior_same_day_allocations(
@@ -1760,13 +1797,22 @@ def load_prior_same_day_allocations(
                         # Pass the exact recorded file rather than run_dir/"orders.csv"
                         # because run_and_report writes custom-named CSVs.
                         report_fills = _orders_csv_fills(orders_csv_file.parent, orders_csv_file=orders_csv_file)
+                        submitted_notionals = _orders_csv_submitted_notionals(orders_csv_file)
+                        # Merge filled rows (known price) then submitted rows (unknown price).
+                        # Filled rows for a ticker win over submitted rows for the same ticker.
+                        _csv_tickers: Dict[str, tuple] = {}  # ticker -> (amount, ref_price)
                         for _ticker, _fill in report_fills.items():
                             if _fill["quantity_filled"]:
-                                _amount = _fill["avg_fill_price"] * _fill["quantity_filled"]
-                                _ref = _fill["avg_fill_price"]
-                            else:
-                                _amount = 0.0
-                                _ref = None
+                                _csv_tickers[_ticker] = (
+                                    _fill["avg_fill_price"] * _fill["quantity_filled"],
+                                    _fill["avg_fill_price"],
+                                )
+                        for _ticker, _notional in submitted_notionals.items():
+                            if _ticker not in _csv_tickers:
+                                _csv_tickers[_ticker] = (_notional, None)
+                        for _ticker, (_amount, _ref) in _csv_tickers.items():
+                            if _amount <= 0:
+                                continue
                             _entry = aggregated.setdefault(
                                 _ticker,
                                 {"amount": 0.0, "reference_price": None, "run_id": run_id, "source": source},
@@ -2403,7 +2449,7 @@ def run_once(
         # this afternoon: a morning spend on MSFT reduces the remaining daily/weekly
         # cap even when MSFT doesn't qualify for the afternoon run.
         for _ticker, _alloc in prior_same_day_allocations.items():
-            if _alloc.amount_usd > 0:
+            if _alloc.amount_usd > 0 and state.buys_today(_ticker, trading_day) == 0:
                 state.record_buy(_ticker, trading_day, _alloc.amount_usd)
 
     # Tracks the trailing-7-day scheduled-live deployment total live as orders
