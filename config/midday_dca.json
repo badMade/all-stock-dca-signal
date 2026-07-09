@@ -47,25 +47,30 @@
     "separation_note": "The midday ledger is a separate session from both the morning ledger and the afternoon StrategyState / BUDGET_TIERS ledger. Midday buys never consume or validate the morning or afternoon 3:20 daily/weekly budget."
   },
   "top_up_rule": {
-    "description": "Morning/manual prior same-day buys are prior-allocation context only; they never block the midday run. The midday run tops up only when it is buying into a lower price.",
+    "description": "Morning/manual prior same-day buys are prior-allocation context only; they never block the midday run. The midday run tops up only when it is buying into a lower price. The identical guard applies to the morning, midday, afternoon, and manual override same-day fills: every later run buys only max(0, desired_amount - prior_same_day_amount), and only when the current decision price is strictly below the prior same-day reference price.",
     "boundary_et": "14:30",
+    "reference_price_preference": "The prior same-day reference price is resolved in this order: the run's logged target_price, then decision_price, then the confirmed average_fill_price (from orders.csv or a manual override's filled_orders.csv). A missing reference price (none of the three available) means no automatic top-up: the candidate is flagged top_up_manual_review (manual_review_candidate) at $0.",
     "rules": [
       "No earlier same-day allocation for the ticker -> normal allocation (buy the full midday desired amount).",
-      "Earlier allocation exists and the midday decision price is strictly below the earlier run's reference price -> buy only the incremental dollar difference (midday desired - amount already bought); $0 if that is <= 0.",
+      "Earlier allocation exists and the midday decision price is strictly below the earlier run's reference price -> buy only the incremental dollar difference max(0, midday desired - amount already bought); $0 if that is <= 0.",
       "Earlier allocation exists but the midday price is not below the reference price -> buy $0.",
-      "Earlier amount known but no comparable price (missing prior reference or current midday price) -> conservative $0 with top_up_manual_review flagged."
+      "Earlier amount known but no comparable price (missing prior reference or current midday price) -> conservative $0 with top_up_manual_review flagged (manual_review_candidate)."
     ],
-    "prior_allocation_sources": "Morning live and manual runs under the morning-live root; scheduled runs are ignored as prior context. Midday's own runs are eligible prior context for the afternoon guard."
+    "prior_allocation_sources": "Morning live and manual runs under the morning-live root; scheduled afternoon runs are ignored as prior context. Midday's own scheduled runs and its manual override reruns (manual_reruns/) are eligible prior context for the afternoon guard only."
   },
   "artifact_paths": {
     "live_run_state_root": "/home/user/workspace/cron_tracking/midday_dca",
     "live_scheduled_run_dir": "/home/user/workspace/cron_tracking/midday_dca/YYYYMMDD_1230ET/",
     "live_latest_run_pointer": "/home/user/workspace/cron_tracking/midday_dca/latest_midday_run.json",
+    "manual_rerun_root": "/home/user/workspace/cron_tracking/midday_dca/manual_reruns",
+    "manual_rerun_run_state_glob": "/home/user/workspace/cron_tracking/midday_dca/manual_reruns/**/run_state.json",
+    "manual_rerun_fills_filename": "filled_orders.csv",
     "run_state_filename": "run_state.json",
     "prior_allocation_roots": [
       "/home/user/workspace/cron_tracking/morning_dca"
     ],
-    "separation_note": "The midday stream writes ONLY under its own root. It never writes into the morning roots, /home/user/workspace/cron_tracking/ce16ba6b/**, updates latest_scheduled_run.json, or touches afternoon scheduled_runs/ folders."
+    "manual_rerun_note": "Manual override fills are recorded under manual_reruns/**/run_state.json and filled_orders.csv (run_origin='manual', manual_run=true). They are EXCLUDED from scheduled evidence, slippage, reliability, fill counts, watchdog confirmation, and cost basis, and are used ONLY as prior-allocation context for the same-day top-up guard (they affect the afternoon 3:20 PM top-up eligibility, not any scheduled metric). Manual override reruns are not part of prior_allocation_roots for the midday run itself because they post-date the 12:30 PM decision; the afternoon guard folds them in via the midday root.",
+    "separation_note": "The midday stream writes ONLY under its own root (scheduled runs plus manual override reruns under manual_reruns/). It never writes into the morning roots, /home/user/workspace/cron_tracking/ce16ba6b/**, updates latest_scheduled_run.json, or touches afternoon scheduled_runs/ folders."
   },
   "scheduled_run_classification": {
     "live": {
@@ -83,6 +88,21 @@
       "valid_afternoon_evidence": false,
       "state_schema_version": "midday-live-v1"
     }
+  },
+  "manual_override_run_classification": {
+    "run_origin": "manual",
+    "run_type": "midday_dca_live",
+    "stream": "midday",
+    "cron_id": "a6239dae",
+    "supersedes_cron_id": null,
+    "manual_run": true,
+    "trades": true,
+    "valid_afternoon_evidence": false,
+    "state_schema_version": "midday-live-v1",
+    "run_id_pattern": "manual_midday_live_YYYYMMDD_HHMMSSZ_<suffix>",
+    "artifact_root": "/home/user/workspace/cron_tracking/midday_dca/manual_reruns/<timestamp>/",
+    "fills_filename": "filled_orders.csv",
+    "note": "Manual override reruns are a MANUAL invocation of the midday live executor on account 562057042 (run_origin='manual', manual_run=true, run_type stays 'midday_dca_live', non-scheduled run_id). They validate against schemas/midday_run_classification.schema.json's manual branch. EXCLUDED from all scheduled metrics; used ONLY as prior-allocation context for the afternoon same-day top-up guard. Example fills (2026-07-09): AMZN $3.00 at avg fill 242.1099; GOOG $4.50 at 352.1778; GOOGL $4.50 at 354.9800."
   },
   "artifact_fields": {
     "signal_row": [
@@ -132,6 +152,7 @@
     "A midday run_state has stream='midday' and valid_afternoon_evidence=false; any consumer must exclude it from afternoon scheduled-live cost basis, slippage, reliability, and order-count metrics.",
     "The midday stream does not update latest_scheduled_run.json or write into afternoon scheduled/manual folders.",
     "Midday fills count only as PRIOR-ALLOCATION CONTEXT for the afternoon same-day top-up guard; they are never afternoon scheduled evidence, slippage, watchdog confirmation, scheduled cost basis, or scheduled fill counts.",
-    "Morning/manual fills count only as PRIOR-ALLOCATION CONTEXT for the midday same-day top-up guard."
+    "Morning/manual fills count only as PRIOR-ALLOCATION CONTEXT for the midday same-day top-up guard.",
+    "Manual override reruns under /home/user/workspace/cron_tracking/midday_dca/manual_reruns/**/run_state.json and filled_orders.csv are EXCLUDED from every scheduled metric (evidence, slippage, reliability, fill counts, cost basis) and are used ONLY as prior-allocation context for the afternoon same-day top-up guard."
   ]
 }

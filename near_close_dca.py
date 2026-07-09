@@ -1615,6 +1615,27 @@ def _write_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
 _PRIOR_ALLOCATION_STATUSES = frozenset({"submitted", "filled"})
 
 
+def _candidate_logged_reference_price(candidate: Dict[str, Any]) -> Optional[float]:
+    """Resolve a prior candidate's logged reference price by policy preference.
+
+    Same-day top-up guard policy resolves a prior run's reference price in this
+    order: the run's logged ``target_price``, then ``decision_price`` (also
+    recorded as ``decision_bar_close``). The caller falls back to the confirmed
+    ``average_fill_price`` from the orders CSV when none of these are logged, and
+    treats a still-missing reference as "unknown" (conservative no-top-up /
+    manual_review path). Returns the first strictly-positive value, else ``None``.
+    """
+    for key in ("target_price", "decision_price", "decision_bar_close"):
+        raw = candidate.get(key)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
 def _prior_run_is_scheduled(run_state: Dict[str, Any]) -> bool:
     """True when a run_state is classified as the scheduled *afternoon* run.
 
@@ -1671,9 +1692,19 @@ def _orders_csv_fills(
     ``run_state.artifacts.orders_csv_path``) instead of looking for a sibling
     ``orders.csv``; ``run_and_report`` writes files with custom names like
     ``dca_<label>_<day>_<stamp>_orders.csv`` that ``run_dir / "orders.csv"`` won't find.
+
+    When no explicit file is given the sibling ``orders.csv`` is used, falling back
+    to ``filled_orders.csv`` -- the confirmed-fill record manual override reruns
+    write under ``.../manual_reruns/`` -- so a manual override fill still counts as
+    prior-allocation context for the same-day top-up guard.
     """
     fills: Dict[str, Dict[str, Any]] = {}
-    orders_csv = orders_csv_file if orders_csv_file is not None else run_dir / "orders.csv"
+    if orders_csv_file is not None:
+        orders_csv = orders_csv_file
+    else:
+        orders_csv = run_dir / "orders.csv"
+        if not orders_csv.exists():
+            orders_csv = run_dir / "filled_orders.csv"
     if not orders_csv.exists():
         return fills
     try:
@@ -1741,18 +1772,25 @@ def load_prior_same_day_allocations(
     """Aggregate earlier same-day allocation context for the scheduled afternoon guard.
 
     Scans ``state_root`` recursively for ``run_state*.json`` artifacts written earlier
-    the same ``trading_day`` by morning/manual runs (including manual market-open
-    recovery and any future morning session), and returns a per-ticker
-    :class:`PriorSameDayAllocation`. These artifacts are read as prior-allocation
-    context ONLY -- they are deliberately never surfaced as scheduled evidence,
-    slippage, watchdog confirmation, scheduled cost basis, or scheduled fill counts.
+    the same ``trading_day`` by morning/midday/manual runs (including manual
+    market-open recovery, manual override reruns under ``.../manual_reruns/``, and any
+    future morning session), and returns a per-ticker :class:`PriorSameDayAllocation`.
+    These artifacts are read as prior-allocation context ONLY -- they are deliberately
+    never surfaced as scheduled evidence, slippage, watchdog confirmation, scheduled
+    cost basis, or scheduled fill counts.
 
     Eligibility mirrors the 2:30 PM ET boundary: only runs generated before
-    ``boundary_et`` on ``trading_day`` are read, scheduled runs are ignored, and only
-    buy candidates whose status shows an order was placed contribute. When multiple
-    earlier runs touched a ticker the dollar amounts are summed and the *lowest*
-    available reference price wins, so the afternoon run must beat the best earlier
-    entry price before it tops up.
+    ``boundary_et`` on ``trading_day`` are read, scheduled *afternoon* runs are
+    ignored (morning/midday-stream runs stay eligible), and only buy candidates whose
+    status shows an order was placed contribute. Each contributing candidate's
+    reference price is resolved by policy preference -- logged ``target_price``, then
+    ``decision_price``, then the confirmed ``average_fill_price`` (from ``orders.csv``
+    or a manual override's ``filled_orders.csv``); a candidate with none is treated as
+    an unknown reference. When multiple earlier runs touched a ticker the dollar
+    amounts are summed and the *lowest* available reference price wins, so the
+    afternoon run must beat the best earlier entry price before it tops up. If any
+    contributing reference is unknown the aggregate reference is unknown, routing the
+    guard to its conservative missing-price / manual_review $0 path.
     """
     root = Path(state_root)
     if not root.exists():
@@ -1873,15 +1911,16 @@ def load_prior_same_day_allocations(
             if amount <= 0:
                 continue
 
-            # reference_price is only ever a confirmed fill price. The
-            # candidate's target_price/decision_bar_close is the price of the
-            # completed decision bar at signal time, not a proven execution
-            # price -- using it as a stand-in reference risks comparing the
-            # afternoon quote against a price nothing actually traded at, which
-            # can wrongly look like (or hide) a real top-up opportunity. No
-            # confirmed fill price means "unknown", which the guard already
-            # handles conservatively (missing_prior_price -> $0 + manual review).
-            reference_price = fill["avg_fill_price"] if fill is not None else None
+            # Reference price preference (same-day top-up guard policy): the
+            # run's logged target_price/decision_price first, then the confirmed
+            # average_fill_price from the orders CSV. The logged intended price is
+            # the entry the run committed to, so it is what a later run must beat
+            # before topping up. Neither logged nor filled means "unknown", which
+            # the guard handles conservatively (missing_prior_price -> $0 +
+            # manual review).
+            reference_price = _candidate_logged_reference_price(candidate)
+            if reference_price is None and fill is not None:
+                reference_price = fill["avg_fill_price"]
 
             entry = aggregated.setdefault(
                 ticker,
@@ -1917,6 +1956,45 @@ def load_prior_same_day_allocations(
         )
         for ticker, entry in aggregated.items()
     }
+
+
+def load_prior_same_day_allocations_multi(
+    state_roots: Sequence[str | Path],
+    trading_day: date,
+    *,
+    boundary_et: time = MORNING_MANUAL_BOUNDARY_ET,
+) -> Dict[str, PriorSameDayAllocation]:
+    """Merge :func:`load_prior_same_day_allocations` across several state roots.
+
+    The afternoon guard folds in earlier same-day fills that live under sibling
+    stream roots -- the morning-live root, the midday-live root, and the manual
+    override reruns under ``.../manual_reruns/`` -- as well as its own task root.
+    Per ticker the dollar amounts are summed and the *lowest* known reference
+    price wins (any unknown reference poisons the aggregate to unknown), so the
+    afternoon run must beat the best earlier entry across every stream before it
+    tops up. Roots that do not exist contribute nothing, so passing production
+    stream roots is safe on days a stream did not run.
+    """
+    merged: Dict[str, PriorSameDayAllocation] = {}
+    for root in state_roots:
+        allocations = load_prior_same_day_allocations(root, trading_day, boundary_et=boundary_et)
+        for ticker, alloc in allocations.items():
+            existing = merged.get(ticker)
+            if existing is None:
+                merged[ticker] = alloc
+                continue
+            if existing.reference_price is None or alloc.reference_price is None:
+                ref = None
+            else:
+                ref = min(existing.reference_price, alloc.reference_price)
+            merged[ticker] = PriorSameDayAllocation(
+                ticker=ticker,
+                amount_usd=round(existing.amount_usd + alloc.amount_usd, 2),
+                reference_price=ref,
+                run_id=alloc.run_id or existing.run_id,
+                source=alloc.source or existing.source,
+            )
+    return merged
 
 
 # Mutually exclusive reasons an active-universe ticker did not produce a filled order.

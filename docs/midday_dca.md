@@ -47,10 +47,17 @@ only** — never midday scheduled evidence. Per ticker the guard applies:
   (midday desired − amount already bought); `$0` if that is `≤ 0`.
 - **Earlier allocation but midday price not below** the reference price → `$0`.
 - **Earlier amount known but no comparable price** (missing prior reference or
-  current midday price) → conservative `$0` with `top_up_manual_review` flagged.
+  current midday price) → conservative `$0` with `top_up_manual_review` flagged
+  (a `manual_review_candidate`).
 
-Only earlier runs generated **before 2:30 PM ET** contribute; scheduled runs are
-excluded as prior context. Prior allocations are scanned across
+**Reference price preference.** A prior run's reference price is resolved in this
+order: the run's logged `target_price`, then `decision_price`, then the confirmed
+`average_fill_price` (from `orders.csv`, or a manual override's
+`filled_orders.csv`). A missing reference (none available) → no automatic top-up
+(`manual_review_candidate`).
+
+Only earlier runs generated **before 2:30 PM ET** contribute; scheduled afternoon
+runs are excluded as prior context. Prior allocations are scanned across
 `prior_allocation_roots` (default the morning-live root); when a ticker appears in
 more than one root the amounts are summed and the lowest reference price wins, so
 midday must beat the best earlier entry before it tops up.
@@ -85,6 +92,33 @@ updates `latest_scheduled_run.json`, and its `run_classification` always carries
 scheduled evidence, slippage, watchdog confirmation, scheduled cost basis, or
 scheduled fill counts. See
 [strategy.md](strategy.md#same-day-prior-run-offset--top-up-guard).
+
+## Manual override reruns
+
+An out-of-band manual buy of the midday stream on account `562057042` is written
+under `.../cron_tracking/midday_dca/manual_reruns/<timestamp>/` as `run_state.json`
+plus a confirmed-fill `filled_orders.csv`. Such a run is a **manual invocation** of
+the same executor: `run_origin='manual'`, `manual_run=true`, `run_type` stays
+`midday_dca_live`, and it uses a non-scheduled `run_id`
+(`manual_midday_live_YYYYMMDD_HHMMSSZ_<suffix>`), so it validates against the
+manual branch of
+[`schemas/midday_run_classification.schema.json`](../schemas/midday_run_classification.schema.json).
+
+Manual override reruns are **excluded** from every scheduled metric — evidence,
+slippage, reliability, fill counts, watchdog confirmation, and cost basis — and
+are used **only** as prior-allocation context for the **afternoon** 3:20 PM
+same-day top-up guard (the afternoon guard scans the midday root, which contains
+`manual_reruns/`). They do **not** affect the midday run itself (they post-date the
+12:30 PM decision).
+
+Example — 2026-07-09 manual override fills (excluded from scheduled evidence,
+affecting afternoon top-up eligibility only):
+
+| Ticker | Amount | Avg fill price |
+|---|---|---|
+| `AMZN` | $3.00 | 242.1099 |
+| `GOOG` | $4.50 | 352.1778 |
+| `GOOGL` | $4.50 | 354.9800 |
 
 ## Midday sizing ladder (0x → 5x)
 

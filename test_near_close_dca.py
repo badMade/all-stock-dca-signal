@@ -46,6 +46,7 @@ from near_close_dca import (
     evaluate_top_up_guard,
     graded_buy_multiplier,
     load_prior_same_day_allocations,
+    load_prior_same_day_allocations_multi,
     reconcile_signals,
     run_and_report,
     run_daily_compact,
@@ -1048,11 +1049,9 @@ def _manual_run_state(candidates, generated_at="2026-06-29T10:00:00-04:00", run_
 
 
 def test_load_prior_same_day_reads_morning_manual_allocation(tmp_path):
-    # No orders.csv at all (legacy/older artifact layout) -- the amount is still
-    # read from run_state.json, but reference_price is None rather than falling
-    # back to target_price/decision_bar_close: that's the decision bar's price at
-    # signal time, not a proven execution price, so using it as a stand-in risks
-    # comparing the afternoon quote against a price nothing actually traded at.
+    # No orders.csv at all (legacy/older artifact layout). Per the reference-price
+    # preference the guard uses the run's logged target_price as the reference
+    # (the entry the run committed to) even without a confirmed fill.
     root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
     _write_prior_run(
         root,
@@ -1064,11 +1063,29 @@ def test_load_prior_same_day_reads_morning_manual_allocation(tmp_path):
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
     assert set(allocations) == {"AAPL"}
     assert allocations["AAPL"].amount_usd == 3.0
-    assert allocations["AAPL"].reference_price is None
+    assert allocations["AAPL"].reference_price == 99.0
     assert allocations["AAPL"].source == "manual"
 
 
-def test_load_prior_same_day_prefers_orders_csv_fill_price(tmp_path):
+def test_load_prior_same_day_no_logged_price_has_no_reference(tmp_path):
+    # No logged target_price/decision_price and no confirmed fill -> reference is
+    # unknown (None), routing the guard to its conservative missing-price path.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    _write_prior_run(
+        root,
+        "manual_runs/0900",
+        _manual_run_state([
+            {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0},
+        ]),
+    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert allocations["AAPL"].amount_usd == 3.0
+    assert allocations["AAPL"].reference_price is None
+
+
+def test_load_prior_same_day_prefers_logged_target_over_fill_price(tmp_path):
+    # Reference-price preference: the logged target_price wins over the confirmed
+    # average_fill_price when both are present.
     root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
     _write_prior_run(
         root,
@@ -1079,8 +1096,99 @@ def test_load_prior_same_day_prefers_orders_csv_fill_price(tmp_path):
         orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "97.5"}],
     )
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
-    # The actual fill price wins over the recorded signal-time target price.
+    assert allocations["AAPL"].reference_price == 99.0
+
+
+def test_load_prior_same_day_falls_back_to_fill_price_without_logged_price(tmp_path):
+    # No logged target_price/decision_price -> use the confirmed average_fill_price.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    _write_prior_run(
+        root,
+        "manual_runs/0900",
+        _manual_run_state([
+            {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0},
+        ]),
+        orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "97.5"}],
+    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
     assert allocations["AAPL"].reference_price == 97.5
+
+
+def test_load_prior_same_day_reads_manual_override_filled_orders_csv(tmp_path):
+    # A manual override rerun records confirmed fills in filled_orders.csv (not
+    # orders.csv). Without a logged price the guard falls back to that fill price,
+    # so a manual override still contributes prior-allocation context.
+    root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    run_dir = os.path.join(root, "manual_reruns", "1505")
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(
+            _manual_run_state([
+                {"ticker": "AMZN", "status": "filled", "planned_amount_usd": 3.0},
+            ]),
+            handle,
+        )
+    with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+        handle.write("ticker,status,avg_fill_price\nAMZN,filled,242.1099\n")
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert allocations["AMZN"].amount_usd == 3.0
+    assert allocations["AMZN"].reference_price == 242.1099
+    assert allocations["AMZN"].source == "manual"
+
+
+def test_load_prior_same_day_multi_merges_roots_sums_amounts_lowest_reference(tmp_path):
+    # The afternoon guard scans multiple roots (its own + morning + midday). When
+    # a ticker appears in more than one root, amounts sum and the lowest known
+    # reference price wins, so the afternoon must beat the best earlier entry.
+    morning_root = os.path.join(tmp_path, "cron_tracking", "morning_dca")
+    _write_prior_run(
+        morning_root,
+        "20260629_1030ET",
+        _manual_run_state([
+            {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0, "target_price": 99.0},
+        ]),
+    )
+    midday_root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    _write_prior_run(
+        midday_root,
+        "20260629_1230ET",
+        _manual_run_state([
+            {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 4.5, "target_price": 97.0},
+        ]),
+    )
+    allocations = load_prior_same_day_allocations_multi(
+        (morning_root, midday_root), date(2026, 6, 29)
+    )
+    assert allocations["AAPL"].amount_usd == 7.5
+    assert allocations["AAPL"].reference_price == 97.0
+
+
+def test_load_prior_same_day_multi_missing_reference_poisons_to_none(tmp_path):
+    # If any contributing run lacks a reference price, the merged reference is
+    # unknown -- the guard can't safely compare, so it routes to the conservative
+    # manual-review path rather than trusting a partial reference.
+    morning_root = os.path.join(tmp_path, "cron_tracking", "morning_dca")
+    _write_prior_run(
+        morning_root,
+        "20260629_1030ET",
+        _manual_run_state([
+            {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0, "target_price": 99.0},
+        ]),
+    )
+    midday_root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    _write_prior_run(
+        midday_root,
+        "20260629_1230ET",
+        _manual_run_state([
+            {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 4.5},
+        ]),
+        orders_rows=[{"ticker": "AAPL", "status": "submitted", "avg_fill_price": ""}],
+    )
+    allocations = load_prior_same_day_allocations_multi(
+        (morning_root, midday_root), date(2026, 6, 29)
+    )
+    assert allocations["AAPL"].amount_usd == 7.5
+    assert allocations["AAPL"].reference_price is None
 
 
 def test_load_prior_same_day_unconfirmed_submitted_order_has_no_reference_price(tmp_path):
@@ -1091,13 +1199,14 @@ def test_load_prior_same_day_unconfirmed_submitted_order_has_no_reference_price(
     # never refreshed, so it stays as prior allocation context with the known
     # planned amount but no reference price -- which routes the afternoon guard
     # to its conservative missing_prior_price / manual-review $0 path rather
-    # than either a blind top-up or a blind full re-buy.
+    # than either a blind top-up or a blind full re-buy. With no logged
+    # target_price/decision_price and no confirmed fill, no reference resolves.
     root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
     _write_prior_run(
         root,
         "manual_runs/0900",
         _manual_run_state([
-            {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0, "target_price": 99.0},
+            {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0},
         ]),
         orders_rows=[{"ticker": "AAPL", "status": "submitted", "avg_fill_price": ""}],
     )
