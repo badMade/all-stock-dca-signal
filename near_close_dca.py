@@ -311,7 +311,7 @@ def select_budget_tier(planned_spend_usd: float, high_multiplier_signal_count: i
     else:
         signal_idx = 0
 
-    return BUDGET_TIERS[max(spend_idx, signal_idx)]
+    return BUDGET_TIERS[spend_idx if spend_idx > signal_idx else signal_idx]
 
 
 @dataclass(frozen=True)
@@ -809,7 +809,7 @@ def build_broker(
 
 def iso_week_key(day: date) -> tuple[int, int]:
     iso = day.isocalendar()
-    return iso.year, iso.week
+    return iso[0], iso[1]
 
 
 def completed_bar_anchor(decision_dt: datetime, interval_minutes: int, config: StrategyConfig) -> datetime:
@@ -819,8 +819,12 @@ def completed_bar_anchor(decision_dt: datetime, interval_minutes: int, config: S
 
 
 def latest_bar_at_or_before(bars: Iterable[Bar], target: datetime) -> Optional[Bar]:
-    eligible = [bar for bar in bars if bar.timestamp <= target]
-    return max(eligible, key=lambda bar: bar.timestamp) if eligible else None
+    best = None
+    for bar in bars:
+        if bar.timestamp <= target:
+            if best is None or bar.timestamp > best.timestamp:
+                best = bar
+    return best
 
 
 def kill_switch_engaged(config: StrategyConfig) -> bool:
@@ -1077,11 +1081,9 @@ def allocation_sort_key(decision: ReconciledDecision) -> Tuple[float, float, str
     same names the strategy state promises. Numeric keys are negated (rather than
     sorting with ``reverse=True``) so ticker still sorts ascending.
     """
-    drop = max(
-        decision.finance_signal.drop_vs_previous_close_pct if decision.finance_signal else 0.0,
-        decision.robinhood_signal.drop_vs_previous_close_pct if decision.robinhood_signal else 0.0,
-    )
-    return (-decision.buy_multiplier, -drop, decision.ticker)
+    f_drop = decision.finance_signal.drop_vs_previous_close_pct if decision.finance_signal else 0.0
+    r_drop = decision.robinhood_signal.drop_vs_previous_close_pct if decision.robinhood_signal else 0.0
+    return (-decision.buy_multiplier, -(f_drop if f_drop > r_drop else r_drop), decision.ticker)
 
 
 def _signal_target_price(decision: ReconciledDecision) -> Optional[float]:
