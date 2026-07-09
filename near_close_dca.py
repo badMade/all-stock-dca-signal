@@ -1616,12 +1616,19 @@ _PRIOR_ALLOCATION_STATUSES = frozenset({"submitted", "filled"})
 
 
 def _prior_run_is_scheduled(run_state: Dict[str, Any]) -> bool:
-    """True when a run_state is classified as the scheduled afternoon run.
+    """True when a run_state is classified as the scheduled *afternoon* run.
 
-    Scheduled runs are never read as prior morning/manual allocation context.
+    The scheduled afternoon run is never read as prior allocation context. A
+    morning-stream run (``run_classification.stream == 'morning'``), however, IS
+    eligible prior context even when its own ``run_origin`` is ``'scheduled'``:
+    the 10:30 AM morning live task is scheduled within the morning stream but
+    must still offset the afternoon top-up. Only afternoon scheduled runs are
+    excluded here.
     """
     classification = run_state.get("run_classification")
     if isinstance(classification, dict):
+        if classification.get("stream") == "morning":
+            return False
         if classification.get("run_origin") == "scheduled":
             return True
         if classification.get("manual_run") is False and classification.get("run_origin") is None:

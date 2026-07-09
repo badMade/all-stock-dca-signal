@@ -1,22 +1,39 @@
 {
-  "policy_id": "morning-dca-dryrun-v1",
-  "version": "2026-07-08",
-  "purpose": "Configuration and separation policy for the MORNING graded-DCA dry-run analytics stream. The morning stream evaluates morning price weakness vs. yesterday's regular-session close on its own 0x-to-3x ladder, tracks a separate morning budget ledger, and writes its own run-state artifacts. It is dry-run/analytics only: no orders, no Robinhood order review, no broker placement. It is INDEPENDENT of, and never valid evidence for, the afternoon live task 10ce362c (which supersedes the deleted ce16ba6b).",
-  "state_schema_version": "run-classification-v1",
-  "mode": "dry_run",
-  "trades": false,
+  "policy_id": "morning-dca-two-stream-v1",
+  "version": "2026-07-09",
+  "purpose": "Configuration and separation policy for the MORNING graded-DCA stream, which now has TWO modes. (1) A 9:45 AM ET read-only watchlist / early-warning scan (mode='watchlist', run_type='morning_dca_watchlist_scan', trades=false): analytics only, no orders, no Robinhood order review, no broker placement; it may surface early candidates but every dollar amount is hypothetical / watchlist-only. (2) A 10:30 AM ET live Robinhood execution (mode='live', run_type='morning_dca_live', trades=true) using a true 60-minute intraday trend window. Both modes share the morning 0x-to-3x ladder and the morning budget ledger but write to distinct artifact roots. Both are INDEPENDENT of, and never valid evidence for, the afternoon live task 10ce362c (which supersedes the deleted ce16ba6b).",
   "stream": "morning",
-  "morning_task": {
+  "confidence_rule": "In LIVE mode, a candidate whose price/drop passes the ladder is auto-bought ONLY when the intraday trend can be validated (>= trend_min_bars usable intraday bars at or before the decision time). If price/drop passes but the intraday trend cannot be validated, the run must NOT auto-buy; it classifies the candidate as execution_status='manual_review_candidate'. There is no loosened trend-unavailable execution path.",
+  "trend_min_bars": 6,
+  "watchlist_task": {
+    "mode": "watchlist",
     "cron_id": "morning-dca-0945",
     "supersedes_cron_id": null,
-    "name": "Morning graded DCA dry-run analytics",
+    "name": "Morning graded DCA watchlist / early-warning scan",
     "schedule_et": "09:45",
     "schedule_human": "9:45 AM ET weekdays",
     "window_start_et": "09:40",
     "window_end_et": "09:50",
-    "run_type": "morning_dca_dry_run",
+    "run_type": "morning_dca_watchlist_scan",
+    "state_schema_version": "morning-watchlist-v1",
+    "trades": false,
     "broker_account": "read_only",
-    "note": "Analytics only. Robinhood account 562057042 remains the sole execution broker for the afternoon live task; Alpaca stays read-only. The morning stream places no trades."
+    "note": "Analytics / read-only only. Identifies early candidates but labels every amount hypothetical / watchlist-only. Places no trades, runs no Robinhood order review, calls no broker placement path."
+  },
+  "live_task": {
+    "mode": "live",
+    "cron_id": "42173154",
+    "supersedes_cron_id": null,
+    "name": "Weekday 10:30 AM morning DCA live Robinhood execution",
+    "schedule_et": "10:30",
+    "schedule_human": "10:30 AM ET weekdays",
+    "window_start_et": "10:25",
+    "window_end_et": "10:35",
+    "run_type": "morning_dca_live",
+    "state_schema_version": "morning-live-v1",
+    "trades": true,
+    "broker_account": "562057042",
+    "note": "Live Robinhood execution using account 562057042 (Alpaca stays read-only for validation/context). Uses a true 60-minute intraday trend window (moved from the former 9:45 AM live slot). Subject to the confidence_rule: no auto-buy when the intraday trend cannot be validated."
   },
   "sizing_ladder": {
     "name": "morning_0x_to_3x",
@@ -36,28 +53,50 @@
     "namespace": "morning",
     "morning_daily_cap_usd": 90.0,
     "morning_weekly_cap_usd": 450.0,
-    "separation_note": "The morning ledger is a separate session from the afternoon StrategyState / BUDGET_TIERS ledger. Morning dry-run (or any future morning buys) never consume or validate the afternoon 3:20/3:45 daily/weekly budget."
+    "separation_note": "The morning ledger is a separate session from the afternoon StrategyState / BUDGET_TIERS ledger. Morning buys (live) or hypothetical amounts (watchlist) never consume or validate the afternoon 3:20 daily/weekly budget."
   },
   "artifact_paths": {
-    "morning_run_state_root": "/home/user/workspace/cron_tracking/morning_dca",
-    "scheduled_run_dir": "/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_0945ET/",
-    "latest_morning_run_pointer": "/home/user/workspace/cron_tracking/morning_dca/latest_morning_run.json",
+    "watchlist_run_state_root": "/home/user/workspace/cron_tracking/morning_dca_watchlist",
+    "live_run_state_root": "/home/user/workspace/cron_tracking/morning_dca",
+    "morning_run_state_root": "/home/user/workspace/cron_tracking/morning_dca_watchlist",
+    "watchlist_scheduled_run_dir": "/home/user/workspace/cron_tracking/morning_dca_watchlist/YYYYMMDD_0945ET/",
+    "live_scheduled_run_dir": "/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/",
+    "watchlist_latest_run_pointer": "/home/user/workspace/cron_tracking/morning_dca_watchlist/latest_morning_run.json",
+    "live_latest_run_pointer": "/home/user/workspace/cron_tracking/morning_dca/latest_morning_run.json",
     "run_state_filename": "run_state.json",
-    "separation_note": "The morning stream writes ONLY under the morning root. It never writes into /home/user/workspace/cron_tracking/ce16ba6b/**, never updates latest_scheduled_run.json, and never touches afternoon scheduled_runs/ folders."
+    "separation_note": "Each morning mode writes ONLY under its own root. Neither writes into /home/user/workspace/cron_tracking/ce16ba6b/**, updates latest_scheduled_run.json, or touches afternoon scheduled_runs/ folders. The legacy 'morning_run_state_root' key mirrors the watchlist root for backwards compatibility."
   },
   "scheduled_run_classification": {
-    "run_origin": "scheduled",
-    "run_type": "morning_dca_dry_run",
-    "stream": "morning",
-    "cron_id": "morning-dca-0945",
-    "supersedes_cron_id": null,
-    "scheduled_for_et": "09:45",
-    "scheduled_window_start_et": "09:40",
-    "scheduled_window_end_et": "09:50",
-    "manual_run": false,
-    "run_id_pattern": "morning_YYYYMMDD_0945ET",
-    "valid_afternoon_evidence": false,
-    "state_schema_version": "run-classification-v1"
+    "watchlist": {
+      "run_origin": "scheduled",
+      "run_type": "morning_dca_watchlist_scan",
+      "stream": "morning",
+      "cron_id": "morning-dca-0945",
+      "supersedes_cron_id": null,
+      "scheduled_for_et": "09:45",
+      "scheduled_window_start_et": "09:40",
+      "scheduled_window_end_et": "09:50",
+      "manual_run": false,
+      "run_id_pattern": "morning_YYYYMMDD_0945ET",
+      "trades": false,
+      "valid_afternoon_evidence": false,
+      "state_schema_version": "morning-watchlist-v1"
+    },
+    "live": {
+      "run_origin": "scheduled",
+      "run_type": "morning_dca_live",
+      "stream": "morning",
+      "cron_id": "42173154",
+      "supersedes_cron_id": null,
+      "scheduled_for_et": "10:30",
+      "scheduled_window_start_et": "10:25",
+      "scheduled_window_end_et": "10:35",
+      "manual_run": false,
+      "run_id_pattern": "morning_live_YYYYMMDD_1030ET",
+      "trades": true,
+      "valid_afternoon_evidence": false,
+      "state_schema_version": "morning-live-v1"
+    }
   },
   "artifact_fields": {
     "signal_row": [
@@ -70,6 +109,8 @@
       "drop_pct",
       "multiplier",
       "hypothetical_amount_usd",
+      "execution_status",
+      "trend_validated",
       "warnings"
     ],
     "run_state_top_level": [
@@ -87,8 +128,9 @@
     ]
   },
   "downstream_separation_rules": [
-    "Afternoon consumers glob only /home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/** and therefore never traverse the morning root.",
-    "A morning run_state has run_type='morning_dca_dry_run', stream='morning', and valid_afternoon_evidence=false; any consumer must exclude it from afternoon scheduled-live cost basis, slippage, reliability, and order-count metrics.",
-    "The morning stream never updates latest_scheduled_run.json and never writes into afternoon scheduled/manual folders."
+    "Afternoon consumers glob only /home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/** and therefore never traverse either morning root.",
+    "A morning run_state has stream='morning' and valid_afternoon_evidence=false; any consumer must exclude it from afternoon scheduled-live cost basis, slippage, reliability, and order-count metrics.",
+    "Neither morning mode updates latest_scheduled_run.json or writes into afternoon scheduled/manual folders.",
+    "Morning fills (live) count only as PRIOR-ALLOCATION CONTEXT for the afternoon same-day top-up guard; they are never afternoon scheduled evidence, slippage, watchdog confirmation, scheduled cost basis, or scheduled fill counts."
   ]
 }

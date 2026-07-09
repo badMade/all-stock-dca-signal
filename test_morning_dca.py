@@ -1,8 +1,10 @@
-"""Self-tests for the morning graded-DCA dry-run executor.
+"""Self-tests for the morning graded-DCA executor (watchlist scan + live).
 
 Covers the morning ladder threshold brackets, the separate budget ledger
-namespace, the run-state path/classification, and the guarantee that a morning
-run never interacts with the afternoon ce16ba6b scheduled evidence.
+namespace, the run-state path/classification for BOTH the 9:45 watchlist scan
+and the 10:30 live execution, the live-mode confidence rule, and the guarantee
+that a morning run never interacts with the afternoon ce16ba6b scheduled
+evidence.
 
 Runnable with ``pytest`` or ``python test_morning_dca.py``.
 """
@@ -12,8 +14,13 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 from morning_dca import (
+    DEFAULT_MORNING_LIVE_STATE_ROOT,
     DEFAULT_MORNING_STATE_ROOT,
+    DEFAULT_MORNING_WATCHLIST_STATE_ROOT,
+    EXEC_AUTO_BUY_ELIGIBLE,
+    EXEC_MANUAL_REVIEW_CANDIDATE,
     MORNING_CRON_ID,
+    MORNING_LIVE_CRON_ID,
     MORNING_SIZING_TIERS,
     DCAExecutor,
     MorningConfig,
@@ -22,6 +29,11 @@ from morning_dca import (
     nyse_holidays,
 )
 from near_close_dca import EASTERN, Action, Bar, SourceName
+
+
+def _now_live():
+    """Decision timestamp for the 10:30 AM ET live execution mode."""
+    return datetime.combine(date(2026, 7, 8), time(10, 30), tzinfo=EASTERN)
 
 
 class FixedDropProvider:
@@ -417,19 +429,20 @@ def test_run_state_path_and_classification(tmp_path):
 
     rc = res["artifacts"]["run_classification"]
     assert rc["run_origin"] == "scheduled"
-    assert rc["run_type"] == "morning_dca_dry_run"
+    assert rc["run_type"] == "morning_dca_watchlist_scan"
     assert rc["stream"] == "morning"
     assert rc["scheduled_for_et"] == "09:45"
     assert rc["manual_run"] is False
-    assert rc["state_schema_version"] == "run-classification-v1"
+    assert rc["state_schema_version"] == "morning-watchlist-v1"
     assert rc["run_id"] == "morning_20260708_0945ET"
     assert rc["valid_afternoon_evidence"] is False
+    assert rc["trades"] is False
     assert rc["cron_id"] == MORNING_CRON_ID
     assert rc["supersedes_cron_id"] is None
 
-    # Dry-run markers present; no order fields.
+    # Watchlist markers present; no order fields, amounts hypothetical only.
     art = res["artifacts"]
-    assert art["mode"] == "dry_run"
+    assert art["mode"] == "watchlist"
     assert art["trades"] is False
     for row in art["signal_rows"]:
         assert "order_id" not in row
@@ -485,9 +498,106 @@ def test_classification_matches_morning_schema(tmp_path):
     ex = MorningDCAExecutor(cfg)
     rc = ex.run_classification(_now(), manual=False)
     assert required.issubset(rc.keys())
-    # Schema consts we hardcode must line up.
-    assert rc["run_type"] == schema["properties"]["run_type"]["const"]
+    # run_type is now an enum across the two morning modes; stream is a const.
+    assert rc["run_type"] in schema["properties"]["run_type"]["enum"]
     assert rc["stream"] == schema["properties"]["stream"]["const"]
+    # The live-mode classification must also satisfy the shared schema.
+    live_ex = MorningDCAExecutor(cfg, mode="live")
+    live_rc = live_ex.run_classification(_now_live(), manual=False)
+    assert required.issubset(live_rc.keys())
+    assert live_rc["run_type"] in schema["properties"]["run_type"]["enum"]
+
+
+# --- Live (10:30 AM) execution mode -----------------------------------------
+def test_live_mode_path_and_classification(tmp_path):
+    cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
+    ex = MorningDCAExecutor(cfg, mode="live")
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data)
+
+    run_state_path = Path(res["paths"]["run_state"])
+    assert run_state_path.parent.name == "20260708_1030ET"
+
+    rc = res["artifacts"]["run_classification"]
+    assert rc["run_origin"] == "scheduled"
+    assert rc["run_type"] == "morning_dca_live"
+    assert rc["stream"] == "morning"
+    assert rc["trades"] is True
+    assert rc["scheduled_for_et"] == "10:30"
+    assert rc["scheduled_window_start_et"] == "10:25"
+    assert rc["scheduled_window_end_et"] == "10:35"
+    assert rc["state_schema_version"] == "morning-live-v1"
+    assert rc["run_id"] == "morning_live_20260708_1030ET"
+    assert rc["cron_id"] == MORNING_LIVE_CRON_ID
+    assert rc["valid_afternoon_evidence"] is False
+
+    art = res["artifacts"]
+    assert art["mode"] == "live"
+    assert art["trades"] is True
+
+
+def test_live_confidence_rule_auto_buys_with_validated_trend():
+    # A full 60-minute window of 5-minute bars (>= trend_min_bars) validates the
+    # intraday trend, so a qualifying candidate is auto_buy_eligible.
+    cfg = MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0)
+    ex = MorningDCAExecutor(cfg, mode="live")
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+    sig = ex.evaluate(_now_live(), data)[0]
+    assert sig.action == Action.BUY
+    assert sig.trend_validated is True
+    assert sig.execution_status == EXEC_AUTO_BUY_ELIGIBLE
+
+
+class FewBarsProvider(FixedDropProvider):
+    """Provider that supplies only a couple of intraday bars near the anchor."""
+
+    def get_intraday_bars(self, ticker, start, end, interval_minutes):
+        price = self._prev * (1.0 - self._drops.get(ticker, 0.0))
+        # Two completed bars ending at the completed-bar anchor (end - one
+        # interval), so current_price resolves but the trend window is too thin.
+        anchor = end - timedelta(minutes=interval_minutes)
+        return [
+            Bar(timestamp=anchor - timedelta(minutes=interval_minutes),
+                open=price, high=price, low=price, close=price, volume=100.0),
+            Bar(timestamp=anchor, open=price, high=price, low=price, close=price, volume=100.0),
+        ]
+
+
+def test_live_confidence_rule_withholds_when_trend_unvalidated(tmp_path):
+    # Price/drop passes, but too few intraday bars means the trend cannot be
+    # validated -> the candidate is a manual_review_candidate, NOT auto-bought.
+    cfg = MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0,
+                        morning_run_state_root=str(tmp_path))
+    ex = MorningDCAExecutor(cfg, mode="live")
+    data = FewBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+
+    sig = ex.evaluate(_now_live(), data)[0]
+    assert sig.action == Action.BUY
+    assert sig.trend_validated is False
+    assert sig.execution_status == EXEC_MANUAL_REVIEW_CANDIDATE
+
+    res = ex.run(_now_live(), data)
+    art = res["artifacts"]
+    assert art["counts"]["manual_review_candidates"] == 1
+    assert art["manual_review_tickers"] == ["BIG"]
+
+
+def test_watchlist_mode_never_sets_execution_status():
+    # The read-only watchlist scan never runs the trend gate; rows carry no
+    # execution_status / trend_validated at all.
+    cfg = MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0)
+    ex = MorningDCAExecutor(cfg)  # default watchlist mode
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+    sig = ex.evaluate(_now(), data)[0]
+    assert sig.execution_status is None
+    assert sig.trend_validated is None
+    assert "execution_status" not in sig.to_row()
+
+
+def test_live_and_watchlist_roots_are_distinct():
+    assert DEFAULT_MORNING_WATCHLIST_STATE_ROOT != DEFAULT_MORNING_LIVE_STATE_ROOT
+    assert DEFAULT_MORNING_STATE_ROOT == DEFAULT_MORNING_WATCHLIST_STATE_ROOT
+    assert "ce16ba6b" not in DEFAULT_MORNING_LIVE_STATE_ROOT
 
 
 # --- No interaction with afternoon scheduled evidence -----------------------
@@ -664,6 +774,48 @@ def test_morning_executor_default_init_loads_config_file():
     ex = MorningDCAExecutor()
     assert ex.config.base_buy_amount_usd == 3.0
     assert ex.config.morning_daily_cap_usd == 90.0
+
+
+def test_classifications_validate_against_json_schema():
+    """Both morning classifications must validate against the JSON schema.
+
+    Skipped gracefully when jsonschema is not installed so the stdlib-only
+    smoke run still passes.
+    """
+    try:
+        import jsonschema
+    except ImportError:
+        return
+
+    schema_path = Path(__file__).resolve().parent / "schemas" / "morning_run_classification.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    cfg = MorningConfig(tickers=("SMALL",))
+
+    watch = MorningDCAExecutor(cfg).run_classification(_now(), manual=False)
+    live = MorningDCAExecutor(cfg, mode="live").run_classification(_now_live(), manual=False)
+    manual = MorningDCAExecutor(cfg, mode="live").run_classification(_now_live(), manual=True)
+    for rc in (watch, live, manual):
+        jsonschema.validate(rc, schema)
+
+
+def test_morning_scheduled_run_counts_as_afternoon_prior_context():
+    """A morning-stream scheduled run must be eligible prior-allocation context.
+
+    _prior_run_is_scheduled excludes only the AFTERNOON scheduled run; a morning
+    run (stream='morning') is scheduled within its own stream but must still be
+    read as prior context for the afternoon same-day top-up guard.
+    """
+    from near_close_dca import _prior_run_is_scheduled
+
+    cfg = MorningConfig(tickers=("SMALL",))
+    morning_rc = MorningDCAExecutor(cfg, mode="live").run_classification(_now_live(), manual=False)
+    assert morning_rc["run_origin"] == "scheduled"
+    assert _prior_run_is_scheduled({"run_classification": morning_rc}) is False
+
+    # An afternoon scheduled run (no morning stream marker) is still excluded.
+    afternoon_rc = {"run_origin": "scheduled", "cron_id": "10ce362c"}
+    assert _prior_run_is_scheduled({"run_classification": afternoon_rc}) is True
+
 
 if __name__ == "__main__":
     import sys

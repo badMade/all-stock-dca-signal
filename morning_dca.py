@@ -1,29 +1,47 @@
-"""Morning graded-DCA dry-run executor.
+"""Morning graded-DCA executor (watchlist scan + live execution streams).
 
-This module adds a *morning* analytics stream on top of the existing near-close
-strategy library (:mod:`near_close_dca`). It is deliberately isolated from the
-afternoon scheduled live task (cron ``10ce362c``, which supersedes the deleted
+This module adds a *morning* stream on top of the existing near-close strategy
+library (:mod:`near_close_dca`). It is deliberately isolated from the afternoon
+scheduled live task (cron ``10ce362c``, which supersedes the deleted
 ``ce16ba6b``):
 
     - It uses its OWN sizing ladder (a coarser 0x -> 3x morning ladder) rather
       than the afternoon 0x -> 5x ladder.
-    - It keeps its OWN budget ledger namespace (:class:`MorningLedger`) so morning
-      dry-run / future morning buys can never consume the afternoon 3:20/3:45
-      budget ledger.
-    - It writes artifacts under its OWN run-state root
-      (``/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_0945ET/``) and
-      NEVER touches ``.../ce16ba6b/latest_scheduled_run.json`` or the afternoon
+    - It keeps its OWN budget ledger namespace (:class:`MorningLedger`) so
+      morning activity can never consume the afternoon 3:20 budget ledger.
+    - It writes artifacts under its OWN run-state roots and NEVER touches
+      ``.../ce16ba6b/latest_scheduled_run.json`` or the afternoon
       ``scheduled_runs/`` folders.
-    - Its run_classification carries ``run_type='morning_dca_dry_run'`` and a
-      distinct ``stream='morning'`` marker so downstream afternoon reporting (which
-      only globs ``.../ce16ba6b/scheduled_runs/**``) never mistakes it for
-      afternoon scheduled evidence.
+    - Its run_classification always carries a distinct ``stream='morning'``
+      marker and ``valid_afternoon_evidence=false`` so downstream afternoon
+      reporting (which only globs ``.../ce16ba6b/scheduled_runs/**``) never
+      mistakes it for afternoon scheduled evidence.
 
-The morning stream is DRY-RUN / ANALYTICS ONLY. It computes hypothetical dollar
-amounts and writes signal artifacts. It NEVER places orders, never runs a
-Robinhood order review, and never calls any broker placement path. Robinhood
-account 562057042 remains the only execution broker for the afternoon live task;
-Alpaca stays read-only.
+The morning stream has two modes (see :data:`MORNING_PROFILES`):
+
+    - ``watchlist`` (9:45 AM ET, ``morning-dca-0945``): a READ-ONLY early-warning
+      watchlist scan. Analytics only, ``trades=false``. It may surface early
+      candidates but every dollar figure is HYPOTHETICAL / watchlist-only. It
+      writes under ``.../cron_tracking/morning_dca_watchlist/YYYYMMDD_0945ET/``
+      with ``run_type='morning_dca_watchlist_scan'`` and
+      ``state_schema_version='morning-watchlist-v1'``.
+    - ``live`` (10:30 AM ET, ``42173154``): the approved live Robinhood morning
+      execution, moved from 9:45 to 10:30 so it evaluates a true 60-minute
+      trend window (9:30-10:30). ``trades=true``. It writes under
+      ``.../cron_tracking/morning_dca/YYYYMMDD_1030ET/`` with
+      ``run_type='morning_dca_live'``, ``scheduled_for_et='10:30'``,
+      ``run_id='morning_live_YYYYMMDD_1030ET'`` and
+      ``state_schema_version='morning-live-v1'``.
+
+Confidence rule (live mode): when a ticker's price/drop qualifies for a buy but
+the intraday trend over the 60-minute window cannot be validated, the candidate
+is NOT auto-bought. It is classified as a ``manual_review_candidate``. The
+loosened "buy anyway when trend is unavailable" rule is deliberately NOT
+implemented.
+
+Robinhood account 562057042 remains the only execution broker; Alpaca stays
+read-only. Morning fills are never afternoon scheduled evidence; they count only
+as prior-allocation context for the afternoon same-day top-up guard.
 """
 
 from __future__ import annotations
@@ -52,21 +70,88 @@ from near_close_dca import (
 
 # --- Morning stream identity / classification constants ---------------------
 #
-# The morning stream is a NEW, independent scheduled analytics task. It does not
-# supersede the afternoon live task and is never valid afternoon evidence. These
-# constants intentionally differ from the afternoon 15:20 classification so the
-# two streams can never be confused (see docs/morning_dca.md).
+# The morning stream is INDEPENDENT of the afternoon live task; it never
+# supersedes it and is never valid afternoon evidence. These constants
+# intentionally differ from the afternoon 15:20 classification so the streams can
+# never be confused (see docs/morning_dca.md).
 MORNING_STREAM = "morning"
-MORNING_CRON_ID = "morning-dca-0945"
-MORNING_RUN_TYPE = "morning_dca_dry_run"
-MORNING_SCHEDULED_FOR_ET = "09:45"
-MORNING_WINDOW_START_ET = "09:40"
-MORNING_WINDOW_END_ET = "09:50"
-STATE_SCHEMA_VERSION = "run-classification-v1"
+# The afternoon live task id, recorded on morning artifacts for cross-reference.
+AFTERNOON_LIVE_CRON_ID = "10ce362c"
 
-# Default artifact root for the morning stream. Deliberately a sibling of, and
-# never nested under, the afternoon ce16ba6b root.
-DEFAULT_MORNING_STATE_ROOT = "/home/user/workspace/cron_tracking/morning_dca"
+# Watchlist (9:45 AM ET) scan identity — analytics-only, no trading.
+MORNING_WATCHLIST_MODE = "watchlist"
+MORNING_WATCHLIST_CRON_ID = "morning-dca-0945"
+MORNING_WATCHLIST_RUN_TYPE = "morning_dca_watchlist_scan"
+MORNING_WATCHLIST_SCHEDULED_FOR_ET = "09:45"
+MORNING_WATCHLIST_WINDOW_START_ET = "09:40"
+MORNING_WATCHLIST_WINDOW_END_ET = "09:50"
+MORNING_WATCHLIST_SCHEMA_VERSION = "morning-watchlist-v1"
+
+# Live (10:30 AM ET) execution identity — Robinhood-only live buys.
+MORNING_LIVE_MODE = "live"
+MORNING_LIVE_CRON_ID = "42173154"
+MORNING_LIVE_RUN_TYPE = "morning_dca_live"
+MORNING_LIVE_SCHEDULED_FOR_ET = "10:30"
+MORNING_LIVE_WINDOW_START_ET = "10:25"
+MORNING_LIVE_WINDOW_END_ET = "10:35"
+MORNING_LIVE_SCHEMA_VERSION = "morning-live-v1"
+
+# Backwards-compatible aliases (the watchlist scan is the successor of the old
+# 9:45 dry-run stream, so unqualified references resolve to it).
+MORNING_CRON_ID = MORNING_WATCHLIST_CRON_ID
+MORNING_RUN_TYPE = MORNING_WATCHLIST_RUN_TYPE
+MORNING_SCHEDULED_FOR_ET = MORNING_WATCHLIST_SCHEDULED_FOR_ET
+MORNING_WINDOW_START_ET = MORNING_WATCHLIST_WINDOW_START_ET
+MORNING_WINDOW_END_ET = MORNING_WATCHLIST_WINDOW_END_ET
+
+# Artifact roots. Both are siblings of, and never nested under, the afternoon
+# ce16ba6b root. The watchlist scan and live execution use distinct roots so a
+# read-only scan can never be confused with a live-execution artifact.
+DEFAULT_MORNING_WATCHLIST_STATE_ROOT = "/home/user/workspace/cron_tracking/morning_dca_watchlist"
+DEFAULT_MORNING_LIVE_STATE_ROOT = "/home/user/workspace/cron_tracking/morning_dca"
+# Legacy alias: the default root historically pointed at the morning stream.
+DEFAULT_MORNING_STATE_ROOT = DEFAULT_MORNING_WATCHLIST_STATE_ROOT
+
+
+# Per-mode identity/profile. Selected by MorningDCAExecutor(mode=...).
+MORNING_PROFILES: Dict[str, Dict[str, Any]] = {
+    MORNING_WATCHLIST_MODE: {
+        "mode": MORNING_WATCHLIST_MODE,
+        "artifact_mode": "watchlist",
+        "trades": False,
+        "cron_id": MORNING_WATCHLIST_CRON_ID,
+        "run_type": MORNING_WATCHLIST_RUN_TYPE,
+        "scheduled_for_et": MORNING_WATCHLIST_SCHEDULED_FOR_ET,
+        "window_start_et": MORNING_WATCHLIST_WINDOW_START_ET,
+        "window_end_et": MORNING_WATCHLIST_WINDOW_END_ET,
+        "state_schema_version": MORNING_WATCHLIST_SCHEMA_VERSION,
+        "state_root": DEFAULT_MORNING_WATCHLIST_STATE_ROOT,
+        "folder_suffix": "0945ET",
+        "scheduled_run_id_prefix": "morning",
+        "manual_run_id_prefix": "manual_morning",
+        "decision_time_et": time(9, 45),
+        "validate_trend": False,
+    },
+    MORNING_LIVE_MODE: {
+        "mode": MORNING_LIVE_MODE,
+        "artifact_mode": "live",
+        "trades": True,
+        "cron_id": MORNING_LIVE_CRON_ID,
+        "run_type": MORNING_LIVE_RUN_TYPE,
+        "scheduled_for_et": MORNING_LIVE_SCHEDULED_FOR_ET,
+        "window_start_et": MORNING_LIVE_WINDOW_START_ET,
+        "window_end_et": MORNING_LIVE_WINDOW_END_ET,
+        "state_schema_version": MORNING_LIVE_SCHEMA_VERSION,
+        "state_root": DEFAULT_MORNING_LIVE_STATE_ROOT,
+        "folder_suffix": "1030ET",
+        "scheduled_run_id_prefix": "morning_live",
+        "manual_run_id_prefix": "manual_morning_live",
+        "decision_time_et": time(10, 30),
+        "validate_trend": True,
+    },
+}
+
+STATE_SCHEMA_VERSION = MORNING_WATCHLIST_SCHEMA_VERSION
 
 # Morning sizing ladder: a coarser 0x -> 3x ladder keyed on the drop vs.
 # *yesterday's regular-session close*. Thresholds are fractions of the previous
@@ -186,11 +271,19 @@ class MorningConfig:
     base_buy_amount_usd: float = 3.0
     sizing_tiers: Tuple[Tuple[float, float], ...] = MORNING_SIZING_TIERS
     minimum_drop_vs_previous_close: float = MORNING_MINIMUM_DROP
-    decision_time_et: time = time(9, 45)
+    # None means "use the active mode's default decision anchor" (09:45 for the
+    # watchlist scan, 10:30 for the live execution).
+    decision_time_et: Optional[time] = None
     interval_minutes: int = 5
     morning_daily_cap_usd: float = DEFAULT_MORNING_DAILY_CAP_USD
     morning_weekly_cap_usd: float = DEFAULT_MORNING_WEEKLY_CAP_USD
-    morning_run_state_root: str = DEFAULT_MORNING_STATE_ROOT
+    # Optional explicit artifact-root override. When None the executor uses the
+    # active mode's default root (watchlist vs. live).
+    morning_run_state_root: Optional[str] = None
+    # Minimum number of completed intraday bars over the trend window required to
+    # validate the intraday trend in live mode. When fewer are available a
+    # qualifying candidate is flagged manual_review_candidate rather than bought.
+    trend_min_bars: int = 6
 
     def as_strategy_config(self) -> StrategyConfig:
         """Return a StrategyConfig view carrying the morning ladder.
@@ -251,9 +344,17 @@ class MorningLedger:
         return self.week_planned(trading_day) > self.weekly_cap_usd
 
 
+# Live-mode execution decision for a qualifying candidate.
+#   auto_buy_eligible     -> price/drop passed AND intraday trend validated.
+#   manual_review_candidate -> price/drop passed but intraday trend could not be
+#                              validated; the run does NOT auto-buy.
+EXEC_AUTO_BUY_ELIGIBLE = "auto_buy_eligible"
+EXEC_MANUAL_REVIEW_CANDIDATE = "manual_review_candidate"
+
+
 @dataclass(frozen=True)
 class MorningSignal:
-    """One morning dry-run signal row for a single ticker."""
+    """One morning signal row for a single ticker."""
 
     ticker: str
     source: str
@@ -265,9 +366,13 @@ class MorningSignal:
     multiplier: float
     hypothetical_amount_usd: float
     warnings: Tuple[str, ...] = ()
+    # Live mode only: the execution decision for a qualifying candidate. None in
+    # watchlist mode (no execution decision is taken there).
+    execution_status: Optional[str] = None
+    trend_validated: Optional[bool] = None
 
     def to_row(self) -> Dict[str, Any]:
-        return {
+        row = {
             "ticker": self.ticker,
             "source": self.source,
             "action": self.action.value,
@@ -279,14 +384,20 @@ class MorningSignal:
             "hypothetical_amount_usd": self.hypothetical_amount_usd,
             "warnings": "; ".join(self.warnings),
         }
+        if self.execution_status is not None:
+            row["execution_status"] = self.execution_status
+            row["trend_validated"] = self.trend_validated
+        return row
 
 
-def load_morning_config(config_dir=None):
+def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
     """Read ``config/morning_dca.json`` and return a :class:`MorningConfig`.
 
-    Looks for ``morning_dca.json`` in ``config_dir`` (default: a ``config/``
-    directory next to this module, falling back to ``./config``).  If the file
-    is absent or unreadable the function logs a warning and returns
+    ``mode`` selects which artifact root to bind (the watchlist scan and the live
+    execution share the morning ladder and budget caps but write to distinct
+    roots). Looks for ``morning_dca.json`` in ``config_dir`` (default: a
+    ``config/`` directory next to this module, falling back to ``./config``). If
+    the file is absent or unreadable the function logs a warning and returns
     ``MorningConfig()`` with hardcoded defaults -- the same graceful-fallback
     pattern used by :func:`dca_config.load_strategy_config`.
     """
@@ -341,7 +452,14 @@ def load_morning_config(config_dir=None):
         kwargs["morning_weekly_cap_usd"] = float(budget["morning_weekly_cap_usd"])
 
     artifact_paths = raw.get("artifact_paths", {})
-    if "morning_run_state_root" in artifact_paths:
+    # Per-mode root keys take precedence; fall back to the legacy shared key.
+    mode_root_key = {
+        MORNING_WATCHLIST_MODE: "watchlist_run_state_root",
+        MORNING_LIVE_MODE: "live_run_state_root",
+    }.get(mode)
+    if mode_root_key and mode_root_key in artifact_paths:
+        kwargs["morning_run_state_root"] = artifact_paths[mode_root_key]
+    elif "morning_run_state_root" in artifact_paths:
         kwargs["morning_run_state_root"] = artifact_paths["morning_run_state_root"]
 
     return MorningConfig(**kwargs)
@@ -381,31 +499,47 @@ class DCAExecutor:
 
 
 class MorningDCAExecutor(DCAExecutor):
-    """Morning dry-run executor: drop-vs-yesterday's-close analytics only.
+    """Morning graded-DCA executor: drop-vs-yesterday's-close evaluation.
 
     Evaluates each ticker's morning price weakness relative to yesterday's
-    regular-session close, grades it on the morning 0x -> 3x ladder, and writes
-    dry-run artifacts under the morning run-state root. It NEVER places orders,
-    reviews orders, or contacts a broker, and it NEVER writes into the afternoon
-    ce16ba6b artifact tree.
+    regular-session close and grades it on the morning 0x -> 3x ladder. Two modes
+    (see :data:`MORNING_PROFILES`):
+
+    - ``watchlist`` (default, 9:45 AM ET): a read-only early-warning scan. It
+      places NO orders and every dollar figure is hypothetical/watchlist-only.
+    - ``live`` (10:30 AM ET): the approved Robinhood morning execution. A
+      candidate whose price/drop qualifies but whose 60-minute intraday trend
+      cannot be validated is flagged ``manual_review_candidate`` and NOT
+      auto-bought (the loosened trend-unavailable rule is not implemented).
+
+    Either mode writes ONLY under its morning run-state root and NEVER into the
+    afternoon ce16ba6b artifact tree or ``latest_scheduled_run.json``.
     """
 
     stream = MORNING_STREAM
-    run_type = MORNING_RUN_TYPE
 
     def __init__(
         self,
         config: Optional[MorningConfig] = None,
         ledger: Optional[MorningLedger] = None,
         *,
+        mode: str = MORNING_WATCHLIST_MODE,
         config_dir: Optional[str] = None,
     ) -> None:
-        self.config = config if config is not None else load_morning_config(config_dir)
+        if mode not in MORNING_PROFILES:
+            raise ValueError(f"unknown morning mode {mode!r}; expected one of {sorted(MORNING_PROFILES)}")
+        self.mode = mode
+        self.profile = MORNING_PROFILES[mode]
+        self.run_type = self.profile["run_type"]
+        self.trades = self.profile["trades"]
+        self.config = config if config is not None else load_morning_config(config_dir, mode=mode)
         self.ledger = ledger or MorningLedger(
             daily_cap_usd=self.config.morning_daily_cap_usd,
             weekly_cap_usd=self.config.morning_weekly_cap_usd,
         )
         self._sizing_config = self.config.as_strategy_config()
+        self.state_root = self.config.morning_run_state_root or self.profile["state_root"]
+        self.decision_time = self.config.decision_time_et or self.profile["decision_time_et"]
 
     # -- DCAExecutor hooks ---------------------------------------------------
     @property
@@ -414,8 +548,8 @@ class MorningDCAExecutor(DCAExecutor):
 
     def run_state_dir(self, now: datetime) -> Path:
         now_et = now.astimezone(EASTERN)
-        folder = f"{now_et.strftime('%Y%m%d')}_0945ET"
-        return Path(self.config.morning_run_state_root) / folder
+        folder = f"{now_et.strftime('%Y%m%d')}_{self.profile['folder_suffix']}"
+        return Path(self.state_root) / folder
 
     def run_id(self, now: datetime, *, manual: bool) -> str:
         now_et = now.astimezone(EASTERN)
@@ -425,49 +559,55 @@ class MorningDCAExecutor(DCAExecutor):
             # replays share the same decision timestamp (down to the second),
             # so write_artifacts never silently overwrites a prior manual run.
             unique = uuid.uuid4().hex[:6]
-            return f"manual_morning_{now_utc.strftime('%Y%m%d_%H%M%S')}Z_{unique}"
-        return f"morning_{now_et.strftime('%Y%m%d')}_0945ET"
+            return f"{self.profile['manual_run_id_prefix']}_{now_utc.strftime('%Y%m%d_%H%M%S')}Z_{unique}"
+        return f"{self.profile['scheduled_run_id_prefix']}_{now_et.strftime('%Y%m%d')}_{self.profile['folder_suffix']}"
 
     def run_classification(self, now: datetime, *, manual: bool = False) -> Dict[str, Any]:
-        """Build the morning run-classification block.
+        """Build the morning run-classification block for the active mode.
 
-        A real scheduled morning dry run is ``run_origin='scheduled'`` with
-        ``run_type='morning_dca_dry_run'`` and ``manual_run=false``. The
-        ``stream='morning'`` marker and ``valid_afternoon_evidence=false`` flag
-        make it unambiguous that this artifact is NOT afternoon scheduled evidence.
+        A scheduled watchlist scan is ``run_type='morning_dca_watchlist_scan'``
+        at 09:45; a scheduled live run is ``run_type='morning_dca_live'`` at
+        10:30. Either way ``stream='morning'`` and ``valid_afternoon_evidence``
+        is false, so the artifact is never afternoon scheduled evidence.
         """
         triggered_iso = now.astimezone(timezone.utc).isoformat()
+        profile = self.profile
         classification: Dict[str, Any] = {
             "run_origin": "manual" if manual else "scheduled",
-            "run_type": self.run_type,
+            "run_type": profile["run_type"],
             "stream": self.stream,
-            "cron_id": MORNING_CRON_ID,
+            "trades": profile["trades"],
+            "cron_id": profile["cron_id"],
             "supersedes_cron_id": None,
-            "scheduled_for_et": None if manual else MORNING_SCHEDULED_FOR_ET,
-            "scheduled_window_start_et": None if manual else MORNING_WINDOW_START_ET,
-            "scheduled_window_end_et": None if manual else MORNING_WINDOW_END_ET,
+            "scheduled_for_et": None if manual else profile["scheduled_for_et"],
+            "scheduled_window_start_et": None if manual else profile["window_start_et"],
+            "scheduled_window_end_et": None if manual else profile["window_end_et"],
             "manual_run": manual,
             "run_id": self.run_id(now, manual=manual),
             "triggered_at_utc": triggered_iso,
-            "state_schema_version": STATE_SCHEMA_VERSION,
+            "state_schema_version": profile["state_schema_version"],
             # Explicit, machine-checkable separation from the afternoon stream.
             "valid_afternoon_evidence": False,
-            "afternoon_live_cron_id": "10ce362c",
+            "afternoon_live_cron_id": AFTERNOON_LIVE_CRON_ID,
         }
         return classification
 
     # -- Evaluation ----------------------------------------------------------
     def evaluate_signal(self, ticker: str, now: datetime, data: Any) -> MorningSignal:
-        """Grade one ticker's morning weakness vs. yesterday's close (dry-run).
+        """Grade one ticker's morning weakness vs. yesterday's close.
 
         Uses the provider's previous-close bar and the latest completed intraday
         bar (or a live quote via ``get_quote`` when available) at/or before the
-        9:45 AM ET decision anchor. Never places or reviews orders.
+        active mode's decision anchor (09:45 for the watchlist scan, 10:30 for
+        the live execution). In live mode a qualifying candidate whose intraday
+        trend cannot be validated is flagged ``manual_review_candidate`` and is
+        not auto-bought. The watchlist scan places no orders.
         """
         source = getattr(getattr(data, "source", None), "value", "unknown")
         now_et = now.astimezone(EASTERN)
         trading_day = now_et.date()
-        decision_dt = datetime.combine(trading_day, self.config.decision_time_et, tzinfo=EASTERN)
+        decision_dt = datetime.combine(trading_day, self.decision_time, tzinfo=EASTERN)
+        anchor_label = self.profile["scheduled_for_et"]
 
         warnings: List[str] = []
         previous_close: Optional[float] = None
@@ -481,7 +621,7 @@ class MorningDCAExecutor(DCAExecutor):
         if prev_bar is not None and prev_bar.timestamp >= decision_dt:
             warnings.append(
                 f"previous_close timestamp {prev_bar.timestamp.isoformat()} is not before "
-                "the 09:45 ET decision anchor; rejecting"
+                f"the {anchor_label} ET decision anchor; rejecting"
             )
             prev_bar = None
         if prev_bar is not None:
@@ -523,6 +663,9 @@ class MorningDCAExecutor(DCAExecutor):
         drop_pct = drop_fraction * 100.0
         multiplier = self.multiplier_for_drop(drop_fraction)
         hypothetical = round(self.config.base_buy_amount_usd * multiplier, 2)
+        execution_status: Optional[str] = None
+        trend_validated: Optional[bool] = None
+        mode_label = "watchlist" if self.mode == MORNING_WATCHLIST_MODE else "live"
 
         if drop_fraction < self.config.minimum_drop_vs_previous_close:
             action = Action.SKIP if current_price >= previous_close else Action.NO_ACTION
@@ -534,7 +677,17 @@ class MorningDCAExecutor(DCAExecutor):
             hypothetical = 0.0
         else:
             action = Action.BUY
-            reason = f"morning weakness {drop_pct:.2f}% vs prior close -> {multiplier:g}x (dry-run)"
+            reason = f"morning weakness {drop_pct:.2f}% vs prior close -> {multiplier:g}x ({mode_label})"
+            if self.profile["validate_trend"]:
+                # Confidence rule: price/drop passed, but only auto-buy when the
+                # intraday trend over the 60-minute window can be validated.
+                # Otherwise flag for manual review instead of buying.
+                trend_validated = self._trend_validated(bars, decision_dt, warnings)
+                if trend_validated:
+                    execution_status = EXEC_AUTO_BUY_ELIGIBLE
+                else:
+                    execution_status = EXEC_MANUAL_REVIEW_CANDIDATE
+                    reason += "; intraday trend unvalidated -> manual_review_candidate (no auto-buy)"
 
         return MorningSignal(
             ticker=ticker,
@@ -547,7 +700,33 @@ class MorningDCAExecutor(DCAExecutor):
             multiplier=multiplier,
             hypothetical_amount_usd=hypothetical,
             warnings=tuple(warnings),
+            execution_status=execution_status,
+            trend_validated=trend_validated,
         )
+
+    def _trend_validated(
+        self, bars: Sequence[Bar], decision_dt: datetime, warnings: List[str]
+    ) -> bool:
+        """Return True when the intraday trend over the window can be validated.
+
+        The 10:30 live run exists to observe a true ~60-minute trend window
+        (9:30-10:30 ET). Validation requires at least ``trend_min_bars``
+        completed, positive-priced intraday bars in that window; when fewer are
+        available the trend is treated as UNVALIDATED so the caller flags the
+        candidate ``manual_review_candidate`` rather than auto-buying. The
+        loosened "buy anyway when trend is unavailable" rule is not implemented.
+        """
+        usable = [
+            b for b in bars
+            if b.timestamp <= decision_dt and math.isfinite(b.close) and b.close > 0
+        ]
+        if len(usable) < self.config.trend_min_bars:
+            warnings.append(
+                f"intraday trend unvalidated: {len(usable)} usable bars < required "
+                f"{self.config.trend_min_bars} over the 60-minute window"
+            )
+            return False
+        return True
 
     def _current_price(
         self,
@@ -579,7 +758,7 @@ class MorningDCAExecutor(DCAExecutor):
                         )
                     elif quote_time > decision_dt:
                         warnings.append(
-                            f"quote timestamp {quote_time!r} is after the 09:45 ET "
+                            f"quote timestamp {quote_time!r} is after the {self.profile['scheduled_for_et']} ET "
                             "decision anchor; falling back to completed bar"
                         )
                     else:
@@ -590,7 +769,7 @@ class MorningDCAExecutor(DCAExecutor):
             except Exception as exc:  # noqa: BLE001
                 warnings.append(f"quote provider error: {exc}")
         if bar is None:
-            warnings.append("missing completed intraday bar at/or before 09:45 ET")
+            warnings.append(f"missing completed intraday bar at/or before {self.profile['scheduled_for_et']} ET")
             return None
         if not math.isfinite(bar.close) or bar.close <= 0:
             warnings.append(f"completed bar close {bar.close!r} is not positive; rejecting")
@@ -627,18 +806,23 @@ class MorningDCAExecutor(DCAExecutor):
         *,
         manual: bool = False,
     ) -> Dict[str, Any]:
-        """Assemble the morning run_state dict (dry-run / analytics only).
+        """Assemble the morning run_state dict for the active mode.
 
         Pure/side-effect-free: reads the ledger but never mutates it. Callers
         must record buy candidates via :meth:`record_buy_candidates` beforehand
         for the ledger-derived fields (caps, remaining budget) to reflect this
-        run.
+        run. In live mode candidates whose intraday trend could not be validated
+        are surfaced as ``manual_review_candidates`` rather than counted as buys.
         """
         now_et = now.astimezone(EASTERN)
         trading_day = now_et.date()
+        is_live = self.mode == MORNING_LIVE_MODE
 
         signal_rows = [s.to_row() for s in signals]
         buy_candidates = self._buy_candidates(signals)
+        manual_review = [
+            c for c in buy_candidates if c.execution_status == EXEC_MANUAL_REVIEW_CANDIDATE
+        ]
 
         hypothetical_spend = round(sum(c.hypothetical_amount_usd for c in buy_candidates), 2)
 
@@ -658,11 +842,11 @@ class MorningDCAExecutor(DCAExecutor):
 
         classification = self.run_classification(now, manual=manual)
 
-        return {
+        artifacts = {
             "run_id": classification["run_id"],
             "stream": self.stream,
-            "mode": "dry_run",
-            "trades": False,
+            "mode": self.profile["artifact_mode"],
+            "trades": self.trades,
             "generated_at": now_et.isoformat(),
             "trading_day": trading_day.isoformat(),
             "iso_week": list(iso_week_key(trading_day)),
@@ -687,12 +871,19 @@ class MorningDCAExecutor(DCAExecutor):
                 "evaluated": len(signals),
                 "buy_candidates": len(buy_candidates),
                 "no_data": sum(1 for s in signals if s.action == Action.NO_DATA),
+                "manual_review_candidates": len(manual_review),
             },
             "run_classification": classification,
             "signal_rows": signal_rows,
             "buy_candidates": [c.to_row() for c in buy_candidates],
             "warnings": warnings,
         }
+        if is_live:
+            # Live-mode confidence rule: expose the trend-unvalidated candidates
+            # that were withheld from auto-buy for downstream manual review.
+            artifacts["manual_review_candidates"] = [c.to_row() for c in manual_review]
+            artifacts["manual_review_tickers"] = [c.ticker for c in manual_review]
+        return artifacts
 
     def write_artifacts(self, artifacts: Dict[str, Any], now: datetime) -> Dict[str, str]:
         """Write morning run_state.json (+ CSV) under the morning run-state root.
@@ -703,7 +894,7 @@ class MorningDCAExecutor(DCAExecutor):
         """
         manual_run = artifacts["run_classification"]["manual_run"]
         out = (
-            Path(self.config.morning_run_state_root) / "manual_runs" / artifacts["run_id"]
+            Path(self.state_root) / "manual_runs" / artifacts["run_id"]
             if manual_run
             else self.run_state_dir(now)
         )
@@ -718,7 +909,7 @@ class MorningDCAExecutor(DCAExecutor):
         paths = {"run_state": str(run_state_path), "signals": str(signals_path)}
 
         if not artifacts["run_classification"]["manual_run"]:
-            pointer = Path(self.config.morning_run_state_root) / "latest_morning_run.json"
+            pointer = Path(self.state_root) / "latest_morning_run.json"
             pointer.parent.mkdir(parents=True, exist_ok=True)
             pointer.write_text(
                 json.dumps(
@@ -745,10 +936,11 @@ class MorningDCAExecutor(DCAExecutor):
         data_source: Optional[str] = None,
         manual: bool = False,
     ) -> Dict[str, Any]:
-        """Evaluate the morning stream and write dry-run artifacts.
+        """Evaluate the morning stream and write its artifacts for the active mode.
 
-        Returns ``{"artifacts": <run_state dict>, "paths": <written paths>}``. No
-        orders are placed and no broker is contacted.
+        Returns ``{"artifacts": <run_state dict>, "paths": <written paths>}``.
+        The watchlist scan places no orders; the live mode surfaces
+        auto-buy-eligible vs. manual_review candidates per the confidence rule.
         """
         trading_day = now.astimezone(EASTERN).date()
         if not manual and trading_day in nyse_holidays(trading_day.year):
