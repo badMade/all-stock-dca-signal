@@ -21,7 +21,8 @@ These instructions apply to the entire repository.
 5. Run the narrowest relevant check first, then the standard checks before handing off:
    - `ruff check .`
    - `pytest`
-   - `python run_dca.py --demo --report --now 2026-07-06T15:45 --artifacts-dir /tmp/dca-demo`
+   - `python run_dca.py --demo --report --now <YYYY-MM-DDTHH:MM> --artifacts-dir /tmp/dca-demo`
+     (use any near-close timestamp, e.g. today's date at 15:45)
 6. Document any check that cannot be run and why.
 7. Before committing, review the diff for secrets, generated artifacts, and excessive churn.
 
@@ -59,6 +60,8 @@ The core application has no runtime third-party dependencies. Optional research 
 - `docs/` — operational documentation and runbooks.
 - `test_*.py`, `scripts/tests/` — core and utility tests.
 - `trading-strategies/`, `analysis/` — research/analysis code and artifacts.
+- `tickers.txt`, `historical_stock_data.csv`, `stock_fetch_progress.json` — operational data files used by fetch/analysis scripts; do not delete.
+- `FETCH_*.md`, `FILE_MANIFEST.txt`, `FINAL_EXECUTION_REPORT.md`, `TASK_SUMMARY.txt`, `README_*.md` — generated operational reports from fetch runs; treat as read-only artifacts.
 
 ## Pull request expectations
 

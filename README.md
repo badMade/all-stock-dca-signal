@@ -47,13 +47,14 @@ pip install -r trading-strategies/requirements.txt
 ### CLI dry run
 
 ```bash
-python run_dca.py --demo --report --now 2026-07-06T15:45 --artifacts-dir /tmp/dca-demo
+python run_dca.py --demo --report --now <YYYY-MM-DDTHH:MM> --artifacts-dir /tmp/dca-demo
+# Use any near-close timestamp, e.g. today's date at 15:45
 ```
 
 ### Installed console scripts
 
 ```bash
-run-dca --demo --report --now 2026-07-06T15:45 --artifacts-dir /tmp/dca-demo
+run-dca --demo --report --now <YYYY-MM-DDTHH:MM> --artifacts-dir /tmp/dca-demo
 run-dca-risk --help
 ```
 
@@ -85,6 +86,8 @@ print(config.base_buy_amount_usd * multiplier)
 | `docs/` | Detailed strategy docs, runbooks, and operational notes. |
 | `test_*.py`, `scripts/tests/` | Automated tests. |
 | `trading-strategies/`, `analysis/` | Optional research tooling and historical analysis artifacts. |
+| `tickers.txt`, `historical_stock_data.csv`, `stock_fetch_progress.json` | Operational data files used by fetch/analysis scripts; do not delete. |
+| `FETCH_*.md`, `FILE_MANIFEST.txt`, `FINAL_EXECUTION_REPORT.md`, `TASK_SUMMARY.txt`, `README_*.md` | Generated operational reports from fetch runs; treat as read-only artifacts. |
 
 ## Agentic workflow compatibility
 
@@ -102,7 +105,8 @@ Recommended checks before handoff:
 ```bash
 ruff check .
 pytest
-python run_dca.py --demo --report --now 2026-07-06T15:45 --artifacts-dir /tmp/dca-demo
+python run_dca.py --demo --report --now <YYYY-MM-DDTHH:MM> --artifacts-dir /tmp/dca-demo
+# Use any near-close timestamp, e.g. today's date at 15:45
 ```
 
 ## Troubleshooting

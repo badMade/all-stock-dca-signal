@@ -52,7 +52,6 @@ py-modules = [
     "dca_cost_tracker",
     "dca_notion_sync",
     "dca_weekly_dashboard",
-    "dca_risk",
     "run_dca",
 ]
 # scripts/run_classification.py is the run-classification contract used by both
