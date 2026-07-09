@@ -1639,7 +1639,9 @@ def _prior_run_before_boundary(run_state: Dict[str, Any], boundary_et: time) -> 
     return parsed.astimezone(EASTERN).timetz().replace(tzinfo=None) < boundary_et
 
 
-def _orders_csv_fills(run_dir: Path) -> Dict[str, Dict[str, Any]]:
+def _orders_csv_fills(
+    run_dir: Path, *, orders_csv_file: Optional[Path] = None
+) -> Dict[str, Dict[str, Any]]:
     """Map ticker -> {order_id, avg_fill_price, quantity_filled} for filled rows only.
 
     Used to reconcile a prior run's ``buy_candidates`` (whose status is fixed at
@@ -1647,9 +1649,14 @@ def _orders_csv_fills(run_dir: Path) -> Dict[str, Dict[str, Any]]:
     recorded ``status='submitted'`` in run_state.json only means an order_id was
     obtained, not that it filled. A submission that never filled (execution gap,
     reject, cancel) must not count as prior-allocation capital.
+
+    Pass ``orders_csv_file`` to read a specific CSV (e.g. the path recorded in
+    ``run_state.artifacts.orders_csv_path``) instead of looking for a sibling
+    ``orders.csv``; ``run_and_report`` writes files with custom names like
+    ``dca_<label>_<day>_<stamp>_orders.csv`` that ``run_dir / "orders.csv"`` won't find.
     """
     fills: Dict[str, Dict[str, Any]] = {}
-    orders_csv = run_dir / "orders.csv"
+    orders_csv = orders_csv_file if orders_csv_file is not None else run_dir / "orders.csv"
     if not orders_csv.exists():
         return fills
     try:
@@ -1736,6 +1743,10 @@ def load_prior_same_day_allocations(
         # than a top-level "buy_candidates" array.  When buy_candidates is absent
         # but an orders_csv_path is recorded, reconstruct prior allocations from
         # that CSV directly (filled rows only).
+        # Full-report dry-run artifacts must never contribute: run_and_report
+        # dry runs write filled DryRunBroker rows with no real capital deployed.
+        if run_state.get("dry_run"):
+            continue
         buy_candidates_raw = run_state.get("buy_candidates")
         if not buy_candidates_raw:
             artifacts_block = run_state.get("artifacts")
@@ -1746,7 +1757,9 @@ def load_prior_same_day_allocations(
                     if not orders_csv_file.is_absolute():
                         orders_csv_file = run_state_path.parent / orders_csv_file
                     if orders_csv_file.exists():
-                        report_fills = _orders_csv_fills(orders_csv_file.parent)
+                        # Pass the exact recorded file rather than run_dir/"orders.csv"
+                        # because run_and_report writes custom-named CSVs.
+                        report_fills = _orders_csv_fills(orders_csv_file.parent, orders_csv_file=orders_csv_file)
                         for _ticker, _fill in report_fills.items():
                             if _fill["quantity_filled"]:
                                 _amount = _fill["avg_fill_price"] * _fill["quantity_filled"]
@@ -1759,7 +1772,12 @@ def load_prior_same_day_allocations(
                                 {"amount": 0.0, "reference_price": None, "run_id": run_id, "source": source},
                             )
                             _entry["amount"] += _amount
-                            if _ref is not None:
+                            if _entry.get("reference_price_unknown"):
+                                pass
+                            elif _ref is None:
+                                _entry["reference_price"] = None
+                                _entry["reference_price_unknown"] = True
+                            else:
                                 if _entry["reference_price"] is None:
                                     _entry["reference_price"] = _ref
                                 else:
@@ -1816,7 +1834,16 @@ def load_prior_same_day_allocations(
                 {"amount": 0.0, "reference_price": None, "run_id": run_id, "source": source},
             )
             entry["amount"] += amount
-            if reference_price is not None:
+            # If ANY contributing prior price is unknown, the whole aggregated
+            # reference is treated as unknown so the guard takes the conservative
+            # missing_prior_price path rather than comparing against only the
+            # known portion while silently ignoring the unknown portion.
+            if entry.get("reference_price_unknown"):
+                pass  # already poisoned; keep None
+            elif reference_price is None:
+                entry["reference_price"] = None
+                entry["reference_price_unknown"] = True
+            else:
                 if entry["reference_price"] is None:
                     entry["reference_price"] = reference_price
                 else:
@@ -2372,9 +2399,11 @@ def run_once(
     # that the cap check sees prior + incremental spend together and stops
     # topping up when the combined total would exceed the daily/weekly cap.
     if guard_active:
-        _buy_candidate_tickers = {d.ticker for d in buy_candidates}
+        # Seed ALL loaded prior allocations, not just tickers that are BUY candidates
+        # this afternoon: a morning spend on MSFT reduces the remaining daily/weekly
+        # cap even when MSFT doesn't qualify for the afternoon run.
         for _ticker, _alloc in prior_same_day_allocations.items():
-            if _ticker in _buy_candidate_tickers and _alloc.amount_usd > 0:
+            if _alloc.amount_usd > 0:
                 state.record_buy(_ticker, trading_day, _alloc.amount_usd)
 
     # Tracks the trailing-7-day scheduled-live deployment total live as orders
@@ -2402,7 +2431,10 @@ def run_once(
                 decision, prior_same_day_allocations.get(ticker), config
             )
             top_up_outcomes[ticker] = outcome
-            order_amount = outcome.incremental_order_amount
+            # Cap the guard's incremental amount to what the kill-switch already
+            # reduced order_amount to: the guard must not reinstate a higher
+            # amount that the kill-switch just capped.
+            order_amount = min(outcome.incremental_order_amount, order_amount)
             if outcome.skipped:
                 candidate_outcomes[ticker] = {
                     "status": "skipped",
