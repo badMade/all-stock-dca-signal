@@ -809,7 +809,7 @@ def build_broker(
 
 def iso_week_key(day: date) -> tuple[int, int]:
     iso = day.isocalendar()
-    return iso[0], iso[1]
+    return iso.year, iso.week
 
 
 def completed_bar_anchor(decision_dt: datetime, interval_minutes: int, config: StrategyConfig) -> datetime:
