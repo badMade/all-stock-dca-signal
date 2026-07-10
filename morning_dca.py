@@ -1238,6 +1238,7 @@ class MorningDCAExecutor(DCAExecutor):
         top_up_outcomes: Optional[Dict[str, Any]],
         remaining_daily: float,
         remaining_weekly: float,
+        manual: bool = False,
     ) -> Dict[str, Any]:
         """Attempt broker order placement for each EXEC_AUTO_BUY_ELIGIBLE candidate.
 
@@ -1253,6 +1254,11 @@ class MorningDCAExecutor(DCAExecutor):
         top-up outcome's ``incremental_order_amount`` rather than the signal's
         ``hypothetical_amount_usd``; the broker's same-day-order duplicate check
         is bypassed when a top-up outcome is active (the prior order is expected).
+
+        Review policy: scheduled runs (manual=False) skip review_market_buy and
+        call place_market_buy directly after all internal checks pass, per the
+        pre-authorization policy in config/budgets.json. Manual runs still call
+        review_market_buy first.
         """
         outcomes: Dict[str, Any] = {}
         submitted_today = 0.0
@@ -1272,6 +1278,15 @@ class MorningDCAExecutor(DCAExecutor):
                 notional = round(top_up.incremental_order_amount, 2)
             else:
                 notional = signal.hypothetical_amount_usd
+
+            # Hard per-order ceiling: 5x * $3 base = $15 (config/budgets.json circuit_breakers).
+            _MAX_ORDER_USD = 15.0
+            if notional > _MAX_ORDER_USD:
+                outcomes[ticker] = {
+                    "status": "blocked",
+                    "skip_reason": f"exceeds ${_MAX_ORDER_USD:.0f} per-order ceiling",
+                }
+                continue
 
             # Enforce daily/weekly caps against pre-run remaining budget.
             if submitted_today + notional > remaining_daily:
@@ -1296,10 +1311,14 @@ class MorningDCAExecutor(DCAExecutor):
             if broker.available_buying_power() < notional:
                 outcomes[ticker] = {"status": "blocked", "skip_reason": "insufficient buying power"}
                 continue
-            review_ok, review_reason = broker.review_market_buy(ticker, notional)
-            if not review_ok:
-                outcomes[ticker] = {"status": "blocked", "skip_reason": f"review blocked: {review_reason}"}
-                continue
+            # Scheduled runs are pre-authorized to call place_equity_order directly
+            # (config/budgets.json execution_authorization_policy: calls_review_equity_order=false).
+            # Manual runs still call review_market_buy before placement.
+            if manual:
+                review_ok, review_reason = broker.review_market_buy(ticker, notional)
+                if not review_ok:
+                    outcomes[ticker] = {"status": "blocked", "skip_reason": f"review blocked: {review_reason}"}
+                    continue
             # Stable across retries so the broker's idempotency key can collapse
             # duplicate submissions; guarded top-ups use a distinct suffix to
             # avoid colliding with the earlier same-day run's ref_id for the ticker.
@@ -1394,6 +1413,7 @@ class MorningDCAExecutor(DCAExecutor):
                 top_up_outcomes,
                 remaining_daily=pre_run_remaining_daily,
                 remaining_weekly=pre_run_remaining_weekly,
+                manual=manual,
             )
         # In live mode record only candidates whose orders were actually submitted
         # so cap-exceeded orders do not inflate the ledger and corrupt budget reporting.
