@@ -986,6 +986,101 @@ def test_preflight_root_distinct_from_watchlist_and_live():
     assert "morning_dca_preflight" in DEFAULT_MORNING_PREFLIGHT_STATE_ROOT
 
 
+def _seed_preflight(tmp_path, tickers, trading_date=None):
+    """Write a preflight run_state.json for the given tickers into tmp_path."""
+    if trading_date is None:
+        trading_date = _now_live().date()
+    folder = trading_date.strftime("%Y%m%d") + "_0945ET"
+    pf_dir = tmp_path / folder
+    pf_dir.mkdir(parents=True, exist_ok=True)
+    (pf_dir / "run_state.json").write_text(
+        json.dumps({"eligible_to_execute_tickers": list(tickers)}),
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def test_live_gate_blocks_outside_approved_window(tmp_path):
+    # A scheduled live run on a day outside approved_test_dates returns a blocked result.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 7)}),  # not 2026-07-08 (_now_live())
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data, manual=False)
+    assert res["artifacts"]["status"] == "blocked"
+    assert res["artifacts"].get("block_reason") == "outside approved trading window"
+
+
+def test_live_gate_permits_when_in_approved_window(tmp_path):
+    # A scheduled live run on a day inside approved_test_dates is not date-gated.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),  # matches _now_live()
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data, manual=False)
+    assert res["artifacts"].get("status") != "blocked"
+
+
+def test_live_gate_manual_bypasses_approved_window(tmp_path):
+    # Manual runs are never blocked by the approved_test_dates gate.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 7)}),  # not today
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data, manual=True)
+    assert res["artifacts"].get("status") != "blocked"
+
+
+def test_auto_buy_candidates_prioritized_by_multiplier_when_cap_hit(tmp_path):
+    # When the daily cap is tight, higher-multiplier tickers are placed first.
+    # BIGDROP: 8% drop -> 5x -> $15 notional. SMALLDROP: 1% drop -> 1.5x -> $4.50 notional.
+    # Daily cap of $16 allows BIGDROP ($15 < $16) then blocks SMALLDROP ($15+$4.50 > $16).
+    # The sort ensures the high-multiplier ticker gets the budget slot, not whichever
+    # happened to be evaluated first.
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+    class _FakeLiveBroker:
+        """Returns real-looking order IDs so submitted_today accumulates."""
+        def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+        def available_buying_power(self): return 500.0
+        def same_day_strategy_order_exists(self, ticker, trading_day): return False
+        def is_tradable_for_fractional_buy(self, ticker): return True
+        def review_market_buy(self, ticker, notional_usd): return True, "ok"
+        def place_market_buy(self, ticker, notional_usd, ref_id): return f"ORDER-{ticker}"
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("BIGDROP", "SMALLDROP"))
+    cfg = MorningConfig(
+        tickers=("BIGDROP", "SMALLDROP"),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        morning_daily_cap_usd=16.0,
+        morning_weekly_cap_usd=500.0,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    # BIGDROP: 8% drop -> 5x multiplier -> $15. SMALLDROP: 1% drop -> 1.5x -> $4.50.
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIGDROP": 0.08, "SMALLDROP": 0.01})
+    res = ex.run(_now_live(), data, broker=_FakeLiveBroker())
+    broker_outcomes = res["artifacts"].get("broker_outcomes", {})
+    assert broker_outcomes.get("BIGDROP", {}).get("status") == "submitted", "BIGDROP (5x) should be placed first"
+    assert broker_outcomes.get("SMALLDROP", {}).get("status") == "cap_exceeded", "SMALLDROP (1.5x) should be cap-gated out"
+
+
 if __name__ == "__main__":
     import sys
     import tempfile

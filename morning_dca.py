@@ -333,6 +333,11 @@ class MorningConfig:
     # Broker account number that must match the supplied BrokerAdapter before
     # any live orders are placed.
     target_account_number: str = ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+    # Weekday dates on which live (non-manual) execution is permitted. Empty
+    # frozenset means the date gate is disabled (no restriction beyond weekends
+    # and NYSE holidays). Mirrors StrategyConfig.approved_test_dates semantics
+    # so morning/midday honour the same trading-window config as the afternoon.
+    approved_test_dates: frozenset[date] = field(default_factory=frozenset)
 
     def as_strategy_config(self) -> StrategyConfig:
         """Return a StrategyConfig view carrying the morning ladder.
@@ -1217,9 +1222,16 @@ class MorningDCAExecutor(DCAExecutor):
         trading_day = now.astimezone(EASTERN).date()
         is_weekend = trading_day.weekday() >= 5
         is_holiday = trading_day in nyse_holidays(trading_day.year)
-        if manual or (not is_weekend and not is_holiday):
+        approved = self.config.approved_test_dates
+        is_outside_window = bool(approved) and trading_day not in approved
+        if manual or (not is_weekend and not is_holiday and not is_outside_window):
             return None
-        block_reason = "weekend" if is_weekend else "market holiday"
+        if is_weekend:
+            block_reason = "weekend"
+        elif is_holiday:
+            block_reason = "market holiday"
+        else:
+            block_reason = "outside approved trading window"
         out = self.run_state_dir(now)
         out.mkdir(parents=True, exist_ok=True)
         state_path = out / "run_state.json"
@@ -1232,7 +1244,8 @@ class MorningDCAExecutor(DCAExecutor):
                 ),
                 encoding="utf-8",
             )
-        return {"artifacts": {"trading_day": trading_day.isoformat(), "status": "blocked"},
+        return {"artifacts": {"trading_day": trading_day.isoformat(), "status": "blocked",
+                              "block_reason": block_reason},
                 "paths": {"run_state": str(state_path)}}
 
     def _place_broker_orders(
@@ -1395,10 +1408,11 @@ class MorningDCAExecutor(DCAExecutor):
         source = data_source or getattr(getattr(data, "source", None), "value", "unknown")
         trading_day = now.astimezone(EASTERN).date()
         top_up_outcomes = self._compute_top_up(now, signals)
-        auto_buy_candidates = [
-            s for s in self._buy_candidates(signals)
-            if s.execution_status != EXEC_MANUAL_REVIEW_CANDIDATE
-        ]
+        auto_buy_candidates = sorted(
+            (s for s in self._buy_candidates(signals) if s.execution_status != EXEC_MANUAL_REVIEW_CANDIDATE),
+            key=lambda s: s.multiplier,
+            reverse=True,
+        )
         # Capture remaining budget BEFORE placing orders so _place_broker_orders
         # enforces caps against the pre-run headroom.
         pre_run_remaining_daily = self.ledger.remaining_daily(trading_day)
