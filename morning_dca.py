@@ -949,24 +949,24 @@ class MorningDCAExecutor(DCAExecutor):
             return None
         return bar.close
 
-    def evaluate(self, now: datetime, data: Any) -> List[MorningSignal]:
+    def evaluate(self, now: datetime, data: Any, *, manual: bool = False) -> List[MorningSignal]:
         """Evaluate every non-excluded ticker for the morning stream.
 
         In morning live (10:30) mode the universe is first narrowed by the
         same-day 9:45 pre-flight gate: only tickers marked
-        ``eligible_to_execute=true`` are re-evaluated. If no same-day pre-flight
-        artifact is found the gate degrades to the full universe (with a warning
-        recorded in :attr:`preflight_gate`) rather than blocking all buys.
+        ``eligible_to_execute=true`` are re-evaluated. For scheduled
+        (non-manual) runs a missing pre-flight artifact is fatal; for manual
+        runs the gate degrades to the full universe with a warning.
         """
         tickers = [t for t in self.config.tickers if t not in self.config.excluded_tickers]
-        tickers = self._apply_preflight_gate(now, tickers)
+        tickers = self._apply_preflight_gate(now, tickers, manual=manual)
         return [self.evaluate_signal(t, now, data) for t in tickers]
 
     # Populated by :meth:`_apply_preflight_gate` for morning live runs so
     # build_artifacts can surface which tickers the pre-flight gate admitted.
     preflight_gate: Optional[Dict[str, Any]] = None
 
-    def _apply_preflight_gate(self, now: datetime, tickers: List[str]) -> List[str]:
+    def _apply_preflight_gate(self, now: datetime, tickers: List[str], *, manual: bool = False) -> List[str]:
         """Restrict the morning live universe to the same-day pre-flight verdict."""
         self.preflight_gate = None
         if not (self.mode == MORNING_LIVE_MODE and self.stream == MORNING_STREAM):
@@ -975,6 +975,11 @@ class MorningDCAExecutor(DCAExecutor):
         root = self.config.preflight_run_state_root or DEFAULT_MORNING_PREFLIGHT_STATE_ROOT
         loaded = load_same_day_preflight(root, trading_day)
         if loaded is None:
+            if not manual:
+                raise RuntimeError(
+                    "no same-day 9:45 pre-flight artifact found; "
+                    "scheduled live run blocked (fail-closed)"
+                )
             self.preflight_gate = {
                 "preflight_found": False,
                 "warning": "no same-day 9:45 pre-flight artifact found; evaluating full universe",
@@ -1386,7 +1391,7 @@ class MorningDCAExecutor(DCAExecutor):
         blocked = self._maybe_block_for_holiday(now, manual=manual)
         if blocked is not None:
             return blocked
-        signals = self.evaluate(now, data)
+        signals = self.evaluate(now, data, manual=manual)
         source = data_source or getattr(getattr(data, "source", None), "value", "unknown")
         trading_day = now.astimezone(EASTERN).date()
         top_up_outcomes = self._compute_top_up(now, signals)

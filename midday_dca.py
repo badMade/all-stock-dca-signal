@@ -408,6 +408,9 @@ class MiddayDCAExecutor(MorningDCAExecutor):
                 artifacts["counts"].get("manual_review_candidates", 0)
                 + len(new_top_up_manual)
             )
+            artifacts["manual_review_tickers"] = (
+                artifacts.get("manual_review_tickers", []) + new_top_up_manual
+            )
 
 
 __all__ = [
