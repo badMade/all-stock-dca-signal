@@ -43,6 +43,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 from morning_dca import (
     DEFAULT_MORNING_LIVE_STATE_ROOT,
+    EXEC_MANUAL_REVIEW_CANDIDATE,
     MorningConfig,
     MorningDCAExecutor,
     MorningSignal,
@@ -79,6 +80,11 @@ MIDDAY_LIVE_SCHEMA_VERSION = "midday-live-v1"
 # Artifact root: a sibling of, and never nested under, the morning or afternoon
 # roots.
 DEFAULT_MIDDAY_LIVE_STATE_ROOT = "/home/user/workspace/cron_tracking/midday_dca"
+
+# The afternoon live task root (cron ce16ba6b). Included in midday's
+# prior_allocation_roots so that manual fills recorded via the afternoon path
+# before 12:30 PM are seen by the midday top-up guard.
+DEFAULT_AFTERNOON_TASK_ROOT = "/home/user/workspace/cron_tracking/ce16ba6b"
 
 # Per-mode identity/profile. The midday stream has a single live mode.
 MIDDAY_PROFILES: Dict[str, Dict[str, Any]] = {
@@ -128,10 +134,15 @@ class MiddayConfig(MorningConfig):
     minimum_drop_vs_previous_close: float = MIDDAY_MINIMUM_DROP
     morning_daily_cap_usd: float = DEFAULT_MIDDAY_DAILY_CAP_USD
     morning_weekly_cap_usd: float = DEFAULT_MIDDAY_WEEKLY_CAP_USD
-    # Roots scanned for morning/manual prior same-day allocations. The morning
-    # live root catches both scheduled morning-live runs and manual recovery
-    # runs (load_prior_same_day_allocations rglobs recursively).
-    prior_allocation_roots: Tuple[str, ...] = (DEFAULT_MORNING_LIVE_STATE_ROOT,)
+    # Roots scanned for same-day prior allocations. The morning live root catches
+    # both scheduled morning-live runs and manual recovery runs
+    # (load_prior_same_day_allocations rglobs recursively). The afternoon task
+    # root ensures that manual fills recorded through the afternoon path before
+    # 12:30 PM are also visible to the midday top-up guard.
+    prior_allocation_roots: Tuple[str, ...] = (
+        DEFAULT_MORNING_LIVE_STATE_ROOT,
+        DEFAULT_AFTERNOON_TASK_ROOT,
+    )
 
 
 @dataclass(frozen=True)
@@ -200,9 +211,6 @@ def load_midday_config(config_dir=None) -> MiddayConfig:
         kwargs["morning_daily_cap_usd"] = float(budget["midday_daily_cap_usd"])
     if "midday_weekly_cap_usd" in budget:
         kwargs["morning_weekly_cap_usd"] = float(budget["midday_weekly_cap_usd"])
-
-    if "trend_min_bars" in raw:
-        kwargs["trend_min_bars"] = int(raw["trend_min_bars"])
 
     artifact_paths = raw.get("artifact_paths", {})
     if "live_run_state_root" in artifact_paths:
@@ -365,17 +373,23 @@ class MiddayDCAExecutor(MorningDCAExecutor):
         row["top_up_guard_result"] = outcome.top_up_guard_result
         row["top_up_skipped"] = outcome.top_up_skipped
         row["top_up_manual_review"] = outcome.top_up_manual_review
+        if outcome.top_up_manual_review:
+            row["execution_status"] = EXEC_MANUAL_REVIEW_CANDIDATE
 
     def _augment_artifacts(
         self, artifacts: Dict[str, Any], top_up_outcomes: Optional[Dict[str, Any]]
     ) -> None:
         outcomes = list(top_up_outcomes.values()) if top_up_outcomes else []
-        artifacts["top_up_manual_review_tickers"] = sorted(
-            o.ticker for o in outcomes if o.top_up_manual_review
-        )
+        top_up_manual_reviews = sorted(o.ticker for o in outcomes if o.top_up_manual_review)
+        artifacts["top_up_manual_review_tickers"] = top_up_manual_reviews
         artifacts["top_up_offset_tickers"] = sorted(
             o.ticker for o in outcomes if o.top_up_skipped and not o.top_up_manual_review
         )
+        if top_up_manual_reviews:
+            artifacts["counts"]["manual_review_candidates"] = (
+                artifacts["counts"].get("manual_review_candidates", 0)
+                + len(top_up_manual_reviews)
+            )
 
 
 __all__ = [

@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import math
 import uuid
 from dataclasses import dataclass, field
@@ -61,12 +62,16 @@ from near_close_dca import (
     EXCLUDED_TICKERS,
     Action,
     Bar,
+    BrokerAdapter,
+    OrderConfirmationRequiredError,
     StrategyConfig,
     completed_bar_anchor,
     graded_buy_multiplier,
     iso_week_key,
     latest_bar_at_or_before,
 )
+
+_log = logging.getLogger(__name__)
 
 # --- Morning stream identity / classification constants ---------------------
 #
@@ -401,9 +406,6 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
     ``MorningConfig()`` with hardcoded defaults -- the same graceful-fallback
     pattern used by :func:`dca_config.load_strategy_config`.
     """
-    import logging
-    _log = logging.getLogger(__name__)
-
     if config_dir is None:
         _here = Path(__file__).resolve().parent
         for candidate in (_here / "config", Path.cwd() / "config"):
@@ -437,10 +439,7 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
         kwargs["minimum_drop_vs_previous_close"] = float(sizing["no_buy_below_pct"]) / 100.0
     if "tiers" in sizing:
         tiers = tuple(
-            (
-                float(t["min_drop_pct"]) / 100.0,
-                float(t["max_drop_pct"]) / 100.0 if t.get("max_drop_pct") is not None else float("inf"),
-            )
+            (float(t["min_drop_pct"]) / 100.0, float(t["multiplier"]))
             for t in sizing["tiers"]
         )
         kwargs["sizing_tiers"] = tiers
@@ -761,14 +760,20 @@ class MorningDCAExecutor(DCAExecutor):
         loosened "buy anyway when trend is unavailable" rule is not implemented.
         """
         bar_anchor = completed_bar_anchor(decision_dt, self.config.interval_minutes, self._sizing_config)
-        usable_timestamps = {
-            b.timestamp for b in bars
-            if b.timestamp <= bar_anchor and math.isfinite(b.close) and b.close > 0
-        }
-        if len(usable_timestamps) < self.config.trend_min_bars:
+        usable: Dict[Any, Bar] = {}
+        for b in bars:
+            if b.timestamp <= bar_anchor and math.isfinite(b.close) and b.close > 0:
+                usable[b.timestamp] = b
+        if len(usable) < self.config.trend_min_bars:
             warnings.append(
-                f"intraday trend unvalidated: {len(usable_timestamps)} usable bars < required "
+                f"intraday trend unvalidated: {len(usable)} usable bars < required "
                 f"{self.config.trend_min_bars} over the 60-minute window"
+            )
+            return False
+        sorted_bars = sorted(usable.values(), key=lambda b: b.timestamp)
+        if sorted_bars[-1].close > sorted_bars[0].close:
+            warnings.append(
+                "intraday trend rising: price is above open; skipping auto-buy"
             )
             return False
         return True
@@ -1021,6 +1026,60 @@ class MorningDCAExecutor(DCAExecutor):
         return {"artifacts": {"trading_day": trading_day.isoformat(), "status": "blocked"},
                 "paths": {"run_state": str(state_path)}}
 
+    def _place_broker_orders(
+        self,
+        candidates: List[MorningSignal],
+        trading_day: Any,
+        broker: BrokerAdapter,
+    ) -> Dict[str, Any]:
+        """Attempt broker order placement for each EXEC_AUTO_BUY_ELIGIBLE candidate.
+
+        Returns a dict mapping ticker → outcome dict. Each outcome has a ``status``
+        key: ``submitted``, ``skipped``, ``blocked``,
+        ``not_submitted_confirmation_required``, or ``failed``.
+        """
+        outcomes: Dict[str, Any] = {}
+        for signal in candidates:
+            ticker = signal.ticker
+            notional = signal.hypothetical_amount_usd
+            if broker.same_day_strategy_order_exists(ticker, trading_day):
+                outcomes[ticker] = {"status": "skipped", "skip_reason": "same-day broker order exists"}
+                continue
+            if not broker.is_tradable_for_fractional_buy(ticker):
+                outcomes[ticker] = {"status": "blocked", "skip_reason": "not tradable for fractional buy"}
+                continue
+            review_ok, review_reason = broker.review_market_buy(ticker, notional)
+            if not review_ok:
+                outcomes[ticker] = {"status": "blocked", "skip_reason": f"review blocked: {review_reason}"}
+                continue
+            ref_id = str(uuid.uuid4())
+            try:
+                order_id = broker.place_market_buy(ticker, notional, ref_id=ref_id)
+            except OrderConfirmationRequiredError:
+                outcomes[ticker] = {
+                    "status": "not_submitted_confirmation_required",
+                    "order_id": None,
+                    "skip_reason": "broker requires post-review confirmation before submission",
+                    "submitted_amount_usd": notional,
+                }
+                continue
+            except Exception as exc:  # noqa: BLE001
+                outcomes[ticker] = {
+                    "status": "failed",
+                    "order_id": None,
+                    "skip_reason": f"placement failed: {exc}",
+                    "submitted_amount_usd": notional,
+                }
+                _log.error("Placement failed for %s: %s", ticker, exc)
+                continue
+            outcomes[ticker] = {
+                "status": "submitted",
+                "order_id": order_id,
+                "submitted_amount_usd": notional,
+            }
+            _log.info("Placed morning buy for %s: $%.2f, order_id=%s", ticker, notional, order_id)
+        return outcomes
+
     def run(
         self,
         now: datetime,
@@ -1028,12 +1087,15 @@ class MorningDCAExecutor(DCAExecutor):
         *,
         data_source: Optional[str] = None,
         manual: bool = False,
+        broker: Optional[BrokerAdapter] = None,
     ) -> Dict[str, Any]:
         """Evaluate the stream and write its artifacts for the active mode.
 
         Returns ``{"artifacts": <run_state dict>, "paths": <written paths>}``.
         The watchlist scan places no orders; the live mode surfaces
         auto-buy-eligible vs. manual_review candidates per the confidence rule.
+        When ``broker`` is supplied in live mode, auto-buy-eligible candidates
+        are submitted via the broker and outcomes recorded in the artifacts.
         """
         blocked = self._maybe_block_for_holiday(now, manual=manual)
         if blocked is not None:
@@ -1047,7 +1109,12 @@ class MorningDCAExecutor(DCAExecutor):
             if s.execution_status != EXEC_MANUAL_REVIEW_CANDIDATE
         ]
         self.record_buy_candidates(trading_day, auto_buy_candidates, top_up_outcomes)
+        broker_outcomes: Optional[Dict[str, Any]] = None
+        if broker is not None and self.mode == MORNING_LIVE_MODE:
+            broker_outcomes = self._place_broker_orders(auto_buy_candidates, trading_day, broker)
         artifacts = self.build_artifacts(now, signals, source, manual=manual, top_up_outcomes=top_up_outcomes)
+        if broker_outcomes is not None:
+            artifacts["broker_outcomes"] = broker_outcomes
         paths = self.write_artifacts(artifacts, now)
         return {"artifacts": artifacts, "paths": paths}
 

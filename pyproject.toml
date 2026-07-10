@@ -45,6 +45,7 @@ run-dca-risk = "dca_risk:main"
 py-modules = [
     "near_close_dca",
     "morning_dca",
+    "midday_dca",
     "dca_config",
     "dca_risk",
     "dca_live_adapters",
@@ -74,6 +75,7 @@ packages = ["scripts"]
     "config/notifications.json",
     "config/reporting.json",
     "config/morning_dca.json",
+    "config/midday_dca.json",
 ]
 
 [tool.pytest.ini_options]
