@@ -399,10 +399,14 @@ class MiddayDCAExecutor(MorningDCAExecutor):
         artifacts["top_up_offset_tickers"] = sorted(
             o.ticker for o in outcomes if o.top_up_skipped and not o.top_up_manual_review
         )
-        if top_up_manual_reviews:
+        # Only count tickers not already in manual_review_tickers to avoid
+        # double-counting trend-unvalidated tickers that also hit the missing-price path.
+        existing_manual_review = set(artifacts.get("manual_review_tickers", []))
+        new_top_up_manual = [t for t in top_up_manual_reviews if t not in existing_manual_review]
+        if new_top_up_manual:
             artifacts["counts"]["manual_review_candidates"] = (
                 artifacts["counts"].get("manual_review_candidates", 0)
-                + len(top_up_manual_reviews)
+                + len(new_top_up_manual)
             )
 
 
