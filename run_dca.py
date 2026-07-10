@@ -225,9 +225,34 @@ def run_pipeline(
             cross_stream_roots = tuple(
                 cron_base / Path(r).name for r in _CROSS_STREAM_PRIOR_ALLOCATION_ROOTS
             )
+            # Afternoon root: use the default 14:30 boundary to exclude the
+            # current run's own artifacts. Cross-stream roots (morning/midday):
+            # use a wide boundary so late manual reruns (e.g. a 15:05 midday
+            # rerun) are included; their scheduled-run check already excludes
+            # any afternoon artifacts that somehow landed there.
             prior_same_day_allocations = load_prior_same_day_allocations_multi(
-                (afternoon_root, *cross_stream_roots), trading_day
+                (afternoon_root,), trading_day
             )
+            cross_stream_allocs = load_prior_same_day_allocations_multi(
+                cross_stream_roots, trading_day, boundary_et=time(23, 59)
+            )
+            for ticker, alloc in cross_stream_allocs.items():
+                existing = prior_same_day_allocations.get(ticker)
+                if existing is None:
+                    prior_same_day_allocations[ticker] = alloc
+                else:
+                    ref = (
+                        None
+                        if existing.reference_price is None or alloc.reference_price is None
+                        else min(existing.reference_price, alloc.reference_price)
+                    )
+                    prior_same_day_allocations[ticker] = PriorSameDayAllocation(
+                        ticker=ticker,
+                        amount_usd=existing.amount_usd + alloc.amount_usd,
+                        reference_price=ref,
+                        run_id=alloc.run_id or existing.run_id,
+                        source=alloc.source or existing.source,
+                    )
         else:
             prior_same_day_allocations = load_prior_same_day_allocations(
                 prior_allocation_state_root, trading_day
