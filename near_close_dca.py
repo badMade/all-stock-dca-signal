@@ -1076,9 +1076,11 @@ def allocation_sort_key(decision: ReconciledDecision) -> Tuple[float, float, str
     same names the strategy state promises. Numeric keys are negated (rather than
     sorting with ``reverse=True``) so ticker still sorts ascending.
     """
-    f_drop = decision.finance_signal.drop_vs_previous_close_pct if decision.finance_signal else 0.0
-    r_drop = decision.robinhood_signal.drop_vs_previous_close_pct if decision.robinhood_signal else 0.0
-    return (-decision.buy_multiplier, -(f_drop if f_drop > r_drop else r_drop), decision.ticker)
+    drop = max(
+        decision.finance_signal.drop_vs_previous_close_pct if decision.finance_signal else 0.0,
+        decision.robinhood_signal.drop_vs_previous_close_pct if decision.robinhood_signal else 0.0,
+    )
+    return (-decision.buy_multiplier, -drop, decision.ticker)
 
 
 def _signal_target_price(decision: ReconciledDecision) -> Optional[float]:
