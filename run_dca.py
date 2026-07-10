@@ -225,12 +225,15 @@ def run_pipeline(
             cross_stream_roots = tuple(
                 cron_base / Path(r).name for r in _CROSS_STREAM_PRIOR_ALLOCATION_ROOTS
             )
-            # Afternoon root: use the default 14:30 boundary to exclude the
-            # current run's own artifacts. Cross-stream roots (morning/midday):
-            # cap at the actual run time so replayed/backfilled runs never load
-            # fills that were created after the scheduled execution window.
+            # All roots are capped at the actual run time so replayed/backfilled
+            # runs never load fills created after the scheduled execution window.
+            # The current run's own artifact is excluded by classification
+            # (run_origin != "scheduled" or stream mismatch) not by time, so
+            # passing `now` here is safe and captures late manual fills (e.g.
+            # a 15:05 manual override under ce16ba6b/manual_runs).
             prior_same_day_allocations = load_prior_same_day_allocations_multi(
-                (afternoon_root,), trading_day
+                (afternoon_root,), trading_day,
+                boundary_et=now.astimezone(EASTERN).time(),
             )
             cross_stream_allocs = load_prior_same_day_allocations_multi(
                 cross_stream_roots, trading_day,
