@@ -513,7 +513,7 @@ def test_usage_proxy_logged_in_run_state(tmp_path):
     assert usage["robinhood_calls_attempted"] == 3
     assert usage["signal_rows_written"] == 6
     assert usage["buy_candidates_written"] == 3
-    assert usage["order_reviews_attempted"] == 3
+    assert usage["order_reviews_attempted"] == 0
     assert usage["orders_placed_count"] == 3
     # signals.csv, buy_candidates.csv, and orders.csv all count toward the proxy.
     assert usage["csv_artifact_count"] == 3
@@ -869,9 +869,8 @@ def test_confirmation_required_broker_response_recorded_distinctly(tmp_path):
     for candidate in run_state["buy_candidates"]:
         assert candidate["status"] == "not_submitted_confirmation_required"
         assert candidate["order_id"] is None
-        # Reviewed order details are still recorded even though nothing submitted.
-        assert candidate["reviewed_order"]["review_passed"] is True
-        assert candidate["reviewed_order"]["notional_usd"] == candidate["planned_amount_usd"]
+        # Scheduled runs place directly (no pre-placement review), so reviewed_order is None.
+        assert candidate["reviewed_order"] is None
     # Not counted as an error: the broker responded normally, just requiring
     # confirmation, so nothing needs retrying and no alert should fire on this basis.
     assert run_state["usage_proxy"]["errors_count"] == 0

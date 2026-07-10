@@ -520,7 +520,17 @@ def test_classification_matches_morning_schema(tmp_path):
 
 # --- Live (10:30 AM) execution mode -----------------------------------------
 def test_live_mode_path_and_classification(tmp_path):
-    cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
+    preflight_root = tmp_path / "preflight"
+    preflight_dir = preflight_root / "20260708_0945ET"
+    preflight_dir.mkdir(parents=True)
+    (preflight_dir / "run_state.json").write_text(
+        json.dumps({"eligible_to_execute_tickers": ["SMALL"]}), encoding="utf-8"
+    )
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path),
+        preflight_run_state_root=str(preflight_root),
+    )
     ex = MorningDCAExecutor(cfg, mode="live")
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
     res = ex.run(_now_live(), data)
@@ -552,7 +562,7 @@ def test_live_confidence_rule_auto_buys_with_validated_trend():
     cfg = MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0)
     ex = MorningDCAExecutor(cfg, mode="live")
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
-    sig = ex.evaluate(_now_live(), data)[0]
+    sig = ex.evaluate(_now_live(), data, manual=True)[0]
     assert sig.action == Action.BUY
     assert sig.trend_validated is True
     assert sig.execution_status == EXEC_AUTO_BUY_ELIGIBLE
@@ -581,12 +591,12 @@ def test_live_confidence_rule_withholds_when_trend_unvalidated(tmp_path):
     ex = MorningDCAExecutor(cfg, mode="live")
     data = FewBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
 
-    sig = ex.evaluate(_now_live(), data)[0]
+    sig = ex.evaluate(_now_live(), data, manual=True)[0]
     assert sig.action == Action.BUY
     assert sig.trend_validated is False
     assert sig.execution_status == EXEC_MANUAL_REVIEW_CANDIDATE
 
-    res = ex.run(_now_live(), data)
+    res = ex.run(_now_live(), data, manual=True)
     art = res["artifacts"]
     assert art["counts"]["manual_review_candidates"] == 1
     assert art["manual_review_tickers"] == ["BIG"]
@@ -912,7 +922,9 @@ def test_live_gate_restricts_to_preflight_eligible(tmp_path):
     assert evaluated == {"BIG"}
 
 
-def test_live_gate_degrades_to_full_universe_when_preflight_missing(tmp_path):
+def test_live_gate_fails_closed_when_preflight_missing_scheduled(tmp_path):
+    # Scheduled live runs must block (fail-closed) when no preflight artifact exists.
+    import pytest
     live = MorningDCAExecutor(
         MorningConfig(
             tickers=("BIG", "FLAT"),
@@ -922,7 +934,22 @@ def test_live_gate_degrades_to_full_universe_when_preflight_missing(tmp_path):
         mode=MORNING_LIVE_MODE,
     )
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10, "FLAT": 0.10})
-    res = live.run(_now_live(), data)
+    with pytest.raises(RuntimeError, match="scheduled live run blocked"):
+        live.run(_now_live(), data)
+
+
+def test_live_gate_degrades_to_full_universe_when_preflight_missing_manual(tmp_path):
+    # Manual live runs degrade to the full universe with a warning when no preflight exists.
+    live = MorningDCAExecutor(
+        MorningConfig(
+            tickers=("BIG", "FLAT"),
+            morning_run_state_root=str(tmp_path / "live"),
+            preflight_run_state_root=str(tmp_path / "empty_preflight"),
+        ),
+        mode=MORNING_LIVE_MODE,
+    )
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10, "FLAT": 0.10})
+    res = live.run(_now_live(), data, manual=True)
     art = res["artifacts"]
     assert art["preflight_gate"]["preflight_found"] is False
     evaluated = {r["ticker"] for r in art["signal_rows"]}

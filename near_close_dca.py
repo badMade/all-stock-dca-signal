@@ -2612,24 +2612,24 @@ def run_once(
             _block(ticker, MISSING_FILL_BROKER_BLOCKED, f"{ticker}: not tradable for fractional/notional buy; skipping")
             continue
 
-        order_reviews_attempted += 1
-        review_ok, review_reason = broker.review_market_buy(ticker, order_amount)
-        if not review_ok:
-            candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": f"review blocked: {review_reason}"}
-            _block(ticker, MISSING_FILL_BROKER_BLOCKED, f"{ticker}: review blocked order: {review_reason}")
-            continue
-
-        # Populated whenever review passed, regardless of the eventual submission
-        # outcome, so a confirmation-blocked or failed placement still records
-        # the order details that were reviewed (schemas/run_state.schema.json).
-        reviewed_order = {
-            "notional_usd": round(order_amount, 2),
-            "side": "buy",
-            "order_type": "market",
-            "time_in_force": None,
-            "estimated_price": None,
-            "review_passed": review_ok,
-        }
+        # Scheduled runs place directly per budgets.json policy (no pre-placement review).
+        # Manual runs still call review_market_buy before placing.
+        reviewed_order = None
+        if not scheduled:
+            order_reviews_attempted += 1
+            review_ok, review_reason = broker.review_market_buy(ticker, order_amount)
+            if not review_ok:
+                candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": f"review blocked: {review_reason}"}
+                _block(ticker, MISSING_FILL_BROKER_BLOCKED, f"{ticker}: review blocked order: {review_reason}")
+                continue
+            reviewed_order = {
+                "notional_usd": round(order_amount, 2),
+                "side": "buy",
+                "order_type": "market",
+                "time_in_force": None,
+                "estimated_price": None,
+                "review_passed": True,
+            }
 
         # A guarded top-up uses a "-topup" ref_id suffix to avoid colliding with
         # the earlier same-day run's ref_id for the same (trading_day, ticker),
