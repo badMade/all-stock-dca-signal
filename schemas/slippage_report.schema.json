@@ -29,6 +29,16 @@
       "type": "boolean",
       "description": "True only when a valid scheduled state existed but lacked order IDs due to a known write failure and in-window broker orders were attributed instead (manual IDs still excluded)."
     },
+    "accepted_state_schema_versions": {
+      "type": "array",
+      "items": { "type": "string", "enum": ["run-classification-v1", "run-classification-v2-preauthorized"] },
+      "description": "Scheduled run_state schema versions accepted for this report. Both run-classification-v1 and the stricter successor run-classification-v2-preauthorized are accepted when the required scheduled identity fields are correct."
+    },
+    "source_order_history_payloads": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Paths to persisted Robinhood order-history payloads (e.g. scheduled_runs/YYYYMMDD_1520ET/raw/orders_after_place.json) used to compute average fill price / executions. Added 2026-07-10: the slippage task persists broker order-history responses before computation and computes fills from the saved payloads rather than re-querying the broker."
+    },
     "manual_test_runs": {
       "type": "object",
       "description": "Clearly labeled 'Manual Test Runs' section. Manual fills are reported here only and never affect scheduled-live cost basis, slippage, reliability, or order-count metrics.",

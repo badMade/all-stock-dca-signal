@@ -18,9 +18,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from run_classification import (  # noqa: E402
+    ACCEPTED_STATE_SCHEMA_VERSIONS,
     ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED,
     ORDER_SUBMIT_STATUS_ERROR,
     STATE_SCHEMA_VERSION,
+    STATE_SCHEMA_VERSION_V2,
     build_manual_classification,
     build_raw_persistence_state,
     build_scheduled_classification,
@@ -29,6 +31,7 @@ from run_classification import (  # noqa: E402
     historicals_batch_filename,
     is_confirmation_blocked,
     is_manual_state,
+    is_preauthorized_v2,
     is_scheduled_state,
     latest_scheduled_run_path,
     list_raw_inputs_saved,
@@ -202,6 +205,25 @@ def test_validation_rejects_bad_schema_version():
     res = validate_classification(rc)
     assert not res.ok
     assert any("state_schema_version" in e for e in res.errors)
+
+
+def test_validation_accepts_v2_preauthorized_scheduled():
+    # The stricter successor version is accepted for scheduled runs when the
+    # required scheduled identity fields are correct.
+    rc = build_scheduled_classification(TRADING_DAY)
+    rc["state_schema_version"] = STATE_SCHEMA_VERSION_V2
+    res = validate_classification(rc)
+    assert res.ok
+    assert STATE_SCHEMA_VERSION_V2 in ACCEPTED_STATE_SCHEMA_VERSIONS
+    assert is_preauthorized_v2(rc)
+    assert not is_preauthorized_v2(build_scheduled_classification(TRADING_DAY))
+
+
+def test_validation_accepts_v2_preauthorized_manual():
+    rc = build_manual_classification()
+    rc["state_schema_version"] = STATE_SCHEMA_VERSION_V2
+    assert validate_classification(rc).ok
+    assert is_preauthorized_v2({"run_classification": rc})
 
 
 def test_validation_rejects_manual_run_id_matching_scheduled():

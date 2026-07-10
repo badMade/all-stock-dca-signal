@@ -4,6 +4,8 @@
   "version": "2026-07-08",
   "purpose": "Single source of truth for distinguishing scheduled live runs of the graded DCA task from manual runs, so downstream slippage/watchdog/weekly reporting never confuses the two. Every run_state artifact must carry a run_classification block matching this policy.",
   "state_schema_version": "run-classification-v1",
+  "accepted_state_schema_versions": ["run-classification-v1", "run-classification-v2-preauthorized"],
+  "accepted_state_schema_versions_note": "Downstream consumers (slippage 67aa802b, weekly 041d9d90) accept BOTH run-classification-v1 and the stricter successor run-classification-v2-preauthorized when the required scheduled identity fields (run_origin, manual_run, cron_id/supersedes_cron_id, scheduled_for_et, window, run_id) are correct. v2 (added 2026-07-10) is the pre-authorized direct-placement contract (no review_equity_order); it is a stricter successor of v1, not a different contract, so a v2 scheduled run_state is valid scheduled evidence and must not be discarded for its version alone.",
   "live_task": {
     "cron_id": "10ce362c",
     "supersedes_cron_id": "ce16ba6b",
@@ -157,11 +159,47 @@
     "applies_to_tasks": ["67aa802b", "a46bf007", "041d9d90", "0656657a"],
     "rules": [
       "Validate scheduled state files against run_classification.schema.json before use.",
+      "Accept BOTH run-classification-v1 and run-classification-v2-preauthorized scheduled run_state files: a v2 run_state is valid scheduled evidence when the required scheduled identity fields are correct and must not be excluded for its state_schema_version alone.",
       "Collect every order_id found in manual_runs/**/run_state*.json and exclude them from all scheduled-live metrics.",
       "Exclude any run_state whose run_classification has run_origin='manual' or manual_run=true, regardless of where the file is located on disk.",
       "Never infer scheduled status from same-day broker orders alone; a valid scheduled run_state must exist.",
       "Scheduled-live cost basis, slippage, reliability, and order-count metrics must be computed only from validated scheduled runs with manual order IDs excluded.",
       "A scheduled run_state with order_submit_status='not_submitted_confirmation_required' is valid scheduled-run evidence that the task ran but is NOT evidence of an order/fill: it contributes zero scheduled fills/order IDs and must not be marked invalid because confirmation blocked submission."
+    ]
+  },
+  "slippage_reporting": {
+    "task_id": "67aa802b",
+    "added": "2026-07-10",
+    "accepted_state_schema_versions": ["run-classification-v1", "run-classification-v2-preauthorized"],
+    "order_history_persistence": {
+      "reason": "The 3:35 PM ET slippage task must persist the Robinhood order-history response before computing slippage, then compute average fill price and executions from the saved payload rather than re-querying the broker.",
+      "persist_path": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/raw/orders_after_place.json",
+      "computed_from": "saved payload",
+      "helper": "dca_reporting.fills_from_order_history_payload",
+      "report_field": "source_order_history_payloads"
+    },
+    "recovered_slippage_2026_07_10": {
+      "trading_day": "2026-07-10",
+      "scope": "afternoon scheduled (15:15-15:35 ET)",
+      "scheduled_run_id": "scheduled_20260710_1520ET",
+      "scheduled_fills": 9,
+      "total_usd": 31.5,
+      "mean_slippage_pct": 0.1047,
+      "max_abs_slippage_symbol": "QBTS",
+      "max_abs_slippage_pct": 0.2089,
+      "excluded_manual_order_ids_count": 46,
+      "artifacts_dir": "/home/user/workspace/cron_tracking/ce16ba6b/slippage/20260710/",
+      "order_history_payload": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260710_1520ET/raw/orders_after_place.json"
+    }
+  },
+  "weekly_reporting": {
+    "task_id": "041d9d90",
+    "added": "2026-07-10",
+    "accepted_state_schema_versions": ["run-classification-v1", "run-classification-v2-preauthorized"],
+    "rules": [
+      "Include run-classification-v2-preauthorized scheduled runs in weekly metrics when the required scheduled identity fields are present; do not drop them for their state_schema_version.",
+      "If per-day slippage report files are missing, use the persisted broker order-history payloads (raw/orders_after_place.json) via dca_reporting.fills_from_order_history_payload before declaring slippage unavailable.",
+      "Manual order IDs are still excluded from weekly scheduled-live metrics."
     ]
   },
   "broker_time_window_fallback": {

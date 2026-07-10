@@ -10,7 +10,11 @@ must declare its origin, and every downstream reporting task must honor it.
 - Embedded in: [`../schemas/run_state.schema.json`](../schemas/run_state.schema.json)
   (the `run_classification` block is **required** on every run_state)
 
-`state_schema_version` for this contract is **`run-classification-v1`**.
+`state_schema_version` for this contract is **`run-classification-v1`**. As of
+2026-07-10 a stricter successor **`run-classification-v2-preauthorized`** is also
+accepted (see [Accepted schema versions](#accepted-schema-versions-v1--v2)):
+downstream consumers accept **both** versions when the required scheduled
+identity fields are correct.
 
 ## Live scheduled task
 
@@ -188,13 +192,49 @@ live in [`../scripts/run_classification.py`](../scripts/run_classification.py):
 `list_raw_inputs_saved`, `build_raw_persistence_state`, and
 `raw_persistence_failure_run_state`.
 
+## Accepted schema versions (v1 + v2)
+
+Two `state_schema_version` values are accepted:
+
+- **`run-classification-v1`** — the original contract.
+- **`run-classification-v2-preauthorized`** — a **stricter successor** added
+  2026-07-10 for the pre-authorized direct-placement live task (no
+  `review_equity_order` step). It is not a different contract; it carries the same
+  required scheduled identity fields (`run_origin`, `manual_run`,
+  `cron_id`/`supersedes_cron_id`, `scheduled_for_et`, window, `run_id`).
+
+Downstream consumers (slippage `67aa802b`, weekly `041d9d90`) accept **both**
+versions and must **not** discard a scheduled run_state for its
+`state_schema_version` alone when the identity fields are correct. The helper
+exposes `ACCEPTED_STATE_SCHEMA_VERSIONS` and `is_preauthorized_v2(...)`, and
+`validate_classification` accepts either version.
+
+## Slippage order-history persistence (added 2026-07-10)
+
+The 3:35 PM ET slippage task (`67aa802b`) **persists the Robinhood order-history
+response before computing slippage** and computes average fill price / executions
+from the saved payload rather than re-querying the broker:
+
+- The payload is saved to
+  `scheduled_runs/YYYYMMDD_1520ET/raw/orders_after_place.json` and its path is
+  recorded in the slippage report's `source_order_history_payloads`.
+- Fills are extracted from the saved payload via
+  `dca_reporting.fills_from_order_history_payload`, which accepts a bare list,
+  `{"orders": [...]}` / `{"results": [...]}`, or a normalized
+  `{"output_path", "data": ...}` pointer payload.
+- The **weekly dashboard** (`041d9d90`) includes v2-preauthorized scheduled runs
+  and, when per-day slippage report files are missing, falls back to these
+  persisted broker-history payloads before declaring slippage unavailable. Manual
+  order IDs remain excluded from all scheduled-live metrics.
+
 ## Downstream reporting rules
 
 Applies to slippage (`67aa802b`), watchdog (`a46bf007`), weekly dashboard
 (`041d9d90`), and monthly dashboard (`0656657a`):
 
 1. **Validate** scheduled state files against the run_classification schema
-   before using them.
+   before using them, accepting **both** `run-classification-v1` and
+   `run-classification-v2-preauthorized` when the identity fields are correct.
 2. **Collect and exclude** every `order_id` found in
    `manual_runs/**/run_state*.json` from all scheduled-live metrics.
 3. **Exclude** any run_state whose classification has `run_origin='manual'` or

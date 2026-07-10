@@ -37,6 +37,13 @@ from zoneinfo import ZoneInfo
 # --- Contract constants (mirror config/run_classification.json) --------------
 
 STATE_SCHEMA_VERSION = "run-classification-v1"
+# Stricter successor introduced 2026-07-10 for the pre-authorized direct-placement
+# live task (no review_equity_order): a scheduled run written under the
+# pre-authorized execution policy tags itself v2. Both versions are accepted for
+# scheduled/manual evidence as long as the required scheduled identity fields are
+# correct; v2 is treated as a stricter successor of v1, not a different contract.
+STATE_SCHEMA_VERSION_V2 = "run-classification-v2-preauthorized"
+ACCEPTED_STATE_SCHEMA_VERSIONS = (STATE_SCHEMA_VERSION, STATE_SCHEMA_VERSION_V2)
 # Repaired live task id. The deleted ce16ba6b is superseded by 10ce362c; the
 # artifact root stays under .../ce16ba6b for continuity (see STATE_ROOT).
 CRON_ID = "10ce362c"
@@ -409,9 +416,9 @@ def validate_classification(rc: Dict[str, object]) -> ValidationResult:
     if origin not in ("scheduled", "manual"):
         errors.append(f"run_origin must be 'scheduled' or 'manual', got {origin!r}")
 
-    if rc.get("state_schema_version") != STATE_SCHEMA_VERSION:
+    if rc.get("state_schema_version") not in ACCEPTED_STATE_SCHEMA_VERSIONS:
         errors.append(
-            f"state_schema_version must be {STATE_SCHEMA_VERSION!r}, "
+            f"state_schema_version must be one of {list(ACCEPTED_STATE_SCHEMA_VERSIONS)!r}, "
             f"got {rc.get('state_schema_version')!r}"
         )
 
@@ -480,6 +487,14 @@ def validate_classification(rc: Dict[str, object]) -> ValidationResult:
             errors.append("manual run_id must not match the scheduled_YYYYMMDD_1520ET pattern")
 
     return ValidationResult(not errors, errors)
+
+
+def is_preauthorized_v2(state_or_rc: Dict[str, object]) -> bool:
+    """True if a run_state (or its run_classification block) is tagged v2-preauthorized."""
+    rc = state_or_rc
+    if isinstance(state_or_rc, dict) and isinstance(state_or_rc.get("run_classification"), dict):
+        rc = state_or_rc["run_classification"]
+    return isinstance(rc, dict) and rc.get("state_schema_version") == STATE_SCHEMA_VERSION_V2
 
 
 def is_manual_state(state: Dict[str, object]) -> bool:
@@ -843,6 +858,9 @@ def select_scheduled_state_for_reporting(
 
 __all__ = [
     "STATE_SCHEMA_VERSION",
+    "STATE_SCHEMA_VERSION_V2",
+    "ACCEPTED_STATE_SCHEMA_VERSIONS",
+    "is_preauthorized_v2",
     "CRON_ID",
     "SUPERSEDES_CRON_ID",
     "ORDER_SUBMIT_STATUS_SUBMITTED",

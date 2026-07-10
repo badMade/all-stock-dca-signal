@@ -16,6 +16,7 @@ from dca_reporting import (
     build_latest_run_summary,
     build_missing_fills,
     compute_slippage_rows,
+    fills_from_order_history_payload,
     generate_reports,
     rank_slippage,
 )
@@ -64,6 +65,51 @@ def _fills():
         {"ticker": "NVDA", "fill_price": 49.5, "filled_qty": 0.0606, "order_id": "O2"},
         {"ticker": "AMD", "fill_price": 30.0, "filled_qty": 0.05, "order_id": "O3"},
     ]
+
+
+def test_fills_from_order_history_payload_shapes():
+    # Bare list, {"orders": [...]}, and normalized {"data": ...} pointer all work.
+    orders = [
+        {
+            "ticker": "AAPL",
+            "id": "O1",
+            "executions": [
+                {"quantity": "0.01", "price": "100.0"},
+                {"quantity": "0.01", "price": "102.0"},
+            ],
+        },
+        {"symbol": "NVDA", "order_id": "O2", "filled_qty": "0.06", "filled_avg_price": "49.5"},
+        {"ticker": "SKIP", "id": "O3", "quantity": "0"},  # no executed qty -> skipped
+    ]
+    for payload in (orders, {"orders": orders}, {"results": orders}, {"output_path": "x", "data": orders}):
+        fills = fills_from_order_history_payload(payload)
+        by_ticker = {f["ticker"]: f for f in fills}
+        assert set(by_ticker) == {"AAPL", "NVDA"}
+        # AAPL avg = weighted mean of executions = 101.0 across 0.02 shares.
+        assert abs(by_ticker["AAPL"]["filled_avg_price"] - 101.0) < 1e-9
+        assert abs(by_ticker["AAPL"]["filled_qty"] - 0.02) < 1e-9
+        assert by_ticker["AAPL"]["executions"] == 2
+        assert by_ticker["AAPL"]["order_id"] == "O1"
+        # NVDA falls back to filled_avg_price when no executions list is present.
+        assert abs(by_ticker["NVDA"]["fill_price"] - 49.5) < 1e-9
+
+
+def test_fills_from_order_history_payload_feeds_slippage():
+    payload = {"orders": [
+        {"ticker": "AAPL", "id": "O1", "filled_qty": "0.0198", "filled_avg_price": "101.0"},
+        {"ticker": "NVDA", "id": "O2", "filled_qty": "0.0606", "filled_avg_price": "49.5"},
+    ]}
+    fills = fills_from_order_history_payload(payload)
+    rows = compute_slippage_rows(_run_state()["buy_candidates"], fills)
+    by_ticker = {r["ticker"]: r for r in rows}
+    assert abs(by_ticker["AAPL"]["slippage_pct"] - 1.0) < 1e-6
+    assert by_ticker["NVDA"]["slippage_pct"] < 0
+
+
+def test_fills_from_order_history_payload_empty():
+    assert fills_from_order_history_payload({}) == []
+    assert fills_from_order_history_payload([]) == []
+    assert fills_from_order_history_payload({"orders": []}) == []
 
 
 def test_target_price_missing_excludes_slippage():

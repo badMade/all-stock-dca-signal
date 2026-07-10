@@ -59,8 +59,8 @@
     },
     "state_schema_version": {
       "type": "string",
-      "const": "run-classification-v1",
-      "description": "Version tag of the run-classification contract. Pinned to 'run-classification-v1'."
+      "enum": ["run-classification-v1", "run-classification-v2-preauthorized"],
+      "description": "Version tag of the run-classification contract. 'run-classification-v1' is the original; 'run-classification-v2-preauthorized' is the stricter successor introduced 2026-07-10 for the pre-authorized direct-placement live task (no review_equity_order). Both are accepted as valid scheduled/manual evidence when the required scheduled identity fields (run_origin, manual_run, cron_id/supersedes_cron_id, scheduled_for_et, window, run_id) are correct; v2 is a stricter successor of v1, not a different contract."
     }
   },
   "allOf": [
