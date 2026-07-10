@@ -227,14 +227,14 @@ def run_pipeline(
             )
             # Afternoon root: use the default 14:30 boundary to exclude the
             # current run's own artifacts. Cross-stream roots (morning/midday):
-            # use a wide boundary so late manual reruns (e.g. a 15:05 midday
-            # rerun) are included; their scheduled-run check already excludes
-            # any afternoon artifacts that somehow landed there.
+            # cap at the actual run time so replayed/backfilled runs never load
+            # fills that were created after the scheduled execution window.
             prior_same_day_allocations = load_prior_same_day_allocations_multi(
                 (afternoon_root,), trading_day
             )
             cross_stream_allocs = load_prior_same_day_allocations_multi(
-                cross_stream_roots, trading_day, boundary_et=time(23, 59)
+                cross_stream_roots, trading_day,
+                boundary_et=now.astimezone(EASTERN).time(),
             )
             for ticker, alloc in cross_stream_allocs.items():
                 existing = prior_same_day_allocations.get(ticker)

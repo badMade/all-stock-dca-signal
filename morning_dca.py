@@ -1110,7 +1110,14 @@ class MorningDCAExecutor(DCAExecutor):
             if not review_ok:
                 outcomes[ticker] = {"status": "blocked", "skip_reason": f"review blocked: {review_reason}"}
                 continue
-            ref_id = str(uuid.uuid4())
+            # Stable across retries so the broker's idempotency key can collapse
+            # duplicate submissions; guarded top-ups use a distinct suffix to
+            # avoid colliding with the earlier same-day run's ref_id for the ticker.
+            ref_id = (
+                f"{self.stream}-dca-topup-{trading_day.isoformat()}-{ticker}"
+                if has_prior_allocation
+                else f"{self.stream}-dca-{trading_day.isoformat()}-{ticker}"
+            )
             try:
                 order_id = broker.place_market_buy(ticker, notional, ref_id=ref_id)
             except OrderConfirmationRequiredError:
@@ -1178,11 +1185,10 @@ class MorningDCAExecutor(DCAExecutor):
             s for s in self._buy_candidates(signals)
             if s.execution_status != EXEC_MANUAL_REVIEW_CANDIDATE
         ]
-        # Capture remaining budget BEFORE recording this run's planned spend so
-        # _place_broker_orders can enforce caps against the pre-run headroom.
+        # Capture remaining budget BEFORE placing orders so _place_broker_orders
+        # enforces caps against the pre-run headroom.
         pre_run_remaining_daily = self.ledger.remaining_daily(trading_day)
         pre_run_remaining_weekly = self.ledger.remaining_weekly(trading_day)
-        self.record_buy_candidates(trading_day, auto_buy_candidates, top_up_outcomes)
         broker_outcomes: Optional[Dict[str, Any]] = None
         if broker is not None and self.mode == MORNING_LIVE_MODE:
             expected_account = getattr(self.config, "target_account_number", None)
@@ -1199,6 +1205,16 @@ class MorningDCAExecutor(DCAExecutor):
                 remaining_daily=pre_run_remaining_daily,
                 remaining_weekly=pre_run_remaining_weekly,
             )
+        # In live mode record only candidates whose orders were actually submitted
+        # so cap-exceeded orders do not inflate the ledger and corrupt budget reporting.
+        if broker_outcomes is not None:
+            submitted_candidates = [
+                c for c in auto_buy_candidates
+                if broker_outcomes.get(c.ticker, {}).get("status") == "submitted"
+            ]
+            self.record_buy_candidates(trading_day, submitted_candidates, top_up_outcomes)
+        else:
+            self.record_buy_candidates(trading_day, auto_buy_candidates, top_up_outcomes)
         artifacts = self.build_artifacts(now, signals, source, manual=manual, top_up_outcomes=top_up_outcomes)
         if broker_outcomes is not None:
             # Update buy_candidate rows with broker outcome so downstream
