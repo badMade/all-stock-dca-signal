@@ -170,13 +170,18 @@ def load_midday_config(config_dir=None) -> MiddayConfig:
     ``MiddayConfig()`` defaults.
     """
     if config_dir is None:
-        _here = Path(__file__).resolve().parent
-        for candidate in (_here / "config", Path.cwd() / "config"):
-            if candidate.is_dir():
-                config_dir_path = candidate
-                break
+        import os as _os
+        env_dir = _os.environ.get("DCA_CONFIG_DIR")
+        if env_dir:
+            config_dir_path = Path(env_dir)
         else:
-            config_dir_path = _here / "config"
+            _here = Path(__file__).resolve().parent
+            for candidate in (_here / "config", Path.cwd() / "config"):
+                if candidate.is_dir():
+                    config_dir_path = candidate
+                    break
+            else:
+                config_dir_path = _here / "config"
     else:
         config_dir_path = Path(config_dir)
 
@@ -211,6 +216,10 @@ def load_midday_config(config_dir=None) -> MiddayConfig:
         kwargs["morning_daily_cap_usd"] = float(budget["midday_daily_cap_usd"])
     if "midday_weekly_cap_usd" in budget:
         kwargs["morning_weekly_cap_usd"] = float(budget["midday_weekly_cap_usd"])
+
+    live_task = raw.get("live_task", {})
+    if "broker_account" in live_task:
+        kwargs["target_account_number"] = str(live_task["broker_account"])
 
     artifact_paths = raw.get("artifact_paths", {})
     if "live_run_state_root" in artifact_paths:

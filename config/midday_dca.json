@@ -67,7 +67,8 @@
     "manual_rerun_fills_filename": "filled_orders.csv",
     "run_state_filename": "run_state.json",
     "prior_allocation_roots": [
-      "/home/user/workspace/cron_tracking/morning_dca"
+      "/home/user/workspace/cron_tracking/morning_dca",
+      "/home/user/workspace/cron_tracking/ce16ba6b"
     ],
     "manual_rerun_note": "Manual override fills are recorded under manual_reruns/**/run_state.json and filled_orders.csv (run_origin='manual', manual_run=true). They are EXCLUDED from scheduled evidence, slippage, reliability, fill counts, watchdog confirmation, and cost basis, and are used ONLY as prior-allocation context for the same-day top-up guard (they affect the afternoon 3:20 PM top-up eligibility, not any scheduled metric). Manual override reruns are not part of prior_allocation_roots for the midday run itself because they post-date the 12:30 PM decision; the afternoon guard folds them in via the midday root.",
     "separation_note": "The midday stream writes ONLY under its own root (scheduled runs plus manual override reruns under manual_reruns/). It never writes into the morning roots, /home/user/workspace/cron_tracking/ce16ba6b/**, updates latest_scheduled_run.json, or touches afternoon scheduled_runs/ folders."

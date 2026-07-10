@@ -50,6 +50,7 @@ import csv
 import json
 import logging
 import math
+import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
@@ -60,6 +61,8 @@ from near_close_dca import (
     ACTIVE_TICKERS,
     EASTERN,
     EXCLUDED_TICKERS,
+    ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
+    TOP_UP_NO_PRIOR_RUN,
     Action,
     Bar,
     BrokerAdapter,
@@ -289,6 +292,9 @@ class MorningConfig:
     # validate the intraday trend in live mode. When fewer are available a
     # qualifying candidate is flagged manual_review_candidate rather than bought.
     trend_min_bars: int = 6
+    # Broker account number that must match the supplied BrokerAdapter before
+    # any live orders are placed.
+    target_account_number: str = ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
     def as_strategy_config(self) -> StrategyConfig:
         """Return a StrategyConfig view carrying the morning ladder.
@@ -407,13 +413,17 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
     pattern used by :func:`dca_config.load_strategy_config`.
     """
     if config_dir is None:
-        _here = Path(__file__).resolve().parent
-        for candidate in (_here / "config", Path.cwd() / "config"):
-            if candidate.is_dir():
-                config_dir_path = candidate
-                break
+        env_dir = os.environ.get("DCA_CONFIG_DIR")
+        if env_dir:
+            config_dir_path = Path(env_dir)
         else:
-            config_dir_path = _here / "config"
+            _here = Path(__file__).resolve().parent
+            for candidate in (_here / "config", Path.cwd() / "config"):
+                if candidate.is_dir():
+                    config_dir_path = candidate
+                    break
+            else:
+                config_dir_path = _here / "config"
     else:
         config_dir_path = Path(config_dir)
 
@@ -452,6 +462,10 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
 
     if "trend_min_bars" in raw:
         kwargs["trend_min_bars"] = int(raw["trend_min_bars"])
+
+    live_task = raw.get("live_task", {})
+    if "broker_account" in live_task:
+        kwargs["target_account_number"] = str(live_task["broker_account"])
 
     artifact_paths = raw.get("artifact_paths", {})
     # Per-mode root keys take precedence; fall back to the legacy shared key.
@@ -1077,13 +1091,20 @@ class MorningDCAExecutor(DCAExecutor):
                 outcomes[ticker] = {"status": "cap_exceeded", "skip_reason": "weekly cap would be exceeded"}
                 continue
 
-            # Skip same-day-order duplicate check when a top-up guard is active;
-            # the earlier order IS expected and the guard computed the incremental amount.
-            if top_up is None and broker.same_day_strategy_order_exists(ticker, trading_day):
+            # Bypass same-day duplicate check only when there is an actual prior
+            # same-day allocation (top-up guard result is not 'no_prior_run').
+            # When no prior run exists, the standard broker duplicate safeguard fires.
+            has_prior_allocation = (
+                top_up is not None and top_up.top_up_guard_result != TOP_UP_NO_PRIOR_RUN
+            )
+            if not has_prior_allocation and broker.same_day_strategy_order_exists(ticker, trading_day):
                 outcomes[ticker] = {"status": "skipped", "skip_reason": "same-day broker order exists"}
                 continue
             if not broker.is_tradable_for_fractional_buy(ticker):
                 outcomes[ticker] = {"status": "blocked", "skip_reason": "not tradable for fractional buy"}
+                continue
+            if broker.available_buying_power() < notional:
+                outcomes[ticker] = {"status": "blocked", "skip_reason": "insufficient buying power"}
                 continue
             review_ok, review_reason = broker.review_market_buy(ticker, notional)
             if not review_ok:
@@ -1108,6 +1129,16 @@ class MorningDCAExecutor(DCAExecutor):
                     "submitted_amount_usd": notional,
                 }
                 _log.error("Placement failed for %s: %s", ticker, exc)
+                continue
+            # DryRunBroker returns a DRY-RUN-... order id; record as dry_run so
+            # load_prior_same_day_allocations never treats it as real capital.
+            if order_id.startswith("DRY-RUN"):
+                outcomes[ticker] = {
+                    "status": "dry_run",
+                    "order_id": order_id,
+                    "skip_reason": "dry_run: order not placed",
+                    "submitted_amount_usd": notional,
+                }
                 continue
             outcomes[ticker] = {
                 "status": "submitted",
@@ -1154,6 +1185,12 @@ class MorningDCAExecutor(DCAExecutor):
         self.record_buy_candidates(trading_day, auto_buy_candidates, top_up_outcomes)
         broker_outcomes: Optional[Dict[str, Any]] = None
         if broker is not None and self.mode == MORNING_LIVE_MODE:
+            expected_account = getattr(self.config, "target_account_number", None)
+            if expected_account and broker.account_number() != expected_account:
+                raise RuntimeError(
+                    f"Refusing to trade account {broker.account_number()}; "
+                    f"expected {expected_account}"
+                )
             broker_outcomes = self._place_broker_orders(
                 auto_buy_candidates,
                 trading_day,
@@ -1165,8 +1202,9 @@ class MorningDCAExecutor(DCAExecutor):
         artifacts = self.build_artifacts(now, signals, source, manual=manual, top_up_outcomes=top_up_outcomes)
         if broker_outcomes is not None:
             # Update buy_candidate rows with broker outcome so downstream
-            # load_prior_same_day_allocations can read "submitted" status and
-            # planned_amount_usd for same-day top-up guards in later runs.
+            # load_prior_same_day_allocations can read "submitted" status,
+            # planned_amount_usd, and decision_price for same-day top-up guards.
+            signal_by_ticker = {s.ticker: s for s in auto_buy_candidates}
             for row in artifacts.get("buy_candidates", []):
                 ticker = row.get("ticker")
                 if ticker and ticker in broker_outcomes:
@@ -1175,6 +1213,11 @@ class MorningDCAExecutor(DCAExecutor):
                     row["order_id"] = oc.get("order_id")
                     if "submitted_amount_usd" in oc:
                         row["planned_amount_usd"] = oc["submitted_amount_usd"]
+                    # Persist the decision price so _candidate_logged_reference_price
+                    # can resolve the top-up guard's reference price for later runs.
+                    sig = signal_by_ticker.get(ticker)
+                    if sig and sig.current_price and "decision_price" not in row:
+                        row["decision_price"] = sig.current_price
             artifacts["broker_outcomes"] = broker_outcomes
         paths = self.write_artifacts(artifacts, now)
         return {"artifacts": artifacts, "paths": paths}
