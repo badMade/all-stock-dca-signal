@@ -1031,18 +1031,55 @@ class MorningDCAExecutor(DCAExecutor):
         candidates: List[MorningSignal],
         trading_day: Any,
         broker: BrokerAdapter,
+        top_up_outcomes: Optional[Dict[str, Any]],
+        remaining_daily: float,
+        remaining_weekly: float,
     ) -> Dict[str, Any]:
         """Attempt broker order placement for each EXEC_AUTO_BUY_ELIGIBLE candidate.
 
         Returns a dict mapping ticker → outcome dict. Each outcome has a ``status``
-        key: ``submitted``, ``skipped``, ``blocked``,
+        key: ``submitted``, ``skipped``, ``blocked``, ``cap_exceeded``,
         ``not_submitted_confirmation_required``, or ``failed``.
+
+        Cap enforcement: tracks running submitted spend against the pre-run
+        remaining daily/weekly budget so orders that would exceed the configured
+        caps are skipped rather than submitted.
+
+        Top-up awareness: for midday candidates the notional is taken from the
+        top-up outcome's ``incremental_order_amount`` rather than the signal's
+        ``hypothetical_amount_usd``; the broker's same-day-order duplicate check
+        is bypassed when a top-up outcome is active (the prior order is expected).
         """
         outcomes: Dict[str, Any] = {}
+        submitted_today = 0.0
+        submitted_this_week = 0.0
         for signal in candidates:
             ticker = signal.ticker
-            notional = signal.hypothetical_amount_usd
-            if broker.same_day_strategy_order_exists(ticker, trading_day):
+            top_up = (top_up_outcomes or {}).get(ticker)
+
+            # Determine the real order notional from the top-up outcome if active.
+            if top_up is not None:
+                if top_up.top_up_skipped or top_up.incremental_order_amount <= 0:
+                    outcomes[ticker] = {
+                        "status": "skipped",
+                        "skip_reason": f"top-up guard: {top_up.top_up_guard_result}",
+                    }
+                    continue
+                notional = round(top_up.incremental_order_amount, 2)
+            else:
+                notional = signal.hypothetical_amount_usd
+
+            # Enforce daily/weekly caps against pre-run remaining budget.
+            if submitted_today + notional > remaining_daily:
+                outcomes[ticker] = {"status": "cap_exceeded", "skip_reason": "daily cap would be exceeded"}
+                continue
+            if submitted_this_week + notional > remaining_weekly:
+                outcomes[ticker] = {"status": "cap_exceeded", "skip_reason": "weekly cap would be exceeded"}
+                continue
+
+            # Skip same-day-order duplicate check when a top-up guard is active;
+            # the earlier order IS expected and the guard computed the incremental amount.
+            if top_up is None and broker.same_day_strategy_order_exists(ticker, trading_day):
                 outcomes[ticker] = {"status": "skipped", "skip_reason": "same-day broker order exists"}
                 continue
             if not broker.is_tradable_for_fractional_buy(ticker):
@@ -1077,6 +1114,8 @@ class MorningDCAExecutor(DCAExecutor):
                 "order_id": order_id,
                 "submitted_amount_usd": notional,
             }
+            submitted_today += notional
+            submitted_this_week += notional
             _log.info("Placed morning buy for %s: $%.2f, order_id=%s", ticker, notional, order_id)
         return outcomes
 
@@ -1108,12 +1147,34 @@ class MorningDCAExecutor(DCAExecutor):
             s for s in self._buy_candidates(signals)
             if s.execution_status != EXEC_MANUAL_REVIEW_CANDIDATE
         ]
+        # Capture remaining budget BEFORE recording this run's planned spend so
+        # _place_broker_orders can enforce caps against the pre-run headroom.
+        pre_run_remaining_daily = self.ledger.remaining_daily(trading_day)
+        pre_run_remaining_weekly = self.ledger.remaining_weekly(trading_day)
         self.record_buy_candidates(trading_day, auto_buy_candidates, top_up_outcomes)
         broker_outcomes: Optional[Dict[str, Any]] = None
         if broker is not None and self.mode == MORNING_LIVE_MODE:
-            broker_outcomes = self._place_broker_orders(auto_buy_candidates, trading_day, broker)
+            broker_outcomes = self._place_broker_orders(
+                auto_buy_candidates,
+                trading_day,
+                broker,
+                top_up_outcomes,
+                remaining_daily=pre_run_remaining_daily,
+                remaining_weekly=pre_run_remaining_weekly,
+            )
         artifacts = self.build_artifacts(now, signals, source, manual=manual, top_up_outcomes=top_up_outcomes)
         if broker_outcomes is not None:
+            # Update buy_candidate rows with broker outcome so downstream
+            # load_prior_same_day_allocations can read "submitted" status and
+            # planned_amount_usd for same-day top-up guards in later runs.
+            for row in artifacts.get("buy_candidates", []):
+                ticker = row.get("ticker")
+                if ticker and ticker in broker_outcomes:
+                    oc = broker_outcomes[ticker]
+                    row["status"] = oc.get("status", "not_submitted")
+                    row["order_id"] = oc.get("order_id")
+                    if "submitted_amount_usd" in oc:
+                        row["planned_amount_usd"] = oc["submitted_amount_usd"]
             artifacts["broker_outcomes"] = broker_outcomes
         paths = self.write_artifacts(artifacts, now)
         return {"artifacts": artifacts, "paths": paths}
