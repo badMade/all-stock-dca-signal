@@ -258,7 +258,8 @@ def run_pipeline(
                     )
         else:
             prior_same_day_allocations = load_prior_same_day_allocations(
-                prior_allocation_state_root, trading_day
+                prior_allocation_state_root, trading_day,
+                boundary_et=now.astimezone(EASTERN).time(),
             )
     if deployment_history_root is None:
         deployment_history_root = Path(artifacts_dir).parent
