@@ -1356,7 +1356,15 @@ class MorningDCAExecutor(DCAExecutor):
             # (config/budgets.json execution_authorization_policy: calls_review_equity_order=false).
             # Manual runs still call review_market_buy before placement.
             if manual:
-                review_ok, review_reason = broker.review_market_buy(ticker, notional)
+                try:
+                    review_ok, review_reason = broker.review_market_buy(ticker, notional)
+                except Exception as exc:  # noqa: BLE001
+                    outcomes[ticker] = {
+                        "status": "blocked",
+                        "skip_reason": f"review failed: {exc}",
+                    }
+                    _log.warning("Review error for %s: %s", ticker, exc)
+                    continue
                 if not review_ok:
                     outcomes[ticker] = {"status": "blocked", "skip_reason": f"review blocked: {review_reason}"}
                     continue
@@ -1432,10 +1440,12 @@ class MorningDCAExecutor(DCAExecutor):
         source = data_source or getattr(getattr(data, "source", None), "value", "unknown")
         trading_day = now.astimezone(EASTERN).date()
         top_up_outcomes = self._compute_top_up(now, signals)
+        # Sort by multiplier DESC, then drop_pct DESC, then ticker ASC so tied
+        # multipliers are resolved by the larger-drop ticker first, matching the
+        # allocation-priority policy in config/budgets.json.
         auto_buy_candidates = sorted(
             (s for s in self._buy_candidates(signals) if s.execution_status != EXEC_MANUAL_REVIEW_CANDIDATE),
-            key=lambda s: s.multiplier,
-            reverse=True,
+            key=lambda s: (-s.multiplier, -(s.drop_pct or 0.0), s.ticker),
         )
         # Capture remaining budget BEFORE placing orders so _place_broker_orders
         # enforces caps against the pre-run headroom.
