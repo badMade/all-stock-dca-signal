@@ -819,12 +819,7 @@ def completed_bar_anchor(decision_dt: datetime, interval_minutes: int, config: S
 
 
 def latest_bar_at_or_before(bars: Iterable[Bar], target: datetime) -> Optional[Bar]:
-    best = None
-    for bar in bars:
-        if bar.timestamp <= target:
-            if best is None or bar.timestamp > best.timestamp:
-                best = bar
-    return best
+    return max((bar for bar in bars if bar.timestamp <= target), key=lambda bar: bar.timestamp, default=None)
 
 
 def kill_switch_engaged(config: StrategyConfig) -> bool:
