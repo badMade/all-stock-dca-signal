@@ -1281,6 +1281,9 @@ class MorningDCAExecutor(DCAExecutor):
         outcomes: Dict[str, Any] = {}
         submitted_today = 0.0
         submitted_this_week = 0.0
+        # Snapshot once so adapters that immediately reflect placed orders don't
+        # cause double-subtraction (reserved_buying_power tracks THIS batch only).
+        batch_buying_power = broker.available_buying_power()
         reserved_buying_power = 0.0
         for signal in candidates:
             ticker = signal.ticker
@@ -1321,13 +1324,23 @@ class MorningDCAExecutor(DCAExecutor):
             has_prior_allocation = (
                 top_up is not None and top_up.top_up_guard_result != TOP_UP_NO_PRIOR_RUN
             )
-            if not has_prior_allocation and broker.same_day_strategy_order_exists(ticker, trading_day):
-                outcomes[ticker] = {"status": "skipped", "skip_reason": "same-day broker order exists"}
-                continue
+            if not has_prior_allocation:
+                try:
+                    dup = broker.same_day_strategy_order_exists(ticker, trading_day)
+                except Exception as exc:  # noqa: BLE001
+                    outcomes[ticker] = {
+                        "status": "blocked",
+                        "skip_reason": f"duplicate-check failed: {exc}",
+                    }
+                    _log.warning("Duplicate-check error for %s: %s", ticker, exc)
+                    continue
+                if dup:
+                    outcomes[ticker] = {"status": "skipped", "skip_reason": "same-day broker order exists"}
+                    continue
             if not broker.is_tradable_for_fractional_buy(ticker):
                 outcomes[ticker] = {"status": "blocked", "skip_reason": "not tradable for fractional buy"}
                 continue
-            if broker.available_buying_power() - reserved_buying_power < notional:
+            if batch_buying_power - reserved_buying_power < notional:
                 outcomes[ticker] = {"status": "blocked", "skip_reason": "insufficient buying power"}
                 continue
             # Scheduled runs are pre-authorized to call place_equity_order directly
