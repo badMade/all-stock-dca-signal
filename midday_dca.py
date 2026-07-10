@@ -181,6 +181,8 @@ def load_midday_config(config_dir=None) -> MiddayConfig:
         return MiddayConfig()
 
     kwargs: Dict[str, Any] = {}
+    if "trend_min_bars" in raw:
+        kwargs["trend_min_bars"] = int(raw["trend_min_bars"])
 
     sizing = raw.get("sizing_ladder", {})
     if "base_amount_usd" in sizing:
