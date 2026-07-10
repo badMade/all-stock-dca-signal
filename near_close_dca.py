@@ -311,7 +311,7 @@ def select_budget_tier(planned_spend_usd: float, high_multiplier_signal_count: i
     else:
         signal_idx = 0
 
-    return BUDGET_TIERS[spend_idx if spend_idx > signal_idx else signal_idx]
+    return BUDGET_TIERS[max(spend_idx, signal_idx)]
 
 
 @dataclass(frozen=True)
