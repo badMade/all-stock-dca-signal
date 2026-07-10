@@ -1337,7 +1337,16 @@ class MorningDCAExecutor(DCAExecutor):
                 if dup:
                     outcomes[ticker] = {"status": "skipped", "skip_reason": "same-day broker order exists"}
                     continue
-            if not broker.is_tradable_for_fractional_buy(ticker):
+            try:
+                tradable = broker.is_tradable_for_fractional_buy(ticker)
+            except Exception as exc:  # noqa: BLE001
+                outcomes[ticker] = {
+                    "status": "blocked",
+                    "skip_reason": f"tradability lookup failed: {exc}",
+                }
+                _log.warning("Tradability lookup error for %s: %s", ticker, exc)
+                continue
+            if not tradable:
                 outcomes[ticker] = {"status": "blocked", "skip_reason": "not tradable for fractional buy"}
                 continue
             if batch_buying_power - reserved_buying_power < notional:
