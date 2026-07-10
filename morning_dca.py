@@ -756,13 +756,14 @@ class MorningDCAExecutor(DCAExecutor):
         candidate ``manual_review_candidate`` rather than auto-buying. The
         loosened "buy anyway when trend is unavailable" rule is not implemented.
         """
-        usable = [
-            b for b in bars
-            if b.timestamp <= decision_dt and math.isfinite(b.close) and b.close > 0
-        ]
-        if len(usable) < self.config.trend_min_bars:
+        bar_anchor = completed_bar_anchor(decision_dt, self.config.interval_minutes, self._sizing_config)
+        usable_timestamps = {
+            b.timestamp for b in bars
+            if b.timestamp <= bar_anchor and math.isfinite(b.close) and b.close > 0
+        }
+        if len(usable_timestamps) < self.config.trend_min_bars:
             warnings.append(
-                f"intraday trend unvalidated: {len(usable)} usable bars < required "
+                f"intraday trend unvalidated: {len(usable_timestamps)} usable bars < required "
                 f"{self.config.trend_min_bars} over the 60-minute window"
             )
             return False
