@@ -451,6 +451,9 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
     if "morning_weekly_cap_usd" in budget:
         kwargs["morning_weekly_cap_usd"] = float(budget["morning_weekly_cap_usd"])
 
+    if "trend_min_bars" in raw:
+        kwargs["trend_min_bars"] = int(raw["trend_min_bars"])
+
     artifact_paths = raw.get("artifact_paths", {})
     # Per-mode root keys take precedence; fall back to the legacy shared key.
     mode_root_key = {
@@ -526,6 +529,7 @@ class MorningDCAExecutor(DCAExecutor):
     ladder_name: str = "morning_0x_to_3x"
     signals_csv_name: str = "morning_signals.csv"
     latest_pointer_name: str = "latest_morning_run.json"
+    manual_run_subdir: str = "manual_runs"
     budget_daily_key: str = "morning_daily_cap_usd"
     budget_weekly_key: str = "morning_weekly_cap_usd"
     budget_label: str = "morning"
@@ -952,7 +956,7 @@ class MorningDCAExecutor(DCAExecutor):
         """
         manual_run = artifacts["run_classification"]["manual_run"]
         out = (
-            Path(self.state_root) / "manual_runs" / artifacts["run_id"]
+            Path(self.state_root) / self.manual_run_subdir / artifacts["run_id"]
             if manual_run
             else self.run_state_dir(now)
         )
@@ -1038,7 +1042,11 @@ class MorningDCAExecutor(DCAExecutor):
         source = data_source or getattr(getattr(data, "source", None), "value", "unknown")
         trading_day = now.astimezone(EASTERN).date()
         top_up_outcomes = self._compute_top_up(now, signals)
-        self.record_buy_candidates(trading_day, self._buy_candidates(signals), top_up_outcomes)
+        auto_buy_candidates = [
+            s for s in self._buy_candidates(signals)
+            if s.execution_status != EXEC_MANUAL_REVIEW_CANDIDATE
+        ]
+        self.record_buy_candidates(trading_day, auto_buy_candidates, top_up_outcomes)
         artifacts = self.build_artifacts(now, signals, source, manual=manual, top_up_outcomes=top_up_outcomes)
         paths = self.write_artifacts(artifacts, now)
         return {"artifacts": artifacts, "paths": paths}
@@ -1048,8 +1056,11 @@ def _write_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
     if not rows:
         path.write_text("", encoding="utf-8")
         return
-    fieldnames = list(rows[0].keys())
+    seen: Dict[str, None] = {}
+    for row in rows:
+        seen.update(dict.fromkeys(row))
+    fieldnames = list(seen)
     with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, restval="")
         writer.writeheader()
         writer.writerows(rows)

@@ -221,8 +221,12 @@ def run_pipeline(
             # buy. An explicit prior_allocation_state_root overrides this and scans
             # only the tree the caller named.
             afternoon_root = _default_prior_allocation_state_root(Path(artifacts_dir))
+            cron_base = afternoon_root.parent
+            cross_stream_roots = tuple(
+                cron_base / Path(r).name for r in _CROSS_STREAM_PRIOR_ALLOCATION_ROOTS
+            )
             prior_same_day_allocations = load_prior_same_day_allocations_multi(
-                (afternoon_root, *_CROSS_STREAM_PRIOR_ALLOCATION_ROOTS), trading_day
+                (afternoon_root, *cross_stream_roots), trading_day
             )
         else:
             prior_same_day_allocations = load_prior_same_day_allocations(

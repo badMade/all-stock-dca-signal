@@ -199,6 +199,9 @@ def load_midday_config(config_dir=None) -> MiddayConfig:
     if "midday_weekly_cap_usd" in budget:
         kwargs["morning_weekly_cap_usd"] = float(budget["midday_weekly_cap_usd"])
 
+    if "trend_min_bars" in raw:
+        kwargs["trend_min_bars"] = int(raw["trend_min_bars"])
+
     artifact_paths = raw.get("artifact_paths", {})
     if "live_run_state_root" in artifact_paths:
         kwargs["morning_run_state_root"] = artifact_paths["live_run_state_root"]
@@ -228,6 +231,7 @@ class MiddayDCAExecutor(MorningDCAExecutor):
     budget_daily_key: str = "midday_daily_cap_usd"
     budget_weekly_key: str = "midday_weekly_cap_usd"
     budget_label: str = "midday"
+    manual_run_subdir: str = "manual_reruns"
 
     def __init__(
         self,
