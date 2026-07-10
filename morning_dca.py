@@ -899,9 +899,9 @@ class MorningDCAExecutor(DCAExecutor):
             )
             return False
         sorted_bars = sorted(usable.values(), key=lambda b: b.timestamp)
-        if sorted_bars[-1].close > sorted_bars[0].close:
+        if sorted_bars[-1].close >= sorted_bars[0].close:
             warnings.append(
-                "intraday trend rising: price is above open; skipping auto-buy"
+                "intraday trend flat or rising: price is at or above open; skipping auto-buy"
             )
             return False
         return True
@@ -1281,6 +1281,7 @@ class MorningDCAExecutor(DCAExecutor):
         outcomes: Dict[str, Any] = {}
         submitted_today = 0.0
         submitted_this_week = 0.0
+        reserved_buying_power = 0.0
         for signal in candidates:
             ticker = signal.ticker
             top_up = (top_up_outcomes or {}).get(ticker)
@@ -1326,7 +1327,7 @@ class MorningDCAExecutor(DCAExecutor):
             if not broker.is_tradable_for_fractional_buy(ticker):
                 outcomes[ticker] = {"status": "blocked", "skip_reason": "not tradable for fractional buy"}
                 continue
-            if broker.available_buying_power() < notional:
+            if broker.available_buying_power() - reserved_buying_power < notional:
                 outcomes[ticker] = {"status": "blocked", "skip_reason": "insufficient buying power"}
                 continue
             # Scheduled runs are pre-authorized to call place_equity_order directly
@@ -1381,6 +1382,7 @@ class MorningDCAExecutor(DCAExecutor):
             }
             submitted_today += notional
             submitted_this_week += notional
+            reserved_buying_power += notional
             _log.info("Placed morning buy for %s: $%.2f, order_id=%s", ticker, notional, order_id)
         return outcomes
 

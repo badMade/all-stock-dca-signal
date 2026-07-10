@@ -66,6 +66,38 @@ class FixedDropProvider:
         return bars
 
 
+class DecliningBarsProvider(FixedDropProvider):
+    """Provider that generates strictly declining intraday bars.
+
+    Bars start at the midpoint between previous close and the final dropped price,
+    declining linearly to the final price. This satisfies the strict downward-trend
+    requirement in `_trend_validated` (last close < first close).
+    """
+
+    def get_intraday_bars(self, ticker, start, end, interval_minutes):
+        drop = self._drops.get(ticker, 0.0)
+        final_price = self._prev * (1.0 - drop)
+        start_price = self._prev * (1.0 - drop * 0.5) if drop > 0 else final_price
+        timestamps = []
+        cursor = start
+        while cursor <= end:
+            timestamps.append(cursor)
+            cursor += timedelta(minutes=interval_minutes)
+        n = len(timestamps)
+        # Interpolate so the bar at end-interval_minutes (the completed-bar anchor
+        # returned by latest_bar_at_or_before) is exactly final_price.  The last
+        # bar (at end) is also set to final_price.
+        anchor_idx = n - 2 if n >= 2 else 0
+        bars = []
+        for i, ts in enumerate(timestamps):
+            if i <= anchor_idx and anchor_idx > 0:
+                price = start_price + (final_price - start_price) * i / anchor_idx
+            else:
+                price = final_price
+            bars.append(Bar(timestamp=ts, open=price, high=price, low=price, close=price, volume=100.0))
+        return bars
+
+
 def _now():
     return datetime.combine(date(2026, 7, 8), time(9, 45), tzinfo=EASTERN)
 
@@ -557,11 +589,11 @@ def test_live_mode_path_and_classification(tmp_path):
 
 
 def test_live_confidence_rule_auto_buys_with_validated_trend():
-    # A full 60-minute window of 5-minute bars (>= trend_min_bars) validates the
-    # intraday trend, so a qualifying candidate is auto_buy_eligible.
+    # A full 60-minute window of declining 5-minute bars (>= trend_min_bars) validates
+    # the strict downward intraday trend, so a qualifying candidate is auto_buy_eligible.
     cfg = MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0)
     ex = MorningDCAExecutor(cfg, mode="live")
-    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
     sig = ex.evaluate(_now_live(), data, manual=True)[0]
     assert sig.action == Action.BUY
     assert sig.trend_validated is True
@@ -1074,7 +1106,7 @@ def test_auto_buy_candidates_prioritized_by_multiplier_when_cap_hit(tmp_path):
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     # BIGDROP: 8% drop -> 5x multiplier -> $15. SMALLDROP: 1% drop -> 1.5x -> $4.50.
-    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIGDROP": 0.08, "SMALLDROP": 0.01})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIGDROP": 0.08, "SMALLDROP": 0.01})
     res = ex.run(_now_live(), data, broker=_FakeLiveBroker())
     broker_outcomes = res["artifacts"].get("broker_outcomes", {})
     assert broker_outcomes.get("BIGDROP", {}).get("status") == "submitted", "BIGDROP (5x) should be placed first"

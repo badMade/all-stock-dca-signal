@@ -70,6 +70,38 @@ class FixedDropProvider:
         return bars
 
 
+class DecliningBarsProvider(FixedDropProvider):
+    """Provider that generates strictly declining intraday bars.
+
+    Bars start at the midpoint between previous close and the final dropped price,
+    declining linearly to the final price. Satisfies the strict downward-trend
+    requirement in `_trend_validated` (last close < first close).
+    """
+
+    def get_intraday_bars(self, ticker, start, end, interval_minutes):
+        drop = self._drops.get(ticker, 0.0)
+        final_price = self._prev * (1.0 - drop)
+        start_price = self._prev * (1.0 - drop * 0.5) if drop > 0 else final_price
+        timestamps = []
+        cursor = start
+        while cursor <= end:
+            timestamps.append(cursor)
+            cursor += timedelta(minutes=interval_minutes)
+        n = len(timestamps)
+        # Interpolate so the bar at end-interval_minutes (the completed-bar anchor
+        # returned by latest_bar_at_or_before) is exactly final_price.  The last
+        # bar (at end) is also set to final_price.
+        anchor_idx = n - 2 if n >= 2 else 0
+        bars = []
+        for i, ts in enumerate(timestamps):
+            if i <= anchor_idx and anchor_idx > 0:
+                price = start_price + (final_price - start_price) * i / anchor_idx
+            else:
+                price = final_price
+            bars.append(Bar(timestamp=ts, open=price, high=price, low=price, close=price, volume=100.0))
+        return bars
+
+
 def _write_prior_morning_run(
     root: Path,
     *,
@@ -195,7 +227,8 @@ def test_midday_manual_run_id_and_no_pointer(tmp_path):
 # --- Live confidence rule (inherited) ---------------------------------------
 def test_midday_confidence_rule_auto_buys_with_validated_trend():
     ex = MiddayDCAExecutor(MiddayConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
-    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+    # Use declining bars so the strict downward-trend check (last close < first close) passes.
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
     sig = ex.evaluate(_now_midday(), data)[0]
     assert sig.action == Action.BUY
     assert sig.trend_validated is True
@@ -240,7 +273,7 @@ def test_top_up_no_prior_buys_full_amount(tmp_path):
         prior_allocation_roots=(str(prior_root),),
     )
     ex = MiddayDCAExecutor(cfg)
-    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
     res = ex.run(_now_midday(), data)
     row = res["artifacts"]["buy_candidates"][0]
     assert row["top_up_guard_result"] == TOP_UP_NO_PRIOR_RUN
@@ -264,7 +297,7 @@ def test_top_up_incremental_when_price_below_prior(tmp_path):
     )
     ex = MiddayDCAExecutor(cfg)
     # Midday price 90.0 is strictly below the 95.0 morning reference.
-    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
     res = ex.run(_now_midday(), data)
     row = res["artifacts"]["buy_candidates"][0]
     assert row["top_up_guard_result"] == TOP_UP_INCREMENTAL
@@ -408,7 +441,7 @@ def test_midday_ledger_namespace_isolated_from_morning_and_afternoon(tmp_path):
                        prior_allocation_roots=(str(tmp_path / "none"),))
     ex = MiddayDCAExecutor(cfg)
     assert ex.ledger.namespace == "midday"
-    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
     ex.run(_now_midday(), data)
     assert afternoon.day_notional(day) == 0.0
     assert ex.ledger.day_planned(day) > 0.0
