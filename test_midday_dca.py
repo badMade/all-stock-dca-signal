@@ -1,7 +1,7 @@
 """Self-tests for the midday graded-DCA executor (12:30 PM ET live execution).
 
-Covers the midday stream identity (0x-to-5x ladder shared with the afternoon
-stream, distinct from the morning 0x-to-3x ladder), the run-state
+Covers the midday stream identity (the shared $3-base 0x-to-5x ladder used by
+all live streams: morning, midday, and afternoon), the run-state
 path/classification, the live-mode confidence rule (inherited), the same-day
 top-up guard against morning/manual prior allocations, and the guarantee that a
 midday run stays isolated from the morning and afternoon artifact trees.
@@ -112,16 +112,16 @@ def _write_prior_morning_run(
 
 
 # --- Ladder identity --------------------------------------------------------
-def test_midday_ladder_matches_afternoon_not_morning():
+def test_midday_ladder_matches_afternoon_and_morning():
     from morning_dca import MORNING_SIZING_TIERS
 
     ex = MiddayDCAExecutor(MiddayConfig())
-    # Same 0x-to-5x ladder as the afternoon StrategyConfig.
+    # As of the Jul 10 2026 update all live streams (morning, midday, afternoon)
+    # share the SAME $3-base 0x-to-5x ladder.
     assert MIDDAY_SIZING_TIERS == StrategyConfig().sizing_tiers
     assert ex.multiplier_for_drop(0.08) == 5.0
     assert graded_buy_multiplier(0.08, StrategyConfig()) == 5.0
-    # Distinct from the morning ladder (which tops out at 3x on an 8% drop).
-    assert MIDDAY_SIZING_TIERS != MORNING_SIZING_TIERS
+    assert MIDDAY_SIZING_TIERS == MORNING_SIZING_TIERS
 
 
 def test_midday_ladder_brackets():

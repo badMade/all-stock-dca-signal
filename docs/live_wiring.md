@@ -72,7 +72,27 @@ artifact records the same figures for audit but is not auto-rehydrated into `Str
 Additional invariants enforced by `run_once`: the broker account must equal
 `config.target_account_number` (`562057042`), the trading day must be in
 `config.approved_test_dates` (the weekday window in `config/trading_window.json`), and
-one order per ticker per day within the daily/weekly/reserve caps.
+one order per ticker per stream per day within the daily/weekly/reserve caps and
+the **$15 max-per-order** circuit breaker.
+
+## Scheduled-live pre-authorization (approved Fri Jul 10 2026 11:20 AM ET)
+
+Scheduled live DCA tasks are **pre-authorized** to place qualifying buys within
+all caps and circuit breakers **without per-order human confirmation**:
+
+- Scheduled live tasks **must not** call `review_equity_order` (it forces a
+  preview + confirmation) and **must not** request per-order confirmation. They
+  call `place_equity_order` directly **only after** every internal validation,
+  signal, budget, spread, confidence/trend, and top-up check passes.
+- **Manual / ad hoc runs still use the review + confirmation path**
+  (`review_equity_order` first). The `review_fn`/`place_fn` wiring above is the
+  manual path; a scheduled live run skips `review_fn`.
+
+The morning 10:30 live run additionally loads the same-day 9:45 **pre-flight**
+artifact and evaluates only `eligible_to_execute=true` tickers. See
+[safeguards.md](safeguards.md), [morning_dca.md](morning_dca.md), and the
+`execution_authorization_policy` / `circuit_breakers` blocks in
+[`config/budgets.json`](../config/budgets.json).
 
 ## CLI (dry-run only)
 

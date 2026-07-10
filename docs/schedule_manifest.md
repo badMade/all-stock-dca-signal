@@ -53,32 +53,43 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 > The scheduled run still writes a valid scheduled run_state even when every buy
 > is fully offset to $0. See [strategy.md](strategy.md#same-day-prior-run-offset--top-up-guard).
 >
-> **Morning two-stream note:** the morning `MorningDCAExecutor` runs on its own
-> **0x-to-3x** ladder and its own `morning` budget ledger in **two** modes.
-> (1) A **9:45 AM ET read-only watchlist / early-warning scan**
-> (`morning-dca-0945`, run_type `morning_dca_watchlist_scan`,
-> `state_schema_version='morning-watchlist-v1'`, **no trades**) writing under
-> `cron_tracking/morning_dca_watchlist/YYYYMMDD_0945ET/`; it may surface early
-> candidates but every amount is **hypothetical / watchlist-only**.
+> **Morning two-stream note:** the morning `MorningDCAExecutor` runs on the
+> shared **$3-base 0x-to-5x** live ladder (as of the Fri Jul 10 2026
+> live-automation update every live stream shares one ladder; the former
+> morning-only 0x-to-3x ladder is historical/superseded) and its own `morning`
+> budget ledger in **two** modes.
+> (1) A **9:45 AM ET read-only pre-flight validation**
+> (`morning-dca-0945`, run_type `morning_dca_preflight`,
+> `state_schema_version='morning-preflight-v1'`, **no trades**) writing under
+> `cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/` (`run_state.json`,
+> `validation.csv`, `signals.csv`, `run_summary.json`, `latest_preflight.json`).
+> It emits **`eligible_to_execute=true/false` per ticker** — a **coarse
+> pre-screen** for the 10:30 evaluator, **not** a final approval. (A read-only
+> `watchlist` early-warning mode remains available under
+> `cron_tracking/morning_dca_watchlist/`, run_type `morning_dca_watchlist_scan`.)
 > (2) A **10:30 AM ET live Robinhood execution** (`42173154`, run_type
 > `morning_dca_live`, `state_schema_version='morning-live-v1'`, **trades=yes**)
 > writing under `cron_tracking/morning_dca/YYYYMMDD_1030ET/`
-> (`run_id='morning_live_YYYYMMDD_1030ET'`), moved from the former 9:45 AM live
-> slot to give a true **60-minute intraday trend window**. **Confidence rule:**
+> (`run_id='morning_live_YYYYMMDD_1030ET'`), giving a true **60-minute intraday
+> trend window**. It **loads the same-day 9:45 pre-flight artifact and evaluates
+> only `eligible_to_execute=true` tickers** (recomputing signals/budget/spread/
+> trend/top-up fresh); if the pre-flight artifact is missing it degrades to the
+> full universe with a warning rather than blocking all buys. **Confidence rule:**
 > if price/drop passes but the intraday trend cannot be validated, the live run
 > does **not** auto-buy — it classifies the candidate as
-> `execution_status='manual_review_candidate'`. Both modes carry `stream='morning'`
-> and `valid_afternoon_evidence=false`, never update `latest_scheduled_run.json`,
-> and are never afternoon scheduled evidence; live morning fills count only as
-> prior-allocation context for the afternoon same-day top-up guard. See
-> [morning_dca.md](morning_dca.md).
+> `execution_status='manual_review_candidate'`. All morning modes carry
+> `stream='morning'` and `valid_afternoon_evidence=false`, never update
+> `latest_scheduled_run.json`, and are never afternoon scheduled evidence; live
+> morning fills count only as prior-allocation context for the afternoon same-day
+> top-up guard. See [morning_dca.md](morning_dca.md).
 >
 > **Midday stream note:** the midday `MiddayDCAExecutor` (`a6239dae`, run_type
 > `midday_dca_live`, `state_schema_version='midday-live-v1'`, **trades=yes**)
 > is a single **12:30 PM ET live Robinhood execution** on account `562057042`,
 > writing under `cron_tracking/midday_dca/YYYYMMDD_1230ET/`
 > (`run_id='midday_live_YYYYMMDD_1230ET'`). It reuses the **afternoon 0x-to-5x
-> ladder** and the same $3 base (not the morning 0x-to-3x ladder), the same
+> ladder** and the same $3 base (the shared live ladder used by all streams as
+> of Jul 10 2026), the same
 > active universe (excluding BYDDY/VCX/TRLV/RVI), the same confidence rule, and
 > its own `midday` budget ledger. It carries `stream='midday'` and
 > `valid_afternoon_evidence=false`, never updates `latest_scheduled_run.json`,
@@ -98,7 +109,7 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 |---|---|---|---|---|---|---|
 | `b7961407` | Pre-market DCA buying-power dashboard | analytics | no | `00 13 * * 1-5` | 9:00 AM weekdays | active |
 | `cd45e95b` | Compact DCA volatility outlier scan | analytics | no | `45 13 * * 1-5` | 9:45 AM weekdays | active |
-| `morning-dca-0945` | Morning graded DCA watchlist / early-warning scan (`MorningDCAExecutor`) | analytics | no | `45 13 * * 1-5` | 9:45 AM weekdays | active |
+| `morning-dca-0945` | Morning graded DCA pre-flight validation (`MorningDCAExecutor`) | analytics | no | `45 13 * * 1-5` | 9:45 AM weekdays | active |
 | `42173154` | Weekday 10:30 AM morning DCA live Robinhood execution (`MorningDCAExecutor`) | trading | **yes** | `30 14 * * 1-5` | 10:30 AM weekdays | active |
 | `a6239dae` | Weekday 12:30 PM midday DCA live Robinhood execution (`MiddayDCAExecutor`) | trading | **yes** | `30 16 * * 1-5` | 12:30 PM weekdays | active |
 | `e3e6f09e` | Monitor-only graded DCA signal check | monitoring | no | `5 19 * * 1-5` | 3:05 PM weekdays | active |
@@ -121,21 +132,24 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 - Analytics only, **no trading**. Runs **9:45 AM ET weekdays**.
 - Scans only **>5% outliers**; no full 41+ ticker narrative on no-outlier days. Uses the current $3 base 0x-to-5x ladder.
 
-### `morning-dca-0945` — Morning graded DCA watchlist / early-warning scan (`MorningDCAExecutor`)
-- Analytics / **read-only**, **no trading**. Runs **9:45 AM ET weekdays** (executor mode `watchlist`).
-- Evaluates morning price weakness vs. yesterday’s regular-session close on the **morning 0x-to-3x ladder** (`config/morning_dca.json`). May surface early candidates but labels every dollar amount **hypothetical / watchlist-only**; runs no Robinhood order review and calls no broker placement path. Writes watchlist artifacts under `/home/user/workspace/cron_tracking/morning_dca_watchlist/YYYYMMDD_0945ET/` (`run_id='morning_YYYYMMDD_0945ET'`).
-- `stream='morning'`, `run_type='morning_dca_watchlist_scan'`, `state_schema_version='morning-watchlist-v1'`, `valid_afternoon_evidence=false`. Never writes into the afternoon `ce16ba6b` tree or updates `latest_scheduled_run.json`.
+### `morning-dca-0945` — Morning graded DCA pre-flight validation (`MorningDCAExecutor`)
+- Analytics / **read-only**, **no trading**. Runs **9:45 AM ET weekdays** (executor mode `preflight`).
+- Evaluates morning price weakness vs. yesterday’s regular-session close on the shared **$3 base 0x-to-5x ladder** (`config/morning_dca.json`) as a pre-screen for the 10:30 live evaluator; runs no Robinhood order review and calls no broker placement path. Writes pre-flight artifacts under `/home/user/workspace/cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/` — `run_state.json`, `validation.csv`, `signals.csv`, `run_summary.json`, and the `latest_preflight.json` pointer (`run_id='morning_preflight_YYYYMMDD_0945ET'`).
+- Emits **`eligible_to_execute=true/false` per ticker**. This is a **coarse pre-screen** (is a ticker worth re-evaluating at 10:30?), **NOT** a final buy approval — the 10:30 live run recomputes signals/budget/spread/trend/top-up from scratch and may still decline. A ticker is eligible when it graded to a positive-multiplier BUY at 9:45 with a usable current price and previous close.
+- `stream='morning'`, `run_type='morning_dca_preflight'`, `state_schema_version='morning-preflight-v1'`, `valid_afternoon_evidence=false`. Never writes into the afternoon `ce16ba6b` tree or updates `latest_scheduled_run.json`. (A read-only `watchlist` early-warning mode remains available, writing under `cron_tracking/morning_dca_watchlist/`.)
 
 ### `42173154` — Weekday 10:30 AM morning DCA live Robinhood execution (`MorningDCAExecutor`)
 - **Live trading** (executor mode `live`). Runs **10:30 AM ET weekdays** — moved from the former 9:45 AM live slot to give a true **60-minute intraday trend window**.
-- Uses the **$3 base morning 0x-to-3x ladder** and the `morning` budget ledger (`config/morning_dca.json`). **Robinhood account 562057042 only**; Alpaca is read-only for validation/context.
+- Uses the shared **$3 base 0x-to-5x live ladder** and the `morning` budget ledger (`config/morning_dca.json`). **Robinhood account 562057042 only**; Alpaca is read-only for validation/context.
+- **Loads the same-day 9:45 pre-flight artifact** (`cron_tracking/morning_dca_preflight/`) and evaluates **only `eligible_to_execute=true` tickers**, recomputing signals/budget/spread/trend/top-up fresh. If the pre-flight artifact is missing it degrades to the full universe with a warning rather than blocking all buys.
+- **Pre-authorized direct placement:** as approved Fri Jul 10 2026 11:20 AM ET, this scheduled live task auto-places qualifying buys within all caps/circuit breakers **without per-order confirmation** and **without calling `review_equity_order`**; it calls `place_equity_order` directly only after every internal validation, signal, budget, spread, confidence, and top-up check passes. (Manual/ad hoc runs still use the review + confirmation path.)
 - **Confidence rule:** if a candidate's price/drop passes the ladder but the **intraday trend cannot be validated** (fewer than `trend_min_bars` usable intraday bars at/before the decision time), the run does **not** auto-buy; it classifies the candidate as `execution_status='manual_review_candidate'`. There is no loosened trend-unavailable execution path.
 - Writes live artifacts under `/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/` (`run_id='morning_live_YYYYMMDD_1030ET'`).
 - `stream='morning'`, `run_type='morning_dca_live'`, `state_schema_version='morning-live-v1'`, `valid_afternoon_evidence=false`. Never writes into the afternoon `ce16ba6b` tree or updates `latest_scheduled_run.json`. Morning fills count **only** as prior-allocation context for the afternoon same-day top-up guard — never afternoon scheduled evidence, slippage, watchdog confirmation, scheduled cost basis, or scheduled fill counts.
 
 ### `a6239dae` — Weekday 12:30 PM midday DCA live Robinhood execution (`MiddayDCAExecutor`)
 - **Live trading** (executor mode `live`). Runs **12:30 PM ET weekdays** (window 12:25–12:35 PM ET).
-- Uses the **$3 base afternoon 0x-to-5x ladder** (`config/midday_dca.json`, same ladder as the afternoon 3:20 PM stream, intentionally distinct from the morning 0x-to-3x ladder) and its own `midday` budget ledger. **Robinhood account 562057042 only**; Alpaca is read-only for validation/context.
+- Uses the shared **$3 base 0x-to-5x live ladder** (`config/midday_dca.json`, the same ladder used by all live streams as of Jul 10 2026) and its own `midday` budget ledger. **Robinhood account 562057042 only**; Alpaca is read-only for validation/context.
 - Same active universe (excludes BYDDY/VCX/TRLV/RVI). **Confidence rule:** if a candidate's price/drop passes the ladder but the **intraday trend cannot be validated** (fewer than `trend_min_bars` usable intraday bars at/before 12:30), the run does **not** auto-buy; it classifies the candidate as `execution_status='manual_review_candidate'`.
 - Writes live artifacts under `/home/user/workspace/cron_tracking/midday_dca/YYYYMMDD_1230ET/` (`run_id='midday_live_YYYYMMDD_1230ET'`) and updates its own `latest_midday_run.json` pointer.
 - `stream='midday'`, `run_type='midday_dca_live'`, `state_schema_version='midday-live-v1'`, `cron_id='a6239dae'`, `supersedes_cron_id=null`, `valid_afternoon_evidence=false`. Never writes into the morning or afternoon (`ce16ba6b`) trees or updates `latest_scheduled_run.json`.

@@ -150,10 +150,12 @@ Per candidate, the scheduled `run_state` records `prior_same_day_amount`,
 The **midday** stream applies the same top-up guard against morning/manual prior
 same-day allocations (buying only the incremental difference into a lower price),
 and midday fills in turn become prior-allocation context for the afternoon guard.
-The morning stream ([morning_dca.md](morning_dca.md)) runs the 0x-to-3x ladder;
-the midday stream ([midday_dca.md](midday_dca.md)) is a 12:30 PM ET live
-execution on the same 0x-to-5x ladder as the afternoon run. Both are independent
-of the afternoon 3:20 PM task and never count as afternoon scheduled evidence.
+The morning stream ([morning_dca.md](morning_dca.md)) and the midday stream
+([midday_dca.md](midday_dca.md), a 12:30 PM ET live execution) both run the same
+shared $3-base 0x-to-5x ladder as the afternoon run — as of the Fri Jul 10 2026
+live-automation update every live stream shares one ladder (the former morning
+0x-to-3x ladder is historical/superseded). Both are independent of the afternoon
+3:20 PM task and never count as afternoon scheduled evidence.
 
 The scheduled afternoon run auto-loads prior context from its own task root
 **plus** the morning-live root (`.../cron_tracking/morning_dca`) and the

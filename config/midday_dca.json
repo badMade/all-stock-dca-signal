@@ -38,7 +38,7 @@
       { "min_drop_pct": 8.0, "max_drop_pct": null, "multiplier": 5.0 }
     ],
     "tier_boundary_rule": "min inclusive, max exclusive; the largest tier threshold <= actual drop wins; drop < 0.1% = 0x (no buy).",
-    "separation_note": "This is the SAME 0x-to-5x ladder the afternoon stream uses (config/sizing_ladder.json), intentionally distinct from the morning 0x-to-3x ladder."
+    "separation_note": "This is the SAME shared $3-base 0x-to-5x live ladder used by all live streams (morning 10:30, midday 12:30, afternoon 3:20; config/sizing_ladder.json). Max per order is 5x * $3 = $15. The former morning-only 0x-to-3x ladder is historical/superseded as of 2026-07-10."
   },
   "budget_ledger": {
     "namespace": "midday",

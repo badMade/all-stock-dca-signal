@@ -5,8 +5,9 @@ library (:mod:`near_close_dca`). It is deliberately isolated from the afternoon
 scheduled live task (cron ``10ce362c``, which supersedes the deleted
 ``ce16ba6b``):
 
-    - It uses its OWN sizing ladder (a coarser 0x -> 3x morning ladder) rather
-      than the afternoon 0x -> 5x ladder.
+    - It uses the SAME canonical $3-base 0x -> 5x graded ladder as the afternoon
+      and midday live streams (bound to ``StrategyConfig.sizing_tiers``); the
+      former coarser 0x -> 3x morning ladder is historical/superseded.
     - It keeps its OWN budget ledger namespace (:class:`MorningLedger`) so
       morning activity can never consume the afternoon 3:20 budget ledger.
     - It writes artifacts under its OWN run-state roots and NEVER touches
@@ -96,6 +97,19 @@ MORNING_WATCHLIST_WINDOW_START_ET = "09:40"
 MORNING_WATCHLIST_WINDOW_END_ET = "09:50"
 MORNING_WATCHLIST_SCHEMA_VERSION = "morning-watchlist-v1"
 
+# Pre-flight validation (9:45 AM ET) identity — read-only pre-screen for the
+# 10:30 live executor. Writes eligible_to_execute=true/false per ticker. This is
+# a COARSE pre-screen (is a ticker worth evaluating at 10:30?), NOT a final
+# approval: the 10:30 live run always recomputes signals, budget, spread, trend,
+# and top-up from scratch and may still decline to place an order.
+MORNING_PREFLIGHT_MODE = "preflight"
+MORNING_PREFLIGHT_CRON_ID = "morning-dca-0945"
+MORNING_PREFLIGHT_RUN_TYPE = "morning_dca_preflight"
+MORNING_PREFLIGHT_SCHEDULED_FOR_ET = "09:45"
+MORNING_PREFLIGHT_WINDOW_START_ET = "09:40"
+MORNING_PREFLIGHT_WINDOW_END_ET = "09:50"
+MORNING_PREFLIGHT_SCHEMA_VERSION = "morning-preflight-v1"
+
 # Live (10:30 AM ET) execution identity — Robinhood-only live buys.
 MORNING_LIVE_MODE = "live"
 MORNING_LIVE_CRON_ID = "42173154"
@@ -117,6 +131,7 @@ MORNING_WINDOW_END_ET = MORNING_WATCHLIST_WINDOW_END_ET
 # ce16ba6b root. The watchlist scan and live execution use distinct roots so a
 # read-only scan can never be confused with a live-execution artifact.
 DEFAULT_MORNING_WATCHLIST_STATE_ROOT = "/home/user/workspace/cron_tracking/morning_dca_watchlist"
+DEFAULT_MORNING_PREFLIGHT_STATE_ROOT = "/home/user/workspace/cron_tracking/morning_dca_preflight"
 DEFAULT_MORNING_LIVE_STATE_ROOT = "/home/user/workspace/cron_tracking/morning_dca"
 # Legacy alias: the default root historically pointed at the morning stream.
 DEFAULT_MORNING_STATE_ROOT = DEFAULT_MORNING_WATCHLIST_STATE_ROOT
@@ -141,6 +156,23 @@ MORNING_PROFILES: Dict[str, Dict[str, Any]] = {
         "decision_time_et": time(9, 45),
         "validate_trend": False,
     },
+    MORNING_PREFLIGHT_MODE: {
+        "mode": MORNING_PREFLIGHT_MODE,
+        "artifact_mode": "preflight",
+        "trades": False,
+        "cron_id": MORNING_PREFLIGHT_CRON_ID,
+        "run_type": MORNING_PREFLIGHT_RUN_TYPE,
+        "scheduled_for_et": MORNING_PREFLIGHT_SCHEDULED_FOR_ET,
+        "window_start_et": MORNING_PREFLIGHT_WINDOW_START_ET,
+        "window_end_et": MORNING_PREFLIGHT_WINDOW_END_ET,
+        "state_schema_version": MORNING_PREFLIGHT_SCHEMA_VERSION,
+        "state_root": DEFAULT_MORNING_PREFLIGHT_STATE_ROOT,
+        "folder_suffix": "0945ET",
+        "scheduled_run_id_prefix": "morning_preflight",
+        "manual_run_id_prefix": "manual_morning_preflight",
+        "decision_time_et": time(9, 45),
+        "validate_trend": False,
+    },
     MORNING_LIVE_MODE: {
         "mode": MORNING_LIVE_MODE,
         "artifact_mode": "live",
@@ -162,22 +194,24 @@ MORNING_PROFILES: Dict[str, Dict[str, Any]] = {
 
 STATE_SCHEMA_VERSION = MORNING_WATCHLIST_SCHEMA_VERSION
 
-# Morning sizing ladder: a coarser 0x -> 3x ladder keyed on the drop vs.
-# *yesterday's regular-session close*. Thresholds are fractions of the previous
-# close (0.02 == 2.0%). The largest threshold <= the actual drop wins; a drop
-# below the first threshold yields no buy (0x). This is SEPARATE from the
-# afternoon 0x -> 5x ladder in StrategyConfig.sizing_tiers.
-#     drop < 0.1%           -> 0x  (no buy)
-#     0.1% <= drop < 2.0%   -> 1x
-#     2.0% <= drop < 5.0%   -> 1.5x
-#     5.0% <= drop < 8.0%   -> 2x
-#     drop >= 8.0%          -> 3x  (no upper cutoff)
-MORNING_SIZING_TIERS: Tuple[Tuple[float, float], ...] = (
-    (0.001, 1.0),
-    (0.020, 1.5),
-    (0.050, 2.0),
-    (0.080, 3.0),
-)
+# Morning sizing ladder. As of the Fri Jul 10 2026 live-automation update every
+# live stream (morning 10:30, midday 12:30, afternoon 3:20) shares the SAME
+# canonical $3-base 0x -> 5x graded ladder defined on
+# ``near_close_dca.StrategyConfig.sizing_tiers``. The former coarser 0x -> 3x
+# morning ladder (0.1-2/2-5/5-8/8+ -> 1x/1.5x/2x/3x) is HISTORICAL/SUPERSEDED and
+# is no longer used by the live morning stream. Binding to the afternoon tuple
+# keeps all live streams in lockstep, so a single ladder edit updates them all.
+#     drop < 0.1%             -> 0x  (no buy)
+#     0.1% <= drop < 1.0%     -> 1x
+#     1.0% <= drop < 2.0%     -> 1.5x
+#     2.0% <= drop < 3.0%     -> 2x
+#     3.0% <= drop < 4.0%     -> 2.5x
+#     4.0% <= drop < 5.0%     -> 3x
+#     5.0% <= drop < 6.0%     -> 3.5x
+#     6.0% <= drop < 7.0%     -> 4x
+#     7.0% <= drop < 8.0%     -> 4.5x
+#     drop >= 8.0%            -> 5x  (no upper cutoff)
+MORNING_SIZING_TIERS: Tuple[Tuple[float, float], ...] = StrategyConfig().sizing_tiers
 
 MORNING_MINIMUM_DROP = 0.001
 
@@ -289,6 +323,9 @@ class MorningConfig:
     # Optional explicit artifact-root override. When None the executor uses the
     # active mode's default root (watchlist vs. live).
     morning_run_state_root: Optional[str] = None
+    # Root the 10:30 live gate reads the same-day 9:45 pre-flight artifact from.
+    # When None the live executor uses DEFAULT_MORNING_PREFLIGHT_STATE_ROOT.
+    preflight_run_state_root: Optional[str] = None
     # Minimum number of completed intraday bars over the trend window required to
     # validate the intraday trend in live mode. When fewer are available a
     # qualifying candidate is flagged manual_review_candidate rather than bought.
@@ -362,6 +399,25 @@ class MorningLedger:
 #                              validated; the run does NOT auto-buy.
 EXEC_AUTO_BUY_ELIGIBLE = "auto_buy_eligible"
 EXEC_MANUAL_REVIEW_CANDIDATE = "manual_review_candidate"
+
+
+def preflight_eligibility(signal: "MorningSignal") -> bool:
+    """Return whether ``signal`` is eligible for the 10:30 live evaluator.
+
+    This is the 9:45 pre-flight verdict: a COARSE pre-screen answering "is this
+    ticker worth re-evaluating at 10:30?", NOT a final buy approval. A ticker is
+    eligible when it graded to a positive-multiplier BUY at 9:45 with both a
+    usable current price and previous close. The 10:30 live run always recomputes
+    signals/budget/spread/trend/top-up from scratch and may still decline, so an
+    eligible ticker is not guaranteed to be bought and an ineligible ticker is
+    simply skipped by the live gate.
+    """
+    return (
+        signal.action == Action.BUY
+        and signal.multiplier > 0
+        and signal.current_price is not None
+        and signal.previous_close is not None
+    )
 
 
 @dataclass(frozen=True)
@@ -473,14 +529,65 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
     # Per-mode root keys take precedence; fall back to the legacy shared key.
     mode_root_key = {
         MORNING_WATCHLIST_MODE: "watchlist_run_state_root",
+        MORNING_PREFLIGHT_MODE: "preflight_run_state_root",
         MORNING_LIVE_MODE: "live_run_state_root",
     }.get(mode)
     if mode_root_key and mode_root_key in artifact_paths:
         kwargs["morning_run_state_root"] = artifact_paths[mode_root_key]
     elif "morning_run_state_root" in artifact_paths:
         kwargs["morning_run_state_root"] = artifact_paths["morning_run_state_root"]
+    # The 10:30 live gate reads the same-day pre-flight artifact from this root.
+    if "preflight_run_state_root" in artifact_paths:
+        kwargs["preflight_run_state_root"] = artifact_paths["preflight_run_state_root"]
 
     return MorningConfig(**kwargs)
+
+
+def load_same_day_preflight(
+    preflight_root: str, trading_day: date
+) -> Optional[Dict[str, Any]]:
+    """Load the same-day 9:45 pre-flight artifact for the 10:30 live gate.
+
+    Returns a dict ``{"run_id", "eligible_tickers": set[str], "run_state_path"}``
+    when a same-day pre-flight ``run_state.json`` is found under
+    ``preflight_root/YYYYMMDD_0945ET/`` (or via ``latest_preflight.json`` when it
+    points at the same trading day), else ``None``. The live executor uses the
+    returned ``eligible_tickers`` to restrict which tickers it re-evaluates; a
+    ``None`` result means "no pre-flight found" and the caller degrades to
+    evaluating the full universe with a warning rather than blocking all buys.
+    """
+    root = Path(preflight_root)
+    run_dir = root / f"{trading_day.strftime('%Y%m%d')}_0945ET"
+    state_path = run_dir / "run_state.json"
+    if not state_path.exists():
+        pointer = root / "latest_preflight.json"
+        if not pointer.exists():
+            return None
+        try:
+            pdata = json.loads(pointer.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+        if pdata.get("trading_day") != trading_day.isoformat():
+            return None
+        state_path = Path(pdata.get("run_state_path", ""))
+        if not state_path.exists():
+            return None
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    eligible = state.get("eligible_to_execute_tickers")
+    if eligible is None:
+        eligible = [
+            row["ticker"]
+            for row in state.get("signal_rows", [])
+            if row.get("eligible_to_execute") is True
+        ]
+    return {
+        "run_id": state.get("run_id"),
+        "eligible_tickers": set(eligible),
+        "run_state_path": str(state_path),
+    }
 
 
 class DCAExecutor:
@@ -520,8 +627,8 @@ class MorningDCAExecutor(DCAExecutor):
     """Morning graded-DCA executor: drop-vs-yesterday's-close evaluation.
 
     Evaluates each ticker's morning price weakness relative to yesterday's
-    regular-session close and grades it on the morning 0x -> 3x ladder. Two modes
-    (see :data:`MORNING_PROFILES`):
+    regular-session close and grades it on the shared $3-base 0x -> 5x live
+    ladder. Two modes (see :data:`MORNING_PROFILES`):
 
     - ``watchlist`` (default, 9:45 AM ET): a read-only early-warning scan. It
       places NO orders and every dollar figure is hypothetical/watchlist-only.
@@ -541,7 +648,7 @@ class MorningDCAExecutor(DCAExecutor):
     # exactly, so morning behavior is unchanged.
     PROFILES: Dict[str, Dict[str, Any]] = MORNING_PROFILES
     ledger_namespace: str = MORNING_STREAM
-    ladder_name: str = "morning_0x_to_3x"
+    ladder_name: str = "morning_0x_to_5x"
     signals_csv_name: str = "morning_signals.csv"
     latest_pointer_name: str = "latest_morning_run.json"
     manual_run_subdir: str = "manual_runs"
@@ -843,9 +950,47 @@ class MorningDCAExecutor(DCAExecutor):
         return bar.close
 
     def evaluate(self, now: datetime, data: Any) -> List[MorningSignal]:
-        """Evaluate every non-excluded ticker for the morning stream."""
+        """Evaluate every non-excluded ticker for the morning stream.
+
+        In morning live (10:30) mode the universe is first narrowed by the
+        same-day 9:45 pre-flight gate: only tickers marked
+        ``eligible_to_execute=true`` are re-evaluated. If no same-day pre-flight
+        artifact is found the gate degrades to the full universe (with a warning
+        recorded in :attr:`preflight_gate`) rather than blocking all buys.
+        """
         tickers = [t for t in self.config.tickers if t not in self.config.excluded_tickers]
+        tickers = self._apply_preflight_gate(now, tickers)
         return [self.evaluate_signal(t, now, data) for t in tickers]
+
+    # Populated by :meth:`_apply_preflight_gate` for morning live runs so
+    # build_artifacts can surface which tickers the pre-flight gate admitted.
+    preflight_gate: Optional[Dict[str, Any]] = None
+
+    def _apply_preflight_gate(self, now: datetime, tickers: List[str]) -> List[str]:
+        """Restrict the morning live universe to the same-day pre-flight verdict."""
+        self.preflight_gate = None
+        if not (self.mode == MORNING_LIVE_MODE and self.stream == MORNING_STREAM):
+            return tickers
+        trading_day = now.astimezone(EASTERN).date()
+        root = self.config.preflight_run_state_root or DEFAULT_MORNING_PREFLIGHT_STATE_ROOT
+        loaded = load_same_day_preflight(root, trading_day)
+        if loaded is None:
+            self.preflight_gate = {
+                "preflight_found": False,
+                "warning": "no same-day 9:45 pre-flight artifact found; evaluating full universe",
+            }
+            return tickers
+        eligible = loaded["eligible_tickers"]
+        admitted = [t for t in tickers if t in eligible]
+        gated_out = [t for t in tickers if t not in eligible]
+        self.preflight_gate = {
+            "preflight_found": True,
+            "preflight_run_id": loaded["run_id"],
+            "eligible_to_execute_tickers": sorted(eligible),
+            "admitted_tickers": admitted,
+            "gated_out_tickers": gated_out,
+        }
+        return admitted
 
     @staticmethod
     def _buy_candidates(signals: Sequence[MorningSignal]) -> List[MorningSignal]:
@@ -891,8 +1036,12 @@ class MorningDCAExecutor(DCAExecutor):
         now_et = now.astimezone(EASTERN)
         trading_day = now_et.date()
         is_live = self.mode == MORNING_LIVE_MODE
+        is_preflight = self.mode == MORNING_PREFLIGHT_MODE
 
         signal_rows = [s.to_row() for s in signals]
+        if is_preflight:
+            for row, sig in zip(signal_rows, signals, strict=True):
+                row["eligible_to_execute"] = preflight_eligibility(sig)
         buy_candidates = self._buy_candidates(signals)
         manual_review = [
             c for c in buy_candidates if c.execution_status == EXEC_MANUAL_REVIEW_CANDIDATE
@@ -965,6 +1114,16 @@ class MorningDCAExecutor(DCAExecutor):
             # that were withheld from auto-buy for downstream manual review.
             artifacts["manual_review_candidates"] = [c.to_row() for c in manual_review]
             artifacts["manual_review_tickers"] = [c.ticker for c in manual_review]
+            if self.preflight_gate is not None:
+                artifacts["preflight_gate"] = self.preflight_gate
+                if not self.preflight_gate.get("preflight_found"):
+                    warnings.append(self.preflight_gate["warning"])
+        if is_preflight:
+            # Pre-flight verdict: which tickers the 10:30 live evaluator should
+            # re-evaluate. Coarse pre-screen only; 10:30 recomputes fresh.
+            eligible = [s for s in signals if preflight_eligibility(s)]
+            artifacts["eligible_to_execute_tickers"] = [s.ticker for s in eligible]
+            artifacts["counts"]["eligible_to_execute"] = len(eligible)
         self._augment_artifacts(artifacts, top_up_outcomes)
         return artifacts
 
@@ -991,8 +1150,34 @@ class MorningDCAExecutor(DCAExecutor):
 
         paths = {"run_state": str(run_state_path), "signals": str(signals_path)}
 
+        is_preflight = self.mode == MORNING_PREFLIGHT_MODE
+        if is_preflight:
+            # validation.csv: the per-ticker eligible_to_execute verdict.
+            validation_path = out / "validation.csv"
+            _write_csv(validation_path, artifacts["signal_rows"])
+            paths["validation"] = str(validation_path)
+            # run_summary.json: a compact roll-up of the pre-flight verdict.
+            summary_path = out / "run_summary.json"
+            summary_path.write_text(
+                json.dumps(
+                    {
+                        "run_id": artifacts["run_id"],
+                        "trading_day": artifacts["trading_day"],
+                        "stream": self.stream,
+                        "mode": artifacts["mode"],
+                        "counts": artifacts["counts"],
+                        "eligible_to_execute_tickers": artifacts.get("eligible_to_execute_tickers", []),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            paths["run_summary"] = str(summary_path)
+
+        pointer_name = "latest_preflight.json" if is_preflight else self.latest_pointer_name
         if not artifacts["run_classification"]["manual_run"]:
-            pointer = Path(self.state_root) / self.latest_pointer_name
+            pointer = Path(self.state_root) / pointer_name
             pointer.parent.mkdir(parents=True, exist_ok=True)
             pointer.write_text(
                 json.dumps(
@@ -1007,7 +1192,7 @@ class MorningDCAExecutor(DCAExecutor):
                 ),
                 encoding="utf-8",
             )
-            paths[self.latest_pointer_name.replace(".json", "")] = str(pointer)
+            paths[pointer_name.replace(".json", "")] = str(pointer)
 
         return paths
 

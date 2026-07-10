@@ -51,15 +51,55 @@
   "allocation_priority": "Prioritize allocations by higher multiplier first, then larger percent drop, then ticker (alphabetical) for a deterministic tie-break. Flag any capped tickers.",
   "broker_roles": {
     "robinhood": { "account": "562057042", "role": "execution", "note": "Only execution broker/account for live and manual runs." },
-    "alpaca": { "role": "read_only", "note": "Read-only validation and account context only; never execution unless explicitly changed later." }
+    "alpaca": { "role": "read_only", "note": "Read-only validation and account context only; never execution unless explicitly changed later." },
+    "finance": { "role": "read_only", "note": "Read-only market-data/validation context only; never execution." },
+    "yahoo": { "role": "read_only", "note": "Read-only market-data/validation context only; never execution." }
   },
-  "safety_policy": "No sells, options, crypto, margin changes, account modifications, or order cancellations unless explicitly requested later. Buys only, regular market hours only, one strategy order per ticker per day.",
+  "safety_policy": "No sells, options, crypto, margin changes, account modifications, or order cancellations unless explicitly requested later. Buys only, regular market hours only, one strategy order per ticker per stream per day.",
+  "execution_authorization_policy": {
+    "approved_on_et": "2026-07-10 11:20 AM ET",
+    "scheduled_live_preauthorized": true,
+    "description": "As approved Fri Jul 10 2026 11:20 AM ET, scheduled live DCA tasks are pre-authorized to auto-place qualifying buys within all caps and circuit breakers WITHOUT per-order human confirmation.",
+    "scheduled_tasks": {
+      "requires_per_order_confirmation": false,
+      "calls_review_equity_order": false,
+      "placement_call": "place_equity_order",
+      "placement_precondition": "May call place_equity_order directly ONLY after every internal validation, signal, budget, spread, confidence/trend, and top-up check passes.",
+      "note": "Scheduled live tasks must NOT request per-order confirmation and must NOT call Robinhood review_equity_order (which forces a preview + confirmation)."
+    },
+    "manual_tasks": {
+      "requires_per_order_confirmation": true,
+      "calls_review_equity_order": true,
+      "placement_call": "review_equity_order -> place_equity_order",
+      "note": "Manual / ad hoc runs still use the review + confirmation path before any placement."
+    }
+  },
+  "circuit_breakers": {
+    "max_per_order_usd": 15.0,
+    "max_per_order_note": "5x * $3 base = $15 is the absolute per-order ceiling across all live streams.",
+    "enforce_budget_caps": true,
+    "enforce_available_buying_power": true,
+    "whitelist_only": true,
+    "one_order_per_ticker_per_stream": true,
+    "skip_conditions": [
+      "skip if data confidence fails",
+      "skip if the bid/ask spread is too wide",
+      "skip if the intraday trend cannot be validated down (flag manual_review_candidate instead of buying)",
+      "skip a top-up if the current price is not strictly below the prior same-day buy reference price",
+      "skip if it would exceed the max per-order $15 ceiling",
+      "skip if it would exceed the selected daily or weekly cap",
+      "skip if it would exceed available buying power",
+      "skip any ticker not on the active whitelist",
+      "skip if a strategy order for that ticker was already placed in this stream today"
+    ]
+  },
   "order_rules": {
     "one_order_per_ticker_per_day": true,
+    "one_order_per_ticker_per_stream": true,
     "order_type": "market",
     "notional_field": "dollar_amount",
     "time_in_force": "gfd",
-    "requires_review_before_submit": "review_equity_order must pass first"
+    "requires_review_before_submit": "Manual runs: review_equity_order must pass first. Scheduled live runs are pre-authorized (see execution_authorization_policy) and call place_equity_order directly after all internal checks pass, without review_equity_order."
   },
-  "hard_limits": "Never exceed the selected daily cap, the selected weekly cap, available buying power, or the broker/order-review limit. Caps are absolute ceilings; when a rule and an order conflict, the order is skipped."
+  "hard_limits": "Never exceed the max per-order $15 ceiling, the selected daily cap, the selected weekly cap, or available buying power. Caps are absolute ceilings; when a rule and an order conflict, the order is skipped."
 }

@@ -2,8 +2,9 @@
 
 The **midday** DCA stream is a single **12:30 PM ET live Robinhood execution**
 that grades each ticker's price weakness against **yesterday's regular-session
-close** on the **afternoon 0x-to-5x** ladder (the same ladder the 3:20 PM
-afternoon stream uses, intentionally distinct from the morning 0x-to-3x ladder).
+close** on the shared **$3-base 0x-to-5x** live ladder (as of the Fri Jul 10 2026
+live-automation update every live stream — morning, midday, afternoon — shares
+this one ladder; the former morning-only 0x-to-3x ladder is historical/superseded).
 It is implemented by [`midday_dca.MiddayDCAExecutor`](../midday_dca.py) and
 governed by [`config/midday_dca.json`](../config/midday_dca.json).
 
