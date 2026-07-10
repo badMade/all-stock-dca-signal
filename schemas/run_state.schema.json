@@ -39,6 +39,23 @@
       "type": ["string", "null"],
       "description": "Target broker account number, or null when not bound (e.g. dry-run). No secrets."
     },
+    "raw_input_dir": {
+      "type": "string",
+      "description": "Absolute path to the raw/ directory under this run's artifact dir where every raw Robinhood/Finance/Alpaca/Yahoo connector response used by the run was persisted (normalized to parseable JSON) BEFORE signal computation. Contract added 2026-07-10 after the 3:20 PM escalation: compute reads only these persisted files, never in-memory tool responses. See docs/schedule_manifest.md (RAW DATA PERSISTENCE FIX) and docs/run_classification.md."
+    },
+    "raw_inputs_saved": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Deterministic filenames actually persisted under raw_input_dir before compute (e.g. quotes_batch1.json, historicals_batch1.json, tradability_pre_place.json, portfolio_pre_place.json, orders_after_place.json, place_SYMBOL.json). Empty when raw persistence failed; in that case the scheduled run_state is still written with order_submit_status='not_submitted_error' and no orders."
+    },
+    "recovery_from_escalation": {
+      "type": "boolean",
+      "description": "True when this scheduled run_state was produced by recovering an escalated run (e.g. re-fetching quotes/historicals, persisting raw connector outputs, normalizing output_path pointers, then computing signals) rather than by a clean first-pass execution."
+    },
+    "raw_persistence_error": {
+      "type": ["string", "null"],
+      "description": "Set when raw connector persistence or normalization failed. The scheduled run_state is still written (run_origin='scheduled', manual_run=false, no orders) with order_submit_status='not_submitted_error' rather than escalating without state."
+    },
     "budget": {
       "type": "object",
       "required": ["budget_tier", "daily_cap_usd", "weekly_cap_usd"],

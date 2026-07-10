@@ -215,6 +215,175 @@ def latest_scheduled_run_path(base: Optional[Path] = None) -> Path:
     return state_root(base) / LATEST_SCHEDULED_RUN_FILENAME
 
 
+# --- Raw connector-input persistence (afternoon escalation fix, 2026-07-10) --
+#
+# The 3:20 PM scheduled live task escalated on 2026-07-10 because quotes and
+# historicals were fetched successfully but the raw connector responses were
+# never persisted to disk before signal computation; the bash compute step had
+# no quotes_batchN.json / historicals_batchN.json to read. Contract from that
+# date on: every raw Robinhood/Finance/Alpaca/Yahoo connector response used by a
+# scheduled run is persisted (normalized to parseable JSON) under the run's
+# raw/ directory BEFORE any signal is computed, and compute reads only those
+# persisted files -- never in-memory tool responses.
+
+RAW_INPUTS_SUBDIR = "raw"
+
+# Deterministic raw-input filenames written before signal computation.
+RAW_TRADABILITY_FILENAME = "tradability_pre_place.json"
+RAW_PORTFOLIO_FILENAME = "portfolio_pre_place.json"
+RAW_ORDERS_AFTER_PLACE_FILENAME = "orders_after_place.json"
+
+
+def raw_input_dir(trading_day: str, base: Optional[Path] = None) -> Path:
+    """Directory holding a scheduled run's persisted raw connector responses."""
+    return scheduled_run_dir(trading_day, base) / RAW_INPUTS_SUBDIR
+
+
+def quotes_batch_filename(n: int) -> str:
+    """Deterministic filename for a persisted quotes batch (1-based)."""
+    return f"quotes_batch{int(n)}.json"
+
+
+def historicals_batch_filename(n: int) -> str:
+    """Deterministic filename for a persisted historicals batch (1-based)."""
+    return f"historicals_batch{int(n)}.json"
+
+
+def place_filename(symbol: str) -> str:
+    """Deterministic filename for a persisted per-symbol place response."""
+    safe = re.sub(r"[^0-9A-Za-z._-]", "", str(symbol).upper()) or "UNKNOWN"
+    return f"place_{safe}.json"
+
+
+def normalize_connector_payload(
+    payload: object, *, read_pointer: bool = True, base_dir: Optional[Path] = None
+) -> Dict[str, object]:
+    """Normalize a raw connector response into an inline, parseable JSON object.
+
+    Some connectors return a large result indirectly as
+    ``{"output_path": "/.../foo.json", ...}`` rather than inline data. Compute
+    must read from persisted, parseable files -- not chase pointers at compute
+    time -- so when a payload carries an ``output_path`` we resolve it to the
+    referenced file's parsed contents (embedded under ``data``) while preserving
+    the original pointer under ``output_path`` and flagging ``normalized=true``.
+
+    A pointer that cannot be read/parsed is left as-is with
+    ``normalized=false`` and a ``normalize_error`` note, so persistence still
+    succeeds and the failure is visible rather than silently dropped.
+    """
+    if not isinstance(payload, Mapping):
+        return {"data": payload, "normalized": False}
+
+    result: Dict[str, object] = dict(payload)
+    pointer = result.get("output_path")
+    if not (read_pointer and isinstance(pointer, str) and pointer):
+        result.setdefault("normalized", False)
+        return result
+
+    path = Path(pointer)
+    if base_dir is not None and not path.is_absolute():
+        path = Path(base_dir) / path
+    try:
+        result["data"] = json.loads(path.read_text())
+        result["normalized"] = True
+    except (OSError, json.JSONDecodeError) as exc:
+        result["normalized"] = False
+        result["normalize_error"] = f"could not read output_path {pointer!r}: {exc}"
+    return result
+
+
+def save_raw_input(
+    trading_day: str,
+    filename: str,
+    payload: object,
+    *,
+    base: Optional[Path] = None,
+    normalize: bool = True,
+) -> Path:
+    """Persist one raw connector response under the run's raw/ directory.
+
+    Returns the written path. ``filename`` must be one of the deterministic
+    names (``quotes_batchN.json``, ``historicals_batchN.json``,
+    ``tradability_pre_place.json``, ``portfolio_pre_place.json``,
+    ``orders_after_place.json``, ``place_SYMBOL.json``). Large connector
+    ``output_path`` pointers are normalized to inline JSON by default so the
+    compute step can parse the file directly.
+    """
+    safe = Path(str(filename)).name
+    if not safe or safe != str(filename):
+        raise ValueError(f"raw input filename must be a bare filename, got {filename!r}")
+    out_dir = raw_input_dir(trading_day, base)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    to_write = normalize_connector_payload(payload) if normalize else payload
+    path = out_dir / safe
+    path.write_text(json.dumps(to_write, indent=2) + "\n")
+    return path
+
+
+def list_raw_inputs_saved(trading_day: str, base: Optional[Path] = None) -> List[str]:
+    """Sorted filenames actually persisted under the run's raw/ directory."""
+    out_dir = raw_input_dir(trading_day, base)
+    if not out_dir.exists():
+        return []
+    return sorted(p.name for p in out_dir.iterdir() if p.is_file())
+
+
+def build_raw_persistence_state(
+    trading_day: str,
+    *,
+    base: Optional[Path] = None,
+    recovery_from_escalation: bool = False,
+) -> Dict[str, object]:
+    """Build the run_state fields recording raw-input persistence for a run.
+
+    Reflects what is actually on disk under raw/ at call time, so the run_state
+    cannot claim inputs were saved that were not.
+    """
+    saved = list_raw_inputs_saved(trading_day, base)
+    return {
+        "raw_input_dir": str(raw_input_dir(trading_day, base)),
+        "raw_inputs_saved": saved,
+        "recovery_from_escalation": bool(recovery_from_escalation),
+    }
+
+
+def raw_persistence_failure_run_state(
+    trading_day: str,
+    error: str,
+    *,
+    base: Optional[Path] = None,
+    triggered_at_utc: Optional[str] = None,
+    broker: str = "robinhood",
+    budget: Optional[Dict[str, object]] = None,
+    recovery_from_escalation: bool = False,
+) -> Dict[str, object]:
+    """Build a valid scheduled run_state for a raw-persistence/normalization failure.
+
+    Contract: if persisting or normalizing raw connector responses fails, the
+    task must still write a valid scheduled run_state (``run_origin='scheduled'``,
+    ``manual_run=false``) recording the error and placing **no** orders, rather
+    than escalating with no state at all. The returned dict satisfies
+    run_state.schema.json (required run_id/generated_at/trading_day/broker/
+    budget/counts) and carries ``order_submit_status='not_submitted_error'``.
+    """
+    ts = triggered_at_utc or _utc_now_iso()
+    return {
+        "run_id": scheduled_run_id(trading_day),
+        "generated_at": datetime.now(_EASTERN).strftime("%Y-%m-%dT%H:%M:%S"),
+        "trading_day": trading_day,
+        "broker": broker,
+        "order_submit_status": ORDER_SUBMIT_STATUS_ERROR,
+        "budget": budget or {"budget_tier": "normal", "daily_cap_usd": 0, "weekly_cap_usd": 0},
+        "counts": {"evaluated": 0, "buy_candidates": 0, "submitted": 0},
+        "buy_candidates": [],
+        "run_classification": build_scheduled_classification(trading_day, ts),
+        "raw_input_dir": str(raw_input_dir(trading_day, base)),
+        "raw_inputs_saved": list_raw_inputs_saved(trading_day, base),
+        "recovery_from_escalation": bool(recovery_from_escalation),
+        "raw_persistence_error": str(error),
+    }
+
+
 # --- Validation --------------------------------------------------------------
 
 @dataclass
@@ -691,6 +860,19 @@ __all__ = [
     "scheduled_run_dir",
     "manual_run_dir",
     "latest_scheduled_run_path",
+    "RAW_INPUTS_SUBDIR",
+    "RAW_TRADABILITY_FILENAME",
+    "RAW_PORTFOLIO_FILENAME",
+    "RAW_ORDERS_AFTER_PLACE_FILENAME",
+    "raw_input_dir",
+    "quotes_batch_filename",
+    "historicals_batch_filename",
+    "place_filename",
+    "normalize_connector_payload",
+    "save_raw_input",
+    "list_raw_inputs_saved",
+    "build_raw_persistence_state",
+    "raw_persistence_failure_run_state",
     "validate_classification",
     "is_manual_state",
     "is_scheduled_state",

@@ -27,6 +27,20 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 > valid scheduled-run evidence the task ran — **not** evidence of an order/fill.
 > See [run_classification.md](run_classification.md).
 
+> **Raw data persistence fix (added Jul 10 2026):** before signal computation the
+> live task (`10ce362c`) must persist every raw Robinhood/Finance/Alpaca/Yahoo
+> connector response it used under
+> `cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/raw/` with deterministic
+> filenames (`quotes_batchN.json`, `historicals_batchN.json`,
+> `tradability_pre_place.json`, `portfolio_pre_place.json`,
+> `orders_after_place.json`, `place_SYMBOL.json`), normalizing large connector
+> `output_path` pointers into parseable JSON. **Compute must read only these
+> persisted files, not in-memory tool responses.** If persistence/normalization
+> fails, the task still writes a valid scheduled `run_state.json`
+> (`run_origin='scheduled'`, `manual_run=false`,
+> `order_submit_status='not_submitted_error'`, no orders) rather than escalating
+> without state. See the `10ce362c` task detail below.
+
 > **Run-classification note:** the live task (`10ce362c`, the repaired task
 > that supersedes the deleted `ce16ba6b`; artifact root stays under
 > `.../ce16ba6b` for continuity) classifies every
@@ -168,6 +182,48 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 - **State-file guarantee:** **always** writes the scheduled `run_state.json` and updates `latest_scheduled_run.json` on every fire, **even when no order is placed**. A confirmation-blocked run (review passed, submission blocked by required post-review confirmation) records `order_submit_status='not_submitted_confirmation_required'`, `reviewed_order` details where available, candidate details, and **no `order_id`** — valid scheduled-run evidence, not order/fill evidence.
 - **Run classification:** a scheduled run writes `scheduled_runs/YYYYMMDD_1520ET/run_state.json` (`run_origin='scheduled'`, `manual_run=false`, `scheduled_for_et='15:20'`, `state_schema_version='run-classification-v1'`, `run_id='scheduled_YYYYMMDD_1520ET'`, and **both** `cron_id='10ce362c'` **and** `supersedes_cron_id='ce16ba6b'`) and updates `latest_scheduled_run.json`; a manual run writes `manual_runs/<timestamp>/run_state.json` (`run_origin='manual'`, `manual_run=true`) and never updates that pointer. Placeholder/ambiguous ids such as `ce16ba6b_replacement` are forbidden; for continuity, consumers still accept `cron_id='10ce362c'` OR `supersedes_cron_id='ce16ba6b'` as valid evidence. See [run_classification.md](run_classification.md).
 - **Manual runs do not count as scheduled-run evidence.** Any stale stored display name is superseded by the authoritative **3:20 PM ET** schedule.
+- **RAW DATA PERSISTENCE FIX ADDED JUL 10 2026:** the 2026-07-10 3:20 PM run
+  (`cron_id 10ce362c`) escalated because quotes and historicals were fetched
+  successfully but the **raw connector responses were never persisted to disk
+  before signal computation** — the bash compute step had no
+  `quotes_batchN.json` / `historicals_batchN.json` to read. From this date on,
+  **before signal computation** the scheduled run must **persist every raw
+  Robinhood/Finance/Alpaca/Yahoo connector response** it used under
+  `scheduled_runs/YYYYMMDD_1520ET/raw/` with deterministic filenames:
+  `quotes_batchN.json`, `historicals_batchN.json`, `tradability_pre_place.json`,
+  `portfolio_pre_place.json`, `orders_after_place.json`, and `place_SYMBOL.json`
+  where applicable.
+  - **Normalize before persisting.** Large connector outputs that return an
+    `output_path` pointer instead of inline data must be normalized into
+    parseable JSON (the referenced file's contents embedded under `data`, the
+    original pointer preserved under `output_path`) so the compute step can parse
+    the saved file directly.
+  - **Compute reads persisted files only.** Signal computation must read from the
+    persisted/normalized files under `raw/`, **not** from in-memory tool
+    responses. Fetch → persist → normalize → compute → place, in that order.
+  - **Persistence failure still writes state.** If raw persistence or
+    normalization fails, the task must **still write a valid scheduled**
+    `run_state.json` with `run_origin='scheduled'`, `manual_run=false`,
+    `order_submit_status='not_submitted_error'`, the error in
+    `raw_persistence_error`, empty `raw_inputs_saved`, and **no orders placed** —
+    rather than escalating without any state.
+  - The run_state records `raw_input_dir` (absolute path to `raw/`),
+    `raw_inputs_saved` (filenames actually written), and
+    `recovery_from_escalation` (true when the state was produced by recovering an
+    escalated run). Helpers: `scripts/run_classification.py`
+    (`raw_input_dir`, `save_raw_input`, `normalize_connector_payload`,
+    `build_raw_persistence_state`, `raw_persistence_failure_run_state`); schema
+    fields in [`schemas/run_state.schema.json`](../schemas/run_state.schema.json).
+  - **Recovered run (2026-07-10 3:20 PM ET):** the escalated run was recovered by
+    re-fetching quotes/historicals, saving raw connector outputs under
+    `/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260710_1520ET/raw/`,
+    normalizing the large `output_path` pointers, computing signals from those
+    files, then placing qualifying incremental orders: **9 incremental scheduled
+    afternoon orders totalling $31.50**, saved under
+    `/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260710_1520ET/`.
+    These are valid afternoon scheduled evidence. Broker policy is unchanged
+    (Robinhood-only execution; Alpaca/Finance/Yahoo read-only; no
+    `review_equity_order` in scheduled live runs).
 - **Same-day top-up guard:** loads earlier same-day (before **2:30 PM ET**, non-scheduled) allocations from its own artifact root **plus** the morning-live root (`.../cron_tracking/morning_dca`) and the midday-live root (`.../cron_tracking/midday_dca`, which also holds manual override reruns under `manual_reruns/`), and offsets each ticker so it buys only the incremental amount `max(0, desired − prior)` into a lower price. The prior reference price is resolved by preference: logged `target_price`, then `decision_price`, then `average_fill_price` (from `orders.csv`/`filled_orders.csv`); a missing reference → `manual_review_candidate` at `$0`. Per-candidate the run_state records `prior_same_day_amount`, `prior_same_day_reference_price`, `prior_same_day_run_id`/`prior_same_day_source`, `afternoon_desired_amount`, `afternoon_decision_price`, `incremental_order_amount`, `top_up_guard_result`, `top_up_skipped`, and `top_up_manual_review`. Morning/midday/manual override prior-context fills are **never** afternoon scheduled evidence, slippage, reliability, fill counts, or cost basis. A fully-offset day still writes a valid scheduled run_state. See [strategy.md](strategy.md#same-day-prior-run-offset--top-up-guard).
 
 ### `d72aa525` — Capital-priority briefing

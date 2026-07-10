@@ -19,17 +19,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from run_classification import (  # noqa: E402
     ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED,
+    ORDER_SUBMIT_STATUS_ERROR,
     STATE_SCHEMA_VERSION,
     build_manual_classification,
+    build_raw_persistence_state,
     build_scheduled_classification,
     collect_manual_order_ids,
     exclude_manual_orders,
+    historicals_batch_filename,
     is_confirmation_blocked,
     is_manual_state,
     is_scheduled_state,
     latest_scheduled_run_path,
+    list_raw_inputs_saved,
     manual_run_id,
+    normalize_connector_payload,
     order_submit_status,
+    place_filename,
+    quotes_batch_filename,
+    raw_input_dir,
+    raw_persistence_failure_run_state,
+    save_raw_input,
     scheduled_run_id,
     select_scheduled_state_for_reporting,
     validate_classification,
@@ -505,6 +515,121 @@ def test_confirmation_blocked_clears_stray_order_ids():
         sel = select_scheduled_state_for_reporting(TRADING_DAY, base=base)
         assert sel.ok
         assert sel.confirmation_blocked
+        assert sel.order_ids == []
+
+
+# --- Raw connector-input persistence (afternoon escalation fix, 2026-07-10) --
+
+
+def test_raw_input_filenames_are_deterministic():
+    assert quotes_batch_filename(1) == "quotes_batch1.json"
+    assert quotes_batch_filename(12) == "quotes_batch12.json"
+    assert historicals_batch_filename(2) == "historicals_batch2.json"
+    assert place_filename("aapl") == "place_AAPL.json"
+    assert place_filename("brk.b") == "place_BRK.B.json"
+    # Path separators are stripped so the symbol cannot escape the raw/ dir.
+    fname = place_filename("../ev/il")
+    assert "/" not in fname and fname.startswith("place_") and fname.endswith(".json")
+
+
+def test_raw_input_dir_under_scheduled_run():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        assert raw_input_dir(TRADING_DAY, base).name == "raw"
+        assert raw_input_dir(TRADING_DAY, base).parent.name == "20260706_1520ET"
+
+
+def test_save_raw_input_persists_before_compute():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        assert list_raw_inputs_saved(TRADING_DAY, base) == []
+        p1 = save_raw_input(TRADING_DAY, quotes_batch_filename(1), {"AAPL": 190.0}, base=base)
+        save_raw_input(TRADING_DAY, historicals_batch_filename(1), {"AAPL": [1, 2, 3]}, base=base)
+        assert p1.exists()
+        # Compute reads the persisted file, not an in-memory response.
+        assert json.loads(p1.read_text())["AAPL"] == 190.0
+        assert list_raw_inputs_saved(TRADING_DAY, base) == [
+            "historicals_batch1.json",
+            "quotes_batch1.json",
+        ]
+
+
+def test_save_raw_input_rejects_non_bare_filename():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        try:
+            save_raw_input(TRADING_DAY, "sub/dir/quotes.json", {}, base=base)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError for non-bare filename")
+
+
+def test_normalize_connector_payload_resolves_output_path():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        pointer_file = base / "big_quotes.json"
+        pointer_file.write_text(json.dumps({"AAPL": 190.0, "MSFT": 400.0}))
+        payload = {"output_path": str(pointer_file), "status": "ok"}
+        normalized = normalize_connector_payload(payload)
+        assert normalized["normalized"] is True
+        assert normalized["data"]["MSFT"] == 400.0
+        # Original pointer is preserved.
+        assert normalized["output_path"] == str(pointer_file)
+
+
+def test_normalize_connector_payload_unreadable_pointer_is_flagged():
+    payload = {"output_path": "/no/such/file.json"}
+    normalized = normalize_connector_payload(payload)
+    assert normalized["normalized"] is False
+    assert "normalize_error" in normalized
+
+
+def test_save_raw_input_normalizes_pointer_payload():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        pointer_file = base / "hist.json"
+        pointer_file.write_text(json.dumps({"AAPL": [1, 2, 3]}))
+        path = save_raw_input(
+            TRADING_DAY, historicals_batch_filename(1),
+            {"output_path": str(pointer_file)}, base=base,
+        )
+        saved = json.loads(path.read_text())
+        assert saved["normalized"] is True
+        assert saved["data"]["AAPL"] == [1, 2, 3]
+
+
+def test_build_raw_persistence_state_reflects_disk():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        save_raw_input(TRADING_DAY, quotes_batch_filename(1), {"AAPL": 1}, base=base)
+        save_raw_input(TRADING_DAY, place_filename("AAPL"), {"id": "x"}, base=base)
+        block = build_raw_persistence_state(TRADING_DAY, base=base, recovery_from_escalation=True)
+        assert block["raw_input_dir"] == str(raw_input_dir(TRADING_DAY, base))
+        assert block["raw_inputs_saved"] == ["place_AAPL.json", "quotes_batch1.json"]
+        assert block["recovery_from_escalation"] is True
+
+
+def test_raw_persistence_failure_still_writes_valid_scheduled_state():
+    # Contract: a persistence/normalization failure must still yield a valid
+    # scheduled run_state (no orders), not an escalation with no state at all.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        state = raw_persistence_failure_run_state(
+            TRADING_DAY, "connector output_path unreadable", base=base,
+            triggered_at_utc="2026-07-06T19:20:01Z",
+        )
+        assert order_submit_status(state) == ORDER_SUBMIT_STATUS_ERROR
+        assert state["buy_candidates"] == []
+        assert state["raw_inputs_saved"] == []
+        assert state["raw_persistence_error"]
+        assert is_scheduled_state(state)
+        assert not is_manual_state(state)
+        # It writes to the scheduled path and updates the pointer like any scheduled run.
+        written = write_run_artifacts(state, base=base)
+        assert "latest_scheduled_run" in written
+        sel = select_scheduled_state_for_reporting(TRADING_DAY, base=base)
+        assert sel.ok
         assert sel.order_ids == []
 
 

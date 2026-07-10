@@ -109,6 +109,37 @@
       ]
     }
   },
+  "raw_input_persistence": {
+    "added": "2026-07-10",
+    "reason": "The 2026-07-10 3:20 PM ET scheduled run escalated because quotes and historicals were fetched successfully but the raw connector responses were never persisted to disk before signal computation; the bash compute step had no quotes_batchN.json / historicals_batchN.json to read.",
+    "raw_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/raw/",
+    "deterministic_filenames": [
+      "quotes_batchN.json",
+      "historicals_batchN.json",
+      "tradability_pre_place.json",
+      "portfolio_pre_place.json",
+      "orders_after_place.json",
+      "place_SYMBOL.json"
+    ],
+    "rules": [
+      "Before computing any signal, persist every raw Robinhood/Finance/Alpaca/Yahoo connector response used by the run under scheduled_runs/YYYYMMDD_1520ET/raw/ with the deterministic filenames above.",
+      "Normalize large connector output_path pointers into parseable JSON before persisting (referenced contents under 'data', original pointer preserved under 'output_path').",
+      "Compute must read only the persisted/normalized files under raw/, never in-memory tool responses. Order of operations: fetch -> persist -> normalize -> compute -> place.",
+      "If raw persistence or normalization fails, still write a valid scheduled run_state (run_origin='scheduled', manual_run=false) with order_submit_status='not_submitted_error', raw_persistence_error set, empty raw_inputs_saved, and no orders placed, rather than escalating without state."
+    ],
+    "run_state_fields": ["raw_input_dir", "raw_inputs_saved", "recovery_from_escalation", "raw_persistence_error"],
+    "helper_module": "scripts/run_classification.py",
+    "broker_policy_unchanged": "Robinhood only for execution; Alpaca/Finance/Yahoo read-only validation; no review_equity_order in scheduled live runs.",
+    "recovered_run_2026_07_10": {
+      "trading_day": "2026-07-10",
+      "scheduled_run_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260710_1520ET/",
+      "raw_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260710_1520ET/raw/",
+      "recovery_from_escalation": true,
+      "orders_placed": 9,
+      "total_usd": 31.5,
+      "note": "Recovered by re-fetching quotes/historicals, saving raw connector outputs, normalizing output_path pointers, computing signals from files, then placing qualifying incremental orders. Valid afternoon scheduled evidence."
+    }
+  },
   "write_rules": {
     "scheduled": [
       "Write run_state.json under scheduled_runs/YYYYMMDD_1520ET/ every time the task fires, even when no order is placed.",

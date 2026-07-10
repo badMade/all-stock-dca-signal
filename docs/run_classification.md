@@ -155,6 +155,39 @@ submitted/filled status.
 - **Weekly/monthly** — count the scheduled run as having occurred; it
   contributes **zero** scheduled fills/orders.
 
+## Raw connector-input persistence (added 2026-07-10)
+
+The 2026-07-10 3:20 PM ET run escalated because quotes and historicals were
+fetched but the **raw connector responses were never persisted before signal
+computation** — the bash compute step had no `quotes_batchN.json` /
+`historicals_batchN.json` to read. Contract from that date on:
+
+1. **Persist before compute.** Before computing any signal, the scheduled run
+   persists every raw Robinhood/Finance/Alpaca/Yahoo connector response it used
+   under `scheduled_runs/YYYYMMDD_1520ET/raw/` with deterministic filenames:
+   `quotes_batchN.json`, `historicals_batchN.json`, `tradability_pre_place.json`,
+   `portfolio_pre_place.json`, `orders_after_place.json`, and `place_SYMBOL.json`
+   where applicable.
+2. **Normalize pointer payloads.** A connector result returned indirectly as
+   `{"output_path": "..."}` is normalized to parseable JSON before persisting
+   (referenced contents under `data`, original pointer preserved under
+   `output_path`), so compute can parse the saved file directly.
+3. **Compute reads persisted files only** — never in-memory tool responses.
+4. **Failure still writes state.** If raw persistence or normalization fails, the
+   task still writes a **valid scheduled** `run_state.json`
+   (`run_origin='scheduled'`, `manual_run=false`,
+   `order_submit_status='not_submitted_error'`, `raw_persistence_error` set,
+   empty `raw_inputs_saved`, no orders) rather than escalating without state.
+
+The run_state records `raw_input_dir`, `raw_inputs_saved`, and
+`recovery_from_escalation` (see
+[`../schemas/run_state.schema.json`](../schemas/run_state.schema.json)). Helpers
+live in [`../scripts/run_classification.py`](../scripts/run_classification.py):
+`raw_input_dir`, `quotes_batch_filename`, `historicals_batch_filename`,
+`place_filename`, `save_raw_input`, `normalize_connector_payload`,
+`list_raw_inputs_saved`, `build_raw_persistence_state`, and
+`raw_persistence_failure_run_state`.
+
 ## Downstream reporting rules
 
 Applies to slippage (`67aa802b`), watchdog (`a46bf007`), weekly dashboard

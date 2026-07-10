@@ -175,6 +175,26 @@ guard. Example (2026-07-09): `AMZN` $3.00 @ 242.1099, `GOOG` $4.50 @ 352.1778,
 and `GOOGL` $4.50 @ 354.9800 were manual override fills — excluded from scheduled
 evidence and only affecting afternoon top-up eligibility.
 
+### Raw connector-input persistence (added 2026-07-10)
+
+Before computing any signal, the scheduled 3:20 PM ET run persists every raw
+Robinhood/Finance/Alpaca/Yahoo connector response it used under
+`scheduled_runs/YYYYMMDD_1520ET/raw/` (deterministic filenames
+`quotes_batchN.json`, `historicals_batchN.json`, `tradability_pre_place.json`,
+`portfolio_pre_place.json`, `orders_after_place.json`, `place_SYMBOL.json`),
+normalizing large connector `output_path` pointers into parseable JSON, and
+computes from those persisted files only — never in-memory tool responses. If
+persistence/normalization fails it still writes a valid scheduled `run_state`
+(`order_submit_status='not_submitted_error'`, no orders) instead of escalating
+without state. See
+[run_classification.md](run_classification.md#raw-connector-input-persistence-added-2026-07-10).
+
+The **2026-07-10 3:20 PM run** was recovered under this fix (re-fetch, persist,
+normalize, compute, place): **9 incremental scheduled afternoon orders totalling
+$31.50** under
+`/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260710_1520ET/`,
+`recovery_from_escalation=true` — valid afternoon scheduled evidence.
+
 ## Execution constraints
 
 See [`docs/safeguards.md`](safeguards.md) for the full list. Summary:
