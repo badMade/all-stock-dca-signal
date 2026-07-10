@@ -51,6 +51,7 @@ import json
 import logging
 import math
 import os
+import sys
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
@@ -418,7 +419,8 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
             config_dir_path = Path(env_dir)
         else:
             _here = Path(__file__).resolve().parent
-            for candidate in (_here / "config", Path.cwd() / "config"):
+            _installed = Path(sys.prefix) / "share" / "all-stock-dca" / "config"
+            for candidate in (_here / "config", _installed, Path.cwd() / "config"):
                 if candidate.is_dir():
                     config_dir_path = candidate
                     break
@@ -1010,9 +1012,9 @@ class MorningDCAExecutor(DCAExecutor):
         return paths
 
     def _maybe_block_for_holiday(self, now: datetime, *, manual: bool) -> Optional[Dict[str, Any]]:
-        """Return a blocked-run result when ``now`` falls on an NYSE holiday.
+        """Return a blocked-run result when ``now`` falls on a weekend or NYSE holiday.
 
-        A weekday cron fire on a full market closure has no real session to
+        A cron fire on a weekend or full market closure has no real session to
         evaluate. Unlike near_close_dca.MARKET_HOLIDAYS (scoped to the afternoon
         live-test window and hand-maintained), this stream runs indefinitely with
         no end date, so it uses the computed nyse_holidays() calendar to stay
@@ -1023,8 +1025,11 @@ class MorningDCAExecutor(DCAExecutor):
         normal trading day.
         """
         trading_day = now.astimezone(EASTERN).date()
-        if manual or trading_day not in nyse_holidays(trading_day.year):
+        is_weekend = trading_day.weekday() >= 5
+        is_holiday = trading_day in nyse_holidays(trading_day.year)
+        if manual or (not is_weekend and not is_holiday):
             return None
+        block_reason = "weekend" if is_weekend else "market holiday"
         out = self.run_state_dir(now)
         out.mkdir(parents=True, exist_ok=True)
         state_path = out / "run_state.json"
@@ -1032,7 +1037,7 @@ class MorningDCAExecutor(DCAExecutor):
             state_path.write_text(
                 json.dumps(
                     {"trading_day": trading_day.isoformat(), "status": "blocked",
-                     "block_reason": "market holiday", "stream": self.stream},
+                     "block_reason": block_reason, "stream": self.stream},
                     indent=2, sort_keys=True,
                 ),
                 encoding="utf-8",

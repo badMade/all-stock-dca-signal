@@ -171,12 +171,14 @@ def load_midday_config(config_dir=None) -> MiddayConfig:
     """
     if config_dir is None:
         import os as _os
+        import sys as _sys
         env_dir = _os.environ.get("DCA_CONFIG_DIR")
         if env_dir:
             config_dir_path = Path(env_dir)
         else:
             _here = Path(__file__).resolve().parent
-            for candidate in (_here / "config", Path.cwd() / "config"):
+            _installed = Path(_sys.prefix) / "share" / "all-stock-dca" / "config"
+            for candidate in (_here / "config", _installed, Path.cwd() / "config"):
                 if candidate.is_dir():
                     config_dir_path = candidate
                     break
@@ -266,19 +268,23 @@ class MiddayDCAExecutor(MorningDCAExecutor):
         return load_midday_config(config_dir)
 
     # -- Top-up guard (morning/manual prior-allocation offset) ---------------
-    def _load_prior_allocations(self, trading_day: date) -> Dict[str, PriorSameDayAllocation]:
+    def _load_prior_allocations(self, now: datetime, trading_day: date) -> Dict[str, PriorSameDayAllocation]:
         """Aggregate morning/manual prior same-day allocations across all roots.
 
         When a ticker appears in more than one root the dollar amounts are summed
         and the lowest available reference price wins, so midday must beat the
         best earlier entry price before it tops up (mirrors
         :func:`load_prior_same_day_allocations`'s within-root merge).
+
+        The scan is capped at the actual run time so replayed/backfilled midday
+        runs never load fills that were created after the 12:30 decision window.
         """
+        boundary_et = now.astimezone(EASTERN).time()
         merged: Dict[str, PriorSameDayAllocation] = {}
         roots = getattr(self.config, "prior_allocation_roots", (DEFAULT_MORNING_LIVE_STATE_ROOT,))
         for root in roots:
             allocations = load_prior_same_day_allocations(
-                root, trading_day, boundary_et=MORNING_MANUAL_BOUNDARY_ET
+                root, trading_day, boundary_et=boundary_et
             )
             for ticker, alloc in allocations.items():
                 existing = merged.get(ticker)
@@ -347,7 +353,7 @@ class MiddayDCAExecutor(MorningDCAExecutor):
         self, now: datetime, signals: Sequence[MorningSignal]
     ) -> Dict[str, MiddayTopUpOutcome]:
         trading_day = now.astimezone(EASTERN).date()
-        prior_allocations = self._load_prior_allocations(trading_day)
+        prior_allocations = self._load_prior_allocations(now, trading_day)
         outcomes: Dict[str, MiddayTopUpOutcome] = {}
         for signal in signals:
             if signal.action != Action.BUY or signal.multiplier <= 0:
