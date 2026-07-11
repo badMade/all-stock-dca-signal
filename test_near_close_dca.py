@@ -876,6 +876,31 @@ def test_confirmation_required_broker_response_recorded_distinctly(tmp_path):
     assert run_state["usage_proxy"]["errors_count"] == 0
 
 
+def test_run_daily_compact_blocks_orders_above_per_order_ceiling(tmp_path):
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-max-order")
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL",),
+        approved_test_dates=config.approved_test_dates,
+        base_buy_amount_usd=10.0,
+        max_per_order_usd=15.0,
+    )
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    candidate = run_state["buy_candidates"][0]
+    assert candidate["ticker"] == "AAPL"
+    assert candidate["planned_amount_usd"] == 20.0
+    assert candidate["status"] == "blocked"
+    assert candidate["skip_reason"] == "max per-order ceiling exceeded"
+    assert run_state["usage_proxy"]["orders_placed_count"] == 0
+
+
 def test_write_run_artifacts_ignores_stale_orders_csv(tmp_path):
     out = os.path.join(tmp_path, "runs", "reused-day")
     os.makedirs(out)
@@ -1048,9 +1073,9 @@ def _manual_run_state(candidates, generated_at="2026-06-29T10:00:00-04:00", run_
 
 
 def test_load_prior_same_day_reads_morning_manual_allocation(tmp_path):
-    # No orders.csv at all (legacy/older artifact layout). Per the reference-price
-    # preference the guard uses the run's logged target_price as the reference
-    # (the entry the run committed to) even without a confirmed fill.
+    # No orders.csv at all (legacy/older artifact layout). A submitted row still
+    # contributes prior-allocation amount, but without a confirmed fill its logged
+    # target_price must not become a known reference price.
     root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
     _write_prior_run(
         root,
@@ -1062,8 +1087,31 @@ def test_load_prior_same_day_reads_morning_manual_allocation(tmp_path):
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
     assert set(allocations) == {"AAPL"}
     assert allocations["AAPL"].amount_usd == 3.0
-    assert allocations["AAPL"].reference_price == 99.0
+    assert allocations["AAPL"].reference_price is None
     assert allocations["AAPL"].source == "manual"
+
+
+def test_load_prior_same_day_submitted_with_logged_price_and_no_fill_has_unknown_reference(tmp_path):
+    # A still-submitted order with no confirmed fill row may later be rejected or
+    # canceled; do not use its logged target/decision price as a known reference.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    _write_prior_run(
+        root,
+        "manual_runs/0900",
+        _manual_run_state([
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": 3.0,
+                "target_price": 99.0,
+                "decision_bar_close": 99.2,
+            },
+        ]),
+        orders_rows=[{"ticker": "AAPL", "status": "submitted", "avg_fill_price": ""}],
+    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert allocations["AAPL"].amount_usd == 3.0
+    assert allocations["AAPL"].reference_price is None
 
 
 def test_load_prior_same_day_no_logged_price_has_no_reference(tmp_path):
@@ -1128,9 +1176,9 @@ def test_load_prior_same_day_reads_manual_override_filled_orders_csv(tmp_path):
             handle,
         )
     with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
-        handle.write("ticker,status,avg_fill_price\nAMZN,filled,242.1099\n")
+        handle.write("ticker,amount_usd,avg_fill_price\nAMZN,2.5,242.1099\n")
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
-    assert allocations["AMZN"].amount_usd == 3.0
+    assert allocations["AMZN"].amount_usd == 2.5
     assert allocations["AMZN"].reference_price == 242.1099
     assert allocations["AMZN"].source == "manual"
 

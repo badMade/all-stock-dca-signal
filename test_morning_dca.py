@@ -615,6 +615,44 @@ class FewBarsProvider(FixedDropProvider):
         ]
 
 
+class StaleBarsProvider(FixedDropProvider):
+    """Provider that stops updating well before the completed-bar anchor."""
+
+    def get_intraday_bars(self, ticker, start, end, interval_minutes):
+        price = self._prev * (1.0 - self._drops.get(ticker, 0.0))
+        bars = []
+        cursor = start
+        stale_end = start + timedelta(minutes=25)
+        while cursor <= stale_end:
+            bars.append(Bar(timestamp=cursor, open=price + 1.0, high=price + 1.0, low=price, close=price, volume=100.0))
+            cursor += timedelta(minutes=interval_minutes)
+        return bars
+
+
+def test_live_confidence_rule_rejects_stale_decision_anchor_bars():
+    cfg = MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0)
+    ex = MorningDCAExecutor(cfg, mode="live")
+    data = StaleBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+
+    sig = ex.evaluate(_now_live(), data, manual=True)[0]
+
+    assert sig.action == Action.NO_DATA
+    assert sig.current_price is None
+    assert any("rejecting stale data" in warning for warning in sig.warnings)
+
+
+def test_live_confidence_rule_rejects_trend_with_stale_latest_bar():
+    cfg = MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0)
+    ex = MorningDCAExecutor(cfg, mode="live")
+    data = StaleBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+
+    warnings = []
+    bars = data.get_intraday_bars("BIG", _now_live() - timedelta(hours=1), _now_live(), 5)
+
+    assert ex._trend_validated(bars, _now_live(), warnings) is False
+    assert any("older than one interval" in warning for warning in warnings)
+
+
 def test_live_confidence_rule_withholds_when_trend_unvalidated(tmp_path):
     # Price/drop passes, but too few intraday bars means the trend cannot be
     # validated -> the candidate is a manual_review_candidate, NOT auto-bought.
@@ -955,8 +993,9 @@ def test_live_gate_restricts_to_preflight_eligible(tmp_path):
 
 
 def test_live_gate_fails_closed_when_preflight_missing_scheduled(tmp_path):
-    # Scheduled live runs must block (fail-closed) when no preflight artifact exists.
-    import pytest
+    # Scheduled live runs must write a durable blocked run_state (fail-closed)
+    # when no preflight artifact exists, rather than raising and leaving no
+    # artifact for watchdog/reporting to observe.
     live = MorningDCAExecutor(
         MorningConfig(
             tickers=("BIG", "FLAT"),
@@ -966,8 +1005,16 @@ def test_live_gate_fails_closed_when_preflight_missing_scheduled(tmp_path):
         mode=MORNING_LIVE_MODE,
     )
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10, "FLAT": 0.10})
-    with pytest.raises(RuntimeError, match="scheduled live run blocked"):
-        live.run(_now_live(), data)
+    res = live.run(_now_live(), data)
+    art = res["artifacts"]
+    assert art["status"] == "blocked"
+    assert "pre-flight" in art["block_reason"]
+    state_path = Path(res["paths"]["run_state"])
+    assert state_path.exists()
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert persisted["status"] == "blocked"
+    assert persisted["trades"] is False
+    assert persisted["broker_outcomes"] == {}
 
 
 def test_live_gate_degrades_to_full_universe_when_preflight_missing_manual(tmp_path):

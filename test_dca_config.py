@@ -117,14 +117,20 @@ def test_sizing_tiers_malformed_raises(tmp_path):
 
 def test_budgets_maps_surviving_fields_only(tmp_path):
     # Daily/weekly caps live in the BUDGET_TIERS ladder, not StrategyConfig; only the
-    # base amount and rollover-reserve cap are overlaid. The budget_tiers block is ignored.
+    # base amount, rollover-reserve cap, and hard per-order ceiling are overlaid.
+    # The budget_tiers block is ignored.
     _write(tmp_path, "budgets.json", {
         "base_amount_usd": 3.0,
         "weekly_rollover_reserve_cap_usd": 900.0,
         "budget_tiers": [{"name": "normal", "daily_cap_usd": 180.0}],
+        "circuit_breakers": {"max_per_order_usd": 15.0},
     })
     out = load_budgets(tmp_path)
-    assert out == {"base_buy_amount_usd": 3.0, "weekly_rollover_reserve_cap_usd": 900.0}
+    assert out == {
+        "base_buy_amount_usd": 3.0,
+        "weekly_rollover_reserve_cap_usd": 900.0,
+        "max_per_order_usd": 15.0,
+    }
 
 
 def test_tickers_loaded(tmp_path):

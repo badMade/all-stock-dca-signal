@@ -322,6 +322,7 @@ class StrategyConfig:
     decision_time_et: time = time(15, 20)  # matches the 3:20 PM ET canonical live schedule
     trend_lookback_minutes: int = 60
     base_buy_amount_usd: float = 3.0
+    max_per_order_usd: float = 15.0
     weekly_rollover_reserve_cap_usd: float = 900.0
     high_multiplier_threshold: float = 3.0
     minimum_drop_vs_previous_close: float = 0.001
@@ -1624,10 +1625,12 @@ def _candidate_logged_reference_price(candidate: Dict[str, Any]) -> Optional[flo
 
     Same-day top-up guard policy resolves a prior run's reference price in this
     order: the run's logged ``target_price``, then ``decision_price`` (also
-    recorded as ``decision_bar_close``). The caller falls back to the confirmed
-    ``average_fill_price`` from the orders CSV when none of these are logged, and
-    treats a still-missing reference as "unknown" (conservative no-top-up /
-    manual_review path). Returns the first strictly-positive value, else ``None``.
+    recorded as ``decision_bar_close``). Callers must only use this logged
+    reference for candidates whose capital movement is confirmed (for example a
+    filled candidate or a candidate with a confirmed fill row). Unconfirmed
+    submitted candidates keep an unknown reference even when target/decision
+    prices were logged, routing later top-ups to the conservative manual-review
+    path. Returns the first strictly-positive value, else ``None``.
     """
     for key in ("target_price", "decision_price", "decision_bar_close"):
         raw = candidate.get(key)
@@ -1715,7 +1718,11 @@ def _orders_csv_fills(
         with orders_csv.open(newline="", encoding="utf-8") as handle:
             for row in csv.DictReader(handle):
                 ticker = row.get("ticker")
-                if not ticker or (row.get("status") or "").lower() != "filled":
+                if not ticker:
+                    continue
+                status = (row.get("status") or "").lower()
+                is_manual_fill_file = orders_csv.name == "filled_orders.csv"
+                if status != "filled" and not (is_manual_fill_file and not status):
                     continue
                 raw_price = row.get("avg_fill_price")
                 try:
@@ -1729,10 +1736,16 @@ def _orders_csv_fills(
                     qty = float(raw_qty) if raw_qty not in (None, "", "-") else None
                 except (TypeError, ValueError):
                     qty = None
+                raw_amount = row.get("amount_usd")
+                try:
+                    amount = float(raw_amount) if raw_amount not in (None, "", "-") else None
+                except (TypeError, ValueError):
+                    amount = None
                 fills[ticker] = {
                     "order_id": row.get("order_id"),
                     "avg_fill_price": price,
                     "quantity_filled": qty if qty and qty > 0 else None,
+                    "amount_usd": amount if amount and amount > 0 else None,
                 }
     except Exception:
         return fills
@@ -1787,10 +1800,12 @@ def load_prior_same_day_allocations(
     ``boundary_et`` on ``trading_day`` are read, scheduled *afternoon* runs are
     ignored (morning/midday-stream runs stay eligible), and only buy candidates whose
     status shows an order was placed contribute. Each contributing candidate's
-    reference price is resolved by policy preference -- logged ``target_price``, then
-    ``decision_price``, then the confirmed ``average_fill_price`` (from ``orders.csv``
-    or a manual override's ``filled_orders.csv``); a candidate with none is treated as
-    an unknown reference. When multiple earlier runs touched a ticker the dollar
+    reference price is resolved only after capital movement is confirmed, by policy
+    preference -- logged ``target_price``, then ``decision_price``, then the confirmed
+    ``average_fill_price`` (from ``orders.csv`` or a manual override's
+    ``filled_orders.csv``). An unconfirmed submitted candidate is retained as prior
+    allocation context with an unknown reference even if it logged target/decision
+    prices. When multiple earlier runs touched a ticker the dollar
     amounts are summed and the *lowest* available reference price wins, so the
     afternoon run must beat the best earlier entry price before it tops up. If any
     contributing reference is unknown the aggregate reference is unknown, routing the
@@ -1852,7 +1867,9 @@ def load_prior_same_day_allocations(
                         # Filled rows for a ticker win over submitted rows for the same ticker.
                         _csv_tickers: Dict[str, tuple] = {}  # ticker -> (amount, ref_price)
                         for _ticker, _fill in report_fills.items():
-                            if _fill["quantity_filled"]:
+                            if _fill.get("amount_usd"):
+                                _csv_tickers[_ticker] = (_fill["amount_usd"], _fill["avg_fill_price"])
+                            elif _fill["quantity_filled"]:
                                 _csv_tickers[_ticker] = (
                                     _fill["avg_fill_price"] * _fill["quantity_filled"],
                                     _fill["avg_fill_price"],
@@ -1908,23 +1925,29 @@ def load_prior_same_day_allocations(
                 amount = float(amount)
             except (TypeError, ValueError):
                 continue
-            if fill is not None and fill["quantity_filled"]:
+            if fill is not None and fill.get("amount_usd"):
+                # Prefer the actual filled notional over the planned amount so a
+                # manual override or partial fill doesn't overstate prior allocation.
+                amount = fill["amount_usd"]
+            elif fill is not None and fill["quantity_filled"]:
                 # Prefer the actual filled notional over the planned amount so a
                 # partial fill doesn't overstate prior allocation.
                 amount = fill["avg_fill_price"] * fill["quantity_filled"]
             if amount <= 0:
                 continue
 
-            # Reference price preference (same-day top-up guard policy): the
-            # run's logged target_price/decision_price first, then the confirmed
-            # average_fill_price from the orders CSV. The logged intended price is
-            # the entry the run committed to, so it is what a later run must beat
-            # before topping up. Neither logged nor filled means "unknown", which
-            # the guard handles conservatively (missing_prior_price -> $0 +
-            # manual review).
-            reference_price = _candidate_logged_reference_price(candidate)
-            if reference_price is None and fill is not None:
-                reference_price = fill["avg_fill_price"]
+            # Reference price preference (same-day top-up guard policy) applies
+            # only after capital movement is confirmed. A still-unfilled
+            # ``submitted`` row may later be rejected/canceled or may simply have
+            # stale order history; using its logged target/decision price as a
+            # known reference would let later top-ups silently take
+            # price_not_below/no_incremental. Keep that path unknown so the guard
+            # routes to missing_prior_price -> $0 + manual review.
+            reference_price = None
+            if status == "filled" or fill is not None:
+                reference_price = _candidate_logged_reference_price(candidate)
+                if reference_price is None and fill is not None:
+                    reference_price = fill["avg_fill_price"]
 
             entry = aggregated.setdefault(
                 ticker,
@@ -2603,6 +2626,15 @@ def run_once(
         if not ticker_guarded and broker.same_day_strategy_order_exists(ticker, trading_day):
             candidate_outcomes[ticker] = {"status": "skipped", "skip_reason": "same-day broker order exists"}
             _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: same-day broker order already exists; skipping")
+            continue
+        if order_amount > config.max_per_order_usd:
+            candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "max per-order ceiling exceeded"}
+            _block(
+                ticker,
+                MISSING_FILL_BUDGET_CAPPED,
+                f"{ticker}: order amount ${order_amount:.2f} exceeds max per-order "
+                f"${config.max_per_order_usd:.2f}; skipping",
+            )
             continue
         if not within_caps(order_amount, state, trading_day, config):
             candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "cap would be exceeded"}
