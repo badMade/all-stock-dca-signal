@@ -205,11 +205,13 @@ def test_run_pipeline_persists_raw_inputs_before_compute(tmp_path):
     config = _demo_config()
     task_root = tmp_path / "cron_tracking" / "ce16ba6b"
     scheduled_dir = task_root / "scheduled_runs" / "20260706_1520ET"
+    quotes_file = tmp_path / "quotes.json"
+    quotes_file.write_text('{"symbol": "AAPL", "price": 150.0}')
     result = run_pipeline(
         _now(), config, StrategyState(),
         DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
         build_broker(config), artifacts_dir=scheduled_dir,
-        raw_connector_inputs={"quotes_batch1.json": {"output_path": str(tmp_path / "quotes.json")}},
+        raw_connector_inputs={"quotes_batch1.json": {"output_path": str(quotes_file)}},
     )
     assert result["blocked"] is False
     raw_file = scheduled_dir / "raw" / "quotes_batch1.json"

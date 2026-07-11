@@ -28,7 +28,8 @@ import argparse
 import csv
 import json
 import logging
-from datetime import datetime, time, timedelta
+import shutil
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -53,6 +54,7 @@ from scripts.run_classification import (
     build_raw_persistence_state,
     raw_persistence_failure_run_state,
     save_raw_input,
+    update_latest_scheduled_run_pointer,
 )
 
 logger = logging.getLogger("near_close_dca.run")
@@ -226,36 +228,70 @@ def run_pipeline(
     """
     raw_persistence_state: Optional[Dict[str, object]] = None
     if scheduled:
-        trading_day_raw = now.astimezone(EASTERN).date().isoformat()
-        raw_base = _default_prior_allocation_state_root(Path(artifacts_dir))
-        try:
-            for filename, payload in (raw_connector_inputs or {}).items():
-                save_raw_input(trading_day_raw, filename, payload, base=raw_base)
-            raw_persistence_state = build_raw_persistence_state(trading_day_raw, base=raw_base)
-        except Exception as exc:  # noqa: BLE001 - failure must still write durable scheduled state
-            out = Path(artifacts_dir)
-            out.mkdir(parents=True, exist_ok=True)
-            failure_state = raw_persistence_failure_run_state(
-                trading_day_raw,
-                str(exc),
-                base=raw_base,
-                triggered_at_utc=now.astimezone().isoformat(),
-                budget={
-                    "budget_tier": state.current_tier().name,
-                    "daily_cap_usd": state.current_tier().daily_cap_usd,
-                    "weekly_cap_usd": state.effective_weekly_cap(),
-                },
-            )
-            (out / "run_state.json").write_text(json.dumps(failure_state, indent=2) + "\n", encoding="utf-8")
-            return {
-                "run_label": run_label,
-                "scheduled": scheduled,
-                "compact": True,
-                "blocked": False,
-                "raw_persistence_error": str(exc),
-                "artifacts_dir": str(out),
-                "run_state_path": str(out / "run_state.json"),
-            }
+        trading_day_et = now.astimezone(EASTERN).date()
+        trading_day_raw = trading_day_et.isoformat()
+        # Only persist raw inputs on approved trading days; unapproved days let
+        # run_daily_compact write the normal blocked stub without side effects.
+        if trading_day_et in config.approved_test_dates:
+            # Always save raw inputs directly under artifacts_dir/raw so the raw
+            # directory is co-located with run_state.json regardless of layout.
+            raw_dir = Path(artifacts_dir) / "raw"
+            # Live runs (dry_run=False) must supply raw_connector_inputs; skipping
+            # persistence on a live run would allow orders that are not reproducible
+            # from the durable raw files, violating the scheduler contract.
+            # Dry-run callers that have not yet been updated may omit them.
+            if raw_connector_inputs is None and not config.dry_run:
+                raise RuntimeError(
+                    "scheduled live run requires raw_connector_inputs; a caller "
+                    "that has not been updated to pass raw connector payloads "
+                    "would place orders without persisting before compute"
+                )
+            if raw_connector_inputs is not None:
+                try:
+                    for filename, payload in raw_connector_inputs.items():
+                        path = save_raw_input(
+                            trading_day_raw, filename, payload, raw_dir=raw_dir
+                        )
+                        written = json.loads(path.read_text(encoding="utf-8"))
+                        if "normalize_error" in written:
+                            raise RuntimeError(
+                                f"normalization failed for {filename!r}: {written['normalize_error']}"
+                            )
+                    raw_persistence_state = build_raw_persistence_state(
+                        trading_day_raw, raw_dir=raw_dir
+                    )
+                except Exception as exc:  # noqa: BLE001 - failure must still write durable scheduled state
+                    # Remove any partially-written raw files so raw_inputs_saved is []
+                    if raw_dir.exists():
+                        shutil.rmtree(raw_dir, ignore_errors=True)
+                    out = Path(artifacts_dir)
+                    out.mkdir(parents=True, exist_ok=True)
+                    failure_state = raw_persistence_failure_run_state(
+                        trading_day_raw,
+                        str(exc),
+                        raw_dir=raw_dir,
+                        triggered_at_utc=now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        budget={
+                            "budget_tier": state.current_tier().name,
+                            "daily_cap_usd": state.current_tier().daily_cap_usd,
+                            "weekly_cap_usd": state.effective_weekly_cap(),
+                        },
+                    )
+                    run_state_path = out / "run_state.json"
+                    run_state_path.write_text(json.dumps(failure_state, indent=2) + "\n", encoding="utf-8")
+                    if classification_state_root is not None:
+                        update_latest_scheduled_run_pointer(
+                            failure_state, run_state_path, base=Path(classification_state_root)
+                        )
+                    return {
+                        "run_label": run_label,
+                        "scheduled": scheduled,
+                        "compact": True,
+                        "blocked": False,
+                        "raw_persistence_error": str(exc),
+                        "artifacts_dir": str(out),
+                        "run_state_path": str(run_state_path),
+                    }
 
     if scheduled and prior_same_day_allocations is None:
         trading_day = now.astimezone(EASTERN).date()
