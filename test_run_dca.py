@@ -288,3 +288,28 @@ def test_run_pipeline_live_run_empty_raw_inputs_writes_error_state(tmp_path):
         run_state = json.load(handle)
     assert run_state["order_submit_status"] == "not_submitted_error"
     assert run_state["raw_inputs_saved"] == []
+
+
+def test_run_pipeline_live_run_partial_raw_inputs_writes_error_state(tmp_path):
+    import json
+
+    config = load_strategy_config(
+        approved_test_dates=frozenset({_now().date()}), dry_run=False
+    )
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
+    quotes_file = tmp_path / "quotes.json"
+    quotes_file.write_text('{"symbol": "AAPL", "price": 150.0}')
+    broker = DryRunBroker(account=config.target_account_number)
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        broker, artifacts_dir=scheduled_dir,
+        raw_connector_inputs={"quotes_batch1.json": {"output_path": str(quotes_file)}},
+        required_raw_filenames=frozenset({"quotes_batch1.json", "historicals_batch1.json"}),
+    )
+    assert "raw_persistence_error" in result
+    assert "historicals_batch1.json" in result["raw_persistence_error"]
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    assert run_state["order_submit_status"] == "not_submitted_error"
+    assert run_state["raw_inputs_saved"] == []

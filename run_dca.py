@@ -193,6 +193,7 @@ def run_pipeline(
     deployment_history_root: Optional[str | Path] = None,
     classification_state_root: Optional[str | Path] = None,
     raw_connector_inputs: Optional[Mapping[str, Any]] = None,
+    required_raw_filenames: Optional[frozenset] = None,
 ) -> Dict[str, Any]:
     """Run one compact DCA cycle and (optionally) the full post-trade report set.
 
@@ -219,6 +220,12 @@ def run_pipeline(
     ``raw/`` directory and stamp the saved-file manifest into ``run_state.json``;
     if persistence or normalization fails, the pipeline writes the documented
     no-order error run_state and returns without computing or placing.
+
+    ``required_raw_filenames`` declares the complete set of filenames the
+    scheduler expects to be present in ``raw_connector_inputs`` for a live run.
+    When provided and ``dry_run=False``, any missing filename is treated as a
+    persistence failure and routes through the fail-closed error state rather
+    than proceeding to compute with an incomplete raw payload set.
 
     ``classification_state_root`` is passed through to ``near_close_dca.run_once``
     for a scheduled run: it is where ``latest_scheduled_run.json`` is
@@ -249,6 +256,13 @@ def run_pipeline(
                             "omitting or passing an empty mapping on a live run allows orders "
                             "without persisting connector responses first"
                         )
+                    if required_raw_filenames and not config.dry_run:
+                        missing = required_raw_filenames - set(raw_connector_inputs.keys())
+                        if missing:
+                            raise RuntimeError(
+                                f"scheduled live run: required raw inputs absent from "
+                                f"raw_connector_inputs: {sorted(missing)}"
+                            )
                     # Clear any stale raw files from prior attempts so the saved-file
                     # manifest only reflects what this run persists.
                     if raw_dir.exists():
