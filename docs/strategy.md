@@ -32,15 +32,15 @@ The order dollar amount before budget constraints is
 
 ## Active ticker universe
 
-43 active symbols (see [`config/tickers.json`](../config/tickers.json)):
+42 active symbols (see [`config/tickers.json`](../config/tickers.json)):
 
 ```
-DFTX TRIN AAAU SPCX RVI EVR LUNR IRDM DXYZ LITE ASML DRAM STX
+DFTX TRIN AAAU SPCX EVR LUNR IRDM DXYZ LITE ASML DRAM STX
 MSFT AAPL AMAT AMD CBRS MRVL BTX STM SNDK WDC TSM AVGO NVDA QBTS FLKR
 INTC GOOGL GOOG AMZN GLW MA GS MU NFLX XLG TOPT QTOP SATA RGTI IBM
 ```
 
-- **Excluded:** `BYDDY`, `VCX`, `TRLV`
+- **Excluded:** `BYDDY`, `VCX`, `TRLV`, `RVI`
 - **Symbol corrections applied:** `IRDMI -> IRDM`, `GLWR -> GLW`
 
 ## Sizing ladder (latest, active)
@@ -103,10 +103,11 @@ selected weekly cap, available buying power, or the broker/order-review limit.
 
 ## Same-day prior-run offset / top-up guard
 
-A morning or manual run must **never block** the scheduled afternoon (3:20 PM ET)
-run. Instead, the scheduled run treats any earlier same-day allocation as
-prior-allocation context and **tops up** only when it is buying into a lower
-price:
+One guard governs the **morning (10:30)**, **midday (12:30)**, and **afternoon
+(3:20 PM ET)** live streams as well as **manual override same-day fills**. An
+earlier run must **never block** a later run. Instead, each later run treats any
+earlier same-day allocation as prior-allocation context and **tops up** only when
+it is buying into a lower price:
 
 - **No earlier same-day allocation** for the ticker → normal allocation (buy the
   full afternoon desired amount).
@@ -117,7 +118,14 @@ price:
   reference price → buy **$0**.
 - **Earlier amount known but no comparable price** (missing prior reference or
   current afternoon price) → conservative **$0** with `top_up_manual_review`
-  flagged, rather than topping up blind.
+  flagged (a `manual_review_candidate`), rather than topping up blind.
+
+**Reference price preference.** A prior run's reference price is resolved in this
+order: the run's logged `target_price`, then `decision_price`, then the confirmed
+`average_fill_price` (from `orders.csv`, or a manual override's
+`filled_orders.csv`). When none of the three is available the reference is
+**unknown**, which routes the candidate to the conservative no-top-up /
+`manual_review_candidate` path above.
 
 Worked example: a morning run bought $3 of a ticker; the afternoon signal wants
 $6. If the afternoon price is below the morning reference, the afternoon run buys
@@ -138,6 +146,34 @@ Per candidate, the scheduled `run_state` records `prior_same_day_amount`,
 `afternoon_desired_amount`, `afternoon_decision_price`, `incremental_order_amount`,
 `top_up_guard_result`, `top_up_skipped`, and `top_up_manual_review` (see
 [`schemas/run_state.schema.json`](../schemas/run_state.schema.json)).
+
+The **midday** stream applies the same top-up guard against morning/manual prior
+same-day allocations (buying only the incremental difference into a lower price),
+and midday fills in turn become prior-allocation context for the afternoon guard.
+The morning stream ([morning_dca.md](morning_dca.md)) and the midday stream
+([midday_dca.md](midday_dca.md), a 12:30 PM ET live execution) both run the same
+shared $3-base 0x-to-5x ladder as the afternoon run — as of the Fri Jul 10 2026
+live-automation update every live stream shares one ladder (the former morning
+0x-to-3x ladder is historical/superseded). Both are independent of the afternoon
+3:20 PM task and never count as afternoon scheduled evidence.
+
+The scheduled afternoon run auto-loads prior context from its own task root
+**plus** the morning-live root (`.../cron_tracking/morning_dca`) and the
+midday-live root (`.../cron_tracking/midday_dca`), so morning, midday, and manual
+override same-day fills all offset the afternoon buy. Roots that did not run that
+day contribute nothing.
+
+### Manual override same-day fills
+
+Manual override reruns (e.g. an out-of-band manual buy on account 562057042) are
+recorded under `.../cron_tracking/midday_dca/manual_reruns/<timestamp>/` as
+`run_state.json` plus a confirmed-fill `filled_orders.csv` (`run_origin='manual'`,
+`manual_run=true`). They are **excluded** from every scheduled metric — evidence,
+slippage, reliability, fill counts, watchdog confirmation, and cost basis — and
+are used **only** as prior-allocation context for the afternoon same-day top-up
+guard. Example (2026-07-09): `AMZN` $3.00 @ 242.1099, `GOOG` $4.50 @ 352.1778,
+and `GOOGL` $4.50 @ 354.9800 were manual override fills — excluded from scheduled
+evidence and only affecting afternoon top-up eligibility.
 
 ## Execution constraints
 

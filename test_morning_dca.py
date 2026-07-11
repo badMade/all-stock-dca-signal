@@ -1,8 +1,10 @@
-"""Self-tests for the morning graded-DCA dry-run executor.
+"""Self-tests for the morning graded-DCA executor (watchlist scan + live).
 
 Covers the morning ladder threshold brackets, the separate budget ledger
-namespace, the run-state path/classification, and the guarantee that a morning
-run never interacts with the afternoon ce16ba6b scheduled evidence.
+namespace, the run-state path/classification for BOTH the 9:45 watchlist scan
+and the 10:30 live execution, the live-mode confidence rule, and the guarantee
+that a morning run never interacts with the afternoon ce16ba6b scheduled
+evidence.
 
 Runnable with ``pytest`` or ``python test_morning_dca.py``.
 """
@@ -12,16 +14,31 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 from morning_dca import (
+    DEFAULT_MORNING_LIVE_STATE_ROOT,
+    DEFAULT_MORNING_PREFLIGHT_STATE_ROOT,
     DEFAULT_MORNING_STATE_ROOT,
+    DEFAULT_MORNING_WATCHLIST_STATE_ROOT,
+    EXEC_AUTO_BUY_ELIGIBLE,
+    EXEC_MANUAL_REVIEW_CANDIDATE,
     MORNING_CRON_ID,
+    MORNING_LIVE_CRON_ID,
+    MORNING_LIVE_MODE,
+    MORNING_PREFLIGHT_MODE,
     MORNING_SIZING_TIERS,
     DCAExecutor,
     MorningConfig,
     MorningDCAExecutor,
     MorningLedger,
+    load_same_day_preflight,
     nyse_holidays,
+    preflight_eligibility,
 )
 from near_close_dca import EASTERN, Action, Bar, SourceName
+
+
+def _now_live():
+    """Decision timestamp for the 10:30 AM ET live execution mode."""
+    return datetime.combine(date(2026, 7, 8), time(10, 30), tzinfo=EASTERN)
 
 
 class FixedDropProvider:
@@ -46,6 +63,38 @@ class FixedDropProvider:
         while cursor <= end:
             bars.append(Bar(timestamp=cursor, open=price, high=price, low=price, close=price, volume=100.0))
             cursor += timedelta(minutes=interval_minutes)
+        return bars
+
+
+class DecliningBarsProvider(FixedDropProvider):
+    """Provider that generates strictly declining intraday bars.
+
+    Bars start at the midpoint between previous close and the final dropped price,
+    declining linearly to the final price. This satisfies the strict downward-trend
+    requirement in `_trend_validated` (last close < first close).
+    """
+
+    def get_intraday_bars(self, ticker, start, end, interval_minutes):
+        drop = self._drops.get(ticker, 0.0)
+        final_price = self._prev * (1.0 - drop)
+        start_price = self._prev * (1.0 - drop * 0.5) if drop > 0 else final_price
+        timestamps = []
+        cursor = start
+        while cursor <= end:
+            timestamps.append(cursor)
+            cursor += timedelta(minutes=interval_minutes)
+        n = len(timestamps)
+        # Interpolate so the bar at end-interval_minutes (the completed-bar anchor
+        # returned by latest_bar_at_or_before) is exactly final_price.  The last
+        # bar (at end) is also set to final_price.
+        anchor_idx = n - 2 if n >= 2 else 0
+        bars = []
+        for i, ts in enumerate(timestamps):
+            if i <= anchor_idx and anchor_idx > 0:
+                price = start_price + (final_price - start_price) * i / anchor_idx
+            else:
+                price = final_price
+            bars.append(Bar(timestamp=ts, open=price, high=price, low=price, close=price, volume=100.0))
         return bars
 
 
@@ -79,30 +128,35 @@ def test_nyse_holidays_shifts_weekend_fixed_dates():
 
 # --- Threshold brackets -----------------------------------------------------
 def test_ladder_brackets():
+    # As of the Jul 10 2026 live-automation update the morning live stream uses
+    # the shared $3-base 0x-to-5x ladder (was 0x-to-3x, now historical).
     ex = MorningDCAExecutor(MorningConfig(base_buy_amount_usd=3.0))
     cases = {
         0.0005: 0.0,   # < 0.1% -> 0x
         0.001: 1.0,    # 0.1%   -> 1x
-        0.019: 1.0,    # < 2%   -> 1x
-        0.020: 1.5,    # 2%     -> 1.5x
-        0.049: 1.5,    # < 5%   -> 1.5x
-        0.050: 2.0,    # 5%     -> 2x
-        0.079: 2.0,    # < 8%   -> 2x
-        0.080: 3.0,    # 8%     -> 3x
-        0.20: 3.0,     # >= 8%  -> 3x (no upper cutoff)
+        0.009: 1.0,    # < 1%   -> 1x
+        0.010: 1.5,    # 1%     -> 1.5x
+        0.020: 2.0,    # 2%     -> 2x
+        0.030: 2.5,    # 3%     -> 2.5x
+        0.040: 3.0,    # 4%     -> 3x
+        0.050: 3.5,    # 5%     -> 3.5x
+        0.060: 4.0,    # 6%     -> 4x
+        0.070: 4.5,    # 7%     -> 4.5x
+        0.080: 5.0,    # 8%     -> 5x
+        0.20: 5.0,     # >= 8%  -> 5x (no upper cutoff)
     }
     for drop, expected in cases.items():
         assert ex.multiplier_for_drop(drop) == expected, (drop, expected)
 
 
-def test_ladder_is_distinct_from_afternoon():
-    # Morning tops out at 3x, afternoon at 5x. An 8% drop must differ.
+def test_ladder_matches_afternoon_live():
+    # All live streams (morning, midday, afternoon) share one 0x-to-5x ladder.
     from near_close_dca import StrategyConfig, graded_buy_multiplier
 
     morning = MorningDCAExecutor(MorningConfig())
-    assert morning.multiplier_for_drop(0.08) == 3.0
+    assert morning.multiplier_for_drop(0.08) == 5.0
     assert graded_buy_multiplier(0.08, StrategyConfig()) == 5.0
-    assert MORNING_SIZING_TIERS != StrategyConfig().sizing_tiers
+    assert MORNING_SIZING_TIERS == StrategyConfig().sizing_tiers
 
 
 def test_signal_amounts_and_actions():
@@ -118,10 +172,10 @@ def test_signal_amounts_and_actions():
     assert sigs["TINY"].action == Action.NO_ACTION  # below prior close but under 0.1% min drop
     assert sigs["TINY"].multiplier == 0.0
     assert sigs["SMALL"].action == Action.BUY
-    assert sigs["SMALL"].multiplier == 1.5
-    assert sigs["SMALL"].hypothetical_amount_usd == 4.5
-    assert sigs["BIG"].multiplier == 3.0
-    assert sigs["BIG"].hypothetical_amount_usd == 9.0
+    assert sigs["SMALL"].multiplier == 2.5  # 3% drop -> 2.5x on the 0x-to-5x ladder
+    assert sigs["SMALL"].hypothetical_amount_usd == 7.5
+    assert sigs["BIG"].multiplier == 5.0  # 10% drop -> 5x
+    assert sigs["BIG"].hypothetical_amount_usd == 15.0
 
 
 class FixedQuoteProvider(FixedDropProvider):
@@ -325,7 +379,7 @@ def test_over_cap_emits_warning(tmp_path):
         morning_run_state_root=str(tmp_path),
     )
     ex = MorningDCAExecutor(cfg)
-    drops = {f"T{i}": 0.10 for i in range(5)}  # each 3x -> $9
+    drops = {f"T{i}": 0.10 for i in range(5)}  # each 5x -> $15
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, drops)
     res = ex.run(_now(), data)
     assert any("exceeds morning daily cap" in w for w in res["artifacts"]["warnings"])
@@ -349,7 +403,7 @@ def test_build_artifacts_does_not_double_count_ledger(tmp_path):
     assert ex.ledger.day_planned(day) == 0.0  # build_artifacts alone never mutates the ledger
 
     ex.run(now, data)
-    assert ex.ledger.day_planned(day) == 9.0  # exactly one run recorded once
+    assert ex.ledger.day_planned(day) == 15.0  # 10% drop -> 5x -> $15, recorded once
 
 
 def test_scheduled_run_skips_artifacts_on_market_holiday(tmp_path):
@@ -417,19 +471,20 @@ def test_run_state_path_and_classification(tmp_path):
 
     rc = res["artifacts"]["run_classification"]
     assert rc["run_origin"] == "scheduled"
-    assert rc["run_type"] == "morning_dca_dry_run"
+    assert rc["run_type"] == "morning_dca_watchlist_scan"
     assert rc["stream"] == "morning"
     assert rc["scheduled_for_et"] == "09:45"
     assert rc["manual_run"] is False
-    assert rc["state_schema_version"] == "run-classification-v1"
+    assert rc["state_schema_version"] == "morning-watchlist-v1"
     assert rc["run_id"] == "morning_20260708_0945ET"
     assert rc["valid_afternoon_evidence"] is False
+    assert rc["trades"] is False
     assert rc["cron_id"] == MORNING_CRON_ID
     assert rc["supersedes_cron_id"] is None
 
-    # Dry-run markers present; no order fields.
+    # Watchlist markers present; no order fields, amounts hypothetical only.
     art = res["artifacts"]
-    assert art["mode"] == "dry_run"
+    assert art["mode"] == "watchlist"
     assert art["trades"] is False
     for row in art["signal_rows"]:
         assert "order_id" not in row
@@ -485,9 +540,116 @@ def test_classification_matches_morning_schema(tmp_path):
     ex = MorningDCAExecutor(cfg)
     rc = ex.run_classification(_now(), manual=False)
     assert required.issubset(rc.keys())
-    # Schema consts we hardcode must line up.
-    assert rc["run_type"] == schema["properties"]["run_type"]["const"]
+    # run_type is now an enum across the two morning modes; stream is a const.
+    assert rc["run_type"] in schema["properties"]["run_type"]["enum"]
     assert rc["stream"] == schema["properties"]["stream"]["const"]
+    # The live-mode classification must also satisfy the shared schema.
+    live_ex = MorningDCAExecutor(cfg, mode="live")
+    live_rc = live_ex.run_classification(_now_live(), manual=False)
+    assert required.issubset(live_rc.keys())
+    assert live_rc["run_type"] in schema["properties"]["run_type"]["enum"]
+
+
+# --- Live (10:30 AM) execution mode -----------------------------------------
+def test_live_mode_path_and_classification(tmp_path):
+    preflight_root = tmp_path / "preflight"
+    preflight_dir = preflight_root / "20260708_0945ET"
+    preflight_dir.mkdir(parents=True)
+    (preflight_dir / "run_state.json").write_text(
+        json.dumps({"eligible_to_execute_tickers": ["SMALL"]}), encoding="utf-8"
+    )
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path),
+        preflight_run_state_root=str(preflight_root),
+    )
+    ex = MorningDCAExecutor(cfg, mode="live")
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data)
+
+    run_state_path = Path(res["paths"]["run_state"])
+    assert run_state_path.parent.name == "20260708_1030ET"
+
+    rc = res["artifacts"]["run_classification"]
+    assert rc["run_origin"] == "scheduled"
+    assert rc["run_type"] == "morning_dca_live"
+    assert rc["stream"] == "morning"
+    assert rc["trades"] is True
+    assert rc["scheduled_for_et"] == "10:30"
+    assert rc["scheduled_window_start_et"] == "10:25"
+    assert rc["scheduled_window_end_et"] == "10:35"
+    assert rc["state_schema_version"] == "morning-live-v1"
+    assert rc["run_id"] == "morning_live_20260708_1030ET"
+    assert rc["cron_id"] == MORNING_LIVE_CRON_ID
+    assert rc["valid_afternoon_evidence"] is False
+
+    art = res["artifacts"]
+    assert art["mode"] == "live"
+    assert art["trades"] is True
+
+
+def test_live_confidence_rule_auto_buys_with_validated_trend():
+    # A full 60-minute window of declining 5-minute bars (>= trend_min_bars) validates
+    # the strict downward intraday trend, so a qualifying candidate is auto_buy_eligible.
+    cfg = MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0)
+    ex = MorningDCAExecutor(cfg, mode="live")
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+    sig = ex.evaluate(_now_live(), data, manual=True)[0]
+    assert sig.action == Action.BUY
+    assert sig.trend_validated is True
+    assert sig.execution_status == EXEC_AUTO_BUY_ELIGIBLE
+
+
+class FewBarsProvider(FixedDropProvider):
+    """Provider that supplies only a couple of intraday bars near the anchor."""
+
+    def get_intraday_bars(self, ticker, start, end, interval_minutes):
+        price = self._prev * (1.0 - self._drops.get(ticker, 0.0))
+        # Two completed bars ending at the completed-bar anchor (end - one
+        # interval), so current_price resolves but the trend window is too thin.
+        anchor = end - timedelta(minutes=interval_minutes)
+        return [
+            Bar(timestamp=anchor - timedelta(minutes=interval_minutes),
+                open=price, high=price, low=price, close=price, volume=100.0),
+            Bar(timestamp=anchor, open=price, high=price, low=price, close=price, volume=100.0),
+        ]
+
+
+def test_live_confidence_rule_withholds_when_trend_unvalidated(tmp_path):
+    # Price/drop passes, but too few intraday bars means the trend cannot be
+    # validated -> the candidate is a manual_review_candidate, NOT auto-bought.
+    cfg = MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0,
+                        morning_run_state_root=str(tmp_path))
+    ex = MorningDCAExecutor(cfg, mode="live")
+    data = FewBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+
+    sig = ex.evaluate(_now_live(), data, manual=True)[0]
+    assert sig.action == Action.BUY
+    assert sig.trend_validated is False
+    assert sig.execution_status == EXEC_MANUAL_REVIEW_CANDIDATE
+
+    res = ex.run(_now_live(), data, manual=True)
+    art = res["artifacts"]
+    assert art["counts"]["manual_review_candidates"] == 1
+    assert art["manual_review_tickers"] == ["BIG"]
+
+
+def test_watchlist_mode_never_sets_execution_status():
+    # The read-only watchlist scan never runs the trend gate; rows carry no
+    # execution_status / trend_validated at all.
+    cfg = MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0)
+    ex = MorningDCAExecutor(cfg)  # default watchlist mode
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+    sig = ex.evaluate(_now(), data)[0]
+    assert sig.execution_status is None
+    assert sig.trend_validated is None
+    assert "execution_status" not in sig.to_row()
+
+
+def test_live_and_watchlist_roots_are_distinct():
+    assert DEFAULT_MORNING_WATCHLIST_STATE_ROOT != DEFAULT_MORNING_LIVE_STATE_ROOT
+    assert DEFAULT_MORNING_STATE_ROOT == DEFAULT_MORNING_WATCHLIST_STATE_ROOT
+    assert "ce16ba6b" not in DEFAULT_MORNING_LIVE_STATE_ROOT
 
 
 # --- No interaction with afternoon scheduled evidence -----------------------
@@ -664,6 +826,292 @@ def test_morning_executor_default_init_loads_config_file():
     ex = MorningDCAExecutor()
     assert ex.config.base_buy_amount_usd == 3.0
     assert ex.config.morning_daily_cap_usd == 90.0
+
+
+def test_classifications_validate_against_json_schema():
+    """Both morning classifications must validate against the JSON schema.
+
+    Skipped gracefully when jsonschema is not installed so the stdlib-only
+    smoke run still passes.
+    """
+    try:
+        import jsonschema
+    except ImportError:
+        return
+
+    schema_path = Path(__file__).resolve().parent / "schemas" / "morning_run_classification.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    cfg = MorningConfig(tickers=("SMALL",))
+
+    watch = MorningDCAExecutor(cfg).run_classification(_now(), manual=False)
+    live = MorningDCAExecutor(cfg, mode="live").run_classification(_now_live(), manual=False)
+    manual = MorningDCAExecutor(cfg, mode="live").run_classification(_now_live(), manual=True)
+    for rc in (watch, live, manual):
+        jsonschema.validate(rc, schema)
+
+
+def test_morning_scheduled_run_counts_as_afternoon_prior_context():
+    """A morning-stream scheduled run must be eligible prior-allocation context.
+
+    _prior_run_is_scheduled excludes only the AFTERNOON scheduled run; a morning
+    run (stream='morning') is scheduled within its own stream but must still be
+    read as prior context for the afternoon same-day top-up guard.
+    """
+    from near_close_dca import _prior_run_is_scheduled
+
+    cfg = MorningConfig(tickers=("SMALL",))
+    morning_rc = MorningDCAExecutor(cfg, mode="live").run_classification(_now_live(), manual=False)
+    assert morning_rc["run_origin"] == "scheduled"
+    assert _prior_run_is_scheduled({"run_classification": morning_rc}) is False
+
+    # An afternoon scheduled run (no morning stream marker) is still excluded.
+    afternoon_rc = {"run_origin": "scheduled", "cron_id": "10ce362c"}
+    assert _prior_run_is_scheduled({"run_classification": afternoon_rc}) is True
+
+
+# --- 9:45 pre-flight validation + 10:30 live gate ---------------------------
+def _now_preflight():
+    """Decision timestamp for the 9:45 AM ET pre-flight validation mode."""
+    return datetime.combine(date(2026, 7, 8), time(9, 45), tzinfo=EASTERN)
+
+
+def test_preflight_eligibility_helper():
+    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG", "FLAT")), mode=MORNING_PREFLIGHT_MODE)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.03, "FLAT": 0.0})
+    sigs = {s.ticker: s for s in ex.evaluate(_now_preflight(), data)}
+    # BIG dropped 3% -> BUY with positive multiplier -> eligible.
+    assert preflight_eligibility(sigs["BIG"]) is True
+    # FLAT is at prior close -> no buy -> not eligible.
+    assert preflight_eligibility(sigs["FLAT"]) is False
+
+
+def test_preflight_run_writes_validation_and_summary_and_pointer(tmp_path):
+    cfg = MorningConfig(tickers=("BIG", "FLAT"), morning_run_state_root=str(tmp_path))
+    ex = MorningDCAExecutor(cfg, mode=MORNING_PREFLIGHT_MODE)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.03, "FLAT": 0.0})
+    res = ex.run(_now_preflight(), data)
+
+    art = res["artifacts"]
+    assert art["mode"] == "preflight"
+    assert art["trades"] is False
+    assert art["run_classification"]["run_type"] == "morning_dca_preflight"
+    assert art["run_classification"]["state_schema_version"] == "morning-preflight-v1"
+    assert art["eligible_to_execute_tickers"] == ["BIG"]
+    assert art["counts"]["eligible_to_execute"] == 1
+    # Every signal row carries the per-ticker verdict.
+    verdicts = {r["ticker"]: r["eligible_to_execute"] for r in art["signal_rows"]}
+    assert verdicts == {"BIG": True, "FLAT": False}
+
+    run_dir = Path(res["paths"]["run_state"]).parent
+    assert run_dir.name == "20260708_0945ET"
+    assert (run_dir / "validation.csv").exists()
+    assert (run_dir / "run_summary.json").exists()
+    # Scheduled pre-flight advances the preflight-specific pointer only.
+    assert (Path(tmp_path) / "latest_preflight.json").exists()
+    assert not (Path(tmp_path) / "latest_morning_run.json").exists()
+
+
+def test_load_same_day_preflight_reads_eligible_set(tmp_path):
+    cfg = MorningConfig(tickers=("BIG", "FLAT"), morning_run_state_root=str(tmp_path))
+    ex = MorningDCAExecutor(cfg, mode=MORNING_PREFLIGHT_MODE)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.03, "FLAT": 0.0})
+    ex.run(_now_preflight(), data)
+
+    loaded = load_same_day_preflight(str(tmp_path), date(2026, 7, 8))
+    assert loaded is not None
+    assert loaded["eligible_tickers"] == {"BIG"}
+    # No artifact for a different day.
+    assert load_same_day_preflight(str(tmp_path), date(2026, 7, 9)) is None
+
+
+def test_live_gate_restricts_to_preflight_eligible(tmp_path):
+    preflight_root = tmp_path / "preflight"
+    pf = MorningDCAExecutor(
+        MorningConfig(tickers=("BIG", "FLAT"), morning_run_state_root=str(preflight_root)),
+        mode=MORNING_PREFLIGHT_MODE,
+    )
+    pf_data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.03, "FLAT": 0.0})
+    pf.run(_now_preflight(), pf_data)
+
+    live = MorningDCAExecutor(
+        MorningConfig(
+            tickers=("BIG", "FLAT"),
+            morning_run_state_root=str(tmp_path / "live"),
+            preflight_run_state_root=str(preflight_root),
+        ),
+        mode=MORNING_LIVE_MODE,
+    )
+    live_data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10, "FLAT": 0.10})
+    res = live.run(_now_live(), live_data)
+    art = res["artifacts"]
+    # Only BIG was admitted; FLAT (ineligible at 9:45) is gated out even though it
+    # would have qualified at 10:30.
+    gate = art["preflight_gate"]
+    assert gate["preflight_found"] is True
+    assert gate["admitted_tickers"] == ["BIG"]
+    assert gate["gated_out_tickers"] == ["FLAT"]
+    evaluated = {r["ticker"] for r in art["signal_rows"]}
+    assert evaluated == {"BIG"}
+
+
+def test_live_gate_fails_closed_when_preflight_missing_scheduled(tmp_path):
+    # Scheduled live runs must block (fail-closed) when no preflight artifact exists.
+    import pytest
+    live = MorningDCAExecutor(
+        MorningConfig(
+            tickers=("BIG", "FLAT"),
+            morning_run_state_root=str(tmp_path / "live"),
+            preflight_run_state_root=str(tmp_path / "empty_preflight"),
+        ),
+        mode=MORNING_LIVE_MODE,
+    )
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10, "FLAT": 0.10})
+    with pytest.raises(RuntimeError, match="scheduled live run blocked"):
+        live.run(_now_live(), data)
+
+
+def test_live_gate_degrades_to_full_universe_when_preflight_missing_manual(tmp_path):
+    # Manual live runs degrade to the full universe with a warning when no preflight exists.
+    live = MorningDCAExecutor(
+        MorningConfig(
+            tickers=("BIG", "FLAT"),
+            morning_run_state_root=str(tmp_path / "live"),
+            preflight_run_state_root=str(tmp_path / "empty_preflight"),
+        ),
+        mode=MORNING_LIVE_MODE,
+    )
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10, "FLAT": 0.10})
+    res = live.run(_now_live(), data, manual=True)
+    art = res["artifacts"]
+    assert art["preflight_gate"]["preflight_found"] is False
+    evaluated = {r["ticker"] for r in art["signal_rows"]}
+    assert evaluated == {"BIG", "FLAT"}
+    assert any("no same-day 9:45 pre-flight" in w for w in art["warnings"])
+
+
+def test_preflight_classification_matches_morning_schema():
+    schema_path = Path(__file__).resolve().parent / "schemas" / "morning_run_classification.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    cfg = MorningConfig(tickers=("BIG",))
+    rc = MorningDCAExecutor(cfg, mode=MORNING_PREFLIGHT_MODE).run_classification(
+        _now_preflight(), manual=False
+    )
+    assert rc["run_type"] == "morning_dca_preflight"
+    assert rc["cron_id"] == "morning-dca-0945"
+    assert rc["state_schema_version"] == "morning-preflight-v1"
+    assert rc["run_id"] == "morning_preflight_20260708_0945ET"
+    assert set(schema["required"]).issubset(rc.keys())
+    try:
+        import jsonschema
+    except ImportError:
+        return
+    jsonschema.validate(rc, schema)
+    manual_rc = MorningDCAExecutor(cfg, mode=MORNING_PREFLIGHT_MODE).run_classification(
+        _now_preflight(), manual=True
+    )
+    jsonschema.validate(manual_rc, schema)
+
+
+def test_preflight_root_distinct_from_watchlist_and_live():
+    assert DEFAULT_MORNING_PREFLIGHT_STATE_ROOT != DEFAULT_MORNING_LIVE_STATE_ROOT
+    assert DEFAULT_MORNING_PREFLIGHT_STATE_ROOT != DEFAULT_MORNING_WATCHLIST_STATE_ROOT
+    assert "morning_dca_preflight" in DEFAULT_MORNING_PREFLIGHT_STATE_ROOT
+
+
+def _seed_preflight(tmp_path, tickers, trading_date=None):
+    """Write a preflight run_state.json for the given tickers into tmp_path."""
+    if trading_date is None:
+        trading_date = _now_live().date()
+    folder = trading_date.strftime("%Y%m%d") + "_0945ET"
+    pf_dir = tmp_path / folder
+    pf_dir.mkdir(parents=True, exist_ok=True)
+    (pf_dir / "run_state.json").write_text(
+        json.dumps({"eligible_to_execute_tickers": list(tickers)}),
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def test_live_gate_blocks_outside_approved_window(tmp_path):
+    # A scheduled live run on a day outside approved_test_dates returns a blocked result.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 7)}),  # not 2026-07-08 (_now_live())
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data, manual=False)
+    assert res["artifacts"]["status"] == "blocked"
+    assert res["artifacts"].get("block_reason") == "outside approved trading window"
+
+
+def test_live_gate_permits_when_in_approved_window(tmp_path):
+    # A scheduled live run on a day inside approved_test_dates is not date-gated.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),  # matches _now_live()
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data, manual=False)
+    assert res["artifacts"].get("status") != "blocked"
+
+
+def test_live_gate_manual_bypasses_approved_window(tmp_path):
+    # Manual runs are never blocked by the approved_test_dates gate.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 7)}),  # not today
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data, manual=True)
+    assert res["artifacts"].get("status") != "blocked"
+
+
+def test_auto_buy_candidates_prioritized_by_multiplier_when_cap_hit(tmp_path):
+    # When the daily cap is tight, higher-multiplier tickers are placed first.
+    # BIGDROP: 8% drop -> 5x -> $15 notional. SMALLDROP: 1% drop -> 1.5x -> $4.50 notional.
+    # Daily cap of $16 allows BIGDROP ($15 < $16) then blocks SMALLDROP ($15+$4.50 > $16).
+    # The sort ensures the high-multiplier ticker gets the budget slot, not whichever
+    # happened to be evaluated first.
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+    class _FakeLiveBroker:
+        """Returns real-looking order IDs so submitted_today accumulates."""
+        def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+        def available_buying_power(self): return 500.0
+        def same_day_strategy_order_exists(self, ticker, trading_day): return False
+        def is_tradable_for_fractional_buy(self, ticker): return True
+        def review_market_buy(self, ticker, notional_usd): return True, "ok"
+        def place_market_buy(self, ticker, notional_usd, ref_id): return f"ORDER-{ticker}"
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("BIGDROP", "SMALLDROP"))
+    cfg = MorningConfig(
+        tickers=("BIGDROP", "SMALLDROP"),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        morning_daily_cap_usd=16.0,
+        morning_weekly_cap_usd=500.0,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    # BIGDROP: 8% drop -> 5x multiplier -> $15. SMALLDROP: 1% drop -> 1.5x -> $4.50.
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIGDROP": 0.08, "SMALLDROP": 0.01})
+    res = ex.run(_now_live(), data, broker=_FakeLiveBroker())
+    broker_outcomes = res["artifacts"].get("broker_outcomes", {})
+    assert broker_outcomes.get("BIGDROP", {}).get("status") == "submitted", "BIGDROP (5x) should be placed first"
+    assert broker_outcomes.get("SMALLDROP", {}).get("status") == "cap_exceeded", "SMALLDROP (1.5x) should be cap-gated out"
+
 
 if __name__ == "__main__":
     import sys

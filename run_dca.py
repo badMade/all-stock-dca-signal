@@ -33,6 +33,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from dca_config import DEFAULT_CONFIG_DIR, load_strategy_config
+from midday_dca import DEFAULT_MIDDAY_LIVE_STATE_ROOT
+from morning_dca import DEFAULT_MORNING_LIVE_STATE_ROOT
 from near_close_dca import (
     EASTERN,
     Bar,
@@ -44,10 +46,22 @@ from near_close_dca import (
     StrategyState,
     build_broker,
     load_prior_same_day_allocations,
+    load_prior_same_day_allocations_multi,
     run_daily_compact,
 )
 
 logger = logging.getLogger("near_close_dca.run")
+
+# Sibling stream roots the scheduled afternoon top-up guard folds in as prior
+# same-day allocation context (in addition to its own task root): the morning and
+# midday live roots, the latter of which also holds manual override reruns under
+# ``manual_reruns/``. Absent roots contribute nothing, so this is safe on days a
+# stream did not run. These are prior-allocation context ONLY -- never scheduled
+# afternoon evidence, slippage, reliability, fill counts, or cost basis.
+_CROSS_STREAM_PRIOR_ALLOCATION_ROOTS: Tuple[str, ...] = (
+    DEFAULT_MORNING_LIVE_STATE_ROOT,
+    DEFAULT_MIDDAY_LIVE_STATE_ROOT,
+)
 
 
 def configure_logging(level: str = "INFO") -> None:
@@ -199,12 +213,54 @@ def run_pipeline(
     caller must pass the real cron_tracking root explicitly to enable it.
     """
     if scheduled and prior_same_day_allocations is None:
-        if prior_allocation_state_root is None:
-            prior_allocation_state_root = _default_prior_allocation_state_root(Path(artifacts_dir))
         trading_day = now.astimezone(EASTERN).date()
-        prior_same_day_allocations = load_prior_same_day_allocations(
-            prior_allocation_state_root, trading_day
-        )
+        if prior_allocation_state_root is None:
+            # Auto-derive the afternoon task root and fold in the sibling morning/
+            # midday stream roots (incl. manual override reruns), so morning,
+            # midday, and manual override same-day fills all offset the afternoon
+            # buy. An explicit prior_allocation_state_root overrides this and scans
+            # only the tree the caller named.
+            afternoon_root = _default_prior_allocation_state_root(Path(artifacts_dir))
+            cron_base = afternoon_root.parent
+            cross_stream_roots = tuple(
+                cron_base / Path(r).name for r in _CROSS_STREAM_PRIOR_ALLOCATION_ROOTS
+            )
+            # All roots are capped at the actual run time so replayed/backfilled
+            # runs never load fills created after the scheduled execution window.
+            # The current run's own artifact is excluded by classification
+            # (run_origin != "scheduled" or stream mismatch) not by time, so
+            # passing `now` here is safe and captures late manual fills (e.g.
+            # a 15:05 manual override under ce16ba6b/manual_runs).
+            prior_same_day_allocations = load_prior_same_day_allocations_multi(
+                (afternoon_root,), trading_day,
+                boundary_et=now.astimezone(EASTERN).time(),
+            )
+            cross_stream_allocs = load_prior_same_day_allocations_multi(
+                cross_stream_roots, trading_day,
+                boundary_et=now.astimezone(EASTERN).time(),
+            )
+            for ticker, alloc in cross_stream_allocs.items():
+                existing = prior_same_day_allocations.get(ticker)
+                if existing is None:
+                    prior_same_day_allocations[ticker] = alloc
+                else:
+                    ref = (
+                        None
+                        if existing.reference_price is None or alloc.reference_price is None
+                        else min(existing.reference_price, alloc.reference_price)
+                    )
+                    prior_same_day_allocations[ticker] = PriorSameDayAllocation(
+                        ticker=ticker,
+                        amount_usd=existing.amount_usd + alloc.amount_usd,
+                        reference_price=ref,
+                        run_id=alloc.run_id or existing.run_id,
+                        source=alloc.source or existing.source,
+                    )
+        else:
+            prior_same_day_allocations = load_prior_same_day_allocations(
+                prior_allocation_state_root, trading_day,
+                boundary_et=now.astimezone(EASTERN).time(),
+            )
     if deployment_history_root is None:
         deployment_history_root = Path(artifacts_dir).parent
     result = run_daily_compact(
