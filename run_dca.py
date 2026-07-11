@@ -285,17 +285,20 @@ def run_pipeline(
                         shutil.rmtree(raw_dir, ignore_errors=True)
                     out = Path(artifacts_dir)
                     out.mkdir(parents=True, exist_ok=True)
-                    # Remove stale compact artifacts from any prior attempt so
-                    # they are not mistaken for this failed run's output.
+                    # Remove stale compact and report artifacts from any prior
+                    # attempt so they are not mistaken for this failed run's output.
                     for _stale in (
                         "signals.csv", "buy_candidates.csv", "orders.csv",
                         "latest_run_summary.json", "slippage_and_coverage_report.md",
+                        "slippage_ranked.csv", "missing_fills_report.csv",
+                        "notion_latest_run_compact.md", "notion_latest_run_payload.json",
                     ):
                         (out / _stale).unlink(missing_ok=True)
                     failure_state = raw_persistence_failure_run_state(
                         trading_day_raw,
                         str(exc),
                         raw_dir=raw_dir,
+                        broker=config.broker.value,
                         triggered_at_utc=now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                         generated_at=now.astimezone(EASTERN).strftime("%Y-%m-%dT%H:%M:%S"),
                         budget={

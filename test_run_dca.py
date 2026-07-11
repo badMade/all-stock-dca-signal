@@ -256,8 +256,14 @@ def test_run_pipeline_raw_persistence_failure_clears_stale_compact_artifacts(tmp
     config = _demo_config()
     scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
     scheduled_dir.mkdir(parents=True)
-    # Seed stale compact artifacts from a prior (successful) attempt.
-    for stale in ("orders.csv", "signals.csv", "buy_candidates.csv", "latest_run_summary.json"):
+    # Seed stale compact + derived-report artifacts from a prior successful attempt.
+    stale_files = (
+        "orders.csv", "signals.csv", "buy_candidates.csv",
+        "latest_run_summary.json", "slippage_and_coverage_report.md",
+        "slippage_ranked.csv", "missing_fills_report.csv",
+        "notion_latest_run_compact.md", "notion_latest_run_payload.json",
+    )
+    for stale in stale_files:
         (scheduled_dir / stale).write_text("stale", encoding="utf-8")
 
     result = run_pipeline(
@@ -267,11 +273,12 @@ def test_run_pipeline_raw_persistence_failure_clears_stale_compact_artifacts(tmp
         raw_connector_inputs={"quotes_batch1.json": ExplodingPayload()},
     )
     assert "raw_persistence_error" in result
-    for stale in ("orders.csv", "signals.csv", "buy_candidates.csv", "latest_run_summary.json"):
+    for stale in stale_files:
         assert not (scheduled_dir / stale).exists(), f"{stale} was not removed"
     with open(result["run_state_path"], encoding="utf-8") as handle:
         run_state = json.load(handle)
     assert run_state["order_submit_status"] == "not_submitted_error"
+    assert run_state["broker"] == "robinhood"
 
 
 def test_run_pipeline_live_run_missing_raw_inputs_writes_error_state(tmp_path):
