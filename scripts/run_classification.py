@@ -284,7 +284,9 @@ def normalize_connector_payload(
     result: Dict[str, object] = dict(payload)
     pointer = result.get("output_path")
     if not (read_pointer and isinstance(pointer, str) and pointer):
-        result.setdefault("normalized", False)
+        if isinstance(pointer, str) and pointer:
+            # Has an output_path but caller asked not to resolve it — flag as not normalized.
+            result.setdefault("normalized", False)
         return result
 
     path = Path(pointer)
