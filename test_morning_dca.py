@@ -98,6 +98,30 @@ class DecliningBarsProvider(FixedDropProvider):
         return bars
 
 
+class FakeLiveBroker:
+    """Minimal successful broker for scheduled live tests."""
+
+    def account_number(self):
+        from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+    def available_buying_power(self):
+        return 500.0
+
+    def same_day_strategy_order_exists(self, ticker, trading_day):
+        return False
+
+    def is_tradable_for_fractional_buy(self, ticker):
+        return True
+
+    def review_market_buy(self, ticker, notional_usd):
+        return True, "ok"
+
+    def place_market_buy(self, ticker, notional_usd, ref_id):
+        return f"ORDER-{ticker}"
+
+
 def _now():
     return datetime.combine(date(2026, 7, 8), time(9, 45), tzinfo=EASTERN)
 
@@ -942,7 +966,7 @@ def test_live_gate_restricts_to_preflight_eligible(tmp_path):
         mode=MORNING_LIVE_MODE,
     )
     live_data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10, "FLAT": 0.10})
-    res = live.run(_now_live(), live_data)
+    res = live.run(_now_live(), live_data, broker=FakeLiveBroker())
     art = res["artifacts"]
     # Only BIG was admitted; FLAT (ineligible at 9:45) is gated out even though it
     # would have qualified at 10:30.
@@ -1059,7 +1083,7 @@ def test_live_gate_permits_when_in_approved_window(tmp_path):
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
-    res = ex.run(_now_live(), data, manual=False)
+    res = ex.run(_now_live(), data, manual=False, broker=FakeLiveBroker())
     assert res["artifacts"].get("status") != "blocked"
 
 
@@ -1076,6 +1100,65 @@ def test_live_gate_manual_bypasses_approved_window(tmp_path):
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
     res = ex.run(_now_live(), data, manual=True)
     assert res["artifacts"].get("status") != "blocked"
+
+
+def test_scheduled_live_run_without_broker_fails_closed(tmp_path):
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    res = ex.run(_now_live(), data, broker=None)
+
+    assert res["artifacts"]["status"] == "blocked"
+    assert res["artifacts"]["block_reason"] == "missing broker adapter for scheduled live execution"
+    assert res["artifacts"]["trades"] is True
+    assert res["artifacts"]["broker_outcomes"] == {}
+    written = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
+    assert written["status"] == "blocked"
+    assert written["run_classification"]["run_type"] == "morning_dca_live"
+
+
+def test_scheduled_live_run_with_wrong_broker_account_fails_closed_before_ordering(tmp_path):
+    class _WrongAccountBroker:
+        def __init__(self):
+            self.placed = False
+
+        def account_number(self):
+            return "not-the-approved-account"
+
+        def available_buying_power(self):
+            raise AssertionError("buying power should not be checked for wrong account")
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.placed = True
+            raise AssertionError("orders must not be placed for wrong account")
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        target_account_number="562057042",
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    broker = _WrongAccountBroker()
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    res = ex.run(_now_live(), data, broker=broker)
+
+    assert res["artifacts"]["status"] == "blocked"
+    assert res["artifacts"]["block_reason"] == (
+        "broker account mismatch: expected 562057042, got not-the-approved-account"
+    )
+    assert broker.placed is False
+    assert Path(res["paths"]["run_state"]).exists()
 
 
 def test_auto_buy_candidates_prioritized_by_multiplier_when_cap_hit(tmp_path):

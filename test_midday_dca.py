@@ -45,6 +45,30 @@ def _now_midday():
     return datetime.combine(date(2026, 7, 8), time(12, 30), tzinfo=EASTERN)
 
 
+class FakeLiveBroker:
+    """Minimal successful broker for scheduled midday live tests."""
+
+    def account_number(self):
+        from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+    def available_buying_power(self):
+        return 500.0
+
+    def same_day_strategy_order_exists(self, ticker, trading_day):
+        return False
+
+    def is_tradable_for_fractional_buy(self, ticker):
+        return True
+
+    def review_market_buy(self, ticker, notional_usd):
+        return True, "ok"
+
+    def place_market_buy(self, ticker, notional_usd, ref_id):
+        return f"ORDER-{ticker}"
+
+
 class FixedDropProvider:
     """Deterministic provider: each ticker drops a fixed fraction vs. prior close."""
 
@@ -180,7 +204,7 @@ def test_midday_run_state_path_and_classification(tmp_path):
     cfg = MiddayConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
     ex = MiddayDCAExecutor(cfg)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
-    res = ex.run(_now_midday(), data)
+    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
 
     run_state_path = Path(res["paths"]["run_state"])
     assert run_state_path.parent.name == "20260708_1230ET"
@@ -258,7 +282,7 @@ def test_midday_confidence_rule_withholds_when_trend_unvalidated(tmp_path):
     assert sig.trend_validated is False
     assert sig.execution_status == EXEC_MANUAL_REVIEW_CANDIDATE
 
-    res = ex.run(_now_midday(), data)
+    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
     art = res["artifacts"]
     assert art["counts"]["manual_review_candidates"] == 1
     assert art["manual_review_tickers"] == ["BIG"]
@@ -274,7 +298,7 @@ def test_top_up_no_prior_buys_full_amount(tmp_path):
     )
     ex = MiddayDCAExecutor(cfg)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
-    res = ex.run(_now_midday(), data)
+    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
     row = res["artifacts"]["buy_candidates"][0]
     assert row["top_up_guard_result"] == TOP_UP_NO_PRIOR_RUN
     assert row["incremental_order_amount"] == 15.0
@@ -298,7 +322,7 @@ def test_top_up_incremental_when_price_below_prior(tmp_path):
     ex = MiddayDCAExecutor(cfg)
     # Midday price 90.0 is strictly below the 95.0 morning reference.
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
-    res = ex.run(_now_midday(), data)
+    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
     row = res["artifacts"]["buy_candidates"][0]
     assert row["top_up_guard_result"] == TOP_UP_INCREMENTAL
     assert row["prior_same_day_amount"] == 3.0
@@ -324,7 +348,7 @@ def test_top_up_zero_when_price_not_below_prior(tmp_path):
     )
     ex = MiddayDCAExecutor(cfg)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
-    res = ex.run(_now_midday(), data)
+    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
     row = res["artifacts"]["buy_candidates"][0]
     assert row["top_up_guard_result"] == TOP_UP_PRICE_NOT_BELOW
     assert row["incremental_order_amount"] == 0.0
@@ -345,7 +369,7 @@ def test_top_up_manual_review_when_prior_price_unknown(tmp_path):
     )
     ex = MiddayDCAExecutor(cfg)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
-    res = ex.run(_now_midday(), data)
+    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
     row = res["artifacts"]["buy_candidates"][0]
     assert row["top_up_guard_result"] == TOP_UP_MISSING_PRIOR_PRICE
     assert row["incremental_order_amount"] == 0.0
@@ -372,7 +396,7 @@ def test_midday_does_not_write_afternoon_or_morning_artifacts(tmp_path):
                        prior_allocation_roots=(str(tmp_path / "nonexistent_morning"),))
     ex = MiddayDCAExecutor(cfg)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
-    res = ex.run(_now_midday(), data)
+    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
 
     assert latest.read_text(encoding="utf-8") == before
     assert list(afternoon_root.rglob("run_state*.json")) == []
@@ -442,7 +466,7 @@ def test_midday_ledger_namespace_isolated_from_morning_and_afternoon(tmp_path):
     ex = MiddayDCAExecutor(cfg)
     assert ex.ledger.namespace == "midday"
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
-    ex.run(_now_midday(), data)
+    ex.run(_now_midday(), data, broker=FakeLiveBroker())
     assert afternoon.day_notional(day) == 0.0
     assert ex.ledger.day_planned(day) > 0.0
 
