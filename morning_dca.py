@@ -593,7 +593,7 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
             cb = budgets_raw.get("circuit_breakers", {})
             if "max_per_order_usd" in cb:
                 max_order = float(cb["max_per_order_usd"])
-                if max_order > 0:
+                if math.isfinite(max_order) and max_order > 0:
                     kwargs["max_per_order_usd"] = max_order
         except (json.JSONDecodeError, OSError, ValueError):
             pass  # fall back to MorningConfig default

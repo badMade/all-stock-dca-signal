@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import dataclass
 from datetime import time
 from pathlib import Path
@@ -219,7 +220,7 @@ def load_midday_config(config_dir=None) -> MiddayConfig:
             cb = budgets_raw.get("circuit_breakers", {})
             if "max_per_order_usd" in cb:
                 max_order = float(cb["max_per_order_usd"])
-                if max_order > 0:
+                if math.isfinite(max_order) and max_order > 0:
                     kwargs["max_per_order_usd"] = max_order
         except (json.JSONDecodeError, OSError, ValueError):
             pass  # fall back to MiddayConfig default
