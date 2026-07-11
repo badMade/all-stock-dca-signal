@@ -1176,9 +1176,9 @@ def test_load_prior_same_day_reads_manual_override_filled_orders_csv(tmp_path):
             handle,
         )
     with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
-        handle.write("ticker,status,avg_fill_price\nAMZN,filled,242.1099\n")
+        handle.write("ticker,amount_usd,avg_fill_price\nAMZN,2.5,242.1099\n")
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
-    assert allocations["AMZN"].amount_usd == 3.0
+    assert allocations["AMZN"].amount_usd == 2.5
     assert allocations["AMZN"].reference_price == 242.1099
     assert allocations["AMZN"].source == "manual"
 

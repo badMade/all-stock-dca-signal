@@ -1714,7 +1714,11 @@ def _orders_csv_fills(
         with orders_csv.open(newline="", encoding="utf-8") as handle:
             for row in csv.DictReader(handle):
                 ticker = row.get("ticker")
-                if not ticker or (row.get("status") or "").lower() != "filled":
+                if not ticker:
+                    continue
+                status = (row.get("status") or "").lower()
+                is_manual_fill_file = orders_csv.name == "filled_orders.csv"
+                if status != "filled" and not (is_manual_fill_file and not status):
                     continue
                 raw_price = row.get("avg_fill_price")
                 try:
@@ -1728,10 +1732,16 @@ def _orders_csv_fills(
                     qty = float(raw_qty) if raw_qty not in (None, "", "-") else None
                 except (TypeError, ValueError):
                     qty = None
+                raw_amount = row.get("amount_usd")
+                try:
+                    amount = float(raw_amount) if raw_amount not in (None, "", "-") else None
+                except (TypeError, ValueError):
+                    amount = None
                 fills[ticker] = {
                     "order_id": row.get("order_id"),
                     "avg_fill_price": price,
                     "quantity_filled": qty if qty and qty > 0 else None,
+                    "amount_usd": amount if amount and amount > 0 else None,
                 }
     except Exception:
         return fills
@@ -1853,7 +1863,9 @@ def load_prior_same_day_allocations(
                         # Filled rows for a ticker win over submitted rows for the same ticker.
                         _csv_tickers: Dict[str, tuple] = {}  # ticker -> (amount, ref_price)
                         for _ticker, _fill in report_fills.items():
-                            if _fill["quantity_filled"]:
+                            if _fill.get("amount_usd"):
+                                _csv_tickers[_ticker] = (_fill["amount_usd"], _fill["avg_fill_price"])
+                            elif _fill["quantity_filled"]:
                                 _csv_tickers[_ticker] = (
                                     _fill["avg_fill_price"] * _fill["quantity_filled"],
                                     _fill["avg_fill_price"],
@@ -1909,7 +1921,11 @@ def load_prior_same_day_allocations(
                 amount = float(amount)
             except (TypeError, ValueError):
                 continue
-            if fill is not None and fill["quantity_filled"]:
+            if fill is not None and fill.get("amount_usd"):
+                # Prefer the actual filled notional over the planned amount so a
+                # manual override or partial fill doesn't overstate prior allocation.
+                amount = fill["amount_usd"]
+            elif fill is not None and fill["quantity_filled"]:
                 # Prefer the actual filled notional over the planned amount so a
                 # partial fill doesn't overstate prior allocation.
                 amount = fill["avg_fill_price"] * fill["quantity_filled"]
