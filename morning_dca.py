@@ -59,6 +59,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from dca_config import load_approved_dates
 from near_close_dca import (
     ACTIVE_TICKERS,
     EASTERN,
@@ -531,15 +532,21 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
         _log.warning(
             "morning_dca.json not found at %s; using MorningConfig defaults", cfg_path
         )
-        return MorningConfig()
+        return MorningConfig(
+            approved_test_dates=load_approved_dates(config_dir_path).get("approved_test_dates", frozenset())
+        )
+
+    approved_date_overrides = {
+        "approved_test_dates": load_approved_dates(config_dir_path).get("approved_test_dates", frozenset())
+    }
 
     try:
         raw = json.loads(cfg_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
         _log.warning("could not parse %s (%s); using MorningConfig defaults", cfg_path, exc)
-        return MorningConfig()
+        return MorningConfig(**approved_date_overrides)
 
-    kwargs = {}
+    kwargs = dict(approved_date_overrides)
 
     sizing = raw.get("sizing_ladder", {})
     if "base_amount_usd" in sizing:

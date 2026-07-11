@@ -849,6 +849,23 @@ def test_load_morning_config_reads_config_file(tmp_path):
     assert cfg.morning_run_state_root == "/custom/morning/root"
 
 
+
+def test_load_morning_config_reads_approved_dates_from_trading_window(tmp_path):
+    from morning_dca import load_morning_config
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "morning_dca.json").write_text("{}", encoding="utf-8")
+    (cfg_dir / "trading_window.json").write_text(
+        json.dumps({"start_date": "2026-07-02", "end_date": "2026-07-06", "weekdays_only": True}),
+        encoding="utf-8",
+    )
+
+    cfg = load_morning_config(str(cfg_dir))
+
+    assert cfg.approved_test_dates == frozenset({date(2026, 7, 2), date(2026, 7, 3), date(2026, 7, 6)})
+    assert cfg.decision_time_et is None
+
 def test_load_morning_config_falls_back_to_defaults_if_missing(tmp_path):
     """load_morning_config gracefully falls back when file is absent."""
     from morning_dca import load_morning_config
@@ -864,6 +881,8 @@ def test_morning_executor_default_init_loads_config_file():
     ex = MorningDCAExecutor()
     assert ex.config.base_buy_amount_usd == 3.0
     assert ex.config.morning_daily_cap_usd == 90.0
+    assert date(2026, 7, 2) in ex.config.approved_test_dates
+    assert date(2026, 8, 28) in ex.config.approved_test_dates
 
 
 def test_classifications_validate_against_json_schema():
