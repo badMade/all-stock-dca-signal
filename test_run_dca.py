@@ -109,7 +109,7 @@ def test_run_pipeline_explicit_prior_root_uses_run_time_boundary(tmp_path):
     (manual_dir / "run_state.json").write_text(
         json.dumps({
             "trading_day": now.date().isoformat(),
-            "generated_at": f"{now.date().isoformat()}T15:05:00-04:00",
+            "generated_at": datetime.combine(now.date(), time(15, 5), tzinfo=EASTERN).isoformat(),
             "run_classification": {"run_origin": "manual", "run_id": "manual_1505"},
             "buy_candidates": [
                 {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0, "target_price": 0.01},
