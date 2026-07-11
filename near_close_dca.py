@@ -1621,10 +1621,12 @@ def _candidate_logged_reference_price(candidate: Dict[str, Any]) -> Optional[flo
 
     Same-day top-up guard policy resolves a prior run's reference price in this
     order: the run's logged ``target_price``, then ``decision_price`` (also
-    recorded as ``decision_bar_close``). The caller falls back to the confirmed
-    ``average_fill_price`` from the orders CSV when none of these are logged, and
-    treats a still-missing reference as "unknown" (conservative no-top-up /
-    manual_review path). Returns the first strictly-positive value, else ``None``.
+    recorded as ``decision_bar_close``). Callers must only use this logged
+    reference for candidates whose capital movement is confirmed (for example a
+    filled candidate or a candidate with a confirmed fill row). Unconfirmed
+    submitted candidates keep an unknown reference even when target/decision
+    prices were logged, routing later top-ups to the conservative manual-review
+    path. Returns the first strictly-positive value, else ``None``.
     """
     for key in ("target_price", "decision_price", "decision_bar_close"):
         raw = candidate.get(key)
@@ -1784,10 +1786,12 @@ def load_prior_same_day_allocations(
     ``boundary_et`` on ``trading_day`` are read, scheduled *afternoon* runs are
     ignored (morning/midday-stream runs stay eligible), and only buy candidates whose
     status shows an order was placed contribute. Each contributing candidate's
-    reference price is resolved by policy preference -- logged ``target_price``, then
-    ``decision_price``, then the confirmed ``average_fill_price`` (from ``orders.csv``
-    or a manual override's ``filled_orders.csv``); a candidate with none is treated as
-    an unknown reference. When multiple earlier runs touched a ticker the dollar
+    reference price is resolved only after capital movement is confirmed, by policy
+    preference -- logged ``target_price``, then ``decision_price``, then the confirmed
+    ``average_fill_price`` (from ``orders.csv`` or a manual override's
+    ``filled_orders.csv``). An unconfirmed submitted candidate is retained as prior
+    allocation context with an unknown reference even if it logged target/decision
+    prices. When multiple earlier runs touched a ticker the dollar
     amounts are summed and the *lowest* available reference price wins, so the
     afternoon run must beat the best earlier entry price before it tops up. If any
     contributing reference is unknown the aggregate reference is unknown, routing the
@@ -1912,16 +1916,18 @@ def load_prior_same_day_allocations(
             if amount <= 0:
                 continue
 
-            # Reference price preference (same-day top-up guard policy): the
-            # run's logged target_price/decision_price first, then the confirmed
-            # average_fill_price from the orders CSV. The logged intended price is
-            # the entry the run committed to, so it is what a later run must beat
-            # before topping up. Neither logged nor filled means "unknown", which
-            # the guard handles conservatively (missing_prior_price -> $0 +
-            # manual review).
-            reference_price = _candidate_logged_reference_price(candidate)
-            if reference_price is None and fill is not None:
-                reference_price = fill["avg_fill_price"]
+            # Reference price preference (same-day top-up guard policy) applies
+            # only after capital movement is confirmed. A still-unfilled
+            # ``submitted`` row may later be rejected/canceled or may simply have
+            # stale order history; using its logged target/decision price as a
+            # known reference would let later top-ups silently take
+            # price_not_below/no_incremental. Keep that path unknown so the guard
+            # routes to missing_prior_price -> $0 + manual review.
+            reference_price = None
+            if status == "filled" or fill is not None:
+                reference_price = _candidate_logged_reference_price(candidate)
+                if reference_price is None and fill is not None:
+                    reference_price = fill["avg_fill_price"]
 
             entry = aggregated.setdefault(
                 ticker,
