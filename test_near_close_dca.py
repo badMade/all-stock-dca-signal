@@ -876,6 +876,31 @@ def test_confirmation_required_broker_response_recorded_distinctly(tmp_path):
     assert run_state["usage_proxy"]["errors_count"] == 0
 
 
+def test_run_daily_compact_blocks_orders_above_per_order_ceiling(tmp_path):
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-max-order")
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL",),
+        approved_test_dates=config.approved_test_dates,
+        base_buy_amount_usd=10.0,
+        max_per_order_usd=15.0,
+    )
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    candidate = run_state["buy_candidates"][0]
+    assert candidate["ticker"] == "AAPL"
+    assert candidate["planned_amount_usd"] == 20.0
+    assert candidate["status"] == "blocked"
+    assert candidate["skip_reason"] == "max per-order ceiling exceeded"
+    assert run_state["usage_proxy"]["orders_placed_count"] == 0
+
+
 def test_write_run_artifacts_ignores_stale_orders_csv(tmp_path):
     out = os.path.join(tmp_path, "runs", "reused-day")
     os.makedirs(out)

@@ -322,6 +322,7 @@ class StrategyConfig:
     decision_time_et: time = time(15, 20)  # matches the 3:20 PM ET canonical live schedule
     trend_lookback_minutes: int = 60
     base_buy_amount_usd: float = 3.0
+    max_per_order_usd: float = 15.0
     weekly_rollover_reserve_cap_usd: float = 900.0
     high_multiplier_threshold: float = 3.0
     minimum_drop_vs_previous_close: float = 0.001
@@ -2598,6 +2599,15 @@ def run_once(
         if not ticker_guarded and broker.same_day_strategy_order_exists(ticker, trading_day):
             candidate_outcomes[ticker] = {"status": "skipped", "skip_reason": "same-day broker order exists"}
             _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: same-day broker order already exists; skipping")
+            continue
+        if order_amount > config.max_per_order_usd:
+            candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "max per-order ceiling exceeded"}
+            _block(
+                ticker,
+                MISSING_FILL_BUDGET_CAPPED,
+                f"{ticker}: order amount ${order_amount:.2f} exceeds max per-order "
+                f"${config.max_per_order_usd:.2f}; skipping",
+            )
             continue
         if not within_caps(order_amount, state, trading_day, config):
             candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "cap would be exceeded"}
