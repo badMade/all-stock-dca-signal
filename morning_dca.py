@@ -888,17 +888,27 @@ class MorningDCAExecutor(DCAExecutor):
         loosened "buy anyway when trend is unavailable" rule is not implemented.
         """
         bar_anchor = completed_bar_anchor(decision_dt, self.config.interval_minutes, self._sizing_config)
+        interval = timedelta(minutes=self.config.interval_minutes)
+        window_start = decision_dt - timedelta(minutes=60)
+        freshest_allowed = bar_anchor - interval
         usable: Dict[Any, Bar] = {}
         for b in bars:
-            if b.timestamp <= bar_anchor and math.isfinite(b.close) and b.close > 0:
+            if window_start <= b.timestamp <= bar_anchor and math.isfinite(b.close) and b.close > 0:
                 usable[b.timestamp] = b
+        sorted_bars = sorted(usable.values(), key=lambda b: b.timestamp)
+        if not sorted_bars or sorted_bars[-1].timestamp < freshest_allowed:
+            latest = sorted_bars[-1].timestamp.isoformat() if sorted_bars else "none"
+            warnings.append(
+                "intraday trend unvalidated: latest completed bar "
+                f"{latest} is older than one interval before the decision anchor {bar_anchor.isoformat()}"
+            )
+            return False
         if len(usable) < self.config.trend_min_bars:
             warnings.append(
                 f"intraday trend unvalidated: {len(usable)} usable bars < required "
-                f"{self.config.trend_min_bars} over the 60-minute window"
+                f"{self.config.trend_min_bars} over the latest 60-minute window"
             )
             return False
-        sorted_bars = sorted(usable.values(), key=lambda b: b.timestamp)
         if sorted_bars[-1].close >= sorted_bars[0].close:
             warnings.append(
                 "intraday trend flat or rising: price is at or above open; skipping auto-buy"
@@ -948,6 +958,13 @@ class MorningDCAExecutor(DCAExecutor):
                 warnings.append(f"quote provider error: {exc}")
         if bar is None:
             warnings.append(f"missing completed intraday bar at/or before {self.profile['scheduled_for_et']} ET")
+            return None
+        freshest_allowed = bar_anchor - timedelta(minutes=self.config.interval_minutes)
+        if bar.timestamp < freshest_allowed:
+            warnings.append(
+                f"latest completed intraday bar {bar.timestamp.isoformat()} is older than one interval before "
+                f"the {self.profile['scheduled_for_et']} ET decision anchor; rejecting stale data"
+            )
             return None
         if not math.isfinite(bar.close) or bar.close <= 0:
             warnings.append(f"completed bar close {bar.close!r} is not positive; rejecting")
