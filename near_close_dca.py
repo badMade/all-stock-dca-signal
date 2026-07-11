@@ -322,6 +322,7 @@ class StrategyConfig:
     decision_time_et: time = time(15, 20)  # matches the 3:20 PM ET canonical live schedule
     trend_lookback_minutes: int = 60
     base_buy_amount_usd: float = 3.0
+    max_per_order_usd: float = 15.0
     weekly_rollover_reserve_cap_usd: float = 900.0
     high_multiplier_threshold: float = 3.0
     minimum_drop_vs_previous_close: float = 0.001
@@ -2649,6 +2650,15 @@ def run_once(
                 MISSING_FILL_BROKER_BLOCKED,
                 f"{ticker}: bid/ask spread {spread_pct:.2f}% exceeds "
                 f"{config.max_bid_ask_spread_pct:.2f}% limit; skipping",
+            )
+            continue
+        if order_amount > config.max_per_order_usd:
+            candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "max per-order ceiling exceeded"}
+            _block(
+                ticker,
+                MISSING_FILL_BUDGET_CAPPED,
+                f"{ticker}: order amount ${order_amount:.2f} exceeds max per-order "
+                f"${config.max_per_order_usd:.2f}; skipping",
             )
             continue
         if not within_caps(order_amount, state, trading_day, config):

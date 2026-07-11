@@ -284,7 +284,9 @@ def normalize_connector_payload(
     result: Dict[str, object] = dict(payload)
     pointer = result.get("output_path")
     if not (read_pointer and isinstance(pointer, str) and pointer):
-        result.setdefault("normalized", False)
+        if isinstance(pointer, str) and pointer:
+            # Has an output_path but caller asked not to resolve it — flag as not normalized.
+            result.setdefault("normalized", False)
         return result
 
     path = Path(pointer)
@@ -385,7 +387,7 @@ def raw_persistence_failure_run_state(
         "buy_candidates": [],
         "run_classification": build_scheduled_classification(trading_day, ts),
         "raw_input_dir": str(raw_input_dir(trading_day, base)),
-        "raw_inputs_saved": list_raw_inputs_saved(trading_day, base),
+        "raw_inputs_saved": [],
         "recovery_from_escalation": bool(recovery_from_escalation),
         "raw_persistence_error": str(error),
     }
