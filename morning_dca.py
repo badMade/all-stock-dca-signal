@@ -1122,10 +1122,17 @@ class MorningDCAExecutor(DCAExecutor):
         loaded = load_same_day_preflight(root, trading_day)
         if loaded is None:
             if not manual:
-                raise RuntimeError(
-                    "no same-day 9:45 pre-flight artifact found; "
-                    "scheduled live run blocked (fail-closed)"
-                )
+                # Fail closed but write a durable blocked artifact so watchdog and
+                # reporting can distinguish a missing-preflight block from a crash.
+                self.preflight_gate = {
+                    "preflight_found": False,
+                    "preflight_missing_block": True,
+                    "block_reason": (
+                        "no same-day 9:45 pre-flight artifact found; "
+                        "scheduled live run blocked (fail-closed)"
+                    ),
+                }
+                return []
             self.preflight_gate = {
                 "preflight_found": False,
                 "warning": "no same-day 9:45 pre-flight artifact found; evaluating full universe",
@@ -1580,6 +1587,29 @@ class MorningDCAExecutor(DCAExecutor):
         if blocked is not None:
             return blocked
         signals = self.evaluate(now, data, manual=manual)
+        # Scheduled-run preflight block: _apply_preflight_gate found no same-day
+        # pre-flight artifact and set preflight_missing_block instead of raising,
+        # so we can write a durable blocked run_state before returning.
+        pgate = getattr(self, "preflight_gate", None)
+        if pgate and pgate.get("preflight_missing_block"):
+            trading_day = now.astimezone(EASTERN).date()
+            block_reason = pgate["block_reason"]
+            out = self.run_state_dir(now)
+            out.mkdir(parents=True, exist_ok=True)
+            state_path = out / "run_state.json"
+            if not state_path.exists():
+                state_path.write_text(
+                    json.dumps(
+                        {"trading_day": trading_day.isoformat(), "status": "blocked",
+                         "block_reason": block_reason, "stream": self.stream,
+                         "trades": False, "broker_outcomes": {}},
+                        indent=2, sort_keys=True,
+                    ),
+                    encoding="utf-8",
+                )
+            return {"artifacts": {"trading_day": trading_day.isoformat(), "status": "blocked",
+                                  "block_reason": block_reason},
+                    "paths": {"run_state": str(state_path)}}
         source = data_source or getattr(getattr(data, "source", None), "value", "unknown")
         trading_day = now.astimezone(EASTERN).date()
         top_up_outcomes = self._compute_top_up(now, signals)

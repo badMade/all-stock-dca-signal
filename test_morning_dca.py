@@ -955,8 +955,9 @@ def test_live_gate_restricts_to_preflight_eligible(tmp_path):
 
 
 def test_live_gate_fails_closed_when_preflight_missing_scheduled(tmp_path):
-    # Scheduled live runs must block (fail-closed) when no preflight artifact exists.
-    import pytest
+    # Scheduled live runs must write a durable blocked run_state (fail-closed)
+    # when no preflight artifact exists, rather than raising and leaving no
+    # artifact for watchdog/reporting to observe.
     live = MorningDCAExecutor(
         MorningConfig(
             tickers=("BIG", "FLAT"),
@@ -966,8 +967,17 @@ def test_live_gate_fails_closed_when_preflight_missing_scheduled(tmp_path):
         mode=MORNING_LIVE_MODE,
     )
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10, "FLAT": 0.10})
-    with pytest.raises(RuntimeError, match="scheduled live run blocked"):
-        live.run(_now_live(), data)
+    res = live.run(_now_live(), data)
+    art = res["artifacts"]
+    assert art["status"] == "blocked"
+    assert "pre-flight" in art["block_reason"]
+    # A run_state.json must have been written.
+    state_path = Path(res["paths"]["run_state"])
+    assert state_path.exists()
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert persisted["status"] == "blocked"
+    assert persisted["trades"] is False
+    assert persisted["broker_outcomes"] == {}
 
 
 def test_live_gate_degrades_to_full_universe_when_preflight_missing_manual(tmp_path):
