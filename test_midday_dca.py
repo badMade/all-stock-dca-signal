@@ -310,6 +310,90 @@ def test_top_up_incremental_when_price_below_prior(tmp_path):
     assert ex.ledger.day_planned(day) == 12.0
 
 
+class _TopUpDuplicateBroker:
+    def __init__(self, duplicate: bool) -> None:
+        self.duplicate = duplicate
+        self.broad_duplicate_calls = 0
+        self.same_stream_calls = 0
+        self.placed = []
+
+    def account_number(self):
+        from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+    def available_buying_power(self):
+        return 500.0
+
+    def same_day_strategy_order_exists(self, ticker, trading_day):
+        self.broad_duplicate_calls += 1
+        return True
+
+    def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+        self.same_stream_calls += 1
+        assert ref_id_prefixes[0] == f"midday-dca-topup-{trading_day.isoformat()}-{ticker}"
+        return self.duplicate
+
+    def is_tradable_for_fractional_buy(self, ticker):
+        return True
+
+    def review_market_buy(self, ticker, notional_usd):
+        return True, "ok"
+
+    def place_market_buy(self, ticker, notional_usd, ref_id):
+        self.placed.append((ticker, notional_usd, ref_id))
+        return f"ORDER-{ticker}"
+
+
+def test_guarded_midday_top_up_checks_same_stream_duplicate_before_placing(tmp_path):
+    prior_root = tmp_path / "morning"
+    _write_prior_morning_run(
+        prior_root, ticker="BIG", planned_amount=3.0,
+        fill_price=95.0, quantity=round(3.0 / 95.0, 6),
+    )
+    cfg = MiddayConfig(
+        tickers=("BIG",), base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "midday"),
+        prior_allocation_roots=(str(prior_root),),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MiddayDCAExecutor(cfg)
+    broker = _TopUpDuplicateBroker(duplicate=True)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+
+    res = ex.run(_now_midday(), data, broker=broker)
+
+    assert broker.broad_duplicate_calls == 0
+    assert broker.same_stream_calls == 1
+    assert broker.placed == []
+    assert res["artifacts"]["broker_outcomes"]["BIG"]["status"] == "skipped"
+    assert res["artifacts"]["broker_outcomes"]["BIG"]["skip_reason"] == "same-stream broker order exists"
+
+
+def test_guarded_midday_top_up_ignores_cross_stream_duplicate_for_incremental_order(tmp_path):
+    prior_root = tmp_path / "morning"
+    _write_prior_morning_run(
+        prior_root, ticker="BIG", planned_amount=3.0,
+        fill_price=95.0, quantity=round(3.0 / 95.0, 6),
+    )
+    cfg = MiddayConfig(
+        tickers=("BIG",), base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "midday"),
+        prior_allocation_roots=(str(prior_root),),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MiddayDCAExecutor(cfg)
+    broker = _TopUpDuplicateBroker(duplicate=False)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+
+    res = ex.run(_now_midday(), data, broker=broker)
+
+    assert broker.broad_duplicate_calls == 0
+    assert broker.same_stream_calls == 1
+    assert broker.placed == [("BIG", 12.0, "midday-dca-topup-2026-07-08-BIG")]
+    assert res["artifacts"]["broker_outcomes"]["BIG"]["status"] == "submitted"
+
+
 def test_top_up_zero_when_price_not_below_prior(tmp_path):
     prior_root = tmp_path / "morning"
     # Morning fill price 50.0 (below the midday price of 90.0).
