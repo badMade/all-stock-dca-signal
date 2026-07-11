@@ -971,6 +971,29 @@ def test_live_gate_fails_closed_when_preflight_missing_scheduled(tmp_path):
     art = res["artifacts"]
     assert art["status"] == "blocked"
     assert "pre-flight" in art["block_reason"]
+    state_path = Path(res["paths"]["run_state"])
+    assert state_path.exists()
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert persisted["status"] == "blocked"
+    assert persisted["trades"] is False
+    assert persisted["broker_outcomes"] == {}
+
+
+def test_live_gate_degrades_to_full_universe_when_preflight_missing_manual(tmp_path):
+    # Manual live runs degrade to the full universe with a warning when no preflight exists.
+    live = MorningDCAExecutor(
+        MorningConfig(
+            tickers=("BIG", "FLAT"),
+            morning_run_state_root=str(tmp_path / "live"),
+            preflight_run_state_root=str(tmp_path / "empty_preflight"),
+        ),
+        mode=MORNING_LIVE_MODE,
+    )
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10, "FLAT": 0.10})
+    res = live.run(_now_live(), data, manual=True)
+    art = res["artifacts"]
+    assert art["status"] == "blocked"
+    assert "pre-flight" in art["block_reason"]
     # A run_state.json must have been written.
     state_path = Path(res["paths"]["run_state"])
     assert state_path.exists()
