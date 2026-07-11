@@ -1482,14 +1482,13 @@ class MorningDCAExecutor(DCAExecutor):
         if self.mode == MORNING_LIVE_MODE and self.trades and not manual and broker is None:
             return self._blocked_live_result(now, "missing broker adapter for scheduled live execution")
         if broker is not None and self.mode == MORNING_LIVE_MODE:
-            if self.trades and not manual:
-                expected_account = getattr(self.config, "target_account_number", None)
-                actual_account = broker.account_number()
-                if expected_account and actual_account != expected_account:
-                    return self._blocked_live_result(
-                        now,
-                        f"broker account mismatch: expected {expected_account}, got {actual_account}",
-                    )
+            expected_account = getattr(self.config, "target_account_number", None)
+            actual_account = broker.account_number()
+            if expected_account and actual_account != expected_account:
+                mismatch = f"broker account mismatch: expected {expected_account}, got {actual_account}"
+                if not manual:
+                    return self._blocked_live_result(now, mismatch)
+                raise RuntimeError(mismatch)
             broker_outcomes = self._place_broker_orders(
                 auto_buy_candidates,
                 trading_day,

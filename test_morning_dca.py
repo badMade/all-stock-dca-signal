@@ -1161,6 +1161,44 @@ def test_scheduled_live_run_with_wrong_broker_account_fails_closed_before_orderi
     assert Path(res["paths"]["run_state"]).exists()
 
 
+def test_manual_live_run_with_wrong_broker_account_raises_before_ordering(tmp_path):
+    import pytest
+
+    class _WrongAccountBroker:
+        def __init__(self):
+            self.buying_power_checked = False
+            self.placed = False
+
+        def account_number(self):
+            return "not-the-approved-account"
+
+        def available_buying_power(self):
+            self.buying_power_checked = True
+            raise AssertionError("buying power should not be checked for wrong account")
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.placed = True
+            raise AssertionError("orders must not be placed for wrong account")
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        target_account_number="562057042",
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    broker = _WrongAccountBroker()
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    with pytest.raises(RuntimeError, match="broker account mismatch: expected 562057042, got not-the-approved-account"):
+        ex.run(_now_live(), data, manual=True, broker=broker)
+
+    assert broker.buying_power_checked is False
+    assert broker.placed is False
+
+
 def test_auto_buy_candidates_prioritized_by_multiplier_when_cap_hit(tmp_path):
     # When the daily cap is tight, higher-multiplier tickers are placed first.
     # BIGDROP: 8% drop -> 5x -> $15 notional. SMALLDROP: 1% drop -> 1.5x -> $4.50 notional.

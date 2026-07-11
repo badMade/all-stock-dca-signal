@@ -471,6 +471,42 @@ def test_midday_ledger_namespace_isolated_from_morning_and_afternoon(tmp_path):
     assert ex.ledger.day_planned(day) > 0.0
 
 
+def test_manual_midday_run_with_wrong_broker_account_raises_before_ordering(tmp_path):
+    import pytest
+
+    class _WrongAccountBroker:
+        def __init__(self):
+            self.buying_power_checked = False
+            self.placed = False
+
+        def account_number(self):
+            return "not-the-approved-account"
+
+        def available_buying_power(self):
+            self.buying_power_checked = True
+            raise AssertionError("buying power should not be checked for wrong account")
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.placed = True
+            raise AssertionError("orders must not be placed for wrong account")
+
+    cfg = MiddayConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "midday"),
+        target_account_number="562057042",
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    broker = _WrongAccountBroker()
+    ex = MiddayDCAExecutor(cfg)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    with pytest.raises(RuntimeError, match="broker account mismatch: expected 562057042, got not-the-approved-account"):
+        ex.run(_now_midday(), data, manual=True, broker=broker)
+
+    assert broker.buying_power_checked is False
+    assert broker.placed is False
+
+
 # --- Schema validation ------------------------------------------------------
 def test_midday_classification_validates_against_json_schema():
     try:
