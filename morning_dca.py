@@ -1278,6 +1278,8 @@ class MorningDCAExecutor(DCAExecutor):
         pre-authorization policy in config/budgets.json. Manual runs still call
         review_market_buy first.
         """
+        if not candidates:
+            return {}
         outcomes: Dict[str, Any] = {}
         submitted_today = 0.0
         submitted_this_week = 0.0
