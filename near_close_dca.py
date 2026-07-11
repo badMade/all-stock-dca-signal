@@ -1696,7 +1696,9 @@ def _orders_csv_fills(
     When no explicit file is given the sibling ``orders.csv`` is used, falling back
     to ``filled_orders.csv`` -- the confirmed-fill record manual override reruns
     write under ``.../manual_reruns/`` -- so a manual override fill still counts as
-    prior-allocation context for the same-day top-up guard.
+    prior-allocation context for the same-day top-up guard. Manual fill files may
+    use the documented ``amount_usd``/``avg_fill_price`` shape without orders.csv
+    fields like ``status`` or ``quantity_filled``.
     """
     fills: Dict[str, Dict[str, Any]] = {}
     if orders_csv_file is not None:
@@ -1714,8 +1716,8 @@ def _orders_csv_fills(
                 if not ticker:
                     continue
                 status = (row.get("status") or "").lower()
-                is_manual_fill_file = orders_csv.name == "filled_orders.csv"
-                if status != "filled" and not (is_manual_fill_file and not status):
+                is_manual_filled_orders = (orders_csv.name == "filled_orders.csv" or "amount_usd" in row) and not status
+                if status != "filled" and not is_manual_filled_orders:
                     continue
                 raw_price = row.get("avg_fill_price")
                 try:

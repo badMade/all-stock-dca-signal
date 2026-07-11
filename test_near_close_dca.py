@@ -1135,6 +1135,29 @@ def test_load_prior_same_day_reads_manual_override_filled_orders_csv(tmp_path):
     assert allocations["AMZN"].source == "manual"
 
 
+def test_load_prior_same_day_reads_documented_manual_filled_orders_shape(tmp_path):
+    # Documented manual override fills can omit orders.csv-only fields such as
+    # status and quantity_filled, while recording amount_usd and avg_fill_price.
+    root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    run_dir = os.path.join(root, "manual_reruns", "1505")
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(
+            _manual_run_state([
+                {"ticker": "AMZN", "status": "filled", "planned_amount_usd": 6.0},
+            ]),
+            handle,
+        )
+    with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+        handle.write("ticker,amount_usd,avg_fill_price\nAMZN,4.25,242.1099\n")
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["AMZN"].amount_usd == 4.25
+    assert allocations["AMZN"].reference_price == 242.1099
+    assert allocations["AMZN"].source == "manual"
+
+
 def test_load_prior_same_day_multi_merges_roots_sums_amounts_lowest_reference(tmp_path):
     # The afternoon guard scans multiple roots (its own + morning + midday). When
     # a ticker appears in more than one root, amounts sum and the lowest known
