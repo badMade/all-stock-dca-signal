@@ -210,6 +210,20 @@ def load_midday_config(config_dir=None) -> MiddayConfig:
     if isinstance(roots, list) and roots:
         kwargs["prior_allocation_roots"] = tuple(str(r) for r in roots)
 
+    # Load max_per_order_usd from the shared budgets.json circuit_breakers block so
+    # an emergency cap change applies to the midday stream without touching code constants.
+    budgets_path = config_dir_path / "budgets.json"
+    if budgets_path.exists():
+        try:
+            budgets_raw = json.loads(budgets_path.read_text(encoding="utf-8"))
+            cb = budgets_raw.get("circuit_breakers", {})
+            if "max_per_order_usd" in cb:
+                max_order = float(cb["max_per_order_usd"])
+                if max_order > 0:
+                    kwargs["max_per_order_usd"] = max_order
+        except (json.JSONDecodeError, OSError, ValueError):
+            pass  # fall back to MiddayConfig default
+
     return MiddayConfig(**kwargs)
 
 
