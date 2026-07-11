@@ -371,6 +371,9 @@ class MorningConfig:
     # and NYSE holidays). Mirrors StrategyConfig.approved_test_dates semantics
     # so morning/midday honour the same trading-window config as the afternoon.
     approved_test_dates: frozenset[date] = field(default_factory=frozenset)
+    # Absolute per-order ceiling loaded from config/budgets.json
+    # circuit_breakers.max_per_order_usd. 5x * $3 base = $15 default.
+    max_per_order_usd: float = 15.0
 
     def as_strategy_config(self) -> StrategyConfig:
         """Return a StrategyConfig view carrying the morning ladder.
@@ -580,6 +583,20 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
     prior_roots = artifact_paths.get("prior_allocation_roots")
     if isinstance(prior_roots, list) and prior_roots:
         kwargs["prior_allocation_roots"] = tuple(str(r) for r in prior_roots)
+
+    # Load max_per_order_usd from the shared budgets.json circuit_breakers block so
+    # an emergency cap change takes effect without touching code constants.
+    budgets_path = config_dir_path / "budgets.json"
+    if budgets_path.exists():
+        try:
+            budgets_raw = json.loads(budgets_path.read_text(encoding="utf-8"))
+            cb = budgets_raw.get("circuit_breakers", {})
+            if "max_per_order_usd" in cb:
+                max_order = float(cb["max_per_order_usd"])
+                if max_order > 0:
+                    kwargs["max_per_order_usd"] = max_order
+        except (json.JSONDecodeError, OSError, ValueError):
+            pass  # fall back to MorningConfig default
 
     return MorningConfig(**kwargs)
 
@@ -1451,12 +1468,12 @@ class MorningDCAExecutor(DCAExecutor):
             else:
                 notional = signal.hypothetical_amount_usd
 
-            # Hard per-order ceiling: 5x * $3 base = $15 (config/budgets.json circuit_breakers).
-            _MAX_ORDER_USD = 15.0
-            if notional > _MAX_ORDER_USD:
+            # Hard per-order ceiling from config/budgets.json circuit_breakers.max_per_order_usd.
+            _max_order_usd = self.config.max_per_order_usd
+            if notional > _max_order_usd:
                 outcomes[ticker] = {
                     "status": "blocked",
-                    "skip_reason": f"exceeds ${_MAX_ORDER_USD:.0f} per-order ceiling",
+                    "skip_reason": f"exceeds ${_max_order_usd:.0f} per-order ceiling",
                 }
                 continue
 
