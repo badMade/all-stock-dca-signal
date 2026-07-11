@@ -366,8 +366,38 @@ def test_guarded_midday_top_up_checks_same_stream_duplicate_before_placing(tmp_p
     assert broker.broad_duplicate_calls == 0
     assert broker.same_stream_calls == 1
     assert broker.placed == []
-    assert res["artifacts"]["broker_outcomes"]["BIG"]["status"] == "skipped"
+    assert res["artifacts"]["broker_outcomes"]["BIG"]["status"] == "submitted"
     assert res["artifacts"]["broker_outcomes"]["BIG"]["skip_reason"] == "same-stream broker order exists"
+    assert res["artifacts"]["buy_candidates"][0]["status"] == "submitted"
+    assert res["artifacts"]["buy_candidates"][0]["planned_amount_usd"] == 12.0
+
+
+class _TopUpBrokerWithoutSameStreamCheck(_TopUpDuplicateBroker):
+    same_day_strategy_order_exists_with_ref_id_prefix = None
+
+
+def test_guarded_midday_top_up_blocks_when_same_stream_checker_unavailable(tmp_path):
+    prior_root = tmp_path / "morning"
+    _write_prior_morning_run(
+        prior_root, ticker="BIG", planned_amount=3.0,
+        fill_price=95.0, quantity=round(3.0 / 95.0, 6),
+    )
+    cfg = MiddayConfig(
+        tickers=("BIG",), base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "midday"),
+        prior_allocation_roots=(str(prior_root),),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MiddayDCAExecutor(cfg)
+    broker = _TopUpBrokerWithoutSameStreamCheck(duplicate=False)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+
+    res = ex.run(_now_midday(), data, broker=broker)
+
+    outcome = res["artifacts"]["broker_outcomes"]["BIG"]
+    assert broker.placed == []
+    assert outcome["status"] == "blocked"
+    assert outcome["skip_reason"].startswith("duplicate-check failed: broker does not support same-stream")
 
 
 def test_guarded_midday_top_up_ignores_cross_stream_duplicate_for_incremental_order(tmp_path):

@@ -1343,7 +1343,23 @@ class MorningDCAExecutor(DCAExecutor):
                 _log.warning("Duplicate-check error for %s: %s", ticker, exc)
                 continue
             if dup:
-                outcomes[ticker] = {"status": "skipped", "skip_reason": duplicate_reason}
+                if has_prior_allocation:
+                    # A same-stream top-up duplicate means this stream already
+                    # submitted/reserved the incremental order on an earlier
+                    # attempt. Persist it as submitted so rewriting run_state on
+                    # retry does not erase the durable prior-allocation context
+                    # that later same-day guards depend on.
+                    outcomes[ticker] = {
+                        "status": "submitted",
+                        "order_id": None,
+                        "skip_reason": duplicate_reason,
+                        "submitted_amount_usd": notional,
+                    }
+                    submitted_today += notional
+                    submitted_this_week += notional
+                    reserved_buying_power += notional
+                else:
+                    outcomes[ticker] = {"status": "skipped", "skip_reason": duplicate_reason}
                 continue
             try:
                 tradable = broker.is_tradable_for_fractional_buy(ticker)
@@ -1520,7 +1536,9 @@ def _same_stream_order_exists(broker: BrokerAdapter, ticker: str, trading_day: d
     """
     checker = getattr(broker, "same_day_strategy_order_exists_with_ref_id_prefix", None)
     if checker is None:
-        return False
+        raise RuntimeError(
+            "broker does not support same-stream ref-id duplicate checks for guarded top-ups"
+        )
     prefixes = (
         f"{stream}-dca-topup-{trading_day.isoformat()}-{ticker}",
         f"{stream}-dca-{trading_day.isoformat()}-{ticker}",
