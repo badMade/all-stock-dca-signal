@@ -376,6 +376,7 @@ def raw_persistence_failure_run_state(
     base: Optional[Path] = None,
     raw_dir: Optional[Path] = None,
     triggered_at_utc: Optional[str] = None,
+    generated_at: Optional[str] = None,
     broker: str = "robinhood",
     budget: Optional[Dict[str, object]] = None,
     recovery_from_escalation: bool = False,
@@ -391,12 +392,19 @@ def raw_persistence_failure_run_state(
 
     ``raw_dir`` overrides the default ``raw_input_dir`` computation; pass the
     same value as the corresponding ``save_raw_input`` calls.
+
+    ``generated_at`` pins the run timestamp for replays/backfills where ``now``
+    is the scheduled fire time; when omitted, falls back to the wall clock.
+    ``dca_risk.run_timestamp_et()`` reads ``generated_at`` before the
+    classification timestamp, so passing the scheduled ``now`` here prevents
+    a failure state from being attributed to the wrong time window.
     """
     out_dir = raw_dir if raw_dir is not None else raw_input_dir(trading_day, base)
     ts = triggered_at_utc or _utc_now_iso()
+    _generated_at = generated_at or datetime.now(_EASTERN).strftime("%Y-%m-%dT%H:%M:%S")
     return {
         "run_id": scheduled_run_id(trading_day),
-        "generated_at": datetime.now(_EASTERN).strftime("%Y-%m-%dT%H:%M:%S"),
+        "generated_at": _generated_at,
         "trading_day": trading_day,
         "broker": broker,
         "order_submit_status": ORDER_SUBMIT_STATUS_ERROR,

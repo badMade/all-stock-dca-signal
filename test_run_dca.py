@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, time
 
 from dca_config import load_strategy_config
-from near_close_dca import EASTERN, SourceName, StrategyConfig, StrategyState, build_broker
+from near_close_dca import EASTERN, DryRunBroker, SourceName, StrategyConfig, StrategyState, build_broker
 from run_dca import DemoDataProvider, _fills_from_orders_csv, main, run_pipeline
 
 
@@ -245,3 +245,46 @@ def test_run_pipeline_raw_persistence_failure_writes_error_state(tmp_path):
     assert run_state["raw_persistence_error"]
     assert run_state["raw_inputs_saved"] == []
     assert run_state["buy_candidates"] == []
+
+
+def test_run_pipeline_live_run_missing_raw_inputs_writes_error_state(tmp_path):
+    import json
+
+    config = load_strategy_config(
+        approved_test_dates=frozenset({_now().date()}), dry_run=False
+    )
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
+    # The raw persistence error fires before any broker call, so a DryRunBroker is fine here.
+    broker = DryRunBroker(account=config.target_account_number)
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        broker, artifacts_dir=scheduled_dir,
+        raw_connector_inputs=None,
+    )
+    assert "raw_persistence_error" in result
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    assert run_state["order_submit_status"] == "not_submitted_error"
+    assert run_state["raw_inputs_saved"] == []
+
+
+def test_run_pipeline_live_run_empty_raw_inputs_writes_error_state(tmp_path):
+    import json
+
+    config = load_strategy_config(
+        approved_test_dates=frozenset({_now().date()}), dry_run=False
+    )
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
+    broker = DryRunBroker(account=config.target_account_number)
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        broker, artifacts_dir=scheduled_dir,
+        raw_connector_inputs={},
+    )
+    assert "raw_persistence_error" in result
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    assert run_state["order_submit_status"] == "not_submitted_error"
+    assert run_state["raw_inputs_saved"] == []

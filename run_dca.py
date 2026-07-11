@@ -236,18 +236,23 @@ def run_pipeline(
             # Always save raw inputs directly under artifacts_dir/raw so the raw
             # directory is co-located with run_state.json regardless of layout.
             raw_dir = Path(artifacts_dir) / "raw"
-            # Live runs (dry_run=False) must supply raw_connector_inputs; skipping
-            # persistence on a live run would allow orders that are not reproducible
-            # from the durable raw files, violating the scheduler contract.
-            # Dry-run callers that have not yet been updated may omit them.
-            if raw_connector_inputs is None and not config.dry_run:
-                raise RuntimeError(
-                    "scheduled live run requires raw_connector_inputs; a caller "
-                    "that has not been updated to pass raw connector payloads "
-                    "would place orders without persisting before compute"
-                )
-            if raw_connector_inputs is not None:
+            # Live runs (dry_run=False) require non-empty raw_connector_inputs.
+            # Dry-run callers that have not yet been updated may omit entirely.
+            # Both None and empty-dict on live runs go through the fail-closed path
+            # (inside the try) so a durable no-order run_state is always written.
+            _needs_raw = raw_connector_inputs is not None or not config.dry_run
+            if _needs_raw:
                 try:
+                    if raw_connector_inputs is None or (not config.dry_run and not raw_connector_inputs):
+                        raise RuntimeError(
+                            "scheduled live run requires non-empty raw_connector_inputs; "
+                            "omitting or passing an empty mapping on a live run allows orders "
+                            "without persisting connector responses first"
+                        )
+                    # Clear any stale raw files from prior attempts so the saved-file
+                    # manifest only reflects what this run persists.
+                    if raw_dir.exists():
+                        shutil.rmtree(raw_dir)
                     for filename, payload in raw_connector_inputs.items():
                         path = save_raw_input(
                             trading_day_raw, filename, payload, raw_dir=raw_dir
@@ -271,6 +276,7 @@ def run_pipeline(
                         str(exc),
                         raw_dir=raw_dir,
                         triggered_at_utc=now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        generated_at=now.astimezone(EASTERN).strftime("%Y-%m-%dT%H:%M:%S"),
                         budget={
                             "budget_tier": state.current_tier().name,
                             "daily_cap_usd": state.current_tier().daily_cap_usd,
