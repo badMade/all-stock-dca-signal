@@ -197,3 +197,49 @@ def test_cli_refuses_when_dry_run_false(tmp_path, monkeypatch):
     monkeypatch.setattr(run_dca, "load_strategy_config", lambda *a, **k: StrategyConfig(dry_run=False))
     rc = run_dca.main(["--demo", "--artifacts-dir", str(tmp_path)])
     assert rc == 2
+
+
+def test_run_pipeline_persists_raw_inputs_before_compute(tmp_path):
+    import json
+
+    config = _demo_config()
+    task_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    scheduled_dir = task_root / "scheduled_runs" / "20260706_1520ET"
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=scheduled_dir,
+        raw_connector_inputs={"quotes_batch1.json": {"output_path": str(tmp_path / "quotes.json")}},
+    )
+    assert result["blocked"] is False
+    raw_file = scheduled_dir / "raw" / "quotes_batch1.json"
+    assert raw_file.exists()
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    assert run_state["raw_input_dir"] == str(scheduled_dir / "raw")
+    assert run_state["raw_inputs_saved"] == ["quotes_batch1.json"]
+
+
+def test_run_pipeline_raw_persistence_failure_writes_error_state(tmp_path):
+    import json
+
+    class ExplodingPayload:
+        pass
+
+    config = _demo_config()
+    task_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    scheduled_dir = task_root / "scheduled_runs" / "20260706_1520ET"
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=scheduled_dir,
+        raw_connector_inputs={"quotes_batch1.json": ExplodingPayload()},
+    )
+    assert "raw_persistence_error" in result
+    assert not (scheduled_dir / "orders.csv").exists()
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    assert run_state["order_submit_status"] == "not_submitted_error"
+    assert run_state["raw_persistence_error"]
+    assert run_state["raw_inputs_saved"] == []
+    assert run_state["buy_candidates"] == []

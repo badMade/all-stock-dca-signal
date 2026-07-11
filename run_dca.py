@@ -30,7 +30,7 @@ import json
 import logging
 from datetime import datetime, time, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from dca_config import DEFAULT_CONFIG_DIR, load_strategy_config
 from midday_dca import DEFAULT_MIDDAY_LIVE_STATE_ROOT
@@ -48,6 +48,11 @@ from near_close_dca import (
     load_prior_same_day_allocations,
     load_prior_same_day_allocations_multi,
     run_daily_compact,
+)
+from scripts.run_classification import (
+    build_raw_persistence_state,
+    raw_persistence_failure_run_state,
+    save_raw_input,
 )
 
 logger = logging.getLogger("near_close_dca.run")
@@ -185,6 +190,7 @@ def run_pipeline(
     prior_allocation_state_root: Optional[str | Path] = None,
     deployment_history_root: Optional[str | Path] = None,
     classification_state_root: Optional[str | Path] = None,
+    raw_connector_inputs: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run one compact DCA cycle and (optionally) the full post-trade report set.
 
@@ -206,12 +212,51 @@ def run_pipeline(
     prior days' ``run_state.json`` artifacts. Defaults to ``artifacts_dir``'s
     parent, since the live task's per-day directories are its siblings.
 
+    ``raw_connector_inputs`` lets the scheduler hand in raw connector responses
+    before signal computation. Scheduled runs persist these under the run's
+    ``raw/`` directory and stamp the saved-file manifest into ``run_state.json``;
+    if persistence or normalization fails, the pipeline writes the documented
+    no-order error run_state and returns without computing or placing.
+
     ``classification_state_root`` is passed through to ``near_close_dca.run_once``
     for a scheduled run: it is where ``latest_scheduled_run.json`` is
     written/updated (see ``scripts.run_classification``). Opt-in only: when not
     given, no ``latest_scheduled_run.json`` write is attempted at all, so a
     caller must pass the real cron_tracking root explicitly to enable it.
     """
+    raw_persistence_state: Optional[Dict[str, object]] = None
+    if scheduled:
+        trading_day_raw = now.astimezone(EASTERN).date().isoformat()
+        raw_base = _default_prior_allocation_state_root(Path(artifacts_dir))
+        try:
+            for filename, payload in (raw_connector_inputs or {}).items():
+                save_raw_input(trading_day_raw, filename, payload, base=raw_base)
+            raw_persistence_state = build_raw_persistence_state(trading_day_raw, base=raw_base)
+        except Exception as exc:  # noqa: BLE001 - failure must still write durable scheduled state
+            out = Path(artifacts_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            failure_state = raw_persistence_failure_run_state(
+                trading_day_raw,
+                str(exc),
+                base=raw_base,
+                triggered_at_utc=now.astimezone().isoformat(),
+                budget={
+                    "budget_tier": state.current_tier().name,
+                    "daily_cap_usd": state.current_tier().daily_cap_usd,
+                    "weekly_cap_usd": state.effective_weekly_cap(),
+                },
+            )
+            (out / "run_state.json").write_text(json.dumps(failure_state, indent=2) + "\n", encoding="utf-8")
+            return {
+                "run_label": run_label,
+                "scheduled": scheduled,
+                "compact": True,
+                "blocked": False,
+                "raw_persistence_error": str(exc),
+                "artifacts_dir": str(out),
+                "run_state_path": str(out / "run_state.json"),
+            }
+
     if scheduled and prior_same_day_allocations is None:
         trading_day = now.astimezone(EASTERN).date()
         if prior_allocation_state_root is None:
@@ -276,6 +321,7 @@ def run_pipeline(
         prior_same_day_allocations=prior_same_day_allocations,
         deployment_history_root=deployment_history_root,
         classification_state_root=classification_state_root,
+        raw_persistence_state=raw_persistence_state,
     )
     if result.get("blocked"):
         logger.warning("run blocked by date gate for %s; skipping reports", result.get("run_state_path"))
