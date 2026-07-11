@@ -247,6 +247,33 @@ def test_run_pipeline_raw_persistence_failure_writes_error_state(tmp_path):
     assert run_state["buy_candidates"] == []
 
 
+def test_run_pipeline_raw_persistence_failure_clears_stale_compact_artifacts(tmp_path):
+    import json
+
+    class ExplodingPayload:
+        pass
+
+    config = _demo_config()
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
+    scheduled_dir.mkdir(parents=True)
+    # Seed stale compact artifacts from a prior (successful) attempt.
+    for stale in ("orders.csv", "signals.csv", "buy_candidates.csv", "latest_run_summary.json"):
+        (scheduled_dir / stale).write_text("stale", encoding="utf-8")
+
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=scheduled_dir,
+        raw_connector_inputs={"quotes_batch1.json": ExplodingPayload()},
+    )
+    assert "raw_persistence_error" in result
+    for stale in ("orders.csv", "signals.csv", "buy_candidates.csv", "latest_run_summary.json"):
+        assert not (scheduled_dir / stale).exists(), f"{stale} was not removed"
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    assert run_state["order_submit_status"] == "not_submitted_error"
+
+
 def test_run_pipeline_live_run_missing_raw_inputs_writes_error_state(tmp_path):
     import json
 

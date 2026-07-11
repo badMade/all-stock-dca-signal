@@ -285,6 +285,13 @@ def run_pipeline(
                         shutil.rmtree(raw_dir, ignore_errors=True)
                     out = Path(artifacts_dir)
                     out.mkdir(parents=True, exist_ok=True)
+                    # Remove stale compact artifacts from any prior attempt so
+                    # they are not mistaken for this failed run's output.
+                    for _stale in (
+                        "signals.csv", "buy_candidates.csv", "orders.csv",
+                        "latest_run_summary.json", "slippage_and_coverage_report.md",
+                    ):
+                        (out / _stale).unlink(missing_ok=True)
                     failure_state = raw_persistence_failure_run_state(
                         trading_day_raw,
                         str(exc),
