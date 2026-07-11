@@ -326,6 +326,7 @@ class StrategyConfig:
     high_multiplier_threshold: float = 3.0
     minimum_drop_vs_previous_close: float = 0.001
     max_buys_per_ticker_per_day: int = 1
+    max_bid_ask_spread_pct: float = 1.0
     target_account_number: str = ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
     broker: BrokerName = BrokerName.ROBINHOOD
     dry_run: bool = True
@@ -1067,6 +1068,41 @@ def within_caps(amount: float, state: StrategyState, trading_day: date, config: 
     if amount > state.remaining_spend_today(trading_day, config):
         return False
     return True
+
+
+def _quote_bid_ask(data: MarketDataProvider, ticker: str, as_of: datetime) -> Optional[tuple[float, float]]:
+    """Return a live bid/ask quote when the provider exposes one.
+
+    The scheduled live path uses this as a final pre-placement spread circuit
+    breaker. Providers that cannot expose bid/ask return ``None``; a concrete
+    bid/ask with an excessive spread blocks the order before the broker path.
+    """
+    get_bid_ask = getattr(data, "get_bid_ask", None)
+    if not callable(get_bid_ask):
+        return None
+    quote = get_bid_ask(ticker, as_of)
+    if quote is None or not isinstance(quote, (tuple, list)) or len(quote) < 2:
+        return None
+    try:
+        bid = float(quote[0])
+        ask = float(quote[1])
+    except (TypeError, ValueError):
+        return None
+    if bid <= 0 or ask <= 0 or ask < bid:
+        return None
+    return bid, ask
+
+
+def quote_spread_pct(data: MarketDataProvider, ticker: str, as_of: datetime) -> Optional[float]:
+    """Return bid/ask spread as a percent of quote midpoint, if available."""
+    bid_ask = _quote_bid_ask(data, ticker, as_of)
+    if bid_ask is None:
+        return None
+    bid, ask = bid_ask
+    midpoint = (bid + ask) / 2.0
+    if midpoint <= 0:
+        return None
+    return (ask - bid) / midpoint * 100.0
 
 
 def allocation_sort_key(decision: ReconciledDecision) -> Tuple[float, float, str]:
@@ -2598,6 +2634,22 @@ def run_once(
         if not ticker_guarded and broker.same_day_strategy_order_exists(ticker, trading_day):
             candidate_outcomes[ticker] = {"status": "skipped", "skip_reason": "same-day broker order exists"}
             _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: same-day broker order already exists; skipping")
+            continue
+        spread_pct = quote_spread_pct(robinhood_data, ticker, now)
+        if spread_pct is not None and spread_pct > config.max_bid_ask_spread_pct:
+            candidate_outcomes[ticker] = {
+                "status": "blocked",
+                "skip_reason": (
+                    f"bid/ask spread {spread_pct:.2f}% exceeds "
+                    f"{config.max_bid_ask_spread_pct:.2f}% limit"
+                ),
+            }
+            _block(
+                ticker,
+                MISSING_FILL_BROKER_BLOCKED,
+                f"{ticker}: bid/ask spread {spread_pct:.2f}% exceeds "
+                f"{config.max_bid_ask_spread_pct:.2f}% limit; skipping",
+            )
             continue
         if not within_caps(order_amount, state, trading_day, config):
             candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "cap would be exceeded"}

@@ -137,6 +137,27 @@ def test_provider_quote_returns_price_and_time():
     assert when.year == 2026
 
 
+def test_provider_bid_ask_returns_spread_inputs():
+    quotes = {
+        "data": {
+            "results": [
+                {
+                    "quote": {
+                        "symbol": "AAPL",
+                        "last_trade_price": "313.330100",
+                        "bid_price": "313.10",
+                        "ask_price": "313.40",
+                        "has_traded": True,
+                        "state": "active",
+                    }
+                }
+            ]
+        }
+    }
+    prov = RobinhoodDataProvider(historicals_fn=lambda **k: HISTORICALS, quotes_fn=lambda **k: quotes)
+    assert prov.get_bid_ask("AAPL", _decision_dt()) == pytest.approx((313.10, 313.40))
+
+
 def test_provider_quote_none_without_quotes_fn():
     prov = RobinhoodDataProvider(historicals_fn=lambda **k: HISTORICALS)
     assert prov.get_quote("AAPL", _decision_dt()) is None
