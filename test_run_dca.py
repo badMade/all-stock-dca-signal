@@ -206,7 +206,7 @@ def test_run_pipeline_persists_raw_inputs_before_compute(tmp_path):
     task_root = tmp_path / "cron_tracking" / "ce16ba6b"
     scheduled_dir = task_root / "scheduled_runs" / "20260706_1520ET"
     quotes_file = tmp_path / "quotes.json"
-    quotes_file.write_text('{"symbol": "AAPL", "price": 150.0}')
+    quotes_file.write_text('{"symbol": "AAPL", "price": 150.0}', encoding="utf-8")
     result = run_pipeline(
         _now(), config, StrategyState(),
         DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
@@ -332,7 +332,7 @@ def test_run_pipeline_live_run_partial_raw_inputs_writes_error_state(tmp_path):
     )
     scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
     quotes_file = tmp_path / "quotes.json"
-    quotes_file.write_text('{"symbol": "AAPL", "price": 150.0}')
+    quotes_file.write_text('{"symbol": "AAPL", "price": 150.0}', encoding="utf-8")
     broker = DryRunBroker(account=config.target_account_number)
     result = run_pipeline(
         _now(), config, StrategyState(),

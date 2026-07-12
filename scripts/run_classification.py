@@ -330,7 +330,7 @@ def save_raw_input(
     out_dir.mkdir(parents=True, exist_ok=True)
     to_write = normalize_connector_payload(payload) if normalize else payload
     path = out_dir / safe
-    path.write_text(json.dumps(to_write, indent=2) + "\n")
+    path.write_text(json.dumps(to_write, indent=2) + "\n", encoding="utf-8")
     return path
 
 
