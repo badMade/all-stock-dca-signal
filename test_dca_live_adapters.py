@@ -158,6 +158,20 @@ def test_provider_bid_ask_returns_spread_inputs():
     assert prov.get_bid_ask("AAPL", _decision_dt()) == pytest.approx((313.10, 313.40))
 
 
+def test_provider_bid_ask_raises_on_missing_fields():
+    # QUOTES fixture has no bid_price/ask_price — fail closed rather than silently bypassing.
+    prov = RobinhoodDataProvider(historicals_fn=lambda **k: HISTORICALS, quotes_fn=lambda **k: QUOTES)
+    with pytest.raises(ValueError, match="no usable bid/ask"):
+        prov.get_bid_ask("AAPL", _decision_dt())
+
+
+def test_provider_bid_ask_raises_on_inactive_quote():
+    halted = {"data": {"results": [{"quote": {"symbol": "AAPL", "last_trade_price": "1", "state": "halted", "has_traded": True}, "close": {}}]}}
+    prov = RobinhoodDataProvider(historicals_fn=lambda **k: HISTORICALS, quotes_fn=lambda **k: halted)
+    with pytest.raises(ValueError, match="inactive quote"):
+        prov.get_bid_ask("AAPL", _decision_dt())
+
+
 def test_provider_quote_none_without_quotes_fn():
     prov = RobinhoodDataProvider(historicals_fn=lambda **k: HISTORICALS)
     assert prov.get_quote("AAPL", _decision_dt()) is None

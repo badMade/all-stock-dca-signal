@@ -264,17 +264,16 @@ class RobinhoodDataProvider:
         if quote is None:
             return None
         if not quote.get("has_traded", True) or quote.get("state", "active") != "active":
-            logger.warning(
-                "skipping bid/ask for %s: has_traded=%s state=%s",
-                ticker,
-                quote.get("has_traded"),
-                quote.get("state"),
+            raise ValueError(
+                f"no spread for {ticker}: inactive quote "
+                f"(has_traded={quote.get('has_traded')}, state={quote.get('state')})"
             )
-            return None
         bid = _to_float(quote.get("bid_price", quote.get("bid")))
         ask = _to_float(quote.get("ask_price", quote.get("ask")))
         if bid <= 0 or ask <= 0 or ask < bid:
-            return None
+            raise ValueError(
+                f"no usable bid/ask in {ticker} quote (bid={bid!r}, ask={ask!r})"
+            )
         return bid, ask
 
     # -- internals ---------------------------------------------------------------

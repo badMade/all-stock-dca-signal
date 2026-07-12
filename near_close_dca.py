@@ -2636,7 +2636,16 @@ def run_once(
             candidate_outcomes[ticker] = {"status": "skipped", "skip_reason": "same-day broker order exists"}
             _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: same-day broker order already exists; skipping")
             continue
-        spread_pct = quote_spread_pct(robinhood_data, ticker, now)
+        try:
+            spread_pct = quote_spread_pct(robinhood_data, ticker, now)
+        except Exception as exc:  # noqa: BLE001
+            errors_count += 1
+            candidate_outcomes[ticker] = {
+                "status": "blocked",
+                "skip_reason": f"spread quote error: {exc}",
+            }
+            _block(ticker, MISSING_FILL_DATA_ERROR, f"{ticker}: spread quote failed: {exc}; skipping")
+            continue
         if spread_pct is not None and spread_pct > config.max_bid_ask_spread_pct:
             candidate_outcomes[ticker] = {
                 "status": "blocked",
