@@ -99,6 +99,40 @@ def test_run_pipeline_scheduled_run_auto_loads_prior_allocations(tmp_path):
     assert not (task_root / "latest_run_summary.json").exists()
 
 
+def test_run_pipeline_explicit_prior_root_uses_run_time_boundary(tmp_path):
+    import json
+
+    prior_root = tmp_path / "custom_prior_root"
+    manual_dir = prior_root / "manual_runs" / "1505"
+    manual_dir.mkdir(parents=True)
+    now = _now()
+    (manual_dir / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": now.date().isoformat(),
+            "generated_at": datetime.combine(now.date(), time(15, 5), tzinfo=EASTERN).isoformat(),
+            "run_classification": {"run_origin": "manual", "run_id": "manual_1505"},
+            "buy_candidates": [
+                {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0, "target_price": 0.01},
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    config = _demo_config()
+    result = run_pipeline(
+        now, config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path / "scheduled",
+        prior_allocation_state_root=prior_root,
+    )
+
+    assert result["blocked"] is False
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    assert by_ticker["AAPL"]["top_up_guard_result"] != "no_prior_run"
+
+
 def test_default_prior_allocation_state_root_walks_past_scheduled_runs():
     from pathlib import Path
 
