@@ -16,6 +16,48 @@
     "base_amount_usd": 3.0,
     "summary": "The graded DCA base amount is exactly $3.00; every candidate dollar amount equals $3.00 x multiplier. Never infer, discover, or fall back to $50.00 or any broker/account default base amount. If the base-amount config is missing or unreadable, continue using $3.00 and record base_amount_source='hardcoded_user_confirmed_3_usd'."
   },
+  "execution_authorization_policy": {
+    "approved_on_et": "2026-07-10 11:20 AM ET",
+    "summary": "Scheduled live DCA tasks (morning 10:30, midday 12:30, afternoon 3:20) are explicitly pre-authorized to automatically place qualifying buy orders within caps. They MUST NOT request per-order confirmation and MUST NOT call Robinhood review_equity_order (which forces preview-plus-confirmation). A scheduled live task may call place_equity_order directly ONLY after every internal validation, signal, budget, spread, confidence, and top-up check passes.",
+    "manual_runs": "Manual / ad hoc runs still use review_equity_order plus confirmation before submit.",
+    "broker_roles": {
+      "robinhood": { "account": "562057042", "role": "execution" },
+      "alpaca": { "role": "read_only", "note": "Read-only validation/account context only." },
+      "finance": { "role": "read_only", "note": "Read-only validation/account context only." },
+      "yahoo": { "role": "read_only", "note": "Read-only validation/account context only." }
+    },
+    "order_constraints": "Buy-only, regular-hours-only market orders. No sells, options, crypto, margin, account changes, or cancellations. No more than one strategy order per ticker per stream."
+  },
+  "circuit_breakers": {
+    "summary": "Hard circuit breakers enforced on every scheduled live order. When any breaker trips, the order is skipped (never resized past a cap).",
+    "max_per_order_usd": 15.0,
+    "max_per_order_note": "5x (max ladder multiplier) * $3 base = $15. No single order may exceed $15.",
+    "budget_caps": "Per-run/day/week caps follow the tiered $3-base budget policy in config/budgets.json (budget_tiers) for the afternoon stream and the per-stream morning/midday ledgers (daily $90 / weekly $450 each).",
+    "available_buying_power": "Never exceed available Robinhood buying power.",
+    "whitelist_only": "Only whitelisted active tickers (config/tickers.json:active) may be traded.",
+    "skip_conditions": [
+      "Skip if data confidence fails.",
+      "Skip if the bid/ask spread is too wide.",
+      "Skip if the intraday trend cannot be validated down.",
+      "Skip a top-up if the current price is not below the prior same-day buy reference price.",
+      "Place no more than one strategy order per ticker per stream."
+    ]
+  },
+  "same_day_top_up_policy": {
+    "summary": "One same-day top-up guard governs the morning (10:30), midday (12:30), and afternoon (3:20) live streams AND manual override same-day fills. Each later run buys only the incremental difference max(0, desired_amount - prior_same_day_amount), and only when its current decision price is strictly below the prior same-day reference price; otherwise it buys $0.",
+    "reference_price_preference": "The prior same-day reference price is resolved in order: logged target_price, then decision_price, then average_fill_price (from orders.csv or a manual override's filled_orders.csv). A missing reference price (none available) means NO automatic top-up: the candidate is classified execution_status='manual_review_candidate' (top_up_manual_review=true) at $0.",
+    "prior_allocation_chain": [
+      "Midday (12:30) folds in morning-live and manual same-day fills as prior context.",
+      "Afternoon (3:20) folds in morning-live, midday-live, and manual override reruns as prior context (scans /home/user/workspace/cron_tracking/morning_dca and /home/user/workspace/cron_tracking/midday_dca in addition to its own ce16ba6b task root).",
+      "Only scheduled AFTERNOON runs are excluded from prior context; morning/midday-stream scheduled runs remain eligible."
+    ],
+    "manual_override_handling": "Manual override fills recorded under /home/user/workspace/cron_tracking/midday_dca/manual_reruns/**/run_state.json and filled_orders.csv (run_origin='manual', manual_run=true) are EXCLUDED from all scheduled evidence, slippage, reliability, fill counts, watchdog confirmation, and cost basis, and are used ONLY as prior-allocation context for the same-day top-up guard (they affect afternoon 3:20 PM top-up eligibility, no scheduled metric).",
+    "jul9_manual_override_examples": [
+      { "ticker": "AMZN", "amount_usd": 3.0, "avg_fill_price": 242.1099, "trading_day": "2026-07-09" },
+      { "ticker": "GOOG", "amount_usd": 4.5, "avg_fill_price": 352.1778, "trading_day": "2026-07-09" },
+      { "ticker": "GOOGL", "amount_usd": 4.5, "avg_fill_price": 354.98, "trading_day": "2026-07-09" }
+    ]
+  },
   "tasks": [
     {
       "id": "b7961407",
@@ -39,32 +81,101 @@
     },
     {
       "id": "morning-dca-0945",
-      "name": "Morning graded DCA live execution",
-      "type": "trading",
+      "name": "Morning DCA pre-flight validation (read-only)",
+      "type": "analytics",
       "status": "active",
       "cron_utc": "45 13 * * 1-5",
       "et_equivalent": "9:45 AM ET weekdays (EDT)",
       "trades": true,
       "broker_account": "robinhood:562057042",
       "executor": "MorningDCAExecutor",
+      "executor_mode": "preflight",
+      "config_file": "config/morning_dca.json",
+      "state_dir": "/home/user/workspace/cron_tracking/morning_dca_preflight",
+      "preflight_artifacts": {
+        "scheduled_run_dir": "/home/user/workspace/cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/",
+        "files": ["run_state.json", "validation.csv", "signals.csv", "run_summary.json"],
+        "latest_pointer": "/home/user/workspace/cron_tracking/morning_dca_preflight/latest_preflight.json",
+        "eligibility_field": "eligible_to_execute",
+        "eligibility_semantics": "Per ticker eligible_to_execute=true/false. Eligibility means the ticker is eligible for the 10:30 evaluator, NOT final order approval. The 10:30 live task must still recompute a fresh quote, prior close, spread, trend, signal, and budget before placing."
+      },
+      "run_classification": {
+        "run_origin": "scheduled",
+        "run_type": "morning_dca_preflight",
+        "stream": "morning",
+        "cron_id": "morning-dca-0945",
+        "supersedes_cron_id": null,
+        "scheduled_for_et": "09:45",
+        "scheduled_window_start_et": "09:40",
+        "scheduled_window_end_et": "09:50",
+        "state_schema_version": "morning-preflight-v1",
+        "trades": false,
+        "valid_afternoon_evidence": false,
+        "policy_file": "config/morning_dca.json"
+      },
+      "notes": "Analytics / read-only only, no trading. A 9:45 AM ET morning DCA pre-flight validation vs. yesterday's regular-session close, graded on the shared $3-base 0x-to-5x live ladder. Runs no Robinhood order review and calls no broker placement path. Writes run_state.json, validation.csv, signals.csv, run_summary.json under morning_dca_preflight/YYYYMMDD_0945ET/ and a latest_preflight.json pointer; emits eligible_to_execute=true/false per ticker. Eligibility marks a ticker as eligible for the 10:30 evaluator ONLY, not final order approval: 10:30 recomputes fresh quote/prior close/spread/trend/signal/budget. Never touches the afternoon ce16ba6b artifact tree or latest_scheduled_run.json. stream='morning', valid_afternoon_evidence=false."
+    },
+    {
+      "id": "42173154",
+      "name": "Weekday 10:30 AM morning DCA live Robinhood execution",
+      "type": "trading",
+      "status": "active",
+      "cron_utc": "30 14 * * 1-5",
+      "et_equivalent": "10:30 AM ET weekdays (EDT)",
+      "trades": true,
+      "broker_account": "robinhood:562057042",
+      "executor": "MorningDCAExecutor",
+      "executor_mode": "live",
       "config_file": "config/morning_dca.json",
       "state_dir": "/home/user/workspace/cron_tracking/morning_dca",
       "run_classification": {
         "run_origin": "scheduled",
         "run_type": "morning_dca_live",
         "stream": "morning",
-        "cron_id": "morning-dca-0945",
+        "cron_id": "42173154",
         "supersedes_cron_id": null,
-        "scheduled_for_et": "09:45",
-        "manual_run": false,
-        "run_id_pattern": "morning_live_YYYYMMDD_0945ET",
+        "scheduled_for_et": "10:30",
+        "scheduled_window_start_et": "10:25",
+        "scheduled_window_end_et": "10:35",
         "state_schema_version": "morning-live-v1",
-        "execution_broker": "robinhood",
-        "account_number": "562057042",
+        "trades": true,
         "valid_afternoon_evidence": false,
         "policy_file": "config/morning_dca.json"
       },
-      "notes": "LIVE Robinhood execution approved 2026-07-09. Evaluates morning price weakness vs. yesterday's regular-session close using the current $3 base 0x-to-5x ladder and places real market buy orders through Robinhood account 562057042 (the sole execution broker); Alpaca is read-only validation/account context only. Writes live artifacts under the morning root only (/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_0945ET/); never writes under ce16ba6b/scheduled_runs/ and never updates latest_scheduled_run.json. stream='morning', valid_afternoon_evidence=false: morning orders/fills are NOT afternoon scheduled-execution evidence, afternoon slippage, afternoon fill counts, afternoon reliability, afternoon watchdog confirmation, or afternoon scheduled cost basis. Morning orders/fills DO count as prior same-day allocation context for the afternoon (10ce362c) same-day top-up guard. Separate from the 9:45 AM volatility outlier scan (cd45e95b) and 9:00 AM pre-market buying-power analysis (b7961407), which remain analytics-only and place no orders (avoiding duplicate orders)."
+      "preauthorized_direct_placement": true,
+      "requires_preflight_artifact": true,
+      "preflight_dependency": "Loads the same-day 9:45 pre-flight artifact (morning_dca_preflight/YYYYMMDD_0945ET/) and only evaluates/places for tickers with eligible_to_execute=true; it then recomputes a fresh quote, prior close, spread, trend, signal, and budget before placing.",
+      "notes": "Live morning Robinhood execution moved from the former 9:45 AM slot to 10:30 AM ET to give a true 60-minute intraday trend window. Robinhood account 562057042 only; Alpaca/Finance/Yahoo read-only for validation/context. Uses the shared $3 base 0x-to-5x live ladder (max per order 5x*$3=$15) and the morning budget ledger. PRE-FLIGHT GATE: requires loading the same-day 9:45 pre-flight artifact and only evaluates/places for eligible_to_execute=true tickers, recomputing fresh quote/prior close/spread/trend/signal/budget. PRE-AUTHORIZED (user approved 2026-07-10 11:20 AM ET): this scheduled live task places qualifying buys automatically within caps and MUST NOT request per-order confirmation and MUST NOT call review_equity_order; it calls place_equity_order directly only after every internal validation, signal, budget, spread, confidence, and top-up check passes. CONFIDENCE RULE: if a candidate's price/drop passes but the intraday trend cannot be validated, it does NOT auto-buy; it is classified execution_status='manual_review_candidate' (no loosened trend-unavailable execution path). Writes live artifacts under the morning_dca root (YYYYMMDD_1030ET/, run_id='morning_live_YYYYMMDD_1030ET'); never touches the afternoon ce16ba6b tree or latest_scheduled_run.json. stream='morning', valid_afternoon_evidence=false. Morning fills count only as prior-allocation context for the midday/afternoon same-day top-up guard."
+    },
+    {
+      "id": "a6239dae",
+      "name": "Weekday 12:30 PM midday DCA live Robinhood execution",
+      "type": "trading",
+      "status": "active",
+      "cron_utc": "30 16 * * 1-5",
+      "et_equivalent": "12:30 PM ET weekdays (EDT)",
+      "trades": true,
+      "broker_account": "robinhood:562057042",
+      "executor": "MiddayDCAExecutor",
+      "executor_mode": "live",
+      "config_file": "config/midday_dca.json",
+      "state_dir": "/home/user/workspace/cron_tracking/midday_dca",
+      "run_classification": {
+        "run_origin": "scheduled",
+        "run_type": "midday_dca_live",
+        "stream": "midday",
+        "cron_id": "a6239dae",
+        "supersedes_cron_id": null,
+        "scheduled_for_et": "12:30",
+        "scheduled_window_start_et": "12:25",
+        "scheduled_window_end_et": "12:35",
+        "state_schema_version": "midday-live-v1",
+        "trades": true,
+        "valid_afternoon_evidence": false,
+        "policy_file": "config/midday_dca.json"
+      },
+      "preauthorized_direct_placement": true,
+      "notes": "Live midday Robinhood execution at 12:30 PM ET. Robinhood account 562057042 only; Alpaca/Finance/Yahoo read-only for validation/context. Uses the SAME shared $3 base 0x-to-5x live ladder as the morning and afternoon streams (max per order 5x*$3=$15) and its own midday budget ledger. PRE-AUTHORIZED (user approved 2026-07-10 11:20 AM ET): places qualifying buys automatically within caps; MUST NOT request per-order confirmation and MUST NOT call review_equity_order; calls place_equity_order directly only after every internal validation, signal, budget, spread, confidence, and top-up check passes. Same active universe (excludes BYDDY/VCX/TRLV/RVI). CONFIDENCE RULE: if a candidate's price/drop passes but the intraday trend cannot be validated, it does NOT auto-buy; it is classified execution_status='manual_review_candidate' (no loosened trend-unavailable execution path). TOP-UP RULE: morning/manual prior same-day buys are prior-allocation context only; the midday run buys only the incremental difference max(0, desired - prior) when the midday price is strictly below the prior reference, else $0. Reference price preference: logged target_price, then decision_price, then average_fill_price; a missing reference => no auto top-up (manual_review_candidate). Writes live artifacts under the midday_dca root (YYYYMMDD_1230ET/, run_id='midday_live_YYYYMMDD_1230ET'); manual override reruns write under midday_dca/manual_reruns/<timestamp>/ (run_origin='manual'). Never touches the morning roots, the afternoon ce16ba6b tree, or latest_scheduled_run.json. stream='midday', valid_afternoon_evidence=false. Midday scheduled and manual override fills count only as prior-allocation context for the afternoon same-day top-up guard, never as scheduled evidence/metrics."
     },
     {
       "id": "e3e6f09e",
@@ -102,7 +213,7 @@
         "policy_file": "config/run_classification.json",
         "state_file_guarantee": "Always writes a scheduled run_state.json under scheduled_runs/YYYYMMDD_1520ET/ and updates latest_scheduled_run.json every time it fires, even when no order is placed. If Robinhood review passes but submission is blocked by required post-review user confirmation, the run_state is still valid and carries order_submit_status='not_submitted_confirmation_required', reviewed_order details where available, candidate details, and NO order_id. Such a run is valid scheduled-run evidence that the task ran, but NOT evidence of an order/fill."
       },
-      "notes": "Primary afternoon trading task. This is the repaired live task 10ce362c, which supersedes the deleted ce16ba6b; the artifact root stays under .../ce16ba6b for continuity. Approved live Robinhood execution using the $3 base 0x-to-5x ladder with tiered daily/weekly caps. Robinhood account 562057042 only; Alpaca read-only. Places real market buy orders automatically within safeguards; must not fall back to interactive confirmation. A SCHEDULED run writes run_state.json (with run_classification run_origin='scheduled', run_type='scheduled_live_test', manual_run=false, scheduled_for_et='15:20', run_id='scheduled_YYYYMMDD_1520ET', and BOTH cron_id='10ce362c' AND supersedes_cron_id='ce16ba6b') under scheduled_runs/YYYYMMDD_1520ET/ AND updates latest_scheduled_run.json. Placeholder/ambiguous ids such as 'ce16ba6b_replacement' are forbidden; for continuity, consumers still accept cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b' as valid evidence. The scheduled run_state is ALWAYS written even when no order is placed; a confirmation-blocked run records order_submit_status='not_submitted_confirmation_required', reviewed_order details, candidate details, and no order_id, and remains valid scheduled-run evidence (but not order/fill evidence). A MANUAL run writes run_state.json (run_origin='manual', manual_run=true, distinct run_id) under manual_runs/<timestamp>/ and MUST NOT update latest_scheduled_run.json. All run_state files carry state_schema_version='run-classification-v1'. Test window through Fri Aug 28 2026 inclusive. Manual runs do not count as scheduled-run evidence. Same-day morning live fills (morning-dca-0945) are consumed only as prior same-day allocation context for this task's same-day top-up guard: incremental_order_amount=max(0, desired_amount - prior_same_day_amount), and when earlier same-day buys exist the task buys only if the current price is strictly below the prior-run reference price. Any stale stored display name is superseded by this authoritative 3:20 PM ET schedule."
+      "notes": "Afternoon (3:20 PM ET) live trading task. One of three pre-authorized live trading tasks (morning 42173154, midday a6239dae, afternoon 10ce362c). This is the repaired live task 10ce362c, which supersedes the deleted ce16ba6b; the artifact root stays under .../ce16ba6b for continuity. Approved live Robinhood execution using the $3 base 0x-to-5x ladder (max per order 5x*$3=$15) with tiered daily/weekly caps. Robinhood account 562057042 only; Alpaca/Finance/Yahoo read-only. PRE-AUTHORIZED (user approved 2026-07-10 11:20 AM ET): places real market buy orders automatically within safeguards; MUST NOT fall back to interactive/per-order confirmation and MUST NOT call review_equity_order; calls place_equity_order directly only after every internal validation, signal, budget, spread, confidence, and top-up check passes. Manual/ad hoc runs still use review/confirmation. A SCHEDULED run writes run_state.json (with run_classification run_origin='scheduled', run_type='scheduled_live_test', manual_run=false, scheduled_for_et='15:20', run_id='scheduled_YYYYMMDD_1520ET', and BOTH cron_id='10ce362c' AND supersedes_cron_id='ce16ba6b') under scheduled_runs/YYYYMMDD_1520ET/ AND updates latest_scheduled_run.json. Placeholder/ambiguous ids such as 'ce16ba6b_replacement' are forbidden; for continuity, consumers still accept cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b' as valid evidence. The scheduled run_state is ALWAYS written even when no order is placed; a confirmation-blocked run records order_submit_status='not_submitted_confirmation_required', reviewed_order details, candidate details, and no order_id, and remains valid scheduled-run evidence (but not order/fill evidence). A MANUAL run writes run_state.json (run_origin='manual', manual_run=true, distinct run_id) under manual_runs/<timestamp>/ and MUST NOT update latest_scheduled_run.json. All run_state files carry state_schema_version='run-classification-v1'. Test window through Fri Aug 28 2026 inclusive. Manual runs do not count as scheduled-run evidence. SAME-DAY TOP-UP GUARD: the scheduled afternoon run folds in earlier same-day fills from the morning-live root, the midday-live root, and manual override reruns (midday_dca/manual_reruns/) as prior-allocation context (in addition to its own manual_runs/), buying only max(0, desired - prior) and only when its decision price is strictly below the prior reference price (preference: logged target_price, then decision_price, then average_fill_price; missing reference => manual_review_candidate at $0). These prior-context fills are never scheduled evidence, slippage, reliability, fill counts, or cost basis. Any stale stored display name is superseded by this authoritative 3:20 PM ET schedule."
     },
     {
       "id": "d72aa525",

@@ -1,27 +1,62 @@
 {
-  "policy_id": "morning-dca-live-v1",
+  "policy_id": "morning-dca-two-stream-v1",
   "version": "2026-07-09",
-  "purpose": "Configuration and separation policy for the MORNING graded-DCA LIVE execution stream approved 2026-07-09. The morning stream evaluates morning price weakness vs. yesterday's regular-session close on the current 0x-to-5x ladder, tracks a separate morning budget ledger, and writes its own run-state artifacts. It places LIVE Robinhood orders through account 562057042 (the sole execution broker). It is INDEPENDENT of, and never valid scheduled evidence for, the afternoon live task 10ce362c (which supersedes the deleted ce16ba6b); its only afternoon linkage is as prior same-day allocation context for the afternoon top-up guard.",
-  "state_schema_version": "morning-live-v1",
-  "mode": "live",
-  "trades": true,
+  "purpose": "Configuration and separation policy for the MORNING graded-DCA stream, which now has TWO modes. (1) A 9:45 AM ET read-only watchlist / early-warning scan (mode='watchlist', run_type='morning_dca_watchlist_scan', trades=false): analytics only, no orders, no Robinhood order review, no broker placement; it may surface early candidates but every dollar amount is hypothetical / watchlist-only. (2) A 10:30 AM ET live Robinhood execution (mode='live', run_type='morning_dca_live', trades=true) using a true 60-minute intraday trend window. Both modes share the shared $3-base 0x-to-5x live ladder and the morning budget ledger but write to distinct artifact roots. Both are INDEPENDENT of, and never valid evidence for, the afternoon live task 10ce362c (which supersedes the deleted ce16ba6b).",
   "stream": "morning",
-  "morning_task": {
+  "confidence_rule": "In LIVE mode, a candidate whose price/drop passes the ladder is auto-bought ONLY when the intraday trend can be validated (>= trend_min_bars usable intraday bars at or before the decision time). If price/drop passes but the intraday trend cannot be validated, the run must NOT auto-buy; it classifies the candidate as execution_status='manual_review_candidate'. There is no loosened trend-unavailable execution path.",
+  "trend_min_bars": 6,
+  "watchlist_task": {
+    "mode": "watchlist",
     "cron_id": "morning-dca-0945",
     "supersedes_cron_id": null,
-    "name": "Morning graded DCA live execution",
+    "name": "Morning graded DCA watchlist / early-warning scan",
     "schedule_et": "09:45",
     "schedule_human": "9:45 AM ET weekdays",
     "window_start_et": "09:40",
     "window_end_et": "09:50",
+    "run_type": "morning_dca_watchlist_scan",
+    "state_schema_version": "morning-watchlist-v1",
+    "trades": false,
+    "broker_account": "read_only",
+    "note": "Analytics / read-only only. Identifies early candidates but labels every amount hypothetical / watchlist-only. Places no trades, runs no Robinhood order review, calls no broker placement path."
+  },
+  "preflight_task": {
+    "mode": "preflight",
+    "cron_id": "morning-dca-0945",
+    "supersedes_cron_id": null,
+    "name": "Morning graded DCA pre-flight validation",
+    "schedule_et": "09:45",
+    "schedule_human": "9:45 AM ET weekdays",
+    "window_start_et": "09:40",
+    "window_end_et": "09:50",
+    "run_type": "morning_dca_preflight",
+    "state_schema_version": "morning-preflight-v1",
+    "trades": false,
+    "broker_account": "read_only",
+    "emits_eligible_to_execute": true,
+    "artifacts": ["run_state.json", "validation.csv", "signals.csv", "run_summary.json", "latest_preflight.json"],
+    "eligibility_semantics": "eligible_to_execute is a COARSE pre-screen answering 'should the 10:30 live evaluator re-evaluate this ticker?', NOT a final buy approval. A ticker is eligible when it graded to a positive-multiplier BUY at 9:45 with a usable current price and previous close. The 10:30 live run recomputes signals/budget/spread/trend/top-up from scratch and may still decline; an ineligible ticker is skipped by the 10:30 gate.",
+    "note": "Read-only pre-screen for the 10:30 live executor. Places no trades, runs no Robinhood order review, calls no broker placement path. The 10:30 live run loads the same-day preflight artifact and evaluates only eligible_to_execute=true tickers; if the artifact is missing it degrades to the full universe with a warning rather than blocking all buys."
+  },
+  "live_task": {
+    "mode": "live",
+    "cron_id": "42173154",
+    "supersedes_cron_id": null,
+    "name": "Weekday 10:30 AM morning DCA live Robinhood execution",
+    "schedule_et": "10:30",
+    "schedule_human": "10:30 AM ET weekdays",
+    "window_start_et": "10:25",
+    "window_end_et": "10:35",
     "run_type": "morning_dca_live",
-    "execution_broker": "robinhood",
-    "account_number": "562057042",
-    "broker_account": "robinhood:562057042",
-    "note": "LIVE trading. Robinhood account 562057042 is the sole execution broker for both the morning live stream and the afternoon live task; Alpaca stays read-only validation/account context only. The separate 9:45 AM volatility outlier scan (cron cd45e95b) and the 9:00 AM pre-market buying-power/cost analysis (cron b7961407) remain analytics-only and place no orders."
+    "state_schema_version": "morning-live-v1",
+    "trades": true,
+    "broker_account": "562057042",
+    "loads_same_day_preflight": true,
+    "preflight_run_state_root": "/home/user/workspace/cron_tracking/morning_dca_preflight",
+    "note": "Live Robinhood execution using account 562057042 (Alpaca stays read-only for validation/context). Uses a true 60-minute intraday trend window (moved from the former 9:45 AM live slot). Loads the same-day 9:45 preflight artifact and evaluates only eligible_to_execute=true tickers (recomputing fresh); if the preflight artifact is missing it degrades to the full universe with a warning rather than blocking all buys. Subject to the confidence_rule: no auto-buy when the intraday trend cannot be validated."
   },
   "sizing_ladder": {
-    "name": "current_0x_to_5x",
+    "name": "live_0x_to_5x",
     "drop_metric": "fraction_down_vs_previous_regular_session_close",
     "base_amount_usd": 3.0,
     "no_buy_below_pct": 0.1,
@@ -37,36 +72,60 @@
       { "min_drop_pct": 8.0, "max_drop_pct": null, "multiplier": 5.0 }
     ],
     "tier_boundary_rule": "min inclusive, max exclusive; the largest tier threshold <= actual drop wins; drop < 0.1% = 0x (no buy).",
-    "separation_note": "The morning live stream uses the current 0x-to-5x ladder, matching the afternoon ladder in config/sizing_ladder.json. Order amount = base_amount_usd * multiplier."
+    "separation_note": "As of the Fri Jul 10 2026 live-automation update the morning live stream uses the SAME shared $3-base 0x-to-5x ladder as the midday and afternoon streams (config/sizing_ladder.json). The former morning-only 0x-to-3x ladder (0.1-2/2-5/5-8/8+ -> 1x/1.5x/2x/3x) is HISTORICAL/SUPERSEDED. Max per order is therefore 5x * $3 = $15."
   },
   "budget_ledger": {
     "namespace": "morning",
     "morning_daily_cap_usd": 90.0,
     "morning_weekly_cap_usd": 450.0,
-    "separation_note": "The morning ledger is a separate session from the afternoon StrategyState / BUDGET_TIERS ledger. Morning live buys never consume or validate the afternoon 3:20/3:45 daily/weekly budget."
+    "separation_note": "The morning ledger is a separate session from the afternoon StrategyState / BUDGET_TIERS ledger. Morning buys (live) or hypothetical amounts (watchlist) never consume or validate the afternoon 3:20 daily/weekly budget."
   },
   "artifact_paths": {
-    "morning_run_state_root": "/home/user/workspace/cron_tracking/morning_dca",
-    "scheduled_run_dir": "/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_0945ET/",
-    "latest_morning_run_pointer": "/home/user/workspace/cron_tracking/morning_dca/latest_morning_run.json",
+    "watchlist_run_state_root": "/home/user/workspace/cron_tracking/morning_dca_watchlist",
+    "preflight_run_state_root": "/home/user/workspace/cron_tracking/morning_dca_preflight",
+    "live_run_state_root": "/home/user/workspace/cron_tracking/morning_dca",
+    "morning_run_state_root": "/home/user/workspace/cron_tracking/morning_dca_watchlist",
+    "watchlist_scheduled_run_dir": "/home/user/workspace/cron_tracking/morning_dca_watchlist/YYYYMMDD_0945ET/",
+    "preflight_scheduled_run_dir": "/home/user/workspace/cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/",
+    "live_scheduled_run_dir": "/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/",
+    "watchlist_latest_run_pointer": "/home/user/workspace/cron_tracking/morning_dca_watchlist/latest_morning_run.json",
+    "preflight_latest_run_pointer": "/home/user/workspace/cron_tracking/morning_dca_preflight/latest_preflight.json",
+    "live_latest_run_pointer": "/home/user/workspace/cron_tracking/morning_dca/latest_morning_run.json",
     "run_state_filename": "run_state.json",
-    "separation_note": "The morning stream writes ONLY under the morning root. It never writes into /home/user/workspace/cron_tracking/ce16ba6b/**, never updates latest_scheduled_run.json, and never touches afternoon scheduled_runs/ folders."
+    "preflight_artifact_filenames": ["run_state.json", "validation.csv", "signals.csv", "run_summary.json"],
+    "separation_note": "Each morning mode writes ONLY under its own root. None writes into /home/user/workspace/cron_tracking/ce16ba6b/**, updates latest_scheduled_run.json, or touches afternoon scheduled_runs/ folders. The 10:30 live run READS (never writes) the same-day preflight root to load eligible_to_execute. The legacy 'morning_run_state_root' key mirrors the watchlist root for backwards compatibility."
   },
   "scheduled_run_classification": {
-    "run_origin": "scheduled",
-    "run_type": "morning_dca_live",
-    "stream": "morning",
-    "cron_id": "morning-dca-0945",
-    "supersedes_cron_id": null,
-    "scheduled_for_et": "09:45",
-    "scheduled_window_start_et": "09:40",
-    "scheduled_window_end_et": "09:50",
-    "manual_run": false,
-    "run_id_pattern": "morning_live_YYYYMMDD_0945ET",
-    "valid_afternoon_evidence": false,
-    "state_schema_version": "morning-live-v1",
-    "execution_broker": "robinhood",
-    "account_number": "562057042"
+    "watchlist": {
+      "run_origin": "scheduled",
+      "run_type": "morning_dca_watchlist_scan",
+      "stream": "morning",
+      "cron_id": "morning-dca-0945",
+      "supersedes_cron_id": null,
+      "scheduled_for_et": "09:45",
+      "scheduled_window_start_et": "09:40",
+      "scheduled_window_end_et": "09:50",
+      "manual_run": false,
+      "run_id_pattern": "morning_YYYYMMDD_0945ET",
+      "trades": false,
+      "valid_afternoon_evidence": false,
+      "state_schema_version": "morning-watchlist-v1"
+    },
+    "live": {
+      "run_origin": "scheduled",
+      "run_type": "morning_dca_live",
+      "stream": "morning",
+      "cron_id": "42173154",
+      "supersedes_cron_id": null,
+      "scheduled_for_et": "10:30",
+      "scheduled_window_start_et": "10:25",
+      "scheduled_window_end_et": "10:35",
+      "manual_run": false,
+      "run_id_pattern": "morning_live_YYYYMMDD_1030ET",
+      "trades": true,
+      "valid_afternoon_evidence": false,
+      "state_schema_version": "morning-live-v1"
+    }
   },
   "top_up_guard": {
     "purpose": "Morning live orders/fills are recorded as prior same-day allocation context so the afternoon 3:20/3:45 tasks can offset (top up) rather than duplicate the same-day position. This is the ONLY way morning activity feeds the afternoon stream.",
@@ -96,6 +155,8 @@
       "drop_pct",
       "multiplier",
       "hypothetical_amount_usd",
+      "execution_status",
+      "trend_validated",
       "warnings"
     ],
     "run_state_top_level": [
@@ -113,9 +174,9 @@
     ]
   },
   "downstream_separation_rules": [
-    "Afternoon consumers glob only /home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/** and therefore never traverse the morning root.",
-    "A morning run_state has run_type='morning_dca_live', stream='morning', and valid_afternoon_evidence=false; consumers must exclude morning orders/fills from afternoon scheduled-execution evidence, afternoon slippage, afternoon fill counts, afternoon reliability, afternoon watchdog confirmation, and afternoon scheduled cost basis.",
-    "The morning stream never updates latest_scheduled_run.json and never writes into afternoon scheduled/manual folders.",
-    "Morning orders/fills DO count as prior same-day allocation context for the afternoon same-day top-up guard (see top_up_guard)."
+    "Afternoon consumers glob only /home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/** and therefore never traverse either morning root.",
+    "A morning run_state has stream='morning' and valid_afternoon_evidence=false; any consumer must exclude it from afternoon scheduled-live cost basis, slippage, reliability, and order-count metrics.",
+    "Neither morning mode updates latest_scheduled_run.json or writes into afternoon scheduled/manual folders.",
+    "Morning fills (live) count only as PRIOR-ALLOCATION CONTEXT for the afternoon same-day top-up guard; they are never afternoon scheduled evidence, slippage, watchdog confirmation, scheduled cost basis, or scheduled fill counts."
   ]
 }

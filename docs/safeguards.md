@@ -10,8 +10,9 @@ should skip rather than trade. Machine-readable copies live in
 
 - **Robinhood Agentic account `562057042` is the only execution broker/account**
   for live and manual runs.
-- **Alpaca is read-only** — validation and account context only — unless the
-  user explicitly changes this later.
+- **Alpaca, Finance, and Yahoo are read-only** — validation, market-data, and
+  account context only; never execution — unless the user explicitly changes this
+  later.
 
 ## Trading constraints
 
@@ -19,10 +20,36 @@ should skip rather than trade. Machine-readable copies live in
 - **No options, no crypto, no margin changes.**
 - **No order replacement, no order cancellations, no account modifications.**
 - **No trading outside regular market hours.**
-- **One strategy order per ticker per day.**
+- **One strategy order per ticker per stream per day.**
 - Orders are **market buys** with a `dollar_amount` notional and
-  `time_in_force = gfd`, submitted **only after `review_equity_order` passes**.
+  `time_in_force = gfd`.
+- **Submission path (approved Fri Jul 10 2026 11:20 AM ET):**
+  - **Scheduled live tasks are pre-authorized.** They **must not** request
+    per-order confirmation and **must not** call Robinhood `review_equity_order`
+    (which forces a preview + confirmation). They call `place_equity_order`
+    directly **only after every internal validation, signal, budget, spread,
+    confidence/trend, and top-up check passes**.
+  - **Manual / ad hoc runs still use the review + confirmation path** —
+    `review_equity_order` must pass before any placement.
 - None of the above may change unless the user explicitly requests it later.
+
+## Circuit breakers
+
+Hard limits that skip an order rather than trade when any is hit:
+
+- **Max per order: $15** (5x × $3 base) — the absolute per-order ceiling across
+  all live streams.
+- Never exceed the selected **daily cap**, **weekly cap**, or **available buying
+  power**.
+- **Whitelisted (active-universe) tickers only.**
+- **Skip** when data confidence fails, the bid/ask spread is too wide, the
+  intraday trend cannot be validated down (flag `manual_review_candidate` instead
+  of buying), or a same-day top-up's current price is not strictly below the prior
+  same-day buy reference price.
+- **No more than one strategy order per ticker per stream.**
+
+See the `execution_authorization_policy` and `circuit_breakers` blocks in
+[`config/budgets.json`](../config/budgets.json).
 
 ## Budget caps
 
