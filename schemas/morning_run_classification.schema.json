@@ -14,9 +14,7 @@
     "run_id",
     "triggered_at_utc",
     "state_schema_version",
-    "valid_afternoon_evidence",
-    "execution_broker",
-    "account_number"
+    "valid_afternoon_evidence"
   ],
   "additionalProperties": true,
   "properties": {
@@ -323,6 +321,25 @@
             "pattern": "^morning_live_[0-9]{8}_1030ET$"
           }
         }
+      }
+    },
+    {
+      "comment": "Live execution requires execution_broker and account_number; watchlist/preflight do not.",
+      "if": {
+        "properties": {
+          "run_type": {
+            "const": "morning_dca_live"
+          }
+        },
+        "required": [
+          "run_type"
+        ]
+      },
+      "then": {
+        "required": [
+          "execution_broker",
+          "account_number"
+        ]
       }
     },
     {

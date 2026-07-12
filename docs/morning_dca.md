@@ -105,15 +105,15 @@ the afternoon (`10ce362c`) same-day top-up guard. When the afternoon task
 evaluates a ticker that already received a same-day morning buy, it tops up
 rather than duplicating:
 
-- `incremental_order_amount = max(0, morning_desired_amount - prior_same_day_amount)`
+- `incremental_order_amount = max(0, afternoon_desired_amount - prior_same_day_amount)`
 - When earlier same-day buys exist, the afternoon task buys only if the current
   price is **strictly below** the prior-run reference price; otherwise it holds.
 
 Top-up guard fields carried for the 9:45 → afternoon linkage:
 `prior_same_day_amount`, `prior_same_day_reference_price`,
-`prior_same_day_source`, `prior_same_day_run_id`, `prior_same_day_order_id`,
-`morning_desired_amount`, `incremental_order_amount`, `top_up_guard_result`, and
-`reason`.
+`prior_same_day_source`, `prior_same_day_run_id`, `afternoon_desired_amount_usd`,
+`afternoon_desired_amount`, `afternoon_decision_price`, `incremental_order_amount`,
+`top_up_guard_result`, `top_up_skipped`, and `top_up_manual_review`.
 
 ## Sizing ladder (0x → 5x)
 

@@ -86,7 +86,7 @@
       "status": "active",
       "cron_utc": "45 13 * * 1-5",
       "et_equivalent": "9:45 AM ET weekdays (EDT)",
-      "trades": true,
+      "trades": false,
       "broker_account": "robinhood:562057042",
       "executor": "MorningDCAExecutor",
       "executor_mode": "preflight",
