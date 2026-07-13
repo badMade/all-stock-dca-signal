@@ -108,13 +108,24 @@ MORNING_WATCHLIST_SCHEMA_VERSION = "morning-watchlist-v1"
 # a COARSE pre-screen (is a ticker worth evaluating at 10:30?), NOT a final
 # approval: the 10:30 live run always recomputes signals, budget, spread, trend,
 # and top-up from scratch and may still decline to place an order.
+#
+# As of Mon Jul 13 2026 the artifact is machine-complete
+# (schema morning-preflight-v2-machine-complete, schemas/morning_preflight.schema.json):
+# it always writes the top-level overall_ok flag plus eligible_count,
+# ineligible_count, unresolved_tickers, blocking_errors, and a
+# per_ticker_eligibility list with every active-universe symbol exactly once, so
+# the 10:30 live task can gate directly off machine fields. Unresolved symbols
+# (e.g. AAAU, SPCX) are emitted as rows with eligible_to_execute=false and
+# ineligible_reason='unresolved_ticker'; they never force overall_ok=false, which
+# flips false only for global/account/buying-power/auth/schema-write failures.
 MORNING_PREFLIGHT_MODE = "preflight"
 MORNING_PREFLIGHT_CRON_ID = "morning-dca-0945"
 MORNING_PREFLIGHT_RUN_TYPE = "morning_dca_preflight"
 MORNING_PREFLIGHT_SCHEDULED_FOR_ET = "09:45"
 MORNING_PREFLIGHT_WINDOW_START_ET = "09:40"
 MORNING_PREFLIGHT_WINDOW_END_ET = "09:50"
-MORNING_PREFLIGHT_SCHEMA_VERSION = "morning-preflight-v1"
+MORNING_PREFLIGHT_SCHEMA_VERSION = "morning-preflight-v2-machine-complete"
+MORNING_PREFLIGHT_TREND_STATUS = "not_evaluated_preflight"
 
 # Live (10:30 AM ET) execution identity — Robinhood-only live buys.
 MORNING_LIVE_MODE = "live"
@@ -459,6 +470,55 @@ def preflight_eligibility(signal: "MorningSignal") -> bool:
         and signal.current_price is not None
         and signal.previous_close is not None
     )
+
+
+def preflight_ticker_eligibility_row(signal: "MorningSignal") -> Dict[str, Any]:
+    """Build one machine-complete ``per_ticker_eligibility`` row for ``signal``.
+
+    Emits every field the 10:30 live gate consumes, exactly once per active
+    symbol. Fields the coarse read-only pre-flight does not evaluate (account,
+    buying power, spread) are ``None`` rather than fabricated; the 10:30 live run
+    computes them fresh. Trend is ``not_evaluated_preflight`` (no 60-minute
+    window at 9:45). Unresolved symbols (no usable quote or prior close, e.g.
+    AAAU/SPCX) are marked ``eligible_to_execute=false`` with
+    ``ineligible_reason='unresolved_ticker'`` and never invalidate the artifact.
+    """
+    quote_available = signal.current_price is not None
+    prior_close_available = signal.previous_close is not None
+    resolved = quote_available and prior_close_available
+    eligible = preflight_eligibility(signal)
+
+    if not quote_available and not prior_close_available:
+        ineligible_reason: Optional[str] = "unresolved_ticker"
+    elif not quote_available:
+        ineligible_reason = "quote_unavailable"
+    elif not prior_close_available:
+        ineligible_reason = "prior_close_unavailable"
+    elif not eligible:
+        ineligible_reason = "no_qualifying_drop"
+    else:
+        ineligible_reason = None
+
+    return {
+        "symbol": signal.ticker,
+        "active_universe": True,
+        "quote_available": quote_available,
+        "prior_close_available": prior_close_available,
+        "tradable": resolved,
+        # Account/buying-power/spread are not bound by the read-only pre-flight;
+        # the 10:30 live run performs the authoritative checks.
+        "account_ok": None,
+        "buying_power_ok": None,
+        "spread_pct": None,
+        "spread_ok": None,
+        "trend_status": MORNING_PREFLIGHT_TREND_STATUS,
+        "data_confidence_status": "resolved" if resolved else "unresolved",
+        "early_drop_pct": signal.drop_pct,
+        "early_multiplier": signal.multiplier,
+        "hypothetical_amount": signal.hypothetical_amount_usd,
+        "eligible_to_execute": eligible,
+        "ineligible_reason": ineligible_reason,
+    }
 
 
 @dataclass(frozen=True)
@@ -1316,6 +1376,24 @@ class MorningDCAExecutor(DCAExecutor):
             eligible = [s for s in signals if preflight_eligibility(s)]
             artifacts["eligible_to_execute_tickers"] = [s.ticker for s in eligible]
             artifacts["counts"]["eligible_to_execute"] = len(eligible)
+            # Machine-complete envelope (schema morning-preflight-v2-machine-complete):
+            # one row per active symbol plus top-level gate fields the 10:30 live
+            # task consumes without re-deriving. Unresolved symbols become rows
+            # with eligible_to_execute=false; they never flip overall_ok.
+            ticker_rows = [preflight_ticker_eligibility_row(s) for s in signals]
+            unresolved = [
+                r["symbol"] for r in ticker_rows
+                if r["data_confidence_status"] != "resolved"
+            ]
+            blocking_errors: List[str] = []
+            artifacts["per_ticker_eligibility"] = ticker_rows
+            artifacts["eligible_count"] = sum(1 for r in ticker_rows if r["eligible_to_execute"])
+            artifacts["ineligible_count"] = sum(1 for r in ticker_rows if not r["eligible_to_execute"])
+            artifacts["unresolved_tickers"] = unresolved
+            artifacts["blocking_errors"] = blocking_errors
+            # overall_ok is false ONLY for global/account/auth/schema-write
+            # failures; per-symbol unresolved/ineligible tickers do not count.
+            artifacts["overall_ok"] = not blocking_errors
         self._augment_artifacts(artifacts, top_up_outcomes)
         return artifacts
 

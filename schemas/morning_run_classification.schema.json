@@ -72,8 +72,8 @@
     },
     "state_schema_version": {
       "type": "string",
-      "enum": ["morning-watchlist-v1", "morning-preflight-v1", "morning-live-v1"],
-      "description": "Contract version tag: 'morning-watchlist-v1' for the watchlist scan, 'morning-preflight-v1' for the pre-flight validation, 'morning-live-v1' for the live execution."
+      "enum": ["morning-watchlist-v1", "morning-preflight-v2-machine-complete", "morning-live-v1"],
+      "description": "Contract version tag: 'morning-watchlist-v1' for the watchlist scan, 'morning-preflight-v2-machine-complete' for the machine-complete pre-flight validation (see schemas/morning_preflight.schema.json), 'morning-live-v1' for the live execution."
     },
     "valid_afternoon_evidence": {
       "type": "boolean",
@@ -103,7 +103,7 @@
       "then": {
         "properties": {
           "cron_id": { "const": "morning-dca-0945" },
-          "state_schema_version": { "const": "morning-preflight-v1" },
+          "state_schema_version": { "const": "morning-preflight-v2-machine-complete" },
           "trades": { "const": false }
         }
       }

@@ -95,8 +95,12 @@
         "scheduled_run_dir": "/home/user/workspace/cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/",
         "files": ["run_state.json", "validation.csv", "signals.csv", "run_summary.json"],
         "latest_pointer": "/home/user/workspace/cron_tracking/morning_dca_preflight/latest_preflight.json",
+        "run_state_schema_file": "schemas/morning_preflight.schema.json",
+        "state_schema_version": "morning-preflight-v2-machine-complete",
         "eligibility_field": "eligible_to_execute",
-        "eligibility_semantics": "Per ticker eligible_to_execute=true/false. Eligibility means the ticker is eligible for the 10:30 evaluator, NOT final order approval. The 10:30 live task must still recompute a fresh quote, prior close, spread, trend, signal, and budget before placing."
+        "eligibility_semantics": "Per ticker eligible_to_execute=true/false. Eligibility means the ticker is eligible for the 10:30 evaluator, NOT final order approval. The 10:30 live task must still recompute a fresh quote, prior close, spread, trend, signal, and budget before placing.",
+        "machine_complete_contract": "Since 2026-07-13 the run_state.json MUST always include top-level overall_ok, eligible_count, ineligible_count, unresolved_tickers, blocking_errors, warnings, run_classification, and per_ticker_eligibility (every active-universe symbol exactly once, each row carrying symbol, active_universe, quote_available, prior_close_available, tradable, account_ok, buying_power_ok, spread_pct, spread_ok, trend_status, data_confidence_status, early_drop_pct, early_multiplier, hypothetical_amount, eligible_to_execute, ineligible_reason). This machine contract exists because the 2026-07-13 10:30 live run was blocked by a 9:45 artifact missing overall_ok and the per-ticker eligibility list.",
+        "unresolved_ticker_rule": "Unresolved symbols (e.g. AAAU, SPCX) are per-symbol rows with eligible_to_execute=false and ineligible_reason='unresolved_ticker' (or a specific lookup/tradability failure) and are listed in unresolved_tickers; they never set overall_ok=false. overall_ok is false ONLY for global/account/buying-power/auth/schema-write failures."
       },
       "run_classification": {
         "run_origin": "scheduled",
@@ -107,12 +111,12 @@
         "scheduled_for_et": "09:45",
         "scheduled_window_start_et": "09:40",
         "scheduled_window_end_et": "09:50",
-        "state_schema_version": "morning-preflight-v1",
+        "state_schema_version": "morning-preflight-v2-machine-complete",
         "trades": false,
         "valid_afternoon_evidence": false,
         "policy_file": "config/morning_dca.json"
       },
-      "notes": "Analytics / read-only only, no trading. A 9:45 AM ET morning DCA pre-flight validation vs. yesterday's regular-session close, graded on the shared $3-base 0x-to-5x live ladder. Runs no Robinhood order review and calls no broker placement path. Writes run_state.json, validation.csv, signals.csv, run_summary.json under morning_dca_preflight/YYYYMMDD_0945ET/ and a latest_preflight.json pointer; emits eligible_to_execute=true/false per ticker. Eligibility marks a ticker as eligible for the 10:30 evaluator ONLY, not final order approval: 10:30 recomputes fresh quote/prior close/spread/trend/signal/budget. Never touches the afternoon ce16ba6b artifact tree or latest_scheduled_run.json. stream='morning', valid_afternoon_evidence=false."
+      "notes": "Analytics / read-only only, no trading. A 9:45 AM ET morning DCA pre-flight validation vs. yesterday's regular-session close, graded on the shared $3-base 0x-to-5x live ladder. Runs no Robinhood order review and calls no broker placement path. Writes run_state.json, validation.csv, signals.csv, run_summary.json under morning_dca_preflight/YYYYMMDD_0945ET/ and a latest_preflight.json pointer. As of 2026-07-13 the run_state.json is machine-complete (schema morning-preflight-v2-machine-complete): it always writes top-level overall_ok, eligible_count, ineligible_count, unresolved_tickers, blocking_errors, warnings, run_classification, and per_ticker_eligibility (every active-universe symbol exactly once) so the 10:30 live task can gate directly off machine fields — this was added after the 2026-07-13 10:30 run was blocked by a 9:45 artifact missing overall_ok and the per-ticker eligibility list. Unresolved symbols (e.g. AAAU, SPCX) become rows with eligible_to_execute=false, ineligible_reason='unresolved_ticker' and never set overall_ok=false; overall_ok is false only for global/account/buying-power/auth/schema-write failures. Eligibility marks a ticker as eligible for the 10:30 evaluator ONLY, not final order approval: 10:30 recomputes fresh quote/prior close/spread/trend/signal/budget. Never touches the afternoon ce16ba6b artifact tree or latest_scheduled_run.json. stream='morning', valid_afternoon_evidence=false."
     },
     {
       "id": "42173154",

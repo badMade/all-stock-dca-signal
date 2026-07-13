@@ -74,9 +74,21 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 > budget ledger in **two** modes.
 > (1) A **9:45 AM ET read-only pre-flight validation**
 > (`morning-dca-0945`, run_type `morning_dca_preflight`,
-> `state_schema_version='morning-preflight-v1'`, **no trades**) writing under
-> `cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/` (`run_state.json`,
-> `validation.csv`, `signals.csv`, `run_summary.json`, `latest_preflight.json`).
+> `state_schema_version='morning-preflight-v2-machine-complete'`, **no trades**)
+> writing under `cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/`
+> (`run_state.json`, `validation.csv`, `signals.csv`, `run_summary.json`,
+> `latest_preflight.json`). As of **2026-07-13** the `run_state.json` is
+> **machine-complete** (schema
+> [`schemas/morning_preflight.schema.json`](../schemas/morning_preflight.schema.json)):
+> it always writes top-level `overall_ok`, `eligible_count`, `ineligible_count`,
+> `unresolved_tickers`, `blocking_errors`, `warnings`, `run_classification`, and a
+> `per_ticker_eligibility` list with **every active-universe symbol exactly once**
+> so the 10:30 live task can gate directly off machine fields (added after the
+> 2026-07-13 10:30 run was blocked by a 9:45 artifact missing `overall_ok` and the
+> per-ticker eligibility list). Unresolved symbols (e.g. AAAU, SPCX) are rows with
+> `eligible_to_execute=false`, `ineligible_reason='unresolved_ticker'` and never
+> set `overall_ok=false`; `overall_ok` is false only for
+> global/account/buying-power/auth/schema-write failures.
 > It emits **`eligible_to_execute=true/false` per ticker** — a **coarse
 > pre-screen** for the 10:30 evaluator, **not** a final approval. (A read-only
 > `watchlist` early-warning mode remains available under
@@ -150,7 +162,7 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 - Analytics / **read-only**, **no trading**. Runs **9:45 AM ET weekdays** (executor mode `preflight`).
 - Evaluates morning price weakness vs. yesterday’s regular-session close on the shared **$3 base 0x-to-5x ladder** (`config/morning_dca.json`) as a pre-screen for the 10:30 live evaluator; runs no Robinhood order review and calls no broker placement path. Writes pre-flight artifacts under `/home/user/workspace/cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/` — `run_state.json`, `validation.csv`, `signals.csv`, `run_summary.json`, and the `latest_preflight.json` pointer (`run_id='morning_preflight_YYYYMMDD_0945ET'`).
 - Emits **`eligible_to_execute=true/false` per ticker**. This is a **coarse pre-screen** (is a ticker worth re-evaluating at 10:30?), **NOT** a final buy approval — the 10:30 live run recomputes signals/budget/spread/trend/top-up from scratch and may still decline. A ticker is eligible when it graded to a positive-multiplier BUY at 9:45 with a usable current price and previous close.
-- `stream='morning'`, `run_type='morning_dca_preflight'`, `state_schema_version='morning-preflight-v1'`, `valid_afternoon_evidence=false`. Never writes into the afternoon `ce16ba6b` tree or updates `latest_scheduled_run.json`. (A read-only `watchlist` early-warning mode remains available, writing under `cron_tracking/morning_dca_watchlist/`.)
+- `stream='morning'`, `run_type='morning_dca_preflight'`, `state_schema_version='morning-preflight-v2-machine-complete'`, `valid_afternoon_evidence=false`. Never writes into the afternoon `ce16ba6b` tree or updates `latest_scheduled_run.json`. (A read-only `watchlist` early-warning mode remains available, writing under `cron_tracking/morning_dca_watchlist/`.)
 
 ### `42173154` — Weekday 10:30 AM morning DCA live Robinhood execution (`MorningDCAExecutor`)
 - **Live trading** (executor mode `live`). Runs **10:30 AM ET weekdays** — moved from the former 9:45 AM live slot to give a true **60-minute intraday trend window**.

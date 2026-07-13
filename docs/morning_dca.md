@@ -13,7 +13,7 @@ The stream runs in these modes:
 
 | Mode | Task | ET | Trades | run_type | schema | Artifact root |
 |---|---|---|---|---|---|---|
-| `preflight` | `morning-dca-0945` | 9:45 AM | **no** | `morning_dca_preflight` | `morning-preflight-v1` | `.../cron_tracking/morning_dca_preflight/` |
+| `preflight` | `morning-dca-0945` | 9:45 AM | **no** | `morning_dca_preflight` | `morning-preflight-v2-machine-complete` | `.../cron_tracking/morning_dca_preflight/` |
 | `live` | `42173154` | 10:30 AM | **yes** | `morning_dca_live` | `morning-live-v1` | `.../cron_tracking/morning_dca/` |
 | `watchlist` | (read-only, optional) | 9:45 AM | **no** | `morning_dca_watchlist_scan` | `morning-watchlist-v1` | `.../cron_tracking/morning_dca_watchlist/` |
 
@@ -36,6 +36,42 @@ and may still decline; an ineligible ticker is simply skipped by the 10:30 gate.
 (An optional read-only `watchlist` early-warning scan mode remains available,
 writing under `.../cron_tracking/morning_dca_watchlist/`, run_type
 `morning_dca_watchlist_scan`; its dollar amounts are hypothetical/watchlist-only.)
+
+### Machine-complete pre-flight contract (`morning-preflight-v2-machine-complete`)
+
+As of **Mon Jul 13 2026** the 9:45 `run_state.json` is **machine-complete** and
+validated by
+[`schemas/morning_preflight.schema.json`](../schemas/morning_preflight.schema.json).
+It was introduced after the 10:30 AM live execution was **blocked** because the
+9:45 artifact lacked the machine-readable gate fields the live task needs — a
+top-level `overall_ok` flag and a per-ticker `eligible_to_execute` list. The
+pre-flight now **always** writes:
+
+- Top level: `overall_ok`, `eligible_count`, `ineligible_count`,
+  `unresolved_tickers`, `blocking_errors`, `warnings`, `run_classification`, and
+  `per_ticker_eligibility`.
+- `per_ticker_eligibility` — one row per **active-universe symbol, each exactly
+  once**, carrying `symbol`, `active_universe`, `quote_available`,
+  `prior_close_available`, `tradable`, `account_ok`, `buying_power_ok`,
+  `spread_pct`, `spread_ok`, `trend_status`, `data_confidence_status`,
+  `early_drop_pct`, `early_multiplier`, `hypothetical_amount`,
+  `eligible_to_execute`, and `ineligible_reason`.
+
+The read-only coarse pre-flight does not bind a broker account or evaluate
+spread/trend, so `account_ok`, `buying_power_ok`, `spread_pct`, `spread_ok` are
+`null` and `trend_status` is `not_evaluated_preflight`; the 10:30 live run
+computes them fresh.
+
+**`overall_ok` rule:** `overall_ok` is `false` **only** for
+global/account/buying-power/auth/schema-write failures (recorded in
+`blocking_errors`).
+
+**Unresolved-ticker rule:** unresolved symbols such as **AAAU** or **SPCX** are
+represented as per-symbol rows with `eligible_to_execute=false` and
+`ineligible_reason='unresolved_ticker'` (or a specific lookup/tradability
+failure code) and listed in `unresolved_tickers`. They **never** set
+`overall_ok=false` or invalidate the whole artifact as long as the other required
+fields were written.
 
 ## 10:30 AM live Robinhood execution
 
@@ -241,3 +277,36 @@ cost basis, or scheduled fill counts).
 The DFTX fill of **$13.50 = 4.5× $3** is only reachable on the 0x-to-5x ladder
 (the former morning-only 0x-to-3x ladder capped at 3× = $9), confirming the
 morning live stream now shares the canonical 0x-to-5x ladder.
+
+## Recovery record — 2026-07-13 morning pre-flight repair + recovery batch
+
+On **Mon Jul 13 2026** the scheduled 10:30 AM morning DCA live execution was
+**blocked**: the 9:45 pre-flight artifact was missing the machine-readable gate
+fields (top-level `overall_ok` and a per-ticker `eligible_to_execute` list), so
+the live task could not gate. The fix is the machine-complete pre-flight
+contract described above (schema `morning-preflight-v2-machine-complete`).
+
+A same-day **recovery run at ~11:07 AM ET** repaired the 9:45 pre-flight artifact
+(re-emitting the machine-complete fields) and placed a **manual recovery /
+morning evidence batch of 13 filled orders totaling $66.00**. This is **valid
+morning recovery context only** — not afternoon scheduled evidence. Afternoon /
+midday tasks may use it **only as same-day top-up context** (like any morning
+fill), never as afternoon scheduled evidence, slippage, watchdog confirmation,
+scheduled cost basis, or scheduled fill counts.
+
+| Ticker | Planned amount (USD) |
+|---|---|
+| DFTX | $10.50 |
+| TRIN | $3.00 |
+| AAAU | $6.00 |
+| EVR | $3.00 |
+| IRDM | $3.00 |
+| ASML | $6.00 |
+| STM | $6.00 |
+| AVGO | $6.00 |
+| NVDA | $4.50 |
+| QBTS | $9.00 |
+| GS | $3.00 |
+| XLG | $3.00 |
+| TOPT | $3.00 |
+| **Total** | **$66.00** |

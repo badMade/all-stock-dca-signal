@@ -29,9 +29,11 @@ from morning_dca import (
     MorningConfig,
     MorningDCAExecutor,
     MorningLedger,
+    MorningSignal,
     load_same_day_preflight,
     nyse_holidays,
     preflight_eligibility,
+    preflight_ticker_eligibility_row,
 )
 from near_close_dca import EASTERN, Action, Bar, SourceName
 
@@ -933,7 +935,7 @@ def test_preflight_run_writes_validation_and_summary_and_pointer(tmp_path):
     assert art["mode"] == "preflight"
     assert art["trades"] is False
     assert art["run_classification"]["run_type"] == "morning_dca_preflight"
-    assert art["run_classification"]["state_schema_version"] == "morning-preflight-v1"
+    assert art["run_classification"]["state_schema_version"] == "morning-preflight-v2-machine-complete"
     assert art["eligible_to_execute_tickers"] == ["BIG"]
     assert art["counts"]["eligible_to_execute"] == 1
     # Every signal row carries the per-ticker verdict.
@@ -947,6 +949,142 @@ def test_preflight_run_writes_validation_and_summary_and_pointer(tmp_path):
     # Scheduled pre-flight advances the preflight-specific pointer only.
     assert (Path(tmp_path) / "latest_preflight.json").exists()
     assert not (Path(tmp_path) / "latest_morning_run.json").exists()
+
+
+# --- Machine-complete pre-flight contract (morning-preflight-v2) ------------
+_MACHINE_TICKER_FIELDS = {
+    "symbol", "active_universe", "quote_available", "prior_close_available",
+    "tradable", "account_ok", "buying_power_ok", "spread_pct", "spread_ok",
+    "trend_status", "data_confidence_status", "early_drop_pct", "early_multiplier",
+    "hypothetical_amount", "eligible_to_execute", "ineligible_reason",
+}
+
+
+class _UnresolvedProvider(FixedDropProvider):
+    """Marks ``unresolved`` symbols as fully unresolvable (no quote, no prior close)."""
+
+    def __init__(self, source, previous_close, drops, unresolved):
+        super().__init__(source, previous_close, drops)
+        self._unresolved = set(unresolved)
+
+    def get_previous_close_bar(self, ticker, as_of):
+        if ticker in self._unresolved:
+            ts = datetime.combine(
+                as_of.astimezone(EASTERN).date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN
+            )
+            return Bar(timestamp=ts, open=-1.0, high=-1.0, low=-1.0, close=-1.0, volume=0.0)
+        return super().get_previous_close_bar(ticker, as_of)
+
+
+def test_preflight_machine_complete_envelope():
+    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG", "FLAT")), mode=MORNING_PREFLIGHT_MODE)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.03, "FLAT": 0.0})
+    art = ex.run(_now_preflight(), data)["artifacts"]
+
+    # Every required top-level machine field is present.
+    for key in ("overall_ok", "eligible_count", "ineligible_count",
+                "unresolved_tickers", "blocking_errors", "warnings",
+                "run_classification", "per_ticker_eligibility"):
+        assert key in art, key
+
+    # No global failure -> overall_ok true even with an ineligible ticker.
+    assert art["overall_ok"] is True
+    assert art["blocking_errors"] == []
+
+    rows = {r["symbol"]: r for r in art["per_ticker_eligibility"]}
+    # Every active symbol appears exactly once with the full field set.
+    assert set(rows) == {"BIG", "FLAT"}
+    assert len(art["per_ticker_eligibility"]) == 2
+    for row in art["per_ticker_eligibility"]:
+        assert set(row.keys()) == _MACHINE_TICKER_FIELDS
+        # Coarse read-only pre-flight does not bind account/spread/trend.
+        assert row["account_ok"] is None
+        assert row["buying_power_ok"] is None
+        assert row["spread_pct"] is None
+        assert row["spread_ok"] is None
+        assert row["trend_status"] == "not_evaluated_preflight"
+
+    assert rows["BIG"]["eligible_to_execute"] is True
+    assert rows["BIG"]["ineligible_reason"] is None
+    assert rows["FLAT"]["eligible_to_execute"] is False
+    assert rows["FLAT"]["ineligible_reason"] == "no_qualifying_drop"
+
+    assert art["eligible_count"] == 1
+    assert art["ineligible_count"] == 1
+    assert art["unresolved_tickers"] == []
+
+
+def test_preflight_unresolved_ticker_does_not_invalidate_run():
+    # An unresolved symbol (no quote, no prior close) must be a per-symbol row
+    # with eligible_to_execute=false and ineligible_reason='unresolved_ticker',
+    # listed in unresolved_tickers, and MUST NOT flip overall_ok.
+    ex = MorningDCAExecutor(
+        MorningConfig(tickers=("BIG", "AAAU")), mode=MORNING_PREFLIGHT_MODE
+    )
+    data = _UnresolvedProvider(
+        SourceName.ROBINHOOD, 100.0, {"BIG": 0.03, "AAAU": 1.0}, unresolved=("AAAU",)
+    )
+    art = ex.run(_now_preflight(), data)["artifacts"]
+
+    assert art["overall_ok"] is True
+    assert "AAAU" in art["unresolved_tickers"]
+    rows = {r["symbol"]: r for r in art["per_ticker_eligibility"]}
+    assert rows["AAAU"]["eligible_to_execute"] is False
+    assert rows["AAAU"]["ineligible_reason"] == "unresolved_ticker"
+    assert rows["AAAU"]["data_confidence_status"] == "unresolved"
+    assert rows["AAAU"]["quote_available"] is False
+    assert rows["AAAU"]["prior_close_available"] is False
+    # BIG still resolves and stays eligible alongside the unresolved row.
+    assert rows["BIG"]["eligible_to_execute"] is True
+
+
+def test_preflight_ticker_eligibility_row_unresolved_unit():
+    sig = MorningSignal(
+        ticker="SPCX",
+        source=SourceName.ROBINHOOD.value,
+        action=Action.NO_DATA,
+        reason="unresolved",
+        current_price=None,
+        previous_close=None,
+        drop_pct=None,
+        multiplier=0.0,
+        hypothetical_amount_usd=0.0,
+        warnings=("lookup failed",),
+    )
+    row = preflight_ticker_eligibility_row(sig)
+    assert set(row.keys()) == _MACHINE_TICKER_FIELDS
+    assert row["symbol"] == "SPCX"
+    assert row["eligible_to_execute"] is False
+    assert row["ineligible_reason"] == "unresolved_ticker"
+    assert row["data_confidence_status"] == "unresolved"
+    assert row["tradable"] is False
+
+
+def test_preflight_machine_complete_validates_against_json_schema(tmp_path):
+    try:
+        import jsonschema
+        from referencing import Registry, Resource
+    except ImportError:
+        return
+
+    schemas_dir = Path(__file__).resolve().parent / "schemas"
+    main = json.loads((schemas_dir / "morning_preflight.schema.json").read_text(encoding="utf-8"))
+    resources = [
+        (name, Resource.from_contents(
+            json.loads((schemas_dir / name).read_text(encoding="utf-8"))))
+        for name in ("morning_preflight.schema.json", "morning_run_classification.schema.json")
+    ]
+    registry = Registry().with_resources(resources)
+
+    ex = MorningDCAExecutor(
+        MorningConfig(tickers=("BIG", "AAAU"), morning_run_state_root=str(tmp_path)),
+        mode=MORNING_PREFLIGHT_MODE,
+    )
+    data = _UnresolvedProvider(
+        SourceName.ROBINHOOD, 100.0, {"BIG": 0.03, "AAAU": 1.0}, unresolved=("AAAU",)
+    )
+    art = ex.run(_now_preflight(), data)["artifacts"]
+    jsonschema.Draft7Validator(main, registry=registry).validate(art)
 
 
 def test_load_same_day_preflight_reads_eligible_set(tmp_path):
@@ -1045,7 +1183,7 @@ def test_preflight_classification_matches_morning_schema():
     )
     assert rc["run_type"] == "morning_dca_preflight"
     assert rc["cron_id"] == "morning-dca-0945"
-    assert rc["state_schema_version"] == "morning-preflight-v1"
+    assert rc["state_schema_version"] == "morning-preflight-v2-machine-complete"
     assert rc["run_id"] == "morning_preflight_20260708_0945ET"
     assert set(schema["required"]).issubset(rc.keys())
     try:
