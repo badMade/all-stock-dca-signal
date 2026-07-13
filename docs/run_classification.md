@@ -93,6 +93,37 @@ artifacts written before/after the repair both remain valid.
 The manual `run_id` must be **distinct** and must never match the scheduled
 pattern `scheduled_YYYYMMDD_1520ET`.
 
+### Manual final buy override (`final_manual_buy_override`)
+
+When the **final buy of the day** is requested manually (e.g. the scheduled
+3:20 PM ET run placed 0 orders and the user asks for the final buy by hand), the
+run is a manual run with `run_type='final_manual_buy_override'` and adds two
+explicit flags so downstream reporting can never mistake it for scheduled
+evidence:
+
+```json
+{
+  "run_origin": "manual",
+  "manual_run": true,
+  "run_type": "final_manual_buy_override",
+  "valid_afternoon_scheduled_evidence": false,
+  "same_day_top_up_context_only": true,
+  "cron_id": "10ce362c",
+  "supersedes_cron_id": "ce16ba6b",
+  "run_id": "manual_YYYYMMDD_HHMMSSZ",
+  "triggered_at_utc": "2026-07-13T19:36:00Z",
+  "state_schema_version": "run-classification-v1"
+}
+```
+
+Build it with `build_final_manual_override_classification(...)`. The
+**2026-07-13** incident is the canonical example: 34 fills, planned total
+$234.00, backfilled under
+`.../cron_tracking/ce16ba6b/manual_runs/final_manual_override_20260713_1536ET/`
+and `.../cron_tracking/midday_dca/manual_reruns/final_manual_override_20260713_1536ET/`.
+Its order IDs are excluded from all scheduled-live metrics and shown only in the
+"Manual Final Buy Override / Same-Day Top-Up Context" report section (below).
+
 ## Scheduled state-file guarantee (always write, even with no order)
 
 The 3:20 PM live task (`10ce362c`) **always** writes a scheduled
@@ -235,8 +266,15 @@ Applies to slippage (`67aa802b`), watchdog (`a46bf007`), weekly dashboard
 1. **Validate** scheduled state files against the run_classification schema
    before using them, accepting **both** `run-classification-v1` and
    `run-classification-v2-preauthorized` when the identity fields are correct.
-2. **Collect and exclude** every `order_id` found in
-   `manual_runs/**/run_state*.json` from all scheduled-live metrics.
+2. **Collect and exclude** every `order_id` found under the manual exclusion
+   roots from all scheduled-live metrics. The roots are the task's own
+   `manual_runs/**/run_state*.json` **plus** these additional roots (added
+   2026-07-13 so out-of-task manual overrides are still excluded):
+   `final_manual_review/**`,
+   `.../cron_tracking/ce16ba6b/manual_runs/final_manual_override_*`, and
+   `.../cron_tracking/midday_dca/manual_reruns/`. `collect_manual_order_ids`
+   iterates all of these (see `manual_exclusion_roots` and
+   `MANUAL_EXCLUSION_SUBROOTS` in the helper).
 3. **Exclude** any run_state whose classification has `run_origin='manual'` or
    `manual_run=true`, *regardless of where the file sits on disk*. If either
    signal says manual, the run is manual.
@@ -286,6 +324,17 @@ section (see `manual_test_runs` in
 They must not affect scheduled-live cost basis, scheduled-live slippage,
 scheduled-live reliability, or scheduled-live order-count metrics.
 
+## Manual Final Buy Override / Same-Day Top-Up Context reporting
+
+Fills from a `final_manual_buy_override` run (and same-day top-up context) may be
+reported **only** in a clearly labeled **"Manual Final Buy Override / Same-Day
+Top-Up Context"** section (see `manual_final_buy_override` in
+[`../schemas/slippage_report.schema.json`](../schemas/slippage_report.schema.json)).
+They must **never** affect scheduled-live cost basis, scheduled-live slippage,
+scheduled-live reliability, scheduled-live order-count, or watchdog-confirmation
+metrics. Their order IDs come from the manual exclusion roots (rule 2 above) and
+appear in the slippage report's `excluded_manual_order_ids`.
+
 ## Enforcement helper
 
 [`scripts/run_classification.py`](../scripts/run_classification.py) implements
@@ -294,10 +343,12 @@ the contract with the standard library only (no secrets, no network):
 | Function | Purpose |
 |---|---|
 | `build_scheduled_classification` / `build_manual_classification` | Build compliant blocks |
+| `build_final_manual_override_classification` | Build a `final_manual_buy_override` manual block (`valid_afternoon_scheduled_evidence=false`, `same_day_top_up_context_only=true`) |
 | `write_run_artifacts` | Write to the correct path; update the pointer only for scheduled runs |
 | `validate_classification` | Runtime validation mirroring the JSON schema |
 | `is_scheduled_state` / `is_manual_state` | Origin checks (manual flag wins) |
-| `collect_manual_order_ids` / `exclude_manual_orders` | Manual order exclusion |
+| `manual_exclusion_roots` / `cron_tracking_root` | Resolve all manual exclusion roots (task `manual_runs` + `final_manual_review`, `midday_dca/manual_reruns`) |
+| `collect_manual_order_ids` / `exclude_manual_orders` | Manual order exclusion across all exclusion roots |
 | `select_scheduled_state_for_reporting` | Pick the scheduled state, apply the narrow fallback |
 
 Tests: [`scripts/tests/test_run_classification.py`](../scripts/tests/test_run_classification.py).

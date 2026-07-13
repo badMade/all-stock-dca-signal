@@ -55,8 +55,31 @@ SCHEDULED_WINDOW_END_ET = "15:35"
 
 # Artifact root remains the ce16ba6b path for continuity across the task repair.
 STATE_ROOT = "/home/user/workspace/cron_tracking/ce16ba6b"
+# Parent directory holding every per-task cron_tracking tree (ce16ba6b, morning_dca,
+# midday_dca, final_manual_review, ...). Used to reach the out-of-task manual-exclusion
+# roots below.
+CRON_TRACKING_ROOT = "/home/user/workspace/cron_tracking"
 RUN_STATE_FILENAME = "run_state.json"
 LATEST_SCHEDULED_RUN_FILENAME = "latest_scheduled_run.json"
+
+# Final manual buy override (Jul 13 2026 final-buy behavior invoked manually). These
+# runs are manual by contract: run_origin='manual', manual_run=true, and a distinct
+# run_type so slippage/watchdog/weekly reporting exclude them from every scheduled
+# metric and surface them only in a "Manual Final Buy Override / Same-Day Top-Up
+# Context" section.
+FINAL_MANUAL_OVERRIDE_RUN_TYPE = "final_manual_buy_override"
+FINAL_MANUAL_OVERRIDE_DIR_PREFIX = "final_manual_override_"
+
+# Manual-exclusion roots beyond ce16ba6b/manual_runs. The 2026-07-13 final manual buy
+# override backfilled live artifacts under midday_dca/manual_reruns/final_manual_override_*
+# and a final_manual_review/** tree, both OUTSIDE the ce16ba6b task root. Slippage
+# (67aa802b), the watchdog (a46bf007), and weekly/monthly reporting must treat every
+# run_state/orders CSV under these roots as manual and exclude their order IDs from all
+# scheduled-live metrics. Paths are relative to CRON_TRACKING_ROOT.
+MANUAL_EXCLUSION_SUBROOTS = (
+    "final_manual_review",
+    "midday_dca/manual_reruns",
+)
 
 SCHEDULED_RUN_ID_RE = re.compile(r"^scheduled_[0-9]{8}_1520ET$")
 
@@ -202,6 +225,26 @@ def build_manual_classification(
     }
 
 
+def build_final_manual_override_classification(
+    triggered_at_utc: Optional[str] = None, run_id: Optional[str] = None
+) -> Dict[str, object]:
+    """Return a manual run_classification block for a final manual buy override.
+
+    The final-buy behavior (full active-universe scan, trend filter ignored for the
+    final-buy decision only) may be invoked manually after the scheduled 3:20 PM run.
+    Such a run is manual by contract and additionally flags itself as NOT valid
+    afternoon scheduled evidence and same-day top-up context only, so downstream
+    reporting shows it only in the Manual Final Buy Override / Same-Day Top-Up Context
+    section and never in any scheduled-live metric.
+    """
+    ts = triggered_at_utc or _utc_now_iso()
+    block = build_manual_classification(ts, run_id)
+    block["run_type"] = FINAL_MANUAL_OVERRIDE_RUN_TYPE
+    block["valid_afternoon_scheduled_evidence"] = False
+    block["same_day_top_up_context_only"] = True
+    return block
+
+
 # --- Path helpers ------------------------------------------------------------
 
 def state_root(base: Optional[Path] = None) -> Path:
@@ -220,6 +263,36 @@ def manual_run_dir(timestamp: str, base: Optional[Path] = None) -> Path:
 
 def latest_scheduled_run_path(base: Optional[Path] = None) -> Path:
     return state_root(base) / LATEST_SCHEDULED_RUN_FILENAME
+
+
+def cron_tracking_root(base: Optional[Path] = None) -> Path:
+    """Parent directory holding every per-task cron_tracking tree.
+
+    With an explicit ``base`` (tests point ``base`` at a temporary ce16ba6b root) this
+    is ``base.parent``; otherwise the canonical ``CRON_TRACKING_ROOT``. Used to reach
+    the out-of-task manual-exclusion roots (``final_manual_review``,
+    ``midday_dca/manual_reruns``).
+    """
+    if base is not None:
+        return Path(base).parent
+    return Path(CRON_TRACKING_ROOT)
+
+
+def manual_exclusion_roots(base: Optional[Path] = None) -> List[Path]:
+    """Every directory scanned for manual order IDs.
+
+    Always includes the ce16ba6b ``manual_runs/`` tree (which holds
+    ``final_manual_override_*`` subdirs). Adds the out-of-task roots that the
+    2026-07-13 final manual buy override introduced — ``final_manual_review/**`` and
+    ``midday_dca/manual_reruns/**`` (incl. ``final_manual_override_*``) — so their
+    order IDs are excluded from every scheduled-live metric even though they live
+    outside the ce16ba6b task root.
+    """
+    roots = [state_root(base) / "manual_runs"]
+    parent = cron_tracking_root(base)
+    for sub in MANUAL_EXCLUSION_SUBROOTS:
+        roots.append(parent / sub)
+    return roots
 
 
 # --- Raw connector-input persistence (afternoon escalation fix, 2026-07-10) --
@@ -685,24 +758,27 @@ def _referenced_orders_csvs(state: Dict[str, object], run_dir: Path) -> List[Pat
 
 
 def collect_manual_order_ids(base: Optional[Path] = None) -> Set[str]:
-    """Union of every order_id found under manual_runs/.
+    """Union of every order_id found under any manual-exclusion root.
 
-    Reads both the embedded ``buy_candidates``/``orders`` in each
-    ``run_state*.json`` and the ``order_id`` column of any orders CSV the state
-    references or sits beside, so manual fills from the heavier
-    ``run_and_report`` path are excluded too. These IDs must never appear in
-    scheduled-live metrics.
+    Scans the ce16ba6b ``manual_runs/`` tree plus the out-of-task
+    ``final_manual_review/**`` and ``midday_dca/manual_reruns/**`` roots (see
+    :func:`manual_exclusion_roots`), so final manual buy overrides and midday manual
+    reruns are excluded too. Reads both the embedded ``buy_candidates``/``orders`` in
+    each ``run_state*.json`` and the ``order_id`` column of any orders CSV the state
+    references or sits beside (e.g. a final override's ``filled_orders.csv``), so
+    manual fills from the heavier ``run_and_report`` path are excluded as well. These
+    IDs must never appear in scheduled-live metrics.
     """
-    manual_root = state_root(base) / "manual_runs"
     ids: Set[str] = set()
-    for path in _iter_run_state_files(manual_root):
-        try:
-            state = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError):
-            continue
-        ids |= _order_ids_from_state(state)
-        for csv_path in _referenced_orders_csvs(state, path.parent):
-            ids |= _order_ids_from_orders_csv(csv_path)
+    for manual_root in manual_exclusion_roots(base):
+        for path in _iter_run_state_files(manual_root):
+            try:
+                state = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            ids |= _order_ids_from_state(state)
+            for csv_path in _referenced_orders_csvs(state, path.parent):
+                ids |= _order_ids_from_orders_csv(csv_path)
     return ids
 
 
@@ -875,11 +951,18 @@ __all__ = [
     "is_confirmation_blocked",
     "build_scheduled_classification",
     "build_manual_classification",
+    "build_final_manual_override_classification",
+    "FINAL_MANUAL_OVERRIDE_RUN_TYPE",
+    "FINAL_MANUAL_OVERRIDE_DIR_PREFIX",
+    "MANUAL_EXCLUSION_SUBROOTS",
+    "CRON_TRACKING_ROOT",
     "scheduled_run_id",
     "manual_run_id",
     "scheduled_run_dir",
     "manual_run_dir",
     "latest_scheduled_run_path",
+    "cron_tracking_root",
+    "manual_exclusion_roots",
     "RAW_INPUTS_SUBDIR",
     "RAW_TRADABILITY_FILENAME",
     "RAW_PORTFOLIO_FILENAME",

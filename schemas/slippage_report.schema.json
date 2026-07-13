@@ -51,6 +51,19 @@
         }
       }
     },
+    "manual_final_buy_override": {
+      "type": "object",
+      "description": "Clearly labeled 'Manual Final Buy Override / Same-Day Top-Up Context' section. Holds fills from manual final-buy overrides (run_type='final_manual_buy_override', e.g. the 2026-07-13 incident) and same-day top-up context. These fills are reported here only and never affect scheduled-live cost basis, slippage, reliability, order-count, or watchdog-confirmation metrics. Order IDs here are sourced from the manual exclusion roots (ce16ba6b/manual_runs/final_manual_override_*, midday_dca/manual_reruns, final_manual_review/**) and appear in excluded_manual_order_ids.",
+      "additionalProperties": true,
+      "properties": {
+        "label": { "type": "string", "const": "Manual Final Buy Override / Same-Day Top-Up Context" },
+        "run_date_et": { "type": "string", "format": "date" },
+        "rows": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": true }
+        }
+      }
+    },
     "rows": {
       "type": "array",
       "items": {

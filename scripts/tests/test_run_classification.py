@@ -19,10 +19,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from run_classification import (  # noqa: E402
     ACCEPTED_STATE_SCHEMA_VERSIONS,
+    FINAL_MANUAL_OVERRIDE_RUN_TYPE,
     ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED,
     ORDER_SUBMIT_STATUS_ERROR,
     STATE_SCHEMA_VERSION,
     STATE_SCHEMA_VERSION_V2,
+    build_final_manual_override_classification,
     build_manual_classification,
     build_raw_persistence_state,
     build_scheduled_classification,
@@ -35,6 +37,7 @@ from run_classification import (  # noqa: E402
     is_scheduled_state,
     latest_scheduled_run_path,
     list_raw_inputs_saved,
+    manual_exclusion_roots,
     manual_run_id,
     normalize_connector_payload,
     order_submit_status,
@@ -653,6 +656,106 @@ def test_raw_persistence_failure_still_writes_valid_scheduled_state():
         sel = select_scheduled_state_for_reporting(TRADING_DAY, base=base)
         assert sel.ok
         assert sel.order_ids == []
+
+
+# --- Final manual buy override (2026-07-13 final-buy behavior) ---------------
+
+
+def test_final_manual_override_classification_is_manual():
+    rc = build_final_manual_override_classification("2026-07-13T19:36:00Z")
+    assert rc["run_origin"] == "manual"
+    assert rc["manual_run"] is True
+    assert rc["run_type"] == FINAL_MANUAL_OVERRIDE_RUN_TYPE
+    assert rc["valid_afternoon_scheduled_evidence"] is False
+    assert rc["same_day_top_up_context_only"] is True
+    assert rc["cron_id"] == "10ce362c"
+    assert rc["supersedes_cron_id"] == "ce16ba6b"
+    # A manual classification block must still validate and never look scheduled.
+    assert validate_classification(rc).ok
+    assert not is_scheduled_state({"run_classification": rc})
+    assert is_manual_state({"run_classification": rc})
+
+
+def test_final_manual_override_custom_run_id_not_scheduled():
+    rc = build_final_manual_override_classification(
+        "2026-07-13T19:36:00Z", run_id="final_manual_override_20260713_1536ET"
+    )
+    assert rc["run_id"] == "final_manual_override_20260713_1536ET"
+    # Must never collide with the scheduled_YYYYMMDD_1520ET pattern.
+    assert validate_classification(rc).ok
+
+
+def test_manual_exclusion_roots_cover_final_override_paths():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        roots = [str(r) for r in manual_exclusion_roots(base)]
+        assert str(base / "manual_runs") in roots
+        assert str(Path(d) / "final_manual_review") in roots
+        assert str(Path(d) / "midday_dca" / "manual_reruns") in roots
+
+
+def _write_final_override_state(run_dir: Path, order_ids, ts="2026-07-13T19:36:00Z"):
+    run_dir.mkdir(parents=True, exist_ok=True)
+    state = {
+        "run_id": "final_manual_override_20260713_1536ET",
+        "generated_at": "2026-07-13T15:36:00",
+        "trading_day": "2026-07-13",
+        "broker": "robinhood",
+        "budget": {"budget_tier": "normal", "daily_cap_usd": 180, "weekly_cap_usd": 900},
+        "counts": {"submitted": len(order_ids)},
+        "run_classification": build_final_manual_override_classification(ts),
+        "buy_candidates": [
+            {"ticker": f"F{i}", "planned_amount_usd": 3.0, "status": "submitted", "order_id": oid}
+            for i, oid in enumerate(order_ids)
+        ],
+    }
+    (run_dir / "run_state.json").write_text(json.dumps(state, indent=2))
+
+
+def test_collect_excludes_final_override_under_ce16ba6b_manual_runs():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        run_dir = base / "manual_runs" / "final_manual_override_20260713_1536ET"
+        _write_final_override_state(run_dir, ("FMO-1", "FMO-2"))
+        assert collect_manual_order_ids(base) == {"FMO-1", "FMO-2"}
+
+
+def test_collect_excludes_midday_manual_reruns_final_override():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        run_dir = Path(d) / "midday_dca" / "manual_reruns" / "final_manual_override_20260713_1536ET"
+        _write_final_override_state(run_dir, ("MID-FMO-1",))
+        # A filled_orders.csv beside the state (run_and_report style) is scanned too.
+        (run_dir / "filled_orders.csv").write_text(
+            "ticker,status,order_id,notional_usd\nDFTX,filled,MID-FMO-CSV,3.0\n"
+        )
+        ids = collect_manual_order_ids(base)
+        assert ids == {"MID-FMO-1", "MID-FMO-CSV"}
+
+
+def test_collect_excludes_final_manual_review_tree():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        run_dir = Path(d) / "final_manual_review" / "20260713_1536ET"
+        _write_final_override_state(run_dir, ("REVIEW-FMO-1",))
+        assert collect_manual_order_ids(base) == {"REVIEW-FMO-1"}
+
+
+def test_final_override_ids_excluded_from_scheduled_selection():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        # Scheduled afternoon run that (defensively) shares an id with a final override.
+        write_run_artifacts(_scheduled_state(order_ids=("SCHED-1", "MID-FMO-1")), base=base)
+        run_dir = Path(d) / "midday_dca" / "manual_reruns" / "final_manual_override_20260713_1536ET"
+        _write_final_override_state(run_dir, ("MID-FMO-1",))
+        sel = select_scheduled_state_for_reporting(TRADING_DAY, base=base)
+        assert sel.ok
+        assert sel.order_ids == ["SCHED-1"]  # MID-FMO-1 excluded as a manual override id
+        assert "MID-FMO-1" in sel.excluded_manual_order_ids
 
 
 def _run_all():
