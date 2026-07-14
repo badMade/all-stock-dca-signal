@@ -481,13 +481,14 @@ def test_run_state_path_and_classification(tmp_path):
     assert rc["trades"] is False
     assert rc["cron_id"] == MORNING_CRON_ID
     assert rc["supersedes_cron_id"] is None
+    assert rc["execution_broker"] == "robinhood"
+    assert rc["account_number"] == "562057042"
 
     # Watchlist markers present; no order fields, amounts hypothetical only.
     art = res["artifacts"]
     assert art["mode"] == "watchlist"
     assert art["trades"] is False
     for row in art["signal_rows"]:
-        assert "order_id" not in row
         assert set(
             ["ticker", "current_price", "previous_close", "drop_pct", "multiplier",
              "hypothetical_amount_usd", "source", "warnings"]

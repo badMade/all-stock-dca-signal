@@ -1,7 +1,7 @@
 {
   "$schema": "../schemas/scheduled_tasks.schema.json",
-  "version": "2026-07-08",
-  "verified_on_et": "2026-07-08",
+  "version": "2026-07-09",
+  "verified_on_et": "2026-07-09",
   "timezone_note": "Cron expressions are in UTC. ET equivalents are during US Eastern Daylight Time (EDT, UTC-4). Confirm around DST transitions.",
   "afternoon_completion_rule": "All afternoon trading and artifact-writing tasks complete no later than 3:40 PM ET, when the read-only live-run watchdog (a46bf007) begins its final verification. The watchdog's own post-3:40 PM verification and the Friday weekly Notion performance refresh at 5:00 PM ET are the only approved post-3:40 PM DCA-related exceptions.",
   "run_classification_policy": {
@@ -87,6 +87,7 @@
       "cron_utc": "45 13 * * 1-5",
       "et_equivalent": "9:45 AM ET weekdays (EDT)",
       "trades": false,
+      "broker_account": "robinhood:562057042",
       "executor": "MorningDCAExecutor",
       "executor_mode": "preflight",
       "config_file": "config/morning_dca.json",

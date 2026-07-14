@@ -301,7 +301,7 @@ DEFAULT_MORNING_WEEKLY_CAP_USD = 450.0
 
 @dataclass(frozen=True)
 class MorningConfig:
-    """Configuration hooks for the morning dry-run stream.
+    """Configuration hooks for the morning live stream.
 
     Kept separate from :class:`~near_close_dca.StrategyConfig` so the morning
     ladder, caps, decision anchor, and run-state root can never leak into the
@@ -359,9 +359,8 @@ class MorningConfig:
 class MorningLedger:
     """A budget ledger namespaced to the morning stream.
 
-    This is a self-contained session that tracks only *hypothetical* morning
-    dry-run notional (and, if the morning stream ever executes in the future, its
-    real notional). It shares no state with the afternoon
+    This is a self-contained session that tracks the morning live stream's own
+    notional. It shares no state with the afternoon
     :class:`~near_close_dca.StrategyState`, so morning activity can never consume
     or validate the afternoon 3:20/3:45 daily/weekly budget ledger.
     """
@@ -602,8 +601,8 @@ class DCAExecutor:
     ``run_daily_compact``) and remains the authoritative live path. This base
     introduces the shared extension points a class-based executor needs — the
     sizing ladder, a run-state root, and a run-classification block — so new
-    streams (starting with the morning dry-run) can plug in without touching the
-    afternoon code.
+    streams (starting with the morning live stream) can plug in without touching
+    the afternoon code.
 
     Subclasses provide the concrete ladder via :attr:`sizing_config`, the artifact
     root via :meth:`run_state_dir`, and the classification via
@@ -757,6 +756,9 @@ class MorningDCAExecutor(DCAExecutor):
             "run_id": self.run_id(now, manual=manual),
             "triggered_at_utc": triggered_iso,
             "state_schema_version": profile["state_schema_version"],
+            # The execution broker and account for all morning stream modes; always Robinhood.
+            "execution_broker": "robinhood",
+            "account_number": ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
             # Explicit, machine-checkable separation from the afternoon stream.
             "valid_afternoon_evidence": False,
             "afternoon_live_cron_id": AFTERNOON_LIVE_CRON_ID,

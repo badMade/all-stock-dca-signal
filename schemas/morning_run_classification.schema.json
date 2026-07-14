@@ -20,12 +20,19 @@
   "properties": {
     "run_origin": {
       "type": "string",
-      "enum": ["scheduled", "manual"],
+      "enum": [
+        "scheduled",
+        "manual"
+      ],
       "description": "Origin of the morning run. 'scheduled' is the 9:45 AM ET watchlist scan or the 10:30 AM ET live execution; everything else is 'manual'."
     },
     "run_type": {
       "type": "string",
-      "enum": ["morning_dca_watchlist_scan", "morning_dca_preflight", "morning_dca_live"],
+      "enum": [
+        "morning_dca_watchlist_scan",
+        "morning_dca_preflight",
+        "morning_dca_live"
+      ],
       "description": "'morning_dca_watchlist_scan' for the 9:45 AM read-only scan, 'morning_dca_preflight' for the 9:45 AM read-only pre-flight validation that emits eligible_to_execute per ticker, 'morning_dca_live' for the 10:30 AM live execution. Deliberately never the afternoon 'scheduled_live_test'."
     },
     "stream": {
@@ -43,23 +50,38 @@
     },
     "cron_id": {
       "type": "string",
-      "enum": ["morning-dca-0945", "42173154"],
+      "enum": [
+        "morning-dca-0945",
+        "42173154"
+      ],
       "description": "Morning task id: 'morning-dca-0945' for the watchlist scan, '42173154' for the live execution. Distinct from the afternoon live task '10ce362c'."
     },
     "supersedes_cron_id": {
-      "type": ["string", "null"],
+      "type": [
+        "string",
+        "null"
+      ],
       "description": "Always null: the morning tasks supersede nothing."
     },
     "scheduled_for_et": {
-      "type": ["string", "null"],
+      "type": [
+        "string",
+        "null"
+      ],
       "description": "Nominal ET fire time, HH:MM. '09:45' (watchlist) or '10:30' (live) for scheduled runs; null for manual runs."
     },
     "scheduled_window_start_et": {
-      "type": ["string", "null"],
+      "type": [
+        "string",
+        "null"
+      ],
       "description": "Inclusive start of the accepted morning window in ET, HH:MM."
     },
     "scheduled_window_end_et": {
-      "type": ["string", "null"],
+      "type": [
+        "string",
+        "null"
+      ],
       "description": "Inclusive end of the accepted morning window in ET, HH:MM."
     },
     "run_id": {
@@ -72,7 +94,11 @@
     },
     "state_schema_version": {
       "type": "string",
-      "enum": ["morning-watchlist-v1", "morning-preflight-v1", "morning-live-v1"],
+      "enum": [
+        "morning-watchlist-v1",
+        "morning-preflight-v1",
+        "morning-live-v1"
+      ],
       "description": "Contract version tag: 'morning-watchlist-v1' for the watchlist scan, 'morning-preflight-v1' for the pre-flight validation, 'morning-live-v1' for the live execution."
     },
     "valid_afternoon_evidence": {
@@ -83,28 +109,68 @@
     "afternoon_live_cron_id": {
       "type": "string",
       "description": "The afternoon live task id ('10ce362c') recorded for cross-reference only."
+    },
+    "execution_broker": {
+      "type": "string",
+      "const": "robinhood",
+      "description": "The sole execution broker for the morning live streams. Always 'robinhood'."
+    },
+    "account_number": {
+      "type": "string",
+      "const": "562057042",
+      "description": "The Robinhood account number used for morning live execution. Not a secret."
     }
   },
   "allOf": [
     {
       "comment": "Watchlist scan (9:45 AM ET) invariants.",
-      "if": { "properties": { "run_type": { "const": "morning_dca_watchlist_scan" } }, "required": ["run_type"] },
+      "if": {
+        "properties": {
+          "run_type": {
+            "const": "morning_dca_watchlist_scan"
+          }
+        },
+        "required": [
+          "run_type"
+        ]
+      },
       "then": {
         "properties": {
-          "cron_id": { "const": "morning-dca-0945" },
-          "state_schema_version": { "const": "morning-watchlist-v1" },
-          "trades": { "const": false }
+          "cron_id": {
+            "const": "morning-dca-0945"
+          },
+          "state_schema_version": {
+            "const": "morning-watchlist-v1"
+          },
+          "trades": {
+            "const": false
+          }
         }
       }
     },
     {
       "comment": "Pre-flight validation (9:45 AM ET) invariants.",
-      "if": { "properties": { "run_type": { "const": "morning_dca_preflight" } }, "required": ["run_type"] },
+      "if": {
+        "properties": {
+          "run_type": {
+            "const": "morning_dca_preflight"
+          }
+        },
+        "required": [
+          "run_type"
+        ]
+      },
       "then": {
         "properties": {
-          "cron_id": { "const": "morning-dca-0945" },
-          "state_schema_version": { "const": "morning-preflight-v1" },
-          "trades": { "const": false }
+          "cron_id": {
+            "const": "morning-dca-0945"
+          },
+          "state_schema_version": {
+            "const": "morning-preflight-v1"
+          },
+          "trades": {
+            "const": false
+          }
         }
       }
     },
@@ -112,30 +178,66 @@
       "comment": "Scheduled pre-flight validation: pinned window and run_id pattern.",
       "if": {
         "properties": {
-          "run_origin": { "const": "scheduled" },
-          "run_type": { "const": "morning_dca_preflight" }
+          "run_origin": {
+            "const": "scheduled"
+          },
+          "run_type": {
+            "const": "morning_dca_preflight"
+          }
         },
-        "required": ["run_origin", "run_type"]
+        "required": [
+          "run_origin",
+          "run_type"
+        ]
       },
       "then": {
-        "required": ["scheduled_for_et", "scheduled_window_start_et", "scheduled_window_end_et"],
+        "required": [
+          "scheduled_for_et",
+          "scheduled_window_start_et",
+          "scheduled_window_end_et"
+        ],
         "properties": {
-          "manual_run": { "const": false },
-          "scheduled_for_et": { "const": "09:45" },
-          "scheduled_window_start_et": { "const": "09:40" },
-          "scheduled_window_end_et": { "const": "09:50" },
-          "run_id": { "pattern": "^morning_preflight_[0-9]{8}_0945ET$" }
+          "manual_run": {
+            "const": false
+          },
+          "scheduled_for_et": {
+            "const": "09:45"
+          },
+          "scheduled_window_start_et": {
+            "const": "09:40"
+          },
+          "scheduled_window_end_et": {
+            "const": "09:50"
+          },
+          "run_id": {
+            "pattern": "^morning_preflight_[0-9]{8}_0945ET$"
+          }
         }
       }
     },
     {
       "comment": "Live execution (10:30 AM ET) invariants.",
-      "if": { "properties": { "run_type": { "const": "morning_dca_live" } }, "required": ["run_type"] },
+      "if": {
+        "properties": {
+          "run_type": {
+            "const": "morning_dca_live"
+          }
+        },
+        "required": [
+          "run_type"
+        ]
+      },
       "then": {
         "properties": {
-          "cron_id": { "const": "42173154" },
-          "state_schema_version": { "const": "morning-live-v1" },
-          "trades": { "const": true }
+          "cron_id": {
+            "const": "42173154"
+          },
+          "state_schema_version": {
+            "const": "morning-live-v1"
+          },
+          "trades": {
+            "const": true
+          }
         }
       }
     },
@@ -143,19 +245,40 @@
       "comment": "Scheduled watchlist scan: pinned window and run_id pattern.",
       "if": {
         "properties": {
-          "run_origin": { "const": "scheduled" },
-          "run_type": { "const": "morning_dca_watchlist_scan" }
+          "run_origin": {
+            "const": "scheduled"
+          },
+          "run_type": {
+            "const": "morning_dca_watchlist_scan"
+          }
         },
-        "required": ["run_origin", "run_type"]
+        "required": [
+          "run_origin",
+          "run_type"
+        ]
       },
       "then": {
-        "required": ["scheduled_for_et", "scheduled_window_start_et", "scheduled_window_end_et"],
+        "required": [
+          "scheduled_for_et",
+          "scheduled_window_start_et",
+          "scheduled_window_end_et"
+        ],
         "properties": {
-          "manual_run": { "const": false },
-          "scheduled_for_et": { "const": "09:45" },
-          "scheduled_window_start_et": { "const": "09:40" },
-          "scheduled_window_end_et": { "const": "09:50" },
-          "run_id": { "pattern": "^morning_[0-9]{8}_0945ET$" }
+          "manual_run": {
+            "const": false
+          },
+          "scheduled_for_et": {
+            "const": "09:45"
+          },
+          "scheduled_window_start_et": {
+            "const": "09:40"
+          },
+          "scheduled_window_end_et": {
+            "const": "09:50"
+          },
+          "run_id": {
+            "pattern": "^morning_[0-9]{8}_0945ET$"
+          }
         }
       }
     },
@@ -163,33 +286,96 @@
       "comment": "Scheduled live execution: pinned window and run_id pattern.",
       "if": {
         "properties": {
-          "run_origin": { "const": "scheduled" },
-          "run_type": { "const": "morning_dca_live" }
+          "run_origin": {
+            "const": "scheduled"
+          },
+          "run_type": {
+            "const": "morning_dca_live"
+          }
         },
-        "required": ["run_origin", "run_type"]
+        "required": [
+          "run_origin",
+          "run_type"
+        ]
       },
       "then": {
-        "required": ["scheduled_for_et", "scheduled_window_start_et", "scheduled_window_end_et"],
+        "required": [
+          "scheduled_for_et",
+          "scheduled_window_start_et",
+          "scheduled_window_end_et"
+        ],
         "properties": {
-          "manual_run": { "const": false },
-          "scheduled_for_et": { "const": "10:30" },
-          "scheduled_window_start_et": { "const": "10:25" },
-          "scheduled_window_end_et": { "const": "10:35" },
-          "run_id": { "pattern": "^morning_live_[0-9]{8}_1030ET$" }
+          "manual_run": {
+            "const": false
+          },
+          "scheduled_for_et": {
+            "const": "10:30"
+          },
+          "scheduled_window_start_et": {
+            "const": "10:25"
+          },
+          "scheduled_window_end_et": {
+            "const": "10:35"
+          },
+          "run_id": {
+            "pattern": "^morning_live_[0-9]{8}_1030ET$"
+          }
         }
       }
     },
     {
+      "comment": "Live execution requires execution_broker and account_number; watchlist/preflight do not.",
+      "if": {
+        "properties": {
+          "run_type": {
+            "const": "morning_dca_live"
+          }
+        },
+        "required": [
+          "run_type"
+        ]
+      },
+      "then": {
+        "required": [
+          "execution_broker",
+          "account_number"
+        ]
+      }
+    },
+    {
       "comment": "Manual runs never use a scheduled run_id and are always manual_run=true.",
-      "if": { "properties": { "run_origin": { "const": "manual" } }, "required": ["run_origin"] },
+      "if": {
+        "properties": {
+          "run_origin": {
+            "const": "manual"
+          }
+        },
+        "required": [
+          "run_origin"
+        ]
+      },
       "then": {
         "properties": {
-          "manual_run": { "const": true },
+          "manual_run": {
+            "const": true
+          },
           "run_id": {
             "allOf": [
-              { "not": { "pattern": "^morning_[0-9]{8}_0945ET$" } },
-              { "not": { "pattern": "^morning_preflight_[0-9]{8}_0945ET$" } },
-              { "not": { "pattern": "^morning_live_[0-9]{8}_1030ET$" } }
+              {
+                "not": {
+                  "pattern": "^morning_[0-9]{8}_0945ET$"
+                }
+              },
+              {
+                "not": {
+                  "pattern": "^morning_preflight_[0-9]{8}_0945ET$"
+                }
+              },
+              {
+                "not": {
+                  "pattern": "^morning_live_[0-9]{8}_1030ET$"
+                }
+              }
             ]
           }
         }
