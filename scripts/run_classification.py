@@ -390,13 +390,26 @@ def save_raw_input(
     ``orders_after_place.json``, ``place_SYMBOL.json``). Large connector
     ``output_path`` pointers are normalized to inline JSON by default so the
     compute step can parse the file directly.
+
+    Fails closed when normalization of an ``output_path`` pointer fails:
+    raises ``ValueError`` and writes nothing, rather than persisting a
+    ``{"normalized": false, "normalize_error": ...}`` placeholder that the
+    compute step -- which reads only the persisted file, never the original
+    in-memory payload -- would silently treat as valid input. A payload with
+    no pointer to resolve (plain inline data) is not a failure and persists
+    normally.
     """
     safe = Path(str(filename)).name
     if not safe or safe != str(filename):
         raise ValueError(f"raw input filename must be a bare filename, got {filename!r}")
+    to_write = normalize_connector_payload(payload) if normalize else payload
+    if normalize and isinstance(to_write, dict) and "normalize_error" in to_write:
+        raise ValueError(
+            f"failed to persist {filename}: {to_write['normalize_error']}; refusing to "
+            "silently write an unnormalized raw connector payload"
+        )
     out_dir = raw_input_dir(trading_day, base)
     out_dir.mkdir(parents=True, exist_ok=True)
-    to_write = normalize_connector_payload(payload) if normalize else payload
     path = out_dir / safe
     path.write_text(json.dumps(to_write, indent=2) + "\n")
     return path

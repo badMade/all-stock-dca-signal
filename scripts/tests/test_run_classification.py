@@ -610,6 +610,28 @@ def test_normalize_connector_payload_unreadable_pointer_is_flagged():
     assert "normalize_error" in normalized
 
 
+def test_save_raw_input_fails_closed_on_unreadable_pointer():
+    # Codex review #72: "fail closed when raw pointer normalization fails."
+    # normalize_connector_payload() itself still just flags an unreadable
+    # pointer (test above) since it's a general-purpose helper, but
+    # save_raw_input() is the persistence entry point the "compute reads only
+    # persisted files" contract depends on -- it must not silently write an
+    # unresolved/broken output_path pointer as if persistence succeeded.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        try:
+            save_raw_input(
+                TRADING_DAY, historicals_batch_filename(1),
+                {"output_path": "/no/such/file.json"}, base=base,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError for an unreadable output_path pointer")
+        # Nothing should be written for the failed persist.
+        assert list_raw_inputs_saved(TRADING_DAY, base) == []
+
+
 def test_save_raw_input_normalizes_pointer_payload():
     with tempfile.TemporaryDirectory() as d:
         base = Path(d)
