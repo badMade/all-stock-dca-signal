@@ -435,6 +435,40 @@ def test_guarded_midday_top_up_checks_same_stream_duplicate_before_placing(tmp_p
     assert res["artifacts"]["buy_candidates"][0]["planned_amount_usd"] == 12.0
 
 
+def test_manual_retry_of_guarded_top_up_duplicate_is_skipped_not_submitted(tmp_path):
+    # Codex review on PR #22: a manual/recovery rerun always writes to its own
+    # fresh, uuid-suffixed artifact directory (see run_id()) rather than
+    # overwriting the original scheduled run's run_state.json. If a same-stream
+    # duplicate found on a MANUAL retry were still recorded as a fresh
+    # "submitted" candidate (the way a same-path SCHEDULED retry legitimately
+    # is), load_prior_same_day_allocations() would find both files and
+    # double-count the same broker order as two separate same-day allocations.
+    prior_root = tmp_path / "morning"
+    _write_prior_morning_run(
+        prior_root, ticker="BIG", planned_amount=3.0,
+        fill_price=95.0, quantity=round(3.0 / 95.0, 6),
+    )
+    cfg = MiddayConfig(
+        tickers=("BIG",), base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "midday"),
+        prior_allocation_roots=(str(prior_root),),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MiddayDCAExecutor(cfg)
+    broker = _TopUpDuplicateBroker(duplicate=True)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+
+    res = ex.run(_now_midday(), data, broker=broker, manual=True)
+
+    assert broker.same_stream_calls == 1
+    assert broker.placed == []
+    outcome = res["artifacts"]["broker_outcomes"]["BIG"]
+    assert outcome["status"] == "skipped"
+    assert "same-stream broker order exists" in outcome["skip_reason"]
+    assert "submitted_amount_usd" not in outcome
+    assert res["artifacts"]["buy_candidates"][0]["status"] == "skipped"
+
+
 class _TopUpBrokerWithoutSameStreamCheck(_TopUpDuplicateBroker):
     same_day_strategy_order_exists_with_ref_id_prefix = None
 

@@ -1724,12 +1724,16 @@ class MorningDCAExecutor(DCAExecutor):
                 _log.warning("Duplicate-check error for %s: %s", ticker, exc)
                 continue
             if dup:
-                if has_prior_allocation:
-                    # A same-stream top-up duplicate means this stream already
-                    # submitted/reserved the incremental order on an earlier
-                    # attempt. Persist it as submitted so rewriting run_state on
-                    # retry does not erase the durable prior-allocation context
-                    # that later same-day guards depend on.
+                if has_prior_allocation and not manual:
+                    # A same-stream top-up duplicate on a SCHEDULED retry means
+                    # this stream already submitted/reserved the incremental
+                    # order on an earlier attempt today, and a scheduled rerun
+                    # overwrites the same date-keyed run_state.json path (see
+                    # run_state_dir()), so there is no separate artifact for
+                    # load_prior_same_day_allocations() to double-sum against.
+                    # Persist it as submitted so rewriting run_state on retry
+                    # does not erase the durable prior-allocation context that
+                    # later same-day guards depend on.
                     outcomes[ticker] = {
                         "status": "submitted",
                         "order_id": None,
@@ -1739,6 +1743,21 @@ class MorningDCAExecutor(DCAExecutor):
                     submitted_today += notional
                     submitted_this_week += notional
                     reserved_buying_power += notional
+                elif has_prior_allocation and manual:
+                    # A MANUAL/recovery retry always writes to its own fresh,
+                    # uuid-suffixed artifact directory (see run_id()) and never
+                    # overwrites the original submission's run_state.json. If
+                    # this were also recorded as "submitted" with a fresh
+                    # notional, load_prior_same_day_allocations() would find
+                    # both files and double-count the same broker order as two
+                    # separate same-day allocations, understating what an
+                    # afternoon/final top-up is still owed. The original
+                    # submission's own artifact already carries the real
+                    # notional, so this retry contributes nothing further.
+                    outcomes[ticker] = {
+                        "status": "skipped",
+                        "skip_reason": f"{duplicate_reason} (duplicate top-up retry; already recorded by the original run)",
+                    }
                 else:
                     outcomes[ticker] = {"status": "skipped", "skip_reason": duplicate_reason}
                 continue
