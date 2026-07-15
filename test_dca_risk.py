@@ -136,6 +136,21 @@ def test_candidates_present_but_none_submitted_deploy_zero():
     assert deployed_usd(state) == 0.0
 
 
+def test_empty_buy_candidates_does_not_fall_back_to_budget_notional():
+    # Codex review #9 on PR #22: when the top-up guard seeds cross-stream
+    # (morning/midday) prior allocations into the afternoon StrategyState but
+    # the afternoon run itself has no BUY candidates, the artifact's
+    # buy_candidates list is explicitly empty ([]), not absent. An empty list
+    # means "nothing was deployed this run" -- deployed_usd() must not fall
+    # back to budget.day_notional_usd, which can reflect the seeded
+    # cross-stream capital rather than an actual afternoon-submitted order,
+    # double-counting a morning/midday spend as afternoon deployment.
+    state = _scheduled_state("2026-07-07", 0.0)
+    state["buy_candidates"] = []
+    state["budget"] = {"day_notional_usd": 300.0}
+    assert deployed_usd(state) == 0.0
+
+
 def test_non_positive_allocation_disables_guard():
     """A mis-/unconfigured allocation must never wedge the ladder to 1x."""
     guarded = dataclasses.replace(_config(monthly_cash_allocation_usd=0.0), deployed_last_7d_usd=9999.0)
