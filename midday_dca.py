@@ -42,6 +42,7 @@ from datetime import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from dca_config import load_approved_dates
 from morning_dca import (
     DEFAULT_MORNING_LIVE_STATE_ROOT,
     EXEC_MANUAL_REVIEW_CANDIDATE,
@@ -170,15 +171,21 @@ def load_midday_config(config_dir=None) -> MiddayConfig:
     cfg_path = config_dir_path / "midday_dca.json"
     if not cfg_path.exists():
         _log.warning("midday_dca.json not found at %s; using MiddayConfig defaults", cfg_path)
-        return MiddayConfig()
+        return MiddayConfig(
+            approved_test_dates=load_approved_dates(config_dir_path).get("approved_test_dates", frozenset())
+        )
+
+    approved_date_overrides = {
+        "approved_test_dates": load_approved_dates(config_dir_path).get("approved_test_dates", frozenset())
+    }
 
     try:
         raw = json.loads(cfg_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
         _log.warning("could not parse %s (%s); using MiddayConfig defaults", cfg_path, exc)
-        return MiddayConfig()
+        return MiddayConfig(**approved_date_overrides)
 
-    kwargs: Dict[str, Any] = {}
+    kwargs: Dict[str, Any] = dict(approved_date_overrides)
     if "trend_min_bars" in raw:
         kwargs["trend_min_bars"] = int(raw["trend_min_bars"])
 

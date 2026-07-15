@@ -576,10 +576,27 @@ def test_load_midday_config_raises_on_invalid_configured_order_cap(tmp_path):
         load_midday_config(str(cfg_dir))
 
 
+def test_load_midday_config_reads_approved_dates_from_trading_window(tmp_path):
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "midday_dca.json").write_text("{}", encoding="utf-8")
+    (cfg_dir / "trading_window.json").write_text(
+        json.dumps({"start_date": "2026-07-02", "end_date": "2026-07-06", "weekdays_only": True}),
+        encoding="utf-8",
+    )
+
+    cfg = load_midday_config(str(cfg_dir))
+
+    assert cfg.approved_test_dates == frozenset({date(2026, 7, 2), date(2026, 7, 3), date(2026, 7, 6)})
+    assert cfg.decision_time_et is None
+
+
 def test_midday_executor_default_init_loads_shipped_config():
     ex = MiddayDCAExecutor()
     assert ex.config.base_buy_amount_usd == 3.0
     assert ex.config.morning_daily_cap_usd == 90.0
+    assert date(2026, 7, 2) in ex.config.approved_test_dates
+    assert date(2026, 8, 28) in ex.config.approved_test_dates
     assert ex.state_root == DEFAULT_MIDDAY_LIVE_STATE_ROOT
     assert ex.config.sizing_tiers == StrategyConfig().sizing_tiers
 
