@@ -1372,6 +1372,7 @@ def build_run_artifacts(
     cost_control_notes: Optional[Sequence[str]] = None,
     top_up_outcomes: Optional[Dict[str, "TopUpGuardOutcome"]] = None,
     manual: bool = False,
+    raw_persistence_state: Optional[Dict[str, object]] = None,
 ) -> Dict[str, Any]:
     """Build the structured run-state dict written by the daily live-run path.
 
@@ -1486,7 +1487,7 @@ def build_run_artifacts(
     # effective weekly cap is reported.
     state.roll_weekly_reserve(trading_day, config)
 
-    return {
+    artifacts = {
         "run_id": run_id,
         "run_classification": run_classification,
         "order_submit_status": _derive_order_submit_status(config, buy_candidates, errors_count),
@@ -1543,6 +1544,9 @@ def build_run_artifacts(
             cost_control_notes=cost_control_notes,
         ),
     }
+    if raw_persistence_state is not None:
+        artifacts.update(raw_persistence_state)
+    return artifacts
 
 
 # CSV artifacts a run may leave beside run_state.json, and the status recorded in
@@ -2507,6 +2511,7 @@ def run_once(
     deployment_history_root: Optional[str | Path] = None,
     scheduled: bool = True,
     classification_state_root: Optional[str | Path] = None,
+    raw_persistence_state: Optional[Dict[str, object]] = None,
 ) -> List[ReconciledDecision]:
     now_et = now.astimezone(EASTERN)
     trading_day = now_et.date()
@@ -2882,6 +2887,7 @@ def run_once(
             cost_control_notes=cost_control_notes,
             top_up_outcomes=top_up_outcomes if guard_active else None,
             manual=not scheduled,
+            raw_persistence_state=raw_persistence_state,
         )
         paths = write_run_artifacts(artifacts, artifacts_dir)
         logger.info("Wrote run artifacts: %s", paths["run_state"])
@@ -3000,6 +3006,7 @@ def run_daily_compact(
     prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]] = None,
     deployment_history_root: Optional[str | Path] = None,
     classification_state_root: Optional[str | Path] = None,
+    raw_persistence_state: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     """Run one DCA scan and write only compact, structured daily artifacts.
 
@@ -3037,6 +3044,7 @@ def run_daily_compact(
         deployment_history_root=deployment_history_root,
         scheduled=scheduled,
         classification_state_root=classification_state_root,
+        raw_persistence_state=raw_persistence_state,
     )
 
     out = Path(artifacts_dir)

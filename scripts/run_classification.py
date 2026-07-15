@@ -380,6 +380,7 @@ def save_raw_input(
     payload: object,
     *,
     base: Optional[Path] = None,
+    raw_dir: Optional[Path] = None,
     normalize: bool = True,
 ) -> Path:
     """Persist one raw connector response under the run's raw/ directory.
@@ -390,6 +391,10 @@ def save_raw_input(
     ``orders_after_place.json``, ``place_SYMBOL.json``). Large connector
     ``output_path`` pointers are normalized to inline JSON by default so the
     compute step can parse the file directly.
+
+    ``raw_dir`` overrides the default ``raw_input_dir(trading_day, base)``
+    computation, so callers can pin raw inputs directly under their
+    ``artifacts_dir / "raw"`` regardless of directory layout.
 
     Fails closed when normalization of an ``output_path`` pointer fails:
     raises ``ValueError`` and writes nothing, rather than persisting a
@@ -408,16 +413,21 @@ def save_raw_input(
             f"failed to persist {filename}: {to_write['normalize_error']}; refusing to "
             "silently write an unnormalized raw connector payload"
         )
-    out_dir = raw_input_dir(trading_day, base)
+    out_dir = raw_dir if raw_dir is not None else raw_input_dir(trading_day, base)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / safe
-    path.write_text(json.dumps(to_write, indent=2) + "\n")
+    path.write_text(json.dumps(to_write, indent=2) + "\n", encoding="utf-8")
     return path
 
 
-def list_raw_inputs_saved(trading_day: str, base: Optional[Path] = None) -> List[str]:
+def list_raw_inputs_saved(
+    trading_day: str,
+    base: Optional[Path] = None,
+    *,
+    raw_dir: Optional[Path] = None,
+) -> List[str]:
     """Sorted filenames actually persisted under the run's raw/ directory."""
-    out_dir = raw_input_dir(trading_day, base)
+    out_dir = raw_dir if raw_dir is not None else raw_input_dir(trading_day, base)
     if not out_dir.exists():
         return []
     return sorted(p.name for p in out_dir.iterdir() if p.is_file())
@@ -427,16 +437,21 @@ def build_raw_persistence_state(
     trading_day: str,
     *,
     base: Optional[Path] = None,
+    raw_dir: Optional[Path] = None,
     recovery_from_escalation: bool = False,
 ) -> Dict[str, object]:
     """Build the run_state fields recording raw-input persistence for a run.
 
     Reflects what is actually on disk under raw/ at call time, so the run_state
     cannot claim inputs were saved that were not.
+
+    ``raw_dir`` overrides the default ``raw_input_dir`` computation; pass the
+    same value as the corresponding ``save_raw_input`` calls.
     """
-    saved = list_raw_inputs_saved(trading_day, base)
+    out_dir = raw_dir if raw_dir is not None else raw_input_dir(trading_day, base)
+    saved = list_raw_inputs_saved(trading_day, base, raw_dir=raw_dir)
     return {
-        "raw_input_dir": str(raw_input_dir(trading_day, base)),
+        "raw_input_dir": str(out_dir),
         "raw_inputs_saved": saved,
         "recovery_from_escalation": bool(recovery_from_escalation),
     }
@@ -447,7 +462,9 @@ def raw_persistence_failure_run_state(
     error: str,
     *,
     base: Optional[Path] = None,
+    raw_dir: Optional[Path] = None,
     triggered_at_utc: Optional[str] = None,
+    generated_at: Optional[str] = None,
     broker: str = "robinhood",
     budget: Optional[Dict[str, object]] = None,
     recovery_from_escalation: bool = False,
@@ -460,11 +477,22 @@ def raw_persistence_failure_run_state(
     than escalating with no state at all. The returned dict satisfies
     run_state.schema.json (required run_id/generated_at/trading_day/broker/
     budget/counts) and carries ``order_submit_status='not_submitted_error'``.
+
+    ``raw_dir`` overrides the default ``raw_input_dir`` computation; pass the
+    same value as the corresponding ``save_raw_input`` calls.
+
+    ``generated_at`` pins the run timestamp for replays/backfills where ``now``
+    is the scheduled fire time; when omitted, falls back to the wall clock.
+    ``dca_risk.run_timestamp_et()`` reads ``generated_at`` before the
+    classification timestamp, so passing the scheduled ``now`` here prevents
+    a failure state from being attributed to the wrong time window.
     """
+    out_dir = raw_dir if raw_dir is not None else raw_input_dir(trading_day, base)
     ts = triggered_at_utc or _utc_now_iso()
+    _generated_at = generated_at or datetime.now(_EASTERN).strftime("%Y-%m-%dT%H:%M:%S")
     return {
         "run_id": scheduled_run_id(trading_day),
-        "generated_at": datetime.now(_EASTERN).strftime("%Y-%m-%dT%H:%M:%S"),
+        "generated_at": _generated_at,
         "trading_day": trading_day,
         "broker": broker,
         "order_submit_status": ORDER_SUBMIT_STATUS_ERROR,
@@ -472,7 +500,7 @@ def raw_persistence_failure_run_state(
         "counts": {"evaluated": 0, "buy_candidates": 0, "submitted": 0},
         "buy_candidates": [],
         "run_classification": build_scheduled_classification(trading_day, ts),
-        "raw_input_dir": str(raw_input_dir(trading_day, base)),
+        "raw_input_dir": str(out_dir),
         "raw_inputs_saved": [],
         "recovery_from_escalation": bool(recovery_from_escalation),
         "raw_persistence_error": str(error),

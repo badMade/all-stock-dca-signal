@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, time
 
 from dca_config import load_strategy_config
-from near_close_dca import EASTERN, SourceName, StrategyConfig, StrategyState, build_broker
+from near_close_dca import EASTERN, DryRunBroker, SourceName, StrategyConfig, StrategyState, build_broker
 from run_dca import DemoDataProvider, _fills_from_orders_csv, main, run_pipeline
 
 
@@ -231,3 +231,153 @@ def test_cli_refuses_when_dry_run_false(tmp_path, monkeypatch):
     monkeypatch.setattr(run_dca, "load_strategy_config", lambda *a, **k: StrategyConfig(dry_run=False))
     rc = run_dca.main(["--demo", "--artifacts-dir", str(tmp_path)])
     assert rc == 2
+
+
+def test_run_pipeline_persists_raw_inputs_before_compute(tmp_path):
+    import json
+
+    config = _demo_config()
+    task_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    scheduled_dir = task_root / "scheduled_runs" / "20260706_1520ET"
+    quotes_file = tmp_path / "quotes.json"
+    quotes_file.write_text('{"symbol": "AAPL", "price": 150.0}', encoding="utf-8")
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=scheduled_dir,
+        raw_connector_inputs={"quotes_batch1.json": {"output_path": str(quotes_file)}},
+    )
+    assert result["blocked"] is False
+    raw_file = scheduled_dir / "raw" / "quotes_batch1.json"
+    assert raw_file.exists()
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    assert run_state["raw_input_dir"] == str(scheduled_dir / "raw")
+    assert run_state["raw_inputs_saved"] == ["quotes_batch1.json"]
+
+
+def test_run_pipeline_raw_persistence_failure_writes_error_state(tmp_path):
+    import json
+
+    class ExplodingPayload:
+        pass
+
+    config = _demo_config()
+    task_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    scheduled_dir = task_root / "scheduled_runs" / "20260706_1520ET"
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=scheduled_dir,
+        raw_connector_inputs={"quotes_batch1.json": ExplodingPayload()},
+    )
+    assert "raw_persistence_error" in result
+    assert not (scheduled_dir / "orders.csv").exists()
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    assert run_state["order_submit_status"] == "not_submitted_error"
+    assert run_state["raw_persistence_error"]
+    assert run_state["raw_inputs_saved"] == []
+    assert run_state["buy_candidates"] == []
+
+
+def test_run_pipeline_raw_persistence_failure_clears_stale_compact_artifacts(tmp_path):
+    import json
+
+    class ExplodingPayload:
+        pass
+
+    config = _demo_config()
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
+    scheduled_dir.mkdir(parents=True)
+    # Seed stale compact + derived-report artifacts from a prior successful attempt.
+    stale_files = (
+        "orders.csv", "signals.csv", "buy_candidates.csv",
+        "latest_run_summary.json", "slippage_and_coverage_report.md",
+        "slippage_ranked.csv", "missing_fills_report.csv",
+        "notion_latest_run_compact.md", "notion_latest_run_payload.json",
+    )
+    for stale in stale_files:
+        (scheduled_dir / stale).write_text("stale", encoding="utf-8")
+
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=scheduled_dir,
+        raw_connector_inputs={"quotes_batch1.json": ExplodingPayload()},
+    )
+    assert "raw_persistence_error" in result
+    for stale in stale_files:
+        assert not (scheduled_dir / stale).exists(), f"{stale} was not removed"
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    assert run_state["order_submit_status"] == "not_submitted_error"
+    assert run_state["broker"] == "robinhood"
+
+
+def test_run_pipeline_live_run_missing_raw_inputs_writes_error_state(tmp_path):
+    import json
+
+    config = load_strategy_config(
+        approved_test_dates=frozenset({_now().date()}), dry_run=False
+    )
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
+    # The raw persistence error fires before any broker call, so a DryRunBroker is fine here.
+    broker = DryRunBroker(account=config.target_account_number)
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        broker, artifacts_dir=scheduled_dir,
+        raw_connector_inputs=None,
+    )
+    assert "raw_persistence_error" in result
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    assert run_state["order_submit_status"] == "not_submitted_error"
+    assert run_state["raw_inputs_saved"] == []
+
+
+def test_run_pipeline_live_run_empty_raw_inputs_writes_error_state(tmp_path):
+    import json
+
+    config = load_strategy_config(
+        approved_test_dates=frozenset({_now().date()}), dry_run=False
+    )
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
+    broker = DryRunBroker(account=config.target_account_number)
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        broker, artifacts_dir=scheduled_dir,
+        raw_connector_inputs={},
+    )
+    assert "raw_persistence_error" in result
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    assert run_state["order_submit_status"] == "not_submitted_error"
+    assert run_state["raw_inputs_saved"] == []
+
+
+def test_run_pipeline_live_run_partial_raw_inputs_writes_error_state(tmp_path):
+    import json
+
+    config = load_strategy_config(
+        approved_test_dates=frozenset({_now().date()}), dry_run=False
+    )
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
+    quotes_file = tmp_path / "quotes.json"
+    quotes_file.write_text('{"symbol": "AAPL", "price": 150.0}', encoding="utf-8")
+    broker = DryRunBroker(account=config.target_account_number)
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        broker, artifacts_dir=scheduled_dir,
+        raw_connector_inputs={"quotes_batch1.json": {"output_path": str(quotes_file)}},
+        required_raw_filenames=frozenset({"quotes_batch1.json", "historicals_batch1.json"}),
+    )
+    assert "raw_persistence_error" in result
+    assert "historicals_batch1.json" in result["raw_persistence_error"]
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    assert run_state["order_submit_status"] == "not_submitted_error"
+    assert run_state["raw_inputs_saved"] == []
