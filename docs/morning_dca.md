@@ -106,11 +106,11 @@ run_state counts and lists `manual_review_candidates` / `manual_review_tickers`.
 
 The afternoon live task (`10ce362c`, which supersedes the deleted `ce16ba6b`)
 must not be cannibalized or validated by morning activity. The morning stream is
-isolated on every axis:
+isolated on every axis except the same-day top-up guard (see below):
 
 | Axis | Afternoon live (`10ce362c`) | Morning stream |
 |---|---|---|
-| Ladder | 0x → **5x** (`config/sizing_ladder.json`) | 0x → **3x** (this stream) |
+| Ladder | 0x → **5x** (`config/sizing_ladder.json`) | 0x → **5x** (shared) |
 | Budget ledger | `StrategyState` / `BUDGET_TIERS` | `MorningLedger` namespace `morning` |
 | Artifact root | `.../cron_tracking/ce16ba6b/` | `.../cron_tracking/morning_dca[_watchlist]/` |
 | Run type | `scheduled_live_test` @ `15:20` | `morning_dca_watchlist_scan` @ `09:45` / `morning_dca_live` @ `10:30` |
@@ -129,18 +129,46 @@ afternoon scheduled evidence, slippage, watchdog confirmation, scheduled cost
 basis, or scheduled fill counts. See
 [strategy.md](strategy.md#same-day-prior-run-offset--top-up-guard).
 
-## Morning sizing ladder (0x → 3x)
+Morning orders/fills are therefore **never** counted as afternoon
+scheduled-execution evidence, afternoon slippage, afternoon fill counts,
+afternoon reliability, afternoon watchdog confirmation, or afternoon scheduled
+cost basis.
+
+## Same-day top-up linkage (the only afternoon linkage)
+
+Morning orders/fills **do** count as **prior same-day allocation context** for
+the afternoon (`10ce362c`) same-day top-up guard. When the afternoon task
+evaluates a ticker that already received a same-day morning buy, it tops up
+rather than duplicating:
+
+- `incremental_order_amount = max(0, afternoon_desired_amount - prior_same_day_amount)`
+- When earlier same-day buys exist, the afternoon task buys only if the current
+  price is **strictly below** the prior-run reference price; otherwise it holds.
+
+Top-up guard fields carried for the 9:45 → afternoon linkage:
+`prior_same_day_amount`, `prior_same_day_reference_price`,
+`prior_same_day_source`, `prior_same_day_run_id`, `afternoon_desired_amount_usd`,
+`afternoon_desired_amount`, `afternoon_decision_price`, `incremental_order_amount`,
+`top_up_guard_result`, `top_up_skipped`, and `top_up_manual_review`.
+
+## Sizing ladder (0x → 5x)
 
 Drop is measured as a fraction below yesterday's regular-session close. The
-largest tier threshold ≤ the actual drop wins.
+largest tier threshold ≤ the actual drop wins. This is the current $3-base
+0x-to-5x ladder shared with the afternoon stream.
 
 | Drop vs. prior close | Multiplier |
 |---|---|
 | < 0.1% | 0x (no buy) |
-| 0.1% – < 2% | 1x |
-| 2% – < 5% | 1.5x |
-| 5% – < 8% | 2x |
-| ≥ 8% | 3x (no upper cutoff) |
+| 0.1% – < 1% | 1x |
+| 1% – < 2% | 1.5x |
+| 2% – < 3% | 2x |
+| 3% – < 4% | 2.5x |
+| 4% – < 5% | 3x |
+| 5% – < 6% | 3.5x |
+| 6% – < 7% | 4x |
+| 7% – < 8% | 4.5x |
+| ≥ 8% | 5x (no upper cutoff) |
 
 Dollars = `base_amount_usd (default $3) × multiplier` (hypothetical in
 watchlist mode, actual order size in live mode).

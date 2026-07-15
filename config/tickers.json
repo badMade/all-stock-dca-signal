@@ -1,6 +1,6 @@
 {
   "$schema": "../schemas/tickers.schema.json",
-  "version": "2026-07-08",
+  "version": "2026-07-09",
   "description": "Active graded DCA ticker universe. Backup of the latest thread state; no secrets.",
   "active": [
     "DFTX", "TRIN", "AAAU", "SPCX", "EVR", "LUNR", "IRDM",
@@ -14,5 +14,5 @@
     "IRDMI": "IRDM",
     "GLWR": "GLW"
   },
-  "notes": "42 active symbols. BYDDY, VCX, TRLV, and RVI excluded. IRDMI->IRDM and GLWR->GLW corrected upstream."
+  "notes": "42 active symbols. BYDDY, VCX, TRLV, and RVI excluded. IRDMI->IRDM and GLWR->GLW corrected upstream; IBM included."
 }

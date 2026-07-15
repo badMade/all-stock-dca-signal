@@ -138,6 +138,25 @@
       "state_schema_version": "morning-live-v1"
     }
   },
+  "top_up_guard": {
+    "purpose": "Morning live orders/fills are recorded as prior same-day allocation context so the afternoon 3:20 task can offset (top up) rather than duplicate the same-day position. This is the ONLY way morning activity feeds the afternoon stream.",
+    "fields": [
+      "prior_same_day_amount",
+      "prior_same_day_reference_price",
+      "prior_same_day_source",
+      "prior_same_day_run_id",
+      "afternoon_desired_amount_usd",
+      "afternoon_desired_amount",
+      "afternoon_decision_price",
+      "incremental_order_amount",
+      "top_up_guard_result",
+      "top_up_skipped",
+      "top_up_manual_review"
+    ],
+    "incremental_order_amount_formula": "incremental_order_amount = max(0, afternoon_desired_amount - prior_same_day_amount)",
+    "price_rule": "When earlier same-day buys exist for a ticker, the afternoon task only buys if the current price is strictly below the prior-run reference price; otherwise it holds.",
+    "note": "These are the actual fields emitted in buy_candidates rows by near_close_dca.run_once; morning fills populate prior_same_day_* for the afternoon evaluation."
+  },
   "artifact_fields": {
     "signal_row": [
       "ticker",
