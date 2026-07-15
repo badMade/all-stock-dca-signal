@@ -1649,6 +1649,97 @@ def test_per_order_cap_blocks_without_any_broker_call(tmp_path):
     assert "per-order ceiling" in broker_outcomes["BIGDROP"]["skip_reason"]
 
 
+class _WideSpreadProvider(DecliningBarsProvider):
+    """A provider exposing a live bid/ask quote with an excessive spread."""
+
+    def __init__(self, *args, spread_pct=5.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._spread_pct = spread_pct
+
+    def get_bid_ask(self, ticker, as_of):
+        midpoint = 100.0
+        half_spread = midpoint * (self._spread_pct / 100.0) / 2.0
+        return (midpoint - half_spread, midpoint + half_spread)
+
+
+def test_spread_breaker_blocks_wide_spread_before_placement(tmp_path):
+    # Codex review #12 on PR #22: the afternoon stream enforces a bid/ask
+    # spread circuit breaker before placing an order (PR #37), but the morning
+    # and midday live streams share the same _place_broker_orders path and had
+    # no equivalent check at all -- a wide-spread 10:30/12:30 candidate would
+    # place directly through tradability/buying-power without ever reading a
+    # quote.
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+    class _FakeLiveBroker:
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            raise AssertionError("tradability must not be reached once the spread breaker blocks")
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise AssertionError("placement must not be reached once the spread breaker blocks")
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("BIGDROP",))
+    cfg = MorningConfig(
+        tickers=("BIGDROP",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        max_bid_ask_spread_pct=1.0,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = _WideSpreadProvider(SourceName.ROBINHOOD, 100.0, {"BIGDROP": 0.08}, spread_pct=5.0)
+    res = ex.run(_now_live(), data, broker=_FakeLiveBroker())
+    broker_outcomes = res["artifacts"].get("broker_outcomes", {})
+    assert broker_outcomes.get("BIGDROP", {}).get("status") == "blocked"
+    assert "spread" in broker_outcomes["BIGDROP"]["skip_reason"]
+
+
+def test_spread_breaker_allows_tight_spread(tmp_path):
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+    class _FakeLiveBroker:
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            return f"ORDER-{ticker}"
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("BIGDROP",))
+    cfg = MorningConfig(
+        tickers=("BIGDROP",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        max_bid_ask_spread_pct=1.0,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = _WideSpreadProvider(SourceName.ROBINHOOD, 100.0, {"BIGDROP": 0.08}, spread_pct=0.2)
+    res = ex.run(_now_live(), data, broker=_FakeLiveBroker())
+    broker_outcomes = res["artifacts"].get("broker_outcomes", {})
+    assert broker_outcomes.get("BIGDROP", {}).get("status") == "submitted"
+
+
 if __name__ == "__main__":
     import sys
     import tempfile

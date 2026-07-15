@@ -81,6 +81,7 @@ from near_close_dca import (
     iso_week_key,
     latest_bar_at_or_before,
     load_prior_same_day_allocations_multi,
+    quote_spread_pct,
 )
 
 _log = logging.getLogger(__name__)
@@ -386,6 +387,11 @@ class MorningConfig:
     # Absolute per-order ceiling loaded from config/budgets.json
     # circuit_breakers.max_per_order_usd. 5x * $3 base = $15 default.
     max_per_order_usd: float = 15.0
+    # Bid/ask spread circuit breaker for live placement, mirroring the
+    # afternoon stream's StrategyConfig.max_bid_ask_spread_pct. A candidate
+    # whose live quote spread exceeds this percent of the quote midpoint is
+    # blocked before placement rather than bought at a stale/no-data price.
+    max_bid_ask_spread_pct: float = 1.0
 
     def as_strategy_config(self) -> StrategyConfig:
         """Return a StrategyConfig view carrying the morning ladder.
@@ -1620,6 +1626,8 @@ class MorningDCAExecutor(DCAExecutor):
         remaining_daily: float,
         remaining_weekly: float,
         manual: bool = False,
+        data: Any = None,
+        now: Optional[datetime] = None,
     ) -> Dict[str, Any]:
         """Attempt broker order placement for each EXEC_AUTO_BUY_ELIGIBLE candidate.
 
@@ -1636,6 +1644,12 @@ class MorningDCAExecutor(DCAExecutor):
         ``hypothetical_amount_usd``. Cross-stream prior orders are expected for
         guarded top-ups, but same-stream ref-id duplicate checks still run so
         retries cannot submit the same stream order twice.
+
+        Spread breaker: when ``data`` exposes a live bid/ask quote (the same
+        mechanism the afternoon stream uses), a candidate whose spread exceeds
+        ``config.max_bid_ask_spread_pct`` is blocked before placement. Providers
+        without a ``get_bid_ask`` hook (e.g. most test doubles) are silently
+        skipped -- this is a best-effort circuit breaker, not a hard requirement.
 
         Review policy: scheduled runs (manual=False) skip review_market_buy and
         call place_market_buy directly after all internal checks pass, per the
@@ -1728,6 +1742,25 @@ class MorningDCAExecutor(DCAExecutor):
                 else:
                     outcomes[ticker] = {"status": "skipped", "skip_reason": duplicate_reason}
                 continue
+            if data is not None and now is not None:
+                try:
+                    spread_pct = quote_spread_pct(data, ticker, now)
+                except Exception as exc:  # noqa: BLE001
+                    outcomes[ticker] = {
+                        "status": "blocked",
+                        "skip_reason": f"spread quote error: {exc}",
+                    }
+                    _log.warning("Spread quote error for %s: %s", ticker, exc)
+                    continue
+                max_spread = self.config.max_bid_ask_spread_pct
+                if spread_pct is not None and spread_pct > max_spread:
+                    outcomes[ticker] = {
+                        "status": "blocked",
+                        "skip_reason": (
+                            f"bid/ask spread {spread_pct:.2f}% exceeds {max_spread:.2f}% limit"
+                        ),
+                    }
+                    continue
             try:
                 tradable = broker.is_tradable_for_fractional_buy(ticker)
             except Exception as exc:  # noqa: BLE001
@@ -1882,6 +1915,8 @@ class MorningDCAExecutor(DCAExecutor):
                 remaining_daily=pre_run_remaining_daily,
                 remaining_weekly=pre_run_remaining_weekly,
                 manual=manual,
+                data=data,
+                now=now,
             )
         # In live mode record only candidates whose orders were actually submitted
         # so cap-exceeded orders do not inflate the ledger and corrupt budget reporting.

@@ -341,6 +341,38 @@ def test_top_up_incremental_when_price_below_prior(tmp_path):
     assert ex.ledger.day_planned(day) == 12.0
 
 
+class _WideSpreadProvider(DecliningBarsProvider):
+    """A provider exposing a live bid/ask quote with an excessive spread."""
+
+    def __init__(self, *args, spread_pct=5.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._spread_pct = spread_pct
+
+    def get_bid_ask(self, ticker, as_of):
+        midpoint = 100.0
+        half_spread = midpoint * (self._spread_pct / 100.0) / 2.0
+        return (midpoint - half_spread, midpoint + half_spread)
+
+
+def test_midday_spread_breaker_blocks_wide_spread(tmp_path):
+    # Codex review #12 on PR #22: the spread circuit breaker added to the
+    # afternoon stream (PR #37) and the morning stream must also cover
+    # midday, since MiddayDCAExecutor shares _place_broker_orders with
+    # MorningDCAExecutor.
+    cfg = MiddayConfig(
+        tickers=("BIG",), base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "midday"),
+        max_bid_ask_spread_pct=1.0,
+    )
+    ex = MiddayDCAExecutor(cfg)
+    data = _WideSpreadProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10}, spread_pct=5.0)
+    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
+    row = res["artifacts"]["buy_candidates"][0]
+    assert row["status"] == "blocked"
+    outcome = res["artifacts"]["broker_outcomes"]["BIG"]
+    assert "spread" in outcome["skip_reason"]
+
+
 class _TopUpDuplicateBroker:
     def __init__(self, duplicate: bool) -> None:
         self.duplicate = duplicate
