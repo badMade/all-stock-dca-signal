@@ -1362,6 +1362,120 @@ def test_load_prior_same_day_ignores_other_trading_days(tmp_path):
     assert load_prior_same_day_allocations(root, date(2026, 6, 29)) == {}
 
 
+# --- PR #22 bot-review regression coverage (batch: top-up guard) --------------
+
+
+def test_load_prior_same_day_preserves_amount_only_fill_as_unknown_price(tmp_path):
+    # Codex review #88: a CSV-only prior allocation row can have amount_usd but
+    # no usable avg_fill_price (e.g. a manual override fill logged without a
+    # captured price). The row's amount must still count as prior-allocation
+    # capital, with an unknown (None) reference price -- not be dropped entirely.
+    root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    run_dir = os.path.join(root, "manual_reruns", "1505")
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(
+            _manual_run_state([{"ticker": "AMZN", "status": "filled", "planned_amount_usd": 3.0}]),
+            handle,
+        )
+    with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+        handle.write("ticker,amount_usd,avg_fill_price\nAMZN,2.5,\n")
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["AMZN"].amount_usd == 2.5
+    assert allocations["AMZN"].reference_price is None
+
+
+def test_load_prior_same_day_quantity_only_fill_without_price_does_not_crash(tmp_path):
+    # Codex review #90 (paired with #88): a filled row with a quantity but no
+    # usable price and no amount_usd carries no way to derive a dollar amount.
+    # It must be dropped safely, never raise (e.g. None * quantity), and never
+    # fabricate a reference price.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    _write_prior_run(
+        root,
+        "manual_runs/0900",
+        _manual_run_state([{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0}]),
+    )
+    orders_csv = os.path.join(root, "manual_runs", "0900", "orders.csv")
+    with open(orders_csv, "w", encoding="utf-8") as handle:
+        handle.write("ticker,status,avg_fill_price,quantity_filled\nAAPL,filled,,0.05\n")
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    # No crash, and no fabricated reference price for the priceless fill row.
+    assert allocations["AAPL"].reference_price is None
+
+
+def test_run_daily_compact_checks_per_order_cap_before_broker_duplicate_lookup(tmp_path):
+    # Codex review #83: the hard per-order cap must be checked before the
+    # broker's same-day-duplicate lookup, not after -- an over-cap candidate
+    # should never need a same_day_strategy_order_exists() broker round-trip.
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-cap-before-dup")
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL",),
+        approved_test_dates=config.approved_test_dates,
+        base_buy_amount_usd=10.0,
+        max_per_order_usd=15.0,
+    )
+
+    class _TrackingBroker(DryRunBroker):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.duplicate_lookup_calls = []
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            self.duplicate_lookup_calls.append(ticker)
+            return super().same_day_strategy_order_exists(ticker, trading_day)
+
+    tracking_broker = _TrackingBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+
+    run_daily_compact(now, config, state, fin, rh, tracking_broker, artifacts_dir=artifacts_dir)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    candidate = run_state["buy_candidates"][0]
+    assert candidate["status"] == "blocked"
+    assert candidate["skip_reason"] == "max per-order ceiling exceeded"
+    assert tracking_broker.duplicate_lookup_calls == []
+
+
+def test_load_prior_same_day_final_override_can_see_earlier_scheduled_run(tmp_path):
+    # Codex review #96: a final manual buy override invoked after the day's
+    # already-completed scheduled afternoon run must still see that run's
+    # allocation as prior context, or it risks double-buying the same ticker.
+    # Default guard behavior (used by the scheduled run itself) is unchanged --
+    # only an explicit opt-in surfaces the earlier scheduled run.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    _write_prior_run(
+        root,
+        "scheduled_runs/20260629_1520ET",
+        _manual_run_state(
+            [{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0}],
+            generated_at="2026-06-29T15:20:00-04:00",
+            run_origin="scheduled",
+        ),
+        orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "99.0"}],
+    )
+
+    # Default behavior is unchanged: the scheduled run is never prior context.
+    default_allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert default_allocations == {}
+
+    # A final override running later the same day must see it.
+    override_allocations = load_prior_same_day_allocations(
+        root,
+        date(2026, 6, 29),
+        boundary_et=time(15, 35),
+        include_scheduled_afternoon=True,
+    )
+    assert override_allocations["AAPL"].amount_usd == 3.0
+    assert override_allocations["AAPL"].reference_price == 99.0
+
+
 # --- Integration: top-up guard through run_daily_compact ----------------------
 
 

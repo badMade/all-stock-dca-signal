@@ -1727,8 +1727,7 @@ def _orders_csv_fills(
                     price = float(raw_price) if raw_price not in (None, "", "-") else None
                 except (TypeError, ValueError):
                     price = None
-                if not price or price <= 0:
-                    continue
+                price_valid = price is not None and price > 0
                 raw_qty = row.get("quantity_filled")
                 try:
                     qty = float(raw_qty) if raw_qty not in (None, "", "-") else None
@@ -1739,11 +1738,20 @@ def _orders_csv_fills(
                     amount = float(raw_amount) if raw_amount not in (None, "", "-") else None
                 except (TypeError, ValueError):
                     amount = None
+                amount_valid = amount is not None and amount > 0
+                if not price_valid and not amount_valid:
+                    # No usable price AND no usable amount_usd -- genuinely no
+                    # capital-movement information to preserve for this row.
+                    continue
                 fills[ticker] = {
                     "order_id": row.get("order_id"),
-                    "avg_fill_price": price,
+                    # Preserve amount-only rows (amount_usd present, price missing/
+                    # invalid) as an unknown-price allocation instead of dropping
+                    # them outright -- the confirmed CSV amount must not be
+                    # silently discarded in favor of a stale planned amount.
+                    "avg_fill_price": price if price_valid else None,
                     "quantity_filled": qty if qty and qty > 0 else None,
-                    "amount_usd": amount if amount and amount > 0 else None,
+                    "amount_usd": amount if amount_valid else None,
                 }
     except Exception:
         return fills
@@ -1783,6 +1791,7 @@ def load_prior_same_day_allocations(
     trading_day: date,
     *,
     boundary_et: time = MORNING_MANUAL_BOUNDARY_ET,
+    include_scheduled_afternoon: bool = False,
 ) -> Dict[str, PriorSameDayAllocation]:
     """Aggregate earlier same-day allocation context for the scheduled afternoon guard.
 
@@ -1808,6 +1817,13 @@ def load_prior_same_day_allocations(
     afternoon run must beat the best earlier entry price before it tops up. If any
     contributing reference is unknown the aggregate reference is unknown, routing the
     guard to its conservative missing-price / manual_review $0 path.
+
+    ``include_scheduled_afternoon`` defaults to False, matching the normal
+    scheduled afternoon run's own guard invocation (which must never see another
+    afternoon-scheduled run as prior context). Set it True only for a distinct,
+    later same-day invocation -- e.g. a final manual buy override -- that needs
+    to see the day's already-completed scheduled run so it doesn't double-buy;
+    pass a ``boundary_et`` later than that run's timestamp to include it.
     """
     root = Path(state_root)
     if not root.exists():
@@ -1823,7 +1839,7 @@ def load_prior_same_day_allocations(
             continue
         if run_state.get("trading_day") != trading_day.isoformat():
             continue
-        if _prior_run_is_scheduled(run_state):
+        if _prior_run_is_scheduled(run_state) and not include_scheduled_afternoon:
             continue
         if not _prior_run_before_boundary(run_state, boundary_et):
             continue
@@ -1927,9 +1943,12 @@ def load_prior_same_day_allocations(
                 # Prefer the actual filled notional over the planned amount so a
                 # manual override or partial fill doesn't overstate prior allocation.
                 amount = fill["amount_usd"]
-            elif fill is not None and fill["quantity_filled"]:
+            elif fill is not None and fill["quantity_filled"] and fill.get("avg_fill_price") is not None:
                 # Prefer the actual filled notional over the planned amount so a
-                # partial fill doesn't overstate prior allocation.
+                # partial fill doesn't overstate prior allocation. Requires a
+                # confirmed price -- a quantity-only fill with no usable price
+                # carries no way to derive a dollar amount and must not be
+                # multiplied against a missing (None) price.
                 amount = fill["avg_fill_price"] * fill["quantity_filled"]
             if amount <= 0:
                 continue
@@ -1988,6 +2007,7 @@ def load_prior_same_day_allocations_multi(
     trading_day: date,
     *,
     boundary_et: time = MORNING_MANUAL_BOUNDARY_ET,
+    include_scheduled_afternoon: bool = False,
 ) -> Dict[str, PriorSameDayAllocation]:
     """Merge :func:`load_prior_same_day_allocations` across several state roots.
 
@@ -1999,10 +2019,18 @@ def load_prior_same_day_allocations_multi(
     afternoon run must beat the best earlier entry across every stream before it
     tops up. Roots that do not exist contribute nothing, so passing production
     stream roots is safe on days a stream did not run.
+
+    ``include_scheduled_afternoon`` is forwarded to each per-root call; see
+    :func:`load_prior_same_day_allocations` for when to set it True.
     """
     merged: Dict[str, PriorSameDayAllocation] = {}
     for root in state_roots:
-        allocations = load_prior_same_day_allocations(root, trading_day, boundary_et=boundary_et)
+        allocations = load_prior_same_day_allocations(
+            root,
+            trading_day,
+            boundary_et=boundary_et,
+            include_scheduled_afternoon=include_scheduled_afternoon,
+        )
         for ticker, alloc in allocations.items():
             existing = merged.get(ticker)
             if existing is None:
@@ -2616,14 +2644,8 @@ def run_once(
             candidate_outcomes[ticker] = {"status": "skipped", "skip_reason": "already bought today"}
             _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: already bought today; skipping")
             continue
-        # A morning/manual run must NOT block the scheduled afternoon run: when the
-        # top-up guard has a loaded prior allocation for this ticker, the earlier
-        # same-day allocation is handled above, so the broker's same-day-order
-        # block is intentionally bypassed here.
-        if not ticker_guarded and broker.same_day_strategy_order_exists(ticker, trading_day):
-            candidate_outcomes[ticker] = {"status": "skipped", "skip_reason": "same-day broker order exists"}
-            _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: same-day broker order already exists; skipping")
-            continue
+        # Hard per-order ceiling is checked before any broker round-trip: an
+        # over-cap candidate should never need a same-day-duplicate lookup.
         if order_amount > config.max_per_order_usd:
             candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "max per-order ceiling exceeded"}
             _block(
@@ -2632,6 +2654,14 @@ def run_once(
                 f"{ticker}: order amount ${order_amount:.2f} exceeds max per-order "
                 f"${config.max_per_order_usd:.2f}; skipping",
             )
+            continue
+        # A morning/manual run must NOT block the scheduled afternoon run: when the
+        # top-up guard has a loaded prior allocation for this ticker, the earlier
+        # same-day allocation is handled above, so the broker's same-day-order
+        # block is intentionally bypassed here.
+        if not ticker_guarded and broker.same_day_strategy_order_exists(ticker, trading_day):
+            candidate_outcomes[ticker] = {"status": "skipped", "skip_reason": "same-day broker order exists"}
+            _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: same-day broker order already exists; skipping")
             continue
         if not within_caps(order_amount, state, trading_day, config):
             candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "cap would be exceeded"}
