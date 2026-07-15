@@ -117,6 +117,11 @@ class FakeLiveBroker:
     def same_day_strategy_order_exists(self, ticker, trading_day):
         return False
 
+    def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+        # No duplicate: this fake broker never has prior orders on file, so
+        # guarded top-ups always proceed as fresh placements.
+        return False
+
     def is_tradable_for_fractional_buy(self, ticker):
         return True
 
