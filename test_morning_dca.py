@@ -1075,8 +1075,18 @@ class _UnresolvedProvider(FixedDropProvider):
         return super().get_previous_close_bar(ticker, as_of)
 
 
-def test_preflight_machine_complete_envelope():
-    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG", "FLAT")), mode=MORNING_PREFLIGHT_MODE)
+def test_preflight_machine_complete_envelope(tmp_path):
+    # Regression: this test previously constructed MorningConfig without a
+    # morning_run_state_root override, so the executor fell back to the
+    # production DEFAULT_MORNING_PREFLIGHT_STATE_ROOT
+    # ("/home/user/workspace/..."). That path doesn't exist (and isn't
+    # writable) on CI runners, so the test failed with PermissionError there
+    # even though it happened to pass on a dev machine that already had the
+    # directory. Every artifact-writing test must scope state under tmp_path.
+    ex = MorningDCAExecutor(
+        MorningConfig(tickers=("BIG", "FLAT"), morning_run_state_root=str(tmp_path)),
+        mode=MORNING_PREFLIGHT_MODE,
+    )
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.03, "FLAT": 0.0})
     art = ex.run(_now_preflight(), data)["artifacts"]
 
@@ -1113,12 +1123,16 @@ def test_preflight_machine_complete_envelope():
     assert art["unresolved_tickers"] == []
 
 
-def test_preflight_unresolved_ticker_does_not_invalidate_run():
+def test_preflight_unresolved_ticker_does_not_invalidate_run(tmp_path):
     # An unresolved symbol (no quote, no prior close) must be a per-symbol row
     # with eligible_to_execute=false and ineligible_reason='unresolved_ticker',
     # listed in unresolved_tickers, and MUST NOT flip overall_ok.
+    # Same tmp_path scoping fix as test_preflight_machine_complete_envelope
+    # above: without morning_run_state_root, this writes to the hardcoded
+    # production path and fails with PermissionError on CI runners.
     ex = MorningDCAExecutor(
-        MorningConfig(tickers=("BIG", "AAAU")), mode=MORNING_PREFLIGHT_MODE
+        MorningConfig(tickers=("BIG", "AAAU"), morning_run_state_root=str(tmp_path)),
+        mode=MORNING_PREFLIGHT_MODE,
     )
     data = _UnresolvedProvider(
         SourceName.ROBINHOOD, 100.0, {"BIG": 0.03, "AAAU": 1.0}, unresolved=("AAAU",)
