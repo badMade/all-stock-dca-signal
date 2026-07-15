@@ -1490,6 +1490,20 @@ def test_scheduled_live_run_without_broker_fails_closed(tmp_path):
     written = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
     assert written["status"] == "blocked"
     assert written["run_classification"]["run_type"] == "morning_dca_live"
+    # Codex review on PR #22: this fail-closed stub must go through the normal
+    # build_artifacts()/write_artifacts() pipeline, not a hand-rolled dict, so
+    # watchdog/latest-pointer consumers see it as an intentional block rather
+    # than a malformed or missing run.
+    assert written["run_id"]
+    assert written["generated_at"]
+    assert written["counts"]["evaluated"] == 1
+    assert len(written["signal_rows"]) == 1
+    assert "run_state" in res["paths"]
+    assert "latest_morning_run" in res["paths"]
+    pointer_path = Path(res["paths"]["latest_morning_run"])
+    assert pointer_path.exists()
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    assert pointer["run_id"] == written["run_id"]
 
 
 def test_scheduled_live_run_with_wrong_broker_account_fails_closed_before_ordering(tmp_path):
@@ -1527,6 +1541,12 @@ def test_scheduled_live_run_with_wrong_broker_account_fails_closed_before_orderi
     )
     assert broker.placed is False
     assert Path(res["paths"]["run_state"]).exists()
+    # Same normal-artifact-pipeline requirement as the missing-broker case above.
+    assert res["artifacts"]["run_id"]
+    assert res["artifacts"]["generated_at"]
+    assert res["artifacts"]["counts"]["evaluated"] == 1
+    assert "latest_morning_run" in res["paths"]
+    assert Path(res["paths"]["latest_morning_run"]).exists()
 
 
 def test_manual_live_run_with_wrong_broker_account_raises_before_ordering(tmp_path):

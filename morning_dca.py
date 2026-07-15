@@ -1550,30 +1550,32 @@ class MorningDCAExecutor(DCAExecutor):
 
         return paths
 
-    def _blocked_live_result(self, now: datetime, block_reason: str) -> Dict[str, Any]:
-        """Write and return a fail-closed live-run stub before broker placement.
+    def _blocked_live_result(
+        self,
+        now: datetime,
+        block_reason: str,
+        signals: Sequence[MorningSignal],
+        source: str,
+    ) -> Dict[str, Any]:
+        """Write and return a fail-closed live-run result before broker placement.
 
         This is used for scheduler-wiring safety failures (for example no broker
-        adapter or the wrong live account) where no evaluation or ordering should
-        proceed, but operators still need a durable run_state explaining why the
-        scheduled live stream did not submit orders.
+        adapter or the wrong live account) where no ordering should proceed, but
+        operators still need a durable run_state explaining why the scheduled
+        live stream did not submit orders. Routed through the normal
+        build_artifacts()/write_artifacts() pipeline -- mirroring the preflight-
+        missing-block path above -- rather than a hand-rolled stub, so the
+        persisted state still carries run_id, generated_at, counts, and the
+        signal/candidate arrays already evaluated for this run, and the latest
+        scheduled pointer is still updated: watchdog/latest-pointer consumers
+        see this as an intentional block rather than a malformed or missing run.
         """
-        trading_day = now.astimezone(EASTERN).date()
-        out = self.run_state_dir(now)
-        out.mkdir(parents=True, exist_ok=True)
-        state_path = out / "run_state.json"
-        artifacts = {
-            "trading_day": trading_day.isoformat(),
-            "status": "blocked",
-            "block_reason": block_reason,
-            "stream": self.stream,
-            "mode": self.mode,
-            "trades": self.trades,
-            "broker_outcomes": {},
-            "run_classification": self.run_classification(now, manual=False),
-        }
-        state_path.write_text(json.dumps(artifacts, indent=2, sort_keys=True), encoding="utf-8")
-        return {"artifacts": artifacts, "paths": {"run_state": str(state_path)}}
+        artifacts = self.build_artifacts(now, signals, source, manual=False)
+        artifacts["status"] = "blocked"
+        artifacts["block_reason"] = block_reason
+        artifacts["broker_outcomes"] = {}
+        paths = self.write_artifacts(artifacts, now)
+        return {"artifacts": artifacts, "paths": paths}
 
     def _maybe_block_for_holiday(self, now: datetime, *, manual: bool) -> Optional[Dict[str, Any]]:
         """Return a blocked-run result when ``now`` falls on a weekend or NYSE holiday.
@@ -1917,14 +1919,16 @@ class MorningDCAExecutor(DCAExecutor):
         pre_run_remaining_weekly = self.ledger.remaining_weekly(trading_day)
         broker_outcomes: Optional[Dict[str, Any]] = None
         if self.mode == MORNING_LIVE_MODE and self.trades and not manual and broker is None:
-            return self._blocked_live_result(now, "missing broker adapter for scheduled live execution")
+            return self._blocked_live_result(
+                now, "missing broker adapter for scheduled live execution", signals, source
+            )
         if broker is not None and self.mode == MORNING_LIVE_MODE:
             expected_account = getattr(self.config, "target_account_number", None)
             actual_account = broker.account_number()
             if expected_account and actual_account != expected_account:
                 mismatch = f"broker account mismatch: expected {expected_account}, got {actual_account}"
                 if not manual:
-                    return self._blocked_live_result(now, mismatch)
+                    return self._blocked_live_result(now, mismatch, signals, source)
                 raise RuntimeError(mismatch)
             broker_outcomes = self._place_broker_orders(
                 auto_buy_candidates,
