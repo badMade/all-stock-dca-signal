@@ -2715,6 +2715,23 @@ def run_once(
             }
             _block(ticker, MISSING_FILL_DATA_ERROR, f"{ticker}: spread quote failed: {exc}; skipping")
             continue
+        if spread_pct is None and scheduled:
+            # config/scheduled_tasks.json requires spread_ok=true before any
+            # scheduled live order: a provider without bid/ask support, or a
+            # quote lookup that returned nothing, must fail closed here
+            # rather than silently bypass the breaker. Manual runs still go
+            # through review_market_buy as a human-reviewed safety net, so
+            # they are not blocked on a missing spread alone.
+            candidate_outcomes[ticker] = {
+                "status": "blocked",
+                "skip_reason": "bid/ask spread unavailable; scheduled runs require spread_ok",
+            }
+            _block(
+                ticker,
+                MISSING_FILL_BROKER_BLOCKED,
+                f"{ticker}: bid/ask spread unavailable for scheduled run; skipping",
+            )
+            continue
         if spread_pct is not None and spread_pct > config.max_bid_ask_spread_pct:
             candidate_outcomes[ticker] = {
                 "status": "blocked",

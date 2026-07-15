@@ -506,7 +506,12 @@ def _compact_setup(workdir):
     state = StrategyState()
     broker = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
-    rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+    # Tight bid/ask (0.2% spread, well under the default 1% breaker) so these
+    # compact-mode tests -- which exercise usage-proxy logging, kill-switch
+    # accounting, confirmation-required handling, and top-up recording, not
+    # spread behavior itself -- still reach a submitted/dry_run outcome under
+    # the scheduled-run fail-closed-on-missing-spread breaker.
+    rh = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
     return now, config, state, broker, fin, rh
 
 
@@ -641,7 +646,9 @@ def test_deployment_history_root_engages_kill_switch_on_later_run(tmp_path):
     state1 = StrategyState()
     broker1 = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     fin1 = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now1))
-    rh1 = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now1))
+    # Tight bid/ask so the scheduled-run fail-closed-on-missing-spread breaker
+    # doesn't block this kill-switch scenario (spread behavior is not under test).
+    rh1 = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now1), bid_ask=(97.9, 98.1))
     run_daily_compact(now1, config, state1, fin1, rh1, broker1, artifacts_dir=day1_dir)
 
     with open(os.path.join(day1_dir, "run_state.json"), encoding="utf-8") as handle:
@@ -658,7 +665,7 @@ def test_deployment_history_root_engages_kill_switch_on_later_run(tmp_path):
     state2 = StrategyState()
     broker2 = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     fin2 = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now2))
-    rh2 = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now2))
+    rh2 = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now2), bid_ask=(97.9, 98.1))
     run_daily_compact(
         now2, config, state2, fin2, rh2, broker2,
         artifacts_dir=day2_dir, deployment_history_root=history_root,
@@ -697,7 +704,7 @@ def test_kill_switch_caps_later_candidates_within_the_same_batch(tmp_path):
     state = StrategyState()
     broker = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
-    rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+    rh = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir)
 
@@ -917,6 +924,62 @@ def test_scheduled_afternoon_blocks_wide_spread_before_ordering(tmp_path):
     assert candidate["status"] == "blocked"
     assert "bid/ask spread" in candidate["skip_reason"]
     assert run_state["usage_proxy"]["orders_placed_count"] == 0
+
+
+def test_scheduled_afternoon_blocks_when_spread_unavailable(tmp_path):
+    # Codex review on PR #22: config/scheduled_tasks.json requires spread_ok=true
+    # before any scheduled live order. A provider without get_bid_ask support (or
+    # one whose quote returns nothing) must fail closed here, not silently bypass
+    # the breaker the way it did when spread_pct was simply left as None.
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
+    )
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+    fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    # Plain _FakeData has no get_bid_ask method at all.
+    rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+    artifacts_dir = os.path.join(tmp_path, "runs", "missing-spread")
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    [candidate] = run_state["buy_candidates"]
+    assert candidate["ticker"] == "AAPL"
+    assert candidate["status"] == "blocked"
+    assert "spread" in candidate["skip_reason"]
+    assert run_state["usage_proxy"]["orders_placed_count"] == 0
+
+
+def test_manual_run_not_blocked_when_spread_unavailable(tmp_path):
+    # The missing-spread fail-closed breaker is scoped to scheduled runs only:
+    # a manual run still has review_market_buy as a human-reviewed safety net,
+    # so it must not be blocked on a missing spread alone.
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
+    )
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+    fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+    artifacts_dir = os.path.join(tmp_path, "runs", "manual-missing-spread")
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=False)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    [candidate] = run_state["buy_candidates"]
+    assert candidate["ticker"] == "AAPL"
+    assert candidate["status"] != "blocked"
 
 
 def test_scheduled_afternoon_spread_error_is_caught_and_recorded(tmp_path):
