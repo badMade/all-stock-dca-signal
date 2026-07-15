@@ -1599,8 +1599,9 @@ class MorningDCAExecutor(DCAExecutor):
 
         Top-up awareness: for midday candidates the notional is taken from the
         top-up outcome's ``incremental_order_amount`` rather than the signal's
-        ``hypothetical_amount_usd``; the broker's same-day-order duplicate check
-        is bypassed when a top-up outcome is active (the prior order is expected).
+        ``hypothetical_amount_usd``. Cross-stream prior orders are expected for
+        guarded top-ups, but same-stream ref-id duplicate checks still run so
+        retries cannot submit the same stream order twice.
 
         Review policy: scheduled runs (manual=False) skip review_market_buy and
         call place_market_buy directly after all internal checks pass, per the
@@ -1649,25 +1650,46 @@ class MorningDCAExecutor(DCAExecutor):
                 outcomes[ticker] = {"status": "cap_exceeded", "skip_reason": "weekly cap would be exceeded"}
                 continue
 
-            # Bypass same-day duplicate check only when there is an actual prior
-            # same-day allocation (top-up guard result is not 'no_prior_run').
-            # When no prior run exists, the standard broker duplicate safeguard fires.
+            # Bypass the broad same-day duplicate check only when there is an actual
+            # cross-stream prior allocation (top-up guard result is not 'no_prior_run').
+            # Even then, keep a same-stream ref-id check so retrying this stream after
+            # it already submitted the ticker remains idempotent.
             has_prior_allocation = (
                 top_up is not None and top_up.top_up_guard_result != TOP_UP_NO_PRIOR_RUN
             )
-            if not has_prior_allocation:
-                try:
+            try:
+                if has_prior_allocation:
+                    dup = _same_stream_order_exists(broker, ticker, trading_day, self.stream)
+                    duplicate_reason = "same-stream broker order exists"
+                else:
                     dup = broker.same_day_strategy_order_exists(ticker, trading_day)
-                except Exception as exc:  # noqa: BLE001
+                    duplicate_reason = "same-day broker order exists"
+            except Exception as exc:  # noqa: BLE001
+                outcomes[ticker] = {
+                    "status": "blocked",
+                    "skip_reason": f"duplicate-check failed: {exc}",
+                }
+                _log.warning("Duplicate-check error for %s: %s", ticker, exc)
+                continue
+            if dup:
+                if has_prior_allocation:
+                    # A same-stream top-up duplicate means this stream already
+                    # submitted/reserved the incremental order on an earlier
+                    # attempt. Persist it as submitted so rewriting run_state on
+                    # retry does not erase the durable prior-allocation context
+                    # that later same-day guards depend on.
                     outcomes[ticker] = {
-                        "status": "blocked",
-                        "skip_reason": f"duplicate-check failed: {exc}",
+                        "status": "submitted",
+                        "order_id": None,
+                        "skip_reason": duplicate_reason,
+                        "submitted_amount_usd": notional,
                     }
-                    _log.warning("Duplicate-check error for %s: %s", ticker, exc)
-                    continue
-                if dup:
-                    outcomes[ticker] = {"status": "skipped", "skip_reason": "same-day broker order exists"}
-                    continue
+                    submitted_today += notional
+                    submitted_this_week += notional
+                    reserved_buying_power += notional
+                else:
+                    outcomes[ticker] = {"status": "skipped", "skip_reason": duplicate_reason}
+                continue
             try:
                 tradable = broker.is_tradable_for_fractional_buy(ticker)
             except Exception as exc:  # noqa: BLE001
@@ -1850,6 +1872,26 @@ class MorningDCAExecutor(DCAExecutor):
             artifacts["broker_outcomes"] = broker_outcomes
         paths = self.write_artifacts(artifacts, now)
         return {"artifacts": artifacts, "paths": paths}
+
+
+def _same_stream_order_exists(broker: BrokerAdapter, ticker: str, trading_day: date, stream: str) -> bool:
+    """Return True when broker history already has this stream's idempotency ref id.
+
+    Guarded midday top-ups intentionally allow earlier cross-stream orders for the
+    same ticker, so the broad same-day duplicate check would be too strict. This
+    narrower hook lets live brokers fail closed on retries of the current stream
+    without treating the morning/manual prior allocation as a duplicate.
+    """
+    checker = getattr(broker, "same_day_strategy_order_exists_with_ref_id_prefix", None)
+    if checker is None:
+        raise RuntimeError(
+            "broker does not support same-stream ref-id duplicate checks for guarded top-ups"
+        )
+    prefixes = (
+        f"{stream}-dca-topup-{trading_day.isoformat()}-{ticker}",
+        f"{stream}-dca-{trading_day.isoformat()}-{ticker}",
+    )
+    return bool(checker(ticker, trading_day, prefixes))
 
 
 def _write_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:

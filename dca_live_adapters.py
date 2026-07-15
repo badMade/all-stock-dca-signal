@@ -442,9 +442,9 @@ class RobinhoodBroker:
             return 0.0
         return _to_float(result)
 
-    def same_day_strategy_order_exists(self, ticker: str, trading_day: date) -> bool:
+    def _same_day_orders(self, ticker: str, trading_day: date) -> List[Dict[str, Any]]:
         if self._orders_fn is None:
-            return False
+            return []
         response = self._orders_fn(
             account_number=self._account,
             symbol=ticker,
@@ -456,8 +456,29 @@ class RobinhoodBroker:
             # the one-order-per-ticker-per-day guard pass and allow a duplicate buy.
             raise RuntimeError(f"same-day order lookup for {ticker} failed: {error}")
         data = _unwrap(response)
-        for order in data.get("orders") or []:
+        return list(data.get("orders") or [])
+
+    def same_day_strategy_order_exists(self, ticker: str, trading_day: date) -> bool:
+        for order in self._same_day_orders(ticker, trading_day):
             if str(order.get("state", "")).lower() in _LIVE_ORDER_STATES:
+                return True
+        return False
+
+    def same_day_strategy_order_exists_with_ref_id_prefix(
+        self, ticker: str, trading_day: date, ref_id_prefixes: Tuple[str, ...]
+    ) -> bool:
+        """Return True for live same-day orders whose client ref id matches a prefix."""
+        for order in self._same_day_orders(ticker, trading_day):
+            if str(order.get("state", "")).lower() not in _LIVE_ORDER_STATES:
+                continue
+            ref_id = str(
+                order.get("ref_id")
+                or order.get("client_order_id")
+                or order.get("client_order_uuid")
+                or order.get("client_id")
+                or ""
+            )
+            if ref_id and any(ref_id.startswith(prefix) for prefix in ref_id_prefixes):
                 return True
         return False
 
