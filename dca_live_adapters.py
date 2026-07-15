@@ -256,6 +256,26 @@ class RobinhoodDataProvider:
             return None
         return price, _parse_rfc3339(quote.get("venue_last_trade_time"))
 
+    def get_bid_ask(self, ticker: str, as_of: datetime) -> Optional[Tuple[float, float]]:
+        """Return the current bid/ask quote for the spread circuit breaker."""
+        if self._quotes_fn is None:
+            return None
+        quote = self._quote_for(ticker)
+        if quote is None:
+            return None
+        if not quote.get("has_traded", True) or quote.get("state", "active") != "active":
+            raise ValueError(
+                f"no spread for {ticker}: inactive quote "
+                f"(has_traded={quote.get('has_traded')}, state={quote.get('state')})"
+            )
+        bid = _to_float(quote.get("bid_price", quote.get("bid")))
+        ask = _to_float(quote.get("ask_price", quote.get("ask")))
+        if bid <= 0 or ask <= 0 or ask < bid:
+            raise ValueError(
+                f"no usable bid/ask in {ticker} quote (bid={bid!r}, ask={ask!r})"
+            )
+        return bid, ask
+
     # -- internals ---------------------------------------------------------------
 
     def _parse_bars(self, response: Any, ticker: str) -> List[Bar]:

@@ -190,6 +190,22 @@ class _FakeData:
         return self._quote  # (price, time) or None
 
 
+class _FakeDataWithBidAsk(_FakeData):
+    def __init__(self, source, close_price, prev_close, quote=None, bid_ask=(97.0, 99.0)):
+        super().__init__(source, close_price, prev_close, quote=quote)
+        self._bid_ask = bid_ask
+
+    def get_bid_ask(self, ticker, as_of):
+        return self._bid_ask
+
+
+class _FakeDataWithRaisingBidAsk(_FakeData):
+    """Simulates a provider whose get_bid_ask raises (e.g. inactive/halted quote or missing fields)."""
+
+    def get_bid_ask(self, ticker, as_of):
+        raise ValueError(f"no usable bid/ask in {ticker} quote")
+
+
 def test_target_price_defaults_to_signal_quote():
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     quote_time = datetime(2026, 6, 29, 15, 44, tzinfo=EASTERN)
@@ -874,6 +890,60 @@ def test_confirmation_required_broker_response_recorded_distinctly(tmp_path):
     # Not counted as an error: the broker responded normally, just requiring
     # confirmation, so nothing needs retrying and no alert should fire on this basis.
     assert run_state["usage_proxy"]["errors_count"] == 0
+
+
+def test_scheduled_afternoon_blocks_wide_spread_before_ordering(tmp_path):
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
+        max_bid_ask_spread_pct=1.0,
+    )
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+    fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    # 97 x 99 is a ~2.04% midpoint spread, above the configured 1% hard breaker.
+    rh = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.0, 99.0))
+    artifacts_dir = os.path.join(tmp_path, "runs", "wide-spread")
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    [candidate] = run_state["buy_candidates"]
+    assert candidate["ticker"] == "AAPL"
+    assert candidate["status"] == "blocked"
+    assert "bid/ask spread" in candidate["skip_reason"]
+    assert run_state["usage_proxy"]["orders_placed_count"] == 0
+
+
+def test_scheduled_afternoon_spread_error_is_caught_and_recorded(tmp_path):
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
+    )
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+    fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    # Provider raises on get_bid_ask (e.g. halted or missing bid/ask fields).
+    rh = _FakeDataWithRaisingBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+    artifacts_dir = os.path.join(tmp_path, "runs", "spread-error")
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    [candidate] = run_state["buy_candidates"]
+    assert candidate["ticker"] == "AAPL"
+    assert candidate["status"] == "blocked"
+    assert "spread quote error" in candidate["skip_reason"]
+    assert run_state["usage_proxy"]["orders_placed_count"] == 0
+    assert run_state["usage_proxy"]["errors_count"] == 1
 
 
 def test_run_daily_compact_blocks_orders_above_per_order_ceiling(tmp_path):
