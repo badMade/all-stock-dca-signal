@@ -13,6 +13,8 @@ import json
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
+import pytest
+
 from midday_dca import (
     DEFAULT_MIDDAY_LIVE_STATE_ROOT,
     MIDDAY_LIVE_CRON_ID,
@@ -421,6 +423,43 @@ def test_load_midday_config_reads_config_file(tmp_path):
     assert cfg.morning_weekly_cap_usd == 350.0
     assert cfg.morning_run_state_root == "/custom/midday/root"
     assert cfg.prior_allocation_roots == ("/custom/morning/root",)
+
+
+# --- PR #22 bot-review regression coverage (batch: midday config loading) ----
+
+
+def test_load_midday_config_reads_configured_ticker_whitelist(tmp_path):
+    # Codex review #71: the midday live stream must load its ticker whitelist
+    # from config/tickers.json, not only the hardcoded module-level
+    # ACTIVE_TICKERS/EXCLUDED_TICKERS defaults.
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "midday_dca.json").write_text("{}", encoding="utf-8")
+    (cfg_dir / "tickers.json").write_text(
+        json.dumps({"active": ["ZZZZ"], "excluded": ["YYYY"]}),
+        encoding="utf-8",
+    )
+
+    cfg = load_midday_config(str(cfg_dir))
+
+    assert cfg.tickers == ("ZZZZ",)
+    assert cfg.excluded_tickers == frozenset({"YYYY"})
+
+
+def test_load_midday_config_raises_on_invalid_configured_order_cap(tmp_path):
+    # Codex review #85: an explicitly configured but invalid
+    # circuit_breakers.max_per_order_usd must fail closed -- raise -- rather
+    # than silently keep the default cap for a live trading stream.
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "midday_dca.json").write_text("{}", encoding="utf-8")
+    (cfg_dir / "budgets.json").write_text(
+        json.dumps({"circuit_breakers": {"max_per_order_usd": float("nan")}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError):
+        load_midday_config(str(cfg_dir))
 
 
 def test_midday_executor_default_init_loads_shipped_config():

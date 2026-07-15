@@ -13,6 +13,8 @@ import json
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
+import pytest
+
 from morning_dca import (
     DEFAULT_MORNING_LIVE_STATE_ROOT,
     DEFAULT_MORNING_PREFLIGHT_STATE_ROOT,
@@ -30,6 +32,7 @@ from morning_dca import (
     MorningDCAExecutor,
     MorningLedger,
     MorningSignal,
+    TopUpOutcome,
     load_same_day_preflight,
     nyse_holidays,
     preflight_eligibility,
@@ -859,6 +862,82 @@ def test_load_morning_config_falls_back_to_defaults_if_missing(tmp_path):
     defaults = MorningConfig()
     assert cfg.base_buy_amount_usd == defaults.base_buy_amount_usd
     assert cfg.morning_daily_cap_usd == defaults.morning_daily_cap_usd
+
+
+# --- PR #22 bot-review regression coverage (batch: morning config loading) ---
+
+
+def test_load_morning_config_reads_configured_ticker_whitelist(tmp_path):
+    # Codex review #71: the morning live stream must load its ticker whitelist
+    # from config/tickers.json (the same source near_close_dca's afternoon
+    # stream reads via dca_config.load_strategy_config), not only the
+    # hardcoded module-level ACTIVE_TICKERS/EXCLUDED_TICKERS defaults.
+    from morning_dca import load_morning_config
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "morning_dca.json").write_text("{}", encoding="utf-8")
+    (cfg_dir / "tickers.json").write_text(
+        json.dumps({"active": ["ZZZZ"], "excluded": ["YYYY"]}),
+        encoding="utf-8",
+    )
+
+    cfg = load_morning_config(str(cfg_dir))
+
+    assert cfg.tickers == ("ZZZZ",)
+    assert cfg.excluded_tickers == frozenset({"YYYY"})
+
+
+def test_load_morning_config_raises_on_invalid_configured_order_cap(tmp_path):
+    # Codex review #85: an explicitly configured but invalid
+    # circuit_breakers.max_per_order_usd (non-finite, non-positive, or
+    # unparseable) must fail closed -- raise -- rather than silently keep the
+    # default cap for a live trading stream.
+    from morning_dca import load_morning_config
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "morning_dca.json").write_text("{}", encoding="utf-8")
+    (cfg_dir / "budgets.json").write_text(
+        json.dumps({"circuit_breakers": {"max_per_order_usd": -5}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError):
+        load_morning_config(str(cfg_dir))
+
+
+def test_augment_artifacts_appends_top_up_manual_review_candidate_row():
+    # Codex review #82: a new top-up-manual-review ticker must also get a row
+    # in the manual_review_candidates detail list, not just an incremented
+    # count and a ticker appended to manual_review_tickers.
+    cfg = MorningConfig(tickers=("AAPL",))
+    ex = MorningDCAExecutor(cfg)
+    outcome = TopUpOutcome(
+        ticker="AAPL",
+        desired_amount=6.0,
+        decision_price=99.0,
+        prior_same_day_amount=3.0,
+        prior_same_day_reference_price=None,
+        prior_same_day_run_id="manual_am",
+        prior_same_day_source="manual",
+        incremental_order_amount=0.0,
+        top_up_guard_result="missing_prior_price",
+        top_up_skipped=True,
+        top_up_manual_review=True,
+    )
+    artifacts = {
+        "counts": {"manual_review_candidates": 0},
+        "manual_review_tickers": [],
+        "manual_review_candidates": [],
+    }
+
+    ex._augment_artifacts(artifacts, {"AAPL": outcome})
+
+    assert artifacts["counts"]["manual_review_candidates"] == 1
+    assert artifacts["manual_review_tickers"] == ["AAPL"]
+    assert len(artifacts["manual_review_candidates"]) == 1
+    assert artifacts["manual_review_candidates"][0]["ticker"] == "AAPL"
 
 
 def test_morning_executor_default_init_loads_config_file():

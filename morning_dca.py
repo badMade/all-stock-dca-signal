@@ -644,19 +644,47 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
     if isinstance(prior_roots, list) and prior_roots:
         kwargs["prior_allocation_roots"] = tuple(str(r) for r in prior_roots)
 
+    # Load the configured ticker whitelist from config/tickers.json, the same
+    # version-controlled source near_close_dca's afternoon stream reads via
+    # dca_config.load_strategy_config -- otherwise this stream silently trades
+    # the hardcoded ACTIVE_TICKERS/EXCLUDED_TICKERS module defaults even after
+    # the whitelist is edited.
+    from dca_config import load_tickers
+
+    ticker_data = load_tickers(config_dir_path)
+    if "tickers" in ticker_data:
+        kwargs["tickers"] = ticker_data["tickers"]
+    if "excluded_tickers" in ticker_data:
+        kwargs["excluded_tickers"] = ticker_data["excluded_tickers"]
+
     # Load max_per_order_usd from the shared budgets.json circuit_breakers block so
-    # an emergency cap change takes effect without touching code constants.
+    # an emergency cap change takes effect without touching code constants. The
+    # whole file being absent/corrupt still degrades gracefully to the default
+    # cap, but a key that IS present with an invalid value (non-finite,
+    # non-positive, or unparseable) fails closed -- raises -- rather than
+    # silently trading under a stale default cap for a live trading stream.
     budgets_path = config_dir_path / "budgets.json"
     if budgets_path.exists():
         try:
             budgets_raw = json.loads(budgets_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            _log.warning("could not parse %s (%s); using MorningConfig cap default", budgets_path, exc)
+            budgets_raw = None
+        if budgets_raw is not None:
             cb = budgets_raw.get("circuit_breakers", {})
             if "max_per_order_usd" in cb:
-                max_order = float(cb["max_per_order_usd"])
-                if math.isfinite(max_order) and max_order > 0:
-                    kwargs["max_per_order_usd"] = max_order
-        except (json.JSONDecodeError, OSError, ValueError):
-            pass  # fall back to MorningConfig default
+                raw_cap = cb["max_per_order_usd"]
+                try:
+                    max_order = float(raw_cap)
+                except (TypeError, ValueError):
+                    max_order = None
+                if max_order is None or not (math.isfinite(max_order) and max_order > 0):
+                    raise ValueError(
+                        f"config/budgets.json circuit_breakers.max_per_order_usd={raw_cap!r} "
+                        "is present but not a positive finite number; refusing to silently "
+                        "fall back to a default per-order cap for a live trading stream"
+                    )
+                kwargs["max_per_order_usd"] = max_order
 
     return MorningConfig(**kwargs)
 
@@ -928,6 +956,21 @@ class MorningDCAExecutor(DCAExecutor):
             )
             artifacts["manual_review_tickers"] = (
                 artifacts.get("manual_review_tickers", []) + new_top_up_manual
+            )
+            outcomes_by_ticker = {o.ticker: o for o in outcomes}
+            new_rows = []
+            for ticker in new_top_up_manual:
+                outcome = outcomes_by_ticker[ticker]
+                new_rows.append(
+                    {
+                        "ticker": ticker,
+                        "reason": f"top-up guard: {outcome.top_up_guard_result}",
+                        "hypothetical_amount_usd": outcome.desired_amount,
+                        "current_price": outcome.decision_price,
+                    }
+                )
+            artifacts["manual_review_candidates"] = (
+                artifacts.get("manual_review_candidates", []) + new_rows
             )
 
     # -- DCAExecutor hooks ---------------------------------------------------
