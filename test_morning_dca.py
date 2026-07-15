@@ -1179,6 +1179,55 @@ def test_load_same_day_preflight_reads_eligible_set(tmp_path):
     assert load_same_day_preflight(str(tmp_path), date(2026, 7, 9)) is None
 
 
+def test_load_same_day_preflight_reads_per_ticker_eligibility_v2(tmp_path):
+    # Codex review #92: a strictly schema-compliant v2 preflight artifact is
+    # only required to carry per_ticker_eligibility, not the legacy
+    # eligible_to_execute_tickers convenience field. The reader must derive
+    # eligibility from per_ticker_eligibility instead of silently returning
+    # an empty set when the legacy field is absent.
+    run_dir = tmp_path / "20260708_0945ET"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps({
+            "run_id": "morning_preflight_20260708",
+            "trading_day": "2026-07-08",
+            "overall_ok": True,
+            "per_ticker_eligibility": [
+                {"symbol": "BIG", "eligible_to_execute": True},
+                {"symbol": "FLAT", "eligible_to_execute": False},
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    loaded = load_same_day_preflight(str(tmp_path), date(2026, 7, 8))
+
+    assert loaded is not None
+    assert loaded["eligible_tickers"] == {"BIG"}
+
+
+def test_load_same_day_preflight_fails_closed_when_overall_ok_false(tmp_path):
+    # Codex review #93: a preflight artifact that explicitly declares itself
+    # invalid (overall_ok=False, e.g. a global/account/buying-power/auth/
+    # schema-write failure) must be treated the same as "no preflight found",
+    # not consumed for whatever eligibility data happens to be present.
+    run_dir = tmp_path / "20260708_0945ET"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps({
+            "run_id": "morning_preflight_20260708",
+            "trading_day": "2026-07-08",
+            "overall_ok": False,
+            "blocking_errors": ["account lookup failed"],
+            # Even if some eligibility data is present, it must not be trusted.
+            "eligible_to_execute_tickers": ["BIG"],
+        }),
+        encoding="utf-8",
+    )
+
+    assert load_same_day_preflight(str(tmp_path), date(2026, 7, 8)) is None
+
+
 def test_live_gate_restricts_to_preflight_eligible(tmp_path):
     preflight_root = tmp_path / "preflight"
     pf = MorningDCAExecutor(
@@ -1213,10 +1262,11 @@ def test_live_gate_fails_closed_when_preflight_missing_scheduled(tmp_path):
     # Scheduled live runs must write a durable blocked run_state (fail-closed)
     # when no preflight artifact exists, rather than raising and leaving no
     # artifact for watchdog/reporting to observe.
+    state_root = str(tmp_path / "live")
     live = MorningDCAExecutor(
         MorningConfig(
             tickers=("BIG", "FLAT"),
-            morning_run_state_root=str(tmp_path / "live"),
+            morning_run_state_root=state_root,
             preflight_run_state_root=str(tmp_path / "empty_preflight"),
         ),
         mode=MORNING_LIVE_MODE,
@@ -1232,6 +1282,21 @@ def test_live_gate_fails_closed_when_preflight_missing_scheduled(tmp_path):
     assert persisted["status"] == "blocked"
     assert persisted["trades"] is False
     assert persisted["broker_outcomes"] == {}
+
+    # Codex review #77: "write a valid blocked run_state for missing
+    # preflight" -- the persisted artifact must use the normal scheduled
+    # artifact shape (run_id, generated_at, counts, run_classification), and
+    # the latest scheduled pointer must still be updated, so watchdog and
+    # reporting can validate this as a real (blocked) scheduled-run attempt
+    # rather than a malformed/missing one.
+    for key in ("run_id", "generated_at", "counts", "run_classification"):
+        assert key in persisted, f"blocked run_state is missing {key!r}"
+    assert persisted["run_classification"]["run_origin"] == "scheduled"
+    assert persisted["run_classification"]["manual_run"] is False
+    pointer_path = Path(state_root) / "latest_morning_run.json"
+    assert pointer_path.exists()
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    assert pointer["run_id"] == persisted["run_id"]
 
 
 def test_live_gate_degrades_to_full_universe_when_preflight_missing_manual(tmp_path):

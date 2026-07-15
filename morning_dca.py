@@ -701,6 +701,18 @@ def load_same_day_preflight(
     returned ``eligible_tickers`` to restrict which tickers it re-evaluates; a
     ``None`` result means "no pre-flight found" and the caller degrades to
     evaluating the full universe with a warning rather than blocking all buys.
+
+    An artifact that explicitly declares ``overall_ok=False`` (a global/
+    account/buying-power/auth/schema-write failure per the machine-complete
+    contract) is treated the same as "no pre-flight found" -- None is
+    returned -- rather than trusting whatever eligibility data happens to be
+    present on a preflight run that flagged itself invalid.
+
+    Eligibility is derived primarily from ``per_ticker_eligibility`` (the
+    schema-required v2 field: every active-universe symbol with a ``symbol``
+    key and an ``eligible_to_execute`` flag), falling back to the legacy
+    ``eligible_to_execute_tickers`` convenience field only when
+    ``per_ticker_eligibility`` is absent (an older artifact shape).
     """
     root = Path(preflight_root)
     run_dir = root / f"{trading_day.strftime('%Y%m%d')}_0945ET"
@@ -722,13 +734,23 @@ def load_same_day_preflight(
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
-    eligible = state.get("eligible_to_execute_tickers")
-    if eligible is None:
+    if state.get("overall_ok") is False:
+        return None
+    per_ticker = state.get("per_ticker_eligibility")
+    if isinstance(per_ticker, list) and per_ticker:
         eligible = [
-            row["ticker"]
-            for row in state.get("signal_rows", [])
-            if row.get("eligible_to_execute") is True
+            row.get("symbol")
+            for row in per_ticker
+            if isinstance(row, dict) and row.get("eligible_to_execute") is True
         ]
+    else:
+        eligible = state.get("eligible_to_execute_tickers")
+        if eligible is None:
+            eligible = [
+                row["ticker"]
+                for row in state.get("signal_rows", [])
+                if row.get("eligible_to_execute") is True
+            ]
     return {
         "run_id": state.get("run_id"),
         "eligible_tickers": set(eligible),
@@ -1412,7 +1434,11 @@ class MorningDCAExecutor(DCAExecutor):
             if self.preflight_gate is not None:
                 artifacts["preflight_gate"] = self.preflight_gate
                 if not self.preflight_gate.get("preflight_found"):
-                    warnings.append(self.preflight_gate["warning"])
+                    # The manual degrade-to-full-universe path sets "warning"; the
+                    # scheduled fail-closed block sets "block_reason" instead.
+                    warnings.append(
+                        self.preflight_gate.get("warning") or self.preflight_gate.get("block_reason")
+                    )
         if is_preflight:
             # Pre-flight verdict: which tickers the 10:30 live evaluator should
             # re-evaluate. Coarse pre-screen only; 10:30 recomputes fresh.
@@ -1742,30 +1768,26 @@ class MorningDCAExecutor(DCAExecutor):
         if blocked is not None:
             return blocked
         signals = self.evaluate(now, data, manual=manual)
+        source = data_source or getattr(getattr(data, "source", None), "value", "unknown")
         # Scheduled-run preflight block: _apply_preflight_gate found no same-day
-        # pre-flight artifact and set preflight_missing_block instead of raising,
-        # so we can write a durable blocked run_state before returning.
+        # pre-flight artifact (or one that explicitly flagged itself invalid) and
+        # set preflight_missing_block instead of raising. Build the blocked result
+        # through the normal artifact pipeline (build_artifacts/write_artifacts)
+        # rather than a hand-written stub, so the persisted run_state carries the
+        # standard shape (run_id, generated_at, counts, run_classification) and
+        # the latest scheduled pointer is still updated -- watchdog/reporting can
+        # then validate this as a real (blocked) scheduled-run attempt instead of
+        # something that looks malformed or missing.
         pgate = getattr(self, "preflight_gate", None)
         if pgate and pgate.get("preflight_missing_block"):
-            trading_day = now.astimezone(EASTERN).date()
             block_reason = pgate["block_reason"]
-            out = self.run_state_dir(now)
-            out.mkdir(parents=True, exist_ok=True)
-            state_path = out / "run_state.json"
-            if not state_path.exists():
-                state_path.write_text(
-                    json.dumps(
-                        {"trading_day": trading_day.isoformat(), "status": "blocked",
-                         "block_reason": block_reason, "stream": self.stream,
-                         "trades": False, "broker_outcomes": {}},
-                        indent=2, sort_keys=True,
-                    ),
-                    encoding="utf-8",
-                )
-            return {"artifacts": {"trading_day": trading_day.isoformat(), "status": "blocked",
-                                  "block_reason": block_reason},
-                    "paths": {"run_state": str(state_path)}}
-        source = data_source or getattr(getattr(data, "source", None), "value", "unknown")
+            artifacts = self.build_artifacts(now, signals, source, manual=manual)
+            artifacts["status"] = "blocked"
+            artifacts["block_reason"] = block_reason
+            artifacts["trades"] = False
+            artifacts["broker_outcomes"] = {}
+            paths = self.write_artifacts(artifacts, now)
+            return {"artifacts": artifacts, "paths": paths}
         trading_day = now.astimezone(EASTERN).date()
         top_up_outcomes = self._compute_top_up(now, signals)
         # Sort by multiplier DESC, then drop_pct DESC, then ticker ASC so tied
