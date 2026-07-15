@@ -1544,6 +1544,31 @@ class MorningDCAExecutor(DCAExecutor):
 
         return paths
 
+    def _blocked_live_result(self, now: datetime, block_reason: str) -> Dict[str, Any]:
+        """Write and return a fail-closed live-run stub before broker placement.
+
+        This is used for scheduler-wiring safety failures (for example no broker
+        adapter or the wrong live account) where no evaluation or ordering should
+        proceed, but operators still need a durable run_state explaining why the
+        scheduled live stream did not submit orders.
+        """
+        trading_day = now.astimezone(EASTERN).date()
+        out = self.run_state_dir(now)
+        out.mkdir(parents=True, exist_ok=True)
+        state_path = out / "run_state.json"
+        artifacts = {
+            "trading_day": trading_day.isoformat(),
+            "status": "blocked",
+            "block_reason": block_reason,
+            "stream": self.stream,
+            "mode": self.mode,
+            "trades": self.trades,
+            "broker_outcomes": {},
+            "run_classification": self.run_classification(now, manual=False),
+        }
+        state_path.write_text(json.dumps(artifacts, indent=2, sort_keys=True), encoding="utf-8")
+        return {"artifacts": artifacts, "paths": {"run_state": str(state_path)}}
+
     def _maybe_block_for_holiday(self, now: datetime, *, manual: bool) -> Optional[Dict[str, Any]]:
         """Return a blocked-run result when ``now`` falls on a weekend or NYSE holiday.
 
@@ -1833,13 +1858,16 @@ class MorningDCAExecutor(DCAExecutor):
         pre_run_remaining_daily = self.ledger.remaining_daily(trading_day)
         pre_run_remaining_weekly = self.ledger.remaining_weekly(trading_day)
         broker_outcomes: Optional[Dict[str, Any]] = None
+        if self.mode == MORNING_LIVE_MODE and self.trades and not manual and broker is None:
+            return self._blocked_live_result(now, "missing broker adapter for scheduled live execution")
         if broker is not None and self.mode == MORNING_LIVE_MODE:
             expected_account = getattr(self.config, "target_account_number", None)
-            if expected_account and broker.account_number() != expected_account:
-                raise RuntimeError(
-                    f"Refusing to trade account {broker.account_number()}; "
-                    f"expected {expected_account}"
-                )
+            actual_account = broker.account_number()
+            if expected_account and actual_account != expected_account:
+                mismatch = f"broker account mismatch: expected {expected_account}, got {actual_account}"
+                if not manual:
+                    return self._blocked_live_result(now, mismatch)
+                raise RuntimeError(mismatch)
             broker_outcomes = self._place_broker_orders(
                 auto_buy_candidates,
                 trading_day,
