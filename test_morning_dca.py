@@ -1602,6 +1602,53 @@ def test_auto_buy_candidates_prioritized_by_multiplier_when_cap_hit(tmp_path):
     assert broker_outcomes.get("SMALLDROP", {}).get("status") == "cap_exceeded", "SMALLDROP (1.5x) should be cap-gated out"
 
 
+def test_per_order_cap_blocks_without_any_broker_call(tmp_path):
+    # Codex review #25 on PR #22: the per-order cap should block a candidate
+    # without needing any broker/account round-trip, but _place_broker_orders
+    # unconditionally called broker.available_buying_power() once per batch
+    # BEFORE the per-candidate cap check ran for even the first candidate.
+    # When every candidate in the batch exceeds max_per_order_usd, the broker
+    # must never be touched at all.
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+    class _NoBuyingPowerCallBroker:
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            raise AssertionError(
+                "available_buying_power() must not be called when the "
+                "per-order cap alone blocks every candidate"
+            )
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            raise AssertionError("duplicate-check must not be reached for an over-cap candidate")
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            raise AssertionError("tradability lookup must not be reached for an over-cap candidate")
+
+        def review_market_buy(self, ticker, notional_usd):
+            raise AssertionError("review must not be reached for an over-cap candidate")
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise AssertionError("placement must not be reached for an over-cap candidate")
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("BIGDROP",))
+    cfg = MorningConfig(
+        tickers=("BIGDROP",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        max_per_order_usd=1.0,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIGDROP": 0.08})
+    res = ex.run(_now_live(), data, broker=_NoBuyingPowerCallBroker())
+    broker_outcomes = res["artifacts"].get("broker_outcomes", {})
+    assert broker_outcomes.get("BIGDROP", {}).get("status") == "blocked"
+    assert "per-order ceiling" in broker_outcomes["BIGDROP"]["skip_reason"]
+
+
 if __name__ == "__main__":
     import sys
     import tempfile

@@ -1647,9 +1647,13 @@ class MorningDCAExecutor(DCAExecutor):
         outcomes: Dict[str, Any] = {}
         submitted_today = 0.0
         submitted_this_week = 0.0
-        # Snapshot once so adapters that immediately reflect placed orders don't
-        # cause double-subtraction (reserved_buying_power tracks THIS batch only).
-        batch_buying_power = broker.available_buying_power()
+        # Snapshotted lazily (see below) so adapters that immediately reflect
+        # placed orders don't cause double-subtraction (reserved_buying_power
+        # tracks THIS batch only). None means "not fetched yet" -- fetched on
+        # first actual need so a batch where every candidate is blocked by an
+        # earlier, cheaper check (per-order cap, duplicate, tradability) never
+        # makes an unnecessary broker/account round-trip.
+        batch_buying_power: Optional[float] = None
         reserved_buying_power = 0.0
         for signal in candidates:
             ticker = signal.ticker
@@ -1736,6 +1740,8 @@ class MorningDCAExecutor(DCAExecutor):
             if not tradable:
                 outcomes[ticker] = {"status": "blocked", "skip_reason": "not tradable for fractional buy"}
                 continue
+            if batch_buying_power is None:
+                batch_buying_power = broker.available_buying_power()
             if batch_buying_power - reserved_buying_power < notional:
                 outcomes[ticker] = {"status": "blocked", "skip_reason": "insufficient buying power"}
                 continue
