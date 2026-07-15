@@ -126,7 +126,9 @@ def compute_slippage_rows(
     return rows
 
 
-def fills_from_order_history_payload(payload: Any) -> List[Dict[str, Any]]:
+def fills_from_order_history_payload(
+    payload: Any, *, order_id_to_ticker: Optional[Dict[str, str]] = None
+) -> List[Dict[str, Any]]:
     """Normalize a persisted Robinhood order-history payload into ``fills`` dicts.
 
     Added 2026-07-10: the 3:35 slippage task persists broker order-history
@@ -137,19 +139,36 @@ def fills_from_order_history_payload(payload: Any) -> List[Dict[str, Any]]:
       * a bare list of order dicts,
       * ``{"orders": [...]}`` / ``{"results": [...]}`` broker envelopes,
       * a normalized connector pointer ``{"output_path": ..., "data": <any above>}``
-        (see scripts/run_classification.normalize_connector_payload).
+        (see scripts/run_classification.normalize_connector_payload), unwrapped
+        recursively in case the pointer wraps another ``{"data": ...}`` envelope.
 
     Each order contributes a fill carrying ``ticker``, ``order_id``,
     ``filled_qty`` (summed executed quantity), and ``filled_avg_price``
     (quantity-weighted average of its executions, falling back to the order's own
-    average_price/price). Orders with no executed quantity are skipped.
+    average_price/price). An order is skipped when:
+
+      * it has no confirmed executed quantity -- ``executions``, ``filled_qty``,
+        or ``cumulative_quantity``. The order's own top-level ``quantity`` is the
+        originally *requested* size, not a confirmation of execution, so an
+        unfilled/open/rejected order is never reported as a fill;
+      * it has an executed quantity but no resolvable price anywhere (no priced
+        executions, no ``filled_avg_price``/``average_price``/``price``) --
+        reporting a priced-at-zero fill would understate cost and show a false
+        -100% slippage rather than a missing/unpriced fill.
+
+    ``order_id_to_ticker`` lets the caller supply ticker context for the
+    "live adapter" order shape (``id``/``cumulative_quantity``/``average_price``),
+    which is often symbol- or order-id-scoped and carries no inline ticker field.
     """
     orders = _order_list_from_payload(payload)
     fills: List[Dict[str, Any]] = []
     for order in orders:
         if not isinstance(order, dict):
             continue
+        order_id = order.get("order_id") or order.get("id") or order.get("broker_order_id")
         ticker = order.get("ticker") or order.get("symbol") or order.get("instrument_symbol")
+        if not ticker and order_id_to_ticker:
+            ticker = order_id_to_ticker.get(order_id)
         if not ticker:
             continue
 
@@ -165,9 +184,8 @@ def fills_from_order_history_payload(payload: Any) -> List[Dict[str, Any]]:
                 exec_qty += q
                 exec_cost += q * p
 
-        qty = exec_qty or _to_float(
-            order.get("filled_qty") or order.get("cumulative_quantity") or order.get("quantity")
-        ) or 0.0
+        # Confirmed-executed quantity only -- never the requested "quantity".
+        qty = exec_qty or _to_float(order.get("filled_qty") or order.get("cumulative_quantity")) or 0.0
         if qty <= 0:
             continue
 
@@ -179,11 +197,15 @@ def fills_from_order_history_payload(payload: Any) -> List[Dict[str, Any]]:
                 or order.get("average_price")
                 or order.get("price")
             )
+        if avg_price is None:
+            # Executed quantity with no resolvable price: report as missing
+            # rather than a false, zero-coerced fill.
+            continue
 
         fills.append(
             {
                 "ticker": ticker,
-                "order_id": order.get("order_id") or order.get("id") or order.get("broker_order_id"),
+                "order_id": order_id,
                 "filled_qty": qty,
                 "filled_avg_price": avg_price,
                 "fill_price": avg_price,
@@ -194,8 +216,19 @@ def fills_from_order_history_payload(payload: Any) -> List[Dict[str, Any]]:
 
 
 def _order_list_from_payload(payload: Any) -> List[Any]:
-    """Extract the list of order dicts from the accepted payload shapes."""
-    if isinstance(payload, dict) and "data" in payload:
+    """Extract the list of order dicts from the accepted payload shapes.
+
+    ``save_raw_input()`` can normalize a raw broker envelope that is itself
+    ``{"data": {...}}``, producing a doubly (or more) nested pointer such as
+    ``{"output_path": ..., "data": {"data": {"orders": [...]}}}``. Keep
+    unwrapping ``data`` layers -- not just one -- until an orders/results list
+    is found or the payload stops being an unwrappable dict.
+    """
+    seen_ids: set[int] = set()
+    while isinstance(payload, dict) and "data" in payload:
+        if id(payload) in seen_ids:
+            break  # defend against a cyclic/self-referential payload
+        seen_ids.add(id(payload))
         payload = payload["data"]
     if isinstance(payload, list):
         return payload

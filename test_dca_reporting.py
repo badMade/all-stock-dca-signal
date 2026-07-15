@@ -577,6 +577,67 @@ def test_load_json_files_skips_manual_states(tmp_path):
     assert loaded[0]["trading_day"] == "2026-06-29"
 
 
+# --- PR #22 bot-review regression coverage (batch: order-history parsing) ----
+# Each test below reproduces one unresolved chatgpt-codex-connector review
+# comment on PR #22 against the current fills_from_order_history_payload /
+# _order_list_from_payload implementation, before any fix is applied.
+
+
+def test_fills_from_order_history_payload_ignores_unfilled_order_quantity():
+    # Codex review: "Do not treat order quantity as executed fills." An
+    # unfilled/open/rejected order carries only the original requested
+    # "quantity" with no executions/filled_qty/cumulative_quantity -- that
+    # must not be reported as an executed fill (it would falsely show the
+    # candidate as filled with coverage/slippage numbers).
+    payload = {"orders": [
+        {"ticker": "AAPL", "id": "O1", "quantity": "5", "status": "rejected"},
+    ]}
+    fills = fills_from_order_history_payload(payload)
+    assert fills == []
+
+
+def test_fills_from_order_history_payload_maps_ticker_by_order_id():
+    # Codex review: "Preserve ticker context when parsing order history." The
+    # live-adapter order shape (id/cumulative_quantity/average_price) often
+    # carries no ticker/symbol field at all because the request itself was
+    # symbol- or order-id-scoped. The caller must be able to supply an
+    # order_id -> ticker map so the fill isn't dropped for lack of an inline
+    # ticker field.
+    payload = {"orders": [
+        {"id": "O1", "cumulative_quantity": "0.02", "average_price": "101.0"},
+    ]}
+    fills = fills_from_order_history_payload(payload, order_id_to_ticker={"O1": "AAPL"})
+    assert len(fills) == 1
+    assert fills[0]["ticker"] == "AAPL"
+    assert fills[0]["order_id"] == "O1"
+
+
+def test_fills_from_order_history_payload_unwraps_nested_data_envelopes():
+    # Codex review: "Unwrap normalized order-history envelopes recursively."
+    # save_raw_input() normalizing a raw Robinhood envelope that is itself
+    # {"data": {"orders": [...]}} produces a doubly-nested pointer:
+    # {"output_path": ..., "data": {"data": {"orders": [...]}}}. The parser
+    # must keep unwrapping "data" layers until it finds an orders/results list.
+    orders = [{"ticker": "AAPL", "id": "O1", "filled_qty": "0.02", "filled_avg_price": "101.0"}]
+    payload = {"output_path": "x", "data": {"data": {"orders": orders}}}
+    fills = fills_from_order_history_payload(payload)
+    assert len(fills) == 1
+    assert fills[0]["ticker"] == "AAPL"
+
+
+def test_fills_from_order_history_payload_skips_fills_with_no_price():
+    # Codex review: "Require fill prices before reporting order-history
+    # fills." An executed quantity with no price anywhere (no executions, no
+    # filled_avg_price/average_price/price) must not be reported as a priced
+    # fill -- compute_slippage_rows coerces a missing price to 0.0, which
+    # would show false coverage and a false -100% slippage number.
+    payload = {"orders": [
+        {"ticker": "AAPL", "id": "O1", "filled_qty": "0.02"},
+    ]}
+    fills = fills_from_order_history_payload(payload)
+    assert fills == []
+
+
 def _run_all():
     import inspect
     import tempfile
