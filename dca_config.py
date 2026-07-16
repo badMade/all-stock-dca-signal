@@ -15,6 +15,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
 import os
 import sys
 from datetime import date, datetime, timedelta
@@ -119,6 +120,12 @@ def load_budgets(config_dir: Path) -> Dict[str, Any]:
                     f"kill_switch_7d_deploy_fraction must be between 0 and 1, got {fraction}"
                 )
             out["kill_switch_7d_deploy_fraction"] = fraction
+    circuit_breakers = data.get("circuit_breakers")
+    if isinstance(circuit_breakers, dict) and "max_per_order_usd" in circuit_breakers:
+        max_per_order = float(circuit_breakers["max_per_order_usd"])
+        if not (math.isfinite(max_per_order) and max_per_order > 0):
+            raise ValueError(f"max_per_order_usd must be a finite positive number, got {max_per_order}")
+        out["max_per_order_usd"] = max_per_order
     return out
 
 

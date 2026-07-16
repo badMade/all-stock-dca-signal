@@ -30,6 +30,31 @@ A buy signal fires for a ticker only when **all three** conditions hold:
 The order dollar amount before budget constraints is
 `base_amount_usd × multiplier` = `$3 × multiplier`.
 
+The **morning (10:30)** and **midday (12:30)** live streams keep requiring all
+three conditions, including the 60-minute downward-trend filter (condition 2),
+unless changed later.
+
+### Final buy of the day (3:20 PM ET, task `10ce362c`)
+
+For the **final live buy of the day** the run performs a **full active-universe
+scan** and, **for this final-buy decision only**, **ignores the 60-minute
+downward-trend filter** (condition 2 above). Every other gate still applies:
+
+- current / decision price **strictly below the prior completed regular-session
+  close**,
+- ladder **multiplier > 0** (from the $3-base 0x-to-5x ladder),
+- **data-confidence** check passes,
+- **`spread_ok=true`**,
+- **budget / tiered-cap** pass,
+- **regular trading hours only**,
+- **whitelisted ticker** (active universe), and
+- all **hard circuit breakers** clear.
+
+The same-day top-up guard below still governs the final buy (see the guard
+section). Dropping the trend filter widens only which tickers the final buy may
+consider; it never relaxes the price-below-prior-close, budget, data-confidence,
+spread, whitelist, or circuit-breaker requirements.
+
 ## Active ticker universe
 
 42 active symbols (see [`config/tickers.json`](../config/tickers.json)):
@@ -174,6 +199,57 @@ are used **only** as prior-allocation context for the afternoon same-day top-up
 guard. Example (2026-07-09): `AMZN` $3.00 @ 242.1099, `GOOG` $4.50 @ 352.1778,
 and `GOOGL` $4.50 @ 354.9800 were manual override fills — excluded from scheduled
 evidence and only affecting afternoon top-up eligibility.
+
+#### Manual final buy override — 2026-07-13 incident
+
+On **2026-07-13** the scheduled 3:20 PM ET run (`10ce362c`) placed **0 orders**,
+and the user then requested the final buy **manually**. A final manual-review
+scan ran the final-buy behavior above (full active-universe scan, trend filter
+ignored) and applied the same-day top-up offsets. **34 orders filled**, planned
+total **$234.00**, tickers: `DFTX TRIN SPCX LUNR IRDM DXYZ LITE ASML DRAM STX
+AMAT AMD CBRS MRVL BTX STM SNDK WDC TSM AVGO NVDA QBTS FLKR INTC GOOGL GOOG GLW
+GS MU XLG TOPT QTOP SATA RGTI`.
+
+These are **manual final-buy overrides and same-day top-up context only** — they
+are **not** scheduled-afternoon execution evidence. Their `run_state.json`
+carries `run_type='final_manual_buy_override'`, `run_origin='manual'`,
+`manual_run=true`, `valid_afternoon_scheduled_evidence=false`, and
+`same_day_top_up_context_only=true`. Artifacts (run_state + `filled_orders.csv`
+with all order IDs) were backfilled under
+`.../cron_tracking/ce16ba6b/manual_runs/final_manual_override_20260713_1536ET/`
+and `.../cron_tracking/midday_dca/manual_reruns/final_manual_override_20260713_1536ET/`.
+All order IDs are **excluded** from scheduled slippage, scheduled fills,
+scheduled reliability, scheduled cost basis, and watchdog confirmation, and are
+surfaced only in the **"Manual Final Buy Override / Same-Day Top-Up Context"**
+report section.
+
+**Exclusion scan paths.** Downstream slippage/watchdog/reporting scan these
+manual exclusion roots for final-override order IDs: `final_manual_review/**`,
+`.../cron_tracking/ce16ba6b/manual_runs/final_manual_override_*`, and
+`.../cron_tracking/midday_dca/manual_reruns/` (in addition to the task's own
+`manual_runs/` root). See
+[run_classification.md](run_classification.md) and
+[`config/run_classification.json`](../config/run_classification.json).
+
+### Raw connector-input persistence (added 2026-07-10)
+
+Before computing any signal, the scheduled 3:20 PM ET run persists every raw
+Robinhood/Finance/Alpaca/Yahoo connector response it used under
+`scheduled_runs/YYYYMMDD_1520ET/raw/` (deterministic filenames
+`quotes_batchN.json`, `historicals_batchN.json`, `tradability_pre_place.json`,
+`portfolio_pre_place.json`, `orders_after_place.json`, `place_SYMBOL.json`),
+normalizing large connector `output_path` pointers into parseable JSON, and
+computes from those persisted files only — never in-memory tool responses. If
+persistence/normalization fails it still writes a valid scheduled `run_state`
+(`order_submit_status='not_submitted_error'`, no orders) instead of escalating
+without state. See
+[run_classification.md](run_classification.md#raw-connector-input-persistence-added-2026-07-10).
+
+The **2026-07-10 3:20 PM run** was recovered under this fix (re-fetch, persist,
+normalize, compute, place): **9 incremental scheduled afternoon orders totalling
+$31.50** under
+`/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260710_1520ET/`,
+`recovery_from_escalation=true` — valid afternoon scheduled evidence.
 
 ## Execution constraints
 

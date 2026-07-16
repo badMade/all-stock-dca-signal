@@ -29,12 +29,35 @@
       "type": "boolean",
       "description": "True only when a valid scheduled state existed but lacked order IDs due to a known write failure and in-window broker orders were attributed instead (manual IDs still excluded)."
     },
+    "accepted_state_schema_versions": {
+      "type": "array",
+      "items": { "type": "string", "enum": ["run-classification-v1", "run-classification-v2-preauthorized"] },
+      "description": "Scheduled run_state schema versions accepted for this report. Both run-classification-v1 and the stricter successor run-classification-v2-preauthorized are accepted when the required scheduled identity fields are correct."
+    },
+    "source_order_history_payloads": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Paths to persisted Robinhood order-history payloads (e.g. scheduled_runs/YYYYMMDD_1520ET/raw/orders_after_place.json) used to compute average fill price / executions. Added 2026-07-10: the slippage task persists broker order-history responses before computation and computes fills from the saved payloads rather than re-querying the broker."
+    },
     "manual_test_runs": {
       "type": "object",
       "description": "Clearly labeled 'Manual Test Runs' section. Manual fills are reported here only and never affect scheduled-live cost basis, slippage, reliability, or order-count metrics.",
       "additionalProperties": true,
       "properties": {
         "label": { "type": "string", "const": "Manual Test Runs" },
+        "rows": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": true }
+        }
+      }
+    },
+    "manual_final_buy_override": {
+      "type": "object",
+      "description": "Clearly labeled 'Manual Final Buy Override / Same-Day Top-Up Context' section. Holds fills from manual final-buy overrides (run_type='final_manual_buy_override', e.g. the 2026-07-13 incident) and same-day top-up context. These fills are reported here only and never affect scheduled-live cost basis, slippage, reliability, order-count, or watchdog-confirmation metrics. Order IDs here are sourced from the manual exclusion roots (ce16ba6b/manual_runs/final_manual_override_*, midday_dca/manual_reruns, final_manual_review/**) and appear in excluded_manual_order_ids.",
+      "additionalProperties": true,
+      "properties": {
+        "label": { "type": "string", "const": "Manual Final Buy Override / Same-Day Top-Up Context" },
+        "run_date_et": { "type": "string", "format": "date" },
         "rows": {
           "type": "array",
           "items": { "type": "object", "additionalProperties": true }

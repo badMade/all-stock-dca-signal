@@ -159,7 +159,7 @@ def deployed_usd(state: Dict[str, Any]) -> float:
     detail is present. Never counts skipped/blocked/not-submitted candidates.
     """
     candidates = state.get("buy_candidates")
-    if isinstance(candidates, list) and candidates:
+    if isinstance(candidates, list):
         submitted = [
             c for c in candidates
             if isinstance(c, dict) and c.get("status") == "submitted"
@@ -172,9 +172,15 @@ def deployed_usd(state: Dict[str, Any]) -> float:
                 except (TypeError, ValueError):
                     pass
             return round(total, 2)
-        # Candidates present but none submitted -> genuinely nothing deployed.
-        if any(isinstance(c, dict) and "status" in c for c in candidates):
-            return 0.0
+        # buy_candidates is a list (possibly empty) with nothing submitted ->
+        # genuinely nothing deployed this run. This must NOT fall back to
+        # budget.day_notional_usd: when the top-up guard seeds cross-stream
+        # (morning/midday) prior allocations into the afternoon StrategyState
+        # but the afternoon run itself has no BUY candidates, buy_candidates
+        # is explicitly [] while budget.day_notional_usd can still reflect
+        # that seeded cross-stream capital, which would otherwise get double
+        # counted as afternoon-scheduled deployment.
+        return 0.0
     budget = state.get("budget")
     if isinstance(budget, dict):
         try:

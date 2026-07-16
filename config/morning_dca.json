@@ -30,13 +30,24 @@
     "window_start_et": "09:40",
     "window_end_et": "09:50",
     "run_type": "morning_dca_preflight",
-    "state_schema_version": "morning-preflight-v1",
+    "state_schema_version": "morning-preflight-v2-machine-complete",
+    "run_state_schema_file": "schemas/morning_preflight.schema.json",
     "trades": false,
     "broker_account": "read_only",
     "emits_eligible_to_execute": true,
     "artifacts": ["run_state.json", "validation.csv", "signals.csv", "run_summary.json", "latest_preflight.json"],
+    "machine_complete_contract": {
+      "since": "2026-07-13",
+      "reason": "On Mon Jul 13 2026 the 10:30 AM live execution was blocked because the 9:45 artifact lacked machine-readable gate fields (top-level overall_ok and a per-ticker eligible_to_execute list). The 9:45 pre-flight run_state.json must now ALWAYS write these machine fields so the 10:30 live task can gate directly off them.",
+      "required_top_level_fields": ["overall_ok", "eligible_count", "ineligible_count", "unresolved_tickers", "blocking_errors", "warnings", "run_classification", "per_ticker_eligibility"],
+      "per_ticker_fields": ["symbol", "active_universe", "quote_available", "prior_close_available", "tradable", "account_ok", "buying_power_ok", "spread_pct", "spread_ok", "trend_status", "data_confidence_status", "early_drop_pct", "early_multiplier", "hypothetical_amount", "eligible_to_execute", "ineligible_reason"],
+      "per_ticker_coverage": "per_ticker_eligibility contains every active-universe symbol exactly once.",
+      "unresolved_ticker_rule": "Unresolved symbols (e.g. AAAU, SPCX) are emitted as per-symbol rows with eligible_to_execute=false and ineligible_reason='unresolved_ticker' (or a specific lookup/tradability failure code) and are listed in unresolved_tickers. They MUST NOT set overall_ok=false or invalidate the whole artifact as long as the other required fields were written.",
+      "overall_ok_rule": "overall_ok is false ONLY for global/account/buying-power/auth/schema-write failures (recorded in blocking_errors), never for individual unresolved or ineligible tickers.",
+      "not_evaluated_fields": "The read-only coarse pre-flight does not bind a broker account or evaluate spread/trend, so account_ok, buying_power_ok, spread_pct, spread_ok are null and trend_status is 'not_evaluated_preflight'; the 10:30 live run computes them fresh."
+    },
     "eligibility_semantics": "eligible_to_execute is a COARSE pre-screen answering 'should the 10:30 live evaluator re-evaluate this ticker?', NOT a final buy approval. A ticker is eligible when it graded to a positive-multiplier BUY at 9:45 with a usable current price and previous close. The 10:30 live run recomputes signals/budget/spread/trend/top-up from scratch and may still decline; an ineligible ticker is skipped by the 10:30 gate.",
-    "note": "Read-only pre-screen for the 10:30 live executor. Places no trades, runs no Robinhood order review, calls no broker placement path. The 10:30 live run loads the same-day preflight artifact and evaluates only eligible_to_execute=true tickers; if the artifact is missing it degrades to the full universe with a warning rather than blocking all buys."
+    "note": "Read-only pre-screen for the 10:30 live executor. Places no trades, runs no Robinhood order review, calls no broker placement path. Writes a machine-complete run_state.json (schema morning-preflight-v2-machine-complete). The 10:30 live run loads the same-day preflight artifact and evaluates only eligible_to_execute=true tickers; if the artifact is missing it degrades to the full universe with a warning rather than blocking all buys."
   },
   "live_task": {
     "mode": "live",

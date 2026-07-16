@@ -4,6 +4,8 @@
   "version": "2026-07-08",
   "purpose": "Single source of truth for distinguishing scheduled live runs of the graded DCA task from manual runs, so downstream slippage/watchdog/weekly reporting never confuses the two. Every run_state artifact must carry a run_classification block matching this policy.",
   "state_schema_version": "run-classification-v1",
+  "accepted_state_schema_versions": ["run-classification-v1", "run-classification-v2-preauthorized"],
+  "accepted_state_schema_versions_note": "Downstream consumers (slippage 67aa802b, weekly 041d9d90) accept BOTH run-classification-v1 and the stricter successor run-classification-v2-preauthorized when the required scheduled identity fields (run_origin, manual_run, cron_id/supersedes_cron_id, scheduled_for_et, window, run_id) are correct. v2 (added 2026-07-10) is the pre-authorized direct-placement contract (no review_equity_order); it is a stricter successor of v1, not a different contract, so a v2 scheduled run_state is valid scheduled evidence and must not be discarded for its version alone.",
   "live_task": {
     "cron_id": "10ce362c",
     "supersedes_cron_id": "ce16ba6b",
@@ -109,6 +111,37 @@
       ]
     }
   },
+  "raw_input_persistence": {
+    "added": "2026-07-10",
+    "reason": "The 2026-07-10 3:20 PM ET scheduled run escalated because quotes and historicals were fetched successfully but the raw connector responses were never persisted to disk before signal computation; the bash compute step had no quotes_batchN.json / historicals_batchN.json to read.",
+    "raw_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/raw/",
+    "deterministic_filenames": [
+      "quotes_batchN.json",
+      "historicals_batchN.json",
+      "tradability_pre_place.json",
+      "portfolio_pre_place.json",
+      "orders_after_place.json",
+      "place_SYMBOL.json"
+    ],
+    "rules": [
+      "Before computing any signal, persist every raw Robinhood/Finance/Alpaca/Yahoo connector response used by the run under scheduled_runs/YYYYMMDD_1520ET/raw/ with the deterministic filenames above.",
+      "Normalize large connector output_path pointers into parseable JSON before persisting (referenced contents under 'data', original pointer preserved under 'output_path').",
+      "Compute must read only the persisted/normalized files under raw/, never in-memory tool responses. Order of operations: fetch -> persist -> normalize -> compute -> place.",
+      "If raw persistence or normalization fails, still write a valid scheduled run_state (run_origin='scheduled', manual_run=false) with order_submit_status='not_submitted_error', raw_persistence_error set, empty raw_inputs_saved, and no orders placed, rather than escalating without state."
+    ],
+    "run_state_fields": ["raw_input_dir", "raw_inputs_saved", "recovery_from_escalation", "raw_persistence_error"],
+    "helper_module": "scripts/run_classification.py",
+    "broker_policy_unchanged": "Robinhood only for execution; Alpaca/Finance/Yahoo read-only validation; no review_equity_order in scheduled live runs.",
+    "recovered_run_2026_07_10": {
+      "trading_day": "2026-07-10",
+      "scheduled_run_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260710_1520ET/",
+      "raw_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260710_1520ET/raw/",
+      "recovery_from_escalation": true,
+      "orders_placed": 9,
+      "total_usd": 31.5,
+      "note": "Recovered by re-fetching quotes/historicals, saving raw connector outputs, normalizing output_path pointers, computing signals from files, then placing qualifying incremental orders. Valid afternoon scheduled evidence."
+    }
+  },
   "write_rules": {
     "scheduled": [
       "Write run_state.json under scheduled_runs/YYYYMMDD_1520ET/ every time the task fires, even when no order is placed.",
@@ -126,11 +159,106 @@
     "applies_to_tasks": ["67aa802b", "a46bf007", "041d9d90", "0656657a"],
     "rules": [
       "Validate scheduled state files against run_classification.schema.json before use.",
-      "Collect every order_id found in manual_runs/**/run_state*.json and exclude them from all scheduled-live metrics.",
+      "Accept BOTH run-classification-v1 and run-classification-v2-preauthorized scheduled run_state files: a v2 run_state is valid scheduled evidence when the required scheduled identity fields are correct and must not be excluded for its state_schema_version alone.",
+      "Collect every order_id found under the manual-exclusion roots (see manual_exclusion_roots) and exclude them from all scheduled-live metrics.",
       "Exclude any run_state whose run_classification has run_origin='manual' or manual_run=true, regardless of where the file is located on disk.",
       "Never infer scheduled status from same-day broker orders alone; a valid scheduled run_state must exist.",
       "Scheduled-live cost basis, slippage, reliability, and order-count metrics must be computed only from validated scheduled runs with manual order IDs excluded.",
-      "A scheduled run_state with order_submit_status='not_submitted_confirmation_required' is valid scheduled-run evidence that the task ran but is NOT evidence of an order/fill: it contributes zero scheduled fills/order IDs and must not be marked invalid because confirmation blocked submission."
+      "A scheduled run_state with order_submit_status='not_submitted_confirmation_required' is valid scheduled-run evidence that the task ran but is NOT evidence of an order/fill: it contributes zero scheduled fills/order IDs and must not be marked invalid because confirmation blocked submission.",
+      "Exclude final manual buy overrides (run_type='final_manual_buy_override', valid_afternoon_scheduled_evidence=false, same_day_top_up_context_only=true) from scheduled slippage, scheduled fills, scheduled reliability, scheduled cost basis, and watchdog confirmation. Show them only in a labeled Manual Final Buy Override / Same-Day Top-Up Context section (see manual_reporting)."
+    ],
+    "manual_exclusion_roots": {
+      "reason": "The 2026-07-13 final manual buy override backfilled live artifacts under midday_dca/manual_reruns/final_manual_override_* and a final_manual_review/** tree, both OUTSIDE the ce16ba6b task root. Slippage/watchdog/reporting must scan these as manual exclusions so their order IDs never leak into scheduled-live metrics.",
+      "roots": [
+        "/home/user/workspace/cron_tracking/ce16ba6b/manual_runs/**",
+        "/home/user/workspace/cron_tracking/ce16ba6b/manual_runs/final_manual_override_*",
+        "/home/user/workspace/cron_tracking/final_manual_review/**",
+        "/home/user/workspace/cron_tracking/midday_dca/manual_reruns/**",
+        "/home/user/workspace/cron_tracking/midday_dca/manual_reruns/final_manual_override_*"
+      ],
+      "helper": "scripts/run_classification.py:manual_exclusion_roots / collect_manual_order_ids"
+    }
+  },
+  "final_buy_behavior": {
+    "added": "2026-07-13",
+    "applies_to_task": "10ce362c",
+    "summary": "For the final live buy of the day (the 3:20 PM ET task 10ce362c), perform a full active-universe scan and ignore the 60-minute downward-trend filter FOR THE FINAL-BUY DECISION ONLY. Every other guard still applies.",
+    "final_buy_gates": [
+      "Full active-universe scan (all whitelisted tickers), not a shortlist.",
+      "Ignore the 60-minute downward-trend filter for the final-buy decision ONLY (morning 10:30 and midday 12:30 live runs still require trend validation unless changed later).",
+      "Still require current/decision price strictly below the prior completed regular-session close.",
+      "Still require multiplier > 0 from the $3-base 0x-to-5x ladder.",
+      "Still require data-confidence pass.",
+      "Still require spread_ok=true.",
+      "Still require budget pass (daily/weekly caps, buying power, per-order ceiling).",
+      "Regular-hours-only, whitelisted ticker only.",
+      "Hard circuit breakers still apply."
+    ],
+    "same_day_top_up_guard": "Apply the same-day top-up guard across morning, midday, manual, and final override streams: if a ticker was already bought earlier today, buy only the incremental difference max(0, final_desired_amount - prior_same_day_amount), and only if the final decision price is strictly below the LOWEST prior same-day reference price. A missing prior reference => no auto-top-up (conservative $0 / manual_review_candidate).",
+    "trend_note": "Morning (10:30) and midday (12:30) live runs still require trend validation. The trend filter is ignored ONLY for the final-buy decision on 10ce362c."
+  },
+  "final_manual_override": {
+    "run_type": "final_manual_buy_override",
+    "run_origin": "manual",
+    "manual_run": true,
+    "flags": {
+      "valid_afternoon_scheduled_evidence": false,
+      "same_day_top_up_context_only": true
+    },
+    "summary": "A final manual buy override is the final-buy behavior invoked manually (e.g. after the scheduled 3:20 PM run placed 0 orders). It ignores trend and applies same-day top-up offsets, but is manual by contract: excluded from every scheduled metric and used only as prior-allocation context for same-day top-up. Reported only in the Manual Final Buy Override / Same-Day Top-Up Context section.",
+    "artifact_paths": [
+      "/home/user/workspace/cron_tracking/ce16ba6b/manual_runs/final_manual_override_<YYYYMMDD_HHMMET>/",
+      "/home/user/workspace/cron_tracking/midday_dca/manual_reruns/final_manual_override_<YYYYMMDD_HHMMET>/"
+    ],
+    "helper": "scripts/run_classification.py:build_final_manual_override_classification"
+  },
+  "final_manual_override_incident_2026_07_13": {
+    "trading_day": "2026-07-13",
+    "trigger": "User requested final-buy behavior manually after the scheduled 3:20 PM ET run (10ce362c) had placed 0 orders. A final manual-review scan ignored trend and applied same-day top-up offsets.",
+    "orders_filled": 34,
+    "planned_total_usd": 234.0,
+    "tickers": ["DFTX", "TRIN", "SPCX", "LUNR", "IRDM", "DXYZ", "LITE", "ASML", "DRAM", "STX", "AMAT", "AMD", "CBRS", "MRVL", "BTX", "STM", "SNDK", "WDC", "TSM", "AVGO", "NVDA", "QBTS", "FLKR", "INTC", "GOOGL", "GOOG", "GLW", "GS", "MU", "XLG", "TOPT", "QTOP", "SATA", "RGTI"],
+    "classification": "final_manual_buy_override (run_origin='manual', manual_run=true, valid_afternoon_scheduled_evidence=false, same_day_top_up_context_only=true)",
+    "backfilled_artifacts": [
+      "/home/user/workspace/cron_tracking/ce16ba6b/manual_runs/final_manual_override_20260713_1536ET/",
+      "/home/user/workspace/cron_tracking/midday_dca/manual_reruns/final_manual_override_20260713_1536ET/"
+    ],
+    "watchdog_context": "The 3:40 PM watchdog alerted because broker history had orders after 3:15 PM ET but no manual-run artifacts were present under the paths it scanned. Live artifacts were backfilled with run_origin='manual', manual_run=true, run_type='final_manual_buy_override', valid_afternoon_scheduled_evidence=false, same_day_top_up_context_only=true, and all order IDs.",
+    "note": "These are manual final-buy overrides and same-day top-up context only; NOT scheduled-afternoon execution evidence. Excluded from scheduled slippage, scheduled fills, scheduled reliability, scheduled cost basis, and watchdog confirmation."
+  },
+  "slippage_reporting": {
+    "task_id": "67aa802b",
+    "added": "2026-07-10",
+    "accepted_state_schema_versions": ["run-classification-v1", "run-classification-v2-preauthorized"],
+    "order_history_persistence": {
+      "reason": "The 3:35 PM ET slippage task must persist the Robinhood order-history response before computing slippage, then compute average fill price and executions from the saved payload rather than re-querying the broker.",
+      "persist_path": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/raw/orders_after_place.json",
+      "computed_from": "saved payload",
+      "helper": "dca_reporting.fills_from_order_history_payload",
+      "report_field": "source_order_history_payloads"
+    },
+    "recovered_slippage_2026_07_10": {
+      "trading_day": "2026-07-10",
+      "scope": "afternoon scheduled (15:15-15:35 ET)",
+      "scheduled_run_id": "scheduled_20260710_1520ET",
+      "scheduled_fills": 9,
+      "total_usd": 31.5,
+      "mean_slippage_pct": 0.1047,
+      "max_abs_slippage_symbol": "QBTS",
+      "max_abs_slippage_pct": 0.2089,
+      "excluded_manual_order_ids_count": 46,
+      "artifacts_dir": "/home/user/workspace/cron_tracking/ce16ba6b/slippage/20260710/",
+      "order_history_payload": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260710_1520ET/raw/orders_after_place.json"
+    }
+  },
+  "weekly_reporting": {
+    "task_id": "041d9d90",
+    "added": "2026-07-10",
+    "accepted_state_schema_versions": ["run-classification-v1", "run-classification-v2-preauthorized"],
+    "rules": [
+      "Include run-classification-v2-preauthorized scheduled runs in weekly metrics when the required scheduled identity fields are present; do not drop them for their state_schema_version.",
+      "If per-day slippage report files are missing, use the persisted broker order-history payloads (raw/orders_after_place.json) via dca_reporting.fills_from_order_history_payload before declaring slippage unavailable.",
+      "Manual order IDs are still excluded from weekly scheduled-live metrics."
     ]
   },
   "broker_time_window_fallback": {
@@ -148,8 +276,10 @@
   },
   "manual_reporting": {
     "section_label": "Manual Test Runs",
+    "final_manual_override_section_label": "Manual Final Buy Override / Same-Day Top-Up Context",
     "rules": [
       "Manual fills may be reported only inside a clearly labeled 'Manual Test Runs' section.",
+      "Final manual buy overrides (run_type='final_manual_buy_override') are reported only inside the labeled 'Manual Final Buy Override / Same-Day Top-Up Context' section.",
       "Manual fills must not affect scheduled-live cost basis.",
       "Manual fills must not affect scheduled-live slippage.",
       "Manual fills must not affect scheduled-live reliability.",

@@ -37,6 +37,13 @@ from zoneinfo import ZoneInfo
 # --- Contract constants (mirror config/run_classification.json) --------------
 
 STATE_SCHEMA_VERSION = "run-classification-v1"
+# Stricter successor introduced 2026-07-10 for the pre-authorized direct-placement
+# live task (no review_equity_order): a scheduled run written under the
+# pre-authorized execution policy tags itself v2. Both versions are accepted for
+# scheduled/manual evidence as long as the required scheduled identity fields are
+# correct; v2 is treated as a stricter successor of v1, not a different contract.
+STATE_SCHEMA_VERSION_V2 = "run-classification-v2-preauthorized"
+ACCEPTED_STATE_SCHEMA_VERSIONS = (STATE_SCHEMA_VERSION, STATE_SCHEMA_VERSION_V2)
 # Repaired live task id. The deleted ce16ba6b is superseded by 10ce362c; the
 # artifact root stays under .../ce16ba6b for continuity (see STATE_ROOT).
 CRON_ID = "10ce362c"
@@ -48,8 +55,31 @@ SCHEDULED_WINDOW_END_ET = "15:35"
 
 # Artifact root remains the ce16ba6b path for continuity across the task repair.
 STATE_ROOT = "/home/user/workspace/cron_tracking/ce16ba6b"
+# Parent directory holding every per-task cron_tracking tree (ce16ba6b, morning_dca,
+# midday_dca, final_manual_review, ...). Used to reach the out-of-task manual-exclusion
+# roots below.
+CRON_TRACKING_ROOT = "/home/user/workspace/cron_tracking"
 RUN_STATE_FILENAME = "run_state.json"
 LATEST_SCHEDULED_RUN_FILENAME = "latest_scheduled_run.json"
+
+# Final manual buy override (Jul 13 2026 final-buy behavior invoked manually). These
+# runs are manual by contract: run_origin='manual', manual_run=true, and a distinct
+# run_type so slippage/watchdog/weekly reporting exclude them from every scheduled
+# metric and surface them only in a "Manual Final Buy Override / Same-Day Top-Up
+# Context" section.
+FINAL_MANUAL_OVERRIDE_RUN_TYPE = "final_manual_buy_override"
+FINAL_MANUAL_OVERRIDE_DIR_PREFIX = "final_manual_override_"
+
+# Manual-exclusion roots beyond ce16ba6b/manual_runs. The 2026-07-13 final manual buy
+# override backfilled live artifacts under midday_dca/manual_reruns/final_manual_override_*
+# and a final_manual_review/** tree, both OUTSIDE the ce16ba6b task root. Slippage
+# (67aa802b), the watchdog (a46bf007), and weekly/monthly reporting must treat every
+# run_state/orders CSV under these roots as manual and exclude their order IDs from all
+# scheduled-live metrics. Paths are relative to CRON_TRACKING_ROOT.
+MANUAL_EXCLUSION_SUBROOTS = (
+    "final_manual_review",
+    "midday_dca/manual_reruns",
+)
 
 SCHEDULED_RUN_ID_RE = re.compile(r"^scheduled_[0-9]{8}_1520ET$")
 
@@ -195,6 +225,26 @@ def build_manual_classification(
     }
 
 
+def build_final_manual_override_classification(
+    triggered_at_utc: Optional[str] = None, run_id: Optional[str] = None
+) -> Dict[str, object]:
+    """Return a manual run_classification block for a final manual buy override.
+
+    The final-buy behavior (full active-universe scan, trend filter ignored for the
+    final-buy decision only) may be invoked manually after the scheduled 3:20 PM run.
+    Such a run is manual by contract and additionally flags itself as NOT valid
+    afternoon scheduled evidence and same-day top-up context only, so downstream
+    reporting shows it only in the Manual Final Buy Override / Same-Day Top-Up Context
+    section and never in any scheduled-live metric.
+    """
+    ts = triggered_at_utc or _utc_now_iso()
+    block = build_manual_classification(ts, run_id)
+    block["run_type"] = FINAL_MANUAL_OVERRIDE_RUN_TYPE
+    block["valid_afternoon_scheduled_evidence"] = False
+    block["same_day_top_up_context_only"] = True
+    return block
+
+
 # --- Path helpers ------------------------------------------------------------
 
 def state_root(base: Optional[Path] = None) -> Path:
@@ -213,6 +263,248 @@ def manual_run_dir(timestamp: str, base: Optional[Path] = None) -> Path:
 
 def latest_scheduled_run_path(base: Optional[Path] = None) -> Path:
     return state_root(base) / LATEST_SCHEDULED_RUN_FILENAME
+
+
+def cron_tracking_root(base: Optional[Path] = None) -> Path:
+    """Parent directory holding every per-task cron_tracking tree.
+
+    With an explicit ``base`` (tests point ``base`` at a temporary ce16ba6b root) this
+    is ``base.parent``; otherwise the canonical ``CRON_TRACKING_ROOT``. Used to reach
+    the out-of-task manual-exclusion roots (``final_manual_review``,
+    ``midday_dca/manual_reruns``).
+    """
+    if base is not None:
+        return Path(base).parent
+    return Path(CRON_TRACKING_ROOT)
+
+
+def manual_exclusion_roots(base: Optional[Path] = None) -> List[Path]:
+    """Every directory scanned for manual order IDs.
+
+    Always includes the ce16ba6b ``manual_runs/`` tree (which holds
+    ``final_manual_override_*`` subdirs). Adds the out-of-task roots that the
+    2026-07-13 final manual buy override introduced — ``final_manual_review/**`` and
+    ``midday_dca/manual_reruns/**`` (incl. ``final_manual_override_*``) — so their
+    order IDs are excluded from every scheduled-live metric even though they live
+    outside the ce16ba6b task root.
+    """
+    roots = [state_root(base) / "manual_runs"]
+    parent = cron_tracking_root(base)
+    for sub in MANUAL_EXCLUSION_SUBROOTS:
+        roots.append(parent / sub)
+    return roots
+
+
+# --- Raw connector-input persistence (afternoon escalation fix, 2026-07-10) --
+#
+# The 3:20 PM scheduled live task escalated on 2026-07-10 because quotes and
+# historicals were fetched successfully but the raw connector responses were
+# never persisted to disk before signal computation; the bash compute step had
+# no quotes_batchN.json / historicals_batchN.json to read. Contract from that
+# date on: every raw Robinhood/Finance/Alpaca/Yahoo connector response used by a
+# scheduled run is persisted (normalized to parseable JSON) under the run's
+# raw/ directory BEFORE any signal is computed, and compute reads only those
+# persisted files -- never in-memory tool responses.
+
+RAW_INPUTS_SUBDIR = "raw"
+
+# Deterministic raw-input filenames written before signal computation.
+RAW_TRADABILITY_FILENAME = "tradability_pre_place.json"
+RAW_PORTFOLIO_FILENAME = "portfolio_pre_place.json"
+RAW_ORDERS_AFTER_PLACE_FILENAME = "orders_after_place.json"
+
+
+def raw_input_dir(trading_day: str, base: Optional[Path] = None) -> Path:
+    """Directory holding a scheduled run's persisted raw connector responses."""
+    return scheduled_run_dir(trading_day, base) / RAW_INPUTS_SUBDIR
+
+
+def quotes_batch_filename(n: int) -> str:
+    """Deterministic filename for a persisted quotes batch (1-based)."""
+    return f"quotes_batch{int(n)}.json"
+
+
+def historicals_batch_filename(n: int) -> str:
+    """Deterministic filename for a persisted historicals batch (1-based)."""
+    return f"historicals_batch{int(n)}.json"
+
+
+def place_filename(symbol: str) -> str:
+    """Deterministic filename for a persisted per-symbol place response."""
+    safe = re.sub(r"[^0-9A-Za-z._-]", "", str(symbol).upper()) or "UNKNOWN"
+    return f"place_{safe}.json"
+
+
+def normalize_connector_payload(
+    payload: object, *, read_pointer: bool = True, base_dir: Optional[Path] = None
+) -> Dict[str, object]:
+    """Normalize a raw connector response into an inline, parseable JSON object.
+
+    Some connectors return a large result indirectly as
+    ``{"output_path": "/.../foo.json", ...}`` rather than inline data. Compute
+    must read from persisted, parseable files -- not chase pointers at compute
+    time -- so when a payload carries an ``output_path`` we resolve it to the
+    referenced file's parsed contents (embedded under ``data``) while preserving
+    the original pointer under ``output_path`` and flagging ``normalized=true``.
+
+    A pointer that cannot be read/parsed is left as-is with
+    ``normalized=false`` and a ``normalize_error`` note, so persistence still
+    succeeds and the failure is visible rather than silently dropped.
+    """
+    if not isinstance(payload, Mapping):
+        return {"data": payload, "normalized": False}
+
+    result: Dict[str, object] = dict(payload)
+    pointer = result.get("output_path")
+    if not (read_pointer and isinstance(pointer, str) and pointer):
+        if isinstance(pointer, str) and pointer:
+            # Has an output_path but caller asked not to resolve it — flag as not normalized.
+            result.setdefault("normalized", False)
+        return result
+
+    path = Path(pointer)
+    if base_dir is not None and not path.is_absolute():
+        path = Path(base_dir) / path
+    try:
+        result["data"] = json.loads(path.read_text())
+        result["normalized"] = True
+    except (OSError, json.JSONDecodeError) as exc:
+        result["normalized"] = False
+        result["normalize_error"] = f"could not read output_path {pointer!r}: {exc}"
+    return result
+
+
+def save_raw_input(
+    trading_day: str,
+    filename: str,
+    payload: object,
+    *,
+    base: Optional[Path] = None,
+    raw_dir: Optional[Path] = None,
+    normalize: bool = True,
+) -> Path:
+    """Persist one raw connector response under the run's raw/ directory.
+
+    Returns the written path. ``filename`` must be one of the deterministic
+    names (``quotes_batchN.json``, ``historicals_batchN.json``,
+    ``tradability_pre_place.json``, ``portfolio_pre_place.json``,
+    ``orders_after_place.json``, ``place_SYMBOL.json``). Large connector
+    ``output_path`` pointers are normalized to inline JSON by default so the
+    compute step can parse the file directly.
+
+    ``raw_dir`` overrides the default ``raw_input_dir(trading_day, base)``
+    computation, so callers can pin raw inputs directly under their
+    ``artifacts_dir / "raw"`` regardless of directory layout.
+
+    Fails closed when normalization of an ``output_path`` pointer fails:
+    raises ``ValueError`` and writes nothing, rather than persisting a
+    ``{"normalized": false, "normalize_error": ...}`` placeholder that the
+    compute step -- which reads only the persisted file, never the original
+    in-memory payload -- would silently treat as valid input. A payload with
+    no pointer to resolve (plain inline data) is not a failure and persists
+    normally.
+    """
+    safe = Path(str(filename)).name
+    if not safe or safe != str(filename):
+        raise ValueError(f"raw input filename must be a bare filename, got {filename!r}")
+    to_write = normalize_connector_payload(payload) if normalize else payload
+    if normalize and isinstance(to_write, dict) and "normalize_error" in to_write:
+        raise ValueError(
+            f"failed to persist {filename}: {to_write['normalize_error']}; refusing to "
+            "silently write an unnormalized raw connector payload"
+        )
+    out_dir = raw_dir if raw_dir is not None else raw_input_dir(trading_day, base)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / safe
+    path.write_text(json.dumps(to_write, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def list_raw_inputs_saved(
+    trading_day: str,
+    base: Optional[Path] = None,
+    *,
+    raw_dir: Optional[Path] = None,
+) -> List[str]:
+    """Sorted filenames actually persisted under the run's raw/ directory."""
+    out_dir = raw_dir if raw_dir is not None else raw_input_dir(trading_day, base)
+    if not out_dir.exists():
+        return []
+    return sorted(p.name for p in out_dir.iterdir() if p.is_file())
+
+
+def build_raw_persistence_state(
+    trading_day: str,
+    *,
+    base: Optional[Path] = None,
+    raw_dir: Optional[Path] = None,
+    recovery_from_escalation: bool = False,
+) -> Dict[str, object]:
+    """Build the run_state fields recording raw-input persistence for a run.
+
+    Reflects what is actually on disk under raw/ at call time, so the run_state
+    cannot claim inputs were saved that were not.
+
+    ``raw_dir`` overrides the default ``raw_input_dir`` computation; pass the
+    same value as the corresponding ``save_raw_input`` calls.
+    """
+    out_dir = raw_dir if raw_dir is not None else raw_input_dir(trading_day, base)
+    saved = list_raw_inputs_saved(trading_day, base, raw_dir=raw_dir)
+    return {
+        "raw_input_dir": str(out_dir),
+        "raw_inputs_saved": saved,
+        "recovery_from_escalation": bool(recovery_from_escalation),
+    }
+
+
+def raw_persistence_failure_run_state(
+    trading_day: str,
+    error: str,
+    *,
+    base: Optional[Path] = None,
+    raw_dir: Optional[Path] = None,
+    triggered_at_utc: Optional[str] = None,
+    generated_at: Optional[str] = None,
+    broker: str = "robinhood",
+    budget: Optional[Dict[str, object]] = None,
+    recovery_from_escalation: bool = False,
+) -> Dict[str, object]:
+    """Build a valid scheduled run_state for a raw-persistence/normalization failure.
+
+    Contract: if persisting or normalizing raw connector responses fails, the
+    task must still write a valid scheduled run_state (``run_origin='scheduled'``,
+    ``manual_run=false``) recording the error and placing **no** orders, rather
+    than escalating with no state at all. The returned dict satisfies
+    run_state.schema.json (required run_id/generated_at/trading_day/broker/
+    budget/counts) and carries ``order_submit_status='not_submitted_error'``.
+
+    ``raw_dir`` overrides the default ``raw_input_dir`` computation; pass the
+    same value as the corresponding ``save_raw_input`` calls.
+
+    ``generated_at`` pins the run timestamp for replays/backfills where ``now``
+    is the scheduled fire time; when omitted, falls back to the wall clock.
+    ``dca_risk.run_timestamp_et()`` reads ``generated_at`` before the
+    classification timestamp, so passing the scheduled ``now`` here prevents
+    a failure state from being attributed to the wrong time window.
+    """
+    out_dir = raw_dir if raw_dir is not None else raw_input_dir(trading_day, base)
+    ts = triggered_at_utc or _utc_now_iso()
+    _generated_at = generated_at or datetime.now(_EASTERN).strftime("%Y-%m-%dT%H:%M:%S")
+    return {
+        "run_id": scheduled_run_id(trading_day),
+        "generated_at": _generated_at,
+        "trading_day": trading_day,
+        "broker": broker,
+        "order_submit_status": ORDER_SUBMIT_STATUS_ERROR,
+        "budget": budget or {"budget_tier": "normal", "daily_cap_usd": 0, "weekly_cap_usd": 0},
+        "counts": {"evaluated": 0, "buy_candidates": 0, "submitted": 0},
+        "buy_candidates": [],
+        "run_classification": build_scheduled_classification(trading_day, ts),
+        "raw_input_dir": str(out_dir),
+        "raw_inputs_saved": [],
+        "recovery_from_escalation": bool(recovery_from_escalation),
+        "raw_persistence_error": str(error),
+    }
 
 
 # --- Validation --------------------------------------------------------------
@@ -240,9 +532,9 @@ def validate_classification(rc: Dict[str, object]) -> ValidationResult:
     if origin not in ("scheduled", "manual"):
         errors.append(f"run_origin must be 'scheduled' or 'manual', got {origin!r}")
 
-    if rc.get("state_schema_version") != STATE_SCHEMA_VERSION:
+    if rc.get("state_schema_version") not in ACCEPTED_STATE_SCHEMA_VERSIONS:
         errors.append(
-            f"state_schema_version must be {STATE_SCHEMA_VERSION!r}, "
+            f"state_schema_version must be one of {list(ACCEPTED_STATE_SCHEMA_VERSIONS)!r}, "
             f"got {rc.get('state_schema_version')!r}"
         )
 
@@ -311,6 +603,14 @@ def validate_classification(rc: Dict[str, object]) -> ValidationResult:
             errors.append("manual run_id must not match the scheduled_YYYYMMDD_1520ET pattern")
 
     return ValidationResult(not errors, errors)
+
+
+def is_preauthorized_v2(state_or_rc: Dict[str, object]) -> bool:
+    """True if a run_state (or its run_classification block) is tagged v2-preauthorized."""
+    rc = state_or_rc
+    if isinstance(state_or_rc, dict) and isinstance(state_or_rc.get("run_classification"), dict):
+        rc = state_or_rc["run_classification"]
+    return isinstance(rc, dict) and rc.get("state_schema_version") == STATE_SCHEMA_VERSION_V2
 
 
 def is_manual_state(state: Dict[str, object]) -> bool:
@@ -499,24 +799,27 @@ def _referenced_orders_csvs(state: Dict[str, object], run_dir: Path) -> List[Pat
 
 
 def collect_manual_order_ids(base: Optional[Path] = None) -> Set[str]:
-    """Union of every order_id found under manual_runs/.
+    """Union of every order_id found under any manual-exclusion root.
 
-    Reads both the embedded ``buy_candidates``/``orders`` in each
-    ``run_state*.json`` and the ``order_id`` column of any orders CSV the state
-    references or sits beside, so manual fills from the heavier
-    ``run_and_report`` path are excluded too. These IDs must never appear in
-    scheduled-live metrics.
+    Scans the ce16ba6b ``manual_runs/`` tree plus the out-of-task
+    ``final_manual_review/**`` and ``midday_dca/manual_reruns/**`` roots (see
+    :func:`manual_exclusion_roots`), so final manual buy overrides and midday manual
+    reruns are excluded too. Reads both the embedded ``buy_candidates``/``orders`` in
+    each ``run_state*.json`` and the ``order_id`` column of any orders CSV the state
+    references or sits beside (e.g. a final override's ``filled_orders.csv``), so
+    manual fills from the heavier ``run_and_report`` path are excluded as well. These
+    IDs must never appear in scheduled-live metrics.
     """
-    manual_root = state_root(base) / "manual_runs"
     ids: Set[str] = set()
-    for path in _iter_run_state_files(manual_root):
-        try:
-            state = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError):
-            continue
-        ids |= _order_ids_from_state(state)
-        for csv_path in _referenced_orders_csvs(state, path.parent):
-            ids |= _order_ids_from_orders_csv(csv_path)
+    for manual_root in manual_exclusion_roots(base):
+        for path in _iter_run_state_files(manual_root):
+            try:
+                state = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            ids |= _order_ids_from_state(state)
+            for csv_path in _referenced_orders_csvs(state, path.parent):
+                ids |= _order_ids_from_orders_csv(csv_path)
     return ids
 
 
@@ -674,6 +977,9 @@ def select_scheduled_state_for_reporting(
 
 __all__ = [
     "STATE_SCHEMA_VERSION",
+    "STATE_SCHEMA_VERSION_V2",
+    "ACCEPTED_STATE_SCHEMA_VERSIONS",
+    "is_preauthorized_v2",
     "CRON_ID",
     "SUPERSEDES_CRON_ID",
     "ORDER_SUBMIT_STATUS_SUBMITTED",
@@ -686,11 +992,31 @@ __all__ = [
     "is_confirmation_blocked",
     "build_scheduled_classification",
     "build_manual_classification",
+    "build_final_manual_override_classification",
+    "FINAL_MANUAL_OVERRIDE_RUN_TYPE",
+    "FINAL_MANUAL_OVERRIDE_DIR_PREFIX",
+    "MANUAL_EXCLUSION_SUBROOTS",
+    "CRON_TRACKING_ROOT",
     "scheduled_run_id",
     "manual_run_id",
     "scheduled_run_dir",
     "manual_run_dir",
     "latest_scheduled_run_path",
+    "cron_tracking_root",
+    "manual_exclusion_roots",
+    "RAW_INPUTS_SUBDIR",
+    "RAW_TRADABILITY_FILENAME",
+    "RAW_PORTFOLIO_FILENAME",
+    "RAW_ORDERS_AFTER_PLACE_FILENAME",
+    "raw_input_dir",
+    "quotes_batch_filename",
+    "historicals_batch_filename",
+    "place_filename",
+    "normalize_connector_payload",
+    "save_raw_input",
+    "list_raw_inputs_saved",
+    "build_raw_persistence_state",
+    "raw_persistence_failure_run_state",
     "validate_classification",
     "is_manual_state",
     "is_scheduled_state",

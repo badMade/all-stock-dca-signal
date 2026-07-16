@@ -59,21 +59,29 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from dca_config import load_approved_dates
 from near_close_dca import (
     ACTIVE_TICKERS,
     EASTERN,
     EXCLUDED_TICKERS,
     ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
+    TOP_UP_INCREMENTAL,
+    TOP_UP_MISSING_PRIOR_PRICE,
+    TOP_UP_NO_INCREMENTAL,
     TOP_UP_NO_PRIOR_RUN,
+    TOP_UP_PRICE_NOT_BELOW,
     Action,
     Bar,
     BrokerAdapter,
     OrderConfirmationRequiredError,
+    PriorSameDayAllocation,
     StrategyConfig,
     completed_bar_anchor,
     graded_buy_multiplier,
     iso_week_key,
     latest_bar_at_or_before,
+    load_prior_same_day_allocations_multi,
+    quote_spread_pct,
 )
 
 _log = logging.getLogger(__name__)
@@ -102,13 +110,24 @@ MORNING_WATCHLIST_SCHEMA_VERSION = "morning-watchlist-v1"
 # a COARSE pre-screen (is a ticker worth evaluating at 10:30?), NOT a final
 # approval: the 10:30 live run always recomputes signals, budget, spread, trend,
 # and top-up from scratch and may still decline to place an order.
+#
+# As of Mon Jul 13 2026 the artifact is machine-complete
+# (schema morning-preflight-v2-machine-complete, schemas/morning_preflight.schema.json):
+# it always writes the top-level overall_ok flag plus eligible_count,
+# ineligible_count, unresolved_tickers, blocking_errors, and a
+# per_ticker_eligibility list with every active-universe symbol exactly once, so
+# the 10:30 live task can gate directly off machine fields. Unresolved symbols
+# (e.g. AAAU, SPCX) are emitted as rows with eligible_to_execute=false and
+# ineligible_reason='unresolved_ticker'; they never force overall_ok=false, which
+# flips false only for global/account/buying-power/auth/schema-write failures.
 MORNING_PREFLIGHT_MODE = "preflight"
 MORNING_PREFLIGHT_CRON_ID = "morning-dca-0945"
 MORNING_PREFLIGHT_RUN_TYPE = "morning_dca_preflight"
 MORNING_PREFLIGHT_SCHEDULED_FOR_ET = "09:45"
 MORNING_PREFLIGHT_WINDOW_START_ET = "09:40"
 MORNING_PREFLIGHT_WINDOW_END_ET = "09:50"
-MORNING_PREFLIGHT_SCHEMA_VERSION = "morning-preflight-v1"
+MORNING_PREFLIGHT_SCHEMA_VERSION = "morning-preflight-v2-machine-complete"
+MORNING_PREFLIGHT_TREND_STATUS = "not_evaluated_preflight"
 
 # Live (10:30 AM ET) execution identity — Robinhood-only live buys.
 MORNING_LIVE_MODE = "live"
@@ -300,6 +319,27 @@ DEFAULT_MORNING_WEEKLY_CAP_USD = 450.0
 
 
 @dataclass(frozen=True)
+class TopUpOutcome:
+    """Per-ticker result of the same-day prior-run offset/top-up guard.
+
+    Shared by the morning and midday live streams; ``MiddayTopUpOutcome`` in
+    ``midday_dca`` is an alias for backwards compatibility.
+    """
+
+    ticker: str
+    desired_amount: float
+    decision_price: Optional[float]
+    prior_same_day_amount: float
+    prior_same_day_reference_price: Optional[float]
+    prior_same_day_run_id: Optional[str]
+    prior_same_day_source: Optional[str]
+    incremental_order_amount: float
+    top_up_guard_result: str
+    top_up_skipped: bool
+    top_up_manual_review: bool = False
+
+
+@dataclass(frozen=True)
 class MorningConfig:
     """Configuration hooks for the morning live stream.
 
@@ -326,6 +366,12 @@ class MorningConfig:
     # Root the 10:30 live gate reads the same-day 9:45 pre-flight artifact from.
     # When None the live executor uses DEFAULT_MORNING_PREFLIGHT_STATE_ROOT.
     preflight_run_state_root: Optional[str] = None
+    # Roots scanned for same-day prior allocations by the morning live top-up
+    # guard. When None (the default) the guard is disabled and morning always
+    # buys the full graded amount. Set via artifact_paths.prior_allocation_roots
+    # in morning_dca.json to enable, e.g. to scan manual/recovery runs that
+    # happened before the 10:30 AM decision.
+    prior_allocation_roots: Optional[Tuple[str, ...]] = None
     # Minimum number of completed intraday bars over the trend window required to
     # validate the intraday trend in live mode. When fewer are available a
     # qualifying candidate is flagged manual_review_candidate rather than bought.
@@ -338,6 +384,14 @@ class MorningConfig:
     # and NYSE holidays). Mirrors StrategyConfig.approved_test_dates semantics
     # so morning/midday honour the same trading-window config as the afternoon.
     approved_test_dates: frozenset[date] = field(default_factory=frozenset)
+    # Absolute per-order ceiling loaded from config/budgets.json
+    # circuit_breakers.max_per_order_usd. 5x * $3 base = $15 default.
+    max_per_order_usd: float = 15.0
+    # Bid/ask spread circuit breaker for live placement, mirroring the
+    # afternoon stream's StrategyConfig.max_bid_ask_spread_pct. A candidate
+    # whose live quote spread exceeds this percent of the quote midpoint is
+    # blocked before placement rather than bought at a stale/no-data price.
+    max_bid_ask_spread_pct: float = 1.0
 
     def as_strategy_config(self) -> StrategyConfig:
         """Return a StrategyConfig view carrying the morning ladder.
@@ -424,6 +478,55 @@ def preflight_eligibility(signal: "MorningSignal") -> bool:
     )
 
 
+def preflight_ticker_eligibility_row(signal: "MorningSignal") -> Dict[str, Any]:
+    """Build one machine-complete ``per_ticker_eligibility`` row for ``signal``.
+
+    Emits every field the 10:30 live gate consumes, exactly once per active
+    symbol. Fields the coarse read-only pre-flight does not evaluate (account,
+    buying power, spread) are ``None`` rather than fabricated; the 10:30 live run
+    computes them fresh. Trend is ``not_evaluated_preflight`` (no 60-minute
+    window at 9:45). Unresolved symbols (no usable quote or prior close, e.g.
+    AAAU/SPCX) are marked ``eligible_to_execute=false`` with
+    ``ineligible_reason='unresolved_ticker'`` and never invalidate the artifact.
+    """
+    quote_available = signal.current_price is not None
+    prior_close_available = signal.previous_close is not None
+    resolved = quote_available and prior_close_available
+    eligible = preflight_eligibility(signal)
+
+    if not quote_available and not prior_close_available:
+        ineligible_reason: Optional[str] = "unresolved_ticker"
+    elif not quote_available:
+        ineligible_reason = "quote_unavailable"
+    elif not prior_close_available:
+        ineligible_reason = "prior_close_unavailable"
+    elif not eligible:
+        ineligible_reason = "no_qualifying_drop"
+    else:
+        ineligible_reason = None
+
+    return {
+        "symbol": signal.ticker,
+        "active_universe": True,
+        "quote_available": quote_available,
+        "prior_close_available": prior_close_available,
+        "tradable": resolved,
+        # Account/buying-power/spread are not bound by the read-only pre-flight;
+        # the 10:30 live run performs the authoritative checks.
+        "account_ok": None,
+        "buying_power_ok": None,
+        "spread_pct": None,
+        "spread_ok": None,
+        "trend_status": MORNING_PREFLIGHT_TREND_STATUS,
+        "data_confidence_status": "resolved" if resolved else "unresolved",
+        "early_drop_pct": signal.drop_pct,
+        "early_multiplier": signal.multiplier,
+        "hypothetical_amount": signal.hypothetical_amount_usd,
+        "eligible_to_execute": eligible,
+        "ineligible_reason": ineligible_reason,
+    }
+
+
 @dataclass(frozen=True)
 class MorningSignal:
     """One morning signal row for a single ticker."""
@@ -494,15 +597,21 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
         _log.warning(
             "morning_dca.json not found at %s; using MorningConfig defaults", cfg_path
         )
-        return MorningConfig()
+        return MorningConfig(
+            approved_test_dates=load_approved_dates(config_dir_path).get("approved_test_dates", frozenset())
+        )
+
+    approved_date_overrides = {
+        "approved_test_dates": load_approved_dates(config_dir_path).get("approved_test_dates", frozenset())
+    }
 
     try:
         raw = json.loads(cfg_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
         _log.warning("could not parse %s (%s); using MorningConfig defaults", cfg_path, exc)
-        return MorningConfig()
+        return MorningConfig(**approved_date_overrides)
 
-    kwargs = {}
+    kwargs = dict(approved_date_overrides)
 
     sizing = raw.get("sizing_ladder", {})
     if "base_amount_usd" in sizing:
@@ -543,6 +652,51 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
     # The 10:30 live gate reads the same-day pre-flight artifact from this root.
     if "preflight_run_state_root" in artifact_paths:
         kwargs["preflight_run_state_root"] = artifact_paths["preflight_run_state_root"]
+    prior_roots = artifact_paths.get("prior_allocation_roots")
+    if isinstance(prior_roots, list) and prior_roots:
+        kwargs["prior_allocation_roots"] = tuple(str(r) for r in prior_roots)
+
+    # Load the configured ticker whitelist from config/tickers.json, the same
+    # version-controlled source near_close_dca's afternoon stream reads via
+    # dca_config.load_strategy_config -- otherwise this stream silently trades
+    # the hardcoded ACTIVE_TICKERS/EXCLUDED_TICKERS module defaults even after
+    # the whitelist is edited.
+    from dca_config import load_tickers
+
+    ticker_data = load_tickers(config_dir_path)
+    if "tickers" in ticker_data:
+        kwargs["tickers"] = ticker_data["tickers"]
+    if "excluded_tickers" in ticker_data:
+        kwargs["excluded_tickers"] = ticker_data["excluded_tickers"]
+
+    # Load max_per_order_usd from the shared budgets.json circuit_breakers block so
+    # an emergency cap change takes effect without touching code constants. The
+    # whole file being absent/corrupt still degrades gracefully to the default
+    # cap, but a key that IS present with an invalid value (non-finite,
+    # non-positive, or unparseable) fails closed -- raises -- rather than
+    # silently trading under a stale default cap for a live trading stream.
+    budgets_path = config_dir_path / "budgets.json"
+    if budgets_path.exists():
+        try:
+            budgets_raw = json.loads(budgets_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            _log.warning("could not parse %s (%s); using MorningConfig cap default", budgets_path, exc)
+            budgets_raw = None
+        if budgets_raw is not None:
+            cb = budgets_raw.get("circuit_breakers", {})
+            if "max_per_order_usd" in cb:
+                raw_cap = cb["max_per_order_usd"]
+                try:
+                    max_order = float(raw_cap)
+                except (TypeError, ValueError):
+                    max_order = None
+                if max_order is None or not (math.isfinite(max_order) and max_order > 0):
+                    raise ValueError(
+                        f"config/budgets.json circuit_breakers.max_per_order_usd={raw_cap!r} "
+                        "is present but not a positive finite number; refusing to silently "
+                        "fall back to a default per-order cap for a live trading stream"
+                    )
+                kwargs["max_per_order_usd"] = max_order
 
     return MorningConfig(**kwargs)
 
@@ -559,6 +713,18 @@ def load_same_day_preflight(
     returned ``eligible_tickers`` to restrict which tickers it re-evaluates; a
     ``None`` result means "no pre-flight found" and the caller degrades to
     evaluating the full universe with a warning rather than blocking all buys.
+
+    An artifact that explicitly declares ``overall_ok=False`` (a global/
+    account/buying-power/auth/schema-write failure per the machine-complete
+    contract) is treated the same as "no pre-flight found" -- None is
+    returned -- rather than trusting whatever eligibility data happens to be
+    present on a preflight run that flagged itself invalid.
+
+    Eligibility is derived primarily from ``per_ticker_eligibility`` (the
+    schema-required v2 field: every active-universe symbol with a ``symbol``
+    key and an ``eligible_to_execute`` flag), falling back to the legacy
+    ``eligible_to_execute_tickers`` convenience field only when
+    ``per_ticker_eligibility`` is absent (an older artifact shape).
     """
     root = Path(preflight_root)
     run_dir = root / f"{trading_day.strftime('%Y%m%d')}_0945ET"
@@ -580,13 +746,23 @@ def load_same_day_preflight(
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
-    eligible = state.get("eligible_to_execute_tickers")
-    if eligible is None:
+    if state.get("overall_ok") is False:
+        return None
+    per_ticker = state.get("per_ticker_eligibility")
+    if isinstance(per_ticker, list) and per_ticker:
         eligible = [
-            row["ticker"]
-            for row in state.get("signal_rows", [])
-            if row.get("eligible_to_execute") is True
+            row.get("symbol")
+            for row in per_ticker
+            if isinstance(row, dict) and row.get("eligible_to_execute") is True
         ]
+    else:
+        eligible = state.get("eligible_to_execute_tickers")
+        if eligible is None:
+            eligible = [
+                row["ticker"]
+                for row in state.get("signal_rows", [])
+                if row.get("eligible_to_execute") is True
+            ]
     return {
         "run_id": state.get("run_id"),
         "eligible_tickers": set(eligible),
@@ -688,28 +864,148 @@ class MorningDCAExecutor(DCAExecutor):
         """Load this executor's config when none is passed. Overridable per stream."""
         return load_morning_config(config_dir, mode=mode)
 
-    # -- Reuse hooks (no-ops for the morning stream) -------------------------
-    def _compute_top_up(self, now: datetime, signals: Sequence["MorningSignal"]) -> Dict[str, Any]:
-        """Return per-ticker prior-allocation/top-up outcomes. Empty for morning."""
-        return {}
+    # -- Top-up guard (same-day prior-allocation offset) ---------------------
+    def _compute_top_up(
+        self, now: datetime, signals: Sequence["MorningSignal"]
+    ) -> Dict[str, TopUpOutcome]:
+        """Return per-ticker prior-allocation/top-up outcomes.
 
+        When ``config.prior_allocation_roots`` is not set (the morning default)
+        returns an empty dict so the caller buys the full graded amount.  When
+        roots are configured, loads same-day fills up to the run boundary and
+        computes an incremental top-up for every qualifying BUY signal.
+        """
+        roots = getattr(self.config, "prior_allocation_roots", None)
+        if not roots:
+            return {}
+        trading_day = now.astimezone(EASTERN).date()
+        boundary_et = now.astimezone(EASTERN).time()
+        prior_allocations = load_prior_same_day_allocations_multi(
+            roots, trading_day, boundary_et=boundary_et
+        )
+        outcomes: Dict[str, TopUpOutcome] = {}
+        for signal in signals:
+            if signal.action != Action.BUY or signal.multiplier <= 0:
+                continue
+            outcomes[signal.ticker] = self._evaluate_top_up(
+                signal, prior_allocations.get(signal.ticker)
+            )
+        return outcomes
+
+    def _evaluate_top_up(
+        self, signal: "MorningSignal", prior: Optional[PriorSameDayAllocation]
+    ) -> TopUpOutcome:
+        """Apply the same-day top-up rule to one live buy candidate.
+
+        No earlier allocation → full desired amount.  Earlier allocation and
+        current price strictly below the prior reference → incremental
+        difference only (desired − prior; $0 if ≤ 0).  Price not below
+        reference → $0.  Amount known but reference price missing → $0 with
+        manual review flagged.
+        """
+        desired = round(signal.hypothetical_amount_usd, 2)
+        price = signal.current_price
+
+        def _outcome(
+            incremental: float, result: str, *, skipped: bool, manual_review: bool = False
+        ) -> TopUpOutcome:
+            return TopUpOutcome(
+                ticker=signal.ticker,
+                desired_amount=desired,
+                decision_price=price,
+                prior_same_day_amount=round(prior.amount_usd, 2) if prior else 0.0,
+                prior_same_day_reference_price=prior.reference_price if prior else None,
+                prior_same_day_run_id=prior.run_id if prior else None,
+                prior_same_day_source=prior.source if prior else None,
+                incremental_order_amount=round(max(0.0, incremental), 2),
+                top_up_guard_result=result,
+                top_up_skipped=skipped,
+                top_up_manual_review=manual_review,
+            )
+
+        if prior is None or prior.amount_usd <= 0:
+            return _outcome(desired, TOP_UP_NO_PRIOR_RUN, skipped=desired <= 0)
+        if prior.reference_price is None or price is None:
+            return _outcome(0.0, TOP_UP_MISSING_PRIOR_PRICE, skipped=True, manual_review=True)
+        if price >= prior.reference_price:
+            return _outcome(0.0, TOP_UP_PRICE_NOT_BELOW, skipped=True)
+        incremental = desired - round(prior.amount_usd, 2)
+        if incremental <= 0:
+            return _outcome(0.0, TOP_UP_NO_INCREMENTAL, skipped=True)
+        return _outcome(incremental, TOP_UP_INCREMENTAL, skipped=False)
+
+    # -- Reuse hooks ---------------------------------------------------------
     def _effective_buy_amount(
         self, signal: "MorningSignal", top_up_outcomes: Optional[Dict[str, Any]]
     ) -> float:
-        """Dollar amount actually planned for a buy candidate. Morning: the graded amount."""
+        """Dollar amount actually planned for a buy candidate.
+
+        Returns the incremental order amount when a top-up outcome exists for
+        the ticker (which may be $0 for fully-offset candidates), otherwise the
+        full graded amount.
+        """
+        if top_up_outcomes:
+            outcome = top_up_outcomes.get(signal.ticker)
+            if outcome is not None:
+                return outcome.incremental_order_amount
         return signal.hypothetical_amount_usd
 
     def _augment_buy_candidate_row(
         self, row: Dict[str, Any], signal: "MorningSignal", top_up_outcomes: Optional[Dict[str, Any]]
     ) -> None:
-        """Attach stream-specific fields to a buy-candidate row. No-op for morning."""
-        return None
+        """Attach top-up guard fields to a buy-candidate row when the guard ran."""
+        outcome = top_up_outcomes.get(signal.ticker) if top_up_outcomes else None
+        if outcome is None:
+            return
+        row["prior_same_day_amount"] = outcome.prior_same_day_amount
+        row["prior_same_day_reference_price"] = outcome.prior_same_day_reference_price
+        row["prior_same_day_run_id"] = outcome.prior_same_day_run_id
+        row["prior_same_day_source"] = outcome.prior_same_day_source
+        row["morning_desired_amount"] = outcome.desired_amount
+        row["morning_decision_price"] = outcome.decision_price
+        row["incremental_order_amount"] = outcome.incremental_order_amount
+        row["top_up_guard_result"] = outcome.top_up_guard_result
+        row["top_up_skipped"] = outcome.top_up_skipped
+        row["top_up_manual_review"] = outcome.top_up_manual_review
+        if outcome.top_up_manual_review:
+            row["execution_status"] = EXEC_MANUAL_REVIEW_CANDIDATE
 
     def _augment_artifacts(
         self, artifacts: Dict[str, Any], top_up_outcomes: Optional[Dict[str, Any]]
     ) -> None:
-        """Attach stream-specific top-level artifact fields. No-op for morning."""
-        return None
+        """Attach top-up summary fields to the run artifact when the guard ran."""
+        if not top_up_outcomes:
+            return
+        outcomes = list(top_up_outcomes.values())
+        top_up_manual_reviews = sorted(o.ticker for o in outcomes if o.top_up_manual_review)
+        artifacts["top_up_manual_review_tickers"] = top_up_manual_reviews
+        artifacts["top_up_offset_tickers"] = sorted(
+            o.ticker for o in outcomes if o.top_up_skipped and not o.top_up_manual_review
+        )
+        existing_manual_review = set(artifacts.get("manual_review_tickers", []))
+        new_top_up_manual = [t for t in top_up_manual_reviews if t not in existing_manual_review]
+        if new_top_up_manual:
+            artifacts["counts"]["manual_review_candidates"] = (
+                artifacts["counts"].get("manual_review_candidates", 0) + len(new_top_up_manual)
+            )
+            artifacts["manual_review_tickers"] = (
+                artifacts.get("manual_review_tickers", []) + new_top_up_manual
+            )
+            outcomes_by_ticker = {o.ticker: o for o in outcomes}
+            new_rows = []
+            for ticker in new_top_up_manual:
+                outcome = outcomes_by_ticker[ticker]
+                new_rows.append(
+                    {
+                        "ticker": ticker,
+                        "reason": f"top-up guard: {outcome.top_up_guard_result}",
+                        "hypothetical_amount_usd": outcome.desired_amount,
+                        "current_price": outcome.decision_price,
+                    }
+                )
+            artifacts["manual_review_candidates"] = (
+                artifacts.get("manual_review_candidates", []) + new_rows
+            )
 
     # -- DCAExecutor hooks ---------------------------------------------------
     @property
@@ -890,17 +1186,27 @@ class MorningDCAExecutor(DCAExecutor):
         loosened "buy anyway when trend is unavailable" rule is not implemented.
         """
         bar_anchor = completed_bar_anchor(decision_dt, self.config.interval_minutes, self._sizing_config)
+        interval = timedelta(minutes=self.config.interval_minutes)
+        window_start = decision_dt - timedelta(minutes=60)
+        freshest_allowed = bar_anchor - interval
         usable: Dict[Any, Bar] = {}
         for b in bars:
-            if b.timestamp <= bar_anchor and math.isfinite(b.close) and b.close > 0:
+            if window_start <= b.timestamp <= bar_anchor and math.isfinite(b.close) and b.close > 0:
                 usable[b.timestamp] = b
+        sorted_bars = sorted(usable.values(), key=lambda b: b.timestamp)
+        if not sorted_bars or sorted_bars[-1].timestamp < freshest_allowed:
+            latest = sorted_bars[-1].timestamp.isoformat() if sorted_bars else "none"
+            warnings.append(
+                "intraday trend unvalidated: latest completed bar "
+                f"{latest} is older than one interval before the decision anchor {bar_anchor.isoformat()}"
+            )
+            return False
         if len(usable) < self.config.trend_min_bars:
             warnings.append(
                 f"intraday trend unvalidated: {len(usable)} usable bars < required "
-                f"{self.config.trend_min_bars} over the 60-minute window"
+                f"{self.config.trend_min_bars} over the latest 60-minute window"
             )
             return False
-        sorted_bars = sorted(usable.values(), key=lambda b: b.timestamp)
         if sorted_bars[-1].close >= sorted_bars[0].close:
             warnings.append(
                 "intraday trend flat or rising: price is at or above open; skipping auto-buy"
@@ -951,6 +1257,13 @@ class MorningDCAExecutor(DCAExecutor):
         if bar is None:
             warnings.append(f"missing completed intraday bar at/or before {self.profile['scheduled_for_et']} ET")
             return None
+        freshest_allowed = bar_anchor - timedelta(minutes=self.config.interval_minutes)
+        if bar.timestamp < freshest_allowed:
+            warnings.append(
+                f"latest completed intraday bar {bar.timestamp.isoformat()} is older than one interval before "
+                f"the {self.profile['scheduled_for_et']} ET decision anchor; rejecting stale data"
+            )
+            return None
         if not math.isfinite(bar.close) or bar.close <= 0:
             warnings.append(f"completed bar close {bar.close!r} is not positive; rejecting")
             return None
@@ -983,10 +1296,17 @@ class MorningDCAExecutor(DCAExecutor):
         loaded = load_same_day_preflight(root, trading_day)
         if loaded is None:
             if not manual:
-                raise RuntimeError(
-                    "no same-day 9:45 pre-flight artifact found; "
-                    "scheduled live run blocked (fail-closed)"
-                )
+                # Fail closed but write a durable blocked artifact so watchdog and
+                # reporting can distinguish a missing-preflight block from a crash.
+                self.preflight_gate = {
+                    "preflight_found": False,
+                    "preflight_missing_block": True,
+                    "block_reason": (
+                        "no same-day 9:45 pre-flight artifact found; "
+                        "scheduled live run blocked (fail-closed)"
+                    ),
+                }
+                return []
             self.preflight_gate = {
                 "preflight_found": False,
                 "warning": "no same-day 9:45 pre-flight artifact found; evaluating full universe",
@@ -1129,13 +1449,35 @@ class MorningDCAExecutor(DCAExecutor):
             if self.preflight_gate is not None:
                 artifacts["preflight_gate"] = self.preflight_gate
                 if not self.preflight_gate.get("preflight_found"):
-                    warnings.append(self.preflight_gate["warning"])
+                    # The manual degrade-to-full-universe path sets "warning"; the
+                    # scheduled fail-closed block sets "block_reason" instead.
+                    warnings.append(
+                        self.preflight_gate.get("warning") or self.preflight_gate.get("block_reason")
+                    )
         if is_preflight:
             # Pre-flight verdict: which tickers the 10:30 live evaluator should
             # re-evaluate. Coarse pre-screen only; 10:30 recomputes fresh.
             eligible = [s for s in signals if preflight_eligibility(s)]
             artifacts["eligible_to_execute_tickers"] = [s.ticker for s in eligible]
             artifacts["counts"]["eligible_to_execute"] = len(eligible)
+            # Machine-complete envelope (schema morning-preflight-v2-machine-complete):
+            # one row per active symbol plus top-level gate fields the 10:30 live
+            # task consumes without re-deriving. Unresolved symbols become rows
+            # with eligible_to_execute=false; they never flip overall_ok.
+            ticker_rows = [preflight_ticker_eligibility_row(s) for s in signals]
+            unresolved = [
+                r["symbol"] for r in ticker_rows
+                if r["data_confidence_status"] != "resolved"
+            ]
+            blocking_errors: List[str] = []
+            artifacts["per_ticker_eligibility"] = ticker_rows
+            artifacts["eligible_count"] = sum(1 for r in ticker_rows if r["eligible_to_execute"])
+            artifacts["ineligible_count"] = sum(1 for r in ticker_rows if not r["eligible_to_execute"])
+            artifacts["unresolved_tickers"] = unresolved
+            artifacts["blocking_errors"] = blocking_errors
+            # overall_ok is false ONLY for global/account/auth/schema-write
+            # failures; per-symbol unresolved/ineligible tickers do not count.
+            artifacts["overall_ok"] = not blocking_errors
         self._augment_artifacts(artifacts, top_up_outcomes)
         return artifacts
 
@@ -1208,6 +1550,33 @@ class MorningDCAExecutor(DCAExecutor):
 
         return paths
 
+    def _blocked_live_result(
+        self,
+        now: datetime,
+        block_reason: str,
+        signals: Sequence[MorningSignal],
+        source: str,
+    ) -> Dict[str, Any]:
+        """Write and return a fail-closed live-run result before broker placement.
+
+        This is used for scheduler-wiring safety failures (for example no broker
+        adapter or the wrong live account) where no ordering should proceed, but
+        operators still need a durable run_state explaining why the scheduled
+        live stream did not submit orders. Routed through the normal
+        build_artifacts()/write_artifacts() pipeline -- mirroring the preflight-
+        missing-block path above -- rather than a hand-rolled stub, so the
+        persisted state still carries run_id, generated_at, counts, and the
+        signal/candidate arrays already evaluated for this run, and the latest
+        scheduled pointer is still updated: watchdog/latest-pointer consumers
+        see this as an intentional block rather than a malformed or missing run.
+        """
+        artifacts = self.build_artifacts(now, signals, source, manual=False)
+        artifacts["status"] = "blocked"
+        artifacts["block_reason"] = block_reason
+        artifacts["broker_outcomes"] = {}
+        paths = self.write_artifacts(artifacts, now)
+        return {"artifacts": artifacts, "paths": paths}
+
     def _maybe_block_for_holiday(self, now: datetime, *, manual: bool) -> Optional[Dict[str, Any]]:
         """Return a blocked-run result when ``now`` falls on a weekend or NYSE holiday.
 
@@ -1259,6 +1628,8 @@ class MorningDCAExecutor(DCAExecutor):
         remaining_daily: float,
         remaining_weekly: float,
         manual: bool = False,
+        data: Any = None,
+        now: Optional[datetime] = None,
     ) -> Dict[str, Any]:
         """Attempt broker order placement for each EXEC_AUTO_BUY_ELIGIBLE candidate.
 
@@ -1272,8 +1643,15 @@ class MorningDCAExecutor(DCAExecutor):
 
         Top-up awareness: for midday candidates the notional is taken from the
         top-up outcome's ``incremental_order_amount`` rather than the signal's
-        ``hypothetical_amount_usd``; the broker's same-day-order duplicate check
-        is bypassed when a top-up outcome is active (the prior order is expected).
+        ``hypothetical_amount_usd``. Cross-stream prior orders are expected for
+        guarded top-ups, but same-stream ref-id duplicate checks still run so
+        retries cannot submit the same stream order twice.
+
+        Spread breaker: when ``data`` exposes a live bid/ask quote (the same
+        mechanism the afternoon stream uses), a candidate whose spread exceeds
+        ``config.max_bid_ask_spread_pct`` is blocked before placement. Providers
+        without a ``get_bid_ask`` hook (e.g. most test doubles) are silently
+        skipped -- this is a best-effort circuit breaker, not a hard requirement.
 
         Review policy: scheduled runs (manual=False) skip review_market_buy and
         call place_market_buy directly after all internal checks pass, per the
@@ -1285,9 +1663,13 @@ class MorningDCAExecutor(DCAExecutor):
         outcomes: Dict[str, Any] = {}
         submitted_today = 0.0
         submitted_this_week = 0.0
-        # Snapshot once so adapters that immediately reflect placed orders don't
-        # cause double-subtraction (reserved_buying_power tracks THIS batch only).
-        batch_buying_power = broker.available_buying_power()
+        # Snapshotted lazily (see below) so adapters that immediately reflect
+        # placed orders don't cause double-subtraction (reserved_buying_power
+        # tracks THIS batch only). None means "not fetched yet" -- fetched on
+        # first actual need so a batch where every candidate is blocked by an
+        # earlier, cheaper check (per-order cap, duplicate, tradability) never
+        # makes an unnecessary broker/account round-trip.
+        batch_buying_power: Optional[float] = None
         reserved_buying_power = 0.0
         for signal in candidates:
             ticker = signal.ticker
@@ -1305,12 +1687,12 @@ class MorningDCAExecutor(DCAExecutor):
             else:
                 notional = signal.hypothetical_amount_usd
 
-            # Hard per-order ceiling: 5x * $3 base = $15 (config/budgets.json circuit_breakers).
-            _MAX_ORDER_USD = 15.0
-            if notional > _MAX_ORDER_USD:
+            # Hard per-order ceiling from config/budgets.json circuit_breakers.max_per_order_usd.
+            _max_order_usd = self.config.max_per_order_usd
+            if notional > _max_order_usd:
                 outcomes[ticker] = {
                     "status": "blocked",
-                    "skip_reason": f"exceeds ${_MAX_ORDER_USD:.0f} per-order ceiling",
+                    "skip_reason": f"exceeds ${_max_order_usd:.0f} per-order ceiling",
                 }
                 continue
 
@@ -1322,24 +1704,83 @@ class MorningDCAExecutor(DCAExecutor):
                 outcomes[ticker] = {"status": "cap_exceeded", "skip_reason": "weekly cap would be exceeded"}
                 continue
 
-            # Bypass same-day duplicate check only when there is an actual prior
-            # same-day allocation (top-up guard result is not 'no_prior_run').
-            # When no prior run exists, the standard broker duplicate safeguard fires.
+            # Bypass the broad same-day duplicate check only when there is an actual
+            # cross-stream prior allocation (top-up guard result is not 'no_prior_run').
+            # Even then, keep a same-stream ref-id check so retrying this stream after
+            # it already submitted the ticker remains idempotent.
             has_prior_allocation = (
                 top_up is not None and top_up.top_up_guard_result != TOP_UP_NO_PRIOR_RUN
             )
-            if not has_prior_allocation:
-                try:
+            try:
+                if has_prior_allocation:
+                    dup = _same_stream_order_exists(broker, ticker, trading_day, self.stream)
+                    duplicate_reason = "same-stream broker order exists"
+                else:
                     dup = broker.same_day_strategy_order_exists(ticker, trading_day)
+                    duplicate_reason = "same-day broker order exists"
+            except Exception as exc:  # noqa: BLE001
+                outcomes[ticker] = {
+                    "status": "blocked",
+                    "skip_reason": f"duplicate-check failed: {exc}",
+                }
+                _log.warning("Duplicate-check error for %s: %s", ticker, exc)
+                continue
+            if dup:
+                if has_prior_allocation and not manual:
+                    # A same-stream top-up duplicate on a SCHEDULED retry means
+                    # this stream already submitted/reserved the incremental
+                    # order on an earlier attempt today, and a scheduled rerun
+                    # overwrites the same date-keyed run_state.json path (see
+                    # run_state_dir()), so there is no separate artifact for
+                    # load_prior_same_day_allocations() to double-sum against.
+                    # Persist it as submitted so rewriting run_state on retry
+                    # does not erase the durable prior-allocation context that
+                    # later same-day guards depend on.
+                    outcomes[ticker] = {
+                        "status": "submitted",
+                        "order_id": None,
+                        "skip_reason": duplicate_reason,
+                        "submitted_amount_usd": notional,
+                    }
+                    submitted_today += notional
+                    submitted_this_week += notional
+                    reserved_buying_power += notional
+                elif has_prior_allocation and manual:
+                    # A MANUAL/recovery retry always writes to its own fresh,
+                    # uuid-suffixed artifact directory (see run_id()) and never
+                    # overwrites the original submission's run_state.json. If
+                    # this were also recorded as "submitted" with a fresh
+                    # notional, load_prior_same_day_allocations() would find
+                    # both files and double-count the same broker order as two
+                    # separate same-day allocations, understating what an
+                    # afternoon/final top-up is still owed. The original
+                    # submission's own artifact already carries the real
+                    # notional, so this retry contributes nothing further.
+                    outcomes[ticker] = {
+                        "status": "skipped",
+                        "skip_reason": f"{duplicate_reason} (duplicate top-up retry; already recorded by the original run)",
+                    }
+                else:
+                    outcomes[ticker] = {"status": "skipped", "skip_reason": duplicate_reason}
+                continue
+            if data is not None and now is not None:
+                try:
+                    spread_pct = quote_spread_pct(data, ticker, now)
                 except Exception as exc:  # noqa: BLE001
                     outcomes[ticker] = {
                         "status": "blocked",
-                        "skip_reason": f"duplicate-check failed: {exc}",
+                        "skip_reason": f"spread quote error: {exc}",
                     }
-                    _log.warning("Duplicate-check error for %s: %s", ticker, exc)
+                    _log.warning("Spread quote error for %s: %s", ticker, exc)
                     continue
-                if dup:
-                    outcomes[ticker] = {"status": "skipped", "skip_reason": "same-day broker order exists"}
+                max_spread = self.config.max_bid_ask_spread_pct
+                if spread_pct is not None and spread_pct > max_spread:
+                    outcomes[ticker] = {
+                        "status": "blocked",
+                        "skip_reason": (
+                            f"bid/ask spread {spread_pct:.2f}% exceeds {max_spread:.2f}% limit"
+                        ),
+                    }
                     continue
             try:
                 tradable = broker.is_tradable_for_fractional_buy(ticker)
@@ -1353,6 +1794,8 @@ class MorningDCAExecutor(DCAExecutor):
             if not tradable:
                 outcomes[ticker] = {"status": "blocked", "skip_reason": "not tradable for fractional buy"}
                 continue
+            if batch_buying_power is None:
+                batch_buying_power = broker.available_buying_power()
             if batch_buying_power - reserved_buying_power < notional:
                 outcomes[ticker] = {"status": "blocked", "skip_reason": "insufficient buying power"}
                 continue
@@ -1442,6 +1885,25 @@ class MorningDCAExecutor(DCAExecutor):
             return blocked
         signals = self.evaluate(now, data, manual=manual)
         source = data_source or getattr(getattr(data, "source", None), "value", "unknown")
+        # Scheduled-run preflight block: _apply_preflight_gate found no same-day
+        # pre-flight artifact (or one that explicitly flagged itself invalid) and
+        # set preflight_missing_block instead of raising. Build the blocked result
+        # through the normal artifact pipeline (build_artifacts/write_artifacts)
+        # rather than a hand-written stub, so the persisted run_state carries the
+        # standard shape (run_id, generated_at, counts, run_classification) and
+        # the latest scheduled pointer is still updated -- watchdog/reporting can
+        # then validate this as a real (blocked) scheduled-run attempt instead of
+        # something that looks malformed or missing.
+        pgate = getattr(self, "preflight_gate", None)
+        if pgate and pgate.get("preflight_missing_block"):
+            block_reason = pgate["block_reason"]
+            artifacts = self.build_artifacts(now, signals, source, manual=manual)
+            artifacts["status"] = "blocked"
+            artifacts["block_reason"] = block_reason
+            artifacts["trades"] = False
+            artifacts["broker_outcomes"] = {}
+            paths = self.write_artifacts(artifacts, now)
+            return {"artifacts": artifacts, "paths": paths}
         trading_day = now.astimezone(EASTERN).date()
         top_up_outcomes = self._compute_top_up(now, signals)
         # Sort by multiplier DESC, then drop_pct DESC, then ticker ASC so tied
@@ -1456,13 +1918,18 @@ class MorningDCAExecutor(DCAExecutor):
         pre_run_remaining_daily = self.ledger.remaining_daily(trading_day)
         pre_run_remaining_weekly = self.ledger.remaining_weekly(trading_day)
         broker_outcomes: Optional[Dict[str, Any]] = None
+        if self.mode == MORNING_LIVE_MODE and self.trades and not manual and broker is None:
+            return self._blocked_live_result(
+                now, "missing broker adapter for scheduled live execution", signals, source
+            )
         if broker is not None and self.mode == MORNING_LIVE_MODE:
             expected_account = getattr(self.config, "target_account_number", None)
-            if expected_account and broker.account_number() != expected_account:
-                raise RuntimeError(
-                    f"Refusing to trade account {broker.account_number()}; "
-                    f"expected {expected_account}"
-                )
+            actual_account = broker.account_number()
+            if expected_account and actual_account != expected_account:
+                mismatch = f"broker account mismatch: expected {expected_account}, got {actual_account}"
+                if not manual:
+                    return self._blocked_live_result(now, mismatch, signals, source)
+                raise RuntimeError(mismatch)
             broker_outcomes = self._place_broker_orders(
                 auto_buy_candidates,
                 trading_day,
@@ -1471,6 +1938,8 @@ class MorningDCAExecutor(DCAExecutor):
                 remaining_daily=pre_run_remaining_daily,
                 remaining_weekly=pre_run_remaining_weekly,
                 manual=manual,
+                data=data,
+                now=now,
             )
         # In live mode record only candidates whose orders were actually submitted
         # so cap-exceeded orders do not inflate the ledger and corrupt budget reporting.
@@ -1504,6 +1973,26 @@ class MorningDCAExecutor(DCAExecutor):
             artifacts["broker_outcomes"] = broker_outcomes
         paths = self.write_artifacts(artifacts, now)
         return {"artifacts": artifacts, "paths": paths}
+
+
+def _same_stream_order_exists(broker: BrokerAdapter, ticker: str, trading_day: date, stream: str) -> bool:
+    """Return True when broker history already has this stream's idempotency ref id.
+
+    Guarded midday top-ups intentionally allow earlier cross-stream orders for the
+    same ticker, so the broad same-day duplicate check would be too strict. This
+    narrower hook lets live brokers fail closed on retries of the current stream
+    without treating the morning/manual prior allocation as a duplicate.
+    """
+    checker = getattr(broker, "same_day_strategy_order_exists_with_ref_id_prefix", None)
+    if checker is None:
+        raise RuntimeError(
+            "broker does not support same-stream ref-id duplicate checks for guarded top-ups"
+        )
+    prefixes = (
+        f"{stream}-dca-topup-{trading_day.isoformat()}-{ticker}",
+        f"{stream}-dca-{trading_day.isoformat()}-{ticker}",
+    )
+    return bool(checker(ticker, trading_day, prefixes))
 
 
 def _write_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:

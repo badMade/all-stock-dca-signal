@@ -190,6 +190,22 @@ class _FakeData:
         return self._quote  # (price, time) or None
 
 
+class _FakeDataWithBidAsk(_FakeData):
+    def __init__(self, source, close_price, prev_close, quote=None, bid_ask=(97.0, 99.0)):
+        super().__init__(source, close_price, prev_close, quote=quote)
+        self._bid_ask = bid_ask
+
+    def get_bid_ask(self, ticker, as_of):
+        return self._bid_ask
+
+
+class _FakeDataWithRaisingBidAsk(_FakeData):
+    """Simulates a provider whose get_bid_ask raises (e.g. inactive/halted quote or missing fields)."""
+
+    def get_bid_ask(self, ticker, as_of):
+        raise ValueError(f"no usable bid/ask in {ticker} quote")
+
+
 def test_target_price_defaults_to_signal_quote():
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     quote_time = datetime(2026, 6, 29, 15, 44, tzinfo=EASTERN)
@@ -490,7 +506,12 @@ def _compact_setup(workdir):
     state = StrategyState()
     broker = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
-    rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+    # Tight bid/ask (0.2% spread, well under the default 1% breaker) so these
+    # compact-mode tests -- which exercise usage-proxy logging, kill-switch
+    # accounting, confirmation-required handling, and top-up recording, not
+    # spread behavior itself -- still reach a submitted/dry_run outcome under
+    # the scheduled-run fail-closed-on-missing-spread breaker.
+    rh = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
     return now, config, state, broker, fin, rh
 
 
@@ -625,7 +646,9 @@ def test_deployment_history_root_engages_kill_switch_on_later_run(tmp_path):
     state1 = StrategyState()
     broker1 = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     fin1 = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now1))
-    rh1 = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now1))
+    # Tight bid/ask so the scheduled-run fail-closed-on-missing-spread breaker
+    # doesn't block this kill-switch scenario (spread behavior is not under test).
+    rh1 = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now1), bid_ask=(97.9, 98.1))
     run_daily_compact(now1, config, state1, fin1, rh1, broker1, artifacts_dir=day1_dir)
 
     with open(os.path.join(day1_dir, "run_state.json"), encoding="utf-8") as handle:
@@ -642,7 +665,7 @@ def test_deployment_history_root_engages_kill_switch_on_later_run(tmp_path):
     state2 = StrategyState()
     broker2 = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     fin2 = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now2))
-    rh2 = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now2))
+    rh2 = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now2), bid_ask=(97.9, 98.1))
     run_daily_compact(
         now2, config, state2, fin2, rh2, broker2,
         artifacts_dir=day2_dir, deployment_history_root=history_root,
@@ -681,7 +704,7 @@ def test_kill_switch_caps_later_candidates_within_the_same_batch(tmp_path):
     state = StrategyState()
     broker = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
-    rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+    rh = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir)
 
@@ -876,6 +899,141 @@ def test_confirmation_required_broker_response_recorded_distinctly(tmp_path):
     assert run_state["usage_proxy"]["errors_count"] == 0
 
 
+def test_scheduled_afternoon_blocks_wide_spread_before_ordering(tmp_path):
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
+        max_bid_ask_spread_pct=1.0,
+    )
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+    fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    # 97 x 99 is a ~2.04% midpoint spread, above the configured 1% hard breaker.
+    rh = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.0, 99.0))
+    artifacts_dir = os.path.join(tmp_path, "runs", "wide-spread")
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    [candidate] = run_state["buy_candidates"]
+    assert candidate["ticker"] == "AAPL"
+    assert candidate["status"] == "blocked"
+    assert "bid/ask spread" in candidate["skip_reason"]
+    assert run_state["usage_proxy"]["orders_placed_count"] == 0
+
+
+def test_scheduled_afternoon_blocks_when_spread_unavailable(tmp_path):
+    # Codex review on PR #22: config/scheduled_tasks.json requires spread_ok=true
+    # before any scheduled live order. A provider without get_bid_ask support (or
+    # one whose quote returns nothing) must fail closed here, not silently bypass
+    # the breaker the way it did when spread_pct was simply left as None.
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
+    )
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+    fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    # Plain _FakeData has no get_bid_ask method at all.
+    rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+    artifacts_dir = os.path.join(tmp_path, "runs", "missing-spread")
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    [candidate] = run_state["buy_candidates"]
+    assert candidate["ticker"] == "AAPL"
+    assert candidate["status"] == "blocked"
+    assert "spread" in candidate["skip_reason"]
+    assert run_state["usage_proxy"]["orders_placed_count"] == 0
+
+
+def test_manual_run_not_blocked_when_spread_unavailable(tmp_path):
+    # The missing-spread fail-closed breaker is scoped to scheduled runs only:
+    # a manual run still has review_market_buy as a human-reviewed safety net,
+    # so it must not be blocked on a missing spread alone.
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
+    )
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+    fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+    artifacts_dir = os.path.join(tmp_path, "runs", "manual-missing-spread")
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=False)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    [candidate] = run_state["buy_candidates"]
+    assert candidate["ticker"] == "AAPL"
+    assert candidate["status"] != "blocked"
+
+
+def test_scheduled_afternoon_spread_error_is_caught_and_recorded(tmp_path):
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
+    )
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+    fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    # Provider raises on get_bid_ask (e.g. halted or missing bid/ask fields).
+    rh = _FakeDataWithRaisingBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+    artifacts_dir = os.path.join(tmp_path, "runs", "spread-error")
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    [candidate] = run_state["buy_candidates"]
+    assert candidate["ticker"] == "AAPL"
+    assert candidate["status"] == "blocked"
+    assert "spread quote error" in candidate["skip_reason"]
+    assert run_state["usage_proxy"]["orders_placed_count"] == 0
+    assert run_state["usage_proxy"]["errors_count"] == 1
+
+
+def test_run_daily_compact_blocks_orders_above_per_order_ceiling(tmp_path):
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-max-order")
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL",),
+        approved_test_dates=config.approved_test_dates,
+        base_buy_amount_usd=10.0,
+        max_per_order_usd=15.0,
+    )
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    candidate = run_state["buy_candidates"][0]
+    assert candidate["ticker"] == "AAPL"
+    assert candidate["planned_amount_usd"] == 20.0
+    assert candidate["status"] == "blocked"
+    assert candidate["skip_reason"] == "max per-order ceiling exceeded"
+    assert run_state["usage_proxy"]["orders_placed_count"] == 0
+
+
 def test_write_run_artifacts_ignores_stale_orders_csv(tmp_path):
     out = os.path.join(tmp_path, "runs", "reused-day")
     os.makedirs(out)
@@ -1048,9 +1206,9 @@ def _manual_run_state(candidates, generated_at="2026-06-29T10:00:00-04:00", run_
 
 
 def test_load_prior_same_day_reads_morning_manual_allocation(tmp_path):
-    # No orders.csv at all (legacy/older artifact layout). Per the reference-price
-    # preference the guard uses the run's logged target_price as the reference
-    # (the entry the run committed to) even without a confirmed fill.
+    # No orders.csv at all (legacy/older artifact layout). A submitted row still
+    # contributes prior-allocation amount, but without a confirmed fill its logged
+    # target_price must not become a known reference price.
     root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
     _write_prior_run(
         root,
@@ -1062,8 +1220,31 @@ def test_load_prior_same_day_reads_morning_manual_allocation(tmp_path):
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
     assert set(allocations) == {"AAPL"}
     assert allocations["AAPL"].amount_usd == 3.0
-    assert allocations["AAPL"].reference_price == 99.0
+    assert allocations["AAPL"].reference_price is None
     assert allocations["AAPL"].source == "manual"
+
+
+def test_load_prior_same_day_submitted_with_logged_price_and_no_fill_has_unknown_reference(tmp_path):
+    # A still-submitted order with no confirmed fill row may later be rejected or
+    # canceled; do not use its logged target/decision price as a known reference.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    _write_prior_run(
+        root,
+        "manual_runs/0900",
+        _manual_run_state([
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": 3.0,
+                "target_price": 99.0,
+                "decision_bar_close": 99.2,
+            },
+        ]),
+        orders_rows=[{"ticker": "AAPL", "status": "submitted", "avg_fill_price": ""}],
+    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert allocations["AAPL"].amount_usd == 3.0
+    assert allocations["AAPL"].reference_price is None
 
 
 def test_load_prior_same_day_no_logged_price_has_no_reference(tmp_path):
@@ -1128,9 +1309,32 @@ def test_load_prior_same_day_reads_manual_override_filled_orders_csv(tmp_path):
             handle,
         )
     with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
-        handle.write("ticker,status,avg_fill_price\nAMZN,filled,242.1099\n")
+        handle.write("ticker,amount_usd,avg_fill_price\nAMZN,2.5,242.1099\n")
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
-    assert allocations["AMZN"].amount_usd == 3.0
+    assert allocations["AMZN"].amount_usd == 2.5
+    assert allocations["AMZN"].reference_price == 242.1099
+    assert allocations["AMZN"].source == "manual"
+
+
+def test_load_prior_same_day_reads_documented_manual_filled_orders_shape(tmp_path):
+    # Documented manual override fills can omit orders.csv-only fields such as
+    # status and quantity_filled, while recording amount_usd and avg_fill_price.
+    root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    run_dir = os.path.join(root, "manual_reruns", "1505")
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(
+            _manual_run_state([
+                {"ticker": "AMZN", "status": "filled", "planned_amount_usd": 6.0},
+            ]),
+            handle,
+        )
+    with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+        handle.write("ticker,amount_usd,avg_fill_price\nAMZN,4.25,242.1099\n")
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["AMZN"].amount_usd == 4.25
     assert allocations["AMZN"].reference_price == 242.1099
     assert allocations["AMZN"].source == "manual"
 
@@ -1289,6 +1493,120 @@ def test_load_prior_same_day_ignores_other_trading_days(tmp_path):
     state["trading_day"] = "2026-06-26"
     _write_prior_run(root, "manual_runs/0900", state)
     assert load_prior_same_day_allocations(root, date(2026, 6, 29)) == {}
+
+
+# --- PR #22 bot-review regression coverage (batch: top-up guard) --------------
+
+
+def test_load_prior_same_day_preserves_amount_only_fill_as_unknown_price(tmp_path):
+    # Codex review #88: a CSV-only prior allocation row can have amount_usd but
+    # no usable avg_fill_price (e.g. a manual override fill logged without a
+    # captured price). The row's amount must still count as prior-allocation
+    # capital, with an unknown (None) reference price -- not be dropped entirely.
+    root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    run_dir = os.path.join(root, "manual_reruns", "1505")
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(
+            _manual_run_state([{"ticker": "AMZN", "status": "filled", "planned_amount_usd": 3.0}]),
+            handle,
+        )
+    with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+        handle.write("ticker,amount_usd,avg_fill_price\nAMZN,2.5,\n")
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["AMZN"].amount_usd == 2.5
+    assert allocations["AMZN"].reference_price is None
+
+
+def test_load_prior_same_day_quantity_only_fill_without_price_does_not_crash(tmp_path):
+    # Codex review #90 (paired with #88): a filled row with a quantity but no
+    # usable price and no amount_usd carries no way to derive a dollar amount.
+    # It must be dropped safely, never raise (e.g. None * quantity), and never
+    # fabricate a reference price.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    _write_prior_run(
+        root,
+        "manual_runs/0900",
+        _manual_run_state([{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0}]),
+    )
+    orders_csv = os.path.join(root, "manual_runs", "0900", "orders.csv")
+    with open(orders_csv, "w", encoding="utf-8") as handle:
+        handle.write("ticker,status,avg_fill_price,quantity_filled\nAAPL,filled,,0.05\n")
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    # No crash, and no fabricated reference price for the priceless fill row.
+    assert allocations["AAPL"].reference_price is None
+
+
+def test_run_daily_compact_checks_per_order_cap_before_broker_duplicate_lookup(tmp_path):
+    # Codex review #83: the hard per-order cap must be checked before the
+    # broker's same-day-duplicate lookup, not after -- an over-cap candidate
+    # should never need a same_day_strategy_order_exists() broker round-trip.
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-cap-before-dup")
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL",),
+        approved_test_dates=config.approved_test_dates,
+        base_buy_amount_usd=10.0,
+        max_per_order_usd=15.0,
+    )
+
+    class _TrackingBroker(DryRunBroker):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.duplicate_lookup_calls = []
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            self.duplicate_lookup_calls.append(ticker)
+            return super().same_day_strategy_order_exists(ticker, trading_day)
+
+    tracking_broker = _TrackingBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+
+    run_daily_compact(now, config, state, fin, rh, tracking_broker, artifacts_dir=artifacts_dir)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    candidate = run_state["buy_candidates"][0]
+    assert candidate["status"] == "blocked"
+    assert candidate["skip_reason"] == "max per-order ceiling exceeded"
+    assert tracking_broker.duplicate_lookup_calls == []
+
+
+def test_load_prior_same_day_final_override_can_see_earlier_scheduled_run(tmp_path):
+    # Codex review #96: a final manual buy override invoked after the day's
+    # already-completed scheduled afternoon run must still see that run's
+    # allocation as prior context, or it risks double-buying the same ticker.
+    # Default guard behavior (used by the scheduled run itself) is unchanged --
+    # only an explicit opt-in surfaces the earlier scheduled run.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    _write_prior_run(
+        root,
+        "scheduled_runs/20260629_1520ET",
+        _manual_run_state(
+            [{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0}],
+            generated_at="2026-06-29T15:20:00-04:00",
+            run_origin="scheduled",
+        ),
+        orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "99.0"}],
+    )
+
+    # Default behavior is unchanged: the scheduled run is never prior context.
+    default_allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert default_allocations == {}
+
+    # A final override running later the same day must see it.
+    override_allocations = load_prior_same_day_allocations(
+        root,
+        date(2026, 6, 29),
+        boundary_et=time(15, 35),
+        include_scheduled_afternoon=True,
+    )
+    assert override_allocations["AAPL"].amount_usd == 3.0
+    assert override_allocations["AAPL"].reference_price == 99.0
 
 
 # --- Integration: top-up guard through run_daily_compact ----------------------

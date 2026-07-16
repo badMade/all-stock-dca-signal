@@ -27,6 +27,20 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 > valid scheduled-run evidence the task ran — **not** evidence of an order/fill.
 > See [run_classification.md](run_classification.md).
 
+> **Raw data persistence fix (added Jul 10 2026):** before signal computation the
+> live task (`10ce362c`) must persist every raw Robinhood/Finance/Alpaca/Yahoo
+> connector response it used under
+> `cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/raw/` with deterministic
+> filenames (`quotes_batchN.json`, `historicals_batchN.json`,
+> `tradability_pre_place.json`, `portfolio_pre_place.json`,
+> `orders_after_place.json`, `place_SYMBOL.json`), normalizing large connector
+> `output_path` pointers into parseable JSON. **Compute must read only these
+> persisted files, not in-memory tool responses.** If persistence/normalization
+> fails, the task still writes a valid scheduled `run_state.json`
+> (`run_origin='scheduled'`, `manual_run=false`,
+> `order_submit_status='not_submitted_error'`, no orders) rather than escalating
+> without state. See the `10ce362c` task detail below.
+
 > **Run-classification note:** the live task (`10ce362c`, the repaired task
 > that supersedes the deleted `ce16ba6b`; artifact root stays under
 > `.../ce16ba6b` for continuity) classifies every
@@ -60,9 +74,21 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 > budget ledger in **two** modes.
 > (1) A **9:45 AM ET read-only pre-flight validation**
 > (`morning-dca-0945`, run_type `morning_dca_preflight`,
-> `state_schema_version='morning-preflight-v1'`, **no trades**) writing under
-> `cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/` (`run_state.json`,
-> `validation.csv`, `signals.csv`, `run_summary.json`, `latest_preflight.json`).
+> `state_schema_version='morning-preflight-v2-machine-complete'`, **no trades**)
+> writing under `cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/`
+> (`run_state.json`, `validation.csv`, `signals.csv`, `run_summary.json`,
+> `latest_preflight.json`). As of **2026-07-13** the `run_state.json` is
+> **machine-complete** (schema
+> [`schemas/morning_preflight.schema.json`](../schemas/morning_preflight.schema.json)):
+> it always writes top-level `overall_ok`, `eligible_count`, `ineligible_count`,
+> `unresolved_tickers`, `blocking_errors`, `warnings`, `run_classification`, and a
+> `per_ticker_eligibility` list with **every active-universe symbol exactly once**
+> so the 10:30 live task can gate directly off machine fields (added after the
+> 2026-07-13 10:30 run was blocked by a 9:45 artifact missing `overall_ok` and the
+> per-ticker eligibility list). Unresolved symbols (e.g. AAAU, SPCX) are rows with
+> `eligible_to_execute=false`, `ineligible_reason='unresolved_ticker'` and never
+> set `overall_ok=false`; `overall_ok` is false only for
+> global/account/buying-power/auth/schema-write failures.
 > It emits **`eligible_to_execute=true/false` per ticker** — a **coarse
 > pre-screen** for the 10:30 evaluator, **not** a final approval. (A read-only
 > `watchlist` early-warning mode remains available under
@@ -136,7 +162,7 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 - Analytics / **read-only**, **no trading**. Runs **9:45 AM ET weekdays** (executor mode `preflight`).
 - Evaluates morning price weakness vs. yesterday’s regular-session close on the shared **$3 base 0x-to-5x ladder** (`config/morning_dca.json`) as a pre-screen for the 10:30 live evaluator; runs no Robinhood order review and calls no broker placement path. Writes pre-flight artifacts under `/home/user/workspace/cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/` — `run_state.json`, `validation.csv`, `signals.csv`, `run_summary.json`, and the `latest_preflight.json` pointer (`run_id='morning_preflight_YYYYMMDD_0945ET'`).
 - Emits **`eligible_to_execute=true/false` per ticker**. This is a **coarse pre-screen** (is a ticker worth re-evaluating at 10:30?), **NOT** a final buy approval — the 10:30 live run recomputes signals/budget/spread/trend/top-up from scratch and may still decline. A ticker is eligible when it graded to a positive-multiplier BUY at 9:45 with a usable current price and previous close.
-- `stream='morning'`, `run_type='morning_dca_preflight'`, `state_schema_version='morning-preflight-v1'`, `valid_afternoon_evidence=false`. Never writes into the afternoon `ce16ba6b` tree or updates `latest_scheduled_run.json`. (A read-only `watchlist` early-warning mode remains available, writing under `cron_tracking/morning_dca_watchlist/`.)
+- `stream='morning'`, `run_type='morning_dca_preflight'`, `state_schema_version='morning-preflight-v2-machine-complete'`, `valid_afternoon_evidence=false`. Never writes into the afternoon `ce16ba6b` tree or updates `latest_scheduled_run.json`. (A read-only `watchlist` early-warning mode remains available, writing under `cron_tracking/morning_dca_watchlist/`.)
 
 ### `42173154` — Weekday 10:30 AM morning DCA live Robinhood execution (`MorningDCAExecutor`)
 - **Live trading** (executor mode `live`). Runs **10:30 AM ET weekdays** — moved from the former 9:45 AM live slot to give a true **60-minute intraday trend window**.
@@ -168,7 +194,51 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 - **State-file guarantee:** **always** writes the scheduled `run_state.json` and updates `latest_scheduled_run.json` on every fire, **even when no order is placed**. A confirmation-blocked run (review passed, submission blocked by required post-review confirmation) records `order_submit_status='not_submitted_confirmation_required'`, `reviewed_order` details where available, candidate details, and **no `order_id`** — valid scheduled-run evidence, not order/fill evidence.
 - **Run classification:** a scheduled run writes `scheduled_runs/YYYYMMDD_1520ET/run_state.json` (`run_origin='scheduled'`, `manual_run=false`, `scheduled_for_et='15:20'`, `state_schema_version='run-classification-v1'`, `run_id='scheduled_YYYYMMDD_1520ET'`, and **both** `cron_id='10ce362c'` **and** `supersedes_cron_id='ce16ba6b'`) and updates `latest_scheduled_run.json`; a manual run writes `manual_runs/<timestamp>/run_state.json` (`run_origin='manual'`, `manual_run=true`) and never updates that pointer. Placeholder/ambiguous ids such as `ce16ba6b_replacement` are forbidden; for continuity, consumers still accept `cron_id='10ce362c'` OR `supersedes_cron_id='ce16ba6b'` as valid evidence. See [run_classification.md](run_classification.md).
 - **Manual runs do not count as scheduled-run evidence.** Any stale stored display name is superseded by the authoritative **3:20 PM ET** schedule.
+- **RAW DATA PERSISTENCE FIX ADDED JUL 10 2026:** the 2026-07-10 3:20 PM run
+  (`cron_id 10ce362c`) escalated because quotes and historicals were fetched
+  successfully but the **raw connector responses were never persisted to disk
+  before signal computation** — the bash compute step had no
+  `quotes_batchN.json` / `historicals_batchN.json` to read. From this date on,
+  **before signal computation** the scheduled run must **persist every raw
+  Robinhood/Finance/Alpaca/Yahoo connector response** it used under
+  `scheduled_runs/YYYYMMDD_1520ET/raw/` with deterministic filenames:
+  `quotes_batchN.json`, `historicals_batchN.json`, `tradability_pre_place.json`,
+  `portfolio_pre_place.json`, `orders_after_place.json`, and `place_SYMBOL.json`
+  where applicable.
+  - **Normalize before persisting.** Large connector outputs that return an
+    `output_path` pointer instead of inline data must be normalized into
+    parseable JSON (the referenced file's contents embedded under `data`, the
+    original pointer preserved under `output_path`) so the compute step can parse
+    the saved file directly.
+  - **Compute reads persisted files only.** Signal computation must read from the
+    persisted/normalized files under `raw/`, **not** from in-memory tool
+    responses. Fetch → persist → normalize → compute → place, in that order.
+  - **Persistence failure still writes state.** If raw persistence or
+    normalization fails, the task must **still write a valid scheduled**
+    `run_state.json` with `run_origin='scheduled'`, `manual_run=false`,
+    `order_submit_status='not_submitted_error'`, the error in
+    `raw_persistence_error`, empty `raw_inputs_saved`, and **no orders placed** —
+    rather than escalating without any state.
+  - The run_state records `raw_input_dir` (absolute path to `raw/`),
+    `raw_inputs_saved` (filenames actually written), and
+    `recovery_from_escalation` (true when the state was produced by recovering an
+    escalated run). Helpers: `scripts/run_classification.py`
+    (`raw_input_dir`, `save_raw_input`, `normalize_connector_payload`,
+    `build_raw_persistence_state`, `raw_persistence_failure_run_state`); schema
+    fields in [`schemas/run_state.schema.json`](../schemas/run_state.schema.json).
+  - **Recovered run (2026-07-10 3:20 PM ET):** the escalated run was recovered by
+    re-fetching quotes/historicals, saving raw connector outputs under
+    `/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260710_1520ET/raw/`,
+    normalizing the large `output_path` pointers, computing signals from those
+    files, then placing qualifying incremental orders: **9 incremental scheduled
+    afternoon orders totalling $31.50**, saved under
+    `/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260710_1520ET/`.
+    These are valid afternoon scheduled evidence. Broker policy is unchanged
+    (Robinhood-only execution; Alpaca/Finance/Yahoo read-only; no
+    `review_equity_order` in scheduled live runs).
 - **Same-day top-up guard:** loads earlier same-day (before **2:30 PM ET**, non-scheduled) allocations from its own artifact root **plus** the morning-live root (`.../cron_tracking/morning_dca`) and the midday-live root (`.../cron_tracking/midday_dca`, which also holds manual override reruns under `manual_reruns/`), and offsets each ticker so it buys only the incremental amount `max(0, desired − prior)` into a lower price. The prior reference price is resolved by preference: logged `target_price`, then `decision_price`, then `average_fill_price` (from `orders.csv`/`filled_orders.csv`); a missing reference → `manual_review_candidate` at `$0`. Per-candidate the run_state records `prior_same_day_amount`, `prior_same_day_reference_price`, `prior_same_day_run_id`/`prior_same_day_source`, `afternoon_desired_amount`, `afternoon_decision_price`, `incremental_order_amount`, `top_up_guard_result`, `top_up_skipped`, and `top_up_manual_review`. Morning/midday/manual override prior-context fills are **never** afternoon scheduled evidence, slippage, reliability, fill counts, or cost basis. A fully-offset day still writes a valid scheduled run_state. See [strategy.md](strategy.md#same-day-prior-run-offset--top-up-guard).
+- **Final buy of the day behavior:** for the **final live buy of the day** the run performs a **full active-universe scan** and, **for this final-buy decision only**, **ignores the 60-minute downward-trend filter**. Every other gate still holds: current/decision price **strictly below the prior completed regular-session close**, ladder **multiplier > 0** (from the $3-base 0x-to-5x ladder), **data-confidence** pass, **`spread_ok=true`**, **budget/tiered-cap** pass, **regular trading hours only**, **whitelisted (active-universe) ticker**, and all **hard circuit breakers** clear. The same-day top-up guard above still applies to the final buy. (Morning 10:30 and midday 12:30 live runs still require trend validation unless changed later.) See [strategy.md](strategy.md#final-buy-of-the-day-320-pm-et-task-10ce362c).
+- **Jul 13 2026 final manual override incident:** the scheduled 3:20 PM ET run placed **0 orders**; the user then requested the final buy **manually**. A final manual-review scan ran the final-buy behavior above (full scan, trend ignored) with same-day top-up offsets and filled **34 orders**, planned total **$234.00** (`DFTX TRIN SPCX LUNR IRDM DXYZ LITE ASML DRAM STX AMAT AMD CBRS MRVL BTX STM SNDK WDC TSM AVGO NVDA QBTS FLKR INTC GOOGL GOOG GLW GS MU XLG TOPT QTOP SATA RGTI`). These are **manual final-buy overrides / same-day top-up context only — NOT scheduled-afternoon execution evidence**. Their run_state carries `run_type='final_manual_buy_override'`, `run_origin='manual'`, `manual_run=true`, `valid_afternoon_scheduled_evidence=false`, `same_day_top_up_context_only=true`. Artifacts (run_state + `filled_orders.csv` with all order IDs) were backfilled under `/home/user/workspace/cron_tracking/ce16ba6b/manual_runs/final_manual_override_20260713_1536ET/` and `/home/user/workspace/cron_tracking/midday_dca/manual_reruns/final_manual_override_20260713_1536ET/`. All order IDs are excluded from scheduled slippage/fills/reliability/cost basis/watchdog confirmation and shown only in the **"Manual Final Buy Override / Same-Day Top-Up Context"** section. See [run_classification.md](run_classification.md) and [strategy.md](strategy.md#manual-final-buy-override--2026-07-13-incident).
 
 ### `d72aa525` — Capital-priority briefing
 - Analytics only, **no trading**. Runs **3:25 PM ET weekdays**.
@@ -178,18 +248,30 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 - Analytics only, **no trading**. Runs **3:35 PM ET weekdays**.
 - Reads the **scheduled** live-run state and Robinhood order history, writes slippage/coverage artifacts, updates the compact Notion **Latest Run** section only.
 - **Run classification:** scheduled-live rows exclude all manual order IDs and any `run_origin='manual'`/`manual_run=true` state; manual fills go only in the labeled **Manual Test Runs** section. See [run_classification.md](run_classification.md).
+- **Manual exclusion roots + final override (added Jul 13 2026):** collect and exclude manual order IDs from all manual exclusion roots — the task's own `manual_runs/**` **plus** `final_manual_review/**`, `.../cron_tracking/ce16ba6b/manual_runs/final_manual_override_*`, and `.../cron_tracking/midday_dca/manual_reruns/`. Fills from a `final_manual_buy_override` run (e.g. the 2026-07-13 incident) are excluded from scheduled slippage/fills/reliability/cost basis and reported only in the labeled **"Manual Final Buy Override / Same-Day Top-Up Context"** section (`manual_final_buy_override` in [`schemas/slippage_report.schema.json`](../schemas/slippage_report.schema.json)).
 - **Confirmation-blocked run:** when the scheduled state has `order_submit_status='not_submitted_confirmation_required'`, report **no scheduled fills and no scheduled order IDs**; do **not** invalidate the run_state and do **not** apply the broker time-window fallback (no write failure occurred).
+- **Schema-version acceptance (added Jul 10 2026):** accept scheduled run_states tagged **either** `state_schema_version='run-classification-v1'` **or** `run-classification-v2-preauthorized` as long as the required scheduled identity fields are correct (`run_origin='scheduled'`, `manual_run=false`, `cron_id='10ce362c'` OR `supersedes_cron_id='ce16ba6b'`, `scheduled_for_et='15:20'`, window, `run_id`). v2 is a **stricter successor** of v1 (pre-authorized direct placement), not a different contract.
+- **Order-history payload persistence (added Jul 10 2026):** persist the Robinhood order-history payloads used for slippage (e.g. `scheduled_runs/YYYYMMDD_1520ET/raw/orders_after_place.json`) **before** slippage computation, and compute average fill price / executions from the **saved payloads** (`dca_reporting.fills_from_order_history_payload`) rather than re-querying the broker. Record the payload paths in `source_order_history_payloads` (see [`schemas/slippage_report.schema.json`](../schemas/slippage_report.schema.json)).
 
 ### `a46bf007` — Live-run watchdog
 - Read-only, **no trading**. Runs **3:40 PM ET weekdays** — the **final scheduled afternoon event**.
 - Alerts only on missed, incomplete, error, or discrepancy conditions.
 - **Run classification:** validates that a scheduled run_state exists and `latest_scheduled_run.json` points at it; a manual-only or broker-orders-only day is a discrepancy, not a scheduled run.
 - **Confirmation-blocked run:** when `order_submit_status='not_submitted_confirmation_required'`, alert that **no order was placed**, but do **not** mark the lineage/scheduled state invalid — a confirmation-blocked run with the required fields present is a valid scheduled run that fired.
+- **Watchdog scan fix (added Jul 13 2026):** when broker order history shows orders after 3:15 PM ET but no scheduled state accounts for them, scan the manual exclusion roots — `final_manual_review/**`, `.../cron_tracking/ce16ba6b/manual_runs/final_manual_override_*`, and `.../cron_tracking/midday_dca/manual_reruns/` — before flagging a discrepancy. Orders matched to a `final_manual_buy_override` run are manual overrides (`valid_afternoon_scheduled_evidence=false`): exclude them from scheduled-confirmation and do **not** treat them as scheduled evidence. The 3:40 PM 2026-07-13 alert was caused by final-override fills lacking artifacts under the scanned paths; artifacts were backfilled under the two `final_manual_override_20260713_1536ET/` roots. See [run_classification.md](run_classification.md).
 
 ### `041d9d90` — Weekly Notion performance dashboard refresh
 - Analytics only, **no trading**. Runs **Fridays 5:00 PM ET** — the only approved post-3:40 PM exception.
 - Recalculates and refreshes the full Notion performance dashboard. No routine email.
 - **Run classification:** weekly scheduled-live metrics use only validated scheduled runs with manual runs/order IDs excluded; manual fills, if shown, are confined to a labeled **Manual Test Runs** section. See [run_classification.md](run_classification.md).
+- **Schema-version compatibility (added Jul 10 2026):** include **v2-preauthorized** scheduled runs (`state_schema_version='run-classification-v2-preauthorized'`) in weekly metrics whenever the required scheduled identity fields are present, alongside v1 runs.
+- **Slippage fallback (added Jul 10 2026):** if per-day slippage artifacts are missing, compute from the persisted broker-history payloads (`scheduled_runs/YYYYMMDD_1520ET/raw/orders_after_place.json` via `dca_reporting.fills_from_order_history_payload`) **before** declaring slippage unavailable for that day.
+
+#### Recovered slippage — 2026-07-10 (afternoon scheduled)
+- **9 valid afternoon scheduled fills**, total **$31.50**.
+- Average `slippage_pct` ≈ **0.1047%**; largest absolute slippage symbol **QBTS** ≈ **0.2089%**.
+- **46 manual order IDs excluded** from the scheduled-live metrics.
+- Artifacts under `/home/user/workspace/cron_tracking/ce16ba6b/slippage/20260710/`; fills computed from the scheduled run's raw `orders_after_place.json`.
 
 ### `0656657a` — Monthly graded DCA dashboard refresh
 - Analytics only, **no trading**. First weekday of the month **8:45 AM ET**. No-op otherwise.

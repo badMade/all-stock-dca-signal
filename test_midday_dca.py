@@ -13,6 +13,8 @@ import json
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
+import pytest
+
 from midday_dca import (
     DEFAULT_MIDDAY_LIVE_STATE_ROOT,
     MIDDAY_LIVE_CRON_ID,
@@ -43,6 +45,35 @@ from near_close_dca import (
 def _now_midday():
     """Decision timestamp for the 12:30 PM ET live execution."""
     return datetime.combine(date(2026, 7, 8), time(12, 30), tzinfo=EASTERN)
+
+
+class FakeLiveBroker:
+    """Minimal successful broker for scheduled midday live tests."""
+
+    def account_number(self):
+        from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+    def available_buying_power(self):
+        return 500.0
+
+    def same_day_strategy_order_exists(self, ticker, trading_day):
+        return False
+
+    def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+        # No duplicate: this fake broker never has prior orders on file, so
+        # guarded top-ups always proceed as fresh placements.
+        return False
+
+    def is_tradable_for_fractional_buy(self, ticker):
+        return True
+
+    def review_market_buy(self, ticker, notional_usd):
+        return True, "ok"
+
+    def place_market_buy(self, ticker, notional_usd, ref_id):
+        return f"ORDER-{ticker}"
 
 
 class FixedDropProvider:
@@ -180,7 +211,7 @@ def test_midday_run_state_path_and_classification(tmp_path):
     cfg = MiddayConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
     ex = MiddayDCAExecutor(cfg)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
-    res = ex.run(_now_midday(), data)
+    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
 
     run_state_path = Path(res["paths"]["run_state"])
     assert run_state_path.parent.name == "20260708_1230ET"
@@ -258,7 +289,7 @@ def test_midday_confidence_rule_withholds_when_trend_unvalidated(tmp_path):
     assert sig.trend_validated is False
     assert sig.execution_status == EXEC_MANUAL_REVIEW_CANDIDATE
 
-    res = ex.run(_now_midday(), data)
+    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
     art = res["artifacts"]
     assert art["counts"]["manual_review_candidates"] == 1
     assert art["manual_review_tickers"] == ["BIG"]
@@ -274,7 +305,7 @@ def test_top_up_no_prior_buys_full_amount(tmp_path):
     )
     ex = MiddayDCAExecutor(cfg)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
-    res = ex.run(_now_midday(), data)
+    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
     row = res["artifacts"]["buy_candidates"][0]
     assert row["top_up_guard_result"] == TOP_UP_NO_PRIOR_RUN
     assert row["incremental_order_amount"] == 15.0
@@ -298,7 +329,7 @@ def test_top_up_incremental_when_price_below_prior(tmp_path):
     ex = MiddayDCAExecutor(cfg)
     # Midday price 90.0 is strictly below the 95.0 morning reference.
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
-    res = ex.run(_now_midday(), data)
+    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
     row = res["artifacts"]["buy_candidates"][0]
     assert row["top_up_guard_result"] == TOP_UP_INCREMENTAL
     assert row["prior_same_day_amount"] == 3.0
@@ -308,6 +339,186 @@ def test_top_up_incremental_when_price_below_prior(tmp_path):
     assert row["incremental_order_amount"] == 12.0
     day = _now_midday().astimezone(EASTERN).date()
     assert ex.ledger.day_planned(day) == 12.0
+
+
+class _WideSpreadProvider(DecliningBarsProvider):
+    """A provider exposing a live bid/ask quote with an excessive spread."""
+
+    def __init__(self, *args, spread_pct=5.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._spread_pct = spread_pct
+
+    def get_bid_ask(self, ticker, as_of):
+        midpoint = 100.0
+        half_spread = midpoint * (self._spread_pct / 100.0) / 2.0
+        return (midpoint - half_spread, midpoint + half_spread)
+
+
+def test_midday_spread_breaker_blocks_wide_spread(tmp_path):
+    # Codex review #12 on PR #22: the spread circuit breaker added to the
+    # afternoon stream (PR #37) and the morning stream must also cover
+    # midday, since MiddayDCAExecutor shares _place_broker_orders with
+    # MorningDCAExecutor.
+    cfg = MiddayConfig(
+        tickers=("BIG",), base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "midday"),
+        max_bid_ask_spread_pct=1.0,
+    )
+    ex = MiddayDCAExecutor(cfg)
+    data = _WideSpreadProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10}, spread_pct=5.0)
+    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
+    row = res["artifacts"]["buy_candidates"][0]
+    assert row["status"] == "blocked"
+    outcome = res["artifacts"]["broker_outcomes"]["BIG"]
+    assert "spread" in outcome["skip_reason"]
+
+
+class _TopUpDuplicateBroker:
+    def __init__(self, duplicate: bool) -> None:
+        self.duplicate = duplicate
+        self.broad_duplicate_calls = 0
+        self.same_stream_calls = 0
+        self.placed = []
+
+    def account_number(self):
+        from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+    def available_buying_power(self):
+        return 500.0
+
+    def same_day_strategy_order_exists(self, ticker, trading_day):
+        self.broad_duplicate_calls += 1
+        return True
+
+    def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+        self.same_stream_calls += 1
+        assert ref_id_prefixes[0] == f"midday-dca-topup-{trading_day.isoformat()}-{ticker}"
+        return self.duplicate
+
+    def is_tradable_for_fractional_buy(self, ticker):
+        return True
+
+    def review_market_buy(self, ticker, notional_usd):
+        return True, "ok"
+
+    def place_market_buy(self, ticker, notional_usd, ref_id):
+        self.placed.append((ticker, notional_usd, ref_id))
+        return f"ORDER-{ticker}"
+
+
+def test_guarded_midday_top_up_checks_same_stream_duplicate_before_placing(tmp_path):
+    prior_root = tmp_path / "morning"
+    _write_prior_morning_run(
+        prior_root, ticker="BIG", planned_amount=3.0,
+        fill_price=95.0, quantity=round(3.0 / 95.0, 6),
+    )
+    cfg = MiddayConfig(
+        tickers=("BIG",), base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "midday"),
+        prior_allocation_roots=(str(prior_root),),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MiddayDCAExecutor(cfg)
+    broker = _TopUpDuplicateBroker(duplicate=True)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+
+    res = ex.run(_now_midday(), data, broker=broker)
+
+    assert broker.broad_duplicate_calls == 0
+    assert broker.same_stream_calls == 1
+    assert broker.placed == []
+    assert res["artifacts"]["broker_outcomes"]["BIG"]["status"] == "submitted"
+    assert res["artifacts"]["broker_outcomes"]["BIG"]["skip_reason"] == "same-stream broker order exists"
+    assert res["artifacts"]["buy_candidates"][0]["status"] == "submitted"
+    assert res["artifacts"]["buy_candidates"][0]["planned_amount_usd"] == 12.0
+
+
+def test_manual_retry_of_guarded_top_up_duplicate_is_skipped_not_submitted(tmp_path):
+    # Codex review on PR #22: a manual/recovery rerun always writes to its own
+    # fresh, uuid-suffixed artifact directory (see run_id()) rather than
+    # overwriting the original scheduled run's run_state.json. If a same-stream
+    # duplicate found on a MANUAL retry were still recorded as a fresh
+    # "submitted" candidate (the way a same-path SCHEDULED retry legitimately
+    # is), load_prior_same_day_allocations() would find both files and
+    # double-count the same broker order as two separate same-day allocations.
+    prior_root = tmp_path / "morning"
+    _write_prior_morning_run(
+        prior_root, ticker="BIG", planned_amount=3.0,
+        fill_price=95.0, quantity=round(3.0 / 95.0, 6),
+    )
+    cfg = MiddayConfig(
+        tickers=("BIG",), base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "midday"),
+        prior_allocation_roots=(str(prior_root),),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MiddayDCAExecutor(cfg)
+    broker = _TopUpDuplicateBroker(duplicate=True)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+
+    res = ex.run(_now_midday(), data, broker=broker, manual=True)
+
+    assert broker.same_stream_calls == 1
+    assert broker.placed == []
+    outcome = res["artifacts"]["broker_outcomes"]["BIG"]
+    assert outcome["status"] == "skipped"
+    assert "same-stream broker order exists" in outcome["skip_reason"]
+    assert "submitted_amount_usd" not in outcome
+    assert res["artifacts"]["buy_candidates"][0]["status"] == "skipped"
+
+
+class _TopUpBrokerWithoutSameStreamCheck(_TopUpDuplicateBroker):
+    same_day_strategy_order_exists_with_ref_id_prefix = None
+
+
+def test_guarded_midday_top_up_blocks_when_same_stream_checker_unavailable(tmp_path):
+    prior_root = tmp_path / "morning"
+    _write_prior_morning_run(
+        prior_root, ticker="BIG", planned_amount=3.0,
+        fill_price=95.0, quantity=round(3.0 / 95.0, 6),
+    )
+    cfg = MiddayConfig(
+        tickers=("BIG",), base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "midday"),
+        prior_allocation_roots=(str(prior_root),),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MiddayDCAExecutor(cfg)
+    broker = _TopUpBrokerWithoutSameStreamCheck(duplicate=False)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+
+    res = ex.run(_now_midday(), data, broker=broker)
+
+    outcome = res["artifacts"]["broker_outcomes"]["BIG"]
+    assert broker.placed == []
+    assert outcome["status"] == "blocked"
+    assert outcome["skip_reason"].startswith("duplicate-check failed: broker does not support same-stream")
+
+
+def test_guarded_midday_top_up_ignores_cross_stream_duplicate_for_incremental_order(tmp_path):
+    prior_root = tmp_path / "morning"
+    _write_prior_morning_run(
+        prior_root, ticker="BIG", planned_amount=3.0,
+        fill_price=95.0, quantity=round(3.0 / 95.0, 6),
+    )
+    cfg = MiddayConfig(
+        tickers=("BIG",), base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "midday"),
+        prior_allocation_roots=(str(prior_root),),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MiddayDCAExecutor(cfg)
+    broker = _TopUpDuplicateBroker(duplicate=False)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+
+    res = ex.run(_now_midday(), data, broker=broker)
+
+    assert broker.broad_duplicate_calls == 0
+    assert broker.same_stream_calls == 1
+    assert broker.placed == [("BIG", 12.0, "midday-dca-topup-2026-07-08-BIG")]
+    assert res["artifacts"]["broker_outcomes"]["BIG"]["status"] == "submitted"
 
 
 def test_top_up_zero_when_price_not_below_prior(tmp_path):
@@ -324,7 +535,7 @@ def test_top_up_zero_when_price_not_below_prior(tmp_path):
     )
     ex = MiddayDCAExecutor(cfg)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
-    res = ex.run(_now_midday(), data)
+    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
     row = res["artifacts"]["buy_candidates"][0]
     assert row["top_up_guard_result"] == TOP_UP_PRICE_NOT_BELOW
     assert row["incremental_order_amount"] == 0.0
@@ -345,7 +556,7 @@ def test_top_up_manual_review_when_prior_price_unknown(tmp_path):
     )
     ex = MiddayDCAExecutor(cfg)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
-    res = ex.run(_now_midday(), data)
+    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
     row = res["artifacts"]["buy_candidates"][0]
     assert row["top_up_guard_result"] == TOP_UP_MISSING_PRIOR_PRICE
     assert row["incremental_order_amount"] == 0.0
@@ -372,7 +583,7 @@ def test_midday_does_not_write_afternoon_or_morning_artifacts(tmp_path):
                        prior_allocation_roots=(str(tmp_path / "nonexistent_morning"),))
     ex = MiddayDCAExecutor(cfg)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
-    res = ex.run(_now_midday(), data)
+    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
 
     assert latest.read_text(encoding="utf-8") == before
     assert list(afternoon_root.rglob("run_state*.json")) == []
@@ -423,10 +634,64 @@ def test_load_midday_config_reads_config_file(tmp_path):
     assert cfg.prior_allocation_roots == ("/custom/morning/root",)
 
 
+# --- PR #22 bot-review regression coverage (batch: midday config loading) ----
+
+
+def test_load_midday_config_reads_configured_ticker_whitelist(tmp_path):
+    # Codex review #71: the midday live stream must load its ticker whitelist
+    # from config/tickers.json, not only the hardcoded module-level
+    # ACTIVE_TICKERS/EXCLUDED_TICKERS defaults.
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "midday_dca.json").write_text("{}", encoding="utf-8")
+    (cfg_dir / "tickers.json").write_text(
+        json.dumps({"active": ["ZZZZ"], "excluded": ["YYYY"]}),
+        encoding="utf-8",
+    )
+
+    cfg = load_midday_config(str(cfg_dir))
+
+    assert cfg.tickers == ("ZZZZ",)
+    assert cfg.excluded_tickers == frozenset({"YYYY"})
+
+
+def test_load_midday_config_raises_on_invalid_configured_order_cap(tmp_path):
+    # Codex review #85: an explicitly configured but invalid
+    # circuit_breakers.max_per_order_usd must fail closed -- raise -- rather
+    # than silently keep the default cap for a live trading stream.
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "midday_dca.json").write_text("{}", encoding="utf-8")
+    (cfg_dir / "budgets.json").write_text(
+        json.dumps({"circuit_breakers": {"max_per_order_usd": float("nan")}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError):
+        load_midday_config(str(cfg_dir))
+
+
+def test_load_midday_config_reads_approved_dates_from_trading_window(tmp_path):
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "midday_dca.json").write_text("{}", encoding="utf-8")
+    (cfg_dir / "trading_window.json").write_text(
+        json.dumps({"start_date": "2026-07-02", "end_date": "2026-07-06", "weekdays_only": True}),
+        encoding="utf-8",
+    )
+
+    cfg = load_midday_config(str(cfg_dir))
+
+    assert cfg.approved_test_dates == frozenset({date(2026, 7, 2), date(2026, 7, 3), date(2026, 7, 6)})
+    assert cfg.decision_time_et is None
+
+
 def test_midday_executor_default_init_loads_shipped_config():
     ex = MiddayDCAExecutor()
     assert ex.config.base_buy_amount_usd == 3.0
     assert ex.config.morning_daily_cap_usd == 90.0
+    assert date(2026, 7, 2) in ex.config.approved_test_dates
+    assert date(2026, 8, 28) in ex.config.approved_test_dates
     assert ex.state_root == DEFAULT_MIDDAY_LIVE_STATE_ROOT
     assert ex.config.sizing_tiers == StrategyConfig().sizing_tiers
 
@@ -442,9 +707,45 @@ def test_midday_ledger_namespace_isolated_from_morning_and_afternoon(tmp_path):
     ex = MiddayDCAExecutor(cfg)
     assert ex.ledger.namespace == "midday"
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
-    ex.run(_now_midday(), data)
+    ex.run(_now_midday(), data, broker=FakeLiveBroker())
     assert afternoon.day_notional(day) == 0.0
     assert ex.ledger.day_planned(day) > 0.0
+
+
+def test_manual_midday_run_with_wrong_broker_account_raises_before_ordering(tmp_path):
+    import pytest
+
+    class _WrongAccountBroker:
+        def __init__(self):
+            self.buying_power_checked = False
+            self.placed = False
+
+        def account_number(self):
+            return "not-the-approved-account"
+
+        def available_buying_power(self):
+            self.buying_power_checked = True
+            raise AssertionError("buying power should not be checked for wrong account")
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.placed = True
+            raise AssertionError("orders must not be placed for wrong account")
+
+    cfg = MiddayConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "midday"),
+        target_account_number="562057042",
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    broker = _WrongAccountBroker()
+    ex = MiddayDCAExecutor(cfg)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    with pytest.raises(RuntimeError, match="broker account mismatch: expected 562057042, got not-the-approved-account"):
+        ex.run(_now_midday(), data, manual=True, broker=broker)
+
+    assert broker.buying_power_checked is False
+    assert broker.placed is False
 
 
 # --- Schema validation ------------------------------------------------------

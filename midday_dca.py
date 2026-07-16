@@ -36,31 +36,25 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Tuple
 
+from dca_config import load_approved_dates
 from morning_dca import (
     DEFAULT_MORNING_LIVE_STATE_ROOT,
     EXEC_MANUAL_REVIEW_CANDIDATE,
     MorningConfig,
     MorningDCAExecutor,
     MorningSignal,
+    TopUpOutcome,
 )
 from near_close_dca import (
     ACTIVE_TICKERS,
-    EASTERN,
     EXCLUDED_TICKERS,
-    TOP_UP_INCREMENTAL,
-    TOP_UP_MISSING_PRIOR_PRICE,
-    TOP_UP_NO_INCREMENTAL,
-    TOP_UP_NO_PRIOR_RUN,
-    TOP_UP_PRICE_NOT_BELOW,
-    Action,
-    PriorSameDayAllocation,
     StrategyConfig,
-    load_prior_same_day_allocations,
 )
 
 _log = logging.getLogger(__name__)
@@ -144,21 +138,9 @@ class MiddayConfig(MorningConfig):
     )
 
 
-@dataclass(frozen=True)
-class MiddayTopUpOutcome:
-    """Per-ticker result of the midday same-day prior-run offset/top-up guard."""
-
-    ticker: str
-    desired_amount: float
-    decision_price: Optional[float]
-    prior_same_day_amount: float
-    prior_same_day_reference_price: Optional[float]
-    prior_same_day_run_id: Optional[str]
-    prior_same_day_source: Optional[str]
-    incremental_order_amount: float
-    top_up_guard_result: str
-    top_up_skipped: bool
-    top_up_manual_review: bool = False
+# Backwards-compatibility alias; the type now lives in morning_dca so both
+# streams share the same guard shape and evaluation logic.
+MiddayTopUpOutcome = TopUpOutcome
 
 
 def load_midday_config(config_dir=None) -> MiddayConfig:
@@ -189,15 +171,21 @@ def load_midday_config(config_dir=None) -> MiddayConfig:
     cfg_path = config_dir_path / "midday_dca.json"
     if not cfg_path.exists():
         _log.warning("midday_dca.json not found at %s; using MiddayConfig defaults", cfg_path)
-        return MiddayConfig()
+        return MiddayConfig(
+            approved_test_dates=load_approved_dates(config_dir_path).get("approved_test_dates", frozenset())
+        )
+
+    approved_date_overrides = {
+        "approved_test_dates": load_approved_dates(config_dir_path).get("approved_test_dates", frozenset())
+    }
 
     try:
         raw = json.loads(cfg_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
         _log.warning("could not parse %s (%s); using MiddayConfig defaults", cfg_path, exc)
-        return MiddayConfig()
+        return MiddayConfig(**approved_date_overrides)
 
-    kwargs: Dict[str, Any] = {}
+    kwargs: Dict[str, Any] = dict(approved_date_overrides)
     if "trend_min_bars" in raw:
         kwargs["trend_min_bars"] = int(raw["trend_min_bars"])
 
@@ -229,6 +217,48 @@ def load_midday_config(config_dir=None) -> MiddayConfig:
     roots = artifact_paths.get("prior_allocation_roots")
     if isinstance(roots, list) and roots:
         kwargs["prior_allocation_roots"] = tuple(str(r) for r in roots)
+
+    # Load the configured ticker whitelist from config/tickers.json, the same
+    # version-controlled source near_close_dca's afternoon stream reads via
+    # dca_config.load_strategy_config -- otherwise this stream silently trades
+    # the hardcoded ACTIVE_TICKERS/EXCLUDED_TICKERS module defaults even after
+    # the whitelist is edited.
+    from dca_config import load_tickers
+
+    ticker_data = load_tickers(config_dir_path)
+    if "tickers" in ticker_data:
+        kwargs["tickers"] = ticker_data["tickers"]
+    if "excluded_tickers" in ticker_data:
+        kwargs["excluded_tickers"] = ticker_data["excluded_tickers"]
+
+    # Load max_per_order_usd from the shared budgets.json circuit_breakers block so
+    # an emergency cap change applies to the midday stream without touching code
+    # constants. The whole file being absent/corrupt still degrades gracefully to
+    # the default cap, but a key that IS present with an invalid value (non-finite,
+    # non-positive, or unparseable) fails closed -- raises -- rather than silently
+    # trading under a stale default cap for a live trading stream.
+    budgets_path = config_dir_path / "budgets.json"
+    if budgets_path.exists():
+        try:
+            budgets_raw = json.loads(budgets_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            _log.warning("could not parse %s (%s); using MiddayConfig cap default", budgets_path, exc)
+            budgets_raw = None
+        if budgets_raw is not None:
+            cb = budgets_raw.get("circuit_breakers", {})
+            if "max_per_order_usd" in cb:
+                raw_cap = cb["max_per_order_usd"]
+                try:
+                    max_order = float(raw_cap)
+                except (TypeError, ValueError):
+                    max_order = None
+                if max_order is None or not (math.isfinite(max_order) and max_order > 0):
+                    raise ValueError(
+                        f"config/budgets.json circuit_breakers.max_per_order_usd={raw_cap!r} "
+                        "is present but not a positive finite number; refusing to silently "
+                        "fall back to a default per-order cap for a live trading stream"
+                    )
+                kwargs["max_per_order_usd"] = max_order
 
     return MiddayConfig(**kwargs)
 
@@ -266,111 +296,7 @@ class MiddayDCAExecutor(MorningDCAExecutor):
     def _load_default_config(self, config_dir: Optional[str], mode: str) -> MiddayConfig:
         return load_midday_config(config_dir)
 
-    # -- Top-up guard (morning/manual prior-allocation offset) ---------------
-    def _load_prior_allocations(self, now: datetime, trading_day: date) -> Dict[str, PriorSameDayAllocation]:
-        """Aggregate morning/manual prior same-day allocations across all roots.
-
-        When a ticker appears in more than one root the dollar amounts are summed
-        and the lowest available reference price wins, so midday must beat the
-        best earlier entry price before it tops up (mirrors
-        :func:`load_prior_same_day_allocations`'s within-root merge).
-
-        The scan is capped at the actual run time so replayed/backfilled midday
-        runs never load fills that were created after the 12:30 decision window.
-        """
-        boundary_et = now.astimezone(EASTERN).time()
-        merged: Dict[str, PriorSameDayAllocation] = {}
-        roots = getattr(self.config, "prior_allocation_roots", (DEFAULT_MORNING_LIVE_STATE_ROOT,))
-        for root in roots:
-            allocations = load_prior_same_day_allocations(
-                root, trading_day, boundary_et=boundary_et
-            )
-            for ticker, alloc in allocations.items():
-                existing = merged.get(ticker)
-                if existing is None:
-                    merged[ticker] = alloc
-                    continue
-                if existing.reference_price is None or alloc.reference_price is None:
-                    ref = None
-                else:
-                    ref = min(existing.reference_price, alloc.reference_price)
-                merged[ticker] = PriorSameDayAllocation(
-                    ticker=ticker,
-                    amount_usd=existing.amount_usd + alloc.amount_usd,
-                    reference_price=ref,
-                    run_id=alloc.run_id or existing.run_id,
-                    source=alloc.source or existing.source,
-                )
-        return merged
-
-    def _evaluate_top_up(
-        self, signal: MorningSignal, prior: Optional[PriorSameDayAllocation]
-    ) -> MiddayTopUpOutcome:
-        """Apply the same-day top-up rule to one midday buy candidate.
-
-          * No earlier same-day allocation -> normal allocation (full desired).
-          * Earlier allocation and midday price strictly below the prior
-            reference -> buy only the incremental difference (desired - prior);
-            $0 if <= 0.
-          * Earlier allocation but midday price not below the reference -> $0.
-          * Prior amount known but no comparable price -> conservative $0 with
-            manual review flagged.
-        """
-        desired = round(signal.hypothetical_amount_usd, 2)
-        price = signal.current_price
-
-        def _outcome(
-            incremental: float, result: str, *, skipped: bool, manual_review: bool = False
-        ) -> MiddayTopUpOutcome:
-            return MiddayTopUpOutcome(
-                ticker=signal.ticker,
-                desired_amount=desired,
-                decision_price=price,
-                prior_same_day_amount=round(prior.amount_usd, 2) if prior else 0.0,
-                prior_same_day_reference_price=prior.reference_price if prior else None,
-                prior_same_day_run_id=prior.run_id if prior else None,
-                prior_same_day_source=prior.source if prior else None,
-                incremental_order_amount=round(max(0.0, incremental), 2),
-                top_up_guard_result=result,
-                top_up_skipped=skipped,
-                top_up_manual_review=manual_review,
-            )
-
-        if prior is None or prior.amount_usd <= 0:
-            return _outcome(desired, TOP_UP_NO_PRIOR_RUN, skipped=desired <= 0)
-        if prior.reference_price is None or price is None:
-            return _outcome(0.0, TOP_UP_MISSING_PRIOR_PRICE, skipped=True, manual_review=True)
-        if price >= prior.reference_price:
-            return _outcome(0.0, TOP_UP_PRICE_NOT_BELOW, skipped=True)
-        incremental = desired - round(prior.amount_usd, 2)
-        if incremental <= 0:
-            return _outcome(0.0, TOP_UP_NO_INCREMENTAL, skipped=True)
-        return _outcome(incremental, TOP_UP_INCREMENTAL, skipped=False)
-
-    # -- Reuse hooks ---------------------------------------------------------
-    def _compute_top_up(
-        self, now: datetime, signals: Sequence[MorningSignal]
-    ) -> Dict[str, MiddayTopUpOutcome]:
-        trading_day = now.astimezone(EASTERN).date()
-        prior_allocations = self._load_prior_allocations(now, trading_day)
-        outcomes: Dict[str, MiddayTopUpOutcome] = {}
-        for signal in signals:
-            if signal.action != Action.BUY or signal.multiplier <= 0:
-                continue
-            outcomes[signal.ticker] = self._evaluate_top_up(
-                signal, prior_allocations.get(signal.ticker)
-            )
-        return outcomes
-
-    def _effective_buy_amount(
-        self, signal: MorningSignal, top_up_outcomes: Optional[Dict[str, Any]]
-    ) -> float:
-        if top_up_outcomes:
-            outcome = top_up_outcomes.get(signal.ticker)
-            if outcome is not None:
-                return outcome.incremental_order_amount
-        return signal.hypothetical_amount_usd
-
+    # -- Reuse hooks (stream-specific field names) ---------------------------
     def _augment_buy_candidate_row(
         self, row: Dict[str, Any], signal: MorningSignal, top_up_outcomes: Optional[Dict[str, Any]]
     ) -> None:

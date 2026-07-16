@@ -16,6 +16,7 @@ from dca_reporting import (
     build_latest_run_summary,
     build_missing_fills,
     compute_slippage_rows,
+    fills_from_order_history_payload,
     generate_reports,
     rank_slippage,
 )
@@ -64,6 +65,51 @@ def _fills():
         {"ticker": "NVDA", "fill_price": 49.5, "filled_qty": 0.0606, "order_id": "O2"},
         {"ticker": "AMD", "fill_price": 30.0, "filled_qty": 0.05, "order_id": "O3"},
     ]
+
+
+def test_fills_from_order_history_payload_shapes():
+    # Bare list, {"orders": [...]}, and normalized {"data": ...} pointer all work.
+    orders = [
+        {
+            "ticker": "AAPL",
+            "id": "O1",
+            "executions": [
+                {"quantity": "0.01", "price": "100.0"},
+                {"quantity": "0.01", "price": "102.0"},
+            ],
+        },
+        {"symbol": "NVDA", "order_id": "O2", "filled_qty": "0.06", "filled_avg_price": "49.5"},
+        {"ticker": "SKIP", "id": "O3", "quantity": "0"},  # no executed qty -> skipped
+    ]
+    for payload in (orders, {"orders": orders}, {"results": orders}, {"output_path": "x", "data": orders}):
+        fills = fills_from_order_history_payload(payload)
+        by_ticker = {f["ticker"]: f for f in fills}
+        assert set(by_ticker) == {"AAPL", "NVDA"}
+        # AAPL avg = weighted mean of executions = 101.0 across 0.02 shares.
+        assert abs(by_ticker["AAPL"]["filled_avg_price"] - 101.0) < 1e-9
+        assert abs(by_ticker["AAPL"]["filled_qty"] - 0.02) < 1e-9
+        assert by_ticker["AAPL"]["executions"] == 2
+        assert by_ticker["AAPL"]["order_id"] == "O1"
+        # NVDA falls back to filled_avg_price when no executions list is present.
+        assert abs(by_ticker["NVDA"]["fill_price"] - 49.5) < 1e-9
+
+
+def test_fills_from_order_history_payload_feeds_slippage():
+    payload = {"orders": [
+        {"ticker": "AAPL", "id": "O1", "filled_qty": "0.0198", "filled_avg_price": "101.0"},
+        {"ticker": "NVDA", "id": "O2", "filled_qty": "0.0606", "filled_avg_price": "49.5"},
+    ]}
+    fills = fills_from_order_history_payload(payload)
+    rows = compute_slippage_rows(_run_state()["buy_candidates"], fills)
+    by_ticker = {r["ticker"]: r for r in rows}
+    assert abs(by_ticker["AAPL"]["slippage_pct"] - 1.0) < 1e-6
+    assert by_ticker["NVDA"]["slippage_pct"] < 0
+
+
+def test_fills_from_order_history_payload_empty():
+    assert fills_from_order_history_payload({}) == []
+    assert fills_from_order_history_payload([]) == []
+    assert fills_from_order_history_payload({"orders": []}) == []
 
 
 def test_target_price_missing_excludes_slippage():
@@ -529,6 +575,94 @@ def test_load_json_files_skips_manual_states(tmp_path):
     # The Friday dashboard is scheduled-live only: manual runs are dropped.
     assert len(loaded) == 1
     assert loaded[0]["trading_day"] == "2026-06-29"
+
+
+# --- PR #22 bot-review regression coverage (batch: order-history parsing) ----
+# Each test below reproduces one unresolved chatgpt-codex-connector review
+# comment on PR #22 against the current fills_from_order_history_payload /
+# _order_list_from_payload implementation, before any fix is applied.
+
+
+def test_fills_from_order_history_payload_ignores_unfilled_order_quantity():
+    # Codex review: "Do not treat order quantity as executed fills." An
+    # unfilled/open/rejected order carries only the original requested
+    # "quantity" with no executions/filled_qty/cumulative_quantity -- that
+    # must not be reported as an executed fill (it would falsely show the
+    # candidate as filled with coverage/slippage numbers).
+    payload = {"orders": [
+        {"ticker": "AAPL", "id": "O1", "quantity": "5", "status": "rejected"},
+    ]}
+    fills = fills_from_order_history_payload(payload)
+    assert fills == []
+
+
+def test_fills_from_order_history_payload_maps_ticker_by_order_id():
+    # Codex review: "Preserve ticker context when parsing order history." The
+    # live-adapter order shape (id/cumulative_quantity/average_price) often
+    # carries no ticker/symbol field at all because the request itself was
+    # symbol- or order-id-scoped. The caller must be able to supply an
+    # order_id -> ticker map so the fill isn't dropped for lack of an inline
+    # ticker field.
+    payload = {"orders": [
+        {"id": "O1", "cumulative_quantity": "0.02", "average_price": "101.0"},
+    ]}
+    fills = fills_from_order_history_payload(payload, order_id_to_ticker={"O1": "AAPL"})
+    assert len(fills) == 1
+    assert fills[0]["ticker"] == "AAPL"
+    assert fills[0]["order_id"] == "O1"
+
+
+def test_fills_from_order_history_payload_unwraps_nested_data_envelopes():
+    # Codex review: "Unwrap normalized order-history envelopes recursively."
+    # save_raw_input() normalizing a raw Robinhood envelope that is itself
+    # {"data": {"orders": [...]}} produces a doubly-nested pointer:
+    # {"output_path": ..., "data": {"data": {"orders": [...]}}}. The parser
+    # must keep unwrapping "data" layers until it finds an orders/results list.
+    orders = [{"ticker": "AAPL", "id": "O1", "filled_qty": "0.02", "filled_avg_price": "101.0"}]
+    payload = {"output_path": "x", "data": {"data": {"orders": orders}}}
+    fills = fills_from_order_history_payload(payload)
+    assert len(fills) == 1
+    assert fills[0]["ticker"] == "AAPL"
+
+
+def test_fills_from_order_history_payload_skips_fills_with_no_price():
+    # Codex review: "Require fill prices before reporting order-history
+    # fills." An executed quantity with no price anywhere (no executions, no
+    # filled_avg_price/average_price/price) must not be reported as a priced
+    # fill -- compute_slippage_rows coerces a missing price to 0.0, which
+    # would show false coverage and a false -100% slippage number.
+    payload = {"orders": [
+        {"ticker": "AAPL", "id": "O1", "filled_qty": "0.02"},
+    ]}
+    fills = fills_from_order_history_payload(payload)
+    assert fills == []
+
+
+def test_fills_from_order_history_payload_rejects_zero_priced_executions():
+    # Codex review: "Reject unpriced executions instead of zeroing them." An
+    # execution with a quantity but a blank/missing price must not be coerced
+    # to price=0.0 and folded into the weighted average -- that would drag an
+    # otherwise-valid fill toward a false, understated price (or, if every
+    # execution is unpriced, a false $0 fill showing -100% slippage) instead
+    # of the fill being reported as missing/unpriced.
+    payload = {"orders": [
+        # Every execution lacks a price -> no resolvable price anywhere -> skipped.
+        {"ticker": "AAPL", "id": "O1", "executions": [
+            {"quantity": "0.02", "price": None},
+        ]},
+        # One priced execution and one unpriced execution -> average must come
+        # from the priced execution alone (100.0), not diluted by the unpriced
+        # quantity toward a lower blended price.
+        {"ticker": "NVDA", "id": "O2", "executions": [
+            {"quantity": "0.01", "price": "100.0"},
+            {"quantity": "0.01", "price": None},
+        ]},
+    ]}
+    fills = fills_from_order_history_payload(payload)
+    by_ticker = {f["ticker"]: f for f in fills}
+    assert set(by_ticker) == {"NVDA"}
+    assert abs(by_ticker["NVDA"]["fill_price"] - 100.0) < 1e-9
+    assert abs(by_ticker["NVDA"]["filled_qty"] - 0.01) < 1e-9
 
 
 def _run_all():

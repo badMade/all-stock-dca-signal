@@ -28,9 +28,10 @@ import argparse
 import csv
 import json
 import logging
-from datetime import datetime, time, timedelta
+import shutil
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from dca_config import DEFAULT_CONFIG_DIR, load_strategy_config
 from midday_dca import DEFAULT_MIDDAY_LIVE_STATE_ROOT
@@ -48,6 +49,12 @@ from near_close_dca import (
     load_prior_same_day_allocations,
     load_prior_same_day_allocations_multi,
     run_daily_compact,
+)
+from scripts.run_classification import (
+    build_raw_persistence_state,
+    raw_persistence_failure_run_state,
+    save_raw_input,
+    update_latest_scheduled_run_pointer,
 )
 
 logger = logging.getLogger("near_close_dca.run")
@@ -185,6 +192,8 @@ def run_pipeline(
     prior_allocation_state_root: Optional[str | Path] = None,
     deployment_history_root: Optional[str | Path] = None,
     classification_state_root: Optional[str | Path] = None,
+    raw_connector_inputs: Optional[Mapping[str, Any]] = None,
+    required_raw_filenames: Optional[frozenset] = None,
 ) -> Dict[str, Any]:
     """Run one compact DCA cycle and (optionally) the full post-trade report set.
 
@@ -206,12 +215,114 @@ def run_pipeline(
     prior days' ``run_state.json`` artifacts. Defaults to ``artifacts_dir``'s
     parent, since the live task's per-day directories are its siblings.
 
+    ``raw_connector_inputs`` lets the scheduler hand in raw connector responses
+    before signal computation. Scheduled runs persist these under the run's
+    ``raw/`` directory and stamp the saved-file manifest into ``run_state.json``;
+    if persistence or normalization fails, the pipeline writes the documented
+    no-order error run_state and returns without computing or placing.
+
+    ``required_raw_filenames`` declares the complete set of filenames the
+    scheduler expects to be present in ``raw_connector_inputs`` for a live run.
+    When provided and ``dry_run=False``, any missing filename is treated as a
+    persistence failure and routes through the fail-closed error state rather
+    than proceeding to compute with an incomplete raw payload set.
+
     ``classification_state_root`` is passed through to ``near_close_dca.run_once``
     for a scheduled run: it is where ``latest_scheduled_run.json`` is
     written/updated (see ``scripts.run_classification``). Opt-in only: when not
     given, no ``latest_scheduled_run.json`` write is attempted at all, so a
     caller must pass the real cron_tracking root explicitly to enable it.
     """
+    raw_persistence_state: Optional[Dict[str, object]] = None
+    if scheduled:
+        trading_day_et = now.astimezone(EASTERN).date()
+        trading_day_raw = trading_day_et.isoformat()
+        # Only persist raw inputs on approved trading days; unapproved days let
+        # run_daily_compact write the normal blocked stub without side effects.
+        if trading_day_et in config.approved_test_dates:
+            # Always save raw inputs directly under artifacts_dir/raw so the raw
+            # directory is co-located with run_state.json regardless of layout.
+            raw_dir = Path(artifacts_dir) / "raw"
+            # Live runs (dry_run=False) require non-empty raw_connector_inputs.
+            # Dry-run callers that have not yet been updated may omit entirely.
+            # Both None and empty-dict on live runs go through the fail-closed path
+            # (inside the try) so a durable no-order run_state is always written.
+            _needs_raw = raw_connector_inputs is not None or not config.dry_run
+            if _needs_raw:
+                try:
+                    if raw_connector_inputs is None or (not config.dry_run and not raw_connector_inputs):
+                        raise RuntimeError(
+                            "scheduled live run requires non-empty raw_connector_inputs; "
+                            "omitting or passing an empty mapping on a live run allows orders "
+                            "without persisting connector responses first"
+                        )
+                    if required_raw_filenames and not config.dry_run:
+                        missing = required_raw_filenames - set(raw_connector_inputs.keys())
+                        if missing:
+                            raise RuntimeError(
+                                f"scheduled live run: required raw inputs absent from "
+                                f"raw_connector_inputs: {sorted(missing)}"
+                            )
+                    # Clear any stale raw files from prior attempts so the saved-file
+                    # manifest only reflects what this run persists.
+                    if raw_dir.exists():
+                        shutil.rmtree(raw_dir)
+                    for filename, payload in raw_connector_inputs.items():
+                        path = save_raw_input(
+                            trading_day_raw, filename, payload, raw_dir=raw_dir
+                        )
+                        written = json.loads(path.read_text(encoding="utf-8"))
+                        if "normalize_error" in written:
+                            raise RuntimeError(
+                                f"normalization failed for {filename!r}: {written['normalize_error']}"
+                            )
+                    raw_persistence_state = build_raw_persistence_state(
+                        trading_day_raw, raw_dir=raw_dir
+                    )
+                except Exception as exc:  # noqa: BLE001 - failure must still write durable scheduled state
+                    # Remove any partially-written raw files so raw_inputs_saved is []
+                    if raw_dir.exists():
+                        shutil.rmtree(raw_dir, ignore_errors=True)
+                    out = Path(artifacts_dir)
+                    out.mkdir(parents=True, exist_ok=True)
+                    # Remove stale compact and report artifacts from any prior
+                    # attempt so they are not mistaken for this failed run's output.
+                    for _stale in (
+                        "signals.csv", "buy_candidates.csv", "orders.csv",
+                        "latest_run_summary.json", "slippage_and_coverage_report.md",
+                        "slippage_ranked.csv", "missing_fills_report.csv",
+                        "notion_latest_run_compact.md", "notion_latest_run_payload.json",
+                    ):
+                        (out / _stale).unlink(missing_ok=True)
+                    failure_state = raw_persistence_failure_run_state(
+                        trading_day_raw,
+                        str(exc),
+                        raw_dir=raw_dir,
+                        broker=config.broker.value,
+                        triggered_at_utc=now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        generated_at=now.astimezone(EASTERN).strftime("%Y-%m-%dT%H:%M:%S"),
+                        budget={
+                            "budget_tier": state.current_tier().name,
+                            "daily_cap_usd": state.current_tier().daily_cap_usd,
+                            "weekly_cap_usd": state.effective_weekly_cap(),
+                        },
+                    )
+                    run_state_path = out / "run_state.json"
+                    run_state_path.write_text(json.dumps(failure_state, indent=2) + "\n", encoding="utf-8")
+                    if classification_state_root is not None:
+                        update_latest_scheduled_run_pointer(
+                            failure_state, run_state_path, base=Path(classification_state_root)
+                        )
+                    return {
+                        "run_label": run_label,
+                        "scheduled": scheduled,
+                        "compact": True,
+                        "blocked": False,
+                        "raw_persistence_error": str(exc),
+                        "artifacts_dir": str(out),
+                        "run_state_path": str(run_state_path),
+                    }
+
     if scheduled and prior_same_day_allocations is None:
         trading_day = now.astimezone(EASTERN).date()
         if prior_allocation_state_root is None:
@@ -276,6 +387,7 @@ def run_pipeline(
         prior_same_day_allocations=prior_same_day_allocations,
         deployment_history_root=deployment_history_root,
         classification_state_root=classification_state_root,
+        raw_persistence_state=raw_persistence_state,
     )
     if result.get("blocked"):
         logger.warning("run blocked by date gate for %s; skipping reports", result.get("run_state_path"))

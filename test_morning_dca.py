@@ -13,6 +13,8 @@ import json
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
+import pytest
+
 from morning_dca import (
     DEFAULT_MORNING_LIVE_STATE_ROOT,
     DEFAULT_MORNING_PREFLIGHT_STATE_ROOT,
@@ -29,9 +31,12 @@ from morning_dca import (
     MorningConfig,
     MorningDCAExecutor,
     MorningLedger,
+    MorningSignal,
+    TopUpOutcome,
     load_same_day_preflight,
     nyse_holidays,
     preflight_eligibility,
+    preflight_ticker_eligibility_row,
 )
 from near_close_dca import EASTERN, Action, Bar, SourceName
 
@@ -96,6 +101,35 @@ class DecliningBarsProvider(FixedDropProvider):
                 price = final_price
             bars.append(Bar(timestamp=ts, open=price, high=price, low=price, close=price, volume=100.0))
         return bars
+
+
+class FakeLiveBroker:
+    """Minimal successful broker for scheduled live tests."""
+
+    def account_number(self):
+        from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+    def available_buying_power(self):
+        return 500.0
+
+    def same_day_strategy_order_exists(self, ticker, trading_day):
+        return False
+
+    def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+        # No duplicate: this fake broker never has prior orders on file, so
+        # guarded top-ups always proceed as fresh placements.
+        return False
+
+    def is_tradable_for_fractional_buy(self, ticker):
+        return True
+
+    def review_market_buy(self, ticker, notional_usd):
+        return True, "ok"
+
+    def place_market_buy(self, ticker, notional_usd, ref_id):
+        return f"ORDER-{ticker}"
 
 
 def _now():
@@ -616,6 +650,44 @@ class FewBarsProvider(FixedDropProvider):
         ]
 
 
+class StaleBarsProvider(FixedDropProvider):
+    """Provider that stops updating well before the completed-bar anchor."""
+
+    def get_intraday_bars(self, ticker, start, end, interval_minutes):
+        price = self._prev * (1.0 - self._drops.get(ticker, 0.0))
+        bars = []
+        cursor = start
+        stale_end = start + timedelta(minutes=25)
+        while cursor <= stale_end:
+            bars.append(Bar(timestamp=cursor, open=price + 1.0, high=price + 1.0, low=price, close=price, volume=100.0))
+            cursor += timedelta(minutes=interval_minutes)
+        return bars
+
+
+def test_live_confidence_rule_rejects_stale_decision_anchor_bars():
+    cfg = MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0)
+    ex = MorningDCAExecutor(cfg, mode="live")
+    data = StaleBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+
+    sig = ex.evaluate(_now_live(), data, manual=True)[0]
+
+    assert sig.action == Action.NO_DATA
+    assert sig.current_price is None
+    assert any("rejecting stale data" in warning for warning in sig.warnings)
+
+
+def test_live_confidence_rule_rejects_trend_with_stale_latest_bar():
+    cfg = MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0)
+    ex = MorningDCAExecutor(cfg, mode="live")
+    data = StaleBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+
+    warnings = []
+    bars = data.get_intraday_bars("BIG", _now_live() - timedelta(hours=1), _now_live(), 5)
+
+    assert ex._trend_validated(bars, _now_live(), warnings) is False
+    assert any("older than one interval" in warning for warning in warnings)
+
+
 def test_live_confidence_rule_withholds_when_trend_unvalidated(tmp_path):
     # Price/drop passes, but too few intraday bars means the trend cannot be
     # validated -> the candidate is a manual_review_candidate, NOT auto-bought.
@@ -812,6 +884,23 @@ def test_load_morning_config_reads_config_file(tmp_path):
     assert cfg.morning_run_state_root == "/custom/morning/root"
 
 
+
+def test_load_morning_config_reads_approved_dates_from_trading_window(tmp_path):
+    from morning_dca import load_morning_config
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "morning_dca.json").write_text("{}", encoding="utf-8")
+    (cfg_dir / "trading_window.json").write_text(
+        json.dumps({"start_date": "2026-07-02", "end_date": "2026-07-06", "weekdays_only": True}),
+        encoding="utf-8",
+    )
+
+    cfg = load_morning_config(str(cfg_dir))
+
+    assert cfg.approved_test_dates == frozenset({date(2026, 7, 2), date(2026, 7, 3), date(2026, 7, 6)})
+    assert cfg.decision_time_et is None
+
 def test_load_morning_config_falls_back_to_defaults_if_missing(tmp_path):
     """load_morning_config gracefully falls back when file is absent."""
     from morning_dca import load_morning_config
@@ -822,11 +911,89 @@ def test_load_morning_config_falls_back_to_defaults_if_missing(tmp_path):
     assert cfg.morning_daily_cap_usd == defaults.morning_daily_cap_usd
 
 
+# --- PR #22 bot-review regression coverage (batch: morning config loading) ---
+
+
+def test_load_morning_config_reads_configured_ticker_whitelist(tmp_path):
+    # Codex review #71: the morning live stream must load its ticker whitelist
+    # from config/tickers.json (the same source near_close_dca's afternoon
+    # stream reads via dca_config.load_strategy_config), not only the
+    # hardcoded module-level ACTIVE_TICKERS/EXCLUDED_TICKERS defaults.
+    from morning_dca import load_morning_config
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "morning_dca.json").write_text("{}", encoding="utf-8")
+    (cfg_dir / "tickers.json").write_text(
+        json.dumps({"active": ["ZZZZ"], "excluded": ["YYYY"]}),
+        encoding="utf-8",
+    )
+
+    cfg = load_morning_config(str(cfg_dir))
+
+    assert cfg.tickers == ("ZZZZ",)
+    assert cfg.excluded_tickers == frozenset({"YYYY"})
+
+
+def test_load_morning_config_raises_on_invalid_configured_order_cap(tmp_path):
+    # Codex review #85: an explicitly configured but invalid
+    # circuit_breakers.max_per_order_usd (non-finite, non-positive, or
+    # unparseable) must fail closed -- raise -- rather than silently keep the
+    # default cap for a live trading stream.
+    from morning_dca import load_morning_config
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "morning_dca.json").write_text("{}", encoding="utf-8")
+    (cfg_dir / "budgets.json").write_text(
+        json.dumps({"circuit_breakers": {"max_per_order_usd": -5}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError):
+        load_morning_config(str(cfg_dir))
+
+
+def test_augment_artifacts_appends_top_up_manual_review_candidate_row():
+    # Codex review #82: a new top-up-manual-review ticker must also get a row
+    # in the manual_review_candidates detail list, not just an incremented
+    # count and a ticker appended to manual_review_tickers.
+    cfg = MorningConfig(tickers=("AAPL",))
+    ex = MorningDCAExecutor(cfg)
+    outcome = TopUpOutcome(
+        ticker="AAPL",
+        desired_amount=6.0,
+        decision_price=99.0,
+        prior_same_day_amount=3.0,
+        prior_same_day_reference_price=None,
+        prior_same_day_run_id="manual_am",
+        prior_same_day_source="manual",
+        incremental_order_amount=0.0,
+        top_up_guard_result="missing_prior_price",
+        top_up_skipped=True,
+        top_up_manual_review=True,
+    )
+    artifacts = {
+        "counts": {"manual_review_candidates": 0},
+        "manual_review_tickers": [],
+        "manual_review_candidates": [],
+    }
+
+    ex._augment_artifacts(artifacts, {"AAPL": outcome})
+
+    assert artifacts["counts"]["manual_review_candidates"] == 1
+    assert artifacts["manual_review_tickers"] == ["AAPL"]
+    assert len(artifacts["manual_review_candidates"]) == 1
+    assert artifacts["manual_review_candidates"][0]["ticker"] == "AAPL"
+
+
 def test_morning_executor_default_init_loads_config_file():
     """MorningDCAExecutor() with no args loads from the shipped config/morning_dca.json."""
     ex = MorningDCAExecutor()
     assert ex.config.base_buy_amount_usd == 3.0
     assert ex.config.morning_daily_cap_usd == 90.0
+    assert date(2026, 7, 2) in ex.config.approved_test_dates
+    assert date(2026, 8, 28) in ex.config.approved_test_dates
 
 
 def test_classifications_validate_against_json_schema():
@@ -896,7 +1063,7 @@ def test_preflight_run_writes_validation_and_summary_and_pointer(tmp_path):
     assert art["mode"] == "preflight"
     assert art["trades"] is False
     assert art["run_classification"]["run_type"] == "morning_dca_preflight"
-    assert art["run_classification"]["state_schema_version"] == "morning-preflight-v1"
+    assert art["run_classification"]["state_schema_version"] == "morning-preflight-v2-machine-complete"
     assert art["eligible_to_execute_tickers"] == ["BIG"]
     assert art["counts"]["eligible_to_execute"] == 1
     # Every signal row carries the per-ticker verdict.
@@ -912,6 +1079,156 @@ def test_preflight_run_writes_validation_and_summary_and_pointer(tmp_path):
     assert not (Path(tmp_path) / "latest_morning_run.json").exists()
 
 
+# --- Machine-complete pre-flight contract (morning-preflight-v2) ------------
+_MACHINE_TICKER_FIELDS = {
+    "symbol", "active_universe", "quote_available", "prior_close_available",
+    "tradable", "account_ok", "buying_power_ok", "spread_pct", "spread_ok",
+    "trend_status", "data_confidence_status", "early_drop_pct", "early_multiplier",
+    "hypothetical_amount", "eligible_to_execute", "ineligible_reason",
+}
+
+
+class _UnresolvedProvider(FixedDropProvider):
+    """Marks ``unresolved`` symbols as fully unresolvable (no quote, no prior close)."""
+
+    def __init__(self, source, previous_close, drops, unresolved):
+        super().__init__(source, previous_close, drops)
+        self._unresolved = set(unresolved)
+
+    def get_previous_close_bar(self, ticker, as_of):
+        if ticker in self._unresolved:
+            ts = datetime.combine(
+                as_of.astimezone(EASTERN).date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN
+            )
+            return Bar(timestamp=ts, open=-1.0, high=-1.0, low=-1.0, close=-1.0, volume=0.0)
+        return super().get_previous_close_bar(ticker, as_of)
+
+
+def test_preflight_machine_complete_envelope(tmp_path):
+    # Regression: this test previously constructed MorningConfig without a
+    # morning_run_state_root override, so the executor fell back to the
+    # production DEFAULT_MORNING_PREFLIGHT_STATE_ROOT
+    # ("/home/user/workspace/..."). That path doesn't exist (and isn't
+    # writable) on CI runners, so the test failed with PermissionError there
+    # even though it happened to pass on a dev machine that already had the
+    # directory. Every artifact-writing test must scope state under tmp_path.
+    ex = MorningDCAExecutor(
+        MorningConfig(tickers=("BIG", "FLAT"), morning_run_state_root=str(tmp_path)),
+        mode=MORNING_PREFLIGHT_MODE,
+    )
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.03, "FLAT": 0.0})
+    art = ex.run(_now_preflight(), data)["artifacts"]
+
+    # Every required top-level machine field is present.
+    for key in ("overall_ok", "eligible_count", "ineligible_count",
+                "unresolved_tickers", "blocking_errors", "warnings",
+                "run_classification", "per_ticker_eligibility"):
+        assert key in art, key
+
+    # No global failure -> overall_ok true even with an ineligible ticker.
+    assert art["overall_ok"] is True
+    assert art["blocking_errors"] == []
+
+    rows = {r["symbol"]: r for r in art["per_ticker_eligibility"]}
+    # Every active symbol appears exactly once with the full field set.
+    assert set(rows) == {"BIG", "FLAT"}
+    assert len(art["per_ticker_eligibility"]) == 2
+    for row in art["per_ticker_eligibility"]:
+        assert set(row.keys()) == _MACHINE_TICKER_FIELDS
+        # Coarse read-only pre-flight does not bind account/spread/trend.
+        assert row["account_ok"] is None
+        assert row["buying_power_ok"] is None
+        assert row["spread_pct"] is None
+        assert row["spread_ok"] is None
+        assert row["trend_status"] == "not_evaluated_preflight"
+
+    assert rows["BIG"]["eligible_to_execute"] is True
+    assert rows["BIG"]["ineligible_reason"] is None
+    assert rows["FLAT"]["eligible_to_execute"] is False
+    assert rows["FLAT"]["ineligible_reason"] == "no_qualifying_drop"
+
+    assert art["eligible_count"] == 1
+    assert art["ineligible_count"] == 1
+    assert art["unresolved_tickers"] == []
+
+
+def test_preflight_unresolved_ticker_does_not_invalidate_run(tmp_path):
+    # An unresolved symbol (no quote, no prior close) must be a per-symbol row
+    # with eligible_to_execute=false and ineligible_reason='unresolved_ticker',
+    # listed in unresolved_tickers, and MUST NOT flip overall_ok.
+    # Same tmp_path scoping fix as test_preflight_machine_complete_envelope
+    # above: without morning_run_state_root, this writes to the hardcoded
+    # production path and fails with PermissionError on CI runners.
+    ex = MorningDCAExecutor(
+        MorningConfig(tickers=("BIG", "AAAU"), morning_run_state_root=str(tmp_path)),
+        mode=MORNING_PREFLIGHT_MODE,
+    )
+    data = _UnresolvedProvider(
+        SourceName.ROBINHOOD, 100.0, {"BIG": 0.03, "AAAU": 1.0}, unresolved=("AAAU",)
+    )
+    art = ex.run(_now_preflight(), data)["artifacts"]
+
+    assert art["overall_ok"] is True
+    assert "AAAU" in art["unresolved_tickers"]
+    rows = {r["symbol"]: r for r in art["per_ticker_eligibility"]}
+    assert rows["AAAU"]["eligible_to_execute"] is False
+    assert rows["AAAU"]["ineligible_reason"] == "unresolved_ticker"
+    assert rows["AAAU"]["data_confidence_status"] == "unresolved"
+    assert rows["AAAU"]["quote_available"] is False
+    assert rows["AAAU"]["prior_close_available"] is False
+    # BIG still resolves and stays eligible alongside the unresolved row.
+    assert rows["BIG"]["eligible_to_execute"] is True
+
+
+def test_preflight_ticker_eligibility_row_unresolved_unit():
+    sig = MorningSignal(
+        ticker="SPCX",
+        source=SourceName.ROBINHOOD.value,
+        action=Action.NO_DATA,
+        reason="unresolved",
+        current_price=None,
+        previous_close=None,
+        drop_pct=None,
+        multiplier=0.0,
+        hypothetical_amount_usd=0.0,
+        warnings=("lookup failed",),
+    )
+    row = preflight_ticker_eligibility_row(sig)
+    assert set(row.keys()) == _MACHINE_TICKER_FIELDS
+    assert row["symbol"] == "SPCX"
+    assert row["eligible_to_execute"] is False
+    assert row["ineligible_reason"] == "unresolved_ticker"
+    assert row["data_confidence_status"] == "unresolved"
+    assert row["tradable"] is False
+
+
+def test_preflight_machine_complete_validates_against_json_schema(tmp_path):
+    try:
+        import jsonschema
+        from referencing import Registry, Resource
+    except ImportError:
+        return
+
+    schemas_dir = Path(__file__).resolve().parent / "schemas"
+    main = json.loads((schemas_dir / "morning_preflight.schema.json").read_text(encoding="utf-8"))
+    resources = [
+        (name, Resource.from_contents(
+            json.loads((schemas_dir / name).read_text(encoding="utf-8"))))
+        for name in ("morning_preflight.schema.json", "morning_run_classification.schema.json")
+    ]
+    registry = Registry().with_resources(resources)
+
+    ex = MorningDCAExecutor(
+        MorningConfig(tickers=("BIG", "AAAU"), morning_run_state_root=str(tmp_path)),
+        mode=MORNING_PREFLIGHT_MODE,
+    )
+    data = _UnresolvedProvider(
+        SourceName.ROBINHOOD, 100.0, {"BIG": 0.03, "AAAU": 1.0}, unresolved=("AAAU",)
+    )
+    art = ex.run(_now_preflight(), data)["artifacts"]
+    jsonschema.Draft7Validator(main, registry=registry).validate(art)
+
+
 def test_load_same_day_preflight_reads_eligible_set(tmp_path):
     cfg = MorningConfig(tickers=("BIG", "FLAT"), morning_run_state_root=str(tmp_path))
     ex = MorningDCAExecutor(cfg, mode=MORNING_PREFLIGHT_MODE)
@@ -923,6 +1240,55 @@ def test_load_same_day_preflight_reads_eligible_set(tmp_path):
     assert loaded["eligible_tickers"] == {"BIG"}
     # No artifact for a different day.
     assert load_same_day_preflight(str(tmp_path), date(2026, 7, 9)) is None
+
+
+def test_load_same_day_preflight_reads_per_ticker_eligibility_v2(tmp_path):
+    # Codex review #92: a strictly schema-compliant v2 preflight artifact is
+    # only required to carry per_ticker_eligibility, not the legacy
+    # eligible_to_execute_tickers convenience field. The reader must derive
+    # eligibility from per_ticker_eligibility instead of silently returning
+    # an empty set when the legacy field is absent.
+    run_dir = tmp_path / "20260708_0945ET"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps({
+            "run_id": "morning_preflight_20260708",
+            "trading_day": "2026-07-08",
+            "overall_ok": True,
+            "per_ticker_eligibility": [
+                {"symbol": "BIG", "eligible_to_execute": True},
+                {"symbol": "FLAT", "eligible_to_execute": False},
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    loaded = load_same_day_preflight(str(tmp_path), date(2026, 7, 8))
+
+    assert loaded is not None
+    assert loaded["eligible_tickers"] == {"BIG"}
+
+
+def test_load_same_day_preflight_fails_closed_when_overall_ok_false(tmp_path):
+    # Codex review #93: a preflight artifact that explicitly declares itself
+    # invalid (overall_ok=False, e.g. a global/account/buying-power/auth/
+    # schema-write failure) must be treated the same as "no preflight found",
+    # not consumed for whatever eligibility data happens to be present.
+    run_dir = tmp_path / "20260708_0945ET"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps({
+            "run_id": "morning_preflight_20260708",
+            "trading_day": "2026-07-08",
+            "overall_ok": False,
+            "blocking_errors": ["account lookup failed"],
+            # Even if some eligibility data is present, it must not be trusted.
+            "eligible_to_execute_tickers": ["BIG"],
+        }),
+        encoding="utf-8",
+    )
+
+    assert load_same_day_preflight(str(tmp_path), date(2026, 7, 8)) is None
 
 
 def test_live_gate_restricts_to_preflight_eligible(tmp_path):
@@ -943,7 +1309,7 @@ def test_live_gate_restricts_to_preflight_eligible(tmp_path):
         mode=MORNING_LIVE_MODE,
     )
     live_data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10, "FLAT": 0.10})
-    res = live.run(_now_live(), live_data)
+    res = live.run(_now_live(), live_data, broker=FakeLiveBroker())
     art = res["artifacts"]
     # Only BIG was admitted; FLAT (ineligible at 9:45) is gated out even though it
     # would have qualified at 10:30.
@@ -956,19 +1322,44 @@ def test_live_gate_restricts_to_preflight_eligible(tmp_path):
 
 
 def test_live_gate_fails_closed_when_preflight_missing_scheduled(tmp_path):
-    # Scheduled live runs must block (fail-closed) when no preflight artifact exists.
-    import pytest
+    # Scheduled live runs must write a durable blocked run_state (fail-closed)
+    # when no preflight artifact exists, rather than raising and leaving no
+    # artifact for watchdog/reporting to observe.
+    state_root = str(tmp_path / "live")
     live = MorningDCAExecutor(
         MorningConfig(
             tickers=("BIG", "FLAT"),
-            morning_run_state_root=str(tmp_path / "live"),
+            morning_run_state_root=state_root,
             preflight_run_state_root=str(tmp_path / "empty_preflight"),
         ),
         mode=MORNING_LIVE_MODE,
     )
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10, "FLAT": 0.10})
-    with pytest.raises(RuntimeError, match="scheduled live run blocked"):
-        live.run(_now_live(), data)
+    res = live.run(_now_live(), data)
+    art = res["artifacts"]
+    assert art["status"] == "blocked"
+    assert "pre-flight" in art["block_reason"]
+    state_path = Path(res["paths"]["run_state"])
+    assert state_path.exists()
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert persisted["status"] == "blocked"
+    assert persisted["trades"] is False
+    assert persisted["broker_outcomes"] == {}
+
+    # Codex review #77: "write a valid blocked run_state for missing
+    # preflight" -- the persisted artifact must use the normal scheduled
+    # artifact shape (run_id, generated_at, counts, run_classification), and
+    # the latest scheduled pointer must still be updated, so watchdog and
+    # reporting can validate this as a real (blocked) scheduled-run attempt
+    # rather than a malformed/missing one.
+    for key in ("run_id", "generated_at", "counts", "run_classification"):
+        assert key in persisted, f"blocked run_state is missing {key!r}"
+    assert persisted["run_classification"]["run_origin"] == "scheduled"
+    assert persisted["run_classification"]["manual_run"] is False
+    pointer_path = Path(state_root) / "latest_morning_run.json"
+    assert pointer_path.exists()
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    assert pointer["run_id"] == persisted["run_id"]
 
 
 def test_live_gate_degrades_to_full_universe_when_preflight_missing_manual(tmp_path):
@@ -999,7 +1390,7 @@ def test_preflight_classification_matches_morning_schema():
     )
     assert rc["run_type"] == "morning_dca_preflight"
     assert rc["cron_id"] == "morning-dca-0945"
-    assert rc["state_schema_version"] == "morning-preflight-v1"
+    assert rc["state_schema_version"] == "morning-preflight-v2-machine-complete"
     assert rc["run_id"] == "morning_preflight_20260708_0945ET"
     assert set(schema["required"]).issubset(rc.keys())
     try:
@@ -1060,7 +1451,7 @@ def test_live_gate_permits_when_in_approved_window(tmp_path):
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
-    res = ex.run(_now_live(), data, manual=False)
+    res = ex.run(_now_live(), data, manual=False, broker=FakeLiveBroker())
     assert res["artifacts"].get("status") != "blocked"
 
 
@@ -1077,6 +1468,123 @@ def test_live_gate_manual_bypasses_approved_window(tmp_path):
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
     res = ex.run(_now_live(), data, manual=True)
     assert res["artifacts"].get("status") != "blocked"
+
+
+def test_scheduled_live_run_without_broker_fails_closed(tmp_path):
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    res = ex.run(_now_live(), data, broker=None)
+
+    assert res["artifacts"]["status"] == "blocked"
+    assert res["artifacts"]["block_reason"] == "missing broker adapter for scheduled live execution"
+    assert res["artifacts"]["trades"] is True
+    assert res["artifacts"]["broker_outcomes"] == {}
+    written = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
+    assert written["status"] == "blocked"
+    assert written["run_classification"]["run_type"] == "morning_dca_live"
+    # Codex review on PR #22: this fail-closed stub must go through the normal
+    # build_artifacts()/write_artifacts() pipeline, not a hand-rolled dict, so
+    # watchdog/latest-pointer consumers see it as an intentional block rather
+    # than a malformed or missing run.
+    assert written["run_id"]
+    assert written["generated_at"]
+    assert written["counts"]["evaluated"] == 1
+    assert len(written["signal_rows"]) == 1
+    assert "run_state" in res["paths"]
+    assert "latest_morning_run" in res["paths"]
+    pointer_path = Path(res["paths"]["latest_morning_run"])
+    assert pointer_path.exists()
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    assert pointer["run_id"] == written["run_id"]
+
+
+def test_scheduled_live_run_with_wrong_broker_account_fails_closed_before_ordering(tmp_path):
+    class _WrongAccountBroker:
+        def __init__(self):
+            self.placed = False
+
+        def account_number(self):
+            return "not-the-approved-account"
+
+        def available_buying_power(self):
+            raise AssertionError("buying power should not be checked for wrong account")
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.placed = True
+            raise AssertionError("orders must not be placed for wrong account")
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        target_account_number="562057042",
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    broker = _WrongAccountBroker()
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    res = ex.run(_now_live(), data, broker=broker)
+
+    assert res["artifacts"]["status"] == "blocked"
+    assert res["artifacts"]["block_reason"] == (
+        "broker account mismatch: expected 562057042, got not-the-approved-account"
+    )
+    assert broker.placed is False
+    assert Path(res["paths"]["run_state"]).exists()
+    # Same normal-artifact-pipeline requirement as the missing-broker case above.
+    assert res["artifacts"]["run_id"]
+    assert res["artifacts"]["generated_at"]
+    assert res["artifacts"]["counts"]["evaluated"] == 1
+    assert "latest_morning_run" in res["paths"]
+    assert Path(res["paths"]["latest_morning_run"]).exists()
+
+
+def test_manual_live_run_with_wrong_broker_account_raises_before_ordering(tmp_path):
+    import pytest
+
+    class _WrongAccountBroker:
+        def __init__(self):
+            self.buying_power_checked = False
+            self.placed = False
+
+        def account_number(self):
+            return "not-the-approved-account"
+
+        def available_buying_power(self):
+            self.buying_power_checked = True
+            raise AssertionError("buying power should not be checked for wrong account")
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.placed = True
+            raise AssertionError("orders must not be placed for wrong account")
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        target_account_number="562057042",
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    broker = _WrongAccountBroker()
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    with pytest.raises(RuntimeError, match="broker account mismatch: expected 562057042, got not-the-approved-account"):
+        ex.run(_now_live(), data, manual=True, broker=broker)
+
+    assert broker.buying_power_checked is False
+    assert broker.placed is False
 
 
 def test_auto_buy_candidates_prioritized_by_multiplier_when_cap_hit(tmp_path):
@@ -1112,6 +1620,144 @@ def test_auto_buy_candidates_prioritized_by_multiplier_when_cap_hit(tmp_path):
     broker_outcomes = res["artifacts"].get("broker_outcomes", {})
     assert broker_outcomes.get("BIGDROP", {}).get("status") == "submitted", "BIGDROP (5x) should be placed first"
     assert broker_outcomes.get("SMALLDROP", {}).get("status") == "cap_exceeded", "SMALLDROP (1.5x) should be cap-gated out"
+
+
+def test_per_order_cap_blocks_without_any_broker_call(tmp_path):
+    # Codex review #25 on PR #22: the per-order cap should block a candidate
+    # without needing any broker/account round-trip, but _place_broker_orders
+    # unconditionally called broker.available_buying_power() once per batch
+    # BEFORE the per-candidate cap check ran for even the first candidate.
+    # When every candidate in the batch exceeds max_per_order_usd, the broker
+    # must never be touched at all.
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+    class _NoBuyingPowerCallBroker:
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            raise AssertionError(
+                "available_buying_power() must not be called when the "
+                "per-order cap alone blocks every candidate"
+            )
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            raise AssertionError("duplicate-check must not be reached for an over-cap candidate")
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            raise AssertionError("tradability lookup must not be reached for an over-cap candidate")
+
+        def review_market_buy(self, ticker, notional_usd):
+            raise AssertionError("review must not be reached for an over-cap candidate")
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise AssertionError("placement must not be reached for an over-cap candidate")
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("BIGDROP",))
+    cfg = MorningConfig(
+        tickers=("BIGDROP",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        max_per_order_usd=1.0,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIGDROP": 0.08})
+    res = ex.run(_now_live(), data, broker=_NoBuyingPowerCallBroker())
+    broker_outcomes = res["artifacts"].get("broker_outcomes", {})
+    assert broker_outcomes.get("BIGDROP", {}).get("status") == "blocked"
+    assert "per-order ceiling" in broker_outcomes["BIGDROP"]["skip_reason"]
+
+
+class _WideSpreadProvider(DecliningBarsProvider):
+    """A provider exposing a live bid/ask quote with an excessive spread."""
+
+    def __init__(self, *args, spread_pct=5.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._spread_pct = spread_pct
+
+    def get_bid_ask(self, ticker, as_of):
+        midpoint = 100.0
+        half_spread = midpoint * (self._spread_pct / 100.0) / 2.0
+        return (midpoint - half_spread, midpoint + half_spread)
+
+
+def test_spread_breaker_blocks_wide_spread_before_placement(tmp_path):
+    # Codex review #12 on PR #22: the afternoon stream enforces a bid/ask
+    # spread circuit breaker before placing an order (PR #37), but the morning
+    # and midday live streams share the same _place_broker_orders path and had
+    # no equivalent check at all -- a wide-spread 10:30/12:30 candidate would
+    # place directly through tradability/buying-power without ever reading a
+    # quote.
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+    class _FakeLiveBroker:
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            raise AssertionError("tradability must not be reached once the spread breaker blocks")
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise AssertionError("placement must not be reached once the spread breaker blocks")
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("BIGDROP",))
+    cfg = MorningConfig(
+        tickers=("BIGDROP",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        max_bid_ask_spread_pct=1.0,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = _WideSpreadProvider(SourceName.ROBINHOOD, 100.0, {"BIGDROP": 0.08}, spread_pct=5.0)
+    res = ex.run(_now_live(), data, broker=_FakeLiveBroker())
+    broker_outcomes = res["artifacts"].get("broker_outcomes", {})
+    assert broker_outcomes.get("BIGDROP", {}).get("status") == "blocked"
+    assert "spread" in broker_outcomes["BIGDROP"]["skip_reason"]
+
+
+def test_spread_breaker_allows_tight_spread(tmp_path):
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+    class _FakeLiveBroker:
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            return f"ORDER-{ticker}"
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("BIGDROP",))
+    cfg = MorningConfig(
+        tickers=("BIGDROP",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        max_bid_ask_spread_pct=1.0,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = _WideSpreadProvider(SourceName.ROBINHOOD, 100.0, {"BIGDROP": 0.08}, spread_pct=0.2)
+    res = ex.run(_now_live(), data, broker=_FakeLiveBroker())
+    broker_outcomes = res["artifacts"].get("broker_outcomes", {})
+    assert broker_outcomes.get("BIGDROP", {}).get("status") == "submitted"
 
 
 if __name__ == "__main__":

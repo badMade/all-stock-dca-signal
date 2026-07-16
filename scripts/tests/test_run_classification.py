@@ -18,18 +18,34 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from run_classification import (  # noqa: E402
+    ACCEPTED_STATE_SCHEMA_VERSIONS,
+    FINAL_MANUAL_OVERRIDE_RUN_TYPE,
     ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED,
+    ORDER_SUBMIT_STATUS_ERROR,
     STATE_SCHEMA_VERSION,
+    STATE_SCHEMA_VERSION_V2,
+    build_final_manual_override_classification,
     build_manual_classification,
+    build_raw_persistence_state,
     build_scheduled_classification,
     collect_manual_order_ids,
     exclude_manual_orders,
+    historicals_batch_filename,
     is_confirmation_blocked,
     is_manual_state,
+    is_preauthorized_v2,
     is_scheduled_state,
     latest_scheduled_run_path,
+    list_raw_inputs_saved,
+    manual_exclusion_roots,
     manual_run_id,
+    normalize_connector_payload,
     order_submit_status,
+    place_filename,
+    quotes_batch_filename,
+    raw_input_dir,
+    raw_persistence_failure_run_state,
+    save_raw_input,
     scheduled_run_id,
     select_scheduled_state_for_reporting,
     validate_classification,
@@ -192,6 +208,25 @@ def test_validation_rejects_bad_schema_version():
     res = validate_classification(rc)
     assert not res.ok
     assert any("state_schema_version" in e for e in res.errors)
+
+
+def test_validation_accepts_v2_preauthorized_scheduled():
+    # The stricter successor version is accepted for scheduled runs when the
+    # required scheduled identity fields are correct.
+    rc = build_scheduled_classification(TRADING_DAY)
+    rc["state_schema_version"] = STATE_SCHEMA_VERSION_V2
+    res = validate_classification(rc)
+    assert res.ok
+    assert STATE_SCHEMA_VERSION_V2 in ACCEPTED_STATE_SCHEMA_VERSIONS
+    assert is_preauthorized_v2(rc)
+    assert not is_preauthorized_v2(build_scheduled_classification(TRADING_DAY))
+
+
+def test_validation_accepts_v2_preauthorized_manual():
+    rc = build_manual_classification()
+    rc["state_schema_version"] = STATE_SCHEMA_VERSION_V2
+    assert validate_classification(rc).ok
+    assert is_preauthorized_v2({"run_classification": rc})
 
 
 def test_validation_rejects_manual_run_id_matching_scheduled():
@@ -506,6 +541,243 @@ def test_confirmation_blocked_clears_stray_order_ids():
         assert sel.ok
         assert sel.confirmation_blocked
         assert sel.order_ids == []
+
+
+# --- Raw connector-input persistence (afternoon escalation fix, 2026-07-10) --
+
+
+def test_raw_input_filenames_are_deterministic():
+    assert quotes_batch_filename(1) == "quotes_batch1.json"
+    assert quotes_batch_filename(12) == "quotes_batch12.json"
+    assert historicals_batch_filename(2) == "historicals_batch2.json"
+    assert place_filename("aapl") == "place_AAPL.json"
+    assert place_filename("brk.b") == "place_BRK.B.json"
+    # Path separators are stripped so the symbol cannot escape the raw/ dir.
+    fname = place_filename("../ev/il")
+    assert "/" not in fname and fname.startswith("place_") and fname.endswith(".json")
+
+
+def test_raw_input_dir_under_scheduled_run():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        assert raw_input_dir(TRADING_DAY, base).name == "raw"
+        assert raw_input_dir(TRADING_DAY, base).parent.name == "20260706_1520ET"
+
+
+def test_save_raw_input_persists_before_compute():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        assert list_raw_inputs_saved(TRADING_DAY, base) == []
+        p1 = save_raw_input(TRADING_DAY, quotes_batch_filename(1), {"AAPL": 190.0}, base=base)
+        save_raw_input(TRADING_DAY, historicals_batch_filename(1), {"AAPL": [1, 2, 3]}, base=base)
+        assert p1.exists()
+        # Compute reads the persisted file, not an in-memory response.
+        assert json.loads(p1.read_text())["AAPL"] == 190.0
+        assert list_raw_inputs_saved(TRADING_DAY, base) == [
+            "historicals_batch1.json",
+            "quotes_batch1.json",
+        ]
+
+
+def test_save_raw_input_rejects_non_bare_filename():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        try:
+            save_raw_input(TRADING_DAY, "sub/dir/quotes.json", {}, base=base)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError for non-bare filename")
+
+
+def test_normalize_connector_payload_resolves_output_path():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        pointer_file = base / "big_quotes.json"
+        pointer_file.write_text(json.dumps({"AAPL": 190.0, "MSFT": 400.0}))
+        payload = {"output_path": str(pointer_file), "status": "ok"}
+        normalized = normalize_connector_payload(payload)
+        assert normalized["normalized"] is True
+        assert normalized["data"]["MSFT"] == 400.0
+        # Original pointer is preserved.
+        assert normalized["output_path"] == str(pointer_file)
+
+
+def test_normalize_connector_payload_unreadable_pointer_is_flagged():
+    payload = {"output_path": "/no/such/file.json"}
+    normalized = normalize_connector_payload(payload)
+    assert normalized["normalized"] is False
+    assert "normalize_error" in normalized
+
+
+def test_save_raw_input_fails_closed_on_unreadable_pointer():
+    # Codex review #72: "fail closed when raw pointer normalization fails."
+    # normalize_connector_payload() itself still just flags an unreadable
+    # pointer (test above) since it's a general-purpose helper, but
+    # save_raw_input() is the persistence entry point the "compute reads only
+    # persisted files" contract depends on -- it must not silently write an
+    # unresolved/broken output_path pointer as if persistence succeeded.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        try:
+            save_raw_input(
+                TRADING_DAY, historicals_batch_filename(1),
+                {"output_path": "/no/such/file.json"}, base=base,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError for an unreadable output_path pointer")
+        # Nothing should be written for the failed persist.
+        assert list_raw_inputs_saved(TRADING_DAY, base) == []
+
+
+def test_save_raw_input_normalizes_pointer_payload():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        pointer_file = base / "hist.json"
+        pointer_file.write_text(json.dumps({"AAPL": [1, 2, 3]}))
+        path = save_raw_input(
+            TRADING_DAY, historicals_batch_filename(1),
+            {"output_path": str(pointer_file)}, base=base,
+        )
+        saved = json.loads(path.read_text())
+        assert saved["normalized"] is True
+        assert saved["data"]["AAPL"] == [1, 2, 3]
+
+
+def test_build_raw_persistence_state_reflects_disk():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        save_raw_input(TRADING_DAY, quotes_batch_filename(1), {"AAPL": 1}, base=base)
+        save_raw_input(TRADING_DAY, place_filename("AAPL"), {"id": "x"}, base=base)
+        block = build_raw_persistence_state(TRADING_DAY, base=base, recovery_from_escalation=True)
+        assert block["raw_input_dir"] == str(raw_input_dir(TRADING_DAY, base))
+        assert block["raw_inputs_saved"] == ["place_AAPL.json", "quotes_batch1.json"]
+        assert block["recovery_from_escalation"] is True
+
+
+def test_raw_persistence_failure_still_writes_valid_scheduled_state():
+    # Contract: a persistence/normalization failure must still yield a valid
+    # scheduled run_state (no orders), not an escalation with no state at all.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        state = raw_persistence_failure_run_state(
+            TRADING_DAY, "connector output_path unreadable", base=base,
+            triggered_at_utc="2026-07-06T19:20:01Z",
+        )
+        assert order_submit_status(state) == ORDER_SUBMIT_STATUS_ERROR
+        assert state["buy_candidates"] == []
+        assert state["raw_inputs_saved"] == []
+        assert state["raw_persistence_error"]
+        assert is_scheduled_state(state)
+        assert not is_manual_state(state)
+        # It writes to the scheduled path and updates the pointer like any scheduled run.
+        written = write_run_artifacts(state, base=base)
+        assert "latest_scheduled_run" in written
+        sel = select_scheduled_state_for_reporting(TRADING_DAY, base=base)
+        assert sel.ok
+        assert sel.order_ids == []
+
+
+# --- Final manual buy override (2026-07-13 final-buy behavior) ---------------
+
+
+def test_final_manual_override_classification_is_manual():
+    rc = build_final_manual_override_classification("2026-07-13T19:36:00Z")
+    assert rc["run_origin"] == "manual"
+    assert rc["manual_run"] is True
+    assert rc["run_type"] == FINAL_MANUAL_OVERRIDE_RUN_TYPE
+    assert rc["valid_afternoon_scheduled_evidence"] is False
+    assert rc["same_day_top_up_context_only"] is True
+    assert rc["cron_id"] == "10ce362c"
+    assert rc["supersedes_cron_id"] == "ce16ba6b"
+    # A manual classification block must still validate and never look scheduled.
+    assert validate_classification(rc).ok
+    assert not is_scheduled_state({"run_classification": rc})
+    assert is_manual_state({"run_classification": rc})
+
+
+def test_final_manual_override_custom_run_id_not_scheduled():
+    rc = build_final_manual_override_classification(
+        "2026-07-13T19:36:00Z", run_id="final_manual_override_20260713_1536ET"
+    )
+    assert rc["run_id"] == "final_manual_override_20260713_1536ET"
+    # Must never collide with the scheduled_YYYYMMDD_1520ET pattern.
+    assert validate_classification(rc).ok
+
+
+def test_manual_exclusion_roots_cover_final_override_paths():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        roots = [str(r) for r in manual_exclusion_roots(base)]
+        assert str(base / "manual_runs") in roots
+        assert str(Path(d) / "final_manual_review") in roots
+        assert str(Path(d) / "midday_dca" / "manual_reruns") in roots
+
+
+def _write_final_override_state(run_dir: Path, order_ids, ts="2026-07-13T19:36:00Z"):
+    run_dir.mkdir(parents=True, exist_ok=True)
+    state = {
+        "run_id": "final_manual_override_20260713_1536ET",
+        "generated_at": "2026-07-13T15:36:00",
+        "trading_day": "2026-07-13",
+        "broker": "robinhood",
+        "budget": {"budget_tier": "normal", "daily_cap_usd": 180, "weekly_cap_usd": 900},
+        "counts": {"submitted": len(order_ids)},
+        "run_classification": build_final_manual_override_classification(ts),
+        "buy_candidates": [
+            {"ticker": f"F{i}", "planned_amount_usd": 3.0, "status": "submitted", "order_id": oid}
+            for i, oid in enumerate(order_ids)
+        ],
+    }
+    (run_dir / "run_state.json").write_text(json.dumps(state, indent=2))
+
+
+def test_collect_excludes_final_override_under_ce16ba6b_manual_runs():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        run_dir = base / "manual_runs" / "final_manual_override_20260713_1536ET"
+        _write_final_override_state(run_dir, ("FMO-1", "FMO-2"))
+        assert collect_manual_order_ids(base) == {"FMO-1", "FMO-2"}
+
+
+def test_collect_excludes_midday_manual_reruns_final_override():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        run_dir = Path(d) / "midday_dca" / "manual_reruns" / "final_manual_override_20260713_1536ET"
+        _write_final_override_state(run_dir, ("MID-FMO-1",))
+        # A filled_orders.csv beside the state (run_and_report style) is scanned too.
+        (run_dir / "filled_orders.csv").write_text(
+            "ticker,status,order_id,notional_usd\nDFTX,filled,MID-FMO-CSV,3.0\n"
+        )
+        ids = collect_manual_order_ids(base)
+        assert ids == {"MID-FMO-1", "MID-FMO-CSV"}
+
+
+def test_collect_excludes_final_manual_review_tree():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        run_dir = Path(d) / "final_manual_review" / "20260713_1536ET"
+        _write_final_override_state(run_dir, ("REVIEW-FMO-1",))
+        assert collect_manual_order_ids(base) == {"REVIEW-FMO-1"}
+
+
+def test_final_override_ids_excluded_from_scheduled_selection():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        # Scheduled afternoon run that (defensively) shares an id with a final override.
+        write_run_artifacts(_scheduled_state(order_ids=("SCHED-1", "MID-FMO-1")), base=base)
+        run_dir = Path(d) / "midday_dca" / "manual_reruns" / "final_manual_override_20260713_1536ET"
+        _write_final_override_state(run_dir, ("MID-FMO-1",))
+        sel = select_scheduled_state_for_reporting(TRADING_DAY, base=base)
+        assert sel.ok
+        assert sel.order_ids == ["SCHED-1"]  # MID-FMO-1 excluded as a manual override id
+        assert "MID-FMO-1" in sel.excluded_manual_order_ids
 
 
 def _run_all():
