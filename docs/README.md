@@ -13,6 +13,7 @@ workflow, and Notion template. **No credentials or secrets are stored here.**
 | [safeguards.md](safeguards.md) | Broker/account, trading constraints, budget caps, test window |
 | [schedule_manifest.md](schedule_manifest.md) | All 11 scheduled tasks (only `10ce362c`, which supersedes `ce16ba6b`, trades) |
 | [run_classification.md](run_classification.md) | Scheduled-vs-manual run contract (paths, required fields, exclusion rules) |
+| [drift_detection.md](drift_detection.md) | Post-artifact signals-vs-submitted-orders drift detector + Slack alerting |
 | [reporting_workflow.md](reporting_workflow.md) | Daily/periodic artifact + Notion flow |
 | [notion_dashboard_template.md](notion_dashboard_template.md) | Notion page template + conceptual API sync |
 | [cost_tracking.md](cost_tracking.md) | Cost-control policy and usage proxies |

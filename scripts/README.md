@@ -1,10 +1,27 @@
 # Strategy backup utilities
 
-This directory holds two standard-library-only utilities:
+This directory holds standard-library-only utilities:
 
 - `backup_strategy.py` — re-extract strategy config from a transcript (below).
 - `run_classification.py` — enforce the scheduled-vs-manual **run-classification
   contract** (see [`../docs/run_classification.md`](../docs/run_classification.md)).
+- `drift_detection.py` — reconcile a run's `signals.csv` (intended auto-buys)
+  against `submitted_orders.csv` (actual order records) and alert on drift (see
+  [`../docs/drift_detection.md`](../docs/drift_detection.md)).
+
+## `drift_detection.py`
+
+Runs immediately after each live trading task writes its artifacts and flags any
+symbol with an auto-buy signal and a positive intended amount but no
+submitted-order record — the Jul 16 2026 failure mode (signals written, orders
+neither placed nor persisted). Emits a compact JSON + markdown diagnostic and,
+optionally, an immediate Slack alert (webhook read from `DCA_DRIFT_SLACK_WEBHOOK`,
+never hardcoded).
+
+```bash
+python scripts/drift_detection.py --run-dir <run_dir> --fail-on-drift
+python -m pytest scripts/tests/test_drift_detection.py -q
+```
 
 ## `run_classification.py`
 

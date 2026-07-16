@@ -68,6 +68,24 @@
       "note": "Manual final-buy overrides and same-day top-up context only; NOT scheduled-afternoon execution evidence. Backfilled under ce16ba6b/manual_runs/final_manual_override_20260713_1536ET/ and midday_dca/manual_reruns/final_manual_override_20260713_1536ET/ with run_type='final_manual_buy_override', valid_afternoon_scheduled_evidence=false, same_day_top_up_context_only=true."
     }
   },
+  "drift_detection_policy": {
+    "summary": "Every live trading run (morning 10:30, midday 12:30, afternoon 3:20) MUST invoke scripts/drift_detection.py against its own run directory immediately AFTER it finishes writing artifacts. The detector reconciles signals.csv (intended auto-buys) against submitted_orders.csv (actual order records) and alerts when any symbol has auto_buy_signal true (case-insensitive true/1/yes) and incremental_order_amount > 0 or a positive desired amount, but no submitted-order record exists for that symbol.",
+    "detector": "scripts/drift_detection.py",
+    "doc": "docs/drift_detection.md",
+    "tests": "scripts/tests/test_drift_detection.py",
+    "invocation": "python scripts/drift_detection.py --run-dir <run_dir> --json-out <run_dir>/drift_report.json --md-out <run_dir>/drift_report.md --slack --fail-on-drift",
+    "slack_alert": "Optional Slack path is OFF unless a webhook is configured. The webhook is read from the DCA_DRIFT_SLACK_WEBHOOK environment variable (or --slack-webhook); it is NEVER hardcoded in config or source. When --slack is set and drift is detected, the detector posts an immediate alert. If no webhook is configured it warns and continues (exit code still reflects drift via --fail-on-drift).",
+    "suspected_cause_signals": [
+      "raw/ directory missing (raw_data_persistence_failure)",
+      "submitted_orders.csv empty or missing",
+      "order_errors.csv / rejections.csv present",
+      "per-row top_up_guard_result / block_reason / manual_review status (deliberate $0 buy)",
+      "budget-guard columns (remaining/cap = 0, kill_switch)",
+      "spread / data_confidence / intraday_trend fields",
+      "run_state.json missing/errored or lacking run_classification"
+    ],
+    "jul16_2026_failure_mode": "On Thu Jul 16 2026 a live run wrote signals.csv with 8 auto_buy_signal=true rows carrying positive incremental amounts, while submitted_orders.csv was empty and the raw/ directory was missing -- signals computed but no orders placed or persisted, and nothing alerted until the next day. This detector is wired post-artifact-write specifically so that condition pages immediately: it reports drift_detected=true, run_suspected_cause='raw_data_persistence_failure', lists all 8 affected symbols with expected amounts, and (with --slack) fires an immediate Slack alert."
+  },
   "tasks": [
     {
       "id": "b7961407",
@@ -142,6 +160,13 @@
       "executor_mode": "live",
       "config_file": "config/morning_dca.json",
       "state_dir": "/home/user/workspace/cron_tracking/morning_dca",
+      "post_artifact_drift_check": {
+        "enabled": true,
+        "detector": "scripts/drift_detection.py",
+        "run_after": "artifact_write",
+        "command": "python scripts/drift_detection.py --run-dir <run_dir> --json-out <run_dir>/drift_report.json --md-out <run_dir>/drift_report.md --slack --fail-on-drift",
+        "note": "After writing morning artifacts, reconcile signals.csv vs submitted_orders.csv. Fire an immediate Slack alert (webhook from DCA_DRIFT_SLACK_WEBHOOK) when an auto-buy signal exists with a positive amount but no submitted order. See drift_detection_policy."
+      },
       "run_classification": {
         "run_origin": "scheduled",
         "run_type": "morning_dca_live",
@@ -174,6 +199,13 @@
       "executor_mode": "live",
       "config_file": "config/midday_dca.json",
       "state_dir": "/home/user/workspace/cron_tracking/midday_dca",
+      "post_artifact_drift_check": {
+        "enabled": true,
+        "detector": "scripts/drift_detection.py",
+        "run_after": "artifact_write",
+        "command": "python scripts/drift_detection.py --run-dir <run_dir> --json-out <run_dir>/drift_report.json --md-out <run_dir>/drift_report.md --slack --fail-on-drift",
+        "note": "After the 12:30 PM midday run writes artifacts (YYYYMMDD_1230ET/), reconcile signals.csv vs submitted_orders.csv and fire an immediate Slack alert on any auto-buy-without-order. This is the primary guard against the Jul 16 2026 failure mode. See drift_detection_policy."
+      },
       "run_classification": {
         "run_origin": "scheduled",
         "run_type": "midday_dca_live",
@@ -214,6 +246,13 @@
       "trigger_gate": "programmatic_trigger_check.sh",
       "trigger_window": "Weekdays 2026-07-02 through 2026-08-28, 3:20-3:35 PM ET (aligned to the 15:15-15:35 ET scheduled classification window so a late-but-permitted start cannot place buys after the 3:35 PM post-trade sync or outside the attributable window).",
       "state_dir": "/home/user/workspace/cron_tracking/ce16ba6b",
+      "post_artifact_drift_check": {
+        "enabled": true,
+        "detector": "scripts/drift_detection.py",
+        "run_after": "artifact_write",
+        "command": "python scripts/drift_detection.py --run-dir <scheduled_run_dir> --json-out <scheduled_run_dir>/drift_report.json --md-out <scheduled_run_dir>/drift_report.md --slack --fail-on-drift",
+        "note": "After the 3:20 PM scheduled run writes its run_state/CSVs and raw/, reconcile signals.csv vs submitted_orders.csv. Because raw/ persistence and order placement have both silently failed before (Jul 16 2026), a missing raw/ or empty submitted_orders.csv while auto-buy signals exist must fire an immediate Slack alert. Must complete before the 3:40 PM watchdog. See drift_detection_policy."
+      },
       "run_classification": {
         "role": "writer",
         "cron_id": "10ce362c",
@@ -356,6 +395,20 @@
       "et_equivalent": "First weekday of month 9:55 AM ET (EDT)",
       "trades": false,
       "notes": "Analytics only, no trading. Reports usage proxies only; exact Perplexity credit consumption is not exposed, so do not claim exact credits."
+    },
+    {
+      "id": "d1f7a2c0",
+      "name": "Post-artifact DCA drift detector (signals vs submitted orders)",
+      "type": "monitoring",
+      "status": "active",
+      "trades": false,
+      "detector": "scripts/drift_detection.py",
+      "doc": "docs/drift_detection.md",
+      "invoked_by": ["42173154", "a6239dae", "10ce362c"],
+      "run_after": "artifact_write",
+      "command": "python scripts/drift_detection.py --run-dir <run_dir> --json-out <run_dir>/drift_report.json --md-out <run_dir>/drift_report.md --slack --fail-on-drift",
+      "slack_webhook_env": "DCA_DRIFT_SLACK_WEBHOOK",
+      "notes": "Read-only, no trading. Not an independent cron: each live trading task (morning 10:30, midday 12:30, afternoon 3:20) calls this detector immediately after it writes artifacts, per drift_detection_policy. Reconciles signals.csv (auto-buy intent) against submitted_orders.csv (order records) and, when an auto-buy signal with a positive amount has no submitted order, writes a JSON+markdown diagnostic and (with --slack) fires an immediate Slack alert. Covers the Jul 16 2026 failure mode (8 auto-buy signals, empty submitted_orders.csv, missing raw/). No secrets: the Slack webhook is read from DCA_DRIFT_SLACK_WEBHOOK, never hardcoded."
     },
     {
       "id": "f7411889",

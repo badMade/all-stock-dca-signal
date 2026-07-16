@@ -2,13 +2,23 @@
   "$schema": "../schemas/notifications.schema.json",
   "version": "2026-07-06",
   "channels": {
-    "slack": { "enabled": false, "note": "No Slack. Explicitly disabled." },
+    "slack": {
+      "enabled": false,
+      "note": "No Slack for routine notifications. Explicitly disabled as a default channel.",
+      "optional_drift_alert": {
+        "purpose": "Opt-in path for immediate drift alerts from scripts/drift_detection.py only.",
+        "webhook_env": "DCA_DRIFT_SLACK_WEBHOOK",
+        "secret_policy": "The webhook URL is read from the DCA_DRIFT_SLACK_WEBHOOK environment variable (or --slack-webhook) at runtime and is NEVER stored in git or this config. Leave the env var unset to keep Slack off; the detector then falls back to in_app_message_center routing.",
+        "enable": "Set DCA_DRIFT_SLACK_WEBHOOK in the scheduler environment and pass --slack to the detector."
+      }
+    },
     "in_app_message_center": { "enabled": true, "note": "Primary notification channel." },
     "email": { "enabled": true, "scope": "Only where a task explicitly says to email; no routine dashboard emails." }
   },
   "routing": {
     "live_run_alerts": ["in_app_message_center"],
     "watchdog_alerts": ["in_app_message_center"],
+    "drift_alerts": ["in_app_message_center"],
     "volatility_outliers": ["in_app_message_center"],
     "premarket_buying_power": [],
     "capital_priority_briefing": ["in_app_message_center", "email"],
@@ -18,6 +28,7 @@
   "routing_conditions": {
     "capital_priority_briefing": "Notify (in-app + email) only if at least one ticker triggers a 1.5x or higher multiplier; otherwise silent.",
     "premarket_buying_power": "Analytics dashboard only; no routine notification.",
-    "volatility_outliers": "Alert only for >5% outliers or actionable errors."
+    "volatility_outliers": "Alert only for >5% outliers or actionable errors.",
+    "drift_alerts": "Fire an IMMEDIATE alert when scripts/drift_detection.py detects an auto-buy signal (auto_buy_signal true and incremental_order_amount > 0 or desired amount > 0) with no corresponding submitted-order record. Routes to in_app_message_center by default; also posts to Slack when DCA_DRIFT_SLACK_WEBHOOK is set and the detector is run with --slack. Never routine/heartbeat -- only on detected drift."
   }
 }

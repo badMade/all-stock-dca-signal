@@ -41,6 +41,27 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 > `order_submit_status='not_submitted_error'`, no orders) rather than escalating
 > without state. See the `10ce362c` task detail below.
 
+> **Post-artifact drift detection (added Jul 16 2026):** every live trading task
+> (morning `42173154` 10:30 AM, midday `a6239dae` 12:30 PM, afternoon
+> `10ce362c` 3:20 PM) must invoke `scripts/drift_detection.py` against its own
+> run directory **immediately after writing artifacts**. The detector reconciles
+> `signals.csv` (intended auto-buys) against `submitted_orders.csv` (actual order
+> records) and fires an **immediate alert** when any symbol has
+> `auto_buy_signal` true (case-insensitive `true`/`1`/`yes`) and
+> `incremental_order_amount > 0` or a positive desired amount, but **no
+> submitted-order record exists** for that symbol. This exists because of the
+> **Jul 16 2026 failure mode**: `signals.csv` held **8** `auto_buy_signal=true`
+> rows with positive incremental amounts while `submitted_orders.csv` was
+> **empty** and `raw/` was **missing** — signals computed, no orders placed or
+> persisted, and nothing alerted until the next day. The detector writes a
+> compact JSON + markdown diagnostic (affected symbols, expected amount,
+> suspected cause, run directory, recommended action) and, when
+> `DCA_DRIFT_SLACK_WEBHOOK` is set and `--slack` is passed, posts an immediate
+> Slack alert (no webhook is ever hardcoded). The 3:20 PM check must complete
+> **before** the 3:40 PM watchdog (`a46bf007`). See
+> [drift_detection.md](drift_detection.md) and the `drift_detection_policy` block
+> in [`config/scheduled_tasks.json`](../config/scheduled_tasks.json).
+
 > **Run-classification note:** the live task (`10ce362c`, the repaired task
 > that supersedes the deleted `ce16ba6b`; artifact root stays under
 > `.../ce16ba6b` for continuity) classifies every
