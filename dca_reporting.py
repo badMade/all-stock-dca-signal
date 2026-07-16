@@ -180,7 +180,15 @@ def fills_from_order_history_payload(
                 if not isinstance(ex, dict):
                     continue
                 q = _to_float(ex.get("quantity") or ex.get("filled_qty")) or 0.0
-                p = _to_float(ex.get("price") or ex.get("fill_price")) or 0.0
+                p = _to_float(ex.get("price") or ex.get("fill_price"))
+                # Skip executions without a positive price entirely (neither
+                # quantity nor cost contributes) rather than coercing a
+                # missing/blank price to 0.0: folding a zero-priced execution
+                # into the weighted average turns an unpriced execution into
+                # false coverage and a false -100% slippage number instead of
+                # a missing/unpriced fill.
+                if p is None or p <= 0:
+                    continue
                 exec_qty += q
                 exec_cost += q * p
 
@@ -197,9 +205,9 @@ def fills_from_order_history_payload(
                 or order.get("average_price")
                 or order.get("price")
             )
-        if avg_price is None:
-            # Executed quantity with no resolvable price: report as missing
-            # rather than a false, zero-coerced fill.
+        if avg_price is None or avg_price <= 0:
+            # Executed quantity with no resolvable positive price: report as
+            # missing rather than a false, zero-coerced fill.
             continue
 
         fills.append(

@@ -638,6 +638,33 @@ def test_fills_from_order_history_payload_skips_fills_with_no_price():
     assert fills == []
 
 
+def test_fills_from_order_history_payload_rejects_zero_priced_executions():
+    # Codex review: "Reject unpriced executions instead of zeroing them." An
+    # execution with a quantity but a blank/missing price must not be coerced
+    # to price=0.0 and folded into the weighted average -- that would drag an
+    # otherwise-valid fill toward a false, understated price (or, if every
+    # execution is unpriced, a false $0 fill showing -100% slippage) instead
+    # of the fill being reported as missing/unpriced.
+    payload = {"orders": [
+        # Every execution lacks a price -> no resolvable price anywhere -> skipped.
+        {"ticker": "AAPL", "id": "O1", "executions": [
+            {"quantity": "0.02", "price": None},
+        ]},
+        # One priced execution and one unpriced execution -> average must come
+        # from the priced execution alone (100.0), not diluted by the unpriced
+        # quantity toward a lower blended price.
+        {"ticker": "NVDA", "id": "O2", "executions": [
+            {"quantity": "0.01", "price": "100.0"},
+            {"quantity": "0.01", "price": None},
+        ]},
+    ]}
+    fills = fills_from_order_history_payload(payload)
+    by_ticker = {f["ticker"]: f for f in fills}
+    assert set(by_ticker) == {"NVDA"}
+    assert abs(by_ticker["NVDA"]["fill_price"] - 100.0) < 1e-9
+    assert abs(by_ticker["NVDA"]["filled_qty"] - 0.01) < 1e-9
+
+
 def _run_all():
     import inspect
     import tempfile
