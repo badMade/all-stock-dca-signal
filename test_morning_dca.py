@@ -1591,6 +1591,140 @@ def test_manual_live_run_with_wrong_broker_account_raises_before_ordering(tmp_pa
     assert broker.placed is False
 
 
+def test_blocked_live_retry_preserves_prior_submitted_evidence(tmp_path):
+    # Codex/Gemini review on PR #46: a scheduled retry that hits a
+    # scheduler-wiring safety failure (missing broker, wrong account) must not
+    # overwrite an EARLIER scheduled attempt's run_state.json for the same slot
+    # if that state already has real submitted-order evidence -- that evidence
+    # is required for same-day top-up guards and reporting, and a sparse
+    # blocked stub would erase it.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    # First scheduled attempt: broker wired correctly, order submitted.
+    first = ex.run(_now_live(), data, broker=FakeLiveBroker())
+    assert first["artifacts"].get("status") != "blocked"
+    assert first["artifacts"]["buy_candidates"][0]["status"] == "submitted"
+    run_state_path = Path(first["paths"]["run_state"])
+    assert run_state_path.exists()
+
+    # Second scheduled attempt at the SAME slot: broker adapter missing this
+    # time (a wiring regression). The prior submitted evidence must survive.
+    second = ex.run(_now_live(), data, broker=None)
+
+    assert second["artifacts"].get("status") != "blocked", (
+        "a later blocked scheduler-wiring retry must not overwrite prior submitted evidence"
+    )
+    assert second["artifacts"]["buy_candidates"][0]["status"] == "submitted"
+    on_disk = json.loads(run_state_path.read_text(encoding="utf-8"))
+    assert on_disk["buy_candidates"][0]["status"] == "submitted"
+
+
+def test_blocked_live_retry_does_not_preserve_stale_non_submitted_block(tmp_path):
+    # Codex review on PR #46: the preservation above must NOT apply blindly --
+    # if the existing state is itself just a prior blocked stub (no submitted
+    # evidence), a later retry with a DIFFERENT block_reason must overwrite it
+    # with the new reason, not hide the new failure behind the old one.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        target_account_number="562057042",
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    # First scheduled attempt: broker adapter missing -> blocked stub, no
+    # submitted evidence.
+    first = ex.run(_now_live(), data, broker=None)
+    assert first["artifacts"]["status"] == "blocked"
+    assert first["artifacts"]["block_reason"] == "missing broker adapter for scheduled live execution"
+    run_state_path = Path(first["paths"]["run_state"])
+
+    # Second scheduled attempt at the SAME slot: broker present but wrong
+    # account. This is a DIFFERENT failure and must be recorded, not masked by
+    # the stale first block_reason.
+    class _WrongAccountBroker:
+        def account_number(self):
+            return "not-the-approved-account"
+
+    second = ex.run(_now_live(), data, broker=_WrongAccountBroker())
+
+    assert second["artifacts"]["status"] == "blocked"
+    assert second["artifacts"]["block_reason"] == (
+        "broker account mismatch: expected 562057042, got not-the-approved-account"
+    )
+    on_disk = json.loads(run_state_path.read_text(encoding="utf-8"))
+    assert on_disk["block_reason"] == (
+        "broker account mismatch: expected 562057042, got not-the-approved-account"
+    )
+
+
+def test_blocked_live_retry_recovers_from_corrupted_existing_run_state(tmp_path):
+    # Codex/Gemini review on PR #46: an existing run_state.json that is
+    # unreadable or invalid JSON (e.g. a crash mid-write) must not crash the
+    # scheduler-wiring safety block -- it must fall back to writing a fresh
+    # blocked stub, preserving the fail-closed guarantee this path exists for.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run_state.json").write_text("{not valid json", encoding="utf-8")
+
+    result = ex.run(_now_live(), data, broker=None)
+
+    assert result["artifacts"]["status"] == "blocked"
+    assert result["artifacts"]["block_reason"] == "missing broker adapter for scheduled live execution"
+    on_disk = json.loads(Path(result["paths"]["run_state"]).read_text(encoding="utf-8"))
+    assert on_disk["block_reason"] == "missing broker adapter for scheduled live execution"
+
+
+def test_blocked_live_retry_recovers_from_non_utf8_existing_run_state(tmp_path):
+    # Codex review on PR #47: a run_state.json containing invalid UTF-8 bytes
+    # (e.g. truncated mid-write on a multi-byte boundary, or corrupted on disk)
+    # raises UnicodeDecodeError from read_text(encoding="utf-8"), which is
+    # neither OSError nor json.JSONDecodeError. That must not crash the
+    # scheduler-wiring safety block -- it must fall back to a fresh blocked
+    # stub the same as any other unreadable existing state.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run_state.json").write_bytes(b"\xff\xfe\x00invalid-utf8")
+
+    result = ex.run(_now_live(), data, broker=None)
+
+    assert result["artifacts"]["status"] == "blocked"
+    assert result["artifacts"]["block_reason"] == "missing broker adapter for scheduled live execution"
+    on_disk = json.loads(Path(result["paths"]["run_state"]).read_text(encoding="utf-8"))
+    assert on_disk["block_reason"] == "missing broker adapter for scheduled live execution"
+
+
 def test_auto_buy_candidates_prioritized_by_multiplier_when_cap_hit(tmp_path):
     # When the daily cap is tight, higher-multiplier tickers are placed first.
     # BIGDROP: 8% drop -> 5x -> $15 notional. SMALLDROP: 1% drop -> 1.5x -> $4.50 notional.

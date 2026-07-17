@@ -1614,13 +1614,61 @@ class MorningDCAExecutor(DCAExecutor):
         signal/candidate arrays already evaluated for this run, and the latest
         scheduled pointer is still updated: watchdog/latest-pointer consumers
         see this as an intentional block rather than a malformed or missing run.
+
+        Before writing a fresh blocked stub, checks whether this scheduled
+        slot's run_state.json already exists and carries genuine submitted-order
+        evidence (a buy_candidates row or broker_outcomes entry with
+        status == "submitted") from an earlier attempt this run. If so, that
+        state is returned UNCHANGED: a later scheduler-wiring failure (missing
+        broker, wrong account) must never erase real broker-order evidence a
+        same-day top-up guard depends on. An existing state that is unreadable,
+        not a dict, or has no submitted evidence is NOT preserved -- it is
+        overwritten with the fresh block_reason, so a second, different wiring
+        failure is never hidden behind a stale first one.
         """
+        existing = self._existing_submitted_run_state(now)
+        if existing is not None:
+            return existing
         artifacts = self.build_artifacts(now, signals, source, manual=False)
         artifacts["status"] = "blocked"
         artifacts["block_reason"] = block_reason
         artifacts["broker_outcomes"] = {}
         paths = self.write_artifacts(artifacts, now)
         return {"artifacts": artifacts, "paths": paths}
+
+    def _existing_submitted_run_state(self, now: datetime) -> Optional[Dict[str, Any]]:
+        """Return the existing scheduled-slot run_state if it has submitted evidence.
+
+        Returns ``None`` (nothing to preserve) when the file is missing, unreadable,
+        not a JSON object, or has no buy_candidates/broker_outcomes entry with
+        status == "submitted".
+        """
+        state_path = self.run_state_dir(now) / "run_state.json"
+        if not state_path.exists():
+            return None
+        try:
+            existing_artifacts = json.loads(state_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+            _log.warning(
+                "existing run_state.json at %s is corrupted or unreadable (%s); "
+                "overwriting with a fresh blocked stub",
+                state_path,
+                exc,
+            )
+            return None
+        if not isinstance(existing_artifacts, dict):
+            return None
+        has_submitted = any(
+            row.get("status") == "submitted"
+            for row in existing_artifacts.get("buy_candidates", [])
+            if isinstance(row, dict)
+        ) or any(
+            isinstance(outcome, dict) and outcome.get("status") == "submitted"
+            for outcome in existing_artifacts.get("broker_outcomes", {}).values()
+        )
+        if not has_submitted:
+            return None
+        return {"artifacts": existing_artifacts, "paths": {"run_state": str(state_path)}}
 
     def _maybe_block_for_holiday(self, now: datetime, *, manual: bool) -> Optional[Dict[str, Any]]:
         """Return a blocked-run result when ``now`` falls on a weekend or NYSE holiday.
