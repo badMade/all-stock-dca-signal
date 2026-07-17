@@ -304,6 +304,42 @@ def test_run_pipeline_persists_raw_inputs_before_compute(tmp_path):
     assert run_state["raw_inputs_saved"] == ["quotes_batch1.json"]
 
 
+def test_run_pipeline_raw_persistence_failure_preserves_prior_successful_raw_files(tmp_path):
+    # Codex review on PR #49: a same-day retry that fails to persist its own
+    # raw connector responses must not destroy a PRIOR successful attempt's
+    # durable raw/ files -- those are the audit/replay record for any live
+    # orders that attempt already placed.
+
+    class ExplodingPayload:
+        pass
+
+    config = _demo_config()
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
+    quotes_file = tmp_path / "quotes.json"
+    quotes_file.write_text('{"symbol": "AAPL", "price": 150.0}', encoding="utf-8")
+
+    first = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=scheduled_dir,
+        raw_connector_inputs={"quotes_batch1.json": {"output_path": str(quotes_file)}},
+    )
+    assert first["blocked"] is False
+    raw_file = scheduled_dir / "raw" / "quotes_batch1.json"
+    assert raw_file.exists()
+    prior_contents = raw_file.read_text(encoding="utf-8")
+
+    second = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=scheduled_dir,
+        raw_connector_inputs={"quotes_batch1.json": ExplodingPayload()},
+    )
+    assert "raw_persistence_error" in second
+    assert raw_file.exists(), "prior successful run's raw file was destroyed by the failed retry"
+    assert raw_file.read_text(encoding="utf-8") == prior_contents
+
+
 def test_run_pipeline_raw_persistence_failure_writes_error_state(tmp_path):
     import json
 

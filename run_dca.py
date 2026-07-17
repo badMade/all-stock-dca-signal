@@ -243,6 +243,12 @@ def run_pipeline(
             # Always save raw inputs directly under artifacts_dir/raw so the raw
             # directory is co-located with run_state.json regardless of layout.
             raw_dir = Path(artifacts_dir) / "raw"
+            # New raw inputs are staged here first and only swapped into raw_dir
+            # once every file has saved and normalized cleanly. A same-day retry
+            # that fails partway through must not destroy a prior successful
+            # attempt's raw/ files -- those are the audit/replay record for any
+            # live orders that attempt already placed.
+            staging_dir = Path(artifacts_dir) / "raw.tmp"
             # Live runs (dry_run=False) require non-empty raw_connector_inputs.
             # Dry-run callers that have not yet been updated may omit entirely.
             # Both None and empty-dict on live runs go through the fail-closed path
@@ -263,26 +269,34 @@ def run_pipeline(
                                 f"scheduled live run: required raw inputs absent from "
                                 f"raw_connector_inputs: {sorted(missing)}"
                             )
-                    # Clear any stale raw files from prior attempts so the saved-file
-                    # manifest only reflects what this run persists.
-                    if raw_dir.exists():
-                        shutil.rmtree(raw_dir)
+                    # Stage this attempt's raw saves in a separate directory so a
+                    # failure below never touches the existing raw_dir.
+                    if staging_dir.exists():
+                        shutil.rmtree(staging_dir)
                     for filename, payload in raw_connector_inputs.items():
                         path = save_raw_input(
-                            trading_day_raw, filename, payload, raw_dir=raw_dir
+                            trading_day_raw, filename, payload, raw_dir=staging_dir
                         )
                         written = json.loads(path.read_text(encoding="utf-8"))
                         if "normalize_error" in written:
                             raise RuntimeError(
                                 f"normalization failed for {filename!r}: {written['normalize_error']}"
                             )
+                    # Every file staged and normalized cleanly -- swap the staging
+                    # directory into place as this run's raw/, replacing whatever
+                    # a prior attempt left there.
+                    if raw_dir.exists():
+                        shutil.rmtree(raw_dir)
+                    staging_dir.rename(raw_dir)
                     raw_persistence_state = build_raw_persistence_state(
                         trading_day_raw, raw_dir=raw_dir
                     )
                 except Exception as exc:  # noqa: BLE001 - failure must still write durable scheduled state
-                    # Remove any partially-written raw files so raw_inputs_saved is []
-                    if raw_dir.exists():
-                        shutil.rmtree(raw_dir, ignore_errors=True)
+                    # Remove only the staging directory. raw_dir (if a prior
+                    # attempt populated it) is left untouched so its audit trail
+                    # survives this failed retry.
+                    if staging_dir.exists():
+                        shutil.rmtree(staging_dir, ignore_errors=True)
                     out = Path(artifacts_dir)
                     out.mkdir(parents=True, exist_ok=True)
                     # Remove stale compact and report artifacts from any prior
