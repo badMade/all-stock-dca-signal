@@ -1339,6 +1339,32 @@ def test_load_prior_same_day_reads_documented_manual_filled_orders_shape(tmp_pat
     assert allocations["AMZN"].source == "manual"
 
 
+def test_orders_csv_fills_rejects_non_finite_amount_and_price(tmp_path):
+    # Gemini review on PR #31: _orders_csv_fills validated amount_usd/avg_fill_price
+    # with only `value > 0`, which excludes NaN (NaN > 0 is False) but NOT
+    # Infinity (float('inf') > 0 is True). A malformed/corrupted manual
+    # filled_orders.csv row with an infinite amount_usd or avg_fill_price would
+    # otherwise poison the same-day top-up guard with an unbounded prior
+    # allocation or reference price.
+    from near_close_dca import _orders_csv_fills
+
+    run_dir = tmp_path / "manual_reruns" / "1505"
+    run_dir.mkdir(parents=True)
+    (run_dir / "filled_orders.csv").write_text(
+        "ticker,amount_usd,avg_fill_price,quantity_filled\n"
+        "AMZN,inf,242.1099,\n"
+        "GOOG,4.5,Infinity,\n"
+        "GOOGL,nan,242.1099,\n"
+        "MU,4.5,242.1099,inf\n",
+        encoding="utf-8",
+    )
+    fills = _orders_csv_fills(run_dir)
+    assert fills["AMZN"]["amount_usd"] is None
+    assert fills["GOOG"]["avg_fill_price"] is None
+    assert fills["GOOGL"]["amount_usd"] is None
+    assert fills["MU"]["quantity_filled"] is None
+
+
 def test_load_prior_same_day_multi_merges_roots_sums_amounts_lowest_reference(tmp_path):
     # The afternoon guard scans multiple roots (its own + morning + midday). When
     # a ticker appears in more than one root, amounts sum and the lowest known

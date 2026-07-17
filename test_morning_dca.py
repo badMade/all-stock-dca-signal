@@ -977,6 +977,10 @@ def test_augment_artifacts_appends_top_up_manual_review_candidate_row():
         "counts": {"manual_review_candidates": 0},
         "manual_review_tickers": [],
         "manual_review_candidates": [],
+        # _augment_artifacts pulls the full row (not a re-derived minimal dict)
+        # from buy_candidates for any new top-up-manual-review ticker, so
+        # downstream readers see the same shape as trend-unvalidated cases.
+        "buy_candidates": [{"ticker": "AAPL", "action": "buy", "reason": "graded ladder"}],
     }
 
     ex._augment_artifacts(artifacts, {"AAPL": outcome})
@@ -1621,6 +1625,230 @@ def test_auto_buy_candidates_prioritized_by_multiplier_when_cap_hit(tmp_path):
     assert broker_outcomes.get("BIGDROP", {}).get("status") == "submitted", "BIGDROP (5x) should be placed first"
     assert broker_outcomes.get("SMALLDROP", {}).get("status") == "cap_exceeded", "SMALLDROP (1.5x) should be cap-gated out"
 
+
+# ---------------------------------------------------------------------------
+# Top-up guard regression tests
+# ---------------------------------------------------------------------------
+
+def _seed_prior(root, ticker, amount_usd, *, status="filled", reference_price=95.0, trading_date=None):
+    """Write a prior-fill run_state.json for one ticker under root."""
+    if trading_date is None:
+        trading_date = _now_live().date()
+    folder = trading_date.strftime("%Y%m%d") + "_0900ET"
+    run_dir = Path(root) / folder
+    run_dir.mkdir(parents=True, exist_ok=True)
+    candidate: dict = {"ticker": ticker, "status": status, "planned_amount_usd": amount_usd}
+    if status == "filled" and reference_price is not None:
+        candidate["target_price"] = reference_price
+    state = {
+        "trading_day": trading_date.isoformat(),
+        "generated_at": f"{trading_date.isoformat()}T09:00:00-04:00",
+        "run_classification": {"run_id": "test_prior", "run_origin": "manual", "stream": "morning"},
+        "buy_candidates": [candidate],
+    }
+    (run_dir / "run_state.json").write_text(json.dumps(state), encoding="utf-8")
+    return root
+
+
+class _TopUpBroker:
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER as _acct
+    def __init__(self):
+        self.placed = {}
+    def account_number(self): return self._acct
+    def available_buying_power(self): return 1000.0
+    def same_day_strategy_order_exists(self, ticker, trading_day): return False
+    def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+        # Guarded top-ups use the narrower same-stream ref-id duplicate check;
+        # this fixture never has prior broker orders on file, so it always
+        # proceeds as a fresh placement.
+        return False
+    def is_tradable_for_fractional_buy(self, ticker): return True
+    def review_market_buy(self, ticker, notional_usd): return True, "ok"
+    def place_market_buy(self, ticker, notional_usd, ref_id):
+        self.placed[ticker] = notional_usd
+        return f"ORDER-{ticker}"
+
+
+def test_morning_live_applies_prior_manual_offset_incremental(tmp_path):
+    # Prior manual fill: NVDA $3 at $95 reference. Morning price $90 (10% drop, below ref).
+    # Desired = 5x * $3 = $15. Incremental = $15 - $3 = $12.
+    prior_root = _seed_prior(tmp_path / "prior", "NVDA", 3.0, reference_price=95.0)
+    cfg = MorningConfig(
+        tickers=("NVDA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        prior_allocation_roots=(str(prior_root),),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    broker = _TopUpBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=broker, manual=True)
+    assert "NVDA" in broker.placed, f"expected incremental order; broker_outcomes={res['artifacts'].get('broker_outcomes')}"
+    assert abs(broker.placed["NVDA"] - 12.0) < 0.01, f"expected $12 incremental; got {broker.placed['NVDA']}"
+    rows = {r["ticker"]: r for r in res["artifacts"].get("buy_candidates", [])}
+    assert rows["NVDA"]["top_up_guard_result"] == "incremental_top_up"
+
+
+def test_morning_live_skips_when_price_not_below_prior_reference(tmp_path):
+    # Prior: NVDA $3 at $85 reference. Morning price $90 (10% drop from $100).
+    # $90 >= $85 → price_not_below → skip, no order.
+    prior_root = _seed_prior(tmp_path / "prior", "NVDA", 3.0, reference_price=85.0)
+    cfg = MorningConfig(
+        tickers=("NVDA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        prior_allocation_roots=(str(prior_root),),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    broker = _TopUpBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=broker, manual=True)
+    assert "NVDA" not in broker.placed, f"expected no order; broker.placed={broker.placed}"
+    art = res["artifacts"]
+    assert "NVDA" in art.get("top_up_offset_tickers", []), art.get("top_up_offset_tickers")
+
+
+def test_morning_live_full_buy_when_no_prior_allocation(tmp_path):
+    # Empty prior root → no_prior_run → buy the full desired amount ($15 = 5x * $3).
+    cfg = MorningConfig(
+        tickers=("NVDA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        prior_allocation_roots=(str(tmp_path / "empty_prior"),),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    broker = _TopUpBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=broker, manual=True)
+    assert "NVDA" in broker.placed, f"expected full buy; broker.placed={broker.placed}"
+    assert abs(broker.placed["NVDA"] - 15.0) < 0.01, f"expected $15; got {broker.placed['NVDA']}"
+    rows = {r["ticker"]: r for r in res["artifacts"].get("buy_candidates", [])}
+    assert rows["NVDA"]["top_up_guard_result"] == "no_prior_run"
+
+
+def test_morning_live_missing_price_triggers_manual_review(tmp_path):
+    # Prior: NVDA "submitted" with unknown reference price → missing_prior_price → $0 + manual review.
+    prior_root = _seed_prior(tmp_path / "prior", "NVDA", 9.0, status="submitted", reference_price=None)
+    cfg = MorningConfig(
+        tickers=("NVDA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        prior_allocation_roots=(str(prior_root),),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    broker = _TopUpBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=broker, manual=True)
+    assert "NVDA" not in broker.placed, f"expected no order; broker.placed={broker.placed}"
+    art = res["artifacts"]
+    assert "NVDA" in art.get("top_up_manual_review_tickers", []), art.get("top_up_manual_review_tickers")
+    assert "NVDA" in art.get("manual_review_tickers", []), art.get("manual_review_tickers")
+    assert art["counts"].get("manual_review_candidates", 0) >= 1, art["counts"]
+    # Row must also appear in the manual_review_candidates array so downstream
+    # consumers that read the full list see top-up missing-price cases.
+    mr_tickers = [r.get("ticker") for r in art.get("manual_review_candidates", [])]
+    assert "NVDA" in mr_tickers, f"manual_review_candidates rows: {mr_tickers}"
+
+
+def test_morning_live_no_incremental_when_prior_covers_full_desired(tmp_path):
+    # Prior: NVDA $20 at $95 reference. Desired = $15. $15 - $20 = -$5 ≤ 0 → no_incremental.
+    prior_root = _seed_prior(tmp_path / "prior", "NVDA", 20.0, reference_price=95.0)
+    cfg = MorningConfig(
+        tickers=("NVDA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        prior_allocation_roots=(str(prior_root),),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    broker = _TopUpBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=broker, manual=True)
+    assert "NVDA" not in broker.placed, f"expected no order; broker.placed={broker.placed}"
+    art = res["artifacts"]
+    assert "NVDA" in art.get("top_up_offset_tickers", []), art.get("top_up_offset_tickers")
+    rows = {r["ticker"]: r for r in art.get("buy_candidates", [])}
+    assert rows["NVDA"]["top_up_guard_result"] == "no_incremental_difference"
+
+
+def test_morning_live_prior_from_configured_root_only(tmp_path):
+    # Only roots in prior_allocation_roots contribute; fills under other_root are invisible.
+    # configured_root: NVDA $3 at $95 → incremental $12.
+    # other_root: NVDA $20 at $95 → would produce no_incremental if scanned.
+    configured_root = _seed_prior(tmp_path / "configured", "NVDA", 3.0, reference_price=95.0)
+    _seed_prior(tmp_path / "other", "NVDA", 20.0, reference_price=95.0)
+    cfg = MorningConfig(
+        tickers=("NVDA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        prior_allocation_roots=(str(configured_root),),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    broker = _TopUpBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=broker, manual=True)
+    # Configured root contributes $3 only → incremental $12, not no_incremental.
+    assert "NVDA" in broker.placed, f"expected incremental order; broker_outcomes={res['artifacts'].get('broker_outcomes')}"
+    assert abs(broker.placed["NVDA"] - 12.0) < 0.01, f"expected $12; got {broker.placed['NVDA']}"
+
+
+def test_morning_live_scheduled_artifact_not_prior_context_on_retry(tmp_path):
+    # Regression for Codex P2: a scheduled run artifact under YYYYMMDD_1030ET/
+    # inside self.state_root must NOT be treated as prior context on a same-day
+    # retry, because that would route the retry through the top-up path instead
+    # of the normal broker duplicate-order guard.
+    live_root = tmp_path / "live"
+    live_root.mkdir()
+    # Seed an earlier scheduled run artifact directly under YYYYMMDD_1030ET/
+    # (the pattern used by MorningDCAExecutor._run_folder_path for scheduled runs).
+    trading_date = _now_live().date()
+    scheduled_folder = live_root / f"{trading_date.strftime('%Y%m%d')}_1030ET"
+    scheduled_folder.mkdir(parents=True)
+    state = {
+        "trading_day": trading_date.isoformat(),
+        "generated_at": f"{trading_date.isoformat()}T10:30:00-04:00",
+        "run_classification": {"run_id": "morning_live_first", "run_origin": "scheduled", "stream": "morning"},
+        "buy_candidates": [{"ticker": "NVDA", "status": "filled", "planned_amount_usd": 20.0, "target_price": 95.0}],
+    }
+    (scheduled_folder / "run_state.json").write_text(json.dumps(state), encoding="utf-8")
+
+    configured_root = tmp_path / "configured_prior"
+    configured_root.mkdir()
+
+    cfg = MorningConfig(
+        tickers=("NVDA",),
+        morning_run_state_root=str(live_root),
+        prior_allocation_roots=(str(configured_root),),  # enable guard without scanning state_root itself
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    broker = _TopUpBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=broker, manual=True)
+
+    artifacts = res["artifacts"]
+    rows = {r["ticker"]: r for r in artifacts.get("buy_candidates", [])}
+    assert rows["NVDA"]["top_up_guard_result"] == "no_prior_run"
+
+    # The scheduled artifact must be invisible to _compute_top_up.
+    assert "NVDA" in broker.placed, f"expected full buy; broker={broker.placed}"
+    top_up_offset = artifacts.get("top_up_offset_tickers", [])
+    assert "NVDA" not in top_up_offset, (
+        f"scheduled artifact incorrectly treated as prior context: top_up_offset_tickers={top_up_offset}"
+    )
+
+
+def test_morning_live_empty_roots_disables_guard(tmp_path):
+    # Setting prior_allocation_roots=() must fully disable the top-up guard so
+    # that a full buy is placed even when a prior fill exists.  This honours the
+    # [] opt-out in morning_dca.json (load_morning_config preserves [] as ()).
+    _seed_prior(tmp_path / "prior", "NVDA", 20.0, reference_price=95.0)
+    cfg = MorningConfig(
+        tickers=("NVDA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        prior_allocation_roots=(),  # explicit empty → guard fully disabled
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    broker = _TopUpBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=broker, manual=True)
+    art = res["artifacts"]
+    # Guard disabled → no top_up_offset_tickers, full buy placed.
+    assert "NVDA" in broker.placed, f"expected full buy; broker.placed={broker.placed}"
+    assert art.get("top_up_offset_tickers", []) == [], art.get("top_up_offset_tickers")
+    assert art.get("top_up_manual_review_tickers", []) == [], art.get("top_up_manual_review_tickers")
 
 def test_per_order_cap_blocks_without_any_broker_call(tmp_path):
     # Codex review #25 on PR #22: the per-order cap should block a candidate

@@ -154,6 +154,9 @@ DEFAULT_MORNING_PREFLIGHT_STATE_ROOT = "/home/user/workspace/cron_tracking/morni
 DEFAULT_MORNING_LIVE_STATE_ROOT = "/home/user/workspace/cron_tracking/morning_dca"
 # Legacy alias: the default root historically pointed at the morning stream.
 DEFAULT_MORNING_STATE_ROOT = DEFAULT_MORNING_WATCHLIST_STATE_ROOT
+# The afternoon live task artifact root (cron 10ce362c; supersedes ce16ba6b). Scanned by the morning top-up
+# guard so manual/recovery fills recorded before 10:30 AM are detected.
+DEFAULT_AFTERNOON_TASK_ROOT = "/home/user/workspace/cron_tracking/ce16ba6b"
 
 
 # Per-mode identity/profile. Selected by MorningDCAExecutor(mode=...).
@@ -367,10 +370,12 @@ class MorningConfig:
     # When None the live executor uses DEFAULT_MORNING_PREFLIGHT_STATE_ROOT.
     preflight_run_state_root: Optional[str] = None
     # Roots scanned for same-day prior allocations by the morning live top-up
-    # guard. When None (the default) the guard is disabled and morning always
-    # buys the full graded amount. Set via artifact_paths.prior_allocation_roots
-    # in morning_dca.json to enable, e.g. to scan manual/recovery runs that
-    # happened before the 10:30 AM decision.
+    # guard. None (default) means use [DEFAULT_AFTERNOON_TASK_ROOT] at runtime
+    # so manual/recovery fills before 10:30 AM are detected automatically.
+    # Set to () (empty tuple) to fully disable the guard (equivalent to setting
+    # artifact_paths.prior_allocation_roots to [] in morning_dca.json).
+    # Override via artifact_paths.prior_allocation_roots in morning_dca.json;
+    # an explicit [] is preserved as () to honour the opt-out intent.
     prior_allocation_roots: Optional[Tuple[str, ...]] = None
     # Minimum number of completed intraday bars over the trend window required to
     # validate the intraday trend in live mode. When fewer are available a
@@ -653,7 +658,9 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
     if "preflight_run_state_root" in artifact_paths:
         kwargs["preflight_run_state_root"] = artifact_paths["preflight_run_state_root"]
     prior_roots = artifact_paths.get("prior_allocation_roots")
-    if isinstance(prior_roots, list) and prior_roots:
+    if isinstance(prior_roots, list):
+        # Preserve [] as () so an explicit empty array in JSON fully disables
+        # the guard (None = not set = use default afternoon root at runtime).
         kwargs["prior_allocation_roots"] = tuple(str(r) for r in prior_roots)
 
     # Load the configured ticker whitelist from config/tickers.json, the same
@@ -870,14 +877,42 @@ class MorningDCAExecutor(DCAExecutor):
     ) -> Dict[str, TopUpOutcome]:
         """Return per-ticker prior-allocation/top-up outcomes.
 
-        When ``config.prior_allocation_roots`` is not set (the morning default)
-        returns an empty dict so the caller buys the full graded amount.  When
-        roots are configured, loads same-day fills up to the run boundary and
-        computes an incremental top-up for every qualifying BUY signal.
+        Only active in ``MORNING_LIVE_MODE``; returns an empty dict for watchlist
+        and preflight modes so their artifacts always reflect the raw signal
+        budget and the 10:30 live run re-evaluates from scratch.
+
+        Scans ``config.prior_allocation_roots`` and, for the morning stream
+        only, appends the ``manual_runs`` subtree of ``self.state_root`` so
+        that manual morning recovery runs under an overridden
+        ``morning_run_state_root`` are visible. Scheduled same-window artifacts
+        in ``YYYYMMDD_1030ET/`` are excluded (handled by the normal broker
+        duplicate-order guard on retry). Midday manual reruns are NOT appended
+        here — they are prior context for the afternoon guard only. The append
+        is also skipped when a configured root already covers the manual subtree
+        to avoid double-counting fills.
         """
-        roots = getattr(self.config, "prior_allocation_roots", None)
-        if not roots:
+        if self.mode != MORNING_LIVE_MODE:
             return {}
+        raw_roots = getattr(self.config, "prior_allocation_roots", None)
+        if raw_roots is not None and len(raw_roots) == 0:
+            # Caller explicitly set [] in morning_dca.json → fully disable guard.
+            return {}
+        configured = list(raw_roots) if raw_roots is not None else [DEFAULT_AFTERNOON_TASK_ROOT]
+        # Append the manual_runs subtree of self.state_root only for the morning
+        # stream. Midday manual reruns are prior context for the afternoon guard,
+        # not for the midday scheduled run; skip to avoid scanning
+        # midday_dca/manual_reruns as live prior allocation.
+        # Also skip when a configured root already covers manual_root (ancestor)
+        # to avoid load_prior_same_day_allocations_multi double-counting fills.
+        manual_root = str(Path(self.state_root) / self.manual_run_subdir)
+        morning_only = self.stream == MORNING_STREAM
+        already_covered = any(
+            Path(manual_root).is_relative_to(Path(r)) for r in configured
+        )
+        if morning_only and not already_covered:
+            roots = list(dict.fromkeys([*configured, manual_root]))
+        else:
+            roots = list(dict.fromkeys(configured))
         trading_day = now.astimezone(EASTERN).date()
         boundary_et = now.astimezone(EASTERN).time()
         prior_allocations = load_prior_same_day_allocations_multi(
@@ -991,21 +1026,31 @@ class MorningDCAExecutor(DCAExecutor):
             artifacts["manual_review_tickers"] = (
                 artifacts.get("manual_review_tickers", []) + new_top_up_manual
             )
-            outcomes_by_ticker = {o.ticker: o for o in outcomes}
-            new_rows = []
-            for ticker in new_top_up_manual:
-                outcome = outcomes_by_ticker[ticker]
-                new_rows.append(
-                    {
-                        "ticker": ticker,
-                        "reason": f"top-up guard: {outcome.top_up_guard_result}",
-                        "hypothetical_amount_usd": outcome.desired_amount,
-                        "current_price": outcome.decision_price,
-                    }
-                )
-            artifacts["manual_review_candidates"] = (
-                artifacts.get("manual_review_candidates", []) + new_rows
-            )
+            # Also add the full row dicts (not a re-derived minimal dict) so
+            # downstream readers of manual_review_candidates see top-up
+            # missing-price cases with the same shape as trend-unvalidated
+            # cases (MorningSignal.to_row(): source, action, drop_pct,
+            # multiplier, warnings, execution_status, trend_validated) plus
+            # the top-up fields _attach_top_up_fields already set on the
+            # buy_candidates row (prior_same_day_*, morning_desired_amount,
+            # morning_decision_price, incremental_order_amount,
+            # top_up_guard_result, top_up_skipped, top_up_manual_review).
+            new_set = set(new_top_up_manual)
+            extra_rows = [
+                row for row in artifacts.get("buy_candidates", [])
+                if row.get("ticker") in new_set
+            ]
+            if extra_rows:
+                manual_rows = list(artifacts.get("manual_review_candidates", []))
+                by_ticker = {r.get("ticker"): r for r in manual_rows if r.get("ticker")}
+                for row in extra_rows:
+                    ticker = row.get("ticker")
+                    if ticker in by_ticker:
+                        by_ticker[ticker].update(row)
+                    else:
+                        manual_rows.append(row)
+                        by_ticker[ticker] = row
+                artifacts["manual_review_candidates"] = manual_rows
 
     # -- DCAExecutor hooks ---------------------------------------------------
     @property

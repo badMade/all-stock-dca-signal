@@ -29,6 +29,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import math
 import os
 import statistics
 from dataclasses import dataclass, field, replace
@@ -1766,18 +1767,24 @@ def _orders_csv_fills(
                     price = float(raw_price) if raw_price not in (None, "", "-") else None
                 except (TypeError, ValueError):
                     price = None
-                price_valid = price is not None and price > 0
+                # `> 0` alone excludes NaN (NaN > 0 is False) but NOT Infinity
+                # (float('inf') > 0 is True) -- math.isfinite() also rejects a
+                # corrupted/malformed CSV value of "inf"/"Infinity" so it can
+                # never poison the same-day top-up guard with an unbounded
+                # reference price or prior allocation (Gemini review on PR #31).
+                price_valid = price is not None and math.isfinite(price) and price > 0
                 raw_qty = row.get("quantity_filled")
                 try:
                     qty = float(raw_qty) if raw_qty not in (None, "", "-") else None
                 except (TypeError, ValueError):
                     qty = None
+                qty_valid = qty is not None and math.isfinite(qty) and qty > 0
                 raw_amount = row.get("amount_usd")
                 try:
                     amount = float(raw_amount) if raw_amount not in (None, "", "-") else None
                 except (TypeError, ValueError):
                     amount = None
-                amount_valid = amount is not None and amount > 0
+                amount_valid = amount is not None and math.isfinite(amount) and amount > 0
                 if not price_valid and not amount_valid:
                     # No usable price AND no usable amount_usd -- genuinely no
                     # capital-movement information to preserve for this row.
@@ -1789,7 +1796,7 @@ def _orders_csv_fills(
                     # them outright -- the confirmed CSV amount must not be
                     # silently discarded in favor of a stale planned amount.
                     "avg_fill_price": price if price_valid else None,
-                    "quantity_filled": qty if qty and qty > 0 else None,
+                    "quantity_filled": qty if qty_valid else None,
                     "amount_usd": amount if amount_valid else None,
                 }
     except Exception:

@@ -133,6 +133,54 @@ def test_run_pipeline_explicit_prior_root_uses_run_time_boundary(tmp_path):
     assert by_ticker["AAPL"]["top_up_guard_result"] != "no_prior_run"
 
 
+def test_run_pipeline_scheduled_run_loads_sibling_stream_roots_to_run_time(tmp_path):
+    import json
+
+    # The afternoon scheduled artifacts can live under a non-standard cron_tracking
+    # base. Sibling morning/midday roots must be derived from that local base, and
+    # scans must include manual/live fills recorded after the historical 14:30 ET
+    # cutoff but before the actual afternoon run time.
+    cron_base = tmp_path / "custom_cron_tracking"
+    afternoon_root = cron_base / "ce16ba6b"
+    midday_root = cron_base / "midday_dca"
+    prior_dir = midday_root / "manual_reruns" / "1505"
+    prior_dir.mkdir(parents=True)
+    (prior_dir / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": _now().date().isoformat(),
+            "generated_at": f"{_now().date().isoformat()}T15:05:00-04:00",
+            "run_classification": {"run_origin": "manual", "run_id": "midday_manual_1505"},
+            "buy_candidates": [
+                {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0, "target_price": 0.01},
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    config = _demo_config()
+    scheduled_dir = afternoon_root / "scheduled_runs" / "20260706_1520ET"
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=scheduled_dir,
+    )
+
+    assert result["blocked"] is False
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    aapl = by_ticker["AAPL"]
+    # Prove the midday sibling root was scanned: the run_id must match the seeded run.
+    assert aapl["prior_same_day_run_id"] == "midday_manual_1505"
+    assert aapl["prior_same_day_amount"] == 3.0
+    # Prove the run-time boundary (15:45) was used, not the historical 14:30 cutoff:
+    # the seeded fill is at 15:05, which is after 14:30 but before 15:45.  With the
+    # old 14:30 boundary the fill would have been excluded and guard_result would be
+    # "no_prior_run"; with the correct run-time boundary it is found and the guard
+    # blocks or reduces the afternoon buy.
+    assert aapl["top_up_guard_result"] != "no_prior_run"
+
+
 def test_default_prior_allocation_state_root_walks_past_scheduled_runs():
     from pathlib import Path
 

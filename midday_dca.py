@@ -44,6 +44,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from dca_config import load_approved_dates
 from morning_dca import (
+    DEFAULT_AFTERNOON_TASK_ROOT,
     DEFAULT_MORNING_LIVE_STATE_ROOT,
     EXEC_MANUAL_REVIEW_CANDIDATE,
     MorningConfig,
@@ -73,11 +74,6 @@ MIDDAY_LIVE_SCHEMA_VERSION = "midday-live-v1"
 # Artifact root: a sibling of, and never nested under, the morning or afternoon
 # roots.
 DEFAULT_MIDDAY_LIVE_STATE_ROOT = "/home/user/workspace/cron_tracking/midday_dca"
-
-# The afternoon live task root (cron ce16ba6b). Included in midday's
-# prior_allocation_roots so that manual fills recorded via the afternoon path
-# before 12:30 PM are seen by the midday top-up guard.
-DEFAULT_AFTERNOON_TASK_ROOT = "/home/user/workspace/cron_tracking/ce16ba6b"
 
 # Per-mode identity/profile. The midday stream has a single live mode.
 MIDDAY_PROFILES: Dict[str, Dict[str, Any]] = {
@@ -215,7 +211,9 @@ def load_midday_config(config_dir=None) -> MiddayConfig:
         kwargs["morning_run_state_root"] = artifact_paths["live_run_state_root"]
 
     roots = artifact_paths.get("prior_allocation_roots")
-    if isinstance(roots, list) and roots:
+    if isinstance(roots, list):
+        # Preserve [] as () so an explicit empty array in JSON fully disables
+        # the guard (consistent with load_morning_config).
         kwargs["prior_allocation_roots"] = tuple(str(r) for r in roots)
 
     # Load the configured ticker whitelist from config/tickers.json, the same
