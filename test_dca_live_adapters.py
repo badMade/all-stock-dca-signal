@@ -172,6 +172,107 @@ def test_provider_bid_ask_raises_on_inactive_quote():
         prov.get_bid_ask("AAPL", _decision_dt())
 
 
+def test_provider_bid_ask_reads_top_level_mcp_sibling_fields():
+    # PR #48 / Codex review: some Robinhood MCP payloads expose bid/ask as
+    # siblings of the nested "quote" object rather than inside it. The
+    # nested quote here has no bid/ask at all, so the only usable spread
+    # data is on the top-level result.
+    quotes = {
+        "data": {
+            "results": [
+                {
+                    "quote": {
+                        "symbol": "AAPL",
+                        "last_trade_price": "313.330100",
+                        "has_traded": True,
+                        "state": "active",
+                    },
+                    "bid_price": "313.10",
+                    "ask_price": "313.40",
+                }
+            ]
+        }
+    }
+    prov = RobinhoodDataProvider(historicals_fn=lambda **k: HISTORICALS, quotes_fn=lambda **k: quotes)
+    assert prov.get_bid_ask("AAPL", _decision_dt()) == pytest.approx((313.10, 313.40))
+
+
+def test_provider_bid_ask_prefers_sibling_over_empty_nested_placeholder():
+    # Codex review on PR #48: when the nested quote object carries an empty
+    # or zero bid/ask placeholder alongside a usable top-level sibling, the
+    # placeholder must not win just because it is nested. The genuinely
+    # positive value (wherever it lives) should be used.
+    quotes = {
+        "data": {
+            "results": [
+                {
+                    "quote": {
+                        "symbol": "AAPL",
+                        "last_trade_price": "313.330100",
+                        "bid_price": "0",
+                        "ask_price": "",
+                        "has_traded": True,
+                        "state": "active",
+                    },
+                    "bid_price": "313.10",
+                    "ask_price": "313.40",
+                }
+            ]
+        }
+    }
+    prov = RobinhoodDataProvider(historicals_fn=lambda **k: HISTORICALS, quotes_fn=lambda **k: quotes)
+    assert prov.get_bid_ask("AAPL", _decision_dt()) == pytest.approx((313.10, 313.40))
+
+
+def test_provider_bid_ask_recognizes_alternate_key_names():
+    # Codex/Copilot review on PR #48: some MCP shapes name the fields
+    # best_bid/best_ask instead of bid_price/ask_price.
+    quotes = {
+        "data": {
+            "results": [
+                {
+                    "quote": {
+                        "symbol": "AAPL",
+                        "last_trade_price": "313.330100",
+                        "best_bid": "313.10",
+                        "best_ask": "313.40",
+                        "has_traded": True,
+                        "state": "active",
+                    }
+                }
+            ]
+        }
+    }
+    prov = RobinhoodDataProvider(historicals_fn=lambda **k: HISTORICALS, quotes_fn=lambda **k: quotes)
+    assert prov.get_bid_ask("AAPL", _decision_dt()) == pytest.approx((313.10, 313.40))
+
+
+def test_provider_bid_ask_raises_on_partial_nbbo_even_with_siblings():
+    # Codex review on PR #48 explicitly warned against a trade-price fallback
+    # that fires when only one side of the NBBO is present -- that would let
+    # the spread breaker see a false 0% spread. We deliberately did not add
+    # any last-trade-price fallback, so a one-sided quote (bid present, ask
+    # missing everywhere) must still fail closed.
+    quotes = {
+        "data": {
+            "results": [
+                {
+                    "quote": {
+                        "symbol": "AAPL",
+                        "last_trade_price": "313.330100",
+                        "bid_price": "313.10",
+                        "has_traded": True,
+                        "state": "active",
+                    }
+                }
+            ]
+        }
+    }
+    prov = RobinhoodDataProvider(historicals_fn=lambda **k: HISTORICALS, quotes_fn=lambda **k: quotes)
+    with pytest.raises(ValueError, match="no usable bid/ask"):
+        prov.get_bid_ask("AAPL", _decision_dt())
+
+
 def test_provider_quote_none_without_quotes_fn():
     prov = RobinhoodDataProvider(historicals_fn=lambda **k: HISTORICALS)
     assert prov.get_quote("AAPL", _decision_dt()) is None

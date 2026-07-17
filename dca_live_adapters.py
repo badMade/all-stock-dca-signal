@@ -84,6 +84,20 @@ def _to_float(value: Any, default: float = 0.0) -> float:
     return result if math.isfinite(result) else default
 
 
+def _first_positive_float(mapping: Dict[str, Any], *keys: str) -> float:
+    """Return the first strictly-positive float found across ``keys`` in ``mapping``.
+
+    Returns ``0.0`` if no key is present or every candidate is non-positive/non-numeric,
+    so callers can treat that the same as "field not present" rather than special-casing
+    each of several possible key names individually.
+    """
+    for key in keys:
+        value = _to_float(mapping.get(key))
+        if value > 0:
+            return value
+    return 0.0
+
+
 def _is_error_response(data: Dict[str, Any]) -> Optional[str]:
     """Return a reason string if a wrapper reported failure as data, else ``None``.
 
@@ -268,8 +282,21 @@ class RobinhoodDataProvider:
                 f"no spread for {ticker}: inactive quote "
                 f"(has_traded={quote.get('has_traded')}, state={quote.get('state')})"
             )
-        bid = _to_float(quote.get("bid_price", quote.get("bid")))
-        ask = _to_float(quote.get("ask_price", quote.get("ask")))
+        # Some Robinhood MCP payloads expose bid/ask under alternate key names
+        # (best_bid/best_ask) and/or as siblings of the nested "quote" object
+        # rather than inside it. Check the nested quote first, then the raw
+        # top-level result, so a genuinely positive value in either location
+        # wins rather than an empty/zero nested placeholder unconditionally
+        # shadowing a usable sibling value.
+        siblings = quote.get("_siblings") or {}
+        bid_keys = ("bid_price", "bid", "best_bid", "best_bid_price")
+        ask_keys = ("ask_price", "ask", "best_ask", "best_ask_price")
+        bid = _first_positive_float(quote, *bid_keys) or _first_positive_float(siblings, *bid_keys)
+        ask = _first_positive_float(quote, *ask_keys) or _first_positive_float(siblings, *ask_keys)
+        # Deliberately no last-trade-price fallback here: a spread breaker
+        # that treats a missing/one-sided NBBO as a synthetic 0% spread would
+        # fail open exactly when it has the least information. Any quote
+        # without a genuine two-sided bid/ask stays unavailable.
         if bid <= 0 or ask <= 0 or ask < bid:
             raise ValueError(
                 f"no usable bid/ask in {ticker} quote (bid={bid!r}, ask={ask!r})"
@@ -318,6 +345,13 @@ class RobinhoodDataProvider:
                 # Attach the official settled close so callers can reuse it.
                 quote = dict(quote)
                 quote["_close"] = result.get("close") or {}
+                # Some MCP payloads expose bid/ask (and possibly other quote-side
+                # fields) as top-level siblings of the nested "quote" object rather
+                # than inside it. Keep the raw top-level result available so callers
+                # like get_bid_ask can fall back to sibling fields without an
+                # unconditional merge silently discarding usable nested data (or
+                # vice versa).
+                quote["_siblings"] = result
                 return quote
         return None
 
