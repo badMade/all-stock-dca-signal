@@ -907,7 +907,7 @@ class MorningDCAExecutor(DCAExecutor):
         manual_root = str(Path(self.state_root) / self.manual_run_subdir)
         morning_only = self.stream == MORNING_STREAM
         already_covered = any(
-            Path(manual_root).is_relative_to(Path(r)) for r in configured
+            Path(manual_root).resolve().is_relative_to(Path(r).resolve()) for r in configured
         )
         if morning_only and not already_covered:
             roots = list(dict.fromkeys([*configured, manual_root]))
@@ -1048,8 +1048,9 @@ class MorningDCAExecutor(DCAExecutor):
                     if ticker in by_ticker:
                         by_ticker[ticker].update(row)
                     else:
-                        manual_rows.append(row)
-                        by_ticker[ticker] = row
+                        copied_row = row.copy()
+                        manual_rows.append(copied_row)
+                        by_ticker[ticker] = copied_row
                 artifacts["manual_review_candidates"] = manual_rows
 
     # -- DCAExecutor hooks ---------------------------------------------------
@@ -1628,6 +1629,25 @@ class MorningDCAExecutor(DCAExecutor):
         """
         existing = self._existing_submitted_run_state(now)
         if existing is not None:
+            # Refresh the scheduled latest pointer to the preserved state so downstream
+            # consumers still see a valid, intentional run for this slot.
+            pointer_name = self.latest_pointer_name
+            pointer = Path(self.state_root) / pointer_name
+            pointer.parent.mkdir(parents=True, exist_ok=True)
+            pointer.write_text(
+                json.dumps(
+                    {
+                        "run_id": existing["artifacts"].get("run_id"),
+                        "run_state_path": existing["paths"]["run_state"],
+                        "trading_day": existing["artifacts"].get("trading_day"),
+                        "stream": existing["artifacts"].get("stream", self.stream),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            existing["paths"][pointer_name.replace(".json", "")] = str(pointer)
             return existing
         artifacts = self.build_artifacts(now, signals, source, manual=False)
         artifacts["status"] = "blocked"
@@ -1658,13 +1678,16 @@ class MorningDCAExecutor(DCAExecutor):
             return None
         if not isinstance(existing_artifacts, dict):
             return None
+        broker_outcomes = existing_artifacts.get("broker_outcomes")
         has_submitted = any(
             row.get("status") == "submitted"
             for row in existing_artifacts.get("buy_candidates", [])
             if isinstance(row, dict)
-        ) or any(
-            isinstance(outcome, dict) and outcome.get("status") == "submitted"
-            for outcome in existing_artifacts.get("broker_outcomes", {}).values()
+        ) or (
+            isinstance(broker_outcomes, dict) and any(
+                isinstance(outcome, dict) and outcome.get("status") == "submitted"
+                for outcome in broker_outcomes.values()
+            )
         )
         if not has_submitted:
             return None
