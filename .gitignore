@@ -17,6 +17,7 @@ dist/
 
 # Local run output
 artifacts/
+.coverage
 
 # Claude Code agent directory
 .claude/

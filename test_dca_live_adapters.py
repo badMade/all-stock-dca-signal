@@ -90,8 +90,11 @@ def test_to_float_rejects_non_finite():
 def test_rh_interval_mapping_and_rejection():
     assert _rh_interval(5) == "5minute"
     assert _rh_interval(30) == "30minute"
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as exc_info:
         _rh_interval(15)
+
+    assert "Robinhood has no 15-minute bar; supported minutes:" in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, KeyError)
 
 
 # -- RobinhoodDataProvider -------------------------------------------------------
