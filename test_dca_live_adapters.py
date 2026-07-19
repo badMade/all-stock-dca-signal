@@ -566,3 +566,38 @@ def test_build_broker_refuses_simulator_on_live_run():
         build_broker(StrategyConfig(broker=BrokerName.ROBINHOOD, dry_run=False))
     # dry_run=True is fine (returns the simulator).
     assert isinstance(build_broker(StrategyConfig(broker=BrokerName.ROBINHOOD, dry_run=True)), DryRunBroker)
+
+
+def test_build_broker_refuses_live_run_with_unset_account_sentinel():
+    # gemini-code-assist / chatgpt-codex-connector review on PR #54: run_once's
+    # `broker.account_number() != config.target_account_number` safety check is a
+    # tautology -- build_broker always constructs the broker with
+    # `account=config.target_account_number`, so both sides of that comparison are
+    # the same value by construction and the check can never fail. If the
+    # ROBINHOOD_AGENTIC_ACCOUNT_NUMBER env var is unset, config.target_account_number
+    # silently defaults to the "UNSET_ROBINHOOD_AGENTIC_ACCOUNT_NUMBER" placeholder,
+    # and a live (dry_run=False) run would build a real RobinhoodBroker against that
+    # placeholder instead of refusing to trade. build_broker must fail closed before
+    # constructing any live broker when the account number is unset or the sentinel.
+    with pytest.raises(RuntimeError, match="target_account_number"):
+        build_broker(
+            StrategyConfig(broker=BrokerName.ROBINHOOD, dry_run=False, target_account_number=""),
+            review_fn=lambda **k: {},
+        )
+    with pytest.raises(RuntimeError, match="target_account_number"):
+        build_broker(
+            StrategyConfig(
+                broker=BrokerName.ROBINHOOD,
+                dry_run=False,
+                target_account_number="UNSET_ROBINHOOD_AGENTIC_ACCOUNT_NUMBER",
+            ),
+            review_fn=lambda **k: {},
+        )
+    # Same guard applies to the ALPACA branch, which also skips the dry_run gate.
+    with pytest.raises(RuntimeError, match="target_account_number"):
+        build_broker(StrategyConfig(broker=BrokerName.ALPACA, dry_run=False, target_account_number=""))
+    # A dry run with an unset account number is fine (no real order can be placed).
+    assert isinstance(
+        build_broker(StrategyConfig(broker=BrokerName.ROBINHOOD, dry_run=True, target_account_number="")),
+        DryRunBroker,
+    )

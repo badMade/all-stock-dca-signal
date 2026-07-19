@@ -9,6 +9,20 @@ evidence.
 Runnable with ``pytest`` or ``python test_morning_dca.py``.
 """
 
+import os
+
+# chatgpt-codex-connector review on PR #54: conftest.py's
+# ``os.environ.setdefault("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", ...)`` only runs
+# when pytest collects this module, so ``python test_morning_dca.py`` (the
+# standalone runner documented above) bypasses it entirely. near_close_dca
+# reads the env var at import time, so the default must be set here, before
+# ``from morning_dca import ...`` below triggers that import, or the
+# standalone run picks up the unset-account sentinel instead of the fixture
+# value test_run_state_path_and_classification asserts against. This mirrors
+# conftest.py's setdefault exactly, so it's a no-op under pytest (conftest.py
+# already ran first) and only matters for the standalone path.
+os.environ.setdefault("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "562057042")
+
 import json
 from datetime import date, datetime, time, timedelta
 from pathlib import Path

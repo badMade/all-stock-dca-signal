@@ -57,7 +57,11 @@ EASTERN = ZoneInfo("America/New_York")
 # an unattended live task can route it to files/alerting instead of bare stdout.
 logger = logging.getLogger("near_close_dca")
 
-ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = "562057042"
+# Security Enhancement: Fetch account number from environment variable
+# to prevent exposing sensitive identifiers in version control.
+_UNSET_ACCOUNT_SENTINEL = "UNSET_ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"
+_env_account = os.environ.get("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER")
+ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = _env_account or _UNSET_ACCOUNT_SENTINEL
 
 # Lightweight usage-proxy fields logged to each live run's run_state so the monthly
 # cost tracker can aggregate automation load without any exact credit accounting.
@@ -802,7 +806,24 @@ def build_broker(
     the safe simulator. For ``BrokerName.ALPACA`` an :class:`AlpacaBroker` is returned.
     Live placement stays gated behind ``config.dry_run`` and the adapter's own
     ``enable_live_orders`` flag regardless of which backend is selected.
+
+    Security: for a live run (``config.dry_run`` is False) ``config.target_account_number``
+    must be a real, explicitly-configured value. ``run_once`` guards against trading the
+    wrong account with ``broker.account_number() != config.target_account_number``, but every
+    branch below constructs the broker with ``account=config.target_account_number``, so that
+    check is trivially satisfied by construction and can never catch a missing account number.
+    Refuse to build a live broker (the ALPACA branch, and the ROBINHOOD branch when adapter
+    callables are wired) here instead, before any live adapter is constructed.
     """
+    if not config.dry_run and (
+        not config.target_account_number or config.target_account_number == _UNSET_ACCOUNT_SENTINEL
+    ):
+        raise RuntimeError(
+            "build_broker: config.dry_run is False but config.target_account_number is "
+            f"unset ({config.target_account_number!r}). Set the ROBINHOOD_AGENTIC_ACCOUNT_NUMBER "
+            "environment variable (or otherwise configure a real account number) before running "
+            "live, or set dry_run=True."
+        )
     if config.broker == BrokerName.ALPACA:
         return AlpacaBroker(
             config=alpaca_config or AlpacaConfig(),
