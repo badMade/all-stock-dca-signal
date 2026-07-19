@@ -11,6 +11,7 @@ from dca_risk import (
     STREAM_MANUAL,
     STREAM_OTHER,
     STREAM_SCHEDULED,
+    _trading_day,
     apply_risk_guard,
     build_risk_report,
     classify_stream,
@@ -238,3 +239,13 @@ def test_rolling_30day_burn_rate_window_and_average():
     assert burn["total_deployed_usd"] == 900.0
     assert burn["daily_burn_rate_usd"] == pytest.approx(30.0)  # 900 / 30
     assert burn["active_deployment_days"] == 2
+
+def test_trading_day_invalid_date_returns_none():
+    """An unparseable trading_day string returns None."""
+    state = {"trading_day": "not-a-real-date"}
+    assert _trading_day(state) is None
+
+def test_trading_day_missing_or_wrong_type_returns_none():
+    """Missing or non-string trading_day returns None."""
+    assert _trading_day({}) is None
+    assert _trading_day({"trading_day": 12345}) is None
