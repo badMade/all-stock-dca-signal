@@ -1984,6 +1984,61 @@ def test_morning_live_empty_roots_disables_guard(tmp_path):
     assert art.get("top_up_offset_tickers", []) == [], art.get("top_up_offset_tickers")
     assert art.get("top_up_manual_review_tickers", []) == [], art.get("top_up_manual_review_tickers")
 
+
+def test_morning_top_up_guard_inactive_in_watchlist_mode(tmp_path):
+    # Watchlist mode is analytics-only: prior fills must never reduce hypothetical
+    # amounts even when prior_allocation_roots is configured.
+    prior_root = _seed_prior(tmp_path / "prior", "TOPUP", 4.50, reference_price=99.0)
+    cfg = MorningConfig(
+        tickers=("TOPUP",),
+        morning_run_state_root=str(tmp_path / "watchlist"),
+        prior_allocation_roots=(str(prior_root),),
+    )
+    ex = MorningDCAExecutor(cfg)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.03})
+    res = ex.run(_now(), data)
+    candidates = {r["ticker"]: r for r in res["artifacts"].get("buy_candidates", [])}
+    assert "TOPUP" in candidates
+    row = candidates["TOPUP"]
+    assert "top_up_guard_result" not in row, "top-up guard must not run in watchlist mode"
+    assert row.get("hypothetical_amount_usd") == 7.5
+
+
+def test_morning_top_up_guard_seeds_daily_cap_with_prior_spend(tmp_path):
+    # A prior same-day fill on a DIFFERENT ticker has consumed $85 of the $90
+    # daily cap. Without cap seeding the live run would see $90 remaining and
+    # place a $7.50 order; with seeding it correctly sees only $5 remaining and
+    # blocks the order as cap_exceeded.
+    prior_root = _seed_prior(tmp_path / "prior", "PREV", 85.0, reference_price=50.0)
+    cfg = MorningConfig(
+        tickers=("TOPUP",),
+        morning_run_state_root=str(tmp_path / "live"),
+        prior_allocation_roots=(str(prior_root),),
+        prior_cap_seed_roots=(str(prior_root),),
+        morning_daily_cap_usd=90.0,
+        morning_weekly_cap_usd=500.0,
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    broker = _TopUpBroker()
+    # TOPUP: 10% drop -> 5x -> $15 desired; no prior fill for TOPUP itself.
+    # $85 prior spend leaves only $5 -> $15 must be blocked as cap_exceeded.
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.10})
+    res = ex.run(_now_live(), data, broker=broker, manual=True)
+    broker_outcomes = res["artifacts"].get("broker_outcomes", {})
+    assert broker_outcomes.get("TOPUP", {}).get("status") == "cap_exceeded", (
+        f"TOPUP must be cap_exceeded: $15 > $5.00 remaining after $85 prior spend; "
+        f"broker_outcomes={broker_outcomes}"
+    )
+    assert "TOPUP" not in broker.placed, "broker.place_market_buy must not be called"
+    budget = res["artifacts"]["budget"]
+    assert budget["prior_same_day_spend_usd"] == 85.0, (
+        f"prior_same_day_spend_usd should be 85.0, got {budget['prior_same_day_spend_usd']}"
+    )
+    assert budget["remaining_daily_usd"] == 5.0, (
+        f"remaining_daily_usd should be 5.0 (90 - 85), got {budget['remaining_daily_usd']}"
+    )
+
+
 def test_per_order_cap_blocks_without_any_broker_call(tmp_path):
     # Codex review #25 on PR #22: the per-order cap should block a candidate
     # without needing any broker/account round-trip, but _place_broker_orders

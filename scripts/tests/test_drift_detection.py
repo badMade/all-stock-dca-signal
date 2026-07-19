@@ -235,6 +235,44 @@ class DriftDetectionTests(unittest.TestCase):
         code = main(["--run-dir", str(self.run_dir / "does-not-exist")])
         self.assertEqual(code, 1)
 
+    # --- afternoon action=buy without reconciled candidate -------------------
+    def test_afternoon_action_buy_without_candidate_is_not_drift(self):
+        """Finance-alone action=buy with no buy_candidates.csv entry must not alert.
+
+        When reconciliation filters out a Finance-only signal (e.g. Robinhood
+        disagreed), no buy_candidates.csv entry is written and no order is ever
+        placed. The detector must not count this as drift — absence of a buy
+        candidate is the evidence that the signal was legitimately filtered.
+        """
+        self._raw()
+        afternoon_signal_fields = ["ticker", "action", "buy_multiplier"]
+        with open(self.run_dir / "signals.csv", "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=afternoon_signal_fields)
+            writer.writeheader()
+            writer.writerow({"ticker": "AAPL", "action": "buy", "buy_multiplier": "1.0"})
+        # No buy_candidates.csv — reconciliation produced no candidate for AAPL.
+        report = detect_drift(self.run_dir)
+        self.assertFalse(report.drift_detected)
+        self.assertEqual(report.expected_symbol_count, 0)
+
+    def test_afternoon_action_buy_with_candidate_and_no_order_is_drift(self):
+        """Afternoon action=buy with a matching buy_candidates.csv entry but no
+        submitted order IS real drift."""
+        self._raw()
+        afternoon_signal_fields = ["ticker", "action", "buy_multiplier"]
+        with open(self.run_dir / "signals.csv", "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=afternoon_signal_fields)
+            writer.writeheader()
+            writer.writerow({"ticker": "AAPL", "action": "buy", "buy_multiplier": "1.0"})
+        with open(self.run_dir / "buy_candidates.csv", "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=["ticker", "desired_amount_usd", "status"])
+            writer.writeheader()
+            writer.writerow({"ticker": "AAPL", "desired_amount_usd": "7.50", "status": "buy"})
+        report = detect_drift(self.run_dir)
+        self.assertTrue(report.drift_detected)
+        self.assertEqual(report.expected_symbol_count, 1)
+        self.assertEqual(report.affected_symbols[0].symbol, "AAPL")
+
 
 class SlackTests(unittest.TestCase):
     def setUp(self):

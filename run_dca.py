@@ -71,6 +71,214 @@ _CROSS_STREAM_PRIOR_ALLOCATION_ROOTS: Tuple[str, ...] = (
 )
 
 
+def _build_frozen_providers_from_raw(
+    original_finance: "MarketDataProvider",
+    original_robinhood: "MarketDataProvider",
+    raw_dir: "Path",
+    *,
+    strict_finance: bool = False,
+    strict_robinhood: bool = False,
+) -> "Tuple[MarketDataProvider, MarketDataProvider]":
+    """Return frozen (finance_data, robinhood_data) backed by the persisted raw files.
+
+    Reads all batch files from ``raw_dir`` and constructs providers whose callables
+    serve the exact archived data so ``run_daily_compact()`` computes from the same
+    snapshot that was persisted, not from potentially-stale live MCP calls.
+
+    Robinhood files (``historicals_batchN.json``, ``quotes_batchN.json``):
+        Frozen ``RobinhoodDataProvider`` filters by ticker+interval so bars from
+        different granularities are never mixed.
+
+    Finance files (``finance_bars_batchN.json``, ``finance_close_batchN.json``):
+        Frozen ``FinanceDataProvider`` keyed by ``(ticker, interval_minutes)`` for
+        bars and by ticker for previous-close.  When no finance files are present,
+        the original live provider is returned for that source and a warning is
+        logged; the scheduler should persist finance connector responses under these
+        names to satisfy the full persist-before-compute contract.
+
+    Falls back to both original providers when ``raw_dir`` is absent or empty.
+    """
+    hist_results: List[Dict[str, Any]] = []
+    quotes_results: List[Dict[str, Any]] = []
+    # finance_bars keyed by (ticker, interval_minutes) → list of raw bar dicts
+    finance_bars: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+    finance_close: Dict[str, Any] = {}  # ticker → raw close value / dict
+    # Track file presence separately from parsed content: a persisted batch file
+    # with empty results is a valid archived snapshot (upstream returned no data)
+    # and must satisfy the strict check. Only raise when NO matching files exist.
+    hist_files_seen = False
+    quotes_files_seen = False
+    finance_files_seen = False
+
+    if raw_dir.is_dir():
+        for path in sorted(raw_dir.iterdir()):
+            name = path.name
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            # Unwrap the data envelope so both save paths read the same way:
+            # (a) normalize_connector_payload() resolves output_path pointers and
+            #     embeds the result under payload["data"] (normalized=true).
+            # (b) Inline adapter responses may also use {"data": {"results": [...]}}
+            #     as their carrier shape without an output_path; save_raw_input()
+            #     preserves that envelope as-is since there is nothing to resolve.
+            # In both cases, step into "data" when it is a dict and "results" is
+            # not already at the top level of the outer envelope.
+            if isinstance(payload, dict):
+                inner = payload.get("data")
+                if isinstance(inner, dict) and "results" not in payload:
+                    payload = inner
+            if not isinstance(payload, dict):
+                continue
+            if name.startswith("historicals_batch") and name.endswith(".json"):
+                hist_files_seen = True
+                hist_results.extend(payload.get("results") or [])
+            elif name.startswith("quotes_batch") and name.endswith(".json"):
+                quotes_files_seen = True
+                quotes_results.extend(payload.get("results") or [])
+            elif name.startswith("finance_bars_batch") and name.endswith(".json"):
+                finance_files_seen = True
+                for entry in payload.get("results") or []:
+                    tkr = str(entry.get("ticker") or "").strip().upper()
+                    ivl = int(entry.get("interval_minutes") or 0)
+                    if tkr and ivl:
+                        finance_bars.setdefault((tkr, ivl), []).extend(
+                            entry.get("bars") or []
+                        )
+            elif name.startswith("finance_close_batch") and name.endswith(".json"):
+                finance_files_seen = True
+                for entry in payload.get("results") or []:
+                    tkr = str(entry.get("ticker") or "").strip().upper()
+                    if tkr:
+                        finance_close[tkr] = entry.get("previous_close")
+
+    # --- Robinhood frozen provider -------------------------------------------
+    if hist_results or quotes_results or hist_files_seen or quotes_files_seen:
+        _h = hist_results
+        _q = quotes_results
+
+        def _frozen_historicals(symbols=None, interval=None, **_kw):
+            sym_set = set(symbols or [])
+            return {
+                "results": [
+                    r for r in _h
+                    if (not sym_set or r.get("symbol") in sym_set)
+                    and (interval is None or r.get("interval") == interval)
+                ]
+            }
+
+        def _frozen_quotes(symbols=None, **_kw):
+            sym_set = set(symbols or [])
+            return {
+                "results": [
+                    r for r in _q
+                    if not sym_set or (r.get("quote") or {}).get("symbol") in sym_set
+                ]
+            }
+
+        from dca_live_adapters import RobinhoodDataProvider as _RDP
+        frozen_robinhood: "MarketDataProvider" = _RDP(
+            historicals_fn=_frozen_historicals,
+            quotes_fn=_frozen_quotes if quotes_results else None,
+            bounds=getattr(original_robinhood, "_bounds", "regular"),
+            adjustment_type=getattr(original_robinhood, "_adjustment_type", "none"),
+        )
+    else:
+        if strict_robinhood:
+            raise RuntimeError(
+                "Robinhood raw files (historicals_batchN.json / quotes_batchN.json) "
+                f"absent from {raw_dir} — a scheduled live run requires a frozen Robinhood "
+                "provider to satisfy the persist-before-compute contract; persist Robinhood "
+                "connector responses under those filenames or add them to raw_connector_inputs"
+            )
+        logger.warning(
+            "Robinhood raw files (historicals_batchN.json / quotes_batchN.json) "
+            "absent from %s — robinhood_data will use the live provider; "
+            "persist Robinhood connector responses to satisfy the full "
+            "persist-before-compute contract",
+            raw_dir,
+        )
+        frozen_robinhood = original_robinhood
+
+    # --- Finance frozen provider ----------------------------------------------
+    if finance_bars or finance_close or finance_files_seen:
+        _fb = finance_bars
+        _fc = finance_close
+
+        def _frozen_finance_bars(ticker, _start, _end, interval_minutes):
+            return _fb.get((str(ticker).strip().upper(), int(interval_minutes)), [])
+
+        def _frozen_finance_close(ticker, _as_of):
+            return _fc.get(str(ticker).strip().upper())
+
+        from dca_live_adapters import FinanceDataProvider as _FDP
+        frozen_finance: "MarketDataProvider" = _FDP(
+            bars_fn=_frozen_finance_bars,
+            previous_close_fn=_frozen_finance_close,
+        )
+    else:
+        if strict_finance:
+            raise RuntimeError(
+                "finance raw files (finance_bars_batchN.json / finance_close_batchN.json) "
+                f"absent from {raw_dir} — a scheduled live run requires a frozen finance "
+                "provider to satisfy the persist-before-compute contract; persist finance "
+                "connector responses under those filenames or add them to raw_connector_inputs"
+            )
+        logger.warning(
+            "finance raw files (finance_bars_batchN.json / finance_close_batchN.json) "
+            "absent from %s — finance_data will use the live provider; "
+            "persist finance connector responses to satisfy the full "
+            "persist-before-compute contract",
+            raw_dir,
+        )
+        frozen_finance = original_finance
+
+    return frozen_finance, frozen_robinhood
+
+
+def _run_drift_check(run_dir: Path) -> Optional[Dict[str, Any]]:
+    """Invoke the artifact drift detector after a live run writes its artifacts.
+
+    Writes ``drift_report.json`` and ``drift_report.md`` alongside the run's
+    artifacts and logs a warning when drift is detected. Sends a Slack alert
+    when ``DCA_DRIFT_SLACK_WEBHOOK`` is set and drift is detected. Returns the
+    parsed drift report dict, or None when the directory is missing/unreadable.
+    """
+    try:
+        from scripts.drift_detection import (  # lazy — stdlib only dep
+            DEFAULT_SLACK_WEBHOOK_ENV,
+            detect_drift,
+            send_slack_alert,
+        )
+    except Exception as exc:  # pragma: no cover
+        logger.warning("drift detection unavailable: %s", exc)
+        return None
+    try:
+        report = detect_drift(run_dir)
+        (run_dir / "drift_report.json").write_text(
+            report.to_json(compact=False), encoding="utf-8"
+        )
+        (run_dir / "drift_report.md").write_text(report.to_markdown(), encoding="utf-8")
+        if report.drift_detected:
+            logger.warning(
+                "DRIFT DETECTED in %s: %d symbol(s) expected but no order record — %s",
+                run_dir,
+                len(report.affected_symbols),
+                ", ".join(s.symbol for s in report.affected_symbols),
+            )
+            try:
+                send_slack_alert(report, env_var=DEFAULT_SLACK_WEBHOOK_ENV)
+            except Exception as slack_exc:  # pragma: no cover
+                logger.warning("drift Slack alert failed: %s", slack_exc)
+        else:
+            logger.info("drift check OK for %s", run_dir)
+        return report.to_dict()
+    except Exception as exc:  # pragma: no cover
+        logger.warning("drift check failed for %s: %s", run_dir, exc)
+        return None
+
+
 def configure_logging(level: str = "INFO") -> None:
     """Configure a single stream handler for CLI/scheduler use (idempotent)."""
     logging.basicConfig(
@@ -188,6 +396,7 @@ def run_pipeline(
     run_label: str = "daily",
     scheduled: bool = True,
     generate_full_reports: bool = False,
+    ignore_trend_filter: bool = False,
     prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]] = None,
     prior_allocation_state_root: Optional[str | Path] = None,
     deployment_history_root: Optional[str | Path] = None,
@@ -233,6 +442,27 @@ def run_pipeline(
     given, no ``latest_scheduled_run.json`` write is attempted at all, so a
     caller must pass the real cron_tracking root explicitly to enable it.
     """
+    # Drain any leftover raw placement responses from a prior run on this broker
+    # instance (e.g. a manual run_pipeline() call that preceded this scheduled one).
+    # Without this, a non-scheduled manual call would leave its responses in the
+    # buffer and the next scheduled run would write them into its orders_after_place.json.
+    getattr(broker, "get_raw_placement_responses", lambda: [])()
+    if ignore_trend_filter and not config.ignore_trend_filter:
+        import dataclasses as _dc
+        config = _dc.replace(config, ignore_trend_filter=True)
+    # Auto-apply the final-buy trend override for scheduled runs in the 3:15-3:35 PM ET
+    # window (task 10ce362c, "scheduled_window_et": "15:15-15:35" in scheduled_tasks.json).
+    # This is restricted to scheduled live runs so manual, demo, and morning/midday callers
+    # are unaffected — they run outside this window and/or with scheduled=False.
+    elif scheduled and not config.dry_run and not config.ignore_trend_filter:
+        _now_et = now.astimezone(EASTERN).time()
+        if time(15, 15) <= _now_et <= time(15, 35):
+            import dataclasses as _dc
+            config = _dc.replace(config, ignore_trend_filter=True)
+            logger.info(
+                "final-buy window (%s ET): applied ignore_trend_filter=True for scheduled run",
+                _now_et.strftime("%H:%M"),
+            )
     raw_persistence_state: Optional[Dict[str, object]] = None
     if scheduled:
         trading_day_et = now.astimezone(EASTERN).date()
@@ -284,12 +514,28 @@ def run_pipeline(
                             )
                     # Every file staged and normalized cleanly -- swap the staging
                     # directory into place as this run's raw/, replacing whatever
-                    # a prior attempt left there.
+                    # a prior attempt left there. Preserve any post-placement
+                    # order history from the prior attempt first: if that run
+                    # placed an order and this retry is deduplicated (broker
+                    # dedup means no new order), the fill snapshot must survive
+                    # for slippage reporting and is not re-produced this run.
                     if raw_dir.exists():
+                        _prior_oap = raw_dir / "orders_after_place.json"
+                        _staged_oap = staging_dir / "orders_after_place.json"
+                        if _prior_oap.exists() and not _staged_oap.exists():
+                            shutil.copy2(_prior_oap, _staged_oap)
                         shutil.rmtree(raw_dir)
                     staging_dir.rename(raw_dir)
                     raw_persistence_state = build_raw_persistence_state(
                         trading_day_raw, raw_dir=raw_dir
+                    )
+                    # Rebuild both providers from the persisted, normalized files so
+                    # run_daily_compact() computes from the exact archived snapshot and
+                    # not potentially-stale live MCP calls made at a different time.
+                    finance_data, robinhood_data = _build_frozen_providers_from_raw(
+                        finance_data, robinhood_data, raw_dir,
+                        strict_finance=not config.dry_run,
+                        strict_robinhood=not config.dry_run,
                     )
                 except Exception as exc:  # noqa: BLE001 - failure must still write durable scheduled state
                     # Remove only the staging directory. raw_dir (if a prior
@@ -299,10 +545,13 @@ def run_pipeline(
                         shutil.rmtree(staging_dir, ignore_errors=True)
                     out = Path(artifacts_dir)
                     out.mkdir(parents=True, exist_ok=True)
-                    # Remove stale compact and report artifacts from any prior
+                    # Remove stale derived/report artifacts from any prior
                     # attempt so they are not mistaken for this failed run's output.
+                    # Do NOT delete orders.csv or buy_candidates.csv: a retry in the
+                    # same directory may follow a previously-successful attempt whose
+                    # real fill records must survive for reporting and cap accounting.
                     for _stale in (
-                        "signals.csv", "buy_candidates.csv", "orders.csv",
+                        "signals.csv",
                         "latest_run_summary.json", "slippage_and_coverage_report.md",
                         "slippage_ranked.csv", "missing_fills_report.csv",
                         "notion_latest_run_compact.md", "notion_latest_run_payload.json",
@@ -321,13 +570,24 @@ def run_pipeline(
                             "weekly_cap_usd": state.effective_weekly_cap(),
                         },
                     )
+                    # Preserve orders.csv from a prior successful run so that
+                    # load_prior_same_day_allocations() can still find the fills
+                    # even when this retry's raw-persistence fails.
+                    _prior_orders_csv = out / "orders.csv"
+                    if _prior_orders_csv.exists():
+                        failure_state["artifacts"] = {"orders_csv_path": str(_prior_orders_csv)}
                     run_state_path = out / "run_state.json"
                     run_state_path.write_text(json.dumps(failure_state, indent=2) + "\n", encoding="utf-8")
                     if classification_state_root is not None:
                         update_latest_scheduled_run_pointer(
                             failure_state, run_state_path, base=Path(classification_state_root)
                         )
-                    return {
+                    # signals.csv was already deleted above, so detect_drift()
+                    # finds an empty expected set and returns drift_detected=False —
+                    # _run_drift_check() would log nothing and send no Slack alert.
+                    # Emit the raw-persistence alert directly instead so operators
+                    # are paged on the documented missing-raw failure mode.
+                    failure_result: Dict[str, Any] = {
                         "run_label": run_label,
                         "scheduled": scheduled,
                         "compact": True,
@@ -336,6 +596,48 @@ def run_pipeline(
                         "artifacts_dir": str(out),
                         "run_state_path": str(run_state_path),
                     }
+                    try:
+                        from scripts.drift_detection import (
+                            CAUSE_RAW_MISSING,
+                            DEFAULT_SLACK_WEBHOOK_ENV,
+                            DriftReport,
+                            send_slack_alert,
+                        )
+                        _fail_report = DriftReport(
+                            run_dir=str(out),
+                            drift_detected=True,
+                            affected_symbols=[],
+                            run_suspected_cause=CAUSE_RAW_MISSING,
+                            recommended_action=(
+                                "Raw input persistence failed before signal computation; no orders "
+                                "were placed. Re-run the live task after confirming connector "
+                                "responses are available and raw/ can be written."
+                            ),
+                            signals_present=False,
+                            orders_present=False,
+                            submitted_orders_empty=True,
+                            raw_dir_present=False,
+                            expected_symbol_count=0,
+                            submitted_symbol_count=0,
+                            notes=[f"raw_persistence_error: {exc}"],
+                        )
+                        logger.warning(
+                            "RAW-PERSISTENCE FAILURE in %s — no signals computed, no orders placed: %s",
+                            out,
+                            exc,
+                        )
+                        (out / "drift_report.json").write_text(
+                            _fail_report.to_json(compact=False), encoding="utf-8"
+                        )
+                        (out / "drift_report.md").write_text(
+                            _fail_report.to_markdown(), encoding="utf-8"
+                        )
+                        if scheduled and not config.dry_run:
+                            send_slack_alert(_fail_report, env_var=DEFAULT_SLACK_WEBHOOK_ENV)
+                        failure_result["drift_report"] = _fail_report.to_dict()
+                    except Exception as _alert_exc:  # pragma: no cover
+                        logger.warning("raw-persistence failure alert failed: %s", _alert_exc)
+                    return failure_result
 
     if scheduled and prior_same_day_allocations is None:
         trading_day = now.astimezone(EASTERN).date()
@@ -406,6 +708,33 @@ def run_pipeline(
     if result.get("blocked"):
         logger.warning("run blocked by date gate for %s; skipping reports", result.get("run_state_path"))
         return result
+    if scheduled and not config.dry_run:
+        # Persist raw placement responses so fill data is replayable from
+        # durable storage without a live broker re-query at reporting time.
+        raw_responses = getattr(broker, "get_raw_placement_responses", lambda: [])()
+        if raw_responses:
+            raw_dir = Path(artifacts_dir) / "raw"
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            oap_path = raw_dir / "orders_after_place.json"
+            # Merge with any prior placement history so a partial retry (where some
+            # orders are broker-deduplicated and others are newly placed) preserves
+            # fill snapshots from both attempts. New responses take precedence on
+            # order_id collision so the freshest broker state always wins.
+            prior_orders: list = []
+            if oap_path.exists():
+                try:
+                    prior_orders = json.loads(oap_path.read_text(encoding="utf-8")).get("orders", []) or []
+                except (json.JSONDecodeError, OSError, AttributeError):
+                    prior_orders = []
+            new_ids = {r.get("order_id") or r.get("id") for r in raw_responses} - {None}
+            merged = raw_responses + [o for o in prior_orders if (o.get("order_id") or o.get("id")) not in new_ids]
+            oap_path.write_text(
+                json.dumps({"orders": merged}, indent=2) + "\n", encoding="utf-8"
+            )
+            result["orders_after_place_path"] = str(oap_path)
+        drift = _run_drift_check(Path(artifacts_dir))
+        if drift is not None:
+            result["drift_report"] = drift
     if not generate_full_reports:
         return result
 
@@ -417,9 +746,35 @@ def run_pipeline(
     run_state = json.loads((out / "run_state.json").read_text(encoding="utf-8"))
     orders_csv = out / "orders.csv"
     fills = _fills_from_orders_csv(orders_csv)
-    # A fill can land between placement and this (later) reporting step; re-query the broker
-    # for any submitted-but-unfilled order so it is not reported as a missing execution gap.
-    fills = _refresh_fills_from_broker(orders_csv, broker, fills)
+    # When raw/orders_after_place.json was persisted at order time, use it for
+    # fill data so the slippage report is replayable from the same durable file
+    # rather than re-querying the broker at reporting time.
+    orders_after_place = out / "raw" / "orders_after_place.json"
+    if orders_after_place.exists():
+        from dca_reporting import fills_from_order_history_payload
+        order_id_to_ticker: Dict[str, str] = {}
+        if orders_csv.exists():
+            with orders_csv.open(newline="", encoding="utf-8") as _fh:
+                for _row in csv.DictReader(_fh):
+                    _oid = _row.get("order_id")
+                    _tkr = _row.get("ticker")
+                    if _oid and _tkr:
+                        order_id_to_ticker[_oid] = _tkr
+        persisted_fills = fills_from_order_history_payload(
+            json.loads(orders_after_place.read_text(encoding="utf-8")),
+            order_id_to_ticker=order_id_to_ticker,
+        )
+        persisted_ids = {f.get("order_id") for f in persisted_fills if f.get("order_id")}
+        fills = [f for f in fills if f.get("order_id") not in persisted_ids] + persisted_fills
+        # The persisted snapshot captures order state at placement time; orders that
+        # were accepted/open then may have settled by now. Refresh any order ID that
+        # appears in orders.csv but not in persisted_fills (i.e. not yet filled at
+        # placement time) so they are not permanently reported as execution gaps.
+        fills = _refresh_fills_from_broker(orders_csv, broker, fills)
+    else:
+        # Fallback: re-query the broker for any submitted-but-unfilled order so
+        # it is not reported as a missing execution gap.
+        fills = _refresh_fills_from_broker(orders_csv, broker, fills)
     # Align candidate target prices with the durable execution records so the slippage
     # report ranks against the same target the orders CSV uses (the signal-time quote).
     targets = _execution_targets_from_orders_csv(orders_csv)

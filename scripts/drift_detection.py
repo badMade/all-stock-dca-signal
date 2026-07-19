@@ -55,6 +55,8 @@ SIGNAL_CSV_NAMES = ("signals.csv", "morning_signals.csv", "midday_signals.csv")
 ORDER_CSV_NAMES = ("submitted_orders.csv", "orders.csv", "filled_orders.csv")
 # Files that, if present and non-empty, name explicit broker/order failures.
 ERROR_CSV_NAMES = ("order_errors.csv", "rejections.csv", "order_rejections.csv")
+# Afternoon stream writes planned amounts here; signals.csv carries action/multiplier only.
+BUY_CANDIDATES_CSV_NAME = "buy_candidates.csv"
 RAW_DIR_NAME = "raw"
 RUN_STATE_NAME = "run_state.json"
 
@@ -62,12 +64,18 @@ RUN_STATE_NAME = "run_state.json"
 
 SYMBOL_COLUMNS = ("ticker", "symbol")
 AUTO_BUY_COLUMNS = ("auto_buy_signal", "auto_buy", "autobuy")
+# Morning/midday executor rows use execution_status="auto_buy_eligible" instead
+# of a boolean auto_buy column; detect it here so those rows aren't silently
+# excluded from the expected-buys set.
+EXECUTION_STATUS_COLUMN = "execution_status"
+EXEC_AUTO_BUY_VALUE = "auto_buy_eligible"
 INCREMENTAL_COLUMNS = ("incremental_order_amount", "incremental_amount_usd", "incremental_amount")
 DESIRED_COLUMNS = (
     "afternoon_desired_amount",
     "afternoon_desired_amount_usd",
     "desired_amount_usd",
     "desired_amount",
+    "hypothetical_amount_usd",
     "planned_amount_usd",
 )
 TOP_UP_GUARD_COLUMNS = ("top_up_guard_result", "top_up_result", "skip_reason")
@@ -79,6 +87,23 @@ STATUS_COLUMNS = ("status", "execution_status", "order_submit_status")
 
 # Values (case-insensitive) that count as boolean true.
 _TRUE_TOKENS = {"true", "1", "yes", "y", "t"}
+
+# buy_candidates.csv status values that indicate a deliberate non-submission.
+# An afternoon signal with a matching candidate status is an intentional guard
+# outcome, not drift, so we exclude it from the expected set to avoid false alerts.
+_DELIBERATE_SKIP_STATUSES = frozenset({
+    "blocked",
+    "cap_exceeded",   # morning/midday: daily or weekly cap exhausted before placement
+    "not_submitted",
+    "skipped",
+    "manual_review",
+    "manual_review_candidate",
+    "budget_exceeded",
+    "spread_fail",
+    "confidence_fail",
+    "trend_blocked",
+    "no_incremental",
+})
 
 # top_up_guard_result / skip_reason substrings that mean "the buy was
 # deliberately reduced to $0 for this row" -- an explanation, not silent drift.
@@ -166,6 +191,7 @@ class RunArtifacts:
     error_source_name: Optional[str]
     raw_dir_present: bool
     run_state: Optional[Dict[str, Any]]
+    buy_candidate_rows: List[Dict[str, str]] = field(default_factory=list)
 
     @property
     def submitted_symbols(self) -> set:
@@ -174,6 +200,16 @@ class RunArtifacts:
             sym = _symbol(row)
             if sym:
                 symbols.add(sym)
+        # Morning/midday executors record submitted orders in run_state["broker_outcomes"]
+        # rather than a separate order CSV; include status="submitted" tickers so their
+        # auto_buy_eligible rows are not reported as false-alarm submitted_orders_missing.
+        outcomes = (self.run_state or {}).get("broker_outcomes", {})
+        if isinstance(outcomes, dict):
+            for ticker, outcome in outcomes.items():
+                if isinstance(outcome, dict) and outcome.get("status") == "submitted":
+                    sym = str(ticker).strip().upper()
+                    if sym:
+                        symbols.add(sym)
         return symbols
 
 
@@ -190,6 +226,7 @@ def load_run_artifacts(run_dir: Path) -> RunArtifacts:
     signals_path = _first_existing(run_dir, SIGNAL_CSV_NAMES)
     orders_path = _first_existing(run_dir, ORDER_CSV_NAMES)
     error_path = _first_existing(run_dir, ERROR_CSV_NAMES)
+    buy_candidates_path = run_dir / BUY_CANDIDATES_CSV_NAME
 
     run_state: Optional[Dict[str, Any]] = None
     state_path = run_dir / RUN_STATE_NAME
@@ -210,6 +247,7 @@ def load_run_artifacts(run_dir: Path) -> RunArtifacts:
         error_source_name=error_path.name if error_path else None,
         raw_dir_present=(run_dir / RAW_DIR_NAME).is_dir(),
         run_state=run_state,
+        buy_candidate_rows=read_csv_rows(buy_candidates_path),
     )
 
 
@@ -351,7 +389,13 @@ def _row_block_evidence(row: Mapping[str, Any]) -> List[str]:
 
 def _infer_run_cause(art: RunArtifacts, submitted_orders_empty: bool) -> str:
     """Pick the single most-likely run-level cause of missing orders."""
-    if not art.raw_dir_present:
+    # raw/ is only written by the afternoon pipeline; morning and midday executors
+    # (identified by their stream-specific signals CSV names) never produce it.
+    # Gate the raw-missing cause on afternoon runs so morning/midday genuine
+    # broker failures are not incorrectly diagnosed as persistence failures.
+    _signals_name = art.signals_path.name if art.signals_path is not None else ""
+    _raw_expected = _signals_name not in ("morning_signals.csv", "midday_signals.csv")
+    if not art.raw_dir_present and _raw_expected:
         return CAUSE_RAW_MISSING
     if art.orders_path is None:
         return CAUSE_ORDERS_MISSING
@@ -406,23 +450,92 @@ def detect_drift(run_dir: Path) -> DriftReport:
     submitted = art.submitted_symbols
     submitted_orders_empty = art.orders_path is not None and len(art.order_rows) == 0
 
-    expected: List[tuple] = []  # (symbol, amount, auto_buy, row_evidence)
+    # Index buy_candidates.csv by ticker for amount lookup on afternoon rows.
+    # The afternoon signals.csv carries action/multiplier but not dollar amounts;
+    # planned_amount_usd lives in buy_candidates.csv keyed by ticker.
+    buy_candidate_by_ticker: Dict[str, Dict[str, str]] = {}
+    for bc_row in art.buy_candidate_rows:
+        sym = _symbol(bc_row)
+        if sym:
+            buy_candidate_by_ticker[sym] = bc_row
+
+    expected: Dict[str, tuple] = {}  # symbol -> (symbol, amount, auto_buy, row_evidence)
     for row in art.signal_rows:
         symbol = _symbol(row)
         if symbol is None:
             continue
-        auto_buy = parse_bool(_get(row, AUTO_BUY_COLUMNS))
+        exec_status = _get(row, (EXECUTION_STATUS_COLUMN,))
+        auto_buy = (
+            parse_bool(_get(row, AUTO_BUY_COLUMNS))
+            or (exec_status is not None and str(exec_status).strip() == EXEC_AUTO_BUY_VALUE)
+        )
+        # Afternoon stream: action="buy" with buy_multiplier > 0 is an eligible buy.
+        # These rows carry no boolean auto_buy_signal column; recognize the pattern here.
+        # Track separately so we can require a buy_candidates.csv entry for these rows
+        # (absence means reconciliation filtered the signal out, e.g. Finance-alone).
+        auto_buy_from_action = False
+        if not auto_buy:
+            action_val = _get(row, ("action",))
+            multiplier_val = _get(row, ("buy_multiplier",))
+            if (
+                action_val is not None
+                and str(action_val).strip().lower() == "buy"
+                and parse_amount(multiplier_val) > 0
+            ):
+                auto_buy = True
+                auto_buy_from_action = True
         incremental = parse_amount(_get(row, INCREMENTAL_COLUMNS))
         desired = parse_amount(_get(row, DESIRED_COLUMNS))
+        # For afternoon action="buy" rows, amounts live in buy_candidates.csv.
+        # Also check the candidate's outcome status: a deliberate guard block is
+        # not drift, so we exclude it from the expected set rather than firing a
+        # false alert. Evidence from the candidate row is merged with signal evidence
+        # for any remaining rows so deliberate blocks still surface in the report.
+        bc_evidence: List[str] = []
+        if auto_buy and symbol in buy_candidate_by_ticker:
+            bc = buy_candidate_by_ticker[symbol]
+            bc_status = str(_get(bc, STATUS_COLUMNS) or "").strip().lower()
+            if bc_status in _DELIBERATE_SKIP_STATUSES:
+                # Deliberate non-submission recorded in buy_candidates.csv — not drift.
+                continue
+            bc_evidence = _row_block_evidence(bc)
+            if incremental == 0 and desired == 0:
+                desired = parse_amount(_get(bc, DESIRED_COLUMNS))
+                incremental = parse_amount(_get(bc, INCREMENTAL_COLUMNS))
+        elif auto_buy:
+            if auto_buy_from_action:
+                # Afternoon action=buy row with no matching buy_candidates.csv entry:
+                # reconciliation did not produce a candidate (e.g. Finance signal
+                # without Robinhood agreement), so no order was ever intended.
+                # Skip rather than raising a false drift alert.
+                continue
+            # Morning/midday executors don't write buy_candidates.csv; their
+            # per-symbol execution outcomes (cap_exceeded, blocked, etc.) are
+            # recorded in run_state["broker_outcomes"]. Check there so deliberate
+            # safety blocks are not misreported as drift.
+            _outcomes = (art.run_state or {}).get("broker_outcomes", {})
+            if isinstance(_outcomes, dict) and symbol in _outcomes:
+                _outcome = _outcomes[symbol]
+                _ostatus = str(
+                    (_outcome.get("status") if isinstance(_outcome, dict) else _outcome) or ""
+                ).strip().lower()
+                if _ostatus in _DELIBERATE_SKIP_STATUSES:
+                    continue
         positive = incremental > 0 or desired > 0
         if auto_buy and positive:
             amount = incremental if incremental > 0 else desired
-            expected.append((symbol, amount, auto_buy, _row_block_evidence(row)))
+            # Use setdefault so only the first row per ticker is kept; afternoon
+            # signals.csv may carry both Finance and Robinhood source rows for
+            # the same ticker, which would otherwise produce duplicate entries.
+            expected.setdefault(
+                symbol,
+                (symbol, amount, auto_buy, _row_block_evidence(row) + bc_evidence),
+            )
 
     run_cause = _infer_run_cause(art, submitted_orders_empty)
 
     affected: List[SymbolDrift] = []
-    for symbol, amount, auto_buy, row_evidence in expected:
+    for symbol, amount, auto_buy, row_evidence in expected.values():
         if symbol in submitted:
             continue
         # A per-row guard explanation overrides the generic run-level cause.

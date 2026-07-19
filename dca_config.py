@@ -220,6 +220,29 @@ def load_approved_dates(config_dir: Path) -> Dict[str, Any]:
     return out
 
 
+def load_near_close_overrides(config_dir: Path) -> Dict[str, Any]:
+    """Load per-field overrides from ``near_close_dca.json`` for the afternoon task.
+
+    Only keys that correspond to valid :class:`~near_close_dca.StrategyConfig`
+    fields are forwarded; unknown keys are silently ignored so the file can
+    carry documentation-only entries without breaking the loader.
+
+    ``dry_run`` and ``broker`` are excluded from the allowed set — they must
+    never be set from file config so that loading config alone can never enable
+    live trading.
+    """
+    data = _read_json(config_dir / "near_close_dca.json")
+    if data is None:
+        return {}
+    valid_fields = {f.name for f in dataclasses.fields(StrategyConfig)}
+    excluded = {"dry_run", "broker"}
+    out: Dict[str, Any] = {}
+    for key, value in data.items():
+        if key in valid_fields and key not in excluded:
+            out[key] = value
+    return out
+
+
 def load_strategy_config(
     config_dir: str | Path = DEFAULT_CONFIG_DIR,
     *,
@@ -252,6 +275,7 @@ def load_strategy_config(
     merged.update(load_budgets(config_dir))
     merged.update(load_sizing_tiers(config_dir))
     merged.update(load_approved_dates(config_dir))
+    merged.update(load_near_close_overrides(config_dir))
     merged.update(overrides)
 
     valid_fields = {f.name for f in dataclasses.fields(StrategyConfig)}

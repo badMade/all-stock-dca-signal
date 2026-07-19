@@ -374,15 +374,18 @@ def test_run_pipeline_raw_persistence_failure_clears_stale_compact_artifacts(tmp
     config = _demo_config()
     scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
     scheduled_dir.mkdir(parents=True)
-    # Seed stale compact + derived-report artifacts from a prior successful attempt.
-    stale_files = (
-        "orders.csv", "signals.csv", "buy_candidates.csv",
+    # Seed stale derived-report artifacts from a prior attempt.
+    # orders.csv and buy_candidates.csv are intentionally NOT seeded here; they are
+    # preserved across retry failures so a successful prior run's fill records survive
+    # (see test_run_pipeline_raw_persistence_failure_preserves_prior_order_artifacts).
+    cleared_files = (
+        "signals.csv",
         "latest_run_summary.json", "slippage_and_coverage_report.md",
         "slippage_ranked.csv", "missing_fills_report.csv",
         "notion_latest_run_compact.md", "notion_latest_run_payload.json",
     )
-    for stale in stale_files:
-        (scheduled_dir / stale).write_text("stale", encoding="utf-8")
+    for name in cleared_files:
+        (scheduled_dir / name).write_text("stale", encoding="utf-8")
 
     result = run_pipeline(
         _now(), config, StrategyState(),
@@ -391,12 +394,44 @@ def test_run_pipeline_raw_persistence_failure_clears_stale_compact_artifacts(tmp
         raw_connector_inputs={"quotes_batch1.json": ExplodingPayload()},
     )
     assert "raw_persistence_error" in result
-    for stale in stale_files:
-        assert not (scheduled_dir / stale).exists(), f"{stale} was not removed"
+    for name in cleared_files:
+        assert not (scheduled_dir / name).exists(), f"{name} was not removed"
     with open(result["run_state_path"], encoding="utf-8") as handle:
         run_state = json.load(handle)
     assert run_state["order_submit_status"] == "not_submitted_error"
     assert run_state["broker"] == "robinhood"
+
+
+def test_run_pipeline_raw_persistence_failure_preserves_prior_order_artifacts(tmp_path):
+    """A raw-persistence failure must not delete orders.csv or buy_candidates.csv.
+
+    If a prior successful run in the same directory already placed orders,
+    a subsequent retry that fails at the raw-persistence step must preserve
+    those fill records so reporting and cap accounting are not lost.
+    """
+    class ExplodingPayload:
+        pass
+
+    config = _demo_config()
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
+    scheduled_dir.mkdir(parents=True)
+    # Simulate a prior successful run that already wrote real order artifacts.
+    prior_orders_csv = scheduled_dir / "orders.csv"
+    prior_candidates_csv = scheduled_dir / "buy_candidates.csv"
+    prior_orders_csv.write_text("ticker,order_id\nAAPL,ord-123\n", encoding="utf-8")
+    prior_candidates_csv.write_text("ticker,amount\nAAPL,7.50\n", encoding="utf-8")
+
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=scheduled_dir,
+        raw_connector_inputs={"quotes_batch1.json": ExplodingPayload()},
+    )
+    assert "raw_persistence_error" in result
+    # Order artifacts from the prior successful run must survive.
+    assert prior_orders_csv.exists(), "orders.csv was deleted by a retry failure"
+    assert prior_orders_csv.read_text(encoding="utf-8") == "ticker,order_id\nAAPL,ord-123\n"
+    assert prior_candidates_csv.exists(), "buy_candidates.csv was deleted by a retry failure"
 
 
 def test_run_pipeline_live_run_missing_raw_inputs_writes_error_state(tmp_path):
@@ -465,3 +500,167 @@ def test_run_pipeline_live_run_partial_raw_inputs_writes_error_state(tmp_path):
         run_state = json.load(handle)
     assert run_state["order_submit_status"] == "not_submitted_error"
     assert run_state["raw_inputs_saved"] == []
+
+
+def test_build_frozen_providers_strict_finance_raises_on_live_run(tmp_path):
+    """A live run (dry_run=False) must fail closed when finance raw files are absent.
+
+    Providing only Robinhood raw inputs satisfies raw persistence but
+    _build_frozen_providers_from_raw must raise (not warn) when strict_finance=True
+    and no finance_bars/finance_close batch files were written.
+    """
+    import json as _json
+
+    config = load_strategy_config(
+        approved_test_dates=frozenset({_now().date()}), dry_run=False
+    )
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
+    broker = DryRunBroker(account=config.target_account_number)
+    rh_only_inputs = {
+        "quotes_batch1.json": {"results": [{"quote": {"symbol": "AAPL"}}]},
+        "historicals_batch1.json": {"results": [{"symbol": "AAPL", "interval": 5, "items": []}]},
+    }
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        broker, artifacts_dir=scheduled_dir,
+        raw_connector_inputs=rh_only_inputs,
+    )
+    assert "raw_persistence_error" in result, (
+        "Expected raw_persistence_error when finance raw files absent on a live run"
+    )
+    assert "finance" in result["raw_persistence_error"].lower(), (
+        f"Expected 'finance' in error message, got: {result['raw_persistence_error']!r}"
+    )
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = _json.load(handle)
+    assert run_state["order_submit_status"] == "not_submitted_error"
+
+
+def test_build_frozen_providers_strict_robinhood_raises_on_live_run(tmp_path):
+    """A live run (dry_run=False) must fail closed when Robinhood raw files are absent.
+
+    Providing only finance raw inputs satisfies raw persistence but
+    _build_frozen_providers_from_raw must raise (not warn) when strict_robinhood=True
+    and no historicals/quotes batch files were written.
+    """
+    import json as _json
+
+    config = load_strategy_config(
+        approved_test_dates=frozenset({_now().date()}), dry_run=False
+    )
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
+    broker = DryRunBroker(account=config.target_account_number)
+    finance_only_inputs = {
+        "finance_bars_batch1.json": {"results": []},
+        "finance_close_batch1.json": {"results": []},
+    }
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        broker, artifacts_dir=scheduled_dir,
+        raw_connector_inputs=finance_only_inputs,
+    )
+    assert "raw_persistence_error" in result, (
+        "Expected raw_persistence_error when Robinhood raw files absent on a live run"
+    )
+    assert "robinhood" in result["raw_persistence_error"].lower(), (
+        f"Expected 'robinhood' in error message, got: {result['raw_persistence_error']!r}"
+    )
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = _json.load(handle)
+    assert run_state["order_submit_status"] == "not_submitted_error"
+
+
+def test_run_pipeline_retry_preserves_orders_after_place(tmp_path):
+    """A successful retry must carry over orders_after_place.json from the prior raw/.
+
+    Simulates a prior raw/ containing orders_after_place.json (written by a first
+    successful attempt that placed an order). The second run's staging swap must
+    preserve it so a broker-deduplicated retry that places no new order does not
+    lose the durable fill snapshot from the original placement attempt.
+    """
+    config = _demo_config()
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
+    scheduled_dir.mkdir(parents=True)
+
+    # Seed a prior raw/ with orders_after_place.json as a prior run would leave it.
+    prior_raw = scheduled_dir / "raw"
+    prior_raw.mkdir()
+    prior_oap_content = '{"orders": [{"ticker": "AAPL", "order_id": "prior-X1"}]}'
+    (prior_raw / "orders_after_place.json").write_text(prior_oap_content, encoding="utf-8")
+
+    # Second run with new raw connector inputs. The dry-run broker never calls
+    # get_raw_placement_responses, so no new orders_after_place.json is written.
+    quotes_file = tmp_path / "quotes.json"
+    quotes_file.write_text('{"symbol": "AAPL", "price": 150.0}', encoding="utf-8")
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=scheduled_dir,
+        raw_connector_inputs={"quotes_batch1.json": {"output_path": str(quotes_file)}},
+    )
+    assert result["blocked"] is False
+    preserved = scheduled_dir / "raw" / "orders_after_place.json"
+    assert preserved.exists(), "orders_after_place.json was lost during staging swap"
+    assert "prior-X1" in preserved.read_text(encoding="utf-8")
+
+
+def test_run_pipeline_partial_retry_merges_orders_after_place(tmp_path):
+    """Partial retry: new orders merged with prior fill history, not overwritten.
+
+    First attempt placed AAPL; raw/orders_after_place.json holds its fill.
+    Retry places MSFT (broker deduplicates AAPL so no new AAPL response).
+    After the retry, orders_after_place.json must contain both AAPL and MSFT.
+    """
+    import json as _json
+
+    class _BrokerWithResponses(DryRunBroker):
+        def get_raw_placement_responses(self):
+            return [{"ticker": "MSFT", "order_id": "retry-Y2"}]
+
+    config = load_strategy_config(
+        approved_test_dates=frozenset({_now().date()}), dry_run=False
+    )
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
+    scheduled_dir.mkdir(parents=True)
+
+    prior_raw = scheduled_dir / "raw"
+    prior_raw.mkdir()
+    (prior_raw / "orders_after_place.json").write_text(
+        '{"orders": [{"ticker": "AAPL", "order_id": "prior-X1"}]}', encoding="utf-8"
+    )
+    # Provide valid Robinhood + Finance batch files so _build_frozen_providers_from_raw
+    # does not raise under strict_robinhood=True / strict_finance=True (dry_run=False).
+    quotes_file = tmp_path / "quotes.json"
+    quotes_file.write_text(
+        '{"results": [{"quote": {"symbol": "AAPL", "last_trade_price": "150.00"}}]}',
+        encoding="utf-8",
+    )
+    finance_bars_file = tmp_path / "finance_bars.json"
+    finance_bars_file.write_text(
+        '{"results": [{"ticker": "AAPL", "interval_minutes": 5, "bars": []}]}',
+        encoding="utf-8",
+    )
+    finance_close_file = tmp_path / "finance_close.json"
+    finance_close_file.write_text(
+        '{"results": [{"ticker": "AAPL", "previous_close": 149.0}]}',
+        encoding="utf-8",
+    )
+
+    broker = _BrokerWithResponses(account=config.target_account_number)
+    run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        broker, artifacts_dir=scheduled_dir,
+        raw_connector_inputs={
+            "quotes_batch1.json": {"output_path": str(quotes_file)},
+            "finance_bars_batch1.json": {"output_path": str(finance_bars_file)},
+            "finance_close_batch1.json": {"output_path": str(finance_close_file)},
+        },
+    )
+    oap = scheduled_dir / "raw" / "orders_after_place.json"
+    assert oap.exists(), "orders_after_place.json missing after partial retry"
+    order_ids = {o["order_id"] for o in _json.loads(oap.read_text(encoding="utf-8"))["orders"]}
+    assert "retry-Y2" in order_ids, "New MSFT order missing from merged file"
+    assert "prior-X1" in order_ids, "Prior AAPL fill lost during partial retry"

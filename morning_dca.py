@@ -377,6 +377,16 @@ class MorningConfig:
     # Override via artifact_paths.prior_allocation_roots in morning_dca.json;
     # an explicit [] is preserved as () to honour the opt-out intent.
     prior_allocation_roots: Optional[Tuple[str, ...]] = None
+    # Roots whose fills are summed to seed the daily/weekly cap before this
+    # run's orders are placed. Must contain only same-stream artifact roots so
+    # cross-stream fills (e.g. afternoon fills scanned by prior_allocation_roots
+    # for per-ticker top-up context) do not erroneously reduce this stream's cap.
+    # When None (the default) no cap seeding is applied. Set via
+    # artifact_paths.prior_cap_seed_roots in morning_dca.json. Point at the
+    # stream's own run-state root (not just manual_runs/) so that both
+    # scheduled and manual same-day fills are visible; load_prior_same_day_allocations
+    # rglobs recursively from these roots.
+    prior_cap_seed_roots: Optional[Tuple[str, ...]] = None
     # Minimum number of completed intraday bars over the trend window required to
     # validate the intraday trend in live mode. When fewer are available a
     # qualifying candidate is flagged manual_review_candidate rather than bought.
@@ -662,6 +672,9 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
         # Preserve [] as () so an explicit empty array in JSON fully disables
         # the guard (None = not set = use default afternoon root at runtime).
         kwargs["prior_allocation_roots"] = tuple(str(r) for r in prior_roots)
+    cap_seed_roots = artifact_paths.get("prior_cap_seed_roots")
+    if isinstance(cap_seed_roots, list) and cap_seed_roots:
+        kwargs["prior_cap_seed_roots"] = tuple(str(r) for r in cap_seed_roots)
 
     # Load the configured ticker whitelist from config/tickers.json, the same
     # version-controlled source near_close_dca's afternoon stream reads via
@@ -866,6 +879,7 @@ class MorningDCAExecutor(DCAExecutor):
         self._sizing_config = self.config.as_strategy_config()
         self.state_root = self.config.morning_run_state_root or self.profile["state_root"]
         self.decision_time = self.config.decision_time_et or self.profile["decision_time_et"]
+        self._prior_daily_spend_seeded = 0.0
 
     def _load_default_config(self, config_dir: Optional[str], mode: str) -> MorningConfig:
         """Load this executor's config when none is passed. Overridable per stream."""
@@ -873,9 +887,16 @@ class MorningDCAExecutor(DCAExecutor):
 
     # -- Top-up guard (same-day prior-allocation offset) ---------------------
     def _compute_top_up(
-        self, now: datetime, signals: Sequence["MorningSignal"]
+        self, now: datetime, signals: Sequence["MorningSignal"], *, manual: bool = False
     ) -> Dict[str, TopUpOutcome]:
         """Return per-ticker prior-allocation/top-up outcomes.
+
+        Always resets ``_prior_daily_spend_seeded`` and, when
+        ``config.prior_cap_seed_roots`` is configured, seeds it from same-stream
+        fills so :meth:`run` can reduce the pre-run remaining budget accordingly.
+        Cap seeding is intentionally separate from ``prior_allocation_roots`` so
+        cross-stream fills (e.g. afternoon fills scanned for per-ticker top-up
+        context) never erroneously reduce this stream's cap.
 
         Only active in ``MORNING_LIVE_MODE``; returns an empty dict for watchlist
         and preflight modes so their artifacts always reflect the raw signal
@@ -891,11 +912,24 @@ class MorningDCAExecutor(DCAExecutor):
         is also skipped when a configured root already covers the manual subtree
         to avoid double-counting fills.
         """
+        self._prior_daily_spend_seeded = 0.0
         if self.mode != MORNING_LIVE_MODE:
             return {}
         raw_roots = getattr(self.config, "prior_allocation_roots", None)
         if raw_roots is not None and len(raw_roots) == 0:
-            # Caller explicitly set [] in morning_dca.json → fully disable guard.
+            # Caller explicitly set [] in morning_dca.json → fully disable the
+            # per-ticker top-up guard. Still seed caps from prior_cap_seed_roots so
+            # a morning recovery run cannot spend the full daily/weekly cap again.
+            cap_seed_roots = getattr(self.config, "prior_cap_seed_roots", None)
+            if cap_seed_roots:
+                _trading_day = now.astimezone(EASTERN).date()
+                _boundary_et = now.astimezone(EASTERN).time()
+                _cap_seed_allocs = load_prior_same_day_allocations_multi(
+                    cap_seed_roots, _trading_day, boundary_et=_boundary_et
+                )
+                self._prior_daily_spend_seeded = sum(
+                    a.amount_usd for a in _cap_seed_allocs.values()
+                )
             return {}
         configured = list(raw_roots) if raw_roots is not None else [DEFAULT_AFTERNOON_TASK_ROOT]
         # Append the manual_runs subtree of self.state_root only for the morning
@@ -915,6 +949,17 @@ class MorningDCAExecutor(DCAExecutor):
             roots = list(dict.fromkeys(configured))
         trading_day = now.astimezone(EASTERN).date()
         boundary_et = now.astimezone(EASTERN).time()
+        # Cap seeding: sum fills from same-stream roots only. These are separate
+        # from prior_allocation_roots so cross-stream top-up context does not
+        # bleed into this stream's budget enforcement.
+        cap_seed_roots = getattr(self.config, "prior_cap_seed_roots", None)
+        if cap_seed_roots:
+            cap_seed_allocs = load_prior_same_day_allocations_multi(
+                cap_seed_roots, trading_day, boundary_et=boundary_et
+            )
+            self._prior_daily_spend_seeded = sum(
+                a.amount_usd for a in cap_seed_allocs.values()
+            )
         prior_allocations = load_prior_same_day_allocations_multi(
             roots, trading_day, boundary_et=boundary_et
         )
@@ -1473,8 +1518,13 @@ class MorningDCAExecutor(DCAExecutor):
                 "hypothetical_planned_spend_usd": hypothetical_spend,
                 "hypothetical_day_spend_usd": round(self.ledger.day_planned(trading_day), 2),
                 "hypothetical_week_spend_usd": round(self.ledger.week_planned(trading_day), 2),
-                "remaining_daily_usd": round(self.ledger.remaining_daily(trading_day), 2),
-                "remaining_weekly_usd": round(self.ledger.remaining_weekly(trading_day), 2),
+                "prior_same_day_spend_usd": round(self._prior_daily_spend_seeded, 2),
+                "remaining_daily_usd": round(
+                    max(0.0, self.ledger.remaining_daily(trading_day) - self._prior_daily_spend_seeded), 2
+                ),
+                "remaining_weekly_usd": round(
+                    max(0.0, self.ledger.remaining_weekly(trading_day) - self._prior_daily_spend_seeded), 2
+                ),
             },
             "counts": {
                 "evaluated": len(signals),
@@ -1654,6 +1704,11 @@ class MorningDCAExecutor(DCAExecutor):
         artifacts["block_reason"] = block_reason
         artifacts["broker_outcomes"] = {}
         paths = self.write_artifacts(artifacts, now)
+        # A blocked scheduled live run may have committed signals but placed no
+        # orders — exactly the scenario the drift detector guards against. Run the
+        # check so operators receive an immediate alert rather than a silent gap.
+        if self.mode == MORNING_LIVE_MODE and self.trades:
+            _run_drift_check(Path(paths["run_state"]).parent)
         return {"artifacts": artifacts, "paths": paths}
 
     def _existing_submitted_run_state(self, now: datetime) -> Optional[Dict[str, Any]]:
@@ -2019,9 +2074,11 @@ class MorningDCAExecutor(DCAExecutor):
             artifacts["trades"] = False
             artifacts["broker_outcomes"] = {}
             paths = self.write_artifacts(artifacts, now)
+            if self.mode == MORNING_LIVE_MODE and self.trades:
+                _run_drift_check(Path(paths["run_state"]).parent)
             return {"artifacts": artifacts, "paths": paths}
         trading_day = now.astimezone(EASTERN).date()
-        top_up_outcomes = self._compute_top_up(now, signals)
+        top_up_outcomes = self._compute_top_up(now, signals, manual=manual)
         # Sort by multiplier DESC, then drop_pct DESC, then ticker ASC so tied
         # multipliers are resolved by the larger-drop ticker first, matching the
         # allocation-priority policy in config/budgets.json.
@@ -2029,10 +2086,19 @@ class MorningDCAExecutor(DCAExecutor):
             (s for s in self._buy_candidates(signals) if s.execution_status != EXEC_MANUAL_REVIEW_CANDIDATE),
             key=lambda s: (-s.multiplier, -(s.drop_pct or 0.0), s.ticker),
         )
-        # Capture remaining budget BEFORE placing orders so _place_broker_orders
-        # enforces caps against the pre-run headroom.
-        pre_run_remaining_daily = self.ledger.remaining_daily(trading_day)
-        pre_run_remaining_weekly = self.ledger.remaining_weekly(trading_day)
+        # Subtract prior same-day spend (recorded by _compute_top_up) from the
+        # pre-run budget so caps account for earlier manual/recovery fills that
+        # already consumed part of the daily/weekly cap on other tickers.
+        # Restrict to the morning stream: midday has its own independent ledger
+        # namespace and daily/weekly budget, so morning fills must not reduce
+        # the midday cap even when prior_cap_seed_roots is configured.
+        prior_daily_seeded = self._prior_daily_spend_seeded if self.stream == MORNING_STREAM else 0.0
+        pre_run_remaining_daily = max(
+            0.0, self.ledger.remaining_daily(trading_day) - prior_daily_seeded
+        )
+        pre_run_remaining_weekly = max(
+            0.0, self.ledger.remaining_weekly(trading_day) - prior_daily_seeded
+        )
         broker_outcomes: Optional[Dict[str, Any]] = None
         if self.mode == MORNING_LIVE_MODE and self.trades and not manual and broker is None:
             return self._blocked_live_result(
@@ -2088,7 +2154,49 @@ class MorningDCAExecutor(DCAExecutor):
                         row["decision_price"] = sig.current_price
             artifacts["broker_outcomes"] = broker_outcomes
         paths = self.write_artifacts(artifacts, now)
+        if self.mode == MORNING_LIVE_MODE and self.trades:
+            _run_drift_check(Path(paths["run_state"]).parent)
         return {"artifacts": artifacts, "paths": paths}
+
+
+def _run_drift_check(run_dir: Path) -> None:
+    """Invoke drift detection after a live run writes its artifacts.
+
+    Writes ``drift_report.json`` and ``drift_report.md`` alongside the run's
+    artifacts, logs a warning when drift is detected, and sends a Slack alert
+    when ``DCA_DRIFT_SLACK_WEBHOOK`` is set and drift is detected.
+    """
+    _log = logging.getLogger("morning_dca.drift")
+    try:
+        from scripts.drift_detection import (  # lazy — stdlib only dep
+            DEFAULT_SLACK_WEBHOOK_ENV,
+            detect_drift,
+            send_slack_alert,
+        )
+    except Exception as exc:  # pragma: no cover
+        _log.warning("drift detection unavailable: %s", exc)
+        return
+    try:
+        report = detect_drift(run_dir)
+        (run_dir / "drift_report.json").write_text(
+            report.to_json(compact=False), encoding="utf-8"
+        )
+        (run_dir / "drift_report.md").write_text(report.to_markdown(), encoding="utf-8")
+        if report.drift_detected:
+            _log.warning(
+                "DRIFT DETECTED in %s: %d symbol(s) expected but no order record — %s",
+                run_dir,
+                len(report.affected_symbols),
+                ", ".join(s.symbol for s in report.affected_symbols),
+            )
+            try:
+                send_slack_alert(report, env_var=DEFAULT_SLACK_WEBHOOK_ENV)
+            except Exception as slack_exc:  # pragma: no cover
+                _log.warning("drift Slack alert failed: %s", slack_exc)
+        else:
+            _log.info("drift check OK for %s", run_dir)
+    except Exception as exc:  # pragma: no cover
+        _log.warning("drift check failed for %s: %s", run_dir, exc)
 
 
 def _same_stream_order_exists(broker: BrokerAdapter, ticker: str, trading_day: date, stream: str) -> bool:

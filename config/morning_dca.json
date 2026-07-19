@@ -104,7 +104,14 @@
     "live_latest_run_pointer": "/home/user/workspace/cron_tracking/morning_dca/latest_morning_run.json",
     "run_state_filename": "run_state.json",
     "preflight_artifact_filenames": ["run_state.json", "validation.csv", "signals.csv", "run_summary.json"],
-    "separation_note": "Each morning mode writes ONLY under its own root. None writes into /home/user/workspace/cron_tracking/ce16ba6b/**, updates latest_scheduled_run.json, or touches afternoon scheduled_runs/ folders. The 10:30 live run READS (never writes) the same-day preflight root to load eligible_to_execute. The legacy 'morning_run_state_root' key mirrors the watchlist root for backwards compatibility."
+    "prior_allocation_roots": [
+      "/home/user/workspace/cron_tracking/morning_dca/manual_runs",
+      "/home/user/workspace/cron_tracking/ce16ba6b"
+    ],
+    "prior_cap_seed_roots": [
+      "/home/user/workspace/cron_tracking/morning_dca"
+    ],
+    "separation_note": "Each morning mode writes ONLY under its own root. None writes into /home/user/workspace/cron_tracking/ce16ba6b/**, updates latest_scheduled_run.json, or touches afternoon scheduled_runs/ folders. The 10:30 live run READS (never writes) the same-day preflight root to load eligible_to_execute. The legacy 'morning_run_state_root' key mirrors the watchlist root for backwards compatibility. prior_allocation_roots lists roots scanned for earlier same-day manual fills so the morning live run applies the same top-up offset guard as midday/afternoon."
   },
   "scheduled_run_classification": {
     "watchlist": {

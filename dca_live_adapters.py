@@ -277,10 +277,18 @@ class RobinhoodDataProvider:
         quote = self._quote_for(ticker)
         if quote is None:
             return None
-        if not quote.get("has_traded", True) or quote.get("state", "active") != "active":
+        # Check activity from both the nested quote and the raw sibling result —
+        # some payloads expose has_traded/state at the top-level result alongside
+        # the nested "quote" object. Fail closed if either source says inactive.
+        siblings = quote.get("_siblings") or {}
+        has_traded = quote.get("has_traded", True) and siblings.get("has_traded", True)
+        state = quote.get("state", "active")
+        sibling_state = siblings.get("state", "active")
+        if not has_traded or state != "active" or sibling_state != "active":
             raise ValueError(
                 f"no spread for {ticker}: inactive quote "
-                f"(has_traded={quote.get('has_traded')}, state={quote.get('state')})"
+                f"(has_traded={quote.get('has_traded')}/{siblings.get('has_traded')}, "
+                f"state={quote.get('state')}/{siblings.get('state')})"
             )
         # Some Robinhood MCP payloads expose bid/ask under alternate key names
         # (best_bid/best_ask) and/or as siblings of the nested "quote" object
@@ -288,7 +296,6 @@ class RobinhoodDataProvider:
         # top-level result, so a genuinely positive value in either location
         # wins rather than an empty/zero nested placeholder unconditionally
         # shadowing a usable sibling value.
-        siblings = quote.get("_siblings") or {}
         bid_keys = ("bid_price", "bid", "best_bid", "best_bid_price")
         ask_keys = ("ask_price", "ask", "best_ask", "best_ask_price")
         bid = _first_positive_float(quote, *bid_keys) or _first_positive_float(siblings, *bid_keys)
@@ -474,6 +481,7 @@ class RobinhoodBroker:
         self.enable_live_orders = enable_live_orders
         self._time_in_force = time_in_force
         self._simulated_buying_power_usd = simulated_buying_power_usd
+        self._raw_placement_responses: List[Dict[str, Any]] = []
 
     def account_number(self) -> str:
         return self._account
@@ -605,7 +613,24 @@ class RobinhoodBroker:
             # submitted would consume budget and block a retry, so raise instead.
             logger.error("place_equity_order for %s returned terminal state %s: %s", ticker, state, data)
             raise RuntimeError(f"live placement for {ticker} came back in terminal state {state}; response={data}")
+        # Accumulate raw broker response for orders_after_place.json so fill data
+        # is replayable from durable storage without a live broker re-query.
+        self._raw_placement_responses.append({
+            "ticker": ticker,
+            "order_id": str(order_id),
+            **order,
+        })
         return str(order_id)
+
+    def get_raw_placement_responses(self) -> List[Dict[str, Any]]:
+        """Return and clear all raw broker placement responses for the current run.
+
+        Drains the internal buffer so a reused broker instance does not carry
+        responses from a prior pipeline call into a subsequent one.
+        """
+        responses = list(self._raw_placement_responses)
+        self._raw_placement_responses.clear()
+        return responses
 
     def get_order_fill(self, order_id: str) -> Optional[OrderFill]:
         if not order_id or self._order_fill_fn is None:

@@ -377,6 +377,14 @@ class StrategyConfig:
     kill_switch_7d_deploy_fraction: float = 0.40
     deployed_last_7d_usd: float = 0.0
 
+    # When True the 60-minute intraday trend filter is skipped for the buy
+    # decision: a ticker below its prior close with multiplier > 0 is bought
+    # regardless of whether the 60-minute trend is up or flat. All other guards
+    # (minimum drop, spread, budget, data confidence, hard circuit breakers) still
+    # apply. Set to True for the final scheduled live buy of the day (3:20 PM ET)
+    # per the final_buy_behavior policy in config/scheduled_tasks.json.
+    ignore_trend_filter: bool = False
+
 
 @dataclass
 class StrategyState:
@@ -564,6 +572,15 @@ class BrokerAdapter(Protocol):
 
     def get_order_fill(self, order_id: str) -> Optional[OrderFill]:
         """Return fill details for a placed order, or None if not yet filled."""
+
+    def get_raw_placement_responses(self) -> List[Dict[str, Any]]:
+        """Return raw broker response dicts for every order placed this run.
+
+        Used to persist ``raw/orders_after_place.json`` for durable fill
+        data so the slippage report is replayable without a live broker
+        re-query. Brokers that do not support this may return ``[]``.
+        """
+        return []
 
 
 class DryRunBroker:
@@ -925,16 +942,22 @@ def evaluate_source_signal(
     above_previous_close = decision_price > previous_close
     intraday_trend_up = decision_price > lookback_price
 
-    if below_previous_close and minimum_drop_met and intraday_trend_down and buy_multiplier > 0:
+    trend_required = not getattr(config, "ignore_trend_filter", False)
+    if below_previous_close and minimum_drop_met and buy_multiplier > 0 and (
+        intraday_trend_down or not trend_required
+    ):
         action = Action.BUY
-        reason = "below prior close, minimum drop met, 60-minute trend down"
+        if trend_required:
+            reason = "below prior close, minimum drop met, 60-minute trend down"
+        else:
+            reason = "below prior close, minimum drop met, trend filter bypassed (final-buy)"
     elif above_previous_close and intraday_trend_up:
         action = Action.SKIP
         reason = "above prior close and 60-minute trend up"
     elif below_previous_close and not minimum_drop_met:
         action = Action.NO_ACTION
         reason = "below prior close but below 0.1% minimum drop"
-    elif below_previous_close and not intraday_trend_down:
+    elif below_previous_close and not intraday_trend_down and trend_required:
         action = Action.NO_ACTION
         reason = "below prior close but 60-minute trend not down"
     else:
