@@ -42,7 +42,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import requests
-from jinja2 import Template
+from jinja2 import Environment
 from newsapi import NewsApiClient
 from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
 import torch
@@ -835,7 +835,7 @@ class EmailBriefing:
                 "is_significant": r.get("is_significant", False),
             })
 
-        template = Template(EMAIL_TEMPLATE)
+        template = Environment(autoescape=True).from_string(EMAIL_TEMPLATE)
         html = template.render(
             report_date=today_str,
             tickers=tickers,
