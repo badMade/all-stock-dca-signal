@@ -124,11 +124,22 @@ def _build_frozen_providers_from_raw(
             #     as their carrier shape without an output_path; save_raw_input()
             #     preserves that envelope as-is since there is nothing to resolve.
             # In both cases, step into "data" when it is a dict and "results" is
-            # not already at the top level of the outer envelope.
-            if isinstance(payload, dict):
-                inner = payload.get("data")
-                if isinstance(inner, dict) and "results" not in payload:
-                    payload = inner
+            # not already at the top level of the outer envelope. This can nest
+            # more than one layer deep -- e.g. an output_path pointing at a raw
+            # response that is itself {"data": {"results": [...]}} normalizes to
+            # {"data": {"data": {"results": [...]}}} on disk (the same doubly
+            # wrapped pointer shape dca_reporting._order_list_from_payload
+            # already handles) -- so keep stepping in, not just once.
+            seen_ids: set = set()
+            while (
+                isinstance(payload, dict)
+                and "results" not in payload
+                and isinstance(payload.get("data"), dict)
+            ):
+                if id(payload) in seen_ids:
+                    break  # defend against a cyclic/self-referential payload
+                seen_ids.add(id(payload))
+                payload = payload["data"]
             if not isinstance(payload, dict):
                 continue
             if name.startswith("historicals_batch") and name.endswith(".json"):
@@ -183,6 +194,18 @@ def _build_frozen_providers_from_raw(
             quotes_fn=_frozen_quotes if quotes_results else None,
             bounds=getattr(original_robinhood, "_bounds", "regular"),
             adjustment_type=getattr(original_robinhood, "_adjustment_type", "none"),
+        )
+        # get_bid_ask backs the final pre-placement spread circuit breaker (see
+        # near_close_dca.quote_spread_pct), a last-moment check meant to catch
+        # price movement between signal computation and order placement.
+        # Leaving it on the frozen provider would serve that breaker from this
+        # archived quote snapshot instead, defeating its purpose -- delegate to
+        # whatever live capability the originally-injected provider has, and
+        # expose none at all (fail closed) when it has none either, rather than
+        # silently falling back to frozen data.
+        _live_get_bid_ask = getattr(original_robinhood, "get_bid_ask", None)
+        frozen_robinhood.get_bid_ask = (
+            _live_get_bid_ask if callable(_live_get_bid_ask) else (lambda ticker, as_of: None)
         )
     else:
         if strict_robinhood:

@@ -572,6 +572,88 @@ def test_build_frozen_providers_strict_robinhood_raises_on_live_run(tmp_path):
     assert run_state["order_submit_status"] == "not_submitted_error"
 
 
+def test_build_frozen_providers_keeps_bid_ask_live(tmp_path):
+    """get_bid_ask backs the final pre-placement spread circuit breaker
+    (near_close_dca.quote_spread_pct), a last-moment safety check meant to
+    catch price movement between signal computation and order placement.
+    The frozen Robinhood provider must never let that breaker read the
+    archived quote snapshot -- it should delegate to whatever live provider
+    the caller originally injected, and fail closed (return None) when no
+    live bid/ask capability is available, rather than falling back to the
+    frozen data.
+    """
+    import json as _json
+
+    from run_dca import _build_frozen_providers_from_raw
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    # A stale persisted quote with its own (deliberately different) price,
+    # standing in for what a scheduler fetched well before placement time.
+    (raw_dir / "quotes_batch1.json").write_text(
+        _json.dumps({"results": [{"quote": {"symbol": "AAPL", "last_trade_price": "1.0"}}]}),
+        encoding="utf-8",
+    )
+
+    class LiveStub(DemoDataProvider):
+        def get_bid_ask(self, ticker, as_of):
+            return (50.0, 51.0)
+
+    _finance, robinhood = _build_frozen_providers_from_raw(
+        DemoDataProvider(SourceName.FINANCE), LiveStub(SourceName.ROBINHOOD), raw_dir,
+    )
+    assert robinhood.get_bid_ask("AAPL", _now()) == (50.0, 51.0)
+
+    _finance_no_live, robinhood_no_live = _build_frozen_providers_from_raw(
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD), raw_dir,
+    )
+    assert robinhood_no_live.get_bid_ask("AAPL", _now()) is None
+
+
+def test_build_frozen_providers_unwraps_doubly_nested_pointer_data(tmp_path):
+    """Codex review on PR #95 (ported): unwrap all normalized data envelopes.
+
+    When an output_path pointer targets a raw response that is itself
+    {"data": {...}}, normalize_connector_payload nests it one layer deeper,
+    producing {"output_path": ..., "data": {"data": {...}}} on disk (the
+    same doubly-wrapped shape dca_reporting._order_list_from_payload already
+    handles). The frozen-provider builder must unwrap both layers, not just
+    one, or a persisted batch in this shape looks empty.
+    """
+    import json as _json
+
+    from run_dca import _build_frozen_providers_from_raw
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    raw_dir.joinpath("historicals_batch1.json").write_text(
+        _json.dumps({
+            "data": {"data": {
+                "results": [{
+                    "symbol": "AAPL",
+                    "interval": "5minute",
+                    "bars": [{"begins_at": "2026-07-06T14:00:00-04:00", "close_price": "100.0"}],
+                }],
+            }},
+        }),
+        encoding="utf-8",
+    )
+    raw_dir.joinpath("quotes_batch1.json").write_text(_json.dumps({"results": []}), encoding="utf-8")
+
+    robinhood_live = DemoDataProvider(SourceName.ROBINHOOD)
+    _finance, robinhood = _build_frozen_providers_from_raw(
+        DemoDataProvider(SourceName.FINANCE), robinhood_live, raw_dir,
+    )
+    bars = robinhood.get_intraday_bars(
+        "AAPL",
+        datetime.combine(datetime(2026, 7, 6).date(), time(13, 0), tzinfo=EASTERN),
+        _now(),
+        5,
+    )
+    assert len(bars) == 1
+    assert bars[0].close == 100.0
+
+
 def test_run_pipeline_retry_preserves_orders_after_place(tmp_path):
     """A successful retry must carry over orders_after_place.json from the prior raw/.
 
