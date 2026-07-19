@@ -1899,14 +1899,31 @@ def load_prior_same_day_allocations(
         return {}
 
     aggregated: Dict[str, Dict[str, Any]] = {}
+    trading_day_iso = trading_day.isoformat()
     for run_state_path in sorted(root.rglob("run_state*.json")):
         try:
-            run_state = json.loads(run_state_path.read_text(encoding="utf-8"))
+            raw_text = run_state_path.read_text(encoding="utf-8")
         except (OSError, ValueError):
             continue
+
+        # Fast path: skip the expensive JSON parse if this artifact isn't for the
+        # target day. Only trust the raw substring match when the file contains no
+        # JSON unicode escape sequences -- a spec-valid encoder may spell an ASCII
+        # character such as one of the date's hyphens as a unicode escape, which
+        # would not literal-match trading_day_iso even though the parsed value is
+        # identical. Escaped files fall through to a full parse so a
+        # differently-escaped same-day artifact is never silently dropped.
+        if trading_day_iso not in raw_text and "\\u" not in raw_text:
+            continue
+
+        try:
+            run_state = json.loads(raw_text)
+        except ValueError:
+            continue
+
         if not isinstance(run_state, dict):
             continue
-        if run_state.get("trading_day") != trading_day.isoformat():
+        if run_state.get("trading_day") != trading_day_iso:
             continue
         if _prior_run_is_scheduled(run_state) and not include_scheduled_afternoon:
             continue

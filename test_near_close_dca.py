@@ -1635,6 +1635,61 @@ def test_load_prior_same_day_final_override_can_see_earlier_scheduled_run(tmp_pa
     assert override_allocations["AAPL"].reference_price == 99.0
 
 
+def test_load_prior_same_day_matches_json_escaped_trading_day(tmp_path):
+    # Codex review on PR #53: the fast substring pre-check ("if trading_day_iso
+    # not in raw_text: continue") must not skip a same-day artifact just because
+    # its trading_day string happens to be spelled with JSON unicode escapes
+    # (e.g. "2026-06-29") instead of literal hyphens -- json.loads
+    # resolves that to the identical date string, but the naive substring check
+    # would miss it and silently drop this prior allocation, letting the
+    # afternoon top-up guard place a duplicate order on top of a fill it never
+    # saw.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    run_dir = os.path.join(root, "manual_runs", "0900")
+    os.makedirs(run_dir, exist_ok=True)
+    # Both date-bearing fields are escaped so no literal "2026-06-29" substring
+    # appears anywhere in the file -- otherwise the (unescaped) generated_at
+    # field alone would satisfy the fast-path check and mask the bug.
+    raw = (
+        '{"trading_day": "2026\\u002d06\\u002d29", '
+        '"generated_at": "2026\\u002d06\\u002d29T10:00:00-04:00", '
+        '"run_classification": {"run_origin": "manual", "run_id": "manual_am"}, '
+        '"buy_candidates": [{"ticker": "AAPL", "status": "submitted", '
+        '"planned_amount_usd": 3.0, "target_price": 99.0}]}'
+    )
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        handle.write(raw)
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert set(allocations) == {"AAPL"}
+    assert allocations["AAPL"].amount_usd == 3.0
+
+
+def test_load_prior_same_day_skips_non_utf8_artifact_without_crashing(tmp_path):
+    # Codex/Gemini review on PR #53: Path.read_text() can raise
+    # UnicodeDecodeError (a ValueError subclass) on a truncated/corrupt
+    # historical artifact. The fast-path refactor narrowed the except clause
+    # around the read itself to OSError only, so a single bad file would crash
+    # the whole same-day scan (and the scheduled run) instead of being skipped
+    # like the pre-refactor code did.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    bad_dir = os.path.join(root, "manual_runs", "0800")
+    os.makedirs(bad_dir, exist_ok=True)
+    with open(os.path.join(bad_dir, "run_state.json"), "wb") as handle:
+        handle.write(b"\xff\xfe not valid utf-8 \x80\x81")
+
+    _write_prior_run(
+        root,
+        "manual_runs/0900",
+        _manual_run_state([
+            {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0, "target_price": 99.0},
+        ]),
+    )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert set(allocations) == {"AAPL"}
+
+
 # --- Integration: top-up guard through run_daily_compact ----------------------
 
 
