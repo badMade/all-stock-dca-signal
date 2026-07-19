@@ -1895,6 +1895,33 @@ def test_prior_allocations_count_against_cap(tmp_path):
 # --- Fix 3: load_prior_same_day_allocations reads full-report run_state ------
 
 
+def test_load_prior_same_day_ignores_unreadable_or_invalid_json(tmp_path):
+    from datetime import date
+
+    root = tmp_path / "state_root"
+    root.mkdir()
+
+    # 1. Invalid JSON
+    bad_json = root / "run_state_bad.json"
+    bad_json.write_text("{this is not json}", encoding="utf-8")
+
+    # 2. Unreadable JSON (OSError path). gemini-code-assist / chatgpt-codex-connector
+    # review on PR #58: os.chmod(path, 0) does not reliably trigger an OSError --
+    # it's a no-op for the root user (the sandbox/CI containers this suite runs in
+    # commonly run as root) and Windows only supports a read-only attribute, not
+    # POSIX permission bits. Either environment would let read_text() succeed, so a
+    # regression that removed the OSError handler would still pass silently.
+    # Creating a directory with the matching filename raises IsADirectoryError (an
+    # OSError subclass) from read_text() deterministically on every platform and
+    # user, including root.
+    unreadable_json = root / "run_state_unreadable.json"
+    unreadable_json.mkdir()
+
+    # Should gracefully ignore both ValueError and OSError and continue
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert allocations == {}
+
+
 def test_load_prior_same_day_reads_full_report_run_state_via_orders_csv(tmp_path):
     """load_prior_same_day_allocations must handle full-report run_states that store
     'artifacts.orders_csv_path' instead of a top-level 'buy_candidates' list.
