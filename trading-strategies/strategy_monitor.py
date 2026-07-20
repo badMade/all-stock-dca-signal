@@ -997,6 +997,26 @@ class SheetsWriter:
         self.sheet_name     = config.get("GOOGLE_SHEET_NAME", "Weekly_Report")
         self.token          = config.get("PIPEDREAM_TOKEN", "")
 
+    def _sanitize(self, body: str) -> str:
+        """Sanitize response bodies before logging to prevent token leakage."""
+        if not body:
+            return ""
+
+        # Mask the explicit token if known
+        if self.token:
+            body = body.replace(self.token, "***")
+
+        # Mask generic Bearer tokens
+        import re
+        body = re.sub(r'Bearer\s+[A-Za-z0-9\-._~+/=]+', 'Bearer ***', body)
+
+        # Truncate to avoid log spam / filling buffers
+        max_len = 500
+        if len(body) > max_len:
+            body = body[:max_len] + "... [truncated]"
+
+        return body
+
     def write_rows(
         self,
         all_metrics: dict[str, dict[str, float]],
@@ -1064,11 +1084,11 @@ class SheetsWriter:
                     return True
                 else:
                     body = resp.read().decode("utf-8", errors="replace")
-                    logger.error("SheetsWriter: unexpected HTTP %d — %s", status_code, body)
+                    logger.error("SheetsWriter: unexpected HTTP %d — %s", status_code, self._sanitize(body))
                     return False
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
-            logger.error("SheetsWriter HTTP error %d: %s", exc.code, body)
+            logger.error("SheetsWriter HTTP error %d: %s", exc.code, self._sanitize(body))
             return False
         except Exception as exc:
             logger.error("SheetsWriter failed: %s", exc)

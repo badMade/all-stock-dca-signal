@@ -1,3 +1,8 @@
+## 2024-05-18 - Unsanitized HTTP Error Response Logging
+**Vulnerability:** HTTP response errors from Pipedream containing `PIPEDREAM_TOKEN` (or generic `Bearer` tokens) were directly logged to the application console without being sanitized.
+**Learning:** Raw responses from failed external API integrations often echo authentication parameters. Blindly logging these error responses can lead to credential exposure within error tracking logs.
+**Prevention:** Implement sanitization helpers across API clients that truncate long response payloads and actively mask standard token patterns prior to application logging.
+
 ## 2024-05-24 - Insecure Jinja2 Template Instantiation (XSS Risk)
 **Vulnerability:** Jinja2 `Template` was used without `autoescape=True`, leading to potential XSS through injected variables.
 **Learning:** `jinja2.Template` defaults to `autoescape=False`. This is a common pitfall.
