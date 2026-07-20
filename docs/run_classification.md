@@ -375,6 +375,53 @@ roots (rule 2 above), so its order IDs are excluded from all scheduled-live
 metrics. See the `manual_missed_morning_recovery` block in
 [`../config/run_classification.json`](../config/run_classification.json).
 
+## 3:20 runner self-containment and state-file guarantee (added 2026-07-20)
+
+After the Jul 20 2026 10:30 and 12:30 scheduled live runs both failed (they
+invoked saved runners without first generating the same-day raw inputs and
+escalated with no scheduled failure-state artifact), the same self-containment and
+state-file guarantees apply to the 3:20 afternoon final live task (`10ce362c`,
+supersedes `ce16ba6b`):
+
+**Generate raw inputs first.** The task **must not** assume runner inputs already
+exist. Before invoking any saved runner or order module, it **creates**
+`/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/raw/`
+and persists all required raw inputs: portfolio / buying power, quotes, prior
+regular-session close, tradability, `orders_after_1430ET` (for afternoon evidence
+checks), the same-day prior-allocation context from the morning-live, midday,
+manual missed-morning recovery, and manual override roots, and the historical /
+trend bars needed for the trend check. If a runner requires a `RUN_DATE_ET`
+argument, pass the current America/New_York date as `YYYYMMDD`. Do **not** reuse
+stale files. Inputs come from the Finance connector primary, Alpaca and Robinhood
+validation / context, and `yfinance` fallback **only** when connector data is
+unavailable, stale, incomplete, or unresolved. If raw input generation fails once,
+perform **one** bounded recovery attempt on the alternate approved data source
+path, then stop.
+
+**Always write the state files.** The 3:20 scheduled run **always** writes
+`run_state.json`, `run_summary.json`, and `latest_scheduled_run.json`, **even when
+execution is blocked, is a no-op, or errors**. On a blocking condition it writes a
+**valid scheduled** afternoon `run_state` with `run_origin='scheduled'`,
+`manual_run=false`, `stream='afternoon'`, `scheduled_for_et='15:20'`,
+`cron_id='10ce362c'`, `supersedes_cron_id='ce16ba6b'`,
+`state_schema_version='run-classification-v1'`, `orders_submitted_count=0`, a
+concrete `order_submit_status`, a concrete `error_class` such as
+`missing_or_invalid_raw_inputs` or `no_incremental_top_up`, and a compact list of
+missing files, block reasons, or failed data sources. This artifact is valid proof
+the 3:20 scheduled task **fired** but is **not** order or fill evidence. If any
+step fails after raw collection has started, it writes the `signals.csv` when
+possible, an empty `submitted_orders.csv` with headers when no orders were placed,
+and `run_state.json` (no half-done run without a state file).
+
+**Manual recovery exclusion.** Manual recovery artifacts (missed-morning under
+`morning_dca/manual_recovery/**` and manual 12:30 under
+`midday_dca/manual_recovery/**`) remain prior-allocation / top-up context only and
+are **never** afternoon scheduled evidence, slippage, reliability, fill-count, or
+cost-basis evidence. See the `live_schedule_hardening_2026_07_20` block in
+[`../config/run_classification.json`](../config/run_classification.json) and
+`config/scheduled_tasks.json`'s
+`live_schedule_hardening_2026_07_20.afternoon_1520`.
+
 ## Recovery reruns
 
 The three scheduled **live** tasks — morning (`42173154`), midday (`a6239dae`),

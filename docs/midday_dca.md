@@ -134,6 +134,33 @@ affecting afternoon top-up eligibility only):
 | `GOOG` | $4.50 | 352.1778 |
 | `GOOGL` | $4.50 | 354.9800 |
 
+### Manual missed-12:30 recovery (added Jul 20 2026)
+
+Separate from a manual **override** rerun, this covers the case where the **12:30
+scheduled midday task did not run or failed**. A human may then place the missed
+midday buys by hand under a dedicated path:
+
+- Pattern: `/home/user/workspace/cron_tracking/midday_dca/manual_recovery/YYYYMMDD_*`
+- Example: `/home/user/workspace/cron_tracking/midday_dca/manual_recovery/20260720_1259ET`
+  (Jul 20 2026: placed at 12:59 ET after the 12:30 scheduled midday run failed).
+
+Fills in that recovery:
+
+| Ticker | Amount | Avg fill price |
+|---|---|---|
+| `AAPL` | $1.00 | 324.389900 |
+| `TRIN` | $2.00 | 17.399900 |
+| `ASML` | $2.00 | 1739.506300 |
+| `IRDM` | $2.00 | 46.669900 |
+
+The artifact carries `run_origin='manual'`, `manual_run=true`,
+`same_day_top_up_context_only=true`, and `valid_scheduled_evidence=false`. It is
+prior-allocation / same-day top-up context **only** and must be available to the
+**3:20 afternoon** run as such. It is **never** midday scheduled evidence, never
+proof the 12:30 scheduled task ran, and never counted in scheduled reliability,
+fill counts, slippage, cost basis, or watchdog confirmation. See
+`config/scheduled_tasks.json`'s `midday_dca_manual_recovery_2026_07_20`.
+
 ## Midday sizing ladder (0x → 5x)
 
 Drop is measured as a fraction below yesterday's regular-session close. The

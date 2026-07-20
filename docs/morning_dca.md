@@ -202,6 +202,47 @@ fold them into the top-up guard as prior allocation. See
 `config/morning_dca.json`'s `manual_missed_run_recovery` and
 [run_classification.md](run_classification.md).
 
+### 10:30 runner self-containment and state-file guarantee (added Jul 20 2026)
+
+After the Jul 20 2026 10:30 scheduled morning live run failed (it invoked a saved
+runner without first generating the same-day raw inputs and escalated without
+persisting a scheduled failure-state artifact), the scheduled 10:30 task must:
+
+**Generate raw inputs first.** The task **must not** assume runner inputs already
+exist, except the same-day 9:45 pre-flight artifact at
+`/home/user/workspace/cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/run_state.json`
+(or `latest_preflight.json` when it points to that same-day file). Before
+invoking any saved runner or order module, it **creates**
+`/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/raw/` and persists
+all required raw inputs: portfolio / buying power, quotes, prior regular-session
+close, tradability, `orders_since_midnight` (for same-day top-up context), and the
+historical / trend bars needed for the 60-minute trend check. If a runner requires
+a `RUN_DATE_ET` argument, pass the current America/New_York date as `YYYYMMDD`. Do
+**not** reuse stale files. Inputs come from the Finance connector primary, Alpaca
+and Robinhood validation / context, and `yfinance` fallback **only** when connector
+data is unavailable, stale, incomplete, or unresolved (see
+[safeguards.md](safeguards.md#market-data-source-policy)). If raw input generation
+fails once, perform **one** bounded recovery attempt on the alternate approved
+data source path, then stop.
+
+**Always write the state files.** The 10:30 scheduled run **always** writes
+`run_state.json`, `run_summary.json`, and `latest_morning_run.json` under the
+morning root, **even when execution is blocked or no orders are placed**. If a
+missing pre-flight artifact, missing / invalid raw inputs, trend, budget,
+tradability, spread, or broker condition blocks execution, it writes a **valid
+scheduled** morning `run_state` with `run_origin='scheduled'`, `manual_run=false`,
+`stream='morning'`, `scheduled_for_et='10:30'`, `cron_id='42173154'`,
+`valid_afternoon_evidence=false`, `orders_submitted_count=0`, a concrete
+`order_submit_status`, a concrete `error_class` such as `missing_preflight_artifact`
+or `missing_or_invalid_raw_inputs`, and a compact list of missing files or failed
+data sources. This artifact is valid proof the 10:30 scheduled task **fired** but
+is **not** order or fill evidence. The task **must not** escalate without writing
+this state file unless the workspace itself is unavailable. If failure happens
+after raw collection has started, it writes `morning_signals.csv` when possible,
+an empty `submitted_orders.csv` with headers when no orders were placed, and
+`run_state.json` (no half-done run without a state file). See
+`config/scheduled_tasks.json`'s `live_schedule_hardening_2026_07_20.morning_1030`.
+
 ### Hard circuit breakers
 
 Every scheduled live order is subject to hard circuit breakers that **skip**
