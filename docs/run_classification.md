@@ -190,6 +190,33 @@ submitted/filled status.
 - **Weekly/monthly** — count the scheduled run as having occurred; it
   contributes **zero** scheduled fills/orders.
 
+## Nested run_classification requirement for watchdog confirmation (added 2026-07-17)
+
+The Fri Jul 17 2026 3:20 PM ET scheduled `run_state` was repaired to include a
+**nested `run_classification` object**. From this date on:
+
+1. **Nested object required.** Every scheduled `run_state.json` must contain a
+   nested `run_classification` object, validated against
+   [`../schemas/run_classification.schema.json`](../schemas/run_classification.schema.json).
+   For the scheduled 3:20 PM run it carries `run_origin='scheduled'`,
+   `manual_run=false`, `run_type='scheduled_live_test'`, `cron_id='10ce362c'`,
+   `supersedes_cron_id='ce16ba6b'`, `scheduled_for_et='15:20'`,
+   `scheduled_window_start_et='15:15'`, `scheduled_window_end_et='15:35'`,
+   `run_id='scheduled_YYYYMMDD_1520ET'`, `triggered_at_utc`, and
+   `state_schema_version`.
+2. **Nested object is authoritative.** In this repo, scheduled/manual identity fields live
+   under `run_classification` (see [`../config/run_classification.json`](../config/run_classification.json));
+   top-level mirror fields are not required by the artifact writers/consumers.
+3. **Watchdog confirmation.** The 3:40 PM watchdog (`a46bf007`) confirms a
+   scheduled run **only** when the nested `run_classification` object is present
+   and valid. A `run_state` missing it is a watchdog **discrepancy**.
+
+See the
+`live_reliability_fix_2026_07_17.scheduled_run_state_classification_requirement`
+block in [`../config/scheduled_tasks.json`](../config/scheduled_tasks.json) and
+the `run_classification` property in
+[`../schemas/run_state.schema.json`](../schemas/run_state.schema.json).
+
 ## Raw connector-input persistence (added 2026-07-10)
 
 The 2026-07-10 3:20 PM ET run escalated because quotes and historicals were

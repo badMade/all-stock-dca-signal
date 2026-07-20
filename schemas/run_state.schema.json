@@ -9,7 +9,7 @@
   "properties": {
     "run_classification": {
       "$ref": "run_classification.schema.json",
-      "description": "Authoritative scheduled-vs-manual classification. Validated against run_classification.schema.json when present. Emitted for live scheduled runs; see docs/run_classification.md and config/run_classification.json."
+      "description": "Authoritative scheduled-vs-manual classification. Validated against run_classification.schema.json when present. Emitted for live scheduled runs; see docs/run_classification.md and config/run_classification.json. As of 2026-07-17 every scheduled 3:20 PM run_state must carry this nested run_classification object, and the 3:40 PM watchdog (a46bf007) confirms a scheduled run only when this nested object is present and valid; a run_state missing it is a watchdog discrepancy. Scheduled/manual identity fields live only under this nested object (see docs/run_classification.md); top-level mirror fields are not required by the artifact writers/consumers. It stays out of the top-level `required` list so legacy/compact artifacts written before this was stamped still validate."
     },
     "run_id": { "type": "string", "description": "Trading day plus HHMMSS, e.g. 2026-07-06-153005. This is the artifact build id; run_classification.run_id is the origin-scoped id used by reporting to include/exclude runs." },
     "generated_at": { "type": "string", "description": "ISO-8601 timestamp (America/New_York) when the artifact was built." },
