@@ -17,3 +17,8 @@
 **Vulnerability:** A hardcoded account number `ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = "<REDACTED>"` was found in `near_close_dca.py`.
 **Learning:** Hardcoded secrets/identifiers violate the repository's secrets policy and can be used to identify/compromise broker accounts.
 **Prevention:** Use environment variables (e.g. `os.environ.get("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER")`) to inject sensitive identifiers at runtime instead of hardcoding them in the source code.
+
+## 2024-05-24 - Do not commit .coverage files
+**Vulnerability:** Binary build and testing artifacts were included in Git.
+**Learning:** Checking in test coverage metadata (`.coverage` from pytest-cov) inflates repository size and guarantees continuous merge conflicts across the team.
+**Prevention:** Always verify `git status` precisely before committing. Configure `.gitignore` to explicitly reject `.coverage` and similar tool artifacts.

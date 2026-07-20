@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import dataclasses
+import sys
 from datetime import date
+from unittest import mock
 
 import pytest
 
@@ -239,6 +241,81 @@ def test_rolling_30day_burn_rate_window_and_average():
     assert burn["total_deployed_usd"] == 900.0
     assert burn["daily_burn_rate_usd"] == pytest.approx(30.0)  # 900 / 30
     assert burn["active_deployment_days"] == 2
+
+
+# --- classify_stream coverage ------------------------------------------------
+
+def test_classify_stream_non_dict_state():
+    assert classify_stream(None) == STREAM_OTHER
+    assert classify_stream([]) == STREAM_OTHER
+
+def test_classify_stream_scheduled_but_invalid_classification():
+    state = _scheduled_state("2026-07-07", 500.0)
+    # Break validation by stripping required fields
+    state["run_classification"].pop("run_id", None)
+    assert classify_stream(state) == STREAM_OTHER
+
+def test_classify_stream_scheduled_missing_manual_flag():
+    state = _scheduled_state("2026-07-07", 500.0)
+    state["run_classification"].pop("manual_run", None)
+    assert classify_stream(state) == STREAM_OTHER
+
+def test_classify_stream_import_error():
+    state = _scheduled_state("2026-07-07", 500.0)
+    import scripts.run_classification
+
+    # Simulating ImportError for scripts.run_classification by setting it to None in sys.modules
+    with mock.patch.dict(sys.modules, {
+        "scripts.run_classification": None,
+        "run_classification": scripts.run_classification,
+    }):
+        assert classify_stream(state) == STREAM_SCHEDULED
+
+
+def test_classify_stream_explicit_manual_origin():
+    # If origin is "manual", it should return STREAM_MANUAL even if manual_run is not True
+    state = _scheduled_state("2026-07-07", 500.0)
+    state["run_classification"]["run_origin"] = "manual"
+    state["run_classification"].pop("manual_run", None)
+    assert classify_stream(state) == STREAM_MANUAL
+
+def test_classify_stream_unknown_origin():
+    state = _scheduled_state("2026-07-07", 500.0)
+    state["run_classification"]["run_origin"] = "unknown"
+    state["run_classification"]["manual_run"] = False
+    assert classify_stream(state) == STREAM_OTHER
+
+def test_run_timestamp_fallback_to_rc_triggered_at_utc():
+    from dca_risk import run_timestamp_et
+    # State with no generated_at or triggered_at_utc at top level
+    state = {
+        "run_classification": {
+            "triggered_at_utc": "2026-07-07T19:20:00Z"
+        }
+    }
+    dt = run_timestamp_et(state)
+    assert dt is not None
+    assert dt.hour == 15  # 19:20 UTC -> 15:20 ET
+
+    # State completely lacking timestamps
+    assert run_timestamp_et({}) is None
+    assert run_timestamp_et({"run_classification": {}}) is None
+
+
+def test_parse_iso_et_unparseable():
+    from dca_risk import _parse_iso_et
+    assert _parse_iso_et("") is None
+    assert _parse_iso_et("   ") is None
+    assert _parse_iso_et("not-a-timestamp") is None
+
+def test_parse_iso_et_naive_datetime():
+    from datetime import datetime
+
+    from dca_risk import _parse_iso_et
+    dt = datetime(2026, 7, 7, 15, 20)
+    parsed = _parse_iso_et(dt)
+    assert parsed == dt
+
 
 def test_trading_day_invalid_date_returns_none():
     """An unparseable trading_day string returns None."""
