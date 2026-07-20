@@ -96,7 +96,8 @@ def extract_tickers(text: str) -> Dict[str, object]:
         active = _dedupe(active)
         excluded = _dedupe(excluded)
 
-    active = [s for s in active if s not in set(excluded)]
+    excluded_set = set(excluded)
+    active = [s for s in active if s not in excluded_set]
 
     return {"active": active, "excluded": excluded, "symbol_corrections": corrections}
 
