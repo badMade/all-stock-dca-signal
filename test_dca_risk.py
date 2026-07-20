@@ -249,3 +249,53 @@ def test_trading_day_missing_or_wrong_type_returns_none():
     """Missing or non-string trading_day returns None."""
     assert _trading_day({}) is None
     assert _trading_day({"trading_day": 12345}) is None
+
+
+def test_deployed_usd_with_submitted_candidates():
+    state = {
+        "buy_candidates": [
+            {"status": "submitted", "planned_amount_usd": 100.5},
+            {"status": "skipped", "planned_amount_usd": 50.0},
+            {"status": "submitted", "planned_amount_usd": "200.25"},
+            {"status": "submitted", "planned_amount_usd": None},
+            {"status": "submitted", "planned_amount_usd": "invalid"},
+        ]
+    }
+    assert deployed_usd(state) == 300.75
+
+
+def test_deployed_usd_with_candidates_none_submitted():
+    state = {
+        "buy_candidates": [
+            {"status": "skipped", "planned_amount_usd": 50.0},
+            {"status": "failed", "planned_amount_usd": 20.0},
+        ],
+        "budget": {"day_notional_usd": 1000.0}
+    }
+    assert deployed_usd(state) == 0.0
+
+
+def test_deployed_usd_fallback_to_budget():
+    # buy_candidates must be absent (not an empty list) to fall back to
+    # budget.day_notional_usd -- see
+    # test_empty_buy_candidates_does_not_fall_back_to_budget_notional above.
+    state = {
+        "budget": {"day_notional_usd": 500.55}
+    }
+    assert deployed_usd(state) == 500.55
+
+    state_none = {
+        "buy_candidates": None,
+        "budget": {"day_notional_usd": "100.5"}
+    }
+    assert deployed_usd(state_none) == 100.5
+
+
+def test_deployed_usd_invalid_budget():
+    state = {
+        "budget": {"day_notional_usd": "invalid"}
+    }
+    assert deployed_usd(state) == 0.0
+
+    state_no_budget = {}
+    assert deployed_usd(state_no_budget) == 0.0
