@@ -2734,7 +2734,14 @@ class MorningDCAExecutor(DCAExecutor):
             )
         if broker is not None and self.mode == MORNING_LIVE_MODE:
             expected_account = getattr(self.config, "target_account_number", None)
-            actual_account = broker.account_number()
+            try:
+                actual_account = broker.account_number()
+            except Exception as exc:  # noqa: BLE001 - broker adapters raise arbitrary connector errors
+                if not manual:
+                    return self._blocked_live_result(
+                        now, f"failed to retrieve broker account number: {exc}", signals, source
+                    )
+                raise RuntimeError(f"Failed to retrieve broker account number: {exc}") from exc
             if expected_account and actual_account != expected_account:
                 mismatch = f"broker account mismatch: expected {expected_account}, got {actual_account}"
                 if not manual:

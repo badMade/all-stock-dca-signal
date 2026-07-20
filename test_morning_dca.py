@@ -2479,6 +2479,80 @@ def test_manual_live_run_with_wrong_broker_account_raises_before_ordering(tmp_pa
     assert broker.placed is False
 
 
+def test_scheduled_live_run_with_broker_account_number_error_fails_closed(tmp_path):
+    # broker.account_number() can raise (misconfigured/uninitialized adapter,
+    # connector network/API error). Left uncaught this crashes the process
+    # with a raw traceback instead of producing the durable run_state.json a
+    # scheduled retry depends on.
+    class _RaisingAccountBroker:
+        def __init__(self):
+            self.placed = False
+
+        def account_number(self):
+            raise ConnectionError("robinhood connector unavailable")
+
+        def available_buying_power(self):
+            raise AssertionError("buying power should not be checked when account lookup fails")
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.placed = True
+            raise AssertionError("orders must not be placed when account lookup fails")
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        target_account_number="562057042",
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    broker = _RaisingAccountBroker()
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    res = ex.run(_now_live(), data, broker=broker)
+
+    assert res["artifacts"]["status"] == "blocked"
+    assert "failed to retrieve broker account number" in res["artifacts"]["block_reason"]
+    assert broker.placed is False
+    assert Path(res["paths"]["run_state"]).exists()
+
+
+def test_manual_live_run_with_broker_account_number_error_raises_runtime_error(tmp_path):
+    import pytest
+
+    class _RaisingAccountBroker:
+        def __init__(self):
+            self.placed = False
+
+        def account_number(self):
+            raise ConnectionError("robinhood connector unavailable")
+
+        def available_buying_power(self):
+            raise AssertionError("buying power should not be checked when account lookup fails")
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.placed = True
+            raise AssertionError("orders must not be placed when account lookup fails")
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        target_account_number="562057042",
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    broker = _RaisingAccountBroker()
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    with pytest.raises(RuntimeError, match="Failed to retrieve broker account number"):
+        ex.run(_now_live(), data, manual=True, broker=broker)
+
+    assert broker.placed is False
+
+
 def test_blocked_live_retry_preserves_prior_submitted_evidence(tmp_path):
     # Codex/Gemini review on PR #46: a scheduled retry that hits a
     # scheduler-wiring safety failure (missing broker, wrong account) must not
