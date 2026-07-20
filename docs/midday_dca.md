@@ -167,6 +167,53 @@ only midday notional, independent of both the morning ledger and the afternoon
 Exceeding a cap adds a warning to the run artifact; midday buys never consume or
 validate the morning or afternoon budget.
 
+## Raw input generation and failure-state guarantee (added Jul 20 2026)
+
+After the Jul 20 2026 12:30 run escalated (it invoked a saved runner without
+first generating the same-day raw inputs and wrote no failure-state artifact),
+the scheduled 12:30 task must:
+
+**Generate raw inputs first.** Before invoking any saved runner such as
+`.../cron_tracking/a6239dae/run_midday_live.sh` or `midday_live_runner.py`, the
+task **creates** `.../cron_tracking/midday_dca/YYYYMMDD_1230ET/raw/` and persists
+all required raw inputs for that same-day run:
+
+- `raw/portfolio.json`
+- `raw/quotes.json` (or clearly named quote batches normalized into
+  `raw/quotes.json`)
+- historical / trend files needed for the 60-minute trend check
+
+If the runner requires a `RUN_DATE_ET` argument, pass the current
+America/New_York date as `YYYYMMDD`. The task **must not** assume
+`raw/quotes.json` or historicals already exist from a prior run. Inputs come from
+the Finance connector primary, Alpaca and Robinhood validation / context, and
+`yfinance` fallback **only** when connector data is unavailable, stale,
+incomplete, or unresolved (see [safeguards.md](safeguards.md#market-data-source-policy)).
+If raw input generation fails once, perform **one** bounded recovery attempt with
+the alternate approved data source path, then stop.
+
+**Always write the state files.** The 12:30 scheduled run **always** writes
+`run_state.json`, `run_summary.json`, and `latest_midday_run.json` under the
+midday root, **even when no orders are placed or execution is blocked**. If raw
+inputs are missing, malformed, stale, or not generated, it writes a **valid
+scheduled** midday `run_state` with `run_origin='scheduled'`, `manual_run=false`,
+`stream='midday'`, `scheduled_for_et='12:30'`, `cron_id='a6239dae'`,
+`valid_afternoon_evidence=false`, `order_submit_status='not_submitted_error'`,
+`error_class='missing_or_invalid_raw_inputs'`, `orders_submitted_count=0`, and a
+compact list of missing files or failed data sources. This failure-state artifact
+is valid proof the 12:30 scheduled task **fired**, but it is **not** order or fill
+evidence. The task **must not** escalate without writing this state file unless
+the workspace itself is unavailable.
+
+**Missed-morning recovery interaction.** When same-day manual missed-10:30
+recovery artifacts exist under
+`.../cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*`, load them **after**
+raw market data is available and **before** order sizing. They remain
+prior-allocation / top-up context only: they **must not** satisfy raw quote or
+historical input requirements, **must not** be copied into the scheduled evidence
+stream, and **must not** be counted as proof the 10:30 scheduled task ran. See
+[run_classification.md](run_classification.md#manual-missed-morning-recovery-added-2026-07-20).
+
 ## Artifacts
 
 A scheduled midday run writes to `.../cron_tracking/midday_dca/YYYYMMDD_1230ET/`:

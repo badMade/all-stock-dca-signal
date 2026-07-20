@@ -210,6 +210,58 @@
     "execution_broker": "Robinhood is the ONLY execution broker; Alpaca/Finance/Yahoo remain read-only validation/context and never place orders.",
     "doc": "docs/safeguards.md"
   },
+  "midday_raw_input_and_failure_state_fix_2026_07_20": {
+    "added": "2026-07-20",
+    "applies_to": ["a6239dae"],
+    "trigger_incident": "The Jul 20 2026 12:30 PM midday scheduled run escalated because it invoked a saved runner without first generating the same-day raw inputs, and it did not persist a scheduled failure-state artifact before escalating.",
+    "raw_input_generation": {
+      "summary": "Before invoking any saved runner such as /home/user/workspace/cron_tracking/a6239dae/run_midday_live.sh or midday_live_runner.py, the scheduled 12:30 task MUST create /home/user/workspace/cron_tracking/midday_dca/YYYYMMDD_1230ET/raw/ and persist all required raw inputs for that same-day run.",
+      "raw_dir": "/home/user/workspace/cron_tracking/midday_dca/YYYYMMDD_1230ET/raw/",
+      "required_inputs": [
+        "raw/portfolio.json",
+        "raw/quotes.json (or clearly named quote batches normalized into raw/quotes.json)",
+        "historical/trend files needed for the 60-minute trend check"
+      ],
+      "run_date_arg": "If the runner requires a RUN_DATE_ET argument, pass the current America/New_York date as YYYYMMDD.",
+      "no_stale_reuse": "Do NOT assume raw/quotes.json or historicals already exist from a prior run.",
+      "data_sources": "Generate raw inputs from the Finance connector primary, Alpaca and Robinhood validation/context, and yfinance fallback ONLY when connector data is unavailable, stale, incomplete, or unresolved (see market_data_source_policy).",
+      "bounded_recovery": "If raw input generation fails once, perform ONE bounded recovery attempt with the alternate approved data source path, then stop."
+    },
+    "state_file_guarantee": {
+      "summary": "The 12:30 scheduled run MUST always write run_state.json, run_summary.json, and latest_midday_run.json under the midday root even when no orders are placed or execution is blocked.",
+      "always_write": [
+        "/home/user/workspace/cron_tracking/midday_dca/YYYYMMDD_1230ET/run_state.json",
+        "/home/user/workspace/cron_tracking/midday_dca/YYYYMMDD_1230ET/run_summary.json",
+        "/home/user/workspace/cron_tracking/midday_dca/latest_midday_run.json"
+      ],
+      "missing_or_invalid_raw_inputs_state": {
+        "when": "If raw inputs are missing, malformed, stale, or not generated, write a valid scheduled midday run_state.",
+        "run_origin": "scheduled",
+        "manual_run": false,
+        "stream": "midday",
+        "scheduled_for_et": "12:30",
+        "cron_id": "a6239dae",
+        "valid_afternoon_evidence": false,
+        "order_submit_status": "not_submitted_error",
+        "error_class": "missing_or_invalid_raw_inputs",
+        "orders_submitted_count": 0,
+        "missing_inputs_field": "Include a compact list of missing files or failed data sources."
+      },
+      "evidence_meaning": "This failure-state artifact is valid proof that the 12:30 scheduled task FIRED, but it is NOT order or fill evidence.",
+      "no_silent_escalation": "Do NOT escalate without writing this state file unless the workspace itself is unavailable."
+    },
+    "missed_morning_recovery_interaction": {
+      "summary": "When same-day manual missed-10:30 recovery artifacts exist under /home/user/workspace/cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*, load them AFTER raw market data is available and BEFORE order sizing.",
+      "context_only": "These artifacts remain prior-allocation / top-up context only.",
+      "must_not": [
+        "MUST NOT satisfy raw quote or historical input requirements.",
+        "MUST NOT be copied into the scheduled evidence stream.",
+        "MUST NOT be counted as proof that the 10:30 scheduled task ran."
+      ],
+      "see": "missed_morning_run_recovery_policy"
+    },
+    "doc": "docs/midday_dca.md"
+  },
   "scheduled_run_outcomes": {
     "summary": "Dated machine-readable ledger of afternoon scheduled live-run outcomes for task 10ce362c (supersedes ce16ba6b). Scheduled evidence only; manual/override order IDs are excluded from every scheduled metric. See config/run_classification.json for the full per-run records and docs/schedule_manifest.md for the human-readable notes.",
     "runs": [
@@ -658,7 +710,46 @@
       "state_dir": "/home/user/workspace/cron_tracking/midday_dca",
       "scans_missed_morning_recovery": {
         "path_pattern": "/home/user/workspace/cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*",
-        "purpose": "The 12:30 midday run scans same-day manual missed-morning 10:30 recovery artifacts (run_origin='manual', manual_run=true, same_day_top_up_context_only=true, valid_scheduled_evidence=false) and folds them into the top-up guard as prior allocation only. They are never midday scheduled evidence, never prove the 10:30 scheduled task ran, and never counted in scheduled reliability, fill counts, slippage, cost basis, or watchdog confirmation. See missed_morning_run_recovery_policy."
+        "purpose": "The 12:30 midday run scans same-day manual missed-morning 10:30 recovery artifacts (run_origin='manual', manual_run=true, same_day_top_up_context_only=true, valid_scheduled_evidence=false) and folds them into the top-up guard as prior allocation only. They are never midday scheduled evidence, never prove the 10:30 scheduled task ran, and never counted in scheduled reliability, fill counts, slippage, cost basis, or watchdog confirmation. See missed_morning_run_recovery_policy.",
+        "load_order": "Load these artifacts AFTER raw market data is available and BEFORE order sizing. They MUST NOT satisfy raw quote or historical input requirements, MUST NOT be copied into the scheduled evidence stream, and MUST NOT be counted as proof the 10:30 scheduled task ran. See midday_raw_input_and_failure_state_fix_2026_07_20.missed_morning_recovery_interaction."
+      },
+      "raw_input_generation": {
+        "added": "2026-07-20",
+        "raw_dir": "/home/user/workspace/cron_tracking/midday_dca/YYYYMMDD_1230ET/raw/",
+        "summary": "Before invoking any saved runner (e.g. /home/user/workspace/cron_tracking/a6239dae/run_midday_live.sh or midday_live_runner.py), create raw_dir and persist all required raw inputs for the same-day run. Do NOT assume raw/quotes.json or historicals already exist from a prior run.",
+        "required_inputs": [
+          "raw/portfolio.json",
+          "raw/quotes.json (or clearly named quote batches normalized into raw/quotes.json)",
+          "historical/trend files needed for the 60-minute trend check"
+        ],
+        "run_date_arg": "If the runner requires a RUN_DATE_ET argument, pass the current America/New_York date as YYYYMMDD.",
+        "data_sources": "Finance connector primary, Alpaca and Robinhood validation/context, yfinance fallback ONLY when connector data is unavailable, stale, incomplete, or unresolved.",
+        "bounded_recovery": "If raw input generation fails once, perform ONE bounded recovery attempt with the alternate approved data source path, then stop.",
+        "see": "midday_raw_input_and_failure_state_fix_2026_07_20.raw_input_generation"
+      },
+      "state_file_guarantee": {
+        "added": "2026-07-20",
+        "always_write": [
+          "/home/user/workspace/cron_tracking/midday_dca/YYYYMMDD_1230ET/run_state.json",
+          "/home/user/workspace/cron_tracking/midday_dca/YYYYMMDD_1230ET/run_summary.json",
+          "/home/user/workspace/cron_tracking/midday_dca/latest_midday_run.json"
+        ],
+        "always_write_even_when": "no orders are placed or execution is blocked.",
+        "missing_or_invalid_raw_inputs_state": {
+          "run_origin": "scheduled",
+          "manual_run": false,
+          "stream": "midday",
+          "scheduled_for_et": "12:30",
+          "cron_id": "a6239dae",
+          "valid_afternoon_evidence": false,
+          "order_submit_status": "not_submitted_error",
+          "error_class": "missing_or_invalid_raw_inputs",
+          "orders_submitted_count": 0,
+          "missing_inputs_field": "Include a compact list of missing files or failed data sources."
+        },
+        "evidence_meaning": "Valid proof the 12:30 scheduled task FIRED, but NOT order or fill evidence.",
+        "no_silent_escalation": "Do NOT escalate without writing this state file unless the workspace itself is unavailable.",
+        "see": "midday_raw_input_and_failure_state_fix_2026_07_20.state_file_guarantee"
       },
       "post_artifact_drift_check": {
         "enabled": true,
