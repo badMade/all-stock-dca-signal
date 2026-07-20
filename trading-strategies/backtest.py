@@ -273,7 +273,7 @@ def generate_rsi_reversion_signals(
     entries, exits : pd.Series[bool]
     """
     # pandas-ta computes RSI with Wilder smoothing by default
-    rsi = close.ta.rsi(length=rsi_period)
+    rsi = ta.rsi(close, length=rsi_period)
 
     # Entry: RSI was below rsi_low yesterday, now >= rsi_low  (bounce from oversold)
     entries = (rsi >= rsi_low) & (rsi.shift(1) < rsi_low)
@@ -573,7 +573,6 @@ def print_results_table(
         # "MaxDD (%)" are not valid Python identifiers and would raise ValueError
         # from the namedtuple field-name validation otherwise.
         for row in df.itertuples(name=None):
-            # row[0] is the index, row[1:] are the values
             table.add_row(str(row[0]), *[str(v) for v in row[1:]])
         console.print(table)
     else:
