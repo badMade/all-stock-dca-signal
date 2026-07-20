@@ -352,7 +352,7 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 > is fully offset to $0. See [strategy.md](strategy.md#same-day-prior-run-offset--top-up-guard).
 >
 > **Morning two-stream note:** the morning `MorningDCAExecutor` runs on the
-> shared **$3-base 0x-to-5x** live ladder (as of the Fri Jul 10 2026
+> shared **$2-base 0x-to-5x** live ladder (as of the Fri Jul 10 2026
 > live-automation update every live stream shares one ladder; the former
 > morning-only 0x-to-3x ladder is historical/superseded) and its own `morning`
 > budget ledger in **two** modes.
@@ -434,7 +434,7 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 > is a single **12:30 PM ET live Robinhood execution** on account `562057042`,
 > writing under `cron_tracking/midday_dca/YYYYMMDD_1230ET/`
 > (`run_id='midday_live_YYYYMMDD_1230ET'`). It reuses the **afternoon 0x-to-5x
-> ladder** and the same $3 base (the shared live ladder used by all streams as
+> ladder** and the same $2 base (the shared live ladder used by all streams as
 > of Jul 10 2026), the same
 > active universe (excluding BYDDY/VCX/TRLV/RVI), the same confidence rule, and
 > its own `midday` budget ledger. It carries `stream='midday'` and
@@ -444,12 +444,20 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 > incremental difference only when its decision price is strictly below the prior
 > reference price); midday fills in turn count only as prior-allocation context
 > for the afternoon 3:20 PM top-up guard. See [midday_dca.md](midday_dca.md).
-> **Base-amount note:** the graded DCA base amount is exactly **$3.00**; every
-> candidate dollar amount is **`$3.00 × multiplier`**. The automation must never
+> **Base-amount note:** the graded DCA base amount is exactly **$2.00**; every
+> candidate dollar amount is **`$2.00 × multiplier`**. The automation must never
 > infer, discover, or fall back to **$50.00** or any broker/account default. If
 > the base-amount config (`config/budgets.json`) is missing or unreadable,
-> continue using **$3.00** and record
-> `base_amount_source='hardcoded_user_confirmed_3_usd'`.
+> continue using **$2.00** as a hardcoded, user-confirmed fallback.
+
+> **Base-amount change (Jul 19 2026):** the user changed all future DCA
+> scheduled runs from a $3 base amount to a $2 base amount. The order amount is
+> now $2 x multiplier, and the max per order is $10 under the 5x tier. This
+> applies to every universe-bearing live and analytics task below (morning
+> 10:30, midday 12:30, afternoon 3:20, and the analytics/monitor scans). Ladder
+> multipliers, the ticker universe, exclusions, budget caps, the top-up guard,
+> pre-authorization, confidence, recovery, and all other safety rules are
+> unchanged.
 
 | ID | Name | Type | Trades | Cron (UTC) | ET (EDT) | Status |
 |---|---|---|---|---|---|---|
@@ -459,7 +467,7 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 | `42173154` | Weekday 10:30 AM morning DCA live Robinhood execution (`MorningDCAExecutor`) | trading | **yes** | `30 14 * * 1-5` | 10:30 AM weekdays | active |
 | `a6239dae` | Weekday 12:30 PM midday DCA live Robinhood execution (`MiddayDCAExecutor`) | trading | **yes** | `30 16 * * 1-5` | 12:30 PM weekdays | active |
 | `e3e6f09e` | Monitor-only graded DCA signal check | monitoring | no | `5 19 * * 1-5` | 3:05 PM weekdays | active |
-| `10ce362c` | Graded DCA automatic live test - $3 allocation (supersedes `ce16ba6b`) | trading | **yes** | `20 19 * * 1-5` | 3:20 PM weekdays | active |
+| `10ce362c` | Graded DCA automatic live test - $2 allocation (supersedes `ce16ba6b`) | trading | **yes** | `20 19 * * 1-5` | 3:20 PM weekdays | active |
 | `d72aa525` | Capital-priority briefing | analytics | no | `25 19 * * 1-5` | 3:25 PM weekdays | active |
 | `67aa802b` | Post-trade slippage + compact Notion latest-run sync | analytics | no | `35 19 * * 1-5` | 3:35 PM weekdays | active |
 | `a46bf007` | Live-run watchdog | monitoring | no | `40 19 * * 1-5` | 3:40 PM weekdays | active |
@@ -472,19 +480,19 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 
 ### `b7961407` — Pre-market DCA buying-power dashboard
 - Analytics only, **no trading**. Runs **9:00 AM ET weekdays**.
-- Pre-market buying-power dashboard using the current **$3 base 0x-to-5x ladder**.
+- Pre-market buying-power dashboard using the current **$2 base 0x-to-5x ladder**.
 
 - **Cost-conscious model instruction (Jul 17 2026):** use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review. See the top-of-file cost-conscious model instruction note.
 
 ### `cd45e95b` — Compact DCA volatility outlier scan
 - Analytics only, **no trading**. Runs **9:45 AM ET weekdays**.
-- Scans only **>5% outliers**; no full 41+ ticker narrative on no-outlier days. Uses the current $3 base 0x-to-5x ladder.
+- Scans only **>5% outliers**; no full 41+ ticker narrative on no-outlier days. Uses the current $2 base 0x-to-5x ladder.
 
 - **Cost-conscious model instruction (Jul 17 2026):** use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review. See the top-of-file cost-conscious model instruction note.
 
 ### `morning-dca-0945` — Morning graded DCA pre-flight validation (`MorningDCAExecutor`)
 - Analytics / **read-only**, **no trading**. Runs **9:45 AM ET weekdays** (executor mode `preflight`).
-- Evaluates morning price weakness vs. yesterday’s regular-session close on the shared **$3 base 0x-to-5x ladder** (`config/morning_dca.json`) as a pre-screen for the 10:30 live evaluator; runs no Robinhood order review and calls no broker placement path. Writes pre-flight artifacts under `/home/user/workspace/cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/` — `run_state.json`, `validation.csv`, `signals.csv`, `run_summary.json`, and the `latest_preflight.json` pointer (`run_id='morning_preflight_YYYYMMDD_0945ET'`).
+- Evaluates morning price weakness vs. yesterday’s regular-session close on the shared **$2 base 0x-to-5x ladder** (`config/morning_dca.json`) as a pre-screen for the 10:30 live evaluator; runs no Robinhood order review and calls no broker placement path. Writes pre-flight artifacts under `/home/user/workspace/cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/` — `run_state.json`, `validation.csv`, `signals.csv`, `run_summary.json`, and the `latest_preflight.json` pointer (`run_id='morning_preflight_YYYYMMDD_0945ET'`).
 - Emits **`eligible_to_execute=true/false` per ticker**. This is a **coarse pre-screen** (is a ticker worth re-evaluating at 10:30?), **NOT** a final buy approval — the 10:30 live run recomputes signals/budget/spread/trend/top-up from scratch and may still decline. A ticker is eligible when it graded to a positive-multiplier BUY at 9:45 with a usable current price and previous close.
 - `stream='morning'`, `run_type='morning_dca_preflight'`, `state_schema_version='morning-preflight-v2-machine-complete'`, `valid_afternoon_evidence=false`. Never writes into the afternoon `ce16ba6b` tree or updates `latest_scheduled_run.json`. (A read-only `watchlist` early-warning mode remains available, writing under `cron_tracking/morning_dca_watchlist/`.)
 
@@ -492,14 +500,14 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 
 ### `42173154` — Weekday 10:30 AM morning DCA live Robinhood execution (`MorningDCAExecutor`)
 - **Live trading** (executor mode `live`). Runs **10:30 AM ET weekdays** — cron `30 14 * * 1-5` (**14:30 UTC weekdays** during EDT) — moved from the former 9:45 AM live slot to give a true **60-minute intraday trend window**.
-- Uses the shared **$3 base 0x-to-5x live ladder** and the `morning` budget ledger (`config/morning_dca.json`). **Robinhood account 562057042 is the only execution broker**; **Alpaca, Finance, and Yahoo are read-only** validation/account context only.
+- Uses the shared **$2 base 0x-to-5x live ladder** and the `morning` budget ledger (`config/morning_dca.json`). **Robinhood account 562057042 is the only execution broker**; **Alpaca, Finance, and Yahoo are read-only** validation/account context only.
 - **Depends on the same-day 9:45 pre-flight artifact** (`cron_tracking/morning_dca_preflight/`) and evaluates **only `eligible_to_execute=true` tickers**, then **recomputes a fresh price, prior close, spread, 60-minute downtrend, signal, and budget before placing** — and **skips / routes to manual review if the trend cannot be validated**. If the pre-flight artifact is missing, a **scheduled** run fails closed (`_apply_preflight_gate()` returns zero tickers and writes a blocked `run_state.json`); only a **manual** run degrades to the full universe with a warning.
 - **Pre-authorized direct placement (scheduled live runs only):** as approved Fri Jul 10 2026 11:20 AM ET, this scheduled live task auto-places qualifying buys within all caps/circuit breakers **without per-order confirmation** and **without calling `review_equity_order`**; it calls `place_equity_order` directly only after every safeguard passes. **Manual / ad hoc runs still go through Robinhood's review + confirmation path:** `review_equity_order` must pass before `place_equity_order` is attempted, and if Robinhood's own review requires additional post-review confirmation (e.g. a step-up/2FA gate), placement raises `OrderConfirmationRequiredError` and the run records `not_submitted_confirmation_required` with **no order placed** — there is no separate confirmation step implemented in this code beyond that broker-driven gate.
 - **GFUZ special handling:** GFUZ is in the active universe, but **Robinhood is its primary source** because **Finance may not resolve GFUZ**; an unresolved GFUZ on Finance **must not block the whole run**. The *intent* is that if the **9:45 pre-flight lacks GFUZ**, the 10:30 task runs a **supplemental GFUZ read-only validation** and **persists `gfuz_supplemental_preflight.json`** under `/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/` before GFUZ decisioning — **not yet implemented**: today a missing GFUZ preflight row just gates GFUZ out (safe, fail-closed) via the plain `tickers ∩ eligible_tickers` intersection. See `config/morning_dca.json`'s `gfuz_special_handling.supplemental_preflight.implementation_status`.
 - **Raw data persistence (added Jul 15 2026, confirmed Jul 16 2026):** the *intended* contract is that **before any signal computation, budget calculation, top-up calculation, or order placement**, the task persists every raw Robinhood/Finance/Alpaca/Yahoo connector response under `/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/raw/` with deterministic filenames, **normalizing** `output_path`/wrapped outputs into parseable JSON, with the decision engine reading only from the persisted files (fetch → persist → normalize → compute → place), and if data fetch succeeds but raw persistence/normalization fails, placing no orders and still writing `run_state.json` with the blocking reason — **not yet implemented**: `MorningDCAExecutor.run()` evaluates directly from the in-memory data provider. See `config/morning_dca.json`'s `raw_data_persistence.implementation_status`.
 - **Automatic failure recovery:** the *intended* contract is that if the run fails because of internal persistence, parsing, wrapper-normalization, transient connector throttling, or a raw-file write problem **after data was fetched**, it immediately **reruns the required read-only inputs once**, persists all raw responses first, **recomputes only from the persisted files**, and continues the same guarded execution if safeguards pass, reusing the **same logical run directory** with **`recovery_rerun=true`** and **never classifying recovery as manual** — **not yet implemented**: there is no recovery-rerun code path in `morning_dca.py` today. See `config/morning_dca.json`'s `automatic_failure_recovery.implementation_status`.
 - **Confidence rule:** if a candidate's price/drop passes the ladder but the **intraday trend cannot be validated** (fewer than `trend_min_bars` usable intraday bars at/before the decision time), the run does **not** auto-buy; it classifies the candidate as `execution_status='manual_review_candidate'`. There is no loosened trend-unavailable execution path.
-- **Hard circuit breakers:** max per order **$15**, budget caps, available buying power, whitelist-only, data confidence, spread threshold, trend validation, regular-hours-only, and one strategy order per ticker per run — each **skips** rather than resizing past a cap.
+- **Hard circuit breakers:** max per order **$10**, budget caps, available buying power, whitelist-only, data confidence, spread threshold, trend validation, regular-hours-only, and one strategy order per ticker per run — each **skips** rather than resizing past a cap.
 - **Artifacts:** always writes `run_state.json` and `morning_signals.csv` under `/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/` (`run_id='morning_live_YYYYMMDD_1030ET'`) — **not** `signals.csv`, and **not** `run_summary.json`/`validation.csv` (those are preflight-only). It additionally writes `submitted_orders.csv` whenever at least one order was actually submitted; `filled_orders.csv` is **never** written by this task (there is no fill-confirmation step). See `config/morning_dca.json`'s `artifacts.manifest_accuracy_note`.
 - `stream='morning'`, `run_type='morning_dca_live'`, `state_schema_version='morning-live-v2-preauthorized'`, `cron_id='42173154'`, `execution_broker='robinhood'`, `account_number='562057042'`, `preauthorized_direct_place=true`, `valid_morning_evidence=true`, `valid_afternoon_evidence=false`. Never writes into the afternoon `ce16ba6b` tree or updates `latest_scheduled_run.json`. **Same-day top-up guard:** earlier same-day manual/order fills are prior-allocation context only; buy only if the current decision price is **strictly below** the prior reference price and only the **incremental** difference. **Morning evidence must never count as afternoon evidence** — morning fills count **only** as prior-allocation context for the midday/afternoon same-day top-up guard, never afternoon scheduled evidence, slippage, watchdog confirmation, scheduled cost basis, or scheduled fill counts.
 - **Live reliability fix (Jul 17 2026):** before calling `place_equity_order`, describe the Robinhood connector schemas needed in-session (`place_equity_order` and `get_equity_orders`); every actionable signal is intended to end with exactly one persisted result (`order_id`, broker rejection, top-up/budget/cap/data-confidence/spread/trend/safety block); an actionable signal missing both an `order_id` and a block/rejection is classified `execution_lineage_incomplete`, triggering one recovery retry in the same scheduled directory for only the missing tickers with the same `ref_id` values, reconciling duplicate `ref_id` or timeout through `get_equity_orders` before declaring failure. Manual overrides stay `manual_run=true` and never count as scheduled evidence. This is manifest metadata only, not yet consumed by `morning_dca.py` (see the top-of-file live reliability fix note); the artifacts this task actually writes remain governed by the **Artifacts** bullet above.
@@ -508,7 +516,7 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 
 ### `a6239dae` — Weekday 12:30 PM midday DCA live Robinhood execution (`MiddayDCAExecutor`)
 - **Live trading** (executor mode `live`). Runs **12:30 PM ET weekdays** (window 12:25–12:35 PM ET).
-- Uses the shared **$3 base 0x-to-5x live ladder** (`config/midday_dca.json`, the same ladder used by all live streams as of Jul 10 2026) and its own `midday` budget ledger. **Robinhood account 562057042 only**; Alpaca is read-only for validation/context.
+- Uses the shared **$2 base 0x-to-5x live ladder** (`config/midday_dca.json`, the same ladder used by all live streams as of Jul 10 2026) and its own `midday` budget ledger. **Robinhood account 562057042 only**; Alpaca is read-only for validation/context.
 - Same active universe (excludes BYDDY/VCX/TRLV/RVI). **Confidence rule:** if a candidate's price/drop passes the ladder but the **intraday trend cannot be validated** (fewer than `trend_min_bars` usable intraday bars at/before 12:30), the run does **not** auto-buy; it classifies the candidate as `execution_status='manual_review_candidate'`.
 - Writes live artifacts under `/home/user/workspace/cron_tracking/midday_dca/YYYYMMDD_1230ET/` (`run_id='midday_live_YYYYMMDD_1230ET'`) and updates its own `latest_midday_run.json` pointer.
 - `stream='midday'`, `run_type='midday_dca_live'`, `state_schema_version='midday-live-v1'`, `cron_id='a6239dae'`, `supersedes_cron_id=null`, `valid_afternoon_evidence=false`. Never writes into the morning or afternoon (`ce16ba6b`) trees or updates `latest_scheduled_run.json`.
@@ -522,13 +530,13 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 
 ### `e3e6f09e` — Monitor-only graded DCA signal check
 - Analytics and notifications only; **no trades**. Runs **3:05 PM ET weekdays**.
-- Monitor-only signal check that surfaces the planned allocation and tier selection using the current $3 base 0x-to-5x ladder.
+- Monitor-only signal check that surfaces the planned allocation and tier selection using the current $2 base 0x-to-5x ladder.
 
 - **Cost-conscious model instruction (Jul 17 2026):** use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review. See the top-of-file cost-conscious model instruction note.
 
-### `10ce362c` — Graded DCA automatic live test - $3 allocation (the only trading task)
+### `10ce362c` — Graded DCA automatic live test - $2 allocation (the only trading task)
 - Repaired live task `10ce362c`, which **supersedes the deleted `ce16ba6b`**; the artifact root stays under `.../ce16ba6b` for continuity.
-- Approved live trading task running the **$3 base 0x-to-5x ladder with tiered caps**. Places real market buy orders automatically within safeguards. Runs **3:20 PM ET weekdays**.
+- Approved live trading task running the **$2 base 0x-to-5x ladder with tiered caps**. Places real market buy orders automatically within safeguards. Runs **3:20 PM ET weekdays**.
 - Uses **only** Robinhood account `562057042`; Alpaca is read-only.
 - Trigger gate: `programmatic_trigger_check.sh`, allowing weekdays **2026-07-02 through 2026-08-28**, **3:20–3:35 PM ET** (aligned to the 15:15–15:35 ET scheduled classification window so a late-but-permitted start cannot place buys after the 3:35 PM post-trade sync).
 - Writes standardized same-day state files under `/home/user/workspace/cron_tracking/ce16ba6b` ([`schemas/run_state.schema.json`](../schemas/run_state.schema.json)); must **not** fall back to interactive confirmation.
@@ -578,7 +586,7 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
     (Robinhood-only execution; Alpaca/Finance/Yahoo read-only; no
     `review_equity_order` in scheduled live runs).
 - **Same-day top-up guard:** loads earlier same-day (before **2:30 PM ET**, non-scheduled) allocations from its own artifact root **plus** the morning-live root (`.../cron_tracking/morning_dca`) and the midday-live root (`.../cron_tracking/midday_dca`, which also holds manual override reruns under `manual_reruns/`), and offsets each ticker so it buys only the incremental amount `max(0, desired − prior)` into a lower price. The prior reference price is resolved by preference: logged `target_price`, then `decision_price`, then `average_fill_price` (from `orders.csv`/`filled_orders.csv`); a missing reference → `manual_review_candidate` at `$0`. Per-candidate the run_state records `prior_same_day_amount`, `prior_same_day_reference_price`, `prior_same_day_run_id`/`prior_same_day_source`, `afternoon_desired_amount`, `afternoon_decision_price`, `incremental_order_amount`, `top_up_guard_result`, `top_up_skipped`, and `top_up_manual_review`. Morning/midday/manual override prior-context fills are **never** afternoon scheduled evidence, slippage, reliability, fill counts, or cost basis. A fully-offset day still writes a valid scheduled run_state. See [strategy.md](strategy.md#same-day-prior-run-offset--top-up-guard).
-- **Final buy of the day behavior:** for the **final live buy of the day** the run performs a **full active-universe scan** and, **for this final-buy decision only**, **ignores the 60-minute downward-trend filter**. Every other gate still holds: current/decision price **strictly below the prior completed regular-session close**, ladder **multiplier > 0** (from the $3-base 0x-to-5x ladder), **data-confidence** pass, **`spread_ok=true`**, **budget/tiered-cap** pass, **regular trading hours only**, **whitelisted (active-universe) ticker**, and all **hard circuit breakers** clear. The same-day top-up guard above still applies to the final buy. (Morning 10:30 and midday 12:30 live runs still require trend validation unless changed later.) See [strategy.md](strategy.md#final-buy-of-the-day-320-pm-et-task-10ce362c).
+- **Final buy of the day behavior:** for the **final live buy of the day** the run performs a **full active-universe scan** and, **for this final-buy decision only**, **ignores the 60-minute downward-trend filter**. Every other gate still holds: current/decision price **strictly below the prior completed regular-session close**, ladder **multiplier > 0** (from the $2-base 0x-to-5x ladder), **data-confidence** pass, **`spread_ok=true`**, **budget/tiered-cap** pass, **regular trading hours only**, **whitelisted (active-universe) ticker**, and all **hard circuit breakers** clear. The same-day top-up guard above still applies to the final buy. (Morning 10:30 and midday 12:30 live runs still require trend validation unless changed later.) See [strategy.md](strategy.md#final-buy-of-the-day-320-pm-et-task-10ce362c).
 - **Jul 13 2026 final manual override incident:** the scheduled 3:20 PM ET run placed **0 orders**; the user then requested the final buy **manually**. A final manual-review scan ran the final-buy behavior above (full scan, trend ignored) with same-day top-up offsets and filled **34 orders**, planned total **$234.00** (`DFTX TRIN SPCX LUNR IRDM DXYZ LITE ASML DRAM STX AMAT AMD CBRS MRVL BTX STM SNDK WDC TSM AVGO NVDA QBTS FLKR INTC GOOGL GOOG GLW GS MU XLG TOPT QTOP SATA RGTI`). These are **manual final-buy overrides / same-day top-up context only — NOT scheduled-afternoon execution evidence**. Their run_state carries `run_type='final_manual_buy_override'`, `run_origin='manual'`, `manual_run=true`, `valid_afternoon_scheduled_evidence=false`, `same_day_top_up_context_only=true`. Artifacts (run_state + `filled_orders.csv` with all order IDs) were backfilled under `/home/user/workspace/cron_tracking/ce16ba6b/manual_runs/final_manual_override_20260713_1536ET/` and `/home/user/workspace/cron_tracking/midday_dca/manual_reruns/final_manual_override_20260713_1536ET/`. All order IDs are excluded from scheduled slippage/fills/reliability/cost basis/watchdog confirmation and shown only in the **"Manual Final Buy Override / Same-Day Top-Up Context"** section. See [run_classification.md](run_classification.md) and [strategy.md](strategy.md#manual-final-buy-override--2026-07-13-incident).
 - **Automatic failure recovery:** if the run fails on internal persistence, parsing, wrapper-normalization, transient connector throttling, or raw-file write problems **after data was fetched**, it is a recovery trigger, not a terminal stop. The task reruns the required read-only inputs **once**, **persists all raw responses first**, **recomputes only from the persisted files**, and continues through the same pre-authorized guarded path if every safeguard still passes. The recovery reuses the same `scheduled_runs/YYYYMMDD_1520ET/` directory with `recovery_rerun=true`, keeps `run_origin='scheduled'` (both `cron_id='10ce362c'` and `supersedes_cron_id='ce16ba6b'`), and still updates `latest_scheduled_run.json` — it is **never** reclassified as manual. If the recovery attempt also fails or a safety/account/order rejection occurs, it writes `run_state.json` with the blocking reason and escalates.
 - **Live reliability fix (Jul 17 2026):** before calling `place_equity_order`, describe the Robinhood connector schemas needed in-session (`place_equity_order` and `get_equity_orders`); always write the final `run_state.json`, `run_summary.json`, `signals.csv`, `submitted_orders.csv`, and `filled_orders.csv` where applicable, even for no-order/blocked/failed/recovery runs; every actionable signal ends with exactly one persisted result (`order_id`, broker rejection, top-up/budget/cap/data-confidence/spread/trend/safety block); an actionable signal missing both an `order_id` and a block/rejection is classified `execution_lineage_incomplete`, triggering one recovery retry in the same scheduled directory (`scheduled_runs/YYYYMMDD_1520ET/`) for only the missing tickers with the same `ref_id` values, reconciling duplicate `ref_id` or timeout through `get_equity_orders` before declaring failure. Manual overrides stay `manual_run=true` and never count as scheduled evidence. See the top-of-file live reliability fix note.
@@ -624,7 +632,7 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 
 ### `d72aa525` — Capital-priority briefing
 - Analytics only, **no trading**. Runs **3:25 PM ET weekdays**.
-- Uses the current $3 base 0x-to-5x ladder. Sends **email/in-app notification only if at least one ticker triggers 1.5x or higher**; otherwise silent.
+- Uses the current $2 base 0x-to-5x ladder. Sends **email/in-app notification only if at least one ticker triggers 1.5x or higher**; otherwise silent.
 
 ### `67aa802b` — Post-trade slippage + compact Notion latest-run sync
 - Analytics only, **no trading**. Runs **3:35 PM ET weekdays**.

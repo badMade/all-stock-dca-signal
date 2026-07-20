@@ -2,9 +2,9 @@
   "$schema": "../schemas/sizing_ladder.schema.json",
   "version": "2026-07-08",
   "status": "backtest_analytics",
-  "description": "Coarser sizing ladder used ONLY for the 12-month analytics backtest, NOT for live/manual execution. Live afternoon tasks always use config/sizing_ladder.json (the $3-base 0x-to-5x ladder) unless the dynamic risk kill-switch caps sizing to 1x. This ladder exists so backtest analytics can be run against a simpler, wider-band curve without changing anything the live task does.",
+  "description": "Coarser sizing ladder used ONLY for the 12-month analytics backtest, NOT for live/manual execution. Live afternoon tasks always use config/sizing_ladder.json (the $2-base 0x-to-5x ladder) unless the dynamic risk kill-switch caps sizing to 1x. This ladder exists so backtest analytics can be run against a simpler, wider-band curve without changing anything the live task does.",
   "drop_metric": "fraction_down_vs_previous_close",
-  "base_amount_usd": 3.0,
+  "base_amount_usd": 2.0,
   "no_buy_below_pct": 0.1,
   "tiers": [
     { "min_drop_pct": 0.1, "max_drop_pct": 2.0, "multiplier": 1.0 },

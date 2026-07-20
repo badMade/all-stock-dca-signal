@@ -7,7 +7,7 @@ private links are stored in this repo.**
 ## Daily flow (weekdays, EDT)
 
 1. **9:00 AM ET — Pre-market buying-power dashboard (`b7961407`)**
-   Analytics only. Pre-market buying-power view using the $3 base 0x-to-5x ladder.
+   Analytics only. Pre-market buying-power view using the $2 base 0x-to-5x ladder.
 2. **9:45 AM ET — Volatility outlier scan (`cd45e95b`)**
    Alerts only for >5% outliers or actionable errors.
 3. **3:05 PM ET — Monitor-only signal check (`e3e6f09e`)**

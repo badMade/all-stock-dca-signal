@@ -73,7 +73,7 @@ Additional invariants enforced by `run_once`: the broker account must equal
 `config.target_account_number` (`562057042`), the trading day must be in
 `config.approved_test_dates` (the weekday window in `config/trading_window.json`), and
 one order per ticker per stream per day within the daily/weekly/reserve caps and
-the **$15 max-per-order** circuit breaker.
+the **$10 max-per-order** circuit breaker.
 
 ## Scheduled-live pre-authorization (approved Fri Jul 10 2026 11:20 AM ET)
 

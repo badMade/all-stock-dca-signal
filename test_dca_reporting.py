@@ -247,6 +247,37 @@ def test_weekly_graded_vs_fixed_delta():
     assert "-2.50" in md
 
 
+def test_weekly_graded_vs_fixed_missing_base_amount_uses_pre_change_default():
+    # Codex review: a legacy run_state dated before the Jul 19 2026 base-amount
+    # change may predate this field being tracked at all; every such artifact
+    # used $3, so build_graded_vs_fixed must use that known value instead of
+    # raising and blocking the whole weekly report.
+    run_states = [{
+        "trading_day": "2026-07-10",
+        "budget": {},
+        "buy_candidates": [{"ticker": "AAPL", "planned_amount_usd": 3.0}],
+    }]
+    md = build_graded_vs_fixed(run_states)
+    # Fixed baseline: 1 candidate * pre-change $3 base = $3.00.
+    assert "$3.00" in md
+
+
+def test_weekly_graded_vs_fixed_missing_base_amount_raises_on_or_after_change():
+    # A run_state dated on/after the change is expected to always carry the
+    # field; a missing value there is a genuine anomaly, not a legacy gap.
+    run_states = [{
+        "trading_day": "2026-07-19",
+        "budget": {},
+        "buy_candidates": [{"ticker": "AAPL", "planned_amount_usd": 2.0}],
+    }]
+    try:
+        build_graded_vs_fixed(run_states)
+    except ValueError as exc:
+        assert "base_amount_usd" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for a missing base amount on/after the change")
+
+
 def test_weekly_sector_matrix_buckets_unclassified():
     md = build_sector_matrix([_run_state()], sector_map={"AAPL": "Tech"})
     assert "Tech" in md
@@ -551,7 +582,7 @@ def test_build_run_artifacts_captures_target_price():
     assert by_ticker["AMD"]["target_price_missing"] is True
     assert artifacts["budget"]["weekly_cap_usd"] == 900.0
     assert artifacts["budget"]["budget_tier"] == "normal"
-    assert artifacts["budget"]["base_buy_amount_usd"] == 3.0
+    assert artifacts["budget"]["base_buy_amount_usd"] == 2.0
 
     from scripts.run_classification import validate_classification
 

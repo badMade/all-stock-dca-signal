@@ -202,8 +202,10 @@ def test_nyse_holidays_shifts_weekend_fixed_dates():
 # --- Threshold brackets -----------------------------------------------------
 def test_ladder_brackets():
     # As of the Jul 10 2026 live-automation update the morning live stream uses
-    # the shared $3-base 0x-to-5x ladder (was 0x-to-3x, now historical).
-    ex = MorningDCAExecutor(MorningConfig(base_buy_amount_usd=3.0))
+    # the shared $2-base 0x-to-5x ladder (was 0x-to-3x, now historical). This
+    # test only asserts multiplier brackets, not dollar amounts, so it uses the
+    # default base_buy_amount_usd rather than overriding it.
+    ex = MorningDCAExecutor(MorningConfig())
     cases = {
         0.0005: 0.0,   # < 0.1% -> 0x
         0.001: 1.0,    # 0.1%   -> 1x
@@ -233,7 +235,7 @@ def test_ladder_matches_afternoon_live():
 
 
 def test_signal_amounts_and_actions():
-    cfg = MorningConfig(tickers=("UP", "FLAT", "TINY", "SMALL", "BIG"), base_buy_amount_usd=3.0)
+    cfg = MorningConfig(tickers=("UP", "FLAT", "TINY", "SMALL", "BIG"), base_buy_amount_usd=2.0)
     drops = {"UP": -0.01, "FLAT": 0.0, "TINY": 0.0005, "SMALL": 0.03, "BIG": 0.10}
     ex = MorningDCAExecutor(cfg)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, drops)
@@ -246,9 +248,9 @@ def test_signal_amounts_and_actions():
     assert sigs["TINY"].multiplier == 0.0
     assert sigs["SMALL"].action == Action.BUY
     assert sigs["SMALL"].multiplier == 2.5  # 3% drop -> 2.5x on the 0x-to-5x ladder
-    assert sigs["SMALL"].hypothetical_amount_usd == 7.5
+    assert sigs["SMALL"].hypothetical_amount_usd == 5.0
     assert sigs["BIG"].multiplier == 5.0  # 10% drop -> 5x
-    assert sigs["BIG"].hypothetical_amount_usd == 15.0
+    assert sigs["BIG"].hypothetical_amount_usd == 10.0
 
 
 class FixedQuoteProvider(FixedDropProvider):
@@ -447,12 +449,12 @@ def test_morning_ledger_does_not_touch_afternoon_state(tmp_path):
 def test_over_cap_emits_warning(tmp_path):
     cfg = MorningConfig(
         tickers=tuple(f"T{i}" for i in range(5)),
-        base_buy_amount_usd=3.0,
+        base_buy_amount_usd=2.0,
         morning_daily_cap_usd=5.0,
         morning_run_state_root=str(tmp_path),
     )
     ex = MorningDCAExecutor(cfg)
-    drops = {f"T{i}": 0.10 for i in range(5)}  # each 5x -> $15
+    drops = {f"T{i}": 0.10 for i in range(5)}  # each 5x -> $10
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, drops)
     res = ex.run(_now(), data)
     assert any("exceeds morning daily cap" in w for w in res["artifacts"]["warnings"])
@@ -463,7 +465,7 @@ def test_build_artifacts_does_not_double_count_ledger(tmp_path):
     # inspecting artifacts before writing) must not re-record spend against the
     # ledger. Only run()'s single record_buy_candidates() call should count.
     cfg = MorningConfig(
-        tickers=("BIG",), base_buy_amount_usd=3.0, morning_run_state_root=str(tmp_path),
+        tickers=("BIG",), base_buy_amount_usd=2.0, morning_run_state_root=str(tmp_path),
     )
     ex = MorningDCAExecutor(cfg)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
@@ -476,7 +478,7 @@ def test_build_artifacts_does_not_double_count_ledger(tmp_path):
     assert ex.ledger.day_planned(day) == 0.0  # build_artifacts alone never mutates the ledger
 
     ex.run(now, data)
-    assert ex.ledger.day_planned(day) == 15.0  # 10% drop -> 5x -> $15, recorded once
+    assert ex.ledger.day_planned(day) == 10.0  # 10% drop -> 5x -> $10, recorded once
 
 
 def test_scheduled_run_skips_artifacts_on_market_holiday(tmp_path):
@@ -871,7 +873,7 @@ def test_morning_run_reviews_places_and_records_orders_csv(tmp_path):
     # Broker orders only place in live mode; DecliningBarsProvider confirms the
     # intraday trend-down required for auto-buy eligibility, and manual=True
     # bypasses the preflight-gate/approved-window checks for this unit test.
-    cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
+    cfg = MorningConfig(tickers=("SMALL",), base_buy_amount_usd=3.0, morning_run_state_root=str(tmp_path))
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
     broker = DryRunBroker(account="562057042", reference_prices={"SMALL": 97.0})
@@ -927,7 +929,7 @@ class RecordingLiveBroker:
 
 
 def test_morning_artifacts_include_planned_amount_for_prior_allocation_loader(tmp_path):
-    cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
+    cfg = MorningConfig(tickers=("SMALL",), base_buy_amount_usd=3.0, morning_run_state_root=str(tmp_path))
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
     broker = DryRunBroker(account="562057042", reference_prices={"SMALL": 97.0})
@@ -946,6 +948,7 @@ def test_morning_live_orders_are_blocked_before_exceeding_daily_cap(tmp_path):
     # exceed the cap), so BBB is cap_exceeded rather than placed.
     cfg = MorningConfig(
         tickers=("AAA", "BBB"),
+        base_buy_amount_usd=3.0,
         morning_daily_cap_usd=10.0,
         morning_weekly_cap_usd=100.0,
         morning_run_state_root=str(tmp_path),
@@ -981,6 +984,7 @@ def test_morning_live_ledger_seeds_cap_spend_from_earlier_same_process_day_run(t
     # wrongly re-spending the full $10.
     cfg = MorningConfig(
         tickers=("AAA",),
+        base_buy_amount_usd=3.0,
         morning_daily_cap_usd=10.0,
         morning_weekly_cap_usd=100.0,
         morning_run_state_root=str(tmp_path),
@@ -995,6 +999,7 @@ def test_morning_live_ledger_seeds_cap_spend_from_earlier_same_process_day_run(t
     # brand-new cron process picking up where the first one left off.
     cfg2 = MorningConfig(
         tickers=("BBB",),
+        base_buy_amount_usd=3.0,
         morning_daily_cap_usd=10.0,
         morning_weekly_cap_usd=100.0,
         morning_run_state_root=str(tmp_path),
@@ -1019,6 +1024,7 @@ def test_morning_live_ledger_seeds_weekly_cap_from_earlier_day_same_week(tmp_pat
     monday = datetime.combine(date(2026, 7, 6), time(10, 30), tzinfo=EASTERN)
     cfg1 = MorningConfig(
         tickers=("AAA",),
+        base_buy_amount_usd=3.0,
         morning_daily_cap_usd=100.0,
         morning_weekly_cap_usd=10.0,
         morning_run_state_root=str(tmp_path),
@@ -1033,6 +1039,7 @@ def test_morning_live_ledger_seeds_weekly_cap_from_earlier_day_same_week(tmp_pat
     # Fresh process (fresh in-memory ledger) on Wednesday of the same week.
     cfg2 = MorningConfig(
         tickers=("BBB",),
+        base_buy_amount_usd=3.0,
         morning_daily_cap_usd=100.0,
         morning_weekly_cap_usd=10.0,
         morning_run_state_root=str(tmp_path),
@@ -1766,7 +1773,7 @@ def test_augment_artifacts_appends_top_up_manual_review_candidate_row():
 def test_morning_executor_default_init_loads_config_file():
     """MorningDCAExecutor() with no args loads from the shipped config/morning_dca.json."""
     ex = MorningDCAExecutor()
-    assert ex.config.base_buy_amount_usd == 3.0
+    assert ex.config.base_buy_amount_usd == 2.0
     assert ex.config.morning_daily_cap_usd == 90.0
     assert date(2026, 7, 2) in ex.config.approved_test_dates
     assert date(2026, 8, 28) in ex.config.approved_test_dates
@@ -2367,7 +2374,7 @@ def test_morning_live_no_broker_does_not_record_hypothetical_ledger_spend(tmp_pa
     # this fix introduced. broker=None means no orders were actually placed
     # (broker_outcomes stays None), so record_buy_candidates() must be skipped
     # entirely for the morning live stream -- the ledger must stay at $0
-    # despite SMALL's real hypothetical $7.50 signal, so a later broker-backed
+    # despite SMALL's real hypothetical $5.00 signal, so a later broker-backed
     # retry sees the FULL cap available rather than being pre-charged for
     # spend that never happened.
     pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
@@ -2387,7 +2394,7 @@ def test_morning_live_no_broker_does_not_record_hypothetical_ledger_spend(tmp_pa
     res = ex.run(_now_live(), data, manual=True, broker=None)
     assert res["artifacts"].get("status") != "blocked"
     sm = res["artifacts"]["buy_candidates"][0]
-    assert sm["hypothetical_amount_usd"] == 7.5  # confirms this exercises the fix's target path
+    assert sm["hypothetical_amount_usd"] == 5.0  # confirms this exercises the fix's target path
     trading_day = _now_live().astimezone(EASTERN).date()
     assert ex.ledger.day_planned(trading_day) == 0.0
     assert ex.ledger.week_planned(trading_day) == 0.0
@@ -2868,8 +2875,8 @@ def test_preflight_missing_block_retry_preserves_prior_submitted_evidence(tmp_pa
 
 def test_auto_buy_candidates_prioritized_by_multiplier_when_cap_hit(tmp_path):
     # When the daily cap is tight, higher-multiplier tickers are placed first.
-    # BIGDROP: 8% drop -> 5x -> $15 notional. SMALLDROP: 1% drop -> 1.5x -> $4.50 notional.
-    # Daily cap of $16 allows BIGDROP ($15 < $16) then blocks SMALLDROP ($15+$4.50 > $16).
+    # BIGDROP: 8% drop -> 5x -> $10 notional. SMALLDROP: 1% drop -> 1.5x -> $3.00 notional.
+    # Daily cap of $11 allows BIGDROP ($10 < $11) then blocks SMALLDROP ($10+$3 > $11).
     # The sort ensures the high-multiplier ticker gets the budget slot, not whichever
     # happened to be evaluated first.
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
@@ -2888,12 +2895,12 @@ def test_auto_buy_candidates_prioritized_by_multiplier_when_cap_hit(tmp_path):
         tickers=("BIGDROP", "SMALLDROP"),
         morning_run_state_root=str(tmp_path / "live"),
         preflight_run_state_root=str(pf_root),
-        morning_daily_cap_usd=16.0,
+        morning_daily_cap_usd=11.0,
         morning_weekly_cap_usd=500.0,
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
-    # BIGDROP: 8% drop -> 5x multiplier -> $15. SMALLDROP: 1% drop -> 1.5x -> $4.50.
+    # BIGDROP: 8% drop -> 5x multiplier -> $10. SMALLDROP: 1% drop -> 1.5x -> $3.00.
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIGDROP": 0.08, "SMALLDROP": 0.01})
     res = ex.run(_now_live(), data, broker=_FakeLiveBroker())
     broker_outcomes = res["artifacts"].get("broker_outcomes", {})
@@ -2962,6 +2969,7 @@ def test_morning_top_up_guard_buys_incremental_when_prior_fill_exists(tmp_path):
     pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
     cfg = MorningConfig(
         tickers=("TOPUP",),
+        base_buy_amount_usd=3.0,
         morning_run_state_root=str(tmp_path / "live"),
         preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),
@@ -3027,6 +3035,7 @@ def test_morning_top_up_guard_inactive_in_watchlist_mode(tmp_path):
     _write_prior_run_state(prior_root, "TOPUP", amount_usd=4.50, decision_price=99.0)
     cfg = MorningConfig(
         tickers=("TOPUP",),
+        base_buy_amount_usd=3.0,
         morning_run_state_root=str(tmp_path / "watchlist"),
         prior_allocation_roots=(str(prior_root),),
     )
@@ -3069,6 +3078,7 @@ def test_morning_top_up_guard_seeds_ledger_from_prior_fills(tmp_path):
     pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
     cfg = MorningConfig(
         tickers=("TOPUP",),
+        base_buy_amount_usd=3.0,
         morning_run_state_root=str(tmp_path / "live"),
         preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(morning_root),),
@@ -3112,6 +3122,7 @@ def test_morning_top_up_guard_afternoon_fills_do_not_reduce_morning_cap(tmp_path
     pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
     cfg = MorningConfig(
         tickers=("TOPUP",),
+        base_buy_amount_usd=3.0,
         morning_run_state_root=str(tmp_path / "live"),
         preflight_run_state_root=str(pf_root),
         # Afternoon root in prior_allocation_roots for per-ticker offset check…
@@ -3209,6 +3220,7 @@ def test_morning_cap_seeding_is_idempotent_across_multiple_runs(tmp_path):
     pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
     cfg = MorningConfig(
         tickers=("TOPUP",),
+        base_buy_amount_usd=3.0,
         morning_run_state_root=str(tmp_path / "live"),
         preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(morning_root),),
@@ -3363,6 +3375,7 @@ def test_morning_cap_seeding_watermark_exclusive_of_own_recorded(tmp_path):
     pf_root = _seed_preflight(tmp_path / "pf", ("TICK",))
     cfg = MorningConfig(
         tickers=("TICK",),
+        base_buy_amount_usd=3.0,
         morning_run_state_root=str(live_root),
         preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(manual_root),),
@@ -3599,6 +3612,7 @@ def test_morning_ledger_seed_still_covers_scheduled_slot_when_cap_roots_are_manu
 
     cfg1 = MorningConfig(
         tickers=("AAA",),
+        base_buy_amount_usd=3.0,
         morning_run_state_root=str(live_root),
         preflight_run_state_root=str(pf_root),
         cap_seed_roots=(str(live_root / "manual_runs"),),  # narrow: excludes the scheduled slot
@@ -3616,6 +3630,7 @@ def test_morning_ledger_seed_still_covers_scheduled_slot_when_cap_roots_are_manu
     # brand-new cron process retrying the same scheduled slot.
     cfg2 = MorningConfig(
         tickers=("BBB",),
+        base_buy_amount_usd=3.0,
         morning_run_state_root=str(live_root),
         preflight_run_state_root=str(pf_root),
         cap_seed_roots=(str(live_root / "manual_runs"),),
@@ -3662,6 +3677,7 @@ def test_morning_top_up_guard_no_prior_run_when_default_roots_empty(tmp_path):
     pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
     cfg = MorningConfig(
         tickers=("TOPUP",),
+        base_buy_amount_usd=3.0,
         morning_run_state_root=str(tmp_path / "live"),
         preflight_run_state_root=str(pf_root),
         # prior_allocation_roots=None → uses default root; empty default → no_prior_run
@@ -3724,8 +3740,8 @@ class _TopUpBroker:
 
 def test_morning_live_applies_prior_manual_offset_incremental(tmp_path):
     # Prior manual fill: NVDA $3 at $95 reference. Morning price $90 (10% drop, below ref).
-    # Desired = 5x * $3 = $15. Incremental = $15 - $3 = $12.
-    prior_root = _seed_prior(tmp_path / "prior", "NVDA", 3.0, reference_price=95.0)
+    # Desired = 5x * $2 = $10. Incremental = $15 - $3 = $8.
+    prior_root = _seed_prior(tmp_path / "prior", "NVDA", 2.0, reference_price=95.0)
     pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
@@ -3738,7 +3754,7 @@ def test_morning_live_applies_prior_manual_offset_incremental(tmp_path):
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
     res = ex.run(_now_live(), data, broker=broker)
     assert "NVDA" in broker.placed, f"expected incremental order; broker_outcomes={res['artifacts'].get('broker_outcomes')}"
-    assert abs(broker.placed["NVDA"] - 12.0) < 0.01, f"expected $12 incremental; got {broker.placed['NVDA']}"
+    assert abs(broker.placed["NVDA"] - 8.0) < 0.01, f"expected $8 incremental; got {broker.placed['NVDA']}"
     rows = {r["ticker"]: r for r in res["artifacts"].get("buy_candidates", [])}
     assert rows["NVDA"]["top_up_guard_result"] == "incremental_top_up"
 
@@ -3797,6 +3813,7 @@ def test_morning_scheduled_top_up_not_blocked_by_manual_fills_ordinary_ref_id(tm
     pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
+        base_buy_amount_usd=3.0,
         morning_run_state_root=str(live_root),
         preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(live_root / "manual_runs"),),
@@ -3864,6 +3881,8 @@ def test_morning_scheduled_top_up_duplicate_preserves_original_submitted_amount(
     pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
+        base_buy_amount_usd=3.0,
+        max_per_order_usd=15.0,
         morning_run_state_root=str(live_root),
         preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),
@@ -3923,6 +3942,8 @@ def test_morning_scheduled_duplicate_check_preserved_when_cap_fully_consumed(tmp
     pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
+        base_buy_amount_usd=3.0,
+        max_per_order_usd=15.0,
         morning_run_state_root=str(tmp_path / "live"),
         preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),
@@ -3968,6 +3989,8 @@ def test_morning_scheduled_duplicate_not_rebooked_into_ledger(tmp_path):
     pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
+        base_buy_amount_usd=3.0,
+        max_per_order_usd=15.0,
         morning_run_state_root=str(tmp_path / "live"),
         preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),
@@ -3997,9 +4020,9 @@ def test_morning_scheduled_duplicate_not_rebooked_into_ledger(tmp_path):
 
 
 def test_morning_live_skips_when_price_not_below_prior_reference(tmp_path):
-    # Prior: NVDA $3 at $85 reference. Morning price $90 (10% drop from $100).
+    # Prior: NVDA $2 at $85 reference. Morning price $90 (10% drop from $100).
     # $90 >= $85 → price_not_below → skip, no order.
-    prior_root = _seed_prior(tmp_path / "prior", "NVDA", 3.0, reference_price=85.0)
+    prior_root = _seed_prior(tmp_path / "prior", "NVDA", 2.0, reference_price=85.0)
     pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
@@ -4017,7 +4040,7 @@ def test_morning_live_skips_when_price_not_below_prior_reference(tmp_path):
 
 
 def test_morning_live_full_buy_when_no_prior_allocation(tmp_path):
-    # Empty prior root → no_prior_run → buy the full desired amount ($15 = 5x * $3).
+    # Empty prior root → no_prior_run → buy the full desired amount ($10 = 5x * $2).
     pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
@@ -4030,7 +4053,7 @@ def test_morning_live_full_buy_when_no_prior_allocation(tmp_path):
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
     res = ex.run(_now_live(), data, broker=broker)
     assert "NVDA" in broker.placed, f"expected full buy; broker.placed={broker.placed}"
-    assert abs(broker.placed["NVDA"] - 15.0) < 0.01, f"expected $15; got {broker.placed['NVDA']}"
+    assert abs(broker.placed["NVDA"] - 10.0) < 0.01, f"expected $10; got {broker.placed['NVDA']}"
     rows = {r["ticker"]: r for r in res["artifacts"].get("buy_candidates", [])}
     assert rows["NVDA"]["top_up_guard_result"] == "no_prior_run"
 
@@ -4061,7 +4084,7 @@ def test_morning_live_missing_price_triggers_manual_review(tmp_path):
 
 
 def test_morning_live_no_incremental_when_prior_covers_full_desired(tmp_path):
-    # Prior: NVDA $20 at $95 reference. Desired = $15. $15 - $20 = -$5 ≤ 0 → no_incremental.
+    # Prior: NVDA $20 at $95 reference. Desired = $10. $10 - $20 = -$10 ≤ 0 → no_incremental.
     prior_root = _seed_prior(tmp_path / "prior", "NVDA", 20.0, reference_price=95.0)
     pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
@@ -4083,9 +4106,9 @@ def test_morning_live_no_incremental_when_prior_covers_full_desired(tmp_path):
 
 def test_morning_live_prior_from_configured_root_only(tmp_path):
     # Only roots in prior_allocation_roots contribute; fills under other_root are invisible.
-    # configured_root: NVDA $3 at $95 → incremental $12.
+    # configured_root: NVDA $2 at $95 → incremental $8.
     # other_root: NVDA $20 at $95 → would produce no_incremental if scanned.
-    configured_root = _seed_prior(tmp_path / "configured", "NVDA", 3.0, reference_price=95.0)
+    configured_root = _seed_prior(tmp_path / "configured", "NVDA", 2.0, reference_price=95.0)
     _seed_prior(tmp_path / "other", "NVDA", 20.0, reference_price=95.0)
     pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
@@ -4098,9 +4121,9 @@ def test_morning_live_prior_from_configured_root_only(tmp_path):
     broker = _TopUpBroker()
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
     res = ex.run(_now_live(), data, broker=broker)
-    # Configured root contributes $3 only → incremental $12, not no_incremental.
+    # Configured root contributes $3 only → incremental $8, not no_incremental.
     assert "NVDA" in broker.placed, f"expected incremental order; broker_outcomes={res['artifacts'].get('broker_outcomes')}"
-    assert abs(broker.placed["NVDA"] - 12.0) < 0.01, f"expected $12; got {broker.placed['NVDA']}"
+    assert abs(broker.placed["NVDA"] - 8.0) < 0.01, f"expected $8; got {broker.placed['NVDA']}"
 
 
 def test_morning_live_scheduled_artifact_not_prior_context_on_retry(tmp_path):
@@ -4231,6 +4254,7 @@ def test_morning_cap_seeding_runs_even_when_per_ticker_guard_disabled(tmp_path):
     pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
     cfg = MorningConfig(
         tickers=("TOPUP",),
+        base_buy_amount_usd=3.0,
         morning_run_state_root=str(tmp_path / "live"),
         preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(),  # guard disabled via []
@@ -4287,6 +4311,7 @@ def test_morning_cap_seeding_own_amount_scoped_to_cap_roots(tmp_path):
     pf_root = _seed_preflight(tmp_path / "pf", ("TICK",))
     cfg = MorningConfig(
         tickers=("TICK",),
+        base_buy_amount_usd=3.0,
         morning_run_state_root=str(live_root),
         preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(live_root / "manual_runs"),),
@@ -4593,6 +4618,8 @@ def test_morning_live_same_stream_check_ignores_manual_fill_ref_id(tmp_path):
 
     cfg = MorningConfig(
         tickers=("NVDA",),
+        base_buy_amount_usd=3.0,
+        max_per_order_usd=15.0,
         morning_run_state_root=str(tmp_path / "live"),
         preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),

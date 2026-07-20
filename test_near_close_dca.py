@@ -86,8 +86,8 @@ def test_ladder_boundaries():
         assert actual == expected, f"drop {drop_pct}% -> {actual}, expected {expected}"
 
 
-def test_base_amount_is_three_dollars():
-    assert StrategyConfig().base_buy_amount_usd == 3.0
+def test_base_amount_is_two_dollars():
+    assert StrategyConfig().base_buy_amount_usd == 2.0
 
 
 def test_weekly_rollover_reserve_cap():
@@ -729,9 +729,9 @@ def test_deployment_history_root_engages_kill_switch_on_later_run(tmp_path):
 
 def test_kill_switch_caps_later_candidates_within_the_same_batch(tmp_path):
     # No prior-day history is needed: two same-day candidates each priced at
-    # $6 (2x the $3 base) with a $10 monthly allocation (40% threshold = $4)
+    # $4 (2x the $2 base) with a $7.50 monthly allocation (40% threshold = $3)
     # mean the FIRST submitted order alone already crosses the threshold. The
-    # SECOND candidate in the same run must then be capped to the $3 base
+    # SECOND candidate in the same run must then be capped to the $2 base
     # instead of keeping its uncapped 2x amount -- otherwise a volatile day
     # could overshoot the guard well beyond the base amount before the guard
     # is even visible to tomorrow's run.
@@ -741,7 +741,7 @@ def test_kill_switch_caps_later_candidates_within_the_same_batch(tmp_path):
         dry_run=False,
         tickers=("AAA", "BBB"),
         approved_test_dates=frozenset({date(2026, 6, 29)}),
-        monthly_cash_allocation_usd=10.0,
+        monthly_cash_allocation_usd=7.5,
     )
     state = StrategyState()
     broker = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
@@ -756,30 +756,30 @@ def test_kill_switch_caps_later_candidates_within_the_same_batch(tmp_path):
     submitted = [c for c in run_state["buy_candidates"] if c["status"] == "submitted"]
     assert len(submitted) == 2
     # AAA is filled first (alphabetical tiebreak at equal multiplier/drop) at
-    # its full 2x amount, which alone crosses the $4 threshold.
-    assert by_ticker["AAA"]["planned_amount_usd"] == 6.0
+    # its full 2x amount, which alone crosses the $3 threshold.
+    assert by_ticker["AAA"]["planned_amount_usd"] == 4.0
     assert by_ticker["AAA"]["buy_multiplier"] == 2.0
-    # BBB, priced after the threshold is crossed, is capped to the $3 base --
+    # BBB, priced after the threshold is crossed, is capped to the $2 base --
     # even though its ladder multiplier (still reported for audit purposes)
     # remains 2.0, showing the cap is a dollar-amount guard, not a multiplier
     # rewrite.
-    assert by_ticker["BBB"]["planned_amount_usd"] == 3.0
+    assert by_ticker["BBB"]["planned_amount_usd"] == 2.0
     assert by_ticker["BBB"]["buy_multiplier"] == 2.0
 
 
 def test_manual_run_submissions_do_not_advance_in_batch_burn(tmp_path):
-    # Same setup as the scheduled in-batch test above (AAA/BBB, $10 monthly
+    # Same setup as the scheduled in-batch test above (AAA/BBB, $7.50 monthly
     # allocation), but scheduled=False: a manual run's own submissions must
     # never advance the scheduled-live 7-day figure the kill-switch reads, so
     # neither candidate is capped even though AAA's amount alone would cross
-    # the $4 threshold if counted.
+    # the $3 threshold if counted.
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-manual")
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=("AAA", "BBB"),
         approved_test_dates=frozenset({date(2026, 6, 29)}),
-        monthly_cash_allocation_usd=10.0,
+        monthly_cash_allocation_usd=7.5,
     )
     state = StrategyState()
     broker = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
@@ -793,8 +793,8 @@ def test_manual_run_submissions_do_not_advance_in_batch_burn(tmp_path):
     with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
-    assert by_ticker["AAA"]["planned_amount_usd"] == 6.0
-    assert by_ticker["BBB"]["planned_amount_usd"] == 6.0  # NOT capped to the $3 base
+    assert by_ticker["AAA"]["planned_amount_usd"] == 4.0
+    assert by_ticker["BBB"]["planned_amount_usd"] == 4.0  # NOT capped to the $2 base
     assert run_state["risk_guard"]["kill_switch_engaged"] is False
 
 
@@ -1832,9 +1832,9 @@ def test_load_prior_same_day_skips_non_utf8_artifact_without_crashing(tmp_path):
 def test_run_daily_compact_top_up_records_incremental(tmp_path):
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
-    # 100 -> 98 is a 2% drop -> 2x -> $6 desired. Morning bought $3 at 99.0; the
-    # afternoon quote is 98.0 (< 99.0) so only the $3 difference is bought.
-    prior = {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=3.0, reference_price=99.0, run_id="manual_am", source="manual")}
+    # 100 -> 98 is a 2% drop -> 2x -> $4 desired. Morning bought $2 at 99.0; the
+    # afternoon quote is 98.0 (< 99.0) so only the $2 difference is bought.
+    prior = {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=2.0, reference_price=99.0, run_id="manual_am", source="manual")}
 
     run_daily_compact(
         now, config, state, fin, rh, broker,
@@ -1846,9 +1846,9 @@ def test_run_daily_compact_top_up_records_incremental(tmp_path):
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
     aapl = by_ticker["AAPL"]
     assert aapl["top_up_guard_result"] == TOP_UP_INCREMENTAL
-    assert aapl["incremental_order_amount"] == 3.0
-    assert aapl["afternoon_desired_amount"] == 6.0
-    assert aapl["prior_same_day_amount"] == 3.0
+    assert aapl["incremental_order_amount"] == 2.0
+    assert aapl["afternoon_desired_amount"] == 4.0
+    assert aapl["prior_same_day_amount"] == 2.0
     assert aapl["prior_same_day_reference_price"] == 99.0
     assert aapl["prior_same_day_run_id"] == "manual_am"
     assert aapl["status"] == "dry_run"
@@ -1861,7 +1861,7 @@ def test_run_daily_compact_top_up_records_incremental(tmp_path):
     # A ticker with no prior allocation still buys its full amount, using the
     # plain (non-topup) ref_id formula.
     assert by_ticker["NVDA"]["top_up_guard_result"] == TOP_UP_NO_PRIOR_RUN
-    assert by_ticker["NVDA"]["incremental_order_amount"] == 6.0
+    assert by_ticker["NVDA"]["incremental_order_amount"] == 4.0
     assert "graded-dca-topup" not in by_ticker["NVDA"]["order_id"]
     assert "graded-dca-2026-06-29-NVDA" in by_ticker["NVDA"]["order_id"]
 
@@ -1873,7 +1873,7 @@ def test_run_daily_compact_fully_offset_still_writes_valid_state(tmp_path):
     # (price not below prior) so each candidate tops up $0, yet a valid scheduled
     # run_state must still be written.
     prior = {
-        t: PriorSameDayAllocation(t, amount_usd=3.0, reference_price=97.0, run_id="manual_am", source="manual")
+        t: PriorSameDayAllocation(t, amount_usd=2.0, reference_price=97.0, run_id="manual_am", source="manual")
         for t in config.tickers
     }
 
@@ -1887,9 +1887,9 @@ def test_run_daily_compact_fully_offset_still_writes_valid_state(tmp_path):
     with open(result["run_state_path"], encoding="utf-8") as handle:
         run_state = json.load(handle)
     # Fix 2: prior amounts are seeded into the ledger before the cap check,
-    # so day_notional reflects the 3 tickers x $3 prior spend even though the
+    # so day_notional reflects the 3 tickers x $2 prior spend even though the
     # afternoon incremental is $0 for all (price not below prior).
-    assert run_state["budget"]["day_notional_usd"] == 9.0
+    assert run_state["budget"]["day_notional_usd"] == 6.0
     for candidate in run_state["buy_candidates"]:
         assert candidate["top_up_guard_result"] == TOP_UP_PRICE_NOT_BELOW
         assert candidate["incremental_order_amount"] == 0.0
@@ -1907,7 +1907,7 @@ def test_run_daily_compact_manual_run_does_not_block_scheduled(tmp_path):
             return True
 
     blocking = _BlockingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
-    prior = {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=3.0, reference_price=99.0, run_id="manual_am", source="manual")}
+    prior = {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=2.0, reference_price=99.0, run_id="manual_am", source="manual")}
 
     run_daily_compact(
         now, config, state, fin, rh, blocking,
@@ -1920,7 +1920,7 @@ def test_run_daily_compact_manual_run_does_not_block_scheduled(tmp_path):
     # Guard bypassed the same-day broker block and still topped up AAPL, which
     # has a loaded prior allocation.
     assert by_ticker["AAPL"]["status"] == "dry_run"
-    assert by_ticker["AAPL"]["incremental_order_amount"] == 3.0
+    assert by_ticker["AAPL"]["incremental_order_amount"] == 2.0
     # NVDA has NO loaded prior allocation, so the broker's same-day-order check
     # must still apply -- the guard bypass is scoped per-ticker, not blanket.
     assert by_ticker["NVDA"]["status"] == "skipped"

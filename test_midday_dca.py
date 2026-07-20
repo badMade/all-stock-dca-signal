@@ -1,6 +1,6 @@
 """Self-tests for the midday graded-DCA executor (12:30 PM ET live execution).
 
-Covers the midday stream identity (the shared $3-base 0x-to-5x ladder used by
+Covers the midday stream identity (the shared $2-base 0x-to-5x ladder used by
 all live streams: morning, midday, and afternoon), the run-state
 path/classification, the live-mode confidence rule (inherited), the same-day
 top-up guard against morning/manual prior allocations, and the guarantee that a
@@ -180,7 +180,7 @@ def test_midday_ladder_matches_afternoon_and_morning():
 
     ex = MiddayDCAExecutor(MiddayConfig())
     # As of the Jul 10 2026 update all live streams (morning, midday, afternoon)
-    # share the SAME $3-base 0x-to-5x ladder.
+    # share the SAME $2-base 0x-to-5x ladder.
     assert MIDDAY_SIZING_TIERS == StrategyConfig().sizing_tiers
     assert ex.multiplier_for_drop(0.08) == 5.0
     assert graded_buy_multiplier(0.08, StrategyConfig()) == 5.0
@@ -188,7 +188,7 @@ def test_midday_ladder_matches_afternoon_and_morning():
 
 
 def test_midday_ladder_brackets():
-    ex = MiddayDCAExecutor(MiddayConfig(base_buy_amount_usd=3.0))
+    ex = MiddayDCAExecutor(MiddayConfig(base_buy_amount_usd=2.0))
     cases = {
         0.0005: 0.0,
         0.001: 1.0,
@@ -262,15 +262,15 @@ def test_midday_manual_run_id_and_no_pointer(tmp_path):
 
 # --- Live confidence rule (inherited) ---------------------------------------
 def test_midday_confidence_rule_auto_buys_with_validated_trend():
-    ex = MiddayDCAExecutor(MiddayConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
+    ex = MiddayDCAExecutor(MiddayConfig(tickers=("BIG",), base_buy_amount_usd=2.0))
     # Use declining bars so the strict downward-trend check (last close < first close) passes.
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
     sig = ex.evaluate(_now_midday(), data)[0]
     assert sig.action == Action.BUY
     assert sig.trend_validated is True
     assert sig.execution_status == EXEC_AUTO_BUY_ELIGIBLE
-    # 0x-to-5x ladder: 10% drop -> 5x -> $15.
-    assert sig.hypothetical_amount_usd == 15.0
+    # 0x-to-5x ladder: 10% drop -> 5x -> $10.
+    assert sig.hypothetical_amount_usd == 10.0
 
 
 class FewBarsProvider(FixedDropProvider):
@@ -285,7 +285,7 @@ class FewBarsProvider(FixedDropProvider):
 
 
 def test_midday_confidence_rule_withholds_when_trend_unvalidated(tmp_path):
-    cfg = MiddayConfig(tickers=("BIG",), base_buy_amount_usd=3.0,
+    cfg = MiddayConfig(tickers=("BIG",), base_buy_amount_usd=2.0,
                        morning_run_state_root=str(tmp_path))
     ex = MiddayDCAExecutor(cfg)
     data = FewBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
@@ -304,7 +304,7 @@ def test_midday_confidence_rule_withholds_when_trend_unvalidated(tmp_path):
 def test_top_up_no_prior_buys_full_amount(tmp_path):
     prior_root = tmp_path / "morning"
     cfg = MiddayConfig(
-        tickers=("BIG",), base_buy_amount_usd=3.0,
+        tickers=("BIG",), base_buy_amount_usd=2.0,
         morning_run_state_root=str(tmp_path / "midday"),
         prior_allocation_roots=(str(prior_root),),
     )
@@ -313,21 +313,21 @@ def test_top_up_no_prior_buys_full_amount(tmp_path):
     res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
     row = res["artifacts"]["buy_candidates"][0]
     assert row["top_up_guard_result"] == TOP_UP_NO_PRIOR_RUN
-    assert row["incremental_order_amount"] == 15.0
+    assert row["incremental_order_amount"] == 10.0
     # Ledger recorded the full (un-offset) amount.
     day = _now_midday().astimezone(EASTERN).date()
-    assert ex.ledger.day_planned(day) == 15.0
+    assert ex.ledger.day_planned(day) == 10.0
 
 
 def test_top_up_incremental_when_price_below_prior(tmp_path):
     prior_root = tmp_path / "morning"
-    # Morning bought ~$3 at a fill price of 95.0.
+    # Morning bought ~$2 at a fill price of 95.0.
     _write_prior_morning_run(
-        prior_root, ticker="BIG", planned_amount=3.0,
-        fill_price=95.0, quantity=round(3.0 / 95.0, 6),
+        prior_root, ticker="BIG", planned_amount=2.0,
+        fill_price=95.0, quantity=round(2.0 / 95.0, 6),
     )
     cfg = MiddayConfig(
-        tickers=("BIG",), base_buy_amount_usd=3.0,
+        tickers=("BIG",), base_buy_amount_usd=2.0,
         morning_run_state_root=str(tmp_path / "midday"),
         prior_allocation_roots=(str(prior_root),),
     )
@@ -337,13 +337,13 @@ def test_top_up_incremental_when_price_below_prior(tmp_path):
     res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
     row = res["artifacts"]["buy_candidates"][0]
     assert row["top_up_guard_result"] == TOP_UP_INCREMENTAL
-    assert row["prior_same_day_amount"] == 3.0
+    assert row["prior_same_day_amount"] == 2.0
     assert row["prior_same_day_reference_price"] == 95.0
     assert row["midday_decision_price"] == 90.0
-    # Desired $15 minus prior $3 = $12 incremental.
-    assert row["incremental_order_amount"] == 12.0
+    # Desired $10 minus prior $2 = $8 incremental.
+    assert row["incremental_order_amount"] == 8.0
     day = _now_midday().astimezone(EASTERN).date()
-    assert ex.ledger.day_planned(day) == 12.0
+    assert ex.ledger.day_planned(day) == 8.0
 
 
 class _WideSpreadProvider(DecliningBarsProvider):
@@ -365,7 +365,7 @@ def test_midday_spread_breaker_blocks_wide_spread(tmp_path):
     # midday, since MiddayDCAExecutor shares _place_broker_orders with
     # MorningDCAExecutor.
     cfg = MiddayConfig(
-        tickers=("BIG",), base_buy_amount_usd=3.0,
+        tickers=("BIG",), base_buy_amount_usd=2.0,
         morning_run_state_root=str(tmp_path / "midday"),
         max_bid_ask_spread_pct=1.0,
     )
@@ -423,11 +423,11 @@ class _TopUpDuplicateBroker:
 def test_guarded_midday_top_up_checks_same_stream_duplicate_before_placing(tmp_path):
     prior_root = tmp_path / "morning"
     _write_prior_morning_run(
-        prior_root, ticker="BIG", planned_amount=3.0,
-        fill_price=95.0, quantity=round(3.0 / 95.0, 6),
+        prior_root, ticker="BIG", planned_amount=2.0,
+        fill_price=95.0, quantity=round(2.0 / 95.0, 6),
     )
     cfg = MiddayConfig(
-        tickers=("BIG",), base_buy_amount_usd=3.0,
+        tickers=("BIG",), base_buy_amount_usd=2.0,
         morning_run_state_root=str(tmp_path / "midday"),
         prior_allocation_roots=(str(prior_root),),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
@@ -459,11 +459,11 @@ def test_manual_retry_of_guarded_top_up_duplicate_is_skipped_not_submitted(tmp_p
     # double-count the same broker order as two separate same-day allocations.
     prior_root = tmp_path / "morning"
     _write_prior_morning_run(
-        prior_root, ticker="BIG", planned_amount=3.0,
-        fill_price=95.0, quantity=round(3.0 / 95.0, 6),
+        prior_root, ticker="BIG", planned_amount=2.0,
+        fill_price=95.0, quantity=round(2.0 / 95.0, 6),
     )
     cfg = MiddayConfig(
-        tickers=("BIG",), base_buy_amount_usd=3.0,
+        tickers=("BIG",), base_buy_amount_usd=2.0,
         morning_run_state_root=str(tmp_path / "midday"),
         prior_allocation_roots=(str(prior_root),),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
@@ -490,11 +490,11 @@ class _TopUpBrokerWithoutSameStreamCheck(_TopUpDuplicateBroker):
 def test_guarded_midday_top_up_blocks_when_same_stream_checker_unavailable(tmp_path):
     prior_root = tmp_path / "morning"
     _write_prior_morning_run(
-        prior_root, ticker="BIG", planned_amount=3.0,
-        fill_price=95.0, quantity=round(3.0 / 95.0, 6),
+        prior_root, ticker="BIG", planned_amount=2.0,
+        fill_price=95.0, quantity=round(2.0 / 95.0, 6),
     )
     cfg = MiddayConfig(
-        tickers=("BIG",), base_buy_amount_usd=3.0,
+        tickers=("BIG",), base_buy_amount_usd=2.0,
         morning_run_state_root=str(tmp_path / "midday"),
         prior_allocation_roots=(str(prior_root),),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
@@ -514,11 +514,11 @@ def test_guarded_midday_top_up_blocks_when_same_stream_checker_unavailable(tmp_p
 def test_guarded_midday_top_up_ignores_cross_stream_duplicate_for_incremental_order(tmp_path):
     prior_root = tmp_path / "morning"
     _write_prior_morning_run(
-        prior_root, ticker="BIG", planned_amount=3.0,
-        fill_price=95.0, quantity=round(3.0 / 95.0, 6),
+        prior_root, ticker="BIG", planned_amount=2.0,
+        fill_price=95.0, quantity=round(2.0 / 95.0, 6),
     )
     cfg = MiddayConfig(
-        tickers=("BIG",), base_buy_amount_usd=3.0,
+        tickers=("BIG",), base_buy_amount_usd=2.0,
         morning_run_state_root=str(tmp_path / "midday"),
         prior_allocation_roots=(str(prior_root),),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
@@ -531,7 +531,7 @@ def test_guarded_midday_top_up_ignores_cross_stream_duplicate_for_incremental_or
 
     assert broker.broad_duplicate_calls == 0
     assert broker.same_stream_calls == 1
-    assert broker.placed == [("BIG", 12.0, "midday-dca-topup-2026-07-08-BIG")]
+    assert broker.placed == [("BIG", 8.0, "midday-dca-topup-2026-07-08-BIG")]
     assert res["artifacts"]["broker_outcomes"]["BIG"]["status"] == "submitted"
 
 
@@ -539,11 +539,11 @@ def test_top_up_zero_when_price_not_below_prior(tmp_path):
     prior_root = tmp_path / "morning"
     # Morning fill price 50.0 (below the midday price of 90.0).
     _write_prior_morning_run(
-        prior_root, ticker="BIG", planned_amount=3.0,
-        fill_price=50.0, quantity=round(3.0 / 50.0, 6),
+        prior_root, ticker="BIG", planned_amount=2.0,
+        fill_price=50.0, quantity=round(2.0 / 50.0, 6),
     )
     cfg = MiddayConfig(
-        tickers=("BIG",), base_buy_amount_usd=3.0,
+        tickers=("BIG",), base_buy_amount_usd=2.0,
         morning_run_state_root=str(tmp_path / "midday"),
         prior_allocation_roots=(str(prior_root),),
     )
@@ -567,9 +567,9 @@ def test_top_up_zero_when_price_not_below_prior(tmp_path):
 def test_top_up_manual_review_when_prior_price_unknown(tmp_path):
     prior_root = tmp_path / "morning"
     # Prior amount known but no orders.csv -> unknown reference price.
-    _write_prior_morning_run(prior_root, ticker="BIG", planned_amount=3.0)
+    _write_prior_morning_run(prior_root, ticker="BIG", planned_amount=2.0)
     cfg = MiddayConfig(
-        tickers=("BIG",), base_buy_amount_usd=3.0,
+        tickers=("BIG",), base_buy_amount_usd=2.0,
         morning_run_state_root=str(tmp_path / "midday"),
         prior_allocation_roots=(str(prior_root),),
     )
@@ -787,7 +787,7 @@ def test_load_midday_config_reads_approved_dates_from_trading_window(tmp_path):
 
 def test_midday_executor_default_init_loads_shipped_config():
     ex = MiddayDCAExecutor()
-    assert ex.config.base_buy_amount_usd == 3.0
+    assert ex.config.base_buy_amount_usd == 2.0
     assert ex.config.morning_daily_cap_usd == 90.0
     assert date(2026, 7, 2) in ex.config.approved_test_dates
     assert date(2026, 8, 28) in ex.config.approved_test_dates
@@ -800,7 +800,7 @@ def test_midday_ledger_namespace_isolated_from_morning_and_afternoon(tmp_path):
 
     afternoon = StrategyState()
     day = _now_midday().astimezone(EASTERN).date()
-    cfg = MiddayConfig(tickers=("BIG",), base_buy_amount_usd=3.0,
+    cfg = MiddayConfig(tickers=("BIG",), base_buy_amount_usd=2.0,
                        morning_run_state_root=str(tmp_path),
                        prior_allocation_roots=(str(tmp_path / "none"),))
     ex = MiddayDCAExecutor(cfg)

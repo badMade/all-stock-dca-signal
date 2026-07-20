@@ -276,7 +276,7 @@ class BudgetTier:
     uses_rollover_reserve: bool = False
 
 
-# Ordered low-to-high. The live $3-allocation policy selects the highest tier
+# Ordered low-to-high. The live $2-allocation policy selects the highest tier
 # triggered by EITHER the day's planned spend or the count of 3x-or-greater
 # signals. These tier values are NOT loaded from config at runtime; they must be
 # kept in sync with config/budgets.json, which documents the same policy.
@@ -326,8 +326,8 @@ class StrategyConfig:
     approved_test_dates: frozenset[date] = frozenset(APPROVED_TEST_DATES)
     decision_time_et: time = time(15, 20)  # matches the 3:20 PM ET canonical live schedule
     trend_lookback_minutes: int = 60
-    base_buy_amount_usd: float = 3.0
-    max_per_order_usd: float = 15.0
+    base_buy_amount_usd: float = 2.0
+    max_per_order_usd: float = 10.0
     weekly_rollover_reserve_cap_usd: float = 900.0
     high_multiplier_threshold: float = 3.0
     minimum_drop_vs_previous_close: float = 0.001

@@ -1,7 +1,7 @@
 {
   "policy_id": "morning-dca-two-stream-v1",
-  "version": "2026-07-09",
-  "purpose": "Configuration and separation policy for the MORNING graded-DCA stream, which now has TWO modes. (1) A 9:45 AM ET read-only watchlist / early-warning scan (mode='watchlist', run_type='morning_dca_watchlist_scan', trades=false): analytics only, no orders, no Robinhood order review, no broker placement; it may surface early candidates but every dollar amount is hypothetical / watchlist-only. (2) A 10:30 AM ET live Robinhood execution (mode='live', run_type='morning_dca_live', trades=true) using a true 60-minute intraday trend window. Both modes share the shared $3-base 0x-to-5x live ladder and the morning budget ledger but write to distinct artifact roots. Both are INDEPENDENT of, and never valid evidence for, the afternoon live task 10ce362c (which supersedes the deleted ce16ba6b).",
+  "version": "2026-07-19",
+  "purpose": "Configuration and separation policy for the MORNING graded-DCA stream, which now has TWO modes. (1) A 9:45 AM ET read-only watchlist / early-warning scan (mode='watchlist', run_type='morning_dca_watchlist_scan', trades=false): analytics only, no orders, no Robinhood order review, no broker placement; it may surface early candidates but every dollar amount is hypothetical / watchlist-only. (2) A 10:30 AM ET live Robinhood execution (mode='live', run_type='morning_dca_live', trades=true) using a true 60-minute intraday trend window. Both modes share the shared $2-base 0x-to-5x live ladder and the morning budget ledger but write to distinct artifact roots. Both are INDEPENDENT of, and never valid evidence for, the afternoon live task 10ce362c (which supersedes the deleted ce16ba6b).",
   "stream": "morning",
   "confidence_rule": "In LIVE mode, a candidate whose price/drop passes the ladder is auto-bought ONLY when the intraday trend can be validated (>= trend_min_bars usable intraday bars at or before the decision time). If price/drop passes but the intraday trend cannot be validated, the run must NOT auto-buy; it classifies the candidate as execution_status='manual_review_candidate'. There is no loosened trend-unavailable execution path.",
   "trend_min_bars": 6,
@@ -141,7 +141,7 @@
   "sizing_ladder": {
     "name": "live_0x_to_5x",
     "drop_metric": "fraction_down_vs_previous_regular_session_close",
-    "base_amount_usd": 3.0,
+    "base_amount_usd": 2.0,
     "no_buy_below_pct": 0.1,
     "tiers": [
       { "min_drop_pct": 0.1, "max_drop_pct": 1.0, "multiplier": 1.0 },
@@ -155,7 +155,7 @@
       { "min_drop_pct": 8.0, "max_drop_pct": null, "multiplier": 5.0 }
     ],
     "tier_boundary_rule": "min inclusive, max exclusive; the largest tier threshold <= actual drop wins; drop < 0.1% = 0x (no buy).",
-    "separation_note": "As of the Fri Jul 10 2026 live-automation update the morning live stream uses the SAME shared $3-base 0x-to-5x ladder as the midday and afternoon streams (config/sizing_ladder.json). The former morning-only 0x-to-3x ladder (0.1-2/2-5/5-8/8+ -> 1x/1.5x/2x/3x) is HISTORICAL/SUPERSEDED. Max per order is therefore 5x * $3 = $15."
+    "separation_note": "As of the Fri Jul 10 2026 live-automation update the morning live stream uses the SAME shared $2-base 0x-to-5x ladder as the midday and afternoon streams (config/sizing_ladder.json). The former morning-only 0x-to-3x ladder (0.1-2/2-5/5-8/8+ -> 1x/1.5x/2x/3x) is HISTORICAL/SUPERSEDED. Max per order is therefore 5x * $2 = $10."
   },
   "budget_ledger": {
     "namespace": "morning",

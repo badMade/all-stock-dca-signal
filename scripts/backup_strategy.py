@@ -171,9 +171,14 @@ def extract_sizing_ladder(text: str) -> Dict[str, object]:
     if no_buy_below is None and tiers:
         no_buy_below = tiers[0]["min_drop_pct"]
 
+    # Reuse extract_budgets' own selection logic rather than hardcoding the
+    # base amount, so a future base-amount change only needs updating in one
+    # place.
+    base_amount_usd = _select_base_amount_usd(text)
+
     return {
         "status": "active",
-        "base_amount_usd": 3.0,
+        "base_amount_usd": base_amount_usd,
         "no_buy_below_pct": no_buy_below,
         "tiers": tiers,
     }
@@ -188,8 +193,49 @@ def _to_float(raw: str) -> float:
     return float(raw.replace(",", ""))
 
 
+def _first_group(m: "re.Match[str]") -> Optional[str]:
+    """Return the first non-None capture group from a multi-alternative match."""
+    return next((g for g in m.groups() if g is not None), None)
+
+
+def _last_match_value(pattern: str, text: str) -> Optional[str]:
+    """Return the first non-None capture group of the LAST match of pattern in text."""
+    matches = list(re.finditer(pattern, text, re.IGNORECASE))
+    return _first_group(matches[-1]) if matches else None
+
+
+# An explicit "base amount ... $2" or short "base $2" declaration -- more
+# deliberate, and so more authoritative, than an incidental "$2-base ladder"
+# mention (which is often just describing the ladder, not stating policy).
+_EXPLICIT_BASE_AMOUNT_PATTERN = (
+    rf"base\s+amount[^$]*\$\s*({_NUMBER})"
+    rf"|base\s*\$\s*({_NUMBER})"
+)
+# The common "$2-base"/"$2 base" ladder-wording ordering, used only when no
+# explicit declaration is present anywhere in the transcript.
+_INCIDENTAL_BASE_AMOUNT_PATTERN = rf"\$\s*({_NUMBER})[\s-]+base\b"
+
+
+def _select_base_amount_usd(text: str) -> Optional[float]:
+    """Find the current graded-DCA base amount in a messy transcript.
+
+    Transcripts often carry a superseded mention (e.g. an old "$3-base
+    ladder" line) ahead of the current "Base amount $2" declaration, so a
+    plain re.search would return whichever comes first in the text -- wrong
+    when the superseded mention comes first. Prefer an explicit declaration
+    over an incidental ladder-wording mention, and within either tier prefer
+    the LAST match, since later text in a running transcript/doc is more
+    likely to reflect the current policy than earlier, possibly-superseded
+    text.
+    """
+    for pattern in (_EXPLICIT_BASE_AMOUNT_PATTERN, _INCIDENTAL_BASE_AMOUNT_PATTERN):
+        value = _last_match_value(pattern, text)
+        if value is not None:
+            return _to_float(value)
+    return None
+
+
 _BUDGET_PATTERNS = {
-    "base_amount_usd": rf"base\s+amount[^$]*\$\s*({_NUMBER})",
     "weekly_rollover_reserve_cap_usd": rf"weekly\s+rollover\s+reserve[^$]*\$\s*({_NUMBER})",
 }
 
@@ -231,10 +277,15 @@ def extract_budget_tiers(text: str) -> List[Dict[str, object]]:
 
 def extract_budgets(text: str) -> Dict[str, object]:
     out: Dict[str, object] = {}
+    base_amount_usd = _select_base_amount_usd(text)
+    if base_amount_usd is not None:
+        out["base_amount_usd"] = base_amount_usd
     for key, pat in _BUDGET_PATTERNS.items():
         m = re.search(pat, text, re.IGNORECASE)
         if m:
-            out[key] = _to_float(m.group(1))
+            value = _first_group(m)
+            if value is not None:
+                out[key] = _to_float(value)
     tiers = extract_budget_tiers(text)
     if tiers:
         out["budget_tiers"] = tiers

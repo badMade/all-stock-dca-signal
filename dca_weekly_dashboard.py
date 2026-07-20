@@ -72,6 +72,44 @@ def _num(value: Any) -> float:
         return 0.0
 
 
+
+# The base amount changed from $3 to $2 on this date (see the "Base-amount
+# change (Jul 19 2026)" note in docs/strategy.md and config/scheduled_tasks.json).
+# ISO date strings ("YYYY-MM-DD") compare correctly as plain strings.
+_BASE_AMOUNT_CHANGE_DATE = "2026-07-19"
+_PRE_CHANGE_BASE_AMOUNT_USD = 3.0
+
+
+def _require_base_amount(rs: Dict[str, Any]) -> float:
+    """Read the base DCA amount used for a run_state's budget.
+
+    This is a financial config value driving the fixed-baseline comparison, so a
+    missing or non-numeric key fails fast rather than silently assuming today's
+    base amount. The one documented exception: a run_state dated before the
+    Jul 19 2026 base-amount change that omits the field predates this field
+    being tracked at all, and every such historical artifact used $3 -- that is
+    a known fact, not a guess, so it is used instead of failing the report.
+    """
+    budget = rs.get("budget") or {}
+    raw = budget.get("base_amount_usd", budget.get("base_buy_amount_usd"))
+    trading_day = rs.get("trading_day", "?")
+    if raw is None:
+        if isinstance(trading_day, str) and trading_day < _BASE_AMOUNT_CHANGE_DATE:
+            return _PRE_CHANGE_BASE_AMOUNT_USD
+        raise ValueError(
+            f"run_state for trading_day={trading_day!r} is missing "
+            "budget.base_amount_usd/base_buy_amount_usd; refusing to guess a "
+            "base DCA amount for the fixed-baseline comparison."
+        )
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"run_state for trading_day={trading_day!r} has a non-numeric "
+            f"budget.base_amount_usd/base_buy_amount_usd: {raw!r}"
+        ) from None
+
+
 def build_performance_snapshot(run_states: Sequence[Dict[str, Any]]) -> str:
     days = len(run_states)
     total_candidates = sum(_num((rs.get("counts") or {}).get("buy_candidates")) for rs in run_states)
@@ -123,7 +161,7 @@ def build_graded_vs_fixed(run_states: Sequence[Dict[str, Any]]) -> str:
     fixed_total = 0.0
     for rs in run_states:
         candidates = rs.get("buy_candidates", [])
-        base = _num(rs.get("budget", {}).get("base_amount_usd") or rs.get("budget", {}).get("base_buy_amount_usd")) or 3.0
+        base = _require_base_amount(rs)
         graded = sum(_num(c.get("planned_amount_usd")) for c in candidates)
         fixed = base * len(candidates)
         graded_total += graded

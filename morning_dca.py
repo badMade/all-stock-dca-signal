@@ -5,7 +5,7 @@ library (:mod:`near_close_dca`). It is deliberately isolated from the afternoon
 scheduled live task (cron ``10ce362c``, which supersedes the deleted
 ``ce16ba6b``):
 
-    - It uses the SAME canonical $3-base 0x -> 5x graded ladder as the afternoon
+    - It uses the SAME canonical $2-base 0x -> 5x graded ladder as the afternoon
       and midday live streams (bound to ``StrategyConfig.sizing_tiers``); the
       former coarser 0x -> 3x morning ladder is historical/superseded.
     - It keeps its OWN budget ledger namespace (:class:`MorningLedger`) so
@@ -223,7 +223,7 @@ STATE_SCHEMA_VERSION = MORNING_WATCHLIST_SCHEMA_VERSION
 
 # Morning sizing ladder. As of the Fri Jul 10 2026 live-automation update every
 # live stream (morning 10:30, midday 12:30, afternoon 3:20) shares the SAME
-# canonical $3-base 0x -> 5x graded ladder defined on
+# canonical $2-base 0x -> 5x graded ladder defined on
 # ``near_close_dca.StrategyConfig.sizing_tiers``. The former coarser 0x -> 3x
 # morning ladder (0.1-2/2-5/5-8/8+ -> 1x/1.5x/2x/3x) is HISTORICAL/SUPERSEDED and
 # is no longer used by the live morning stream. Binding to the afternoon tuple
@@ -355,13 +355,13 @@ class MorningConfig:
 
     Kept separate from :class:`~near_close_dca.StrategyConfig` so the morning
     ladder, caps, decision anchor, and run-state root can never leak into the
-    afternoon scheduled path. ``base_buy_amount_usd`` matches the afternoon $3
+    afternoon scheduled path. ``base_buy_amount_usd`` matches the afternoon $2
     base by default so the hypothetical dollar figures are comparable.
     """
 
     tickers: Sequence[str] = field(default_factory=lambda: tuple(ACTIVE_TICKERS))
     excluded_tickers: frozenset[str] = field(default_factory=lambda: frozenset(EXCLUDED_TICKERS))
-    base_buy_amount_usd: float = 3.0
+    base_buy_amount_usd: float = 2.0
     sizing_tiers: Tuple[Tuple[float, float], ...] = MORNING_SIZING_TIERS
     minimum_drop_vs_previous_close: float = MORNING_MINIMUM_DROP
     # None means "use the active mode's default decision anchor" (09:45 for the
@@ -402,9 +402,10 @@ class MorningConfig:
     # and NYSE holidays). Mirrors StrategyConfig.approved_test_dates semantics
     # so morning/midday honour the same trading-window config as the afternoon.
     approved_test_dates: frozenset[date] = field(default_factory=frozenset)
-    # Per-order ceiling loaded from config/budgets.json circuit_breakers. Any
+    # Absolute per-order ceiling loaded from config/budgets.json
+    # circuit_breakers.max_per_order_usd. 5x * $2 base = $10 default. Any
     # single order amount above this is blocked before it reaches the broker.
-    max_per_order_usd: float = 15.0
+    max_per_order_usd: float = 10.0
     # Bid/ask spread circuit breaker for live placement, mirroring the
     # afternoon stream's StrategyConfig.max_bid_ask_spread_pct. A candidate
     # whose live quote spread exceeds this percent of the quote midpoint is
@@ -890,7 +891,7 @@ class MorningDCAExecutor(DCAExecutor):
     """Morning graded-DCA executor: drop-vs-yesterday's-close evaluation.
 
     Evaluates each ticker's morning price weakness relative to yesterday's
-    regular-session close and grades it on the shared $3-base 0x -> 5x live
+    regular-session close and grades it on the shared $2-base 0x -> 5x live
     ladder. Two modes (see :data:`MORNING_PROFILES`):
 
     - ``watchlist`` (default, 9:45 AM ET): a read-only early-warning scan. It

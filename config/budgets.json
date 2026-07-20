@@ -1,14 +1,14 @@
 {
   "$schema": "../schemas/budgets.schema.json",
-  "version": "2026-07-07",
+  "version": "2026-07-19",
   "currency": "USD",
-  "base_amount_usd": 3.0,
+  "base_amount_usd": 2.0,
   "base_amount_policy": {
-    "base_amount_usd": 3.0,
+    "base_amount_usd": 2.0,
     "exact": true,
-    "candidate_dollar_formula": "candidate_dollar_amount = base_amount_usd * multiplier = $3.00 * multiplier",
+    "candidate_dollar_formula": "candidate_dollar_amount = base_amount_usd * multiplier = $2.00 * multiplier",
     "source_of_truth": "config/budgets.json:base_amount_usd (mirrored in config/sizing_ladder.json:base_amount_usd)",
-    "no_fallback": "Never infer, discover, or fall back to $50.00 or any broker/account default base amount. The base is fixed at exactly $3.00.",
+    "no_fallback": "Never infer, discover, or fall back to $50.00 or any broker/account default base amount. The base is fixed at exactly $2.00.",
     "forbidden_fallback_values_usd": [50.0]
   },
   "high_multiplier_threshold": 3.0,
@@ -75,8 +75,8 @@
     }
   },
   "circuit_breakers": {
-    "max_per_order_usd": 15.0,
-    "max_per_order_note": "5x * $3 base = $15 is the absolute per-order ceiling across all live streams.",
+    "max_per_order_usd": 10.0,
+    "max_per_order_note": "5x * $2 base = $10 is the absolute per-order ceiling across all live streams.",
     "enforce_budget_caps": true,
     "enforce_available_buying_power": true,
     "whitelist_only": true,
@@ -86,7 +86,7 @@
       "skip if the bid/ask spread is too wide",
       "skip if the intraday trend cannot be validated down (flag manual_review_candidate instead of buying)",
       "skip a top-up if the current price is not strictly below the prior same-day buy reference price",
-      "skip if it would exceed the max per-order $15 ceiling",
+      "skip if it would exceed the max per-order $10 ceiling",
       "skip if it would exceed the selected daily or weekly cap",
       "skip if it would exceed available buying power",
       "skip any ticker not on the active whitelist",
@@ -101,5 +101,5 @@
     "time_in_force": "gfd",
     "requires_review_before_submit": "Manual runs: review_equity_order must pass first. Scheduled live runs are pre-authorized (see execution_authorization_policy) and call place_equity_order directly after all internal checks pass, without review_equity_order."
   },
-  "hard_limits": "Never exceed the max per-order $15 ceiling, the selected daily cap, the selected weekly cap, or available buying power. Caps are absolute ceilings; when a rule and an order conflict, the order is skipped."
+  "hard_limits": "Never exceed the max per-order $10 ceiling, the selected daily cap, the selected weekly cap, or available buying power. Caps are absolute ceilings; when a rule and an order conflict, the order is skipped."
 }

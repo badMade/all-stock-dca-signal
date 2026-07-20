@@ -2,7 +2,7 @@
 
 The **midday** DCA stream is a single **12:30 PM ET live Robinhood execution**
 that grades each ticker's price weakness against **yesterday's regular-session
-close** on the shared **$3-base 0x-to-5x** live ladder (as of the Fri Jul 10 2026
+close** on the shared **$2-base 0x-to-5x** live ladder (as of the Fri Jul 10 2026
 live-automation update every live stream — morning, midday, afternoon — shares
 this one ladder; the former morning-only 0x-to-3x ladder is historical/superseded).
 It is implemented by [`midday_dca.MiddayDCAExecutor`](../midday_dca.py) and
@@ -19,7 +19,7 @@ adding the same-day top-up guard.
 ## 12:30 PM live Robinhood execution
 
 Uses **Robinhood account `562057042`** as the sole execution broker (Alpaca stays
-read-only for validation/context), the **$3 base afternoon 0x-to-5x ladder**, the
+read-only for validation/context), the **$2 base afternoon 0x-to-5x ladder**, the
 same active universe (excludes BYDDY/VCX/TRLV/RVI), and its own `midday` budget
 ledger. Writes under `.../cron_tracking/midday_dca/YYYYMMDD_1230ET/`
 (`run_id='midday_live_YYYYMMDD_1230ET'`) and updates that root's
@@ -139,7 +139,7 @@ largest tier threshold ≤ the actual drop wins.
 | 7% – < 8% | 4.5x |
 | ≥ 8% | 5x (no upper cutoff) |
 
-Dollars = `base_amount_usd (default $3) × multiplier` (actual order size,
+Dollars = `base_amount_usd (default $2) × multiplier` (actual order size,
 subject to the top-up guard offset).
 
 ## Budget ledger

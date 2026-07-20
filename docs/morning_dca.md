@@ -1,7 +1,7 @@
 # Morning DCA Stream
 
 The **morning** DCA stream grades each ticker's morning price weakness against
-**yesterday's regular-session close** on the shared **$3-base 0x-to-5x** live
+**yesterday's regular-session close** on the shared **$2-base 0x-to-5x** live
 ladder. As of the **Fri Jul 10 2026** live-automation update every live stream
 (morning 10:30, midday 12:30, afternoon 3:20) shares one ladder (bound to
 `near_close_dca.StrategyConfig.sizing_tiers`); the former morning-only 0x-to-3x
@@ -79,7 +79,7 @@ The live execution runs at **10:30 AM ET** (`cron_id=42173154`, cron
 `30 14 * * 1-5` = **14:30 UTC weekdays** during EDT) so the trend read has a true
 **60-minute intraday window**. It uses **Robinhood account `562057042`** as the
 **only execution broker** (Alpaca, Finance, and Yahoo stay **read-only** for
-validation/account context), the shared **$3 base 0x-to-5x live ladder**, and the
+validation/account context), the shared **$2 base 0x-to-5x live ladder**, and the
 `morning` budget ledger.
 
 It **depends on the same-day 9:45 pre-flight artifact** and evaluates **only
@@ -176,7 +176,7 @@ rejection occurs, the task writes `run_state.json` with the blocking reason and
 ### Hard circuit breakers
 
 Every scheduled live order is subject to hard circuit breakers that **skip**
-(never resize past a cap): **max per order `$15`** (5× × $3), **budget caps**,
+(never resize past a cap): **max per order `$10`** (5× × $2), **budget caps**,
 **available buying power**, **whitelist-only** (active-universe tickers),
 **data-confidence**, **spread threshold**, **trend validation**,
 **regular-hours-only**, and **one strategy order per ticker per run**.
@@ -247,7 +247,7 @@ Top-up guard fields carried for the 9:45 → afternoon linkage:
 ## Sizing ladder (0x → 5x)
 
 Drop is measured as a fraction below yesterday's regular-session close. The
-largest tier threshold ≤ the actual drop wins. This is the current $3-base
+largest tier threshold ≤ the actual drop wins. This is the current $2-base
 0x-to-5x ladder shared with the afternoon stream.
 
 | Drop vs. prior close | Multiplier |
@@ -263,7 +263,7 @@ largest tier threshold ≤ the actual drop wins. This is the current $3-base
 | 7% – < 8% | 4.5x |
 | ≥ 8% | 5x (no upper cutoff) |
 
-Dollars = `base_amount_usd (default $3) × multiplier` (hypothetical in
+Dollars = `base_amount_usd (default $2) × multiplier` (hypothetical in
 watchlist mode, actual order size in live mode).
 
 ## Budget ledger

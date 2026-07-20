@@ -29,12 +29,12 @@ workflow, and Notion template. **No credentials or secrets are stored here.**
 ## Key facts (quick reference)
 
 - **Active universe:** 44 tickers (includes `GFUZ`, `TXN`); `BYDDY`, `VCX`, `TRLV`, `RVI` excluded; `IRDMI→IRDM`, `GLWR→GLW`; `GFUZ` uses Robinhood primary data (finance `NOT_FOUND`).
-- **Latest ladder:** 0.1%→8%+, base $3, max **5x** (no upper cutoff). Older
+- **Latest ladder:** 0.1%→8%+, base $2, max **5x** (no upper cutoff). Older
   0.1%–12% ladders are **superseded**.
-- **Budgets:** $3 base · tiered caps selected per run by planned spend and 3x+
+- **Budgets:** $2 base · tiered caps selected per run by planned spend and 3x+
   signal count — Normal $180/$900 · Elevated $240/$1,200 · High-vol $300/$1,500 ·
   Stress $360/$1,800 (daily/weekly); weekly rollover reserve capped at $900.
-- **Only trading task:** `10ce362c` ("Graded DCA automatic live test - $3
+- **Only trading task:** `10ce362c` ("Graded DCA automatic live test - $2
   allocation"; the repaired task that supersedes the deleted `ce16ba6b`, with
   artifact root kept under `.../ce16ba6b` for continuity), **3:20 PM ET**
   weekdays, Robinhood account `562057042` only;

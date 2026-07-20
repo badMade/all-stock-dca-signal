@@ -1,7 +1,7 @@
 {
   "policy_id": "midday-dca-live-v1",
-  "version": "2026-07-09",
-  "purpose": "Configuration and separation policy for the MIDDAY graded-DCA stream: a single 12:30 PM ET live Robinhood execution (cron a6239dae, run_type='midday_dca_live', trades=true) on account 562057042. It uses the SAME afternoon 0x-to-5x ladder and $3 base, the same active universe (excluding BYDDY/VCX/TRLV/RVI), the same confidence rule, and the same balanced $3-base budget policy. It is INDEPENDENT of, and never valid evidence for, the afternoon live task 10ce362c (which supersedes the deleted ce16ba6b).",
+  "version": "2026-07-19",
+  "purpose": "Configuration and separation policy for the MIDDAY graded-DCA stream: a single 12:30 PM ET live Robinhood execution (cron a6239dae, run_type='midday_dca_live', trades=true) on account 562057042. It uses the SAME afternoon 0x-to-5x ladder and $2 base, the same active universe (excluding BYDDY/VCX/TRLV/RVI), the same confidence rule, and the same balanced $2-base budget policy. It is INDEPENDENT of, and never valid evidence for, the afternoon live task 10ce362c (which supersedes the deleted ce16ba6b).",
   "stream": "midday",
   "confidence_rule": "A candidate whose price/drop passes the ladder is auto-bought ONLY when the intraday trend can be validated (>= trend_min_bars usable intraday bars at or before the 12:30 decision time). If price/drop passes but the intraday trend cannot be validated, the run must NOT auto-buy; it classifies the candidate as execution_status='manual_review_candidate'. There is no loosened trend-unavailable execution path.",
   "trend_min_bars": 6,
@@ -24,7 +24,7 @@
   "sizing_ladder": {
     "name": "midday_0x_to_5x",
     "drop_metric": "fraction_down_vs_previous_regular_session_close",
-    "base_amount_usd": 3.0,
+    "base_amount_usd": 2.0,
     "no_buy_below_pct": 0.1,
     "tiers": [
       { "min_drop_pct": 0.1, "max_drop_pct": 1.0, "multiplier": 1.0 },
@@ -38,7 +38,7 @@
       { "min_drop_pct": 8.0, "max_drop_pct": null, "multiplier": 5.0 }
     ],
     "tier_boundary_rule": "min inclusive, max exclusive; the largest tier threshold <= actual drop wins; drop < 0.1% = 0x (no buy).",
-    "separation_note": "This is the SAME shared $3-base 0x-to-5x live ladder used by all live streams (morning 10:30, midday 12:30, afternoon 3:20; config/sizing_ladder.json). Max per order is 5x * $3 = $15. The former morning-only 0x-to-3x ladder is historical/superseded as of 2026-07-10."
+    "separation_note": "This is the SAME shared $2-base 0x-to-5x live ladder used by all live streams (morning 10:30, midday 12:30, afternoon 3:20; config/sizing_ladder.json). Max per order is 5x * $2 = $10. The former morning-only 0x-to-3x ladder is historical/superseded as of 2026-07-10."
   },
   "budget_ledger": {
     "namespace": "midday",

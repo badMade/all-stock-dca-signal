@@ -1,14 +1,14 @@
 {
   "$schema": "../schemas/sizing_ladder.schema.json",
-  "version": "2026-07-07",
+  "version": "2026-07-19",
   "status": "active",
   "description": "Latest active graded sizing ladder. Maps the drop vs. previous close to a buy multiplier. Base amount is multiplied by the tier multiplier. No upper cutoff: any drop >= 8% is 5x.",
   "drop_metric": "fraction_down_vs_previous_close",
-  "base_amount_usd": 3.0,
+  "base_amount_usd": 2.0,
   "base_amount_policy": {
-    "base_amount_usd": 3.0,
+    "base_amount_usd": 2.0,
     "no_fallback_to_50_usd_or_broker_default": true,
-    "on_missing_or_unreadable_config": "Use $3.00 and record base_amount_source='hardcoded_user_confirmed_3_usd'; never fall back to $50.00 or any broker/account default.",
+    "on_missing_or_unreadable_config": "Use $2.00 as a hardcoded, user-confirmed fallback; never fall back to $50.00 or any broker/account default.",
     "authoritative_base_amount_source": "config/budgets.json (see base_amount_policy)"
   },
   "no_buy_below_pct": 0.1,

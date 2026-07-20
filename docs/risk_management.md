@@ -31,7 +31,7 @@ the graded ladder is **capped at 1x**:
 
 - Every positive multiplier (1.5x, 2x, … up to 5x) collapses to **1x**.
 - A **0x** (no-buy) stays **0x** — the guard never forces a buy.
-- The strategy therefore keeps **participating in dips at the $3 base amount**
+- The strategy therefore keeps **participating in dips at the $2 base amount**
   but stops scaling up until the rolling 7-day deployment falls back under the
   threshold.
 
@@ -56,7 +56,7 @@ With the guard in place, a hypothetical 20% correction plays out like this:
    into the early dip exactly as designed.
 2. **Threshold crossed:** once the trailing-7-day deployment passes
    `0.40 × $3,600 = $1,440`, the kill-switch engages. Every subsequent buy in
-   that window is sized at **1x ($3)**, not 2x–5x.
+   that window is sized at **1x ($2)**, not 2x–5x.
 3. **Still participating:** because the cap is 1x (not 0x), the strategy keeps
    buying the ongoing dip every day it qualifies — it just does so at the base
    amount, preserving cash for the rest of the correction instead of front-loading it.
@@ -97,7 +97,7 @@ The guard changes sizing only. It does **not** relax any standing constraint:
 ## Live vs. backtest ladders
 
 - **Live / manual execution** always uses the active
-  [`config/sizing_ladder.json`](../config/sizing_ladder.json) — the **$3-base
+  [`config/sizing_ladder.json`](../config/sizing_ladder.json) — the **$2-base
   0x-to-5x** ladder — unless the kill-switch above caps it to 1x.
 - **Analytics only**, the 12-month backtest uses the coarser
   [`config/backtest_sizing_ladder.json`](../config/backtest_sizing_ladder.json):

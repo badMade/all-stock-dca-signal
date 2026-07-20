@@ -90,7 +90,7 @@ The extractors key off natural phrasings, e.g.:
   `Excluded: BYDDY` and `Corrected symbols: IRDMI -> IRDM`.
 - Ladder lines like `0.1% to <1% = 1x`, `>=8% = 5x`. A `drop <0.1% = 0x` line
   sets the no-buy threshold.
-- Budget lines like `Base amount $3.`, `Weekly rollover reserve max $900.`, and
+- Budget lines like `Base amount $2.`, `Weekly rollover reserve max $900.`, and
   tier lines like `Normal: daily cap $180, weekly cap $900.`.
 - Schedule lines like `10ce362c ... schedule 20 19 * * 1-5 UTC = 3:20 PM ET weekdays`.
 

@@ -44,8 +44,8 @@ drop <0.1% = 0x
 7% to <8% = 4.5x
 >=8% = 5x, no upper cutoff
 
-Budget rules ($3 allocation policy):
-- Base amount $3.
+Budget rules ($2 allocation policy):
+- Base amount $2.
 - Weekly rollover reserve max $900.
 - Normal: daily cap $180, weekly cap $900.
 - Elevated: daily cap $240, weekly cap $1200.
@@ -85,9 +85,65 @@ def test_extract_latest_ladder():
     assert max(tier["multiplier"] for tier in tiers) == 5.0
 
 
+def test_extract_base_amount_recognizes_common_wordings():
+    # Codex review: transcripts often phrase the base amount as "$2-base" or
+    # "base $2" rather than the exact "base amount $2" the regex first
+    # supported. Both extract_budgets and extract_sizing_ladder must resolve
+    # these common orderings, not silently return None.
+    for text in (
+        "the shared $2-base ladder",
+        "$2 base 0x-to-5x ladder",
+        "base $2 allocation",
+    ):
+        assert extract_budgets(text)["base_amount_usd"] == 2.0, text
+        assert extract_sizing_ladder(text)["base_amount_usd"] == 2.0, text
+
+
+def test_extract_base_amount_prefers_explicit_over_superseded_incidental_mention():
+    # Codex review: a messy transcript often carries a superseded "$3-base
+    # ladder" mention (describing the OLD ladder) ahead of the current, more
+    # deliberate "Base amount $2" declaration. re.search would return the
+    # earlier $3 match; both extractors must instead prefer the explicit
+    # declaration regardless of where it falls in the text.
+    text = (
+        "Older notes reference the $3-base ladder from before the change.\n"
+        "Budget rules: Base amount $2.\n"
+    )
+    assert extract_budgets(text)["base_amount_usd"] == 2.0
+    assert extract_sizing_ladder(text)["base_amount_usd"] == 2.0
+
+
+def test_extract_base_amount_prefers_last_match_within_same_tier():
+    # When only incidental "$X-base" mentions are present (no explicit "base
+    # amount" declaration), or multiple explicit declarations appear, the
+    # LAST one in the text wins, since later text in a running transcript is
+    # more likely to reflect the current, not superseded, policy.
+    incidental_only = "the old $3-base ladder is superseded by the new $2-base ladder"
+    assert extract_budgets(incidental_only)["base_amount_usd"] == 2.0
+    assert extract_sizing_ladder(incidental_only)["base_amount_usd"] == 2.0
+
+    two_explicit = "Base amount $3 (superseded). Base amount $2 (current)."
+    assert extract_budgets(two_explicit)["base_amount_usd"] == 2.0
+    assert extract_sizing_ladder(two_explicit)["base_amount_usd"] == 2.0
+
+
+def test_write_configs_refreshes_base_amount_from_dollar_dash_base_wording():
+    # Codex review: without recognizing "$2-base" wording, refreshing an
+    # existing $3 ladder from a transcript phrased this way left it at $3
+    # (write_configs filters out the None update) despite the transcript
+    # stating the new $2 policy.
+    transcript = "Latest active sizing ladder, now on the $2-base ladder:\n0.1% to <1% = 1x\n"
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d)
+        (out / "sizing_ladder.json").write_text(json.dumps({"base_amount_usd": 3.0}))
+        write_configs(extract_all(transcript), out, only=["ladder"])
+        ladder = json.loads((out / "sizing_ladder.json").read_text())
+        assert ladder["base_amount_usd"] == 2.0
+
+
 def test_extract_budgets():
     b = extract_budgets(SAMPLE)
-    assert b["base_amount_usd"] == 3.0
+    assert b["base_amount_usd"] == 2.0
     assert b["weekly_rollover_reserve_cap_usd"] == 900.0
     tiers = {t["name"]: t for t in b["budget_tiers"]}
     assert tiers["normal"] == {"name": "normal", "daily_cap_usd": 180.0, "weekly_cap_usd": 900.0}

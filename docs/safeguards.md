@@ -37,7 +37,7 @@ should skip rather than trade. Machine-readable copies live in
 
 Hard limits that skip an order rather than trade when any is hit:
 
-- **Max per order: $15** (5x × $3 base) — the absolute per-order ceiling across
+- **Max per order: $10** (5x × $2 base) — the absolute per-order ceiling across
   all live streams.
 - Never exceed the selected **daily cap**, **weekly cap**, or **available buying
   power**.
@@ -53,7 +53,7 @@ See the `execution_authorization_policy` and `circuit_breakers` blocks in
 
 ## Budget caps
 
-Base amount is **$3**. Daily and weekly caps are selected per run by tier, based
+Base amount is **$2**. Daily and weekly caps are selected per run by tier, based
 on the day's planned spend and the count of 3x-or-greater signals (multiplier
 >= 3.0). Pick the highest tier triggered by **either** dimension.
 
@@ -75,7 +75,7 @@ on the day's planned spend and the count of 3x-or-greater signals (multiplier
 - **Dynamic risk kill-switch:** when capital deployed by the scheduled-live
   afternoon stream in any trailing 7-day window exceeds **40% of the monthly
   cash allocation** (`monthly_cash_allocation_usd`, default $3,600), the graded
-  ladder is **capped at 1x** — the strategy keeps buying dips at the $3 base but
+  ladder is **capped at 1x** — the strategy keeps buying dips at the $2 base but
   stops scaling up until the window rolls back under the threshold. A rolling
   30-day cash-burn rate is tracked for visibility. Manual and other streams are
   never counted toward this guard. See [risk_management.md](risk_management.md)

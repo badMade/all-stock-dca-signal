@@ -40,7 +40,7 @@ secret manager.
    - Robinhood account `562057042` execution credentials.
    - `NOTION_TOKEN` for the dashboard sync (see
      [`notion_dashboard_template.md`](notion_dashboard_template.md)).
-5. Verify safeguards are enforced: $3 base with tiered caps (Normal $180/$900,
+5. Verify safeguards are enforced: $2 base with tiered caps (Normal $180/$900,
    Elevated $240/$1,200, High-vol $300/$1,500, Stress $360/$1,800 daily/weekly;
    weekly rollover reserve capped at $900), one order per ticker per day, market +
    `gfd` + `review_equity_order`, no sells/options/crypto/margin/cancellations,
@@ -62,7 +62,7 @@ Then diff and review before committing. See [`scripts/README.md`](../scripts/REA
 
 - [ ] Active universe = 44 symbols (includes `GFUZ`, `TXN`); `BYDDY`, `VCX`, `TRLV`, `RVI` excluded; `IRDMI→IRDM`, `GLWR→GLW` applied; `GFUZ` included (Robinhood primary data, finance `NOT_FOUND`).
 - [ ] Ladder is the latest (0.1%–8%+, max 5x, no upper cutoff). No 12x-era tiers.
-- [ ] Base amount $3; tiered daily/weekly caps and $900 weekly rollover reserve cap intact.
+- [ ] Base amount $2; tiered daily/weekly caps and $900 weekly rollover reserve cap intact.
 - [ ] Only the live task `10ce362c` (supersedes deleted `ce16ba6b`) can trade; it uses only account `562057042`; Alpaca read-only.
 - [ ] Live task at 3:20 PM ET; slippage/Notion sync at 3:35 PM ET (not merged).
 - [ ] Run-classification contract wired: every run_state has a `run_classification` block; scheduled runs update `latest_scheduled_run.json`, manual runs don't; reporting excludes manual runs/order IDs (`python scripts/tests/test_run_classification.py`).
