@@ -1133,6 +1133,8 @@ def _quote_bid_ask(data: MarketDataProvider, ticker: str, as_of: datetime) -> Op
         ask = float(quote[1])
     except (TypeError, ValueError):
         return None
+    if not math.isfinite(bid) or not math.isfinite(ask):
+        return None
     if bid <= 0 or ask <= 0 or ask < bid:
         return None
     return bid, ask
@@ -1261,6 +1263,7 @@ def _signal_row(ticker: str, source: str, signal: Optional[SourceSignal]) -> Dic
             "source": source,
             "action": Action.NO_DATA.value,
             "reason": "no signal produced",
+            "auto_buy_signal": False,
             "provider_error": None,
             "decision_bar_close": None,
             "previous_close": None,
@@ -1278,6 +1281,7 @@ def _signal_row(ticker: str, source: str, signal: Optional[SourceSignal]) -> Dic
         "source": source,
         "action": signal.action.value,
         "reason": signal.reason,
+        "auto_buy_signal": signal.action == Action.BUY,
         "provider_error": signal.provider_error,
         "decision_bar_close": signal.decision_price,
         "previous_close": signal.previous_close,
@@ -1286,6 +1290,7 @@ def _signal_row(ticker: str, source: str, signal: Optional[SourceSignal]) -> Dic
         "intraday_trend_pct": signal.intraday_trend_pct,
         "drop_vs_previous_close_pct": signal.drop_vs_previous_close_pct,
         "buy_multiplier": signal.buy_multiplier,
+        "suggested_amount_usd": signal.suggested_amount_usd,
         "decision_bar_timestamp": _iso_or_none(signal.decision_bar_timestamp),
         "previous_close_timestamp": _iso_or_none(signal.previous_close_timestamp),
         "lookback_bar_timestamp": _iso_or_none(signal.lookback_bar_timestamp),
@@ -1450,8 +1455,33 @@ def build_run_artifacts(
 
     signal_rows: List[Dict[str, Any]] = []
     for decision in decisions:
-        signal_rows.append(_signal_row(decision.ticker, SourceName.FINANCE.value, decision.finance_signal))
-        signal_rows.append(_signal_row(decision.ticker, SourceName.ROBINHOOD.value, decision.robinhood_signal))
+        is_reconciled_buy = decision.action == Action.BUY
+        finance_row = _signal_row(decision.ticker, SourceName.FINANCE.value, decision.finance_signal)
+        robinhood_row = _signal_row(decision.ticker, SourceName.ROBINHOOD.value, decision.robinhood_signal)
+        # Override auto_buy_signal with the RECONCILED decision. When providers
+        # disagree (one BUY, one SKIP/NO_ACTION) reconcile_signals() produces
+        # MANUAL_REVIEW and no order is placed; using the per-provider action would
+        # mark that ticker as expected and trigger a false drift alert.
+        finance_row["auto_buy_signal"] = is_reconciled_buy
+        robinhood_row["auto_buy_signal"] = is_reconciled_buy
+        signal_rows.append(finance_row)
+        signal_rows.append(robinhood_row)
+
+    # Reconcile auto_buy_signal against final placement outcomes. A BUY decision
+    # may still be deliberately skipped by the top-up guard, same-day duplicate
+    # guard, budget cap, safety breakers (spread, ceiling, tradability, buying
+    # power). Clear the flag for those so the drift detector ignores them.
+    # Keep it True for genuine errors (spread-quote error, placement failure) so
+    # those do trigger alerts.
+    _afternoon_deliberate_skips = {
+        t for t, oc in candidate_outcomes.items()
+        if oc.get("status") == "skipped"
+        or (oc.get("status") == "blocked" and oc.get("deliberate_skip"))
+    }
+    if _afternoon_deliberate_skips:
+        for _row in signal_rows:
+            if _row.get("auto_buy_signal") and _row.get("ticker") in _afternoon_deliberate_skips:
+                _row["auto_buy_signal"] = False
 
     buy_candidates: List[Dict[str, Any]] = []
     for decision in decisions:
@@ -1519,6 +1549,22 @@ def build_run_artifacts(
     for candidate in buy_candidates:
         if candidate.get("top_up_manual_review") and candidate["ticker"] not in manual_review_tickers:
             manual_review_tickers.append(candidate["ticker"])
+
+    # Backfill signal rows with the reconciled planned_amount_usd from buy candidates
+    # so the drift detector uses the actual order amount rather than a per-provider
+    # suggested amount. When both providers return BUY at different tiers, each
+    # signal row carries its own suggested_amount_usd but the reconciled candidate
+    # row captures what was actually placed. The drift detector reads suggested_amount_usd
+    # via DESIRED_COLUMNS; overwriting it here ensures accurate missing-order reporting.
+    _reconciled_amount_by_ticker: Dict[str, float] = {
+        c["ticker"]: c["planned_amount_usd"]
+        for c in buy_candidates
+        if c.get("planned_amount_usd") is not None
+    }
+    for _srow in signal_rows:
+        _sticker = _srow.get("ticker")
+        if _sticker in _reconciled_amount_by_ticker and _srow.get("auto_buy_signal"):
+            _srow["suggested_amount_usd"] = _reconciled_amount_by_ticker[_sticker]
 
     planned_spend = sum(c["planned_amount_usd"] for c in buy_candidates)
     high_multiplier_signals = sum(
@@ -2756,7 +2802,7 @@ def run_once(
         # over-cap candidate should never need a same-day-duplicate lookup or a
         # spread quote.
         if order_amount > config.max_per_order_usd:
-            candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "max per-order ceiling exceeded"}
+            candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "max per-order ceiling exceeded", "deliberate_skip": True}
             _block(
                 ticker,
                 MISSING_FILL_BUDGET_CAPPED,
@@ -2792,6 +2838,7 @@ def run_once(
             candidate_outcomes[ticker] = {
                 "status": "blocked",
                 "skip_reason": "bid/ask spread unavailable; scheduled runs require spread_ok",
+                "deliberate_skip": True,
             }
             _block(
                 ticker,
@@ -2806,6 +2853,7 @@ def run_once(
                     f"bid/ask spread {spread_pct:.2f}% exceeds "
                     f"{config.max_bid_ask_spread_pct:.2f}% limit"
                 ),
+                "deliberate_skip": True,
             }
             _block(
                 ticker,
@@ -2815,15 +2863,15 @@ def run_once(
             )
             continue
         if not within_caps(order_amount, state, trading_day, config):
-            candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "cap would be exceeded"}
+            candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "cap would be exceeded", "deliberate_skip": True}
             _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: cap would be exceeded; skipping")
             continue
         if broker.available_buying_power() < order_amount:
-            candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "insufficient buying power"}
+            candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "insufficient buying power", "deliberate_skip": True}
             _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: insufficient buying power; skipping")
             continue
         if not broker.is_tradable_for_fractional_buy(ticker):
-            candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "not tradable for fractional buy"}
+            candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "not tradable for fractional buy", "deliberate_skip": True}
             _block(ticker, MISSING_FILL_BROKER_BLOCKED, f"{ticker}: not tradable for fractional/notional buy; skipping")
             continue
 
@@ -2834,7 +2882,7 @@ def run_once(
             order_reviews_attempted += 1
             review_ok, review_reason = broker.review_market_buy(ticker, order_amount)
             if not review_ok:
-                candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": f"review blocked: {review_reason}"}
+                candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": f"review blocked: {review_reason}", "deliberate_skip": True}
                 _block(ticker, MISSING_FILL_BROKER_BLOCKED, f"{ticker}: review blocked order: {review_reason}")
                 continue
             reviewed_order = {

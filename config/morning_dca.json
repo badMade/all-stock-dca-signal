@@ -108,10 +108,10 @@
       "/home/user/workspace/cron_tracking/morning_dca/manual_runs",
       "/home/user/workspace/cron_tracking/ce16ba6b"
     ],
-    "prior_cap_seed_roots": [
+    "cap_seed_roots": [
       "/home/user/workspace/cron_tracking/morning_dca"
     ],
-    "separation_note": "Each morning mode writes ONLY under its own root. None writes into /home/user/workspace/cron_tracking/ce16ba6b/**, updates latest_scheduled_run.json, or touches afternoon scheduled_runs/ folders. The 10:30 live run READS (never writes) the same-day preflight root to load eligible_to_execute. The legacy 'morning_run_state_root' key mirrors the watchlist root for backwards compatibility. prior_allocation_roots lists roots scanned for earlier same-day manual fills so the morning live run applies the same top-up offset guard as midday/afternoon."
+    "separation_note": "Each morning mode writes ONLY under its own root. None writes into /home/user/workspace/cron_tracking/ce16ba6b/**, updates latest_scheduled_run.json, or touches afternoon scheduled_runs/ folders. The 10:30 live run READS (never writes) the same-day preflight root to load eligible_to_execute. The legacy 'morning_run_state_root' key mirrors the watchlist root for backwards compatibility. prior_allocation_roots lists all roots scanned for earlier same-day manual fills so the morning live run applies the per-ticker top-up offset guard. cap_seed_roots covers the full morning_dca tree (manual_runs/ plus scheduled YYYYMMDD_1030ET/ slots) so a restart or scheduler retry seeds from any prior morning fill; it intentionally excludes afternoon roots like ce16ba6b so afternoon recovery fills do not exhaust the morning daily cap."
   },
   "scheduled_run_classification": {
     "watchlist": {

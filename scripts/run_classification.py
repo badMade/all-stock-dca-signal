@@ -347,9 +347,8 @@ def normalize_connector_payload(
     referenced file's parsed contents (embedded under ``data``) while preserving
     the original pointer under ``output_path`` and flagging ``normalized=true``.
 
-    A pointer that cannot be read/parsed is left as-is with
-    ``normalized=false`` and a ``normalize_error`` note, so persistence still
-    succeeds and the failure is visible rather than silently dropped.
+    A pointer that cannot be read/parsed raises ``RuntimeError`` so the
+    caller knows immediately and cannot silently persist a broken payload.
     """
     if not isinstance(payload, Mapping):
         return {"data": payload, "normalized": False}
@@ -366,11 +365,12 @@ def normalize_connector_payload(
     if base_dir is not None and not path.is_absolute():
         path = Path(base_dir) / path
     try:
-        result["data"] = json.loads(path.read_text())
+        result["data"] = json.loads(path.read_text(encoding="utf-8"))
         result["normalized"] = True
-    except (OSError, json.JSONDecodeError) as exc:
-        result["normalized"] = False
-        result["normalize_error"] = f"could not read output_path {pointer!r}: {exc}"
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"normalize_connector_payload: could not read output_path {pointer!r}: {exc}"
+        ) from exc
     return result
 
 
@@ -407,12 +407,13 @@ def save_raw_input(
     safe = Path(str(filename)).name
     if not safe or safe != str(filename):
         raise ValueError(f"raw input filename must be a bare filename, got {filename!r}")
-    to_write = normalize_connector_payload(payload) if normalize else payload
-    if normalize and isinstance(to_write, dict) and "normalize_error" in to_write:
+    try:
+        to_write = normalize_connector_payload(payload) if normalize else payload
+    except RuntimeError as exc:
         raise ValueError(
-            f"failed to persist {filename}: {to_write['normalize_error']}; refusing to "
+            f"failed to persist {filename}: {exc}; refusing to "
             "silently write an unnormalized raw connector payload"
-        )
+        ) from exc
     out_dir = raw_dir if raw_dir is not None else raw_input_dir(trading_day, base)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / safe

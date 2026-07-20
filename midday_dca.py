@@ -36,13 +36,12 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 from dataclasses import dataclass
 from datetime import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from dca_config import load_approved_dates
+from dca_config import load_tickers
 from morning_dca import (
     DEFAULT_AFTERNOON_TASK_ROOT,
     DEFAULT_MORNING_LIVE_STATE_ROOT,
@@ -51,6 +50,8 @@ from morning_dca import (
     MorningDCAExecutor,
     MorningSignal,
     TopUpOutcome,
+    _load_approved_dates_fail_closed,
+    load_max_per_order_usd,
 )
 from near_close_dca import (
     ACTIVE_TICKERS,
@@ -168,11 +169,11 @@ def load_midday_config(config_dir=None) -> MiddayConfig:
     if not cfg_path.exists():
         _log.warning("midday_dca.json not found at %s; using MiddayConfig defaults", cfg_path)
         return MiddayConfig(
-            approved_test_dates=load_approved_dates(config_dir_path).get("approved_test_dates", frozenset())
+            approved_test_dates=_load_approved_dates_fail_closed(config_dir_path)
         )
 
     approved_date_overrides = {
-        "approved_test_dates": load_approved_dates(config_dir_path).get("approved_test_dates", frozenset())
+        "approved_test_dates": _load_approved_dates_fail_closed(config_dir_path)
     }
 
     try:
@@ -216,47 +217,23 @@ def load_midday_config(config_dir=None) -> MiddayConfig:
         # the guard (consistent with load_morning_config).
         kwargs["prior_allocation_roots"] = tuple(str(r) for r in roots)
 
-    # Load the configured ticker whitelist from config/tickers.json, the same
-    # version-controlled source near_close_dca's afternoon stream reads via
-    # dca_config.load_strategy_config -- otherwise this stream silently trades
-    # the hardcoded ACTIVE_TICKERS/EXCLUDED_TICKERS module defaults even after
-    # the whitelist is edited.
-    from dca_config import load_tickers
+    max_order = load_max_per_order_usd(config_dir_path)
+    if max_order is not None:
+        kwargs["max_per_order_usd"] = max_order
 
-    ticker_data = load_tickers(config_dir_path)
-    if "tickers" in ticker_data:
-        kwargs["tickers"] = ticker_data["tickers"]
-    if "excluded_tickers" in ticker_data:
-        kwargs["excluded_tickers"] = ticker_data["excluded_tickers"]
+    # Overlay trading_window.json so scheduled live runs respect the approved date
+    # window (empty frozenset = gate disabled; non-empty = only approved dates allowed).
+    approved_dates = _load_approved_dates_fail_closed(config_dir_path)
+    if approved_dates:
+        kwargs["approved_test_dates"] = approved_dates
 
-    # Load max_per_order_usd from the shared budgets.json circuit_breakers block so
-    # an emergency cap change applies to the midday stream without touching code
-    # constants. The whole file being absent/corrupt still degrades gracefully to
-    # the default cap, but a key that IS present with an invalid value (non-finite,
-    # non-positive, or unparseable) fails closed -- raises -- rather than silently
-    # trading under a stale default cap for a live trading stream.
-    budgets_path = config_dir_path / "budgets.json"
-    if budgets_path.exists():
-        try:
-            budgets_raw = json.loads(budgets_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
-            _log.warning("could not parse %s (%s); using MiddayConfig cap default", budgets_path, exc)
-            budgets_raw = None
-        if budgets_raw is not None:
-            cb = budgets_raw.get("circuit_breakers", {})
-            if "max_per_order_usd" in cb:
-                raw_cap = cb["max_per_order_usd"]
-                try:
-                    max_order = float(raw_cap)
-                except (TypeError, ValueError):
-                    max_order = None
-                if max_order is None or not (math.isfinite(max_order) and max_order > 0):
-                    raise ValueError(
-                        f"config/budgets.json circuit_breakers.max_per_order_usd={raw_cap!r} "
-                        "is present but not a positive finite number; refusing to silently "
-                        "fall back to a default per-order cap for a live trading stream"
-                    )
-                kwargs["max_per_order_usd"] = max_order
+    # Overlay tickers.json so config-only emergency exclusions take effect without
+    # a code deploy (mirrors the afternoon load_strategy_config ticker overlay).
+    ticker_cfg = load_tickers(config_dir_path)
+    if "tickers" in ticker_cfg:
+        kwargs["tickers"] = ticker_cfg["tickers"]
+    if "excluded_tickers" in ticker_cfg:
+        kwargs["excluded_tickers"] = ticker_cfg["excluded_tickers"]
 
     return MiddayConfig(**kwargs)
 
@@ -335,6 +312,26 @@ class MiddayDCAExecutor(MorningDCAExecutor):
             artifacts["manual_review_tickers"] = (
                 artifacts.get("manual_review_tickers", []) + new_top_up_manual
             )
+            # Pull the full enriched row from buy_candidates (which already has
+            # prior_same_day_*, incremental_order_amount, top_up_guard_result, etc.
+            # attached by _attach_top_up_fields) so consumers of
+            # manual_review_candidates see the same shape as trend-unvalidated rows.
+            new_set = set(new_top_up_manual)
+            extra_rows = [
+                row for row in artifacts.get("buy_candidates", [])
+                if row.get("ticker") in new_set
+            ]
+            if extra_rows:
+                manual_rows = list(artifacts.get("manual_review_candidates", []))
+                by_ticker = {r.get("ticker"): r for r in manual_rows if r.get("ticker")}
+                for row in extra_rows:
+                    ticker = row.get("ticker")
+                    if ticker in by_ticker:
+                        by_ticker[ticker].update(row)
+                    else:
+                        manual_rows.append(row)
+                        by_ticker[ticker] = row
+                artifacts["manual_review_candidates"] = manual_rows
 
 
 __all__ = [

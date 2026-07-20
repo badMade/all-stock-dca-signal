@@ -956,6 +956,40 @@ def test_scheduled_afternoon_blocks_when_spread_unavailable(tmp_path):
     assert run_state["usage_proxy"]["orders_placed_count"] == 0
 
 
+def test_scheduled_afternoon_blocks_non_finite_bid_ask_quote(tmp_path):
+    # Codex review on the PR #42 merge commit: bid <= 0 / ask <= 0 / ask < bid
+    # comparisons are all False against NaN, and float('inf') satisfies > 0, so a
+    # provider returning a NaN or infinite bid/ask previously slipped past
+    # _quote_bid_ask() and produced a NaN spread_pct. `NaN > max_bid_ask_spread_pct`
+    # is also False, so the scheduled path would have placed an order against an
+    # unusable quote instead of failing closed the way a missing quote already does.
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
+        max_bid_ask_spread_pct=1.0,
+    )
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+    fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    rh = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(float("nan"), 99.0)
+    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "nan-spread")
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    [candidate] = run_state["buy_candidates"]
+    assert candidate["ticker"] == "AAPL"
+    assert candidate["status"] == "blocked"
+    assert "spread" in candidate["skip_reason"]
+    assert run_state["usage_proxy"]["orders_placed_count"] == 0
+
+
 def test_manual_run_not_blocked_when_spread_unavailable(tmp_path):
     # The missing-spread fail-closed breaker is scoped to scheduled runs only:
     # a manual run still has review_market_buy as a human-reviewed safety net,

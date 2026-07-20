@@ -547,8 +547,37 @@ def run_pipeline(
                         _staged_oap = staging_dir / "orders_after_place.json"
                         if _prior_oap.exists() and not _staged_oap.exists():
                             shutil.copy2(_prior_oap, _staged_oap)
-                        shutil.rmtree(raw_dir)
-                    staging_dir.rename(raw_dir)
+                    # Keep a backup until the rename succeeds so a filesystem error
+                    # can't destroy the prior audit record: rename raw/ → raw.bak,
+                    # rename staging/ → raw/, then remove raw.bak. On any failure,
+                    # restore raw.bak → raw/.
+                    #
+                    # A stale raw.bak can be left by a prior interrupted swap:
+                    # - If raw/ also exists the prior swap completed but cleanup did
+                    #   not; raw.bak is stale -- remove it so the rename below can
+                    #   proceed.
+                    # - If raw/ is absent the staging rename failed last time; raw.bak
+                    #   holds the real prior data -- restore it before proceeding.
+                    raw_backup = raw_dir.with_name("raw.bak")
+                    if raw_backup.exists():
+                        if raw_dir.exists():
+                            # Stale backup from an interrupted prior swap: raw/ was
+                            # already restored so the backup is redundant. Remove it
+                            # explicitly (no ignore_errors) so a failure surfaces here
+                            # rather than silently causing the rename below to fail.
+                            shutil.rmtree(raw_backup)
+                        else:
+                            raw_backup.rename(raw_dir)
+                    if raw_dir.exists():
+                        raw_dir.rename(raw_backup)
+                        try:
+                            staging_dir.rename(raw_dir)
+                        except Exception:
+                            raw_backup.rename(raw_dir)
+                            raise
+                        shutil.rmtree(raw_backup, ignore_errors=True)
+                    else:
+                        staging_dir.rename(raw_dir)
                     raw_persistence_state = build_raw_persistence_state(
                         trading_day_raw, raw_dir=raw_dir
                     )
@@ -561,15 +590,18 @@ def run_pipeline(
                         strict_robinhood=not config.dry_run,
                     )
                 except Exception as exc:  # noqa: BLE001 - failure must still write durable scheduled state
-                    # Remove only the staging directory. raw_dir (if a prior
-                    # attempt populated it) is left untouched so its audit trail
-                    # survives this failed retry.
+                    # Remove only the staging directory; raw/ has been restored
+                    # from raw.bak (if a prior attempt populated it) so its audit
+                    # trail survives this failed retry.
                     if staging_dir.exists():
                         shutil.rmtree(staging_dir, ignore_errors=True)
                     out = Path(artifacts_dir)
                     out.mkdir(parents=True, exist_ok=True)
                     # Remove stale derived/report artifacts from any prior
                     # attempt so they are not mistaken for this failed run's output.
+                    # Include drift reports: a prior clean run may have written
+                    # drift_report.json/md; leaving them next to a new raw-persistence-
+                    # failure run_state would mislead operators about the current status.
                     # Do NOT delete orders.csv or buy_candidates.csv: a retry in the
                     # same directory may follow a previously-successful attempt whose
                     # real fill records must survive for reporting and cap accounting.
@@ -578,6 +610,7 @@ def run_pipeline(
                         "latest_run_summary.json", "slippage_and_coverage_report.md",
                         "slippage_ranked.csv", "missing_fills_report.csv",
                         "notion_latest_run_compact.md", "notion_latest_run_payload.json",
+                        "drift_report.json", "drift_report.md",
                     ):
                         (out / _stale).unlink(missing_ok=True)
                     failure_state = raw_persistence_failure_run_state(

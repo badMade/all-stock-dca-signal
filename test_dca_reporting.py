@@ -389,6 +389,81 @@ def test_generate_scheduled_reports_excludes_fills_for_confirmation_blocked_run(
     assert summary["coverage"]["fills"] == 0
 
 
+def test_generate_scheduled_reports_raw_fallback_survives_null_broker_outcomes(tmp_path=None):
+    # Codex review (PR #88): "Guard malformed broker outcomes in raw-fill
+    # fallback". (selection.state or {}).get("broker_outcomes", {}).items()
+    # only substitutes the {} default when the key is ABSENT -- a parseable
+    # but structurally corrupted scheduled state with "broker_outcomes": null
+    # (or a list) returns None/a list from .get() and raises
+    # AttributeError/TypeError from .items(), crashing the whole reporting
+    # job instead of falling back to the caller-supplied fills. The same gap
+    # existed for "buy_candidates": null two lines above.
+    import tempfile
+    from pathlib import Path
+
+    from dca_reporting import generate_scheduled_reports
+
+    build_sched, _build_manual, write_run_artifacts = _classification_helpers()
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-06"
+
+    state = _sched_state(day, [("AAPL", "O1")], build_sched(day, f"{day}T19:20:01Z"))
+    # Structurally corrupt but still a valid scheduled state otherwise.
+    state["broker_outcomes"] = None
+    written = write_run_artifacts(state, base=base)
+
+    # No caller-supplied fill for O1 -> missing_ids triggers the raw-fill
+    # fallback, which reads orders_after_place.json next to the state file.
+    raw_dir = Path(written["run_state"]).parent / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    (raw_dir / "orders_after_place.json").write_text(
+        json.dumps({"orders": [
+            {"id": "O1", "symbol": "AAPL", "state": "filled",
+             "cumulative_quantity": "0.03", "average_price": "101.0"},
+        ]}),
+        encoding="utf-8",
+    )
+
+    # Must not raise AttributeError/TypeError from the null broker_outcomes.
+    paths = generate_scheduled_reports(day, [], base / "reports", base=base)
+    summary = json.loads(Path(paths["latest_run_summary"]).read_text())
+    assert summary["coverage"]["fills"] == 1, (
+        "raw-fill fallback should have resolved AAPL's O1 fill despite null broker_outcomes"
+    )
+
+
+def test_generate_scheduled_reports_raw_fallback_survives_non_utf8_orders_file(tmp_path=None):
+    # Codex review (PR #88): "Handle non-UTF-8 persisted raw orders as a
+    # fallback miss". orders_after_place.json containing invalid UTF-8 bytes
+    # (e.g. truncated mid-write) raises UnicodeDecodeError from
+    # read_text(encoding="utf-8"), which the except clause didn't cover
+    # (UnicodeDecodeError is a ValueError subclass, not an OSError). The
+    # fallback already treats unreadable/malformed JSON as non-fatal; this
+    # must degrade the same way instead of crashing the whole reporting job.
+    import tempfile
+    from pathlib import Path
+
+    from dca_reporting import generate_scheduled_reports
+
+    build_sched, _build_manual, write_run_artifacts = _classification_helpers()
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-06"
+
+    state = _sched_state(day, [("AAPL", "O1")], build_sched(day, f"{day}T19:20:01Z"))
+    written = write_run_artifacts(state, base=base)
+
+    raw_dir = Path(written["run_state"]).parent / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    (raw_dir / "orders_after_place.json").write_bytes(b"\xff\xfe\x00invalid-utf8")
+
+    # Must not raise UnicodeDecodeError -- degrades to the normal missing-fill
+    # report instead (no caller-supplied fill for O1, and the raw fallback
+    # can't be read either).
+    paths = generate_scheduled_reports(day, [], base / "reports", base=base)
+    summary = json.loads(Path(paths["latest_run_summary"]).read_text())
+    assert summary["coverage"]["fills"] == 0
+
+
 def test_generate_scheduled_reports_requires_scheduled_state(tmp_path=None):
     import tempfile
     from pathlib import Path
@@ -612,6 +687,48 @@ def test_fills_from_order_history_payload_maps_ticker_by_order_id():
     assert fills[0]["order_id"] == "O1"
 
 
+def test_fills_from_order_history_payload_handles_order_wrapped_shape():
+    # Codex review on PR #50: orders_after_place.json can be an order-ID-scoped
+    # Robinhood response shaped like {"data": {"order": {...}}} (the single-order
+    # shape RobinhoodBroker.get_order_fill() accepts). Without unwrapping the
+    # nested "order" member, this fallback would report zero fills even though
+    # a persisted filled scheduled order with cumulative_quantity/average_price
+    # is present.
+    payload = {
+        "order": {
+            "id": "O1",
+            "cumulative_quantity": "0.02",
+            "average_price": "101.0",
+            "state": "filled",
+        }
+    }
+    fills = fills_from_order_history_payload(payload, order_id_to_ticker={"O1": "AAPL"})
+    assert len(fills) == 1
+    assert fills[0]["ticker"] == "AAPL"
+    assert fills[0]["order_id"] == "O1"
+    assert abs(fills[0]["filled_qty"] - 0.02) < 1e-9
+
+
+def test_fills_from_order_history_payload_handles_bare_single_order_shape():
+    # Codex review on PR #50: orders_after_place.json can also be a bare single
+    # Robinhood order object with no "order" wrapper key at all, e.g.
+    # {"id": ..., "cumulative_quantity": ...} directly at the top level (the
+    # same single-order shape RobinhoodBroker.get_order_fill() accepts when
+    # data.get("id") is present). This must be detected as a one-element order
+    # list rather than reporting the fill as missing.
+    payload = {
+        "id": "O1",
+        "cumulative_quantity": "0.02",
+        "average_price": "101.0",
+        "state": "filled",
+    }
+    fills = fills_from_order_history_payload(payload, order_id_to_ticker={"O1": "AAPL"})
+    assert len(fills) == 1
+    assert fills[0]["ticker"] == "AAPL"
+    assert fills[0]["order_id"] == "O1"
+    assert abs(fills[0]["filled_qty"] - 0.02) < 1e-9
+
+
 def test_fills_from_order_history_payload_unwraps_nested_data_envelopes():
     # Codex review: "Unwrap normalized order-history envelopes recursively."
     # save_raw_input() normalizing a raw Robinhood envelope that is itself
@@ -663,6 +780,38 @@ def test_fills_from_order_history_payload_rejects_zero_priced_executions():
     assert set(by_ticker) == {"NVDA"}
     assert abs(by_ticker["NVDA"]["fill_price"] - 100.0) < 1e-9
     assert abs(by_ticker["NVDA"]["filled_qty"] - 0.01) < 1e-9
+
+
+def test_fills_from_order_history_payload_rejects_non_finite_prices_and_quantities():
+    # Codex review (PR #88): "Reject non-finite broker fill prices". Infinity
+    # and NaN are neither None nor <= 0 (NaN compares False to every
+    # comparison, Infinity is > 0), so a corrupted broker record carrying
+    # either value used to slip past the existing checks and be reported as
+    # a real fill -- feeding non-finite slippage/JSON into downstream
+    # reports instead of being treated as unpriced and missing.
+    payload = {"orders": [
+        # Order-level average_price is Infinity.
+        {"ticker": "AAPL", "id": "O1", "state": "filled",
+         "filled_qty": "0.02", "average_price": "Infinity"},
+        # Order-level average_price is NaN.
+        {"ticker": "NVDA", "id": "O2", "state": "filled",
+         "filled_qty": "0.01", "average_price": "NaN"},
+        # Per-execution price is Infinity.
+        {"ticker": "GOOG", "id": "O3", "executions": [
+            {"quantity": "0.01", "price": "Infinity"},
+        ]},
+        # Bare-quantity fallback: quantity itself is NaN.
+        {"ticker": "MSFT", "id": "O4", "state": "filled",
+         "quantity": "NaN", "average_price": "100.0"},
+        # A genuinely valid order must still be reported.
+        {"ticker": "AMZN", "id": "O5", "state": "filled",
+         "filled_qty": "0.02", "average_price": "100.0"},
+    ]}
+    fills = fills_from_order_history_payload(payload)
+    by_ticker = {f["ticker"]: f for f in fills}
+    assert set(by_ticker) == {"AMZN"}, (
+        f"non-finite price/quantity orders must be rejected, got {sorted(by_ticker)}"
+    )
 
 
 def _run_all():

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
@@ -186,18 +187,41 @@ def fills_from_order_history_payload(
                 # missing/blank price to 0.0: folding a zero-priced execution
                 # into the weighted average turns an unpriced execution into
                 # false coverage and a false -100% slippage number instead of
-                # a missing/unpriced fill.
-                if p is None or p <= 0:
+                # a missing/unpriced fill. A corrupted broker record can carry
+                # Infinity/NaN, which passes `<= 0` unscathed (NaN compares
+                # False to everything; Infinity is > 0) -- isfinite() closes
+                # that gap.
+                if q <= 0 or not math.isfinite(q) or p is None or p <= 0 or not math.isfinite(p):
                     continue
                 exec_qty += q
                 exec_cost += q * p
 
-        # Confirmed-executed quantity only -- never the requested "quantity".
+        # Prefer confirmed-executed quantity fields; bare "quantity" is accepted
+        # only as a last resort when state=="filled" guarantees full execution.
         qty = exec_qty or _to_float(order.get("filled_qty") or order.get("cumulative_quantity")) or 0.0
+        if not math.isfinite(qty):
+            qty = 0.0
+        if qty <= 0:
+            # Mirror RobinhoodBroker.get_order_fill(): accept bare `quantity` only
+            # when the order is fully filled and a fill price is present. Restricting
+            # to state=="filled" avoids inflating coverage for partially_filled orders
+            # where `quantity` is the requested size, not the executed size.
+            order_state = order.get("state", "")
+            avg_price_hint = _to_float(order.get("average_price") or order.get("price"))
+            if (
+                order_state == "filled"
+                and avg_price_hint
+                and avg_price_hint > 0
+                and math.isfinite(avg_price_hint)
+            ):
+                qty = _to_float(order.get("quantity")) or 0.0
+                if not math.isfinite(qty):
+                    qty = 0.0
         if qty <= 0:
             continue
 
         if exec_qty > 0:
+            # exec_qty > 0 implies exec_cost > 0 (both accumulate only when p > 0).
             avg_price = exec_cost / exec_qty
         else:
             avg_price = _to_float(
@@ -205,9 +229,13 @@ def fills_from_order_history_payload(
                 or order.get("average_price")
                 or order.get("price")
             )
-        if avg_price is None or avg_price <= 0:
-            # Executed quantity with no resolvable positive price: report as
-            # missing rather than a false, zero-coerced fill.
+        # Skip fills with no resolvable price or a zero/negative price:
+        # compute_slippage_rows() coerces missing prices to 0.0, which would
+        # produce spurious -100% slippage rather than a missing/unpriced fill.
+        # A corrupted broker record's average_price/price can be Infinity or
+        # NaN, which passes `<= 0` unscathed -- isfinite() closes that gap
+        # (Codex review, PR #88: "Reject non-finite broker fill prices").
+        if avg_price is None or avg_price <= 0 or not math.isfinite(avg_price):
             continue
 
         fills.append(
@@ -245,6 +273,13 @@ def _order_list_from_payload(payload: Any) -> List[Any]:
             value = payload.get(key)
             if isinstance(value, list):
                 return value
+        # Single-order shape: {"order": {...}} (e.g. order-ID-scoped Robinhood response).
+        order = payload.get("order")
+        if isinstance(order, dict):
+            return [order]
+        # Bare single-order object: top-level dict that IS an order (has id/order_id).
+        if payload.get("id") or payload.get("order_id"):
+            return [payload]
     return []
 
 
@@ -559,6 +594,68 @@ def generate_scheduled_reports(
     # published as scheduled evidence.
     scheduled_ids = set(selection.order_ids)
     fills = [f for f in fills if (f.get("order_id") or f.get("broker_order_id")) in scheduled_ids]
+
+    # Fallback: load fills from the persisted orders_after_place.json for any
+    # scheduled order IDs not already covered by the caller-supplied fills.
+    # This activates when the caller passes an empty sequence (the scheduler
+    # persisted the raw payload but did not re-query the broker for this report).
+    if scheduled_ids and selection.state_path:
+        covered_ids = {
+            f.get("order_id") or f.get("broker_order_id") for f in fills
+        } - {None}
+        missing_ids = scheduled_ids - covered_ids
+        if missing_ids:
+            raw_orders_path = Path(selection.state_path).parent / "raw" / "orders_after_place.json"
+            if raw_orders_path.exists():
+                try:
+                    raw_payload = json.loads(raw_orders_path.read_text(encoding="utf-8"))
+                    # Map every tracked order ID (order_id or broker_order_id)
+                    # to its ticker so fills_from_order_history_payload() can
+                    # resolve symbols for order-ID-scoped payloads without a
+                    # symbol field. Covers both buy_candidates and broker_outcomes.
+                    ticker_by_order_id: Dict[str, str] = {}
+                    state = selection.state or {}
+                    # .get(key, default) only substitutes the default when the
+                    # key is ABSENT; a state with "buy_candidates": null or
+                    # "broker_outcomes": null (structurally corrupted but still
+                    # a valid scheduled state otherwise) would return None and
+                    # raise TypeError/AttributeError below instead of simply
+                    # falling back to the caller-supplied fills.
+                    buy_candidates = state.get("buy_candidates")
+                    if not isinstance(buy_candidates, list):
+                        buy_candidates = []
+                    for c in buy_candidates:
+                        if not isinstance(c, dict) or not c.get("ticker"):
+                            continue
+                        for key in ("order_id", "broker_order_id"):
+                            oid = c.get(key)
+                            if oid:
+                                ticker_by_order_id[oid] = c["ticker"]
+                    broker_outcomes = state.get("broker_outcomes")
+                    if not isinstance(broker_outcomes, dict):
+                        broker_outcomes = {}
+                    for tkr, oc in broker_outcomes.items():
+                        if isinstance(oc, dict) and isinstance(tkr, str):
+                            oid = oc.get("order_id") or oc.get("broker_order_id")
+                            if oid:
+                                ticker_by_order_id[oid] = tkr
+                    raw_fills = fills_from_order_history_payload(
+                        raw_payload, order_id_to_ticker=ticker_by_order_id
+                    )
+                    raw_scheduled = [
+                        f for f in raw_fills
+                        if (f.get("order_id") or f.get("broker_order_id")) in missing_ids
+                    ]
+                    fills = list(fills) + raw_scheduled
+                except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                    # A truncated or non-UTF-8 orders_after_place.json (e.g.
+                    # a crash mid-write) must degrade to no raw-fill fallback,
+                    # not crash the whole reporting job -- UnicodeDecodeError
+                    # is a ValueError subclass, not an OSError, so it needs
+                    # its own arm here (Codex review, PR #88: "Handle non-
+                    # UTF-8 persisted raw orders as a fallback miss").
+                    pass
+
     return generate_reports(
         selection.state,
         fills,

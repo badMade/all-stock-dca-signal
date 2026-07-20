@@ -60,6 +60,11 @@ BUY_CANDIDATES_CSV_NAME = "buy_candidates.csv"
 RAW_DIR_NAME = "raw"
 RUN_STATE_NAME = "run_state.json"
 
+# Streams that never persist a raw/ directory (morning and midday executors
+# write only run_state.json + CSVs). A missing raw/ for these is expected and
+# must NOT be diagnosed as raw_data_persistence_failure.
+_STREAMS_WITHOUT_RAW = {"morning", "midday"}
+
 # --- Column aliases (schema-tolerant lookups) --------------------------------
 
 SYMBOL_COLUMNS = ("ticker", "symbol")
@@ -73,10 +78,13 @@ INCREMENTAL_COLUMNS = ("incremental_order_amount", "incremental_amount_usd", "in
 DESIRED_COLUMNS = (
     "afternoon_desired_amount",
     "afternoon_desired_amount_usd",
+    "morning_desired_amount",       # morning stream buy-candidates augmentation
     "desired_amount_usd",
     "desired_amount",
     "hypothetical_amount_usd",
     "planned_amount_usd",
+    "suggested_amount_usd",         # afternoon near_close_dca _signal_row()
+    "hypothetical_amount_usd",      # morning stream MorningSignal.to_row() fallback
 )
 TOP_UP_GUARD_COLUMNS = ("top_up_guard_result", "top_up_result", "skip_reason")
 BLOCK_REASON_COLUMNS = ("block_reason", "loop_block_reason", "reason")
@@ -389,13 +397,14 @@ def _row_block_evidence(row: Mapping[str, Any]) -> List[str]:
 
 def _infer_run_cause(art: RunArtifacts, submitted_orders_empty: bool) -> str:
     """Pick the single most-likely run-level cause of missing orders."""
-    # raw/ is only written by the afternoon pipeline; morning and midday executors
-    # (identified by their stream-specific signals CSV names) never produce it.
-    # Gate the raw-missing cause on afternoon runs so morning/midday genuine
-    # broker failures are not incorrectly diagnosed as persistence failures.
-    _signals_name = art.signals_path.name if art.signals_path is not None else ""
-    _raw_expected = _signals_name not in ("morning_signals.csv", "midday_signals.csv")
-    if not art.raw_dir_present and _raw_expected:
+    state = art.run_state or {}
+    # Morning and midday streams never write a raw/ directory; skip the raw-dir
+    # check for them so a genuine placement failure isn't misdiagnosed as a raw
+    # persistence problem (which would suggest re-running for raw persistence
+    # rather than investigating the broker error).
+    stream = str(state.get("stream", "")).lower()
+    raw_required = stream not in _STREAMS_WITHOUT_RAW
+    if raw_required and not art.raw_dir_present:
         return CAUSE_RAW_MISSING
     if art.orders_path is None:
         return CAUSE_ORDERS_MISSING
@@ -403,7 +412,6 @@ def _infer_run_cause(art: RunArtifacts, submitted_orders_empty: bool) -> str:
         return CAUSE_ORDERS_EMPTY
     if art.error_rows:
         return CAUSE_ORDER_ERRORS
-    state = art.run_state or {}
     submit_status = str(state.get("order_submit_status", "")).lower()
     if art.run_state is None or "error" in submit_status or "run_classification" not in state:
         return CAUSE_RUN_STATE_ERROR
@@ -459,7 +467,12 @@ def detect_drift(run_dir: Path) -> DriftReport:
         if sym:
             buy_candidate_by_ticker[sym] = bc_row
 
-    expected: Dict[str, tuple] = {}  # symbol -> (symbol, amount, auto_buy, row_evidence)
+    # Build expected buys: one entry per ticker regardless of how many provider
+    # rows the stream emitted (e.g. near-close emits two rows — finance and
+    # robinhood — for the same ticker). Dedup by ticker, keeping the entry with
+    # the largest positive amount so we don't double-report a single missing order.
+    expected: List[tuple] = []  # (symbol, amount, auto_buy, row_evidence)
+    _symbol_to_expected_idx: Dict[str, int] = {}
     for row in art.signal_rows:
         symbol = _symbol(row)
         if symbol is None:
@@ -524,18 +537,19 @@ def detect_drift(run_dir: Path) -> DriftReport:
         positive = incremental > 0 or desired > 0
         if auto_buy and positive:
             amount = incremental if incremental > 0 else desired
-            # Use setdefault so only the first row per ticker is kept; afternoon
-            # signals.csv may carry both Finance and Robinhood source rows for
-            # the same ticker, which would otherwise produce duplicate entries.
-            expected.setdefault(
-                symbol,
-                (symbol, amount, auto_buy, _row_block_evidence(row) + bc_evidence),
-            )
+            evidence = _row_block_evidence(row) + bc_evidence
+            if symbol in _symbol_to_expected_idx:
+                idx = _symbol_to_expected_idx[symbol]
+                if amount > expected[idx][1]:
+                    expected[idx] = (symbol, amount, auto_buy, evidence)
+            else:
+                _symbol_to_expected_idx[symbol] = len(expected)
+                expected.append((symbol, amount, auto_buy, evidence))
 
     run_cause = _infer_run_cause(art, submitted_orders_empty)
 
     affected: List[SymbolDrift] = []
-    for symbol, amount, auto_buy, row_evidence in expected.values():
+    for symbol, amount, auto_buy, row_evidence in expected:
         if symbol in submitted:
             continue
         # A per-row guard explanation overrides the generic run-level cause.

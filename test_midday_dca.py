@@ -64,7 +64,7 @@ class FakeLiveBroker:
     def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
         # No duplicate: this fake broker never has prior orders on file, so
         # guarded top-ups always proceed as fresh placements.
-        return False
+        return None
 
     def is_tradable_for_fractional_buy(self, ticker):
         return True
@@ -395,7 +395,14 @@ class _TopUpDuplicateBroker:
     def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
         self.same_stream_calls += 1
         assert ref_id_prefixes[0] == f"midday-dca-topup-{trading_day.isoformat()}-{ticker}"
-        return self.duplicate
+        if self.duplicate:
+            return {
+                "id": f"EXISTING-ORDER-{ticker}",
+                "state": "confirmed",
+                "dollar_amount": "12.00",
+                "ref_id": ref_id_prefixes[0],
+            }
+        return None
 
     def is_tradable_for_fractional_buy(self, ticker):
         return True
@@ -429,10 +436,12 @@ def test_guarded_midday_top_up_checks_same_stream_duplicate_before_placing(tmp_p
     assert broker.broad_duplicate_calls == 0
     assert broker.same_stream_calls == 1
     assert broker.placed == []
-    assert res["artifacts"]["broker_outcomes"]["BIG"]["status"] == "submitted"
-    assert res["artifacts"]["broker_outcomes"]["BIG"]["skip_reason"] == "same-stream broker order exists"
+    outcome = res["artifacts"]["broker_outcomes"]["BIG"]
+    assert outcome["status"] == "submitted"
+    assert outcome["skip_reason"] == "same-stream broker order exists"
+    assert outcome["order_id"] == "EXISTING-ORDER-BIG"
+    assert outcome["submitted_amount_usd"] == 12.0
     assert res["artifacts"]["buy_candidates"][0]["status"] == "submitted"
-    assert res["artifacts"]["buy_candidates"][0]["planned_amount_usd"] == 12.0
 
 
 def test_manual_retry_of_guarded_top_up_duplicate_is_skipped_not_submitted(tmp_path):
@@ -534,7 +543,12 @@ def test_top_up_zero_when_price_not_below_prior(tmp_path):
         prior_allocation_roots=(str(prior_root),),
     )
     ex = MiddayDCAExecutor(cfg)
-    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+    # DecliningBarsProvider (not the flat FixedDropProvider): the intraday trend
+    # gate added on base rejects flat-or-rising sessions, and this test needs a
+    # trend-validated candidate so it lands in buy_candidates rather than
+    # manual_review_candidates. broker=FakeLiveBroker() satisfies the newer
+    # "missing broker adapter" gate for scheduled live runs.
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
     res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
     row = res["artifacts"]["buy_candidates"][0]
     assert row["top_up_guard_result"] == TOP_UP_PRICE_NOT_BELOW
@@ -555,13 +569,93 @@ def test_top_up_manual_review_when_prior_price_unknown(tmp_path):
         prior_allocation_roots=(str(prior_root),),
     )
     ex = MiddayDCAExecutor(cfg)
-    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+    # Same trend-validated-provider + broker rationale as the test above.
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
     res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
     row = res["artifacts"]["buy_candidates"][0]
     assert row["top_up_guard_result"] == TOP_UP_MISSING_PRIOR_PRICE
     assert row["incremental_order_amount"] == 0.0
     assert row["top_up_manual_review"] is True
     assert res["artifacts"]["top_up_manual_review_tickers"] == ["BIG"]
+
+
+def test_augment_artifacts_appends_top_up_manual_review_candidate_row():
+    """_augment_artifacts must promote the full buy_candidates row to manual_review_candidates."""
+    from morning_dca import TopUpOutcome
+    cfg = MiddayConfig(tickers=("BIG",))
+    ex = MiddayDCAExecutor(cfg)
+    outcome = TopUpOutcome(
+        ticker="BIG",
+        desired_amount=6.0,
+        decision_price=99.0,
+        prior_same_day_amount=3.0,
+        prior_same_day_reference_price=None,
+        prior_same_day_run_id="sched_am",
+        prior_same_day_source="morning",
+        incremental_order_amount=0.0,
+        top_up_guard_result="missing_prior_price",
+        top_up_skipped=True,
+        top_up_manual_review=True,
+    )
+    candidate_row = {
+        "ticker": "BIG",
+        "prior_same_day_amount": 3.0,
+        "prior_same_day_reference_price": None,
+        "top_up_guard_result": "missing_prior_price",
+        "incremental_order_amount": 0.0,
+        "execution_status": EXEC_MANUAL_REVIEW_CANDIDATE,
+    }
+    artifacts = {
+        "counts": {"manual_review_candidates": 0},
+        "manual_review_tickers": [],
+        "manual_review_candidates": [],
+        "buy_candidates": [candidate_row],
+    }
+    ex._augment_artifacts(artifacts, {"BIG": outcome})
+    assert artifacts["counts"]["manual_review_candidates"] == 1
+    assert artifacts["manual_review_tickers"] == ["BIG"]
+    assert len(artifacts["manual_review_candidates"]) == 1
+    row = artifacts["manual_review_candidates"][0]
+    assert row["ticker"] == "BIG"
+    assert row["top_up_guard_result"] == "missing_prior_price"
+    assert row["prior_same_day_amount"] == pytest.approx(3.0)
+
+
+def test_manual_review_candidate_row_keeps_top_up_context_when_trend_unvalidated(tmp_path):
+    # Codex review on the PR #43 merge: a trend-unvalidated BUY can still have a
+    # same-day top-up outcome (_compute_top_up only checks action/multiplier, not
+    # trend_validated). Withholding the row from buy_candidates must not also
+    # strip the prior-allocation/top-up fields from the manual_review_candidates
+    # row -- otherwise a reviewer looking at a 12:30 manual-review case after an
+    # earlier morning buy has no way to tell what incremental top-up amount, if
+    # any, would be safe.
+    prior_root = tmp_path / "morning"
+    _write_prior_morning_run(
+        prior_root, ticker="BIG", planned_amount=3.0,
+        fill_price=95.0, quantity=round(3.0 / 95.0, 6),
+    )
+    cfg = MiddayConfig(
+        tickers=("BIG",), base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "midday"),
+        prior_allocation_roots=(str(prior_root),),
+    )
+    ex = MiddayDCAExecutor(cfg)
+    # FixedDropProvider is flat, so _trend_validated() (>= rejects flat-or-rising)
+    # withholds this candidate to manual_review_candidates -- but the ticker still
+    # has a resolvable prior fill at $95.0, current price $90.0 is below that
+    # reference, so _compute_top_up still produces a real TOP_UP_INCREMENTAL outcome.
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
+
+    assert res["artifacts"]["buy_candidates"] == []
+    [row] = res["artifacts"]["manual_review_candidates"]
+    assert row["ticker"] == "BIG"
+    assert row["prior_same_day_amount"] == 3.0
+    assert row["prior_same_day_reference_price"] == 95.0
+    assert row["top_up_guard_result"] == TOP_UP_INCREMENTAL
+    # 10% drop is beyond the top 8% sizing tier -> capped at 5.0x * $3 base = $15
+    # desired; incremental = $15 - the prior $3 fill = $12.
+    assert row["incremental_order_amount"] == pytest.approx(12.0)
 
 
 # --- Isolation from other streams -------------------------------------------

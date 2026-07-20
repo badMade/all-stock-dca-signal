@@ -603,11 +603,14 @@ def test_normalize_connector_payload_resolves_output_path():
         assert normalized["output_path"] == str(pointer_file)
 
 
-def test_normalize_connector_payload_unreadable_pointer_is_flagged():
+def test_normalize_connector_payload_unreadable_pointer_raises():
     payload = {"output_path": "/no/such/file.json"}
-    normalized = normalize_connector_payload(payload)
-    assert normalized["normalized"] is False
-    assert "normalize_error" in normalized
+    try:
+        normalize_connector_payload(payload)
+    except RuntimeError as exc:
+        assert "/no/such/file.json" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError for unreadable output_path")
 
 
 def test_save_raw_input_fails_closed_on_unreadable_pointer():
