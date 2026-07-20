@@ -1,3 +1,7 @@
+## 2026-07-17 - Iterating Pandas Dataframes fast
+**Learning:** `iterrows()` is extremely slow for Pandas dataframe iterations.
+**Action:** Prefer `itertuples(name=None, index=False)` for fast read-only iteration (use `index=True` if you need the index), and `to_dict('records')` when per-row mutation or dict-style column access is required (e.g. non-standard column names like numeric headers).
+
 ## 2026-06-29 - [Pandas Iteration Performance]
 **Learning:** `iterrows()` is extremely slow for iterating over DataFrames because it creates a Series object for each row. `itertuples()` is much faster for read-only operations as it returns namedtuples. For cases where row mutability is needed or column names are not valid identifiers (like "1x"), `to_dict('records')` offers a massive speedup over `iterrows()` while preserving dict-like access.
 **Action:** Always prefer `itertuples()` for read-only iteration and `to_dict('records')` for mutable/dict-access iteration over pandas DataFrames. Never use `iterrows()` unless strictly necessary for type preservation across columns.
