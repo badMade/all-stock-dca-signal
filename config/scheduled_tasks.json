@@ -1,7 +1,7 @@
 {
   "$schema": "../schemas/scheduled_tasks.schema.json",
-  "version": "2026-07-17",
-  "verified_on_et": "2026-07-17",
+  "version": "2026-07-19",
+  "verified_on_et": "2026-07-19",
   "timezone_note": "Cron expressions are in UTC. ET equivalents are during US Eastern Daylight Time (EDT, UTC-4). Confirm around DST transitions.",
   "operating_mode": {
     "mode": "cost_saving_daily_compact",
@@ -73,6 +73,12 @@
     "doc": "docs/cost_tracking.md"
   },
   "afternoon_completion_rule": "All afternoon trading and artifact-writing tasks complete no later than 3:40 PM ET, when the read-only live-run watchdog (a46bf007) begins its final verification. The watchdog's own post-3:40 PM verification and the Friday weekly Notion performance refresh at 5:00 PM ET are the only approved post-3:40 PM DCA-related exceptions.",
+  "ticker_universe_policy": {
+    "source_of_truth": "config/tickers.json",
+    "active_count": 44,
+    "summary": "Every universe-bearing scheduled task (pre-market dashboard, 9:45 scans, morning/midday/afternoon live streams, monitor-only signal check, post-trade slippage sync, watchdog, weekly/monthly refreshes) evaluates the active graded DCA universe in config/tickers.json:active. Only whitelisted active-universe tickers may be traded. BYDDY, VCX, TRLV, and RVI remain excluded. IRDMI->IRDM and GLWR->GLW remain corrected upstream.",
+    "ticker_universe_update_2026_07_19": "TICKER UNIVERSE UPDATE JUL 19 2026: TXN is added to the active DCA universe and GFUZ remains active, taking the active universe to 44 symbols. Robinhood resolved TXN as Texas Instruments Incorporated Common Stock, state active, tradeable true, fractional tradability tradable, regular-hours dollar orders supported, and prior close available. Finance lookup resolved TXN as Texas Instruments Incorporated. Existing exclusions remain BYDDY, VCX, TRLV, and RVI; corrected symbols IRDM and GLW remain; IBM and GFUZ remain included (GFUZ with Robinhood primary if finance is unresolved). This adds whitelisted symbols only and preserves all existing trading safety, pre-authorization, same-day top-up, run-classification, budget, cost-conscious, manual-exclusion, and recovery language."
+  },
   "run_classification_policy": {
     "policy_file": "config/run_classification.json",
     "schema": "schemas/run_classification.schema.json",

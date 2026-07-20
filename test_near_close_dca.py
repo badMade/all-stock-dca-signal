@@ -148,6 +148,8 @@ def test_weekly_rollover_reserve_rolls_at_week_boundary():
 
 def test_ticker_universe():
     assert "IBM" in ACTIVE_TICKERS
+    assert "TXN" in ACTIVE_TICKERS
+    assert "GFUZ" in ACTIVE_TICKERS
     assert "IRDM" in ACTIVE_TICKERS
     assert "GLW" in ACTIVE_TICKERS
     assert "IRDMI" not in ACTIVE_TICKERS

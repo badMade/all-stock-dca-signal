@@ -57,12 +57,12 @@ spread, whitelist, or circuit-breaker requirements.
 
 ## Active ticker universe
 
-43 active symbols (see [`config/tickers.json`](../config/tickers.json)):
+44 active symbols (see [`config/tickers.json`](../config/tickers.json)):
 
 ```
 DFTX TRIN AAAU SPCX EVR LUNR IRDM DXYZ LITE ASML DRAM STX
 MSFT AAPL AMAT AMD CBRS MRVL BTX STM SNDK WDC TSM AVGO NVDA QBTS FLKR
-INTC GOOGL GOOG AMZN GLW MA GS MU NFLX XLG TOPT QTOP SATA RGTI IBM GFUZ
+INTC GOOGL GOOG AMZN GLW MA GS MU NFLX XLG TOPT QTOP SATA RGTI IBM GFUZ TXN
 ```
 
 - **Excluded:** `BYDDY`, `VCX`, `TRLV`, `RVI`
@@ -71,6 +71,15 @@ INTC GOOGL GOOG AMZN GLW MA GS MU NFLX XLG TOPT QTOP SATA RGTI IBM GFUZ
   **Robinhood primary data** (resolved active, tradeable, `fractional_tradability='tradable'`,
   regular-hours dollar orders, prior close available). The Finance connector lookup
   returned `NOT_FOUND`, so finance data may be unresolved/unavailable for `GFUZ`.
+
+> **TICKER UNIVERSE UPDATE JUL 19 2026:** TXN is added to the active DCA
+> universe and GFUZ remains active. Robinhood resolved TXN as Texas Instruments
+> Incorporated Common Stock, state active, tradeable true, fractional
+> tradability tradable, regular-hours dollar orders supported, and prior close
+> available. Finance lookup resolved TXN as Texas Instruments Incorporated.
+> Existing exclusions remain BYDDY, VCX, TRLV, and RVI; corrected symbols IRDM
+> and GLW remain; IBM and GFUZ remain included (GFUZ with Robinhood primary if
+> finance is unresolved).
 
 ## Sizing ladder (latest, active)
 

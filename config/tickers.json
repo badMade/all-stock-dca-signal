@@ -1,13 +1,13 @@
 {
   "$schema": "../schemas/tickers.schema.json",
-  "version": "2026-07-17",
+  "version": "2026-07-19",
   "description": "Active graded DCA ticker universe. Backup of the latest thread state; no secrets.",
   "active": [
     "DFTX", "TRIN", "AAAU", "SPCX", "EVR", "LUNR", "IRDM",
     "DXYZ", "LITE", "ASML", "DRAM", "STX", "MSFT", "AAPL", "AMAT", "AMD", "CBRS",
     "MRVL", "BTX", "STM", "SNDK", "WDC", "TSM", "AVGO", "NVDA", "QBTS", "FLKR",
     "INTC", "GOOGL", "GOOG", "AMZN", "GLW", "MA", "GS", "MU", "NFLX", "XLG",
-    "TOPT", "QTOP", "SATA", "RGTI", "IBM", "GFUZ"
+    "TOPT", "QTOP", "SATA", "RGTI", "IBM", "GFUZ", "TXN"
   ],
   "excluded": ["BYDDY", "VCX", "TRLV", "RVI"],
   "symbol_corrections": {
@@ -30,5 +30,5 @@
       }
     }
   },
-  "notes": "43 active symbols. GFUZ and EVR are active and on the buy list. BYDDY, VCX, TRLV, and RVI excluded. IRDMI->IRDM and GLWR->GLW corrected upstream; IBM and GFUZ included. GFUZ added 2026-07-15 (user-approved): Robinhood is primary (Finance connector returns NOT_FOUND). GFUZ has special handling (see special_handling): an unresolved GFUZ on Finance must not block the whole run, and if the 9:45 pre-flight lacks GFUZ the run intent is a supplemental GFUZ read-only validation persisted to gfuz_supplemental_preflight.json before decisioning, not yet implemented in code (see special_handling.GFUZ.supplemental_preflight.implementation_status); today a missing GFUZ preflight row just gates GFUZ out for that run."
+  "notes": "44 active symbols. BYDDY, VCX, TRLV, and RVI excluded. IRDMI->IRDM and GLWR->GLW corrected upstream; IBM and GFUZ included. GFUZ added 2026-07-15 (user-approved): Robinhood is primary (Finance connector returns NOT_FOUND). GFUZ has special handling (see special_handling): an unresolved GFUZ on Finance must not block the whole run, and if the 9:45 pre-flight lacks GFUZ the run intent is a supplemental GFUZ read-only validation persisted to gfuz_supplemental_preflight.json before decisioning — not yet implemented in code (see special_handling.GFUZ.supplemental_preflight.implementation_status); today a missing GFUZ preflight row just gates GFUZ out for that run. TICKER UNIVERSE UPDATE JUL 19 2026: TXN is added to the active DCA universe. Robinhood resolved TXN as Texas Instruments Incorporated Common Stock, state active, tradeable true, fractional tradability tradable, regular-hours dollar orders supported, and prior close available. Finance lookup resolved TXN as Texas Instruments Incorporated. Existing exclusions remain BYDDY, VCX, TRLV, and RVI; corrected symbols IRDM and GLW remain; IBM remains included."
 }

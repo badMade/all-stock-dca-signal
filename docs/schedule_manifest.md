@@ -12,6 +12,21 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 > verification and the Friday weekly Notion performance refresh at **5:00 PM ET**
 > are the only approved post-3:40 PM DCA-related exceptions.
 
+> **TICKER UNIVERSE UPDATE JUL 19 2026:** TXN is added to the active DCA
+> universe and GFUZ remains active, used by every universe-bearing scheduled
+> task (the pre-market dashboard, the 9:45 scans, the morning/midday/afternoon
+> live streams, the monitor-only signal check, the post-trade slippage sync, the
+> watchdog, and the weekly/monthly refreshes). The active universe is now **44
+> symbols** including both GFUZ and TXN. Robinhood resolved TXN as Texas
+> Instruments Incorporated Common Stock, state active, tradeable true, fractional
+> tradability tradable, regular-hours dollar orders supported, and prior close
+> available. Finance lookup resolved TXN as Texas Instruments Incorporated.
+> Existing exclusions remain BYDDY, VCX, TRLV, and RVI; corrected symbols IRDM
+> and GLW remain; IBM and GFUZ remain included (GFUZ with Robinhood primary if
+> finance is unresolved). This adds whitelisted symbols only; it preserves all
+> existing trading safety, pre-authorization, top-up, run-classification,
+> budget, cost-conscious, manual-exclusion, and recovery text.
+
 > **Schedule integrity note:** the live trading task runs at **3:20 PM ET**; the
 > post-trade slippage / Notion sync runs at **3:35 PM ET**. These are two
 > different tasks. Do not merge them or move the live trade off 3:20 PM ET.
