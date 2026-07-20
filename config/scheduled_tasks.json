@@ -846,7 +846,7 @@
         },
         "evidence_meaning": "This proves the task FIRED but is NOT order/fill evidence.",
         "no_silent_escalation": "Do NOT escalate without writing this state file unless the workspace itself is unavailable.",
-        "post_raw_failure_rule": "If failure happens AFTER raw collection starts, write signals.csv when possible, an empty submitted_orders.csv with headers when no orders, and run_state.json.",
+        "post_raw_failure_rule": "If failure happens AFTER raw collection starts, write morning_signals.csv when possible, an empty submitted_orders.csv with headers when no orders, and run_state.json.",
         "see": "live_schedule_hardening_2026_07_20.morning_1030"
       },
       "post_artifact_drift_check": {
