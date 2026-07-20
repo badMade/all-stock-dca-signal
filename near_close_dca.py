@@ -2609,6 +2609,338 @@ def write_run_state(
     return state_path
 
 
+
+def _check_execution_gates(
+    trading_day: date,
+    config: StrategyConfig,
+    broker: BrokerAdapter,
+    artifacts_dir: Optional[str | Path],
+) -> bool:
+    if trading_day not in config.approved_test_dates:
+        logger.warning("Date gate blocked execution for %s. No trades.", trading_day)
+        if artifacts_dir:
+            out = Path(artifacts_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            state_path = out / "run_state.json"
+            # Never clobber a previously recorded run when a directory is reused;
+            # the stub only marks days that produced no artifact at all.
+            if not state_path.exists():
+                state_path.write_text(
+                    _serialize_run_state(
+                        {"trading_day": trading_day.isoformat(), "status": RUN_STATUS_BLOCKED}
+                    ),
+                    encoding="utf-8",
+                )
+        return False
+
+    if broker.account_number() != config.target_account_number:
+        raise RuntimeError(
+            f"Refusing to trade account {broker.account_number()}; expected {config.target_account_number}"
+        )
+    return True
+
+
+def _apply_deployment_history(
+    config: StrategyConfig, trading_day: date, deployment_history_root: str | Path
+) -> StrategyConfig:
+    from dca_risk import apply_risk_guard, deployed_by_day, find_run_state_files
+
+    prior_states = []
+    for path in find_run_state_files(deployment_history_root):
+        try:
+            with path.open(encoding="utf-8") as f:
+                data = json.load(f)
+        except (ValueError, OSError):
+            continue
+        if isinstance(data, dict) and data.get("status") != RUN_STATUS_BLOCKED:
+            prior_states.append(data)
+    return apply_risk_guard(config, deployed_by_day(prior_states), trading_day)
+
+
+def _finalize_and_write_artifacts(
+    now: datetime,
+    config: StrategyConfig,
+    state: StrategyState,
+    decisions: List[ReconciledDecision],
+    candidate_outcomes: Dict[str, Dict[str, Any]],
+    order_reviews_attempted: int,
+    errors_count: int,
+    notifications_sent: Optional[int],
+    cost_control_notes: Optional[Sequence[str]],
+    top_up_outcomes: Optional[Dict[str, TopUpGuardOutcome]],
+    scheduled: bool,
+    artifacts_dir: Optional[str | Path],
+    classification_state_root: Optional[str | Path],
+    raw_persistence_state: Optional[Dict[str, object]] = None,
+) -> None:
+    if artifacts_dir is None:
+        return
+
+    artifacts = build_run_artifacts(
+        now,
+        config,
+        state,
+        decisions,
+        candidate_outcomes,
+        order_reviews_attempted=order_reviews_attempted,
+        errors_count=errors_count,
+        notifications_sent=notifications_sent,
+        cost_control_notes=cost_control_notes,
+        top_up_outcomes=top_up_outcomes,
+        manual=not scheduled,
+        raw_persistence_state=raw_persistence_state,
+    )
+    paths = write_run_artifacts(artifacts, artifacts_dir)
+    logger.info("Wrote run artifacts: %s", paths["run_state"])
+
+    if scheduled and classification_state_root is not None:
+        try:
+            from scripts.run_classification import (
+                update_latest_scheduled_run_pointer,
+                validate_classification,
+            )
+        except ImportError:
+            from run_classification import (
+                update_latest_scheduled_run_pointer,
+                validate_classification,
+            )
+        rc = artifacts.get("run_classification")
+        result = validate_classification(rc if isinstance(rc, dict) else {})
+        if result:
+            update_latest_scheduled_run_pointer(
+                artifacts, paths["run_state"], classification_state_root
+            )
+        else:
+            logger.error(
+                "Not updating latest_scheduled_run.json: invalid run_classification (%s)",
+                "; ".join(result.errors),
+            )
+
+
+def _process_buy_candidate(
+    decision: ReconciledDecision,
+    config: StrategyConfig,
+    state: StrategyState,
+    broker: BrokerAdapter,
+    robinhood_data: MarketDataProvider,
+    now: datetime,
+    trading_day: date,
+    guard_active: bool,
+    prior_same_day_allocations: Dict[str, PriorSameDayAllocation],
+    running_deployed_7d: float,
+    scheduled: bool,
+    run_result: Optional[RunResult],
+) -> tuple[Dict[str, Any], Optional[TopUpGuardOutcome], float, int, int]:
+    ticker = decision.ticker
+    order_amount = decision.suggested_amount_usd
+    ticker_guarded = guard_active and prior_same_day_allocations.get(ticker) is not None
+    top_up_outcome = None
+    errors_count_inc = 0
+    order_reviews_attempted_inc = 0
+    candidate_outcome: Dict[str, Any] = {}
+
+    def _block(reason: str, message: str) -> None:
+        if run_result is not None:
+            run_result.loop_block_reasons[ticker] = reason
+        logger.info(message)
+
+
+
+    if kill_switch_engaged(replace(config, deployed_last_7d_usd=running_deployed_7d)):
+        order_amount = min(order_amount, config.base_buy_amount_usd)
+
+    if guard_active:
+        outcome = evaluate_top_up_guard(
+            decision, prior_same_day_allocations.get(ticker), config
+        )
+        top_up_outcome = outcome
+        order_amount = min(outcome.incremental_order_amount, order_amount)
+        if outcome.skipped:
+            candidate_outcome = {
+                "status": "skipped",
+                "order_id": None,
+                "skip_reason": outcome.top_up_guard_result,
+            }
+            if outcome.manual_review:
+                logger.warning(
+                    "%s: prior same-day amount $%.2f but no comparable price; "
+                    "conservative $0 top-up, manual review required",
+                    ticker,
+                    outcome.prior_same_day_amount,
+                )
+            _block(
+                MISSING_FILL_TOP_UP_OFFSET,
+                f"{ticker}: top-up guard offset ({outcome.top_up_guard_result}); no incremental buy",
+            )
+            return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+
+    if not ticker_guarded and state.buys_today(ticker, trading_day) >= config.max_buys_per_ticker_per_day:
+        candidate_outcome = {"status": "skipped", "skip_reason": "already bought today"}
+        _block(MISSING_FILL_BUDGET_CAPPED, f"{ticker}: already bought today; skipping")
+        return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+    # Hard per-order ceiling is checked before any broker round-trip: an
+    # over-cap candidate should never need a same-day-duplicate lookup or a
+    # spread quote.
+    if order_amount > config.max_per_order_usd:
+        candidate_outcome = {"status": "blocked", "skip_reason": "max per-order ceiling exceeded", "deliberate_skip": True}
+        _block(
+            MISSING_FILL_BUDGET_CAPPED,
+            f"{ticker}: order amount ${order_amount:.2f} exceeds max per-order "
+            f"${config.max_per_order_usd:.2f}; skipping",
+        )
+        return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+    # A morning/manual run must NOT block the scheduled afternoon run: when the
+    # top-up guard has a loaded prior allocation for this ticker, the earlier
+    # same-day allocation is handled above, so the broker's same-day-order
+    # block is intentionally bypassed here.
+    if not ticker_guarded and broker.same_day_strategy_order_exists(ticker, trading_day):
+        candidate_outcome = {"status": "skipped", "skip_reason": "same-day broker order exists"}
+        _block(MISSING_FILL_BUDGET_CAPPED, f"{ticker}: same-day broker order already exists; skipping")
+        return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+    try:
+        spread_pct = quote_spread_pct(robinhood_data, ticker, now)
+    except Exception as exc:  # noqa: BLE001
+        errors_count_inc += 1
+        candidate_outcome = {
+            "status": "blocked",
+            "skip_reason": f"spread quote error: {exc}",
+        }
+        _block(MISSING_FILL_DATA_ERROR, f"{ticker}: spread quote failed: {exc}; skipping")
+        return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+    if spread_pct is None and scheduled:
+        # config/scheduled_tasks.json requires spread_ok=true before any
+        # scheduled live order: a provider without bid/ask support, or a
+        # quote lookup that returned nothing, must fail closed here
+        # rather than silently bypass the breaker. Manual runs still go
+        # through review_market_buy as a human-reviewed safety net, so
+        # they are not blocked on a missing spread alone.
+        candidate_outcome = {
+            "status": "blocked",
+            "skip_reason": "bid/ask spread unavailable; scheduled runs require spread_ok",
+            "deliberate_skip": True,
+        }
+        _block(
+            MISSING_FILL_BROKER_BLOCKED,
+            f"{ticker}: bid/ask spread unavailable for scheduled run; skipping",
+        )
+        return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+    if spread_pct is not None and spread_pct > config.max_bid_ask_spread_pct:
+        candidate_outcome = {
+            "status": "blocked",
+            "skip_reason": (
+                f"bid/ask spread {spread_pct:.2f}% exceeds "
+                f"{config.max_bid_ask_spread_pct:.2f}% limit"
+            ),
+            "deliberate_skip": True,
+        }
+        _block(
+            MISSING_FILL_BROKER_BLOCKED,
+            f"{ticker}: bid/ask spread {spread_pct:.2f}% exceeds "
+            f"{config.max_bid_ask_spread_pct:.2f}% limit; skipping",
+        )
+        return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+    if not within_caps(order_amount, state, trading_day, config):
+        candidate_outcome = {"status": "blocked", "skip_reason": "cap would be exceeded", "deliberate_skip": True}
+        _block(MISSING_FILL_BUDGET_CAPPED, f"{ticker}: cap would be exceeded; skipping")
+        return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+    if broker.available_buying_power() < order_amount:
+        candidate_outcome = {"status": "blocked", "skip_reason": "insufficient buying power", "deliberate_skip": True}
+        _block(MISSING_FILL_BUDGET_CAPPED, f"{ticker}: insufficient buying power; skipping")
+        return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+    if not broker.is_tradable_for_fractional_buy(ticker):
+        candidate_outcome = {"status": "blocked", "skip_reason": "not tradable for fractional buy", "deliberate_skip": True}
+        _block(MISSING_FILL_BROKER_BLOCKED, f"{ticker}: not tradable for fractional/notional buy; skipping")
+        return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+
+    reviewed_order = None
+    if not scheduled:
+        order_reviews_attempted_inc += 1
+        review_ok, review_reason = broker.review_market_buy(ticker, order_amount)
+        if not review_ok:
+            candidate_outcome = {"status": "blocked", "skip_reason": f"review blocked: {review_reason}", "deliberate_skip": True}
+            _block(MISSING_FILL_BROKER_BLOCKED, f"{ticker}: review blocked order: {review_reason}")
+            return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+        reviewed_order = {
+            "notional_usd": round(order_amount, 2),
+            "side": "buy",
+            "order_type": "market",
+            "time_in_force": None,
+            "estimated_price": None,
+            "review_passed": True,
+        }
+
+    ref_id = (
+        f"graded-dca-topup-{trading_day.isoformat()}-{ticker}"
+        if ticker_guarded
+        else f"graded-dca-{trading_day.isoformat()}-{ticker}"
+    )
+    if config.dry_run:
+        logger.info(
+            "[DRY RUN] Would buy %s: $%.2f (%s)",
+            ticker,
+            order_amount,
+            decision.reason,
+        )
+        if isinstance(broker, DryRunBroker):
+            order_id = broker.place_market_buy(ticker, order_amount, ref_id=ref_id)
+        else:
+            order_id = f"DRY-RUN-SIM-{ticker}-{order_amount:.2f}-{ref_id}"
+        candidate_outcome = {
+            "status": "dry_run",
+            "order_id": order_id,
+            "skip_reason": "dry_run: order not placed",
+            "reviewed_order": reviewed_order,
+            "submitted_amount_usd": order_amount,
+        }
+    else:
+        try:
+            order_id = broker.place_market_buy(ticker, order_amount, ref_id=ref_id)
+        except OrderConfirmationRequiredError:
+            candidate_outcome = {
+                "status": "not_submitted_confirmation_required",
+                "order_id": None,
+                "skip_reason": "broker requires post-review confirmation before submission",
+                "reviewed_order": reviewed_order,
+                "submitted_amount_usd": order_amount,
+            }
+            _block(
+                MISSING_FILL_BROKER_BLOCKED,
+                f"{ticker}: broker requires confirmation before submission; skipping",
+            )
+            return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+        except Exception as exc:  # noqa: BLE001
+            errors_count_inc += 1
+            candidate_outcome = {
+                "status": "failed",
+                "order_id": None,
+                "skip_reason": f"placement failed: {exc}",
+                "reviewed_order": reviewed_order,
+                "submitted_amount_usd": order_amount,
+            }
+            logger.error("Placement failed for %s: %s", ticker, exc)
+            return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+        state.record_buy(ticker, trading_day, order_amount)
+        if scheduled:
+            running_deployed_7d += order_amount
+        logger.info(
+            "Placed buy for %s: $%.2f, order_id=%s",
+            ticker,
+            order_amount,
+            order_id,
+        )
+        candidate_outcome = {
+            "status": "submitted",
+            "order_id": order_id,
+            "skip_reason": None,
+            "reviewed_order": reviewed_order,
+            "submitted_amount_usd": order_amount,
+        }
+
+    if run_result is not None:
+        _log_execution(run_result, decision, candidate_outcome.get("order_id"), broker, notional_usd=order_amount)
+
+    return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+
 def run_once(
     now: datetime,
     config: StrategyConfig,
@@ -2634,44 +2966,14 @@ def run_once(
     errors_count = 0
     order_reviews_attempted = 0
 
-    if trading_day not in config.approved_test_dates:
-        logger.warning("Date gate blocked execution for %s. No trades.", trading_day)
-        if artifacts_dir:
-            out = Path(artifacts_dir)
-            out.mkdir(parents=True, exist_ok=True)
-            state_path = out / "run_state.json"
-            # Never clobber a previously recorded run when a directory is reused;
-            # the stub only marks days that produced no artifact at all.
-            if not state_path.exists():
-                state_path.write_text(
-                    _serialize_run_state(
-                        {"trading_day": trading_day.isoformat(), "status": RUN_STATUS_BLOCKED}
-                    ),
-                    encoding="utf-8",
-                )
+    if not _check_execution_gates(trading_day, config, broker, artifacts_dir):
         return []
-
-    if broker.account_number() != config.target_account_number:
-        raise RuntimeError(
-            f"Refusing to trade account {broker.account_number()}; expected {config.target_account_number}"
-        )
 
     # Inject the trailing-7-day scheduled-live deployment from history so the
     # kill-switch in graded_buy_multiplier reflects real cash burn. Imported
     # lazily to avoid a circular import (dca_risk imports from this module).
     if deployment_history_root is not None:
-        from dca_risk import apply_risk_guard, deployed_by_day, find_run_state_files
-
-        prior_states = []
-        for path in find_run_state_files(deployment_history_root):
-            try:
-                with path.open(encoding="utf-8") as f:
-                    data = json.load(f)
-            except (ValueError, OSError):
-                continue
-            if isinstance(data, dict) and data.get("status") != RUN_STATUS_BLOCKED:
-                prior_states.append(data)
-        config = apply_risk_guard(config, deployed_by_day(prior_states), trading_day)
+        config = _apply_deployment_history(config, trading_day, deployment_history_root)
 
     decisions: List[ReconciledDecision] = []
     tradable_tickers = [ticker for ticker in config.tickers if ticker not in config.excluded_tickers]
@@ -2706,10 +3008,7 @@ def run_once(
     if run_result is not None:
         run_result.decisions = decisions
 
-    def _block(ticker: str, reason: str, message: str) -> None:
-        if run_result is not None:
-            run_result.loop_block_reasons[ticker] = reason
-        logger.info(message)
+
 
     buy_candidates = [decision for decision in decisions if decision.action == Action.BUY]
     # Higher multiplier -> larger drop -> ticker alphabetical (see allocation_sort_key).
@@ -2753,234 +3052,25 @@ def run_once(
     running_deployed_7d = config.deployed_last_7d_usd
 
     for decision in buy_candidates:
-        ticker = decision.ticker
-        order_amount = decision.suggested_amount_usd
-        # Only bypass the same-day duplicate-order checks below for a ticker whose
-        # prior allocation was actually loaded: if the guard is active but this
-        # ticker has no scanned prior allocation (missing/malformed artifact,
-        # boundary-excluded run, etc.), the broker/state duplicate checks must
-        # still apply so a real same-day order is never placed twice.
-        ticker_guarded = guard_active and prior_same_day_allocations.get(ticker) is not None
-
-        if kill_switch_engaged(replace(config, deployed_last_7d_usd=running_deployed_7d)):
-            order_amount = min(order_amount, config.base_buy_amount_usd)
-
-        if guard_active:
-            outcome = evaluate_top_up_guard(
-                decision, prior_same_day_allocations.get(ticker), config
-            )
-            top_up_outcomes[ticker] = outcome
-            # Cap the guard's incremental amount to what the kill-switch already
-            # reduced order_amount to: the guard must not reinstate a higher
-            # amount that the kill-switch just capped.
-            order_amount = min(outcome.incremental_order_amount, order_amount)
-            if outcome.skipped:
-                candidate_outcomes[ticker] = {
-                    "status": "skipped",
-                    "order_id": None,
-                    "skip_reason": outcome.top_up_guard_result,
-                }
-                if outcome.manual_review:
-                    logger.warning(
-                        "%s: prior same-day amount $%.2f but no comparable price; "
-                        "conservative $0 top-up, manual review required",
-                        ticker,
-                        outcome.prior_same_day_amount,
-                    )
-                _block(
-                    ticker,
-                    MISSING_FILL_TOP_UP_OFFSET,
-                    f"{ticker}: top-up guard offset ({outcome.top_up_guard_result}); no incremental buy",
-                )
-                continue
-
-        if not ticker_guarded and state.buys_today(ticker, trading_day) >= config.max_buys_per_ticker_per_day:
-            candidate_outcomes[ticker] = {"status": "skipped", "skip_reason": "already bought today"}
-            _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: already bought today; skipping")
-            continue
-        # Hard per-order ceiling is checked before any broker round-trip: an
-        # over-cap candidate should never need a same-day-duplicate lookup or a
-        # spread quote.
-        if order_amount > config.max_per_order_usd:
-            candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "max per-order ceiling exceeded", "deliberate_skip": True}
-            _block(
-                ticker,
-                MISSING_FILL_BUDGET_CAPPED,
-                f"{ticker}: order amount ${order_amount:.2f} exceeds max per-order "
-                f"${config.max_per_order_usd:.2f}; skipping",
-            )
-            continue
-        # A morning/manual run must NOT block the scheduled afternoon run: when the
-        # top-up guard has a loaded prior allocation for this ticker, the earlier
-        # same-day allocation is handled above, so the broker's same-day-order
-        # block is intentionally bypassed here.
-        if not ticker_guarded and broker.same_day_strategy_order_exists(ticker, trading_day):
-            candidate_outcomes[ticker] = {"status": "skipped", "skip_reason": "same-day broker order exists"}
-            _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: same-day broker order already exists; skipping")
-            continue
-        try:
-            spread_pct = quote_spread_pct(robinhood_data, ticker, now)
-        except Exception as exc:  # noqa: BLE001
-            errors_count += 1
-            candidate_outcomes[ticker] = {
-                "status": "blocked",
-                "skip_reason": f"spread quote error: {exc}",
-            }
-            _block(ticker, MISSING_FILL_DATA_ERROR, f"{ticker}: spread quote failed: {exc}; skipping")
-            continue
-        if spread_pct is None and scheduled:
-            # config/scheduled_tasks.json requires spread_ok=true before any
-            # scheduled live order: a provider without bid/ask support, or a
-            # quote lookup that returned nothing, must fail closed here
-            # rather than silently bypass the breaker. Manual runs still go
-            # through review_market_buy as a human-reviewed safety net, so
-            # they are not blocked on a missing spread alone.
-            candidate_outcomes[ticker] = {
-                "status": "blocked",
-                "skip_reason": "bid/ask spread unavailable; scheduled runs require spread_ok",
-                "deliberate_skip": True,
-            }
-            _block(
-                ticker,
-                MISSING_FILL_BROKER_BLOCKED,
-                f"{ticker}: bid/ask spread unavailable for scheduled run; skipping",
-            )
-            continue
-        if spread_pct is not None and spread_pct > config.max_bid_ask_spread_pct:
-            candidate_outcomes[ticker] = {
-                "status": "blocked",
-                "skip_reason": (
-                    f"bid/ask spread {spread_pct:.2f}% exceeds "
-                    f"{config.max_bid_ask_spread_pct:.2f}% limit"
-                ),
-                "deliberate_skip": True,
-            }
-            _block(
-                ticker,
-                MISSING_FILL_BROKER_BLOCKED,
-                f"{ticker}: bid/ask spread {spread_pct:.2f}% exceeds "
-                f"{config.max_bid_ask_spread_pct:.2f}% limit; skipping",
-            )
-            continue
-        if not within_caps(order_amount, state, trading_day, config):
-            candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "cap would be exceeded", "deliberate_skip": True}
-            _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: cap would be exceeded; skipping")
-            continue
-        if broker.available_buying_power() < order_amount:
-            candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "insufficient buying power", "deliberate_skip": True}
-            _block(ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: insufficient buying power; skipping")
-            continue
-        if not broker.is_tradable_for_fractional_buy(ticker):
-            candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": "not tradable for fractional buy", "deliberate_skip": True}
-            _block(ticker, MISSING_FILL_BROKER_BLOCKED, f"{ticker}: not tradable for fractional/notional buy; skipping")
-            continue
-
-        # Scheduled runs place directly per budgets.json policy (no pre-placement review).
-        # Manual runs still call review_market_buy before placing.
-        reviewed_order = None
-        if not scheduled:
-            order_reviews_attempted += 1
-            review_ok, review_reason = broker.review_market_buy(ticker, order_amount)
-            if not review_ok:
-                candidate_outcomes[ticker] = {"status": "blocked", "skip_reason": f"review blocked: {review_reason}", "deliberate_skip": True}
-                _block(ticker, MISSING_FILL_BROKER_BLOCKED, f"{ticker}: review blocked order: {review_reason}")
-                continue
-            reviewed_order = {
-                "notional_usd": round(order_amount, 2),
-                "side": "buy",
-                "order_type": "market",
-                "time_in_force": None,
-                "estimated_price": None,
-                "review_passed": True,
-            }
-
-        # A guarded top-up uses a "-topup" ref_id suffix to avoid colliding with
-        # the earlier same-day run's ref_id for the same (trading_day, ticker),
-        # preventing a broker treating ref_id as an idempotency key from silently
-        # resolving this placement to the earlier order. The suffix is stable
-        # across retries of this scheduled run, preserving retry idempotency.
-        ref_id = (
-            f"graded-dca-topup-{trading_day.isoformat()}-{ticker}"
-            if ticker_guarded
-            else f"graded-dca-{trading_day.isoformat()}-{ticker}"
+        c_outcome, t_outcome, running_deployed_7d, err_inc, rev_inc = _process_buy_candidate(
+            decision=decision,
+            config=config,
+            state=state,
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=guard_active,
+            prior_same_day_allocations=prior_same_day_allocations or {},
+            running_deployed_7d=running_deployed_7d,
+            scheduled=scheduled,
+            run_result=run_result,
         )
-        if config.dry_run:
-            logger.info(
-                "[DRY RUN] Would buy %s: $%.2f (%s)",
-                ticker,
-                order_amount,
-                decision.reason,
-            )
-            if isinstance(broker, DryRunBroker):
-                order_id = broker.place_market_buy(ticker, order_amount, ref_id=ref_id)
-            else:
-                order_id = f"DRY-RUN-SIM-{ticker}-{order_amount:.2f}-{ref_id}"
-            candidate_outcomes[ticker] = {
-                "status": "dry_run",
-                "order_id": order_id,
-                "skip_reason": "dry_run: order not placed",
-                "reviewed_order": reviewed_order,
-                "submitted_amount_usd": order_amount,
-            }
-        else:
-            try:
-                order_id = broker.place_market_buy(ticker, order_amount, ref_id=ref_id)
-            except OrderConfirmationRequiredError:
-                # Review passed but the broker requires additional post-review
-                # confirmation before it will submit -- not an error: no order
-                # was attempted, and this run remains valid scheduled-run
-                # evidence that it executed and passed review.
-                candidate_outcomes[ticker] = {
-                    "status": "not_submitted_confirmation_required",
-                    "order_id": None,
-                    "skip_reason": "broker requires post-review confirmation before submission",
-                    "reviewed_order": reviewed_order,
-                    "submitted_amount_usd": order_amount,
-                }
-                _block(
-                    ticker,
-                    MISSING_FILL_BROKER_BLOCKED,
-                    f"{ticker}: broker requires confirmation before submission; skipping",
-                )
-                continue
-            except Exception as exc:  # noqa: BLE001 - isolate one bad placement from the rest
-                # A failed placement (no order id, terminal/failed state, wrapper error) must
-                # not abort the whole run: earlier successful orders would then lose their
-                # durable run_state/orders.csv record. Record the failure and keep going so
-                # artifacts are always written and other candidates still get a chance.
-                errors_count += 1
-                candidate_outcomes[ticker] = {
-                    "status": "failed",
-                    "order_id": None,
-                    "skip_reason": f"placement failed: {exc}",
-                    "reviewed_order": reviewed_order,
-                    "submitted_amount_usd": order_amount,
-                }
-                logger.error("Placement failed for %s: %s", ticker, exc)
-                continue
-            state.record_buy(ticker, trading_day, order_amount)
-            if scheduled:
-                # Mirrors dca_risk.deployed_by_day(..., stream=STREAM_SCHEDULED),
-                # which excludes manual states: a manual run's own submissions
-                # must never advance the scheduled-live 7-day figure that later
-                # candidates (in this run or a future one) are capped against.
-                running_deployed_7d += order_amount
-            logger.info(
-                "Placed buy for %s: $%.2f, order_id=%s",
-                ticker,
-                order_amount,
-                order_id,
-            )
-            candidate_outcomes[ticker] = {
-                "status": "submitted",
-                "order_id": order_id,
-                "skip_reason": None,
-                "reviewed_order": reviewed_order,
-                "submitted_amount_usd": order_amount,
-            }
-
-        if run_result is not None:
-            _log_execution(run_result, decision, order_id, broker, notional_usd=order_amount)
+        candidate_outcomes[decision.ticker] = c_outcome
+        if t_outcome is not None:
+            top_up_outcomes[decision.ticker] = t_outcome
+        errors_count += err_inc
+        order_reviews_attempted += rev_inc
 
     # Reflect any in-batch kill-switch engagement in the config used to build
     # this run's artifacts, so the risk_guard audit block (and
@@ -3006,59 +3096,22 @@ def run_once(
         state.weekly_rollover_reserve_usd,
     )
 
-    if artifacts_dir is not None:
-        artifacts = build_run_artifacts(
-            now,
-            config,
-            state,
-            decisions,
-            candidate_outcomes,
-            order_reviews_attempted=order_reviews_attempted,
-            errors_count=errors_count,
-            notifications_sent=notifications_sent,
-            cost_control_notes=cost_control_notes,
-            top_up_outcomes=top_up_outcomes if guard_active else None,
-            manual=not scheduled,
-            raw_persistence_state=raw_persistence_state,
-        )
-        paths = write_run_artifacts(artifacts, artifacts_dir)
-        logger.info("Wrote run artifacts: %s", paths["run_state"])
-
-        if scheduled and classification_state_root is not None:
-            # Update the latest_scheduled_run.json pointer that reporting/the
-            # watchdog rely on to find the scheduled run -- without this, a
-            # correctly-classified run_state is still invisible to them. Reuse
-            # write_run_artifacts' own directory (rather than recomputing one
-            # from classification_state_root) so this never creates a second
-            # copy of run_state.json in a different location.
-            #
-            # Gated on an explicit classification_state_root (mirroring the
-            # deployment_history_root pattern used elsewhere in this module)
-            # rather than defaulting to scripts.run_classification's own
-            # production STATE_ROOT: a caller that doesn't pass one (including
-            # every existing test that predates this feature) must never
-            # silently write to a real absolute filesystem path.
-            try:
-                from scripts.run_classification import (
-                    update_latest_scheduled_run_pointer,
-                    validate_classification,
-                )
-            except ImportError:
-                from run_classification import (
-                    update_latest_scheduled_run_pointer,
-                    validate_classification,
-                )
-            rc = artifacts.get("run_classification")
-            result = validate_classification(rc if isinstance(rc, dict) else {})
-            if result:
-                update_latest_scheduled_run_pointer(
-                    artifacts, paths["run_state"], classification_state_root
-                )
-            else:
-                logger.error(
-                    "Not updating latest_scheduled_run.json: invalid run_classification (%s)",
-                    "; ".join(result.errors),
-                )
+    _finalize_and_write_artifacts(
+        now=now,
+        config=config,
+        state=state,
+        decisions=decisions,
+        candidate_outcomes=candidate_outcomes,
+        order_reviews_attempted=order_reviews_attempted,
+        errors_count=errors_count,
+        notifications_sent=notifications_sent,
+        cost_control_notes=cost_control_notes,
+        top_up_outcomes=top_up_outcomes if guard_active else None,
+        scheduled=scheduled,
+        artifacts_dir=artifacts_dir,
+        classification_state_root=classification_state_root,
+        raw_persistence_state=raw_persistence_state,
+    )
 
     return decisions
 
