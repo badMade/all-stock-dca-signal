@@ -459,6 +459,44 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 > pre-authorization, confidence, recovery, and all other safety rules are
 > unchanged.
 
+> **Missed 10:30 morning run recovery (added Jul 20 2026):** when the scheduled
+> **10:30 AM ET morning live task did not run**, a human-triggered **manual
+> recovery** may place the missed morning buys by hand and write artifacts under
+> a dedicated manual-recovery path:
+> `/home/user/workspace/cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*`
+> (example: `.../manual_recovery/20260720_1048ET` for the Jul 20 2026 missed
+> morning run). These artifacts are valid **prior-allocation / same-day top-up
+> context only** when `run_origin='manual'`, `manual_run=true`,
+> `same_day_top_up_context_only=true`, and `valid_scheduled_evidence=false` all
+> hold. They **never** count as proof that the 10:30 scheduled task ran, are
+> **never** written into the midday or afternoon scheduled evidence stream, and
+> are **never** used for scheduled reliability, scheduled fill counts, scheduled
+> slippage, scheduled cost basis, or watchdog confirmation. They may **only**
+> reduce or block additional buys through the same-day top-up rule: a later run
+> buys `max(0, desired - prior)` and only if the later decision price is
+> **strictly below** the prior reference price. The **12:30 midday** run
+> (`a6239dae`) and the **3:20 final** run (`10ce362c`) **must scan** this path for
+> same-day manual recovery artifacts and fold them into the top-up guard as prior
+> allocation. Machine-readable source:
+> [`config/scheduled_tasks.json`](../config/scheduled_tasks.json) →
+> `missed_morning_run_recovery_policy` (and
+> `config/morning_dca.json:manual_missed_run_recovery`,
+> `config/run_classification.json:manual_missed_morning_recovery`). See
+> [run_classification.md](run_classification.md) and [strategy.md](strategy.md#same-day-prior-run-offset--top-up-guard).
+
+> **Market-data source policy:** the **Finance connector is the primary**
+> market-data source. **Alpaca and Robinhood** provide validation / context.
+> **Yahoo Finance through yfinance is a fallback only**, used when connector data
+> is **unavailable, stale, incomplete, or unresolved**. Fallback data must be
+> **labeled as fallback** and must **not weaken** confidence, spread, trend,
+> top-up, budget, whitelist, buy-only, regular-hours-only, or any safety rule.
+> **Robinhood remains the only execution broker.** **GFUZ** may use Robinhood as
+> its primary source when Finance cannot resolve it. Machine-readable source:
+> [`config/scheduled_tasks.json`](../config/scheduled_tasks.json) →
+> `market_data_source_policy` (mirrored in
+> `config/budgets.json:market_data_source_policy`). See
+> [safeguards.md](safeguards.md).
+
 | ID | Name | Type | Trades | Cron (UTC) | ET (EDT) | Status |
 |---|---|---|---|---|---|---|
 | `b7961407` | Pre-market DCA buying-power dashboard | analytics | no | `00 13 * * 1-5` | 9:00 AM weekdays | active |

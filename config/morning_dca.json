@@ -117,6 +117,27 @@
     "run_state_fields": ["recovery_rerun", "recovery_reason", "recovery_attempts"],
     "implementation_status": "NOT YET IMPLEMENTED in MorningDCAExecutor (morning_dca.py) as of 2026-07-18, same Codex finding as raw_data_persistence.implementation_status above -- there is no recovery-rerun code path in morning_dca.py's run(), so recovery_rerun/recovery_reason/recovery_attempts are never populated on any morning artifact."
   },
+  "manual_missed_run_recovery": {
+    "added": "2026-07-20",
+    "summary": "When the scheduled 10:30 AM live morning task did not run (missed scheduled fire), a human-triggered manual recovery may place the missed morning buys by hand. These MANUAL missed-morning recovery artifacts are written under a dedicated manual_recovery/ path and are prior-allocation / same-day top-up context ONLY. They are NEVER proof that the 10:30 scheduled task ran and NEVER scheduled evidence.",
+    "artifact_path_pattern": "/home/user/workspace/cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*",
+    "example_artifact": "/home/user/workspace/cron_tracking/morning_dca/manual_recovery/20260720_1048ET",
+    "example_note": "Jul 20 2026 manual missed-morning recovery: the 10:30 scheduled morning live task did not run, so a manual recovery ran at 10:48 AM ET and wrote artifacts under manual_recovery/20260720_1048ET.",
+    "required_classification": {
+      "run_origin": "manual",
+      "manual_run": true,
+      "same_day_top_up_context_only": true,
+      "valid_scheduled_evidence": false
+    },
+    "rules": [
+      "Valid as prior-allocation / same-day top-up context ONLY when run_origin='manual', manual_run=true, same_day_top_up_context_only=true, and valid_scheduled_evidence=false all hold.",
+      "MUST NEVER count as proof that the 10:30 scheduled task ran.",
+      "MUST NEVER be written into the midday or afternoon scheduled evidence stream.",
+      "MUST NEVER be used for scheduled reliability, scheduled fill counts, scheduled slippage, scheduled cost basis, or watchdog confirmation.",
+      "MAY ONLY reduce or block additional buys through the same-day top-up rule: a later run buys max(0, desired - prior) and only if the later decision price is strictly below the prior reference price.",
+      "The 12:30 midday run and the 3:20 final run MUST scan manual_recovery/YYYYMMDD_* for same-day manual recovery artifacts and fold them into the top-up guard as prior allocation."
+    ]
+  },
   "artifacts": {
     "run_dir": "/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/",
     "always_write": ["run_state.json", "morning_signals.csv"],
@@ -178,8 +199,12 @@
     "preflight_artifact_filenames": ["run_state.json", "validation.csv", "signals.csv", "run_summary.json"],
     "prior_allocation_roots": [
       "/home/user/workspace/cron_tracking/morning_dca/manual_runs",
+      "/home/user/workspace/cron_tracking/morning_dca/manual_recovery",
       "/home/user/workspace/cron_tracking/ce16ba6b"
     ],
+    "manual_recovery_root": "/home/user/workspace/cron_tracking/morning_dca/manual_recovery",
+    "manual_recovery_run_dir_glob": "/home/user/workspace/cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*",
+    "manual_recovery_note": "manual_recovery/YYYYMMDD_* holds MANUAL missed-morning 10:30 recovery artifacts (run_origin='manual', manual_run=true, same_day_top_up_context_only=true, valid_scheduled_evidence=false). See manual_missed_run_recovery. They are same-day prior-allocation / top-up context only for the later midday (12:30) and afternoon (3:20) runs; they are never scheduled evidence and never prove the 10:30 scheduled task ran.",
     "cap_seed_roots": [
       "/home/user/workspace/cron_tracking/morning_dca"
     ],

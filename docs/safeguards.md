@@ -14,6 +14,28 @@ should skip rather than trade. Machine-readable copies live in
   account context only; never execution — unless the user explicitly changes this
   later.
 
+## Market-data source policy
+
+- The **Finance connector is the PRIMARY market-data source** for quotes, prior
+  closes, spreads, and trend inputs.
+- **Alpaca and Robinhood provide validation / context** on top of the primary
+  source.
+- **Yahoo Finance via `yfinance` is a FALLBACK ONLY**, used when the Finance
+  connector data is unavailable, stale, incomplete, or unresolved. Fallback data
+  **must be labeled as fallback** and must **not** weaken confidence, spread,
+  trend, top-up, budget, whitelist, buy-only, regular-hours-only, or any other
+  safety rule.
+- **Robinhood remains the only execution broker** regardless of which source
+  produced the market data.
+- **GFUZ exception:** GFUZ may use **Robinhood as its PRIMARY** source when the
+  Finance connector cannot resolve it (see
+  `config/tickers.json:special_handling.GFUZ` and
+  [morning_dca.md](morning_dca.md#gfuz-special-handling)).
+
+See the `market_data_source_policy` block in
+[`config/budgets.json`](../config/budgets.json) and
+[`config/scheduled_tasks.json`](../config/scheduled_tasks.json).
+
 ## Trading constraints
 
 - **No sells.** Buys only.
@@ -130,6 +152,17 @@ on the day's planned spend and the count of 3x-or-greater signals (multiplier
   path. See the `failure_recovery_policy` block in
   [`config/scheduled_tasks.json`](../config/scheduled_tasks.json) and
   [run_classification.md](run_classification.md#recovery-reruns).
+- **Manual missed-morning recovery (added Jul 20 2026):** if the **10:30 AM
+  scheduled live morning task did not run at all**, a human may place the missed
+  morning buys by hand under
+  `.../cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*` (example
+  `20260720_1048ET`). These artifacts are **manual** (`run_origin='manual'`,
+  `manual_run=true`, `same_day_top_up_context_only=true`,
+  `valid_scheduled_evidence=false`): prior-allocation / same-day top-up context
+  **only**, never proof the 10:30 scheduled task ran and never scheduled
+  evidence. The **12:30 midday** and **3:20 final** runs must scan this path and
+  fold any same-day recovery fills into the top-up guard as prior allocation. See
+  [run_classification.md](run_classification.md#manual-missed-morning-recovery-added-2026-07-20).
 - **Afternoon completion rule:** all afternoon **trading and artifact-writing**
   tasks complete **no later than 3:40 PM ET**, when the read-only watchdog
   (`a46bf007`) begins its final verification. The watchdog's own post-3:40 PM

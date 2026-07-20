@@ -173,6 +173,35 @@ rejection occurs, the task writes `run_state.json` with the blocking reason and
 > `recovery_attempts` are never populated on any morning artifact. See
 > `config/morning_dca.json`'s `automatic_failure_recovery.implementation_status`.
 
+### Manual missed-run recovery (added Jul 20 2026)
+
+Separate from the *automatic* (scheduled, in-process) failure recovery above,
+this covers the case where the **10:30 AM scheduled live task did not run at
+all** (a missed scheduled fire). A human may then trigger a **manual** recovery
+that places the missed morning buys by hand. These manual artifacts are written
+under a dedicated path:
+
+- Pattern: `/home/user/workspace/cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*`
+- Example: `/home/user/workspace/cron_tracking/morning_dca/manual_recovery/20260720_1048ET`
+  (Jul 20 2026: the 10:30 scheduled morning live task did not run, so a manual
+  recovery ran at 10:48 AM ET.)
+
+Every such artifact carries `run_origin='manual'`, `manual_run=true`,
+`same_day_top_up_context_only=true`, and `valid_scheduled_evidence=false`. Under
+those flags it is valid **only as prior-allocation / same-day top-up context**.
+It **never** counts as proof the 10:30 scheduled task ran, is **never** written
+into the midday or afternoon scheduled evidence stream, and is **never** used for
+scheduled reliability, scheduled fill counts, scheduled slippage, scheduled cost
+basis, or watchdog confirmation. It may only **reduce or block** additional buys
+through the same-day top-up rule: a later run buys `max(0, desired - prior)` and
+only if the later decision price is **strictly below** the prior reference price.
+
+The **12:30 midday** (`a6239dae`) and **3:20 final** (`10ce362c`) runs **must
+scan** `manual_recovery/YYYYMMDD_*` for same-day manual recovery artifacts and
+fold them into the top-up guard as prior allocation. See
+`config/morning_dca.json`'s `manual_missed_run_recovery` and
+[run_classification.md](run_classification.md).
+
 ### Hard circuit breakers
 
 Every scheduled live order is subject to hard circuit breakers that **skip**

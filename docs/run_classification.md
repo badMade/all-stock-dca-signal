@@ -343,6 +343,38 @@ does **not** reclassify anything:
   valid scheduled run_state; the watchdog treats it as a completed scheduled run,
   not a discrepancy.
 
+## Manual missed-morning recovery (added 2026-07-20)
+
+Distinct from the **automatic** recovery reruns below (which stay *scheduled*),
+this covers the case where the **10:30 AM scheduled live morning task did not run
+at all** and a human places the missed morning buys **by hand**. Such a recovery
+is **manual by contract** and is written under a dedicated path:
+
+- Pattern: `/home/user/workspace/cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*`
+- Example: `/home/user/workspace/cron_tracking/morning_dca/manual_recovery/20260720_1048ET`
+  (Jul 20 2026: the 10:30 scheduled morning live task did not run, so a manual
+  recovery ran at 10:48 AM ET.)
+
+Every such artifact carries `run_origin='manual'`, `manual_run=true`,
+`same_day_top_up_context_only=true`, and `valid_scheduled_evidence=false`. Under
+those flags:
+
+- It is valid **only** as prior-allocation / same-day top-up context.
+- It **never** counts as proof the 10:30 scheduled task ran.
+- It is **never** written into the midday or afternoon scheduled evidence stream.
+- It is **never** used for scheduled reliability, scheduled fill counts,
+  scheduled slippage, scheduled cost basis, or watchdog confirmation.
+- It may **only** reduce or block additional buys through the same-day top-up
+  rule: a later run buys `max(0, desired - prior)` and only if the later decision
+  price is **strictly below** the prior reference price.
+
+The **12:30 midday** (`a6239dae`) and **3:20 final** (`10ce362c`) runs **must
+scan** this path for same-day manual recovery artifacts and fold them into the
+top-up guard as prior allocation. The path is also part of the manual exclusion
+roots (rule 2 above), so its order IDs are excluded from all scheduled-live
+metrics. See the `manual_missed_morning_recovery` block in
+[`../config/run_classification.json`](../config/run_classification.json).
+
 ## Recovery reruns
 
 The three scheduled **live** tasks — morning (`42173154`), midday (`a6239dae`),

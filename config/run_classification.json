@@ -202,7 +202,8 @@
       "Never infer scheduled status from same-day broker orders alone; a valid scheduled run_state must exist.",
       "Scheduled-live cost basis, slippage, reliability, and order-count metrics must be computed only from validated scheduled runs with manual order IDs excluded.",
       "A scheduled run_state with order_submit_status='not_submitted_confirmation_required' is valid scheduled-run evidence that the task ran but is NOT evidence of an order/fill: it contributes zero scheduled fills/order IDs and must not be marked invalid because confirmation blocked submission.",
-      "Exclude final manual buy overrides (run_type='final_manual_buy_override', valid_afternoon_scheduled_evidence=false, same_day_top_up_context_only=true) from scheduled slippage, scheduled fills, scheduled reliability, scheduled cost basis, and watchdog confirmation. Show them only in a labeled Manual Final Buy Override / Same-Day Top-Up Context section (see manual_reporting)."
+      "Exclude final manual buy overrides (run_type='final_manual_buy_override', valid_afternoon_scheduled_evidence=false, same_day_top_up_context_only=true) from scheduled slippage, scheduled fills, scheduled reliability, scheduled cost basis, and watchdog confirmation. Show them only in a labeled Manual Final Buy Override / Same-Day Top-Up Context section (see manual_reporting).",
+      "Exclude manual missed-morning recovery artifacts (under morning_dca/manual_recovery/**, run_origin='manual', manual_run=true, same_day_top_up_context_only=true, valid_scheduled_evidence=false) from scheduled slippage, scheduled fills, scheduled reliability, scheduled cost basis, and watchdog confirmation. They never prove the 10:30 scheduled task ran and are used only as same-day prior-allocation / top-up context (see manual_missed_morning_recovery)."
     ],
     "manual_exclusion_roots": {
       "reason": "The 2026-07-13 final manual buy override backfilled live artifacts under midday_dca/manual_reruns/final_manual_override_* and a final_manual_review/** tree, both OUTSIDE the ce16ba6b task root. Slippage/watchdog/reporting must scan these as manual exclusions so their order IDs never leak into scheduled-live metrics.",
@@ -211,7 +212,8 @@
         "/home/user/workspace/cron_tracking/ce16ba6b/manual_runs/final_manual_override_*",
         "/home/user/workspace/cron_tracking/final_manual_review/**",
         "/home/user/workspace/cron_tracking/midday_dca/manual_reruns/**",
-        "/home/user/workspace/cron_tracking/midday_dca/manual_reruns/final_manual_override_*"
+        "/home/user/workspace/cron_tracking/midday_dca/manual_reruns/final_manual_override_*",
+        "/home/user/workspace/cron_tracking/morning_dca/manual_recovery/**"
       ],
       "helper": "scripts/run_classification.py:manual_exclusion_roots / collect_manual_order_ids"
     }
@@ -262,6 +264,26 @@
     ],
     "watchdog_context": "The 3:40 PM watchdog alerted because broker history had orders after 3:15 PM ET but no manual-run artifacts were present under the paths it scanned. Live artifacts were backfilled with run_origin='manual', manual_run=true, run_type='final_manual_buy_override', valid_afternoon_scheduled_evidence=false, same_day_top_up_context_only=true, and all order IDs.",
     "note": "These are manual final-buy overrides and same-day top-up context only; NOT scheduled-afternoon execution evidence. Excluded from scheduled slippage, scheduled fills, scheduled reliability, scheduled cost basis, and watchdog confirmation."
+  },
+  "manual_missed_morning_recovery": {
+    "added": "2026-07-20",
+    "run_origin": "manual",
+    "manual_run": true,
+    "flags": {
+      "same_day_top_up_context_only": true,
+      "valid_scheduled_evidence": false
+    },
+    "summary": "A MANUAL missed-morning recovery is a by-hand placement of the morning buys after the scheduled 10:30 AM live morning task did not run. It is manual by contract: excluded from every scheduled metric and used only as prior-allocation context for the same-day top-up guard. It is NEVER proof that the 10:30 scheduled task ran and NEVER scheduled evidence.",
+    "artifact_path_pattern": "/home/user/workspace/cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*",
+    "example_artifact": "/home/user/workspace/cron_tracking/morning_dca/manual_recovery/20260720_1048ET",
+    "rules": [
+      "Valid prior-allocation / top-up context ONLY when run_origin='manual', manual_run=true, same_day_top_up_context_only=true, and valid_scheduled_evidence=false.",
+      "Never counts as proof the 10:30 scheduled task ran.",
+      "Never written into the midday or afternoon scheduled evidence stream.",
+      "Never used for scheduled reliability, scheduled fill counts, scheduled slippage, scheduled cost basis, or watchdog confirmation.",
+      "May only reduce or block additional buys through the same-day top-up rule: buy max(0, desired - prior) only if the later decision price is strictly below the prior reference price.",
+      "The 12:30 midday run and the 3:20 final run must scan the artifact_path_pattern for same-day manual recovery artifacts and fold them into the top-up guard."
+    ]
   },
   "slippage_reporting": {
     "task_id": "67aa802b",

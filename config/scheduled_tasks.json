@@ -150,8 +150,9 @@
     "summary": "One same-day top-up guard governs the morning (10:30), midday (12:30), and afternoon (3:20) live streams AND manual override same-day fills. Each later run buys only the incremental difference max(0, desired_amount - prior_same_day_amount), and only when its current decision price is strictly below the prior same-day reference price; otherwise it buys $0.",
     "reference_price_preference": "The prior same-day reference price is resolved in order: logged target_price, then decision_price, then average_fill_price (from orders.csv or a manual override's filled_orders.csv). A missing reference price (none available) means NO automatic top-up: the candidate is classified execution_status='manual_review_candidate' (top_up_manual_review=true) at $0.",
     "prior_allocation_chain": [
-      "Midday (12:30) folds in morning-live and manual same-day fills as prior context.",
-      "Afternoon (3:20) folds in morning-live, midday-live, and manual override reruns as prior context (scans /home/user/workspace/cron_tracking/morning_dca and /home/user/workspace/cron_tracking/midday_dca in addition to its own ce16ba6b task root).",
+      "Midday (12:30) folds in morning-live, manual same-day fills, AND manual missed-morning recovery artifacts (morning_dca/manual_recovery/YYYYMMDD_*) as prior context.",
+      "Afternoon (3:20) folds in morning-live, midday-live, manual override reruns, AND manual missed-morning recovery artifacts as prior context (scans /home/user/workspace/cron_tracking/morning_dca including morning_dca/manual_recovery and /home/user/workspace/cron_tracking/midday_dca in addition to its own ce16ba6b task root).",
+      "Both the 12:30 midday run and the 3:20 final run MUST scan /home/user/workspace/cron_tracking/morning_dca/manual_recovery/YYYYMMDD_* for same-day manual missed-morning 10:30 recovery artifacts and fold them into the top-up guard.",
       "Only scheduled AFTERNOON runs are excluded from prior context; morning/midday-stream scheduled runs remain eligible."
     ],
     "streams_covered": ["morning", "midday", "manual", "final_override"],
@@ -170,6 +171,44 @@
       "tickers": ["DFTX", "TRIN", "SPCX", "LUNR", "IRDM", "DXYZ", "LITE", "ASML", "DRAM", "STX", "AMAT", "AMD", "CBRS", "MRVL", "BTX", "STM", "SNDK", "WDC", "TSM", "AVGO", "NVDA", "QBTS", "FLKR", "INTC", "GOOGL", "GOOG", "GLW", "GS", "MU", "XLG", "TOPT", "QTOP", "SATA", "RGTI"],
       "note": "Manual final-buy overrides and same-day top-up context only; NOT scheduled-afternoon execution evidence. Backfilled under ce16ba6b/manual_runs/final_manual_override_20260713_1536ET/ and midday_dca/manual_reruns/final_manual_override_20260713_1536ET/ with run_type='final_manual_buy_override', valid_afternoon_scheduled_evidence=false, same_day_top_up_context_only=true."
     }
+  },
+  "missed_morning_run_recovery_policy": {
+    "added": "2026-07-20",
+    "summary": "Handling for a MISSED 10:30 AM scheduled morning live run. When the scheduled 10:30 morning task did not fire, a human-triggered manual recovery may place the missed morning buys by hand and write artifacts under a dedicated manual_recovery/ path. These artifacts are same-day prior-allocation / top-up context ONLY and are never scheduled evidence.",
+    "artifact_path_pattern": "/home/user/workspace/cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*",
+    "example_artifact": "/home/user/workspace/cron_tracking/morning_dca/manual_recovery/20260720_1048ET",
+    "example_note": "Jul 20 2026: the scheduled 10:30 morning live task did not run; a manual recovery ran at 10:48 AM ET and wrote artifacts under manual_recovery/20260720_1048ET.",
+    "required_classification": {
+      "run_origin": "manual",
+      "manual_run": true,
+      "same_day_top_up_context_only": true,
+      "valid_scheduled_evidence": false
+    },
+    "scanned_by": ["a6239dae", "10ce362c"],
+    "rules": [
+      "Valid prior-allocation / same-day top-up context ONLY when run_origin='manual', manual_run=true, same_day_top_up_context_only=true, and valid_scheduled_evidence=false all hold.",
+      "MUST NEVER count as proof that the 10:30 scheduled task ran.",
+      "MUST NEVER be written into the midday (a6239dae) or afternoon (10ce362c) scheduled evidence stream.",
+      "MUST NEVER be used for scheduled reliability, scheduled fill counts, scheduled slippage, scheduled cost basis, or watchdog confirmation.",
+      "MAY ONLY reduce or block additional buys through the same-day top-up rule: a later run buys max(0, desired - prior) and only if the later decision price is strictly below the prior reference price.",
+      "The 12:30 midday run (a6239dae) and the 3:20 final run (10ce362c) MUST scan the artifact_path_pattern for same-day manual recovery artifacts and fold them into the top-up guard as prior allocation.",
+      "Order IDs found under morning_dca/manual_recovery/** are collected as excluded_manual_order_ids (see run_classification_policy manual_exclusion_roots)."
+    ],
+    "doc": "docs/schedule_manifest.md"
+  },
+  "market_data_source_policy": {
+    "added": "2026-07-20",
+    "summary": "Market-data source precedence for all universe-bearing tasks. The Finance connector is the PRIMARY market-data source. Alpaca and Robinhood provide validation / context. Yahoo Finance via yfinance is a FALLBACK ONLY, used when connector data is unavailable, stale, incomplete, or unresolved. Robinhood remains the only execution broker.",
+    "primary_source": "finance",
+    "validation_context_sources": ["alpaca", "robinhood"],
+    "fallback_source": {
+      "name": "yahoo_finance_yfinance",
+      "when": "Use Yahoo Finance through yfinance ONLY when the Finance connector data is unavailable, stale, incomplete, or unresolved.",
+      "labeling": "Fallback data must be labeled as fallback and must NOT weaken confidence, spread, trend, top-up, budget, whitelist, buy-only, regular-hours-only, or any safety rule."
+    },
+    "gfuz_exception": "GFUZ may use Robinhood as its PRIMARY source when the Finance connector cannot resolve it (see config/tickers.json:special_handling.GFUZ and config/morning_dca.json:gfuz_special_handling).",
+    "execution_broker": "Robinhood is the ONLY execution broker; Alpaca/Finance/Yahoo remain read-only validation/context and never place orders.",
+    "doc": "docs/safeguards.md"
   },
   "scheduled_run_outcomes": {
     "summary": "Dated machine-readable ledger of afternoon scheduled live-run outcomes for task 10ce362c (supersedes ce16ba6b). Scheduled evidence only; manual/override order IDs are excluded from every scheduled metric. See config/run_classification.json for the full per-run records and docs/schedule_manifest.md for the human-readable notes.",
@@ -617,6 +656,10 @@
       "executor_mode": "live",
       "config_file": "config/midday_dca.json",
       "state_dir": "/home/user/workspace/cron_tracking/midday_dca",
+      "scans_missed_morning_recovery": {
+        "path_pattern": "/home/user/workspace/cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*",
+        "purpose": "The 12:30 midday run scans same-day manual missed-morning 10:30 recovery artifacts (run_origin='manual', manual_run=true, same_day_top_up_context_only=true, valid_scheduled_evidence=false) and folds them into the top-up guard as prior allocation only. They are never midday scheduled evidence, never prove the 10:30 scheduled task ran, and never counted in scheduled reliability, fill counts, slippage, cost basis, or watchdog confirmation. See missed_morning_run_recovery_policy."
+      },
       "post_artifact_drift_check": {
         "enabled": true,
         "detector": "scripts/drift_detection.py",
@@ -701,6 +744,10 @@
       "trigger_gate": "programmatic_trigger_check.sh",
       "trigger_window": "Weekdays 2026-07-02 through 2026-08-28, 3:20-3:35 PM ET (aligned to the 15:15-15:35 ET scheduled classification window so a late-but-permitted start cannot place buys after the 3:35 PM post-trade sync or outside the attributable window).",
       "state_dir": "/home/user/workspace/cron_tracking/ce16ba6b",
+      "scans_missed_morning_recovery": {
+        "path_pattern": "/home/user/workspace/cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*",
+        "purpose": "The 3:20 final run scans same-day manual missed-morning 10:30 recovery artifacts (run_origin='manual', manual_run=true, same_day_top_up_context_only=true, valid_scheduled_evidence=false) and folds them into the same-day top-up guard as prior allocation only. They are never afternoon scheduled evidence, never prove the 10:30 scheduled task ran, and never counted in scheduled reliability, fill counts, slippage, cost basis, or watchdog confirmation. See missed_morning_run_recovery_policy."
+      },
       "post_artifact_drift_check": {
         "enabled": true,
         "detector": "scripts/drift_detection.py",

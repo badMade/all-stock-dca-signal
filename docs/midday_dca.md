@@ -59,9 +59,22 @@ order: the run's logged `target_price`, then `decision_price`, then the confirme
 
 Only earlier runs generated **before 2:30 PM ET** contribute; scheduled afternoon
 runs are excluded as prior context. Prior allocations are scanned across
-`prior_allocation_roots` (default the morning-live root); when a ticker appears in
-more than one root the amounts are summed and the lowest reference price wins, so
-midday must beat the best earlier entry before it tops up.
+`prior_allocation_roots` (the morning-live root **and** the manual missed-morning
+recovery root `.../cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*`); when a
+ticker appears in more than one root the amounts are summed and the lowest
+reference price wins, so midday must beat the best earlier entry before it tops
+up.
+
+**Missed 10:30 morning run recovery (added Jul 20 2026).** When the 10:30
+scheduled morning live task did not run and a **manual** recovery placed the
+missed buys under `.../cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*`
+(e.g. `20260720_1048ET`), the 12:30 midday run **scans that path** and folds any
+same-day manual recovery fills into this top-up guard as prior allocation. Those
+manual artifacts (`run_origin='manual'`, `manual_run=true`,
+`same_day_top_up_context_only=true`, `valid_scheduled_evidence=false`) are
+prior-allocation / top-up context **only** — never proof the 10:30 scheduled task
+ran and never midday scheduled evidence. See
+[morning_dca.md](morning_dca.md#manual-missed-run-recovery-added-jul-20-2026).
 
 Per-candidate the run_state records `prior_same_day_amount`,
 `prior_same_day_reference_price`, `prior_same_day_run_id`/`prior_same_day_source`,
