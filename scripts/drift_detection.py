@@ -84,7 +84,6 @@ DESIRED_COLUMNS = (
     "hypothetical_amount_usd",
     "planned_amount_usd",
     "suggested_amount_usd",         # afternoon near_close_dca _signal_row()
-    "hypothetical_amount_usd",      # morning stream MorningSignal.to_row() fallback
 )
 TOP_UP_GUARD_COLUMNS = ("top_up_guard_result", "top_up_result", "skip_reason")
 BLOCK_REASON_COLUMNS = ("block_reason", "loop_block_reason", "reason")

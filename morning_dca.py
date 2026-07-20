@@ -2797,10 +2797,14 @@ class MorningDCAExecutor(DCAExecutor):
         else:
             # No broker in live mode: nothing was submitted, so record nothing in
             # the ledger. A phantom hypothetical amount would inflate the cap and
-            # block cap-seeding's later pickup of a real external fill.
-            # Watchlist/preflight modes always reach this branch and still need
-            # hypothetical spend recorded for cap/budget reporting.
-            candidates_to_record = [] if self.mode == MORNING_LIVE_MODE else auto_buy_candidates
+            # block cap-seeding's later pickup of a real external fill. Scoped to
+            # the morning stream specifically: MIDDAY_LIVE_MODE == MORNING_LIVE_MODE
+            # == "live", so mode alone can't tell the midday executor apart, and it
+            # still needs hypothetical spend recorded for its own cap/budget
+            # reporting. Watchlist/preflight modes always reach this branch and
+            # still need hypothetical spend recorded for cap/budget reporting.
+            morning_live_no_broker = self.mode == MORNING_LIVE_MODE and self.stream == MORNING_STREAM
+            candidates_to_record = [] if morning_live_no_broker else auto_buy_candidates
             self.record_buy_candidates(trading_day, candidates_to_record, top_up_outcomes, _track_own=None)
         artifacts = self.build_artifacts(now, signals, source, manual=manual, top_up_outcomes=top_up_outcomes, broker_outcomes=broker_outcomes)
         if broker_outcomes is not None:

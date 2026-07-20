@@ -2362,6 +2362,37 @@ def test_live_gate_manual_bypasses_approved_window(tmp_path):
     assert res["artifacts"].get("status") != "blocked"
 
 
+def test_morning_live_no_broker_does_not_record_hypothetical_ledger_spend(tmp_path):
+    # Copilot review: no regression test covered the no-broker live-mode path
+    # this fix introduced. broker=None means no orders were actually placed
+    # (broker_outcomes stays None), so record_buy_candidates() must be skipped
+    # entirely for the morning live stream -- the ledger must stay at $0
+    # despite SMALL's real hypothetical $7.50 signal, so a later broker-backed
+    # retry sees the FULL cap available rather than being pre-charged for
+    # spend that never happened.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),  # matches _now_live()
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    # DecliningBarsProvider (not FixedDropProvider): the fix's target code path
+    # is only reached when SMALL clears trend validation into auto_buy_candidates
+    # (hypothetical_amount_usd > 0); FixedDropProvider's flat intraday bars fail
+    # trend validation, routing SMALL to manual_review_candidate instead, which
+    # would make this test pass vacuously regardless of the fix.
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data, manual=True, broker=None)
+    assert res["artifacts"].get("status") != "blocked"
+    sm = res["artifacts"]["buy_candidates"][0]
+    assert sm["hypothetical_amount_usd"] == 7.5  # confirms this exercises the fix's target path
+    trading_day = _now_live().astimezone(EASTERN).date()
+    assert ex.ledger.day_planned(trading_day) == 0.0
+    assert ex.ledger.week_planned(trading_day) == 0.0
+
+
 def test_scheduled_live_run_without_broker_fails_closed(tmp_path):
     pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(

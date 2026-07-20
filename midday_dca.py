@@ -336,8 +336,9 @@ class MiddayDCAExecutor(MorningDCAExecutor):
                     if ticker in by_ticker:
                         by_ticker[ticker].update(row)
                     else:
-                        manual_rows.append(row)
-                        by_ticker[ticker] = row
+                        new_row = dict(row)
+                        manual_rows.append(new_row)
+                        by_ticker[ticker] = new_row
                 artifacts["manual_review_candidates"] = manual_rows
 
 
