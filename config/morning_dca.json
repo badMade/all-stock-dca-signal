@@ -161,11 +161,10 @@
       "bounded_recovery": "If raw input generation fails once, perform ONE bounded recovery attempt with the alternate approved data source path, then stop.",
       "see": "config/scheduled_tasks.json:live_schedule_hardening_2026_07_20.morning_1030"
     },
-    "state_file_guarantee": {
-      "summary": "The 10:30 scheduled run MUST always write run_state.json, run_summary.json, and latest_morning_run.json even when execution is blocked or no orders are placed.",
-      "always_write": [
+    "always_write": [
         "/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/run_state.json",
-        "/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/run_summary.json",
+        "/home/user/workspace/cron_tracking/morning_dca/latest_morning_run.json"
+      ],
         "/home/user/workspace/cron_tracking/morning_dca/latest_morning_run.json"
       ],
       "blocked_state": {
