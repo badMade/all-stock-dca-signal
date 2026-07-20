@@ -154,8 +154,8 @@ def load_quotes() -> pd.DataFrame:
     remaining_daily = DAILY_CAP
     remaining_weekly = WEEKLY_CAP
     budgeted = []
-    for row in q.itertuples(index=False):
-        planned = float(row.planned_dollars)
+    for planned in q["planned_dollars"]:
+        planned = float(planned)
         allowed = min(planned, remaining_daily, remaining_weekly)
         budgeted.append(allowed)
         remaining_daily -= allowed

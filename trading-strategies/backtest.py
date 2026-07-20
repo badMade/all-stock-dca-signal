@@ -568,8 +568,9 @@ def print_results_table(
         table.add_column("Ticker/Label", style="bold white", no_wrap=True)
         for col in df.columns:
             table.add_column(col, justify="right")
-        for idx, row in df.iterrows():
-            table.add_row(str(idx), *[str(v) for v in row])
+        for row in df.itertuples(index=True):
+            # row[0] is the index, row[1:] are the values
+            table.add_row(str(row[0]), *[str(v) for v in row[1:]])
         console.print(table)
     else:
         print(df.to_string())
