@@ -1406,6 +1406,112 @@ def _derive_order_submit_status(
     return ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED
 
 
+def _build_buy_candidates(
+    decisions: Sequence[ReconciledDecision],
+    candidate_outcomes: Dict[str, Dict[str, Any]],
+    top_up_outcomes: Optional[Dict[str, "TopUpGuardOutcome"]],
+) -> List[Dict[str, Any]]:
+    buy_candidates: List[Dict[str, Any]] = []
+    for decision in decisions:
+        if decision.action != Action.BUY:
+            continue
+        outcome = candidate_outcomes.get(decision.ticker, {})
+        target_price = _signal_target_price(decision)
+        # planned_amount_usd: when the top-up guard is active for this ticker use
+        # the incremental amount; otherwise use submitted_amount_usd (which
+        # reflects any mid-batch kill-switch cap) or fall back to suggested_amount.
+        guard = top_up_outcomes.get(decision.ticker) if top_up_outcomes else None
+        submitted_amount = outcome.get("submitted_amount_usd")
+        if guard is not None:
+            # When the kill-switch capped order_amount before the guard ran,
+            # submitted_amount_usd already reflects the actual capped spend.
+            # Use that when available so planned_amount_usd is never higher than
+            # what was really submitted (guard.incremental_order_amount was itself
+            # already capped in run_once, but submitted_amount_usd is the ground truth).
+            planned_amount_usd = (
+                min(guard.incremental_order_amount, submitted_amount)
+                if submitted_amount is not None
+                else guard.incremental_order_amount
+            )
+        else:
+            planned_amount_usd = (
+                submitted_amount if submitted_amount is not None else decision.suggested_amount_usd
+            )
+        candidate_row = {
+            "ticker": decision.ticker,
+            "reason": decision.reason,
+            "buy_multiplier": decision.buy_multiplier,
+            "planned_amount_usd": round(planned_amount_usd, 2),
+            "target_price": target_price,
+            "target_price_missing": target_price is None,
+            "decision_bar_close": target_price,
+            "previous_close": (
+                decision.finance_signal.previous_close
+                if decision.finance_signal is not None
+                else (decision.robinhood_signal.previous_close if decision.robinhood_signal else None)
+            ),
+            "order_id": outcome.get("order_id"),
+            "status": outcome.get("status", "not_submitted"),
+            "skip_reason": outcome.get("skip_reason"),
+            "reviewed_order": outcome.get("reviewed_order"),
+        }
+        if guard is not None:
+            candidate_row.update(
+                {
+                    "afternoon_desired_amount_usd": round(decision.suggested_amount_usd, 2),
+                    "afternoon_desired_amount": round(guard.afternoon_desired_amount, 2),
+                    "afternoon_decision_price": guard.afternoon_decision_price,
+                    "prior_same_day_amount": round(guard.prior_same_day_amount, 2),
+                    "prior_same_day_reference_price": guard.prior_same_day_reference_price,
+                    "prior_same_day_run_id": guard.prior_same_day_run_id,
+                    "prior_same_day_source": guard.prior_same_day_source,
+                    "incremental_order_amount": round(guard.incremental_order_amount, 2),
+                    "top_up_guard_result": guard.top_up_guard_result,
+                    "top_up_skipped": guard.skipped,
+                    "top_up_manual_review": guard.manual_review,
+                }
+            )
+        buy_candidates.append(candidate_row)
+    return buy_candidates
+
+
+def _build_budget_block(
+    config: StrategyConfig,
+    state: StrategyState,
+    tier: BudgetTier,
+    planned_spend: float,
+    high_multiplier_signals: int,
+    trading_day: date,
+) -> Dict[str, Any]:
+    return {
+        "base_amount_usd": config.base_buy_amount_usd,
+        "base_buy_amount_usd": config.base_buy_amount_usd,
+        "budget_tier": tier.name,
+        "planned_spend_usd": round(planned_spend, 2),
+        "high_multiplier_signal_count": high_multiplier_signals,
+        "daily_cap_usd": tier.daily_cap_usd,
+        "weekly_cap_usd": round(state.effective_weekly_cap(), 2),
+        "weekly_rollover_reserve_usd": round(state.weekly_rollover_reserve_usd, 2),
+        "weekly_rollover_reserve_cap_usd": config.weekly_rollover_reserve_cap_usd,
+        "allowed_spend_today_usd": round(state.allowed_spend_today(trading_day, config), 2),
+        "remaining_spend_today_usd": round(state.remaining_spend_today(trading_day, config), 2),
+        "day_notional_usd": round(state.day_notional(trading_day), 2),
+        "week_notional_usd": round(state.week_notional(trading_day), 2),
+    }
+
+
+def _build_risk_guard_block(config: StrategyConfig) -> Dict[str, Any]:
+    return {
+        "monthly_cash_allocation_usd": config.monthly_cash_allocation_usd,
+        "kill_switch_7d_deploy_fraction": config.kill_switch_7d_deploy_fraction,
+        "kill_switch_7d_threshold_usd": round(
+            config.kill_switch_7d_deploy_fraction * config.monthly_cash_allocation_usd, 2
+        ),
+        "deployed_last_7d_usd": round(config.deployed_last_7d_usd, 2),
+        "kill_switch_engaged": kill_switch_engaged(config),
+    }
+
+
 def build_run_artifacts(
     now: datetime,
     config: StrategyConfig,
@@ -1483,67 +1589,7 @@ def build_run_artifacts(
             if _row.get("auto_buy_signal") and _row.get("ticker") in _afternoon_deliberate_skips:
                 _row["auto_buy_signal"] = False
 
-    buy_candidates: List[Dict[str, Any]] = []
-    for decision in decisions:
-        if decision.action != Action.BUY:
-            continue
-        outcome = candidate_outcomes.get(decision.ticker, {})
-        target_price = _signal_target_price(decision)
-        # planned_amount_usd: when the top-up guard is active for this ticker use
-        # the incremental amount; otherwise use submitted_amount_usd (which
-        # reflects any mid-batch kill-switch cap) or fall back to suggested_amount.
-        guard = top_up_outcomes.get(decision.ticker) if top_up_outcomes else None
-        submitted_amount = outcome.get("submitted_amount_usd")
-        if guard is not None:
-            # When the kill-switch capped order_amount before the guard ran,
-            # submitted_amount_usd already reflects the actual capped spend.
-            # Use that when available so planned_amount_usd is never higher than
-            # what was really submitted (guard.incremental_order_amount was itself
-            # already capped in run_once, but submitted_amount_usd is the ground truth).
-            planned_amount_usd = (
-                min(guard.incremental_order_amount, submitted_amount)
-                if submitted_amount is not None
-                else guard.incremental_order_amount
-            )
-        else:
-            planned_amount_usd = (
-                submitted_amount if submitted_amount is not None else decision.suggested_amount_usd
-            )
-        candidate_row = {
-            "ticker": decision.ticker,
-            "reason": decision.reason,
-            "buy_multiplier": decision.buy_multiplier,
-            "planned_amount_usd": round(planned_amount_usd, 2),
-            "target_price": target_price,
-            "target_price_missing": target_price is None,
-            "decision_bar_close": target_price,
-            "previous_close": (
-                decision.finance_signal.previous_close
-                if decision.finance_signal is not None
-                else (decision.robinhood_signal.previous_close if decision.robinhood_signal else None)
-            ),
-            "order_id": outcome.get("order_id"),
-            "status": outcome.get("status", "not_submitted"),
-            "skip_reason": outcome.get("skip_reason"),
-            "reviewed_order": outcome.get("reviewed_order"),
-        }
-        if guard is not None:
-            candidate_row.update(
-                {
-                    "afternoon_desired_amount_usd": round(decision.suggested_amount_usd, 2),
-                    "afternoon_desired_amount": round(guard.afternoon_desired_amount, 2),
-                    "afternoon_decision_price": guard.afternoon_decision_price,
-                    "prior_same_day_amount": round(guard.prior_same_day_amount, 2),
-                    "prior_same_day_reference_price": guard.prior_same_day_reference_price,
-                    "prior_same_day_run_id": guard.prior_same_day_run_id,
-                    "prior_same_day_source": guard.prior_same_day_source,
-                    "incremental_order_amount": round(guard.incremental_order_amount, 2),
-                    "top_up_guard_result": guard.top_up_guard_result,
-                    "top_up_skipped": guard.skipped,
-                    "top_up_manual_review": guard.manual_review,
-                }
-            )
-        buy_candidates.append(candidate_row)
+    buy_candidates = _build_buy_candidates(decisions, candidate_outcomes, top_up_outcomes)
 
     manual_review_tickers = [d.ticker for d in decisions if d.action == Action.MANUAL_REVIEW]
     for candidate in buy_candidates:
@@ -1587,30 +1633,8 @@ def build_run_artifacts(
         "broker": config.broker.value,
         "dry_run": config.dry_run,
         "account_number": None,
-        "budget": {
-            "base_amount_usd": config.base_buy_amount_usd,
-            "base_buy_amount_usd": config.base_buy_amount_usd,
-            "budget_tier": tier.name,
-            "planned_spend_usd": round(planned_spend, 2),
-            "high_multiplier_signal_count": high_multiplier_signals,
-            "daily_cap_usd": tier.daily_cap_usd,
-            "weekly_cap_usd": round(state.effective_weekly_cap(), 2),
-            "weekly_rollover_reserve_usd": round(state.weekly_rollover_reserve_usd, 2),
-            "weekly_rollover_reserve_cap_usd": config.weekly_rollover_reserve_cap_usd,
-            "allowed_spend_today_usd": round(state.allowed_spend_today(trading_day, config), 2),
-            "remaining_spend_today_usd": round(state.remaining_spend_today(trading_day, config), 2),
-            "day_notional_usd": round(state.day_notional(trading_day), 2),
-            "week_notional_usd": round(state.week_notional(trading_day), 2),
-        },
-        "risk_guard": {
-            "monthly_cash_allocation_usd": config.monthly_cash_allocation_usd,
-            "kill_switch_7d_deploy_fraction": config.kill_switch_7d_deploy_fraction,
-            "kill_switch_7d_threshold_usd": round(
-                config.kill_switch_7d_deploy_fraction * config.monthly_cash_allocation_usd, 2
-            ),
-            "deployed_last_7d_usd": round(config.deployed_last_7d_usd, 2),
-            "kill_switch_engaged": kill_switch_engaged(config),
-        },
+        "budget": _build_budget_block(config, state, tier, planned_spend, high_multiplier_signals, trading_day),
+        "risk_guard": _build_risk_guard_block(config),
         "counts": {
             "evaluated": len(decisions),
             "buy_candidates": len(buy_candidates),
