@@ -225,9 +225,9 @@ data is unavailable, stale, incomplete, or unresolved (see
 fails once, perform **one** bounded recovery attempt on the alternate approved
 data source path, then stop.
 
-**Always write the state files.** The 10:30 scheduled run **always** writes
-`run_state.json`, `run_summary.json`, and `latest_morning_run.json` under the
-morning root, **even when execution is blocked or no orders are placed**. If a
+228: **Always write the state files.** The 10:30 scheduled run **always** writes
+229: `run_state.json`, `run_summary.json`, and `latest_morning_run.json` under the
+230: morning root as part of the standard artifact persistence flow, **even when execution is blocked or no orders are placed**.
 missing pre-flight artifact, missing / invalid raw inputs, trend, budget,
 tradability, spread, or broker condition blocks execution, it writes a **valid
 scheduled** morning `run_state` with `run_origin='scheduled'`, `manual_run=false`,
