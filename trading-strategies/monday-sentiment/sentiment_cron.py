@@ -19,6 +19,7 @@ pip install transformers torch newsapi-python requests
 # Standard library
 # ---------------------------------------------------------------------------
 import argparse
+import html
 import json
 import logging
 import os
@@ -511,7 +512,7 @@ def filter_and_rank(
     flagged = []
     normal  = []
 
-    for ticker, info in results.items():
+    for _ticker, info in results.items():
         z = info.get("zscore")
         if z is None:
             # Not enough history — benign default
@@ -619,18 +620,20 @@ def build_email_html(
         top_items = sorted(items, key=lambda x: abs(x.get("score", 0.0)), reverse=True)[:TOP_HEADLINES_IN_EMAIL]
 
         headlines_html = ""
-        for idx, item in enumerate(top_items, start=1):
+        for item in top_items:
             source_type = "📰" if item.get("type") == "news" else "📄"
             item_score  = item.get("score", 0.0)
             score_color = "#1a7a2e" if item_score > 0 else ("#cf222e" if item_score < 0 else "#555")
             badge       = finbert_badge_html(item.get("probs", {})) if item.get("probs") else ""
-            # Truncate headline for display
-            headline_text = item.get("text", "")[:160] + ("…" if len(item.get("text", "")) > 160 else "")
+            # Truncate headline for display, escaping HTML to prevent XSS
+            raw_text = item.get('text') or ''
+            truncated_text = raw_text[:160] + ("…" if len(raw_text) > 160 else "")
+            headline_text = html.escape(truncated_text)
             headlines_html += f"""
             <tr>
               <td style="padding:6px 0;border-bottom:1px solid #f0f0f0;vertical-align:top;">
                 <span style="font-size:13px;color:#333;">{source_type} {headline_text}</span><br>
-                <span style="font-size:11px;color:#888;">Source: {item.get('source','—')} &nbsp;</span>
+                <span style="font-size:11px;color:#888;">Source: {html.escape(item.get('source') or '—')} &nbsp;</span>
                 <span style="font-size:12px;font-weight:bold;color:{score_color};">score: {item_score:+.3f}</span>
                 &nbsp;{badge}
               </td>
@@ -779,7 +782,7 @@ def build_email_html(
     n_flagged = len(flagged)
     subject_preview = f"{n_flagged} stock{'s' if n_flagged != 1 else ''} flagged"
 
-    html = f"""<!DOCTYPE html>
+    email_html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -863,7 +866,7 @@ def build_email_html(
   </table>
 </body>
 </html>"""
-    return html
+    return email_html_content
 
 
 # ===========================================================================
