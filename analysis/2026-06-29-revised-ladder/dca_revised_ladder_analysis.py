@@ -84,10 +84,11 @@ def apply_budget(decisions: pd.DataFrame) -> pd.DataFrame:
         week_key = (iso.year, iso.week)
         remaining_daily = DAILY_CAP
         remaining_weekly = WEEKLY_CAP - week_spend.get(week_key, 0.0)
-        for _, row in group.iterrows():
+        cols = group.columns
+        for tup in group.itertuples(index=False, name=None):
+            row = dict(zip(cols, tup))
             planned = float(row["planned_spend"])
             allowed = min(planned, max(0.0, remaining_daily), max(0.0, remaining_weekly))
-            row = row.copy()
             row["budgeted_spend"] = allowed
             row["budget_capped"] = planned > allowed + 1e-9
             if allowed > 0 and row["close"] > 0:
@@ -155,7 +156,9 @@ def load_quotes() -> pd.DataFrame:
     remaining_daily = DAILY_CAP
     remaining_weekly = WEEKLY_CAP
     budgeted = []
-    for _, row in q.iterrows():
+    cols = q.columns
+    for tup in q.itertuples(index=False, name=None):
+        row = dict(zip(cols, tup))
         planned = float(row["planned_dollars"])
         allowed = min(planned, remaining_daily, remaining_weekly)
         budgeted.append(allowed)
@@ -207,7 +210,9 @@ def write_report(summary: pd.DataFrame, decisions: pd.DataFrame, today: pd.DataF
     md.append("")
     md.append("| Ticker | Graded capital | Graded avg entry | Graded shares | Flat capital | Flat avg entry | Flat shares | 1x | 1.5x | 2x | 3x |")
     md.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
-    for _, r in top_lines.iterrows():
+    cols = top_lines.columns
+    for tup in top_lines.itertuples(index=False, name=None):
+        r = dict(zip(cols, tup))
         md.append(
             f"| {r['symbol']} | {fmt_money(r['graded_total_capital'])} | {fmt_money(r['graded_avg_entry_price'])} | {fmt_num(r['graded_final_shares'])} | "
             f"{fmt_money(r['flat_total_capital'])} | {fmt_money(r['flat_avg_entry_price'])} | {fmt_num(r['flat_final_shares'])} | "
