@@ -409,9 +409,76 @@
     },
     "doc": "docs/schedule_manifest.md"
   },
+  "pointer_output_normalization_2026_07_20": {
+    "added": "2026-07-20",
+    "applies_to": ["42173154", "a6239dae", "e3e6f09e", "10ce362c"],
+    "applies_to_note": "All daily scheduled DCA tasks that use connector data, especially the 10:30 morning (42173154), 12:30 midday (a6239dae), 3:05 monitor-only signal check (e3e6f09e), and 3:20 afternoon (10ce362c) tasks.",
+    "trigger_incident": "On Jul 20 2026 the 3:20 scheduled run collected Robinhood portfolio, quotes, tradability, same-day orders, and historicals, but large historicals (and possibly other connector responses) were only available as output_path / current_session_context tool-output pointers. The background run did NOT persist those pointer targets into the scheduled raw directory before compute, so it escalated after data collection. Parent recovery copied the current_session_context / tool_calls / call_external_tool outputs into /home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260720_1520ET/raw/, computed from the persisted raw files, placed scheduled top-up orders, and wrote run_state.",
+    "rules": [
+      "Any connector response that returns an output_path or current_session_context pointer (instead of inline data) MUST be immediately copied or normalized into the run's raw directory BEFORE compute. Follow the pointer, load the referenced payload, and persist it as parseable JSON (referenced contents under 'data', original pointer preserved under 'output_path').",
+      "Compute modules MUST read ONLY the persisted raw files under the run's raw directory, NEVER in-memory tool responses. Order of operations: fetch -> persist / normalize pointers -> compute -> place.",
+      "Pointer-only collection is NOT a completed run. The task MUST NOT stop after collecting data without writing run_state. Collecting pointers without persisting their targets and without writing run_state is a failed run, not a completed one.",
+      "If pointer normalization fails after ONE bounded recovery attempt, write the task's valid failure-state file with a concrete error_class (e.g. pointer_normalization_failed or missing_or_invalid_raw_inputs), empty submitted_orders.csv headers where applicable, and a compact list of the missing pointer details (which connector responses were pointer-only and could not be persisted)."
+    ],
+    "recovered_run_2026_07_20": {
+      "trading_day": "2026-07-20",
+      "run_id": "scheduled_20260720_1520ET",
+      "run_origin": "scheduled",
+      "manual_run": false,
+      "cron_id": "10ce362c",
+      "supersedes_cron_id": "ce16ba6b",
+      "scheduled_for_et": "15:20",
+      "valid_afternoon_evidence": true,
+      "recovered_after_pointer_persistence_failure": true,
+      "raw_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260720_1520ET/raw/",
+      "order_submit_status": "filled",
+      "orders_filled_count": 6,
+      "total_filled_usd": 10.00,
+      "fills": [
+        {"ticker": "EVR", "amount_usd": 1.00, "average_fill_price": 333.600800},
+        {"ticker": "DXYZ", "amount_usd": 1.00, "average_fill_price": 24.865000},
+        {"ticker": "AMAT", "amount_usd": 2.00, "average_fill_price": 526.819900},
+        {"ticker": "STM", "amount_usd": 2.00, "average_fill_price": 61.450000},
+        {"ticker": "NVDA", "amount_usd": 2.00, "average_fill_price": 202.771200},
+        {"ticker": "GLW", "amount_usd": 2.00, "average_fill_price": 153.810400}
+      ],
+      "evidence_note": "Valid scheduled evidence. It recovered after escalation caused by pointer persistence failure."
+    },
+    "live_task_text_note": "Live task text was updated with POINTER OUTPUT NORMALIZATION ADDED JUL 20 2026 for the 10:30 (42173154), 12:30 (a6239dae), 3:05 (e3e6f09e), and 3:20 (10ce362c) tasks.",
+    "see": "live_schedule_hardening_2026_07_20 and config/run_classification.json:raw_input_persistence",
+    "doc": "docs/schedule_manifest.md"
+  },
   "scheduled_run_outcomes": {
     "summary": "Dated machine-readable ledger of afternoon scheduled live-run outcomes for task 10ce362c (supersedes ce16ba6b). Scheduled evidence only; manual/override order IDs are excluded from every scheduled metric. See config/run_classification.json for the full per-run records and docs/schedule_manifest.md for the human-readable notes.",
     "runs": [
+      {
+        "trading_day": "2026-07-20",
+        "run_id": "scheduled_20260720_1520ET",
+        "is_final_buy_of_day": true,
+        "run_origin": "scheduled",
+        "manual_run": false,
+        "cron_id": "10ce362c",
+        "supersedes_cron_id": "ce16ba6b",
+        "scheduled_for_et": "15:20",
+        "valid_afternoon_evidence": true,
+        "recovered_after_pointer_persistence_failure": true,
+        "order_submit_status": "filled",
+        "orders_filled": 6,
+        "total_filled_usd": 10.00,
+        "fills": [
+          {"ticker": "EVR", "amount_usd": 1.00, "average_fill_price": 333.600800},
+          {"ticker": "DXYZ", "amount_usd": 1.00, "average_fill_price": 24.865000},
+          {"ticker": "AMAT", "amount_usd": 2.00, "average_fill_price": 526.819900},
+          {"ticker": "STM", "amount_usd": 2.00, "average_fill_price": 61.450000},
+          {"ticker": "NVDA", "amount_usd": 2.00, "average_fill_price": 202.771200},
+          {"ticker": "GLW", "amount_usd": 2.00, "average_fill_price": 153.810400}
+        ],
+        "note": "Valid scheduled evidence; recovered after escalation caused by output_path / current_session_context pointer persistence failure. See pointer_output_normalization_2026_07_20.",
+        "artifacts": {
+          "scheduled_run_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260720_1520ET/",
+          "raw_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260720_1520ET/raw/"
+        }
+      },
       {
         "trading_day": "2026-07-16",
         "run_id": "scheduled_20260716_1520ET",

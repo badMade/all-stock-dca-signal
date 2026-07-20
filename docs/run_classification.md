@@ -422,6 +422,47 @@ cost-basis evidence. See the `live_schedule_hardening_2026_07_20` block in
 `config/scheduled_tasks.json`'s
 `live_schedule_hardening_2026_07_20.afternoon_1520`.
 
+## Pointer output normalization (added 2026-07-20)
+
+The Jul 20 2026 3:20 scheduled run collected portfolio, quotes, tradability,
+same-day orders, and historicals, but large historicals (and possibly other
+connector responses) were only available as `output_path` /
+`current_session_context` tool-output **pointers**. The background run did **not**
+persist those pointer targets into the scheduled raw directory before compute, so
+it **escalated after data collection**. This applies to **all daily scheduled DCA
+tasks that use connector data**, especially the **10:30** morning (`42173154`),
+**12:30** midday (`a6239dae`), **3:05** monitor-only signal check (`e3e6f09e`), and
+**3:20** afternoon (`10ce362c`) tasks:
+
+- Any connector response that returns an `output_path` or
+  `current_session_context` pointer must be **immediately copied or normalized into
+  the run's raw directory before compute** (follow the pointer, load the referenced
+  payload, persist as parseable JSON with contents under `data` and the original
+  pointer under `output_path`).
+- Compute modules must read **only** the persisted raw files, never in-memory tool
+  responses.
+- **Pointer-only collection is not a completed run.** The task must not stop after
+  collecting data without writing `run_state`.
+- If pointer normalization fails after **one** bounded recovery attempt, write the
+  task's valid failure-state file with a concrete `error_class` (e.g.
+  `pointer_normalization_failed` or `missing_or_invalid_raw_inputs`), empty
+  `submitted_orders.csv` headers where applicable, and a compact list of the
+  missing pointer details.
+
+Parent recovery copied the `current_session_context` / `tool_calls` /
+`call_external_tool` outputs into
+`/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260720_1520ET/raw/`,
+computed from the persisted raw files, placed scheduled top-up orders, and wrote
+`run_state`. The recovered run is **valid scheduled evidence**:
+`run_id='scheduled_20260720_1520ET'`, `order_submit_status='filled'`,
+`orders_filled_count=6`, total **$10.00** (EVR $1.00 @ 333.600800, DXYZ $1.00 @
+24.865000, AMAT $2.00 @ 526.819900, STM $2.00 @ 61.450000, NVDA $2.00 @
+202.771200, GLW $2.00 @ 153.810400). Live task text was updated with **POINTER
+OUTPUT NORMALIZATION ADDED JUL 20 2026** for the 10:30, 12:30, 3:05, and 3:20
+tasks. See the `pointer_output_normalization_2026_07_20` block in
+[`../config/run_classification.json`](../config/run_classification.json) and
+`config/scheduled_tasks.json`.
+
 ## Recovery reruns
 
 The three scheduled **live** tasks — morning (`42173154`), midday (`a6239dae`),
