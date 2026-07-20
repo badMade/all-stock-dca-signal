@@ -2019,5 +2019,12 @@ def _run_all():
     print("All self-tests passed.")
 
 
+def test_prior_run_before_boundary_malformed_iso_format():
+    from near_close_dca import _prior_run_before_boundary
+    run_state = {"generated_at": "invalid-date-format"}
+    boundary_et = time(14, 30)
+    assert _prior_run_before_boundary(run_state, boundary_et) is True
+
+
 if __name__ == "__main__":
     _run_all()
