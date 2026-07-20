@@ -84,21 +84,19 @@ def apply_budget(decisions: pd.DataFrame) -> pd.DataFrame:
         week_key = (iso.year, iso.week)
         remaining_daily = DAILY_CAP
         remaining_weekly = WEEKLY_CAP - week_spend.get(week_key, 0.0)
-        cols = group.columns
-        for tup in group.itertuples(index=False, name=None):
-            row = dict(zip(cols, tup))
-            planned = float(row["planned_spend"])
+        for row_dict in group.to_dict('records'):
+            planned = float(row_dict["planned_spend"])
             allowed = min(planned, max(0.0, remaining_daily), max(0.0, remaining_weekly))
-            row["budgeted_spend"] = allowed
-            row["budget_capped"] = planned > allowed + 1e-9
-            if allowed > 0 and row["close"] > 0:
-                row["graded_shares"] = allowed / row["close"]
+            row_dict["budgeted_spend"] = allowed
+            row_dict["budget_capped"] = planned > allowed + 1e-9
+            if allowed > 0 and row_dict["close"] > 0:
+                row_dict["graded_shares"] = allowed / row_dict["close"]
             else:
-                row["graded_shares"] = 0.0
+                row_dict["graded_shares"] = 0.0
             remaining_daily -= allowed
             remaining_weekly -= allowed
             week_spend[week_key] = week_spend.get(week_key, 0.0) + allowed
-            rows.append(row)
+            rows.append(row_dict)
     return pd.DataFrame(rows)
 
 
@@ -156,10 +154,8 @@ def load_quotes() -> pd.DataFrame:
     remaining_daily = DAILY_CAP
     remaining_weekly = WEEKLY_CAP
     budgeted = []
-    cols = q.columns
-    for tup in q.itertuples(index=False, name=None):
-        row = dict(zip(cols, tup))
-        planned = float(row["planned_dollars"])
+    for row in q.itertuples(index=False):
+        planned = float(row.planned_dollars)
         allowed = min(planned, remaining_daily, remaining_weekly)
         budgeted.append(allowed)
         remaining_daily -= allowed
@@ -210,13 +206,11 @@ def write_report(summary: pd.DataFrame, decisions: pd.DataFrame, today: pd.DataF
     md.append("")
     md.append("| Ticker | Graded capital | Graded avg entry | Graded shares | Flat capital | Flat avg entry | Flat shares | 1x | 1.5x | 2x | 3x |")
     md.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
-    cols = top_lines.columns
-    for tup in top_lines.itertuples(index=False, name=None):
-        r = dict(zip(cols, tup))
+    for rd in top_lines.to_dict('records'):
         md.append(
-            f"| {r['symbol']} | {fmt_money(r['graded_total_capital'])} | {fmt_money(r['graded_avg_entry_price'])} | {fmt_num(r['graded_final_shares'])} | "
-            f"{fmt_money(r['flat_total_capital'])} | {fmt_money(r['flat_avg_entry_price'])} | {fmt_num(r['flat_final_shares'])} | "
-            f"{int(r['1x'])} | {int(r['1.5x'])} | {int(r['2x'])} | {int(r['3x'])} |"
+            f"| {rd['symbol']} | {fmt_money(rd['graded_total_capital'])} | {fmt_money(rd['graded_avg_entry_price'])} | {fmt_num(rd['graded_final_shares'])} | "
+            f"{fmt_money(rd['flat_total_capital'])} | {fmt_money(rd['flat_avg_entry_price'])} | {fmt_num(rd['flat_final_shares'])} | "
+            f"{int(rd['1x'])} | {int(rd['1.5x'])} | {int(rd['2x'])} | {int(rd['3x'])} |"
         )
     md.append("")
     md.append("## Today tier distribution")
