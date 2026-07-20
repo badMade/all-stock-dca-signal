@@ -95,6 +95,50 @@
       "note": "Manual final-buy overrides and same-day top-up context only; NOT scheduled-afternoon execution evidence. Backfilled under ce16ba6b/manual_runs/final_manual_override_20260713_1536ET/ and midday_dca/manual_reruns/final_manual_override_20260713_1536ET/ with run_type='final_manual_buy_override', valid_afternoon_scheduled_evidence=false, same_day_top_up_context_only=true."
     }
   },
+  "scheduled_run_outcomes": {
+    "summary": "Dated machine-readable ledger of afternoon scheduled live-run outcomes for task 10ce362c (supersedes ce16ba6b). Scheduled evidence only; manual/override order IDs are excluded from every scheduled metric. See config/run_classification.json for the full per-run records and docs/schedule_manifest.md for the human-readable notes.",
+    "runs": [
+      {
+        "trading_day": "2026-07-16",
+        "run_id": "scheduled_20260716_1520ET",
+        "is_final_buy_of_day": true,
+        "run_origin": "scheduled",
+        "manual_run": false,
+        "cron_id": "10ce362c",
+        "supersedes_cron_id": "ce16ba6b",
+        "scheduled_for_et": "15:20",
+        "state_schema_version": "run-classification-v2-preauthorized",
+        "broker_account": "robinhood:562057042",
+        "broker_roles_note": "Robinhood account 562057042 was the only execution broker; Alpaca/Finance/Yahoo read-only.",
+        "base_amount_usd": 3.0,
+        "ladder": "0x-to-5x ($3 base): <0.1%=0x; 0.1-<1%=1x; 1-<2%=1.5x; 2-<3%=2x; 3-<4%=2.5x; 4-<5%=3x; 5-<6%=3.5x; 6-<7%=4x; 7-<8%=4.5x; >=8%=5x.",
+        "final_buy_behavior": "Final buy of the day ignored the 60-minute downward-trend filter for the final-buy decision only; still required price below prior close, multiplier>0, data-confidence, spread_ok, budget/tiered-cap, regular-hours-only, whitelist, top-up guard, and hard circuit breakers.",
+        "same_day_spend_before_final_usd": 213.0,
+        "remaining_daily_cap_before_final_usd": 147.0,
+        "eligible_final_ignore_trend_planned_spend_usd": 150.0,
+        "orders_filled": 29,
+        "total_filled_usd": 145.5,
+        "order_submit_status": "submitted",
+        "skipped_due_to_daily_cap": ["AMZN"],
+        "daily_cap_skip_note": "Eligible ignore-trend planned spend ($150.00) exceeded the $147.00 remaining daily cap, so AMZN was explicitly skipped to stay within the daily cap. AMZN was the sole eligible ticker skipped for daily cap; this skip is expected behavior, not an error.",
+        "slippage": {
+          "scheduled_fills": 29,
+          "notional_weighted_avg_slippage_bps": 30.03,
+          "median_slippage_bps": 13.8,
+          "excluded_manual_order_ids_count": 84
+        },
+        "watchdog": {
+          "result": "ok",
+          "note": "Valid scheduled artifact; 29 filled broker orders matched the scheduled filled_orders.csv with no broker/log mismatch. Sent an OK status update.",
+          "summary_file": "cron_tracking/a46bf007/watchdog_runs/20260716_1540ET_run11_summary.json"
+        },
+        "artifacts": {
+          "scheduled_run_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260716_1520ET/",
+          "slippage_dir": "/home/user/workspace/cron_tracking/ce16ba6b/slippage/20260716/"
+        }
+      }
+    ]
+  },
   "drift_detection_policy": {
     "summary": "Every live trading run (morning 10:30, midday 12:30, afternoon 3:20) MUST invoke scripts/drift_detection.py against its own run directory immediately AFTER it finishes writing artifacts. The detector reconciles signals.csv (intended auto-buys) against submitted_orders.csv (actual order records) and alerts when any symbol has auto_buy_signal true (case-insensitive true/1/yes) and incremental_order_amount > 0 or a positive desired amount, but no submitted-order record exists for that symbol.",
     "detector": "scripts/drift_detection.py",

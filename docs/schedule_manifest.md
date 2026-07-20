@@ -326,6 +326,43 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 - **Jul 13 2026 final manual override incident:** the scheduled 3:20 PM ET run placed **0 orders**; the user then requested the final buy **manually**. A final manual-review scan ran the final-buy behavior above (full scan, trend ignored) with same-day top-up offsets and filled **34 orders**, planned total **$234.00** (`DFTX TRIN SPCX LUNR IRDM DXYZ LITE ASML DRAM STX AMAT AMD CBRS MRVL BTX STM SNDK WDC TSM AVGO NVDA QBTS FLKR INTC GOOGL GOOG GLW GS MU XLG TOPT QTOP SATA RGTI`). These are **manual final-buy overrides / same-day top-up context only — NOT scheduled-afternoon execution evidence**. Their run_state carries `run_type='final_manual_buy_override'`, `run_origin='manual'`, `manual_run=true`, `valid_afternoon_scheduled_evidence=false`, `same_day_top_up_context_only=true`. Artifacts (run_state + `filled_orders.csv` with all order IDs) were backfilled under `/home/user/workspace/cron_tracking/ce16ba6b/manual_runs/final_manual_override_20260713_1536ET/` and `/home/user/workspace/cron_tracking/midday_dca/manual_reruns/final_manual_override_20260713_1536ET/`. All order IDs are excluded from scheduled slippage/fills/reliability/cost basis/watchdog confirmation and shown only in the **"Manual Final Buy Override / Same-Day Top-Up Context"** section. See [run_classification.md](run_classification.md) and [strategy.md](strategy.md#manual-final-buy-override--2026-07-13-incident).
 - **Automatic failure recovery:** if the run fails on internal persistence, parsing, wrapper-normalization, transient connector throttling, or raw-file write problems **after data was fetched**, it is a recovery trigger, not a terminal stop. The task reruns the required read-only inputs **once**, **persists all raw responses first**, **recomputes only from the persisted files**, and continues through the same pre-authorized guarded path if every safeguard still passes. The recovery reuses the same `scheduled_runs/YYYYMMDD_1520ET/` directory with `recovery_rerun=true`, keeps `run_origin='scheduled'` (both `cron_id='10ce362c'` and `supersedes_cron_id='ce16ba6b'`), and still updates `latest_scheduled_run.json` — it is **never** reclassified as manual. If the recovery attempt also fails or a safety/account/order rejection occurs, it writes `run_state.json` with the blocking reason and escalates.
 
+#### Final scheduled run — 2026-07-16 (afternoon scheduled, final buy of the day)
+- **Scheduled** live run (not a recovery, not a manual override):
+  `run_id='scheduled_20260716_1520ET'`, `scheduled_for_et='15:20'`,
+  `run_origin='scheduled'`, `manual_run=false`, `cron_id='10ce362c'`,
+  `supersedes_cron_id='ce16ba6b'`,
+  `state_schema_version='run-classification-v2-preauthorized'`. This was the
+  **final Robinhood scheduled buy run of the day**, using **Robinhood account
+  `562057042` as the only execution broker** (Alpaca/Finance/Yahoo read-only).
+- Used the current **$3 base 0x-to-5x ladder** (`<0.1%=0x`; `0.1–<1%=1x`;
+  `1–<2%=1.5x`; `2–<3%=2x`; `3–<4%=2.5x`; `4–<5%=3x`; `5–<6%=3.5x`; `6–<7%=4x`;
+  `7–<8%=4.5x`; `>=8%=5x`). As the final buy of the day it **ignored the
+  60-minute downward-trend filter for the final-buy decision only**, but still
+  required price **below the prior completed regular-session close**,
+  **multiplier > 0**, **data confidence**, **spread check**, **budget/tiered
+  cap**, **regular-hours-only**, **whitelist (active universe)**, and the
+  **same-day top-up guard**.
+- **Daily-cap math:** same-day spend before the final run was **$213.00**;
+  remaining daily cap before the final run was **$147.00**; the eligible
+  ignore-trend planned spend was **$150.00**. To stay within the daily cap,
+  **AMZN was explicitly skipped due to the daily cap** — AMZN was the **sole
+  eligible ticker skipped for daily cap**, and this skip is **expected
+  behavior, not an error**.
+- **Result:** the final scheduled run submitted and filled **29 Robinhood buy
+  orders totalling $145.50** (`order_submit_status='submitted'`). Artifacts under
+  `/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260716_1520ET/`.
+- **Slippage (`67aa802b`):** confirmed **29 scheduled fills**, notional-weighted
+  average slippage **+30.03 bps**, median **+13.80 bps**, with **84
+  manual/override order IDs excluded** from the scheduled-live metrics. Artifacts
+  under `/home/user/workspace/cron_tracking/ce16ba6b/slippage/20260716/`.
+- **Watchdog (`a46bf007`):** confirmed a valid scheduled artifact and matched the
+  **29 filled broker orders** against the scheduled `filled_orders.csv` with **no
+  broker/log mismatch**, and sent an **OK** status update. Summary:
+  `cron_tracking/a46bf007/watchdog_runs/20260716_1540ET_run11_summary.json`.
+- Machine-readable records: `config/run_classification.json`
+  (`final_scheduled_run_2026_07_16`, `slippage_reporting.scheduled_slippage_2026_07_16`)
+  and `config/scheduled_tasks.json` (`scheduled_run_outcomes.runs`).
+
 ### `d72aa525` — Capital-priority briefing
 - Analytics only, **no trading**. Runs **3:25 PM ET weekdays**.
 - Uses the current $3 base 0x-to-5x ladder. Sends **email/in-app notification only if at least one ticker triggers 1.5x or higher**; otherwise silent.

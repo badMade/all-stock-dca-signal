@@ -41,7 +41,7 @@
     "run_id_pattern": "scheduled_YYYYMMDD_1520ET",
     "run_id_regex": "^scheduled_[0-9]{8}_1520ET$",
     "lineage_rule": "A scheduled run is valid evidence when cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b', so continuity artifacts written before/after the repair both remain valid.",
-    "writer_contract": "Every scheduled 3:20 PM ET run_state MUST be written with BOTH cron_id='10ce362c' AND supersedes_cron_id='ce16ba6b'. Valid scheduled state also requires run_origin='scheduled', manual_run=false, scheduled_for_et='15:20', and state_schema_version='run-classification-v1'. Placeholder/ambiguous ids such as 'ce16ba6b_replacement' are forbidden.",
+    "writer_contract": "Every scheduled 3:20 PM ET run_state MUST be written with BOTH cron_id='10ce362c' AND supersedes_cron_id='ce16ba6b'. Valid scheduled state also requires run_origin='scheduled', manual_run=false, scheduled_for_et='15:20', and state_schema_version set to one of accepted_state_schema_versions ('run-classification-v1' or the stricter pre-authorized successor 'run-classification-v2-preauthorized'). Placeholder/ambiguous ids such as 'ce16ba6b_replacement' are forbidden.",
     "required_fields": [
       "run_origin",
       "run_type",
@@ -141,6 +141,38 @@
       "total_usd": 31.5,
       "note": "Recovered by re-fetching quotes/historicals, saving raw connector outputs, normalizing output_path pointers, computing signals from files, then placing qualifying incremental orders. Valid afternoon scheduled evidence."
     }
+  },
+  "final_scheduled_run_2026_07_16": {
+    "trading_day": "2026-07-16",
+    "run_id": "scheduled_20260716_1520ET",
+    "run_origin": "scheduled",
+    "run_type": "scheduled_live_test",
+    "manual_run": false,
+    "cron_id": "10ce362c",
+    "supersedes_cron_id": "ce16ba6b",
+    "scheduled_for_et": "15:20",
+    "scheduled_window_start_et": "15:15",
+    "scheduled_window_end_et": "15:35",
+    "state_schema_version": "run-classification-v2-preauthorized",
+    "is_final_buy_of_day": true,
+    "broker_account": "robinhood:562057042",
+    "broker_roles_note": "Robinhood account 562057042 was the only execution broker; Alpaca/Finance/Yahoo remained read-only.",
+    "base_amount_usd": 3.0,
+    "ladder": "0x-to-5x ($3 base): <0.1%=0x; 0.1-<1%=1x; 1-<2%=1.5x; 2-<3%=2x; 3-<4%=2.5x; 4-<5%=3x; 5-<6%=3.5x; 6-<7%=4x; 7-<8%=4.5x; >=8%=5x.",
+    "final_buy_behavior_applied": "Final buy of the day: full active-universe scan with the 60-minute downward-trend filter ignored for the final-buy decision only. All other gates still enforced: current/decision price strictly below the prior completed regular-session close, ladder multiplier > 0, data-confidence pass, spread_ok=true, budget/tiered-cap pass, regular-hours-only, whitelisted (active-universe) ticker, hard circuit breakers, and the same-day top-up guard.",
+    "same_day_spend_before_final_usd": 213.0,
+    "remaining_daily_cap_before_final_usd": 147.0,
+    "eligible_final_ignore_trend_planned_spend_usd": 150.0,
+    "orders_filled": 29,
+    "total_filled_usd": 145.5,
+    "skipped_due_to_daily_cap": ["AMZN"],
+    "daily_cap_skip_note": "Eligible ignore-trend planned spend of $150.00 exceeded the $147.00 remaining daily cap by $3.00, so AMZN (planned at $4.50) was explicitly skipped to stay within the daily cap. AMZN was the sole eligible ticker skipped for daily cap and this skip is expected/intended behavior, not an error.",
+    "order_submit_status": "submitted",
+    "scheduled_run_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260716_1520ET/",
+    "slippage_artifacts_dir": "/home/user/workspace/cron_tracking/ce16ba6b/slippage/20260716/",
+    "watchdog_summary": "cron_tracking/a46bf007/watchdog_runs/20260716_1540ET_run11_summary.json",
+    "watchdog_result": "Valid scheduled artifact confirmed; the 29 filled broker orders matched the scheduled filled_orders.csv with no broker/log mismatch. Watchdog sent an OK status update.",
+    "note": "Normal successful final scheduled afternoon run (no recovery, no manual override). Valid afternoon scheduled evidence. Manual/override order IDs remain excluded from all scheduled metrics."
   },
   "write_rules": {
     "scheduled": [
@@ -254,6 +286,18 @@
       "excluded_manual_order_ids_count": 46,
       "artifacts_dir": "/home/user/workspace/cron_tracking/ce16ba6b/slippage/20260710/",
       "order_history_payload": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260710_1520ET/raw/orders_after_place.json"
+    },
+    "scheduled_slippage_2026_07_16": {
+      "trading_day": "2026-07-16",
+      "scope": "afternoon scheduled (15:15-15:35 ET), final buy of the day",
+      "scheduled_run_id": "scheduled_20260716_1520ET",
+      "scheduled_fills": 29,
+      "total_usd": 145.5,
+      "notional_weighted_avg_slippage_bps": 30.03,
+      "median_slippage_bps": 13.8,
+      "excluded_manual_order_ids_count": 84,
+      "excluded_note": "84 manual/override order IDs excluded from the scheduled-live metrics.",
+      "artifacts_dir": "/home/user/workspace/cron_tracking/ce16ba6b/slippage/20260716/"
     }
   },
   "weekly_reporting": {
