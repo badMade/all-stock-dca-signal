@@ -508,6 +508,128 @@ def raw_persistence_failure_run_state(
     }
 
 
+# --- Automatic failure recovery for scheduled live tasks (2026-07-15) --------
+#
+# The three scheduled LIVE Robinhood execution tasks (morning 42173154, midday
+# a6239dae, afternoon 10ce362c) treat a mid-run failure caused by internal
+# persistence, parsing, wrapper-normalization, transient connector throttling,
+# or raw-file write problems -- occurring AFTER data was already fetched -- as
+# a recovery trigger rather than a terminal stop: rerun the required read-only
+# inputs once, persist all raw responses first, recompute only from the
+# persisted files, and continue through the same guarded path if every
+# safeguard still passes (see failure_recovery_policy in
+# config/scheduled_tasks.json and docs/run_classification.md#recovery-reruns).
+# These helpers are the runtime counterpart of that policy: the orchestrator
+# calls build_recovery_state() to stamp a successful recovery rerun's
+# run_state, or recovery_escalation_run_state() when the single recovery
+# attempt also fails or a safety/account/order rejection occurs.
+
+RECOVERY_TRIGGER_REASONS = (
+    "internal_persistence_failure",
+    "parsing_failure",
+    "wrapper_normalization_failure",
+    "transient_connector_throttling",
+    "raw_file_write_failure",
+)
+
+
+def _validate_recovery_trigger_reason(trigger_reason: str) -> None:
+    if trigger_reason not in RECOVERY_TRIGGER_REASONS:
+        raise ValueError(
+            f"trigger_reason must be one of {RECOVERY_TRIGGER_REASONS}, got {trigger_reason!r}"
+        )
+
+
+def build_recovery_state(
+    trigger_reason: str,
+    *,
+    persisted_raw_first: bool,
+    recomputed_from_persisted: bool,
+    attempt: int = 1,
+) -> Dict[str, object]:
+    """Build the run_state fields recording a successful automatic recovery rerun.
+
+    Merge the returned dict into the run_state produced by the recovery attempt
+    (it keeps `run_origin='scheduled'` via the run's normal classification block
+    -- a recovery rerun is never reclassified as manual). ``trigger_reason`` must
+    be one of RECOVERY_TRIGGER_REASONS, kept in sync with
+    ``failure_recovery_policy.recovery_triggers`` in config/scheduled_tasks.json
+    and the ``recovery.trigger_reason`` enum in schemas/run_state.schema.json.
+    Only one recovery attempt is permitted per scheduled run, so ``attempt`` must
+    be 1; the schema's top-level ``if/then`` requires this ``recovery`` block
+    whenever ``recovery_rerun=true``.
+    """
+    _validate_recovery_trigger_reason(trigger_reason)
+    if attempt != 1:
+        raise ValueError(f"only one recovery attempt is permitted per scheduled run, got attempt={attempt!r}")
+    return {
+        "recovery_rerun": True,
+        "recovery": {
+            "trigger_reason": trigger_reason,
+            "attempt": attempt,
+            "persisted_raw_first": bool(persisted_raw_first),
+            "recomputed_from_persisted": bool(recomputed_from_persisted),
+            "escalated": False,
+            "blocking_reason": None,
+        },
+    }
+
+
+def recovery_escalation_run_state(
+    trading_day: str,
+    trigger_reason: str,
+    blocking_reason: str,
+    *,
+    persisted_raw_first: bool = False,
+    recomputed_from_persisted: bool = False,
+    triggered_at_utc: Optional[str] = None,
+    generated_at: Optional[str] = None,
+    broker: str = "robinhood",
+    budget: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    """Build a valid scheduled run_state for an escalated recovery attempt.
+
+    Contract: if the single recovery attempt also fails, or a safety/account/
+    order rejection occurs, the task writes run_state.json recording the
+    blocking reason and escalates -- it does not retry further or drop to an
+    interactive/manual path (see failure_recovery_policy.escalation in
+    config/scheduled_tasks.json). The returned dict satisfies
+    run_state.schema.json (required run_id/generated_at/trading_day/broker/
+    budget/counts, plus recovery -- required because recovery_rerun=true) and
+    carries ``order_submit_status='not_submitted_error'``.
+
+    ``persisted_raw_first``/``recomputed_from_persisted`` default to False (the
+    recovery attempt itself failed before completing those steps); pass True
+    for a rejection that occurred after a successful recompute.
+
+    ``generated_at`` pins the run timestamp for replays/backfills where ``now``
+    is the scheduled fire time; when omitted, falls back to the wall clock.
+    """
+    _validate_recovery_trigger_reason(trigger_reason)
+    ts = triggered_at_utc or _utc_now_iso()
+    _generated_at = generated_at or datetime.now(_EASTERN).strftime("%Y-%m-%dT%H:%M:%S")
+    return {
+        "run_id": scheduled_run_id(trading_day),
+        "generated_at": _generated_at,
+        "trading_day": trading_day,
+        "broker": broker,
+        "order_submit_status": ORDER_SUBMIT_STATUS_ERROR,
+        "budget": budget or {"budget_tier": "normal", "daily_cap_usd": 0, "weekly_cap_usd": 0},
+        "counts": {"evaluated": 0, "buy_candidates": 0, "submitted": 0},
+        "buy_candidates": [],
+        "run_classification": build_scheduled_classification(trading_day, ts),
+        "recovery_rerun": True,
+        "recovery": {
+            "trigger_reason": trigger_reason,
+            "attempt": 1,
+            "persisted_raw_first": bool(persisted_raw_first),
+            "recomputed_from_persisted": bool(recomputed_from_persisted),
+            "escalated": True,
+            "blocking_reason": str(blocking_reason),
+        },
+    }
+
+
 # --- Validation --------------------------------------------------------------
 
 @dataclass
@@ -1018,6 +1140,9 @@ __all__ = [
     "list_raw_inputs_saved",
     "build_raw_persistence_state",
     "raw_persistence_failure_run_state",
+    "RECOVERY_TRIGGER_REASONS",
+    "build_recovery_state",
+    "recovery_escalation_run_state",
     "validate_classification",
     "is_manual_state",
     "is_scheduled_state",

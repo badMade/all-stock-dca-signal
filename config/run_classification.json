@@ -153,6 +153,11 @@
       "Write run_state.json under manual_runs/<timestamp>/.",
       "NEVER update latest_scheduled_run.json from a manual run.",
       "run_classification.run_origin must be 'manual' and manual_run must be true with a distinct run_id."
+    ],
+    "recovery_rerun": [
+      "A scheduled live task's automatic failure recovery (see failure_recovery_policy in config/scheduled_tasks.json) reuses the SAME scheduled_runs/YYYYMMDD_1520ET/ directory and stamps recovery_rerun=true on the run_state.",
+      "A recovery rerun keeps run_origin='scheduled' with BOTH cron_id='10ce362c' AND supersedes_cron_id='ce16ba6b' and still updates latest_scheduled_run.json; it is NEVER reclassified as manual.",
+      "If the single recovery attempt also fails or a safety/account/order rejection occurs, write run_state.json recording recovery.blocking_reason with recovery.escalated=true and escalate; do not retry further or drop to an interactive/manual path."
     ]
   },
   "downstream_reporting_rules": {

@@ -11,6 +11,12 @@
     "active": { "type": "array", "items": { "type": "string", "pattern": "^[A-Z.]{1,6}$" }, "uniqueItems": true },
     "excluded": { "type": "array", "items": { "type": "string" } },
     "symbol_corrections": { "type": "object", "additionalProperties": { "type": "string" } },
+    "data_source_notes": {
+      "type": "object",
+      "description": "Per-ticker free-text notes about data-source availability/resolution quirks (e.g. a symbol resolved on Robinhood but unresolved/NOT_FOUND on the finance connector). Keys are tickers from `active`; values must be non-empty, non-placeholder text.",
+      "propertyNames": { "pattern": "^[A-Z.]{1,6}$" },
+      "additionalProperties": { "type": "string", "minLength": 1, "not": { "enum": ["", "TODO", "TBD", "N/A", "null"] } }
+    },
     "notes": { "type": "string" }
   }
 }

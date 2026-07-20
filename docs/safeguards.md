@@ -114,6 +114,22 @@ on the day's planned spend and the count of 3x-or-greater signals (multiplier
   infers scheduled status from broker orders alone. See
   [run_classification.md](run_classification.md) and
   [`config/run_classification.json`](../config/run_classification.json).
+- **Automatic failure recovery (live trading tasks):** the scheduled live tasks
+  (morning `42173154`, midday `a6239dae`, afternoon `10ce362c`) treat a mid-run
+  failure caused by **internal persistence, parsing, wrapper-normalization,
+  transient connector throttling, or raw-file write** problems **after data was
+  fetched** as a **recovery trigger, not a terminal stop**. The task reruns the
+  required read-only inputs **once**, **persists all raw responses first**,
+  **recomputes only from the persisted files**, and continues through the same
+  pre-authorized guarded path **only if every safeguard above still passes** —
+  no rule is loosened for recovery. The recovery reuses the same scheduled run
+  directory with `recovery_rerun=true` and is **never** reclassified as manual.
+  If the recovery attempt **also fails**, or a **safety / account / order
+  rejection** occurs, the task writes `run_state.json` with the blocking reason
+  and **escalates** rather than retrying further or dropping to an interactive
+  path. See the `failure_recovery_policy` block in
+  [`config/scheduled_tasks.json`](../config/scheduled_tasks.json) and
+  [run_classification.md](run_classification.md#recovery-reruns).
 - **Afternoon completion rule:** all afternoon **trading and artifact-writing**
   tasks complete **no later than 3:40 PM ET**, when the read-only watchdog
   (`a46bf007`) begins its final verification. The watchdog's own post-3:40 PM

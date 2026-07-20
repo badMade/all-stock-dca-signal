@@ -22,11 +22,13 @@ from run_classification import (  # noqa: E402
     FINAL_MANUAL_OVERRIDE_RUN_TYPE,
     ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED,
     ORDER_SUBMIT_STATUS_ERROR,
+    RECOVERY_TRIGGER_REASONS,
     STATE_SCHEMA_VERSION,
     STATE_SCHEMA_VERSION_V2,
     build_final_manual_override_classification,
     build_manual_classification,
     build_raw_persistence_state,
+    build_recovery_state,
     build_scheduled_classification,
     collect_manual_order_ids,
     exclude_manual_orders,
@@ -45,6 +47,7 @@ from run_classification import (  # noqa: E402
     quotes_batch_filename,
     raw_input_dir,
     raw_persistence_failure_run_state,
+    recovery_escalation_run_state,
     save_raw_input,
     scheduled_run_id,
     select_scheduled_state_for_reporting,
@@ -681,6 +684,121 @@ def test_raw_persistence_failure_still_writes_valid_scheduled_state():
         sel = select_scheduled_state_for_reporting(TRADING_DAY, base=base)
         assert sel.ok
         assert sel.order_ids == []
+
+
+# --- Automatic failure recovery (2026-07-15 failure_recovery_policy) ---------
+
+
+def test_build_recovery_state_shape():
+    block = build_recovery_state(
+        "transient_connector_throttling",
+        persisted_raw_first=True,
+        recomputed_from_persisted=True,
+    )
+    assert block["recovery_rerun"] is True
+    recovery = block["recovery"]
+    assert recovery["trigger_reason"] == "transient_connector_throttling"
+    assert recovery["attempt"] == 1
+    assert recovery["persisted_raw_first"] is True
+    assert recovery["recomputed_from_persisted"] is True
+    assert recovery["escalated"] is False
+    assert recovery["blocking_reason"] is None
+
+
+def test_build_recovery_state_rejects_unknown_trigger():
+    try:
+        build_recovery_state("something_else", persisted_raw_first=True, recomputed_from_persisted=True)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for an unlisted trigger_reason")
+
+
+def test_build_recovery_state_rejects_second_attempt():
+    try:
+        build_recovery_state(
+            "raw_file_write_failure",
+            persisted_raw_first=True,
+            recomputed_from_persisted=True,
+            attempt=2,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError: only one recovery attempt is permitted")
+
+
+def test_recovery_escalation_run_state_shape():
+    state = recovery_escalation_run_state(
+        TRADING_DAY, "internal_persistence_failure", "recovery attempt also failed to persist run_state",
+        triggered_at_utc="2026-07-15T19:20:01Z",
+    )
+    assert order_submit_status(state) == ORDER_SUBMIT_STATUS_ERROR
+    assert state["buy_candidates"] == []
+    assert state["recovery_rerun"] is True
+    assert state["recovery"]["escalated"] is True
+    assert state["recovery"]["blocking_reason"] == "recovery attempt also failed to persist run_state"
+    assert is_scheduled_state(state)
+    assert not is_manual_state(state)
+    # It still writes to the scheduled path and updates the pointer like any scheduled run.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        written = write_run_artifacts(state, base=base)
+        assert "latest_scheduled_run" in written
+        sel = select_scheduled_state_for_reporting(TRADING_DAY, base=base)
+        assert sel.ok
+        assert sel.order_ids == []
+
+
+def test_recovery_triggers_match_config_and_schema():
+    # Keep the runtime constant synchronized with the declarative policy/schema
+    # (config/scheduled_tasks.json failure_recovery_policy.recovery_triggers and
+    # schemas/run_state.schema.json recovery.trigger_reason.enum) so they can
+    # never silently drift apart.
+    repo_root = Path(__file__).resolve().parents[2]
+    config = json.loads((repo_root / "config" / "scheduled_tasks.json").read_text(encoding="utf-8"))
+    assert tuple(config["failure_recovery_policy"]["recovery_triggers"]) == RECOVERY_TRIGGER_REASONS
+    schema = json.loads((repo_root / "schemas" / "run_state.schema.json").read_text(encoding="utf-8"))
+    assert tuple(schema["properties"]["recovery"]["properties"]["trigger_reason"]["enum"]) == RECOVERY_TRIGGER_REASONS
+
+
+def test_recovery_state_validates_against_json_schema():
+    try:
+        import jsonschema
+        from referencing import Registry, Resource
+    except ImportError:
+        return
+
+    repo_root = Path(__file__).resolve().parents[2]
+    schemas_dir = repo_root / "schemas"
+    main = json.loads((schemas_dir / "run_state.schema.json").read_text(encoding="utf-8"))
+    resources = [
+        (name, Resource.from_contents(json.loads((schemas_dir / name).read_text(encoding="utf-8"))))
+        for name in ("run_state.schema.json", "run_classification.schema.json")
+    ]
+    registry = Registry().with_resources(resources)
+    validator = jsonschema.Draft7Validator(main, registry=registry)
+
+    state = _scheduled_state()
+    state.update(build_recovery_state(
+        "parsing_failure", persisted_raw_first=True, recomputed_from_persisted=True,
+    ))
+    validator.validate(state)
+
+    escalated = recovery_escalation_run_state(
+        TRADING_DAY, "raw_file_write_failure", "disk full while writing run_state.json",
+    )
+    validator.validate(escalated)
+
+    # recovery_rerun=true with no recovery block must fail the schema's if/then.
+    missing_recovery = _scheduled_state()
+    missing_recovery["recovery_rerun"] = True
+    try:
+        validator.validate(missing_recovery)
+    except jsonschema.ValidationError:
+        pass
+    else:
+        raise AssertionError("expected ValidationError: recovery is required when recovery_rerun=true")
 
 
 # --- Final manual buy override (2026-07-13 final-buy behavior) ---------------

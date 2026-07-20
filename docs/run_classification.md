@@ -316,6 +316,56 @@ does **not** reclassify anything:
   valid scheduled run_state; the watchdog treats it as a completed scheduled run,
   not a discrepancy.
 
+## Recovery reruns
+
+The three scheduled **live** tasks — morning (`42173154`), midday (`a6239dae`),
+and afternoon (`10ce362c`) — support **automatic failure recovery**. When a run
+fails on **internal persistence, parsing, wrapper-normalization, transient
+connector throttling, or raw-file write** problems **after data was fetched**,
+the task treats it as a recovery trigger (not a terminal stop): it reruns the
+required read-only inputs **once**, **persists all raw responses first**,
+**recomputes only from the persisted files**, and continues through the same
+pre-authorized guarded path if every safeguard still passes.
+
+A recovery rerun does **not** change classification:
+
+- It **reuses the same logical scheduled run directory** (afternoon:
+  `scheduled_runs/YYYYMMDD_1520ET/`) and stamps `recovery_rerun=true` on the
+  run_state.
+- It keeps `run_origin='scheduled'` and is **never** reclassified as manual. For
+  the afternoon task it still carries **both** `cron_id='10ce362c'` **and**
+  `supersedes_cron_id='ce16ba6b'` and still updates `latest_scheduled_run.json`.
+  This is distinct from the midday `manual_reruns/` override tree, which **is**
+  manual.
+- If the single recovery attempt **also fails**, or a **safety / account /
+  order rejection** occurs, the task writes `run_state.json` with the blocking
+  reason (`recovery.blocking_reason`, `recovery.escalated=true`) and
+  **escalates** — it does not retry further or drop to an interactive path.
+
+The `recovery_rerun` flag and `recovery` block are defined in
+[`../schemas/run_state.schema.json`](../schemas/run_state.schema.json), which
+requires `recovery` whenever `recovery_rerun=true`; the policy lives in the
+`failure_recovery_policy` block of
+[`../config/scheduled_tasks.json`](../config/scheduled_tasks.json). Downstream
+reporting treats a recovery rerun exactly like any other scheduled run of the
+same stream (a successful recovery contributes its scheduled fills; an escalated
+recovery contributes zero scheduled fills but is still a valid scheduled run
+that fired).
+
+Runtime helpers live in
+[`../scripts/run_classification.py`](../scripts/run_classification.py), the
+same module the 2026-07-10 raw-persistence fix above uses: `RECOVERY_TRIGGER_REASONS`
+(kept in sync with `failure_recovery_policy.recovery_triggers` and the schema's
+`recovery.trigger_reason` enum), `build_recovery_state` (stamps `recovery_rerun`/
+`recovery` on a successful recovery rerun's run_state), and
+`recovery_escalation_run_state` (builds a valid scheduled run_state, mirroring
+`raw_persistence_failure_run_state`, for the case where the recovery attempt also
+fails or hits a safety/account/order rejection). As with raw persistence, the
+orchestrator wrapping the read-only rerun and raw-file persistence around the
+`near_close_dca` provider calls is responsible for invoking these helpers with
+the outcome of that rerun; they give the recovery contract's `run_state` fields
+a concrete, tested implementation rather than being declarative policy alone.
+
 ## Manual Test Runs reporting
 
 Manual fills may be reported **only** in a clearly labeled **"Manual Test Runs"**

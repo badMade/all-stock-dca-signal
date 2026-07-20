@@ -496,6 +496,23 @@ class _RaisingData:
         raise RuntimeError("boom")
 
 
+class _NotFoundData:
+    """Provider that always raises a "ticker not found" style error.
+
+    Mirrors a finance connector lookup failure for a Robinhood-only ticker
+    such as GFUZ (see data_source_notes in config/tickers.json).
+    """
+
+    def __init__(self, source):
+        self.source = source
+
+    def get_previous_close_bar(self, ticker, as_of):
+        raise LookupError(f"{ticker}: Not Found (404)")
+
+    def get_intraday_bars(self, ticker, start, end, interval_minutes):
+        raise LookupError(f"{ticker}: Not Found (404)")
+
+
 def _compact_setup(workdir):
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
@@ -574,6 +591,29 @@ def test_usage_proxy_counts_provider_errors(tmp_path):
     # The artifact rows carry the provider_error flag, not just the reason text.
     finance_rows = [row for row in run_state["signal_rows"] if row["source"] == "finance"]
     assert finance_rows and all(row["provider_error"] is True for row in finance_rows)
+
+
+def test_finance_ticker_not_found_degrades_to_robinhood_only_buy(tmp_path):
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    now, config, state, broker, _fin, rh = _compact_setup(tmp_path)
+    not_found = _NotFoundData(SourceName.FINANCE)
+
+    run_daily_compact(now, config, state, not_found, rh, broker, artifacts_dir=artifacts_dir)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    usage = run_state["usage_proxy"]
+
+    # A permanent "ticker not found" error on one source (e.g. GFUZ unresolved on the
+    # finance connector) must not count as a provider error or force manual review the
+    # way a genuine transient failure does (see test_usage_proxy_counts_provider_errors
+    # above) -- the documented Robinhood-only BUY path still proceeds.
+    assert usage["errors_count"] == 0
+    assert usage["manual_recovery_required"] is False
+    assert usage["orders_placed_count"] == 3
+    finance_rows = [row for row in run_state["signal_rows"] if row["source"] == "finance"]
+    assert finance_rows and all(row["provider_error"] is False for row in finance_rows)
+    assert all("not found" in row["reason"] for row in finance_rows)
 
 
 def test_run_daily_compact_writes_structured_only(tmp_path):

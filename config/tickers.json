@@ -1,18 +1,21 @@
 {
   "$schema": "../schemas/tickers.schema.json",
-  "version": "2026-07-09",
+  "version": "2026-07-15",
   "description": "Active graded DCA ticker universe. Backup of the latest thread state; no secrets.",
   "active": [
     "DFTX", "TRIN", "AAAU", "SPCX", "EVR", "LUNR", "IRDM",
     "DXYZ", "LITE", "ASML", "DRAM", "STX", "MSFT", "AAPL", "AMAT", "AMD", "CBRS",
     "MRVL", "BTX", "STM", "SNDK", "WDC", "TSM", "AVGO", "NVDA", "QBTS", "FLKR",
     "INTC", "GOOGL", "GOOG", "AMZN", "GLW", "MA", "GS", "MU", "NFLX", "XLG",
-    "TOPT", "QTOP", "SATA", "RGTI", "IBM"
+    "TOPT", "QTOP", "SATA", "RGTI", "IBM", "GFUZ"
   ],
   "excluded": ["BYDDY", "VCX", "TRLV", "RVI"],
   "symbol_corrections": {
     "IRDMI": "IRDM",
     "GLWR": "GLW"
   },
-  "notes": "42 active symbols. BYDDY, VCX, TRLV, and RVI excluded. IRDMI->IRDM and GLWR->GLW corrected upstream; IBM included."
+  "data_source_notes": {
+    "GFUZ": "General Fusion Group Ltd. Common Shares. Robinhood is the primary data source: resolved active, tradeable=true, fractional_tradability='tradable', regular-hours dollar orders supported, prior close available. Finance connector ticker lookup returned NOT_FOUND, so finance data may be unresolved/unavailable for GFUZ."
+  },
+  "notes": "43 active symbols. BYDDY, VCX, TRLV, and RVI excluded. IRDMI->IRDM and GLWR->GLW corrected upstream; IBM included. GFUZ added 2026-07-15 (user-approved): uses Robinhood primary data; finance connector unresolved (NOT_FOUND)."
 }

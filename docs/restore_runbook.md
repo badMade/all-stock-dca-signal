@@ -60,7 +60,7 @@ Then diff and review before committing. See [`scripts/README.md`](../scripts/REA
 
 ## Audit checklist
 
-- [ ] Active universe = 45 symbols; `BYDDY` excluded; `IRDMI→IRDM`, `GLWR→GLW` applied.
+- [ ] Active universe = 43 symbols; `BYDDY`, `VCX`, `TRLV`, `RVI` excluded; `IRDMI→IRDM`, `GLWR→GLW` applied; `GFUZ` included (Robinhood primary data, finance `NOT_FOUND`).
 - [ ] Ladder is the latest (0.1%–8%+, max 5x, no upper cutoff). No 12x-era tiers.
 - [ ] Base amount $3; tiered daily/weekly caps and $900 weekly rollover reserve cap intact.
 - [ ] Only the live task `10ce362c` (supersedes deleted `ce16ba6b`) can trade; it uses only account `562057042`; Alpaca read-only.

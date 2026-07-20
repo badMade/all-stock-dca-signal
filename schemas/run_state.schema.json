@@ -23,6 +23,34 @@
     },
     "broker": { "type": "string", "description": "Execution broker for the run (e.g. robinhood)." },
     "dry_run": { "type": "boolean" },
+    "recovery_rerun": {
+      "type": "boolean",
+      "description": "True when this run_state was produced by an automatic failure-recovery attempt of a scheduled live task (morning 42173154, midday a6239dae, afternoon 10ce362c). A recovery rerun reuses the same logical scheduled run directory and keeps the run's scheduled run_classification — it is NEVER reclassified as manual. See the failure_recovery_policy in config/scheduled_tasks.json and docs/run_classification.md#recovery-reruns."
+    },
+    "recovery": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Details of an automatic failure-recovery attempt, present when recovery_rerun=true. Recovery is triggered only by internal persistence, parsing, wrapper-normalization, transient connector throttling, or raw-file write failures that occur AFTER data was fetched; read-only inputs are rerun once, all raw responses are persisted first, and the run is recomputed only from persisted files through the same guarded path. No secrets.",
+      "required": ["trigger_reason", "attempt", "persisted_raw_first", "recomputed_from_persisted", "escalated"],
+      "properties": {
+        "trigger_reason": {
+          "type": "string",
+          "enum": [
+            "internal_persistence_failure",
+            "parsing_failure",
+            "wrapper_normalization_failure",
+            "transient_connector_throttling",
+            "raw_file_write_failure"
+          ],
+          "description": "Which recovery trigger fired."
+        },
+        "attempt": { "type": "integer", "minimum": 1, "maximum": 1, "description": "Recovery attempt number. Only one recovery attempt is permitted per scheduled run." },
+        "persisted_raw_first": { "type": "boolean", "description": "True when all rerun raw responses were persisted to disk before any recomputation." },
+        "recomputed_from_persisted": { "type": "boolean", "description": "True when the run was recomputed only from the persisted raw files." },
+        "escalated": { "type": "boolean", "description": "True when the recovery attempt also failed or a safety/account/order rejection occurred and the run escalated instead of retrying further." },
+        "blocking_reason": { "type": ["string", "null"], "description": "Populated when escalated=true: the reason recovery could not complete (recovery failure, or a safety/account/order rejection)." }
+      }
+    },
     "order_submit_status": {
       "type": "string",
       "enum": [
@@ -161,5 +189,12 @@
       "type": "array",
       "items": { "type": "string" }
     }
+  },
+  "if": {
+    "properties": { "recovery_rerun": { "const": true } },
+    "required": ["recovery_rerun"]
+  },
+  "then": {
+    "required": ["recovery"]
   }
 }

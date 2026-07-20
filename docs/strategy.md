@@ -57,16 +57,20 @@ spread, whitelist, or circuit-breaker requirements.
 
 ## Active ticker universe
 
-42 active symbols (see [`config/tickers.json`](../config/tickers.json)):
+43 active symbols (see [`config/tickers.json`](../config/tickers.json)):
 
 ```
 DFTX TRIN AAAU SPCX EVR LUNR IRDM DXYZ LITE ASML DRAM STX
 MSFT AAPL AMAT AMD CBRS MRVL BTX STM SNDK WDC TSM AVGO NVDA QBTS FLKR
-INTC GOOGL GOOG AMZN GLW MA GS MU NFLX XLG TOPT QTOP SATA RGTI IBM
+INTC GOOGL GOOG AMZN GLW MA GS MU NFLX XLG TOPT QTOP SATA RGTI IBM GFUZ
 ```
 
 - **Excluded:** `BYDDY`, `VCX`, `TRLV`, `RVI`
 - **Symbol corrections applied:** `IRDMI -> IRDM`, `GLWR -> GLW`
+- **`GFUZ` (General Fusion Group Ltd.)** added 2026-07-15 (user-approved). Uses
+  **Robinhood primary data** (resolved active, tradeable, `fractional_tradability='tradable'`,
+  regular-hours dollar orders, prior close available). The Finance connector lookup
+  returned `NOT_FOUND`, so finance data may be unresolved/unavailable for `GFUZ`.
 
 ## Sizing ladder (latest, active)
 

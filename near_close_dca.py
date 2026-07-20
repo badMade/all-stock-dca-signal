@@ -97,7 +97,7 @@ ACTIVE_TICKERS = [
     "DXYZ", "LITE", "ASML", "DRAM", "STX", "MSFT", "AAPL", "AMAT", "AMD", "CBRS",
     "MRVL", "BTX", "STM", "SNDK", "WDC", "TSM", "AVGO", "NVDA", "QBTS", "FLKR",
     "INTC", "GOOGL", "GOOG", "AMZN", "GLW", "MA", "GS", "MU", "NFLX", "XLG",
-    "TOPT", "QTOP", "SATA", "RGTI", "IBM",
+    "TOPT", "QTOP", "SATA", "RGTI", "IBM", "GFUZ",
 ]
 
 # BYDDY (ADR wind-down), VCX, TRLV, and RVI are excluded from the active universe.
@@ -901,6 +901,27 @@ def graded_buy_multiplier(drop_vs_previous_close: float, config: StrategyConfig)
     if kill_switch_engaged(config):
         multiplier = min(multiplier, 1.0)
     return multiplier
+
+
+# Substrings (checked case-insensitively) that indicate a provider raised because the
+# ticker itself is unresolved/unlisted on that source (e.g. GFUZ on the finance
+# connector) rather than a transient failure. This distinction matters: reconcile_signals
+# treats provider_error=True as unsafe-to-auto-buy, but a permanently-unresolved ticker
+# on one source should still allow the documented Robinhood-only BUY path, not permanently
+# force MANUAL_REVIEW every run. See docs data_source_notes in config/tickers.json.
+_TICKER_NOT_FOUND_MARKERS = (
+    "not found",
+    "no data found",
+    "invalid symbol",
+    "unknown symbol",
+    "unresolved symbol",
+    "404",
+)
+
+
+def _is_ticker_not_found_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in _TICKER_NOT_FOUND_MARKERS)
 
 
 def evaluate_source_signal(
@@ -3015,13 +3036,24 @@ def run_once(
                 interval_minutes=interval_minutes,
             )
         except Exception as exc:  # noqa: BLE001 - count and degrade to NO_DATA
-            errors_count += 1
+            not_found = _is_ticker_not_found_error(exc)
+            if not_found:
+                reason = f"ticker not found on {getattr(data, 'source', SourceName.FINANCE).value}: {exc}"
+            else:
+                errors_count += 1
+                reason = f"provider error: {exc}"
             return SourceSignal(
                 ticker=ticker,
                 source=getattr(data, "source", SourceName.FINANCE),
                 action=Action.NO_DATA,
-                reason=f"provider error: {exc}",
-                provider_error=True,
+                reason=reason,
+                # A ticker-not-found error is a permanent, source-specific condition
+                # (e.g. GFUZ unresolved on the finance connector) documented in
+                # config/tickers.json data_source_notes, not a transient failure — it
+                # must not permanently force MANUAL_REVIEW via reconcile_signals'
+                # provider_error guard. Any other exception still sets provider_error
+                # so reconcile_signals blocks auto-buy on real provider failures.
+                provider_error=not not_found,
             )
 
     for ticker in tradable_tickers:
