@@ -382,6 +382,33 @@
     ],
     "doc": "docs/midday_dca.md"
   },
+  "live_task_text_compactness_policy": {
+    "added": "2026-07-20",
+    "applies_to": ["42173154", "a6239dae", "10ce362c"],
+    "trigger_incident": "The schedule service appears to truncate or drop the tail of very long scheduled-task text. When a live task's stored text runs long, critical guardrails near the end can be pushed past the service truncation boundary and silently lost.",
+    "requirement": "Live scheduled task text MUST stay compact enough that critical guardrails are not pushed past the service truncation boundary. Keep every essential safeguard inside the accepted (non-truncated) text; do not rely on trailing text that the service may drop. Prefer compact task text that points at the repo config/docs source of truth for full detail rather than inlining long-form rules that risk truncation.",
+    "essential_guardrails_must_stay_in_text": [
+      "raw input self-containment / generation before invoking any saved runner",
+      "state-file guarantee and no-half-done-run rule",
+      "same-day top-up guard",
+      "manual recovery artifacts are prior-allocation / top-up context only, never scheduled evidence"
+    ],
+    "afternoon_1520_compact_text": {
+      "task": "10ce362c",
+      "replaced_on": "2026-07-20",
+      "approx_char_length": 5850,
+      "summary": "Live task 10ce362c was replaced with a compact ~5,850 character source-of-truth version that keeps all essential safeguards inside the accepted text.",
+      "compact_text_includes": [
+        "RAW INPUT SELF-CONTAINMENT FIX ADDED JUL 20 2026",
+        "STATE FILE GUARANTEE AND NO HALF-DONE RUN RULE ADDED JUL 20 2026",
+        "same-day top-up guard",
+        "the Jul 20 midday recovery artifact path /home/user/workspace/cron_tracking/midday_dca/manual_recovery/20260720_1259ET",
+        "the filled AAPL/TRIN/ASML/IRDM recovery context (AAPL $1.00, TRIN $2.00, ASML $2.00, IRDM $2.00), prior-allocation / top-up context only"
+      ],
+      "see": "live_schedule_hardening_2026_07_20.afternoon_1520 and midday_dca_manual_recovery_2026_07_20"
+    },
+    "doc": "docs/schedule_manifest.md"
+  },
   "scheduled_run_outcomes": {
     "summary": "Dated machine-readable ledger of afternoon scheduled live-run outcomes for task 10ce362c (supersedes ce16ba6b). Scheduled evidence only; manual/override order IDs are excluded from every scheduled metric. See config/run_classification.json for the full per-run records and docs/schedule_manifest.md for the human-readable notes.",
     "runs": [
