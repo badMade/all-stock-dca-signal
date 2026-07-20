@@ -5,6 +5,9 @@ what it *actually* ordered, for a single run directory, and alerts on **drift**:
 any symbol that carried an auto-buy signal with a positive intended dollar amount
 but for which no submitted-order record exists.
 
+- Status: **merged in PR #80** (merge commit `3641b90`) and wired into the live
+  task chain — each live task carries a `post_artifact_drift_check` block and the
+  `d1f7a2c0` monitoring entry tracks it.
 - Machine-readable policy: [`config/scheduled_tasks.json`](../config/scheduled_tasks.json) → `drift_detection_policy`.
 - Notification routing: [`config/notifications.json`](../config/notifications.json) → `routing.drift_alerts`.
 - Tests: [`scripts/tests/test_drift_detection.py`](../scripts/tests/test_drift_detection.py).

@@ -113,6 +113,11 @@ The guard changes sizing only. It does **not** relax any standing constraint:
   (`dca_config.load_backtest_sizing_tiers` returns it in isolation); it exists
   purely so analytics can be run against a simpler curve without touching what
   the live task does.
+- A separate **analytics-only** intraday cumulative cap curve backtest (weekly
+  rollover funding, $1 backtest base) is documented in
+  [backtest_curve.md](backtest_curve.md) with machine-readable candidates in
+  [`config/backtest_intraday_cap_curve.json`](../config/backtest_intraday_cap_curve.json).
+  It is non-live and never changes execution.
 
 ## CLI
 

@@ -1,8 +1,77 @@
 {
   "$schema": "../schemas/scheduled_tasks.schema.json",
-  "version": "2026-07-15",
-  "verified_on_et": "2026-07-15",
+  "version": "2026-07-16",
+  "verified_on_et": "2026-07-16",
   "timezone_note": "Cron expressions are in UTC. ET equivalents are during US Eastern Daylight Time (EDT, UTC-4). Confirm around DST transitions.",
+  "operating_mode": {
+    "mode": "cost_saving_daily_compact",
+    "requested_on_et": "2026-07-16",
+    "summary": "Cost-saving operating mode requested Thu Jul 16 2026: keep the weekday DCA chain compact and defer all heavy analysis to Friday. Daily weekday tasks write compact machine-readable artifacts (JSON/CSV) only, avoid long narrative summaries, suppress no-op notifications, and rely on the post-artifact drift detector instead of manual checking. Full analysis, dashboards, and narrative reporting move to the Friday 5:00 PM ET weekly refresh. This mode changes cost/reporting behavior ONLY; it does NOT relax any trading safety rule (see preserved_trading_safety_rules).",
+    "daily_compact_chain_et": [
+      { "et": "09:45", "task_id": "morning-dca-0945", "role": "pre-flight validation (read-only)" },
+      { "et": "10:30", "task_id": "42173154", "role": "morning live execution" },
+      { "et": "12:30", "task_id": "a6239dae", "role": "midday live execution" },
+      { "et": "15:20", "task_id": "10ce362c", "role": "final live execution (final buy of the day)" },
+      { "et": "15:35", "task_id": "67aa802b", "role": "post-trade slippage + compact Notion latest-run sync" },
+      { "et": "15:40", "task_id": "a46bf007", "role": "live-run watchdog" }
+    ],
+    "daily_mode_rules": [
+      "Write compact artifacts only: machine-readable JSON/CSV, no long narrative summaries.",
+      "Suppress no-op / heartbeat notifications entirely.",
+      "Notify only for actionable events (see actionable_notification_events).",
+      "Use post-artifact drift detection (see drift_detection_policy) instead of manual reconciliation of signals vs orders.",
+      "Batch market-data pulls where possible; persist each raw connector response once and have downstream steps read the saved files rather than re-pulling.",
+      "Limit Notion writes to the compact Latest Run update daily; refresh the full Notion page only in the Friday weekly refresh.",
+      "Cap automated retries at one targeted recovery rerun (see recovery_policy).",
+      "Use cost-conscious / default models for routine repo, script, and summary maintenance; reserve premium models for major architecture or debugging work."
+    ],
+    "actionable_notification_events": [
+      "placed orders",
+      "rejected orders",
+      "candidates capped by budget",
+      "missing or invalid artifacts",
+      "broker/log mismatch",
+      "data-confidence failures",
+      "drift-detector failures",
+      "recovery attempts or failures",
+      "meaningful exceptions"
+    ],
+    "friday_heavy_analysis": {
+      "task_id": "041d9d90",
+      "et": "Fridays 17:00",
+      "scope": [
+        "full Notion refresh",
+        "performance tables",
+        "slippage trend analysis",
+        "missing-fill analysis",
+        "cost-basis / control comparisons",
+        "cost tracker update",
+        "full weekly dashboard refresh"
+      ],
+      "note": "The Friday 5:00 PM ET weekly refresh is the only approved post-3:40 PM DCA-related exception and carries all deferred heavy analysis."
+    },
+    "recovery_policy": {
+      "summary": "Avoid manual full reruns unless a detector or a failed scheduled run indicates a real issue. Prefer targeted recovery runs for the specific failed tickers or failed steps, capped at one recovery rerun.",
+      "avoid_manual_full_reruns_unless": "a drift detector, watchdog, or failed scheduled run signals a real issue",
+      "targeted_recovery": "re-run only the failed tickers or failed steps",
+      "max_recovery_reruns": 1
+    },
+    "efficiency_levers": [
+      "Batch connector/market-data pulls across the active universe instead of per-ticker calls.",
+      "Persist raw connector responses once per run; downstream compute reads the saved files (see raw_data_persistence on task 10ce362c).",
+      "Daily Notion write = Latest Run section only; full page weekly.",
+      "One recovery rerun cap for automated retries.",
+      "Cost-conscious/default models for routine maintenance; premium models only for major architecture/debugging."
+    ],
+    "preserved_trading_safety_rules": [
+      "Robinhood account 562057042 is the only execution broker; Alpaca/Yahoo/Finance are read-only.",
+      "Buy-only. No options, crypto, or margin.",
+      "Active universe includes IBM and GFUZ; excludes BYDDY, VCX, TRLV, RVI.",
+      "Manual, morning, midday, and final streams stay separated.",
+      "Prior-run fills are same-day top-up context only, never scheduled evidence."
+    ],
+    "doc": "docs/cost_tracking.md"
+  },
   "afternoon_completion_rule": "All afternoon trading and artifact-writing tasks complete no later than 3:40 PM ET, when the read-only live-run watchdog (a46bf007) begins its final verification. The watchdog's own post-3:40 PM verification and the Friday weekly Notion performance refresh at 5:00 PM ET are the only approved post-3:40 PM DCA-related exceptions.",
   "run_classification_policy": {
     "policy_file": "config/run_classification.json",
@@ -140,6 +209,10 @@
     ]
   },
   "drift_detection_policy": {
+    "status": "merged",
+    "merged_pr": 80,
+    "merge_commit": "3641b9041e5ebaefb0e0c3595751f151a06c96fd",
+    "wired_into_live_chain": true,
     "summary": "Every live trading run (morning 10:30, midday 12:30, afternoon 3:20) MUST invoke scripts/drift_detection.py against its own run directory immediately AFTER it finishes writing artifacts. The detector reconciles signals.csv (intended auto-buys) against submitted_orders.csv (actual order records) and alerts when any symbol has auto_buy_signal true (case-insensitive true/1/yes) and incremental_order_amount > 0 or a positive desired amount, but no submitted-order record exists for that symbol.",
     "detector": "scripts/drift_detection.py",
     "doc": "docs/drift_detection.md",
@@ -559,6 +632,9 @@
       "type": "monitoring",
       "status": "active",
       "trades": false,
+      "merged_pr": 80,
+      "merge_commit": "3641b9041e5ebaefb0e0c3595751f151a06c96fd",
+      "wired_into_live_chain": true,
       "detector": "scripts/drift_detection.py",
       "doc": "docs/drift_detection.md",
       "invoked_by": ["42173154", "a6239dae", "10ce362c"],

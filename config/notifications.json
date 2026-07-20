@@ -1,6 +1,22 @@
 {
   "$schema": "../schemas/notifications.schema.json",
-  "version": "2026-07-06",
+  "version": "2026-07-16",
+  "daily_compact_mode": {
+    "requested_on_et": "2026-07-16",
+    "summary": "Under the cost-saving daily-compact operating mode (config/scheduled_tasks.json -> operating_mode), weekday tasks suppress no-op / heartbeat notifications and notify ONLY for actionable events. Heavy narrative reporting is deferred to the Friday 5:00 PM ET weekly refresh.",
+    "suppress_no_op_notifications": true,
+    "actionable_events": [
+      "placed orders",
+      "rejected orders",
+      "candidates capped by budget",
+      "missing or invalid artifacts",
+      "broker/log mismatch",
+      "data-confidence failures",
+      "drift-detector failures",
+      "recovery attempts or failures",
+      "meaningful exceptions"
+    ]
+  },
   "channels": {
     "slack": {
       "enabled": false,
@@ -29,6 +45,7 @@
     "capital_priority_briefing": "Notify (in-app + email) only if at least one ticker triggers a 1.5x or higher multiplier; otherwise silent.",
     "premarket_buying_power": "Analytics dashboard only; no routine notification.",
     "volatility_outliers": "Alert only for >5% outliers or actionable errors.",
-    "drift_alerts": "Fire an IMMEDIATE alert when scripts/drift_detection.py detects an auto-buy signal (auto_buy_signal true and incremental_order_amount > 0 or desired amount > 0) with no corresponding submitted-order record. Routes to in_app_message_center by default; also posts to Slack when DCA_DRIFT_SLACK_WEBHOOK is set and the detector is run with --slack. Never routine/heartbeat -- only on detected drift."
+    "drift_alerts": "Fire an IMMEDIATE alert when scripts/drift_detection.py detects an auto-buy signal (auto_buy_signal true and incremental_order_amount > 0 or desired amount > 0) with no corresponding submitted-order record. Routes to in_app_message_center by default; also posts to Slack when DCA_DRIFT_SLACK_WEBHOOK is set and the detector is run with --slack. Never routine/heartbeat -- only on detected drift.",
+    "daily_compact_mode": "Weekday daily tasks suppress no-op/heartbeat notifications and notify only for the actionable events listed in daily_compact_mode.actionable_events (placed/rejected orders, budget-capped candidates, missing/invalid artifacts, broker/log mismatch, data-confidence failures, drift-detector failures, recovery attempts/failures, meaningful exceptions). Full narrative/dashboard reporting is deferred to the Friday weekly refresh (041d9d90)."
   }
 }

@@ -1,0 +1,78 @@
+{
+  "version": "2026-07-17",
+  "status": "backtest_analytics",
+  "usage": "analytics_only",
+  "not_for_execution": true,
+  "description": "Non-live backtest of an intraday cumulative cap curve layered on a weekly-rollover funding model. Analytics ONLY; never loaded into the live StrategyConfig or any live/manual execution path. Live streams keep using config/sizing_ladder.json (the $3-base 0x-to-5x ladder) and the standing safeguards. See docs/backtest_curve.md.",
+  "model": {
+    "base_amount_usd": 1.0,
+    "base_amount_note": "Backtest base is $1, distinct from the live $3.00 base. Live base amount policy is unchanged.",
+    "weekly_funding_usd": 300.0,
+    "rollover_rule": "current_week_available = 300 + prior_week_unused; unused weekly cash rolls forward",
+    "rollover_example": "a week with $360 available that spends $210 leaves the next week starting at $450",
+    "daily_cap_rule": "remaining_weekly_cash / remaining_trading_days_in_week, then the intraday cumulative cap curve applies to that daily cap",
+    "historical_prices": "unchanged from the prior 60 trading day test",
+    "intraday_proxy": {
+      "10:30": "daily_open",
+      "12:30": "average(daily_open, daily_low)",
+      "3:20": "daily_close"
+    }
+  },
+  "curve_definition": "A / B / C are cumulative percentages of the calculated daily cap deployable by 10:30, 12:30, and 3:20 respectively; C is always 100",
+  "highlighted_candidate": "35 / 65 / 100",
+  "candidates": [
+    {
+      "curve": "65 / 90 / 100",
+      "cumulative_cap_pct": [65, 90, 100],
+      "total_deployed_usd": 3546.50,
+      "fills": 2733,
+      "cap_skips": 6,
+      "final_spend_share_pct": 10.45,
+      "ending_rollover_usd": 353.50,
+      "discount_vs_prior_close_pct": 3.44
+    },
+    {
+      "curve": "50 / 85 / 100",
+      "cumulative_cap_pct": [50, 85, 100],
+      "total_deployed_usd": 3544.50,
+      "fills": 2721,
+      "cap_skips": 32,
+      "final_spend_share_pct": 10.51,
+      "ending_rollover_usd": 355.50,
+      "discount_vs_prior_close_pct": 3.45
+    },
+    {
+      "curve": "40 / 75 / 100",
+      "cumulative_cap_pct": [40, 75, 100],
+      "total_deployed_usd": 3541.50,
+      "fills": 2704,
+      "cap_skips": 64,
+      "final_spend_share_pct": 10.70,
+      "ending_rollover_usd": 358.50,
+      "discount_vs_prior_close_pct": 3.46
+    },
+    {
+      "curve": "35 / 65 / 100",
+      "cumulative_cap_pct": [35, 65, 100],
+      "highlighted": true,
+      "total_deployed_usd": 3533.50,
+      "fills": 2677,
+      "cap_skips": 104,
+      "final_spend_share_pct": 11.04,
+      "ending_rollover_usd": 366.50,
+      "discount_vs_prior_close_pct": 3.48
+    },
+    {
+      "curve": "33 / 66 / 100",
+      "cumulative_cap_pct": [33, 66, 100],
+      "total_deployed_usd": 3536.00,
+      "fills": 2671,
+      "cap_skips": 111,
+      "final_spend_share_pct": 10.96,
+      "ending_rollover_usd": 364.00,
+      "discount_vs_prior_close_pct": 3.48
+    }
+  ],
+  "review_note": "Monthly review should include this weekly-rollover intraday cap curve analysis and re-evaluate the highlighted 35 / 65 / 100 candidate.",
+  "historical_note": "Backtest-only. Never loaded into the live StrategyConfig. The active execution ladder remains config/sizing_ladder.json."
+}

@@ -60,7 +60,45 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 > Slack alert (no webhook is ever hardcoded). The 3:20 PM check must complete
 > **before** the 3:40 PM watchdog (`a46bf007`). See
 > [drift_detection.md](drift_detection.md) and the `drift_detection_policy` block
-> in [`config/scheduled_tasks.json`](../config/scheduled_tasks.json).
+> in [`config/scheduled_tasks.json`](../config/scheduled_tasks.json). The drift
+> detector shipped in **PR #80** (merge commit `3641b90`) and is wired into all
+> three live tasks via their `post_artifact_drift_check` blocks and the
+> `d1f7a2c0` monitoring entry.
+
+> **Cost-saving operating mode (requested Thu Jul 16 2026):** the weekday chain
+> runs in **compact** mode and all heavy analysis is deferred to the **Friday
+> 5:00 PM ET** weekly refresh. Machine-readable source:
+> [`config/scheduled_tasks.json`](../config/scheduled_tasks.json) →
+> `operating_mode` (`cost_saving_daily_compact`). Daily weekday compact chain:
+> **9:45** pre-flight (`morning-dca-0945`), **10:30** morning live (`42173154`),
+> **12:30** midday live (`a6239dae`), **3:20** final live (`10ce362c`), **3:35**
+> post-trade slippage + compact Notion Latest Run sync (`67aa802b`), **3:40**
+> watchdog (`a46bf007`). Daily tasks write compact JSON/CSV artifacts only, avoid
+> long narrative summaries, suppress no-op notifications, and notify only for
+> actionable events (placed/rejected orders, budget-capped candidates,
+> missing/invalid artifacts, broker/log mismatch, data-confidence failures,
+> drift-detector failures, recovery attempts/failures, meaningful exceptions).
+> Use **drift detection instead of manual checking**, batch market-data pulls and
+> persist raw connector responses once for downstream reads, keep daily Notion
+> writes to the Latest Run section (full page weekly), and cap automated retries
+> at **one** targeted recovery rerun (recover only failed tickers/steps). This
+> mode changes cost/reporting behavior only — **all trading safety rules are
+> preserved** (Robinhood-only execution on `562057042`; Alpaca/Yahoo/Finance
+> read-only; buy-only, no options/crypto/margin; active universe includes IBM and GFUZ
+> and excludes BYDDY/VCX/TRLV/RVI; manual/morning/midday/final streams stay
+> separated; prior-run fills are same-day top-up context only, never scheduled
+> evidence). See [cost_tracking.md](cost_tracking.md).
+
+> **Weekly-rollover cap-curve backtest (added Jul 17 2026):** an analytics-only,
+> non-live backtest of an intraday cumulative cap curve on a weekly-rollover
+> funding model (base $1 for the backtest, $300 weekly add with unused cash rolled
+> forward, daily cap = remaining weekly cash / remaining trading days, intraday
+> proxy 10:30 open / 12:30 open-low average / 3:20 close, over the same 60 trading
+> day price history). The user-highlighted candidate is **35 / 65 / 100**. This
+> does **not** change any live schedule or execution logic; the monthly review
+> (`0656657a`) should include this analysis. Machine-readable data:
+> [`config/backtest_intraday_cap_curve.json`](../config/backtest_intraday_cap_curve.json);
+> full methodology and results: [backtest_curve.md](backtest_curve.md).
 
 > **Run-classification note:** the live task (`10ce362c`, the repaired task
 > that supersedes the deleted `ce16ba6b`; artifact root stays under
@@ -398,6 +436,13 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 
 ### `0656657a` — Monthly graded DCA dashboard refresh
 - Analytics only, **no trading**. First weekday of the month **8:45 AM ET**. No-op otherwise.
+- **Monthly review scope (added Jul 17 2026):** the monthly review should include
+  the **weekly-rollover intraday cap curve** analytics backtest and re-evaluate the
+  user-highlighted **35 / 65 / 100** candidate against the alternatives. This is an
+  **analytics-only, non-live** candidate: it never changes live schedules or
+  execution logic. Machine-readable data:
+  [`config/backtest_intraday_cap_curve.json`](../config/backtest_intraday_cap_curve.json);
+  methodology and results: [backtest_curve.md](backtest_curve.md).
 
 ### `bec4a6ee` — Monthly DCA automation cost review
 - Analytics only, **no trading**. First weekday of the month **9:55 AM ET**.

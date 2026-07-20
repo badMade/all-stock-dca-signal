@@ -18,6 +18,7 @@ workflow, and Notion template. **No credentials or secrets are stored here.**
 | [notion_dashboard_template.md](notion_dashboard_template.md) | Notion page template + conceptual API sync |
 | [cost_tracking.md](cost_tracking.md) | Cost-control policy and usage proxies |
 | [restore_runbook.md](restore_runbook.md) | Restore procedure + audit checklist |
+| [backtest_curve.md](backtest_curve.md) | Analytics-only weekly-rollover intraday cap curve backtest (35 / 65 / 100 candidate) |
 
 ## Machine-readable backup
 

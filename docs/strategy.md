@@ -130,6 +130,17 @@ dimension.
 Caps are absolute ceilings: a run never exceeds the selected daily cap, the
 selected weekly cap, available buying power, or the broker/order-review limit.
 
+### Intraday cap curve backtest (analytics only, under review)
+
+An analytics-only backtest of an intraday cumulative daily cap curve (cumulative
+cap usage limits by 10:30, 12:30, and 3:20, not per-run allocations), layered on
+a $300 weekly-add rollover funding model with a $1 backtest base, is documented in
+[backtest_curve.md](backtest_curve.md) with machine-readable candidate results in
+[`config/backtest_intraday_cap_curve.json`](../config/backtest_intraday_cap_curve.json).
+The user-highlighted candidate is 35 / 65 / 100. These are non-live modeling
+candidates for review; they do not change the live base amount, ladder, or caps
+above.
+
 ## Same-day prior-run offset / top-up guard
 
 One guard governs the **morning (10:30)**, **midday (12:30)**, and **afternoon
