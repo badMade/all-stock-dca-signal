@@ -230,6 +230,11 @@ def test_midday_run_state_path_and_classification(tmp_path):
     assert rc["cron_id"] == MIDDAY_LIVE_CRON_ID
     assert rc["supersedes_cron_id"] is None
     assert rc["valid_afternoon_evidence"] is False
+    # Codex review (PR #78): MiddayDCAExecutor inherits run_classification()
+    # from MorningDCAExecutor unchanged; valid_morning_evidence must be scoped
+    # to self.stream == "morning", not hardcoded True, or a midday artifact
+    # would misreport itself as valid MORNING evidence.
+    assert rc["valid_morning_evidence"] is False
 
     art = res["artifacts"]
     assert art["mode"] == "live"

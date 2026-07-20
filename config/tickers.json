@@ -17,5 +17,18 @@
   "data_source_notes": {
     "GFUZ": "General Fusion Group Ltd. Common Shares. Robinhood is the primary data source: resolved active, tradeable=true, fractional_tradability='tradable', regular-hours dollar orders supported, prior close available. Finance connector ticker lookup returned NOT_FOUND, so finance data may be unresolved/unavailable for GFUZ."
   },
-  "notes": "43 active symbols. BYDDY, VCX, TRLV, and RVI excluded. IRDMI->IRDM and GLWR->GLW corrected upstream; IBM included. GFUZ added 2026-07-15 (user-approved): uses Robinhood primary data; finance connector unresolved (NOT_FOUND)."
+  "special_handling": {
+    "GFUZ": {
+      "primary_source": "robinhood",
+      "reason": "Finance (and other read-only market-data providers) may not resolve GFUZ. Robinhood is the primary quote/prior-close source for GFUZ; Alpaca/Finance/Yahoo remain read-only validation/context only.",
+      "do_not_block_run_if_finance_unresolved": true,
+      "supplemental_preflight": {
+        "trigger": "If the same-day 9:45 pre-flight artifact does not contain a GFUZ row (e.g. GFUZ was unresolved at 9:45), the 10:30 live task should run a supplemental GFUZ read-only validation before decisioning.",
+        "persist_file": "/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/gfuz_supplemental_preflight.json",
+        "note": "Persist the supplemental read-only validation to gfuz_supplemental_preflight.json before any GFUZ signal/budget/order decisioning; the decision engine reads only from the persisted file.",
+        "implementation_status": "not_implemented: MorningDCAExecutor._apply_preflight_gate() has no code path for this today. A missing GFUZ row in the 9:45 preflight artifact simply gates GFUZ out (tickers ∩ eligible_tickers excludes it) for that run — a safe, fail-closed degradation, not the supplemental-validation flow described above. See config/morning_dca.json's gfuz_special_handling.supplemental_preflight.implementation_status for the authoritative note."
+      }
+    }
+  },
+  "notes": "43 active symbols. BYDDY, VCX, TRLV, and RVI excluded. IRDMI->IRDM and GLWR->GLW corrected upstream; IBM and GFUZ included. GFUZ added 2026-07-15 (user-approved): Robinhood is primary (Finance connector returns NOT_FOUND). GFUZ has special handling (see special_handling): an unresolved GFUZ on Finance must not block the whole run, and if the 9:45 pre-flight lacks GFUZ the run intent is a supplemental GFUZ read-only validation persisted to gfuz_supplemental_preflight.json before decisioning — not yet implemented in code (see special_handling.GFUZ.supplemental_preflight.implementation_status); today a missing GFUZ preflight row just gates GFUZ out for that run."
 }

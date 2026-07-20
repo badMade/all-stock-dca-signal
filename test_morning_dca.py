@@ -693,9 +693,13 @@ def test_live_mode_path_and_classification(tmp_path):
     assert rc["scheduled_for_et"] == "10:30"
     assert rc["scheduled_window_start_et"] == "10:25"
     assert rc["scheduled_window_end_et"] == "10:35"
-    assert rc["state_schema_version"] == "morning-live-v1"
+    assert rc["state_schema_version"] == "morning-live-v2-preauthorized"
     assert rc["run_id"] == "morning_live_20260708_1030ET"
     assert rc["cron_id"] == MORNING_LIVE_CRON_ID
+    assert rc["execution_broker"] == "robinhood"
+    assert rc["account_number"] == "562057042"
+    assert rc["preauthorized_direct_place"] is True
+    assert rc["valid_morning_evidence"] is True
     assert rc["valid_afternoon_evidence"] is False
 
     art = res["artifacts"]
@@ -1871,6 +1875,32 @@ def test_classifications_validate_against_json_schema():
     manual = MorningDCAExecutor(cfg, mode="live").run_classification(_now_live(), manual=True)
     for rc in (watch, live, manual):
         jsonschema.validate(rc, schema)
+
+
+def test_historical_v1_live_classification_still_validates_against_schema():
+    # Codex/Copilot review (PR #78): the enum retains 'morning-live-v1'
+    # explicitly tagged as "HISTORICAL/SUPERSEDED ... retained for backwards
+    # compatibility with pre-2026-07-15 artifacts", but the schema's
+    # scheduled-live branch used to require the v2-only
+    # 'preauthorized_direct_place'/'valid_morning_evidence' fields for every
+    # run_type='morning_dca_live' scheduled document regardless of
+    # state_schema_version, contradicting that claim. A prior test cloned a
+    # freshly generated v2 classification and only swapped the version tag,
+    # which still carried the v2-only fields and so never exercised the real
+    # v1 gap -- this builds an actual pre-2026-07-15 v1-shaped dict (those
+    # fields did not exist yet) to verify it validates.
+    try:
+        import jsonschema
+    except ImportError:
+        return
+    schema_path = Path(__file__).resolve().parent / "schemas" / "morning_run_classification.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    cfg = MorningConfig(tickers=("SMALL",))
+    historical_v1_rc = MorningDCAExecutor(cfg, mode="live").run_classification(_now_live(), manual=False)
+    historical_v1_rc["state_schema_version"] = "morning-live-v1"
+    historical_v1_rc.pop("preauthorized_direct_place", None)
+    historical_v1_rc.pop("valid_morning_evidence", None)
+    jsonschema.validate(historical_v1_rc, schema)
 
 
 def test_morning_scheduled_run_counts_as_afternoon_prior_context():

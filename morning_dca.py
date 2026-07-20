@@ -32,7 +32,9 @@ The morning stream has two modes (see :data:`MORNING_PROFILES`):
       ``.../cron_tracking/morning_dca/YYYYMMDD_1030ET/`` with
       ``run_type='morning_dca_live'``, ``scheduled_for_et='10:30'``,
       ``run_id='morning_live_YYYYMMDD_1030ET'`` and
-      ``state_schema_version='morning-live-v1'``.
+      ``state_schema_version='morning-live-v2-preauthorized'`` (the
+      pre-authorized direct-placement contract with raw-data persistence and
+      automatic failure recovery).
 
 Confidence rule (live mode): when a ticker's price/drop qualifies for a buy but
 the intraday trend over the 60-minute window cannot be validated, the candidate
@@ -136,7 +138,7 @@ MORNING_LIVE_RUN_TYPE = "morning_dca_live"
 MORNING_LIVE_SCHEDULED_FOR_ET = "10:30"
 MORNING_LIVE_WINDOW_START_ET = "10:25"
 MORNING_LIVE_WINDOW_END_ET = "10:35"
-MORNING_LIVE_SCHEMA_VERSION = "morning-live-v1"
+MORNING_LIVE_SCHEMA_VERSION = "morning-live-v2-preauthorized"
 
 # Backwards-compatible aliases (the watchlist scan is the successor of the old
 # 9:45 dry-run stream, so unqualified references resolve to it).
@@ -1300,6 +1302,17 @@ class MorningDCAExecutor(DCAExecutor):
             # The execution broker and account for all morning stream modes; always Robinhood.
             "execution_broker": "robinhood",
             "account_number": ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
+            # Pre-authorized direct placement is only for scheduled LIVE runs; read-only
+            # (watchlist/preflight) and manual runs are never pre-authorized.
+            "preauthorized_direct_place": bool(profile["trades"]) and not manual,
+            # Morning artifacts are valid morning evidence (and prior-allocation context
+            # for the midday/afternoon top-up guard), but never afternoon evidence.
+            # MiddayDCAExecutor inherits this method unchanged, so this must be
+            # scoped to self.stream rather than hardcoded True -- a midday run
+            # (self.stream == "midday") is midday prior-allocation context, not
+            # morning evidence (Codex review: "Keep morning evidence flags off
+            # midday runs").
+            "valid_morning_evidence": self.stream == MORNING_STREAM,
             # Explicit, machine-checkable separation from the afternoon stream.
             "valid_afternoon_evidence": False,
             "afternoon_live_cron_id": AFTERNOON_LIVE_CRON_ID,

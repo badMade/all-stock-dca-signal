@@ -14,7 +14,7 @@ The stream runs in these modes:
 | Mode | Task | ET | Trades | run_type | schema | Artifact root |
 |---|---|---|---|---|---|---|
 | `preflight` | `morning-dca-0945` | 9:45 AM | **no** | `morning_dca_preflight` | `morning-preflight-v2-machine-complete` | `.../cron_tracking/morning_dca_preflight/` |
-| `live` | `42173154` | 10:30 AM | **yes** | `morning_dca_live` | `morning-live-v1` | `.../cron_tracking/morning_dca/` |
+| `live` | `42173154` | 10:30 AM | **yes** | `morning_dca_live` | `morning-live-v2-preauthorized` | `.../cron_tracking/morning_dca/` |
 | `watchlist` | (read-only, optional) | 9:45 AM | **no** | `morning_dca_watchlist_scan` | `morning-watchlist-v1` | `.../cron_tracking/morning_dca_watchlist/` |
 
 ## 9:45 AM pre-flight validation (read-only)
@@ -75,18 +75,111 @@ fields were written.
 
 ## 10:30 AM live Robinhood execution
 
-The live execution runs at **10:30 AM ET** so the trend read has a true
+The live execution runs at **10:30 AM ET** (`cron_id=42173154`, cron
+`30 14 * * 1-5` = **14:30 UTC weekdays** during EDT) so the trend read has a true
 **60-minute intraday window**. It uses **Robinhood account `562057042`** as the
-sole execution broker (Alpaca stays read-only for validation/context), the shared
-**$3 base 0x-to-5x live ladder**, and the `morning` budget ledger. It **loads the
-same-day 9:45 pre-flight artifact** and evaluates **only `eligible_to_execute=true`
-tickers**, recomputing signals/budget/spread/trend/top-up fresh; if the pre-flight
-artifact is missing it degrades to the full universe with a warning rather than
-blocking all buys. As approved Fri Jul 10 2026 11:20 AM ET this scheduled live
-task is **pre-authorized** to place qualifying buys directly via `place_equity_order`
-(no per-order confirmation, no `review_equity_order`) after every internal check
-passes. Writes under `.../cron_tracking/morning_dca/YYYYMMDD_1030ET/`
+**only execution broker** (Alpaca, Finance, and Yahoo stay **read-only** for
+validation/account context), the shared **$3 base 0x-to-5x live ladder**, and the
+`morning` budget ledger.
+
+It **depends on the same-day 9:45 pre-flight artifact** and evaluates **only
+`eligible_to_execute=true` tickers**, then **recomputes a fresh price, prior
+close, spread, 60-minute downtrend, signal, and budget before placing**; if the
+trend cannot be validated it **skips / routes to manual review** (never
+auto-buys). If the pre-flight artifact is missing, a **scheduled** run **fails
+closed** — `_apply_preflight_gate()` evaluates zero tickers and writes a
+blocked `run_state.json` — rather than blocking all buys via a full-universe
+fallback; only a **manual** run degrades to the full universe with a warning.
+
+**Pre-authorized direct placement (scheduled live runs only).** As approved Fri
+Jul 10 2026 11:20 AM ET this scheduled live task is **pre-authorized** to place
+qualifying buys directly via `place_equity_order`: it **does not** request
+per-order confirmation and **does not** call Robinhood `review_equity_order`, and
+calls `place_equity_order` **only after every safeguard passes**. Manual / ad hoc
+runs still go through Robinhood's **review + confirmation path**:
+`review_equity_order` (`review_market_buy`) must pass before `place_equity_order`
+(`place_market_buy`) is attempted, and if Robinhood's own review requires
+additional post-review confirmation (e.g. a step-up/2FA gate), placement raises
+`OrderConfirmationRequiredError` and the run records
+`not_submitted_confirmation_required` with **no order placed** — there is no
+separate confirmation step implemented in this code beyond that broker-driven
+gate. The scheduled live run_state carries
+`state_schema_version='morning-live-v2-preauthorized'` and
+`preauthorized_direct_place=true`. Writes under
+`.../cron_tracking/morning_dca/YYYYMMDD_1030ET/`
 (`run_id='morning_live_YYYYMMDD_1030ET'`).
+
+### GFUZ special handling
+
+**GFUZ** is in the active universe but needs special handling because **Finance
+(and other read-only providers) may not resolve it**:
+
+- **Robinhood is the primary** quote/prior-close source for GFUZ; Alpaca/Finance/
+  Yahoo remain read-only validation/context only.
+- An **unresolved GFUZ on Finance must not block the whole run**.
+- The *intent* is that if the **9:45 pre-flight lacks GFUZ**, the 10:30 live task
+  runs a **supplemental GFUZ read-only validation** and **persists
+  `gfuz_supplemental_preflight.json`** under
+  `.../cron_tracking/morning_dca/YYYYMMDD_1030ET/` **before** any GFUZ signal/
+  budget/top-up/order decisioning, with the decision engine reading GFUZ only
+  from the persisted file.
+
+  > **Not yet implemented.** `_apply_preflight_gate()` admits tickers via a
+  > plain `tickers ∩ eligible_tickers` intersection with no GFUZ-specific
+  > exception, so a same-day preflight artifact missing a GFUZ row simply gates
+  > GFUZ out for that run — a safe, fail-closed degradation (GFUZ is skipped,
+  > never bought on unvalidated data), not the supplemental-validation flow
+  > above. See `config/morning_dca.json`'s
+  > `gfuz_special_handling.supplemental_preflight.implementation_status`.
+
+### Raw data persistence (added Jul 15 2026, confirmed Jul 16 2026)
+
+Mirroring the afternoon `10ce362c` fix, the *intended* contract is that
+**before any signal computation, budget calculation, top-up calculation, or
+order placement** the 10:30 live run persists **every raw
+Robinhood/Finance/Alpaca/Yahoo connector response** it used under
+`.../cron_tracking/morning_dca/YYYYMMDD_1030ET/raw/` with deterministic
+filenames, **normalizing** `output_path` / wrapped outputs into parseable JSON
+(referenced contents under `data`, original pointer under `output_path`), with
+the **decision engine reading only from the persisted files** — never from
+in-memory tool responses. Order of operations: **fetch → persist → normalize →
+compute → place**. If data fetch succeeds but **raw persistence/normalization
+fails, no orders are placed** and the task still writes `run_state.json` with
+the blocking reason (`raw_persistence_error`).
+
+> **Not yet implemented.** `MorningDCAExecutor.run()` evaluates directly from
+> the in-memory data provider; there is no `raw_input_dir`, no call to
+> `save_raw_input`, and `raw_inputs_saved`/`raw_persistence_error` are never
+> populated. This section documents the intended contract, not current
+> behavior. See `config/morning_dca.json`'s
+> `raw_data_persistence.implementation_status`.
+
+### Automatic failure recovery
+
+The *intended* contract is that if the 10:30 run fails because of **internal
+persistence, parsing, wrapper-normalization, transient connector throttling,
+or a raw-file write problem after data was fetched**, it **immediately reruns
+the required read-only inputs once**, persists all raw responses first,
+recomputes **only from the persisted files**, and continues the **same guarded
+execution** if safeguards pass. The recovery **reuses the same logical run
+directory** (`.../morning_dca/YYYYMMDD_1030ET/`) with **`recovery_rerun=true`**
+and is **never classified as manual** (`run_origin='scheduled'`,
+`manual_run=false`). If the recovery rerun also fails, or a safety/account/order
+rejection occurs, the task writes `run_state.json` with the blocking reason and
+**escalates**.
+
+> **Not yet implemented.** There is no recovery-rerun code path in
+> `morning_dca.py`'s `run()` today; `recovery_rerun`/`recovery_reason`/
+> `recovery_attempts` are never populated on any morning artifact. See
+> `config/morning_dca.json`'s `automatic_failure_recovery.implementation_status`.
+
+### Hard circuit breakers
+
+Every scheduled live order is subject to hard circuit breakers that **skip**
+(never resize past a cap): **max per order `$15`** (5× × $3), **budget caps**,
+**available buying power**, **whitelist-only** (active-universe tickers),
+**data-confidence**, **spread threshold**, **trend validation**,
+**regular-hours-only**, and **one strategy order per ticker per run**.
 
 ### Confidence rule (no trend, no auto-buy)
 
@@ -198,6 +291,24 @@ A scheduled morning run writes to its mode's root
 and updates that root's `latest_morning_run.json`. Manual runs write under a
 distinct `manual_morning[_live]_*` run id and never update the pointer.
 
+The **10:30 live** run's `write_artifacts()` **always** writes `run_state.json`
+and `morning_signals.csv` (**not** `signals.csv`, and **not**
+`run_summary.json`/`validation.csv` — those are written only in preflight mode)
+under `.../cron_tracking/morning_dca/YYYYMMDD_1030ET/`, plus
+`submitted_orders.csv` whenever at least one order was actually submitted;
+`filled_orders.csv` is **never** written by this task (there is no
+fill-confirmation step). Raw connector persistence under a `raw/` subdirectory
+and `gfuz_supplemental_preflight.json` are both **not yet implemented** (see
+**Raw data persistence** and **GFUZ special handling** above). See
+`config/morning_dca.json`'s `artifacts.manifest_accuracy_note`. The live
+`run_classification` block carries `run_origin='scheduled'`,
+`run_type='morning_dca_live'`, `scheduled_for_et='10:30'`, `manual_run=false`,
+`state_schema_version='morning-live-v2-preauthorized'`,
+`run_id='morning_live_YYYYMMDD_1030ET'`, `cron_id='42173154'`,
+`execution_broker='robinhood'`, `account_number='562057042'`,
+`preauthorized_direct_place=true`, `valid_morning_evidence=true`, and
+`valid_afternoon_evidence=false`.
+
 Each signal row includes: `ticker`, `source`, `action`, `reason`,
 `current_price`, `previous_close`, `drop_pct`, `multiplier`,
 `hypothetical_amount_usd`, and `warnings`; live-mode rows also carry
@@ -242,7 +353,11 @@ A scheduled live run:
   "scheduled_window_end_et": "10:35",
   "manual_run": false,
   "run_id": "morning_live_YYYYMMDD_1030ET",
-  "state_schema_version": "morning-live-v1",
+  "state_schema_version": "morning-live-v2-preauthorized",
+  "execution_broker": "robinhood",
+  "account_number": "562057042",
+  "preauthorized_direct_place": true,
+  "valid_morning_evidence": true,
   "valid_afternoon_evidence": false
 }
 ```

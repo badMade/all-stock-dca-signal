@@ -94,8 +94,8 @@
     },
     "state_schema_version": {
       "type": "string",
-      "enum": ["morning-watchlist-v1", "morning-preflight-v2-machine-complete", "morning-live-v1"],
-      "description": "Contract version tag: 'morning-watchlist-v1' for the watchlist scan, 'morning-preflight-v2-machine-complete' for the machine-complete pre-flight validation (see schemas/morning_preflight.schema.json), 'morning-live-v1' for the live execution."
+      "enum": ["morning-watchlist-v1", "morning-preflight-v2-machine-complete", "morning-live-v1", "morning-live-v2-preauthorized"],
+      "description": "Contract version tag: 'morning-watchlist-v1' for the watchlist scan, 'morning-preflight-v2-machine-complete' for the machine-complete pre-flight validation (see schemas/morning_preflight.schema.json), and 'morning-live-v2-preauthorized' for the 10:30 live execution (the pre-authorized direct-placement contract with raw-data persistence + automatic failure recovery). 'morning-live-v1' is the HISTORICAL/SUPERSEDED live tag retained for backwards compatibility with pre-2026-07-15 artifacts."
     },
     "valid_afternoon_evidence": {
       "type": "boolean",
@@ -115,6 +115,15 @@
       "type": "string",
       "const": "562057042",
       "description": "The Robinhood account number used for morning live execution. Not a secret."
+    },
+    "preauthorized_direct_place": {
+      "type": "boolean",
+      "description": "True on scheduled 10:30 live runs: pre-authorized direct placement (no per-order confirmation, no review_equity_order; place_equity_order only after all safeguards pass). False for read-only (watchlist/preflight) and manual runs."
+    },
+    "valid_morning_evidence": {
+      "type": "boolean",
+      "const": true,
+      "description": "Always true. This schema's stream field is pinned to the const 'morning' above, so every artifact validated against it is a morning-stream artifact and is therefore valid MORNING evidence (and prior-allocation context for the midday/afternoon top-up guard). A midday run_state (stream='midday') is validated against schemas/midday_run_classification.schema.json instead, where MorningDCAExecutor.run_classification's shared implementation sets this same field to false. Morning evidence never counts as afternoon evidence (valid_afternoon_evidence is always false)."
     }
   },
   "allOf": [
@@ -206,7 +215,7 @@
       }
     },
     {
-      "comment": "Live execution (10:30 AM ET) invariants.",
+      "comment": "Live execution (10:30 AM ET) invariants. state_schema_version is deliberately NOT pinned here (only the top-level enum applies): this branch matches on run_type alone, so it must also accept a HISTORICAL 'morning-live-v1' document re-validated after the fact, not just freshly generated 'morning-live-v2-preauthorized' artifacts. cron_id and trades are stable across both schema versions.",
       "if": {
         "properties": {
           "run_type": {
@@ -221,9 +230,6 @@
         "properties": {
           "cron_id": {
             "const": "42173154"
-          },
-          "state_schema_version": {
-            "const": "morning-live-v1"
           },
           "trades": {
             "const": true
@@ -273,7 +279,7 @@
       }
     },
     {
-      "comment": "Scheduled live execution: pinned window and run_id pattern.",
+      "comment": "Scheduled live execution (any version): pinned window and run_id pattern. Deliberately NOT gated on state_schema_version so a HISTORICAL 'morning-live-v1' scheduled document still validates its window/run_id shape. The v2-only preauthorized/evidence fields are required separately below, scoped to 'morning-live-v2-preauthorized' only.",
       "if": {
         "properties": {
           "run_origin": {
@@ -309,6 +315,38 @@
           },
           "run_id": {
             "pattern": "^morning_live_[0-9]{8}_1030ET$"
+          }
+        }
+      }
+    },
+    {
+      "comment": "Scheduled live execution (v2-preauthorized only): requires and pins the v2 preauthorized-placement contract fields. Gated on state_schema_version so a historical 'morning-live-v1' scheduled document -- which never emitted these fields -- is NOT required to carry them, preserving backwards-compatible validation.",
+      "if": {
+        "properties": {
+          "run_origin": {
+            "const": "scheduled"
+          },
+          "run_type": {
+            "const": "morning_dca_live"
+          },
+          "state_schema_version": {
+            "const": "morning-live-v2-preauthorized"
+          }
+        },
+        "required": [
+          "run_origin",
+          "run_type",
+          "state_schema_version"
+        ]
+      },
+      "then": {
+        "required": [
+          "preauthorized_direct_place",
+          "valid_morning_evidence"
+        ],
+        "properties": {
+          "preauthorized_direct_place": {
+            "const": true
           }
         }
       }
