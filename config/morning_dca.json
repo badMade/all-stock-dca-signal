@@ -162,7 +162,7 @@
     ],
     "incremental_order_amount_formula": "incremental_order_amount = max(0, afternoon_desired_amount - prior_same_day_amount)",
     "price_rule": "When earlier same-day buys exist for a ticker, the afternoon task only buys if the current price is strictly below the prior-run reference price; otherwise it holds.",
-    "note": "These are the actual fields emitted in buy_candidates rows by near_close_dca.run_once; morning fills populate prior_same_day_* for the afternoon evaluation."
+    "note": "These are the actual fields emitted per buy_candidate in buy_candidates rows by near_close_dca.run_once when the top-up guard is active; morning fills populate prior_same_day_* for the afternoon evaluation."
   },
   "artifact_fields": {
     "signal_row": [

@@ -1279,6 +1279,34 @@ def _manual_run_state(candidates, generated_at="2026-06-29T10:00:00-04:00", run_
     }
 
 
+def test_load_prior_same_day_includes_scheduled_morning_live_allocation(tmp_path):
+    root = os.path.join(tmp_path, "cron_tracking", "morning_dca")
+    _write_prior_run(
+        root,
+        "20260629_0945ET",
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T09:45:00-04:00",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "run_type": "morning_dca_live",
+                "stream": "morning",
+                "run_id": "morning_live_20260629_0945ET",
+            },
+            "buy_candidates": [
+                {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0},
+            ],
+        },
+        orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "98.25"}],
+    )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["AAPL"].amount_usd == 3.0
+    assert allocations["AAPL"].reference_price == 98.25
+    assert allocations["AAPL"].source == "scheduled"
+
+
 def test_load_prior_same_day_reads_morning_manual_allocation(tmp_path):
     # No orders.csv at all (legacy/older artifact layout). A submitted row still
     # contributes prior-allocation amount, but without a confirmed fill its logged
@@ -1554,6 +1582,38 @@ def test_load_prior_same_day_excludes_scheduled_and_after_boundary(tmp_path):
     )
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
     assert allocations == {}
+
+
+def test_load_prior_same_day_includes_morning_scheduled_run(tmp_path):
+    """Morning scheduled runs (stream='morning') must be included as prior context."""
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    morning_root = os.path.join(tmp_path, "cron_tracking", "morning_dca")
+    # Morning run with run_origin='scheduled' and stream='morning' — must be included.
+    _write_prior_run(
+        morning_root,
+        "20260629_0945ET",
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T09:45:00-04:00",
+            "stream": "morning",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "stream": "morning",
+                "run_type": "morning_dca_live",
+                "valid_afternoon_evidence": False,
+                "manual_run": False,
+                "run_id": "morning_live_20260629_0945ET",
+            },
+            "buy_candidates": [
+                {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0}
+            ],
+        },
+    )
+    allocations = load_prior_same_day_allocations(
+        root, date(2026, 6, 29), additional_state_roots=[morning_root]
+    )
+    assert "AAPL" in allocations, "morning scheduled run must appear as prior allocation context"
+    assert allocations["AAPL"].amount_usd == 3.0
 
 
 def test_load_prior_same_day_aggregates_amount_and_takes_min_price(tmp_path):

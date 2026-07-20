@@ -1882,9 +1882,13 @@ def _orders_csv_fills(
     if orders_csv_file is not None:
         orders_csv = orders_csv_file
     else:
-        orders_csv = run_dir / "orders.csv"
-        if not orders_csv.exists():
-            orders_csv = run_dir / "filled_orders.csv"
+        # Prefer filled_orders.csv (confirmed-fill record with actual fill
+        # price/quantity) over orders.csv (submitted stub with blank fill
+        # fields), so a partial fill or cancellation is seen correctly by the
+        # afternoon top-up guard. Fall back to orders.csv when no confirmed
+        # fill record exists.
+        filled_csv = run_dir / "filled_orders.csv"
+        orders_csv = filled_csv if filled_csv.exists() else run_dir / "orders.csv"
     if not orders_csv.exists():
         return fills
     try:
@@ -1972,21 +1976,24 @@ def load_prior_same_day_allocations(
     trading_day: date,
     *,
     boundary_et: time = MORNING_MANUAL_BOUNDARY_ET,
+    additional_state_roots: Sequence[str | Path] = (),
     include_scheduled_afternoon: bool = False,
 ) -> Dict[str, PriorSameDayAllocation]:
     """Aggregate earlier same-day allocation context for the scheduled afternoon guard.
 
-    Scans ``state_root`` recursively for ``run_state*.json`` artifacts written earlier
-    the same ``trading_day`` by morning/midday/manual runs (including manual
-    market-open recovery, manual override reruns under ``.../manual_reruns/``, and any
-    future morning session), and returns a per-ticker :class:`PriorSameDayAllocation`.
-    These artifacts are read as prior-allocation context ONLY -- they are deliberately
-    never surfaced as scheduled evidence, slippage, watchdog confirmation, scheduled
+    Scans ``state_root`` (and any ``additional_state_roots``) recursively for
+    ``run_state*.json`` artifacts written earlier the same ``trading_day`` by
+    morning/midday/manual runs (including manual market-open recovery, manual
+    override reruns under ``.../manual_reruns/``, and the morning live stream),
+    and returns a per-ticker :class:`PriorSameDayAllocation`. These artifacts
+    are read as prior-allocation context ONLY -- they are deliberately never
+    surfaced as scheduled evidence, slippage, watchdog confirmation, scheduled
     cost basis, or scheduled fill counts.
 
     Eligibility mirrors the 2:30 PM ET boundary: only runs generated before
     ``boundary_et`` on ``trading_day`` are read, scheduled *afternoon* runs are
-    ignored (morning/midday-stream runs stay eligible), and only buy candidates whose
+    ignored (morning/midday-stream runs stay eligible despite running on a
+    schedule; see ``_prior_run_is_scheduled``), and only buy candidates whose
     status shows an order was placed contribute. Each contributing candidate's
     reference price is resolved only after capital movement is confirmed, by policy
     preference -- logged ``target_price``, then ``decision_price``, then the confirmed
@@ -2006,13 +2013,22 @@ def load_prior_same_day_allocations(
     to see the day's already-completed scheduled run so it doesn't double-buy;
     pass a ``boundary_et`` later than that run's timestamp to include it.
     """
-    root = Path(state_root)
-    if not root.exists():
-        return {}
+    # Deduplicate roots by resolved path so an additional_state_root that matches
+    # state_root (or another additional root) doesn't cause double-counting.
+    _seen_roots: set = set()
+    all_roots = []
+    for _r in [Path(state_root), *[Path(r) for r in additional_state_roots]]:
+        _key = _r.resolve()
+        if _key not in _seen_roots:
+            _seen_roots.add(_key)
+            all_roots.append(_r)
 
     aggregated: Dict[str, Dict[str, Any]] = {}
     trading_day_iso = trading_day.isoformat()
-    for run_state_path in sorted(root.rglob("run_state*.json")):
+    all_run_state_paths = sorted(
+        set(p for root in all_roots if root.exists() for p in root.rglob("run_state*.json"))
+    )
+    for run_state_path in all_run_state_paths:
         try:
             raw_text = run_state_path.read_text(encoding="utf-8")
         except (OSError, ValueError):

@@ -257,6 +257,13 @@ class MiddayDCAExecutor(MorningDCAExecutor):
     budget_weekly_key: str = "midday_weekly_cap_usd"
     budget_label: str = "midday"
     manual_run_subdir: str = "manual_reruns"
+    # manual_reruns/ here holds post-12:30 backfill artifacts documented (see
+    # near_close_dca.py) as prior-allocation context for the afternoon top-up
+    # guard ONLY -- never evidence for midday's own scheduled cap ledger.
+    # Folding them into _seed_ledger_from_prior_runs would let an unrelated
+    # manual override eat into the cap a scheduled midday retry checks
+    # against, wrongly blocking buys the original 12:30 run would have allowed.
+    scan_manual_reruns_for_ledger: bool = False
 
     def __init__(
         self,

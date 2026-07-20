@@ -806,6 +806,44 @@ def test_midday_ledger_namespace_isolated_from_morning_and_afternoon(tmp_path):
     assert ex.ledger.day_planned(day) > 0.0
 
 
+def test_midday_seeding_ignores_manual_reruns(tmp_path):
+    # Codex review (follow-up): manual_reruns/ under the midday root are
+    # documented (near_close_dca.py) as post-12:30 backfill artifacts that
+    # feed ONLY the afternoon top-up guard, never the midday stream's own
+    # scheduled cap ledger. MiddayDCAExecutor inherits
+    # _seed_ledger_from_prior_runs from MorningDCAExecutor unchanged, so it
+    # was also folding manual_reruns/*/run_state.json into the midday
+    # ledger -- meaning a scheduled midday retry could see its own daily cap
+    # already partly consumed by an unrelated manual override, wrongly
+    # blocking buys the original 12:30 run would have allowed.
+    cfg = MiddayConfig(
+        tickers=("AAA",),
+        morning_daily_cap_usd=20.0,
+        morning_weekly_cap_usd=200.0,
+        morning_run_state_root=str(tmp_path),
+    )
+    ex = MiddayDCAExecutor(cfg)
+    trading_day = _now_midday().astimezone(EASTERN).date()
+
+    manual_dir = tmp_path / "manual_reruns" / "manual_run_1"
+    manual_dir.mkdir(parents=True)
+    (manual_dir / "run_state.json").write_text(
+        json.dumps({
+            "run_id": "manual_run_1",
+            "trading_day": trading_day.isoformat(),
+            "buy_candidates": [
+                {"ticker": "ZZZ", "status": "submitted", "planned_amount_usd": 15.0}
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    ex._seed_ledger_from_prior_runs(_now_midday())
+
+    assert ex.ledger.day_planned(trading_day) == 0.0
+    assert ex.ledger.remaining_daily(trading_day) == 20.0
+
+
 def test_manual_midday_run_with_wrong_broker_account_raises_before_ordering(tmp_path):
     import pytest
 

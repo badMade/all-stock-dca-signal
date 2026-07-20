@@ -9,6 +9,7 @@ evidence.
 Runnable with ``pytest`` or ``python test_morning_dca.py``.
 """
 
+import csv
 import os
 
 # chatgpt-codex-connector review on PR #54: conftest.py's
@@ -53,7 +54,7 @@ from morning_dca import (
     preflight_eligibility,
     preflight_ticker_eligibility_row,
 )
-from near_close_dca import EASTERN, Action, Bar, SourceName
+from near_close_dca import EASTERN, Action, Bar, DryRunBroker, SourceName
 
 
 def _now_live():
@@ -837,6 +838,574 @@ def test_live_and_watchlist_roots_are_distinct():
     assert "ce16ba6b" not in DEFAULT_MORNING_LIVE_STATE_ROOT
 
 
+def test_load_morning_config_uses_multiplier_not_max_drop(tmp_path):
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "morning_dca.json").write_text(
+        json.dumps({
+            "sizing_ladder": {
+                "base_amount_usd": 3.0,
+                "no_buy_below_pct": 0.1,
+                "tiers": [
+                    {"min_drop_pct": 0.1, "max_drop_pct": 1.0, "multiplier": 1.0},
+                    {"min_drop_pct": 1.0, "max_drop_pct": 2.0, "multiplier": 1.5},
+                ],
+            }
+        }),
+        encoding="utf-8",
+    )
+    from morning_dca import load_morning_config
+
+    cfg = load_morning_config(cfg_dir)
+    ex = MorningDCAExecutor(cfg)
+
+    assert ex.multiplier_for_drop(0.005) == 1.0
+    assert ex.multiplier_for_drop(0.015) == 1.5
+
+
+def test_morning_run_reviews_places_and_records_orders_csv(tmp_path):
+    # Broker orders only place in live mode; DecliningBarsProvider confirms the
+    # intraday trend-down required for auto-buy eligibility, and manual=True
+    # bypasses the preflight-gate/approved-window checks for this unit test.
+    cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    broker = DryRunBroker(account="562057042", reference_prices={"SMALL": 97.0})
+
+    res = ex.run(_now_live(), data, broker=broker, manual=True)
+    candidate = res["artifacts"]["buy_candidates"][0]
+
+    # DryRunBroker always returns a "DRY-RUN-..." order id, which is recorded
+    # as status="dry_run" (never "submitted") so the top-up guard never treats
+    # a dry-run order as real allocated capital.
+    assert candidate["status"] == "dry_run"
+    assert candidate["order_id"].startswith("DRY-RUN-SMALL")
+    assert candidate["planned_amount_usd"] == 7.5
+    assert res["artifacts"]["broker_outcomes"]["SMALL"]["submitted_amount_usd"] == 7.5
+    orders_csv_text = Path(res["paths"]["orders_csv"]).read_text(encoding="utf-8")
+    assert orders_csv_text.startswith("ticker,order_id,notional_usd,status")
+    assert "SMALL" in orders_csv_text
+
+
+class RecordingLiveBroker:
+    """A broker that returns real-looking (non-"DRY-RUN") order ids.
+
+    DryRunBroker always returns a "DRY-RUN-..." id, which _place_broker_orders
+    deliberately excludes from the running submitted_today/submitted_this_week
+    cap totals (dry-run orders are not real capital). Testing cap enforcement
+    across multiple candidates therefore needs a broker whose orders count as
+    real placements, like this one.
+    """
+
+    def __init__(self, account, reference_prices=None):
+        self._account = account
+        self._reference_prices = reference_prices or {}
+        self.placed_orders = []
+
+    def account_number(self):
+        return self._account
+
+    def available_buying_power(self):
+        return 10_000.0
+
+    def same_day_strategy_order_exists(self, ticker, trading_day):
+        return False
+
+    def is_tradable_for_fractional_buy(self, ticker):
+        return True
+
+    def review_market_buy(self, ticker, notional_usd):
+        return True, "ok"
+
+    def place_market_buy(self, ticker, notional_usd, ref_id):
+        self.placed_orders.append((ticker, notional_usd, ref_id))
+        return f"ORDER-{ticker}"
+
+
+def test_morning_artifacts_include_planned_amount_for_prior_allocation_loader(tmp_path):
+    cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    broker = DryRunBroker(account="562057042", reference_prices={"SMALL": 97.0})
+
+    res = ex.run(_now_live(), data, broker=broker, manual=True)
+    candidate = res["artifacts"]["buy_candidates"][0]
+
+    assert candidate["planned_amount_usd"] == 7.5
+    assert res["artifacts"]["broker_outcomes"]["SMALL"]["submitted_amount_usd"] == 7.5
+
+
+def test_morning_live_orders_are_blocked_before_exceeding_daily_cap(tmp_path):
+    # AAA and BBB both drop 3% -> identical multiplier/drop_pct, so the
+    # priority sort (multiplier DESC, drop_pct DESC, ticker ASC) places AAA
+    # first. Daily cap of $10 admits AAA ($7.50) but not BBB ($7.50 more would
+    # exceed the cap), so BBB is cap_exceeded rather than placed.
+    cfg = MorningConfig(
+        tickers=("AAA", "BBB"),
+        morning_daily_cap_usd=10.0,
+        morning_weekly_cap_usd=100.0,
+        morning_run_state_root=str(tmp_path),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.03, "BBB": 0.03})
+    broker = RecordingLiveBroker(account="562057042", reference_prices={"AAA": 97.0, "BBB": 97.0})
+
+    res = ex.run(_now_live(), data, broker=broker, manual=True)
+    by_ticker = {candidate["ticker"]: candidate for candidate in res["artifacts"]["buy_candidates"]}
+    broker_outcomes = res["artifacts"]["broker_outcomes"]
+
+    assert len(broker.placed_orders) == 1
+    assert broker.placed_orders[0][0] == "AAA"
+    assert by_ticker["AAA"]["status"] == "submitted"
+    assert by_ticker["BBB"]["status"] == "cap_exceeded"
+    assert broker_outcomes["BBB"]["skip_reason"] == "daily cap would be exceeded"
+    # cap_exceeded outcomes carry no submitted_amount_usd, so planned_amount_usd
+    # is never overwritten from the (never-submitted) hypothetical amount.
+    assert "planned_amount_usd" not in by_ticker["BBB"]
+    assert by_ticker["BBB"]["hypothetical_amount_usd"] == 7.5
+
+
+def test_morning_live_ledger_seeds_cap_spend_from_earlier_same_process_day_run(tmp_path):
+    # Codex review: MorningLedger is in-memory and this executor is normally
+    # instantiated fresh per cron invocation, so a retried/rerun live task saw
+    # an empty ledger and could re-spend the daily cap. Simulate two separate
+    # "processes" (two distinct MorningDCAExecutor instances, as a real retry
+    # would be) hitting the same live run-state root on the same trading day:
+    # the first places AAA ($7.50 of a $10 daily cap); a fresh second instance
+    # must read that already-written run_state.json and see only $2.50 of
+    # headroom left, blocking BBB's $7.50 order as cap_exceeded rather than
+    # wrongly re-spending the full $10.
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_daily_cap_usd=10.0,
+        morning_weekly_cap_usd=100.0,
+        morning_run_state_root=str(tmp_path),
+    )
+    ex1 = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data1 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.03})
+    broker1 = RecordingLiveBroker(account="562057042", reference_prices={"AAA": 97.0})
+    res1 = ex1.run(_now_live(), data1, broker=broker1, manual=True)
+    assert res1["artifacts"]["broker_outcomes"]["AAA"]["status"] == "submitted"
+
+    # Fresh executor instance = fresh in-memory MorningLedger, mirroring a
+    # brand-new cron process picking up where the first one left off.
+    cfg2 = MorningConfig(
+        tickers=("BBB",),
+        morning_daily_cap_usd=10.0,
+        morning_weekly_cap_usd=100.0,
+        morning_run_state_root=str(tmp_path),
+    )
+    ex2 = MorningDCAExecutor(cfg2, mode=MORNING_LIVE_MODE)
+    data2 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.03})
+    broker2 = RecordingLiveBroker(account="562057042", reference_prices={"BBB": 97.0})
+    res2 = ex2.run(_now_live(), data2, broker=broker2, manual=True)
+
+    assert len(broker2.placed_orders) == 0
+    bbb = res2["artifacts"]["buy_candidates"][0]
+    assert bbb["status"] == "cap_exceeded"
+    assert res2["artifacts"]["broker_outcomes"]["BBB"]["skip_reason"] == "daily cap would be exceeded"
+
+
+def test_morning_live_ledger_seeds_weekly_cap_from_earlier_day_same_week(tmp_path):
+    # Codex review (follow-up): the seeding scan skipped any run-state file
+    # whose trading_day wasn't an exact match for today, so a fresh process
+    # starting later in the same ISO week never folded in an earlier day's
+    # spend against the shared weekly cap. Monday 2026-07-06 and Wednesday
+    # 2026-07-08 (_now_live()) are both ISO week 28.
+    monday = datetime.combine(date(2026, 7, 6), time(10, 30), tzinfo=EASTERN)
+    cfg1 = MorningConfig(
+        tickers=("AAA",),
+        morning_daily_cap_usd=100.0,
+        morning_weekly_cap_usd=10.0,
+        morning_run_state_root=str(tmp_path),
+    )
+    ex1 = MorningDCAExecutor(cfg1, mode=MORNING_LIVE_MODE)
+    data1 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.03})
+    broker1 = RecordingLiveBroker(account="562057042", reference_prices={"AAA": 97.0})
+    res1 = ex1.run(monday, data1, broker=broker1, manual=True)
+    assert res1["artifacts"]["broker_outcomes"]["AAA"]["status"] == "submitted"
+    assert res1["artifacts"]["buy_candidates"][0]["planned_amount_usd"] == 7.5
+
+    # Fresh process (fresh in-memory ledger) on Wednesday of the same week.
+    cfg2 = MorningConfig(
+        tickers=("BBB",),
+        morning_daily_cap_usd=100.0,
+        morning_weekly_cap_usd=10.0,
+        morning_run_state_root=str(tmp_path),
+    )
+    ex2 = MorningDCAExecutor(cfg2, mode=MORNING_LIVE_MODE)
+    data2 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.03})
+    broker2 = RecordingLiveBroker(account="562057042", reference_prices={"BBB": 97.0})
+    res2 = ex2.run(_now_live(), data2, broker=broker2, manual=True)
+
+    # Monday already spent $7.50 of the $10 weekly cap, leaving only $2.50 of
+    # weekly headroom -- not the full $10 a same-day-only seed would wrongly
+    # leave available -- so BBB's $7.50 must be blocked.
+    assert len(broker2.placed_orders) == 0
+    bbb = res2["artifacts"]["buy_candidates"][0]
+    assert bbb["status"] == "cap_exceeded"
+    assert res2["artifacts"]["broker_outcomes"]["BBB"]["skip_reason"] == "weekly cap would be exceeded"
+
+
+def test_morning_live_ledger_seed_does_not_double_count_same_instance_rerun(tmp_path):
+    # Codex review (follow-up): _seeded_prior_run_ids was only populated BY the
+    # seeding scan itself, so a run's own just-written artifact (already
+    # recorded into the ledger directly via record_buy_candidates) got
+    # re-read from disk and folded in AGAIN the next time the SAME executor
+    # instance called run() -- e.g. a long-lived worker retrying after a
+    # transient broker error. That double count under-reports remaining cap
+    # and wrongly blocks an otherwise-valid second order.
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_daily_cap_usd=20.0,
+        morning_weekly_cap_usd=200.0,
+        morning_run_state_root=str(tmp_path),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data1 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.03})
+    broker1 = RecordingLiveBroker(account="562057042", reference_prices={"AAA": 97.0})
+    res1 = ex.run(_now_live(), data1, broker=broker1, manual=True)
+    assert res1["artifacts"]["broker_outcomes"]["AAA"]["status"] == "submitted"
+
+    # Same instance, second call (simulating a retry), different ticker.
+    ex.config = MorningConfig(
+        tickers=("BBB",),
+        morning_daily_cap_usd=20.0,
+        morning_weekly_cap_usd=200.0,
+        morning_run_state_root=str(tmp_path),
+    )
+    data2 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.03})
+    broker2 = RecordingLiveBroker(account="562057042", reference_prices={"BBB": 97.0})
+    res2 = ex.run(_now_live(), data2, broker=broker2, manual=True)
+
+    # $20 cap: AAA ($7.50) + BBB ($7.50) = $15 <= $20 -- must be admitted. The
+    # double-count bug would see AAA counted twice ($15) + BBB ($7.50) = $22.50
+    # > $20, wrongly blocking BBB.
+    assert len(broker2.placed_orders) == 1
+    assert broker2.placed_orders[0][0] == "BBB"
+    bbb = res2["artifacts"]["buy_candidates"][0]
+    assert bbb["status"] == "submitted"
+
+
+def test_morning_live_ledger_seed_naive_manual_timestamp_is_eastern_not_utc(tmp_path):
+    # Codex review: the generated-at boundary filter for manual_runs/ artifacts
+    # treated a naive (no-offset) timestamp as UTC, but the established
+    # precedent for this exact scenario -- near_close_dca._prior_run_before_boundary,
+    # which this filter's own docstring says it mirrors -- treats a naive
+    # generated_at as Eastern. 14:29 (naive) is AFTER the 10:30 ET replay
+    # decision time when correctly read as 14:29 ET, so it must be excluded
+    # from ledger seeding; the UTC bug would instead read it as 14:29 UTC =
+    # 10:29 ET (EDT), which is BEFORE 10:30 ET and would wrongly include it.
+    manual_dir = tmp_path / "manual_runs" / "20260708_1429"
+    manual_dir.mkdir(parents=True)
+    (manual_dir / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": "2026-07-08",
+            "generated_at": "2026-07-08T14:29:00",
+            "run_id": "manual-late-afternoon",
+            "buy_candidates": [
+                {"ticker": "ZZZ", "status": "submitted", "planned_amount_usd": 7.5}
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_daily_cap_usd=10.0,
+        morning_weekly_cap_usd=100.0,
+        morning_run_state_root=str(tmp_path),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.03})
+    broker = RecordingLiveBroker(account="562057042", reference_prices={"AAA": 97.0})
+    res = ex.run(_now_live(), data, broker=broker, manual=True)
+
+    # A 14:29 manual run must not have consumed any of the $10 daily cap for
+    # this 10:30 ET run: AAA's own $7.50 order must go through in full. The
+    # UTC-interpretation bug would seed $7.50 from the (wrongly-included)
+    # manual run first, leaving only $2.50 of headroom and blocking AAA.
+    assert broker.placed_orders, f"AAA wrongly blocked; ledger={ex.ledger.planned_by_day}"
+    aaa = res["artifacts"]["buy_candidates"][0]
+    assert aaa["status"] == "submitted"
+
+
+def test_morning_live_ledger_seed_excludes_delayed_scheduled_artifact_on_replay(tmp_path):
+    # Codex review: the generated-at boundary was only applied to manual_runs/
+    # artifacts, not the day-by-day scheduled/fixed-slot paths. If a scheduled
+    # invocation actually executed late (e.g. delayed by a retry or outage)
+    # and wrote its fixed 20260708_1030ET/run_state.json with a generated_at
+    # well after the nominal 10:30 decision time, a later replay/backfill
+    # using the nominal 10:30 `now` would still read that delayed file and
+    # wrongly seed its spend, suppressing orders that were valid at the
+    # replay decision time.
+    scheduled_dir = tmp_path / "20260708_1030ET"
+    scheduled_dir.mkdir(parents=True)
+    (scheduled_dir / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": "2026-07-08",
+            "generated_at": "2026-07-08T14:00:00-04:00",
+            "run_id": "scheduled-delayed",
+            "buy_candidates": [
+                {"ticker": "ZZZ", "status": "submitted", "planned_amount_usd": 7.5}
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_daily_cap_usd=10.0,
+        morning_weekly_cap_usd=100.0,
+        morning_run_state_root=str(tmp_path),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.03})
+    broker = RecordingLiveBroker(account="562057042", reference_prices={"AAA": 97.0})
+    res = ex.run(_now_live(), data, broker=broker, manual=True)
+
+    # The delayed 14:00 scheduled artifact must not have consumed any of the
+    # $10 daily cap for this 10:30 ET replay: AAA's own $7.50 order must go
+    # through in full. Wrongly including the delayed artifact would seed
+    # $7.50 first, leaving only $2.50 of headroom and blocking AAA.
+    assert broker.placed_orders, f"AAA wrongly blocked; ledger={ex.ledger.planned_by_day}"
+    aaa = res["artifacts"]["buy_candidates"][0]
+    assert aaa["status"] == "submitted"
+
+
+def test_morning_live_ledger_seed_rejects_non_finite_csv_notional(tmp_path):
+    # Codex review: an inf/-inf/nan notional_usd/amount_usd in a same-week
+    # orders.csv/filled_orders.csv survives float() and would seed the ledger
+    # with infinite cap spend via max(total, csv_total), cap-exceeding every
+    # later order for the rest of the day/week.
+    monday_dir = tmp_path / "20260706_1030ET"
+    monday_dir.mkdir(parents=True)
+    (monday_dir / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": "2026-07-06",
+            "run_id": "scheduled-monday",
+            "buy_candidates": [
+                {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 1.0}
+            ],
+        }),
+        encoding="utf-8",
+    )
+    with (monday_dir / "filled_orders.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["order_id", "ticker", "amount_usd"])
+        writer.writerow(["X-1", "AAA", "inf"])
+
+    cfg = MorningConfig(
+        tickers=("BBB",),
+        morning_daily_cap_usd=100.0,
+        morning_weekly_cap_usd=10.0,
+        morning_run_state_root=str(tmp_path),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.03})
+    broker = RecordingLiveBroker(account="562057042", reference_prices={"BBB": 97.0})
+    res = ex.run(_now_live(), data, broker=broker, manual=True)
+
+    # $10 weekly cap: Monday's JSON total ($1, the inf notional rejected) plus
+    # BBB's $7.50 = $8.50 <= $10 -- must be admitted. The infinite-seed bug
+    # would leave -inf headroom and block BBB outright.
+    assert broker.placed_orders, f"BBB wrongly blocked; ledger={ex.ledger.planned_by_week}"
+    bbb = res["artifacts"]["buy_candidates"][0]
+    assert bbb["status"] == "submitted"
+
+
+def test_morning_live_ledger_seed_survives_corrupt_filled_orders_csv(tmp_path):
+    # Codex review: a non-UTF-8 filled_orders.csv raised UnicodeDecodeError
+    # while csv.DictReader iterated it, which the seeding loop's except OSError
+    # did not catch, aborting the entire scheduled retry over one corrupt
+    # auxiliary fill file instead of falling back to the JSON-derived total.
+    monday_dir = tmp_path / "20260706_1030ET"
+    monday_dir.mkdir(parents=True)
+    (monday_dir / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": "2026-07-06",
+            "run_id": "scheduled-monday",
+            "buy_candidates": [
+                {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 1.0}
+            ],
+        }),
+        encoding="utf-8",
+    )
+    (monday_dir / "filled_orders.csv").write_bytes(b"order_id,ticker,amount_usd\n\xff\xfe,AAA,3.0\n")
+
+    cfg = MorningConfig(
+        tickers=("BBB",),
+        morning_daily_cap_usd=100.0,
+        morning_weekly_cap_usd=100.0,
+        morning_run_state_root=str(tmp_path),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.03})
+    broker = RecordingLiveBroker(account="562057042", reference_prices={"BBB": 97.0})
+    # Must not raise UnicodeDecodeError; falls back to the JSON total ($1).
+    res = ex.run(_now_live(), data, broker=broker, manual=True)
+    assert broker.placed_orders, f"BBB wrongly blocked; ledger={ex.ledger.planned_by_week}"
+    bbb = res["artifacts"]["buy_candidates"][0]
+    assert bbb["status"] == "submitted"
+
+
+def test_morning_live_ledger_seed_falls_back_to_orders_csv_when_filled_orders_unusable(tmp_path):
+    # Codex review: filled_orders.csv is preferred over orders.csv when both
+    # exist, but a corrupt/empty/no-qualifying-rows filled_orders.csv used to
+    # be the end of the line -- the JSON total was accepted as-is even when a
+    # distinct, valid orders.csv (with a larger, more accurate total) also
+    # existed alongside it. A stale/under-reported JSON planned amount could
+    # then let a retry seed too little spend and submit past the cap.
+    monday_dir = tmp_path / "20260706_1030ET"
+    monday_dir.mkdir(parents=True)
+    (monday_dir / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": "2026-07-06",
+            "run_id": "scheduled-monday",
+            "buy_candidates": [
+                {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 1.0}
+            ],
+        }),
+        encoding="utf-8",
+    )
+    # filled_orders.csv exists but is corrupt (non-UTF-8) -- unusable.
+    (monday_dir / "filled_orders.csv").write_bytes(b"order_id,ticker,amount_usd\n\xff\xfe,AAA,3.0\n")
+    # orders.csv is valid and reports the true (larger) confirmed spend.
+    with (monday_dir / "orders.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["order_id", "ticker", "status", "notional_usd"])
+        writer.writerow(["X-1", "AAA", "submitted", "8.0"])
+
+    cfg = MorningConfig(
+        tickers=("BBB",),
+        morning_daily_cap_usd=100.0,
+        morning_weekly_cap_usd=10.0,
+        morning_run_state_root=str(tmp_path),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.03})
+    broker = RecordingLiveBroker(account="562057042", reference_prices={"BBB": 97.0})
+    res = ex.run(_now_live(), data, broker=broker, manual=True)
+
+    # $10 weekly cap: the orders.csv fallback total ($8, not the JSON's stale
+    # $1) plus BBB's $7.50 = $15.50 > $10 -- must be blocked. Silently
+    # accepting the JSON-only $1 would leave $9 of headroom and wrongly admit
+    # BBB's $7.50.
+    assert len(broker.placed_orders) == 0, f"BBB wrongly admitted; placed={broker.placed_orders}"
+    bbb = res["artifacts"]["buy_candidates"][0]
+    assert bbb["status"] == "cap_exceeded"
+
+
+def test_morning_live_ledger_seed_uses_larger_of_partial_filled_orders_and_orders_csv(tmp_path):
+    # Codex review: filled_orders.csv having ANY qualifying row (not just being
+    # totally unusable) used to short-circuit the orders.csv fallback entirely.
+    # A partially reconciled filled_orders.csv (some rows confirmed, others
+    # still only recorded as submitted in orders.csv) would then under-report
+    # relative to orders.csv's larger total, letting a retry seed too little
+    # spend and submit past the cap.
+    monday_dir = tmp_path / "20260706_1030ET"
+    monday_dir.mkdir(parents=True)
+    (monday_dir / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": "2026-07-06",
+            "run_id": "scheduled-monday",
+            "buy_candidates": [
+                {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 1.0}
+            ],
+        }),
+        encoding="utf-8",
+    )
+    # filled_orders.csv is valid and has a qualifying row, but under-reports
+    # relative to orders.csv (e.g. only one of several submitted orders has
+    # been confirmed as filled so far).
+    with (monday_dir / "filled_orders.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["order_id", "ticker", "amount_usd"])
+        writer.writerow(["X-1", "AAA", "3.0"])
+    with (monday_dir / "orders.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["order_id", "ticker", "status", "notional_usd"])
+        writer.writerow(["X-1", "AAA", "submitted", "3.0"])
+        writer.writerow(["X-2", "AAA", "submitted", "5.0"])
+
+    cfg = MorningConfig(
+        tickers=("BBB",),
+        morning_daily_cap_usd=100.0,
+        morning_weekly_cap_usd=12.0,
+        morning_run_state_root=str(tmp_path),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.03})
+    broker = RecordingLiveBroker(account="562057042", reference_prices={"BBB": 97.0})
+    res = ex.run(_now_live(), data, broker=broker, manual=True)
+
+    # $12 weekly cap: orders.csv's larger total ($8, not filled_orders.csv's
+    # partial $3) plus BBB's $7.50 = $15.50 > $12 -- must be blocked. Stopping
+    # at filled_orders.csv's $3 would leave $9 of headroom, enough to wrongly
+    # admit BBB's $7.50.
+    assert len(broker.placed_orders) == 0, f"BBB wrongly admitted; placed={broker.placed_orders}"
+    bbb = res["artifacts"]["buy_candidates"][0]
+    assert bbb["status"] == "cap_exceeded"
+
+
+def test_morning_live_retry_preserves_prior_submitted_candidate_on_scheduled_path(tmp_path):
+    # Codex review (follow-up): a scheduled (non-manual) retry writes to the
+    # SAME fixed run_state_dir path every time, so write_artifacts() fully
+    # overwrote the earlier attempt's persisted buy_candidates. The in-memory
+    # ledger total survives a retry (the seeding fix above), but the earlier
+    # attempt's own submitted-candidate ROW vanished from the final artifact --
+    # and load_prior_same_day_allocations() (used by the afternoon top-up
+    # guard) reads directly from these persisted files, not the ledger, so it
+    # lost visibility into that morning fill entirely after a retry.
+    # Same-day 9:45 pre-flight artifact admitting both tickers, so the 10:30
+    # scheduled (non-manual) live gate doesn't fail-closed for lack of one.
+    preflight_root = tmp_path / "preflight"
+    preflight_dir = preflight_root / "20260708_0945ET"
+    preflight_dir.mkdir(parents=True)
+    (preflight_dir / "run_state.json").write_text(
+        json.dumps({"eligible_to_execute_tickers": ["AAA", "BBB"]}), encoding="utf-8"
+    )
+
+    cfg1 = MorningConfig(
+        tickers=("AAA",),
+        morning_daily_cap_usd=100.0,
+        morning_weekly_cap_usd=1000.0,
+        morning_run_state_root=str(tmp_path),
+        preflight_run_state_root=str(preflight_root),
+    )
+    ex1 = MorningDCAExecutor(cfg1, mode=MORNING_LIVE_MODE)
+    data1 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.03})
+    broker1 = RecordingLiveBroker(account="562057042", reference_prices={"AAA": 97.0})
+    res1 = ex1.run(_now_live(), data1, broker=broker1, manual=False)
+    assert res1["artifacts"]["broker_outcomes"]["AAA"]["status"] == "submitted"
+    scheduled_path = Path(res1["paths"]["run_state"])
+    assert scheduled_path.exists()
+
+    # Fresh process retries the same scheduled slot -- new executor instance,
+    # same fixed run_state_dir path -- and this time only BBB newly qualifies.
+    cfg2 = MorningConfig(
+        tickers=("BBB",),
+        morning_daily_cap_usd=100.0,
+        morning_weekly_cap_usd=1000.0,
+        morning_run_state_root=str(tmp_path),
+        preflight_run_state_root=str(preflight_root),
+    )
+    ex2 = MorningDCAExecutor(cfg2, mode=MORNING_LIVE_MODE)
+    data2 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.03})
+    broker2 = RecordingLiveBroker(account="562057042", reference_prices={"BBB": 97.0})
+    res2 = ex2.run(_now_live(), data2, broker=broker2, manual=False)
+    assert res2["artifacts"]["broker_outcomes"]["BBB"]["status"] == "submitted"
+    assert Path(res2["paths"]["run_state"]) == scheduled_path
+
+    persisted = json.loads(scheduled_path.read_text(encoding="utf-8"))
+    by_ticker = {row["ticker"]: row for row in persisted["buy_candidates"]}
+    assert by_ticker["BBB"]["status"] == "submitted"
+    # AAA's earlier submitted fill must survive the retry's overwrite so the
+    # afternoon top-up guard (which reads run_state.json directly) still sees it.
+    assert "AAA" in by_ticker
+    assert by_ticker["AAA"]["status"] == "submitted"
+
+
 # --- No interaction with afternoon scheduled evidence -----------------------
 def test_does_not_write_afternoon_artifacts(tmp_path):
     afternoon_root = tmp_path / "ce16ba6b"
@@ -1197,6 +1766,89 @@ def test_morning_executor_default_init_loads_config_file():
     assert ex.config.morning_daily_cap_usd == 90.0
     assert date(2026, 7, 2) in ex.config.approved_test_dates
     assert date(2026, 8, 28) in ex.config.approved_test_dates
+
+
+def test_load_morning_config_reads_multipliers_not_max_drop(tmp_path):
+    """load_morning_config must parse the 'multiplier' field, not max_drop_pct."""
+    from morning_dca import load_morning_config
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "morning_dca.json").write_text(
+        json.dumps({
+            "sizing_ladder": {
+                "base_amount_usd": 3.0,
+                "no_buy_below_pct": 0.1,
+                "tiers": [
+                    {"min_drop_pct": 0.1, "max_drop_pct": 1.0, "multiplier": 1.0},
+                    {"min_drop_pct": 1.0, "max_drop_pct": 2.0, "multiplier": 1.5},
+                    {"min_drop_pct": 8.0, "max_drop_pct": None, "multiplier": 5.0},
+                ],
+            },
+        }),
+        encoding="utf-8",
+    )
+    cfg = load_morning_config(str(cfg_dir))
+    # Each tier tuple must be (threshold_fraction, multiplier).
+    # A 0.1%-1% drop should give 1x ($3), not 0.01x ($0.03).
+    tiers = dict(cfg.sizing_tiers)
+    assert tiers[0.001] == 1.0, f"expected 1.0x for 0.1% threshold, got {tiers[0.001]}"
+    assert tiers[0.010] == 1.5
+    assert tiers[0.080] == 5.0
+
+
+def test_run_with_broker_places_orders_and_records_outcomes(tmp_path):
+    """MorningDCAExecutor.run(broker=...) places orders for buy candidates.
+
+    Broker orders are only placed in live mode (see the ``self.mode ==
+    MORNING_LIVE_MODE`` gate in ``run()``); a broker passed in watchlist mode
+    is intentionally a no-op so hypothetical scans never risk real capital.
+    ``manual=True`` bypasses the preflight-gate/approved-window checks that
+    otherwise apply to scheduled live runs.
+    """
+    from near_close_dca import DryRunBroker
+
+    cfg = MorningConfig(tickers=("AAPL",), morning_run_state_root=str(tmp_path))
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    # DecliningBarsProvider (not FixedDropProvider) so the intraday trend-down
+    # confirmation required for auto-buy eligibility actually passes.
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.02})  # 2% drop -> buy
+
+    broker = DryRunBroker(cash=1000.0)
+    res = ex.run(_now_live(), data, broker=broker, manual=True)
+
+    artifacts = res["artifacts"]
+    candidates = artifacts["buy_candidates"]
+    assert len(candidates) == 1
+    c = candidates[0]
+    assert c["ticker"] == "AAPL"
+    # DryRunBroker always returns a "DRY-RUN-..." order id, which
+    # _place_broker_orders deliberately records as status="dry_run" (never
+    # "submitted") so the top-up guard never treats a dry-run order as real
+    # allocated capital.
+    assert c["status"] == "dry_run"
+    assert c["order_id"] is not None
+    assert c["order_id"].startswith("DRY-RUN")
+
+    # orders.csv must be written
+    assert "orders_csv" in res["paths"]
+    orders_csv = Path(res["paths"]["orders_csv"])
+    assert orders_csv.exists()
+    rows = list(csv.DictReader(orders_csv.open(newline="", encoding="utf-8")))
+    assert any(r["ticker"] == "AAPL" for r in rows)
+
+
+def test_run_without_broker_does_not_place_orders(tmp_path):
+    """MorningDCAExecutor.run() without broker records no order outcomes."""
+    cfg = MorningConfig(tickers=("AAPL",), morning_run_state_root=str(tmp_path))
+    ex = MorningDCAExecutor(cfg)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.02})
+
+    res = ex.run(_now(), data)
+    candidates = res["artifacts"]["buy_candidates"]
+    assert len(candidates) == 1
+    assert "order_id" not in candidates[0]
+    assert "orders_csv" not in res["paths"]
 
 
 def test_classifications_validate_against_json_schema():
@@ -1922,6 +2574,75 @@ def test_blocked_live_retry_recovers_from_non_utf8_existing_run_state(tmp_path):
     run_dir = ex.run_state_dir(_now_live())
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "run_state.json").write_bytes(b"\xff\xfe\x00invalid-utf8")
+
+    result = ex.run(_now_live(), data, broker=None)
+
+    assert result["artifacts"]["status"] == "blocked"
+    assert result["artifacts"]["block_reason"] == "missing broker adapter for scheduled live execution"
+    on_disk = json.loads(Path(result["paths"]["run_state"]).read_text(encoding="utf-8"))
+    assert on_disk["block_reason"] == "missing broker adapter for scheduled live execution"
+
+
+def test_blocked_live_retry_recovers_from_non_string_trading_day_in_existing_state(tmp_path):
+    # Codex review on PR #77: an existing run_state.json that is valid,
+    # parseable UTF-8 JSON but has a non-string, truthy "trading_day" field
+    # (e.g. a partially recovered artifact where the field was clobbered to a
+    # list) raises TypeError from date.fromisoformat(), which the seeding
+    # loop's narrower `except ValueError` did not catch (an empty `[]` is
+    # falsy and short-circuits to None before fromisoformat is ever called,
+    # so the field must be truthy to exercise this). Because ledger seeding
+    # runs before the scheduler-wiring fail-closed safety block, that
+    # TypeError used to crash the retry instead of producing the expected
+    # blocked artifact. Must fall back to a fresh blocked stub, same as any
+    # other unreadable/malformed existing state.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps({"trading_day": ["2026-07-08"], "run_id": "prior-run", "buy_candidates": []}),
+        encoding="utf-8",
+    )
+
+    result = ex.run(_now_live(), data, broker=None)
+
+    assert result["artifacts"]["status"] == "blocked"
+    assert result["artifacts"]["block_reason"] == "missing broker adapter for scheduled live execution"
+    on_disk = json.loads(Path(result["paths"]["run_state"]).read_text(encoding="utf-8"))
+    assert on_disk["block_reason"] == "missing broker adapter for scheduled live execution"
+
+
+def test_blocked_live_retry_recovers_from_non_object_existing_run_state(tmp_path):
+    # Codex review on PR #77: an existing run_state.json that is valid,
+    # parseable JSON but whose root is a list (or other non-object value)
+    # rather than a dict -- e.g. a partially recovered/truncated artifact --
+    # raises AttributeError from state.get(...), since json.loads() succeeds
+    # but the result has no .get(). Because ledger seeding runs before the
+    # scheduler-wiring fail-closed safety block, that AttributeError used to
+    # crash the retry instead of producing the expected blocked artifact.
+    # Must fall back to a fresh blocked stub, same as any other
+    # unreadable/malformed existing state.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run_state.json").write_text(json.dumps(["not", "an", "object"]), encoding="utf-8")
 
     result = ex.run(_now_live(), data, broker=None)
 
@@ -2725,6 +3446,62 @@ def test_morning_cap_seeding_picks_up_external_fill_after_own_retry_overwrite(tm
         f"submission was overwritten to skipped; expected {expected}, "
         f"got {ex.ledger.day_planned(date(2026, 7, 8))}"
     )
+
+
+def test_morning_ledger_seed_still_covers_scheduled_slot_when_cap_roots_are_manual_only(tmp_path):
+    # Codex review ("Seed today's scheduled slot when cap roots do not cover
+    # it"): cap_seed_roots may be configured narrowly to cover only
+    # manual_runs/ -- a case _compute_top_up's own_manual_in_scan/
+    # own_scheduled_in_scan split explicitly supports. _seed_ledger_from_prior_runs
+    # must not blanket-skip today's scheduled-slot seeding just because
+    # cap_seed_roots is truthy; it must check whether the scheduled slot is
+    # actually CONTAINED by a configured cap root. Otherwise, with a narrow
+    # cap_seed_roots, NEITHER mechanism seeds the first scheduled submission
+    # and a fresh retry (a new process/executor, as a real cron retry would
+    # be) can spend the full daily cap a second time.
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA", "BBB"))
+    live_root = tmp_path / "live"
+
+    cfg1 = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        cap_seed_roots=(str(live_root / "manual_runs"),),  # narrow: excludes the scheduled slot
+        morning_daily_cap_usd=10.0,
+        morning_weekly_cap_usd=100.0,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex1 = MorningDCAExecutor(cfg1, mode=MORNING_LIVE_MODE)
+    data1 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.03})
+    broker1 = RecordingLiveBroker(account="562057042", reference_prices={"AAA": 97.0})
+    res1 = ex1.run(_now_live(), data1, broker=broker1)
+    assert res1["artifacts"]["broker_outcomes"]["AAA"]["status"] == "submitted"
+
+    # Fresh executor instance = fresh in-memory MorningLedger, mirroring a
+    # brand-new cron process retrying the same scheduled slot.
+    cfg2 = MorningConfig(
+        tickers=("BBB",),
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        cap_seed_roots=(str(live_root / "manual_runs"),),
+        morning_daily_cap_usd=10.0,
+        morning_weekly_cap_usd=100.0,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex2 = MorningDCAExecutor(cfg2, mode=MORNING_LIVE_MODE)
+    data2 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.03})
+    broker2 = RecordingLiveBroker(account="562057042", reference_prices={"BBB": 97.0})
+    res2 = ex2.run(_now_live() + timedelta(minutes=1), data2, broker=broker2)
+
+    assert len(broker2.placed_orders) == 0, (
+        "a fresh retry must still see AAA's earlier scheduled spend against the "
+        "daily cap even though cap_seed_roots doesn't cover the scheduled slot"
+    )
+    # index by ticker, not position: AAA's earlier submitted row is carried
+    # forward into ex2's own artifact (a separate, already-covered fix) and
+    # prepended ahead of BBB's own row.
+    bbb = next(row for row in res2["artifacts"]["buy_candidates"] if row["ticker"] == "BBB")
+    assert bbb["status"] == "cap_exceeded"
 
 
 def test_morning_top_up_guard_no_prior_run_when_default_roots_empty(tmp_path):

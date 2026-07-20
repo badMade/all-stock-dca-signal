@@ -240,6 +240,8 @@ MORNING_SIZING_TIERS: Tuple[Tuple[float, float], ...] = StrategyConfig().sizing_
 
 MORNING_MINIMUM_DROP = 0.001
 
+logger = logging.getLogger(__name__)
+
 
 def _nth_weekday_of_month(year: int, month: int, weekday: int, n: int) -> date:
     """Return the date of the ``n``-th ``weekday`` (0=Mon..6=Sun) in ``year``/``month``."""
@@ -694,7 +696,7 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
 
     cfg_path = config_dir_path / "morning_dca.json"
     if not cfg_path.exists():
-        _log.warning(
+        logger.warning(
             "morning_dca.json not found at %s; using MorningConfig defaults", cfg_path
         )
         approved_dates = _load_approved_dates_fail_closed(config_dir_path)
@@ -707,7 +709,7 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
     try:
         raw = json.loads(cfg_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
-        _log.warning("could not parse %s (%s); using MorningConfig defaults", cfg_path, exc)
+        logger.warning("could not parse %s (%s); using MorningConfig defaults", cfg_path, exc)
         return MorningConfig(**approved_date_overrides)
 
     kwargs = dict(approved_date_overrides)
@@ -914,6 +916,14 @@ class MorningDCAExecutor(DCAExecutor):
     budget_daily_key: str = "morning_daily_cap_usd"
     budget_weekly_key: str = "morning_weekly_cap_usd"
     budget_label: str = "morning"
+    # Whether _seed_ledger_from_prior_runs should also fold manual_run_subdir/
+    # reruns into this stream's OWN cap ledger. True for morning: a manual
+    # rerun there is a rerun of this same scheduled task and should count
+    # against this stream's own cap. Midday overrides this to False because
+    # its manual_reruns/ folder holds post-12:30 backfill artifacts that are
+    # documented (near_close_dca.py) as feeding ONLY the afternoon top-up
+    # guard, never the midday stream's own scheduled cap.
+    scan_manual_reruns_for_ledger: bool = True
 
     def __init__(
         self,
@@ -938,6 +948,17 @@ class MorningDCAExecutor(DCAExecutor):
         self._sizing_config = self.config.as_strategy_config()
         self.state_root = self.config.morning_run_state_root or self.profile["state_root"]
         self.decision_time = self.config.decision_time_et or self.profile["decision_time_et"]
+        # run_ids already folded into self.ledger by _seed_ledger_from_prior_runs
+        # -- including this instance's OWN completed runs (added in run() right
+        # after write_artifacts) -- so a retried/rerun run() on this SAME
+        # executor instance never seeds the same on-disk artifact into the
+        # ledger twice.
+        self._seeded_prior_run_ids: set = set()
+        # Submitted/filled candidate rows recovered from today's own fixed
+        # scheduled run_state.json by the most recent _seed_ledger_from_prior_runs
+        # call, so a scheduled retry can carry them forward into the artifact
+        # it's about to overwrite. Reset at the top of every seeding call.
+        self._prior_same_day_candidate_rows: List[Dict[str, Any]] = []
         # Tracks total amount already seeded per (frozenset(cap_roots), trading_day)
         # so repeated run() calls correctly pick up new fills without double-counting.
         self._cap_seeded_amounts: Dict[Tuple, float] = {}
@@ -1846,6 +1867,27 @@ class MorningDCAExecutor(DCAExecutor):
             )
             paths["run_summary"] = str(summary_path)
 
+        orders_rows = [
+            c for c in artifacts.get('buy_candidates', []) if c.get('order_id')
+        ]
+        if orders_rows:
+            orders_csv_path = out / "orders.csv"
+            _write_csv(
+                orders_csv_path,
+                [
+                    {
+                        "ticker": c.get("ticker", ""),
+                        "order_id": c.get("order_id", ""),
+                        "notional_usd": c.get("planned_amount_usd", c.get("hypothetical_amount_usd", "")),
+                        "status": c.get("status", ""),
+                        "avg_fill_price": "",
+                        "quantity_filled": "",
+                    }
+                    for c in orders_rows
+                ],
+            )
+            paths["orders_csv"] = str(orders_csv_path)
+
         pointer_name = "latest_preflight.json" if is_preflight else self.latest_pointer_name
         if not artifacts["run_classification"]["manual_run"]:
             pointer = Path(self.state_root) / pointer_name
@@ -2032,6 +2074,213 @@ class MorningDCAExecutor(DCAExecutor):
             encoding="utf-8",
         )
         return {"artifacts": artifacts, "paths": {"run_state": str(state_path)}}
+
+    def _seed_ledger_from_prior_runs(self, now: datetime) -> None:
+        """Fold already-submitted same-day/same-week spend into the ledger.
+
+        ``MorningLedger`` is in-memory and this executor is normally instantiated
+        fresh per invocation (a new cron process each time), so a retried or
+        manually rerun live task would otherwise see an empty ledger and could
+        re-spend a cap that an earlier run already spent against. This scans
+        this stream's own live run-state artifacts under this stream's
+        scheduled-folder naming for every day in the current ISO week up to and
+        including today -- the fixed scheduled path for today specifically (a
+        retry overwrites that same path, so the pre-retry file must be read
+        before that happens) -- plus, when :attr:`scan_manual_reruns_for_ledger`
+        is true, any ``manual_run_subdir`` reruns.
+
+        Each already ``submitted``/``filled`` buy candidate's amount from an
+        earlier day in the same ISO week folds into ``planned_by_week`` only
+        (the daily bucket stays scoped to today, and that day already ended).
+        This guards the weekly cap across a fresh process starting later in
+        the week. A file dated today folds into both ``planned_by_day`` and
+        ``planned_by_week`` (via ``record_hypothetical``) UNLESS this stream
+        has ``cap_seed_roots`` configured, in which case ``_compute_top_up``'s
+        cap_seed_roots scan already seeds today's own-stream spend from the
+        same on-disk artifacts and this method must not seed it a second time.
+
+        Guards against double-counting a run's own on-disk artifact if the
+        SAME executor instance calls ``run()`` again later: ``run()`` adds its
+        own ``run_id`` to ``self._seeded_prior_run_ids`` right after writing,
+        so a later same-instance seeding pass recognizes and skips it (its
+        spend is already reflected in ``self.ledger`` from that first call).
+        A different (fresh) instance scanning the same file for the first time
+        still folds it in correctly.
+
+        Also records today's own submitted/filled rows from the fixed
+        scheduled path (not manual reruns, which write to unique paths and are
+        never overwritten) into ``self._prior_same_day_candidate_rows`` so
+        ``run()`` can carry them forward into the artifact it's about to
+        overwrite on a same-day scheduled retry.
+
+        Watchlist/preflight modes never place real orders, so caps are never
+        enforced there and this is a no-op outside live mode.
+        """
+        self._prior_same_day_candidate_rows = []
+        if self.mode != MORNING_LIVE_MODE:
+            return
+        trading_day = now.astimezone(EASTERN).date()
+        this_week = iso_week_key(trading_day)
+        state_root = Path(self.state_root)
+        folder_suffix = self.profile["folder_suffix"]
+        # _compute_top_up's cap_seed_roots scan already seeds TODAY's own-stream
+        # spend (both planned_by_day and planned_by_week) when cap_seed_roots is
+        # configured AND actually covers the scheduled dated-slot path --
+        # seeding it again here would double-count the same on-disk artifact.
+        # Only skip today's amount in that case; a narrower cap_seed_roots
+        # config that covers only manual_runs/ (explicitly supported by
+        # _compute_top_up's own_manual_in_scan/own_scheduled_in_scan split)
+        # never sees the scheduled slot, so this method must remain the one
+        # seeding it or a scheduled retry could re-spend the full cap.
+        _cap_seed_roots = (
+            getattr(self.config, "cap_seed_roots", None) if self.stream == MORNING_STREAM else None
+        )
+        _today_seeded_by_cap_roots = bool(_cap_seed_roots) and any(
+            Path(self.state_root).is_relative_to(Path(r)) for r in _cap_seed_roots
+        )
+
+        scheduled_path = self.run_state_dir(now) / "run_state.json"
+        candidate_paths: List[Tuple[Path, bool]] = []
+        week_start = trading_day - timedelta(days=trading_day.weekday())
+        day = week_start
+        while day <= trading_day:
+            path = state_root / f"{day.strftime('%Y%m%d')}_{folder_suffix}" / "run_state.json"
+            if path.exists():
+                candidate_paths.append((path, path == scheduled_path))
+            day += timedelta(days=1)
+
+        # Cache parsed manual-run states to avoid re-reading files in the main loop.
+        _manual_state_cache: Dict[Path, Dict[str, Any]] = {}
+        if self.scan_manual_reruns_for_ledger:
+            manual_root = state_root / self.manual_run_subdir
+            if manual_root.exists():
+                filtered_manual: List[Tuple[Path, bool]] = []
+                for p in sorted(manual_root.glob("*/run_state.json")):
+                    try:
+                        raw_state = json.loads(p.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    _manual_state_cache[p] = raw_state
+                    filtered_manual.append((p, False))
+                candidate_paths.extend(filtered_manual)
+
+        for path, is_scheduled_today in candidate_paths:
+            if path in _manual_state_cache:
+                state = _manual_state_cache[path]
+            else:
+                try:
+                    state = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+            # A valid JSON document whose root is a list, string, or other
+            # non-object value (e.g. a partially recovered artifact) has no
+            # .get() -- skip it rather than raising AttributeError and
+            # crashing the retry before it can reach the fail-closed path.
+            if not isinstance(state, dict):
+                continue
+            file_trading_day_str = state.get("trading_day")
+            try:
+                file_trading_day = (
+                    date.fromisoformat(file_trading_day_str) if file_trading_day_str else None
+                )
+            except (TypeError, ValueError):
+                file_trading_day = None
+            if file_trading_day is None or file_trading_day > trading_day:
+                continue
+            if iso_week_key(file_trading_day) != this_week:
+                continue
+            # Applies to manual reruns AND the day-by-day scheduled/fixed-slot
+            # paths alike: a replayed/backfilled run (this call's own `now`)
+            # must not seed cap spend out of an artifact that was actually
+            # written later in the day than the decision being reproduced --
+            # e.g. a delayed scheduled invocation whose fixed YYYYMMDD_1030ET/
+            # run_state.json ends up with a generated_at well after 10:30.
+            if _run_state_after_boundary(state, now):
+                continue
+            run_id = state.get("run_id")
+            if run_id is None:
+                continue
+            already_seeded = run_id in self._seeded_prior_run_ids
+            if already_seeded:
+                # Ledger already has this run's spend; skip re-seeding, but
+                # still load submitted rows from the scheduled path so a second
+                # call to run() on the SAME executor instance (same run_id)
+                # carries them forward into _prior_same_day_candidate_rows.
+                if is_scheduled_today:
+                    _bcs = state.get("buy_candidates") or []
+                    if isinstance(_bcs, list):
+                        submitted_rows_only = [
+                            c for c in _bcs
+                            if isinstance(c, dict) and c.get("status") in ("submitted", "filled")
+                        ]
+                        if submitted_rows_only:
+                            self._prior_same_day_candidate_rows.extend(submitted_rows_only)
+                continue
+            total = 0.0
+            submitted_rows = []
+            _buy_candidates = state.get("buy_candidates") or []
+            if not isinstance(_buy_candidates, list):
+                _buy_candidates = []
+            for candidate in _buy_candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                if candidate.get("status") not in ("submitted", "filled"):
+                    continue
+                amount = candidate.get("planned_amount_usd")
+                if amount is None:
+                    amount = candidate.get("hypothetical_amount_usd")
+                try:
+                    amount = float(amount)
+                except (TypeError, ValueError):
+                    continue
+                # Reject inf/-inf/nan for the same reason as the CSV cross-check
+                # below: an infinite amount would seed infinite cap spend.
+                if not math.isfinite(amount):
+                    continue
+                if amount > 0:
+                    total += amount
+                    submitted_rows.append(candidate)
+
+            # Cross-check against the broker-order log written alongside
+            # run_state.json: a Copilot Autofix pass flagged that the JSON
+            # buy_candidates total could under-report actual submitted/filled
+            # spend, so take whichever total is larger as the true
+            # already-spent amount for cap-seeding purposes.
+            # filled_orders.csv (the confirmed-fill source written by manual
+            # midday overrides) is generally the more trustworthy signal, since
+            # orders.csv is always written with blank avg_fill_price /
+            # quantity_filled fields and would shadow real fill data -- but a
+            # PARTIAL filled_orders.csv (some rows confirmed, others still only
+            # in orders.csv as submitted-not-yet-confirmed) can under-report
+            # relative to orders.csv's total. Take the larger of the two
+            # qualifying totals, consistent with the same "take whichever is
+            # larger" policy already applied against the JSON total above,
+            # rather than treating the two files as mutually exclusive.
+            filled_orders_csv = path.parent / "filled_orders.csv"
+            orders_csv = path.parent / "orders.csv"
+            csv_total = _csv_qualifying_notional_total(filled_orders_csv, blank_status_means_filled=True)
+            if orders_csv.exists() and orders_csv != filled_orders_csv:
+                csv_total = max(
+                    csv_total,
+                    _csv_qualifying_notional_total(orders_csv, blank_status_means_filled=False),
+                )
+            total = max(total, csv_total)
+            self._seeded_prior_run_ids.add(run_id)
+            if total > 0:
+                if file_trading_day == trading_day:
+                    # Only seed today's own bucket here when cap_seed_roots isn't
+                    # already doing it (see _today_seeded_by_cap_roots above) --
+                    # otherwise the same on-disk artifact would be double-counted.
+                    if not _today_seeded_by_cap_roots:
+                        self.ledger.record_hypothetical(trading_day, total)
+                else:
+                    # Cross-day-in-week seeding only bumps the shared weekly
+                    # bucket; the daily bucket stays scoped to trading_day.
+                    self.ledger.planned_by_week[this_week] = (
+                        self.ledger.planned_by_week.get(this_week, 0.0) + total
+                    )
+            if is_scheduled_today and submitted_rows:
+                self._prior_same_day_candidate_rows.extend(submitted_rows)
 
     def _place_broker_orders(
         self,
@@ -2381,9 +2630,9 @@ class MorningDCAExecutor(DCAExecutor):
         now: datetime,
         data: Any,
         *,
+        broker: Optional[BrokerAdapter] = None,
         data_source: Optional[str] = None,
         manual: bool = False,
-        broker: Optional[BrokerAdapter] = None,
     ) -> Dict[str, Any]:
         """Evaluate the stream and write its artifacts for the active mode.
 
@@ -2391,7 +2640,9 @@ class MorningDCAExecutor(DCAExecutor):
         The watchlist scan places no orders; the live mode surfaces
         auto-buy-eligible vs. manual_review candidates per the confidence rule.
         When ``broker`` is supplied in live mode, auto-buy-eligible candidates
-        are submitted via the broker and outcomes recorded in the artifacts.
+        are submitted via the broker to the account configured in
+        ``target_account_number`` and outcomes recorded in the artifacts.
+        Alpaca stays read-only.
         """
         blocked = self._maybe_block_for_holiday(now, manual=manual)
         if blocked is not None:
@@ -2441,6 +2692,15 @@ class MorningDCAExecutor(DCAExecutor):
             (s for s in self._buy_candidates(signals) if s.execution_status != EXEC_MANUAL_REVIEW_CANDIDATE),
             key=lambda s: (-s.multiplier, -(s.drop_pct or 0.0), s.ticker),
         )
+        # Fold already-spent same-day capital from an earlier run of this same
+        # stream (retry or manual rerun) into the ledger BEFORE snapshotting
+        # remaining budget, so a fresh-process retry never re-spends the cap.
+        # This only seeds WEEKLY spend from earlier days in the ISO week (plus
+        # today's carry-forward candidate rows) -- today's own-stream spend is
+        # already seeded above by _compute_top_up's cap_seed_roots scan, so
+        # _seed_ledger_from_prior_runs must not also seed today's amount here
+        # or the same on-disk artifact would be double-counted.
+        self._seed_ledger_from_prior_runs(now)
         # Subtract prior same-day spend (recorded by _compute_top_up) from the
         # pre-run budget so caps account for earlier manual/recovery fills that
         # already consumed part of the daily/weekly cap on other tickers.
@@ -2568,7 +2828,56 @@ class MorningDCAExecutor(DCAExecutor):
             for _row in artifacts.get("signal_rows", []):
                 if _row.get("auto_buy_signal") and _row.get("ticker") in _deliberate_skip_tickers:
                     _row["auto_buy_signal"] = False
+        if not manual and self._prior_same_day_candidate_rows:
+            # A scheduled retry is about to overwrite the fixed scheduled
+            # path; carry forward any earlier same-day submitted/filled rows
+            # (found by _seed_ledger_from_prior_runs) for tickers this run
+            # didn't itself re-submit, so the persisted artifact keeps the
+            # afternoon top-up guard's visibility into that earlier fill.
+            # Only suppress carry-forward when the new artifact already has a
+            # submitted/filled row for that ticker. A skipped/cap_exceeded retry
+            # row must NOT shadow the real submitted row from the first run.
+            submitted_tickers = {
+                row.get("ticker")
+                for row in artifacts["buy_candidates"]
+                if row.get("status") in ("submitted", "filled")
+            }
+            carried_forward = [
+                dict(row)
+                for row in self._prior_same_day_candidate_rows
+                if row.get("ticker") not in submitted_tickers
+            ]
+            if carried_forward:
+                artifacts["buy_candidates"] = carried_forward + artifacts["buy_candidates"]
+                artifacts["counts"]["buy_candidates"] = len(artifacts["buy_candidates"])
+                # These rows are this stream's OWN earlier scheduled submissions
+                # being re-persisted into the artifact this call is about to
+                # write, not a fresh submission this call placed. Fold their
+                # total into _own_recorded_scheduled too -- otherwise a later
+                # cap_seed_roots scan of this same on-disk file (_compute_top_up)
+                # would see them as if they were a brand-new external fill and
+                # double-count them into the ledger.
+                carried_forward_total = 0.0
+                for _cf_row in carried_forward:
+                    _cf_amt = _cf_row.get("planned_amount_usd")
+                    if _cf_amt is None:
+                        _cf_amt = _cf_row.get("hypothetical_amount_usd")
+                    try:
+                        _cf_amt = float(_cf_amt)
+                    except (TypeError, ValueError):
+                        continue
+                    if _cf_amt > 0:
+                        carried_forward_total += _cf_amt
+                if carried_forward_total > 0:
+                    self._own_recorded_scheduled[trading_day] = (
+                        self._own_recorded_scheduled.get(trading_day, 0.0) + carried_forward_total
+                    )
         paths = self.write_artifacts(artifacts, now)
+        # Fold this run's own run_id into the seen-set so a LATER run() call on
+        # this SAME executor instance never re-reads this just-written artifact
+        # from disk and double-counts spend already reflected in self.ledger
+        # (via record_buy_candidates above).
+        self._seeded_prior_run_ids.add(artifacts["run_id"])
         if self.mode == MORNING_LIVE_MODE and self.trades and not manual:
             _run_drift_check(Path(paths["run_state"]).parent)
         return {"artifacts": artifacts, "paths": paths}
@@ -2651,6 +2960,76 @@ def _same_stream_order_exists(
         # True → treat as found but without order details.
         return None if not result else {}
     return result
+
+
+def _run_state_after_boundary(state: Dict[str, Any], boundary: datetime) -> bool:
+    """True when ``state["generated_at"]`` is strictly after ``boundary``.
+
+    Used by ``_seed_ledger_from_prior_runs`` to keep a replayed/backfilled run
+    (``boundary`` = that replay's own ``now``) from seeding cap spend out of
+    an artifact -- manual rerun OR the scheduled slot's own fixed-path file --
+    that was actually written later in the day than the decision being
+    reproduced. Strict ``>`` (not ``>=``) so a same-instant retry, where a
+    fresh executor instance calls run() with the identical ``now`` an earlier
+    attempt used for its own generated_at, still sees that attempt's spend --
+    see test_morning_live_ledger_seeds_cap_spend_from_earlier_same_process_day_run.
+    A missing/unparseable generated_at is conservatively treated as NOT after
+    the boundary (more prior context only ever reduces a later buy).
+    """
+    gen_at_str = state.get("generated_at")
+    if not gen_at_str:
+        return False
+    try:
+        gen_at = datetime.fromisoformat(gen_at_str)
+    except (ValueError, TypeError):
+        return False
+    if gen_at.tzinfo is None:
+        # Match _prior_run_before_boundary in near_close_dca.py: a naive
+        # generated_at is a local Eastern timestamp, not UTC.
+        gen_at = gen_at.replace(tzinfo=EASTERN)
+    return gen_at.astimezone(EASTERN) > boundary.astimezone(EASTERN)
+
+
+def _csv_qualifying_notional_total(csv_path: Path, blank_status_means_filled: bool) -> float:
+    """Sum notional_usd/amount_usd across submitted/filled, non-DRY-RUN rows.
+
+    Used by ``_seed_ledger_from_prior_runs`` as a cross-check against the
+    JSON-derived spend total. Returns ``0.0`` -- never raises -- for a missing,
+    corrupt, unreadable, or empty file, or one with no qualifying rows, so the
+    caller can safely try a fallback source (or fall back to the JSON total
+    alone) without any special-casing at the call site.
+    """
+    total = 0.0
+    if not csv_path.exists():
+        return total
+    try:
+        with csv_path.open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                status = (row.get("status") or "").lower()
+                # filled_orders.csv rows are always confirmed fills; a
+                # blank/missing status field still counts as "filled".
+                if blank_status_means_filled and not status:
+                    status = "filled"
+                order_id = row.get("order_id") or ""
+                if status not in ("submitted", "filled") or order_id.startswith("DRY-RUN"):
+                    continue
+                # filled_orders.csv uses amount_usd; orders.csv uses notional_usd.
+                raw = row.get("notional_usd") or row.get("amount_usd")
+                try:
+                    notional = float(raw) if raw not in (None, "", "-") else None
+                except (TypeError, ValueError):
+                    notional = None
+                # Reject inf/-inf/nan: an infinite notional would seed the
+                # ledger with infinite spend and cap-exceed every later order.
+                if notional is not None and not math.isfinite(notional):
+                    notional = None
+                if notional and notional > 0:
+                    total += notional
+    except (OSError, UnicodeDecodeError, csv.Error):
+        # A corrupt/unreadable CSV must not abort the scheduled retry; the
+        # caller falls back to another source (or the JSON total alone).
+        return 0.0
+    return total
 
 
 def _write_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:

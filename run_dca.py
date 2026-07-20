@@ -28,14 +28,15 @@ import argparse
 import csv
 import json
 import logging
+import os
 import shutil
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from dca_config import DEFAULT_CONFIG_DIR, load_strategy_config
-from midday_dca import DEFAULT_MIDDAY_LIVE_STATE_ROOT
-from morning_dca import DEFAULT_MORNING_LIVE_STATE_ROOT
+from midday_dca import DEFAULT_MIDDAY_LIVE_STATE_ROOT, load_midday_config
+from morning_dca import DEFAULT_MORNING_LIVE_STATE_ROOT, MORNING_LIVE_MODE, load_morning_config
 from near_close_dca import (
     EASTERN,
     Bar,
@@ -65,10 +66,179 @@ logger = logging.getLogger("near_close_dca.run")
 # ``manual_reruns/``. Absent roots contribute nothing, so this is safe on days a
 # stream did not run. These are prior-allocation context ONLY -- never scheduled
 # afternoon evidence, slippage, reliability, fill counts, or cost basis.
+#
+# Used both as the sibling-of-afternoon-root fallback and as the default when a
+# stream's own config can't be loaded (see
+# _resolve_cross_stream_prior_allocation_roots).
 _CROSS_STREAM_PRIOR_ALLOCATION_ROOTS: Tuple[str, ...] = (
     DEFAULT_MORNING_LIVE_STATE_ROOT,
     DEFAULT_MIDDAY_LIVE_STATE_ROOT,
 )
+
+
+def _is_within(path: Path, ancestor: Path) -> bool:
+    """True if resolved ``path`` is ``ancestor`` itself or nested under it."""
+    try:
+        path.relative_to(ancestor)
+        return True
+    except ValueError:
+        return False
+
+
+def _resolve_cross_stream_prior_allocation_roots(
+    config_dir: Optional[str | Path],
+    afternoon_root: Path,
+) -> Tuple[Path, ...]:
+    """Resolve the morning/midday live roots the afternoon top-up guard scans.
+
+    Reads each stream's OWN configured artifact root (``MorningConfig``/
+    ``MiddayConfig.morning_run_state_root``, sourced from
+    ``artifact_paths.live_run_state_root`` in ``config/morning_dca.json`` /
+    ``config/midday_dca.json``) rather than ONLY assuming the
+    sibling-of-afternoon-root directory-naming convention, so a deployment that
+    relocates a stream's artifact root (staging, CI, or a future config change)
+    is scanned correctly instead of silently missing that stream's fills
+    (Codex/Copilot review: "Honor the configured morning artifact root").
+
+    Also still includes the sibling-of-``afternoon_root`` roots derived from
+    ``afternoon_root.parent`` -- a caller that relocates the WHOLE
+    cron-tracking tree via a non-production ``artifacts_dir`` (tests, demo,
+    staging) without also pointing ``config_dir`` at a matching relocated
+    config would otherwise have its real sibling morning/midday artifacts
+    missed, since the configured root would still resolve to the bundled
+    production default (Codex follow-up review: "Preserve the sibling
+    stream-root fallback"). Both sets of roots are folded in and deduped by
+    resolved path, so the common case where they coincide doesn't scan the
+    same tree twice.
+
+    Two further guards on top of that:
+
+    - When no ``config_dir`` is given, a stream's configured root is only
+      trusted if it actually lives under this run's cron base (i.e. matches
+      the sibling-of-``afternoon_root`` convention). Without an explicit
+      ``config_dir`` the loader falls back to the bundled production
+      config, so its ``live_run_state_root`` would otherwise resolve to a
+      real production path (e.g. ``/home/user/workspace/cron_tracking/...``)
+      even when this run's whole tree has been relocated for tests, demos,
+      or staging -- silently folding another environment's real same-day
+      fills in as this run's prior-allocation context (Codex follow-up
+      review: "Keep relocated runs from scanning production roots"). An
+      explicit ``config_dir`` is trusted only once the corresponding stream
+      config actually supplied a non-empty root -- the same requirement
+      already applied to the ``DCA_CONFIG_DIR`` path below -- since a
+      relocated/staging ``config_dir`` that lacks ``morning_dca.json`` or
+      ``midday_dca.json`` (or whose stream config fails to load) still
+      falls back to the bundled production default, which must not be
+      admitted just because *some* config_dir was given (Codex review:
+      "Keep fallback roots contained for incomplete configs").
+    - Any resolved root that is a descendant of another resolved root is
+      pruned, keeping only the ancestor. ``load_prior_same_day_allocations``/
+      ``..._multi`` scan every given root recursively (``rglob``), so keeping
+      both a root and its child would load the same ``run_state.json`` files
+      twice and double the afternoon top-up guard's prior-allocation amount
+      (Codex review: "Avoid double-counting nested stream roots").
+    - Any resolved root that is ``afternoon_root`` itself or an ancestor of
+      it is also dropped. The caller scans ``afternoon_root`` separately and
+      sums that result with this function's cross-stream roots (see
+      ``run_pipeline``), so keeping a root that contains -- or equals --
+      ``afternoon_root`` (e.g. a shared ``cron_tracking`` root configured as
+      a stream's ``morning_run_state_root``) would recursively re-scan the
+      same ``afternoon_root`` tree a second time and double-count every
+      manual afternoon allocation beneath it (Codex review: "Exclude the
+      afternoon tree from cross-stream roots").
+    """
+    cron_base = afternoon_root.parent
+
+    # DCA_CONFIG_DIR, when set and pointing to an existing directory, has the
+    # same trust level as an explicit config_dir: deployment deliberately
+    # selected that environment's config, so a root that stream's own config
+    # actually set must be honoured even when the caller did not forward
+    # config_dir to run_pipeline(). But trust is evaluated PER STREAM: if
+    # DCA_CONFIG_DIR exists yet a stream's own JSON (morning_dca.json /
+    # midday_dca.json) doesn't override live_run_state_root, that stream's
+    # loader silently falls back to the bundled production default root --
+    # exactly the untrusted case this containment check exists to catch, and
+    # merely checking that the DCA_CONFIG_DIR directory exists would still
+    # admit it. Only bypass containment for a stream once loading actually
+    # produced an explicit (non-None) root for it.
+    _env_config_dir = os.environ.get("DCA_CONFIG_DIR")
+    _env_config_dir_valid = bool(_env_config_dir and Path(_env_config_dir).is_dir())
+
+    def _configured_root(loader_root: Optional[str], default_root: str) -> Optional[Path]:
+        root = Path(loader_root or default_root)
+        # An empty string is treated as "not configured" everywhere else this
+        # field is consumed (e.g. MorningDCAExecutor.state_root's own
+        # `self.config.morning_run_state_root or self.profile["state_root"]`
+        # fallback), so it must not count as this stream having an explicit
+        # root either -- `loader_root is not None` alone would still trust an
+        # empty override, and `root` above already silently fell back to
+        # default_root (the production path) for it.
+        trusted = bool(loader_root) and (config_dir is not None or _env_config_dir_valid)
+        if not trusted and not _is_within(root.resolve(), cron_base.resolve()):
+            # Neither an explicit config_dir argument nor a DCA_CONFIG_DIR
+            # override for this specific stream was in play, and the resolved
+            # root doesn't belong to this run's cron-tracking tree -- almost
+            # certainly the bundled production default surviving a relocated
+            # (test/demo/staging) tree. Drop it; the sibling-root fallback
+            # below still covers this stream if it actually ran under the
+            # relocated tree.
+            return None
+        return root
+
+    try:
+        morning_root = load_morning_config(config_dir, mode=MORNING_LIVE_MODE).morning_run_state_root
+    except Exception:  # noqa: BLE001 - never let a bad morning config block the afternoon run
+        morning_root = None
+    try:
+        midday_root = load_midday_config(config_dir).morning_run_state_root
+    except Exception:  # noqa: BLE001 - never let a bad midday config block the afternoon run
+        midday_root = None
+
+    configured_roots = tuple(
+        r
+        for r in (
+            _configured_root(morning_root, DEFAULT_MORNING_LIVE_STATE_ROOT),
+            _configured_root(midday_root, DEFAULT_MIDDAY_LIVE_STATE_ROOT),
+        )
+        if r is not None
+    )
+    sibling_roots = tuple(
+        cron_base / Path(r).name for r in _CROSS_STREAM_PRIOR_ALLOCATION_ROOTS
+    )
+
+    # Pass 1: dedupe exact-duplicate resolved paths, preserving first-seen order.
+    seen: set = set()
+    deduped: List[Tuple[Path, Path]] = []
+    for root in (*configured_roots, *sibling_roots):
+        key = root.resolve()
+        if key not in seen:
+            seen.add(key)
+            deduped.append((root, key))
+
+    # Pass 2: drop any root that is afternoon_root itself or an ancestor of it --
+    # the caller scans afternoon_root separately and sums that result with this
+    # function's roots (see run_pipeline), so keeping one that contains
+    # afternoon_root would recursively re-scan (and double-count) that tree.
+    # This MUST happen before Pass 3's descendant pruning below, not folded
+    # into the same comparison: if a stream is configured to the shared
+    # cron_base itself, cron_base contains afternoon_root (dropped here) AND
+    # is the ancestor that would otherwise cause the sibling-root fallback
+    # (a genuine descendant of cron_base) to be pruned as "redundant" in Pass
+    # 3 -- leaving nothing scanned for that stream at all. Excluding
+    # afternoon-containing roots first means Pass 3 never sees cron_base as
+    # an ancestor candidate, so the sibling fallback survives.
+    afternoon_key = afternoon_root.resolve()
+    non_afternoon: List[Tuple[Path, Path]] = [
+        (orig, key) for orig, key in deduped if not _is_within(afternoon_key, key)
+    ]
+
+    # Pass 3: prune any root that is a descendant of another surviving root.
+    resolved: List[Path] = [
+        orig
+        for orig, key in non_afternoon
+        if not any(key != other_key and _is_within(key, other_key) for _, other_key in non_afternoon)
+    ]
+    return tuple(resolved)
 
 
 def _build_frozen_providers_from_raw(
@@ -424,6 +594,7 @@ def run_pipeline(
     prior_allocation_state_root: Optional[str | Path] = None,
     deployment_history_root: Optional[str | Path] = None,
     classification_state_root: Optional[str | Path] = None,
+    config_dir: Optional[str | Path] = None,
     raw_connector_inputs: Optional[Mapping[str, Any]] = None,
     required_raw_filenames: Optional[frozenset] = None,
 ) -> Dict[str, Any]:
@@ -464,6 +635,12 @@ def run_pipeline(
     written/updated (see ``scripts.run_classification``). Opt-in only: when not
     given, no ``latest_scheduled_run.json`` write is attempted at all, so a
     caller must pass the real cron_tracking root explicitly to enable it.
+
+    ``config_dir`` is forwarded to ``load_morning_config``/``load_midday_config``
+    when resolving the sibling morning/midday roots below (see
+    ``_resolve_cross_stream_prior_allocation_roots``); ``None`` uses their own
+    default resolution (``DCA_CONFIG_DIR`` env var, then the bundled config/
+    directory), matching how ``config`` itself is normally loaded.
     """
     # Drain any leftover raw placement responses from a prior run on this broker
     # instance (e.g. a manual run_pipeline() call that preceded this scheduled one).
@@ -698,15 +875,16 @@ def run_pipeline(
     if scheduled and prior_same_day_allocations is None:
         trading_day = now.astimezone(EASTERN).date()
         if prior_allocation_state_root is None:
-            # Auto-derive the afternoon task root and fold in the sibling morning/
-            # midday stream roots (incl. manual override reruns), so morning,
-            # midday, and manual override same-day fills all offset the afternoon
-            # buy. An explicit prior_allocation_state_root overrides this and scans
-            # only the tree the caller named.
+            # Auto-derive the afternoon task root and fold in the morning/midday
+            # stream roots (incl. manual override reruns), so morning, midday,
+            # and manual override same-day fills all offset the afternoon buy.
+            # Each stream's root is read from its OWN config rather than assumed
+            # from directory-naming convention, so a relocated artifact root is
+            # still found. An explicit prior_allocation_state_root overrides all
+            # of this and scans only the tree the caller named.
             afternoon_root = _default_prior_allocation_state_root(Path(artifacts_dir))
-            cron_base = afternoon_root.parent
-            cross_stream_roots = tuple(
-                cron_base / Path(r).name for r in _CROSS_STREAM_PRIOR_ALLOCATION_ROOTS
+            cross_stream_roots = _resolve_cross_stream_prior_allocation_roots(
+                config_dir, afternoon_root
             )
             # All roots are capped at the actual run time so replayed/backfilled
             # runs never load fills created after the scheduled execution window.
