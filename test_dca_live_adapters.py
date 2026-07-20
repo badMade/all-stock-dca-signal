@@ -71,6 +71,7 @@ def test_parse_rfc3339_handles_nanoseconds_and_z():
 def test_parse_rfc3339_bad_values_return_none():
     assert _parse_rfc3339(None) is None
     assert _parse_rfc3339("not-a-date") is None
+    assert _parse_rfc3339("2023-13-45T99:99:99Z") is None
     assert _parse_rfc3339(12345) is None
 
 
