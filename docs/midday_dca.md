@@ -59,8 +59,8 @@ order: the run's logged `target_price`, then `decision_price`, then the confirme
 
 Only earlier runs generated **before 2:30 PM ET** contribute; scheduled afternoon
 runs are excluded as prior context. Prior allocations are scanned across
-`prior_allocation_roots` (the morning-live root **and** the manual missed-morning
-recovery root `.../cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*`); when a
+prior_allocation_roots (the morning-live root, which recursively includes the manual missed-morning
+recovery root .../cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*); when a
 ticker appears in more than one root the amounts are summed and the lowest
 reference price wins, so midday must beat the best earlier entry before it tops
 up.
