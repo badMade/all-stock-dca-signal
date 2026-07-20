@@ -74,6 +74,16 @@ def test_parse_rfc3339_bad_values_return_none():
     assert _parse_rfc3339(12345) is None
 
 
+def test_parse_rfc3339_unparseable_timestamp_string_returns_none():
+    assert _parse_rfc3339("2026-13-01T25:00:00Z") is None
+
+
+def test_parse_rfc3339_naive_timestamp_gets_eastern_tz():
+    parsed = _parse_rfc3339("2026-07-06T18:31:29")
+    assert parsed is not None
+    assert parsed.tzinfo == EASTERN
+
+
 def test_to_float_defaults():
     assert _to_float("3.14") == pytest.approx(3.14)
     assert _to_float(None, default=-1.0) == -1.0
