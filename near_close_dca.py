@@ -577,6 +577,17 @@ class BrokerAdapter(Protocol):
     def get_order_fill(self, order_id: str) -> Optional[OrderFill]:
         """Return fill details for a placed order, or None if not yet filled."""
 
+    @property
+    def supports_concurrent_fill_lookup(self) -> bool:
+        """Whether get_order_fill may be called from multiple threads at once.
+
+        Defaults to False. get_order_fill is commonly a thin wrapper around a
+        scheduler-owned MCP callable that is not guaranteed thread-safe; only
+        override to True once a broker's wiring is verified safe for concurrent
+        calls (see docs/live_wiring.md).
+        """
+        return False
+
     def get_raw_placement_responses(self) -> List[Dict[str, Any]]:
         """Return raw broker response dicts for every order placed this run.
 

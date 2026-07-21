@@ -455,6 +455,12 @@ class RobinhoodBroker:
     * ``review_fn(account_number, symbol, side, type, dollar_amount) -> dict`` (review_equity_order)
     * ``place_fn(account_number, symbol, side, type, dollar_amount, ref_id, time_in_force) -> dict``
     * ``order_fill_fn(account_number, order_id) -> dict`` (get_equity_orders single-order mode)
+
+    ``supports_concurrent_fill_lookup`` defaults to False: ``order_fill_fn`` is typically a
+    thin wrapper around a scheduler-owned MCP callable, and MCP client sessions are commonly
+    bound to a single connection/event loop that is not safe to invoke from multiple threads
+    at once. Only pass ``True`` once the wired ``order_fill_fn`` has been verified safe for
+    concurrent calls (e.g. it opens an independent connection per call).
     """
 
     def __init__(
@@ -470,6 +476,7 @@ class RobinhoodBroker:
         enable_live_orders: bool = False,
         time_in_force: str = "gfd",
         simulated_buying_power_usd: float = 300.0,
+        supports_concurrent_fill_lookup: bool = False,
     ) -> None:
         self._account = account
         self._buying_power_fn = buying_power_fn
@@ -482,6 +489,7 @@ class RobinhoodBroker:
         self._time_in_force = time_in_force
         self._simulated_buying_power_usd = simulated_buying_power_usd
         self._raw_placement_responses: List[Dict[str, Any]] = []
+        self.supports_concurrent_fill_lookup = supports_concurrent_fill_lookup
 
     def account_number(self) -> str:
         return self._account

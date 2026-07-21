@@ -646,6 +646,88 @@ def test_refresh_fills_from_broker(tmp_path):
     assert fills[0]["fill_price"] == 100.0
 
 
+def test_refresh_fills_from_broker_dedupes_and_preserves_order(tmp_path):
+    import threading
+    import time as time_module
+
+    from near_close_dca import OrderFill
+    from run_dca import _refresh_fills_from_broker
+
+    csv_path = tmp_path / "orders.csv"
+    csv_path.write_text(
+        "ticker,status,order_id\n"
+        "AAPL,submitted,O1\n"
+        "NVDA,submitted,O2\n"
+        "MU,submitted,O3\n"
+        "AAPL,submitted,O1\n",
+        encoding="utf-8",
+    )
+
+    # Slowest order first, fastest last: a naive as_completed-based collection
+    # would yield O3 before O1, exposing any loss of deterministic ordering.
+    delays = {"O1": 0.06, "O2": 0.03, "O3": 0.0}
+    call_order = []
+    lock = threading.Lock()
+
+    class _Broker:
+        # Opts into the concurrent path; this is what it exercises.
+        supports_concurrent_fill_lookup = True
+
+        def get_order_fill(self, order_id):
+            with lock:
+                call_order.append(order_id)
+            time_module.sleep(delays[order_id])
+            return OrderFill(avg_fill_price=100.0, quantity_filled=1.0)
+
+    fills = _refresh_fills_from_broker(csv_path, _Broker(), [])
+
+    # The duplicate O1 row must not trigger a second broker call.
+    assert call_order.count("O1") == 1
+    assert sorted(call_order) == ["O1", "O2", "O3"]
+
+    # Results preserve CSV row order regardless of completion timing.
+    assert [f["order_id"] for f in fills] == ["O1", "O2", "O3"]
+
+
+def test_refresh_fills_from_broker_defaults_to_sequential(tmp_path):
+    import threading
+    import time as time_module
+
+    from near_close_dca import OrderFill
+    from run_dca import _refresh_fills_from_broker
+
+    csv_path = tmp_path / "orders.csv"
+    csv_path.write_text(
+        "ticker,status,order_id\n"
+        "AAPL,submitted,O1\n"
+        "NVDA,submitted,O2\n"
+        "MU,submitted,O3\n",
+        encoding="utf-8",
+    )
+
+    lock = threading.Lock()
+    in_flight = 0
+    max_in_flight = 0
+
+    class _Broker:
+        # No supports_concurrent_fill_lookup: must fall back to sequential calls,
+        # since get_order_fill is not guaranteed safe to call from multiple threads.
+        def get_order_fill(self, order_id):
+            nonlocal in_flight, max_in_flight
+            with lock:
+                in_flight += 1
+                max_in_flight = max(max_in_flight, in_flight)
+            time_module.sleep(0.02)
+            with lock:
+                in_flight -= 1
+            return OrderFill(avg_fill_price=100.0, quantity_filled=1.0)
+
+    fills = _refresh_fills_from_broker(csv_path, _Broker(), [])
+
+    assert max_in_flight == 1
+    assert len(fills) == 3
+
+
 def test_fills_from_missing_csv_is_empty(tmp_path):
     assert _fills_from_orders_csv(tmp_path / "nope.csv") == []
 

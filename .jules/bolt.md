@@ -9,7 +9,6 @@
 ## 2023-10-27 - Pandas iteration bottleneck in analysis tools
 **Learning:** Pandas `iterrows()` is extremely slow for large DataFrames because it constructs a new `Series` object for every row. `itertuples()` or `to_dict('records')` are significantly faster (3.5x to 15x in micro-benchmarks). `to_dict('records')` is particularly useful when row mutability is needed, as it avoids `SettingWithCopyWarning` and object overhead. `itertuples(index=True)` combined with positional unpacking (`row[1:]`) is safest when column names might not be valid Python identifiers.
 **Action:** When working with Pandas loops in this codebase (especially in the heavier `analysis/` or `trading-strategies/` directories), default to `itertuples()` for read-only scans and `to_dict('records')` for mutable processing steps.
-
 ## 2026-06-29 - [Pandas Iteration Performance]
 **Learning:** `iterrows()` is extremely slow for iterating over DataFrames because it creates a Series object for each row. `itertuples()` is much faster for read-only operations as it returns namedtuples. For cases where row mutability is needed or column names are not valid identifiers (like "1x"), `to_dict('records')` offers a massive speedup over `iterrows()` while preserving dict-like access.
 **Action:** Always prefer `itertuples()` for read-only iteration and `to_dict('records')` for mutable/dict-access iteration over pandas DataFrames. Never use `iterrows()` unless strictly necessary for type preservation across columns.
@@ -21,3 +20,11 @@
 ## 2026-04-26 - iterrows optimization regression
 **Learning:** `to_dict('records')` drops the index. Always use `.reset_index(names=[idx_name])` when mutating an index that has to be preserved, then `set_index(idx_name).rename_axis(index_name)`. Also the `close.ta.rsi(length)` is not available in standard `import pandas_ta as ta` (throws a `AttributeError`). It needs to be `ta.rsi(close, length)`.
 **Action:** Always reconstruct the index if modifying a dataframe into a list of dicts. When dealing with `pandas-ta`, standard import usage doesn't attach `.ta` properties onto Series by default without a specialized init block, so avoid using Series properties directly.
+
+## 2025-02-12 - Concurrent order fills fetching during reporting
+**Learning:** Sequential loops calling network APIs can lead to severe N+1 bottlenecks. When migrating to concurrency (e.g. `concurrent.futures.ThreadPoolExecutor`), it is important to consider edge cases like duplicate processing that may have naturally been handled sequentially. Also, using `executor.map` rather than `as_completed` guarantees that order of elements remains deterministic, matching the sequential flow expectations.
+**Action:** Always pre-deduplicate locally before fetching in concurrent tasks to prevent duplicate requests. Use `executor.map` whenever result ordering matters compared to the sequential equivalent. Pay close attention to file editing tools to prevent introducing unreachable duplicate code.
+
+## 2026-07-21 - Don't parallelize calls of unverified thread-safety
+**Learning:** A callable injected via dependency injection (e.g. a broker's `order_fill_fn`) is frequently a thin wrapper around an external MCP tool call, and MCP client sessions are commonly bound to a single connection/event loop rather than being safe to invoke from multiple threads at once. Wrapping such a callable in a `ThreadPoolExecutor` without confirming its thread-safety risks silent per-call failures (swallowed by a broad `except Exception`), which for a reporting pipeline means silently under-counting real results rather than a visible crash.
+**Action:** When adding concurrency around an injected/external callable, default to sequential execution and require an explicit opt-in flag (verified safe by whoever wires the callable) before running it from a thread pool.

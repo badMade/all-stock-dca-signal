@@ -49,6 +49,13 @@ run_pipeline(
 save_strategy_state(state)
 ```
 
+Post-trade reporting re-queries `order_fill_fn` for any order still unfilled at trade
+time. By default those lookups run sequentially, since `order_fill_fn` is usually a thin
+wrapper around MCP calls and MCP client sessions are commonly not thread-safe. Only pass
+`build_broker(config, ..., supports_concurrent_fill_lookup=True)` once the wired
+`order_fill_fn` has been verified safe to call from multiple threads at once — e.g. it
+opens an independent connection/session per call rather than sharing one.
+
 ## State persistence (required for the budget safeguards)
 
 `StrategyState` holds the counters the daily/weekly/reserve caps depend on —

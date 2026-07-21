@@ -518,6 +518,13 @@ def test_broker_order_fill_nested_single_order_envelope():
     assert fill.avg_fill_price == pytest.approx(25.0)
 
 
+def test_broker_defaults_to_no_concurrent_fill_lookup():
+    # order_fill_fn is typically an MCP-backed callable of unverified thread-safety;
+    # reporting must not run it concurrently unless a caller explicitly opts in.
+    assert RobinhoodBroker().supports_concurrent_fill_lookup is False
+    assert RobinhoodBroker(supports_concurrent_fill_lookup=True).supports_concurrent_fill_lookup is True
+
+
 def test_broker_buying_power_parses_dict_response():
     # A raw MCP dict (per the module callable contract) must be unwrapped, not cast to 0.0.
     resp = {"data": {"buying_power": "137.00"}}

@@ -25,6 +25,7 @@ via :func:`run_pipeline`, not from this command line.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import json
 import logging
@@ -536,31 +537,58 @@ def _refresh_fills_from_broker(
     The immediate post-trade fill lookup can miss a fill that settles moments later; by the
     3:45 reporting step it is available. Only orders not already recorded as filled are
     re-queried, and lookup failures are swallowed so reporting never crashes.
+
+    Lookups run concurrently only when ``broker.supports_concurrent_fill_lookup`` is
+    ``True``. ``get_order_fill`` is commonly a thin wrapper around a scheduler-owned MCP
+    callable that is not guaranteed thread-safe (see docs/live_wiring.md), so the default
+    is a plain sequential loop; brokers must opt in once their wiring is verified safe for
+    concurrent calls.
     """
     if not orders_csv.exists():
         return fills
     known = {f.get("order_id") for f in fills}
     refreshed = list(fills)
+    queries = []
+
     with orders_csv.open(newline="", encoding="utf-8") as handle:
         for row in csv.DictReader(handle):
             order_id = row.get("order_id")
             if not order_id or order_id in known or (row.get("status") or "").lower() == "filled":
                 continue
-            try:
-                fill = broker.get_order_fill(order_id)
-            except Exception:  # noqa: BLE001 - a fill re-query must never crash reporting
-                logger.exception("fill refresh failed for %s", order_id)
-                continue
-            if fill is not None and fill.quantity_filled > 0 and fill.avg_fill_price > 0:
-                refreshed.append(
-                    {
-                        "ticker": row.get("ticker"),
-                        "fill_price": fill.avg_fill_price,
-                        "filled_qty": fill.quantity_filled,
-                        "order_id": order_id,
-                    }
-                )
-                known.add(order_id)
+            # Deduplicate locally before fetching, regardless of lookup outcome, so a CSV
+            # with repeated rows for the same order_id never queries it twice.
+            known.add(order_id)
+            queries.append((order_id, row.get("ticker")))
+
+    if not queries:
+        return refreshed
+
+    def _fetch(query_tuple):
+        oid, tkr = query_tuple
+        try:
+            return oid, tkr, broker.get_order_fill(oid)
+        except Exception:  # noqa: BLE001 - a fill re-query must never crash reporting
+            logger.exception("fill refresh failed for %s", oid)
+            return oid, tkr, None
+
+    if getattr(broker, "supports_concurrent_fill_lookup", False):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            # Use map to preserve the order of elements from queries
+            results = list(executor.map(_fetch, queries))
+    else:
+        results = [_fetch(query) for query in queries]
+
+    for order_id, ticker, fill in results:
+        if fill is not None and fill.quantity_filled > 0 and fill.avg_fill_price > 0:
+            refreshed.append(
+                {
+                    "ticker": ticker,
+                    "fill_price": fill.avg_fill_price,
+                    "filled_qty": fill.quantity_filled,
+                    "order_id": order_id,
+                }
+            )
+
     return refreshed
 
 
