@@ -163,6 +163,22 @@ DEFAULT_MORNING_STATE_ROOT = DEFAULT_MORNING_WATCHLIST_STATE_ROOT
 # detected.
 DEFAULT_AFTERNOON_TASK_ROOT = "/home/user/workspace/cron_tracking/ce16ba6b"
 
+# Jul 20 2026 pre-flight path fix (see live_task.preflight_artifact_resolution
+# in config/morning_dca.json). The 10:30 live run must never read the same-day
+# 9:45 pre-flight artifact from either of these roots -- both were implicated
+# in the Jul 20 2026 escalation (a stray cron-id path and the live task's own
+# output directory). _apply_preflight_gate() fails closed rather than reading
+# from a preflight_run_state_root that resolves under one of these.
+DEFAULT_PREFLIGHT_FORBIDDEN_ROOTS: Tuple[str, ...] = (
+    "/home/user/workspace/cron_tracking/42173154",
+    DEFAULT_MORNING_LIVE_STATE_ROOT,
+)
+
+# Jul 20 2026 budget ledger location fix (see budget_ledger.bootstrap in
+# config/morning_dca.json). Default filename for the persisted morning budget
+# ledger snapshot written under the live run's own output directory.
+DEFAULT_BUDGET_LEDGER_FILENAME = "budget_ledger.json"
+
 
 # Per-mode identity/profile. Selected by MorningDCAExecutor(mode=...).
 MORNING_PROFILES: Dict[str, Dict[str, Any]] = {
@@ -376,6 +392,18 @@ class MorningConfig:
     # Root the 10:30 live gate reads the same-day 9:45 pre-flight artifact from.
     # When None the live executor uses DEFAULT_MORNING_PREFLIGHT_STATE_ROOT.
     preflight_run_state_root: Optional[str] = None
+    # Roots the pre-flight artifact must NEVER be read from (see
+    # live_task.preflight_artifact_resolution.must_not_look_under in
+    # morning_dca.json). When empty, DEFAULT_PREFLIGHT_FORBIDDEN_ROOTS is used.
+    preflight_forbidden_roots: Tuple[str, ...] = ()
+    # Whether _apply_preflight_gate performs the single bounded recovery scan
+    # (see live_task.preflight_artifact_resolution.bounded_recovery_lookup)
+    # when the primary path and latest_preflight.json pointer both miss.
+    preflight_bounded_recovery: bool = True
+    # Filename of the persisted morning budget ledger snapshot the live task
+    # writes under its own output directory (see budget_ledger.bootstrap /
+    # budget_ledger.ledger_files in morning_dca.json).
+    budget_ledger_filename: str = DEFAULT_BUDGET_LEDGER_FILENAME
     # Roots scanned for same-day prior allocations by the morning live top-up
     # guard. None (default) means use [DEFAULT_AFTERNOON_TASK_ROOT] at runtime
     # so manual/recovery fills before 10:30 AM are detected automatically.
@@ -734,6 +762,13 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
         kwargs["morning_daily_cap_usd"] = float(budget["morning_daily_cap_usd"])
     if "morning_weekly_cap_usd" in budget:
         kwargs["morning_weekly_cap_usd"] = float(budget["morning_weekly_cap_usd"])
+    # budget_ledger.bootstrap (added Jul 20 2026): the live task persists a
+    # budget_ledger.json snapshot under its own output directory using this
+    # configured filename, bootstrapping it from the caps above when absent
+    # rather than requiring a pre-existing ledger file.
+    ledger_files = budget.get("ledger_files")
+    if isinstance(ledger_files, list) and ledger_files:
+        kwargs["budget_ledger_filename"] = str(ledger_files[0])
 
     if "trend_min_bars" in raw:
         kwargs["trend_min_bars"] = int(raw["trend_min_bars"])
@@ -741,6 +776,15 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
     live_task = raw.get("live_task", {})
     if "broker_account" in live_task:
         kwargs["target_account_number"] = str(live_task["broker_account"])
+    # preflight_artifact_resolution (added Jul 20 2026): pins where the 10:30
+    # live gate is and is not allowed to read the same-day 9:45 pre-flight
+    # artifact from, and whether it performs the single bounded recovery scan.
+    preflight_resolution = live_task.get("preflight_artifact_resolution", {})
+    forbidden_roots = preflight_resolution.get("must_not_look_under")
+    if isinstance(forbidden_roots, list) and forbidden_roots:
+        kwargs["preflight_forbidden_roots"] = tuple(str(p) for p in forbidden_roots)
+    if "bounded_recovery_lookup" in preflight_resolution:
+        kwargs["preflight_bounded_recovery"] = bool(preflight_resolution["bounded_recovery_lookup"])
 
     artifact_paths = raw.get("artifact_paths", {})
     # Per-mode root keys take precedence; fall back to the legacy shared key.
@@ -786,17 +830,19 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
 
 
 def load_same_day_preflight(
-    preflight_root: str, trading_day: date
+    preflight_root: str, trading_day: date, *, bounded_recovery: bool = True
 ) -> Optional[Dict[str, Any]]:
     """Load the same-day 9:45 pre-flight artifact for the 10:30 live gate.
 
-    Returns a dict ``{"run_id", "eligible_tickers": set[str], "run_state_path"}``
-    when a same-day pre-flight ``run_state.json`` is found under
-    ``preflight_root/YYYYMMDD_0945ET/`` (or via ``latest_preflight.json`` when it
-    points at the same trading day), else ``None``. The live executor uses the
-    returned ``eligible_tickers`` to restrict which tickers it re-evaluates; a
-    ``None`` result means "no pre-flight found" and the caller degrades to
-    evaluating the full universe with a warning rather than blocking all buys.
+    Returns a dict ``{"run_id", "eligible_tickers": set[str], "run_state_path",
+    "recovered_via_bounded_lookup"}`` when a same-day pre-flight
+    ``run_state.json`` is found under ``preflight_root/YYYYMMDD_0945ET/`` (or
+    via ``latest_preflight.json`` when it points at the same trading day, or
+    via the bounded recovery scan below), else ``None``. The live executor
+    uses the returned ``eligible_tickers`` to restrict which tickers it
+    re-evaluates; a ``None`` result means "no pre-flight found" and the caller
+    degrades to evaluating the full universe with a warning rather than
+    blocking all buys.
 
     An artifact that explicitly declares ``overall_ok=False`` (a global/
     account/buying-power/auth/schema-write failure per the machine-complete
@@ -809,22 +855,49 @@ def load_same_day_preflight(
     key and an ``eligible_to_execute`` flag), falling back to the legacy
     ``eligible_to_execute_tickers`` convenience field only when
     ``per_ticker_eligibility`` is absent (an older artifact shape).
+
+    ``bounded_recovery`` implements
+    ``live_task.preflight_artifact_resolution.bounded_recovery_lookup``: when
+    the primary path and the ``latest_preflight.json`` pointer both miss,
+    perform exactly ONE additional lookup -- a directory scan of
+    ``preflight_root`` for today's ``YYYYMMDD_0945ET`` directory -- before
+    reporting "not found". This is a second, independent lookup path (scan vs.
+    direct path join) so a regression in the primary path construction does
+    not silently fail closed without ever finding an artifact that is actually
+    on disk.
     """
     root = Path(preflight_root)
-    run_dir = root / f"{trading_day.strftime('%Y%m%d')}_0945ET"
+    expected_dir_name = f"{trading_day.strftime('%Y%m%d')}_0945ET"
+    run_dir = root / expected_dir_name
     state_path = run_dir / "run_state.json"
+    recovered_via_bounded_lookup = False
     if not state_path.exists():
+        pointer_state_path: Optional[Path] = None
         pointer = root / "latest_preflight.json"
-        if not pointer.exists():
-            return None
-        try:
-            pdata = json.loads(pointer.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return None
-        if pdata.get("trading_day") != trading_day.isoformat():
-            return None
-        state_path = Path(pdata.get("run_state_path", ""))
-        if not state_path.exists():
+        if pointer.exists():
+            try:
+                pdata = json.loads(pointer.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                pdata = None
+            if pdata is not None and pdata.get("trading_day") == trading_day.isoformat():
+                candidate = Path(pdata.get("run_state_path", ""))
+                if candidate.exists():
+                    pointer_state_path = candidate
+        if pointer_state_path is not None:
+            state_path = pointer_state_path
+        elif bounded_recovery and root.is_dir():
+            recovered_path = None
+            for entry in sorted(root.iterdir()):
+                if entry.name == expected_dir_name and entry.is_dir():
+                    candidate = entry / "run_state.json"
+                    if candidate.exists():
+                        recovered_path = candidate
+                    break
+            if recovered_path is None:
+                return None
+            state_path = recovered_path
+            recovered_via_bounded_lookup = True
+        else:
             return None
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -851,7 +924,43 @@ def load_same_day_preflight(
         "run_id": state.get("run_id"),
         "eligible_tickers": set(eligible),
         "run_state_path": str(state_path),
+        "recovered_via_bounded_lookup": recovered_via_bounded_lookup,
     }
+
+
+def _strip_template_segments(path: str) -> str:
+    """Drop ``YYYYMMDD*`` template path segments (e.g. ``YYYYMMDD_1030ET``).
+
+    ``must_not_look_under`` entries in config/morning_dca.json include the
+    dated live-output directory as a template
+    (``.../morning_dca/YYYYMMDD_1030ET/``); this normalizes that down to the
+    actual root (``.../morning_dca``) so it can be compared against a
+    configured ``preflight_run_state_root``.
+    """
+    segments = [seg for seg in path.rstrip("/").split("/") if "YYYYMMDD" not in seg]
+    return "/".join(segments)
+
+
+def _forbidden_preflight_root_reason(
+    root: str, forbidden_roots: Sequence[str]
+) -> Optional[str]:
+    """Return a block reason if ``root`` resolves under a forbidden path, else None.
+
+    Implements ``live_task.preflight_artifact_resolution.must_not_look_under``:
+    the same-day 9:45 pre-flight artifact must never be read from the 10:30
+    live output directory or a bare cron-id path (the Jul 20 2026 incident).
+    """
+    resolved = str(Path(root)).rstrip("/")
+    for forbidden in forbidden_roots:
+        normalized = _strip_template_segments(str(forbidden))
+        if resolved == normalized or resolved.startswith(normalized + "/"):
+            return (
+                f"preflight_run_state_root {root!r} resolves under a forbidden "
+                f"must_not_look_under path ({forbidden!r}); refusing to read the "
+                "pre-flight artifact from there (see "
+                "live_task.preflight_artifact_resolution in config/morning_dca.json)"
+            )
+    return None
 
 
 class DCAExecutor:
@@ -1552,7 +1661,25 @@ class MorningDCAExecutor(DCAExecutor):
             return tickers
         trading_day = now.astimezone(EASTERN).date()
         root = self.config.preflight_run_state_root or DEFAULT_MORNING_PREFLIGHT_STATE_ROOT
-        loaded = load_same_day_preflight(root, trading_day)
+        forbidden_roots = self.config.preflight_forbidden_roots or DEFAULT_PREFLIGHT_FORBIDDEN_ROOTS
+        forbidden_reason = _forbidden_preflight_root_reason(root, forbidden_roots)
+        if forbidden_reason is not None:
+            # must_not_look_under: treat a misconfigured root the same as
+            # "artifact not found" -- fail closed for scheduled runs -- rather
+            # than silently reading from (or failing to find data in) the
+            # 10:30 live output directory or a bare cron-id path.
+            if not manual:
+                self.preflight_gate = {
+                    "preflight_found": False,
+                    "preflight_missing_block": True,
+                    "block_reason": forbidden_reason,
+                }
+                return []
+            self.preflight_gate = {"preflight_found": False, "warning": forbidden_reason}
+            return tickers
+        loaded = load_same_day_preflight(
+            root, trading_day, bounded_recovery=self.config.preflight_bounded_recovery
+        )
         if loaded is None:
             if not manual:
                 # Fail closed but write a durable blocked artifact so watchdog and
@@ -1580,6 +1707,7 @@ class MorningDCAExecutor(DCAExecutor):
             "eligible_to_execute_tickers": sorted(eligible),
             "admitted_tickers": admitted,
             "gated_out_tickers": gated_out,
+            "recovered_via_bounded_lookup": loaded.get("recovered_via_bounded_lookup", False),
         }
         return admitted
 
@@ -1836,6 +1964,19 @@ class MorningDCAExecutor(DCAExecutor):
         _write_csv(signals_path, artifacts["signal_rows"])
 
         paths = {"run_state": str(run_state_path), "signals": str(signals_path)}
+
+        # budget_ledger.bootstrap (added Jul 20 2026, see config/morning_dca.json):
+        # persist a budget_ledger.json snapshot of the morning ledger under the
+        # live task's own output directory. No pre-existing file is required --
+        # this always (re)writes the snapshot from the caps/spend already
+        # computed into artifacts["budget"], so a missing ledger on disk is
+        # bootstrapped rather than treated as an escalation condition.
+        if self.mode == MORNING_LIVE_MODE and self.stream == MORNING_STREAM:
+            ledger_path = out / self.config.budget_ledger_filename
+            ledger_path.write_text(
+                json.dumps(artifacts["budget"], indent=2, sort_keys=True), encoding="utf-8"
+            )
+            paths["budget_ledger"] = str(ledger_path)
 
         # Write submitted_orders.csv so detect_drift() can build submitted_symbols.
         # Without this file the detector's submitted set is empty and every auto-buy

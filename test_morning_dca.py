@@ -49,6 +49,7 @@ from morning_dca import (
     MorningSignal,
     TopUpOutcome,
     _same_stream_order_exists,
+    load_morning_config,
     load_same_day_preflight,
     nyse_holidays,
     preflight_eligibility,
@@ -707,6 +708,128 @@ def test_live_mode_path_and_classification(tmp_path):
     art = res["artifacts"]
     assert art["mode"] == "live"
     assert art["trades"] is True
+
+
+# --- Jul 20 2026 pre-flight path fix + budget ledger bootstrap --------------
+def test_live_run_writes_budget_ledger_json(tmp_path):
+    """budget_ledger.bootstrap (config/morning_dca.json): the live task always
+    persists a budget_ledger.json snapshot under its own output directory,
+    bootstrapping it from the configured caps -- no pre-existing file needed.
+    """
+    preflight_root = tmp_path / "preflight"
+    preflight_dir = preflight_root / "20260708_0945ET"
+    preflight_dir.mkdir(parents=True)
+    (preflight_dir / "run_state.json").write_text(
+        json.dumps({"eligible_to_execute_tickers": ["SMALL"]}), encoding="utf-8"
+    )
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path),
+        preflight_run_state_root=str(preflight_root),
+        morning_daily_cap_usd=90.0,
+        morning_weekly_cap_usd=450.0,
+    )
+    ex = MorningDCAExecutor(cfg, mode="live")
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data)
+
+    assert "budget_ledger" in res["paths"]
+    ledger_path = Path(res["paths"]["budget_ledger"])
+    assert ledger_path.name == "budget_ledger.json"
+    assert ledger_path.parent == Path(res["paths"]["run_state"]).parent
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert ledger == res["artifacts"]["budget"]
+    assert ledger["morning_daily_cap_usd"] == 90.0
+    assert ledger["morning_weekly_cap_usd"] == 450.0
+
+
+def test_budget_ledger_filename_configurable():
+    cfg = MorningConfig(budget_ledger_filename="custom_ledger.json")
+    assert cfg.budget_ledger_filename == "custom_ledger.json"
+    assert MorningConfig().budget_ledger_filename == "budget_ledger.json"
+
+
+def test_watchlist_run_does_not_write_budget_ledger(tmp_path):
+    cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
+    ex = MorningDCAExecutor(cfg)  # default mode = watchlist
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now(), data)
+    assert "budget_ledger" not in res["paths"]
+
+
+def test_preflight_gate_blocks_when_root_under_forbidden_live_output_dir(tmp_path):
+    """must_not_look_under: a preflight_run_state_root resolving under the
+    10:30 live output directory must fail closed for a scheduled run rather
+    than being read (the Jul 20 2026 incident)."""
+    forbidden_root = tmp_path / "morning_dca"
+    forbidden_root.mkdir()
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "out"),
+        preflight_run_state_root=str(forbidden_root),
+        preflight_forbidden_roots=(str(forbidden_root),),
+    )
+    ex = MorningDCAExecutor(cfg, mode="live")
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data)
+
+    assert res["artifacts"]["status"] == "blocked"
+    assert "forbidden" in res["artifacts"]["block_reason"]
+    assert res["artifacts"]["buy_candidates"] == []
+
+
+def test_preflight_gate_forbidden_root_warns_on_manual_run():
+    forbidden_root = "/home/user/workspace/cron_tracking/42173154"
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        preflight_run_state_root=forbidden_root,
+        preflight_forbidden_roots=(forbidden_root,),
+    )
+    ex = MorningDCAExecutor(cfg, mode="live")
+    admitted = ex._apply_preflight_gate(_now_live(), ["SMALL"], manual=True)
+    assert admitted == ["SMALL"]
+    assert ex.preflight_gate["preflight_found"] is False
+    assert "forbidden" in ex.preflight_gate["warning"]
+
+
+def test_load_same_day_preflight_recovered_via_bounded_lookup_flag(tmp_path):
+    preflight_root = tmp_path / "preflight"
+    run_dir = preflight_root / "20260708_0945ET"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps({"eligible_to_execute_tickers": ["SMALL"]}), encoding="utf-8"
+    )
+    trading_day = date(2026, 7, 8)
+
+    # Found directly via the primary path -- not a recovery.
+    found = load_same_day_preflight(str(preflight_root), trading_day)
+    assert found is not None
+    assert found["recovered_via_bounded_lookup"] is False
+
+    # No artifact at all: same result whether or not bounded recovery is enabled.
+    missing_day = date(2026, 7, 9)
+    assert load_same_day_preflight(str(preflight_root), missing_day) is None
+    assert load_same_day_preflight(str(preflight_root), missing_day, bounded_recovery=False) is None
+
+
+def test_load_morning_config_parses_preflight_and_ledger_blocks(tmp_path):
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    payload = {
+        "budget_ledger": {"ledger_files": ["custom_ledger.json"]},
+        "live_task": {
+            "preflight_artifact_resolution": {
+                "must_not_look_under": ["/some/forbidden/root"],
+                "bounded_recovery_lookup": "",
+            }
+        },
+    }
+    (cfg_dir / "morning_dca.json").write_text(json.dumps(payload), encoding="utf-8")
+    cfg = load_morning_config(str(cfg_dir), mode=MORNING_LIVE_MODE)
+    assert cfg.budget_ledger_filename == "custom_ledger.json"
+    assert cfg.preflight_forbidden_roots == ("/some/forbidden/root",)
+    # An empty-string bounded_recovery_lookup value is falsy -> disabled.
+    assert cfg.preflight_bounded_recovery is False
 
 
 def test_live_confidence_rule_auto_buys_with_validated_trend():
