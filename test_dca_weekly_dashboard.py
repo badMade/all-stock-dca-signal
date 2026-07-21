@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from dca_weekly_dashboard import _is_manual_run_state, load_scheduled_run_states
+from dca_weekly_dashboard import _is_manual_run_state, load_json_files, load_scheduled_run_states
 
 
 def test_is_manual_run_state_no_classification():
@@ -53,6 +53,19 @@ def test_is_manual_run_state_both_manual():
     """Test when both run_origin and manual_run indicate manual."""
     assert _is_manual_run_state({"run_classification": {"run_origin": "manual", "manual_run": True}}) is True
 
+
+def test_load_json_files_filters_manual_run_flag_and_accepts_str_paths(tmp_path: Path):
+    """Test that load_json_files filters manual_run-only states and accepts str paths."""
+    valid_file = tmp_path / "valid.json"
+    valid_file.write_text(json.dumps({"status": "completed", "id": "valid1"}))
+
+    manual_file = tmp_path / "manual.json"
+    manual_file.write_text(json.dumps({"run_classification": {"manual_run": True}, "id": "manual1"}))
+
+    loaded = load_json_files([str(valid_file), str(manual_file)])
+
+    assert len(loaded) == 1
+    assert loaded[0]["id"] == "valid1"
 
 def test_load_scheduled_run_states_missing_dir(tmp_path: Path):
     """Test when scheduled_runs directory does not exist."""
