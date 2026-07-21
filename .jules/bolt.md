@@ -1,3 +1,7 @@
+## 2025-02-28 - Parallel API fetch
+**Learning:** Sequential network API calls in a loop are a massive bottleneck for ticker scanning.
+**Action:** Use `concurrent.futures.ThreadPoolExecutor` to fetch data from different endpoints concurrently. Even wrapping the entire per-ticker process in a future and then launching concurrent API tasks inside that future brings time from O(n*m) down to O(1) network latency.
+
 ## 2026-07-20 - Refactoring of near_close_dca.py run_once function
 **Learning:** Breaking apart large orchestration functions (like run_once, which was 450 lines) into smaller, intent-focused helpers (signal evaluation, loop processing, state mutation) drastically improves readability without altering functionality.
 **Action:** Always maintain the exact same state mutation flow when refactoring such core functions. I encapsulated signal evaluation logic in `_evaluate_all_signals`, budget seeding in `_seed_prior_allocations`, and the core action loop in `_process_buy_candidates_batch`. All parameters mapping to outputs mapped exactly.

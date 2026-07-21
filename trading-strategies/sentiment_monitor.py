@@ -25,6 +25,7 @@ Usage examples:
 # Standard library imports
 # ---------------------------------------------------------------------------
 import argparse
+import concurrent.futures
 import json
 import logging
 import os
@@ -1014,14 +1015,21 @@ def run_pipeline(
     # ------------------------------------------------------------------
     # Per-ticker data collection and scoring
     # ------------------------------------------------------------------
+    # Run network IO concurrently for all tickers and sources (avoid nested thread pools).
+    max_workers = min(10, len(tickers) * 2) if tickers else 1
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {}
+        for t in tickers:
+            futures[(t, "news")] = executor.submit(news_collector.fetch_headlines, t)
+            futures[(t, "sec")] = executor.submit(sec_collector.fetch_filings, t)
+
+        fetch_results = {
+            t: (t, futures[(t, "news")].result(), futures[(t, "sec")].result())
+            for t in tickers
+        }
     for ticker in tickers:
         logger.info("Processing ticker: %s", ticker)
-
-        # (a) Fetch headlines from NewsAPI
-        news_items = news_collector.fetch_headlines(ticker)
-
-        # (b) Fetch SEC EDGAR filings
-        sec_items = sec_collector.fetch_filings(ticker)
+        _, news_items, sec_items = fetch_results[ticker]
 
         # Combine all text sources
         all_items = news_items + sec_items
