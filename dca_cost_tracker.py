@@ -52,6 +52,8 @@ _NUMERIC_PROXY_FIELDS = (
     "errors_count",
 )
 
+_NUMERIC_PROXY_FIELDS_SET = frozenset(_NUMERIC_PROXY_FIELDS)
+
 # Component -> (usage-proxy fields feeding its count, unitless proxy weight).
 # Weights are deliberately coarse and relative; artifact I/O is weighted per-KB so
 # byte counts stay on a comparable scale with call/order counts. NOT credits.
@@ -142,8 +144,9 @@ def aggregate_usage(
         usage = rs.get("usage_proxy")
         if not isinstance(usage, dict):
             continue
-        for field in _NUMERIC_PROXY_FIELDS:
-            totals[field] += _num(usage.get(field))
+        for key, value in usage.items():
+            if key in _NUMERIC_PROXY_FIELDS_SET:
+                totals[key] += _num(value)
         if usage.get("manual_recovery_required"):
             manual_recovery_runs += 1
 

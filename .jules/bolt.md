@@ -17,6 +17,10 @@
 ## 2023-10-27 - Pandas iteration bottleneck in analysis tools
 **Learning:** Pandas `iterrows()` is extremely slow for large DataFrames because it constructs a new `Series` object for every row. `itertuples()` or `to_dict('records')` are significantly faster (3.5x to 15x in micro-benchmarks). `to_dict('records')` is particularly useful when row mutability is needed, as it avoids `SettingWithCopyWarning` and object overhead. `itertuples(index=True)` combined with positional unpacking (`row[1:]`) is safest when column names might not be valid Python identifiers.
 **Action:** When working with Pandas loops in this codebase (especially in the heavier `analysis/` or `trading-strategies/` directories), default to `itertuples()` for read-only scans and `to_dict('records')` for mutable processing steps.
+## 2024-07-20 - Optimize usage dictionary lookups
+**Learning:** Checking membership of dictionary keys against a `frozenset` and iterating over `dict.items()` is significantly faster than using `dict.get(key)` in a loop when dealing with potentially sparse dictionaries or looking for a subset of keys. This avoids unnecessary lookups.
+**Action:** When aggregating or pulling specific fields from dictionaries in tight loops, construct a `frozenset` of the target keys beforehand and iterate over `dict.items()`.
+
 ## 2026-06-29 - [Pandas Iteration Performance]
 **Learning:** `iterrows()` is extremely slow for iterating over DataFrames because it creates a Series object for each row. `itertuples()` is much faster for read-only operations as it returns namedtuples. For cases where row mutability is needed or column names are not valid identifiers (like "1x"), `to_dict('records')` offers a massive speedup over `iterrows()` while preserving dict-like access.
 **Action:** Always prefer `itertuples()` for read-only iteration and `to_dict('records')` for mutable/dict-access iteration over pandas DataFrames. Never use `iterrows()` unless strictly necessary for type preservation across columns.
