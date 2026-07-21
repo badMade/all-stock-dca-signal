@@ -175,9 +175,7 @@
         "scheduled_for_et": "10:30",
         "cron_id": "42173154",
         "valid_afternoon_evidence": false,
-        "orders_submitted_count": 0,
-        "order_submit_status": "Concrete status such as not_submitted_error or not_submitted_blocked.",
-        "error_class": "Concrete class such as missing_preflight_artifact or missing_or_invalid_raw_inputs.",
+        "order_submit_status": "Concrete status such as not_submitted_error.",
         "missing_inputs_field": "Include a compact list of missing files or failed data sources."
       },
       "evidence_meaning": "This failure-state artifact is valid proof that the 10:30 scheduled task FIRED, but it is NOT order or fill evidence.",
