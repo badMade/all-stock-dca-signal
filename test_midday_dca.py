@@ -247,6 +247,27 @@ def test_midday_run_state_path_and_classification(tmp_path):
     assert (Path(tmp_path) / "latest_midday_run.json").exists()
 
 
+def test_midday_refreshes_only_its_own_pointer_with_guard_fields(tmp_path):
+    # Requirement 7: midday refreshes ONLY latest_midday_run.json and must never
+    # touch the morning-only latest_morning_live.json pointer.
+    cfg = MiddayConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
+    ex = MiddayDCAExecutor(cfg)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
+
+    assert (Path(tmp_path) / "latest_midday_run.json").exists()
+    assert not (Path(tmp_path) / "latest_morning_live.json").exists()
+    assert "latest_morning_live" not in res["paths"]
+
+    pdata = json.loads((Path(tmp_path) / "latest_midday_run.json").read_text(encoding="utf-8"))
+    assert pdata["stream"] == "midday"
+    assert pdata["trading_day"] == "2026-07-08"
+    assert pdata["pointer_status"] == "valid"
+    assert pdata["same_day_required"] is True
+    assert pdata["valid_scheduled_evidence"] is True
+    assert pdata["updated_at_utc"].endswith("Z")
+
+
 def test_midday_manual_run_id_and_no_pointer(tmp_path):
     cfg = MiddayConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
     ex = MiddayDCAExecutor(cfg)

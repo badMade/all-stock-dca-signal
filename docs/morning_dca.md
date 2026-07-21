@@ -284,9 +284,10 @@ fails once, perform **one** bounded recovery attempt on the alternate approved
 data source path, then stop.
 
 **Always write the state files.** The 10:30 scheduled run **always** writes
-`run_state.json` and `latest_morning_run.json` under the morning root as part
-of the standard artifact persistence flow, **even when execution is blocked or
-no orders are placed** (`run_summary.json` is preflight-only — see
+`run_state.json` and refreshes **both** `latest_morning_run.json` and
+`latest_morning_live.json` under the morning root as part of the standard
+artifact persistence flow, **even when execution is blocked or no orders are
+placed** (`run_summary.json` is preflight-only — see
 `config/morning_dca.json`'s `artifacts.manifest_accuracy_note`). When a
 missing pre-flight artifact, missing/invalid raw inputs, trend, budget,
 tradability, spread, or broker condition blocks execution, it writes a **valid
@@ -304,6 +305,22 @@ collection has started (i.e. after order placement has begun), the run is
 `morning_signals.csv`/`submitted_orders.csv` are written as usual (no
 half-done run without a state file). See `config/scheduled_tasks.json`'s
 `live_schedule_hardening_2026_07_20.morning_1030`.
+
+### Same-day latest-pointer guard
+
+A latest pointer is authoritative **only** for the America/New_York trading day
+it names (see "Artifacts" above for what each scheduled run writes into it).
+Consumers must validate a pointer before trusting it as current, via
+[`scripts/same_day_pointer.py`](../scripts/same_day_pointer.py):
+`validate_pointer(pointer, expected_stream=..., expected_root=...)` rejects a
+pointer whose `trading_day` is not today, whose `stream` doesn't match, or
+whose `run_state_path` resolves outside the expected root or fails to prove
+(via its own `run_classification`) that it is a genuine same-day scheduled,
+non-manual run. `select_same_day_run_state(...)` prefers a date-specific
+`YYYYMMDD_<suffix>/run_state.json` over the pointer when both are present.
+This prevents the recurrence of the stale-pointer incident where
+`latest_morning_run.json`, `latest_morning_live.json`, and
+`latest_midday_run.json` pointed at prior-day runs.
 
 ### Hard circuit breakers
 
@@ -339,7 +356,7 @@ isolated on every axis except the same-day top-up guard (see below):
 | Budget ledger | `StrategyState` / `BUDGET_TIERS` | `MorningLedger` namespace `morning` |
 | Artifact root | `.../cron_tracking/ce16ba6b/` | `.../cron_tracking/morning_dca[_watchlist]/` |
 | Run type | `scheduled_live_test` @ `15:20` | `morning_dca_watchlist_scan` @ `09:45` / `morning_dca_live` @ `10:30` |
-| Pointer | `latest_scheduled_run.json` | `latest_morning_run.json` |
+| Pointer | `latest_scheduled_run.json` | `latest_morning_run.json` (+ `latest_morning_live.json` in live mode) |
 | Trades | **yes** | watchlist **no** / live **yes** (morning-only) |
 
 Neither morning mode writes into the `ce16ba6b` tree, neither updates
@@ -452,8 +469,13 @@ A scheduled morning run writes to its mode's root
   ledger (caps, spend, remaining capacity). See "Ledger location and
   bootstrap" above.
 
-and updates that root's `latest_morning_run.json`. Manual runs write under a
-distinct `manual_morning[_live]_*` run id and never update the pointer.
+and updates that root's `latest_morning_run.json`. The **10:30 live** run also
+refreshes `latest_morning_live.json` in the same root, so both the run-level and
+live-only consumers see the same-day scheduled state; both pointers carry the
+same-day guard fields (`pointer_status`, `same_day_required`, `trading_day`,
+`updated_at_utc`, and `valid_scheduled_evidence` derived from the run_state).
+Manual runs write under a distinct `manual_morning[_live]_*` run id and never
+update either pointer.
 
 The **10:30 live** run's `write_artifacts()` **always** writes `run_state.json`
 and `morning_signals.csv` (**not** `signals.csv`, and **not**

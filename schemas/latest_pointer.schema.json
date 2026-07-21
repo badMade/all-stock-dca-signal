@@ -1,0 +1,71 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "latest_pointer.schema.json",
+  "title": "Same-day latest-run pointer",
+  "description": "A latest_*.json convenience pointer (latest_morning_run.json, latest_midday_run.json, latest_scheduled_run.json, and the monitor/slippage/watchdog equivalents) written after each scheduled run. A pointer is trusted as same-day scheduled evidence ONLY when trading_day and run_state_path match the current America/New_York date and the expected stream directory. See config/scheduled_tasks.json -> same_day_pointer_validation_policy and scripts/same_day_pointer.py. Recording this metadata does NOT relax any trading safety rule.",
+  "type": "object",
+  "required": [
+    "run_id",
+    "run_state_path",
+    "stream",
+    "trading_day",
+    "pointer_status",
+    "same_day_required",
+    "valid_scheduled_evidence",
+    "updated_at_utc"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "run_id": {
+      "type": ["string", "null"],
+      "description": "Run identifier of the target run_state, e.g. morning_live_YYYYMMDD_1030ET or scheduled_YYYYMMDD_1520ET."
+    },
+    "run_state_path": {
+      "type": "string",
+      "description": "Absolute path to the target run_state.json. Must resolve inside the expected stream root; an outside-root path is ignored."
+    },
+    "stream": {
+      "type": "string",
+      "description": "Logical stream the pointer belongs to.",
+      "enum": ["morning", "midday", "monitor", "afternoon", "slippage", "watchdog", "preflight", "scan", "dashboard", "manual"]
+    },
+    "trading_day": {
+      "type": "string",
+      "description": "America/New_York trading day (YYYY-MM-DD) the target run belongs to. Must equal the current ET day to be same-day evidence."
+    },
+    "pointer_status": {
+      "type": "string",
+      "description": "Lifecycle status. Only 'valid' is trusted; the rest are ignored as scheduled evidence.",
+      "enum": ["valid", "pending", "stale", "prior_date", "future_date", "missing", "malformed", "outside_root", "wrong_stream"]
+    },
+    "same_day_required": {
+      "type": "boolean",
+      "description": "Always true: the pointer is same-day scoped and must match the current ET trading day.",
+      "const": true
+    },
+    "valid_scheduled_evidence": {
+      "type": "boolean",
+      "description": "Derived from the target run_state, never asserted blindly: true only when the target exists and has run_origin='scheduled' and manual_run=false. A pending placeholder is false until the target run_state is finalized."
+    },
+    "updated_at_utc": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC timestamp when the pointer was last refreshed."
+    },
+    "cron_id": { "type": "string", "description": "Optional scheduler cron/task id of the target run." },
+    "supersedes_cron_id": { "type": "string", "description": "Optional superseded cron id for lineage continuity." },
+    "triggered_at_utc": { "type": "string", "description": "Optional trigger timestamp copied from the target run_classification." },
+    "state_schema_version": { "type": "string", "description": "Optional run_state schema version of the target." }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "pointer_status": { "const": "valid" } },
+        "required": ["pointer_status"]
+      },
+      "then": {
+        "properties": { "valid_scheduled_evidence": { "const": true } }
+      }
+    }
+  ]
+}

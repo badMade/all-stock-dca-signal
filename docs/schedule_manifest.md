@@ -696,6 +696,32 @@ Feb, Nov, Dec). Re-verify around DST transitions.
 
 - **Cost-conscious model instruction (Jul 17 2026):** use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review. See the top-of-file cost-conscious model instruction note.
 
+#### Manual no-purchase dry run, 2026-07-21 09:05 ET (diagnostics only)
+- **Manual dry run**, **not scheduled**, **no purchases**: `run_id='manual_dry_run_20260721_0905ET'`,
+  `run_origin='manual_dry_run'`, `dry_run=true`, `no_purchases=true`,
+  `valid_scheduled_evidence=false`. This is a readiness diagnostic only. It is
+  **NOT** scheduled evidence, **NOT** top-up proof, **NOT** slippage evidence, and
+  **NOT** confirmation that any scheduled task ran.
+- **Coverage:** scanned the full **44-symbol** active universe. Finance lookup
+  completed with expected unresolved fallback cases **AAAU, SPCX, GFUZ**.
+  Robinhood account access completed with configured account **562057042** present;
+  portfolio read completed; **3** quote batches and **5** tradability batches
+  completed; `quote_available_count=44`, `prior_close_available_count=44`,
+  `tradability_returned_count=44`. Alpaca account read completed, status **ACTIVE**,
+  `buying_power=0`.
+- **No execution calls:** no `review_equity_order`, no `place_equity_order`, no
+  cancellations, and no broker modifications were called.
+- **Positive dry-run signal (hypothetical only, not placed):** **CBRS**,
+  `drop_pct=0.1074`, multiplier **1x**, hypothetical amount **$2**.
+- **Artifacts:** `/home/user/workspace/cron_tracking/dry_runs/20260721_0905ET/` with
+  `run_state.json`, `run_summary.json`, `signals_dry_run.csv`, and raw connector
+  outputs under `raw/`. These dry-run artifacts must not be treated as scheduled
+  evidence, top-up proof, slippage evidence, or confirmation that any scheduled task
+  ran.
+- Machine-readable records: `config/scheduled_tasks.json`
+  (`morning_manual_dry_run_2026_07_21`) and `config/run_classification.json`
+  (`manual_dry_run_2026_07_21`). See [run_classification.md](run_classification.md).
+
 ### `a6239dae` — Weekday 12:30 PM midday DCA live Robinhood execution (`MiddayDCAExecutor`)
 - **Live trading** (executor mode `live`). Runs **12:30 PM ET weekdays** (window 12:25–12:35 PM ET).
 - Uses the shared **$2 base 0x-to-5x live ladder** (`config/midday_dca.json`, the same ladder used by all live streams as of Jul 10 2026) and its own `midday` budget ledger. **Robinhood account 562057042 only**; Alpaca is read-only for validation/context.

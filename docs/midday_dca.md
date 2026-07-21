@@ -161,6 +161,30 @@ proof the 12:30 scheduled task ran, and never counted in scheduled reliability,
 fill counts, slippage, cost basis, or watchdog confirmation. See
 `config/scheduled_tasks.json`'s `midday_dca_manual_recovery_2026_07_20`.
 
+### Manual midday run (Jul 21 2026, 1:45 PM ET)
+
+A human placed a manual midday run at **1:45 PM ET on 2026-07-21** under
+`/home/user/workspace/cron_tracking/midday_dca/manual_runs/20260721_1345ET`. It
+carries `run_origin='manual'`, `manual_run=true`, `stream='midday_manual'`,
+`same_day_top_up_context_only=true`, `valid_scheduled_evidence=false`, and
+`valid_afternoon_scheduled_evidence=false`. It is same-day top-up context **only**:
+it is **never** proof the 12:30 or 3:20 scheduled tasks ran, and it is **excluded**
+from scheduled slippage, scheduled fill counts, scheduled reliability, scheduled
+cost-basis evidence, watchdog proof, and scheduled afternoon evidence. It may be
+used by the later same-day **3:20** top-up logic as prior-allocation context only.
+Filled orders (total **$9.00**):
+
+| Ticker | Amount | Order id | Avg price | Quantity |
+|---|---|---|---|---|
+| `MSFT` | $2.00 | `6a5fb151-043b-4063-b317-40b666bb4bb7` | 399.136400 | 0.005010 |
+| `GOOGL` | $2.00 | `6a5fb151-de49-4f8d-bd0e-2e98aeece284` | 349.168900 | 0.005727 |
+| `GOOG` | $2.00 | `6a5fb151-330b-4d78-9fcc-3da0151ab289` | 348.485500 | 0.005739 |
+| `MA` | $1.00 | `6a5fb151-653c-4dc9-ae1e-11515afcae27` | 540.544500 | 0.001849 |
+| `IBM` | $2.00 | `6a5fb151-cdee-41e9-889e-8ff65762d394` | 211.790000 | 0.009443 |
+
+See `config/run_classification.json`'s `midday_manual_run_2026_07_21` and
+`config/scheduled_tasks.json`'s `midday_dca_manual_run_2026_07_21`.
+
 ## Midday sizing ladder (0x → 5x)
 
 Drop is measured as a fraction below yesterday's regular-session close. The
@@ -231,6 +255,19 @@ compact list of missing files or failed data sources. This failure-state artifac
 is valid proof the 12:30 scheduled task **fired**, but it is **not** order or fill
 evidence. The task **must not** escalate without writing this state file unless
 the workspace itself is unavailable.
+
+**Same-day pointer guard.** The refreshed `latest_midday_run.json` carries the
+same-day guard fields as the morning pointers (`pointer_status`,
+`same_day_required`, `trading_day`, `updated_at_utc`, `valid_scheduled_evidence`
+derived from the run_state) built by
+[`scripts/same_day_pointer.py`](../scripts/same_day_pointer.py). Midday
+refreshes **only** `latest_midday_run.json` — `_scheduled_pointer_names` only
+appends the second `latest_morning_live.json` pointer when `self.stream ==
+"morning"`, so a midday run (`stream == "midday"`) never touches it. Consumers
+validate it via `same_day_pointer.validate_pointer` (`expected_stream=
+"midday"`) and prefer `select_same_day_run_state` over the raw pointer when a
+date-specific `YYYYMMDD_1230ET/run_state.json` is available. See
+[morning_dca.md](morning_dca.md#same-day-latest-pointer-guard).
 
 **Missed-morning recovery interaction.** When same-day manual missed-10:30
 recovery artifacts exist under

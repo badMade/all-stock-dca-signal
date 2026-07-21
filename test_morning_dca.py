@@ -506,8 +506,11 @@ def test_scheduled_run_skips_artifacts_on_market_holiday(tmp_path):
     assert "run_id" in persisted
     assert "counts" in persisted
     assert "signal_rows" in persisted
-    # The scheduled pointer must never advance to a non-trading-day placeholder.
-    assert not (Path(tmp_path) / "latest_morning_run.json").exists()
+    # Same-day guard consumers must see today's (blocked) evidence rather than
+    # a stale pointer left over from the last real trading session.
+    pointer = json.loads((Path(tmp_path) / "latest_morning_run.json").read_text())
+    assert pointer["trading_day"] == holiday.isoformat()
+    assert pointer["valid_scheduled_evidence"] is True
 
 
 def test_holiday_block_overwrites_stale_minimal_stub(tmp_path):
@@ -543,7 +546,9 @@ def test_holiday_block_overwrites_stale_minimal_stub(tmp_path):
     assert "run_id" in persisted
     assert "counts" in persisted
     assert persisted["status"] == "blocked"
-    assert not (Path(tmp_path) / "latest_morning_run.json").exists()
+    pointer = _json.loads((Path(tmp_path) / "latest_morning_run.json").read_text())
+    assert pointer["trading_day"] == holiday.isoformat()
+    assert pointer["valid_scheduled_evidence"] is True
 
 
 def test_scheduled_run_skips_artifacts_on_future_holiday_beyond_afternoon_window(tmp_path):
@@ -561,7 +566,9 @@ def test_scheduled_run_skips_artifacts_on_future_holiday_beyond_afternoon_window
     res = ex.run(now, data)
 
     assert res["artifacts"]["status"] == "blocked"
-    assert not (Path(tmp_path) / "latest_morning_run.json").exists()
+    pointer = json.loads((Path(tmp_path) / "latest_morning_run.json").read_text())
+    assert pointer["trading_day"] == holiday.isoformat()
+    assert pointer["valid_scheduled_evidence"] is True
 
 
 def test_manual_run_ignores_market_holiday_gate(tmp_path):
@@ -675,11 +682,7 @@ def test_classification_matches_morning_schema(tmp_path):
 # --- Live (10:30 AM) execution mode -----------------------------------------
 def test_live_mode_path_and_classification(tmp_path):
     preflight_root = tmp_path / "preflight"
-    preflight_dir = preflight_root / "20260708_0945ET"
-    preflight_dir.mkdir(parents=True)
-    (preflight_dir / "run_state.json").write_text(
-        json.dumps({"eligible_to_execute_tickers": ["SMALL"]}), encoding="utf-8"
-    )
+    _seed_preflight(preflight_root, ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path),
@@ -712,6 +715,44 @@ def test_live_mode_path_and_classification(tmp_path):
     art = res["artifacts"]
     assert art["mode"] == "live"
     assert art["trades"] is True
+
+
+def test_live_run_refreshes_both_morning_pointers(tmp_path):
+    """The morning live task refreshes both latest_morning_run.json and
+    latest_morning_live.json, each carrying the same-day guard fields and
+    pointing at the same-day scheduled run_state."""
+    preflight_root = tmp_path / "preflight"
+    preflight_dir = preflight_root / "20260708_0945ET"
+    preflight_dir.mkdir(parents=True)
+    (preflight_dir / "run_state.json").write_text(
+        json.dumps({"eligible_to_execute_tickers": ["SMALL"]}), encoding="utf-8"
+    )
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path),
+        preflight_run_state_root=str(preflight_root),
+    )
+    ex = MorningDCAExecutor(cfg, mode="live")
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data)
+
+    run_state_path = res["paths"]["run_state"]
+    run_pointer = Path(tmp_path) / "latest_morning_run.json"
+    live_pointer = Path(tmp_path) / "latest_morning_live.json"
+    assert run_pointer.exists()
+    assert live_pointer.exists()
+    assert res["paths"]["latest_morning_run"] == str(run_pointer)
+    assert res["paths"]["latest_morning_live"] == str(live_pointer)
+
+    for pointer in (run_pointer, live_pointer):
+        payload = json.loads(pointer.read_text(encoding="utf-8"))
+        assert payload["run_state_path"] == run_state_path
+        assert payload["stream"] == "morning"
+        assert payload["same_day_required"] is True
+        assert payload["pointer_status"] == "valid"
+        assert payload["valid_scheduled_evidence"] is True
+        assert "trading_day" in payload
+        assert "updated_at_utc" in payload
 
 
 # --- Jul 20 2026 pre-flight path fix + budget ledger bootstrap --------------
@@ -798,12 +839,8 @@ def test_preflight_gate_forbidden_root_warns_on_manual_run():
 
 def test_load_same_day_preflight_recovered_via_bounded_lookup_flag(tmp_path):
     preflight_root = tmp_path / "preflight"
-    run_dir = preflight_root / "20260708_0945ET"
-    run_dir.mkdir(parents=True)
-    (run_dir / "run_state.json").write_text(
-        json.dumps({"eligible_to_execute_tickers": ["SMALL"]}), encoding="utf-8"
-    )
     trading_day = date(2026, 7, 8)
+    _seed_preflight(preflight_root, ("SMALL",), trading_date=trading_day)
 
     # Found directly via the primary path -- not a recovery.
     found = load_same_day_preflight(str(preflight_root), trading_day)
@@ -1498,11 +1535,7 @@ def test_morning_live_retry_preserves_prior_submitted_candidate_on_scheduled_pat
     # Same-day 9:45 pre-flight artifact admitting both tickers, so the 10:30
     # scheduled (non-manual) live gate doesn't fail-closed for lack of one.
     preflight_root = tmp_path / "preflight"
-    preflight_dir = preflight_root / "20260708_0945ET"
-    preflight_dir.mkdir(parents=True)
-    (preflight_dir / "run_state.json").write_text(
-        json.dumps({"eligible_to_execute_tickers": ["AAA", "BBB"]}), encoding="utf-8"
-    )
+    _seed_preflight(preflight_root, ("AAA", "BBB"))
 
     cfg1 = MorningConfig(
         tickers=("AAA",),
@@ -2309,6 +2342,11 @@ def test_load_same_day_preflight_reads_per_ticker_eligibility_v2(tmp_path):
             "run_id": "morning_preflight_20260708",
             "trading_day": "2026-07-08",
             "overall_ok": True,
+            "run_classification": {
+                "run_origin": "scheduled",
+                "manual_run": False,
+                "stream": "morning",
+            },
             "per_ticker_eligibility": [
                 {"symbol": "BIG", "eligible_to_execute": True},
                 {"symbol": "FLAT", "eligible_to_execute": False},
@@ -2319,6 +2357,165 @@ def test_load_same_day_preflight_reads_per_ticker_eligibility_v2(tmp_path):
 
     loaded = load_same_day_preflight(str(tmp_path), date(2026, 7, 8))
 
+    assert loaded is not None
+    assert loaded["eligible_tickers"] == {"BIG"}
+
+
+def test_load_same_day_preflight_primary_path_manual_state_rejected(tmp_path):
+    # Codex review r3622685590: the primary direct-path lookup only checked
+    # overall_ok, so a manual state left/copied into today's expected
+    # directory would satisfy the 10:30 scheduled live gate just because a
+    # file happened to exist there. Must be rejected the same as a stale or
+    # wrong-stream pointer target.
+    run_dir = tmp_path / "20260708_0945ET"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps({
+            "run_id": "manual_morning_preflight_20260708",
+            "trading_day": "2026-07-08",
+            "overall_ok": True,
+            "run_classification": {"run_origin": "manual", "manual_run": True, "stream": "morning"},
+            "eligible_to_execute_tickers": ["BIG"],
+        }),
+        encoding="utf-8",
+    )
+
+    assert load_same_day_preflight(str(tmp_path), date(2026, 7, 8), bounded_recovery=False) is None
+
+
+def test_load_same_day_preflight_primary_path_prior_day_state_rejected(tmp_path):
+    # Codex review r3622685590: a prior-day run_state copied (or never
+    # cleaned up) into today's expected directory name must not be trusted
+    # just because the directory name and file location happen to be right --
+    # the state's OWN trading_day must independently match today.
+    run_dir = tmp_path / "20260708_0945ET"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps({
+            "run_id": "morning_preflight_20260707",
+            "trading_day": "2026-07-07",
+            "overall_ok": True,
+            "run_classification": {"run_origin": "scheduled", "manual_run": False, "stream": "morning"},
+            "eligible_to_execute_tickers": ["BIG"],
+        }),
+        encoding="utf-8",
+    )
+
+    assert load_same_day_preflight(str(tmp_path), date(2026, 7, 8), bounded_recovery=False) is None
+
+
+def test_load_same_day_preflight_primary_path_wrong_stream_rejected(tmp_path):
+    # Codex review r3622685597: a same-day, scheduled, non-manual state whose
+    # OWN run_classification.stream is a different stream must not be trusted
+    # just because it was found at the morning preflight's expected path
+    # (e.g. a misplaced/copied midday artifact).
+    run_dir = tmp_path / "20260708_0945ET"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps({
+            "run_id": "midday_live_20260708_1230ET",
+            "trading_day": "2026-07-08",
+            "overall_ok": True,
+            "run_classification": {"run_origin": "scheduled", "manual_run": False, "stream": "midday"},
+            "eligible_to_execute_tickers": ["BIG"],
+        }),
+        encoding="utf-8",
+    )
+
+    assert load_same_day_preflight(str(tmp_path), date(2026, 7, 8), bounded_recovery=False) is None
+
+
+def test_load_same_day_preflight_pointer_wrong_stream_rejected(tmp_path):
+    # Codex review r3622223176: the primary-path miss must route
+    # latest_preflight.json through same_day_pointer.validate_pointer rather
+    # than trusting any same-date, existing run_state_path. A pointer
+    # claiming the wrong stream must not satisfy the preflight gate.
+    target_dir = tmp_path / "manual_runs" / "morning_preflight_20260708"
+    target_dir.mkdir(parents=True)
+    target_path = target_dir / "run_state.json"
+    target_path.write_text(
+        json.dumps({
+            "run_id": "morning_preflight_20260708",
+            "trading_day": "2026-07-08",
+            "overall_ok": True,
+            "run_classification": {"run_origin": "scheduled", "manual_run": False},
+            "eligible_to_execute_tickers": ["BIG"],
+        }),
+        encoding="utf-8",
+    )
+    pointer = tmp_path / "latest_preflight.json"
+    pointer.write_text(
+        json.dumps({
+            "run_id": "morning_preflight_20260708",
+            "run_state_path": str(target_path),
+            "trading_day": "2026-07-08",
+            "stream": "midday",
+        }),
+        encoding="utf-8",
+    )
+
+    assert load_same_day_preflight(str(tmp_path), date(2026, 7, 8), bounded_recovery=False) is None
+
+
+def test_load_same_day_preflight_pointer_manual_target_rejected(tmp_path):
+    # A pointer whose target run_state is a manual run must not satisfy the
+    # preflight gate even though it names an existing, same-date file.
+    target_dir = tmp_path / "manual_runs" / "manual_x"
+    target_dir.mkdir(parents=True)
+    target_path = target_dir / "run_state.json"
+    target_path.write_text(
+        json.dumps({
+            "run_id": "manual_x",
+            "trading_day": "2026-07-08",
+            "overall_ok": True,
+            "run_classification": {"run_origin": "manual", "manual_run": True},
+            "eligible_to_execute_tickers": ["BIG"],
+        }),
+        encoding="utf-8",
+    )
+    pointer = tmp_path / "latest_preflight.json"
+    pointer.write_text(
+        json.dumps({
+            "run_id": "manual_x",
+            "run_state_path": str(target_path),
+            "trading_day": "2026-07-08",
+            "stream": "morning",
+        }),
+        encoding="utf-8",
+    )
+
+    assert load_same_day_preflight(str(tmp_path), date(2026, 7, 8), bounded_recovery=False) is None
+
+
+def test_load_same_day_preflight_pointer_valid_used_as_fallback(tmp_path):
+    # A well-formed same-day pointer whose target is a genuine scheduled,
+    # non-manual preflight run_state IS used when the primary path misses.
+    target_dir = tmp_path / "some_other_dir"
+    target_dir.mkdir(parents=True)
+    target_path = target_dir / "run_state.json"
+    target_path.write_text(
+        json.dumps({
+            "run_id": "morning_preflight_20260708",
+            "trading_day": "2026-07-08",
+            "overall_ok": True,
+            "run_classification": {"run_origin": "scheduled", "manual_run": False},
+            "eligible_to_execute_tickers": ["BIG"],
+        }),
+        encoding="utf-8",
+    )
+    pointer = tmp_path / "latest_preflight.json"
+    pointer.write_text(
+        json.dumps({
+            "run_id": "morning_preflight_20260708",
+            "run_state_path": str(target_path),
+            "trading_day": "2026-07-08",
+            "stream": "morning",
+            "pointer_status": "valid",
+        }),
+        encoding="utf-8",
+    )
+
+    loaded = load_same_day_preflight(str(tmp_path), date(2026, 7, 8), bounded_recovery=False)
     assert loaded is not None
     assert loaded["eligible_tickers"] == {"BIG"}
 
@@ -2472,14 +2669,27 @@ def test_preflight_root_distinct_from_watchlist_and_live():
 
 
 def _seed_preflight(tmp_path, tickers, trading_date=None):
-    """Write a preflight run_state.json for the given tickers into tmp_path."""
+    """Write a preflight run_state.json for the given tickers into tmp_path.
+
+    Carries a real (scheduled, non-manual, morning-stream) run_classification
+    and trading_day matching production shape, so it passes the same-day
+    scheduled-evidence checks applied to the primary preflight path.
+    """
     if trading_date is None:
         trading_date = _now_live().date()
     folder = trading_date.strftime("%Y%m%d") + "_0945ET"
     pf_dir = tmp_path / folder
     pf_dir.mkdir(parents=True, exist_ok=True)
     (pf_dir / "run_state.json").write_text(
-        json.dumps({"eligible_to_execute_tickers": list(tickers)}),
+        json.dumps({
+            "eligible_to_execute_tickers": list(tickers),
+            "trading_day": trading_date.isoformat(),
+            "run_classification": {
+                "run_origin": "scheduled",
+                "manual_run": False,
+                "stream": "morning",
+            },
+        }),
         encoding="utf-8",
     )
     return tmp_path
@@ -2488,9 +2698,10 @@ def _seed_preflight(tmp_path, tickers, trading_date=None):
 def test_live_gate_blocks_outside_approved_window(tmp_path):
     # A scheduled live run on a day outside approved_test_dates returns a blocked result.
     pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    live_root = tmp_path / "live"
     cfg = MorningConfig(
         tickers=("SMALL",),
-        morning_run_state_root=str(tmp_path / "live"),
+        morning_run_state_root=str(live_root),
         preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 7)}),  # not 2026-07-08 (_now_live())
     )
@@ -2499,6 +2710,67 @@ def test_live_gate_blocks_outside_approved_window(tmp_path):
     res = ex.run(_now_live(), data, manual=False)
     assert res["artifacts"]["status"] == "blocked"
     assert res["artifacts"].get("block_reason") == "outside approved trading window"
+    # Codex review r3622495870: this date-gate block must still refresh the
+    # same-day pointer(s) -- both latest_morning_run.json and
+    # latest_morning_live.json for the morning live stream -- so a consumer
+    # checking "did today's scheduled task fire" doesn't see a stale pointer
+    # left over from the last real trading session.
+    for name in ("latest_morning_run.json", "latest_morning_live.json"):
+        pointer = json.loads((live_root / name).read_text())
+        assert pointer["trading_day"] == "2026-07-08"
+        assert pointer["valid_scheduled_evidence"] is True
+    # Codex review r3623389445: this gate bypasses write_artifacts() entirely,
+    # so it must still write submitted_orders.csv (header only) itself, or the
+    # run directory fails scripts/scheduled_artifacts.py's live artifact
+    # contract and detect_drift() sees a missing-CSV failure.
+    orders_path = Path(res["paths"]["submitted_orders"])
+    assert orders_path.exists()
+    with orders_path.open(newline="", encoding="utf-8") as fh:
+        assert list(csv.DictReader(fh)) == []
+
+
+def test_outside_window_retry_refreshes_pointer_to_preserved_submitted_evidence(tmp_path):
+    # Codex review r3622495870, existing-evidence branch: a retry that lands in
+    # _maybe_block_for_holiday's "already has submitted-order evidence" path
+    # (e.g. the 10:30 live run placed orders, then trading_window.json briefly
+    # made a retry look outside the approved window) must still refresh the
+    # same-day pointer -- to the PRESERVED submitted state, not a fresh blocked
+    # stub -- so it doesn't fall back to a stale prior-day pointer.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    live_root = tmp_path / "live"
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),  # in window
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    first = ex.run(_now_live(), data, broker=FakeLiveBroker())
+    assert first["artifacts"]["buy_candidates"][0]["status"] == "submitted"
+    run_state_path = Path(first["paths"]["run_state"])
+
+    # Retry at the same slot with a config that now excludes today -> hits the
+    # is_outside_window gate, but must preserve (not overwrite) the submitted
+    # evidence and still refresh the pointer to point at it.
+    retry_cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 7)}),  # no longer approved
+    )
+    retry_ex = MorningDCAExecutor(retry_cfg, mode=MORNING_LIVE_MODE)
+    second = retry_ex.run(_now_live() + timedelta(minutes=1), data, broker=FakeLiveBroker())
+
+    assert second["artifacts"]["buy_candidates"][0]["status"] == "submitted"
+    on_disk = json.loads(run_state_path.read_text(encoding="utf-8"))
+    assert on_disk["buy_candidates"][0]["status"] == "submitted"
+    for name in ("latest_morning_run.json", "latest_morning_live.json"):
+        pointer = json.loads((live_root / name).read_text())
+        assert pointer["trading_day"] == "2026-07-08"
+        assert pointer["valid_scheduled_evidence"] is True
+        assert pointer["run_state_path"] == str(run_state_path)
 
 
 def test_live_gate_permits_when_in_approved_window(tmp_path):

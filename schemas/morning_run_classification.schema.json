@@ -124,6 +124,18 @@
       "type": "boolean",
       "const": true,
       "description": "Always true. This schema's stream field is pinned to the const 'morning' above, so every artifact validated against it is a morning-stream artifact and is therefore valid MORNING evidence (and prior-allocation context for the midday/afternoon top-up guard). A midday run_state (stream='midday') is validated against schemas/midday_run_classification.schema.json instead, where MorningDCAExecutor.run_classification's shared implementation sets this same field to false. Morning evidence never counts as afternoon evidence (valid_afternoon_evidence is always false)."
+    },
+    "trading_day": {
+      "type": "string",
+      "description": "America/New_York trading day (YYYY-MM-DD) this run belongs to. Part of the same-day artifact contract (see config/scheduled_tasks.json:scheduled_run_artifact_contract and scripts/scheduled_artifacts.py)."
+    },
+    "same_day_required": {
+      "type": "boolean",
+      "description": "True for scheduled runs: this artifact is only valid as evidence for its own trading_day. False for manual runs."
+    },
+    "valid_scheduled_evidence": {
+      "type": "boolean",
+      "description": "Derived from the completed run_state (run_origin='scheduled' AND manual_run=false), never asserted blindly. See scripts/same_day_pointer.py:derive_valid_scheduled_evidence."
     }
   },
   "allOf": [

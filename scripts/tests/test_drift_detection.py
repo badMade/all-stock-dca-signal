@@ -137,6 +137,31 @@ class DriftDetectionTests(unittest.TestCase):
         affected = {s.symbol for s in report.affected_symbols}
         self.assertEqual(affected, {"AAPL", "MSFT"})
 
+    # --- confirmation-blocked rows are not real submissions ------------------
+    def test_confirmation_required_row_does_not_count_as_submitted(self):
+        # Codex review r3623249074: scripts/scheduled_artifacts.py's
+        # submitted_orders.csv writer emits a row for a
+        # not_submitted_confirmation_required outcome (order review passed but
+        # OrderConfirmationRequiredError blocked the actual broker call), so a
+        # row existing for a ticker must not by itself mean it was submitted --
+        # otherwise a genuinely blocked buy is silently reconciled as reported
+        # and the drift/Slack alert never fires.
+        self._raw()
+        _write_csv(
+            self.run_dir / "signals.csv",
+            SIGNAL_FIELDS,
+            [_signal("AAPL", incremental=3.0)],
+        )
+        _write_csv(
+            self.run_dir / "submitted_orders.csv",
+            ORDER_FIELDS,
+            [_order("AAPL", status="not_submitted_confirmation_required", order_id="")],
+        )
+        report = detect_drift(self.run_dir)
+        self.assertTrue(report.drift_detected)
+        affected = {s.symbol for s in report.affected_symbols}
+        self.assertEqual(affected, {"AAPL"})
+
     def test_case_insensitive_auto_buy_tokens(self):
         self._raw()
         _write_csv(

@@ -375,6 +375,32 @@ roots (rule 2 above), so its order IDs are excluded from all scheduled-live
 metrics. See the `manual_missed_morning_recovery` block in
 [`../config/run_classification.json`](../config/run_classification.json).
 
+## Manual dry-run runs (added 2026-07-21)
+
+A **manual dry run** exercises the read-only data path (Finance, Robinhood,
+Alpaca) and the signal ladder without placing anything. It carries
+`run_origin='manual_dry_run'`, `dry_run=true`, `no_purchases=true`,
+`order_submit_status='dry_run'`, and `valid_scheduled_evidence=false`. It calls
+no `review_equity_order`, no `place_equity_order`, no cancellations, and no
+broker modifications.
+
+Dry-run artifacts are diagnostics only. They must **not** be treated as
+scheduled evidence, top-up proof, slippage evidence, or confirmation that any
+scheduled task ran, and they are excluded from scheduled reliability, fill
+counts, slippage, cost basis, and watchdog confirmation. A positive dry-run
+signal is a hypothetical sizing preview, not an order.
+
+The **2026-07-21 09:05 ET** run is the canonical example: 44 tickers scanned,
+Finance lookup completed with expected unresolved fallback cases AAAU/SPCX/GFUZ,
+Robinhood account 562057042 present with 44 quotes / 44 prior closes / 44
+tradability results, Alpaca ACTIVE with buying_power 0, one hypothetical
+positive signal (CBRS drop_pct 0.1074, 1x, $2), and no orders placed. Artifacts
+under `/home/user/workspace/cron_tracking/dry_runs/20260721_0905ET/`. See the
+`manual_dry_run_2026_07_21` block in
+[`../config/run_classification.json`](../config/run_classification.json) and
+`morning_manual_dry_run_2026_07_21` in
+[`../config/scheduled_tasks.json`](../config/scheduled_tasks.json).
+
 ## 3:20 runner self-containment and state-file guarantee (added 2026-07-20)
 
 After the Jul 20 2026 10:30 and 12:30 scheduled live runs both failed (they
@@ -549,3 +575,104 @@ the contract with the standard library only (no secrets, no network):
 | `select_scheduled_state_for_reporting` | Pick the scheduled state, apply the narrow fallback |
 
 Tests: [`scripts/tests/test_run_classification.py`](../scripts/tests/test_run_classification.py).
+
+## Same-day latest-pointer validation (added 2026-07-21)
+
+A `latest_*.json` pointer (`latest_morning_run.json`, `latest_midday_run.json`,
+`latest_scheduled_run.json`, and the monitor / slippage / watchdog equivalents)
+is only a convenience shortcut to the most recent run_state for a stream. A
+pointer left over from a prior trading day, half-written, or aimed at the wrong
+stream can look valid and be mistaken for proof that today's scheduled run
+happened. The same-day validation contract (see
+`config/scheduled_tasks.json` -> `same_day_pointer_validation_policy` and
+[`schemas/latest_pointer.schema.json`](../schemas/latest_pointer.schema.json))
+closes that gap.
+
+A latest pointer is trusted as same-day scheduled evidence ONLY when:
+
+- its `trading_day` equals the current America/New_York date, AND
+- its `run_state_path` resolves inside the expected stream root, AND
+- its `stream` matches the expected stream, AND
+- the target run_state exists and is a scheduled, non-manual run
+  (`run_origin='scheduled'`, `manual_run=false`).
+
+Stale, malformed, missing, pending, prior-date, future-date, outside-root, and
+wrong-stream pointers are ignored: they must not be used as scheduled evidence,
+fill evidence, top-up proof, slippage evidence, reliability evidence, or
+confirmation that a stream ran. A date-specific same-day run_state file is
+preferred over the latest pointer when both are present. A pending same-day
+placeholder keeps `valid_scheduled_evidence=false` until the target run_state
+is finalized as a scheduled non-manual run.
+
+After each run, the latest pointer is refreshed with same-day metadata:
+`run_id`, `run_state_path`, `stream`, `trading_day`, `pointer_status`,
+`same_day_required=true`, `updated_at_utc`, and `valid_scheduled_evidence`
+derived from the target run_state (never asserted blindly).
+
+[`scripts/same_day_pointer.py`](../scripts/same_day_pointer.py) implements this
+with the standard library only:
+
+| Function | Purpose |
+|---|---|
+| `validate_pointer` | Validate a pointer as same-day scheduled evidence; returns a `PointerValidation` with `pointer_status` and `valid_scheduled_evidence` |
+| `refresh_latest_pointer` / `build_pointer_metadata` | Write / build the same-day pointer payload |
+| `derive_valid_scheduled_evidence` | True only for a scheduled, non-manual run_state |
+| `select_same_day_run_state` | Resolve today's scheduled state, preferring the date-specific file over the pointer |
+
+Tests: [`scripts/tests/test_same_day_pointer.py`](../scripts/tests/test_same_day_pointer.py).
+
+## Scheduled-run artifact contract (added 2026-07-21)
+
+The Jul 21 2026 scheduled runs exposed two artifact-schema failures: the 9:45
+pre-flight and 10:30 morning-live `run_state.json` files carried a **null
+top-level `run_classification`**, and the 10:30 live run **dropped signals.csv
+and submitted_orders.csv** even though its summary claimed they were written. A
+null classification breaks scheduled-vs-manual attribution downstream, and a
+missing order CSV makes the drift detector report every intended buy as an
+unsubmitted order. Both are **artifact-contract failures, not soft warnings**.
+
+The contract, one source of truth in
+[`scripts/scheduled_artifacts.py`](../scripts/scheduled_artifacts.py):
+
+1. **`run_classification` is always a non-null object, never `null`.** Every
+   scheduled `run_state.json` (9:45 pre-flight, 10:30 morning live, 12:30 midday
+   live) must carry a non-null top-level `run_classification` object. A null,
+   absent, or non-object value is a contract failure.
+   - **9:45 pre-flight** (`build_preflight_run_classification`): `run_origin='scheduled'`,
+     `run_type='morning_dca_preflight'`, `scheduled_for_et='09:45'`,
+     `manual_run=false`, `state_schema_version='morning-preflight-v2-machine-complete'`,
+     `run_id`, `triggered_at_utc`, `cron_id='morning-dca-0945'`, `stream='morning'`,
+     `trading_day`, `same_day_required=true`, `valid_scheduled_evidence` derived
+     from the completed state. Matches the actual producer
+     (`morning_dca.py`'s `MORNING_PREFLIGHT_CRON_ID`/`MORNING_PREFLIGHT_RUN_TYPE`)
+     and [`schemas/morning_preflight.schema.json`](../schemas/morning_preflight.schema.json).
+   - **10:30 morning live** (`build_morning_live_run_classification`): `run_origin='scheduled'`,
+     `manual_run=false`, `stream='morning'`, `scheduled_for_et='10:30'`,
+     `cron_id='42173154'`, `run_id`, `state_schema_version`, `trading_day`,
+     `same_day_required=true`, `valid_afternoon_evidence=false`,
+     `valid_scheduled_evidence` derived from the completed state.
+2. **Live runs always write both CSVs.** A live run writes `signals.csv`
+   whenever signals can be computed, and `submitted_orders.csv` **with a header
+   row even when no order was submitted**. When an order is placed the CSV
+   contains that row; when the broker response is pending/unconfirmed the row
+   keeps its concrete status and is still written (along with the run_state).
+   Deliberate non-orders (skipped, cap_exceeded, dry_run, blocked) are not rows.
+3. **Same defensive guarantee for midday.** The 12:30 midday live run shares the
+   morning runner path, so the always-write-both-CSVs and non-null classification
+   guarantees apply to it as well, without weakening any trading safeguard.
+4. **Missing artifacts fail the contract.** `validate_run_artifacts` fails when
+   `run_state.json` is missing/unreadable, when `run_classification` is
+   null/absent/not-an-object, or when a required CSV is missing.
+   `require_submitted_orders` is True for live runs and False for read-only
+   pre-flight runs.
+
+| Function | Purpose |
+|---|---|
+| `build_preflight_run_classification` / `build_morning_live_run_classification` | Build the non-null scheduled classification for the 9:45 / 10:30 runs |
+| `submitted_order_rows` | Rows for submitted_orders.csv (placed/in-flight statuses or an order_id; pending/unconfirmed preserved) |
+| `write_signals_csv` / `write_submitted_orders_csv` | Write the CSVs; both emit a header even when empty |
+| `validate_run_artifacts` | Validate the run directory against the contract |
+
+Tests: [`scripts/tests/test_scheduled_artifacts.py`](../scripts/tests/test_scheduled_artifacts.py)
+and the preflight/live artifact tests in
+[`test_morning_dca.py`](../test_morning_dca.py).

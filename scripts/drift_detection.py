@@ -65,6 +65,17 @@ RUN_STATE_NAME = "run_state.json"
 # must NOT be diagnosed as raw_data_persistence_failure.
 _STREAMS_WITHOUT_RAW = {"morning", "midday"}
 
+# scripts/scheduled_artifacts.py's submitted_orders.csv writer emits a row for
+# every order ATTEMPT (submitted/filled/pending/unconfirmed) so a live run
+# always produces a machine-readable record, but "not_submitted_confirmation_required"
+# (near_close_dca.OrderConfirmationRequiredError / run_classification.py's
+# ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED) means NO order reached the broker --
+# it was blocked pending a separate pre-authorization confirmation step. A row
+# with that status must never count as a genuine submission here, or a
+# confirmation-blocked buy would be silently reconciled as reported and the
+# drift/Slack alert this detector exists for would never fire.
+_NOT_ACTUALLY_SUBMITTED_STATUSES = {"not_submitted_confirmation_required"}
+
 # --- Column aliases (schema-tolerant lookups) --------------------------------
 
 SYMBOL_COLUMNS = ("ticker", "symbol")
@@ -204,6 +215,8 @@ class RunArtifacts:
     def submitted_symbols(self) -> set:
         symbols = set()
         for row in self.order_rows:
+            if row.get("status") in _NOT_ACTUALLY_SUBMITTED_STATUSES:
+                continue
             sym = _symbol(row)
             if sym:
                 symbols.add(sym)

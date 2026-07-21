@@ -235,7 +235,8 @@
       "Scheduled-live cost basis, slippage, reliability, and order-count metrics must be computed only from validated scheduled runs with manual order IDs excluded.",
       "A scheduled run_state with order_submit_status='not_submitted_confirmation_required' is valid scheduled-run evidence that the task ran but is NOT evidence of an order/fill: it contributes zero scheduled fills/order IDs and must not be marked invalid because confirmation blocked submission.",
       "Exclude final manual buy overrides (run_type='final_manual_buy_override', valid_afternoon_scheduled_evidence=false, same_day_top_up_context_only=true) from scheduled slippage, scheduled fills, scheduled reliability, scheduled cost basis, and watchdog confirmation. Show them only in a labeled Manual Final Buy Override / Same-Day Top-Up Context section (see manual_reporting).",
-      "Exclude manual missed-morning recovery artifacts (under morning_dca/manual_recovery/**, run_origin='manual', manual_run=true, same_day_top_up_context_only=true, valid_scheduled_evidence=false) from scheduled slippage, scheduled fills, scheduled reliability, scheduled cost basis, and watchdog confirmation. They never prove the 10:30 scheduled task ran and are used only as same-day prior-allocation / top-up context (see manual_missed_morning_recovery)."
+      "Exclude manual missed-morning recovery artifacts (under morning_dca/manual_recovery/**, run_origin='manual', manual_run=true, same_day_top_up_context_only=true, valid_scheduled_evidence=false) from scheduled slippage, scheduled fills, scheduled reliability, scheduled cost basis, and watchdog confirmation. They never prove the 10:30 scheduled task ran and are used only as same-day prior-allocation / top-up context (see manual_missed_morning_recovery).",
+      "Exclude the 2026-07-21 manual midday run (under midday_dca/manual_runs/**, run_origin='manual', manual_run=true, stream='midday_manual', same_day_top_up_context_only=true, valid_scheduled_evidence=false, valid_afternoon_scheduled_evidence=false) from scheduled slippage, scheduled fill counts, scheduled reliability, scheduled cost-basis evidence, watchdog proof, and scheduled afternoon evidence. It never proves the 12:30 or 3:20 scheduled tasks ran and is used only as same-day prior-allocation / top-up context by the later 3:20 top-up logic (see midday_manual_run_2026_07_21)."
     ],
     "manual_exclusion_roots": {
       "reason": "The 2026-07-13 final manual buy override backfilled live artifacts under midday_dca/manual_reruns/final_manual_override_* and a final_manual_review/** tree, both OUTSIDE the ce16ba6b task root. Slippage/watchdog/reporting must scan these as manual exclusions so their order IDs never leak into scheduled-live metrics.",
@@ -246,7 +247,8 @@
         "/home/user/workspace/cron_tracking/midday_dca/manual_reruns/**",
         "/home/user/workspace/cron_tracking/midday_dca/manual_reruns/final_manual_override_*",
         "/home/user/workspace/cron_tracking/morning_dca/manual_recovery/**",
-        "/home/user/workspace/cron_tracking/midday_dca/manual_recovery/**"
+        "/home/user/workspace/cron_tracking/midday_dca/manual_recovery/**",
+        "/home/user/workspace/cron_tracking/midday_dca/manual_runs/**"
       ],
       "helper": "scripts/run_classification.py:manual_exclusion_roots / collect_manual_order_ids"
     }
@@ -298,6 +300,27 @@
     "watchdog_context": "The 3:40 PM watchdog alerted because broker history had orders after 3:15 PM ET but no manual-run artifacts were present under the paths it scanned. Live artifacts were backfilled with run_origin='manual', manual_run=true, run_type='final_manual_buy_override', valid_afternoon_scheduled_evidence=false, same_day_top_up_context_only=true, and all order IDs.",
     "note": "These are manual final-buy overrides and same-day top-up context only; NOT scheduled-afternoon execution evidence. Excluded from scheduled slippage, scheduled fills, scheduled reliability, scheduled cost basis, and watchdog confirmation."
   },
+  "manual_dry_run_2026_07_21": {
+    "added": "2026-07-21",
+    "run_id": "manual_dry_run_20260721_0905ET",
+    "run_origin": "manual_dry_run",
+    "dry_run": true,
+    "no_purchases": true,
+    "trading_day": "2026-07-21",
+    "flags": {
+      "valid_scheduled_evidence": false
+    },
+    "summary": "Manual no-purchase dry run at 09:05 ET on 2026-07-21. Read connector data end to end (44 tickers, Finance lookup, Robinhood account/portfolio/quotes/tradability, Alpaca account) but called no review, placement, cancellation, or modification. Diagnostics only.",
+    "expected_finance_unresolved_fallback": ["AAAU", "SPCX", "GFUZ"],
+    "positive_dry_run_signal": "CBRS drop_pct 0.1074, multiplier 1x, hypothetical_amount $2 (hypothetical only; not placed).",
+    "artifact_root": "/home/user/workspace/cron_tracking/dry_runs/20260721_0905ET/",
+    "rules": [
+      "order_submit_status='dry_run': no live orders.",
+      "Dry-run artifacts must NOT be treated as scheduled evidence, top-up proof, slippage evidence, or confirmation that any scheduled task ran.",
+      "Excluded from scheduled reliability, fill counts, slippage, cost basis, and watchdog confirmation."
+    ],
+    "see": "config/scheduled_tasks.json:morning_manual_dry_run_2026_07_21"
+  },
   "manual_missed_morning_recovery": {
     "added": "2026-07-20",
     "run_origin": "manual",
@@ -317,6 +340,38 @@
       "May only reduce or block additional buys through the same-day top-up rule: buy max(0, desired - prior) only if the later decision price is strictly below the prior reference price.",
       "The 12:30 midday run and the 3:20 final run must scan the artifact_path_pattern for same-day manual recovery artifacts and fold them into the top-up guard."
     ]
+  },
+  "midday_manual_run_2026_07_21": {
+    "added": "2026-07-21",
+    "trading_day": "2026-07-21",
+    "run_at_et": "13:45",
+    "run_origin": "manual",
+    "manual_run": true,
+    "stream": "midday_manual",
+    "flags": {
+      "valid_scheduled_evidence": false,
+      "valid_afternoon_scheduled_evidence": false,
+      "same_day_top_up_context_only": true
+    },
+    "artifact_root": "/home/user/workspace/cron_tracking/midday_dca/manual_runs/20260721_1345ET",
+    "summary": "Manual midday run placed by hand at 1:45 PM ET on 2026-07-21. It is manual by contract: same-day top-up context ONLY. It is NEVER proof that the 12:30 or 3:20 scheduled tasks ran and is used only as prior-allocation context by the later same-day 3:20 top-up logic.",
+    "total_filled_usd": 9.00,
+    "fills": [
+      {"ticker": "MSFT", "amount_usd": 2.00, "order_id": "6a5fb151-043b-4063-b317-40b666bb4bb7", "status": "filled", "average_price": 399.136400, "quantity": 0.005010},
+      {"ticker": "GOOGL", "amount_usd": 2.00, "order_id": "6a5fb151-de49-4f8d-bd0e-2e98aeece284", "status": "filled", "average_price": 349.168900, "quantity": 0.005727},
+      {"ticker": "GOOG", "amount_usd": 2.00, "order_id": "6a5fb151-330b-4d78-9fcc-3da0151ab289", "status": "filled", "average_price": 348.485500, "quantity": 0.005739},
+      {"ticker": "MA", "amount_usd": 1.00, "order_id": "6a5fb151-653c-4dc9-ae1e-11515afcae27", "status": "filled", "average_price": 540.544500, "quantity": 0.001849},
+      {"ticker": "IBM", "amount_usd": 2.00, "order_id": "6a5fb151-cdee-41e9-889e-8ff65762d394", "status": "filled", "average_price": 211.790000, "quantity": 0.009443}
+    ],
+    "rules": [
+      "Valid prior-allocation / top-up context ONLY when run_origin='manual', manual_run=true, same_day_top_up_context_only=true, and valid_scheduled_evidence=false.",
+      "Never counts as proof the 12:30 or 3:20 scheduled tasks ran.",
+      "May be used by later same-day 3:20 top-up logic as prior allocation context only.",
+      "Excluded from scheduled slippage, scheduled fill counts, scheduled reliability, scheduled cost-basis evidence, watchdog proof, and scheduled afternoon evidence.",
+      "Order IDs found under midday_dca/manual_runs/** are collected as excluded_manual_order_ids (see downstream_reporting_rules manual_exclusion_roots)."
+    ],
+    "see": "config/scheduled_tasks.json:midday_dca_manual_run_2026_07_21",
+    "doc": "docs/midday_dca.md"
   },
   "live_schedule_hardening_2026_07_20": {
     "added": "2026-07-20",

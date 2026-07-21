@@ -346,6 +346,26 @@ def test_update_latest_scheduled_run_pointer_uses_given_path():
         assert list(base.rglob("run_state.json")) == [external_path]
 
 
+def test_update_latest_scheduled_run_pointer_rejects_incomplete_classification():
+    # An incomplete run_classification that says run_origin=scheduled but omits
+    # manual_run entirely must not be treated as valid scheduled evidence --
+    # manual_run must be the explicit boolean False, not merely "not True".
+    from run_classification import update_latest_scheduled_run_pointer
+
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        state = _scheduled_state()
+        state["run_classification"].pop("manual_run", None)
+        state_path = base / "run_state.json"
+        state_path.write_text(json.dumps(state))
+
+        pointer = update_latest_scheduled_run_pointer(state, state_path, base)
+
+        ptr = json.loads(pointer.read_text())
+        assert ptr["valid_scheduled_evidence"] is False
+        assert ptr["pointer_status"] == "pending"
+
+
 def test_write_rejects_invalid_classification():
     bad = _scheduled_state()
     # Break both lineage signals so neither cron_id nor supersedes_cron_id holds.
@@ -845,6 +865,14 @@ def test_manual_exclusion_roots_cover_manual_recovery_paths():
         roots = [str(r) for r in manual_exclusion_roots(base)]
         assert str(Path(d) / "morning_dca" / "manual_recovery") in roots
         assert str(Path(d) / "midday_dca" / "manual_recovery") in roots
+
+
+def test_manual_exclusion_roots_cover_midday_manual_runs():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        roots = [str(r) for r in manual_exclusion_roots(base)]
+        assert str(Path(d) / "midday_dca" / "manual_runs") in roots
 
 
 def _write_final_override_state(run_dir: Path, order_ids, ts="2026-07-13T19:36:00Z"):

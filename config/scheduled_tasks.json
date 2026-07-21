@@ -155,6 +155,47 @@
     "preserved_note": "Logging metadata only: preserves the $2.00 base amount, the 0x-to-5x ladder, the Finance-primary read-only market-data policy, the GFUZ/TXN active universe with BYDDY/VCX/TRLV/RVI exclusions, the same-day top-up guards, all safety/circuit-breaker rules, live schedules, and run-classification text unchanged. No trades are placed by writing this log.",
     "doc": "docs/cost_tracking.md"
   },
+  "same_day_pointer_validation_policy": {
+    "added_on_et": "2026-07-21",
+    "purpose": "Stop a leftover, half-written, or wrong-stream latest_*.json pointer from being mistaken for proof that today's scheduled run happened. A latest pointer is trusted as same-day scheduled evidence ONLY when its trading_day and run_state_path match the current America/New_York date and the expected stream directory.",
+    "schema": "schemas/latest_pointer.schema.json",
+    "helper": "scripts/same_day_pointer.py",
+    "applies_to_streams": ["morning", "midday", "monitor", "afternoon", "slippage", "watchdog"],
+    "pointer_files": {
+      "morning": "/home/user/workspace/cron_tracking/morning_dca/latest_morning_run.json",
+      "midday": "/home/user/workspace/cron_tracking/midday_dca/latest_midday_run.json",
+      "afternoon": "/home/user/workspace/cron_tracking/ce16ba6b/latest_scheduled_run.json"
+    },
+    "validation_rules": [
+      "A latest pointer is valid only when trading_day and run_state_path match the current ET date and the expected stream root.",
+      "Stale, malformed, missing, pending, prior-date, future-date, outside-root, and wrong-stream pointers are ignored and must NOT be used as scheduled evidence, fill evidence, top-up proof, slippage evidence, reliability evidence, or confirmation that a stream ran.",
+      "A date-specific same-day run_state file is preferred over the latest pointer when both are present.",
+      "A pending same-day placeholder has valid_scheduled_evidence=false until the target run_state exists AND has run_origin='scheduled' and manual_run=false.",
+      "valid_scheduled_evidence is derived from the target run_state, never asserted blindly by the pointer."
+    ],
+    "refresh_rule": "After each run the latest pointer is refreshed with same-day metadata: run_id, run_state_path, stream, trading_day, pointer_status, same_day_required=true, updated_at_utc, and valid_scheduled_evidence derived from the target run_state.",
+    "pointer_status_values": ["valid", "pending", "stale", "prior_date", "future_date", "missing", "malformed", "outside_root", "wrong_stream"],
+    "safety_note": "This is an evidence-integrity contract only; it does NOT relax any trading safety rule. When pointer validation cannot establish valid same-day scheduled evidence, downstream tasks fail closed (treat the stream as not-yet-run) rather than trusting a stale pointer.",
+    "doc": "docs/run_classification.md"
+  },
+  "scheduled_run_artifact_contract": {
+    "added_on_et": "2026-07-21",
+    "purpose": "The Jul 21 2026 scheduled runs wrote a run_state.json whose top-level run_classification was null and, for the 10:30 live run, dropped signals.csv and submitted_orders.csv even though the summary claimed they were written. A null classification breaks scheduled-vs-manual attribution, and a missing order CSV makes the drift detector report every intended buy as an unsubmitted order. Both are artifact-contract failures, not soft warnings.",
+    "helper": "scripts/scheduled_artifacts.py",
+    "doc": "docs/run_classification.md",
+    "applies_to": ["morning-dca-0945 (9:45 pre-flight)", "42173154 (10:30 morning live)", "a6239dae (12:30 midday live)"],
+    "rules": [
+      "run_classification is ALWAYS a non-null top-level object on every scheduled run_state.json; null, absent, or non-object is a contract failure.",
+      "The 9:45 pre-flight run_classification carries run_origin='scheduled', run_type='morning_dca_preflight', scheduled_for_et='09:45', manual_run=false, state_schema_version='morning-preflight-v2-machine-complete', run_id, triggered_at_utc, cron_id='morning-dca-0945', stream='morning', trading_day, same_day_required=true, and valid_scheduled_evidence derived from the completed state. This matches the actual producer (morning_dca.py's MORNING_PREFLIGHT_CRON_ID/MORNING_PREFLIGHT_RUN_TYPE) and schemas/morning_preflight.schema.json -- not a separate aspirational identity.",
+      "The 10:30 morning-live run_classification carries run_origin='scheduled', manual_run=false, stream='morning', scheduled_for_et='10:30', cron_id='42173154', run_id, state_schema_version, trading_day, same_day_required=true, valid_afternoon_evidence=false, and valid_scheduled_evidence derived from the completed state.",
+      "Every LIVE run writes signals.csv whenever signals can be computed AND submitted_orders.csv with a header row even when no order was submitted.",
+      "When an order is placed the submitted_orders.csv contains that row; a pending/unconfirmed broker response keeps its concrete status but still produces a row and a run_state. Deliberate non-orders (skipped, cap_exceeded, dry_run, blocked) are not rows.",
+      "The 12:30 midday live run shares the morning runner path, so the same non-null-classification and always-write-both-CSVs guarantees apply, without weakening any trading safeguard.",
+      "validate_run_artifacts fails on a missing/unreadable run_state.json, a null/absent/non-object run_classification, or a missing required CSV; require_submitted_orders is True for live runs and False for read-only pre-flight runs."
+    ],
+    "safety_note": "This is an artifact-integrity contract only; it does NOT relax any trading safety, budget, spread, confidence, or top-up rule. valid_scheduled_evidence is always derived from the completed run_state, never asserted blindly.",
+    "tests": ["scripts/tests/test_scheduled_artifacts.py", "test_morning_dca.py"]
+  },
   "afternoon_completion_rule": "All afternoon trading and artifact-writing tasks complete no later than 3:40 PM ET, when the read-only live-run watchdog (a46bf007) begins its final verification. The watchdog's own post-3:40 PM verification, the Friday weekly Notion performance refresh at 5:00 PM ET, and the month-end volatility risk refresh at 5:00 PM ET (c9fb1fb8 / 17a3b2a9) are the only approved post-3:40 PM DCA-related exceptions.",
   "ticker_universe_policy": {
     "source_of_truth": "config/tickers.json",
@@ -465,6 +506,33 @@
     ],
     "doc": "docs/midday_dca.md"
   },
+  "midday_dca_manual_run_2026_07_21": {
+    "added": "2026-07-21",
+    "artifact_root": "/home/user/workspace/cron_tracking/midday_dca/manual_runs/20260721_1345ET",
+    "run_at_et": "13:45",
+    "summary": "On Jul 21 2026 a human manually placed a midday run at 1:45 PM ET. This artifact is same-day prior-allocation / top-up context ONLY.",
+    "run_origin": "manual",
+    "manual_run": true,
+    "stream": "midday_manual",
+    "same_day_top_up_context_only": true,
+    "valid_scheduled_evidence": false,
+    "valid_afternoon_scheduled_evidence": false,
+    "must_not": [
+      "MUST NOT be counted as proof that the 12:30 or 3:20 scheduled tasks ran.",
+      "MUST NOT be used for scheduled slippage, scheduled fill counts, scheduled reliability, scheduled cost-basis evidence, watchdog proof, or scheduled afternoon evidence."
+    ],
+    "available_to": "May be used by the later same-day 3:20 afternoon run as prior-allocation / top-up context only.",
+    "total_filled_usd": 9.00,
+    "fills": [
+      {"ticker": "MSFT", "amount_usd": 2.00, "order_id": "6a5fb151-043b-4063-b317-40b666bb4bb7", "status": "filled", "average_price": 399.136400, "quantity": 0.005010},
+      {"ticker": "GOOGL", "amount_usd": 2.00, "order_id": "6a5fb151-de49-4f8d-bd0e-2e98aeece284", "status": "filled", "average_price": 349.168900, "quantity": 0.005727},
+      {"ticker": "GOOG", "amount_usd": 2.00, "order_id": "6a5fb151-330b-4d78-9fcc-3da0151ab289", "status": "filled", "average_price": 348.485500, "quantity": 0.005739},
+      {"ticker": "MA", "amount_usd": 1.00, "order_id": "6a5fb151-653c-4dc9-ae1e-11515afcae27", "status": "filled", "average_price": 540.544500, "quantity": 0.001849},
+      {"ticker": "IBM", "amount_usd": 2.00, "order_id": "6a5fb151-cdee-41e9-889e-8ff65762d394", "status": "filled", "average_price": 211.790000, "quantity": 0.009443}
+    ],
+    "see": "config/run_classification.json:midday_manual_run_2026_07_21",
+    "doc": "docs/midday_dca.md"
+  },
   "live_task_text_compactness_policy": {
     "added": "2026-07-20",
     "applies_to": ["42173154", "a6239dae", "10ce362c"],
@@ -529,6 +597,66 @@
     },
     "live_task_text_note": "Live task text was updated with POINTER OUTPUT NORMALIZATION ADDED JUL 20 2026 for the 10:30 (42173154), 12:30 (a6239dae), 3:05 (e3e6f09e), and 3:20 (10ce362c) tasks.",
     "see": "live_schedule_hardening_2026_07_20 and config/run_classification.json:raw_input_persistence",
+    "doc": "docs/schedule_manifest.md"
+  },
+  "morning_manual_dry_run_2026_07_21": {
+    "added_on_et": "2026-07-21",
+    "run_id": "manual_dry_run_20260721_0905ET",
+    "run_origin": "manual_dry_run",
+    "dry_run": true,
+    "no_purchases": true,
+    "trading_day": "2026-07-21",
+    "scanned_at_et": "09:05",
+    "flags": {
+      "valid_scheduled_evidence": false,
+      "same_day_top_up_context_only": false
+    },
+    "summary": "Manual no-purchase dry run at 09:05 ET on 2026-07-21. It read connector data end to end but placed, reviewed, cancelled, and modified nothing. It is diagnostics only: it is NOT scheduled evidence, NOT top-up proof, NOT slippage evidence, and NOT confirmation that any scheduled task ran.",
+    "universe_scanned_count": 44,
+    "finance": {
+      "lookup_completed": true,
+      "expected_unresolved_fallback_cases": ["AAAU", "SPCX", "GFUZ"]
+    },
+    "robinhood": {
+      "account_access_completed": true,
+      "configured_account_present": "562057042",
+      "portfolio_read_completed": true,
+      "quote_batches_completed": 3,
+      "tradability_batches_completed": 5,
+      "quote_available_count": 44,
+      "prior_close_available_count": 44,
+      "tradability_returned_count": 44
+    },
+    "alpaca": {
+      "account_read_completed": true,
+      "status": "ACTIVE",
+      "buying_power": 0
+    },
+    "no_execution_calls": {
+      "review_equity_order_called": false,
+      "place_equity_order_called": false,
+      "cancellations_called": false,
+      "broker_modifications_called": false
+    },
+    "positive_dry_run_signals": [
+      {
+        "ticker": "CBRS",
+        "drop_pct": 0.1074,
+        "multiplier": "1x",
+        "hypothetical_amount_usd": 2
+      }
+    ],
+    "artifacts": {
+      "artifact_root": "/home/user/workspace/cron_tracking/dry_runs/20260721_0905ET/",
+      "files": ["run_state.json", "run_summary.json", "signals_dry_run.csv"],
+      "raw_dir": "/home/user/workspace/cron_tracking/dry_runs/20260721_0905ET/raw/"
+    },
+    "rules": [
+      "Dry-run artifacts must NOT be treated as scheduled evidence, top-up proof, slippage evidence, or confirmation that any scheduled task ran.",
+      "valid_scheduled_evidence stays false because run_origin='manual_dry_run', dry_run=true, and no orders were placed.",
+      "Excluded from every scheduled metric: reliability, fill counts, slippage, cost basis, and watchdog confirmation."
+    ],
+    "see": "config/run_classification.json:manual_dry_run_2026_07_21 and same_day_pointer_validation_policy",
     "doc": "docs/schedule_manifest.md"
   },
   "scheduled_run_outcomes": {

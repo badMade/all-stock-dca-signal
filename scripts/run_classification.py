@@ -81,6 +81,7 @@ MANUAL_EXCLUSION_SUBROOTS = (
     "midday_dca/manual_reruns",
     "morning_dca/manual_recovery",
     "midday_dca/manual_recovery",
+    "midday_dca/manual_runs",
 )
 
 SCHEDULED_RUN_ID_RE = re.compile(r"^scheduled_[0-9]{8}_1520ET$")
@@ -797,12 +798,24 @@ def update_latest_scheduled_run_pointer(
     day = str(run_state.get("trading_day", "")).strip()
     pointer = latest_scheduled_run_path(base)
     pointer.parent.mkdir(parents=True, exist_ok=True)
+    # valid_scheduled_evidence is derived from the state being pointed at, not
+    # asserted blindly: only a scheduled, non-manual run is same-day evidence
+    # (see scripts/same_day_pointer.py and config/scheduled_tasks.json ->
+    # same_day_pointer_validation_policy). manual_run must be the explicit
+    # boolean False -- an incomplete classification that omits the key must
+    # not default to non-manual.
+    valid_scheduled_evidence = rc.get("run_origin") == "scheduled" and rc.get("manual_run") is False
+    pointer_status = "valid" if valid_scheduled_evidence else "pending"
     pointer.write_text(
         json.dumps(
             {
                 "run_id": rc.get("run_id"),
                 "trading_day": day,
                 "run_state_path": str(run_state_path),
+                "stream": "afternoon",
+                "pointer_status": pointer_status,
+                "same_day_required": True,
+                "valid_scheduled_evidence": bool(valid_scheduled_evidence),
                 "cron_id": rc.get("cron_id"),
                 "supersedes_cron_id": rc.get("supersedes_cron_id"),
                 "triggered_at_utc": rc.get("triggered_at_utc"),

@@ -88,6 +88,15 @@ from near_close_dca import (
 from scripts.model_usage_log import DEFAULT_LOG_ROOT as DEFAULT_MODEL_USAGE_LOG_ROOT
 from scripts.model_usage_log import log_model_usage
 from scripts.run_classification import save_raw_input
+from scripts.same_day_pointer import (
+    build_pointer_metadata,
+    derive_valid_scheduled_evidence,
+    validate_pointer,
+)
+from scripts.scheduled_artifacts import (
+    submitted_order_rows,
+    write_submitted_orders_csv,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -883,12 +892,22 @@ def load_same_day_preflight(
     Returns a dict ``{"run_id", "eligible_tickers": set[str], "run_state_path",
     "recovered_via_bounded_lookup"}`` when a same-day pre-flight
     ``run_state.json`` is found under ``preflight_root/YYYYMMDD_0945ET/`` (or
-    via ``latest_preflight.json`` when it points at the same trading day, or
-    via the bounded recovery scan below), else ``None``. The live executor
+    via ``latest_preflight.json`` when it validates as same-day scheduled
+    evidence per ``scripts/same_day_pointer.py`` -- same stream, inside the
+    preflight root, non-manual, and both the pointer and its target dated
+    today -- or via the bounded recovery scan below), else ``None``. The live executor
     uses the returned ``eligible_tickers`` to restrict which tickers it
     re-evaluates; a ``None`` result means "no pre-flight found" and the caller
     degrades to evaluating the full universe with a warning rather than
     blocking all buys.
+
+    Regardless of which of the three lookup paths resolves ``state_path``, the
+    loaded state itself must independently prove same-day (``trading_day``
+    matches), scheduled non-manual (``derive_valid_scheduled_evidence``), and
+    morning-stream (``run_classification.stream``, when present) evidence
+    before its eligibility data is trusted -- a prior-day, manual, or
+    wrong-stream artifact merely existing at the expected path (the direct
+    join, a scan hit, or a pointer target) is never enough on its own.
 
     An artifact that explicitly declares ``overall_ok=False`` (a global/
     account/buying-power/auth/schema-write failure per the machine-complete
@@ -921,12 +940,14 @@ def load_same_day_preflight(
         pointer_state_path: Optional[Path] = None
         pointer = root / "latest_preflight.json"
         if pointer.exists():
-            try:
-                pdata = json.loads(pointer.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                pdata = None
-            if pdata is not None and pdata.get("trading_day") == trading_day.isoformat():
-                candidate = Path(pdata.get("run_state_path", ""))
+            result = validate_pointer(
+                pointer,
+                expected_stream=MORNING_STREAM,
+                expected_root=root,
+                today=trading_day.isoformat(),
+            )
+            if result.is_valid and result.run_state_path:
+                candidate = Path(result.run_state_path)
                 if candidate.exists():
                     pointer_state_path = candidate
         if pointer_state_path is not None:
@@ -950,6 +971,20 @@ def load_same_day_preflight(
     except (json.JSONDecodeError, OSError):
         return None
     if state.get("overall_ok") is False:
+        return None
+    # The loaded state must independently prove it is same-day, scheduled,
+    # non-manual, morning-stream evidence -- regardless of which of the three
+    # lookup paths above found it (direct path, validated pointer, or bounded
+    # recovery scan) -- so a prior-day, manual, or wrong-stream artifact left
+    # or copied into today's expected directory can never drive the 10:30
+    # live gate just because a file happens to exist at that path.
+    if str(state.get("trading_day", "")).strip() != trading_day.isoformat():
+        return None
+    if not derive_valid_scheduled_evidence(state):
+        return None
+    target_rc = state.get("run_classification")
+    target_stream = target_rc.get("stream") if isinstance(target_rc, dict) else None
+    if target_stream is not None and target_stream != MORNING_STREAM:
         return None
     per_ticker = state.get("per_ticker_eligibility")
     if isinstance(per_ticker, list) and per_ticker:
@@ -1660,6 +1695,14 @@ class MorningDCAExecutor(DCAExecutor):
             # Explicit, machine-checkable separation from the afternoon stream.
             "valid_afternoon_evidence": False,
             "afternoon_live_cron_id": AFTERNOON_LIVE_CRON_ID,
+            # Same-day scheduled-evidence contract (see scripts/scheduled_artifacts.py
+            # and docs/run_classification.md): every scheduled run_state carries a
+            # non-null run_classification object with trading_day, same_day_required,
+            # and valid_scheduled_evidence. valid_scheduled_evidence is finalized in
+            # build_artifacts() from the completed state, never asserted blindly here.
+            "trading_day": now.astimezone(EASTERN).date().isoformat(),
+            "same_day_required": not manual,
+            "valid_scheduled_evidence": False,
         }
         return classification
 
@@ -2126,6 +2169,10 @@ class MorningDCAExecutor(DCAExecutor):
             "buy_candidates": buy_candidate_rows,
             "warnings": warnings,
         }
+        # Derive valid_scheduled_evidence from the completed state rather than
+        # asserting it in run_classification(): a scheduled (non-manual) run is
+        # same-day scheduled evidence, a manual run never is.
+        classification["valid_scheduled_evidence"] = derive_valid_scheduled_evidence(artifacts)
         if is_live:
             # Live-mode confidence rule: expose the trend-unvalidated candidates
             # that were withheld from auto-buy for downstream manual review.
@@ -2176,6 +2223,55 @@ class MorningDCAExecutor(DCAExecutor):
         self._augment_artifacts(artifacts, top_up_outcomes)
         return artifacts
 
+    def _same_day_pointer_payload(
+        self, artifacts: Dict[str, Any], run_state_path: Any
+    ) -> Dict[str, Any]:
+        """Build the same-day latest-pointer payload for a scheduled run.
+
+        Emits the required same-day metadata (pointer_status, same_day_required,
+        updated_at_utc, and valid_scheduled_evidence derived from the run_state
+        being pointed at) so downstream consumers can validate the pointer
+        against the current ET day and stream (see scripts/same_day_pointer.py
+        and config/scheduled_tasks.json -> same_day_pointer_validation_policy).
+        """
+        return build_pointer_metadata(
+            run_id=artifacts.get("run_id"),
+            run_state_path=str(run_state_path),
+            stream=artifacts.get("stream", self.stream),
+            trading_day=artifacts.get("trading_day"),
+            valid_scheduled_evidence=derive_valid_scheduled_evidence(artifacts),
+        )
+
+    def _scheduled_pointer_names(self, is_preflight: bool) -> List[str]:
+        """Latest-pointer file names refreshed by a scheduled run.
+
+        The morning live 10:30 task refreshes both ``latest_morning_run.json``
+        and ``latest_morning_live.json`` so live-only consumers and run-level
+        consumers each see the same-day scheduled state. Preflight refreshes its
+        own pointer; other live streams (e.g. midday) refresh only their single
+        stream pointer.
+        """
+        if is_preflight:
+            return ["latest_preflight.json"]
+        names = [self.latest_pointer_name]
+        if self.mode == MORNING_LIVE_MODE and self.stream == MORNING_STREAM:
+            names.append("latest_morning_live.json")
+        return names
+
+    def _write_same_day_pointers(
+        self,
+        pointer_names: Sequence[str],
+        payload: Dict[str, Any],
+        paths: Dict[str, str],
+    ) -> None:
+        """Write ``payload`` to each same-day latest pointer under the state root."""
+        serialized = json.dumps(payload, indent=2, sort_keys=True)
+        for pointer_name in pointer_names:
+            pointer = Path(self.state_root) / pointer_name
+            pointer.parent.mkdir(parents=True, exist_ok=True)
+            pointer.write_text(serialized, encoding="utf-8")
+            paths[pointer_name.replace(".json", "")] = str(pointer)
+
     def write_artifacts(self, artifacts: Dict[str, Any], now: datetime) -> Dict[str, str]:
         """Write morning run_state.json (+ CSV) under the morning run-state root.
 
@@ -2214,21 +2310,16 @@ class MorningDCAExecutor(DCAExecutor):
 
         # Write submitted_orders.csv so detect_drift() can build submitted_symbols.
         # Without this file the detector's submitted set is empty and every auto-buy
-        # signal is falsely reported as an unsubmitted order.
+        # signal is falsely reported as an unsubmitted order. A LIVE run ALWAYS
+        # writes this file (with a header row even when no order was submitted) so
+        # a no-order live run is a well-formed artifact rather than a missing-CSV
+        # contract failure; pending/unconfirmed broker responses keep their concrete
+        # status but still produce a row (see scripts/scheduled_artifacts.py).
         broker_outcomes: Dict[str, Any] = artifacts.get("broker_outcomes") or {}
-        submitted_rows = [
-            {
-                "ticker": ticker,
-                "order_id": outcome.get("order_id"),
-                "submitted_amount_usd": outcome.get("submitted_amount_usd"),
-                "status": outcome.get("status"),
-            }
-            for ticker, outcome in broker_outcomes.items()
-            if outcome.get("status") == "submitted"
-        ]
-        if submitted_rows:
-            orders_path = out / "submitted_orders.csv"
-            _write_csv(orders_path, submitted_rows)
+        submitted_rows = submitted_order_rows(broker_outcomes)
+        is_live_execution = self.mode == MORNING_LIVE_MODE and self.trades
+        if is_live_execution or submitted_rows:
+            orders_path = write_submitted_orders_csv(out, submitted_rows)
             paths["submitted_orders"] = str(orders_path)
 
         is_preflight = self.mode == MORNING_PREFLIGHT_MODE
@@ -2277,24 +2368,12 @@ class MorningDCAExecutor(DCAExecutor):
             )
             paths["orders_csv"] = str(orders_csv_path)
 
-        pointer_name = "latest_preflight.json" if is_preflight else self.latest_pointer_name
         if not artifacts["run_classification"]["manual_run"]:
-            pointer = Path(self.state_root) / pointer_name
-            pointer.parent.mkdir(parents=True, exist_ok=True)
-            pointer.write_text(
-                json.dumps(
-                    {
-                        "run_id": artifacts["run_id"],
-                        "run_state_path": str(run_state_path),
-                        "trading_day": artifacts["trading_day"],
-                        "stream": self.stream,
-                    },
-                    indent=2,
-                    sort_keys=True,
-                ),
-                encoding="utf-8",
+            self._write_same_day_pointers(
+                self._scheduled_pointer_names(is_preflight),
+                self._same_day_pointer_payload(artifacts, run_state_path),
+                paths,
             )
-            paths[pointer_name.replace(".json", "")] = str(pointer)
 
         return paths
 
@@ -2339,23 +2418,13 @@ class MorningDCAExecutor(DCAExecutor):
         if existing is not None:
             # Refresh the scheduled latest pointer to the preserved state so downstream
             # consumers still see a valid, intentional run for this slot.
-            pointer_name = self.latest_pointer_name
-            pointer = Path(self.state_root) / pointer_name
-            pointer.parent.mkdir(parents=True, exist_ok=True)
-            pointer.write_text(
-                json.dumps(
-                    {
-                        "run_id": existing["artifacts"].get("run_id"),
-                        "run_state_path": existing["paths"]["run_state"],
-                        "trading_day": existing["artifacts"].get("trading_day"),
-                        "stream": existing["artifacts"].get("stream", self.stream),
-                    },
-                    indent=2,
-                    sort_keys=True,
+            self._write_same_day_pointers(
+                self._scheduled_pointer_names(is_preflight=False),
+                self._same_day_pointer_payload(
+                    existing["artifacts"], existing["paths"]["run_state"]
                 ),
-                encoding="utf-8",
+                existing["paths"],
             )
-            existing["paths"][pointer_name.replace(".json", "")] = str(pointer)
             return existing
         artifacts = self.build_artifacts(now, signals, source, manual=False)
         artifacts["status"] = "blocked"
@@ -2425,9 +2494,12 @@ class MorningDCAExecutor(DCAExecutor):
         result through the normal artifact pipeline (``build_artifacts``) so the
         persisted run_state carries the standard shape (run_id, generated_at,
         counts, signal/candidate arrays) and watchdog/reporting consumers see a
-        well-formed blocked run rather than a minimal stub. The latest-run pointer
-        is NOT advanced so it continues to point at the last real trading session.
-        Returns None on a normal trading day.
+        well-formed blocked run rather than a minimal stub. The latest-run
+        pointer(s) ARE refreshed to this blocked state -- same as every other
+        scheduled no-op/blocked path in this file -- so a same-day-guard consumer
+        checking "did today's scheduled task fire" sees today's (blocked)
+        evidence instead of a stale pointer left over from the last real trading
+        session. Returns None on a normal trading day.
         """
         trading_day = now.astimezone(EASTERN).date()
         is_weekend = trading_day.weekday() >= 5
@@ -2446,6 +2518,7 @@ class MorningDCAExecutor(DCAExecutor):
             block_reason = "market holiday"
         else:
             block_reason = "outside approved trading window"
+        is_preflight = self.mode == MORNING_PREFLIGHT_MODE
         # Guard: if this date slot already has submitted-order evidence (e.g. the
         # 10:30 live run placed orders and then trading_window.json was briefly
         # malformed, making a retry fire with is_outside_window=True), never
@@ -2453,6 +2526,11 @@ class MorningDCAExecutor(DCAExecutor):
         # and losing submitted orders would allow a duplicate allocation.
         existing = self._existing_submitted_run_state(now)
         if existing is not None:
+            self._write_same_day_pointers(
+                self._scheduled_pointer_names(is_preflight),
+                self._same_day_pointer_payload(existing["artifacts"], existing["paths"]["run_state"]),
+                existing["paths"],
+            )
             return existing
         artifacts = self.build_artifacts(now, [], "none", manual=manual)
         artifacts["status"] = "blocked"
@@ -2470,7 +2548,22 @@ class MorningDCAExecutor(DCAExecutor):
             json.dumps(artifacts, indent=2, sort_keys=True),
             encoding="utf-8",
         )
-        return {"artifacts": artifacts, "paths": {"run_state": str(state_path)}}
+        paths = {"run_state": str(state_path)}
+        # Codex review r3623389445: this early calendar/window gate bypasses
+        # write_artifacts() entirely, so a scheduled LIVE block (weekend,
+        # holiday, outside approved window) must still write submitted_orders.csv
+        # (header only -- no orders were ever attempted) or the run directory
+        # fails scripts/scheduled_artifacts.py's live artifact contract and
+        # detect_drift() sees a missing-CSV failure instead of a clean no-op.
+        if self.mode == MORNING_LIVE_MODE and self.trades:
+            orders_path = write_submitted_orders_csv(out, [])
+            paths["submitted_orders"] = str(orders_path)
+        self._write_same_day_pointers(
+            self._scheduled_pointer_names(is_preflight),
+            self._same_day_pointer_payload(artifacts, state_path),
+            paths,
+        )
+        return {"artifacts": artifacts, "paths": paths}
 
     def _seed_ledger_from_prior_runs(self, now: datetime) -> None:
         """Fold already-submitted same-day/same-week spend into the ledger.
@@ -3275,8 +3368,9 @@ class MorningDCAExecutor(DCAExecutor):
             #   "skipped"/"cap_exceeded" — guard fired or budget cap blocked
             #   "dry_run" — DryRunBroker intentionally placed no real order;
             #     write_artifacts() only emits submitted_orders.csv rows for
-            #     status=="submitted", so a dry-run candidate never gets an
-            #     order row and would otherwise false-alert every run
+            #     placed/in-flight statuses (submitted/filled/pending/unconfirmed)
+            #     or an order_id, so a dry-run candidate never gets an order row
+            #     and would otherwise false-alert every run
             #   blocked with deliberate_skip=True — safety gate (ceiling, spread,
             #     tradability, buying power, review blocked); these are explicit
             #     strategy decisions, not unexpected failures
