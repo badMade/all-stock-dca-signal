@@ -8,6 +8,7 @@ from datetime import date
 import pytest
 
 from dca_config import (
+    _read_json,
     load_approved_dates,
     load_budgets,
     load_sizing_tiers,
@@ -144,3 +145,22 @@ def test_malformed_json_raises(tmp_path):
     (tmp_path / "tickers.json").write_text("{not valid json", encoding="utf-8")
     with pytest.raises(ValueError, match="could not parse"):
         load_tickers(tmp_path)
+
+def test_read_json_missing_file(tmp_path):
+    assert _read_json(tmp_path / "missing.json") is None
+
+def test_read_json_oserror(tmp_path):
+    # Simulate OSError by trying to read a directory instead of a file
+    with pytest.raises(ValueError, match="could not parse config file"):
+        _read_json(tmp_path)
+
+def test_read_json_not_a_dict(tmp_path):
+    file_path = tmp_path / "not_dict.json"
+    file_path.write_text("[1, 2, 3]", encoding="utf-8")
+    with pytest.raises(ValueError, match="must contain a JSON object, got list"):
+        _read_json(file_path)
+
+def test_read_json_valid(tmp_path):
+    file_path = tmp_path / "valid.json"
+    file_path.write_text('{"key": "value"}', encoding="utf-8")
+    assert _read_json(file_path) == {"key": "value"}
