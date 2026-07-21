@@ -871,7 +871,13 @@ def completed_bar_anchor(decision_dt: datetime, interval_minutes: int, config: S
 
 
 def latest_bar_at_or_before(bars: Iterable[Bar], target: datetime) -> Optional[Bar]:
-    return max((bar for bar in bars if bar.timestamp <= target), key=lambda bar: bar.timestamp, default=None)
+    # ⚡ Bolt Optimization: single-pass loop avoids per-candidate key=lambda calls and generator-expression overhead in this hot path.
+    best = None
+    for bar in bars:
+        if bar.timestamp <= target:
+            if best is None or bar.timestamp > best.timestamp:
+                best = bar
+    return best
 
 
 def kill_switch_engaged(config: StrategyConfig) -> bool:
