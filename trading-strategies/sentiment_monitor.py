@@ -40,12 +40,11 @@ from typing import Dict, List, Optional, Tuple
 # Third-party imports
 # ---------------------------------------------------------------------------
 import numpy as np
-import pandas as pd
 import requests
+import torch
 from jinja2 import Environment
 from newsapi import NewsApiClient
-from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
-import torch
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
 
 # ---------------------------------------------------------------------------
 # Logging setup
