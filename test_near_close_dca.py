@@ -2193,5 +2193,30 @@ def test_prior_run_before_boundary_malformed_iso_format():
     assert _prior_run_before_boundary(run_state, boundary_et) is True
 
 
+def test_iso_week_key():
+    from near_close_dca import iso_week_key
+
+    # Regular mid-week date
+    assert iso_week_key(date(2023, 10, 18)) == (2023, 42)  # Wednesday
+
+    # Year boundaries
+    assert iso_week_key(date(2023, 12, 31)) == (2023, 52)  # Sunday, last day of 2023 ISO week 52
+    assert iso_week_key(date(2024, 1, 1)) == (2024, 1)    # Monday, first day of 2024 ISO week 1
+
+    # Leap year (2024)
+    assert iso_week_key(date(2024, 2, 29)) == (2024, 9)   # Thursday, Leap day
+
+    # A year where Jan 1st is in the previous year's week 52/53
+    # Jan 1, 2023 was a Sunday. ISO weeks start on Monday.
+    # Therefore, Jan 1 2023 belongs to the last ISO week of 2022.
+    assert iso_week_key(date(2023, 1, 1)) == (2022, 52)
+    assert iso_week_key(date(2023, 1, 2)) == (2023, 1)    # Monday, starts week 1 of 2023
+
+    # 53-week year boundary (e.g., 2020)
+    assert iso_week_key(date(2020, 12, 31)) == (2020, 53) # Thursday, week 53
+    assert iso_week_key(date(2021, 1, 3)) == (2020, 53)   # Sunday, last day of week 53
+    assert iso_week_key(date(2021, 1, 4)) == (2021, 1)    # Monday, starts week 1 of 2021
+
+
 if __name__ == "__main__":
     _run_all()
