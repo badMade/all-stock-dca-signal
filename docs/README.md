@@ -23,7 +23,7 @@ workflow, and Notion template. **No credentials or secrets are stored here.**
 ## Machine-readable backup
 
 - [`../config/`](../config) — tickers, sizing ladder, budgets, scheduled tasks, notifications, reporting.
-- [`../schemas/`](../schemas) — JSON schemas for config, run-state, slippage, and cost-tracker artifacts.
+- [`../schemas/`](../schemas) — JSON schemas for config, run-state, slippage, cost-tracker, and model-usage-log artifacts.
 - [`../scripts/`](../scripts) — `backup_strategy.py` to re-extract config from a transcript, `run_classification.py` to enforce the scheduled-vs-manual contract, plus tests.
 
 ## Key facts (quick reference)

@@ -393,6 +393,123 @@ def test_generate_scheduled_reports_routes_through_classification(tmp_path=None)
     assert "NVDA" not in Path(paths["slippage_ranked"]).read_text()
 
 
+def test_generate_scheduled_reports_does_not_write_model_usage_log_by_default(tmp_path=None):
+    import tempfile
+    from pathlib import Path
+
+    from dca_reporting import generate_scheduled_reports
+
+    build_sched, _build_manual, write_run_artifacts = _classification_helpers()
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-06"
+    write_run_artifacts(
+        _sched_state(day, [("AAPL", "O1")], build_sched(day, f"{day}T19:20:01Z")), base=base,
+    )
+    fills = [{"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 0.03, "order_id": "O1"}]
+    generate_scheduled_reports(day, fills, base / "reports", base=base)
+    assert not (base / "model_usage").exists()
+
+
+def test_generate_scheduled_reports_appends_model_usage_log_entry_when_root_configured(tmp_path=None):
+    import tempfile
+    from pathlib import Path
+
+    from dca_reporting import generate_scheduled_reports
+    from scripts.model_usage_log import resolve_log_path
+
+    build_sched, _build_manual, write_run_artifacts = _classification_helpers()
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-06"
+    write_run_artifacts(
+        _sched_state(day, [("AAPL", "O1")], build_sched(day, f"{day}T19:20:01Z")), base=base,
+    )
+    fills = [{"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 0.03, "order_id": "O1"}]
+    log_root = base / "model_usage"
+    report_paths = generate_scheduled_reports(
+        day, fills, base / "reports", base=base, model_usage_log_root=log_root
+    )
+
+    from datetime import datetime, timezone
+
+    log_path = resolve_log_path(datetime.now(timezone.utc), root=log_root)
+    assert log_path.exists()
+    entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+    assert entry["cron_id"] == "67aa802b"
+    # A distinct run_id/artifact for THIS reporting task, not the 15:20 live
+    # run's own run_id/run_state.json -- the live run's run_id is still
+    # referenced in notes.
+    assert entry["run_id"] == f"reporting_{day}_1535ET"
+    assert entry["artifact_path"] == str(base / "reports")
+    assert f"{day}-152001" in entry["notes"]
+    assert entry["run_origin"] == "scheduled"
+    assert Path(report_paths["latest_run_summary"]).exists()
+
+
+def test_generate_scheduled_reports_records_premium_routing_metadata_when_supplied(tmp_path=None):
+    import tempfile
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    from dca_reporting import generate_scheduled_reports
+    from scripts.model_usage_log import resolve_log_path
+
+    build_sched, _build_manual, write_run_artifacts = _classification_helpers()
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-06"
+    write_run_artifacts(
+        _sched_state(day, [("AAPL", "O1")], build_sched(day, f"{day}T19:20:01Z")), base=base,
+    )
+    fills = [{"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 0.03, "order_id": "O1"}]
+    log_root = base / "model_usage"
+    generate_scheduled_reports(
+        day, fills, base / "reports", base=base,
+        model_usage_log_root=log_root,
+        model_usage_model_routing_mode="premium",
+        model_usage_reason_for_premium_model="explicit_user_request",
+    )
+    log_path = resolve_log_path(datetime.now(timezone.utc), root=log_root)
+    entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+    assert entry["model_routing_mode"] == "premium"
+    assert entry["reason_for_premium_model"] == "explicit_user_request"
+
+
+def test_generate_scheduled_reports_logs_even_when_report_generation_fails(tmp_path, monkeypatch):
+    # If generate_reports() raises (e.g. a report artifact can't be written),
+    # the append still happens -- the one-entry-per-task-run contract holds
+    # even for a failed run -- and the original exception still propagates.
+    from datetime import datetime, timezone
+
+    import dca_reporting
+    from scripts.model_usage_log import resolve_log_path
+
+    build_sched, _build_manual, write_run_artifacts = _classification_helpers()
+    base = tmp_path / "root"
+    day = "2026-07-06"
+    write_run_artifacts(
+        _sched_state(day, [("AAPL", "O1")], build_sched(day, f"{day}T19:20:01Z")), base=base,
+    )
+    fills = [{"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 0.03, "order_id": "O1"}]
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("report artifact write failed")
+
+    monkeypatch.setattr(dca_reporting, "generate_reports", _boom)
+
+    log_root = base / "model_usage"
+    try:
+        dca_reporting.generate_scheduled_reports(
+            day, fills, base / "reports", base=base, model_usage_log_root=log_root
+        )
+        raise AssertionError("expected RuntimeError to propagate")
+    except RuntimeError as exc:
+        assert "report artifact write failed" in str(exc)
+
+    log_path = resolve_log_path(datetime.now(timezone.utc), root=log_root)
+    assert log_path.exists()
+    entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+    assert entry["run_id"] == f"reporting_{day}_1535ET"
+
+
 def test_generate_scheduled_reports_excludes_fills_for_confirmation_blocked_run(tmp_path=None):
     import tempfile
     from pathlib import Path

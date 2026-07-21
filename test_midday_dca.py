@@ -785,6 +785,25 @@ def test_load_midday_config_reads_approved_dates_from_trading_window(tmp_path):
     assert cfg.decision_time_et is None
 
 
+def test_load_midday_config_enables_model_usage_log_by_default(tmp_path):
+    # Mirrors load_morning_config: the normal configuration path must resolve
+    # a working model_usage_log_root by default so the audit log isn't
+    # silently disabled in production.
+    from morning_dca import DEFAULT_MODEL_USAGE_LOG_ROOT
+
+    cfg = load_midday_config(str(tmp_path / "nonexistent"))
+    assert cfg.model_usage_log_root == DEFAULT_MODEL_USAGE_LOG_ROOT
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "midday_dca.json").write_text(
+        json.dumps({"artifact_paths": {"model_usage_log_root": "/custom/model_usage"}}),
+        encoding="utf-8",
+    )
+    cfg = load_midday_config(str(cfg_dir))
+    assert cfg.model_usage_log_root == "/custom/model_usage"
+
+
 def test_midday_executor_default_init_loads_shipped_config():
     ex = MiddayDCAExecutor()
     assert ex.config.base_buy_amount_usd == 2.0

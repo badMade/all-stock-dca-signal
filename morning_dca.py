@@ -85,6 +85,8 @@ from near_close_dca import (
     load_prior_same_day_allocations_multi,
     quote_spread_pct,
 )
+from scripts.model_usage_log import DEFAULT_LOG_ROOT as DEFAULT_MODEL_USAGE_LOG_ROOT
+from scripts.model_usage_log import log_model_usage
 from scripts.run_classification import save_raw_input
 
 _log = logging.getLogger(__name__)
@@ -262,6 +264,21 @@ MORNING_MINIMUM_DROP = 0.001
 logger = logging.getLogger(__name__)
 
 
+def _model_usage_routing_overrides(config: Any) -> Dict[str, Any]:
+    """Build the log_model_usage() kwargs for the config's routing-metadata
+    overrides (see MorningConfig.model_usage_model_* / *_reason_for_premium_model),
+    including only the fields the caller actually set so unset ones fall back to
+    log_model_usage's own cost-conscious defaults rather than being overridden
+    with an explicit None (which build_entry would reject)."""
+    overrides = {
+        "model_requested": getattr(config, "model_usage_model_requested", None),
+        "model_actual": getattr(config, "model_usage_model_actual", None),
+        "model_routing_mode": getattr(config, "model_usage_model_routing_mode", None),
+        "reason_for_premium_model": getattr(config, "model_usage_reason_for_premium_model", None),
+    }
+    return {k: v for k, v in overrides.items() if v is not None}
+
+
 def _nth_weekday_of_month(year: int, month: int, weekday: int, n: int) -> date:
     """Return the date of the ``n``-th ``weekday`` (0=Mon..6=Sun) in ``year``/``month``."""
     first = date(year, month, 1)
@@ -390,6 +407,23 @@ class MorningConfig:
     # Optional explicit artifact-root override. When None the executor uses the
     # active mode's default root (watchlist vs. live).
     morning_run_state_root: Optional[str] = None
+    # Opt-in root for the model_usage_log audit append (see
+    # scripts/model_usage_log.py, config/scheduled_tasks.json ->
+    # model_usage_log). None (default) disables the append entirely -- tests
+    # and any caller that hasn't set this up never write to it.
+    model_usage_log_root: Optional[str] = None
+    # Routing metadata for the model_usage_log entry, overriding
+    # log_model_usage's cost-conscious defaults. This code has no visibility
+    # into which model/agent actually drove the run, so these stay None
+    # unless the scheduler that invoked this run explicitly knows it used a
+    # permitted premium escalation (e.g. failure recovery) and sets them --
+    # e.g. via a wrapper that passes replace(config, model_routing_mode=...)
+    # before calling run(). reason_for_premium_model is required (and only
+    # meaningful) when model_routing_mode == "premium".
+    model_usage_model_requested: Optional[str] = None
+    model_usage_model_actual: Optional[str] = None
+    model_usage_model_routing_mode: Optional[str] = None
+    model_usage_reason_for_premium_model: Optional[str] = None
     # Root the 10:30 live gate reads the same-day 9:45 pre-flight artifact from.
     # When None the live executor uses DEFAULT_MORNING_PREFLIGHT_STATE_ROOT.
     preflight_run_state_root: Optional[str] = None
@@ -732,10 +766,13 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
             "morning_dca.json not found at %s; using MorningConfig defaults", cfg_path
         )
         approved_dates = _load_approved_dates_fail_closed(config_dir_path)
-        return MorningConfig(approved_test_dates=approved_dates)
+        return MorningConfig(
+            approved_test_dates=approved_dates, model_usage_log_root=DEFAULT_MODEL_USAGE_LOG_ROOT
+        )
 
     approved_date_overrides = {
-        "approved_test_dates": _load_approved_dates_fail_closed(config_dir_path)
+        "approved_test_dates": _load_approved_dates_fail_closed(config_dir_path),
+        "model_usage_log_root": DEFAULT_MODEL_USAGE_LOG_ROOT,
     }
 
     try:
@@ -809,6 +846,14 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
     cap_roots = artifact_paths.get("cap_seed_roots")
     if isinstance(cap_roots, list) and cap_roots:
         kwargs["cap_seed_roots"] = tuple(str(r) for r in cap_roots)
+    # model_usage_log_root (see scripts/model_usage_log.py, config/scheduled_tasks.json
+    # -> model_usage_log): defaults to DEFAULT_MODEL_USAGE_LOG_ROOT above so the audit
+    # log is enabled for every real load_morning_config() caller; an explicit
+    # artifact_paths.model_usage_log_root overrides it, and null/empty-string disables
+    # the append entirely for this stream.
+    if "model_usage_log_root" in artifact_paths:
+        configured_log_root = artifact_paths["model_usage_log_root"]
+        kwargs["model_usage_log_root"] = str(configured_log_root) if configured_log_root else None
 
     # Only apply the fail-closed per-order cap in live mode: watchlist/preflight runs
     # never reach broker placement, so a malformed budgets.json must not block the
@@ -2995,7 +3040,33 @@ class MorningDCAExecutor(DCAExecutor):
         are submitted via the broker to the account configured in
         ``target_account_number`` and outcomes recorded in the artifacts.
         Alpaca stays read-only.
+
+        Thin wrapper around ``_run_impl`` so the model_usage_log append (see
+        scripts/model_usage_log.py) happens exactly once per call, regardless
+        of which of ``_run_impl``'s several early-return paths was taken,
+        without touching any of that method's trading/safety logic.
         """
+        result = self._run_impl(now, data, broker=broker, data_source=data_source, manual=manual)
+        log_model_usage(
+            root=self.config.model_usage_log_root,
+            run_id=result.get("artifacts", {}).get("run_id"),
+            cron_id=self.profile.get("cron_id"),
+            run_origin="manual" if manual else "scheduled",
+            artifact_path=result.get("paths", {}).get("run_state"),
+            triggered_at_utc=now.astimezone(timezone.utc),
+            **_model_usage_routing_overrides(self.config),
+        )
+        return result
+
+    def _run_impl(
+        self,
+        now: datetime,
+        data: Any,
+        *,
+        broker: Optional[BrokerAdapter] = None,
+        data_source: Optional[str] = None,
+        manual: bool = False,
+    ) -> Dict[str, Any]:
         blocked = self._maybe_block_for_holiday(now, manual=manual)
         if blocked is not None:
             return blocked

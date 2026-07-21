@@ -25,7 +25,7 @@ import os
 os.environ.setdefault("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "562057042")
 
 import json
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -40,6 +40,7 @@ from morning_dca import (
     MORNING_CRON_ID,
     MORNING_LIVE_CRON_ID,
     MORNING_LIVE_MODE,
+    MORNING_PREFLIGHT_CRON_ID,
     MORNING_PREFLIGHT_MODE,
     MORNING_SIZING_TIERS,
     DCAExecutor,
@@ -1814,6 +1815,41 @@ def test_load_morning_config_falls_back_to_defaults_if_missing(tmp_path):
     defaults = MorningConfig()
     assert cfg.base_buy_amount_usd == defaults.base_buy_amount_usd
     assert cfg.morning_daily_cap_usd == defaults.morning_daily_cap_usd
+
+
+def test_load_morning_config_enables_model_usage_log_by_default(tmp_path):
+    # load_morning_config is the "normal configuration path" real scheduled
+    # runs use, so it must resolve a working model_usage_log_root by default
+    # (unlike the bare MorningConfig() dataclass default of None, which
+    # protects ad-hoc/test construction) -- otherwise the audit log the
+    # manifest/docs promise is silently disabled in production.
+    from morning_dca import DEFAULT_MODEL_USAGE_LOG_ROOT, load_morning_config
+
+    # Missing config file.
+    cfg = load_morning_config(str(tmp_path / "nonexistent"))
+    assert cfg.model_usage_log_root == DEFAULT_MODEL_USAGE_LOG_ROOT
+
+    # Present but empty config file.
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "morning_dca.json").write_text("{}", encoding="utf-8")
+    cfg = load_morning_config(str(cfg_dir))
+    assert cfg.model_usage_log_root == DEFAULT_MODEL_USAGE_LOG_ROOT
+
+    # Explicit override via artifact_paths.model_usage_log_root.
+    (cfg_dir / "morning_dca.json").write_text(
+        json.dumps({"artifact_paths": {"model_usage_log_root": "/custom/model_usage"}}),
+        encoding="utf-8",
+    )
+    cfg = load_morning_config(str(cfg_dir))
+    assert cfg.model_usage_log_root == "/custom/model_usage"
+
+    # Explicit null disables it for this stream.
+    (cfg_dir / "morning_dca.json").write_text(
+        json.dumps({"artifact_paths": {"model_usage_log_root": None}}), encoding="utf-8"
+    )
+    cfg = load_morning_config(str(cfg_dir))
+    assert cfg.model_usage_log_root is None
 
 
 # --- PR #22 bot-review regression coverage (batch: morning config loading) ---
@@ -4961,6 +4997,98 @@ def test_scheduled_live_run_surfaces_non_fatal_raw_persistence_error(tmp_path):
     assert artifacts.get("status") != "blocked"
     assert "raw_persistence_error" in artifacts
     assert "SMALL" in artifacts.get("broker_outcomes", {})
+
+
+def test_run_does_not_write_model_usage_log_by_default(tmp_path):
+    # model_usage_log_root defaults to None -- run() must not touch any
+    # model-usage path unless a caller opts in explicitly.
+    cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
+    ex = MorningDCAExecutor(cfg)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    ex.run(_now(), data)
+    assert not (tmp_path / "model_usage").exists()
+
+
+def test_run_appends_model_usage_log_entry_when_root_configured(tmp_path):
+    import json as _json
+
+    from scripts.model_usage_log import resolve_log_path
+
+    log_root = tmp_path / "model_usage"
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "state"),
+        model_usage_log_root=str(log_root),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_PREFLIGHT_MODE)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    now = _now()
+    res = ex.run(now, data)
+
+    log_path = resolve_log_path(now.astimezone(timezone.utc), root=log_root)
+    assert log_path.exists()
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    entry = _json.loads(lines[0])
+    assert entry["cron_id"] == MORNING_PREFLIGHT_CRON_ID
+    assert entry["run_id"] == res["artifacts"]["run_id"]
+    assert entry["artifact_path"] == res["paths"]["run_state"]
+    assert entry["run_origin"] == "scheduled"
+    assert entry["model_actual"] == "not_exposed"
+    assert entry["model_routing_mode"] == "cost_conscious"
+
+
+def test_run_manual_logs_manual_run_origin(tmp_path):
+    import json as _json
+
+    from scripts.model_usage_log import resolve_log_path
+
+    log_root = tmp_path / "model_usage"
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "state"),
+        model_usage_log_root=str(log_root),
+    )
+    ex = MorningDCAExecutor(cfg)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    now = _now()
+    ex.run(now, data, manual=True)
+
+    log_path = resolve_log_path(now.astimezone(timezone.utc), root=log_root)
+    entry = _json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+    assert entry["run_origin"] == "manual"
+
+
+def test_run_records_premium_routing_metadata_when_config_supplies_it(tmp_path):
+    # By default every run logs as cost_conscious (this code has no way to
+    # know the real routing mode). A caller that DOES know -- e.g. the
+    # scheduler escalated to a premium model for failure recovery -- can
+    # override it via MorningConfig's model_usage_model_* fields.
+    import json as _json
+
+    from scripts.model_usage_log import resolve_log_path
+
+    log_root = tmp_path / "model_usage"
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "state"),
+        model_usage_log_root=str(log_root),
+        model_usage_model_requested="claude-opus-4-8",
+        model_usage_model_actual="claude-opus-4-8",
+        model_usage_model_routing_mode="premium",
+        model_usage_reason_for_premium_model="failure_recovery",
+    )
+    ex = MorningDCAExecutor(cfg)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    now = _now()
+    ex.run(now, data)
+
+    log_path = resolve_log_path(now.astimezone(timezone.utc), root=log_root)
+    entry = _json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+    assert entry["model_routing_mode"] == "premium"
+    assert entry["reason_for_premium_model"] == "failure_recovery"
+    assert entry["model_requested"] == "claude-opus-4-8"
+    assert entry["model_actual"] == "claude-opus-4-8"
 
 
 if __name__ == "__main__":

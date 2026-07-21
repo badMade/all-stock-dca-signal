@@ -22,6 +22,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
@@ -559,11 +560,26 @@ def _run_classification_helpers():
     return collect_manual_order_ids, select_scheduled_state_for_reporting
 
 
+def _model_usage_log_helper():
+    """Import the model usage log writer, tolerating either import layout
+    (repo-root namespace package ``scripts`` or ``scripts/`` on sys.path)."""
+    try:
+        from scripts.model_usage_log import log_model_usage  # type: ignore
+    except ImportError:  # scripts/ directly on sys.path
+        from model_usage_log import log_model_usage  # type: ignore
+    return log_model_usage
+
+
 def generate_scheduled_reports(
     trading_day: str,
     fills: Sequence[Dict[str, Any]],
     output_dir: str | Path,
     base: Optional[str | Path] = None,
+    model_usage_log_root: Optional[str | Path] = None,
+    model_usage_model_requested: Optional[str] = None,
+    model_usage_model_actual: Optional[str] = None,
+    model_usage_model_routing_mode: Optional[str] = None,
+    model_usage_reason_for_premium_model: Optional[str] = None,
 ) -> Dict[str, str]:
     """Task 67aa802b entry point: post-trade reports for the SCHEDULED run only.
 
@@ -575,6 +591,15 @@ def generate_scheduled_reports(
 
     ``fills`` is the same broker fill list ``generate_reports`` takes; ``base``
     overrides the artifact root (defaults to the contract's STATE_ROOT).
+    ``model_usage_log_root`` is opt-in (see scripts/model_usage_log.py,
+    config/scheduled_tasks.json -> model_usage_log): None (the default) skips
+    the audit-log append entirely (appended even when report generation
+    raises, so a failed run is still recorded). The ``model_usage_model_*``/
+    ``model_usage_reason_for_premium_model`` kwargs override
+    ``log_model_usage``'s cost-conscious defaults -- this function has no
+    visibility into which model/agent actually drove the run, so they stay
+    unset unless the scheduler invoking this call explicitly knows it used a
+    permitted premium escalation and passes them.
     """
     collect_manual_order_ids, select_scheduled = _run_classification_helpers()
     base_path = Path(base) if base is not None else None
@@ -656,10 +681,39 @@ def generate_scheduled_reports(
                     # UTF-8 persisted raw orders as a fallback miss").
                     pass
 
-    return generate_reports(
-        selection.state,
-        fills,
-        output_dir,
-        exclude_order_ids=manual_ids,
-        require_scheduled=True,
-    )
+    # This reporting task's own identity/artifact -- distinct from the live
+    # run (selection.state_path) it is reporting ON, so the audit log points
+    # an auditor at what THIS task produced (output_dir), not the afternoon
+    # 15:20 live task's run_state.json. The live run's own run_id is kept in
+    # `notes` as an explicit input reference.
+    report_run_id = f"reporting_{trading_day}_1535ET"
+    source_run_id = (selection.state or {}).get("run_id")
+    log_model_usage = _model_usage_log_helper()
+    routing_overrides = {
+        "model_requested": model_usage_model_requested,
+        "model_actual": model_usage_model_actual,
+        "model_routing_mode": model_usage_model_routing_mode,
+        "reason_for_premium_model": model_usage_reason_for_premium_model,
+    }
+    try:
+        report_paths = generate_reports(
+            selection.state,
+            fills,
+            output_dir,
+            exclude_order_ids=manual_ids,
+            require_scheduled=True,
+        )
+    finally:
+        # Best-effort append even when generate_reports raises, so a failed
+        # report run is still recorded per the one-entry-per-task-run contract.
+        log_model_usage(
+            root=model_usage_log_root,
+            run_id=report_run_id,
+            cron_id="67aa802b",
+            run_origin="scheduled",
+            artifact_path=str(output_dir),
+            triggered_at_utc=datetime.now(timezone.utc),
+            notes=f"post-trade reports for live run {source_run_id}",
+            **{k: v for k, v in routing_overrides.items() if v is not None},
+        )
+    return report_paths

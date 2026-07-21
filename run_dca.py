@@ -51,6 +51,10 @@ from near_close_dca import (
     load_prior_same_day_allocations_multi,
     run_daily_compact,
 )
+from scripts.model_usage_log import log_model_usage
+from scripts.run_classification import (
+    CRON_ID as AFTERNOON_LIVE_CRON_ID,
+)
 from scripts.run_classification import (
     build_raw_persistence_state,
     raw_persistence_failure_run_state,
@@ -578,6 +582,94 @@ def _default_prior_allocation_state_root(artifacts_dir: Path) -> Path:
 
 
 def run_pipeline(
+    now: datetime,
+    config: StrategyConfig,
+    state: StrategyState,
+    finance_data: MarketDataProvider,
+    robinhood_data: MarketDataProvider,
+    broker: BrokerAdapter,
+    *,
+    artifacts_dir: str | Path,
+    run_label: str = "daily",
+    scheduled: bool = True,
+    generate_full_reports: bool = False,
+    ignore_trend_filter: bool = False,
+    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]] = None,
+    prior_allocation_state_root: Optional[str | Path] = None,
+    deployment_history_root: Optional[str | Path] = None,
+    classification_state_root: Optional[str | Path] = None,
+    config_dir: Optional[str | Path] = None,
+    raw_connector_inputs: Optional[Mapping[str, Any]] = None,
+    required_raw_filenames: Optional[frozenset] = None,
+    model_usage_log_root: Optional[str | Path] = None,
+    model_usage_model_requested: Optional[str] = None,
+    model_usage_model_actual: Optional[str] = None,
+    model_usage_model_routing_mode: Optional[str] = None,
+    model_usage_reason_for_premium_model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Thin wrapper around ``_run_pipeline_impl``: same signature plus the
+    opt-in ``model_usage_log_root`` (see scripts/model_usage_log.py,
+    config/scheduled_tasks.json -> model_usage_log). None (the default)
+    skips the audit-log append entirely, matching every other opt-in root in
+    this function's signature (e.g. ``classification_state_root``).
+
+    Wrapping rather than inlining the append into ``_run_pipeline_impl``
+    means the append happens exactly once per call regardless of which of
+    that function's several early-return paths was taken, without touching
+    any of its trading/safety logic.
+
+    The ``model_usage_model_*``/``model_usage_reason_for_premium_model``
+    kwargs override ``log_model_usage``'s cost-conscious defaults -- this
+    function has no visibility into which model/agent actually drove the
+    run, so they stay unset unless the scheduler invoking this call
+    explicitly knows it used a permitted premium escalation and passes them.
+    """
+    result = _run_pipeline_impl(
+        now,
+        config,
+        state,
+        finance_data,
+        robinhood_data,
+        broker,
+        artifacts_dir=artifacts_dir,
+        run_label=run_label,
+        scheduled=scheduled,
+        generate_full_reports=generate_full_reports,
+        ignore_trend_filter=ignore_trend_filter,
+        prior_same_day_allocations=prior_same_day_allocations,
+        prior_allocation_state_root=prior_allocation_state_root,
+        deployment_history_root=deployment_history_root,
+        classification_state_root=classification_state_root,
+        config_dir=config_dir,
+        raw_connector_inputs=raw_connector_inputs,
+        required_raw_filenames=required_raw_filenames,
+    )
+    run_state_path = result.get("run_state_path")
+    run_id = None
+    if run_state_path:
+        try:
+            run_id = json.loads(Path(run_state_path).read_text(encoding="utf-8")).get("run_id")
+        except (OSError, json.JSONDecodeError):
+            run_id = None
+    routing_overrides = {
+        "model_requested": model_usage_model_requested,
+        "model_actual": model_usage_model_actual,
+        "model_routing_mode": model_usage_model_routing_mode,
+        "reason_for_premium_model": model_usage_reason_for_premium_model,
+    }
+    log_model_usage(
+        root=model_usage_log_root,
+        run_id=run_id,
+        cron_id=AFTERNOON_LIVE_CRON_ID,
+        run_origin="scheduled" if scheduled else "manual",
+        artifact_path=run_state_path,
+        triggered_at_utc=now.astimezone(timezone.utc),
+        **{k: v for k, v in routing_overrides.items() if v is not None},
+    )
+    return result
+
+
+def _run_pipeline_impl(
     now: datetime,
     config: StrategyConfig,
     state: StrategyState,

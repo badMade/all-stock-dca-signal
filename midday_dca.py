@@ -44,6 +44,7 @@ from typing import Any, Dict, Optional, Tuple
 from dca_config import load_tickers
 from morning_dca import (
     DEFAULT_AFTERNOON_TASK_ROOT,
+    DEFAULT_MODEL_USAGE_LOG_ROOT,
     DEFAULT_MORNING_LIVE_STATE_ROOT,
     EXEC_MANUAL_REVIEW_CANDIDATE,
     MorningConfig,
@@ -169,11 +170,13 @@ def load_midday_config(config_dir=None) -> MiddayConfig:
     if not cfg_path.exists():
         _log.warning("midday_dca.json not found at %s; using MiddayConfig defaults", cfg_path)
         return MiddayConfig(
-            approved_test_dates=_load_approved_dates_fail_closed(config_dir_path)
+            approved_test_dates=_load_approved_dates_fail_closed(config_dir_path),
+            model_usage_log_root=DEFAULT_MODEL_USAGE_LOG_ROOT,
         )
 
     approved_date_overrides = {
-        "approved_test_dates": _load_approved_dates_fail_closed(config_dir_path)
+        "approved_test_dates": _load_approved_dates_fail_closed(config_dir_path),
+        "model_usage_log_root": DEFAULT_MODEL_USAGE_LOG_ROOT,
     }
 
     try:
@@ -216,6 +219,13 @@ def load_midday_config(config_dir=None) -> MiddayConfig:
         # Preserve [] as () so an explicit empty array in JSON fully disables
         # the guard (consistent with load_morning_config).
         kwargs["prior_allocation_roots"] = tuple(str(r) for r in roots)
+
+    # model_usage_log_root: defaults to DEFAULT_MODEL_USAGE_LOG_ROOT above
+    # (consistent with load_morning_config); an explicit
+    # artifact_paths.model_usage_log_root overrides it, null/empty disables it.
+    if "model_usage_log_root" in artifact_paths:
+        configured_log_root = artifact_paths["model_usage_log_root"]
+        kwargs["model_usage_log_root"] = str(configured_log_root) if configured_log_root else None
 
     max_order = load_max_per_order_usd(config_dir_path)
     if max_order is not None:

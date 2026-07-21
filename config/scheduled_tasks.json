@@ -3,6 +3,7 @@
   "version": "2026-07-20",
   "verified_on_et": "2026-07-20",
   "timezone_note": "Cron expressions are in UTC. ET equivalents are in America/New_York and vary with DST. Confirm around DST transitions.",
+  "change_note_2026_07_20": "Consolidated the cost-conscious model-routing policy for daily DCA into the authoritative model_routing_policy section and reaffirmed it on every active daily task (9:00 pre-market dashboard, 9:45 volatility scan, 9:45 pre-flight, 10:30 morning live, 12:30 midday live, 3:05 monitor, 3:20 final live, 3:35 slippage/latest-run sync, 3:40 watchdog). Daily DCA uses cost-conscious/default model routing where available; premium models (e.g. ChatGPT 5.5) are reserved for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Documentation/cost-behavior only: preserves the $2.00 base amount, 0x-to-5x ladder, Finance-primary read-only market-data policy, GFUZ/TXN active universe, BYDDY/VCX/TRLV/RVI exclusions, same-day top-up guards, safety rules, and run-classification text unchanged.",
   "operating_mode": {
     "mode": "cost_saving_daily_compact",
     "requested_on_et": "2026-07-16",
@@ -23,7 +24,7 @@
       "Batch market-data pulls where possible; persist each raw connector response once and have downstream steps read the saved files rather than re-pulling.",
       "Limit Notion writes to the compact Latest Run update daily; refresh the full Notion page only in the Friday weekly refresh.",
       "Cap automated retries at one targeted recovery rerun (see recovery_policy).",
-      "Use cost-conscious / default models for routine repo, script, and summary maintenance; reserve premium models for major architecture or debugging work."
+      "Use cost-conscious / default model routing where available for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, and normal notification/reporting; do NOT use ChatGPT 5.5 or other premium models for these. Premium models are allowed only for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality (see model_routing_policy)."
     ],
     "actionable_notification_events": [
       "placed orders",
@@ -61,7 +62,7 @@
       "Persist raw connector responses once per run; downstream compute reads the saved files (see raw_data_persistence on task 10ce362c).",
       "Daily Notion write = Latest Run section only; full page weekly.",
       "One recovery rerun cap for automated retries.",
-      "Cost-conscious/default models for routine maintenance; premium models only for major architecture/debugging."
+      "Cost-conscious/default model routing where available for routine daily DCA execution, compact artifact writing, manifest/config/docs maintenance, and notification/reporting; premium models (e.g. ChatGPT 5.5) only for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality (see model_routing_policy)."
     ],
     "preserved_trading_safety_rules": [
       "Robinhood account 562057042 is the only execution broker; Alpaca/Yahoo/Finance are read-only.",
@@ -70,6 +71,88 @@
       "Manual, morning, midday, and final streams stay separated.",
       "Prior-run fills are same-day top-up context only, never scheduled evidence."
     ],
+    "doc": "docs/cost_tracking.md"
+  },
+  "model_routing_policy": {
+    "policy_name": "cost_conscious_daily_dca_model_routing",
+    "requested_on_et": "2026-07-17",
+    "reaffirmed_on_et": "2026-07-20",
+    "default_routing": "cost_conscious_or_default_where_available",
+    "summary": "All active daily DCA scheduled tasks use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or any other premium/highest-tier model for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are permitted ONLY for failure recovery, safety validation, connector/debug escalation, or when a user explicitly requests the highest quality. This policy governs model selection and cost/reporting behavior ONLY; it does NOT relax any trading safety rule (see preserved_trading_safety_rules, circuit_breakers, and docs/safeguards.md).",
+    "do_not_use_premium_for": [
+      "routine daily DCA execution",
+      "compact artifact writing (machine-readable JSON/CSV)",
+      "repo manifest / config / docs maintenance",
+      "normal notification and reporting"
+    ],
+    "premium_models_allowed_only_for": [
+      "failure recovery",
+      "safety validation",
+      "connector / debug escalation",
+      "an explicit user request for highest quality"
+    ],
+    "premium_model_examples": ["ChatGPT 5.5", "other premium / highest-tier models"],
+    "compact_execution_rules": [
+      "Write machine-readable JSON/CSV artifacts only in daily runs; no long narrative summaries.",
+      "Batch market-data and broker-history pulls across the active universe where possible instead of per-ticker calls.",
+      "Persist each raw connector response once; downstream steps read the saved files rather than re-pulling.",
+      "Suppress no-op / heartbeat notifications; notify only for actionable events (see actionable_notification_events).",
+      "Avoid full Notion/dashboard rebuilds and broad performance reports in daily runs; defer heavy analysis to the Friday weekly and monthly refreshes."
+    ],
+    "applies_to_daily_tasks_et": [
+      { "et": "09:00", "task_id": "b7961407", "role": "pre-market buying-power dashboard (read-only)" },
+      { "et": "09:45", "task_id": "cd45e95b", "role": "volatility outlier scan (read-only)" },
+      { "et": "09:45", "task_id": "morning-dca-0945", "role": "pre-flight validation (read-only)" },
+      { "et": "10:30", "task_id": "42173154", "role": "morning live execution" },
+      { "et": "12:30", "task_id": "a6239dae", "role": "midday live execution" },
+      { "et": "15:05", "task_id": "e3e6f09e", "role": "monitor-only signal check (read-only)" },
+      { "et": "15:20", "task_id": "10ce362c", "role": "final live execution (final buy of the day)" },
+      { "et": "15:35", "task_id": "67aa802b", "role": "post-trade slippage + compact Notion latest-run sync" },
+      { "et": "15:40", "task_id": "a46bf007", "role": "live-run watchdog" }
+    ],
+    "preserved_note": "Additive policy: preserves the $2.00 base amount, the 0x-to-5x graded sizing ladder, the Finance-primary read-only market-data policy, the GFUZ/TXN active universe with BYDDY/VCX/TRLV/RVI exclusions, the same-day top-up guards, all safety and circuit-breaker rules, and the run-classification text unchanged.",
+    "usage_log": "See model_usage_log: each covered daily task appends one compact JSONL entry recording which model/routing mode it used so routing can be audited over time.",
+    "doc": "docs/cost_tracking.md"
+  },
+  "model_usage_log": {
+    "added_on_et": "2026-07-20",
+    "purpose": "Persistent, auditable record of which model and routing mode each daily DCA scheduled task used, so cost-conscious model routing (see model_routing_policy) can be tracked over time.",
+    "format": "jsonl",
+    "append_only": true,
+    "path_template": "/home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl",
+    "path_note": "YYYYMM is the ET month of the run (e.g. 202607). One append per task run. This is the configured equivalent path under the existing cron_tracking artifact root; if a repo-configured artifacts base is used instead, mirror the model_usage/YYYYMM/model_usage.jsonl layout beneath it.",
+    "schema": "schemas/model_usage_log.schema.json",
+    "entry_fields": [
+      "run_id",
+      "cron_id (or task_id)",
+      "task_name",
+      "scheduled_for_et",
+      "run_origin",
+      "stream",
+      "model_requested",
+      "model_actual",
+      "model_routing_mode",
+      "reason_for_premium_model",
+      "triggered_at_utc",
+      "artifact_path",
+      "notes"
+    ],
+    "model_routing_mode_values": ["cost_conscious", "default", "premium"],
+    "model_actual_not_exposed_rule": "If the platform does not expose the actual backend model, write model_actual='not_exposed' and still record model_requested and model_routing_mode from the task policy (default cost_conscious/default per model_routing_policy).",
+    "premium_reason_rule": "reason_for_premium_model is recorded (non-null) only when model_routing_mode='premium', and must be one of failure_recovery, safety_validation, connector_debug_escalation, or explicit_user_request (see model_routing_policy.premium_models_allowed_only_for). For cost_conscious/default routing it is null/omitted.",
+    "applies_to_daily_tasks_et": [
+      { "et": "09:00", "task_id": "b7961407", "stream": "dashboard", "role": "pre-market buying-power dashboard (read-only)" },
+      { "et": "09:45", "task_id": "cd45e95b", "stream": "scan", "role": "volatility outlier scan (read-only)" },
+      { "et": "09:45", "task_id": "morning-dca-0945", "stream": "preflight", "role": "pre-flight validation (read-only)" },
+      { "et": "10:30", "task_id": "42173154", "stream": "morning", "role": "morning live execution" },
+      { "et": "12:30", "task_id": "a6239dae", "stream": "midday", "role": "midday live execution" },
+      { "et": "15:05", "task_id": "e3e6f09e", "stream": "monitor", "role": "monitor-only signal check (read-only)" },
+      { "et": "15:20", "task_id": "10ce362c", "stream": "afternoon", "role": "final live execution (final buy of the day)" },
+      { "et": "15:35", "task_id": "67aa802b", "stream": "slippage", "role": "post-trade slippage + compact Notion latest-run sync" },
+      { "et": "15:40", "task_id": "a46bf007", "stream": "watchdog", "role": "live-run watchdog" }
+    ],
+    "compact_note": "The entry is compact machine-readable JSONL consistent with the cost-saving daily mode; it adds no narrative reporting and does not trigger notifications.",
+    "preserved_note": "Logging metadata only: preserves the $2.00 base amount, the 0x-to-5x ladder, the Finance-primary read-only market-data policy, the GFUZ/TXN active universe with BYDDY/VCX/TRLV/RVI exclusions, the same-day top-up guards, all safety/circuit-breaker rules, live schedules, and run-classification text unchanged. No trades are placed by writing this log.",
     "doc": "docs/cost_tracking.md"
   },
   "afternoon_completion_rule": "All afternoon trading and artifact-writing tasks complete no later than 3:40 PM ET, when the read-only live-run watchdog (a46bf007) begins its final verification. The watchdog's own post-3:40 PM verification, the Friday weekly Notion performance refresh at 5:00 PM ET, and the month-end volatility risk refresh at 5:00 PM ET (c9fb1fb8 / 17a3b2a9) are the only approved post-3:40 PM DCA-related exceptions.",
@@ -791,6 +874,7 @@
     {
       "id": "b7961407",
       "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
+      "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
       "name": "Pre-market DCA buying-power dashboard",
       "type": "analytics",
       "status": "active",
@@ -802,6 +886,7 @@
     {
       "id": "cd45e95b",
       "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
+      "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
       "name": "Compact DCA volatility outlier scan",
       "type": "analytics",
       "status": "active",
@@ -813,6 +898,7 @@
     {
       "id": "morning-dca-0945",
       "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
+      "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
       "name": "Morning DCA pre-flight validation (read-only)",
       "type": "analytics",
       "status": "active",
@@ -854,6 +940,7 @@
     {
       "id": "42173154",
       "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
+      "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
       "name": "Weekday 10:30 AM morning DCA live Robinhood execution",
       "type": "trading",
       "status": "active",
@@ -1047,6 +1134,7 @@
     {
       "id": "a6239dae",
       "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
+      "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
       "name": "Weekday 12:30 PM midday DCA live Robinhood execution",
       "type": "trading",
       "status": "active",
@@ -1163,6 +1251,7 @@
     {
       "id": "e3e6f09e",
       "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
+      "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
       "name": "Monitor-only graded DCA signal check",
       "type": "monitoring",
       "status": "active",
@@ -1174,6 +1263,7 @@
     {
       "id": "10ce362c",
       "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
+      "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
       "supersedes_cron_id": "ce16ba6b",
       "name": "Graded DCA automatic live test - $2 allocation",
       "type": "trading",
@@ -1343,6 +1433,7 @@
     {
       "id": "67aa802b",
       "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
+      "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
       "name": "Post-trade slippage + compact Notion latest-run sync",
       "type": "analytics",
       "status": "active",
@@ -1366,6 +1457,7 @@
     {
       "id": "a46bf007",
       "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
+      "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
       "name": "Live-run watchdog",
       "type": "monitoring",
       "status": "active",

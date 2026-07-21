@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, time
+from pathlib import Path
 
 from dca_config import load_strategy_config
 from near_close_dca import EASTERN, DryRunBroker, SourceName, StrategyConfig, StrategyState, build_broker
@@ -53,6 +54,89 @@ def test_run_pipeline_blocked_day_skips_reports(tmp_path):
     )
     assert result["blocked"] is True
     assert "reports" not in result
+
+
+def test_run_pipeline_does_not_write_model_usage_log_by_default(tmp_path):
+    # model_usage_log_root defaults to None -- run_pipeline() must not touch
+    # any model-usage path unless a caller opts in explicitly.
+    config = _demo_config()
+    run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+    assert not (tmp_path / "model_usage").exists()
+
+
+def test_run_pipeline_appends_model_usage_log_entry_when_root_configured(tmp_path):
+    import json
+
+    from scripts.model_usage_log import resolve_log_path
+
+    config = _demo_config()
+    log_root = tmp_path / "model_usage"
+    now = _now()
+    result = run_pipeline(
+        now, config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path / "artifacts",
+        model_usage_log_root=log_root,
+    )
+
+    log_path = resolve_log_path(now, root=log_root)
+    assert log_path.exists()
+    entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+    assert entry["cron_id"] == "10ce362c"
+    assert entry["run_origin"] == "scheduled"
+    assert entry["artifact_path"] == result["run_state_path"]
+    run_state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
+    assert entry["run_id"] == run_state["run_id"]
+
+
+def test_run_pipeline_records_premium_routing_metadata_when_supplied(tmp_path):
+    import json
+
+    from scripts.model_usage_log import resolve_log_path
+
+    config = _demo_config()
+    log_root = tmp_path / "model_usage"
+    now = _now()
+    run_pipeline(
+        now, config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path / "artifacts",
+        model_usage_log_root=log_root,
+        model_usage_model_requested="claude-opus-4-8",
+        model_usage_model_actual="claude-opus-4-8",
+        model_usage_model_routing_mode="premium",
+        model_usage_reason_for_premium_model="safety_validation",
+    )
+
+    log_path = resolve_log_path(now, root=log_root)
+    entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+    assert entry["model_routing_mode"] == "premium"
+    assert entry["reason_for_premium_model"] == "safety_validation"
+
+
+def test_run_pipeline_date_gate_blocked_run_has_no_run_id_to_log(tmp_path):
+    # The date-gate-blocked stub (_check_execution_gates) only ever writes
+    # {"trading_day": ..., "status": "blocked"} -- no run_id was ever assigned,
+    # so there is nothing to attribute a usage entry to. log_model_usage must
+    # skip cleanly (not raise) rather than write a malformed entry.
+    from scripts.model_usage_log import resolve_log_path
+
+    config = load_strategy_config(approved_test_dates=frozenset())
+    log_root = tmp_path / "model_usage"
+    now = _now()
+    result = run_pipeline(
+        now, config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path / "artifacts",
+        model_usage_log_root=log_root,
+    )
+    assert result["blocked"] is True
+    log_path = resolve_log_path(now, root=log_root)
+    assert not log_path.exists()
 
 
 def test_run_pipeline_scheduled_run_auto_loads_prior_allocations(tmp_path):
