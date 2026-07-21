@@ -2193,6 +2193,15 @@ def test_prior_run_before_boundary_malformed_iso_format():
     assert _prior_run_before_boundary(run_state, boundary_et) is True
 
 
+def test_iso_or_none():
+    from near_close_dca import _iso_or_none
+
+    assert _iso_or_none(None) is None
+
+    dt = datetime(2023, 1, 1, 12, 0, tzinfo=EASTERN)
+    assert _iso_or_none(dt) == "2023-01-01T12:00:00-05:00"
+
+
 def test_iso_week_key():
     from near_close_dca import iso_week_key
 
