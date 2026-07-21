@@ -165,6 +165,8 @@
         "/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/run_state.json",
         "/home/user/workspace/cron_tracking/morning_dca/latest_morning_run.json"
       ],
+    "always_write": [
+        "/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/run_state.json",
         "/home/user/workspace/cron_tracking/morning_dca/latest_morning_run.json"
       ],
       "blocked_state": {
