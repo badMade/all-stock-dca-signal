@@ -98,13 +98,23 @@ def test_to_float_rejects_non_finite():
     assert _to_float(float("nan"), default=-1.0) == -1.0
 
 
-def test_rh_interval_mapping_and_rejection():
-    assert _rh_interval(5) == "5minute"
-    assert _rh_interval(30) == "30minute"
-    with pytest.raises(ValueError) as exc_info:
-        _rh_interval(15)
+@pytest.mark.parametrize("interval, expected", [
+    (1, "minute"),
+    (5, "5minute"),
+    (10, "10minute"),
+    (30, "30minute"),
+    (60, "hour")
+])
+def test_rh_interval_mapping_supported(interval, expected):
+    assert _rh_interval(interval) == expected
 
-    assert "Robinhood has no 15-minute bar; supported minutes:" in str(exc_info.value)
+
+@pytest.mark.parametrize("interval", [2, 15, 45, 120])
+def test_rh_interval_rejection_unsupported(interval):
+    with pytest.raises(ValueError) as exc_info:
+        _rh_interval(interval)
+
+    assert f"Robinhood has no {interval}-minute bar; supported minutes:" in str(exc_info.value)
     assert isinstance(exc_info.value.__cause__, KeyError)
 
 
