@@ -207,15 +207,18 @@ def fetch_news_headlines(ticker: str, api_key: str, lookback_days: int) -> List[
         "language": "en",
         "sortBy": "relevancy",
         "pageSize": MAX_HEADLINES_PER_TICKER,
-        "apiKey": api_key,
+    }
+    headers = {
+        "X-Api-Key": api_key,
     }
 
     try:
-        resp = requests.get("https://newsapi.org/v2/everything", params=params, timeout=15)
+        resp = requests.get("https://newsapi.org/v2/everything", params=params, headers=headers, timeout=15)
         resp.raise_for_status()
         data = resp.json()
     except requests.RequestException as exc:
-        log.warning("NewsAPI request failed for %s: %s", ticker, exc)
+        safe_exc = str(exc).replace(api_key, "***") if api_key else str(exc)
+        log.warning("NewsAPI request failed for %s: %s", ticker, safe_exc)
         return []
     except json.JSONDecodeError:
         log.warning("NewsAPI returned non-JSON for %s", ticker)
