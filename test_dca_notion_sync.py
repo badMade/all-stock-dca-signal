@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+
+import pytest
 
 from dca_notion_sync import (
     _fmt,
@@ -109,8 +112,30 @@ def test_write_and_load_compact_sync(tmp_path):
 
     assert "## Latest Run" in md_path.read_text()
 
-    # Test load_latest_run_summary with a proper summary file
+
+def test_load_latest_run_summary_success(tmp_path):
     summary_path = tmp_path / "latest_run_summary.json"
     summary_path.write_text('{"run_id": "r-123", "trading_day": "2023-01-01"}')
     loaded_summary = load_latest_run_summary(summary_path)
     assert loaded_summary["run_id"] == "r-123"
+    assert loaded_summary["trading_day"] == "2023-01-01"
+
+
+def test_load_latest_run_summary_not_found(tmp_path):
+    summary_path = tmp_path / "does_not_exist.json"
+    with pytest.raises(FileNotFoundError):
+        load_latest_run_summary(summary_path)
+
+
+def test_load_latest_run_summary_invalid_json(tmp_path):
+    summary_path = tmp_path / "invalid.json"
+    summary_path.write_text('{"run_id": "r-123", ')
+    with pytest.raises(json.JSONDecodeError):
+        load_latest_run_summary(summary_path)
+
+
+def test_load_latest_run_summary_io_error(tmp_path):
+    summary_path = tmp_path / "is_directory"
+    summary_path.mkdir()
+    with pytest.raises(OSError):
+        load_latest_run_summary(summary_path)
