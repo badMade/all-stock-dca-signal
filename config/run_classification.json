@@ -250,7 +250,10 @@
         "/home/user/workspace/cron_tracking/midday_dca/manual_reruns/**",
         "/home/user/workspace/cron_tracking/midday_dca/manual_reruns/final_manual_override_*",
         "/home/user/workspace/cron_tracking/morning_dca/manual_recovery/**",
+        "/home/user/workspace/cron_tracking/morning_dca/manual_recovery/**",
         "/home/user/workspace/cron_tracking/midday_dca/manual_recovery/**"
+      ],
+      "helper": "scripts/run_classification.py:manual_exclusion_roots / collect_manual_order_ids"
     }
   },
   "final_buy_behavior": {
