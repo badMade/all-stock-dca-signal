@@ -214,10 +214,23 @@ live-automation update every live stream shares one ladder (the former morning
 3:20 PM task and never count as afternoon scheduled evidence.
 
 The scheduled afternoon run auto-loads prior context from its own task root
-**plus** the morning-live root (`.../cron_tracking/morning_dca`) and the
-midday-live root (`.../cron_tracking/midday_dca`), so morning, midday, and manual
-override same-day fills all offset the afternoon buy. Roots that did not run that
-day contribute nothing.
+**plus** the morning-live root (`.../cron_tracking/morning_dca`), the
+midday-live root (`.../cron_tracking/midday_dca`), and the manual missed-morning
+recovery root (`.../cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*`), so
+morning, midday, manual override, and manual missed-morning recovery same-day
+fills all offset the afternoon buy. Roots that did not run that day contribute
+nothing.
+
+**Manual missed-morning recovery (added Jul 20 2026).** If the 10:30 scheduled
+morning live task did not run, a human may place the missed buys by hand under
+`.../cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*` (example
+`20260720_1048ET`). Both the **12:30 midday** and **3:20 final** runs scan that
+path and fold any same-day recovery fills into this top-up guard as prior
+allocation. Those artifacts (`run_origin='manual'`, `manual_run=true`,
+`same_day_top_up_context_only=true`, `valid_scheduled_evidence=false`) are
+prior-allocation / top-up context **only** — never proof the 10:30 scheduled task
+ran and never scheduled evidence. See
+[run_classification.md](run_classification.md#manual-missed-morning-recovery-added-2026-07-20).
 
 ### Manual override same-day fills
 

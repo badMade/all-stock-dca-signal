@@ -59,9 +59,22 @@ order: the run's logged `target_price`, then `decision_price`, then the confirme
 
 Only earlier runs generated **before 2:30 PM ET** contribute; scheduled afternoon
 runs are excluded as prior context. Prior allocations are scanned across
-`prior_allocation_roots` (default the morning-live root); when a ticker appears in
-more than one root the amounts are summed and the lowest reference price wins, so
-midday must beat the best earlier entry before it tops up.
+prior_allocation_roots (the morning-live root, which recursively includes the manual missed-morning
+recovery root .../cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*); when a
+ticker appears in more than one root the amounts are summed and the lowest
+reference price wins, so midday must beat the best earlier entry before it tops
+up.
+
+**Missed 10:30 morning run recovery (added Jul 20 2026).** When the 10:30
+scheduled morning live task did not run and a **manual** recovery placed the
+missed buys under `.../cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*`
+(e.g. `20260720_1048ET`), the 12:30 midday run **scans that path** and folds any
+same-day manual recovery fills into this top-up guard as prior allocation. Those
+manual artifacts (`run_origin='manual'`, `manual_run=true`,
+`same_day_top_up_context_only=true`, `valid_scheduled_evidence=false`) are
+prior-allocation / top-up context **only** — never proof the 10:30 scheduled task
+ran and never midday scheduled evidence. See
+[morning_dca.md](morning_dca.md#manual-missed-run-recovery-added-jul-20-2026).
 
 Per-candidate the run_state records `prior_same_day_amount`,
 `prior_same_day_reference_price`, `prior_same_day_run_id`/`prior_same_day_source`,
@@ -121,6 +134,33 @@ affecting afternoon top-up eligibility only):
 | `GOOG` | $4.50 | 352.1778 |
 | `GOOGL` | $4.50 | 354.9800 |
 
+### Manual missed-12:30 recovery (added Jul 20 2026)
+
+Separate from a manual **override** rerun, this covers the case where the **12:30
+scheduled midday task did not run or failed**. A human may then place the missed
+midday buys by hand under a dedicated path:
+
+- Pattern: `/home/user/workspace/cron_tracking/midday_dca/manual_recovery/YYYYMMDD_*`
+- Example: `/home/user/workspace/cron_tracking/midday_dca/manual_recovery/20260720_1259ET`
+  (Jul 20 2026: placed at 12:59 ET after the 12:30 scheduled midday run failed).
+
+Fills in that recovery:
+
+| Ticker | Amount | Avg fill price |
+|---|---|---|
+| `AAPL` | $1.00 | 324.389900 |
+| `TRIN` | $2.00 | 17.399900 |
+| `ASML` | $2.00 | 1739.506300 |
+| `IRDM` | $2.00 | 46.669900 |
+
+The artifact carries `run_origin='manual'`, `manual_run=true`,
+`same_day_top_up_context_only=true`, and `valid_scheduled_evidence=false`. It is
+prior-allocation / same-day top-up context **only** and must be available to the
+**3:20 afternoon** run as such. It is **never** midday scheduled evidence, never
+proof the 12:30 scheduled task ran, and never counted in scheduled reliability,
+fill counts, slippage, cost basis, or watchdog confirmation. See
+`config/scheduled_tasks.json`'s `midday_dca_manual_recovery_2026_07_20`.
+
 ## Midday sizing ladder (0x → 5x)
 
 Drop is measured as a fraction below yesterday's regular-session close. The
@@ -153,6 +193,53 @@ only midday notional, independent of both the morning ledger and the afternoon
 
 Exceeding a cap adds a warning to the run artifact; midday buys never consume or
 validate the morning or afternoon budget.
+
+## Raw input generation and failure-state guarantee (added Jul 20 2026)
+
+After the Jul 20 2026 12:30 run escalated (it invoked a saved runner without
+first generating the same-day raw inputs and wrote no failure-state artifact),
+the scheduled 12:30 task must:
+
+**Generate raw inputs first.** Before invoking any saved runner such as
+`.../cron_tracking/a6239dae/run_midday_live.sh` or `midday_live_runner.py`, the
+task **creates** `.../cron_tracking/midday_dca/YYYYMMDD_1230ET/raw/` and persists
+all required raw inputs for that same-day run:
+
+- `raw/portfolio.json`
+- `raw/quotes.json` (or clearly named quote batches normalized into
+  `raw/quotes.json`)
+- historical / trend files needed for the 60-minute trend check
+
+If the runner requires a `RUN_DATE_ET` argument, pass the current
+America/New_York date as `YYYYMMDD`. The task **must not** assume
+`raw/quotes.json` or historicals already exist from a prior run. Inputs come from
+the Finance connector primary, Alpaca and Robinhood validation / context, and
+`yfinance` fallback **only** when connector data is unavailable, stale,
+incomplete, or unresolved (see [safeguards.md](safeguards.md#market-data-source-policy)).
+If raw input generation fails once, perform **one** bounded recovery attempt with
+the alternate approved data source path, then stop.
+
+**Always write the state files.** The 12:30 scheduled run **always** writes
+`run_state.json`, `run_summary.json`, and `latest_midday_run.json` under the
+midday root, **even when no orders are placed or execution is blocked**. If raw
+inputs are missing, malformed, stale, or not generated, it writes a **valid
+scheduled** midday `run_state` with `run_origin='scheduled'`, `manual_run=false`,
+`stream='midday'`, `scheduled_for_et='12:30'`, `cron_id='a6239dae'`,
+`valid_afternoon_evidence=false`, `order_submit_status='not_submitted_error'`,
+`error_class='missing_or_invalid_raw_inputs'`, `orders_submitted_count=0`, and a
+compact list of missing files or failed data sources. This failure-state artifact
+is valid proof the 12:30 scheduled task **fired**, but it is **not** order or fill
+evidence. The task **must not** escalate without writing this state file unless
+the workspace itself is unavailable.
+
+**Missed-morning recovery interaction.** When same-day manual missed-10:30
+recovery artifacts exist under
+`.../cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*`, load them **after**
+raw market data is available and **before** order sizing. They remain
+prior-allocation / top-up context only: they **must not** satisfy raw quote or
+historical input requirements, **must not** be copied into the scheduled evidence
+stream, and **must not** be counted as proof the 10:30 scheduled task ran. See
+[run_classification.md](run_classification.md#manual-missed-morning-recovery-added-2026-07-20).
 
 ## Artifacts
 

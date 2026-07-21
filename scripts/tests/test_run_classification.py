@@ -838,6 +838,15 @@ def test_manual_exclusion_roots_cover_final_override_paths():
         assert str(Path(d) / "midday_dca" / "manual_reruns") in roots
 
 
+def test_manual_exclusion_roots_cover_manual_recovery_paths():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        roots = [str(r) for r in manual_exclusion_roots(base)]
+        assert str(Path(d) / "morning_dca" / "manual_recovery") in roots
+        assert str(Path(d) / "midday_dca" / "manual_recovery") in roots
+
+
 def _write_final_override_state(run_dir: Path, order_ids, ts="2026-07-13T19:36:00Z"):
     run_dir.mkdir(parents=True, exist_ok=True)
     state = {

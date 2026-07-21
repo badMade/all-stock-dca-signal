@@ -79,6 +79,8 @@ FINAL_MANUAL_OVERRIDE_DIR_PREFIX = "final_manual_override_"
 MANUAL_EXCLUSION_SUBROOTS = (
     "final_manual_review",
     "midday_dca/manual_reruns",
+    "morning_dca/manual_recovery",
+    "midday_dca/manual_recovery",
 )
 
 SCHEDULED_RUN_ID_RE = re.compile(r"^scheduled_[0-9]{8}_1520ET$")

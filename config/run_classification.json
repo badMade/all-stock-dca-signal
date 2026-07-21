@@ -140,6 +140,38 @@
       "orders_placed": 9,
       "total_usd": 31.5,
       "note": "Recovered by re-fetching quotes/historicals, saving raw connector outputs, normalizing output_path pointers, computing signals from files, then placing qualifying incremental orders. Valid afternoon scheduled evidence."
+    },
+    "pointer_output_normalization_2026_07_20": {
+      "added": "2026-07-20",
+      "applies_to_tasks": ["42173154", "a6239dae", "e3e6f09e", "10ce362c"],
+      "trigger_incident": "On Jul 20 2026 the 3:20 scheduled run collected portfolio, quotes, tradability, same-day orders, and historicals, but large historicals (and possibly other connector responses) were only available as output_path / current_session_context tool-output pointers. The background run did not persist those pointer targets into the scheduled raw directory before compute, so it escalated after data collection.",
+      "rules": [
+        "Any connector response that returns an output_path or current_session_context pointer MUST be immediately copied or normalized into the run's raw directory BEFORE compute (follow the pointer, load the referenced payload, persist as parseable JSON with contents under 'data' and the original pointer under 'output_path').",
+        "Compute must read only the persisted raw files, never in-memory tool responses.",
+        "Pointer-only collection is NOT a completed run; the task must not stop after collecting data without writing run_state.",
+        "If pointer normalization fails after one bounded recovery attempt, write the valid failure-state file with a concrete error_class (e.g. pointer_normalization_failed or missing_or_invalid_raw_inputs), empty submitted_orders.csv headers where applicable, and a compact list of the missing pointer details."
+      ],
+      "recovered_run_2026_07_20": {
+        "trading_day": "2026-07-20",
+        "run_id": "scheduled_20260720_1520ET",
+        "scheduled_run_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260720_1520ET/",
+        "raw_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260720_1520ET/raw/",
+        "recovery_from_escalation": true,
+        "recovered_after_pointer_persistence_failure": true,
+        "order_submit_status": "filled",
+        "orders_filled_count": 6,
+        "total_usd": 10.00,
+        "fills": [
+          {"ticker": "EVR", "amount_usd": 1.00, "average_fill_price": 333.600800},
+          {"ticker": "DXYZ", "amount_usd": 1.00, "average_fill_price": 24.865000},
+          {"ticker": "AMAT", "amount_usd": 2.00, "average_fill_price": 526.819900},
+          {"ticker": "STM", "amount_usd": 2.00, "average_fill_price": 61.450000},
+          {"ticker": "NVDA", "amount_usd": 2.00, "average_fill_price": 202.771200},
+          {"ticker": "GLW", "amount_usd": 2.00, "average_fill_price": 153.810400}
+        ],
+        "note": "Parent recovery copied current_session_context / tool_calls / call_external_tool outputs into the scheduled raw directory, computed from the persisted raw files, placed scheduled top-up orders, and wrote run_state. Valid afternoon scheduled evidence."
+      },
+      "see": "config/scheduled_tasks.json:pointer_output_normalization_2026_07_20"
     }
   },
   "final_scheduled_run_2026_07_16": {
@@ -202,7 +234,8 @@
       "Never infer scheduled status from same-day broker orders alone; a valid scheduled run_state must exist.",
       "Scheduled-live cost basis, slippage, reliability, and order-count metrics must be computed only from validated scheduled runs with manual order IDs excluded.",
       "A scheduled run_state with order_submit_status='not_submitted_confirmation_required' is valid scheduled-run evidence that the task ran but is NOT evidence of an order/fill: it contributes zero scheduled fills/order IDs and must not be marked invalid because confirmation blocked submission.",
-      "Exclude final manual buy overrides (run_type='final_manual_buy_override', valid_afternoon_scheduled_evidence=false, same_day_top_up_context_only=true) from scheduled slippage, scheduled fills, scheduled reliability, scheduled cost basis, and watchdog confirmation. Show them only in a labeled Manual Final Buy Override / Same-Day Top-Up Context section (see manual_reporting)."
+      "Exclude final manual buy overrides (run_type='final_manual_buy_override', valid_afternoon_scheduled_evidence=false, same_day_top_up_context_only=true) from scheduled slippage, scheduled fills, scheduled reliability, scheduled cost basis, and watchdog confirmation. Show them only in a labeled Manual Final Buy Override / Same-Day Top-Up Context section (see manual_reporting).",
+      "Exclude manual missed-morning recovery artifacts (under morning_dca/manual_recovery/**, run_origin='manual', manual_run=true, same_day_top_up_context_only=true, valid_scheduled_evidence=false) from scheduled slippage, scheduled fills, scheduled reliability, scheduled cost basis, and watchdog confirmation. They never prove the 10:30 scheduled task ran and are used only as same-day prior-allocation / top-up context (see manual_missed_morning_recovery)."
     ],
     "manual_exclusion_roots": {
       "reason": "The 2026-07-13 final manual buy override backfilled live artifacts under midday_dca/manual_reruns/final_manual_override_* and a final_manual_review/** tree, both OUTSIDE the ce16ba6b task root. Slippage/watchdog/reporting must scan these as manual exclusions so their order IDs never leak into scheduled-live metrics.",
@@ -211,7 +244,9 @@
         "/home/user/workspace/cron_tracking/ce16ba6b/manual_runs/final_manual_override_*",
         "/home/user/workspace/cron_tracking/final_manual_review/**",
         "/home/user/workspace/cron_tracking/midday_dca/manual_reruns/**",
-        "/home/user/workspace/cron_tracking/midday_dca/manual_reruns/final_manual_override_*"
+        "/home/user/workspace/cron_tracking/midday_dca/manual_reruns/final_manual_override_*",
+        "/home/user/workspace/cron_tracking/morning_dca/manual_recovery/**",
+        "/home/user/workspace/cron_tracking/midday_dca/manual_recovery/**"
       ],
       "helper": "scripts/run_classification.py:manual_exclusion_roots / collect_manual_order_ids"
     }
@@ -262,6 +297,77 @@
     ],
     "watchdog_context": "The 3:40 PM watchdog alerted because broker history had orders after 3:15 PM ET but no manual-run artifacts were present under the paths it scanned. Live artifacts were backfilled with run_origin='manual', manual_run=true, run_type='final_manual_buy_override', valid_afternoon_scheduled_evidence=false, same_day_top_up_context_only=true, and all order IDs.",
     "note": "These are manual final-buy overrides and same-day top-up context only; NOT scheduled-afternoon execution evidence. Excluded from scheduled slippage, scheduled fills, scheduled reliability, scheduled cost basis, and watchdog confirmation."
+  },
+  "manual_missed_morning_recovery": {
+    "added": "2026-07-20",
+    "run_origin": "manual",
+    "manual_run": true,
+    "flags": {
+      "same_day_top_up_context_only": true,
+      "valid_scheduled_evidence": false
+    },
+    "summary": "A MANUAL missed-morning recovery is a by-hand placement of the morning buys after the scheduled 10:30 AM live morning task did not run. It is manual by contract: excluded from every scheduled metric and used only as prior-allocation context for the same-day top-up guard. It is NEVER proof that the 10:30 scheduled task ran and NEVER scheduled evidence.",
+    "artifact_path_pattern": "/home/user/workspace/cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*",
+    "example_artifact": "/home/user/workspace/cron_tracking/morning_dca/manual_recovery/20260720_1048ET",
+    "rules": [
+      "Valid prior-allocation / top-up context ONLY when run_origin='manual', manual_run=true, same_day_top_up_context_only=true, and valid_scheduled_evidence=false.",
+      "Never counts as proof the 10:30 scheduled task ran.",
+      "Never written into the midday or afternoon scheduled evidence stream.",
+      "Never used for scheduled reliability, scheduled fill counts, scheduled slippage, scheduled cost basis, or watchdog confirmation.",
+      "May only reduce or block additional buys through the same-day top-up rule: buy max(0, desired - prior) only if the later decision price is strictly below the prior reference price.",
+      "The 12:30 midday run and the 3:20 final run must scan the artifact_path_pattern for same-day manual recovery artifacts and fold them into the top-up guard."
+    ]
+  },
+  "live_schedule_hardening_2026_07_20": {
+    "added": "2026-07-20",
+    "applies_to": ["10ce362c"],
+    "supersedes_cron_id": "ce16ba6b",
+    "scheduled_for_et": "15:20",
+    "trigger_incident": "On Jul 20 2026 the 10:30 morning and 12:30 midday scheduled live runs both failed by invoking saved runners without first generating the same-day raw inputs and escalating without a scheduled failure-state artifact. This block applies the same self-containment and state-file guarantees to the 3:20 afternoon final live task.",
+    "raw_input_generation": {
+      "summary": "The 3:20 scheduled final live task MUST NOT assume runner inputs already exist. Before invoking any saved runner or order module, it MUST create the raw directory and persist all required raw inputs for the current same-day run.",
+      "raw_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/raw/",
+      "required_inputs": [
+        "portfolio / buying power",
+        "quotes",
+        "prior regular-session close",
+        "tradability",
+        "orders_after_1430ET (for afternoon evidence checks)",
+        "same-day prior-allocation context from the morning-live, midday, manual missed-morning recovery, and manual override roots",
+        "historical / trend bars needed for the trend check"
+      ],
+      "run_date_arg": "If a runner requires a RUN_DATE_ET argument, pass the current America/New_York date as YYYYMMDD.",
+      "no_stale_reuse": "Do NOT reuse stale files from a prior run.",
+      "data_sources": "Finance connector primary, Alpaca and Robinhood validation/context, yfinance fallback ONLY when connector data is unavailable, stale, incomplete, or unresolved.",
+      "bounded_recovery": "If raw input generation fails once, perform ONE bounded recovery attempt with the alternate approved data source path, then stop.",
+      "see": "config/scheduled_tasks.json:live_schedule_hardening_2026_07_20.afternoon_1520"
+    },
+    "state_file_guarantee": {
+      "summary": "The 3:20 scheduled run MUST always write run_state.json, run_summary.json, and latest_scheduled_run.json even when execution is blocked, is a no-op, or errors.",
+      "always_write": [
+        "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/run_state.json",
+        "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/run_summary.json",
+        "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/latest_scheduled_run.json"
+      ],
+      "blocked_state_required_fields": {
+        "when": "If raw inputs, trend, budget, tradability, spread, broker, or top-up conditions block execution, write a valid scheduled afternoon run_state.",
+        "run_origin": "scheduled",
+        "manual_run": false,
+        "stream": "afternoon",
+        "scheduled_for_et": "15:20",
+        "cron_id": "10ce362c",
+        "supersedes_cron_id": "ce16ba6b",
+        "state_schema_version": "run-classification-v1",
+        "orders_submitted_count": 0,
+        "order_submit_status": "Concrete status such as not_submitted_error or not_submitted_no_top_up.",
+        "error_class": "Concrete class such as missing_or_invalid_raw_inputs or no_incremental_top_up.",
+        "missing_inputs_field": "Include a compact list of missing files, block reasons, or failed data sources."
+      },
+      "evidence_meaning": "This failure-state artifact is valid proof that the 3:20 scheduled task FIRED, but it is NOT order or fill evidence.",
+      "post_raw_failure_rule": "If any step fails after raw collection has started, write the signals.csv when possible, an empty submitted_orders.csv with headers when no orders were placed, and run_state.json. Do not leave a half-done run with no state file.",
+      "manual_recovery_exclusion": "Manual recovery artifacts (missed-morning under morning_dca/manual_recovery/** and manual 12:30 under midday_dca/manual_recovery/**) remain prior-allocation / top-up context only. They are NEVER afternoon scheduled evidence, slippage, reliability, fill-count, or cost-basis evidence.",
+      "see": "config/scheduled_tasks.json:live_schedule_hardening_2026_07_20.afternoon_1520"
+    }
   },
   "slippage_reporting": {
     "task_id": "67aa802b",

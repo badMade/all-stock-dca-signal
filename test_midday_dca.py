@@ -900,6 +900,24 @@ def test_midday_classification_validates_against_json_schema():
         jsonschema.validate(rc, schema)
 
 
+# --- Raw-input persistence (live_schedule_hardening_2026_07_20, inherited) --
+def test_midday_scheduled_live_run_persists_raw_inputs(tmp_path):
+    # MiddayDCAExecutor inherits MorningDCAExecutor.run() unchanged, so the
+    # raw-input persistence / failure-state guarantee applies to the 12:30
+    # scheduled live task too, under its OWN state root.
+    cfg = MiddayConfig(tickers=("BIG",), base_buy_amount_usd=2.0, morning_run_state_root=str(tmp_path))
+    ex = MiddayDCAExecutor(cfg)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
+    artifacts = res["artifacts"]
+    assert artifacts.get("status") != "blocked"
+    raw_dir = Path(artifacts["raw_input_dir"])
+    assert raw_dir.is_dir()
+    assert raw_dir.parent.name == "20260708_1230ET"
+    assert artifacts["raw_inputs_saved"]
+    assert "raw_persistence_error" not in artifacts
+
+
 if __name__ == "__main__":
     import sys
     import tempfile

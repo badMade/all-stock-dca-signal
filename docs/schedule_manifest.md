@@ -459,6 +459,183 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 > pre-authorization, confidence, recovery, and all other safety rules are
 > unchanged.
 
+> **Missed 10:30 morning run recovery (added Jul 20 2026):** when the scheduled
+> **10:30 AM ET morning live task did not run**, a human-triggered **manual
+> recovery** may place the missed morning buys by hand and write artifacts under
+> a dedicated manual-recovery path:
+> `/home/user/workspace/cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*`
+> (example: `.../manual_recovery/20260720_1048ET` for the Jul 20 2026 missed
+> morning run). These artifacts are valid **prior-allocation / same-day top-up
+> context only** when `run_origin='manual'`, `manual_run=true`,
+> `same_day_top_up_context_only=true`, and `valid_scheduled_evidence=false` all
+> hold. They **never** count as proof that the 10:30 scheduled task ran, are
+> **never** written into the midday or afternoon scheduled evidence stream, and
+> are **never** used for scheduled reliability, scheduled fill counts, scheduled
+> slippage, scheduled cost basis, or watchdog confirmation. They may **only**
+> reduce or block additional buys through the same-day top-up rule: a later run
+> buys `max(0, desired - prior)` and only if the later decision price is
+> **strictly below** the prior reference price. The **12:30 midday** run
+> (`a6239dae`) and the **3:20 final** run (`10ce362c`) **must scan** this path for
+> same-day manual recovery artifacts and fold them into the top-up guard as prior
+> allocation. Machine-readable source:
+> [`config/scheduled_tasks.json`](../config/scheduled_tasks.json) →
+> `missed_morning_run_recovery_policy` (and
+> `config/morning_dca.json:manual_missed_run_recovery`,
+> `config/run_classification.json:manual_missed_morning_recovery`). See
+> [run_classification.md](run_classification.md) and [strategy.md](strategy.md#same-day-prior-run-offset--top-up-guard).
+
+> **Market-data source policy:** the **Finance connector is the primary**
+> market-data source. **Alpaca and Robinhood** provide validation / context.
+> **Yahoo Finance through yfinance is a fallback only**, used when connector data
+> is **unavailable, stale, incomplete, or unresolved**. Fallback data must be
+> **labeled as fallback** and must **not weaken** confidence, spread, trend,
+> top-up, budget, whitelist, buy-only, regular-hours-only, or any safety rule.
+> **Robinhood remains the only execution broker.** **GFUZ** may use Robinhood as
+> its primary source when Finance cannot resolve it. Machine-readable source:
+> [`config/scheduled_tasks.json`](../config/scheduled_tasks.json) →
+> `market_data_source_policy` (mirrored in
+> `config/budgets.json:market_data_source_policy`). See
+> [safeguards.md](safeguards.md).
+
+> **Midday raw input generation and failure-state fix (added Jul 20 2026):**
+> after the 12:30 midday run (`a6239dae`) escalated on Jul 20 2026, the scheduled
+> task must **generate the same-day raw inputs before invoking any saved runner**
+> (e.g. `.../cron_tracking/a6239dae/run_midday_live.sh` or
+> `midday_live_runner.py`). It creates
+> `.../cron_tracking/midday_dca/YYYYMMDD_1230ET/raw/` and persists
+> `raw/portfolio.json`, `raw/quotes.json` (or named quote batches normalized into
+> it), and the historical / trend files needed for the 60-minute trend check,
+> passing the current America/New_York date as `RUN_DATE_ET=YYYYMMDD` when the
+> runner requires it. It must **not** assume `raw/quotes.json` or historicals
+> already exist from a prior run; inputs come from the Finance connector primary,
+> Alpaca and Robinhood validation / context, and `yfinance` fallback only when
+> connector data is unavailable, stale, incomplete, or unresolved. One bounded
+> recovery attempt on the alternate approved data source path is allowed, then
+> stop. **State-file guarantee:** the run **always** writes `run_state.json`,
+> `run_summary.json`, and `latest_midday_run.json` even with no orders or a
+> blocked run; if raw inputs are missing, malformed, stale, or not generated it
+> writes a valid scheduled midday `run_state` with `run_origin='scheduled'`,
+> `manual_run=false`, `stream='midday'`, `scheduled_for_et='12:30'`,
+> `cron_id='a6239dae'`, `valid_afternoon_evidence=false`,
+> `order_submit_status='not_submitted_error'`,
+> `error_class='missing_or_invalid_raw_inputs'`, `orders_submitted_count=0`, and a
+> compact list of missing files or failed data sources. That artifact proves the
+> task **fired** but is **not** order or fill evidence; do not escalate without
+> writing it unless the workspace itself is unavailable. **Missed-morning
+> recovery interaction:** same-day manual missed-10:30 recovery artifacts under
+> `.../morning_dca/manual_recovery/YYYYMMDD_*` are loaded **after** raw market
+> data is available and **before** order sizing, remain prior-allocation / top-up
+> context only, and must **not** satisfy raw quote or historical input
+> requirements, be copied into the scheduled evidence stream, or count as proof
+> the 10:30 scheduled task ran. Machine-readable source:
+> [`config/scheduled_tasks.json`](../config/scheduled_tasks.json) →
+> `midday_raw_input_and_failure_state_fix_2026_07_20` and task `a6239dae`
+> (`raw_input_generation`, `state_file_guarantee`), mirrored in
+> [`config/midday_dca.json`](../config/midday_dca.json). See
+> [midday_dca.md](midday_dca.md#raw-input-generation-and-failure-state-guarantee-added-jul-20-2026).
+
+> **Full live schedule hardening (added Jul 20 2026):** after the 10:30 morning
+> (`42173154`) and 12:30 midday (`a6239dae`) scheduled live runs both failed on
+> Jul 20 2026 by invoking saved runners without first generating the same-day raw
+> inputs and escalating with no scheduled failure-state artifact, the same
+> self-containment and state-file guarantees now apply to the **10:30 morning** and
+> **3:20 afternoon** (`10ce362c`, supersedes `ce16ba6b`) scheduled live tasks. Each
+> task must **generate its same-day raw inputs before invoking any saved runner or
+> order module** — creating its `raw/` directory and persisting portfolio / buying
+> power, quotes, prior close, tradability, the run-specific order context (10:30:
+> `orders_since_midnight`; 3:20: `orders_after_1430ET` plus same-day
+> prior-allocation context from the morning-live, midday, manual missed-morning
+> recovery, and manual override roots), and the historical / trend files. The
+> 10:30 task may assume **only** the same-day 9:45 pre-flight artifact; neither
+> task reuses stale files. Pass the current America/New_York date as
+> `RUN_DATE_ET=YYYYMMDD` when the runner requires it; Finance connector primary,
+> Alpaca and Robinhood validation / context, `yfinance` fallback only, one bounded
+> recovery attempt then stop. Each task **always** writes `run_state.json`,
+> `run_summary.json`, and its latest-run pointer even when blocked, a no-op, or on
+> error, with `run_origin='scheduled'`, `manual_run=false`, the correct `stream`
+> and `scheduled_for_et`/`cron_id` (10:30: `stream='morning'`,
+> `scheduled_for_et='10:30'`, `cron_id='42173154'`; 3:20: `stream='afternoon'`,
+> `scheduled_for_et='15:20'`, `cron_id='10ce362c'`, `supersedes_cron_id='ce16ba6b'`,
+> `state_schema_version='run-classification-v1'`), `orders_submitted_count=0` when
+> none, a concrete `order_submit_status`, a concrete `error_class` (e.g.
+> `missing_preflight_artifact`, `missing_or_invalid_raw_inputs`,
+> `no_incremental_top_up`), and a compact list of missing files / block reasons /
+> failed sources. That artifact proves the task **fired** but is **not** order or
+> fill evidence; it must not escalate without writing it unless the workspace is
+> unavailable, and a failure after raw collection still writes `signals.csv` when
+> possible, an empty `submitted_orders.csv` with headers when no orders, and
+> `run_state.json` (no half-done run). Manual recovery artifacts (missed-morning
+> and manual 12:30) stay prior-allocation / top-up context only. A **manual 12:30
+> recovery** ran at 12:59 ET on Jul 20 2026 under
+> `.../cron_tracking/midday_dca/manual_recovery/20260720_1259ET` (fills AAPL $1.00,
+> TRIN $2.00, ASML $2.00, IRDM $2.00), available to the 3:20 run as
+> prior-allocation context only and never scheduled evidence. Machine-readable
+> source: [`config/scheduled_tasks.json`](../config/scheduled_tasks.json) →
+> `live_schedule_hardening_2026_07_20` and `midday_dca_manual_recovery_2026_07_20`,
+> mirrored in [`config/morning_dca.json`](../config/morning_dca.json),
+> [`config/midday_dca.json`](../config/midday_dca.json), and
+> [`config/run_classification.json`](../config/run_classification.json). See
+> [morning_dca.md](morning_dca.md) and [run_classification.md](run_classification.md).
+
+> **Live task text compactness (added Jul 20 2026):** the schedule service appears
+> to **truncate or drop the tail of very long scheduled-task text**, so critical
+> guardrails placed near the end of a long task can be silently lost. Live
+> scheduled task text (morning `42173154`, midday `a6239dae`, afternoon
+> `10ce362c`) **must stay compact enough that critical guardrails are not pushed
+> past the service truncation boundary**. Keep every essential safeguard inside the
+> accepted (non-truncated) text and point at the repo config/docs source of truth
+> for full detail rather than inlining long-form rules that risk truncation. The
+> essential guardrails that must remain in the task text are: raw input
+> self-containment / generation before invoking any saved runner; the state-file
+> guarantee and no-half-done-run rule; the same-day top-up guard; and the rule that
+> manual recovery artifacts are prior-allocation / top-up context only, never
+> scheduled evidence. For the **3:20 task** specifically, `10ce362c` was replaced
+> on Jul 20 2026 with a compact **~5,850 character** source-of-truth version that
+> keeps all essential safeguards inside the accepted text, including the **RAW INPUT
+> SELF-CONTAINMENT FIX ADDED JUL 20 2026**, the **STATE FILE GUARANTEE AND NO
+> HALF-DONE RUN RULE ADDED JUL 20 2026**, the same-day top-up guard, the Jul 20
+> midday recovery artifact path
+> `/home/user/workspace/cron_tracking/midday_dca/manual_recovery/20260720_1259ET`,
+> and the filled AAPL/TRIN/ASML/IRDM recovery context (AAPL $1.00, TRIN $2.00,
+> ASML $2.00, IRDM $2.00) as prior-allocation / top-up context only.
+> Machine-readable source:
+> [`config/scheduled_tasks.json`](../config/scheduled_tasks.json) →
+> `live_task_text_compactness_policy`.
+
+> **Pointer output normalization (added Jul 20 2026):** the Jul 20 2026 3:20
+> scheduled run collected Robinhood portfolio, quotes, tradability, same-day
+> orders, and historicals, but large historicals (and possibly other connector
+> responses) were only available as `output_path` / `current_session_context`
+> tool-output **pointers**. The background run did **not** persist those pointer
+> targets into the scheduled raw directory before compute, so it **escalated after
+> data collection**. Parent recovery copied the `current_session_context` /
+> `tool_calls` / `call_external_tool` outputs into
+> `/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260720_1520ET/raw/`,
+> computed from the persisted raw files, placed scheduled top-up orders, and wrote
+> `run_state`. Operating requirement for **all daily scheduled DCA tasks that use
+> connector data**, especially the **10:30** morning (`42173154`), **12:30**
+> midday (`a6239dae`), **3:05** monitor-only signal check (`e3e6f09e`), and
+> **3:20** afternoon (`10ce362c`) tasks: any connector response returning an
+> `output_path` or `current_session_context` pointer must be **immediately copied
+> or normalized into the run raw directory before compute**; compute modules must
+> read **only** persisted raw files, never in-memory tool responses;
+> **pointer-only collection is not a completed run** and the task must not stop
+> after collecting data without writing `run_state`; and if pointer normalization
+> fails after one bounded recovery attempt, the task writes its valid failure-state
+> file with a concrete `error_class`, empty `submitted_orders.csv` headers where
+> applicable, and the missing pointer details. Live task text has been updated with
+> **POINTER OUTPUT NORMALIZATION ADDED JUL 20 2026** for the 10:30, 12:30, 3:05,
+> and 3:20 tasks. The Jul 20 recovered run (`run_id='scheduled_20260720_1520ET'`,
+> `order_submit_status='filled'`, `orders_filled_count=6`, total **$10.00**) filled
+> EVR $1.00 @ 333.600800, DXYZ $1.00 @ 24.865000, AMAT $2.00 @ 526.819900, STM
+> $2.00 @ 61.450000, NVDA $2.00 @ 202.771200, and GLW $2.00 @ 153.810400. This is
+> valid scheduled evidence recovered after the pointer persistence escalation.
+> Machine-readable source:
+> [`config/scheduled_tasks.json`](../config/scheduled_tasks.json) →
+> `pointer_output_normalization_2026_07_20` (mirrored in
+> [`config/run_classification.json`](../config/run_classification.json)). See
+> [run_classification.md](run_classification.md).
+
 | ID | Name | Type | Trades | Cron (UTC) | ET (EDT) | Status |
 |---|---|---|---|---|---|---|
 | `b7961407` | Pre-market DCA buying-power dashboard | analytics | no | `00 13 * * 1-5` | 9:00 AM weekdays | active |
@@ -511,8 +688,7 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 - **Confidence rule:** if a candidate's price/drop passes the ladder but the **intraday trend cannot be validated** (fewer than `trend_min_bars` usable intraday bars at/before the decision time), the run does **not** auto-buy; it classifies the candidate as `execution_status='manual_review_candidate'`. There is no loosened trend-unavailable execution path.
 - **Hard circuit breakers:** max per order **$10**, budget caps, available buying power, whitelist-only, data confidence, spread threshold, trend validation, regular-hours-only, and one strategy order per ticker per run — each **skips** rather than resizing past a cap.
 - **Artifacts:** always writes `run_state.json` and `morning_signals.csv` under `/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/` (`run_id='morning_live_YYYYMMDD_1030ET'`) — **not** `signals.csv`, and **not** `run_summary.json`/`validation.csv` (those are preflight-only). It additionally writes `submitted_orders.csv` whenever at least one order was actually submitted; `filled_orders.csv` is **never** written by this task (there is no fill-confirmation step). See `config/morning_dca.json`'s `artifacts.manifest_accuracy_note`.
-- `stream='morning'`, `run_type='morning_dca_live'`, `state_schema_version='morning-live-v2-preauthorized'`, `cron_id='42173154'`, `execution_broker='robinhood'`, `account_number='562057042'`, `preauthorized_direct_place=true`, `valid_morning_evidence=true`, `valid_afternoon_evidence=false`. Never writes into the afternoon `ce16ba6b` tree or updates `latest_scheduled_run.json`. **Same-day top-up guard:** earlier same-day manual/order fills are prior-allocation context only; buy only if the current decision price is **strictly below** the prior reference price and only the **incremental** difference. **Morning evidence must never count as afternoon evidence** — morning fills count **only** as prior-allocation context for the midday/afternoon same-day top-up guard, never afternoon scheduled evidence, slippage, watchdog confirmation, scheduled cost basis, or scheduled fill counts.
-- **Live reliability fix (Jul 17 2026):** before calling `place_equity_order`, describe the Robinhood connector schemas needed in-session (`place_equity_order` and `get_equity_orders`); every actionable signal is intended to end with exactly one persisted result (`order_id`, broker rejection, top-up/budget/cap/data-confidence/spread/trend/safety block); an actionable signal missing both an `order_id` and a block/rejection is classified `execution_lineage_incomplete`, triggering one recovery retry in the same scheduled directory for only the missing tickers with the same `ref_id` values, reconciling duplicate `ref_id` or timeout through `get_equity_orders` before declaring failure. Manual overrides stay `manual_run=true` and never count as scheduled evidence. This is manifest metadata only, not yet consumed by `morning_dca.py` (see the top-of-file live reliability fix note); the artifacts this task actually writes remain governed by the **Artifacts** bullet above.
+- **Raw input persistence (implemented Jul 21 2026):** before `evaluate_signal()`/`_place_broker_orders()` computes from a connector response, that response (previous close, intraday bars, quotes, bid/ask, account number, buying power, tradability, same-day order existence) is persisted under `.../morning_dca/YYYYMMDD_1030ET/raw/`. A persistence failure caught before any order is placed blocks the run with `status='blocked'` and `error_class='missing_or_invalid_raw_inputs'`; a failure discovered only after placement has begun is recorded on `raw_persistence_error` without retroactively blocking. Applies identically to the 12:30 midday task. See `config/morning_dca.json`'s `raw_data_persistence.implementation_status`.
 
 - **Cost-conscious model instruction (Jul 17 2026):** use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review. See the top-of-file cost-conscious model instruction note.
 
@@ -523,16 +699,19 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 - Writes live artifacts under `/home/user/workspace/cron_tracking/midday_dca/YYYYMMDD_1230ET/` (`run_id='midday_live_YYYYMMDD_1230ET'`) and updates its own `latest_midday_run.json` pointer.
 - `stream='midday'`, `run_type='midday_dca_live'`, `state_schema_version='midday-live-v1'`, `cron_id='a6239dae'`, `supersedes_cron_id=null`, `valid_afternoon_evidence=false`. Never writes into the morning or afternoon (`ce16ba6b`) trees or updates `latest_scheduled_run.json`.
 - **Automatic failure recovery:** if the run fails on internal persistence, parsing, wrapper-normalization, transient connector throttling, or raw-file write problems **after data was fetched**, it is a recovery trigger, not a terminal stop. The task reruns the required read-only inputs **once**, **persists all raw responses first**, **recomputes only from the persisted files**, and continues through the same pre-authorized guarded path if every safeguard still passes. The recovery reuses the same `midday_dca/YYYYMMDD_1230ET/` scheduled run directory with `recovery_rerun=true` and stays `stream='midday'` scheduled (**never** reclassified as manual — distinct from the `manual_reruns/` override tree). If the recovery attempt also fails or a safety/account/order rejection occurs, it writes `run_state.json` with the blocking reason and escalates.
+- **Raw input generation and failure-state fix (Jul 20 2026):** after the Jul 20 2026 12:30 run escalated, the task must **generate the same-day raw inputs before invoking any saved runner** (e.g. `.../cron_tracking/a6239dae/run_midday_live.sh` or `midday_live_runner.py`). It creates `.../midday_dca/YYYYMMDD_1230ET/raw/` and persists `raw/portfolio.json`, `raw/quotes.json` (or named quote batches normalized into it), and the historical/trend files for the 60-minute trend check, passing the current America/New_York date as `RUN_DATE_ET=YYYYMMDD` when required; it must **not** assume `raw/quotes.json` or historicals exist from a prior run. Inputs come from Finance primary, Alpaca/Robinhood validation-context, and `yfinance` fallback only when connector data is unavailable, stale, incomplete, or unresolved; one bounded recovery attempt on the alternate source path is allowed, then stop. The run **always** writes `run_state.json`, `run_summary.json`, and `latest_midday_run.json` even with no orders or a blocked run; on missing/malformed/stale/ungenerated raw inputs it writes a valid scheduled `run_state` with `run_origin='scheduled'`, `manual_run=false`, `stream='midday'`, `scheduled_for_et='12:30'`, `cron_id='a6239dae'`, `valid_afternoon_evidence=false`, `order_submit_status='not_submitted_error'`, `error_class='missing_or_invalid_raw_inputs'`, `orders_submitted_count=0`, and a compact list of missing files or failed data sources — proof the task **fired**, not order/fill evidence. Do not escalate without writing it unless the workspace itself is unavailable. Same-day manual missed-10:30 recovery artifacts are loaded **after** raw data is available and **before** order sizing, stay prior-allocation/top-up context only, and never satisfy raw input requirements, enter the scheduled evidence stream, or prove the 10:30 scheduled task ran. See [midday_dca.md](midday_dca.md#raw-input-generation-and-failure-state-guarantee-added-jul-20-2026).
 - **Same-day top-up guard:** morning/manual earlier same-day allocations (before **2:30 PM ET**, non-scheduled) are **prior-allocation context only** — never midday scheduled evidence. Per ticker, the run buys only the **incremental** dollar difference (midday desired minus amount already bought) and only when the midday decision price is **strictly below** the prior reference price; otherwise **$0**. The run_state records `prior_same_day_amount`, `prior_same_day_reference_price`, `prior_same_day_run_id`/`prior_same_day_source`, `midday_desired_amount`, `midday_decision_price`, `incremental_order_amount`, `top_up_guard_result`, `top_up_skipped`, and `top_up_manual_review`. Midday fills count only as prior-allocation context for the afternoon 3:20 PM top-up guard. See [midday_dca.md](midday_dca.md).
 - **Live reliability fix (Jul 17 2026):** before calling `place_equity_order`, describe the Robinhood connector schemas needed in-session (`place_equity_order` and `get_equity_orders`); always write the final `run_state.json`, `run_summary.json`, `signals.csv`, `submitted_orders.csv`, and `filled_orders.csv` where applicable, even for no-order/blocked/failed/recovery runs; every actionable signal ends with exactly one persisted result (`order_id`, broker rejection, top-up/budget/cap/data-confidence/spread/trend/safety block); an actionable signal missing both an `order_id` and a block/rejection is classified `execution_lineage_incomplete`, triggering one recovery retry in the same scheduled directory for only the missing tickers with the same `ref_id` values, reconciling duplicate `ref_id` or timeout through `get_equity_orders` before declaring failure. Manual overrides stay `manual_run=true` and never count as scheduled evidence. See the top-of-file live reliability fix note.
 - **Live 12:30 no-placeholder fix (Jul 17 2026):** the scheduled midday run must **never** write placeholder signals or empty `submitted_orders.csv` / `filled_orders.csv` while marking `valid_midday_evidence=true`; if it cannot compute full signals it must write `valid_midday_evidence=false` with concrete `blocking_errors` and notify; it must parse Robinhood `get_equity_quotes` results from `data.results[].quote` and `data.results[].close`; it must follow `output_path` pointers for large `get_equity_historicals` responses and load the referenced result JSON before computing trend; a placeholder artifact with `blocking_errors=['persistence_placeholder_no_signal_compute']` is a **failed run** that must trigger recovery, not a completed scheduled run. See the top-of-file no-placeholder fix note.
 - **Jul 17 2026 12:30 recovery result:** the original background task escalated after writing placeholder artifacts with `blocking_errors=['persistence_placeholder_no_signal_compute']`. Parent recovery persisted raw quote, history, tradability, portfolio, and order-history files under `/home/user/workspace/cron_tracking/midday_dca/20260717_1230ET/raw/`, corrected the nested Robinhood quote parser and the `output_path` historical parser, and found **exactly one** eligible scheduled midday buy: **TRIN $3.00** (`order_id 6a5a5b53-6502-476d-b6d4-9cc73bab4f31`, state **filled**, `average_fill_price 17.736500`, `quantity 0.169142`, `created_at 2026-07-17T16:41:55.91467Z`). Marked `valid_midday_evidence=true`, `valid_afternoon_evidence=false`; the Jul 17 morning manual override remains manual context only.
+- **Manual missed-12:30 recovery (Jul 20 2026):** after the Jul 20 2026 12:30 scheduled midday run failed, a human placed the missed midday buys by hand at 12:59 ET under `/home/user/workspace/cron_tracking/midday_dca/manual_recovery/20260720_1259ET` (fills **AAPL $1.00** @ 324.389900, **TRIN $2.00** @ 17.399900, **ASML $2.00** @ 1739.506300, **IRDM $2.00** @ 46.669900). It carries `run_origin='manual'`, `manual_run=true`, `same_day_top_up_context_only=true`, `valid_scheduled_evidence=false` and is prior-allocation / same-day top-up context **only** for the 3:20 afternoon run — never midday scheduled evidence, never proof the 12:30 scheduled task ran, and never counted in scheduled reliability, fill counts, slippage, cost basis, or watchdog confirmation. Machine-readable source: `config/scheduled_tasks.json` → `midday_dca_manual_recovery_2026_07_20` (mirrored in `config/midday_dca.json`). See [midday_dca.md](midday_dca.md#manual-missed-1230-recovery-added-jul-20-2026).
 
 - **Cost-conscious model instruction (Jul 17 2026):** use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review. See the top-of-file cost-conscious model instruction note.
 
 ### `e3e6f09e` — Monitor-only graded DCA signal check
 - Analytics and notifications only; **no trades**. Runs **3:05 PM ET weekdays**.
 - Monitor-only signal check that surfaces the planned allocation and tier selection using the current $2 base 0x-to-5x ladder.
+- **Pointer output normalization (Jul 20 2026):** although this task places no orders, it uses connector data, so any connector response returning an `output_path` or `current_session_context` pointer must be copied or normalized into the run raw directory before compute, and compute must read only the persisted raw files. See `config/scheduled_tasks.json` → `pointer_output_normalization_2026_07_20`.
 
 - **Cost-conscious model instruction (Jul 17 2026):** use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review. See the top-of-file cost-conscious model instruction note.
 
@@ -592,6 +771,9 @@ US Eastern Daylight Time (EDT, UTC-4). Re-verify around DST transitions.
 - **Jul 13 2026 final manual override incident:** the scheduled 3:20 PM ET run placed **0 orders**; the user then requested the final buy **manually**. A final manual-review scan ran the final-buy behavior above (full scan, trend ignored) with same-day top-up offsets and filled **34 orders**, planned total **$234.00** (`DFTX TRIN SPCX LUNR IRDM DXYZ LITE ASML DRAM STX AMAT AMD CBRS MRVL BTX STM SNDK WDC TSM AVGO NVDA QBTS FLKR INTC GOOGL GOOG GLW GS MU XLG TOPT QTOP SATA RGTI`). These are **manual final-buy overrides / same-day top-up context only — NOT scheduled-afternoon execution evidence**. Their run_state carries `run_type='final_manual_buy_override'`, `run_origin='manual'`, `manual_run=true`, `valid_afternoon_scheduled_evidence=false`, `same_day_top_up_context_only=true`. Artifacts (run_state + `filled_orders.csv` with all order IDs) were backfilled under `/home/user/workspace/cron_tracking/ce16ba6b/manual_runs/final_manual_override_20260713_1536ET/` and `/home/user/workspace/cron_tracking/midday_dca/manual_reruns/final_manual_override_20260713_1536ET/`. All order IDs are excluded from scheduled slippage/fills/reliability/cost basis/watchdog confirmation and shown only in the **"Manual Final Buy Override / Same-Day Top-Up Context"** section. See [run_classification.md](run_classification.md) and [strategy.md](strategy.md#manual-final-buy-override--2026-07-13-incident).
 - **Automatic failure recovery:** if the run fails on internal persistence, parsing, wrapper-normalization, transient connector throttling, or raw-file write problems **after data was fetched**, it is a recovery trigger, not a terminal stop. The task reruns the required read-only inputs **once**, **persists all raw responses first**, **recomputes only from the persisted files**, and continues through the same pre-authorized guarded path if every safeguard still passes. The recovery reuses the same `scheduled_runs/YYYYMMDD_1520ET/` directory with `recovery_rerun=true`, keeps `run_origin='scheduled'` (both `cron_id='10ce362c'` and `supersedes_cron_id='ce16ba6b'`), and still updates `latest_scheduled_run.json` — it is **never** reclassified as manual. If the recovery attempt also fails or a safety/account/order rejection occurs, it writes `run_state.json` with the blocking reason and escalates.
 - **Live reliability fix (Jul 17 2026):** before calling `place_equity_order`, describe the Robinhood connector schemas needed in-session (`place_equity_order` and `get_equity_orders`); always write the final `run_state.json`, `run_summary.json`, `signals.csv`, `submitted_orders.csv`, and `filled_orders.csv` where applicable, even for no-order/blocked/failed/recovery runs; every actionable signal ends with exactly one persisted result (`order_id`, broker rejection, top-up/budget/cap/data-confidence/spread/trend/safety block); an actionable signal missing both an `order_id` and a block/rejection is classified `execution_lineage_incomplete`, triggering one recovery retry in the same scheduled directory (`scheduled_runs/YYYYMMDD_1520ET/`) for only the missing tickers with the same `ref_id` values, reconciling duplicate `ref_id` or timeout through `get_equity_orders` before declaring failure. Manual overrides stay `manual_run=true` and never count as scheduled evidence. See the top-of-file live reliability fix note.
+- **Pointer output normalization (Jul 20 2026):** the Jul 20 3:20 scheduled run collected portfolio, quotes, tradability, same-day orders, and historicals, but large historicals (and possibly other connector responses) were only available as `output_path` / `current_session_context` tool-output **pointers** that the background run never persisted into the scheduled raw directory before compute, so it **escalated after data collection**. Any connector response returning an `output_path` or `current_session_context` pointer must be **immediately copied or normalized into the run raw directory before compute**; compute must read **only** persisted raw files; **pointer-only collection is not a completed run** (never stop after collecting data without writing `run_state`); and if pointer normalization fails after one bounded recovery attempt, write the valid failure-state file with a concrete `error_class`, empty `submitted_orders.csv` headers where applicable, and the missing pointer details. Parent recovery copied the `current_session_context` / `tool_calls` / `call_external_tool` outputs into `.../ce16ba6b/scheduled_runs/20260720_1520ET/raw/`, computed from the persisted files, and placed scheduled top-up orders: `run_id='scheduled_20260720_1520ET'`, `order_submit_status='filled'`, `orders_filled_count=6`, total **$10.00** (EVR $1.00 @ 333.600800, DXYZ $1.00 @ 24.865000, AMAT $2.00 @ 526.819900, STM $2.00 @ 61.450000, NVDA $2.00 @ 202.771200, GLW $2.00 @ 153.810400), valid scheduled evidence recovered after the escalation. Live task text updated with **POINTER OUTPUT NORMALIZATION ADDED JUL 20 2026** for 10:30, 12:30, 3:05, and 3:20. Machine-readable source: `config/scheduled_tasks.json` → `pointer_output_normalization_2026_07_20` (mirrored in `config/run_classification.json`).
+- **Compact live task text (Jul 20 2026):** because the schedule service appears to truncate or drop the tail of very long task text, `10ce362c` was replaced with a compact **~5,850 character** source-of-truth version that keeps all essential safeguards inside the accepted text: the **RAW INPUT SELF-CONTAINMENT FIX ADDED JUL 20 2026**, the **STATE FILE GUARANTEE AND NO HALF-DONE RUN RULE ADDED JUL 20 2026**, the same-day top-up guard, the Jul 20 midday recovery artifact path `/home/user/workspace/cron_tracking/midday_dca/manual_recovery/20260720_1259ET`, and the filled AAPL/TRIN/ASML/IRDM recovery context as prior-allocation / top-up context only. Live task text must stay compact so critical guardrails are not pushed past the truncation boundary. Machine-readable source: `config/scheduled_tasks.json` → `live_task_text_compactness_policy`.
+- **3:20 runner self-containment and state-file guarantee (Jul 20 2026):** part of the full Jul 20 2026 hardening after the 10:30 and 12:30 runs failed. Before invoking any saved runner or order module the task must **generate its same-day raw inputs**, creating `.../ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/raw/` and persisting portfolio / buying power, quotes, prior close, tradability, `orders_after_1430ET` (afternoon evidence checks), the same-day prior-allocation context from the morning-live, midday, manual missed-morning recovery, and manual override roots, and the historical / trend files — passing `RUN_DATE_ET=YYYYMMDD` when required and never reusing stale files (Finance primary, Alpaca/Robinhood validation-context, `yfinance` fallback only; one bounded recovery attempt then stop). It **always** writes `run_state.json`, `run_summary.json`, and `latest_scheduled_run.json` even when blocked, a no-op, or on error; on a block it writes a valid scheduled `run_state` with `run_origin='scheduled'`, `manual_run=false`, `stream='afternoon'`, `scheduled_for_et='15:20'`, `cron_id='10ce362c'`, `supersedes_cron_id='ce16ba6b'`, `state_schema_version='run-classification-v1'`, `orders_submitted_count=0`, a concrete `order_submit_status`, an `error_class` such as `missing_or_invalid_raw_inputs` or `no_incremental_top_up`, and a compact list of missing files / block reasons / failed sources — proof the task **fired**, not order/fill evidence. A post-raw failure still writes `signals.csv` when possible, an empty `submitted_orders.csv` with headers when no orders, and `run_state.json` (no half-done run). Manual recovery artifacts (missed-morning and manual 12:30) stay prior-allocation / top-up context only and are never afternoon scheduled evidence. Machine-readable source: `config/scheduled_tasks.json` → `live_schedule_hardening_2026_07_20.afternoon_1520` (mirrored in `config/run_classification.json`). See [run_classification.md](run_classification.md).
 
 - **Cost-conscious model instruction (Jul 17 2026):** use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review. See the top-of-file cost-conscious model instruction note.
 

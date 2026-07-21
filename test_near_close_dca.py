@@ -1367,6 +1367,71 @@ def test_load_prior_same_day_no_logged_price_has_no_reference(tmp_path):
     assert allocations["AAPL"].reference_price is None
 
 
+def _manual_recovery_run_state(candidates, **classification_overrides):
+    classification = {
+        "run_origin": "manual",
+        "manual_run": True,
+        "same_day_top_up_context_only": True,
+        "valid_scheduled_evidence": False,
+        "run_id": "manual_recovery_am",
+    }
+    classification.update(classification_overrides)
+    return {
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T10:48:00-04:00",
+        "run_classification": classification,
+        "buy_candidates": candidates,
+    }
+
+
+def test_load_prior_same_day_includes_correctly_classified_manual_recovery(tmp_path):
+    root = os.path.join(tmp_path, "cron_tracking", "morning_dca")
+    _write_prior_run(
+        root,
+        "manual_recovery/20260629_1048ET",
+        _manual_recovery_run_state(
+            [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0}]
+        ),
+    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert set(allocations) == {"AAPL"}
+    assert allocations["AAPL"].amount_usd == 3.0
+
+
+def test_load_prior_same_day_excludes_misclassified_manual_recovery(tmp_path):
+    # manual_missed_run_recovery requires all four classification fields; a
+    # recovery artifact missing/failing one of them must not reduce or block
+    # a later buy (config/morning_dca.json: manual_missed_run_recovery).
+    root = os.path.join(tmp_path, "cron_tracking", "morning_dca")
+    _write_prior_run(
+        root,
+        "manual_recovery/20260629_1048ET",
+        _manual_recovery_run_state(
+            [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0}],
+            valid_scheduled_evidence=True,
+        ),
+    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert allocations == {}
+
+
+def test_load_prior_same_day_excludes_manual_recovery_missing_classification(tmp_path):
+    root = os.path.join(tmp_path, "cron_tracking", "morning_dca")
+    _write_prior_run(
+        root,
+        "manual_recovery/20260629_1048ET",
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T10:48:00-04:00",
+            "buy_candidates": [
+                {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0}
+            ],
+        },
+    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert allocations == {}
+
+
 def test_load_prior_same_day_prefers_logged_target_over_fill_price(tmp_path):
     # Reference-price preference: the logged target_price wins over the confirmed
     # average_fill_price when both are present.

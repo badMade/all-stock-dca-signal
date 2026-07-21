@@ -85,6 +85,7 @@ from near_close_dca import (
     load_prior_same_day_allocations_multi,
     quote_spread_pct,
 )
+from scripts.run_classification import save_raw_input
 
 _log = logging.getLogger(__name__)
 
@@ -926,6 +927,194 @@ def load_same_day_preflight(
         "run_state_path": str(state_path),
         "recovered_via_bounded_lookup": recovered_via_bounded_lookup,
     }
+
+
+def _raw_json_safe(value: Any) -> Any:
+    """Recursively convert a connector response to a JSON-serializable value.
+
+    Handles the shapes returned by :class:`near_close_dca.MarketDataProvider`/
+    :class:`near_close_dca.BrokerAdapter` implementations: ``Bar`` dataclasses,
+    raw datetimes (e.g. inside a ``get_quote``/``get_bid_ask`` tuple), and
+    nested lists/dicts of those. Anything already JSON-safe passes through.
+    """
+    if isinstance(value, Bar):
+        return {
+            "timestamp": value.timestamp.isoformat(),
+            "open": value.open,
+            "high": value.high,
+            "low": value.low,
+            "close": value.close,
+            "volume": value.volume,
+        }
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, (date,)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(k): _raw_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_raw_json_safe(v) for v in value]
+    return value
+
+
+class _RawInputRecorder:
+    """Persists connector responses used by a scheduled live run under ``raw/``.
+
+    Implements ``live_schedule_hardening_2026_07_20``'s raw-input persistence
+    contract (config/morning_dca.json) for the 10:30 morning live task (and,
+    via inheritance, the 12:30 midday live task): before compute uses a
+    connector response, that response is written to ``raw/`` so a downstream
+    consumer never has to trust an in-memory value that was never durably
+    recorded. Morning fetches data lazily per ticker (unlike the afternoon
+    stream's upfront batch fetch), so persistence happens per-call rather than
+    as one preceding batch step -- functionally equivalent (nothing is used
+    for signal computation or order placement before its own response is on
+    disk), just interleaved instead of front-loaded.
+
+    A write failure (disk full, unwritable path, non-serializable payload) is
+    never raised into the caller: it is recorded on :attr:`error` (first
+    failure wins) so ``run()`` can fail the scheduled run closed at a safe
+    checkpoint, rather than surfacing as an unrelated-looking crash deep
+    inside signal evaluation or order placement.
+    """
+
+    def __init__(self, raw_dir: Path, trading_day_iso: str):
+        self.raw_dir = raw_dir
+        self.trading_day_iso = trading_day_iso
+        self.saved_filenames: List[str] = []
+        self.error: Optional[str] = None
+        self._seq = 0
+
+    def persist(self, kind: str, key: str, payload: Any) -> None:
+        self._seq += 1
+        safe_key = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in str(key))
+        filename = f"{kind}_{safe_key}_{self._seq}.json"
+        try:
+            save_raw_input(
+                self.trading_day_iso,
+                filename,
+                _raw_json_safe(payload),
+                raw_dir=self.raw_dir,
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            if self.error is None:
+                self.error = f"failed to persist {filename}: {exc}"
+            return
+        self.saved_filenames.append(filename)
+
+
+class _PersistingMarketDataProvider:
+    """``MarketDataProvider`` decorator that persists every response it returns.
+
+    Wraps ``get_previous_close_bar``/``get_intraday_bars``/``get_quote``/
+    ``get_bid_ask`` -- the price-data calls ``evaluate_signal`` makes -- and
+    forwards everything else (including the ``source`` attribute) to the
+    wrapped provider unchanged.
+    """
+
+    def __init__(self, inner: Any, recorder: _RawInputRecorder):
+        self._inner = inner
+        self._recorder = recorder
+
+    def get_previous_close_bar(self, ticker: str, as_of: datetime) -> Optional[Bar]:
+        bar = self._inner.get_previous_close_bar(ticker, as_of)
+        self._recorder.persist("prior_close", ticker, bar)
+        return bar
+
+    def get_intraday_bars(
+        self, *, ticker: str, start: datetime, end: datetime, interval_minutes: int
+    ) -> Sequence[Bar]:
+        bars = self._inner.get_intraday_bars(
+            ticker=ticker, start=start, end=end, interval_minutes=interval_minutes
+        )
+        self._recorder.persist("intraday_bars", ticker, list(bars))
+        return bars
+
+    def get_quote(self, ticker: str, as_of: datetime) -> Any:
+        get_quote = getattr(self._inner, "get_quote", None)
+        if not callable(get_quote):
+            return None
+        quote = get_quote(ticker, as_of)
+        self._recorder.persist("quote", ticker, quote)
+        return quote
+
+    def get_bid_ask(self, ticker: str, as_of: datetime) -> Any:
+        get_bid_ask = getattr(self._inner, "get_bid_ask", None)
+        if not callable(get_bid_ask):
+            return None
+        result = get_bid_ask(ticker, as_of)
+        self._recorder.persist("bid_ask", ticker, result)
+        return result
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class _PersistingBrokerAdapter:
+    """``BrokerAdapter`` decorator that persists the read-only queries it serves.
+
+    Wraps ``account_number``/``available_buying_power``/
+    ``is_tradable_for_fractional_buy``/``same_day_strategy_order_exists`` --
+    the broker-side inputs a live run consults before placing an order -- so
+    portfolio/buying-power/tradability/same-day-order-existence responses are
+    captured under ``raw/``. ``review_market_buy``/``place_market_buy``/
+    ``get_order_fill``/``get_raw_placement_responses`` pass straight through:
+    those are order actions and fill evidence, not inputs the persist-before-
+    compute contract covers.
+    """
+
+    def __init__(self, inner: BrokerAdapter, recorder: _RawInputRecorder):
+        self._inner = inner
+        self._recorder = recorder
+        self._account_persisted = False
+        self._buying_power_persisted = False
+
+    def account_number(self) -> str:
+        value = self._inner.account_number()
+        if not self._account_persisted:
+            self._recorder.persist("account_number", "account", {"account_number": value})
+            self._account_persisted = True
+        return value
+
+    def available_buying_power(self) -> float:
+        value = self._inner.available_buying_power()
+        if not self._buying_power_persisted:
+            self._recorder.persist("buying_power", "account", {"available_buying_power": value})
+            self._buying_power_persisted = True
+        return value
+
+    def same_day_strategy_order_exists(self, ticker: str, trading_day: date) -> bool:
+        value = self._inner.same_day_strategy_order_exists(ticker, trading_day)
+        self._recorder.persist(
+            "orders_since_midnight",
+            ticker,
+            {"ticker": ticker, "trading_day": trading_day.isoformat(), "same_day_order_exists": value},
+        )
+        return value
+
+    def is_tradable_for_fractional_buy(self, ticker: str) -> bool:
+        value = self._inner.is_tradable_for_fractional_buy(ticker)
+        self._recorder.persist("tradability", ticker, {"ticker": ticker, "tradable": value})
+        return value
+
+    def review_market_buy(self, ticker: str, notional_usd: float):
+        return self._inner.review_market_buy(ticker, notional_usd)
+
+    def place_market_buy(self, ticker: str, notional_usd: float, ref_id: str) -> str:
+        return self._inner.place_market_buy(ticker, notional_usd, ref_id)
+
+    def get_order_fill(self, order_id: str):
+        return self._inner.get_order_fill(order_id)
+
+    def get_raw_placement_responses(self) -> List[Dict[str, Any]]:
+        getter = getattr(self._inner, "get_raw_placement_responses", None)
+        return getter() if callable(getter) else []
+
+    def __getattr__(self, name: str) -> Any:
+        # Forward optional, non-protocol broker methods (e.g.
+        # same_day_strategy_order_exists_with_ref_id_prefix) that some
+        # BrokerAdapter implementations support beyond the base protocol.
+        return getattr(self._inner, name)
 
 
 def _strip_template_segments(path: str) -> str:
@@ -2070,6 +2259,8 @@ class MorningDCAExecutor(DCAExecutor):
         block_reason: str,
         signals: Sequence[MorningSignal],
         source: str,
+        *,
+        error_class: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Write and return a fail-closed live-run result before broker placement.
 
@@ -2094,6 +2285,10 @@ class MorningDCAExecutor(DCAExecutor):
         not a dict, or has no submitted evidence is NOT preserved -- it is
         overwritten with the fresh block_reason, so a second, different wiring
         failure is never hidden behind a stale first one.
+
+        ``error_class`` optionally stamps a concrete, machine-checkable code
+        (e.g. ``"missing_or_invalid_raw_inputs"``) alongside the human-readable
+        ``block_reason``; omitted for the pre-existing wiring-failure callers.
         """
         existing = self._existing_submitted_run_state(now)
         if existing is not None:
@@ -2120,6 +2315,8 @@ class MorningDCAExecutor(DCAExecutor):
         artifacts = self.build_artifacts(now, signals, source, manual=False)
         artifacts["status"] = "blocked"
         artifacts["block_reason"] = block_reason
+        if error_class is not None:
+            artifacts["error_class"] = error_class
         artifacts["broker_outcomes"] = {}
         paths = self.write_artifacts(artifacts, now)
         # A blocked scheduled live run may have committed signals but placed no
@@ -2802,6 +2999,21 @@ class MorningDCAExecutor(DCAExecutor):
         blocked = self._maybe_block_for_holiday(now, manual=manual)
         if blocked is not None:
             return blocked
+        # live_schedule_hardening_2026_07_20 (config/morning_dca.json): a
+        # SCHEDULED live run must persist every raw connector response it uses
+        # under raw/ before that response is used to compute a signal or place
+        # an order, and must never escalate without writing a valid run_state.
+        # Manual/watchlist/preflight runs are unaffected -- the policy's
+        # "applies_to" is scoped to the scheduled live task (42173154/a6239dae).
+        is_scheduled_live = self.mode == MORNING_LIVE_MODE and self.trades and not manual
+        raw_recorder: Optional[_RawInputRecorder] = None
+        raw_dir: Optional[Path] = None
+        if is_scheduled_live:
+            raw_dir = self.run_state_dir(now) / "raw"
+            raw_recorder = _RawInputRecorder(raw_dir, now.astimezone(EASTERN).date().isoformat())
+            data = _PersistingMarketDataProvider(data, raw_recorder)
+            if broker is not None:
+                broker = _PersistingBrokerAdapter(broker, raw_recorder)
         signals = self.evaluate(now, data, manual=manual)
         source = data_source or getattr(getattr(data, "source", None), "value", "unknown")
         # Scheduled-run preflight block: _apply_preflight_gate found no same-day
@@ -2838,6 +3050,20 @@ class MorningDCAExecutor(DCAExecutor):
             if self.mode == MORNING_LIVE_MODE and self.trades:
                 _run_drift_check(Path(paths["run_state"]).parent)
             return {"artifacts": artifacts, "paths": paths}
+        if raw_recorder is not None and raw_recorder.error:
+            # Raw-input persistence failed before any order could be placed --
+            # evaluate() above only reads price data and never places an
+            # order, so nothing has been submitted yet. Fail closed rather
+            # than compute/place from a connector response that was never
+            # durably recorded (config/morning_dca.json:
+            # live_schedule_hardening_2026_07_20.raw_input_generation).
+            return self._blocked_live_result(
+                now,
+                f"raw input persistence failed: {raw_recorder.error}",
+                signals,
+                source,
+                error_class="missing_or_invalid_raw_inputs",
+            )
         trading_day = now.astimezone(EASTERN).date()
         top_up_outcomes = self._compute_top_up(now, signals, manual=manual)
         # Sort by multiplier DESC, then drop_pct DESC, then ticker ASC so tied
@@ -3038,6 +3264,18 @@ class MorningDCAExecutor(DCAExecutor):
                     self._own_recorded_scheduled[trading_day] = (
                         self._own_recorded_scheduled.get(trading_day, 0.0) + carried_forward_total
                     )
+        if raw_recorder is not None:
+            artifacts["raw_input_dir"] = str(raw_dir)
+            artifacts["raw_inputs_saved"] = raw_recorder.saved_filenames
+            if raw_recorder.error:
+                # Persistence failed only after order placement had already
+                # begun (evaluate()-stage failures are caught above, before
+                # any order is placed) -- the safeguards that validated each
+                # already-placed order (budget, tradability, spread, trend)
+                # are unaffected by a failure to also write its audit copy to
+                # disk, so this does not retroactively block the run; it is
+                # surfaced here for operator visibility instead.
+                artifacts["raw_persistence_error"] = raw_recorder.error
         paths = self.write_artifacts(artifacts, now)
         # Fold this run's own run_id into the seen-set so a LATER run() call on
         # this SAME executor instance never re-reads this just-written artifact
