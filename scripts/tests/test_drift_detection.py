@@ -300,6 +300,13 @@ class SlackTests(unittest.TestCase):
         report = detect_drift(self.run_dir)
         self.assertFalse(send_slack_alert(report, webhook=None, env_var="DEFINITELY_UNSET_HOOK_VAR"))
 
+    def test_send_slack_rejects_invalid_scheme(self):
+        import urllib.error
+
+        report = detect_drift(self.run_dir)
+        with self.assertRaises(urllib.error.URLError):
+            send_slack_alert(report, webhook="file:///etc/passwd")
+
     def test_slack_payload_shape(self):
         report = detect_drift(self.run_dir)
         payload = build_slack_payload(report)

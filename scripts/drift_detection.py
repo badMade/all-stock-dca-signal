@@ -646,6 +646,19 @@ def send_slack_alert(
     url = resolve_webhook(webhook, env_var)
     if not url:
         return False
+
+    url = url.strip()
+    if not url:
+        return False
+
+    from urllib.parse import urlsplit
+
+    scheme = urlsplit(url).scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise urllib.error.URLError(
+            f"Invalid webhook URL scheme {scheme!r}. Expected 'http' or 'https'."
+        )
+
     payload = json.dumps(build_slack_payload(report)).encode("utf-8")
     request = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - operator-supplied webhook
