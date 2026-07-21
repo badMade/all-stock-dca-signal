@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import json
-import math
 import os
-import re
 from pathlib import Path
 
 import pandas as pd
-
 
 # Data/output directory. Override with DCA_LADDER_DIR; defaults to this script's own
 # folder so the analysis is portable rather than tied to one machine's absolute path.
@@ -173,7 +170,6 @@ def load_quotes() -> pd.DataFrame:
 
 
 def write_report(summary: pd.DataFrame, decisions: pd.DataFrame, today: pd.DataFrame) -> dict:
-    signal_days = decisions[decisions["budgeted_spend"] > 0]
     total_graded = float(summary["graded_total_capital"].sum())
     total_flat = float(summary["flat_total_capital"].sum())
     total_graded_shares = float(summary["graded_final_shares"].sum())
