@@ -396,6 +396,17 @@ def _decision(ticker, action):
     return ReconciledDecision(ticker=ticker, action=action, reason="x", finance_signal=None, robinhood_signal=None)
 
 
+
+def test_missing_fill_loop_reason_none_decision():
+    assert classify_missing_fill(None, MISSING_FILL_BUDGET_CAPPED) == MISSING_FILL_BUDGET_CAPPED
+
+
+
+def test_missing_fill_none_decision_no_loop_reason():
+    assert classify_missing_fill(None, None) == MISSING_FILL_DATA_ERROR
+
+
+
 def test_missing_fill_classification():
     assert classify_missing_fill(_decision("A", Action.NO_DATA), None) == MISSING_FILL_DATA_ERROR
     assert classify_missing_fill(_decision("A", Action.SKIP), None) == MISSING_FILL_FAILED_TRIGGER
