@@ -36,6 +36,7 @@ from near_close_dca import (
     SourceSignal,
     StrategyConfig,
     StrategyState,
+    _iso_or_none,
     allocation_sort_key,
     build_execution_record,
     build_report,
@@ -2191,6 +2192,24 @@ def test_prior_run_before_boundary_malformed_iso_format():
     run_state = {"generated_at": "invalid-date-format"}
     boundary_et = time(14, 30)
     assert _prior_run_before_boundary(run_state, boundary_et) is True
+
+
+def test_iso_or_none_handles_datetime_and_none():
+    from datetime import timezone
+    # Verify None is passed through
+    assert _iso_or_none(None) is None
+
+    # Verify UTC timezone-aware datetime works
+    dt_utc = datetime(2023, 10, 27, 14, 30, 0, tzinfo=timezone.utc)
+    assert _iso_or_none(dt_utc) == "2023-10-27T14:30:00+00:00"
+
+    # Verify Eastern timezone-aware datetime works (EDT offset is -04:00)
+    dt_eastern = datetime(2023, 10, 27, 14, 30, 0, tzinfo=EASTERN)
+    assert _iso_or_none(dt_eastern) == "2023-10-27T14:30:00-04:00"
+
+    # Verify naive datetime works
+    dt_naive = datetime(2023, 10, 27, 14, 30, 0)
+    assert _iso_or_none(dt_naive) == "2023-10-27T14:30:00"
 
 
 def test_iso_or_none():
