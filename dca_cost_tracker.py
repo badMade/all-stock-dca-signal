@@ -101,10 +101,22 @@ def collect_month_run_states(
     run_states: List[Dict[str, Any]] = []
     for path in find_run_state_files(root):
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
+            raw_text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
             logger.warning("skipping unreadable run-state artifact %s: %s", path, exc)
             continue
+
+        # ⚡ Bolt Optimization: Fast JSON filtering via substring check.
+        # Skip the expensive JSON parse if the file doesn't match the month prefix.
+        if prefix not in raw_text:
+            continue
+
+        try:
+            data = json.loads(raw_text)
+        except json.JSONDecodeError as exc:
+            logger.warning("skipping unparseable run-state artifact %s: %s", path, exc)
+            continue
+
         if data.get("status") == "blocked":
             continue
         trading_day = data.get("trading_day")
