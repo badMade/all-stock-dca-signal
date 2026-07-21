@@ -39,13 +39,15 @@
     "premarket_buying_power": [],
     "capital_priority_briefing": ["in_app_message_center", "email"],
     "weekly_dashboard": [],
-    "cost_review": ["in_app_message_center"]
+    "cost_review": ["in_app_message_center"],
+    "month_end_volatility_risk": ["in_app_message_center", "email"]
   },
   "routing_conditions": {
     "capital_priority_briefing": "Notify (in-app + email) only if at least one ticker triggers a 1.5x or higher multiplier; otherwise silent.",
     "premarket_buying_power": "Analytics dashboard only; no routine notification.",
     "volatility_outliers": "Alert only for >5% outliers or actionable errors.",
     "drift_alerts": "Fire an IMMEDIATE alert when scripts/drift_detection.py detects an auto-buy signal (auto_buy_signal true and incremental_order_amount > 0 or desired amount > 0) with no corresponding submitted-order record. Routes to in_app_message_center by default; also posts to Slack when DCA_DRIFT_SLACK_WEBHOOK is set and the detector is run with --slack. Never routine/heartbeat -- only on detected drift.",
+    "month_end_volatility_risk": "Month-end volatility risk refresh (tasks c9fb1fb8/17a3b2a9, see month_end_volatility_risk_policy in config/scheduled_tasks.json). Notify (in-app + email) ONLY if the Notion refresh fails, data quality blocks the run, or one or more tickers triggered the 3x tier more than twice; otherwise silent. Email subject: 'Month-end DCA volatility risk table'. No Slack. The run also ends silently with no notification when the final-eligible-market-day gate does not pass.",
     "daily_compact_mode": "Weekday daily tasks suppress no-op/heartbeat notifications and notify only for the actionable events listed in daily_compact_mode.actionable_events (placed/rejected orders, budget-capped candidates, missing/invalid artifacts, broker/log mismatch, data-confidence failures, drift-detector failures, recovery attempts/failures, meaningful exceptions). Full narrative/dashboard reporting is deferred to the Friday weekly refresh (041d9d90)."
   }
 }

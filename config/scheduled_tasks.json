@@ -1,8 +1,8 @@
 {
   "$schema": "../schemas/scheduled_tasks.schema.json",
-  "version": "2026-07-19",
-  "verified_on_et": "2026-07-19",
-  "timezone_note": "Cron expressions are in UTC. ET equivalents are during US Eastern Daylight Time (EDT, UTC-4). Confirm around DST transitions.",
+  "version": "2026-07-20",
+  "verified_on_et": "2026-07-20",
+  "timezone_note": "Cron expressions are in UTC. ET equivalents are in America/New_York and vary with DST. Confirm around DST transitions.",
   "operating_mode": {
     "mode": "cost_saving_daily_compact",
     "requested_on_et": "2026-07-16",
@@ -72,7 +72,7 @@
     ],
     "doc": "docs/cost_tracking.md"
   },
-  "afternoon_completion_rule": "All afternoon trading and artifact-writing tasks complete no later than 3:40 PM ET, when the read-only live-run watchdog (a46bf007) begins its final verification. The watchdog's own post-3:40 PM verification and the Friday weekly Notion performance refresh at 5:00 PM ET are the only approved post-3:40 PM DCA-related exceptions.",
+  "afternoon_completion_rule": "All afternoon trading and artifact-writing tasks complete no later than 3:40 PM ET, when the read-only live-run watchdog (a46bf007) begins its final verification. The watchdog's own post-3:40 PM verification, the Friday weekly Notion performance refresh at 5:00 PM ET, and the month-end volatility risk refresh at 5:00 PM ET (c9fb1fb8 / 17a3b2a9) are the only approved post-3:40 PM DCA-related exceptions.",
   "ticker_universe_policy": {
     "source_of_truth": "config/tickers.json",
     "active_count": 44,
@@ -726,6 +726,66 @@
       },
       "note": "The two overrides together filled all 27 budget-blocked signals from the 3:20 scheduled run: 20 in the 1551ET run and the remaining 7 (which failed the 1551ET run on Robinhood 429 throttling / do-not-retry) in the 1556ET run. Manual override context and same-day / top-up allocation context only; never scheduled 3:20 evidence, scheduled slippage, scheduled reliability, or scheduled cost basis."
     }
+  },
+  "month_end_volatility_risk_policy": {
+    "added_on_et": "2026-07-20",
+    "summary": "Month-end volatility risk refresh: an analytics-and-reporting-only task that refreshes a Month-End Volatility Risk Table in the existing All Stock DCA Master Summary Dashboard in Notion once per month, on the final eligible market day of the month at 5:00 PM America/New_York. It NEVER trades. Full monthly volatility risk reporting belongs to this month-end task; the daily cost-saving compact operating mode (see operating_mode) stays intact and daily execution tasks do NOT run this analysis.",
+    "paired_schedules": {
+      "note": "Two paired cron schedules cover EDT and EST months because programmatic month-end trigger checks are disabled. Both fire on calendar days 25-31; each run must self-gate on the final-eligible-market-day check below and end silently otherwise. Only the schedule whose months match the current US Eastern DST state produces a 5:00 PM America/New_York fire time.",
+      "edt": {
+        "task_id": "c9fb1fb8",
+        "cron": "0 21 25-31 3-10 *",
+        "months": "March-October (EDT, UTC-4)",
+        "intended_et": "5:00 PM America/New_York on the final eligible market day of the month"
+      },
+      "est": {
+        "task_id": "17a3b2a9",
+        "cron": "0 22 25-31 1,2,11,12 *",
+        "months": "January, February, November, December (EST, UTC-5)",
+        "intended_et": "5:00 PM America/New_York on the final eligible market day of the month"
+      }
+    },
+    "final_eligible_market_day_gate": "Every run must FIRST determine whether the current America/New_York date is the final eligible market day of the month. If it is NOT, the run ends silently: no notification, no market-data pulls, no Notion updates, and no reporting. All work below happens only after this gate passes.",
+    "safety": "Analytics and reporting only. No trades, no order reviews, no order submissions, no cancellations, no sells, no options, no crypto, no margin changes, and no broker/account modifications.",
+    "universe": {
+      "source_of_truth": "config/tickers.json",
+      "excluded": ["BYDDY", "VCX", "TRLV", "RVI"],
+      "corrections": { "IRDMI": "IRDM", "GLWR": "GLW" },
+      "note": "IBM, GFUZ, and TXN remain included unless later removed."
+    },
+    "data_source_policy": {
+      "primary": "Finance connector is primary for historical market data.",
+      "read_only_validation": "Alpaca and Robinhood are read-only validation/context only.",
+      "fallback": "yfinance is a fallback used ONLY if Finance connector data is unavailable, stale, incomplete, or unresolved. Fallback rows must be labeled source=yfinance_fallback.",
+      "gfuz": "GFUZ may use Robinhood as primary when Finance cannot resolve it.",
+      "data_confidence": "Data-confidence rules must not be weakened."
+    },
+    "analysis_rules": [
+      "After the final-eligible-market-day gate passes, pull the last 30 trading days of daily price action.",
+      "Compute daily drop from the prior completed regular-session close.",
+      "Count 3x risk-tier events using the current risk-monitoring threshold for 3x and above.",
+      "Surface any ticker with more than two 3x-or-higher events in the 30-day window.",
+      "Calculate average drawdown recovery time as trading days from the 3x event close until price recovers to at least the prior close used for the signal. An event is unrecovered if it has not recovered by window end; unrecovered events are NOT excluded from average_recovery_days. Instead, cap each unrecovered event's recovery time at the 30-day window length when computing the average, so the metric is not misleadingly low for tickers that frequently fail to recover. unrecovered_event_count reports how many of a ticker's events were capped this way.",
+      "Refresh the existing All Stock DCA Master Summary Dashboard in Notion with a Month-End Volatility Risk Table section, preserving unrelated content."
+    ],
+    "artifact_output": {
+      "root": "/home/user/workspace/cron_tracking/month_end_volatility_risk/YYYYMM/",
+      "formats": ["csv", "json"],
+      "fields": ["ticker", "sector_or_bucket", "three_x_event_count", "max_drop_pct", "average_drop_pct_on_3x_days", "average_recovery_days", "unrecovered_event_count", "latest_event_date", "risk_flag", "data_source"]
+    },
+    "notification": {
+      "notify_only_if": [
+        "the Notion refresh fails",
+        "data quality blocks the run",
+        "one or more tickers triggered the 3x tier more than twice"
+      ],
+      "channels": ["in_app_message_center", "email"],
+      "email_subject": "Month-end DCA volatility risk table",
+      "no_slack": true,
+      "config": "config/notifications.json -> routing.month_end_volatility_risk"
+    },
+    "operating_mode_note": "Keeps the daily cost-saving operating mode intact (see operating_mode). Full monthly volatility risk reporting belongs to this month-end task, not to daily execution tasks.",
+    "doc": "docs/schedule_manifest.md"
   },
   "tasks": [
     {
@@ -1386,6 +1446,32 @@
       "fires_at_et": "2026-08-15 11:45 AM ET",
       "trades": false,
       "notes": "Reminder only, no trading. Evaluate whether to continue live testing past the 2026-08-28 approved window."
+    },
+    {
+      "id": "c9fb1fb8",
+      "name": "Month-end DCA volatility risk table refresh (EDT months)",
+      "type": "analytics",
+      "status": "active",
+      "cron_utc": "0 21 25-31 3-10 *",
+      "et_equivalent": "5:00 PM America/New_York on the final eligible market day of the month (EDT months Mar-Oct)",
+      "trades": false,
+      "paired_with": "17a3b2a9",
+      "trigger_gate": "Final-eligible-market-day gate: end silently (no notification, no market-data pulls, no Notion updates, no reporting) unless the current America/New_York date is the final eligible market day of the month.",
+      "policy": "month_end_volatility_risk_policy",
+      "notes": "Analytics and reporting only, no trading (no order reviews, submissions, cancellations, sells, options, crypto, margin, or broker/account changes). EDT-months half of the paired month-end volatility risk schedule (EST half is 17a3b2a9); programmatic month-end trigger checks are disabled so both fire on days 25-31 and each self-gates on the final-eligible-market-day check. After the gate passes, pulls the last 30 trading days, computes daily drops from the prior completed regular-session close, counts 3x-or-higher risk-tier events, surfaces any ticker with more than two 3x-or-higher events, computes average drawdown recovery time (trading days to recover to at least the prior signal close; unrecovered if not recovered by window end), refreshes the All Stock DCA Master Summary Dashboard in Notion with a Month-End Volatility Risk Table section preserving unrelated content, and writes compact CSV/JSON artifacts under /home/user/workspace/cron_tracking/month_end_volatility_risk/YYYYMM/. Finance connector primary; Alpaca/Robinhood read-only validation; yfinance fallback only when Finance data is unavailable/stale/incomplete/unresolved (fallback rows labeled source=yfinance_fallback); GFUZ may use Robinhood primary when Finance cannot resolve it; data-confidence rules unchanged. Notifies in-app and email only if the Notion refresh fails, data quality blocks the run, or one or more tickers triggered the 3x tier more than twice (email subject 'Month-end DCA volatility risk table'); no Slack. Full monthly volatility risk reporting lives here, not in daily execution tasks; the daily cost-saving operating mode is unchanged. See month_end_volatility_risk_policy."
+    },
+    {
+      "id": "17a3b2a9",
+      "name": "Month-end DCA volatility risk table refresh (EST months)",
+      "type": "analytics",
+      "status": "active",
+      "cron_utc": "0 22 25-31 1,2,11,12 *",
+      "et_equivalent": "5:00 PM America/New_York on the final eligible market day of the month (EST months Jan, Feb, Nov, Dec)",
+      "trades": false,
+      "paired_with": "c9fb1fb8",
+      "trigger_gate": "Final-eligible-market-day gate: end silently (no notification, no market-data pulls, no Notion updates, no reporting) unless the current America/New_York date is the final eligible market day of the month.",
+      "policy": "month_end_volatility_risk_policy",
+      "notes": "Analytics and reporting only, no trading (no order reviews, submissions, cancellations, sells, options, crypto, margin, or broker/account changes). EST-months half of the paired month-end volatility risk schedule (EDT half is c9fb1fb8); programmatic month-end trigger checks are disabled so both fire on days 25-31 and each self-gates on the final-eligible-market-day check. After the gate passes, pulls the last 30 trading days, computes daily drops from the prior completed regular-session close, counts 3x-or-higher risk-tier events, surfaces any ticker with more than two 3x-or-higher events, computes average drawdown recovery time (trading days to recover to at least the prior signal close; unrecovered if not recovered by window end), refreshes the All Stock DCA Master Summary Dashboard in Notion with a Month-End Volatility Risk Table section preserving unrelated content, and writes compact CSV/JSON artifacts under /home/user/workspace/cron_tracking/month_end_volatility_risk/YYYYMM/. Finance connector primary; Alpaca/Robinhood read-only validation; yfinance fallback only when Finance data is unavailable/stale/incomplete/unresolved (fallback rows labeled source=yfinance_fallback); GFUZ may use Robinhood primary when Finance cannot resolve it; data-confidence rules unchanged. Notifies in-app and email only if the Notion refresh fails, data quality blocks the run, or one or more tickers triggered the 3x tier more than twice (email subject 'Month-end DCA volatility risk table'); no Slack. Full monthly volatility risk reporting lives here, not in daily execution tasks; the daily cost-saving operating mode is unchanged. See month_end_volatility_risk_policy."
     }
   ]
 }
