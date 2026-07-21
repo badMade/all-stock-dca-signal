@@ -131,6 +131,76 @@ def test_load_scheduled_run_states_ignores_manual_runs_dir(tmp_path: Path):
     assert states[0]["id"] == "1"
 
 
+def test_load_scheduled_run_states_ignores_nested_manual_runs_dir(tmp_path: Path):
+    """Test that manual_runs is ignored even when nested under a date directory
+    alongside a sibling scheduled_runs tree."""
+    manual_dir = tmp_path / "manual_runs" / "some_date"
+    manual_dir.mkdir(parents=True)
+    (manual_dir / "run_state_1.json").write_text(json.dumps({"status": "success", "id": 1}))
+
+    sched_dir = tmp_path / "scheduled_runs" / "some_date"
+    sched_dir.mkdir(parents=True)
+    (sched_dir / "run_state_2.json").write_text(json.dumps({"status": "success", "id": 2}))
+
+    results = load_scheduled_run_states(tmp_path)
+    assert len(results) == 1
+    assert results[0]["id"] == 2
+
+
+def test_load_scheduled_run_states_filters_blocked(tmp_path: Path):
+    """Test that blocked run states are filtered out."""
+    sched_dir = tmp_path / "scheduled_runs" / "some_date"
+    sched_dir.mkdir(parents=True)
+
+    (sched_dir / "run_state_1.json").write_text(json.dumps({"status": "blocked", "id": 1}))
+    (sched_dir / "run_state_2.json").write_text(json.dumps({"status": "success", "id": 2}))
+
+    results = load_scheduled_run_states(tmp_path)
+    assert len(results) == 1
+    assert results[0]["id"] == 2
+
+
+def test_load_scheduled_run_states_filters_manual_classification(tmp_path: Path):
+    """Test that manually classified run states in scheduled_runs are filtered out."""
+    sched_dir = tmp_path / "scheduled_runs" / "some_date"
+    sched_dir.mkdir(parents=True)
+
+    (sched_dir / "run_state_1.json").write_text(json.dumps({
+        "status": "success",
+        "id": 1,
+        "run_classification": {"manual_run": True}
+    }))
+    (sched_dir / "run_state_2.json").write_text(json.dumps({
+        "status": "success",
+        "id": 2
+    }))
+
+    results = load_scheduled_run_states(tmp_path)
+    assert len(results) == 1
+    assert results[0]["id"] == 2
+
+
+def test_load_scheduled_run_states_valid_files(tmp_path: Path):
+    """Test loading multiple valid run states from scheduled_runs tree."""
+    sched_dir_1 = tmp_path / "scheduled_runs" / "date1"
+    sched_dir_1.mkdir(parents=True)
+    sched_dir_2 = tmp_path / "scheduled_runs" / "date2"
+    sched_dir_2.mkdir(parents=True)
+
+    (sched_dir_1 / "run_state_abc.json").write_text(json.dumps({"id": 1, "status": "success"}))
+    (sched_dir_1 / "run_state_def.json").write_text(json.dumps({"id": 2, "status": "success"}))
+    (sched_dir_2 / "run_state_xyz.json").write_text(json.dumps({"id": 3, "status": "success"}))
+
+    # Also add a file that shouldn't match the glob (e.g. latest_run_summary.json)
+    (sched_dir_1 / "latest_run_summary.json").write_text(json.dumps({"id": 999}))
+
+    results = load_scheduled_run_states(tmp_path)
+
+    # Files should be sorted by path
+    assert len(results) == 3
+    assert [r["id"] for r in results] == [1, 2, 3]
+
+
 def test_load_scheduled_run_states_corrupt_json(tmp_path: Path):
     """Test that a corrupt JSON file raises an exception."""
     scheduled_dir = tmp_path / "scheduled_runs"
