@@ -302,7 +302,6 @@ class SlackTests(unittest.TestCase):
 
     def test_send_slack_rejects_invalid_scheme(self):
         import urllib.error
-
         report = detect_drift(self.run_dir)
         with self.assertRaises(urllib.error.URLError):
             send_slack_alert(report, webhook="file:///etc/passwd")
