@@ -1836,6 +1836,34 @@ def _prior_run_is_scheduled(run_state: Dict[str, Any]) -> bool:
     return False
 
 
+def _prior_run_is_valid_manual_recovery_artifact(
+    run_state: Dict[str, Any], run_state_path: Path
+) -> bool:
+    """True unless a manual_recovery/ artifact fails its required classification.
+
+    ``manual_missed_run_recovery`` (config/morning_dca.json) makes a manual
+    missed-run recovery artifact valid prior-allocation / same-day top-up
+    context ONLY when it carries ``run_origin='manual'``, ``manual_run=true``,
+    ``same_day_top_up_context_only=true``, and ``valid_scheduled_evidence=false``.
+    A malformed or misclassified file placed under a ``manual_recovery/``
+    directory must not be able to reduce or block a later buy, so such a file
+    is excluded here rather than trusted at face value. Artifacts outside a
+    ``manual_recovery/`` directory (e.g. manual override reruns, which use a
+    distinct classification contract) are unaffected by this check.
+    """
+    if "manual_recovery" not in run_state_path.parts:
+        return True
+    classification = run_state.get("run_classification")
+    if not isinstance(classification, dict):
+        return False
+    return (
+        classification.get("run_origin") == "manual"
+        and classification.get("manual_run") is True
+        and classification.get("same_day_top_up_context_only") is True
+        and classification.get("valid_scheduled_evidence") is False
+    )
+
+
 def _prior_run_before_boundary(run_state: Dict[str, Any], boundary_et: time) -> bool:
     """True when the run's generated_at (ET) is before the morning/manual boundary.
 
@@ -2056,6 +2084,8 @@ def load_prior_same_day_allocations(
         if _prior_run_is_scheduled(run_state) and not include_scheduled_afternoon:
             continue
         if not _prior_run_before_boundary(run_state, boundary_et):
+            continue
+        if not _prior_run_is_valid_manual_recovery_artifact(run_state, run_state_path):
             continue
 
         classification = run_state.get("run_classification")

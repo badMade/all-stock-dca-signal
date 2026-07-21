@@ -48,6 +48,9 @@ from morning_dca import (
     MorningLedger,
     MorningSignal,
     TopUpOutcome,
+    _PersistingBrokerAdapter,
+    _PersistingMarketDataProvider,
+    _RawInputRecorder,
     _same_stream_order_exists,
     load_same_day_preflight,
     nyse_holidays,
@@ -4672,6 +4675,169 @@ def test_morning_live_retry_after_manual_fill_detects_plain_scheduled_order(tmp_
         f"retry must be blocked by same-stream check; broker.placed={broker.placed}; "
         f"broker_outcomes={res['artifacts'].get('broker_outcomes')}"
     )
+
+
+# --- Raw-input persistence / failure-state guarantee (live_schedule_hardening_2026_07_20) --
+
+def test_raw_input_recorder_persists_and_lists_files(tmp_path):
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    recorder.persist("prior_close", "AAPL", {"close": 100.0})
+    recorder.persist("quote", "AAPL", {"price": 99.5})
+    assert recorder.error is None
+    assert len(recorder.saved_filenames) == 2
+    for name in recorder.saved_filenames:
+        assert (tmp_path / "raw" / name).exists()
+
+
+def test_raw_input_recorder_records_error_without_raising(tmp_path):
+    # A file (not a directory) sitting at the target raw/ path makes mkdir()
+    # fail; persist() must record the failure rather than propagate it, so a
+    # persistence problem never crashes deep inside signal evaluation.
+    raw_path = tmp_path / "raw"
+    raw_path.write_text("not a directory", encoding="utf-8")
+    recorder = _RawInputRecorder(raw_path, "2026-07-08")
+    recorder.persist("prior_close", "AAPL", {"close": 100.0})
+    assert recorder.error is not None
+    assert recorder.saved_filenames == []
+
+
+def test_persisting_market_data_provider_records_bar_and_quote_responses(tmp_path):
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.03})
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingMarketDataProvider(data, recorder)
+    now = _now_live()
+    bar = wrapped.get_previous_close_bar("AAPL", now)
+    bars = wrapped.get_intraday_bars(
+        ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=15
+    )
+    assert bar is not None
+    assert bars
+    assert recorder.error is None
+    assert any(name.startswith("prior_close_AAPL_") for name in recorder.saved_filenames)
+    assert any(name.startswith("intraday_bars_AAPL_") for name in recorder.saved_filenames)
+    # Attributes/methods not explicitly wrapped still reach the inner provider.
+    assert wrapped.source == data.source
+
+
+def test_persisting_broker_adapter_records_buying_power_and_tradability(tmp_path):
+    broker = FakeLiveBroker()
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingBrokerAdapter(broker, recorder)
+    assert wrapped.available_buying_power() == 500.0
+    assert wrapped.is_tradable_for_fractional_buy("AAPL") is True
+    assert recorder.error is None
+    assert any(name.startswith("buying_power_") for name in recorder.saved_filenames)
+    assert any(name.startswith("tradability_AAPL_") for name in recorder.saved_filenames)
+    # Optional non-protocol broker methods still forward through __getattr__.
+    assert (
+        wrapped.same_day_strategy_order_exists_with_ref_id_prefix("AAPL", date(2026, 7, 8), [])
+        is None
+    )
+
+
+def test_scheduled_live_run_persists_raw_inputs_on_success(tmp_path):
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data, broker=FakeLiveBroker())
+    artifacts = res["artifacts"]
+    assert artifacts.get("status") != "blocked"
+    raw_dir = Path(artifacts["raw_input_dir"])
+    assert raw_dir.is_dir()
+    saved = artifacts["raw_inputs_saved"]
+    assert saved
+    for name in saved:
+        assert (raw_dir / name).exists()
+    assert any(name.startswith("prior_close_") for name in saved)
+    assert any(name.startswith("intraday_bars_") for name in saved)
+    assert any(name.startswith("buying_power_") for name in saved)
+    assert any(name.startswith("tradability_") for name in saved)
+    assert "raw_persistence_error" not in artifacts
+
+
+def test_manual_live_run_does_not_persist_raw_inputs(tmp_path):
+    # live_schedule_hardening_2026_07_20 is scoped to the SCHEDULED live task;
+    # a manual run gains no (and requires no) raw persistence.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data, manual=True, broker=FakeLiveBroker())
+    assert "raw_input_dir" not in res["artifacts"]
+    assert "raw_inputs_saved" not in res["artifacts"]
+
+
+def test_scheduled_live_run_fails_closed_when_raw_persistence_fails_before_placement(tmp_path):
+    # A raw-input persistence failure discovered during evaluate() (price
+    # data, fetched before any broker call) must block the run BEFORE any
+    # order is placed, writing a valid failure run_state rather than
+    # escalating with no state file at all -- the exact Jul 20 2026 incident
+    # this policy targets (config/morning_dca.json:
+    # live_schedule_hardening_2026_07_20).
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "raw").write_text("not a directory", encoding="utf-8")
+
+    broker = FakeLiveBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data, broker=broker)
+
+    artifacts = res["artifacts"]
+    assert artifacts["status"] == "blocked"
+    assert artifacts["error_class"] == "missing_or_invalid_raw_inputs"
+    assert "raw input persistence failed" in artifacts["block_reason"]
+    assert artifacts["broker_outcomes"] == {}
+    assert Path(res["paths"]["run_state"]).exists()
+
+
+class _Unserializable:
+    def __repr__(self):
+        return "<unserializable>"
+
+
+class _BadTradabilityBroker(FakeLiveBroker):
+    def is_tradable_for_fractional_buy(self, ticker):
+        return _Unserializable()
+
+
+def test_scheduled_live_run_surfaces_non_fatal_raw_persistence_error(tmp_path):
+    # A persistence failure discovered only once broker-side calls begin
+    # (evaluate() already succeeded, so nothing blocks up front) must not
+    # retroactively block an order that already passed every safety check --
+    # it is recorded on the final run_state for operator visibility instead.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data, broker=_BadTradabilityBroker())
+    artifacts = res["artifacts"]
+    assert artifacts.get("status") != "blocked"
+    assert "raw_persistence_error" in artifacts
+    assert "SMALL" in artifacts.get("broker_outcomes", {})
 
 
 if __name__ == "__main__":

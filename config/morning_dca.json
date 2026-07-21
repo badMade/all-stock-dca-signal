@@ -101,8 +101,8 @@
       "If data fetch succeeds but raw persistence or normalization fails, do NOT place orders; still write run_state.json with the blocking reason (raw_persistence_error) and no orders placed."
     ],
     "run_state_fields": ["raw_input_dir", "raw_inputs_saved", "raw_persistence_error"],
-    "implementation_status": "NOT YET IMPLEMENTED in MorningDCAExecutor (morning_dca.py) as of 2026-07-18 -- flagged as a P1 by Codex review on PR #78 ('Implement v2 persistence before emitting v2 artifacts'). The afternoon stream's run_pipeline() (run_dca.py) genuinely calls save_raw_input/build_raw_persistence_state/raw_persistence_failure_run_state from scripts/run_classification.py; MorningDCAExecutor.run() has no equivalent call and evaluates directly from the in-memory data provider. This does not by itself cause an unsafe order (all existing safeguards -- trend validation, budget caps, spread, confidence rule -- still run against whatever data was fetched), but the run_state_fields this section documents (raw_input_dir, raw_inputs_saved, raw_persistence_error) are never populated, so a downstream consumer checking those fields for compliance would be misled. Deliberately left as flagged follow-up work rather than adding a large, untested new persistence/recovery code path to a live-trading executor within a review-comment-response pass; needs an explicit decision to either implement it (mirroring run_dca.py's pattern) or formally step the live task back to a schema tag that doesn't claim it.",
-    "state_schema_version_caveat": "state_schema_version='morning-live-v2-preauthorized' is currently written on every scheduled 10:30 run regardless of raw-persistence implementation_status above; the version tag is a forward-looking contract label the code has not yet fully caught up to, not a passed/failed runtime check."
+    "implementation_status": "IMPLEMENTED in MorningDCAExecutor (morning_dca.py) as of 2026-07-21, closing the P1 flagged by Codex review on PR #78 ('Implement v2 persistence before emitting v2 artifacts') and the follow-up P1 on PR #144 ('Implement the morning raw-input and failure-state path'). For a SCHEDULED (non-manual) live run in MORNING_LIVE_MODE, run() wraps the injected data provider and broker adapter in _PersistingMarketDataProvider / _PersistingBrokerAdapter (backed by _RawInputRecorder), which persist every previous-close/intraday-bar/quote/bid-ask response and every account-number/buying-power/tradability/same-day-order-existence broker query under raw/ via scripts.run_classification.save_raw_input the moment each is obtained -- before evaluate_signal or _place_broker_orders computes from it. This differs from the afternoon run_dca.py pattern in ONE respect: morning fetches lazily per ticker rather than as one upfront batch, so persistence happens per-call rather than as a single preceding step; functionally equivalent, since nothing is used to compute a signal or place an order before its own response is durably recorded, but there is no staging-dir/atomic-swap/backup machinery like run_pipeline()'s raw.tmp/raw.bak (not needed at the same-file granularity this design uses). A persistence failure discovered during evaluate() (before any broker call) fails the run closed via _blocked_live_result() with error_class='missing_or_invalid_raw_inputs' and zero orders placed; a persistence failure discovered only after order placement has begun is NOT retroactively blocking (the orders already placed passed every existing safeguard) and is instead surfaced via raw_persistence_error on the final run_state. Applies identically to the 12:30 midday live task: MiddayDCAExecutor inherits run() unchanged. Covered by test_morning_dca.py (raw-input persistence section) and test_midday_dca.py::test_midday_scheduled_live_run_persists_raw_inputs. automatic_failure_recovery (bounded retry / recovery_rerun) below is a distinct, still-unimplemented policy -- this fix fails closed on a persistence failure rather than auto-retrying it.",
+    "state_schema_version_caveat": "state_schema_version='morning-live-v2-preauthorized' is written on every scheduled 10:30 run; as of 2026-07-21 raw_data_persistence is implemented (see implementation_status above) while automatic_failure_recovery below is not, so the version tag's 'preauthorized' contract is now backed by real persistence but not yet by automatic bounded-retry recovery."
   },
   "automatic_failure_recovery": {
     "added": "2026-07-15",
@@ -159,30 +159,30 @@
       "no_stale_reuse": "Do NOT reuse stale files from a prior run.",
       "data_sources": "Finance connector primary, Alpaca and Robinhood validation/context, yfinance fallback ONLY when connector data is unavailable, stale, incomplete, or unresolved.",
       "bounded_recovery": "If raw input generation fails once, perform ONE bounded recovery attempt with the alternate approved data source path, then stop.",
+      "implementation_status": "raw-input PERSISTENCE is IMPLEMENTED as of 2026-07-21 -- see raw_data_persistence.implementation_status above for the mechanism (MorningDCAExecutor.run() wraps the injected data provider/broker in persisting decorators for every scheduled live run; inherited by the 12:30 midday task). quotes/prior-close/historical-bars/tradability/buying-power/orders_since_midnight are all covered by what this codebase's MarketDataProvider/BrokerAdapter protocols actually expose (there is no separate 'portfolio' query beyond available_buying_power() in this repo's BrokerAdapter). bounded_recovery (retry once against the alternate data source on failure) is NOT implemented -- a persistence failure fails the run closed (or, once placement has begun, is recorded non-fatally) rather than auto-retrying; this matches automatic_failure_recovery.implementation_status below, which remains unimplemented.",
       "see": "config/scheduled_tasks.json:live_schedule_hardening_2026_07_20.morning_1030"
     },
     "always_write": [
-        "/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/run_state.json",
-        "/home/user/workspace/cron_tracking/morning_dca/latest_morning_run.json"
-      ],
-        "/home/user/workspace/cron_tracking/morning_dca/latest_morning_run.json"
-      ],
-      "blocked_state": {
-        "when": "If a missing pre-flight artifact, missing/invalid raw inputs, trend, budget, tradability, spread, or broker condition blocks execution, write a valid scheduled morning run_state.",
-        "run_origin": "scheduled",
-        "manual_run": false,
-        "stream": "morning",
-        "scheduled_for_et": "10:30",
-        "cron_id": "42173154",
-        "valid_afternoon_evidence": false,
-        "order_submit_status": "Concrete status such as not_submitted_error.",
-        "missing_inputs_field": "Include a compact list of missing files or failed data sources."
-      },
-      "evidence_meaning": "This failure-state artifact is valid proof that the 10:30 scheduled task FIRED, but it is NOT order or fill evidence.",
-      "no_silent_escalation": "Do NOT escalate without writing this state file unless the workspace itself is unavailable.",
-      "post_raw_failure_rule": "If failure happens after raw collection has started, write morning_signals.csv when possible, an empty submitted_orders.csv with headers when no orders were placed, and run_state.json. Do not leave a half-done run with no state file.",
-      "see": "config/scheduled_tasks.json:live_schedule_hardening_2026_07_20.morning_1030"
+      "/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/run_state.json",
+      "/home/user/workspace/cron_tracking/morning_dca/latest_morning_run.json"
+    ],
+    "blocked_state": {
+      "when": "If a missing pre-flight artifact, missing/invalid raw inputs, trend, budget, tradability, spread, or broker condition blocks execution, write a valid scheduled morning run_state.",
+      "run_origin": "scheduled",
+      "manual_run": false,
+      "stream": "morning",
+      "scheduled_for_et": "10:30",
+      "cron_id": "42173154",
+      "valid_afternoon_evidence": false,
+      "status": "blocked",
+      "block_reason": "Concrete, human-readable reason (e.g. 'raw input persistence failed: <detail>').",
+      "error_class": "Concrete code such as missing_or_invalid_raw_inputs.",
+      "field_names_note": "Morning's run_state uses status/block_reason/error_class, not the shared afternoon schema's order_submit_status -- MorningDCAExecutor.write_artifacts() never writes an order_submit_status key. Corrected 2026-07-21: an earlier revision of this block named order_submit_status, a field this stream's artifacts have never carried."
     },
+    "evidence_meaning": "This failure-state artifact is valid proof that the 10:30 scheduled task FIRED, but it is NOT order or fill evidence.",
+    "no_silent_escalation": "Do NOT escalate without writing this state file unless the workspace itself is unavailable.",
+    "post_raw_failure_rule": "If failure happens after raw collection has started, write morning_signals.csv when possible, an empty submitted_orders.csv with headers when no orders were placed, and run_state.json. Do not leave a half-done run with no state file.",
+    "see": "config/scheduled_tasks.json:live_schedule_hardening_2026_07_20.morning_1030",
     "doc": "docs/morning_dca.md"
   },
   "artifacts": {
