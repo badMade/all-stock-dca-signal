@@ -1,3 +1,7 @@
+## 2026-07-20 - Refactoring of near_close_dca.py run_once function
+**Learning:** Breaking apart large orchestration functions (like run_once, which was 450 lines) into smaller, intent-focused helpers (signal evaluation, loop processing, state mutation) drastically improves readability without altering functionality.
+**Action:** Always maintain the exact same state mutation flow when refactoring such core functions. I encapsulated signal evaluation logic in `_evaluate_all_signals`, budget seeding in `_seed_prior_allocations`, and the core action loop in `_process_buy_candidates_batch`. All parameters mapping to outputs mapped exactly.
+
 ## 2026-07-17 - Iterating Pandas Dataframes fast
 **Learning:** `iterrows()` is extremely slow for Pandas dataframe iterations.
 **Action:** Prefer `itertuples(name=None, index=False)` for fast read-only iteration (use `index=True` if you need the index), and `to_dict('records')` when per-row mutation or dict-style column access is required (e.g. non-standard column names like numeric headers).

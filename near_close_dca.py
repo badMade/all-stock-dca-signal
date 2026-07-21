@@ -3043,6 +3043,107 @@ def _process_buy_candidate(
 
     return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
 
+
+def _evaluate_all_signals(
+    now: datetime,
+    config: StrategyConfig,
+    tradable_tickers: List[str],
+    finance_data: MarketDataProvider,
+    robinhood_data: MarketDataProvider,
+) -> tuple[List[ReconciledDecision], int]:
+    errors_count = 0
+
+    def _safe_signal(ticker: str, data: MarketDataProvider, interval_minutes: int) -> SourceSignal:
+        nonlocal errors_count
+        try:
+            return evaluate_source_signal(
+                ticker=ticker,
+                now=now,
+                config=config,
+                data=data,
+                interval_minutes=interval_minutes,
+            )
+        except Exception as exc:  # noqa: BLE001 - count and degrade to NO_DATA
+            not_found = _is_ticker_not_found_error(exc)
+            if not_found:
+                reason = f"ticker not found on {getattr(data, 'source', SourceName.FINANCE).value}: {exc}"
+            else:
+                errors_count += 1
+                reason = f"provider error: {exc}"
+            return SourceSignal(
+                ticker=ticker,
+                source=getattr(data, "source", SourceName.FINANCE),
+                action=Action.NO_DATA,
+                reason=reason,
+                # Ticker-not-found is a permanent, source-specific condition documented in config/tickers.json
+                # data_source_notes; it must not force MANUAL_REVIEW via reconcile_signals' provider_error guard.
+                # Any other exception still sets provider_error so provider failures block auto-buy.
+                provider_error=not not_found,
+            )
+
+    decisions = []
+    for ticker in tradable_tickers:
+        finance_signal = _safe_signal(ticker, finance_data, config.finance_interval_minutes)
+        robinhood_signal = _safe_signal(ticker, robinhood_data, config.robinhood_interval_minutes)
+        decisions.append(reconcile_signals(ticker, finance_signal, robinhood_signal))
+
+    return decisions, errors_count
+
+
+def _seed_prior_allocations(
+    state: StrategyState,
+    trading_day: date,
+    guard_active: bool,
+    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]],
+) -> None:
+    if guard_active and prior_same_day_allocations:
+        for _ticker, _alloc in prior_same_day_allocations.items():
+            if _alloc.amount_usd > 0 and state.buys_today(_ticker, trading_day) == 0:
+                state.record_buy(_ticker, trading_day, _alloc.amount_usd)
+
+
+def _process_buy_candidates_batch(
+    buy_candidates: List[ReconciledDecision],
+    config: StrategyConfig,
+    state: StrategyState,
+    broker: BrokerAdapter,
+    robinhood_data: MarketDataProvider,
+    now: datetime,
+    trading_day: date,
+    guard_active: bool,
+    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]],
+    scheduled: bool,
+    run_result: Optional[RunResult],
+) -> tuple[Dict[str, Dict[str, Any]], Dict[str, TopUpGuardOutcome], float, int, int]:
+    candidate_outcomes: Dict[str, Dict[str, Any]] = {}
+    top_up_outcomes: Dict[str, TopUpGuardOutcome] = {}
+    running_deployed_7d = config.deployed_last_7d_usd
+    errors_count_inc = 0
+    order_reviews_attempted_inc = 0
+
+    for decision in buy_candidates:
+        c_outcome, t_outcome, running_deployed_7d, err_inc, rev_inc = _process_buy_candidate(
+            decision=decision,
+            config=config,
+            state=state,
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=guard_active,
+            prior_same_day_allocations=prior_same_day_allocations or {},
+            running_deployed_7d=running_deployed_7d,
+            scheduled=scheduled,
+            run_result=run_result,
+        )
+        candidate_outcomes[decision.ticker] = c_outcome
+        if t_outcome is not None:
+            top_up_outcomes[decision.ticker] = t_outcome
+        errors_count_inc += err_inc
+        order_reviews_attempted_inc += rev_inc
+
+    return candidate_outcomes, top_up_outcomes, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+
 def run_once(
     now: datetime,
     config: StrategyConfig,
@@ -3082,41 +3183,10 @@ def run_once(
     if run_result is not None:
         run_result.active_universe = list(tradable_tickers)
 
-    def _safe_signal(ticker: str, data: MarketDataProvider, interval_minutes: int) -> SourceSignal:
-        nonlocal errors_count
-        try:
-            return evaluate_source_signal(
-                ticker=ticker,
-                now=now,
-                config=config,
-                data=data,
-                interval_minutes=interval_minutes,
-            )
-        except Exception as exc:  # noqa: BLE001 - count and degrade to NO_DATA
-            not_found = _is_ticker_not_found_error(exc)
-            if not_found:
-                reason = f"ticker not found on {getattr(data, 'source', SourceName.FINANCE).value}: {exc}"
-            else:
-                errors_count += 1
-                reason = f"provider error: {exc}"
-            return SourceSignal(
-                ticker=ticker,
-                source=getattr(data, "source", SourceName.FINANCE),
-                action=Action.NO_DATA,
-                reason=reason,
-                # A ticker-not-found error is a permanent, source-specific condition
-                # (e.g. GFUZ unresolved on the finance connector) documented in
-                # config/tickers.json data_source_notes, not a transient failure — it
-                # must not permanently force MANUAL_REVIEW via reconcile_signals'
-                # provider_error guard. Any other exception still sets provider_error
-                # so reconcile_signals blocks auto-buy on real provider failures.
-                provider_error=not not_found,
-            )
-
-    for ticker in tradable_tickers:
-        finance_signal = _safe_signal(ticker, finance_data, config.finance_interval_minutes)
-        robinhood_signal = _safe_signal(ticker, robinhood_data, config.robinhood_interval_minutes)
-        decisions.append(reconcile_signals(ticker, finance_signal, robinhood_signal))
+    decisions, signals_errors_count = _evaluate_all_signals(
+        now, config, tradable_tickers, finance_data, robinhood_data
+    )
+    errors_count += signals_errors_count
 
     if run_result is not None:
         run_result.decisions = decisions
@@ -3137,53 +3207,30 @@ def run_once(
     # capacity into the stress tier's ceiling.
     state.roll_weekly_reserve(trading_day, config)
 
-    candidate_outcomes: Dict[str, Dict[str, Any]] = {}
     # The top-up guard (and its same-day-order-check bypass) is only for the
     # scheduled afternoon run: a manual run must still be blocked by its own
     # same-day-order/max-buys checks even if a caller happens to also pass
     # prior_same_day_allocations (e.g. an auto-loaded state root shared across
     # call sites), or a manual run could unintentionally double-buy.
     guard_active = scheduled and prior_same_day_allocations is not None
-    top_up_outcomes: Dict[str, TopUpGuardOutcome] = {}
 
-    # Seed the budget ledger with prior same-day amounts for guarded tickers so
-    # that the cap check sees prior + incremental spend together and stops
-    # topping up when the combined total would exceed the daily/weekly cap.
-    if guard_active:
-        # Seed ALL loaded prior allocations, not just tickers that are BUY candidates
-        # this afternoon: a morning spend on MSFT reduces the remaining daily/weekly
-        # cap even when MSFT doesn't qualify for the afternoon run.
-        for _ticker, _alloc in prior_same_day_allocations.items():
-            if _alloc.amount_usd > 0 and state.buys_today(_ticker, trading_day) == 0:
-                state.record_buy(_ticker, trading_day, _alloc.amount_usd)
+    _seed_prior_allocations(state, trading_day, guard_active, prior_same_day_allocations)
 
-    # Tracks the trailing-7-day scheduled-live deployment total live as orders
-    # are submitted within this batch (starting from the prior-history figure
-    # injected above), so a volatile day that crosses the kill-switch threshold
-    # mid-run caps the REMAINING candidates in the same batch to the 1x base
-    # amount instead of only affecting tomorrow's run.
-    running_deployed_7d = config.deployed_last_7d_usd
-
-    for decision in buy_candidates:
-        c_outcome, t_outcome, running_deployed_7d, err_inc, rev_inc = _process_buy_candidate(
-            decision=decision,
-            config=config,
-            state=state,
-            broker=broker,
-            robinhood_data=robinhood_data,
-            now=now,
-            trading_day=trading_day,
-            guard_active=guard_active,
-            prior_same_day_allocations=prior_same_day_allocations or {},
-            running_deployed_7d=running_deployed_7d,
-            scheduled=scheduled,
-            run_result=run_result,
-        )
-        candidate_outcomes[decision.ticker] = c_outcome
-        if t_outcome is not None:
-            top_up_outcomes[decision.ticker] = t_outcome
-        errors_count += err_inc
-        order_reviews_attempted += rev_inc
+    candidate_outcomes, top_up_outcomes, running_deployed_7d, err_inc, rev_inc = _process_buy_candidates_batch(
+        buy_candidates=buy_candidates,
+        config=config,
+        state=state,
+        broker=broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=guard_active,
+        prior_same_day_allocations=prior_same_day_allocations,
+        scheduled=scheduled,
+        run_result=run_result,
+    )
+    errors_count += err_inc
+    order_reviews_attempted += rev_inc
 
     # Reflect any in-batch kill-switch engagement in the config used to build
     # this run's artifacts, so the risk_guard audit block (and
