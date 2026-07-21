@@ -12,6 +12,7 @@ from pathlib import Path
 
 from dca_cost_tracker import (
     COST_TRACKER_TITLE,
+    _month_prefix,
     aggregate_usage,
     build_cost_tracker_markdown,
     build_cost_tracker_payload,
@@ -55,6 +56,12 @@ def _write_runs(root, run_states):
         run_dir = Path(root) / f"runs/{rs['trading_day']}-{i}"
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "run_state.json").write_text(json.dumps(rs))
+
+
+def test_month_prefix():
+    assert _month_prefix(2026, 6) == "2026-06"
+    assert _month_prefix(2026, 12) == "2026-12"
+    assert _month_prefix(99, 1) == "0099-01"
 
 
 def test_collect_filters_by_month(tmp_path):
