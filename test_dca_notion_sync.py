@@ -116,9 +116,16 @@ def test_write_and_load_compact_sync(tmp_path):
 def test_load_latest_run_summary_success(tmp_path):
     summary_path = tmp_path / "latest_run_summary.json"
     summary_path.write_text('{"run_id": "r-123", "trading_day": "2023-01-01"}')
+
+    # test with Path object
     loaded_summary = load_latest_run_summary(summary_path)
     assert loaded_summary["run_id"] == "r-123"
     assert loaded_summary["trading_day"] == "2023-01-01"
+
+    # test with string path
+    loaded_summary_str = load_latest_run_summary(str(summary_path))
+    assert loaded_summary_str["run_id"] == "r-123"
+    assert loaded_summary_str["trading_day"] == "2023-01-01"
 
 
 def test_load_latest_run_summary_not_found(tmp_path):
@@ -137,5 +144,5 @@ def test_load_latest_run_summary_invalid_json(tmp_path):
 def test_load_latest_run_summary_io_error(tmp_path):
     summary_path = tmp_path / "is_directory"
     summary_path.mkdir()
-    with pytest.raises(OSError):
+    with pytest.raises(IsADirectoryError):
         load_latest_run_summary(summary_path)
