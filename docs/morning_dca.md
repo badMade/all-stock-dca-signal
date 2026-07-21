@@ -91,6 +91,52 @@ closed** — `_apply_preflight_gate()` evaluates zero tickers and writes a
 blocked `run_state.json` — rather than blocking all buys via a full-universe
 fallback; only a **manual** run degrades to the full universe with a warning.
 
+#### Pre-flight artifact location (added Jul 20 2026)
+
+On **Mon Jul 20 2026** the 10:30 AM morning live run escalated because it looked
+for the same-day 9:45 pre-flight artifact **under its own 10:30 live output
+directory** (and a stray `/home/user/workspace/cron_tracking/42173154` path)
+instead of the pre-flight root. The rule now is explicit:
+
+- **Load the same-day 9:45 pre-flight artifact from**
+  `/home/user/workspace/cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/run_state.json`,
+  or from
+  `/home/user/workspace/cron_tracking/morning_dca_preflight/latest_preflight.json`
+  **only when that pointer points to the same-day** `YYYYMMDD_0945ET/run_state.json`
+  file. If the pointer points to any other or older run, ignore it and use the
+  same-day path.
+- **Do not look** under `/home/user/workspace/cron_tracking/42173154` or under
+  the morning live output directory
+  (`/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/`) for the
+  pre-flight artifact. The pre-flight artifact is never written there.
+- **The morning live output directory remains**
+  `/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/` and holds
+  this task's own artifacts only.
+- **Bounded recovery lookup:** if the pre-flight artifact is missing from the
+  correct path (and `latest_preflight.json` does not point to the same-day file),
+  perform exactly **one** bounded recovery lookup before escalating: scan
+  `/home/user/workspace/cron_tracking/morning_dca_preflight/` for today's
+  `YYYYMMDD_0945ET` directory and load its `run_state.json`. Only after that
+  single lookup also fails does a scheduled run fail closed as described above.
+
+This is a path-resolution fix only. It does not weaken the budget caps, top-up
+guard, data-confidence rule, spread rule, whitelist, buy-only, regular-hours-only,
+Robinhood-execution-only, or any other safety control; fail-closed behavior on a
+genuinely missing artifact is preserved. See `config/morning_dca.json`'s
+`live_task.preflight_artifact_resolution`.
+
+> **Implemented (2026-07-21).** `load_morning_config()` loads
+> `must_not_look_under` into `MorningConfig.preflight_forbidden_roots` and
+> `bounded_recovery_lookup` into `MorningConfig.preflight_bounded_recovery`.
+> `MorningDCAExecutor._apply_preflight_gate()` rejects (fails closed) a
+> `preflight_run_state_root` that resolves under a forbidden root before ever
+> attempting a lookup, and `load_same_day_preflight()` performs the single
+> bounded directory scan described above when the primary path and
+> `latest_preflight.json` pointer both miss, recording
+> `recovered_via_bounded_lookup=true` in `preflight_gate` when it was used. See
+> `config/morning_dca.json`'s
+> `live_task.preflight_artifact_resolution.implementation_status`.
+
 **Pre-authorized direct placement (scheduled live runs only).** As approved Fri
 Jul 10 2026 11:20 AM ET this scheduled live task is **pre-authorized** to place
 qualifying buys directly via `place_equity_order`: it **does not** request
@@ -365,6 +411,35 @@ only morning notional. Configurable hooks:
 Exceeding a cap adds a warning to the run artifact; it never touches the
 afternoon daily/weekly ledger.
 
+### Ledger location and bootstrap (added Jul 20 2026)
+
+The **morning stream budget ledger lives under the 10:30 live output directory**
+`/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/`, not under the
+pre-flight root, the afternoon `ce16ba6b` tree, or any
+`/home/user/workspace/cron_tracking/42173154` path. The 10:30 live task **may create**
+`budget_ledger.json` there if it is absent.
+
+The task **does not require a pre-existing ledger file**. If none exists, it
+initializes the morning ledger from the configured `morning_daily_cap_usd`
+(default `90.0`) and `morning_weekly_cap_usd` (default `450.0`) caps, then writes
+the resulting budget calculations (caps, same-day morning spend, remaining daily
+and weekly capacity) into the 10:30 `run_state.json`. A missing ledger file is
+**not** an escalation condition; it is bootstrapped from the configured caps.
+
+Bootstrapping an absent ledger does not weaken any cap. The daily/weekly caps,
+the top-up guard, and all circuit breakers still apply exactly as before; only
+the requirement of a pre-existing file on disk is removed. See
+`config/morning_dca.json`'s `budget_ledger.bootstrap`.
+
+> **Implemented (2026-07-21).** `load_morning_config()` loads
+> `budget_ledger.ledger_files[0]` into `MorningConfig.budget_ledger_filename`
+> (default `budget_ledger.json`), and `MorningDCAExecutor.write_artifacts()`
+> always writes that file under the live run's own output directory as a
+> snapshot of `artifacts["budget"]` — the same caps/spend/remaining-capacity
+> object already written into `run_state.json`. No pre-existing file is ever
+> required; each run overwrites its own dated slot's snapshot. See
+> `config/morning_dca.json`'s `budget_ledger.bootstrap.implementation_status`.
+
 ## Artifacts
 
 A scheduled morning run writes to its mode's root
@@ -373,6 +448,9 @@ A scheduled morning run writes to its mode's root
 
 - `run_state.json` — classification, ladder, budget, signal rows, warnings.
 - `morning_signals.csv` — one row per ticker.
+- `budget_ledger.json` — live mode only; a snapshot of the morning budget
+  ledger (caps, spend, remaining capacity). See "Ledger location and
+  bootstrap" above.
 
 and updates that root's `latest_morning_run.json`. Manual runs write under a
 distinct `manual_morning[_live]_*` run id and never update the pointer.
