@@ -43,3 +43,6 @@
 ## 2026-07-21 - Generator+key() overhead vs single-pass loop in max()
 **Learning:** In Python, `max((x for x in seq if cond), key=...)` is already O(1) additional space, but it can add constant-factor overhead in hot loops (generator machinery plus per-candidate `key` function calls). A manual single-pass `for` loop that tracks the best candidate can reduce that overhead while keeping the same asymptotic complexity. Benchmarks showed the manual loop is ~15-20% faster for this specific codebase pattern.
 **Action:** In hot loops where you need the single best element after filtering, prefer a single-pass loop that updates a tracked “best” value to avoid per-element `key=` call overhead. Avoid list comprehensions here, since they allocate O(N) memory.
+## 2026-07-21 - Avoid scanning noisy dictionaries in hot loops
+**Learning:** Iterating `dict.items()` is fine for bounded dictionaries, but if the dict can contain many irrelevant keys and you only need a small predefined set, scanning `items()` becomes wasted work.
+**Action:** In hot loops extracting known keys from potentially noisy dicts, iterate the known key list/tuple and check membership (or use `get`) instead of scanning the entire dictionary; keep the `items()` + `frozenset` pattern for bounded dicts.
