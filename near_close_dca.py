@@ -2815,14 +2815,46 @@ def _check_execution_gates(
 def _apply_deployment_history(
     config: StrategyConfig, trading_day: date, deployment_history_root: str | Path
 ) -> StrategyConfig:
-    from dca_risk import apply_risk_guard, deployed_by_day, find_run_state_files
+    from dca_risk import (
+        KILL_SWITCH_WINDOW_DAYS,
+        apply_risk_guard,
+        deployed_by_day,
+        find_run_state_files,
+    )
+
+    # ⚡ Bolt Optimization: the injected figure only sums the trailing
+    # KILL_SWITCH_WINDOW_DAYS calendar days ending on ``trading_day`` (see
+    # dca_risk.seven_day_deployed), so a run_state whose trading_day falls
+    # outside that window can never change it. This runs on every scheduled live
+    # run while the history root grows unbounded over time, so skip the expensive
+    # json.load for any artifact that carries no in-window date -- the same
+    # fast-substring reject used by load_prior_same_day_allocations. A file that
+    # DOES match still passes through the full parse and deployed_by_day
+    # stream/afternoon-evidence filters, so a match is never counted unvalidated.
+    window_days = {
+        (trading_day - timedelta(days=offset)).isoformat()
+        for offset in range(KILL_SWITCH_WINDOW_DAYS)
+    }
 
     prior_states = []
     for path in find_run_state_files(deployment_history_root):
         try:
-            with path.open(encoding="utf-8") as f:
-                data = json.load(f)
+            raw_text = path.read_text(encoding="utf-8")
         except (ValueError, OSError):
+            continue
+
+        # Only trust the substring reject when the file contains no JSON unicode
+        # escape sequence: a spec-valid encoder may spell an ASCII character such
+        # as one of the date's hyphens as a unicode escape, which would not
+        # literal-match the ISO date even though the parsed value is in-window.
+        # Escaped files fall through to a full parse so a same-window artifact is
+        # never silently dropped.
+        if "\\u" not in raw_text and not any(day in raw_text for day in window_days):
+            continue
+
+        try:
+            data = json.loads(raw_text)
+        except ValueError:
             continue
         if isinstance(data, dict) and data.get("status") != RUN_STATUS_BLOCKED:
             prior_states.append(data)

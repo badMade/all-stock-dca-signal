@@ -739,6 +739,66 @@ def test_deployment_history_root_engages_kill_switch_on_later_run(tmp_path):
     assert day2_state["risk_guard"]["deployed_last_7d_usd"] == round(day1_deployed + day2_deployed, 2)
 
 
+def test_apply_deployment_history_only_counts_trailing_7d(tmp_path):
+    # Regression guard for the ⚡ Bolt fast-substring window filter in
+    # _apply_deployment_history: only run_states whose trading_day is inside the
+    # trailing KILL_SWITCH_WINDOW_DAYS ending on the as-of day may contribute to
+    # the injected deployed_last_7d_usd. An artifact dated outside that window is
+    # skipped before the expensive json.load and must not change the figure,
+    # while an in-window artifact must still be parsed and counted.
+    from near_close_dca import _apply_deployment_history
+    from scripts.run_classification import (
+        CRON_ID,
+        SCHEDULED_FOR_ET,
+        SCHEDULED_RUN_TYPE,
+        SCHEDULED_WINDOW_END_ET,
+        SCHEDULED_WINDOW_START_ET,
+    )
+
+    def _write_scheduled_state(day, deployed_usd):
+        run_dir = os.path.join(str(tmp_path), "runs", day.isoformat())
+        os.makedirs(run_dir, exist_ok=True)
+        state = {
+            "trading_day": day.isoformat(),
+            "status": "ok",
+            # generated_at is after 2:30 PM ET so it passes the afternoon-evidence
+            # floor and counts as scheduled-live deployment.
+            "generated_at": f"{day.isoformat()}T15:45:00",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "run_type": SCHEDULED_RUN_TYPE,
+                "cron_id": CRON_ID,
+                "scheduled_for_et": SCHEDULED_FOR_ET,
+                "scheduled_window_start_et": SCHEDULED_WINDOW_START_ET,
+                "scheduled_window_end_et": SCHEDULED_WINDOW_END_ET,
+                "manual_run": False,
+                "run_id": f"scheduled_{day.strftime('%Y%m%d')}_1520ET",
+                "triggered_at_utc": f"{day.isoformat()}T19:45:00Z",
+                "state_schema_version": "run-classification-v1",
+            },
+            "buy_candidates": [
+                {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": deployed_usd}
+            ],
+        }
+        with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+            json.dump(state, handle, indent=2)
+
+    history_root = os.path.join(str(tmp_path), "runs")
+    as_of = date(2026, 7, 21)
+    _write_scheduled_state(as_of - timedelta(days=3), 30.0)     # in window -> counts
+    _write_scheduled_state(as_of - timedelta(days=6), 12.0)     # window edge -> counts
+    _write_scheduled_state(as_of - timedelta(days=7), 999.0)    # first day past window
+    _write_scheduled_state(as_of - timedelta(days=40), 999.0)   # long-stale history
+
+    config = StrategyConfig(monthly_cash_allocation_usd=3600.0)
+    guarded = _apply_deployment_history(config, as_of, history_root)
+
+    # Only the two in-window deployments (30.0 + 12.0) contribute; the day-7 and
+    # day-40 artifacts are correctly excluded even though they are valid,
+    # capital-deploying scheduled runs.
+    assert guarded.deployed_last_7d_usd == 42.0
+
+
 def test_kill_switch_caps_later_candidates_within_the_same_batch(tmp_path):
     # No prior-day history is needed: two same-day candidates each priced at
     # $4 (2x the $2 base) with a $7.50 monthly allocation (40% threshold = $3)
