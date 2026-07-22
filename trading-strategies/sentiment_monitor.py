@@ -564,7 +564,8 @@ class NewsCollector:
             logger.info("NewsAPI: %d articles for %s", len(results), ticker)
             return results
         except Exception as exc:
-            logger.error("NewsAPI error for %s: %s", ticker, exc)
+            safe_exc = str(exc).replace(self.api_key, "***") if self.api_key else str(exc)
+            logger.error("NewsAPI error for %s: %s", ticker, safe_exc)
             return []
 
 
@@ -883,7 +884,7 @@ class EmailBriefing:
         msg.attach(MIMEText(html_body, "html", "utf-8"))
 
         try:
-            with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
+            with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=30) as server:
                 server.ehlo()
                 server.starttls()
                 server.login(self.smtp_user, self.smtp_password)
