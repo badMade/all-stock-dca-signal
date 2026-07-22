@@ -319,6 +319,87 @@ def test_provider_previous_close_fallback_to_daily_bars():
     assert bar.close == pytest.approx(306.0)  # last day strictly before 2026-07-02
 
 
+# -- signal-time quote dedupe (⚡ Bolt) ------------------------------------------
+# One quote payload carrying everything the three consumers read: previous-close
+# (get_previous_close_bar), last trade (get_quote), and a two-sided NBBO (get_bid_ask).
+QUOTES_WITH_SPREAD = {
+    "data": {
+        "results": [
+            {
+                "quote": {
+                    "symbol": "AAPL",
+                    "last_trade_price": "313.330100",
+                    "venue_last_trade_time": "2026-07-06T18:31:29Z",
+                    "previous_close": "308.63",
+                    "previous_close_date": "2026-07-02",
+                    "bid_price": "313.10",
+                    "ask_price": "313.40",
+                    "has_traded": True,
+                    "state": "active",
+                },
+                "close": {"symbol": "AAPL", "date": "2026-07-02", "price": "308.63"},
+            }
+        ]
+    }
+}
+
+
+def _counting_quotes_fn(payload=QUOTES_WITH_SPREAD):
+    """A quotes_fn that records every invocation's symbols so tests can assert the
+    number of underlying quote fetches (each is a live MCP/network round-trip)."""
+    calls = []
+
+    def fn(symbols=None, **_kw):
+        calls.append(tuple(symbols or []))
+        return payload
+
+    fn.calls = calls
+    return fn
+
+
+def test_signal_time_quote_fetched_once_for_prev_close_and_quote():
+    # ⚡ Bolt: get_previous_close_bar and get_quote for the same ticker at the same
+    # decision moment must share a single quotes_fn fetch, not issue two.
+    qf = _counting_quotes_fn()
+    prov = RobinhoodDataProvider(historicals_fn=lambda **k: HISTORICALS, quotes_fn=qf)
+    when = _decision_dt()
+    bar = prov.get_previous_close_bar("AAPL", when)
+    quote = prov.get_quote("AAPL", when)
+    assert bar is not None and quote is not None
+    assert quote[0] == pytest.approx(313.3301)
+    assert bar.close == pytest.approx(308.63)
+    assert qf.calls == [("AAPL",)]  # exactly one fetch, deduped
+
+
+def test_get_bid_ask_never_served_from_signal_quote_cache():
+    # get_bid_ask is the pre-placement spread breaker: it MUST read a fresh quote
+    # even after the signal-time quote for that ticker was already memoized, so a
+    # future refactor cannot silently route it through the cache.
+    qf = _counting_quotes_fn()
+    prov = RobinhoodDataProvider(historicals_fn=lambda **k: HISTORICALS, quotes_fn=qf)
+    when = _decision_dt()
+    prov.get_previous_close_bar("AAPL", when)
+    prov.get_quote("AAPL", when)
+    assert qf.calls == [("AAPL",)]  # signal-time fetch cached
+    assert prov.get_bid_ask("AAPL", when) == pytest.approx((313.10, 313.40))
+    assert qf.calls == [("AAPL",), ("AAPL",)]  # breaker fetched fresh, not cached
+
+
+def test_signal_quote_cache_refetches_on_new_decision_moment():
+    # The memo is bounded to one decision moment: a later as_of drops the prior
+    # snapshot (so the cache can't grow without bound) and re-fetches.
+    qf = _counting_quotes_fn()
+    prov = RobinhoodDataProvider(historicals_fn=lambda **k: HISTORICALS, quotes_fn=qf)
+    first = _decision_dt()
+    second = datetime.combine(datetime(2026, 7, 6).date(), time(15, 45), tzinfo=EASTERN)
+    prov.get_quote("AAPL", first)
+    prov.get_quote("AAPL", first)  # same moment -> cached
+    assert qf.calls == [("AAPL",)]
+    prov.get_quote("AAPL", second)  # new moment -> cleared + re-fetched
+    assert qf.calls == [("AAPL",), ("AAPL",)]
+    assert len(prov._signal_quote_cache) == 1  # bounded: prior moment evicted
+
+
 # -- FinanceDataProvider ---------------------------------------------------------
 
 

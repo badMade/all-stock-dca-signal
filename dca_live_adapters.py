@@ -39,6 +39,11 @@ from near_close_dca import (
 
 logger = logging.getLogger("near_close_dca.live_adapters")
 
+# Sentinel distinguishing "not yet fetched" from a cached ``None`` (quote genuinely
+# unavailable) in the signal-time quote memo, so a legitimately-absent quote is
+# cached rather than re-fetched on the paired signal-time call.
+_UNSET = object()
+
 _UTC = timezone.utc
 
 # Robinhood ``get_equity_historicals`` accepts a fixed set of interval strings; the
@@ -216,6 +221,23 @@ class RobinhoodDataProvider:
         self._quotes_fn = quotes_fn
         self._bounds = bounds
         self._adjustment_type = adjustment_type
+        # ⚡ Bolt: signal-time quote memo, scoped to a single decision moment. Both
+        # get_previous_close_bar (via _previous_close_from_quote) and get_quote are
+        # invoked from near_close_dca.evaluate_source_signal for the SAME ticker at the
+        # SAME decision moment, each previously issuing an identical
+        # quotes_fn(symbols=[ticker]) call -- a duplicate live MCP/network round-trip
+        # (or a duplicate O(N) scan of the frozen quote snapshot) per ticker every run.
+        # Memoizing the signal-time snapshot halves signal-time quote fetches
+        # (~44 redundant fetches -> 0 for the live universe) with byte-identical
+        # behavior: within one run each ticker is evaluated once at one decision moment.
+        # The cache is cleared whenever the decision moment (``as_of``) changes, so a
+        # reused provider stays bounded to the current moment's universe (~44 entries)
+        # and never grows without bound or stale-serves a later run.
+        # Deliberately NOT consulted by get_bid_ask -- that is the pre-placement spread
+        # circuit breaker, which must always read a fresh quote (it keeps using the
+        # uncached _quote_for), so the memo can never stale-serve the breaker.
+        self._signal_quote_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+        self._signal_quote_as_of: Optional[datetime] = None
 
     def get_intraday_bars(
         self,
@@ -259,7 +281,7 @@ class RobinhoodDataProvider:
     def get_quote(self, ticker: str, as_of: datetime) -> Optional[Tuple[float, Optional[datetime]]]:
         if self._quotes_fn is None:
             return None
-        quote = self._quote_for(ticker)
+        quote = self._signal_quote_for(ticker, as_of)
         if quote is None:
             return None
         if not quote.get("has_traded", True) or quote.get("state", "active") != "active":
@@ -344,6 +366,29 @@ class RobinhoodDataProvider:
                 )
         return bars
 
+    def _signal_quote_for(self, ticker: str, as_of: datetime) -> Optional[Dict[str, Any]]:
+        """Signal-time quote for ``ticker``, memoized per (ticker, decision moment).
+
+        ⚡ Bolt: dedupes the two signal-time quote fetches that
+        get_previous_close_bar and get_quote each make for the same ticker at the
+        same decision moment. get_bid_ask intentionally bypasses this (it must read
+        a fresh quote for the pre-placement spread breaker). The returned dict is
+        only ever read by its consumers, so sharing the cached object is safe.
+
+        The memo is scoped to a single decision moment: when ``as_of`` changes it is
+        dropped, keeping it bounded to the current moment's universe rather than
+        accumulating an entry per (ticker, moment) forever on a reused provider.
+        """
+        if as_of != self._signal_quote_as_of:
+            self._signal_quote_cache.clear()
+            self._signal_quote_as_of = as_of
+        cached = self._signal_quote_cache.get(ticker, _UNSET)
+        if cached is not _UNSET:
+            return cached  # type: ignore[return-value]
+        quote = self._quote_for(ticker)
+        self._signal_quote_cache[ticker] = quote
+        return quote
+
     def _quote_for(self, ticker: str) -> Optional[Dict[str, Any]]:
         data = _unwrap(self._quotes_fn(symbols=[ticker]))  # type: ignore[misc]
         for result in data.get("results") or []:
@@ -363,7 +408,7 @@ class RobinhoodDataProvider:
         return None
 
     def _previous_close_from_quote(self, ticker: str, as_of: datetime) -> Optional[Bar]:
-        quote = self._quote_for(ticker)
+        quote = self._signal_quote_for(ticker, as_of)
         if quote is None:
             return None
         official = quote.get("_close") or {}
