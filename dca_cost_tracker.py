@@ -138,17 +138,24 @@ def aggregate_usage(
     """
     totals: Dict[str, float] = {field: 0.0 for field in _NUMERIC_PROXY_FIELDS}
     manual_recovery_runs = 0
+
+    valid_usages = []
     for rs in run_states:
         usage = rs.get("usage_proxy")
         if not isinstance(usage, dict):
             continue
-        # ⚡ Bolt Optimization: Loop explicitly over target keys to avoid scanning
-        # arbitrary/noisy usage dictionary keys unnecessarily.
-        for field in _NUMERIC_PROXY_FIELDS:
-            if field in usage:
-                totals[field] += _num(usage[field])
+        valid_usages.append(usage)
         if usage.get("manual_recovery_required"):
             manual_recovery_runs += 1
+
+    # ⚡ Bolt Optimization: Collect valid usage dicts once and invert the loop.
+    # Outer loop over known numeric fields avoids per-row usage.items() iteration and
+    # reduces repeated writes to the totals dict.
+    for field in _NUMERIC_PROXY_FIELDS:
+        total = 0.0
+        for u in valid_usages:
+            total += _num(u.get(field))
+        totals[field] = total
 
     components: List[Dict[str, Any]] = []
     estimated_total = 0.0
