@@ -83,11 +83,12 @@ from near_close_dca import (
     iso_week_key,
     latest_bar_at_or_before,
     load_prior_same_day_allocations_multi,
+    merge_manual_top_up_context,
     quote_spread_pct,
 )
 from scripts.model_usage_log import DEFAULT_LOG_ROOT as DEFAULT_MODEL_USAGE_LOG_ROOT
 from scripts.model_usage_log import log_model_usage
-from scripts.run_classification import save_raw_input
+from scripts.run_classification import load_same_day_top_up_context, save_raw_input
 from scripts.same_day_pointer import (
     build_pointer_metadata,
     derive_valid_scheduled_evidence,
@@ -1405,6 +1406,15 @@ class MorningDCAExecutor(DCAExecutor):
         # we defer the early return until after the cap-seeding block below.
         explicit_disable = raw_roots is not None and len(raw_roots) == 0
         configured = list(raw_roots) if raw_roots is not None else [DEFAULT_AFTERNOON_TASK_ROOT]
+        # True when the caller left prior_allocation_roots at its class default
+        # (None for MorningConfig's own auto-derive marker, or MiddayConfig's own
+        # hardcoded production default) rather than pointing it at a specific,
+        # narrower tree -- e.g. an isolated replay/staging config (Codex review:
+        # "Honor explicit prior-allocation roots in shared executors").
+        uses_default_prior_allocation_roots = raw_roots is None or tuple(raw_roots) == (
+            DEFAULT_MORNING_LIVE_STATE_ROOT,
+            DEFAULT_AFTERNOON_TASK_ROOT,
+        )
         # Append the manual_runs subtree of self.state_root only for the morning
         # stream. Midday manual reruns are prior context for the afternoon guard,
         # not for the midday scheduled run; skip to avoid scanning
@@ -1481,6 +1491,29 @@ class MorningDCAExecutor(DCAExecutor):
         prior_allocations = load_prior_same_day_allocations_multi(
             roots, trading_day, boundary_et=boundary_et
         )
+        # Fold in same-day MANUAL fills that live only in a bare sibling orders CSV
+        # (no buy_candidates, no recorded artifacts.orders_csv_path -- the Jul 21
+        # manual midday shape) -- load_prior_same_day_allocations_multi above has no
+        # way to find those. Applies to both the morning and midday streams (this
+        # method is shared), matching the documented policy that every same-day
+        # guard folds these manual artifacts in, not just the afternoon one (Codex
+        # review: "Wire manual CSV context into the midday guard"). Anchored on this
+        # stream's own state_root so the shared cron_tracking parent resolves
+        # correctly regardless of which stream is calling; capped at this run's own
+        # time for the same replay-safety reason boundary_et is used above.
+        #
+        # Only when prior_allocation_roots is still at its class default: a
+        # caller that explicitly configured it to an isolated/relocated tree
+        # must have that isolation honored, the same guard already applied to
+        # run_dca.py's explicit prior_allocation_state_root branch (Codex
+        # review: "Honor explicit prior-allocation roots in shared executors").
+        if uses_default_prior_allocation_roots:
+            merge_manual_top_up_context(
+                prior_allocations,
+                load_same_day_top_up_context(
+                    trading_day.isoformat(), base=Path(self.state_root), boundary_et=boundary_et
+                ),
+            )
         outcomes: Dict[str, TopUpOutcome] = {}
         for signal in signals:
             if signal.action != Action.BUY or signal.multiplier <= 0:

@@ -50,6 +50,7 @@ from near_close_dca import (
     build_broker,
     load_prior_same_day_allocations,
     load_prior_same_day_allocations_multi,
+    merge_manual_top_up_context,
     run_daily_compact,
 )
 from scripts.model_usage_log import log_model_usage
@@ -58,6 +59,7 @@ from scripts.run_classification import (
 )
 from scripts.run_classification import (
     build_raw_persistence_state,
+    load_same_day_top_up_context,
     raw_persistence_failure_run_state,
     save_raw_input,
     update_latest_scheduled_run_pointer,
@@ -1037,6 +1039,20 @@ def _run_pipeline_impl(
                         run_id=alloc.run_id or existing.run_id,
                         source=alloc.source or existing.source,
                     )
+            # Manual-context discovery (scripts.run_classification.load_same_day_top_up_context)
+            # only runs for the auto-derived root: it scans SIBLINGS of afternoon_root's
+            # parent (the production cron_tracking layout), which would silently pull in
+            # unrelated trees for a caller that passed an explicit prior_allocation_state_root
+            # to scan ONLY that tree (Codex review: "Respect explicit prior-allocation root
+            # isolation"). Capped at the run time for the same replay-safety reason as above
+            # (Codex review: "Bound manual top-up context to the scheduled execution time").
+            merge_manual_top_up_context(
+                prior_same_day_allocations,
+                load_same_day_top_up_context(
+                    trading_day.isoformat(), base=afternoon_root,
+                    boundary_et=now.astimezone(EASTERN).time(),
+                ),
+            )
         else:
             prior_same_day_allocations = load_prior_same_day_allocations(
                 prior_allocation_state_root, trading_day,

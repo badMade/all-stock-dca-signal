@@ -183,6 +183,63 @@ def test_run_pipeline_scheduled_run_auto_loads_prior_allocations(tmp_path):
     assert not (task_root / "latest_run_summary.json").exists()
 
 
+def test_run_pipeline_scheduled_run_loads_manual_midday_top_up_context(tmp_path):
+    import json
+
+    # Jul 21 2026 incident regression (PR #157 review: "Wire the manual context
+    # loader into the 3:20 pipeline"). A manual midday run whose fills live ONLY
+    # in a sibling submitted_orders.csv -- no embedded buy_candidates, no
+    # recorded artifacts.orders_csv_path -- is a shape
+    # load_prior_same_day_allocations[_multi] cannot read a fill from (no
+    # buy_candidates and no artifacts block to fall back to). Only
+    # scripts.run_classification.load_same_day_top_up_context, wired in via
+    # _merge_manual_top_up_context, can see it.
+    task_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    manual_midday_dir = (
+        tmp_path / "cron_tracking" / "midday_dca" / "manual_runs" / "20260706_1345ET"
+    )
+    manual_midday_dir.mkdir(parents=True)
+    (manual_midday_dir / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": _now().date().isoformat(),
+            "generated_at": f"{_now().date().isoformat()}T13:45:00-04:00",
+            "run_classification": {
+                "run_origin": "manual",
+                "manual_run": True,
+                "run_id": "manual_midday_20260706_1345ET",
+                "stream": "midday_manual",
+                "trading_day": _now().date().isoformat(),
+                "same_day_top_up_context_only": True,
+                "valid_scheduled_evidence": False,
+                "valid_afternoon_scheduled_evidence": False,
+            },
+        }),
+        encoding="utf-8",
+    )
+    # A very low reference price guarantees the afternoon price is never below
+    # it, so this ticker's guard result proves the allocation was loaded
+    # (top_up_guard_result != "no_prior_run") without depending on the demo
+    # provider's exact drop-derived price.
+    (manual_midday_dir / "submitted_orders.csv").write_text(
+        "symbol,amount,order_id,status,average_price,quantity\n"
+        "AAPL,3.0,MID-AAPL-1,filled,0.01,0.1\n",
+        encoding="utf-8",
+    )
+
+    config = _demo_config()
+    scheduled_dir = task_root / "scheduled_runs" / "20260706_1520ET"
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=scheduled_dir,
+    )
+    assert result["blocked"] is False
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    assert by_ticker["AAPL"]["top_up_guard_result"] != "no_prior_run"
+
+
 def test_run_pipeline_honors_configured_morning_artifact_root(tmp_path):
     # Codex/Copilot review: the cross-stream root derivation used to assume the
     # morning/midday roots are siblings of the afternoon task root sharing the
@@ -519,6 +576,59 @@ def test_run_pipeline_explicit_prior_root_uses_run_time_boundary(tmp_path):
         run_state = json.load(handle)
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
     assert by_ticker["AAPL"]["top_up_guard_result"] != "no_prior_run"
+
+
+def test_run_pipeline_explicit_prior_root_does_not_leak_sibling_manual_context(tmp_path):
+    import json
+
+    # Codex review r3626083298 ("Respect explicit prior-allocation root
+    # isolation"): when a caller passes prior_allocation_state_root explicitly,
+    # manual top-up context discovery must not reach outside that root. Seed a
+    # manual midday run as a SIBLING of the explicit root's parent -- exactly
+    # the shape scripts.run_classification.load_same_day_top_up_context would
+    # find if it were (incorrectly) invoked with base=prior_allocation_state_root.
+    # No buy_candidates/artifacts.orders_csv_path, so near_close_dca's own
+    # loader can't see it either -- only a leak through the new loader would.
+    explicit_root = tmp_path / "custom_prior_root"
+    explicit_root.mkdir(parents=True)
+    sibling_manual_dir = tmp_path / "midday_dca" / "manual_runs" / "20260706_1345ET"
+    sibling_manual_dir.mkdir(parents=True)
+    now = _now()
+    (sibling_manual_dir / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": now.date().isoformat(),
+            "generated_at": f"{now.date().isoformat()}T13:45:00-04:00",
+            "run_classification": {
+                "run_origin": "manual",
+                "manual_run": True,
+                "run_id": "manual_midday_20260706_1345ET",
+                "trading_day": now.date().isoformat(),
+                "same_day_top_up_context_only": True,
+                "valid_scheduled_evidence": False,
+                "valid_afternoon_scheduled_evidence": False,
+            },
+        }),
+        encoding="utf-8",
+    )
+    (sibling_manual_dir / "submitted_orders.csv").write_text(
+        "symbol,amount,order_id,status,average_price,quantity\n"
+        "IBM,2.0,SIBLING-IBM-1,filled,0.01,0.1\n",
+        encoding="utf-8",
+    )
+
+    config = _demo_config()
+    result = run_pipeline(
+        now, config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path / "scheduled",
+        prior_allocation_state_root=explicit_root,
+    )
+
+    assert result["blocked"] is False
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    assert by_ticker["IBM"]["top_up_guard_result"] == "no_prior_run"
 
 
 def test_run_pipeline_scheduled_run_loads_sibling_stream_roots_to_run_time(tmp_path):

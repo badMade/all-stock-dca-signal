@@ -401,6 +401,37 @@ under `/home/user/workspace/cron_tracking/dry_runs/20260721_0905ET/`. See the
 `morning_manual_dry_run_2026_07_21` in
 [`../config/scheduled_tasks.json`](../config/scheduled_tasks.json).
 
+## Watchdog all-orders broker query (added 2026-07-21)
+
+The 3:40 PM live-run watchdog (`a46bf007`) previously queried the **agentic**
+(`placed_agent='agent'`) order subset first, so same-day **user/manual** Robinhood
+orders could be missed by primary reconciliation. From **2026-07-21** the watchdog
+**must query ALL same-day Robinhood equity orders for account 562057042 without any
+`placed_agent` filter first**, then classify every returned order. It **may**
+report the agentic-only subset separately, but the primary reconciliation runs over
+the **full** order set.
+
+Each order is classified by:
+
+- **scheduled evidence** — a validated scheduled `run_state` whose
+  `submitted_orders.csv` / `filled_orders.csv` contains the order ID;
+- **manual artifacts** — the manual-exclusion roots;
+- **same-day top-up roots** — `top_up_context_roots()`
+  (`morning_dca/manual_recovery`, `midday_dca/manual_recovery`,
+  `midday_dca/manual_runs`, `midday_dca/manual_reruns`);
+- **`placed_agent`**;
+- **order IDs**.
+
+Orders with `placed_agent='user'` or any non-agentic value are reported in a
+dedicated **Manual/User Orders** section and **must not** count as scheduled fills
+unless their order IDs appear in a valid scheduled `submitted_orders.csv` from the
+same-day scheduled run. Manual fills stay excluded from scheduled slippage,
+scheduled fill counts, scheduled reliability, scheduled cost-basis evidence,
+watchdog proof, and scheduled afternoon evidence. See the
+`watchdog_all_orders_fix_2026_07_21` block in
+[`../config/run_classification.json`](../config/run_classification.json) and
+[`../config/scheduled_tasks.json`](../config/scheduled_tasks.json).
+
 ## 3:20 runner self-containment and state-file guarantee (added 2026-07-20)
 
 After the Jul 20 2026 10:30 and 12:30 scheduled live runs both failed (they

@@ -236,7 +236,8 @@
       "A scheduled run_state with order_submit_status='not_submitted_confirmation_required' is valid scheduled-run evidence that the task ran but is NOT evidence of an order/fill: it contributes zero scheduled fills/order IDs and must not be marked invalid because confirmation blocked submission.",
       "Exclude final manual buy overrides (run_type='final_manual_buy_override', valid_afternoon_scheduled_evidence=false, same_day_top_up_context_only=true) from scheduled slippage, scheduled fills, scheduled reliability, scheduled cost basis, and watchdog confirmation. Show them only in a labeled Manual Final Buy Override / Same-Day Top-Up Context section (see manual_reporting).",
       "Exclude manual missed-morning recovery artifacts (under morning_dca/manual_recovery/**, run_origin='manual', manual_run=true, same_day_top_up_context_only=true, valid_scheduled_evidence=false) from scheduled slippage, scheduled fills, scheduled reliability, scheduled cost basis, and watchdog confirmation. They never prove the 10:30 scheduled task ran and are used only as same-day prior-allocation / top-up context (see manual_missed_morning_recovery).",
-      "Exclude the 2026-07-21 manual midday run (under midday_dca/manual_runs/**, run_origin='manual', manual_run=true, stream='midday_manual', same_day_top_up_context_only=true, valid_scheduled_evidence=false, valid_afternoon_scheduled_evidence=false) from scheduled slippage, scheduled fill counts, scheduled reliability, scheduled cost-basis evidence, watchdog proof, and scheduled afternoon evidence. It never proves the 12:30 or 3:20 scheduled tasks ran and is used only as same-day prior-allocation / top-up context by the later 3:20 top-up logic (see midday_manual_run_2026_07_21)."
+      "Exclude the 2026-07-21 manual midday run (under midday_dca/manual_runs/**, run_origin='manual', manual_run=true, stream='midday_manual', same_day_top_up_context_only=true, valid_scheduled_evidence=false, valid_afternoon_scheduled_evidence=false) from scheduled slippage, scheduled fill counts, scheduled reliability, scheduled cost-basis evidence, watchdog proof, and scheduled afternoon evidence. It never proves the 12:30 or 3:20 scheduled tasks ran and is used only as same-day prior-allocation / top-up context by the later 3:20 top-up logic (see midday_manual_run_2026_07_21).",
+      "The watchdog (a46bf007) queries ALL same-day Robinhood equity orders for account 562057042 WITHOUT a placed_agent filter first, then classifies every order by scheduled evidence, manual artifacts, same-day top-up roots, placed_agent, and order IDs; orders with placed_agent='user' or any non-agentic value appear in a Manual/User Orders section and count as scheduled fills only when their order IDs are in a valid scheduled submitted_orders.csv from the same-day scheduled run (see watchdog_all_orders_fix_2026_07_21)."
     ],
     "manual_exclusion_roots": {
       "reason": "The 2026-07-13 final manual buy override backfilled live artifacts under midday_dca/manual_reruns/final_manual_override_* and a final_manual_review/** tree, both OUTSIDE the ce16ba6b task root. Slippage/watchdog/reporting must scan these as manual exclusions so their order IDs never leak into scheduled-live metrics.",
@@ -370,8 +371,39 @@
       "Excluded from scheduled slippage, scheduled fill counts, scheduled reliability, scheduled cost-basis evidence, watchdog proof, and scheduled afternoon evidence.",
       "Order IDs found under midday_dca/manual_runs/** are collected as excluded_manual_order_ids (see downstream_reporting_rules manual_exclusion_roots)."
     ],
+    "loader": "scripts/run_classification.py:load_same_day_top_up_context (validates run_origin='manual', manual_run=true, same_day_top_up_context_only=true, valid_scheduled_evidence=false, valid_afternoon_scheduled_evidence!=true, matching trading_day; folds fills into per-ticker PriorAllocation for incremental_top_up_amount()). Scans top_up_context_roots(): morning_dca/manual_recovery, midday_dca/manual_recovery, midday_dca/manual_runs, midday_dca/manual_reruns.",
+    "jul21_320_audit": {
+      "afternoon_artifact_root": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260721_1520ET",
+      "wrote": ["signals.csv", "submitted_orders.csv"],
+      "orders_placed": 0,
+      "correct": "Manual order IDs did NOT leak into the scheduled artifacts.",
+      "defect": "The 3:20 runner did not load midday_dca/manual_runs/20260721_1345ET as prior-allocation context, so prior_usd was blank and incremental_usd 0 for MSFT, GOOGL, GOOG, MA, IBM despite the manual fills being on disk. Fixed by explicit manual-root ingestion in load_same_day_top_up_context()."
+    },
     "see": "config/scheduled_tasks.json:midday_dca_manual_run_2026_07_21",
     "doc": "docs/midday_dca.md"
+  },
+  "watchdog_all_orders_fix_2026_07_21": {
+    "added": "2026-07-21",
+    "applies_to_tasks": ["a46bf007"],
+    "broker_account": "robinhood:562057042",
+    "trigger_incident": "The 3:40 PM live-run watchdog queried the agentic (placed_agent='agent') order subset first, so same-day user/manual Robinhood orders could be missed by primary reconciliation.",
+    "requirement": "The watchdog MUST query ALL same-day Robinhood equity orders for account 562057042 WITHOUT any placed_agent filter FIRST, then classify every returned order. The agentic-only (placed_agent='agent') subset MAY be reported separately, but primary reconciliation runs over the full order set.",
+    "classify_every_order_by": [
+      "scheduled evidence (a validated scheduled run_state whose submitted_orders.csv/filled_orders.csv contains the order ID)",
+      "manual artifacts (the manual-exclusion roots)",
+      "same-day top-up roots (top_up_context_roots)",
+      "placed_agent",
+      "order IDs"
+    ],
+    "rules": [
+      "Query all same-day equity orders for robinhood:562057042 with NO placed_agent filter before any reconciliation; do not start from the agentic-only subset.",
+      "Classify every returned order by scheduled evidence, manual artifacts, same-day top-up roots, placed_agent, and order IDs.",
+      "Orders with placed_agent='user' or any non-agentic value are reported in a dedicated Manual/User Orders section and MUST NOT count as scheduled fills unless their order IDs appear in a valid scheduled submitted_orders.csv from the same-day scheduled run.",
+      "The agentic-only (placed_agent='agent') subset MAY be reported separately as context but is never the primary reconciliation set.",
+      "Manual fills stay excluded from scheduled slippage, scheduled fill counts, scheduled reliability, scheduled cost-basis evidence, watchdog proof, and scheduled afternoon evidence."
+    ],
+    "see": "config/scheduled_tasks.json:watchdog_all_orders_fix_2026_07_21",
+    "doc": "docs/run_classification.md"
   },
   "live_schedule_hardening_2026_07_20": {
     "added": "2026-07-20",

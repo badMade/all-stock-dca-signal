@@ -37,6 +37,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -49,6 +50,9 @@ from typing import (
     Tuple,
 )
 from zoneinfo import ZoneInfo
+
+if TYPE_CHECKING:
+    from scripts.run_classification import PriorAllocation
 
 EASTERN = ZoneInfo("America/New_York")
 
@@ -2309,6 +2313,66 @@ def load_prior_same_day_allocations_multi(
                 source=alloc.source or existing.source,
             )
     return merged
+
+
+def merge_manual_top_up_context(
+    prior_same_day_allocations: Dict[str, PriorSameDayAllocation],
+    manual_context: Dict[str, "PriorAllocation"],
+) -> None:
+    """Fold same-day MANUAL fills into a top-up guard's prior-allocation input.
+
+    ``load_prior_same_day_allocations[_multi]`` reads a manual run's fills from its
+    embedded ``buy_candidates`` or, absent those, a recorded
+    ``artifacts.orders_csv_path`` -- it has no way to find a fill that lives ONLY in
+    a sibling orders CSV the run_state never names (see
+    ``scripts.run_classification.load_same_day_top_up_context``, a
+    :class:`scripts.run_classification.PriorAllocation` map, which scans
+    ``top_up_context_roots()`` and also recognizes a bare sibling ``*orders.csv``).
+    Jul 21 2026 incident: the 3:20 final run correctly excluded the manual midday
+    fills under ``midday_dca/manual_runs/20260721_1345ET`` from scheduled evidence,
+    but never loaded them as prior-allocation context, leaving ``prior_usd`` blank
+    and ``incremental_usd`` 0 for MSFT/GOOGL/GOOG/MA/IBM despite the fills being on
+    disk. This merges the two loaders' results the same way ``load_prior_same_day_
+    allocations_multi`` folds in multiple roots: dollar amounts sum, and the lowest
+    reference price wins (an unknown reference from either source poisons the
+    aggregate to unknown, routing the guard to its conservative missing-price path).
+
+    Shared by both ``run_dca.py`` (the 3:20 afternoon guard) and
+    ``morning_dca.py``'s ``MorningDCAExecutor._compute_top_up`` (the 10:30/12:30
+    morning and midday guards -- Codex review: "Wire manual CSV context into the
+    midday guard"): the policy documented in config/run_classification.json
+    requires every same-day guard to fold these manual artifacts in, not just the
+    afternoon one.
+
+    These manual fills stay prior-allocation context ONLY -- merging them here never
+    makes their order IDs scheduled evidence; ``collect_manual_order_ids`` still
+    excludes them from every scheduled-live metric.
+    """
+    for ticker, alloc in manual_context.items():
+        if alloc.prior_usd <= 0:
+            continue
+        existing = prior_same_day_allocations.get(ticker)
+        if existing is None:
+            prior_same_day_allocations[ticker] = PriorSameDayAllocation(
+                ticker=ticker,
+                amount_usd=alloc.prior_usd,
+                reference_price=alloc.reference_price,
+                run_id=(alloc.sources[0] if alloc.sources else None),
+                source="manual_top_up_context",
+            )
+            continue
+        ref = (
+            None
+            if existing.reference_price is None or alloc.reference_price is None
+            else min(existing.reference_price, alloc.reference_price)
+        )
+        prior_same_day_allocations[ticker] = PriorSameDayAllocation(
+            ticker=ticker,
+            amount_usd=existing.amount_usd + alloc.prior_usd,
+            reference_price=ref,
+            run_id=existing.run_id,
+            source=existing.source or "manual_top_up_context",
+        )
 
 
 # Mutually exclusive reasons an active-universe ticker did not produce a filled order.

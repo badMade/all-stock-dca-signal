@@ -367,6 +367,98 @@ def test_top_up_incremental_when_price_below_prior(tmp_path):
     assert ex.ledger.day_planned(day) == 8.0
 
 
+def test_top_up_loads_manual_csv_only_context(tmp_path):
+    # Codex review r3626294840 ("Wire manual CSV context into the midday guard"):
+    # a manual run whose fills live ONLY in a sibling orders CSV -- no
+    # buy_candidates, no recorded artifacts.orders_csv_path (the Jul 21 manual
+    # midday shape) -- is a shape near_close_dca.load_prior_same_day_allocations_
+    # multi alone cannot read (no buy_candidates to read, no artifacts block to
+    # fall back to). Only scripts.run_classification.load_same_day_top_up_context,
+    # wired into the shared _compute_top_up, can see it.
+    now = _now_midday()
+    trading_day_iso = now.astimezone(EASTERN).date().isoformat()
+    manual_dir = tmp_path / "midday_dca" / "manual_runs" / "20260708_1145ET"
+    manual_dir.mkdir(parents=True)
+    (manual_dir / "run_state.json").write_text(json.dumps({
+        "trading_day": trading_day_iso,
+        "generated_at": f"{trading_day_iso}T11:45:00-04:00",
+        "run_classification": {
+            "run_origin": "manual",
+            "manual_run": True,
+            "run_id": "manual_midday_20260708_1145ET",
+            "trading_day": trading_day_iso,
+            "same_day_top_up_context_only": True,
+            "valid_scheduled_evidence": False,
+            "valid_afternoon_scheduled_evidence": False,
+        },
+    }))
+    # avg_fill_price is the codebase-standard fill-price column (near_close_dca.
+    # _orders_csv_fills, _CSV_FIELDS) -- also exercises the avg_fill_price alias.
+    (manual_dir / "submitted_orders.csv").write_text(
+        "symbol,amount,order_id,status,avg_fill_price,quantity\n"
+        "BIG,2.0,MANUAL-BIG-1,filled,95.0,0.021\n"
+    )
+    cfg = MiddayConfig(
+        tickers=("BIG",), base_buy_amount_usd=2.0,
+        morning_run_state_root=str(tmp_path / "midday"),
+    )
+    ex = MiddayDCAExecutor(cfg)
+    # Midday price 90.0 is strictly below the 95.0 manual reference.
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+    res = ex.run(now, data, broker=FakeLiveBroker())
+    row = res["artifacts"]["buy_candidates"][0]
+    assert row["top_up_guard_result"] == TOP_UP_INCREMENTAL
+    assert row["prior_same_day_amount"] == 2.0
+    assert row["prior_same_day_reference_price"] == 95.0
+    assert row["incremental_order_amount"] == 8.0
+
+
+def test_top_up_manual_csv_context_respects_explicit_prior_allocation_roots(tmp_path):
+    # Codex review r3626569750 ("Honor explicit prior-allocation roots in
+    # shared executors"): when a caller configures prior_allocation_roots to a
+    # specific, isolated tree, the manual CSV-only context merge added in
+    # test_top_up_loads_manual_csv_only_context above must not ALSO scan
+    # unrelated sibling cron-tracking trees relative to state_root. Seed a
+    # CSV-only manual fill under a default sibling location (final_manual_review)
+    # that would leak in if isolation weren't honored.
+    leak_dir = tmp_path / "final_manual_review" / "20260708_1145ET"
+    leak_dir.mkdir(parents=True)
+    now = _now_midday()
+    trading_day_iso = now.astimezone(EASTERN).date().isoformat()
+    (leak_dir / "run_state.json").write_text(json.dumps({
+        "trading_day": trading_day_iso,
+        "generated_at": f"{trading_day_iso}T11:45:00-04:00",
+        "run_classification": {
+            "run_origin": "manual",
+            "manual_run": True,
+            "run_id": "leak-run",
+            "trading_day": trading_day_iso,
+            "same_day_top_up_context_only": True,
+            "valid_scheduled_evidence": False,
+            "valid_afternoon_scheduled_evidence": False,
+        },
+    }))
+    (leak_dir / "submitted_orders.csv").write_text(
+        "symbol,amount,order_id,status,avg_fill_price,quantity\n"
+        "BIG,2.0,LEAK-1,filled,90.0,0.02\n"
+    )
+
+    explicit_root = tmp_path / "custom_prior_root"
+    explicit_root.mkdir(parents=True)
+    cfg = MiddayConfig(
+        tickers=("BIG",), base_buy_amount_usd=2.0,
+        morning_run_state_root=str(tmp_path / "midday"),
+        prior_allocation_roots=(str(explicit_root),),
+    )
+    ex = MiddayDCAExecutor(cfg)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+    res = ex.run(now, data, broker=FakeLiveBroker())
+    row = res["artifacts"]["buy_candidates"][0]
+    # Isolation honored: the leaked fill under final_manual_review must not
+    # offset the guard just because it happens to sit next to state_root.
+    assert row["top_up_guard_result"] == TOP_UP_NO_PRIOR_RUN
+
+
 class _WideSpreadProvider(DecliningBarsProvider):
     """A provider exposing a live bid/ask quote with an excessive spread."""
 

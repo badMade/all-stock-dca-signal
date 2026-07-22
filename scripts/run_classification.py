@@ -29,7 +29,7 @@ import csv
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Set
 from zoneinfo import ZoneInfo
@@ -195,7 +195,15 @@ def manual_run_id(triggered_at_utc: Optional[str] = None) -> str:
 def build_scheduled_classification(
     trading_day: str, triggered_at_utc: Optional[str] = None
 ) -> Dict[str, object]:
-    """Return a fully-populated scheduled run_classification block."""
+    """Return a fully-populated scheduled run_classification block.
+
+    Stamps ``stream="afternoon"`` (this builder is the 15:20 ET scheduled live
+    task) so ``scripts.same_day_pointer.select_same_day_run_state``'s
+    direct-resolution path -- which fails closed when a target's own
+    ``run_classification.stream`` is absent -- accepts a real scheduled
+    afternoon run_state instead of rejecting it for a missing field (Codex
+    review: "Accept the valid afternoon dated state").
+    """
     return {
         "run_origin": "scheduled",
         "run_type": SCHEDULED_RUN_TYPE,
@@ -206,6 +214,7 @@ def build_scheduled_classification(
         "scheduled_window_end_et": SCHEDULED_WINDOW_END_ET,
         "manual_run": False,
         "run_id": scheduled_run_id(trading_day),
+        "stream": "afternoon",
         "triggered_at_utc": triggered_at_utc or _utc_now_iso(),
         "state_schema_version": STATE_SCHEMA_VERSION,
     }
@@ -236,14 +245,20 @@ def build_final_manual_override_classification(
     The final-buy behavior (full active-universe scan, trend filter ignored for the
     final-buy decision only) may be invoked manually after the scheduled 3:20 PM run.
     Such a run is manual by contract and additionally flags itself as NOT valid
-    afternoon scheduled evidence and same-day top-up context only, so downstream
-    reporting shows it only in the Manual Final Buy Override / Same-Day Top-Up Context
-    section and never in any scheduled-live metric.
+    afternoon scheduled evidence, not valid scheduled evidence at all, and same-day
+    top-up context only, so downstream reporting shows it only in the Manual Final
+    Buy Override / Same-Day Top-Up Context section and never in any scheduled-live
+    metric. ``valid_scheduled_evidence=False`` is required for
+    :func:`is_top_up_context_state` to admit it as prior-allocation context for the
+    same-day top-up guard (Codex review: "Admit final-manual overrides as top-up
+    context") -- without it, a real final-manual-override artifact built by this
+    function was rejected before its CSV fills were ever read.
     """
     ts = triggered_at_utc or _utc_now_iso()
     block = build_manual_classification(ts, run_id)
     block["run_type"] = FINAL_MANUAL_OVERRIDE_RUN_TYPE
     block["valid_afternoon_scheduled_evidence"] = False
+    block["valid_scheduled_evidence"] = False
     block["same_day_top_up_context_only"] = True
     return block
 
@@ -969,6 +984,559 @@ def exclude_manual_orders(
     return [oid for oid in order_ids if oid not in manual]
 
 
+# --- Same-day prior-allocation / top-up context ------------------------------
+#
+# The later same-day runs (12:30 midday, 3:20 afternoon/final) must fold earlier
+# same-day MANUAL fills in as prior-allocation context for the top-up guard: a
+# later run buys only max(0, desired - prior_same_day_amount) and only when its
+# decision price is strictly below the LOWEST prior same-day reference price.
+#
+# Jul 21 2026 incident (see config/run_classification.json ->
+# midday_manual_run_2026_07_21): the 3:20 final run under
+# ce16ba6b/scheduled_runs/20260721_1520ET correctly EXCLUDED the manual midday
+# fills from scheduled evidence, but FAILED to load
+# midday_dca/manual_runs/20260721_1345ET as same-day prior-allocation context.
+# It therefore set prior_usd blank and incremental_usd 0 for MSFT, GOOGL, GOOG,
+# MA, IBM even though those manual fills were on disk. These helpers close that
+# gap: the manual roots that are excluded from scheduled evidence are ingested
+# here as prior-allocation context ONLY. A fill loaded here NEVER counts as
+# scheduled evidence, scheduled slippage, scheduled fill counts, reliability,
+# cost-basis evidence, watchdog proof, or proof the 12:30/3:20 tasks ran -- its
+# order IDs stay in collect_manual_order_ids()'s exclusion set.
+
+# Roots (relative to CRON_TRACKING_ROOT) scanned for same-day MANUAL top-up
+# context. This overlaps MANUAL_EXCLUSION_SUBROOTS on purpose: a root excluded
+# from scheduled evidence is exactly a root whose fills are valid ONLY as
+# prior-allocation context. midday_dca/manual_runs/YYYYMMDD_* (the Jul 21 manual
+# midday root) is included so later same-day runs pick it up. ce16ba6b/manual_runs
+# is the canonical afternoon task's OWN manual/final-manual-override root -- a
+# pre-3:20 CSV-only run there is same-day top-up context too, and without it
+# here the afternoon guard could treat that ticker as no_prior_run and buy the
+# full amount again (Codex review: "Scan the afternoon manual-runs root for
+# CSV-only context"). final_manual_review is explicitly documented as same-day
+# top-up context too (config/scheduled_tasks.json:
+# same_day_top_up_policy.manual_override_handling), alongside
+# midday_dca/manual_reruns and ce16ba6b/manual_runs/final_manual_override_*
+# (Codex review: "Include final_manual_review in the top-up context roots").
+TOP_UP_CONTEXT_SUBROOTS = (
+    "morning_dca/manual_recovery",
+    "midday_dca/manual_recovery",
+    "midday_dca/manual_runs",
+    "midday_dca/manual_reruns",
+    "ce16ba6b/manual_runs",
+    "final_manual_review",
+)
+
+# CSV column aliases for extracting per-ticker prior allocation from a manual
+# run's orders CSV (submitted_orders.csv / filled_orders.csv). The Jul 21 manual
+# midday CSV uses symbol/amount/average_price; other manual streams use
+# ticker/submitted_amount_usd/average_fill_price, so both are accepted.
+_TICKER_COLS = ("ticker", "symbol")
+_AMOUNT_COLS = (
+    "amount",
+    "amount_usd",
+    "submitted_amount_usd",
+    "planned_amount_usd",
+    "filled_amount_usd",
+    # The codebase-standard amount column (near_close_dca._CSV_FIELDS, existing
+    # manual-order CSV tests) -- without this alias a manual CSV using that
+    # convention has no recognized amount and the ticker is silently discarded
+    # (Codex review: "Parse the standard notional_usd column").
+    "notional_usd",
+    # A buy_candidate's own already-computed incremental top-up amount (see
+    # _rows_from_buy_candidates) when no planned/notional amount is present.
+    "incremental_order_amount",
+)
+# Reference-price preference order (contract): logged target/decision price, then
+# average fill price. Lower-priority price columns are only used when no
+# higher-priority column is present.
+_PRICE_COLS = (
+    "target_price",
+    "decision_price",
+    "average_price",
+    "average_fill_price",
+    # The codebase-standard confirmed-fill price column (near_close_dca.
+    # _orders_csv_fills, near_close_dca._CSV_FIELDS, the scheduled artifact
+    # writers) -- without this alias a manual CSV using that convention is
+    # read with no price, so the guard wrongly returns missing_prior_price
+    # (Codex review: "Accept the standard avg_fill_price column").
+    "avg_fill_price",
+    "price",
+    # A buy_candidate's logged decision-bar close (see _rows_from_buy_candidates),
+    # lowest priority since it's a looser proxy than an explicit target/decision price.
+    "decision_bar_close",
+)
+# Fill-quantity column aliases, used only to derive a notional (price * quantity)
+# when no amount/notional column is present -- the codebase-standard confirmed-fill
+# shape (near_close_dca._orders_csv_fills) records avg_fill_price/quantity_filled
+# with no separate dollar amount (Codex review: "Derive a prior notional from
+# confirmed fill quantity"). The Jul 21 manual midday CSV instead uses "quantity".
+_QUANTITY_COLS = ("quantity_filled", "quantity")
+
+
+def top_up_context_roots(base: Optional[Path] = None) -> List[Path]:
+    """Directories scanned for same-day manual prior-allocation / top-up context."""
+    parent = cron_tracking_root(base)
+    return [parent / sub for sub in TOP_UP_CONTEXT_SUBROOTS]
+
+
+def is_top_up_context_state(
+    state: Dict[str, object], trading_day: Optional[str] = None
+) -> bool:
+    """True only for a same-day MANUAL run usable as prior-allocation context.
+
+    Enforces the manual-root markers before a run's fills may be folded into the
+    top-up guard: ``run_origin='manual'``, ``manual_run=true``,
+    ``same_day_top_up_context_only=true``, ``valid_scheduled_evidence=false``,
+    and -- when the key is present -- ``valid_afternoon_scheduled_evidence=false``.
+    When ``trading_day`` is given, the run's ``trading_day`` must match it. A run
+    that is (or claims to be) scheduled evidence fails closed and is never
+    returned as top-up context.
+    """
+    if not isinstance(state, dict):
+        return False
+    rc = state.get("run_classification")
+    if not isinstance(rc, dict):
+        return False
+    if rc.get("run_origin") != "manual" or rc.get("manual_run") is not True:
+        return False
+    if rc.get("same_day_top_up_context_only") is not True:
+        return False
+    if rc.get("valid_scheduled_evidence") is not False:
+        return False
+    # Optional flag: reject only when explicitly True. A missing flag is allowed
+    # (older manual artifacts predate it) but a True value means the artifact is
+    # asserting afternoon scheduled evidence and must not be top-up context.
+    if rc.get("valid_afternoon_scheduled_evidence") is True:
+        return False
+    if trading_day is not None:
+        state_day = str(rc.get("trading_day") or state.get("trading_day") or "").strip()
+        if state_day != trading_day:
+            return False
+    return True
+
+
+@dataclass
+class PriorAllocation:
+    """Per-ticker same-day prior allocation folded into the top-up guard."""
+
+    ticker: str
+    prior_usd: float
+    reference_price: Optional[float]
+    order_ids: List[str] = field(default_factory=list)
+    sources: List[str] = field(default_factory=list)
+
+
+def _row_ticker(row: Mapping[str, object]) -> Optional[str]:
+    for col in _TICKER_COLS:
+        value = row.get(col)
+        if isinstance(value, str) and value.strip():
+            return value.strip().upper()
+    return None
+
+
+def _row_number(row: Mapping[str, object], cols: Iterable[str]) -> Optional[float]:
+    import math
+
+    for col in cols:
+        raw = row.get(col)
+        if raw in (None, "", "-"):
+            continue
+        try:
+            value = float(str(raw).strip())
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(value) or value <= 0:
+            continue
+        return value
+    return None
+
+
+def _rows_from_buy_candidates(state: Dict[str, object]) -> List[Dict[str, object]]:
+    """Convert a run_state's embedded buy_candidates into row-shaped dicts.
+
+    Lets a run whose fills live only in ``buy_candidates`` (no orders CSV at
+    all) flow through the same dedup/aggregation pipeline as CSV rows (see
+    :func:`_dedupe_rows_by_order_id`, :func:`_prior_from_rows`). Only needed
+    for a run under a root :func:`_already_covered_by_prior_allocation_loader`
+    has decided ``near_close_dca.load_prior_same_day_allocations`` never
+    actually reaches (currently ``final_manual_review/**``, which sits
+    entirely outside the ce16ba6b task root and the morning_dca/midday_dca
+    trees) -- everywhere else, a run with real buy_candidates is already
+    covered by that loader and reading them again here would double-count
+    (Codex review: "Do not skip final-review artifacts outside the core scan
+    roots").
+    """
+    rows: List[Dict[str, object]] = []
+    for cand in state.get("buy_candidates", []) or []:
+        if not isinstance(cand, dict):
+            continue
+        ticker = cand.get("ticker")
+        if not (isinstance(ticker, str) and ticker.strip()):
+            continue
+        status = cand.get("status")
+        if status not in ("submitted", "filled"):
+            continue
+        row = dict(cand)
+        row["ticker"] = ticker
+        row["_confirmed_fill"] = status == "filled"
+        rows.append(row)
+    return rows
+
+
+def _read_csv_rows(csv_path: Path) -> List[Dict[str, object]]:
+    """Read one orders CSV's rows, keeping only submitted/filled statuses.
+
+    Each returned row is tagged with an internal ``_confirmed_fill`` bool: True
+    for an explicit ``status='filled'`` row, OR a STATUSLESS row from a file
+    named ``filled_orders.csv`` (or carrying an ``amount_usd`` column) -- the
+    documented manual-fill shape ``near_close_dca._orders_csv_fills`` already
+    treats as a confirmed fill without a status column (Codex review: "Treat
+    statusless filled-orders rows as confirmed fills"). Only a confirmed row's
+    price may be trusted as a reference.
+    """
+    rows: List[Dict[str, object]] = []
+    try:
+        with csv_path.open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                status = (row.get("status") or "").strip().lower()
+                if status and status not in ("submitted", "filled"):
+                    continue
+                is_manual_filled_shape = not status and (
+                    csv_path.name == "filled_orders.csv" or "amount_usd" in row
+                )
+                row = dict(row)
+                row["_confirmed_fill"] = status == "filled" or is_manual_filled_shape
+                rows.append(row)
+    except (OSError, csv.Error, UnicodeDecodeError):
+        return []
+    return rows
+
+
+def _dedupe_rows_by_order_id(
+    rows: Iterable[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    """Deduplicate order rows by ``order_id``, preferring a confirmed fill row.
+
+    The same order can appear in more than one sibling CSV for a single manual
+    run -- e.g. both ``submitted_orders.csv`` and ``filled_orders.csv`` record
+    the same ``order_id`` -- and summing each file's rows independently would
+    double-count that order's notional (Codex review: "Deduplicate orders
+    repeated in sibling CSVs"). Rows with no usable ``order_id`` can't be
+    matched to a duplicate and are kept as-is.
+    """
+    by_order_id: Dict[str, Dict[str, object]] = {}
+    unkeyed: List[Dict[str, object]] = []
+    for row in rows:
+        oid = (row.get("order_id") or "").strip()
+        if not oid or oid == "-":
+            unkeyed.append(row)
+            continue
+        existing = by_order_id.get(oid)
+        if existing is None:
+            by_order_id[oid] = row
+            continue
+        if row.get("_confirmed_fill") and not existing.get("_confirmed_fill"):
+            by_order_id[oid] = row
+    return [*by_order_id.values(), *unkeyed]
+
+
+def _exclude_seen_order_ids(
+    rows: Iterable[Dict[str, object]], seen_order_ids: Set[str]
+) -> List[Dict[str, object]]:
+    """Drop rows whose ``order_id`` was already counted by an earlier run directory.
+
+    ``_dedupe_rows_by_order_id`` only dedupes within one run's sibling CSVs; a
+    manual override can be backfilled or copied into MORE THAN ONE top-up
+    context root (e.g. both ``midday_dca/manual_reruns`` and
+    ``final_manual_review``), and each run directory is aggregated separately,
+    so the same order's notional would otherwise be added again per directory
+    (Codex review: "Deduplicate copied orders across manual run directories").
+    Mutates ``seen_order_ids`` with every kept order_id so the caller can reuse
+    it across run directories. Rows with no usable ``order_id`` can't be
+    matched to a duplicate and are always kept.
+    """
+    kept: List[Dict[str, object]] = []
+    for row in rows:
+        oid = (row.get("order_id") or "").strip()
+        if oid and oid != "-":
+            if oid in seen_order_ids:
+                continue
+            seen_order_ids.add(oid)
+        kept.append(row)
+    return kept
+
+
+def _prior_from_rows(rows: Iterable[Dict[str, object]]) -> Dict[str, Dict[str, object]]:
+    """Per-ticker {prior_usd, reference_price, order_ids} from deduplicated order rows.
+
+    ``prior_usd`` sums every filled/submitted amount for the ticker (conservative:
+    an outstanding submission may already have consumed the day's budget even
+    before it fills). When no amount/notional column is present, the notional is
+    derived from ``avg_fill_price * quantity_filled`` -- the same fallback
+    ``near_close_dca.py``'s own prior-allocation loader applies for a confirmed
+    fill with no separate dollar amount (Codex review: "Derive a prior notional
+    from confirmed fill quantity"). ``reference_price`` is trusted ONLY from a
+    row tagged ``_confirmed_fill`` (see :func:`_read_csv_rows`) -- a still-
+    outstanding submitted row may yet be rejected, canceled, or repriced, so
+    trusting its logged price as a confirmed reference could let a later top-up
+    race ahead of the first order's own fill and double-buy. Any row that isn't
+    a confirmed fill poisons that ticker's ``reference_price`` to unknown (None)
+    even when another row for the same ticker WAS filled with a known price --
+    matching the "any unknown reference poisons the whole aggregate" policy
+    ``near_close_dca.py`` already applies (Codex review: "Preserve an unknown
+    price for submitted manual orders"), preferring higher-priority price
+    columns per :data:`_PRICE_COLS`.
+    """
+    out: Dict[str, Dict[str, object]] = {}
+    for row in rows:
+        ticker = _row_ticker(row)
+        if not ticker:
+            continue
+        amount = _row_number(row, _AMOUNT_COLS)
+        if amount is None:
+            fill_price = _row_number(row, _PRICE_COLS)
+            quantity = _row_number(row, _QUANTITY_COLS)
+            if fill_price is not None and quantity is not None:
+                amount = fill_price * quantity
+        first_row_for_ticker = ticker not in out
+        entry = out.setdefault(
+            ticker, {"prior_usd": 0.0, "reference_price": None, "order_ids": []}
+        )
+        if amount is not None:
+            entry["prior_usd"] = float(entry["prior_usd"]) + amount
+        price = _row_number(row, _PRICE_COLS) if row.get("_confirmed_fill") else None
+        if first_row_for_ticker:
+            entry["reference_price"] = price
+        elif price is None or entry["reference_price"] is None:
+            entry["reference_price"] = None
+        else:
+            entry["reference_price"] = min(float(entry["reference_price"]), price)
+        oid = (row.get("order_id") or "").strip()
+        if oid and oid != "-":
+            entry["order_ids"].append(oid)
+    return out
+
+
+def _state_generated_before(state: Dict[str, object], boundary_et: Optional[time]) -> bool:
+    """True when ``state['generated_at']`` (ET) is strictly before ``boundary_et``.
+
+    Mirrors ``near_close_dca._prior_run_before_boundary``: a run with no
+    parseable timestamp is treated as eligible (conservative -- more prior
+    context only ever reduces the guarded buy), and ``boundary_et=None`` (the
+    caller didn't ask for a boundary) skips the check entirely. Real callers
+    (``run_dca.py``) pass the scheduled run's own execution time, so a
+    REPLAYED/backfilled run never sees a manual fill written after that
+    replay's nominal time as prior context (Codex review: "Bound manual top-up
+    context to the scheduled execution time").
+    """
+    if boundary_et is None:
+        return True
+    minutes = _et_minutes(state.get("generated_at"))
+    if minutes is None:
+        return True
+    return minutes < boundary_et.hour * 60 + boundary_et.minute
+
+
+# Roots that near_close_dca.load_prior_same_day_allocations[_multi] never
+# scans from ANY caller (run_dca.py's afternoon_root + cross_stream_roots, or
+# morning_dca.py's roots), regardless of a run's buy_candidates/
+# artifacts.orders_csv_path shape. final_manual_review/** sits entirely
+# outside the ce16ba6b task root and the morning_dca/midday_dca trees (see
+# MANUAL_EXCLUSION_SUBROOTS's own note that it backfilled artifacts "OUTSIDE
+# the ce16ba6b task root"), so a run found there is NEVER "already covered" by
+# that loader no matter what it contains (Codex review: "Do not skip
+# final-review artifacts outside the core scan roots").
+_ROOTS_NEVER_REACHED_BY_CORE_LOADER = ("final_manual_review",)
+
+
+def _outside_core_loader_reach(run_dir: Path) -> bool:
+    """True when ``run_dir`` sits under a root the core loader never scans."""
+    return any(part in _ROOTS_NEVER_REACHED_BY_CORE_LOADER for part in run_dir.parts)
+
+
+def _already_covered_by_prior_allocation_loader(
+    state: Dict[str, object], run_dir: Path
+) -> bool:
+    """True when ``near_close_dca.load_prior_same_day_allocations`` already reads this run.
+
+    That loader reads a run's fills from its embedded ``buy_candidates`` when
+    present, or -- only when ``buy_candidates`` is absent -- from a recorded
+    ``artifacts.orders_csv_path``, but ONLY when that path actually resolves to
+    an existing file: it joins a relative path onto ``run_dir`` (mirrored here)
+    but checks an absolute path as-is, with no basename/sibling fallback. A
+    stale recorded path (e.g. an absolute path from a relocated environment)
+    means the core loader finds nothing for this run, so this loader must still
+    process it via :func:`_referenced_orders_csvs`'s own basename/glob fallback
+    -- treating a merely-*present* ``orders_csv_path`` as "already covered"
+    would silently drop the run from BOTH loaders (Codex review: "Fall back
+    when a recorded orders CSV path is stale"). Either mechanism means the run
+    is already fully covered by the sibling-stream prior-allocation scan the
+    scheduled afternoon path runs first; folding it in again here would
+    double-count its notional (Codex review: "Deduplicate manual context
+    already present in prior allocations"). This loader's unique value is the
+    remaining case: fills that live ONLY in a bare sibling orders CSV the
+    run_state never names (the Jul 21 manual midday shape), PLUS any run under
+    :func:`_outside_core_loader_reach` -- see :func:`_rows_from_buy_candidates`.
+    """
+    if _outside_core_loader_reach(run_dir):
+        return False
+    if state.get("buy_candidates"):
+        return True
+    artifacts = state.get("artifacts")
+    if isinstance(artifacts, dict):
+        recorded = artifacts.get("orders_csv_path")
+        if isinstance(recorded, str) and recorded:
+            recorded_path = Path(recorded)
+            if not recorded_path.is_absolute():
+                recorded_path = run_dir / recorded_path
+            if recorded_path.exists():
+                return True
+    return False
+
+
+def _merge_prior(
+    dst: Dict[str, PriorAllocation],
+    src: Dict[str, Dict[str, object]],
+    source_label: str,
+) -> None:
+    """In-place merge of a raw ticker map into the aggregate PriorAllocation map.
+
+    Same poisoning rule as :func:`_prior_from_rows`: an unknown reference from
+    this or any earlier merged source makes the ticker's aggregate reference
+    unknown, rather than silently keeping an earlier known price.
+    """
+    for ticker, entry in src.items():
+        alloc = dst.get(ticker)
+        if alloc is None:
+            alloc = PriorAllocation(ticker=ticker, prior_usd=0.0, reference_price=None)
+            dst[ticker] = alloc
+        first_contribution = not alloc.sources
+        alloc.prior_usd += float(entry.get("prior_usd") or 0.0)
+        price = entry.get("reference_price")
+        if first_contribution:
+            alloc.reference_price = float(price) if isinstance(price, (int, float)) else None
+        elif price is None or alloc.reference_price is None:
+            alloc.reference_price = None
+        else:
+            alloc.reference_price = min(alloc.reference_price, float(price))
+        for oid in entry.get("order_ids", []) or []:
+            if oid not in alloc.order_ids:
+                alloc.order_ids.append(oid)
+        if source_label not in alloc.sources:
+            alloc.sources.append(source_label)
+
+
+def load_same_day_top_up_context(
+    trading_day: str, base: Optional[Path] = None, *, boundary_et: Optional[time] = None
+) -> Dict[str, PriorAllocation]:
+    """Load same-day MANUAL fills as per-ticker prior-allocation / top-up context.
+
+    Scans :func:`top_up_context_roots` for ``run_state*.json`` files that pass
+    :func:`is_top_up_context_state` for ``trading_day`` (run_origin='manual',
+    manual_run=true, same_day_top_up_context_only=true,
+    valid_scheduled_evidence=false, valid_afternoon_scheduled_evidence!=true, and
+    a matching trading_day) and, when ``boundary_et`` is given, were generated
+    strictly before it (see :func:`_state_generated_before` -- pass the
+    scheduled run's own execution time so a replayed/backfilled run never sees
+    a later same-day manual fill as prior context).
+
+    A run already readable by ``near_close_dca.load_prior_same_day_allocations``
+    (it has embedded ``buy_candidates`` or a recorded
+    ``artifacts.orders_csv_path``) is skipped entirely -- see
+    :func:`_already_covered_by_prior_allocation_loader` -- so a manual recovery
+    or override with real ``buy_candidates`` is never double-counted between
+    that loader and this one. For the remaining runs (fills that live ONLY in a
+    bare sibling orders CSV the run_state never names -- the Jul 21 manual
+    midday shape) it reads every referenced orders CSV's rows, deduplicates
+    them by ``order_id`` (a manual run's ``submitted_orders.csv`` and
+    ``filled_orders.csv`` can both record the same order -- Codex review:
+    "Deduplicate orders repeated in sibling CSVs" -- see
+    :func:`_dedupe_rows_by_order_id`), and folds the result into a per-ticker
+    :class:`PriorAllocation` (summed ``prior_usd`` and the LOWEST prior
+    ``reference_price``, with any unconfirmed/unknown price poisoning that
+    ticker's reference -- see :func:`_prior_from_rows`).
+
+    A dry-run artifact (``state['dry_run']``) is always skipped -- it simulates
+    submitted/filled rows against no real capital, exactly the reason
+    ``near_close_dca.load_prior_same_day_allocations`` skips it too (Codex
+    review: "Skip dry-run artifacts when loading manual CSV context"). An
+    ``order_id`` already counted from an earlier run directory is excluded from
+    every later one: a manual override can be backfilled or copied into more
+    than one top-up context root, and each run directory is otherwise
+    aggregated independently, so the same order would be added twice (Codex
+    review: "Deduplicate copied orders across manual run directories").
+
+    A run under a root the core loader never reaches at all (currently just
+    ``final_manual_review/**`` -- see :func:`_outside_core_loader_reach`) has
+    its ``buy_candidates`` read directly here too (see
+    :func:`_rows_from_buy_candidates`), since no other mechanism will ever read
+    them and skipping it as "already covered" would drop it from both loaders
+    entirely (Codex review: "Do not skip final-review artifacts outside the
+    core scan roots").
+
+    The returned context is prior-allocation input for the top-up guard ONLY.
+    These fills are never scheduled evidence; their order IDs remain in
+    :func:`collect_manual_order_ids` so they stay out of every scheduled-live
+    metric and out of the scheduled run's submitted_orders.csv.
+    """
+    result: Dict[str, PriorAllocation] = {}
+    seen_order_ids: Set[str] = set()
+    for root in top_up_context_roots(base):
+        for path in _iter_run_state_files(root):
+            try:
+                state = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            if not isinstance(state, dict) or not is_top_up_context_state(state, trading_day):
+                continue
+            if state.get("dry_run"):
+                continue
+            if not _state_generated_before(state, boundary_et):
+                continue
+            if _already_covered_by_prior_allocation_loader(state, path.parent):
+                continue
+            rc = state.get("run_classification")
+            label = (rc.get("run_id") if isinstance(rc, dict) else None) or str(path.parent)
+            all_rows: List[Dict[str, object]] = []
+            for csv_path in _referenced_orders_csvs(state, path.parent):
+                all_rows.extend(_read_csv_rows(csv_path))
+            if _outside_core_loader_reach(path.parent):
+                all_rows.extend(_rows_from_buy_candidates(state))
+            deduped_rows = _dedupe_rows_by_order_id(all_rows)
+            deduped_rows = _exclude_seen_order_ids(deduped_rows, seen_order_ids)
+            csv_prior = _prior_from_rows(deduped_rows)
+            _merge_prior(result, csv_prior, str(label))
+    return result
+
+
+def incremental_top_up_amount(
+    desired_amount: float,
+    prior_usd: float,
+    current_price: Optional[float],
+    reference_price: Optional[float],
+) -> tuple[float, str]:
+    """Apply the same-day top-up guard for one ticker.
+
+    Returns ``(incremental_amount, guard_result)`` where ``guard_result`` is one
+    of the ``top_up_guard_result`` codes in schemas/run_state.schema.json. A
+    later run buys only ``max(0, desired - prior)`` and only when its
+    ``current_price`` is strictly below the ``reference_price``. When prior
+    allocation exists but no comparable price is available, it conservatively
+    buys $0 and flags manual review (``missing_prior_price``).
+    """
+    if prior_usd <= 0:
+        return max(0.0, desired_amount), "no_prior_run"
+    if reference_price is None or current_price is None:
+        return 0.0, "missing_prior_price"
+    if not (current_price < reference_price):
+        return 0.0, "price_not_below_prior_run"
+    incremental = desired_amount - prior_usd
+    if incremental <= 0:
+        return 0.0, "no_incremental_difference"
+    return incremental, "incremental_top_up"
+
+
 # --- Scheduled-state selection for reporting ---------------------------------
 
 @dataclass
@@ -1165,6 +1733,12 @@ __all__ = [
     "update_latest_scheduled_run_pointer",
     "collect_manual_order_ids",
     "exclude_manual_orders",
+    "TOP_UP_CONTEXT_SUBROOTS",
+    "top_up_context_roots",
+    "is_top_up_context_state",
+    "PriorAllocation",
+    "load_same_day_top_up_context",
+    "incremental_top_up_amount",
     "select_scheduled_state_for_reporting",
     "ScheduledSelection",
     "ValidationResult",
