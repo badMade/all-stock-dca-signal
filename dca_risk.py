@@ -366,7 +366,16 @@ def _load_states(root: str | Path) -> List[Dict[str, Any]]:
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("skipping unreadable run_state %s: %s", path, exc)
             continue
-        if isinstance(data, dict) and data.get("status") != "blocked":
+        # Exclude date-gate blocked stubs, but KEEP a contract-rejected state
+        # (artifact_contract_failure marker): its real submitted orders are deployed
+        # capital that must still count toward the kill-switch/cap accounting, even
+        # though it is invalid scheduled evidence. deployed_usd sums only
+        # status=='submitted' candidates, so a partial-placement failure contributes
+        # exactly its real fills.
+        if isinstance(data, dict) and (
+            data.get("status") != "blocked"
+            or data.get("artifact_contract_failure") is not None
+        ):
             states.append(data)
     return states
 

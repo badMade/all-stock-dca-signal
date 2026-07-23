@@ -63,6 +63,40 @@ def _config(**over) -> StrategyConfig:
 
 # --- Case 1: normal case, no kill-switch -------------------------------------
 
+def test_load_states_keeps_contract_rejected_deployed_capital(tmp_path):
+    # A contract-rejected state (status=blocked + artifact_contract_failure) with a
+    # real submitted order must still contribute its deployed capital to the
+    # kill-switch accounting; a pure date-gate blocked stub must not.
+    import json as _json
+
+    from dca_risk import _load_states
+
+    root = tmp_path / "scheduled_runs"
+    rejected = _scheduled_state("2026-07-06", 42.0)
+    rejected["status"] = "blocked"
+    rejected["artifact_contract_failure"] = {
+        "failure": "artifact_contract_failure", "reason": "compute-only terminal state"
+    }
+    d1 = root / "20260706_1520ET"
+    d1.mkdir(parents=True)
+    (d1 / "run_state.json").write_text(_json.dumps(rejected), encoding="utf-8")
+    d2 = root / "20260707_1520ET"
+    d2.mkdir(parents=True)
+    (d2 / "run_state.json").write_text(
+        _json.dumps({"trading_day": "2026-07-07", "status": "blocked"}), encoding="utf-8"
+    )
+
+    states = _load_states(root)
+    # the rejected-but-real state is kept; the pure date-gate stub is dropped
+    assert any(s.get("artifact_contract_failure") for s in states)
+    assert not any(
+        s.get("status") == "blocked" and not s.get("artifact_contract_failure") for s in states
+    )
+    # its real submitted fill is counted in scheduled deployment accounting
+    by_day = deployed_by_day(states)
+    assert by_day.get(date(2026, 7, 6)) == 42.0
+
+
 def test_normal_case_no_kill_switch_preserves_ladder():
     """Deployment below 40% of monthly leaves the full graded ladder intact."""
     as_of = date(2026, 7, 8)

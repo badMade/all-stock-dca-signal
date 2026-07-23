@@ -71,6 +71,19 @@ def test_evidence_false_for_missing_or_malformed():
     assert derive_valid_scheduled_evidence({"run_classification": "nope"}) is False
 
 
+def test_evidence_false_for_contract_rejected_state():
+    # A run the artifact contract rejected carries a top-level
+    # artifact_contract_failure marker; it must not count as scheduled evidence
+    # even though its classification still says scheduled/non-manual.
+    state = _scheduled_state()
+    assert derive_valid_scheduled_evidence(state) is True
+    state["artifact_contract_failure"] = {
+        "failure": "artifact_contract_failure",
+        "reason": "scheduled-run artifact contract failed",
+    }
+    assert derive_valid_scheduled_evidence(state) is False
+
+
 def test_evidence_false_when_manual_run_key_absent():
     # Codex review r3622223183: an incomplete classification that omits
     # manual_run entirely must NOT be accepted just because it isn't

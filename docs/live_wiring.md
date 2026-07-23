@@ -101,6 +101,36 @@ artifact and evaluates only `eligible_to_execute=true` tickers. See
 `execution_authorization_policy` / `circuit_breakers` blocks in
 [`config/budgets.json`](../config/budgets.json).
 
+## Afternoon placement contract (added Jul 22 2026)
+
+The 3:20 PM ET final live task (`10ce362c`) must not stop at compute-only
+planning. The Jul 22 2026 scheduled run produced 20 planned buy orders with
+planned spend of $60, but the saved compute module did not call the placement
+path and wrote `error_class='placement_not_implemented_in_compute_module'`.
+That state is no longer an allowed terminal outcome when planned orders remain.
+
+After `signals.csv` is written, every eligible row with `incremental_usd > 0`
+or an equivalent planned order amount must enter the same-run placement phase.
+If the saved compute module cannot submit orders, the scheduler must invoke the
+main live placement runner or use the direct platform connector path itself.
+Scheduled live placement still calls `place_equity_order` only after every
+validation, budget, spread, data-confidence, regular-hours, whitelist,
+buy-only, max-per-order, and same-day top-up check passes. It still must not
+call `review_equity_order`.
+
+If the placement phase is unreachable, the task writes
+`order_submit_status='blocked_placement_phase_unreachable'` and
+`error_class='placement_phase_unreachable'`, keeps the planned orders in
+`signals.csv`, writes `submitted_orders.csv` with headers, notifies, and marks
+completed order evidence false while still proving the task fired. It must not
+write `order_submit_status='not_submitted'` with
+`error_class='placement_not_implemented_in_compute_module'` while planned
+orders remain.
+
+Both `run_state.json` and `run_summary.json` must contain the same non-null
+`run_classification` object for the 3:20 task. A null
+`run_summary.run_classification` is an artifact-contract failure.
+
 ## CLI (dry-run only)
 
 ```bash

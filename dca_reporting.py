@@ -358,12 +358,30 @@ def build_latest_run_summary(
     coverage_pct = round(filled_count / candidate_count * 100.0, 2) if candidate_count else None
 
     budget = run_state.get("budget") or {}
-    return {
+    # run_summary.json MUST mirror the SAME non-null run_classification object as
+    # run_state.json for scheduled live runs. The Jul 22 2026 3:20 incident wrote
+    # a valid run_state.run_classification but a null run_summary.run_classification,
+    # which broke scheduled-vs-manual attribution downstream. When the run_state
+    # classification is missing, stamp an artifact_contract_failure instead of
+    # silently emitting null.
+    run_classification = run_state.get("run_classification")
+    if isinstance(run_classification, dict):
+        summary_classification: Any = dict(run_classification)
+        contract_failure: Optional[Dict[str, Any]] = None
+    else:
+        summary_classification = None
+        contract_failure = {
+            "failure": "artifact_contract_failure",
+            "reason": "run_state run_classification is null or absent; run_summary "
+            "cannot mirror a non-null classification",
+        }
+    summary: Dict[str, Any] = {
         "run_id": run_state.get("run_id"),
         "trading_day": run_state.get("trading_day"),
         "generated_at": run_state.get("generated_at"),
         "broker": run_state.get("broker"),
         "dry_run": run_state.get("dry_run"),
+        "run_classification": summary_classification,
         "coverage": {
             "buy_candidates": candidate_count,
             "fills": filled_count,
@@ -392,6 +410,9 @@ def build_latest_run_summary(
         },
         "manual_review_tickers": run_state.get("manual_review_tickers", []),
     }
+    if contract_failure is not None:
+        summary["artifact_contract_failure"] = contract_failure
+    return summary
 
 
 def build_coverage_report_md(

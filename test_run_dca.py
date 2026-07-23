@@ -945,6 +945,50 @@ def test_run_pipeline_raw_persistence_failure_writes_error_state(tmp_path):
     assert run_state["buy_candidates"] == []
 
 
+def test_run_pipeline_raw_persistence_failure_writes_contract_artifacts(tmp_path):
+    # The raw-persistence fail-closed path must route through the scheduled artifact
+    # contract: write a header-only submitted_orders.csv and a canonical
+    # run_summary.json mirroring run_state's run_classification (signals.csv is
+    # legitimately absent -- nothing was computed), overwriting stale copies.
+    import csv as _csv
+    import json
+
+    from scripts.scheduled_artifacts import SUBMITTED_ORDERS_FIELDS, validate_run_artifacts
+
+    class ExplodingPayload:
+        pass
+
+    config = _demo_config()
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
+    scheduled_dir.mkdir(parents=True)
+    # Seed stale contract artifacts from a prior successful attempt.
+    (scheduled_dir / "submitted_orders.csv").write_text("STALE\n", encoding="utf-8")
+    (scheduled_dir / "run_summary.json").write_text('{"stale": true}', encoding="utf-8")
+
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=scheduled_dir,
+        raw_connector_inputs={"quotes_batch1.json": ExplodingPayload()},
+    )
+    assert "raw_persistence_error" in result
+
+    # header-only submitted_orders.csv (stale content overwritten)
+    so_rows = list(_csv.reader((scheduled_dir / "submitted_orders.csv").open()))
+    assert so_rows and so_rows[0] == list(SUBMITTED_ORDERS_FIELDS)
+    assert len(so_rows) == 1  # header only, no simulated orders
+
+    # canonical run_summary.json mirrors run_state's run_classification
+    run_state = json.loads((scheduled_dir / "run_state.json").read_text())
+    summary = json.loads((scheduled_dir / "run_summary.json").read_text())
+    assert summary["run_classification"] == run_state["run_classification"]
+
+    # the fail-closed state satisfies the contract (signals not required)
+    assert validate_run_artifacts(
+        scheduled_dir, require_signals=False, require_submitted_orders=True, require_summary=True
+    )
+
+
 def test_run_pipeline_raw_persistence_failure_clears_stale_compact_artifacts(tmp_path):
     import json
 

@@ -47,6 +47,7 @@ from near_close_dca import (
     SourceName,
     StrategyConfig,
     StrategyState,
+    _write_and_validate_scheduled_contract,
     build_broker,
     load_prior_same_day_allocations,
     load_prior_same_day_allocations_multi,
@@ -933,9 +934,28 @@ def _run_pipeline_impl(
                         failure_state["artifacts"] = {"orders_csv_path": str(_prior_orders_csv)}
                     run_state_path = out / "run_state.json"
                     run_state_path.write_text(json.dumps(failure_state, indent=2) + "\n", encoding="utf-8")
-                    if classification_state_root is not None:
+                    # Route this fail-closed raw-persistence outcome through the same
+                    # scheduled artifact contract as the normal finalizer: write the
+                    # header-only submitted_orders.csv and the mirrored canonical
+                    # run_summary.json (no signals were computed, so signals.csv is
+                    # not required), overwriting any stale copies from a prior attempt.
+                    # Without this the early return bypassed the contract entirely
+                    # while still updating the scheduled pointer. A contract breach
+                    # here (persisted as a blocked/invalid state) also blocks the
+                    # pointer, so it is not recorded as valid scheduled evidence.
+                    contract_ok = bool(
+                        _write_and_validate_scheduled_contract(
+                            failure_state, out, require_signals=False
+                        )
+                    )
+                    if classification_state_root is not None and contract_ok:
                         update_latest_scheduled_run_pointer(
                             failure_state, run_state_path, base=Path(classification_state_root)
+                        )
+                    elif classification_state_root is not None:
+                        logger.error(
+                            "Not updating latest_scheduled_run.json: raw-persistence "
+                            "failure-state artifact contract failed."
                         )
                     # signals.csv was already deleted above, so detect_drift()
                     # finds an empty expected set and returns drift_detected=False —

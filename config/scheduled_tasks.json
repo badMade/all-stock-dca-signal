@@ -183,7 +183,7 @@
     "purpose": "The Jul 21 2026 scheduled runs wrote a run_state.json whose top-level run_classification was null and, for the 10:30 live run, dropped signals.csv and submitted_orders.csv even though the summary claimed they were written. A null classification breaks scheduled-vs-manual attribution, and a missing order CSV makes the drift detector report every intended buy as an unsubmitted order. Both are artifact-contract failures, not soft warnings.",
     "helper": "scripts/scheduled_artifacts.py",
     "doc": "docs/run_classification.md",
-    "applies_to": ["morning-dca-0945 (9:45 pre-flight)", "42173154 (10:30 morning live)", "a6239dae (12:30 midday live)"],
+    "applies_to": ["morning-dca-0945 (9:45 pre-flight)", "42173154 (10:30 morning live)", "a6239dae (12:30 midday live)", "10ce362c (3:20 afternoon final live)"],
     "rules": [
       "run_classification is ALWAYS a non-null top-level object on every scheduled run_state.json; null, absent, or non-object is a contract failure.",
       "The 9:45 pre-flight run_classification carries run_origin='scheduled', run_type='morning_dca_preflight', scheduled_for_et='09:45', manual_run=false, state_schema_version='morning-preflight-v2-machine-complete', run_id, triggered_at_utc, cron_id='morning-dca-0945', stream='morning', trading_day, same_day_required=true, and valid_scheduled_evidence derived from the completed state. This matches the actual producer (morning_dca.py's MORNING_PREFLIGHT_CRON_ID/MORNING_PREFLIGHT_RUN_TYPE) and schemas/morning_preflight.schema.json -- not a separate aspirational identity.",
@@ -191,10 +191,28 @@
       "Every LIVE run writes signals.csv whenever signals can be computed AND submitted_orders.csv with a header row even when no order was submitted.",
       "When an order is placed the submitted_orders.csv contains that row; a pending/unconfirmed broker response keeps its concrete status but still produces a row and a run_state. Deliberate non-orders (skipped, cap_exceeded, dry_run, blocked) are not rows.",
       "The 12:30 midday live run shares the morning runner path, so the same non-null-classification and always-write-both-CSVs guarantees apply, without weakening any trading safeguard.",
+      "The 3:20 afternoon final live run must also carry a non-null run_classification in BOTH run_state.json and run_summary.json. For 3:20 this object carries run_origin='scheduled', manual_run=false, stream='afternoon', scheduled_for_et='15:20', cron_id='10ce362c', supersedes_cron_id='ce16ba6b', run_id, trading_day, same_day_required=true, and valid_scheduled_evidence derived from the completed state.",
       "validate_run_artifacts fails on a missing/unreadable run_state.json, a null/absent/non-object run_classification, or a missing required CSV; require_submitted_orders is True for live runs and False for read-only pre-flight runs."
     ],
     "safety_note": "This is an artifact-integrity contract only; it does NOT relax any trading safety, budget, spread, confidence, or top-up rule. valid_scheduled_evidence is always derived from the completed run_state, never asserted blindly.",
     "tests": ["scripts/tests/test_scheduled_artifacts.py", "test_morning_dca.py"]
+  },
+  "afternoon_placement_contract_2026_07_22": {
+    "added_on_et": "2026-07-22",
+    "incident": "The Jul 22 2026 3:20 PM ET scheduled final live run generated 20 planned buy orders with planned_spend=60.0, but no orders were submitted because the saved compute module stopped with error_class='placement_not_implemented_in_compute_module'. The run wrote run_state.json, signals.csv, and latest_scheduled_run.json, but submitted_orders.csv was empty and run_summary.json serialized run_classification as null.",
+    "applies_to": ["10ce362c (3:20 afternoon final live)"],
+    "rules": [
+      "A compute-only module that produces planned orders is not a valid terminal state for the 3:20 scheduled live task.",
+      "After signals.csv is written, every eligible row with incremental_usd > 0 or an equivalent planned order amount > 0 must enter a placement phase in the same scheduled run.",
+      "The placement phase must call Robinhood place_equity_order directly after every validation, budget, spread, data-confidence, regular-hours, whitelist, buy-only, max-per-order, and same-day top-up check passes.",
+      "The scheduled live task must not call review_equity_order and must not request per-order confirmation.",
+      "If a saved compute module does not implement placement, the task must invoke the main live placement runner or use the direct platform connector placement path itself.",
+      "The task must not write order_submit_status='not_submitted' with error_class='placement_not_implemented_in_compute_module' while planned orders remain.",
+      "If placement cannot be reached, write order_submit_status='blocked_placement_phase_unreachable', error_class='placement_phase_unreachable', keep the planned orders in signals.csv, write submitted_orders.csv with headers, notify, and set completed-order evidence false while still proving the task fired.",
+      "run_summary.json must include the same non-null run_classification object as run_state.json. Null run_summary.run_classification is an artifact_contract_failure."
+    ],
+    "safety_note": "This placement contract does not loosen trading rules. It only requires the scheduled live task to continue from planning into the already pre-authorized guarded placement step when planned orders exist.",
+    "manual_recovery_note_2026_07_22": "Manual recovery orders placed after the failed 3:20 run remain manual/top-up context only unless explicitly written under a valid scheduled run_state and submitted_orders.csv from the scheduled evidence window."
   },
   "afternoon_completion_rule": "All afternoon trading and artifact-writing tasks complete no later than 3:40 PM ET, when the read-only live-run watchdog (a46bf007) begins its final verification. The watchdog's own post-3:40 PM verification, the Friday weekly Notion performance refresh at 5:00 PM ET, and the month-end volatility risk refresh at 5:00 PM ET (c9fb1fb8 / 17a3b2a9) are the only approved post-3:40 PM DCA-related exceptions.",
   "ticker_universe_policy": {

@@ -55,3 +55,6 @@
 ## 2026-07-21 - Avoid scanning noisy dictionaries in hot loops
 **Learning:** Iterating `dict.items()` is fine for bounded dictionaries, but if the dict can contain many irrelevant keys and you only need a small predefined set, scanning `items()` becomes wasted work.
 **Action:** In hot loops extracting known keys from potentially noisy dicts, iterate the known key list/tuple and check membership (or use `get`) instead of scanning the entire dictionary; keep the `items()` + `frozenset` pattern for bounded dicts.
+## 2026-07-22 - Single-pass loop for multi-field aggregations
+**Learning:** Using multiple list comprehensions or generator expressions (e.g. inside `sum()` or `max()`) to aggregate different fields from the same list of dictionaries results in redundant O(N) passes. A single manual loop collecting all fields at once eliminates this overhead and is significantly faster (~20-25% in micro-benchmarks).
+**Action:** When aggregating or extracting multiple different values from a collection (like a list of `run_states`), consolidate the logic into a single `for` loop pass over the collection instead of writing separate generator expressions per value.

@@ -766,8 +766,13 @@ def is_scheduled_state(state: Dict[str, object]) -> bool:
     """True only if a run_state is a *valid* scheduled run.
 
     A manual flag anywhere wins: a state that is both marked scheduled and
-    carries manual_run=true is treated as NOT scheduled.
+    carries manual_run=true is treated as NOT scheduled. A run the artifact
+    contract rejected (top-level ``artifact_contract_failure`` marker) also fails
+    closed here, so the 15:35 reporting selector never publishes a contract-rejected
+    partial-placement run's submitted subset as valid scheduled fills.
     """
+    if isinstance(state, dict) and state.get("artifact_contract_failure") is not None:
+        return False
     rc = state.get("run_classification") if isinstance(state, dict) else None
     if not isinstance(rc, dict):
         return False

@@ -1600,6 +1600,16 @@ def build_run_artifacts(
         if manual
         else build_scheduled_classification(trading_day.isoformat(), triggered_at_utc=triggered_at_utc)
     )
+    if not manual:
+        # The scheduled afternoon (3:20 PM ET) artifact contract requires the
+        # run_classification to additionally carry trading_day, same_day_required,
+        # and valid_scheduled_evidence (see
+        # scripts.scheduled_artifacts.build_afternoon_live_run_classification and
+        # the identical morning-path stamping in morning_dca.py). trading_day and
+        # same_day_required are known now; valid_scheduled_evidence is finalized
+        # from the completed state just before this function returns.
+        run_classification.setdefault("trading_day", trading_day.isoformat())
+        run_classification.setdefault("same_day_required", True)
 
     signal_rows: List[Dict[str, Any]] = []
     for decision in decisions:
@@ -1702,6 +1712,15 @@ def build_run_artifacts(
     }
     if raw_persistence_state is not None:
         artifacts.update(raw_persistence_state)
+    if not manual:
+        # Derive valid_scheduled_evidence from the completed state rather than
+        # asserting it: a scheduled (non-manual) run is same-day scheduled
+        # evidence, a manual run never is. Mirrors morning_dca.py's finalization.
+        try:
+            from scripts.same_day_pointer import derive_valid_scheduled_evidence
+        except ImportError:
+            from same_day_pointer import derive_valid_scheduled_evidence
+        run_classification["valid_scheduled_evidence"] = derive_valid_scheduled_evidence(artifacts)
     return artifacts
 
 
@@ -2856,9 +2875,131 @@ def _apply_deployment_history(
             data = json.loads(raw_text)
         except ValueError:
             continue
-        if isinstance(data, dict) and data.get("status") != RUN_STATUS_BLOCKED:
+        # Exclude date-gate blocked stubs from deployment accounting, but KEEP a
+        # contract-rejected state (artifact_contract_failure marker): it is invalid
+        # scheduled EVIDENCE, yet any orders it actually placed are real deployed
+        # capital that must still count toward the rolling kill-switch/cap so the
+        # next run cannot over-deploy. deployed_usd only sums status=='submitted'
+        # candidates, so a partial-placement failure contributes exactly its real fills.
+        if isinstance(data, dict) and (
+            data.get("status") != RUN_STATUS_BLOCKED
+            or data.get("artifact_contract_failure") is not None
+        ):
             prior_states.append(data)
     return apply_risk_guard(config, deployed_by_day(prior_states), trading_day)
+
+
+def _write_and_validate_scheduled_contract(
+    artifacts: Dict[str, Any], artifacts_dir: str | Path, *, require_signals: bool = True
+) -> Any:
+    """Write the remaining scheduled-live contract files, then validate them.
+
+    The compact daily path already wrote run_state.json + signals.csv. The
+    scheduled afternoon (3:20 PM ET) contract additionally requires
+    ``submitted_orders.csv`` (header row even with no order) and a canonical
+    ``run_summary.json`` whose ``run_classification`` MIRRORS run_state's, and it
+    forbids a compute-only terminal state (planned orders but nothing placed). This
+    finalizes those files and runs :func:`validate_run_artifacts` so a contract
+    breach — a missing/unmirrored summary or the Jul 22 2026 compute-only terminal
+    state — is surfaced as a loud error on the live path itself, not only in tests.
+    Validation failure is logged (mirroring the run_classification validation just
+    below) rather than raised, so it never aborts a run that already placed orders.
+
+    ``require_signals=False`` is used by the raw-persistence failure path, which is
+    a fail-closed outcome where no signals could be computed (signals.csv is
+    legitimately absent); the mirrored summary + header-only submitted_orders.csv
+    are still written and validated so that outcome no longer bypasses the contract.
+    """
+    try:
+        from scripts.scheduled_artifacts import (
+            ORDER_ATTEMPT_STATUSES,
+            artifact_contract_failure,
+            mirror_run_classification,
+            validate_run_artifacts,
+            write_submitted_orders_csv,
+        )
+    except ImportError:  # pragma: no cover - import shim for flat sys.path
+        from scheduled_artifacts import (  # type: ignore
+            ORDER_ATTEMPT_STATUSES,
+            artifact_contract_failure,
+            mirror_run_classification,
+            validate_run_artifacts,
+            write_submitted_orders_csv,
+        )
+
+    out = Path(artifacts_dir)
+    # submitted_orders.csv: one row per candidate that actually placed or attempted
+    # a real order; header-only when none did. A scheduled dry run assigns each
+    # candidate a synthetic DRY-RUN-SIM-* order_id while keeping status="dry_run"
+    # (see _process_buy_candidate); those simulated orders must NOT be recorded as
+    # broker submissions -- the drift detector treats any non-confirmation status
+    # with an order_id as a real submission -- so dry_run is excluded even though it
+    # carries an order_id.
+    order_rows = [
+        {
+            "ticker": c.get("ticker"),
+            "order_id": c.get("order_id"),
+            "submitted_amount_usd": c.get("planned_amount_usd"),
+            "status": c.get("status"),
+        }
+        for c in artifacts.get("buy_candidates", [])
+        if c.get("status") != "dry_run"
+        and (c.get("status") in ORDER_ATTEMPT_STATUSES or c.get("order_id"))
+    ]
+    write_submitted_orders_csv(out, order_rows)
+
+    # run_summary.json must mirror the SAME non-null run_classification object as
+    # run_state.json (Jul 22 2026 3:20 incident: a null summary classification broke
+    # scheduled-vs-manual attribution downstream).
+    summary = {
+        "run_id": artifacts.get("run_id"),
+        "trading_day": artifacts.get("trading_day"),
+        "generated_at": artifacts.get("generated_at"),
+        "broker": artifacts.get("broker"),
+        "dry_run": artifacts.get("dry_run"),
+        "order_submit_status": artifacts.get("order_submit_status"),
+        "run_classification": mirror_run_classification(artifacts),
+    }
+    (out / "run_summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
+    )
+
+    result = validate_run_artifacts(
+        out, require_signals=require_signals, require_submitted_orders=True, require_summary=True
+    )
+    if not result:
+        logger.error(
+            "Scheduled-run artifact contract failed for %s: %s",
+            out,
+            "; ".join(result.errors),
+        )
+        # Persist the rejection INTO the run_state (and its summary) so every
+        # consumer that discovers the file directly refuses to count it as valid
+        # scheduled evidence -- not just the latest-run pointer. select_same_day_
+        # run_state gates on derive_valid_scheduled_evidence (now fails closed on
+        # the artifact_contract_failure marker) and load_scheduled_run_states drops
+        # status=='blocked' stubs.
+        failure = artifact_contract_failure(
+            "scheduled-run artifact contract failed",
+            detail="; ".join(result.errors),
+        )
+        for name in ("run_state.json", "run_summary.json"):
+            fpath = out / name
+            if not fpath.exists():
+                continue
+            try:
+                data = json.loads(fpath.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            data["status"] = RUN_STATUS_BLOCKED
+            data["artifact_contract_failure"] = failure
+            rc = data.get("run_classification")
+            if isinstance(rc, dict):
+                rc["valid_scheduled_evidence"] = False
+            fpath.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    return result
 
 
 def _finalize_and_write_artifacts(
@@ -2897,6 +3038,10 @@ def _finalize_and_write_artifacts(
     paths = write_run_artifacts(artifacts, artifacts_dir)
     logger.info("Wrote run artifacts: %s", paths["run_state"])
 
+    contract_ok = True
+    if scheduled:
+        contract_ok = bool(_write_and_validate_scheduled_contract(artifacts, artifacts_dir))
+
     if scheduled and classification_state_root is not None:
         try:
             from scripts.run_classification import (
@@ -2910,9 +3055,20 @@ def _finalize_and_write_artifacts(
             )
         rc = artifacts.get("run_classification")
         result = validate_classification(rc if isinstance(rc, dict) else {})
-        if result:
+        if result and contract_ok:
             update_latest_scheduled_run_pointer(
                 artifacts, paths["run_state"], classification_state_root
+            )
+        elif not contract_ok:
+            # A run that breached the artifact contract (e.g. the compute-only
+            # terminal state: planned orders but nothing placed) must NOT be
+            # recorded as valid scheduled evidence, even when its run_classification
+            # is well-formed. Skip the pointer update so the invalid run cannot be
+            # picked up as the latest scheduled run.
+            logger.error(
+                "Not updating latest_scheduled_run.json: scheduled-run artifact "
+                "contract failed (see the artifact-contract error above); this run "
+                "is not valid scheduled evidence."
             )
         else:
             logger.error(

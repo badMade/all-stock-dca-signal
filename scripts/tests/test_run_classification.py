@@ -384,6 +384,19 @@ def test_write_rejects_invalid_classification():
             raise AssertionError("expected ValueError for invalid classification")
 
 
+def test_is_scheduled_state_false_for_contract_rejected():
+    # A run the artifact contract rejected (top-level artifact_contract_failure
+    # marker) must not be reported as a valid scheduled run to the 15:35 reporting
+    # selector, even though its classification still says scheduled.
+    sched = _scheduled_state()
+    assert is_scheduled_state(sched)
+    sched["artifact_contract_failure"] = {
+        "failure": "artifact_contract_failure",
+        "reason": "compute-only terminal state",
+    }
+    assert not is_scheduled_state(sched)
+
+
 def test_origin_helpers_defensive_or():
     manual = _manual_state()
     assert is_manual_state(manual)

@@ -154,6 +154,35 @@ def test_latest_run_summary_generation():
     assert summary["budget"]["planned_notional_usd"] == 6.5
 
 
+def test_latest_run_summary_mirrors_run_classification():
+    run_state = _run_state()
+    run_state["run_classification"] = {
+        "run_origin": "scheduled",
+        "manual_run": False,
+        "stream": "afternoon",
+        "cron_id": "10ce362c",
+        "supersedes_cron_id": "ce16ba6b",
+        "run_id": "scheduled_20260722_1520ET",
+    }
+    rows = compute_slippage_rows(run_state["buy_candidates"], _fills())
+    missing = build_missing_fills(run_state["buy_candidates"], _fills())
+    summary = build_latest_run_summary(run_state, rows, missing)
+
+    # run_summary MUST carry the SAME non-null run_classification as run_state.
+    assert summary["run_classification"] == run_state["run_classification"]
+    assert "artifact_contract_failure" not in summary
+
+
+def test_latest_run_summary_marks_contract_failure_when_classification_null():
+    run_state = _run_state()  # no run_classification
+    rows = compute_slippage_rows(run_state["buy_candidates"], _fills())
+    missing = build_missing_fills(run_state["buy_candidates"], _fills())
+    summary = build_latest_run_summary(run_state, rows, missing)
+
+    assert summary["run_classification"] is None
+    assert summary["artifact_contract_failure"]["failure"] == "artifact_contract_failure"
+
+
 def test_missing_fills_reported_when_no_fill():
     run_state = _run_state()
     fills = [f for f in _fills() if f["ticker"] != "NVDA"]
@@ -238,6 +267,26 @@ def test_weekly_dashboard_section_generation():
         "## Weekly review notes",
     ]:
         assert heading in dashboard, f"missing section: {heading}"
+
+
+def test_weekly_dashboard_snapshot_and_review_notes_values():
+    run_states = [_run_state()]
+    summaries = [_summary_fixture()]
+
+    dashboard = build_weekly_dashboard(run_states, summaries, sector_map={"AAPL": "Tech", "NVDA": "Semis"})
+
+    assert "| Run days | 1 |" in dashboard
+    assert "| Buy candidates | 3 |" in dashboard
+    assert "| Orders submitted | 3 |" in dashboard
+    assert "| Planned notional | $6.50 |" in dashboard
+    assert "| Executed notional | $6.50 |" in dashboard
+    assert "| Week notional / cap | $6.50 / $900.00 |" in dashboard
+
+    assert "- Runs analyzed: 1 day(s)." in dashboard
+    assert "- All buy candidates were covered by fills." in dashboard
+    assert "- 1 fill(s) lacked a target price; slippage excluded — check signal capture." in dashboard
+    assert "- 1 manual-review flag(s) across the week — reconcile finance vs Robinhood." in dashboard
+    assert "- Add qualitative notes here before the Notion dashboard refresh." in dashboard
 
 
 def test_weekly_graded_vs_fixed_delta():

@@ -112,27 +112,35 @@ def _require_base_amount(rs: Dict[str, Any]) -> float:
 
 def build_performance_snapshot(run_states: Sequence[Dict[str, Any]]) -> str:
     days = len(run_states)
-    total_candidates = sum(_num((rs.get("counts") or {}).get("buy_candidates")) for rs in run_states)
-    total_submitted = sum(_num((rs.get("counts") or {}).get("submitted")) for rs in run_states)
-    total_notional = sum(_num((rs.get("budget") or {}).get("day_notional_usd")) for rs in run_states)
-    planned_notional = sum(
-        _num(c.get("planned_amount_usd"))
-        for rs in run_states
-        for c in rs.get("buy_candidates") or []
-    )
-    week_notional = max((_num((rs.get("budget") or {}).get("week_notional_usd")) for rs in run_states), default=0.0)
-    # Fall back to the pre-policy key so historical run_state artifacts (which
-    # named the cap ``weekly_notional_cap_usd``) still populate the snapshot.
-    weekly_cap = max(
-        (
-            _num(
-                (rs.get("budget") or {}).get("weekly_cap_usd")
-                or (rs.get("budget") or {}).get("weekly_notional_cap_usd")
-            )
-            for rs in run_states
-        ),
-        default=0.0,
-    )
+    # ⚡ Bolt Optimization: Replace multiple O(N) generator/comprehension scans with a
+    # single pass over run_states to compute all aggregates simultaneously.
+    total_candidates = 0.0
+    total_submitted = 0.0
+    total_notional = 0.0
+    planned_notional = 0.0
+    week_notional = 0.0
+    weekly_cap = 0.0
+
+    for rs in run_states:
+        counts = rs.get("counts") or {}
+        budget = rs.get("budget") or {}
+
+        total_candidates += _num(counts.get("buy_candidates"))
+        total_submitted += _num(counts.get("submitted"))
+        total_notional += _num(budget.get("day_notional_usd"))
+
+        for c in rs.get("buy_candidates") or []:
+            planned_notional += _num(c.get("planned_amount_usd"))
+
+        wn = _num(budget.get("week_notional_usd"))
+        if wn > week_notional:
+            week_notional = wn
+
+        # Fall back to the pre-policy key so historical run_state artifacts (which
+        # named the cap "weekly_notional_cap_usd") still populate the snapshot.
+        wc = _num(budget.get("weekly_cap_usd") or budget.get("weekly_notional_cap_usd"))
+        if wc > weekly_cap:
+            weekly_cap = wc
 
     lines = ["## Performance snapshot", ""]
     lines.append("| Metric | Value |")
@@ -299,9 +307,19 @@ def build_weekly_review_notes(
 ) -> str:
     """Auto-generate review prompts from the week's aggregates."""
     lines = ["## Weekly review notes", ""]
-    total_missing = sum(_num((s.get("coverage") or {}).get("missing_fills")) for s in summaries)
-    total_manual = sum(len(rs.get("manual_review_tickers") or []) for rs in run_states)
-    missing_targets = sum(_num((s.get("execution_quality") or {}).get("target_price_missing")) for s in summaries)
+    # ⚡ Bolt Optimization: Use a single pass over summaries and run_states
+    # instead of multiple O(N) generators to reduce iteration overhead.
+    total_missing = 0.0
+    missing_targets = 0.0
+    for s in summaries:
+        cov = s.get("coverage") or {}
+        exq = s.get("execution_quality") or {}
+        total_missing += _num(cov.get("missing_fills"))
+        missing_targets += _num(exq.get("target_price_missing"))
+
+    total_manual = 0
+    for rs in run_states:
+        total_manual += len(rs.get("manual_review_tickers") or [])
 
     lines.append(f"- Runs analyzed: {len(run_states)} day(s).")
     if total_missing:

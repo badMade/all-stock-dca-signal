@@ -696,6 +696,43 @@ The contract, one source of truth in
    null/absent/not-an-object, or when a required CSV is missing.
    `require_submitted_orders` is True for live runs and False for read-only
    pre-flight runs.
+5. **Same contract for the 3:20 final live run.** The afternoon final live task
+   (`10ce362c`) also writes a non-null `run_classification` object in both
+   `run_state.json` and `run_summary.json`. For 3:20 the object carries
+   `run_origin='scheduled'`, `manual_run=false`, `stream='afternoon'`,
+   `scheduled_for_et='15:20'`, `cron_id='10ce362c'`,
+   `supersedes_cron_id='ce16ba6b'`, `run_id`, `trading_day`,
+   `same_day_required=true`, and evidence flags derived from the completed
+   state. A null `run_summary.run_classification` is an
+   `artifact_contract_failure`.
+
+## 3:20 compute-to-placement contract (added 2026-07-22)
+
+The Jul 22 2026 3:20 PM ET scheduled final live run generated 20 planned buy
+orders with `planned_spend=60.0`, but the saved compute module stopped with
+`error_class='placement_not_implemented_in_compute_module'` and submitted zero
+orders. That is not a valid terminal state for a pre-authorized scheduled live
+run when planned orders remain.
+
+From Jul 22 2026 forward, once the 3:20 task writes `signals.csv`, every
+eligible row with `incremental_usd > 0` or an equivalent planned order amount
+must enter a placement phase in the same scheduled run. The placement phase
+calls Robinhood `place_equity_order` directly after all ordinary safeguards
+pass: validation, budget, spread, data confidence, regular-hours-only,
+whitelist, buy-only, max-per-order, and same-day top-up. It must not call
+`review_equity_order` and must not request per-order confirmation.
+
+If the saved compute module cannot place orders, the scheduled task must invoke
+the main live placement runner or use the direct platform connector placement
+path itself. It must not write `order_submit_status='not_submitted'` with
+`error_class='placement_not_implemented_in_compute_module'` while planned
+orders remain.
+
+If the placement phase is unreachable, the task writes
+`order_submit_status='blocked_placement_phase_unreachable'` and
+`error_class='placement_phase_unreachable'`, preserves the planned orders in
+`signals.csv`, writes `submitted_orders.csv` with headers, notifies, and marks
+completed order evidence false while still proving the scheduled task fired.
 
 | Function | Purpose |
 |---|---|

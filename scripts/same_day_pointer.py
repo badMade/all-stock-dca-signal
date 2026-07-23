@@ -102,8 +102,17 @@ def derive_valid_scheduled_evidence(run_state: Optional[Dict[str, object]]) -> b
     ``manual_run`` key) can never pass as scheduled evidence. This is
     deliberately looser than run_classification.is_scheduled_state (which pins
     the 15:20 afternoon window); a stream's own validator can tighten further.
+
+    A run that the artifact contract rejected is NOT valid scheduled evidence,
+    even if its classification still says scheduled: a top-level
+    ``artifact_contract_failure`` marker (persisted when validate_run_artifacts
+    fails, e.g. the compute-only terminal state) fails closed here so every
+    consumer that discovers the run_state directly -- not just the latest-run
+    pointer -- refuses to count it.
     """
     if not isinstance(run_state, dict):
+        return False
+    if run_state.get("artifact_contract_failure") is not None:
         return False
     rc = run_state.get("run_classification")
     if not isinstance(rc, dict):

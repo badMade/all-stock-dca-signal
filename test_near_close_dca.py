@@ -943,6 +943,162 @@ def test_build_run_artifacts_stamps_manual_classification(tmp_path):
     assert rc["manual_run"] is True
 
 
+def test_scheduled_compact_writes_and_validates_artifact_contract(tmp_path):
+    # The scheduled 3:20 PM live path must write the full contract set and pass
+    # validate_run_artifacts in production (not only in tests): run_state.json,
+    # signals.csv, submitted_orders.csv, and a run_summary.json whose
+    # run_classification mirrors run_state's.
+    from pathlib import Path
+
+    from scripts.scheduled_artifacts import validate_run_artifacts
+
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+
+    d = Path(artifacts_dir)
+    assert (d / "run_state.json").exists()
+    assert (d / "signals.csv").exists()
+    assert (d / "submitted_orders.csv").exists()
+    assert (d / "run_summary.json").exists()
+
+    run_state = json.loads((d / "run_state.json").read_text())
+    summary = json.loads((d / "run_summary.json").read_text())
+    # run_summary.run_classification mirrors run_state's exactly
+    assert summary["run_classification"] == run_state["run_classification"]
+    # the scheduled classification now carries the afternoon-contract fields
+    rc = run_state["run_classification"]
+    assert rc["trading_day"] == run_state["trading_day"]
+    assert rc["same_day_required"] is True
+    assert rc["valid_scheduled_evidence"] is True
+    # the production contract validator passes on the written dir
+    assert validate_run_artifacts(d, require_submitted_orders=True, require_summary=True)
+
+
+def test_manual_compact_does_not_write_scheduled_contract_files(tmp_path):
+    # The manual path is not the scheduled contract: it must not stamp the
+    # scheduled-only evidence field nor write the scheduled contract artifacts.
+    from pathlib import Path
+
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    artifacts_dir = os.path.join(tmp_path, "runs", "manual-am")
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=False)
+
+    run_state = json.loads(Path(artifacts_dir, "run_state.json").read_text())
+    rc = run_state["run_classification"]
+    assert rc["run_origin"] == "manual"
+    assert "valid_scheduled_evidence" not in rc
+    assert not Path(artifacts_dir, "run_summary.json").exists()
+    assert not Path(artifacts_dir, "submitted_orders.csv").exists()
+
+
+def test_scheduled_contract_excludes_dry_run_orders_from_submitted_orders(tmp_path):
+    # A scheduled dry run assigns synthetic DRY-RUN-SIM order_ids while keeping
+    # status="dry_run"; those simulated orders must NOT land in submitted_orders.csv
+    # (the drift detector would otherwise report them as real broker fills).
+    import csv as _csv
+    from pathlib import Path
+
+    from near_close_dca import _write_and_validate_scheduled_contract
+
+    artifacts = {
+        "run_id": "2026-06-29-152000",
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T15:20:00-04:00",
+        "broker": "robinhood",
+        "dry_run": True,
+        "order_submit_status": "dry_run",
+        "run_classification": {"run_origin": "scheduled", "manual_run": False},
+        "buy_candidates": [
+            {"ticker": "A", "planned_amount_usd": 2.0, "status": "dry_run",
+             "order_id": "DRY-RUN-SIM-A-2.00-x"},
+            {"ticker": "B", "planned_amount_usd": 3.0, "status": "dry_run",
+             "order_id": "DRY-RUN-SIM-B-3.00-x"},
+        ],
+    }
+    d = Path(tmp_path)
+    (d / "run_state.json").write_text(json.dumps(artifacts), encoding="utf-8")
+    (d / "signals.csv").write_text("ticker\nA\nB\n", encoding="utf-8")
+
+    result = _write_and_validate_scheduled_contract(artifacts, d)
+    assert result  # dry_run is exempt from the compute-only check; contract passes
+    rows = list(_csv.DictReader((d / "submitted_orders.csv").open()))
+    assert rows == []  # header only -- no simulated dry-run orders recorded
+
+
+def test_contract_failure_persists_invalid_evidence_marker(tmp_path):
+    # A contract-rejected scheduled run must be marked invalid IN the run_state, so
+    # consumers that discover the file directly (not via the pointer) also exclude
+    # it: select_same_day_run_state (derive_valid_scheduled_evidence) and the
+    # weekly dashboard's load_json_files (drops status=='blocked').
+    from pathlib import Path
+
+    from dca_weekly_dashboard import load_json_files
+    from near_close_dca import _write_and_validate_scheduled_contract
+    from scripts.same_day_pointer import derive_valid_scheduled_evidence
+
+    artifacts = {
+        "run_id": "2026-06-29-152000",
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T15:20:00-04:00",
+        "broker": "robinhood",
+        "dry_run": False,
+        "order_submit_status": "submitted",
+        "run_classification": {
+            "run_origin": "scheduled", "manual_run": False, "stream": "afternoon",
+            "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "A", "planned_amount_usd": 2.0, "order_id": "o1", "status": "submitted"},
+            # positive planned row left unplaced -> compute-only terminal failure
+            {"ticker": "B", "planned_amount_usd": 3.0, "status": "not_submitted"},
+        ],
+    }
+    d = Path(tmp_path)
+    (d / "run_state.json").write_text(json.dumps(artifacts), encoding="utf-8")
+    (d / "signals.csv").write_text("ticker\nA\nB\n", encoding="utf-8")
+
+    result = _write_and_validate_scheduled_contract(artifacts, d)
+    assert not result  # partial unplaced planned order -> contract failure
+
+    persisted = json.loads((d / "run_state.json").read_text())
+    assert persisted["status"] == "blocked"
+    assert persisted["artifact_contract_failure"]["failure"] == "artifact_contract_failure"
+    assert persisted["run_classification"]["valid_scheduled_evidence"] is False
+    # both direct-discovery consumers now refuse the rejected run
+    assert derive_valid_scheduled_evidence(persisted) is False
+    assert load_json_files([d / "run_state.json"]) == []
+
+
+def test_contract_failure_blocks_scheduled_pointer_update(tmp_path, monkeypatch):
+    # A run that breached the artifact contract must NOT be recorded as valid
+    # scheduled evidence: the latest_scheduled_run pointer update is skipped even
+    # though the run_classification itself is well-formed.
+    from pathlib import Path
+
+    import near_close_dca
+    from scripts.run_classification import latest_scheduled_run_path
+    from scripts.scheduled_artifacts import ArtifactContractResult
+
+    monkeypatch.setattr(
+        near_close_dca,
+        "_write_and_validate_scheduled_contract",
+        lambda artifacts, artifacts_dir: ArtifactContractResult(False, ["forced contract failure"]),
+    )
+
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    classification_root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    run_daily_compact(
+        now, config, state, fin, rh, broker,
+        artifacts_dir=artifacts_dir, scheduled=True,
+        classification_state_root=classification_root,
+    )
+    # run_state.json is still written, but the invalid run is not pointed at.
+    assert Path(artifacts_dir, "run_state.json").exists()
+    assert not latest_scheduled_run_path(classification_root).exists()
+
+
 def test_scheduled_run_updates_latest_scheduled_run_pointer(tmp_path):
     from pathlib import Path
 
