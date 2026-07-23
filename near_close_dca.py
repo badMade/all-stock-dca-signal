@@ -22,6 +22,28 @@ builds connector-ready payloads for the ``alpaca__pipedream`` source and keeps l
 placement gated behind ``AlpacaConfig.enable_live_orders`` (False by default). Paper
 trading is the safest mode for connection testing; toggle it with
 ``AlpacaConfig.is_paper_api``.
+
+Live contract note (2026-07-23): the authoritative scheduled live contract now
+spans four Robinhood-only streams (9:45 preflight, 10:30 morning live, 12:30
+midday live, 3:20 final live). Runners must validate same-day pointers before
+trusting them, treat a ticker with no prior same-day context as a first
+allocation (top-up only when prior same-day context exists and the price is
+strictly below the lowest prior same-day reference), dedupe against same-day
+submitted orders and Robinhood history before any fallback placement, place
+dollar buys as notional market orders (type='market', dollar_amount,
+time_in_force='gfd'; regular session only), and — for live runs that reached
+signal computation — always write a non-null run_classification plus
+signals.csv and submitted_orders.csv (the read-only 9:45 preflight and the
+pre-signal raw-persistence failure path are standing exceptions). A 3:05
+read-only monitor also runs (no trading).
+
+JUL 23 2026 EFFECTIVE PRIOR ALLOCATION PATCH (10:30 / 12:30 / 3:20; applied to
+the scheduled task text, PENDING in this module and run_dca.py, which do not
+yet compute effective_prior_usd or read prior_usd_rh): compute
+effective_prior_usd from deduped same-day artifacts plus Robinhood same-day order
+history; do not ignore prior_usd_rh; corrected_delta_usd =
+max(0, desired_usd - effective_prior_usd); skip already-met names. See
+analysis/2026-07-23-live-reliability-fixes/live_task_reliability_update_2026-07-23.md.
 """
 
 from __future__ import annotations
