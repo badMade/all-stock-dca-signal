@@ -96,6 +96,8 @@ def compute_slippage_rows(
     rows: List[Dict[str, Any]] = []
     for candidate in buy_candidates:
         ticker = candidate.get("ticker")
+        if not isinstance(ticker, str):
+            continue
         fill = fills_by_ticker.get(ticker)
         if fill is None:
             continue

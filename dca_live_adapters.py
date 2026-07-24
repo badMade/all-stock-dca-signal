@@ -512,7 +512,7 @@ class RobinhoodBroker:
         self,
         account: str = ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
         *,
-        buying_power_fn: Optional[Callable[[str], float]] = None,
+        buying_power_fn: Optional[Callable[..., Any]] = None,
         orders_fn: Optional[Callable[..., Dict[str, Any]]] = None,
         tradability_fn: Optional[Callable[..., Dict[str, Any]]] = None,
         review_fn: Optional[Callable[..., Dict[str, Any]]] = None,
