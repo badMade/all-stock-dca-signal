@@ -86,8 +86,11 @@ addopts = "-q"
 [tool.ruff]
 line-length = 120
 # Third-party research tools and one-off analysis scripts are out of scope for the
-# core lint gate (they carry their own heavy deps and looser conventions).
-extend-exclude = ["trading-strategies", "analysis"]
+# core lint gate (they carry their own heavy deps and looser conventions). The
+# ".github" tree is CI config plus tooling scripts injected into the CI workspace
+# by external review integrations (not tracked core source), so it is excluded
+# too -- the CI lint step is scoped to "core modules", matching this exclude.
+extend-exclude = ["trading-strategies", "analysis", ".github"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B"]
