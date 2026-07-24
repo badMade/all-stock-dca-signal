@@ -99,6 +99,7 @@ def test_trading_window_bad_decision_time_raises(tmp_path):
 def test_sizing_tiers_converted_from_percent(tmp_path):
     _write(tmp_path, "sizing_ladder.json", {
         "base_amount_usd": 2.0,
+        "base_amount_below_close_usd": 1.0,
         "tiers": [
             {"min_drop_pct": 1.0, "max_drop_pct": 2.0, "multiplier": 1.5},
             {"min_drop_pct": 0.1, "max_drop_pct": 1.0, "multiplier": 1.0},
@@ -108,6 +109,7 @@ def test_sizing_tiers_converted_from_percent(tmp_path):
     assert out["sizing_tiers"] == ((0.001, 1.0), (0.01, 1.5))  # sorted, percent->fraction
     assert out["minimum_drop_vs_previous_close"] == pytest.approx(0.001)
     assert out["base_buy_amount_usd"] == 2.0
+    assert out["base_buy_amount_below_close_usd"] == 1.0
 
 
 def test_sizing_tiers_malformed_raises(tmp_path):
@@ -122,6 +124,7 @@ def test_budgets_maps_surviving_fields_only(tmp_path):
     # The budget_tiers block is ignored.
     _write(tmp_path, "budgets.json", {
         "base_amount_usd": 2.0,
+        "base_amount_below_close_usd": 1.0,
         "weekly_rollover_reserve_cap_usd": 900.0,
         "budget_tiers": [{"name": "normal", "daily_cap_usd": 180.0}],
         "circuit_breakers": {"max_per_order_usd": 10.0},
@@ -129,6 +132,7 @@ def test_budgets_maps_surviving_fields_only(tmp_path):
     out = load_budgets(tmp_path)
     assert out == {
         "base_buy_amount_usd": 2.0,
+        "base_buy_amount_below_close_usd": 1.0,
         "weekly_rollover_reserve_cap_usd": 900.0,
         "max_per_order_usd": 10.0,
     }

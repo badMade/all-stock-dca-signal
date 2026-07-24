@@ -85,6 +85,8 @@ from near_close_dca import (
     load_prior_same_day_allocations_multi,
     merge_manual_top_up_context,
     quote_spread_pct,
+    resolve_top_up_desired_amount_usd,
+    select_first_allocation_base_usd,
 )
 from scripts.model_usage_log import DEFAULT_LOG_ROOT as DEFAULT_MODEL_USAGE_LOG_ROOT
 from scripts.model_usage_log import log_model_usage
@@ -391,6 +393,11 @@ class TopUpOutcome:
     top_up_guard_result: str
     top_up_skipped: bool
     top_up_manual_review: bool = False
+    # The base ($1 or $2) that actually produced desired_amount -- see
+    # near_close_dca.resolve_top_up_desired_amount_usd and TopUpGuardOutcome's
+    # matching field (Codex review: "Persist the preserved base on top-up
+    # candidates").
+    effective_base_amount_usd: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -406,6 +413,10 @@ class MorningConfig:
     tickers: Sequence[str] = field(default_factory=lambda: tuple(ACTIVE_TICKERS))
     excluded_tickers: frozenset[str] = field(default_factory=lambda: frozenset(EXCLUDED_TICKERS))
     base_buy_amount_usd: float = 2.0
+    # Reduced first-allocation base ($1) used when the price is below the prior
+    # close but not below the prior regular-session low. See
+    # near_close_dca.select_first_allocation_base_usd.
+    base_buy_amount_below_close_usd: float = 1.0
     sizing_tiers: Tuple[Tuple[float, float], ...] = MORNING_SIZING_TIERS
     minimum_drop_vs_previous_close: float = MORNING_MINIMUM_DROP
     # None means "use the active mode's default decision anchor" (09:45 for the
@@ -495,6 +506,7 @@ class MorningConfig:
         """
         return StrategyConfig(
             base_buy_amount_usd=self.base_buy_amount_usd,
+            base_buy_amount_below_close_usd=self.base_buy_amount_below_close_usd,
             sizing_tiers=tuple(self.sizing_tiers),
             minimum_drop_vs_previous_close=self.minimum_drop_vs_previous_close,
             dry_run=True,
@@ -633,6 +645,12 @@ class MorningSignal:
     multiplier: float
     hypothetical_amount_usd: float
     warnings: Tuple[str, ...] = ()
+    # Prior regular-session low and the first-allocation base scale selected from
+    # it (see near_close_dca.select_first_allocation_base_usd). hypothetical_amount_usd
+    # == selected_base_amount_usd * multiplier.
+    previous_low: Optional[float] = None
+    selected_base_amount_usd: float = 0.0
+    base_selection_reason: str = ""
     # Live mode only: the execution decision for a qualifying candidate. None in
     # watchlist mode (no execution decision is taken there).
     execution_status: Optional[str] = None
@@ -648,6 +666,9 @@ class MorningSignal:
             "previous_close": self.previous_close,
             "drop_pct": self.drop_pct,
             "multiplier": self.multiplier,
+            "previous_low": self.previous_low,
+            "selected_base_amount_usd": self.selected_base_amount_usd,
+            "base_selection_reason": self.base_selection_reason,
             "hypothetical_amount_usd": self.hypothetical_amount_usd,
             "warnings": "; ".join(self.warnings),
         }
@@ -796,6 +817,8 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
     sizing = raw.get("sizing_ladder", {})
     if "base_amount_usd" in sizing:
         kwargs["base_buy_amount_usd"] = float(sizing["base_amount_usd"])
+    if "base_amount_below_close_usd" in sizing:
+        kwargs["base_buy_amount_below_close_usd"] = float(sizing["base_amount_below_close_usd"])
     if "no_buy_below_pct" in sizing:
         kwargs["minimum_drop_vs_previous_close"] = float(sizing["no_buy_below_pct"]) / 100.0
     if "tiers" in sizing:
@@ -1533,8 +1556,15 @@ class MorningDCAExecutor(DCAExecutor):
         difference only (desired − prior; $0 if ≤ 0).  Price not below
         reference → $0.  Amount known but reference price missing → $0 with
         manual review flagged.
+
+        ``desired`` reuses the first same-day allocation's selected base when
+        known (see ``near_close_dca.resolve_top_up_desired_amount_usd``) so a
+        later, lower price cannot silently upgrade the whole day's target to
+        the $2 scale.
         """
-        desired = round(signal.hypothetical_amount_usd, 2)
+        desired, effective_base = resolve_top_up_desired_amount_usd(
+            prior, signal.multiplier, signal.hypothetical_amount_usd, signal.selected_base_amount_usd
+        )
         price = signal.current_price
 
         def _outcome(
@@ -1552,6 +1582,7 @@ class MorningDCAExecutor(DCAExecutor):
                 top_up_guard_result=result,
                 top_up_skipped=skipped,
                 top_up_manual_review=manual_review,
+                effective_base_amount_usd=effective_base,
             )
 
         if prior is None or prior.amount_usd <= 0:
@@ -1608,6 +1639,12 @@ class MorningDCAExecutor(DCAExecutor):
         row["top_up_guard_result"] = outcome.top_up_guard_result
         row["top_up_skipped"] = outcome.top_up_skipped
         row["top_up_manual_review"] = outcome.top_up_manual_review
+        # The guard's effective base (the preserved first-allocation base when
+        # reused) actually produced desired/incremental amounts above -- it must
+        # replace to_row()'s freshly recomputed selected_base_amount_usd so a
+        # later reader sees the base that was ACTUALLY used (Codex review:
+        # "Persist the preserved base on top-up candidates").
+        row["selected_base_amount_usd"] = outcome.effective_base_amount_usd
         if outcome.top_up_manual_review:
             row["execution_status"] = EXEC_MANUAL_REVIEW_CANDIDATE
 
@@ -1758,6 +1795,7 @@ class MorningDCAExecutor(DCAExecutor):
 
         warnings: List[str] = []
         previous_close: Optional[float] = None
+        previous_low: Optional[float] = None
         current_price: Optional[float] = None
 
         try:
@@ -1776,6 +1814,8 @@ class MorningDCAExecutor(DCAExecutor):
                 warnings.append(f"previous close {prev_bar.close} is non-positive; rejecting")
             else:
                 previous_close = prev_bar.close
+                if math.isfinite(prev_bar.low) and prev_bar.low > 0:
+                    previous_low = prev_bar.low
         else:
             warnings.append("missing previous close")
 
@@ -1804,12 +1844,16 @@ class MorningDCAExecutor(DCAExecutor):
                 multiplier=0.0,
                 hypothetical_amount_usd=0.0,
                 warnings=tuple(warnings),
+                previous_low=previous_low,
             )
 
         drop_fraction = (previous_close - current_price) / previous_close
         drop_pct = drop_fraction * 100.0
         multiplier = self.multiplier_for_drop(drop_fraction)
-        hypothetical = round(self.config.base_buy_amount_usd * multiplier, 2)
+        selected_base_amount_usd, base_selection_reason = select_first_allocation_base_usd(
+            current_price, previous_close, previous_low, self.sizing_config
+        )
+        hypothetical = round(selected_base_amount_usd * multiplier, 2)
         execution_status: Optional[str] = None
         trend_validated: Optional[bool] = None
         mode_label = "watchlist" if self.mode == MORNING_WATCHLIST_MODE else "live"
@@ -1849,6 +1893,9 @@ class MorningDCAExecutor(DCAExecutor):
             warnings=tuple(warnings),
             execution_status=execution_status,
             trend_validated=trend_validated,
+            previous_low=previous_low,
+            selected_base_amount_usd=selected_base_amount_usd if action == Action.BUY else 0.0,
+            base_selection_reason=base_selection_reason,
         )
 
     def _trend_validated(

@@ -820,6 +820,7 @@ def test_load_midday_config_reads_config_file(tmp_path):
         json.dumps({
             "sizing_ladder": {
                 "base_amount_usd": 4.0,
+                "base_amount_below_close_usd": 1.5,
                 "no_buy_below_pct": 0.2,
                 "tiers": [
                     {"min_drop_pct": 0.2, "max_drop_pct": 3.0, "multiplier": 1.0},
@@ -839,6 +840,10 @@ def test_load_midday_config_reads_config_file(tmp_path):
     )
     cfg = load_midday_config(str(cfg_dir))
     assert cfg.base_buy_amount_usd == 4.0
+    # Codex review ("Route the reduced base through the midday configuration"):
+    # base_amount_below_close_usd must be forwarded like base_amount_usd is, not
+    # silently left at MiddayConfig's hardcoded $1 default.
+    assert cfg.base_buy_amount_below_close_usd == 1.5
     assert abs(cfg.minimum_drop_vs_previous_close - 0.002) < 1e-9
     assert cfg.morning_daily_cap_usd == 70.0
     assert cfg.morning_weekly_cap_usd == 350.0

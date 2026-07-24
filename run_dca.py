@@ -47,6 +47,7 @@ from near_close_dca import (
     SourceName,
     StrategyConfig,
     StrategyState,
+    _earlier_selected_base,
     _write_and_validate_scheduled_contract,
     build_broker,
     load_prior_same_day_allocations,
@@ -1052,12 +1053,27 @@ def _run_pipeline_impl(
                         if existing.reference_price is None or alloc.reference_price is None
                         else min(existing.reference_price, alloc.reference_price)
                     )
+                    # Pick the chronologically FIRST allocation's base rather than
+                    # always keeping `existing` (the afternoon root, scanned first
+                    # above) -- an earlier morning/midday allocation must win over a
+                    # later same-day manual override recorded under the afternoon
+                    # root, even though the afternoon root loads first (Codex
+                    # review: "Select the base from the chronologically first
+                    # allocation").
+                    base, base_at = _earlier_selected_base(
+                        existing.selected_base_amount_usd,
+                        existing.selected_base_amount_usd_at,
+                        alloc.selected_base_amount_usd,
+                        alloc.selected_base_amount_usd_at,
+                    )
                     prior_same_day_allocations[ticker] = PriorSameDayAllocation(
                         ticker=ticker,
                         amount_usd=existing.amount_usd + alloc.amount_usd,
                         reference_price=ref,
                         run_id=alloc.run_id or existing.run_id,
                         source=alloc.source or existing.source,
+                        selected_base_amount_usd=base,
+                        selected_base_amount_usd_at=base_at,
                     )
             # Manual-context discovery (scripts.run_classification.load_same_day_top_up_context)
             # only runs for the auto-derived root: it scans SIBLINGS of afternoon_root's

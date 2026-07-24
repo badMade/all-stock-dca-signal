@@ -150,6 +150,11 @@ def test_provider_previous_close_from_quote():
     assert bar is not None
     assert bar.close == pytest.approx(308.63)
     assert bar.timestamp.astimezone(EASTERN).hour == 16
+    # A quote-derived bar has no real prior-session low -- it must NOT fabricate
+    # low=close, or select_first_allocation_base_usd would treat every below-close
+    # price as also below the low and always pick the $2 base (Codex review:
+    # "Obtain the prior-session low before selecting the base").
+    assert bar.low == 0.0
 
 
 def test_provider_quote_returns_price_and_time():
@@ -419,6 +424,24 @@ def test_finance_provider_previous_close_scalar():
     prov = FinanceDataProvider(bars_fn=lambda *a: [], previous_close_fn=lambda *a: 42.0)
     bar = prov.get_previous_close_bar("AAPL", _decision_dt())
     assert bar is not None and bar.close == pytest.approx(42.0)
+    # A scalar previous-close carries no real prior-session low -- must not
+    # fabricate low=close (Codex review: "Obtain the prior-session low before
+    # selecting the base"); see the matching RobinhoodDataProvider assertion above.
+    assert bar.low == 0.0
+
+
+def test_finance_provider_preserves_low_from_timestamp_less_mapping():
+    # Codex review ("Preserve an available low in price-only finance mappings"):
+    # a mapping with a real low but no bar timestamp falls through to the scalar
+    # path (since _coerce_bar requires a timestamp) -- it must not discard the
+    # supplied low the way a genuinely low-less scalar (e.g. a bare float) does.
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [], previous_close_fn=lambda *a: {"close": 100.0, "low": 95.0}
+    )
+    bar = prov.get_previous_close_bar("AAPL", _decision_dt())
+    assert bar is not None
+    assert bar.close == pytest.approx(100.0)
+    assert bar.low == pytest.approx(95.0)
 
 
 def test_finance_provider_drops_nonnumeric_close():

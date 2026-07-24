@@ -62,11 +62,21 @@ run-dca-risk --help
 
 ```python
 from dca_config import load_strategy_config
-from near_close_dca import graded_buy_multiplier
+from near_close_dca import graded_buy_multiplier, select_first_allocation_base_usd
 
 config = load_strategy_config()
-multiplier = graded_buy_multiplier(0.03, config)
-print(config.base_buy_amount_usd * multiplier)
+previous_close = 100.0
+previous_low = 95.0
+decision_price = 97.0  # a 3% drop: below the prior close, but not below the prior low
+
+multiplier = graded_buy_multiplier((previous_close - decision_price) / previous_close, config)
+# The first same-day allocation's dollar base is selected separately, BEFORE the
+# ladder multiplier: $2 when decision_price is below both previous_close and
+# previous_low, $1 when below previous_close only (this example), $0 otherwise.
+base_amount_usd, base_selection_reason = select_first_allocation_base_usd(
+    decision_price, previous_close, previous_low, config
+)
+print(base_amount_usd * multiplier)
 ```
 
 ## Project structure

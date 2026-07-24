@@ -12,6 +12,9 @@ from datetime import date, datetime, time, timedelta
 
 from near_close_dca import (
     ACTIVE_TICKERS,
+    BASE_BELOW_CLOSE_AND_LOW,
+    BASE_BELOW_CLOSE_ONLY,
+    BASE_NOT_BELOW_CLOSE,
     BUDGET_TIERS,
     EASTERN,
     EXCLUDED_TICKERS,
@@ -36,7 +39,9 @@ from near_close_dca import (
     SourceSignal,
     StrategyConfig,
     StrategyState,
+    _earlier_selected_base,
     _iso_or_none,
+    _process_buy_candidate,
     allocation_sort_key,
     build_execution_record,
     build_report,
@@ -48,12 +53,15 @@ from near_close_dca import (
     graded_buy_multiplier,
     load_prior_same_day_allocations,
     load_prior_same_day_allocations_multi,
+    merge_manual_top_up_context,
     reconcile_signals,
     run_and_report,
     run_daily_compact,
     select_budget_tier,
+    select_first_allocation_base_usd,
     write_run_artifacts,
 )
+from scripts.run_classification import PriorAllocation
 
 # (drop percent from prior close, expected multiplier).
 LADDER_BOUNDARY_CASES = [
@@ -228,6 +236,85 @@ def test_target_price_falls_back_to_bar_close_without_quote():
     assert signal.decision_bar_close == 98.0
 
 
+class _FakeDataWithLow(_FakeData):
+    """Provider whose previous regular-session bar carries a distinct low.
+
+    The base ``_FakeData`` sets the prior bar's low equal to the prior close, so it
+    cannot distinguish "below prior close only" from "below prior close and low". This
+    variant lets a test place the decision price on either side of the prior low.
+    """
+
+    def __init__(self, source, close_price, prev_close, prev_low, quote=None):
+        super().__init__(source, close_price, prev_close, quote=quote)
+        self._prev_low = prev_low
+
+    def get_previous_close_bar(self, ticker, as_of):
+        ts = datetime.combine(as_of.date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN)
+        # open/high sit at/above the close; low is the distinct prior-session low.
+        return Bar(ts, self._prev, self._prev, self._prev_low, self._prev, 1000)
+
+
+def test_first_allocation_below_close_only_uses_one_dollar_base():
+    # Decision price below the prior close (100) but not below the prior low (95)
+    # -> $1 base scale. Drop is 2% -> 2x multiplier -> $1 * 2 = $2 suggested.
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    data = _FakeDataWithLow(SourceName.FINANCE, close_price=98.0, prev_close=100.0, prev_low=95.0)
+    signal = evaluate_source_signal("AAPL", now, StrategyConfig(), data, interval_minutes=15)
+    assert signal.action == Action.BUY
+    assert signal.previous_low == 95.0
+    assert signal.base_selection_reason == BASE_BELOW_CLOSE_ONLY
+    assert signal.selected_base_amount_usd == 1.0
+    assert signal.buy_multiplier == 2.0
+    assert signal.suggested_amount_usd == 1.0 * 2.0
+
+
+def test_first_allocation_below_close_and_low_uses_two_dollar_base():
+    # Decision price below both the prior close (100) and the prior low (95)
+    # -> $2 base scale. Drop is 6% -> 4x multiplier -> $2 * 4 = $8 suggested.
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    data = _FakeDataWithLow(SourceName.FINANCE, close_price=94.0, prev_close=100.0, prev_low=95.0)
+    signal = evaluate_source_signal("AAPL", now, StrategyConfig(), data, interval_minutes=15)
+    assert signal.action == Action.BUY
+    assert signal.previous_low == 95.0
+    assert signal.base_selection_reason == BASE_BELOW_CLOSE_AND_LOW
+    assert signal.selected_base_amount_usd == 2.0
+    assert signal.buy_multiplier == 4.0
+    assert signal.suggested_amount_usd == 2.0 * 4.0
+
+
+def test_first_allocation_above_close_is_no_buy():
+    # Decision price above the prior close -> no buy, $0 base, zeroed amount.
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    data = _FakeDataWithLow(SourceName.FINANCE, close_price=101.0, prev_close=100.0, prev_low=95.0)
+    signal = evaluate_source_signal("AAPL", now, StrategyConfig(), data, interval_minutes=15)
+    assert signal.action != Action.BUY
+    assert signal.selected_base_amount_usd == 0.0
+    assert signal.suggested_amount_usd == 0.0
+
+
+def test_first_allocation_missing_prior_low_treated_as_below_close_only():
+    # A non-positive/missing prior low is treated conservatively as not-below-low,
+    # so the $1 (below-close-only) scale is selected even on a deep drop.
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    data = _FakeDataWithLow(SourceName.FINANCE, close_price=94.0, prev_close=100.0, prev_low=0.0)
+    signal = evaluate_source_signal("AAPL", now, StrategyConfig(), data, interval_minutes=15)
+    assert signal.action == Action.BUY
+    assert signal.base_selection_reason == BASE_BELOW_CLOSE_ONLY
+    assert signal.selected_base_amount_usd == 1.0
+
+
+def test_select_first_allocation_base_helper_branches():
+    config = StrategyConfig()
+    assert select_first_allocation_base_usd(94.0, 100.0, 95.0, config) == (2.0, BASE_BELOW_CLOSE_AND_LOW)
+    assert select_first_allocation_base_usd(98.0, 100.0, 95.0, config) == (1.0, BASE_BELOW_CLOSE_ONLY)
+    assert select_first_allocation_base_usd(101.0, 100.0, 95.0, config) == (0.0, BASE_NOT_BELOW_CLOSE)
+    assert select_first_allocation_base_usd(100.0, 100.0, 95.0, config) == (0.0, BASE_NOT_BELOW_CLOSE)
+    # Missing prior low -> conservative below-close-only ($1).
+    assert select_first_allocation_base_usd(94.0, 100.0, None, config) == (1.0, BASE_BELOW_CLOSE_ONLY)
+    # Per-order ceiling holds: deepest drop (5x) on the $2 scale tops out at $10.
+    assert 2.0 * 5.0 == config.max_per_order_usd
+
+
 def test_reconciled_decision_carries_target_fields():
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     qt = datetime(2026, 6, 29, 15, 44, tzinfo=EASTERN)
@@ -241,6 +328,153 @@ def test_reconciled_decision_carries_target_fields():
     assert decision.target_price == 97.5
     assert decision.target_price_source == "finance:signal_quote"
     assert decision.decision_bar_close == 98.0
+
+
+def test_merge_manual_top_up_context_poisons_base_to_unknown():
+    # Codex review ("Keep the base unknown after merging an earlier manual
+    # fill"): PriorAllocation (from a bare-CSV-only manual fill) carries no
+    # timestamp, so merging it with an existing allocation that already
+    # resolved a base cannot establish whether the manual fill actually came
+    # first -- the merged base must be poisoned to unknown rather than
+    # silently keep the existing (possibly later) base.
+    prior_same_day_allocations = {
+        "AAPL": PriorSameDayAllocation(
+            "AAPL",
+            amount_usd=2.0,
+            reference_price=97.0,
+            run_id="run1",
+            source="scheduled",
+            selected_base_amount_usd=2.0,
+            selected_base_amount_usd_at="2026-06-29T10:30:00-04:00",
+        ),
+    }
+    manual_context = {
+        "AAPL": PriorAllocation(ticker="AAPL", prior_usd=1.0, reference_price=99.0, sources=["manual_csv"]),
+    }
+    merge_manual_top_up_context(prior_same_day_allocations, manual_context)
+    merged = prior_same_day_allocations["AAPL"]
+    assert merged.amount_usd == 3.0
+    assert merged.selected_base_amount_usd is None
+    assert merged.selected_base_amount_usd_at is None
+
+
+def test_reconcile_signals_agree_preserves_base_from_winning_signal():
+    # Codex review ("Preserve the base that produced the reconciled amount"): when
+    # both sources agree on BUY but disagree on both base and multiplier, the
+    # reconciled base must come from whichever signal actually produced the
+    # (min) amount -- not an independent min() over the two bases, which could
+    # pick a base from the signal that did NOT determine the amount.
+    finance = SourceSignal(
+        ticker="AAPL",
+        source=SourceName.FINANCE,
+        action=Action.BUY,
+        reason="test",
+        buy_multiplier=1.0,
+        suggested_amount_usd=2.0,  # $2 base * 1x
+        selected_base_amount_usd=2.0,
+    )
+    robinhood = SourceSignal(
+        ticker="AAPL",
+        source=SourceName.ROBINHOOD,
+        action=Action.BUY,
+        reason="test",
+        buy_multiplier=2.5,
+        suggested_amount_usd=2.5,  # $1 base * 2.5x
+        selected_base_amount_usd=1.0,
+    )
+    decision = reconcile_signals("AAPL", finance, robinhood)
+    assert decision.suggested_amount_usd == 2.0  # finance's smaller amount wins
+    assert decision.selected_base_amount_usd == 2.0  # finance's base, not Robinhood's $1
+
+
+def test_reconcile_signals_agree_pairs_multiplier_with_winning_signal():
+    # Codex review ("Keep the winning amount's multiplier paired with its
+    # base"): the inverse-ordering case where the smaller amount comes from the
+    # signal with the LARGER multiplier. Finance $2*2.5x=$5, Robinhood
+    # $1*3.5x=$3.50 -> amount is Robinhood's $3.50, so both its base ($1) AND
+    # its multiplier (3.5x) must be used together, not finance's mismatched 2.5x.
+    finance = SourceSignal(
+        ticker="AAPL",
+        source=SourceName.FINANCE,
+        action=Action.BUY,
+        reason="test",
+        buy_multiplier=2.5,
+        suggested_amount_usd=5.0,
+        selected_base_amount_usd=2.0,
+    )
+    robinhood = SourceSignal(
+        ticker="AAPL",
+        source=SourceName.ROBINHOOD,
+        action=Action.BUY,
+        reason="test",
+        buy_multiplier=3.5,
+        suggested_amount_usd=3.5,
+        selected_base_amount_usd=1.0,
+    )
+    decision = reconcile_signals("AAPL", finance, robinhood)
+    assert decision.suggested_amount_usd == 3.5
+    assert decision.selected_base_amount_usd == 1.0
+    assert decision.buy_multiplier == 3.5  # Robinhood's, paired with its own $1 base
+    assert decision.selected_base_amount_usd * decision.buy_multiplier == decision.suggested_amount_usd
+
+
+def test_earlier_selected_base_picks_by_timestamp_not_argument_order():
+    # Codex review ("Select the base from the chronologically first allocation"):
+    # the later (15:05) allocation is passed as `existing` (the position that
+    # previously always won); the earlier (09:45) allocation must still win.
+    later_as_existing = _earlier_selected_base(
+        2.0, "2026-06-29T15:05:00-04:00",  # existing: later, would previously win
+        1.0, "2026-06-29T09:45:00-04:00",  # alloc: earlier
+    )
+    assert later_as_existing == (1.0, "2026-06-29T09:45:00-04:00")
+    # Same two allocations, swapped argument positions -> same (earlier) answer.
+    earlier_as_existing = _earlier_selected_base(
+        1.0, "2026-06-29T09:45:00-04:00",
+        2.0, "2026-06-29T15:05:00-04:00",
+    )
+    assert earlier_as_existing == (1.0, "2026-06-29T09:45:00-04:00")
+    # Missing/unparseable timestamps fall back to preferring `existing` (the
+    # pre-chronological-comparison default) rather than guessing at ordering.
+    assert _earlier_selected_base(2.0, None, 1.0, "2026-06-29T09:45:00-04:00") == (2.0, None)
+    assert _earlier_selected_base(None, None, 1.0, "2026-06-29T09:45:00-04:00") == (1.0, "2026-06-29T09:45:00-04:00")
+
+
+def test_kill_switch_caps_order_at_candidates_own_selected_base():
+    # Codex review ("Cap the kill switch at the selected base"): a below-close-
+    # only candidate's own selected base is $1, not the fixed
+    # config.base_buy_amount_usd ($2). Once the kill switch engages, capping at
+    # the fixed $2 would let this candidate submit double its 1x risk-capped
+    # amount.
+    config = StrategyConfig(monthly_cash_allocation_usd=10.0)
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=5.0,
+        suggested_amount_usd=5.0,  # $1 base * 5x, not yet kill-switch-capped
+        selected_base_amount_usd=1.0,
+        target_price=98.0,
+    )
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+    candidate_outcome, _, _, _, _ = _process_buy_candidate(
+        decision,
+        config,
+        state,
+        broker,
+        robinhood_data=None,
+        now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
+        trading_day=date(2026, 6, 29),
+        guard_active=False,
+        prior_same_day_allocations={},
+        # Trivially over the kill-switch threshold (fraction * $10 allocation).
+        running_deployed_7d=100.0,
+        scheduled=False,
+        run_result=None,
+    )
+    assert candidate_outcome["submitted_amount_usd"] == 1.0  # capped at $1, not $2
 
 
 def test_approved_dates_cover_window_and_exclude_holidays():
@@ -1484,6 +1718,68 @@ def test_top_up_guard_missing_afternoon_price_is_conservative():
     assert outcome.manual_review is True
 
 
+def test_top_up_guard_reuses_first_allocation_base_for_later_top_up():
+    # Codex review ("Preserve the first allocation's base for same-day top-ups"):
+    # prior close $100, prior low $95. A morning run bought using the $1 base (its
+    # decision price was below close but not below the low) for $2 total (1.0 base
+    # * 2x). The afternoon run's OWN decision price ($94) is now below the low too,
+    # so its own freshly-selected base would be $2 -- but the guard must keep using
+    # the first allocation's $1 base with the afternoon run's own 4x multiplier, not
+    # silently upgrade the whole day's target to the $2 scale.
+    prior = PriorSameDayAllocation(
+        "AAPL",
+        amount_usd=2.0,
+        reference_price=98.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=1.0,
+    )
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="test buy candidate",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=4.0,
+        # Recomputed (incorrectly, from this run's own $2 base) as 2.0 * 4.0.
+        suggested_amount_usd=8.0,
+        selected_base_amount_usd=2.0,
+        target_price=94.0,
+    )
+    outcome = evaluate_top_up_guard(decision, prior, StrategyConfig())
+    assert outcome.afternoon_desired_amount == 4.0  # 1.0 (preserved base) * 4x, not 2.0 * 4x
+    assert outcome.top_up_guard_result == TOP_UP_INCREMENTAL
+    assert outcome.incremental_order_amount == 2.0  # 4.0 - 2.0, not 8.0 - 2.0 == 6.0
+    # Codex review ("Persist the preserved base on top-up candidates"): the
+    # guard must expose the PRESERVED $1 base it actually used, not this run's
+    # own freshly recomputed $2 base, so a candidate-row artifact stays
+    # consistent with the amount actually calculated.
+    assert outcome.effective_base_amount_usd == 1.0
+
+
+def test_top_up_guard_falls_back_to_current_amount_when_prior_base_unknown():
+    # An older prior-allocation artifact recorded no selected_base_amount_usd at
+    # all -- must fall back to the pre-existing behavior (this run's own suggested
+    # amount) rather than treat the unknown preserved base as $0.
+    prior = PriorSameDayAllocation("AAPL", amount_usd=2.0, reference_price=98.0, run_id="manual_am", source="manual")
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="test buy candidate",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=2.0,
+        suggested_amount_usd=8.0,
+        selected_base_amount_usd=2.0,
+        target_price=94.0,
+    )
+    outcome = evaluate_top_up_guard(decision, prior, StrategyConfig())
+    assert outcome.afternoon_desired_amount == 8.0
+    assert outcome.incremental_order_amount == 6.0
+    # Falls back to this run's own base ($2) since no prior base was on record.
+    assert outcome.effective_base_amount_usd == 2.0
+
+
 # --- load_prior_same_day_allocations -----------------------------------------
 
 
@@ -1554,6 +1850,139 @@ def test_load_prior_same_day_reads_morning_manual_allocation(tmp_path):
     assert allocations["AAPL"].amount_usd == 3.0
     assert allocations["AAPL"].reference_price is None
     assert allocations["AAPL"].source == "manual"
+
+
+def test_load_prior_same_day_allocation_preserves_selected_base_amount(tmp_path):
+    # Codex review ("Preserve the first allocation's base for same-day top-ups"):
+    # a later same-day top-up guard must be able to recover the first allocation's
+    # selected base from the run_state.json this loader reads.
+    root = os.path.join(tmp_path, "cron_tracking", "morning_dca")
+    _write_prior_run(
+        root,
+        "20260629_0945ET",
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T09:45:00-04:00",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "run_type": "morning_dca_live",
+                "stream": "morning",
+                "run_id": "morning_live_20260629_0945ET",
+            },
+            "buy_candidates": [
+                {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 2.0, "selected_base_amount_usd": 1.0},
+            ],
+        },
+        orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "98.25"}],
+    )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["AAPL"].selected_base_amount_usd == 1.0
+
+
+def test_load_prior_same_day_first_run_locks_base_even_when_unknown(tmp_path):
+    # Codex review ("Do not infer a first-allocation base from a later run"): if the
+    # true FIRST same-day run predates selected_base_amount_usd (or never resolved
+    # one), the aggregate base must stay unknown forever -- a later same-day run's
+    # own base (which could itself be a top-up requalified at a different price)
+    # must never backfill it.
+    root = os.path.join(tmp_path, "cron_tracking", "morning_dca")
+    _write_prior_run(
+        root,
+        "20260629_0945ET",  # sorts (chronologically) before the 1030 run below
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T09:45:00-04:00",
+            "run_classification": {"run_origin": "scheduled", "stream": "morning", "run_id": "morning_0945"},
+            "buy_candidates": [
+                {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 1.0},  # no base field at all
+            ],
+        },
+        orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "99.0"}],
+    )
+    _write_prior_run(
+        root,
+        "20260629_1030ET",
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T10:30:00-04:00",
+            "run_classification": {"run_origin": "scheduled", "stream": "morning", "run_id": "morning_1030"},
+            "buy_candidates": [
+                {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 2.0, "selected_base_amount_usd": 2.0},
+            ],
+        },
+        orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "97.0"}],
+    )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["AAPL"].amount_usd == 3.0
+    assert allocations["AAPL"].selected_base_amount_usd is None
+
+
+def test_load_prior_same_day_processes_runs_by_timestamp_not_path_order(tmp_path):
+    # Codex review ("Sort first-allocation records by timestamp"): within a
+    # single root, "manual_recovery/1100" sorts lexically BEFORE
+    # "manual_runs/0900" even though 09:00 happened first, so the aggregator
+    # must not lock the base from whichever subtree happens to sort first.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    _write_prior_run(
+        root,
+        "manual_recovery/1100",
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T11:00:00-04:00",
+            "run_classification": {
+                "run_origin": "manual",
+                "manual_run": True,
+                "same_day_top_up_context_only": True,
+                "valid_scheduled_evidence": False,
+                "run_id": "recovery_1100",
+            },
+            "buy_candidates": [
+                {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 2.0, "selected_base_amount_usd": 2.0},
+            ],
+        },
+        orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "97.0"}],
+    )
+    _write_prior_run(
+        root,
+        "manual_runs/0900",
+        _manual_run_state(
+            [
+                {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 1.0, "selected_base_amount_usd": 1.0},
+            ],
+            generated_at="2026-06-29T09:00:00-04:00",
+        ),
+        orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "99.0"}],
+    )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["AAPL"].amount_usd == 3.0
+    assert allocations["AAPL"].selected_base_amount_usd == 1.0  # 09:00's base, not 11:00's
+
+
+def test_load_prior_same_day_allocation_unconfirmed_base_not_trusted(tmp_path):
+    # An unconfirmed "submitted" row (no orders.csv fill) has neither a known
+    # reference price nor a trusted base -- same conservative gate as reference_price.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    _write_prior_run(
+        root,
+        "manual_runs/0900",
+        _manual_run_state([
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": 3.0,
+                "target_price": 99.0,
+                "selected_base_amount_usd": 1.0,
+            },
+        ]),
+    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert allocations["AAPL"].selected_base_amount_usd is None
 
 
 def test_load_prior_same_day_submitted_with_logged_price_and_no_fill_has_unknown_reference(tmp_path):
@@ -1815,6 +2244,52 @@ def test_load_prior_same_day_multi_missing_reference_poisons_to_none(tmp_path):
     )
     assert allocations["AAPL"].amount_usd == 7.5
     assert allocations["AAPL"].reference_price is None
+
+
+def test_load_prior_same_day_multi_picks_chronologically_first_base_regardless_of_root_order(tmp_path):
+    # Codex review ("Select the base from the chronologically first allocation"):
+    # a 09:45 morning $1-base buy is the true first same-day allocation; a 15:05
+    # manual $2-base buy under the afternoon root came later. The afternoon root
+    # is passed FIRST here (matching run_dca.py's own scan order), but the
+    # morning allocation's base must still win because it happened first.
+    afternoon_root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    _write_prior_run(
+        afternoon_root,
+        "manual_runs/1505",
+        _manual_run_state(
+            [
+                {
+                    "ticker": "AAPL",
+                    "status": "filled",
+                    "planned_amount_usd": 2.0,
+                    "selected_base_amount_usd": 2.0,
+                    "target_price": 94.0,
+                },
+            ],
+            generated_at="2026-06-29T15:05:00-04:00",
+        ),
+    )
+    morning_root = os.path.join(tmp_path, "cron_tracking", "morning_dca")
+    _write_prior_run(
+        morning_root,
+        "20260629_0945ET",
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T09:45:00-04:00",
+            "run_classification": {"run_origin": "scheduled", "stream": "morning", "run_id": "morning_0945"},
+            "buy_candidates": [
+                {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 1.0, "selected_base_amount_usd": 1.0},
+            ],
+        },
+        orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "99.0"}],
+    )
+
+    allocations = load_prior_same_day_allocations_multi(
+        (afternoon_root, morning_root), date(2026, 6, 29), boundary_et=time(15, 20)
+    )
+
+    assert allocations["AAPL"].amount_usd == 3.0
+    assert allocations["AAPL"].selected_base_amount_usd == 1.0
 
 
 def test_load_prior_same_day_unconfirmed_submitted_order_has_no_reference_price(tmp_path):
@@ -2265,6 +2740,54 @@ def test_build_run_artifacts_uses_guarded_amount_as_planned_notional(tmp_path):
     assert candidates["AAPL"]["afternoon_desired_amount_usd"] == 6.0, (
         "original desired amount must be preserved in afternoon_desired_amount_usd"
     )
+
+
+def test_build_run_artifacts_records_guards_effective_base_not_current_run_base(tmp_path):
+    # Codex review ("Persist the preserved base on top-up candidates"): when the
+    # guard reused a preserved prior-allocation base, the candidate row must
+    # record THAT base, not this run's own freshly recomputed
+    # decision.selected_base_amount_usd.
+    from near_close_dca import TOP_UP_INCREMENTAL, TopUpGuardOutcome, build_run_artifacts
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
+    )
+    state = StrategyState()
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="test buy candidate",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=4.0,
+        suggested_amount_usd=6.0,
+        selected_base_amount_usd=2.0,  # this run's OWN freshly recomputed base
+        target_price=94.0,
+    )
+    guard = TopUpGuardOutcome(
+        ticker="AAPL",
+        top_up_guard_result=TOP_UP_INCREMENTAL,
+        incremental_order_amount=2.0,
+        afternoon_desired_amount=4.0,
+        afternoon_decision_price=94.0,
+        prior_same_day_amount=2.0,
+        prior_same_day_reference_price=98.0,
+        prior_same_day_run_id="manual_am",
+        prior_same_day_source="manual",
+        skipped=False,
+        manual_review=False,
+        effective_base_amount_usd=1.0,  # the PRESERVED base actually used
+    )
+    artifacts = build_run_artifacts(
+        now, config, state, [decision],
+        candidate_outcomes={"AAPL": {"order_id": "x", "status": "dry_run"}},
+        top_up_outcomes={"AAPL": guard},
+    )
+    candidates = {c["ticker"]: c for c in artifacts["buy_candidates"]}
+    assert candidates["AAPL"]["selected_base_amount_usd"] == 1.0
 
 
 # --- Fix 2: prior same-day allocations count against the daily/weekly cap ----

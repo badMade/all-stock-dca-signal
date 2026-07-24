@@ -19,6 +19,7 @@ in and forwards the rendered markdown to whatever Notion integration it owns.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -155,12 +156,37 @@ def build_performance_snapshot(run_states: Sequence[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _candidate_fixed_base_usd(candidate: Dict[str, Any], default_base: float) -> float:
+    """Return one candidate's 1x fixed-baseline dollar amount.
+
+    Prefers the candidate's own dynamic first-allocation base
+    (``selected_base_amount_usd``, $1 or $2 -- see
+    ``near_close_dca.select_first_allocation_base_usd``) so the fixed baseline
+    reflects the SAME per-candidate base the graded ladder actually used (Codex
+    review: "Apply the dynamic base to the analytics baseline"). Falls back to
+    the run's flat ``default_base`` for candidates/artifacts that predate this
+    field.
+    """
+    raw = candidate.get("selected_base_amount_usd")
+    if raw is None:
+        return default_base
+    try:
+        base = float(raw)
+    except (TypeError, ValueError):
+        return default_base
+    if not math.isfinite(base) or base <= 0:
+        return default_base
+    return base
+
+
 def build_graded_vs_fixed(run_states: Sequence[Dict[str, Any]]) -> str:
     """Compare graded-ladder spend to a flat 1x fixed daily DCA baseline.
 
-    The fixed baseline buys every candidate at the 1x base amount; graded applies
-    the ladder multiplier. The delta shows the extra capital the ladder deploys
-    into deeper drops relative to a naive fixed-size DCA.
+    The fixed baseline buys every candidate at its own 1x base amount (the
+    dynamic $1/$2 first-allocation base when the candidate recorded one,
+    otherwise the run's flat base amount); graded applies the ladder
+    multiplier. The delta shows the extra capital the ladder deploys into
+    deeper drops relative to a naive fixed-size DCA.
     """
     lines = ["## Graded DCA vs fixed daily DCA", ""]
     lines.append("| Day | Candidates | Graded $ | Fixed 1x $ | Delta $ |")
@@ -171,7 +197,7 @@ def build_graded_vs_fixed(run_states: Sequence[Dict[str, Any]]) -> str:
         candidates = rs.get("buy_candidates", [])
         base = _require_base_amount(rs)
         graded = sum(_num(c.get("planned_amount_usd")) for c in candidates)
-        fixed = base * len(candidates)
+        fixed = sum(_candidate_fixed_base_usd(c, base) for c in candidates)
         graded_total += graded
         fixed_total += fixed
         lines.append(

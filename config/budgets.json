@@ -3,12 +3,15 @@
   "version": "2026-07-19",
   "currency": "USD",
   "base_amount_usd": 2.0,
+  "base_amount_below_close_usd": 1.0,
   "base_amount_policy": {
     "base_amount_usd": 2.0,
+    "base_amount_below_close_usd": 1.0,
     "exact": true,
-    "candidate_dollar_formula": "candidate_dollar_amount = base_amount_usd * multiplier = $2.00 * multiplier",
-    "source_of_truth": "config/budgets.json:base_amount_usd (mirrored in config/sizing_ladder.json:base_amount_usd)",
-    "no_fallback": "Never infer, discover, or fall back to $50.00 or any broker/account default base amount. The base is fixed at exactly $2.00.",
+    "dynamic_first_allocation_scale": "The first same-day allocation per ticker selects the base BEFORE the ladder multiplier: below the prior regular-session close AND the prior regular-session low -> $2.00 (base_amount_usd); below the prior close only (not below the prior low) -> $1.00 (base_amount_below_close_usd); not below the prior close -> no buy. A missing prior low is treated as not-below-low ($1.00).",
+    "candidate_dollar_formula": "candidate_dollar_amount = selected_base_amount_usd * multiplier, where selected_base_amount_usd is $1.00 or $2.00 per the dynamic_first_allocation_scale.",
+    "source_of_truth": "config/budgets.json:base_amount_usd and base_amount_below_close_usd (mirrored in config/sizing_ladder.json)",
+    "no_fallback": "Never infer, discover, or fall back to $50.00 or any broker/account default base amount. The base is exactly $1.00 or $2.00 per the dynamic scale.",
     "forbidden_fallback_values_usd": [50.0]
   },
   "high_multiplier_threshold": 3.0,
@@ -85,7 +88,7 @@
   },
   "circuit_breakers": {
     "max_per_order_usd": 10.0,
-    "max_per_order_note": "5x * $2 base = $10 is the absolute per-order ceiling across all live streams.",
+    "max_per_order_note": "5x * $2 base = $10 is the absolute per-order ceiling across all live streams. The reduced $1 below-close-only base tops out at 5x * $1 = $5, so the $10 ceiling is unchanged.",
     "enforce_budget_caps": true,
     "enforce_available_buying_power": true,
     "whitelist_only": true,

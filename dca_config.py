@@ -91,6 +91,7 @@ def load_budgets(config_dir: Path) -> Dict[str, Any]:
         return {}
     field_map = {
         "base_amount_usd": "base_buy_amount_usd",
+        "base_amount_below_close_usd": "base_buy_amount_below_close_usd",
         "weekly_rollover_reserve_cap_usd": "weekly_rollover_reserve_cap_usd",
         "monthly_cash_allocation_usd": "monthly_cash_allocation_usd",
     }
@@ -151,6 +152,8 @@ def load_sizing_tiers(config_dir: Path) -> Dict[str, Any]:
     out["minimum_drop_vs_previous_close"] = tiers[0][0]
     if "base_amount_usd" in data:
         out["base_buy_amount_usd"] = float(data["base_amount_usd"])
+    if "base_amount_below_close_usd" in data:
+        out["base_buy_amount_below_close_usd"] = float(data["base_amount_below_close_usd"])
     return out
 
 

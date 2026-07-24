@@ -419,7 +419,12 @@ class RobinhoodDataProvider:
         close_date = _parse_iso_date(close_date_str) or (as_of.astimezone(EASTERN).date() - timedelta(days=1))
         # Stamp the prior-session close bar at the 4pm ET regular-session close.
         timestamp = datetime.combine(close_date, time(16, 0), tzinfo=EASTERN)
-        return Bar(timestamp=timestamp, open=price, high=price, low=price, close=price, volume=0.0)
+        # low=0.0 (not price): this quote-derived bar has no real prior-session low,
+        # only a close. select_first_allocation_base_usd treats a low <= 0 as
+        # unknown/missing (conservative $1 base) -- fabricating low=price here would
+        # make every below-close decision price also read as "below the low" and
+        # always select the $2 base.
+        return Bar(timestamp=timestamp, open=price, high=price, low=0.0, close=price, volume=0.0)
 
 
 class FinanceDataProvider:
@@ -466,6 +471,7 @@ class FinanceDataProvider:
         if isinstance(result, Bar):
             return result
         price = 0.0
+        low = 0.0
         if isinstance(result, dict):
             bar = _coerce_bar(result)
             if bar is not None:
@@ -474,6 +480,15 @@ class FinanceDataProvider:
             # timestamp; fall through to the scalar path rather than dropping it, so the
             # finance source still confirms and the reconciliation stays two-sided.
             price = _to_float(result.get("price") or result.get("close") or result.get("previous_close"))
+            # Preserve a real low the mapping supplied even though it lacks a bar
+            # timestamp (Codex review: "Preserve an available low in price-only
+            # finance mappings") -- e.g. {"close": 100, "low": 95} would otherwise
+            # fall through here and lose its genuine low to the low=0.0 default
+            # below, wrongly downgrading a below-$95 decision price to the $1 base.
+            # select_first_allocation_base_usd separately validates this against
+            # previous_close, so an invalid/missing low still safely falls back to
+            # 0.0 (unknown).
+            low = _to_float(result.get("low"))
         else:
             price = _to_float(result)
         if price <= 0:
@@ -481,7 +496,12 @@ class FinanceDataProvider:
         timestamp = datetime.combine(
             as_of.astimezone(EASTERN).date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN
         )
-        return Bar(timestamp=timestamp, open=price, high=price, low=price, close=price, volume=0.0)
+        # low=0.0 (not price) when no real low was supplied: a scalar previous-close
+        # carries no real prior-session low. See the matching comment in
+        # _previous_close_from_quote above -- fabricating low=price here would make
+        # select_first_allocation_base_usd treat every below-close price as also
+        # below the low and always pick the $2 base.
+        return Bar(timestamp=timestamp, open=price, high=price, low=low, close=price, volume=0.0)
 
 
 class RobinhoodBroker:

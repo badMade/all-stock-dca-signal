@@ -211,6 +211,13 @@ class SourceSignal:
     drop_vs_previous_close_pct: float = 0.0
     buy_multiplier: float = 0.0
     suggested_amount_usd: float = 0.0
+    # Prior regular-session low and the first-allocation base scale selected from
+    # it (see StrategyConfig.base_buy_amount_below_close_usd and
+    # select_first_allocation_base_usd). base_selection_reason records which branch
+    # was taken. suggested_amount_usd == selected_base_amount_usd * buy_multiplier.
+    previous_low: float = 0.0
+    selected_base_amount_usd: float = 0.0
+    base_selection_reason: str = ""
     decision_bar_timestamp: Optional[datetime] = None
     previous_close_timestamp: Optional[datetime] = None
     lookback_bar_timestamp: Optional[datetime] = None
@@ -235,6 +242,11 @@ class ReconciledDecision:
     robinhood_signal: Optional[SourceSignal]
     buy_multiplier: float = 0.0
     suggested_amount_usd: float = 0.0
+    # The first-allocation base ($1 or $2) behind suggested_amount_usd (see
+    # select_first_allocation_base_usd). Persisted so a later same-day top-up
+    # guard call can reuse THIS run's base instead of recomputing one from its
+    # own (possibly lower) price -- see evaluate_top_up_guard.
+    selected_base_amount_usd: float = 0.0
     # Execution target derived from the source that drives the buy. target_price is
     # the signal-time quote by default; decision_bar_close is retained separately.
     target_price: float = 0.0
@@ -273,6 +285,17 @@ class PriorSameDayAllocation:
     reference_price: Optional[float] = None
     run_id: Optional[str] = None
     source: Optional[str] = None
+    # The first same-day allocation's selected_base_amount_usd ($1 or $2), when the
+    # contributing artifact recorded one. None for older artifacts that predate this
+    # field, or when it could not be resolved -- callers must treat that as "unknown"
+    # (fall back to recomputing from the current run) rather than as $0.
+    selected_base_amount_usd: Optional[float] = None
+    # The contributing run's generated_at (ISO string) that established
+    # selected_base_amount_usd, so merging allocations from different roots/streams
+    # (e.g. run_dca.py's afternoon-root + cross-stream-root merge) can pick the
+    # chronologically FIRST allocation's base rather than whichever root happened
+    # to be merged first. None when unresolved/unavailable.
+    selected_base_amount_usd_at: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -290,6 +313,14 @@ class TopUpGuardOutcome:
     top_up_guard_result: str
     skipped: bool
     manual_review: bool = False
+    # The base ($1 or $2) that actually produced afternoon_desired_amount -- the
+    # preserved first-allocation base when reused (see
+    # resolve_top_up_desired_amount_usd), otherwise this run's own freshly
+    # selected base. A candidate-row artifact should record THIS, not the
+    # current run's own selected_base_amount_usd, so it stays consistent with
+    # the amount actually calculated (Codex review: "Persist the preserved
+    # base on top-up candidates").
+    effective_base_amount_usd: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -352,7 +383,15 @@ class StrategyConfig:
     approved_test_dates: frozenset[date] = frozenset(APPROVED_TEST_DATES)
     decision_time_et: time = time(15, 20)  # matches the 3:20 PM ET canonical live schedule
     trend_lookback_minutes: int = 60
+    # First-allocation base amount selected before the ladder multiplier. When the
+    # decision price is below the prior regular-session close AND the prior
+    # regular-session low, the full ``base_buy_amount_usd`` ($2) scale is used;
+    # when it is below the prior close only (not below the prior low), the reduced
+    # ``base_buy_amount_below_close_usd`` ($1) scale is used. Not below the prior
+    # close is no buy. The 0x-to-5x ladder multiplier is applied after this
+    # selection, so the per-order ceiling stays 5x * $2 = $10.
     base_buy_amount_usd: float = 2.0
+    base_buy_amount_below_close_usd: float = 1.0
     max_per_order_usd: float = 10.0
     weekly_rollover_reserve_cap_usd: float = 900.0
     high_multiplier_threshold: float = 3.0
@@ -946,6 +985,43 @@ def graded_buy_multiplier(drop_vs_previous_close: float, config: StrategyConfig)
     return multiplier
 
 
+# base_selection_reason values recorded per signal for the first-allocation base.
+BASE_BELOW_CLOSE_AND_LOW = "below_prior_close_and_low"  # $2 scale
+BASE_BELOW_CLOSE_ONLY = "below_prior_close_only"  # $1 scale
+BASE_NOT_BELOW_CLOSE = "not_below_prior_close_no_buy"  # $0, no buy
+
+
+def select_first_allocation_base_usd(
+    decision_price: float,
+    previous_close: float,
+    previous_low: Optional[float],
+    config: StrategyConfig,
+) -> tuple[float, str]:
+    """Select the first-allocation base dollar amount before the ladder multiplier.
+
+    Policy (applied per ticker before ``graded_buy_multiplier``):
+
+      * decision price not below the prior regular-session close -> $0 (no buy).
+      * below the prior close but not below the prior regular-session low ->
+        the reduced ``base_buy_amount_below_close_usd`` ($1) scale.
+      * below both the prior close and the prior low -> the full
+        ``base_buy_amount_usd`` ($2) scale.
+
+    A missing/unknown ``previous_low`` is treated conservatively as "not below the
+    low" so an unavailable low can never upgrade the base to the larger $2 scale.
+    """
+    if not (decision_price < previous_close):
+        return 0.0, BASE_NOT_BELOW_CLOSE
+    if (
+        previous_low is not None
+        and math.isfinite(previous_low)
+        and 0 < previous_low <= previous_close
+        and decision_price < previous_low
+    ):
+        return config.base_buy_amount_usd, BASE_BELOW_CLOSE_AND_LOW
+    return config.base_buy_amount_below_close_usd, BASE_BELOW_CLOSE_ONLY
+
+
 # Substrings (checked case-insensitively) that indicate a provider raised because the
 # ticker itself is unresolved/unlisted on that source (e.g. GFUZ on the finance
 # connector) rather than a transient failure. This distinction matters: reconcile_signals
@@ -1000,6 +1076,7 @@ def evaluate_source_signal(
 
     decision_price = decision_bar.close
     previous_close = previous_close_bar.close
+    previous_low = previous_close_bar.low
     lookback_price = lookback_bar.close
 
     # Signal-time quote is the intended execution target. Prefer a live quote from
@@ -1019,7 +1096,10 @@ def evaluate_source_signal(
     drop_vs_previous_close = (previous_close - decision_price) / previous_close
     drop_vs_previous_close_pct = drop_vs_previous_close * 100.0
     buy_multiplier = graded_buy_multiplier(drop_vs_previous_close, config)
-    suggested_amount_usd = config.base_buy_amount_usd * buy_multiplier
+    selected_base_amount_usd, base_selection_reason = select_first_allocation_base_usd(
+        decision_price, previous_close, previous_low, config
+    )
+    suggested_amount_usd = selected_base_amount_usd * buy_multiplier
 
     below_previous_close = decision_price < previous_close
     minimum_drop_met = drop_vs_previous_close >= config.minimum_drop_vs_previous_close
@@ -1062,6 +1142,9 @@ def evaluate_source_signal(
         drop_vs_previous_close_pct=drop_vs_previous_close_pct,
         buy_multiplier=buy_multiplier if action == Action.BUY else 0.0,
         suggested_amount_usd=suggested_amount_usd if action == Action.BUY else 0.0,
+        previous_low=previous_low,
+        selected_base_amount_usd=selected_base_amount_usd if action == Action.BUY else 0.0,
+        base_selection_reason=base_selection_reason,
         decision_bar_timestamp=decision_bar.timestamp,
         previous_close_timestamp=previous_close_bar.timestamp,
         lookback_bar_timestamp=lookback_bar.timestamp,
@@ -1109,19 +1192,30 @@ def reconcile_signals(
             )
 
     if finance_action == Action.BUY and robinhood_action == Action.BUY:
-        amount = min(
-            finance_signal.suggested_amount_usd,
-            robinhood_signal.suggested_amount_usd,
+        # Keep amount, base, AND multiplier all from the SAME winning signal --
+        # whichever produced the smaller suggested_amount_usd -- so the
+        # reconciled decision's own base * multiplier always equals its amount
+        # (Codex review: "Keep the winning amount's multiplier paired with its
+        # base", following "Preserve the base that produced the reconciled
+        # amount"). Independently taking min(base1, base2) and
+        # min(mult1, mult2) can each come from a DIFFERENT, non-winning signal
+        # -- e.g. finance $2*2.5x=$5 vs. Robinhood $1*3.5x=$3.50: amount is
+        # Robinhood's $3.50, so both its base ($1) and multiplier (3.5x) must
+        # be used together, not finance's mismatched 2.5x.
+        winning_signal = (
+            finance_signal
+            if finance_signal.suggested_amount_usd <= robinhood_signal.suggested_amount_usd
+            else robinhood_signal
         )
-        multiplier = min(finance_signal.buy_multiplier, robinhood_signal.buy_multiplier)
         return ReconciledDecision(
             ticker=ticker,
             action=Action.BUY,
             reason="finance and Robinhood agree on BUY",
             finance_signal=finance_signal,
             robinhood_signal=robinhood_signal,
-            buy_multiplier=multiplier,
-            suggested_amount_usd=amount,
+            buy_multiplier=winning_signal.buy_multiplier,
+            suggested_amount_usd=winning_signal.suggested_amount_usd,
+            selected_base_amount_usd=winning_signal.selected_base_amount_usd,
             **_target_fields(finance_signal),
         )
 
@@ -1143,6 +1237,7 @@ def reconcile_signals(
             robinhood_signal=robinhood_signal,
             buy_multiplier=robinhood_signal.buy_multiplier,
             suggested_amount_usd=robinhood_signal.suggested_amount_usd,
+            selected_base_amount_usd=robinhood_signal.selected_base_amount_usd,
             **_target_fields(robinhood_signal),
         )
 
@@ -1256,6 +1351,38 @@ def _afternoon_decision_price(decision: ReconciledDecision) -> Optional[float]:
     return _signal_target_price(decision)
 
 
+def resolve_top_up_desired_amount_usd(
+    prior: Optional[PriorSameDayAllocation],
+    current_multiplier: float,
+    current_suggested_amount_usd: float,
+    current_base_amount_usd: float,
+) -> tuple[float, float]:
+    """Return the same-day full-day target used by a top-up guard, base-preserved.
+
+    The first same-day allocation for a ticker fixes that day's first-allocation
+    base scale ($1 or $2, see select_first_allocation_base_usd); a later same-day
+    top-up must keep using THAT base and only re-apply its own run's ladder
+    multiplier (which legitimately varies with price), never recompute the base
+    from its own price. Otherwise a later, lower price that newly crosses the
+    prior regular-session low would silently upgrade the whole day's target from
+    the $1 to the $2 scale and over-order the incremental difference.
+
+    Falls back to ``current_suggested_amount_usd``/``current_base_amount_usd``
+    (the pre-existing behavior) when there is no prior allocation, or it
+    predates this field / could not be resolved -- never treat an unknown
+    preserved base as $0.
+
+    Returns ``(desired_amount_usd, effective_base_amount_usd)`` -- the latter is
+    whichever base actually produced ``desired_amount_usd``, so a caller
+    building a candidate-row artifact can persist the base that was ACTUALLY
+    used (Codex review: "Persist the preserved base on top-up candidates")
+    instead of always the current run's own freshly recomputed base.
+    """
+    if prior is not None and prior.selected_base_amount_usd and prior.selected_base_amount_usd > 0:
+        return round(prior.selected_base_amount_usd * current_multiplier, 2), prior.selected_base_amount_usd
+    return round(current_suggested_amount_usd, 2), current_base_amount_usd
+
+
 def evaluate_top_up_guard(
     decision: ReconciledDecision,
     prior: Optional[PriorSameDayAllocation],
@@ -1276,8 +1403,14 @@ def evaluate_top_up_guard(
       * Earlier amount is known but its reference price (or the current afternoon
         price) is missing -> conservative $0 with ``manual_review`` flagged, rather
         than topping up blind.
+
+    The full-day target (``desired``) reuses the first allocation's selected base
+    when known (see :func:`resolve_top_up_desired_amount_usd`) so a later, lower
+    price cannot silently upgrade the whole day's target to the $2 scale.
     """
-    desired = round(decision.suggested_amount_usd, 2)
+    desired, effective_base = resolve_top_up_desired_amount_usd(
+        prior, decision.buy_multiplier, decision.suggested_amount_usd, decision.selected_base_amount_usd
+    )
     afternoon_price = _afternoon_decision_price(decision)
 
     def _outcome(
@@ -1298,6 +1431,7 @@ def evaluate_top_up_guard(
             incremental_order_amount=round(max(0.0, incremental), 2),
             top_up_guard_result=result,
             skipped=skipped,
+            effective_base_amount_usd=effective_base,
             manual_review=manual_review,
         )
 
@@ -1331,11 +1465,14 @@ def _signal_row(ticker: str, source: str, signal: Optional[SourceSignal]) -> Dic
             "provider_error": None,
             "decision_bar_close": None,
             "previous_close": None,
+            "previous_low": None,
             "lookback_price": None,
             "price_vs_previous_close_pct": None,
             "intraday_trend_pct": None,
             "drop_vs_previous_close_pct": None,
             "buy_multiplier": None,
+            "selected_base_amount_usd": None,
+            "base_selection_reason": None,
             "decision_bar_timestamp": None,
             "previous_close_timestamp": None,
             "lookback_bar_timestamp": None,
@@ -1349,11 +1486,14 @@ def _signal_row(ticker: str, source: str, signal: Optional[SourceSignal]) -> Dic
         "provider_error": signal.provider_error,
         "decision_bar_close": signal.decision_price,
         "previous_close": signal.previous_close,
+        "previous_low": signal.previous_low,
         "lookback_price": signal.lookback_price,
         "price_vs_previous_close_pct": signal.price_vs_previous_close_pct,
         "intraday_trend_pct": signal.intraday_trend_pct,
         "drop_vs_previous_close_pct": signal.drop_vs_previous_close_pct,
         "buy_multiplier": signal.buy_multiplier,
+        "selected_base_amount_usd": signal.selected_base_amount_usd,
+        "base_selection_reason": signal.base_selection_reason,
         "suggested_amount_usd": signal.suggested_amount_usd,
         "decision_bar_timestamp": _iso_or_none(signal.decision_bar_timestamp),
         "previous_close_timestamp": _iso_or_none(signal.previous_close_timestamp),
@@ -1505,6 +1645,17 @@ def _build_buy_candidates(
             "ticker": decision.ticker,
             "reason": decision.reason,
             "buy_multiplier": decision.buy_multiplier,
+            # Recorded so a later same-day top-up guard reading this run back as
+            # prior-allocation context can reuse this run's base if it was the
+            # day's first allocation (see resolve_top_up_desired_amount_usd).
+            # When the guard is active, this must be the base that ACTUALLY
+            # produced planned_amount_usd (guard.effective_base_amount_usd --
+            # the preserved first-allocation base when reused), not this run's
+            # own freshly recomputed decision.selected_base_amount_usd (Codex
+            # review: "Persist the preserved base on top-up candidates").
+            "selected_base_amount_usd": (
+                guard.effective_base_amount_usd if guard is not None else decision.selected_base_amount_usd
+            ),
             "planned_amount_usd": round(planned_amount_usd, 2),
             "target_price": target_price,
             "target_price_missing": target_price is None,
@@ -1945,6 +2096,49 @@ def _prior_run_before_boundary(run_state: Dict[str, Any], boundary_et: time) -> 
     return parsed.astimezone(EASTERN).timetz().replace(tzinfo=None) < boundary_et
 
 
+def _prior_run_timestamp(raw: Optional[str]) -> Optional[datetime]:
+    """Parse a run_state ``generated_at`` string for chronological base comparisons.
+
+    Mirrors :func:`_prior_run_before_boundary`'s parsing (a naive timestamp is
+    assumed ET). Returns ``None`` when ``raw`` is missing/unparseable so callers
+    fall back to a conservative default rather than guess at ordering.
+    """
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=EASTERN)
+    return parsed.astimezone(EASTERN)
+
+
+def _earlier_selected_base(
+    existing_base: Optional[float],
+    existing_at: Optional[str],
+    alloc_base: Optional[float],
+    alloc_at: Optional[str],
+) -> tuple[Optional[float], Optional[str]]:
+    """Pick the base belonging to the chronologically FIRST of two allocations.
+
+    Used wherever two :class:`PriorSameDayAllocation` values for the same ticker
+    (typically from different roots/streams) are merged, so the day's base
+    always reflects the true first same-day allocation rather than whichever
+    side happened to be merged first (Codex review: "Select the base from the
+    chronologically first allocation" -- a later manual override loaded from the
+    afternoon root must not out-rank an earlier morning/midday allocation just
+    because the afternoon root is scanned first). Falls back to preferring
+    ``existing`` when either timestamp is missing/unparseable, matching the
+    default used before chronological comparison was possible.
+    """
+    existing_dt = _prior_run_timestamp(existing_at)
+    alloc_dt = _prior_run_timestamp(alloc_at)
+    if existing_dt is not None and alloc_dt is not None:
+        return (alloc_base, alloc_at) if alloc_dt < existing_dt else (existing_base, existing_at)
+    return (existing_base, existing_at) if existing_base is not None else (alloc_base, alloc_at)
+
+
 def _orders_csv_fills(
     run_dir: Path, *, orders_csv_file: Optional[Path] = None
 ) -> Dict[str, Dict[str, Any]]:
@@ -2118,7 +2312,17 @@ def load_prior_same_day_allocations(
     all_run_state_paths = sorted(
         set(p for root in all_roots if root.exists() for p in root.rglob("run_state*.json"))
     )
-    for run_state_path in all_run_state_paths:
+
+    # Parse every candidate artifact once, then process them in CHRONOLOGICAL
+    # (parsed generated_at) order rather than lexical path order (Codex review:
+    # "Sort first-allocation records by timestamp"): differently-named subtrees
+    # do not sort chronologically by path alone -- e.g. "manual_recovery/1100"
+    # sorts before "manual_runs/0900" even though 09:00 happened first -- which
+    # would lock the day's first-allocation base from the wrong run. A
+    # timestamp-less artifact falls back to (stable) path-scan order and sorts
+    # after every timestamped one, since its true position can't be established.
+    _parsed_runs: List[Tuple[Tuple[int, Any], Path, Dict[str, Any]]] = []
+    for _order, run_state_path in enumerate(all_run_state_paths):
         try:
             raw_text = run_state_path.read_text(encoding="utf-8")
         except (OSError, ValueError):
@@ -2143,6 +2347,14 @@ def load_prior_same_day_allocations(
             continue
         if run_state.get("trading_day") != trading_day_iso:
             continue
+
+        run_ts = _prior_run_timestamp(run_state.get("generated_at"))
+        sort_key = (0, run_ts) if run_ts is not None else (1, _order)
+        _parsed_runs.append((sort_key, run_state_path, run_state))
+
+    _parsed_runs.sort(key=lambda item: item[0])
+
+    for _, run_state_path, run_state in _parsed_runs:
         if _prior_run_is_scheduled(run_state) and not include_scheduled_afternoon:
             continue
         if not _prior_run_before_boundary(run_state, boundary_et):
@@ -2202,7 +2414,15 @@ def load_prior_same_day_allocations(
                                 continue
                             _entry = aggregated.setdefault(
                                 _ticker,
-                                {"amount": 0.0, "reference_price": None, "run_id": run_id, "source": source},
+                                {
+                                    "amount": 0.0,
+                                    "reference_price": None,
+                                    "run_id": run_id,
+                                    "source": source,
+                                    "selected_base_amount_usd": None,
+                                    "selected_base_amount_usd_at": None,
+                                    "selected_base_amount_usd_seen": False,
+                                },
                             )
                             _entry["amount"] += _amount
                             if _entry.get("reference_price_unknown"):
@@ -2215,6 +2435,14 @@ def load_prior_same_day_allocations(
                                     _entry["reference_price"] = _ref
                                 else:
                                     _entry["reference_price"] = min(_entry["reference_price"], _ref)
+                            # This CSV-reconstructed shape carries no base info -- if
+                            # this is the ticker's first contributing entry, lock the
+                            # base permanently unknown (Codex review: "Do not infer a
+                            # first-allocation base from a later run") rather than
+                            # leaving it open for a later run's own base to fill in.
+                            if not _entry["selected_base_amount_usd_seen"]:
+                                _entry["selected_base_amount_usd_at"] = run_state.get("generated_at")
+                                _entry["selected_base_amount_usd_seen"] = True
                             _entry["run_id"] = run_id
                             _entry["source"] = source
         for candidate in buy_candidates_raw or []:
@@ -2267,14 +2495,34 @@ def load_prior_same_day_allocations(
             # price_not_below/no_incremental. Keep that path unknown so the guard
             # routes to missing_prior_price -> $0 + manual review.
             reference_price = None
+            base_amount_usd = None
             if status == "filled" or fill is not None:
                 reference_price = _candidate_logged_reference_price(candidate)
                 if reference_price is None and fill is not None:
                     reference_price = fill["avg_fill_price"]
+                # Same confirmed-capital-movement gate as reference_price: an
+                # unconfirmed submitted candidate's base is not trusted as the
+                # day's fixed first-allocation base either.
+                try:
+                    base_amount_usd = float(candidate.get("selected_base_amount_usd"))
+                except (TypeError, ValueError):
+                    base_amount_usd = None
+                if base_amount_usd is not None and not (
+                    math.isfinite(base_amount_usd) and base_amount_usd > 0
+                ):
+                    base_amount_usd = None
 
             entry = aggregated.setdefault(
                 ticker,
-                {"amount": 0.0, "reference_price": None, "run_id": run_id, "source": source},
+                {
+                    "amount": 0.0,
+                    "reference_price": None,
+                    "run_id": run_id,
+                    "source": source,
+                    "selected_base_amount_usd": None,
+                    "selected_base_amount_usd_at": None,
+                    "selected_base_amount_usd_seen": False,
+                },
             )
             entry["amount"] += amount
             # If ANY contributing prior price is unknown, the whole aggregated
@@ -2291,8 +2539,20 @@ def load_prior_same_day_allocations(
                     entry["reference_price"] = reference_price
                 else:
                     entry["reference_price"] = min(entry["reference_price"], reference_price)
-            # Keep the most recently scanned run's identity (rglob is sorted, so later
-            # timestamped directories win) for auditability.
+            # Only the ticker's FIRST contributing entry sets the base (_parsed_runs
+            # is processed in chronological, parsed-generated_at order -- see above)
+            # -- gated on a "seen" flag, not on the stored value being None, so a
+            # first allocation with an unresolved/untrusted base permanently locks
+            # the base unknown rather than letting a later run's own (possibly
+            # requalified) base fill it in (Codex review: "Do not infer a
+            # first-allocation base from a later run"). See
+            # resolve_top_up_desired_amount_usd for how the guard consumes this.
+            if not entry["selected_base_amount_usd_seen"]:
+                entry["selected_base_amount_usd"] = base_amount_usd
+                entry["selected_base_amount_usd_at"] = run_state.get("generated_at")
+                entry["selected_base_amount_usd_seen"] = True
+            # Keep the most recently scanned (chronologically last) run's identity
+            # for auditability.
             entry["run_id"] = run_id
             entry["source"] = source
 
@@ -2303,6 +2563,8 @@ def load_prior_same_day_allocations(
             reference_price=entry["reference_price"],
             run_id=entry["run_id"],
             source=entry["source"],
+            selected_base_amount_usd=entry.get("selected_base_amount_usd"),
+            selected_base_amount_usd_at=entry.get("selected_base_amount_usd_at"),
         )
         for ticker, entry in aggregated.items()
     }
@@ -2346,12 +2608,25 @@ def load_prior_same_day_allocations_multi(
                 ref = None
             else:
                 ref = min(existing.reference_price, alloc.reference_price)
+            # Pick the chronologically FIRST allocation's base -- state_roots is
+            # not guaranteed to be scanned in true chronological order (Codex
+            # review: "Select the base from the chronologically first
+            # allocation"), so compare each side's own selected_base_amount_usd_at
+            # rather than assuming whichever root came first in the caller's list.
+            base, base_at = _earlier_selected_base(
+                existing.selected_base_amount_usd,
+                existing.selected_base_amount_usd_at,
+                alloc.selected_base_amount_usd,
+                alloc.selected_base_amount_usd_at,
+            )
             merged[ticker] = PriorSameDayAllocation(
                 ticker=ticker,
                 amount_usd=round(existing.amount_usd + alloc.amount_usd, 2),
                 reference_price=ref,
                 run_id=alloc.run_id or existing.run_id,
                 source=alloc.source or existing.source,
+                selected_base_amount_usd=base,
+                selected_base_amount_usd_at=base_at,
             )
     return merged
 
@@ -2413,6 +2688,16 @@ def merge_manual_top_up_context(
             reference_price=ref,
             run_id=existing.run_id,
             source=existing.source or "manual_top_up_context",
+            # PriorAllocation (scripts.run_classification) carries no timestamp,
+            # so there is no way to tell whether this bare-CSV-only manual fill
+            # actually happened before or after `existing`'s already-resolved
+            # base. Poison to unknown rather than silently keep `existing`'s
+            # base as if it were still the true first allocation's (Codex
+            # review: "Keep the base unknown after merging an earlier manual
+            # fill") -- this mirrors reference_price's own poison-on-uncertainty
+            # policy above.
+            selected_base_amount_usd=None,
+            selected_base_amount_usd_at=None,
         )
 
 
@@ -3129,7 +3414,12 @@ def _process_buy_candidate(
 
 
     if kill_switch_engaged(replace(config, deployed_last_7d_usd=running_deployed_7d)):
-        order_amount = min(order_amount, config.base_buy_amount_usd)
+        # Cap at THIS candidate's own selected base ($1 or $2), not the fixed
+        # config.base_buy_amount_usd ($2) -- a below-close-only candidate's 1x
+        # kill-switch amount is $1, and capping it at $2 would let it submit
+        # double the reduced-scale risk cap the kill switch is meant to enforce
+        # (Codex review: "Cap the kill switch at the selected base").
+        order_amount = min(order_amount, decision.selected_base_amount_usd)
 
     if guard_active:
         outcome = evaluate_top_up_guard(

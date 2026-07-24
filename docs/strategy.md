@@ -11,9 +11,12 @@ those files in prose.
 
 Each trading weekday, near the close, the strategy inspects the drop of each
 active ticker versus its previous regular-session close and, if the buy signal
-fires, places a single market buy sized by a graded multiplier of a **$2 base
-amount**. All buys pass a review gate and respect the selected tiered
-daily/weekly budget caps. It never sells.
+fires, places a single market buy sized by a graded multiplier of a **dynamic
+first-allocation base amount**. The base is selected before the ladder: below the
+prior close **and** the prior regular-session low uses a **$2 base**; below the
+prior close **only** (not below the prior low) uses a reduced **$1 base**; not
+below the prior close is **no buy**. All buys pass a review gate and respect the
+selected tiered daily/weekly budget caps. It never sells.
 
 The strategy identity is the **All Stock graded DCA live test**. Live execution
 is on **Robinhood account `562057042` only**; Alpaca is read-only validation /
@@ -28,7 +31,11 @@ A buy signal fires for a ticker only when **all three** conditions hold:
 3. The ladder **multiplier is > 0** (i.e. the drop is at least 0.1%).
 
 The order dollar amount before budget constraints is
-`base_amount_usd × multiplier` = `$2 × multiplier`.
+`selected_base_amount_usd × multiplier`, where `selected_base_amount_usd` is the
+dynamic first-allocation base: **$2** when the decision price is below the prior
+close **and** the prior regular-session low, or **$1** when it is below the prior
+close **only**. A missing prior low is treated conservatively as not-below-low
+(the **$1** scale).
 
 The **morning (10:30)** and **midday (12:30)** live streams keep requiring all
 three conditions, including the 60-minute downward-trend filter (condition 2),
@@ -42,7 +49,7 @@ downward-trend filter** (condition 2 above). Every other gate still applies:
 
 - current / decision price **strictly below the prior completed regular-session
   close**,
-- ladder **multiplier > 0** (from the $2-base 0x-to-5x ladder),
+- ladder **multiplier > 0** (from the dynamic-base 0x-to-5x ladder),
 - **data-confidence** check passes,
 - **`spread_ok=true`**,
 - **budget / tiered-cap** pass,
@@ -83,22 +90,23 @@ INTC GOOGL GOOG AMZN GLW MA GS MU NFLX XLG TOPT QTOP SATA RGTI IBM GFUZ TXN
 
 ## Sizing ladder (latest, active)
 
-Maps the drop vs. previous close to a buy multiplier of the $2 base amount.
+Maps the drop vs. previous close to a buy multiplier, applied to the selected
+first-allocation base ($2 below prior close and low, $1 below prior close only).
 Boundaries are min-inclusive, max-exclusive. There is **no upper cutoff**: any
 drop of 8% or more is 5x. See [`config/sizing_ladder.json`](../config/sizing_ladder.json).
 
-| Drop vs. prior close | Multiplier | Dollars (base $2) |
-|---|---|---|
-| < 0.1%          | 0x (no buy) | $0.00 |
-| 0.1% to < 1%    | 1x   | $2.00 |
-| 1% to < 2%      | 1.5x | $3.00 |
-| 2% to < 3%      | 2x   | $4.00 |
-| 3% to < 4%      | 2.5x | $5.00 |
-| 4% to < 5%      | 3x   | $6.00 |
-| 5% to < 6%      | 3.5x | $7.00 |
-| 6% to < 7%      | 4x   | $8.00 |
-| 7% to < 8%      | 4.5x | $9.00 |
-| >= 8%           | 5x   | $10.00 |
+| Drop vs. prior close | Multiplier | Dollars ($2 base) | Dollars ($1 base) |
+|---|---|---|---|
+| < 0.1%          | 0x (no buy) | $0.00 | $0.00 |
+| 0.1% to < 1%    | 1x   | $2.00 | $1.00 |
+| 1% to < 2%      | 1.5x | $3.00 | $1.50 |
+| 2% to < 3%      | 2x   | $4.00 | $2.00 |
+| 3% to < 4%      | 2.5x | $5.00 | $2.50 |
+| 4% to < 5%      | 3x   | $6.00 | $3.00 |
+| 5% to < 6%      | 3.5x | $7.00 | $3.50 |
+| 6% to < 7%      | 4x   | $8.00 | $4.00 |
+| 7% to < 8%      | 4.5x | $9.00 | $4.50 |
+| >= 8%           | 5x   | $10.00 | $5.00 |
 
 ### Historical / superseded ladders
 
@@ -109,19 +117,28 @@ ladder," treat it as background context, not the current rule.
 
 ## Budget & tiered cap rules
 
-Base amount is exactly **$2.00**. See
+The first-allocation base is dynamic: **$2.00** when the decision price is below
+the prior close **and** the prior regular-session low, **$1.00** when below the
+prior close **only** (a missing prior low is treated as below-close-only), and
+**no buy** when not below the prior close. See
 [`config/budgets.json`](../config/budgets.json) (`base_amount_policy`). Every
-candidate dollar amount is **`$2.00 × multiplier`**. The automation must never
-infer, discover, or fall back to **$50.00** or any broker/account default base
-amount. If the base-amount config is missing or unreadable, continue using
-**$2.00** as a hardcoded, user-confirmed fallback.
+candidate dollar amount is **`selected_base_amount_usd × multiplier`**. The
+automation must never infer, discover, or fall back to **$50.00** or any
+broker/account default base amount. If the base-amount config is missing or
+unreadable, continue using **$2.00** (below close and low) or **$1.00** (below
+close only) as hardcoded, user-confirmed fallbacks.
+
+> **Dynamic first-allocation base (Jul 24 2026):** the user approved a dynamic
+> base for the first same-day allocation per ticker: **$2** below the prior close
+> and prior low, **$1** below the prior close only, no buy otherwise. The order
+> amount is `selected_base × multiplier`. The max per order is unchanged at $10
+> (5x x $2); the $1 scale tops out at $5. Ladder multipliers, the ticker
+> universe, exclusions, budget caps, the top-up guard, pre-authorization,
+> confidence, recovery, and all other safety rules are unchanged.
 
 > **Base-amount change (Jul 19 2026):** the user changed all future DCA
-> scheduled runs from a $3 base amount to a $2 base amount. The order amount is
-> now $2 x multiplier, and the max per order is $10 under the 5x tier. Ladder
-> multipliers, the ticker universe, exclusions, budget caps, the top-up guard,
-> pre-authorization, confidence, recovery, and all other safety rules are
-> unchanged.
+> scheduled runs from a $3 base amount to a $2 base amount. Superseded by the
+> dynamic first-allocation base above; retained for history.
 
 The daily and weekly caps are not fixed: each run selects a budget tier from the
 day's planned spend and the number of **3x-or-greater signals** (buy candidates
@@ -208,7 +225,7 @@ same-day allocations (buying only the incremental difference into a lower price)
 and midday fills in turn become prior-allocation context for the afternoon guard.
 The morning stream ([morning_dca.md](morning_dca.md)) and the midday stream
 ([midday_dca.md](midday_dca.md), a 12:30 PM ET live execution) both run the same
-shared $2-base 0x-to-5x ladder as the afternoon run — as of the Fri Jul 10 2026
+shared dynamic-base 0x-to-5x ladder as the afternoon run — as of the Fri Jul 10 2026
 live-automation update every live stream shares one ladder (the former morning
 0x-to-3x ladder is historical/superseded). Both are independent of the afternoon
 3:20 PM task and never count as afternoon scheduled evidence.

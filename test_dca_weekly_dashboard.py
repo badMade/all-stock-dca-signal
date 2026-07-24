@@ -7,7 +7,32 @@ from pathlib import Path
 
 import pytest
 
-from dca_weekly_dashboard import _is_manual_run_state, load_json_files, load_scheduled_run_states
+from dca_weekly_dashboard import (
+    _is_manual_run_state,
+    build_graded_vs_fixed,
+    load_json_files,
+    load_scheduled_run_states,
+)
+
+
+def test_build_graded_vs_fixed_uses_per_candidate_dynamic_base():
+    # Codex review ("Apply the dynamic base to the analytics baseline"): the fixed
+    # 1x baseline must use each candidate's OWN selected_base_amount_usd ($1 or $2),
+    # not a single flat base for every candidate that day.
+    run_states = [
+        {
+            "trading_day": "2026-07-24",
+            "budget": {"base_amount_usd": 2.0},
+            "buy_candidates": [
+                {"planned_amount_usd": 2.0, "selected_base_amount_usd": 1.0},  # $1 base
+                {"planned_amount_usd": 4.0, "selected_base_amount_usd": 2.0},  # $2 base
+                {"planned_amount_usd": 3.0},  # no recorded base -> falls back to the run's flat $2 base
+            ],
+        }
+    ]
+    report = build_graded_vs_fixed(run_states)
+    assert "$9.00" in report  # graded: 2 + 4 + 3
+    assert "$5.00" in report  # fixed: 1 (own base) + 2 (own base) + 2 (fallback), not 2 * 3 = 6
 
 
 def test_is_manual_run_state_no_classification():

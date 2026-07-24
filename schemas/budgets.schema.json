@@ -7,6 +7,7 @@
   "additionalProperties": true,
   "properties": {
     "base_amount_usd": { "type": "number", "minimum": 0 },
+    "base_amount_below_close_usd": { "type": "number", "minimum": 0 },
     "high_multiplier_threshold": { "type": "number", "minimum": 0 },
     "weekly_rollover_reserve_cap_usd": { "type": "number", "minimum": 0 },
     "monthly_cash_allocation_usd": { "type": "number", "minimum": 0 },

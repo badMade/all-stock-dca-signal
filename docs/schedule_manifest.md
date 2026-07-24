@@ -446,20 +446,30 @@ Feb, Nov, Dec). Re-verify around DST transitions.
 > incremental difference only when its decision price is strictly below the prior
 > reference price); midday fills in turn count only as prior-allocation context
 > for the afternoon 3:20 PM top-up guard. See [midday_dca.md](midday_dca.md).
-> **Base-amount note:** the graded DCA base amount is exactly **$2.00**; every
-> candidate dollar amount is **`$2.00 × multiplier`**. The automation must never
-> infer, discover, or fall back to **$50.00** or any broker/account default. If
-> the base-amount config (`config/budgets.json`) is missing or unreadable,
-> continue using **$2.00** as a hardcoded, user-confirmed fallback.
+> **Base-amount note:** the graded DCA first-allocation base is dynamic: **$2.00**
+> when the decision price is below the prior close **and** the prior
+> regular-session low, **$1.00** when below the prior close **only** (a missing
+> prior low is treated as below-close-only), and **no buy** when not below the
+> prior close. Every candidate dollar amount is
+> **`selected_base_amount_usd × multiplier`**. The automation must never infer,
+> discover, or fall back to **$50.00** or any broker/account default. If the
+> base-amount config (`config/budgets.json`) is missing or unreadable, continue
+> using **$2.00** (below close and low) or **$1.00** (below close only) as
+> hardcoded, user-confirmed fallbacks.
+
+> **Dynamic first-allocation base (Jul 24 2026):** the user approved a dynamic
+> base for the first same-day allocation per ticker: **$2** below the prior close
+> and prior low, **$1** below the prior close only, no buy otherwise. The order
+> amount is `selected_base × multiplier`. The per-order ceiling is unchanged at
+> $10 (5x x $2); the $1 scale tops out at $5. This applies to every
+> universe-bearing live and analytics task below (morning 10:30, midday 12:30,
+> afternoon 3:20, and the analytics/monitor scans). Ladder multipliers, the
+> ticker universe, exclusions, budget caps, the top-up guard, pre-authorization,
+> confidence, recovery, and all other safety rules are unchanged.
 
 > **Base-amount change (Jul 19 2026):** the user changed all future DCA
-> scheduled runs from a $3 base amount to a $2 base amount. The order amount is
-> now $2 x multiplier, and the max per order is $10 under the 5x tier. This
-> applies to every universe-bearing live and analytics task below (morning
-> 10:30, midday 12:30, afternoon 3:20, and the analytics/monitor scans). Ladder
-> multipliers, the ticker universe, exclusions, budget caps, the top-up guard,
-> pre-authorization, confidence, recovery, and all other safety rules are
-> unchanged.
+> scheduled runs from a $3 base amount to a $2 base amount. Superseded by the
+> dynamic first-allocation base above; retained for history.
 
 > **Missed 10:30 morning run recovery (added Jul 20 2026):** when the scheduled
 > **10:30 AM ET morning live task did not run**, a human-triggered **manual

@@ -9,6 +9,7 @@
     "version": { "type": "string" },
     "status": { "type": "string", "enum": ["active", "historical", "backtest_analytics"] },
     "base_amount_usd": { "type": "number", "minimum": 0 },
+    "base_amount_below_close_usd": { "type": "number", "minimum": 0 },
     "no_buy_below_pct": { "type": "number" },
     "tiers": {
       "type": "array",

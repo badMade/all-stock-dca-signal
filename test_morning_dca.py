@@ -59,7 +59,7 @@ from morning_dca import (
     preflight_eligibility,
     preflight_ticker_eligibility_row,
 )
-from near_close_dca import EASTERN, Action, Bar, DryRunBroker, SourceName
+from near_close_dca import EASTERN, Action, Bar, DryRunBroker, PriorSameDayAllocation, SourceName
 
 
 def _now_live():
@@ -256,6 +256,49 @@ def test_signal_amounts_and_actions():
     assert sigs["SMALL"].hypothetical_amount_usd == 5.0
     assert sigs["BIG"].multiplier == 5.0  # 10% drop -> 5x
     assert sigs["BIG"].hypothetical_amount_usd == 10.0
+
+
+class FixedDropProviderWithLow(FixedDropProvider):
+    """FixedDropProvider whose prior regular-session bar carries a distinct low.
+
+    The base provider sets the prior bar's low equal to the prior close, so it cannot
+    exercise the dynamic first-allocation base (which needs the prior low to differ from
+    the prior close). This variant lets a test straddle the prior low.
+    """
+
+    def __init__(self, source, previous_close, drops, *, previous_low):
+        super().__init__(source, previous_close, drops)
+        self._prev_low = previous_low
+
+    def get_previous_close_bar(self, ticker, as_of):
+        ts = datetime.combine(
+            as_of.astimezone(EASTERN).date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN
+        )
+        return Bar(timestamp=ts, open=self._prev, high=self._prev, low=self._prev_low, close=self._prev, volume=0.0)
+
+
+def test_morning_dynamic_first_allocation_base():
+    # Two tickers at the same 3% drop (2.5x) but on opposite sides of the prior low.
+    # SHALLOW closes at 97 (below prior close 100, above prior low 96) -> $1 base -> $2.50.
+    # DEEP closes at 97 too but with a higher prior low so it is below both -> $2 base -> $5.00.
+    cfg = MorningConfig(tickers=("SHALLOW",), base_buy_amount_usd=2.0, base_buy_amount_below_close_usd=1.0)
+    ex = MorningDCAExecutor(cfg)
+    shallow = FixedDropProviderWithLow(SourceName.ROBINHOOD, 100.0, {"SHALLOW": 0.03}, previous_low=96.0)
+    sig = ex.evaluate(_now(), shallow)[0]
+    assert sig.action == Action.BUY
+    assert sig.multiplier == 2.5
+    assert sig.previous_low == 96.0
+    assert sig.selected_base_amount_usd == 1.0
+    assert sig.base_selection_reason == "below_prior_close_only"
+    assert sig.hypothetical_amount_usd == 2.5
+
+    cfg_deep = MorningConfig(tickers=("DEEP",), base_buy_amount_usd=2.0, base_buy_amount_below_close_usd=1.0)
+    deep = FixedDropProviderWithLow(SourceName.ROBINHOOD, 100.0, {"DEEP": 0.03}, previous_low=98.0)
+    sig_deep = MorningDCAExecutor(cfg_deep).evaluate(_now(), deep)[0]
+    assert sig_deep.action == Action.BUY
+    assert sig_deep.selected_base_amount_usd == 2.0
+    assert sig_deep.base_selection_reason == "below_prior_close_and_low"
+    assert sig_deep.hypothetical_amount_usd == 5.0
 
 
 class FixedQuoteProvider(FixedDropProvider):
@@ -3374,6 +3417,47 @@ def _write_prior_run_state(root: Path, ticker: str, *, amount_usd: float, decisi
         }),
         encoding="utf-8",
     )
+
+
+def test_morning_evaluate_top_up_reuses_first_allocation_base():
+    # Codex review ("Preserve the first allocation's base for same-day top-ups"),
+    # exercised through morning_dca's own _evaluate_top_up (the same class of
+    # same-day top-up guard as near_close_dca.evaluate_top_up_guard). An earlier
+    # same-day run bought using the $1 base for $2 total (1.0 * 2x); this run's OWN
+    # price would freshly select the $2 base, but the guard must keep the $1 base
+    # with this run's own 4x multiplier rather than upgrade the whole day's target.
+    ex = MorningDCAExecutor(MorningConfig())
+    prior = PriorSameDayAllocation(
+        "AAPL",
+        amount_usd=2.0,
+        reference_price=98.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=1.0,
+    )
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=94.0,
+        previous_close=100.0,
+        drop_pct=6.0,
+        multiplier=4.0,
+        hypothetical_amount_usd=8.0,  # recomputed (incorrectly) at this run's own $2 base: 2.0 * 4.0
+        selected_base_amount_usd=2.0,
+    )
+    outcome = ex._evaluate_top_up(signal, prior)
+    assert outcome.desired_amount == 4.0  # 1.0 (preserved base) * 4x, not 2.0 * 4x
+    assert outcome.incremental_order_amount == 2.0  # 4.0 - 2.0, not 8.0 - 2.0 == 6.0
+    # Codex review ("Persist the preserved base on top-up candidates"): the
+    # guard must expose the PRESERVED $1 base it actually used, not this
+    # signal's own freshly recomputed $2 base.
+    assert outcome.effective_base_amount_usd == 1.0
+
+    row = signal.to_row()
+    ex._augment_buy_candidate_row(row, signal, {"AAPL": outcome})
+    assert row["selected_base_amount_usd"] == 1.0
 
 
 def test_morning_top_up_guard_buys_incremental_when_prior_fill_exists(tmp_path):

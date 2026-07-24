@@ -192,6 +192,13 @@ def load_midday_config(config_dir=None) -> MiddayConfig:
     sizing = raw.get("sizing_ladder", {})
     if "base_amount_usd" in sizing:
         kwargs["base_buy_amount_usd"] = float(sizing["base_amount_usd"])
+    # Mirrors load_morning_config: without this, an operator-configured
+    # base_amount_below_close_usd silently has no effect on the midday stream and
+    # below-close-only midday orders fall back to MiddayConfig's hardcoded $1
+    # default regardless of what the config says (Codex review: "Route the
+    # reduced base through the midday configuration").
+    if "base_amount_below_close_usd" in sizing:
+        kwargs["base_buy_amount_below_close_usd"] = float(sizing["base_amount_below_close_usd"])
     if "no_buy_below_pct" in sizing:
         kwargs["minimum_drop_vs_previous_close"] = float(sizing["no_buy_below_pct"]) / 100.0
     if "tiers" in sizing:
