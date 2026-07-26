@@ -150,14 +150,11 @@ def aggregate_usage(
         if usage.get("manual_recovery_required"):
             manual_recovery_runs += 1
 
-    # ⚡ Bolt Optimization: Collect valid usage dicts once and invert the loop.
-    # Outer loop over known numeric fields avoids per-row usage.items() iteration and
-    # reduces repeated writes to the totals dict.
+    # ⚡ Jules Optimization: Fast aggregation using sum() across each target field.
+    # Restructures logic to process each target field once across all dictionaries.
+    # Uses a generator expression to avoid allocating an intermediate list.
     for field in _NUMERIC_PROXY_FIELDS:
-        total = 0.0
-        for u in valid_usages:
-            total += _num(u.get(field))
-        totals[field] = total
+        totals[field] = sum(_num(u.get(field)) for u in valid_usages)
 
     components: List[Dict[str, Any]] = []
     estimated_total = 0.0
