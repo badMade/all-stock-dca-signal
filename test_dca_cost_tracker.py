@@ -17,6 +17,7 @@ from dca_cost_tracker import (
     build_cost_tracker_markdown,
     build_cost_tracker_payload,
     collect_month_run_states,
+    find_run_state_files,
     generate_cost_tracker,
 )
 
@@ -173,6 +174,51 @@ def test_generate_cost_tracker_writes_files(tmp_path):
     payload = json.loads(Path(paths["payload"]).read_text())
     assert payload["month_label"] == "2026-06"
     assert payload["aggregate"]["run_count"] == 2
+
+
+
+def test_find_run_state_files(tmp_path):
+    # Setup some test files
+    dir_b = tmp_path / "runs" / "b"
+    dir_b.mkdir(parents=True, exist_ok=True)
+    file_b = dir_b / "run_state.json"
+    file_b.write_text("{}")
+
+    dir_a = tmp_path / "runs" / "a"
+    dir_a.mkdir(parents=True, exist_ok=True)
+    file_a = dir_a / "run_state.json"
+    file_a.write_text("{}")
+
+    dir_c = tmp_path / "runs" / "c"
+    dir_c.mkdir(parents=True, exist_ok=True)
+    (dir_c / "other.json").write_text("{}")
+
+    file_root = tmp_path / "run_state.json"
+    file_root.write_text("{}")
+
+    # Test directory searching and sorting
+    found_files = find_run_state_files(tmp_path)
+
+    # We expect file_root, file_a, file_b in some sorted order
+    # rglob returns path objects that sort alphabetically by their full path
+    # 'a' comes before 'b', and 'run_state.json' might come before 'runs' depending on sorting
+    # Path sorting is consistent, let's just assert on the set first and then order
+
+    expected_paths = {file_root, file_a, file_b}
+    assert set(found_files) == expected_paths
+    assert len(found_files) == 3
+
+    # check that sorting is deterministic (path sorting)
+    assert found_files == sorted([file_root, file_a, file_b])
+
+    # Test direct file path
+    found_single = find_run_state_files(file_a)
+    assert found_single == [file_a]
+
+    # Test empty directory
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir(parents=True, exist_ok=True)
+    assert find_run_state_files(empty_dir) == []
 
 
 def _run_all():
