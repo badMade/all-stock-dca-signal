@@ -1013,6 +1013,46 @@ def test_fills_from_order_history_payload_rejects_non_finite_prices_and_quantiti
     )
 
 
+def test_write_csv_happy_path(tmp_path):
+    import csv
+
+    from dca_reporting import _write_csv
+
+    path = tmp_path / "test.csv"
+    rows = [{"A": 1, "B": "foo"}, {"A": 2, "B": "bar"}]
+    fieldnames = ["A", "B"]
+
+    _write_csv(path, rows, fieldnames)
+
+    assert path.exists()
+    with path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        assert reader.fieldnames == ["A", "B"]
+        data = list(reader)
+        assert len(data) == 2
+        assert data[0] == {"A": "1", "B": "foo"}
+        assert data[1] == {"A": "2", "B": "bar"}
+
+
+def test_write_csv_empty_rows(tmp_path):
+    import csv
+
+    from dca_reporting import _write_csv
+
+    path = tmp_path / "test.csv"
+    _write_csv(path, [{"A": 1, "B": "foo"}], ["A", "B"])
+    assert path.exists()
+
+    # Re-writing with an empty row set must still overwrite the file with a
+    # header-only CSV (per generate_reports' four-file contract) rather than
+    # leaving the previous run's stale row behind.
+    _write_csv(path, [], ["A", "B"])
+    assert path.exists()
+    with path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        assert reader.fieldnames == ["A", "B"]
+        assert list(reader) == []
+
 
 def test_run_classification_helpers():
     from dca_reporting import _run_classification_helpers
