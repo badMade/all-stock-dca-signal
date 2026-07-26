@@ -13,6 +13,7 @@ from pathlib import Path
 from dca_cost_tracker import (
     COST_TRACKER_TITLE,
     _month_prefix,
+    _num,
     aggregate_usage,
     build_cost_tracker_markdown,
     build_cost_tracker_payload,
@@ -175,6 +176,17 @@ def test_generate_cost_tracker_writes_files(tmp_path):
     assert payload["month_label"] == "2026-06"
     assert payload["aggregate"]["run_count"] == 2
 
+
+
+def test_num():
+    assert _num(10) == 10.0
+    assert _num("42.5") == 42.5
+    assert _num("-3") == -3.0
+    assert _num(0) == 0.0
+    assert _num(None) == 0.0
+    assert _num("invalid") == 0.0
+    assert _num([]) == 0.0
+    assert _num({}) == 0.0
 
 
 def test_find_run_state_files(tmp_path):
