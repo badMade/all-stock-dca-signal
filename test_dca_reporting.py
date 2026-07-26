@@ -14,6 +14,7 @@ from dca_notion_sync import (
 )
 from dca_reporting import (
     _is_manual_run_state,
+    _to_float,
     build_latest_run_summary,
     build_missing_fills,
     compute_slippage_rows,
@@ -1011,6 +1012,27 @@ def test_fills_from_order_history_payload_rejects_non_finite_prices_and_quantiti
     assert set(by_ticker) == {"AMZN"}, (
         f"non-finite price/quantity orders must be rejected, got {sorted(by_ticker)}"
     )
+
+
+def test_to_float():
+    """Test _to_float safely converts values to float or returns None."""
+    cases = [
+        (10.5, 10.5),
+        ("10.5", 10.5),
+        (10, 10.0),
+        ("10", 10.0),
+        ("-5.2", -5.2),
+        (0, 0.0),
+        ("0", 0.0),
+        (None, None),
+        ("", None),
+        ("abc", None),
+        ("10.5a", None),
+        ([], None),
+        ({}, None),
+    ]
+    for value, expected in cases:
+        assert _to_float(value) == expected
 
 
 def test_write_csv_happy_path(tmp_path):
