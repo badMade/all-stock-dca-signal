@@ -8,6 +8,7 @@ from datetime import date
 import pytest
 
 from dca_config import (
+    _default_config_dir,
     _read_json,
     load_approved_dates,
     load_budgets,
@@ -168,3 +169,16 @@ def test_read_json_valid(tmp_path):
     file_path = tmp_path / "valid.json"
     file_path.write_text('{"key": "value"}', encoding="utf-8")
     assert _read_json(file_path) == {"key": "value"}
+
+def test_default_config_dir_basic(monkeypatch):
+    """Test that _default_config_dir returns an absolute path ending with 'config' when DCA_CONFIG_DIR is not set."""
+    monkeypatch.delenv("DCA_CONFIG_DIR", raising=False)
+    config_dir = _default_config_dir()
+    assert config_dir.is_absolute()
+    assert config_dir.name == "config"
+
+def test_default_config_dir_env_override(monkeypatch, tmp_path):
+    """DCA_CONFIG_DIR, when set, is returned verbatim even if it doesn't end with 'config'."""
+    override_dir = tmp_path / "etc" / "all-stock-dca"
+    monkeypatch.setenv("DCA_CONFIG_DIR", str(override_dir))
+    assert _default_config_dir() == override_dir
