@@ -1013,6 +1013,18 @@ def test_fills_from_order_history_payload_rejects_non_finite_prices_and_quantiti
     )
 
 
+
+def test_run_classification_helpers():
+    from dca_reporting import _run_classification_helpers
+
+    collect_manual_order_ids, select_scheduled_state_for_reporting = _run_classification_helpers()
+
+    assert callable(collect_manual_order_ids)
+    assert callable(select_scheduled_state_for_reporting)
+    assert collect_manual_order_ids.__name__ == "collect_manual_order_ids"
+    assert select_scheduled_state_for_reporting.__name__ == "select_scheduled_state_for_reporting"
+
+
 def test_is_manual_run_state():
     cases = [
         ({"run_classification": {"run_origin": "manual"}}, True),
@@ -1039,7 +1051,6 @@ def test_load_run_state(tmp_path):
 
     loaded_data = load_run_state(state_file)
     assert loaded_data == expected_data
-
 
 def _run_all():
     import inspect
