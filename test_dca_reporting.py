@@ -13,6 +13,7 @@ from dca_notion_sync import (
     build_notion_sync_payload,
 )
 from dca_reporting import (
+    _is_manual_run_state,
     build_latest_run_summary,
     build_missing_fills,
     compute_slippage_rows,
@@ -1010,6 +1011,25 @@ def test_fills_from_order_history_payload_rejects_non_finite_prices_and_quantiti
     assert set(by_ticker) == {"AMZN"}, (
         f"non-finite price/quantity orders must be rejected, got {sorted(by_ticker)}"
     )
+
+
+def test_is_manual_run_state():
+    cases = [
+        ({"run_classification": {"run_origin": "manual"}}, True),
+        ({"run_classification": {"manual_run": True}}, True),
+        ({"run_classification": {"run_origin": "manual", "manual_run": True}}, True),
+        ({"run_classification": {"run_origin": "scheduled"}}, False),
+        ({"run_classification": {"manual_run": False}}, False),
+        ({"run_classification": {}}, False),
+        ({"run_classification": None}, False),
+        ({"run_classification": "invalid_type"}, False),
+        ({}, False),
+        (None, False),
+        ([], False),
+        ("not_a_dict", False),
+    ]
+    for run_state, expected in cases:
+        assert _is_manual_run_state(run_state) is expected
 
 
 def test_load_run_state(tmp_path):
