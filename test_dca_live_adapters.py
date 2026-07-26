@@ -12,6 +12,7 @@ from dca_live_adapters import (
     RobinhoodDataProvider,
     _interpret_review,
     _parse_rfc3339,
+    _response_failure,
     _rh_interval,
     _to_float,
 )
@@ -736,3 +737,29 @@ def test_build_broker_refuses_live_run_with_unset_account_sentinel():
         build_broker(StrategyConfig(broker=BrokerName.ROBINHOOD, dry_run=True, target_account_number="")),
         DryRunBroker,
     )
+
+@pytest.mark.parametrize("response, expected", [
+    # Happy paths: no errors should return None
+    ({"data": {"result": 42}}, None),
+    ({"success": True}, None),
+    ({"ok": True, "data": {"things": []}}, None),
+
+    # Non-dictionary inputs (handled by explicit string return in the new implementation)
+    (None, "Response is not a valid JSON object"),
+    ("string", "Response is not a valid JSON object"),
+    ([1, 2, 3], "Response is not a valid JSON object"),
+
+    # Outer envelope errors
+    ({"success": False, "data": {"result": 42}}, "success=false"),
+    ({"error": "server down"}, "error: server down"),
+    ({"ok": False}, "ok=false"),
+
+    # Inner errors (within "data")
+    ({"data": {"error": "not found"}}, "error: not found"),
+    ({"data": {"success": False}}, "success=false"),
+
+    # Inner error takes precedence over outer in the new unwrapping logic
+    ({"error": "outer error", "data": {"error": "inner error"}}, "error: inner error"),
+])
+def test_response_failure(response, expected):
+    assert _response_failure(response) == expected

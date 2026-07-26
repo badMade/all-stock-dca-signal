@@ -121,17 +121,19 @@ def _is_error_response(data: Dict[str, Any]) -> Optional[str]:
 
 
 def _response_failure(response: Any) -> Optional[str]:
-    """Detect a wrapper failure reported at the outer envelope OR inside ``data``.
+    """Extract the error message from a raw MCP response, if any.
 
-    ``_unwrap`` strips the ``{"data": ...}`` layer, which would hide a failure envelope
-    like ``{"success": false, "data": {...}}``. Check both levels so a failure that still
-    carries inner data is never mistaken for success.
+    Checks for failure markers at two levels: the outer payload and the first
+    unwrapped inner ``data`` value (via :func:`_unwrap`). Does not recursively
+    unwrap nested envelopes.
+    Returns None if the response is valid and contains no error markers.
     """
-    if isinstance(response, dict):
-        outer = _is_error_response(response)
-        if outer:
-            return outer
-    return _is_error_response(_unwrap(response))
+    data = _unwrap(response)
+    if not data and not isinstance(response, dict):
+        return "Response is not a valid JSON object"
+    # Empty unwrapped dict is usually just empty data, not necessarily an error,
+    # unless the raw payload itself was an error envelope.
+    return _is_error_response(data) or _is_error_response(response if isinstance(response, dict) else {})
 
 
 def _parse_rfc3339(value: Any) -> Optional[datetime]:
