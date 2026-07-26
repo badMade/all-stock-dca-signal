@@ -49,6 +49,7 @@ from morning_dca import (
     MorningLedger,
     MorningSignal,
     TopUpOutcome,
+    _nth_weekday_of_month,
     _PersistingBrokerAdapter,
     _PersistingMarketDataProvider,
     _RawInputRecorder,
@@ -5445,6 +5446,19 @@ def test_run_records_premium_routing_metadata_when_config_supplies_it(tmp_path):
     assert entry["reason_for_premium_model"] == "failure_recovery"
     assert entry["model_requested"] == "claude-opus-4-8"
     assert entry["model_actual"] == "claude-opus-4-8"
+
+
+
+def test_nth_weekday_of_month():
+    cases = [
+        (2024, 1, 0, 1, date(2024, 1, 1)),  # 1st Monday of Jan 2024 (month starts on Monday)
+        (2024, 1, 4, 3, date(2024, 1, 19)),  # 3rd Friday of Jan 2024 (options exp)
+        (2024, 11, 3, 4, date(2024, 11, 28)),  # 4th Thursday of Nov 2024 (Thanksgiving)
+        (2024, 2, 3, 5, date(2024, 2, 29)),  # 5th Thursday of Feb 2024 (Leap Year)
+        (2025, 3, 2, 2, date(2025, 3, 12)),  # 2nd Wednesday of Mar 2025
+    ]
+    for year, month, weekday, n, expected in cases:
+        assert _nth_weekday_of_month(year, month, weekday, n) == expected
 
 
 if __name__ == "__main__":
