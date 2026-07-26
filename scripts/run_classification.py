@@ -34,8 +34,6 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Set
 from zoneinfo import ZoneInfo
 
-from dca_fileio import atomic_write_text
-
 # --- Contract constants (mirror config/run_classification.json) --------------
 
 STATE_SCHEMA_VERSION = "run-classification-v1"
@@ -437,7 +435,7 @@ def save_raw_input(
     out_dir = raw_dir if raw_dir is not None else raw_input_dir(trading_day, base)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / safe
-    atomic_write_text(path, json.dumps(to_write, indent=2) + "\n")
+    path.write_text(json.dumps(to_write, indent=2) + "\n", encoding="utf-8")
     return path
 
 
@@ -828,8 +826,7 @@ def update_latest_scheduled_run_pointer(
     # not default to non-manual.
     valid_scheduled_evidence = rc.get("run_origin") == "scheduled" and rc.get("manual_run") is False
     pointer_status = "valid" if valid_scheduled_evidence else "pending"
-    atomic_write_text(
-        pointer,
+    pointer.write_text(
         json.dumps(
             {
                 "run_id": rc.get("run_id"),
@@ -847,7 +844,7 @@ def update_latest_scheduled_run_pointer(
             },
             indent=2,
         )
-        + "\n",
+        + "\n"
     )
     return pointer
 
@@ -875,7 +872,7 @@ def write_run_artifacts(
         out_dir = scheduled_run_dir(day, base)
         out_dir.mkdir(parents=True, exist_ok=True)
         state_path = out_dir / RUN_STATE_FILENAME
-        atomic_write_text(state_path, json.dumps(run_state, indent=2) + "\n")
+        state_path.write_text(json.dumps(run_state, indent=2) + "\n")
         written["run_state"] = str(state_path)
 
         pointer = update_latest_scheduled_run_pointer(run_state, state_path, base)
@@ -885,7 +882,7 @@ def write_run_artifacts(
         out_dir = manual_run_dir(ts, base)
         out_dir.mkdir(parents=True, exist_ok=True)
         state_path = out_dir / RUN_STATE_FILENAME
-        atomic_write_text(state_path, json.dumps(run_state, indent=2) + "\n")
+        state_path.write_text(json.dumps(run_state, indent=2) + "\n")
         written["run_state"] = str(state_path)
         # Explicitly NOT updating latest_scheduled_run.json.
 

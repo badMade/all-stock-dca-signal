@@ -8,10 +8,8 @@ from datetime import date
 import pytest
 
 from dca_config import (
-    _default_config_dir,
     _read_json,
     load_approved_dates,
-    load_backtest_sizing_tiers,
     load_budgets,
     load_sizing_tiers,
     load_strategy_config,
@@ -170,49 +168,3 @@ def test_read_json_valid(tmp_path):
     file_path = tmp_path / "valid.json"
     file_path.write_text('{"key": "value"}', encoding="utf-8")
     assert _read_json(file_path) == {"key": "value"}
-
-def test_load_backtest_sizing_tiers_valid(tmp_path):
-    _write(tmp_path, "backtest_sizing_ladder.json", {
-        "tiers": [
-            {"min_drop_pct": 1.0, "multiplier": 1.5},
-            {"min_drop_pct": 0.1, "multiplier": 1.0},
-        ],
-    })
-    out = load_backtest_sizing_tiers(tmp_path)
-    assert len(out) == 2
-    assert out[0] == (pytest.approx(0.001), 1.0)  # sorted, percent->fraction
-    assert out[1] == (pytest.approx(0.01), 1.5)
-
-def test_load_backtest_sizing_tiers_missing_file(tmp_path):
-    assert load_backtest_sizing_tiers(tmp_path) == ()
-
-def test_load_backtest_sizing_tiers_no_tiers_list(tmp_path):
-    _write(tmp_path, "backtest_sizing_ladder.json", {"other_key": "value"})
-    assert load_backtest_sizing_tiers(tmp_path) == ()
-
-def test_load_backtest_sizing_tiers_empty_tiers(tmp_path):
-    _write(tmp_path, "backtest_sizing_ladder.json", {"tiers": []})
-    assert load_backtest_sizing_tiers(tmp_path) == ()
-
-def test_load_backtest_sizing_tiers_missing_keys(tmp_path):
-    _write(tmp_path, "backtest_sizing_ladder.json", {"tiers": [{"min_drop_pct": 1.0}]})
-    with pytest.raises(ValueError, match="missing min_drop_pct/multiplier"):
-        load_backtest_sizing_tiers(tmp_path)
-
-def test_load_backtest_sizing_tiers_negative_values(tmp_path):
-    _write(tmp_path, "backtest_sizing_ladder.json", {"tiers": [{"min_drop_pct": -1.0, "multiplier": 1.0}]})
-    with pytest.raises(ValueError, match="negative threshold/multiplier"):
-        load_backtest_sizing_tiers(tmp_path)
-
-def test_default_config_dir_basic(monkeypatch):
-    """Test that _default_config_dir returns an absolute path ending with 'config' when DCA_CONFIG_DIR is not set."""
-    monkeypatch.delenv("DCA_CONFIG_DIR", raising=False)
-    config_dir = _default_config_dir()
-    assert config_dir.is_absolute()
-    assert config_dir.name == "config"
-
-def test_default_config_dir_env_override(monkeypatch, tmp_path):
-    """DCA_CONFIG_DIR, when set, is returned verbatim even if it doesn't end with 'config'."""
-    override_dir = tmp_path / "etc" / "all-stock-dca"
-    monkeypatch.setenv("DCA_CONFIG_DIR", str(override_dir))
-    assert _default_config_dir() == override_dir

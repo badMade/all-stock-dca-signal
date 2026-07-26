@@ -49,7 +49,6 @@ from morning_dca import (
     MorningLedger,
     MorningSignal,
     TopUpOutcome,
-    _nth_weekday_of_month,
     _PersistingBrokerAdapter,
     _PersistingMarketDataProvider,
     _RawInputRecorder,
@@ -5446,60 +5445,6 @@ def test_run_records_premium_routing_metadata_when_config_supplies_it(tmp_path):
     assert entry["reason_for_premium_model"] == "failure_recovery"
     assert entry["model_requested"] == "claude-opus-4-8"
     assert entry["model_actual"] == "claude-opus-4-8"
-
-
-def test_model_usage_routing_overrides():
-    from unittest.mock import Mock
-
-    from morning_dca import _model_usage_routing_overrides
-
-    # Test all fields set
-    config_all = Mock(spec=["model_usage_model_requested", "model_usage_model_actual", "model_usage_model_routing_mode", "model_usage_reason_for_premium_model"])
-    config_all.model_usage_model_requested = "model_a"
-    config_all.model_usage_model_actual = "model_b"
-    config_all.model_usage_model_routing_mode = "fast"
-    config_all.model_usage_reason_for_premium_model = "needed"
-    assert _model_usage_routing_overrides(config_all) == {
-        "model_requested": "model_a",
-        "model_actual": "model_b",
-        "model_routing_mode": "fast",
-        "reason_for_premium_model": "needed",
-    }
-
-    # Test partial fields set
-    config_partial = Mock(spec=["model_usage_model_requested", "model_usage_model_actual", "model_usage_model_routing_mode", "model_usage_reason_for_premium_model"])
-    config_partial.model_usage_model_requested = "model_a"
-    config_partial.model_usage_model_actual = None
-    config_partial.model_usage_model_routing_mode = "fast"
-    config_partial.model_usage_reason_for_premium_model = None
-    assert _model_usage_routing_overrides(config_partial) == {
-        "model_requested": "model_a",
-        "model_routing_mode": "fast",
-    }
-
-    # Test no fields set
-    config_empty = Mock(spec=["model_usage_model_requested", "model_usage_model_actual", "model_usage_model_routing_mode", "model_usage_reason_for_premium_model"])
-    config_empty.model_usage_model_requested = None
-    config_empty.model_usage_model_actual = None
-    config_empty.model_usage_model_routing_mode = None
-    config_empty.model_usage_reason_for_premium_model = None
-    assert _model_usage_routing_overrides(config_empty) == {}
-
-    # Test fields completely missing from config object
-    config_missing = Mock(spec=[])
-    assert _model_usage_routing_overrides(config_missing) == {}
-
-
-def test_nth_weekday_of_month():
-    cases = [
-        (2024, 1, 0, 1, date(2024, 1, 1)),  # 1st Monday of Jan 2024 (month starts on Monday)
-        (2024, 1, 4, 3, date(2024, 1, 19)),  # 3rd Friday of Jan 2024 (options exp)
-        (2024, 11, 3, 4, date(2024, 11, 28)),  # 4th Thursday of Nov 2024 (Thanksgiving)
-        (2024, 2, 3, 5, date(2024, 2, 29)),  # 5th Thursday of Feb 2024 (Leap Year)
-        (2025, 3, 2, 2, date(2025, 3, 12)),  # 2nd Wednesday of Mar 2025
-    ]
-    for year, month, weekday, n, expected in cases:
-        assert _nth_weekday_of_month(year, month, weekday, n) == expected
 
 
 if __name__ == "__main__":

@@ -25,8 +25,6 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-from dca_fileio import atomic_write_text
-
 logger = logging.getLogger("near_close_dca.cost_tracker")
 
 COST_TRACKER_TITLE = "Automation Cost Tracker"
@@ -259,10 +257,10 @@ def generate_cost_tracker(
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     md_path = out / f"automation_cost_tracker_{month_label}.md"
-    atomic_write_text(md_path, build_cost_tracker_markdown(aggregate))
+    md_path.write_text(build_cost_tracker_markdown(aggregate), encoding="utf-8")
     payload_path = out / f"automation_cost_tracker_{month_label}.json"
-    atomic_write_text(
-        payload_path,
+    payload_path.write_text(
         json.dumps(build_cost_tracker_payload(aggregate, page_id=page_id), indent=2, sort_keys=True),
+        encoding="utf-8"
     )
     return {"markdown": str(md_path), "payload": str(payload_path)}

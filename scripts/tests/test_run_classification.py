@@ -17,10 +17,6 @@ from datetime import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-# Repo root too: the scripts modules under test import the shared top-level
-# dca_fileio helper, which direct invocation (python scripts/tests/test_*.py)
-# cannot resolve from scripts/ alone.
-sys.path.insert(1, str(Path(__file__).resolve().parents[2]))
 
 from run_classification import (  # noqa: E402
     ACCEPTED_STATE_SCHEMA_VERSIONS,

@@ -26,7 +26,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-from dca_fileio import atomic_open_w
 from scripts.same_day_pointer import (
     _utc_now_iso,
     derive_valid_scheduled_evidence,
@@ -437,7 +436,7 @@ def submitted_order_rows(
 
 
 def _write_csv(path: Path, rows: Sequence[Dict[str, Any]], fieldnames: Sequence[str]) -> None:
-    with atomic_open_w(path, newline="") as handle:
+    with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(fieldnames), restval="")
         writer.writeheader()
         for row in rows:
