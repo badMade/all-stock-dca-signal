@@ -2935,17 +2935,26 @@ def build_report(run_result: RunResult, run_label: str, generated_at: datetime) 
             run_result.loop_block_reasons.get(ticker),
         )
 
-    abs_pcts = sorted(abs(r.slippage_pct) for r in filled if r.slippage_pct is not None)
     reason_counts: Dict[str, int] = {reason: 0 for reason in MISSING_FILL_REASONS}
     for reason in missing.values():
         reason_counts[reason] = reason_counts.get(reason, 0) + 1
 
+    # ⚡ Bolt Optimization: Consolidate multiple O(N) generator expression passes
+    # into a single manual loop to calculate notional, slippage cost, and abs_pcts.
+    total_filled_notional = 0.0
+    net_slippage_cost = 0.0
+    abs_pcts = []
+    for r in filled:
+        total_filled_notional += (r.avg_fill_price or 0.0) * (r.quantity_filled or 0.0)
+        net_slippage_cost += r.slippage_cost or 0.0
+        if r.slippage_pct is not None:
+            abs_pcts.append(abs(r.slippage_pct))
+    abs_pcts.sort()
+
     metrics: Dict[str, object] = {
         "filled_order_count": len(filled),
-        "total_filled_notional": round(
-            sum((r.avg_fill_price or 0.0) * (r.quantity_filled or 0.0) for r in filled), 6
-        ),
-        "net_slippage_cost": round(sum(r.slippage_cost or 0.0 for r in filled), 6),
+        "total_filled_notional": round(total_filled_notional, 6),
+        "net_slippage_cost": round(net_slippage_cost, 6),
         "mean_abs_slippage_pct": round(statistics.fmean(abs_pcts), 6) if abs_pcts else 0.0,
         "median_abs_slippage_pct": round(statistics.median(abs_pcts), 6) if abs_pcts else 0.0,
         "p90_abs_slippage_pct": round(_percentile(abs_pcts, 90.0), 6),
