@@ -18,6 +18,7 @@ from dca_reporting import (
     compute_slippage_rows,
     fills_from_order_history_payload,
     generate_reports,
+    load_run_state,
     rank_slippage,
 )
 from dca_weekly_dashboard import (
@@ -1009,6 +1010,15 @@ def test_fills_from_order_history_payload_rejects_non_finite_prices_and_quantiti
     assert set(by_ticker) == {"AMZN"}, (
         f"non-finite price/quantity orders must be rejected, got {sorted(by_ticker)}"
     )
+
+
+def test_load_run_state(tmp_path):
+    expected_data = {"run_id": "test-run", "dry_run": True}
+    state_file = tmp_path / "run_state.json"
+    state_file.write_text(json.dumps(expected_data), encoding="utf-8")
+
+    loaded_data = load_run_state(state_file)
+    assert loaded_data == expected_data
 
 
 def _run_all():
