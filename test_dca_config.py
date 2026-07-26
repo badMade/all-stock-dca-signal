@@ -13,6 +13,7 @@ from dca_config import (
     load_approved_dates,
     load_backtest_sizing_tiers,
     load_budgets,
+    load_near_close_overrides,
     load_sizing_tiers,
     load_strategy_config,
     load_tickers,
@@ -170,6 +171,23 @@ def test_read_json_valid(tmp_path):
     file_path = tmp_path / "valid.json"
     file_path.write_text('{"key": "value"}', encoding="utf-8")
     assert _read_json(file_path) == {"key": "value"}
+
+
+def test_load_near_close_overrides_missing_file(tmp_path):
+    assert load_near_close_overrides(tmp_path) == {}
+
+def test_load_near_close_overrides_filters_unknown_and_excluded(tmp_path):
+    _write(
+        tmp_path,
+        "near_close_dca.json",
+        {
+            "base_buy_amount_usd": 5.0,
+            "dry_run": False,
+            "broker": "test",
+            "unknown_field": "ignore"
+        }
+    )
+    assert load_near_close_overrides(tmp_path) == {"base_buy_amount_usd": 5.0}
 
 def test_load_backtest_sizing_tiers_valid(tmp_path):
     _write(tmp_path, "backtest_sizing_ladder.json", {
