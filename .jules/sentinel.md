@@ -32,6 +32,7 @@
 **Vulnerability:** The `apiKey` parameter was passed in the URL query string when making requests to NewsAPI via the `requests` library. When a `requests.RequestException` was thrown (e.g. 401 Unauthorized), the `requests` library's exception message included the full request URL, which was then logged, leaking the API key to application logs.
 **Learning:** Passing credentials via query string parameters exposes them to leakage in multiple places: request logs, proxy logs, and application error logs whenever exceptions containing the URL are stringified.
 **Prevention:** Always pass API keys and other credentials in HTTP headers (like `Authorization` or `X-Api-Key`) rather than query parameters. Additionally, sanitize exception messages (`str(exc).replace(api_key, "***")`) before logging them as defense-in-depth against underlying libraries that might still echo sensitive data.
+
 ## 2026-07-26 - XSS in Python f-string HTML Templates
 **Vulnerability:** The email report template in `sentiment_cron.py` dynamically constructed HTML using f-strings and interpolated unsanitized variables (`ticker` and `company`).
 **Learning:** When rendering HTML without a proper templating engine (like Jinja2 with autoescaping), raw variables fetched from external sources or user input can introduce XSS vulnerabilities.

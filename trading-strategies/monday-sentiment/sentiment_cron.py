@@ -732,6 +732,7 @@ def build_email_html(
             st_str  = "✅ Normal"
             st_bg   = "#ffffff"
 
+        company = html.escape(COMPANY_NAMES.get(raw_ticker, raw_ticker))
         return f"""
           <tr style="background:{st_bg};">
             <td style="padding:8px 12px;font-weight:bold;font-family:Arial,sans-serif;font-size:13px;">{ticker}</td>
@@ -749,9 +750,10 @@ def build_email_html(
     # ---- "No action required" notice ----
     normal_tickers = [html.escape(str(i["ticker"])) for i in normal if i.get("status") == "normal"]
     if normal_tickers:
+        safe_normal_tickers = [html.escape(t) for t in normal_tickers]
         normal_notice = f"""
         <p style="font-size:13px;color:#555;font-family:Arial,sans-serif;margin-top:0;">
-          <strong>No action required:</strong> {', '.join(normal_tickers)} are within normal range (|z| &lt; {threshold}).
+          <strong>No action required:</strong> {', '.join(safe_normal_tickers)} are within normal range (|z| &lt; {threshold}).
         </p>"""
     else:
         normal_notice = ""
