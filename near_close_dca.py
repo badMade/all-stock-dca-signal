@@ -73,6 +73,8 @@ from typing import (
 )
 from zoneinfo import ZoneInfo
 
+from dca_fileio import atomic_open_w, atomic_write_text
+
 if TYPE_CHECKING:
     from scripts.run_classification import PriorAllocation
 
@@ -1957,7 +1959,7 @@ def write_run_artifacts(artifacts: Dict[str, Any], output_dir: str | Path) -> Di
         serialized = _serialize_run_state(artifacts)
 
     run_state_path = out / "run_state.json"
-    run_state_path.write_text(serialized, encoding="utf-8")
+    atomic_write_text(run_state_path, serialized)
 
     return {
         "run_state": str(run_state_path),
@@ -1982,15 +1984,15 @@ def _backfill_orders_csv_usage(run_state_path: Path) -> None:
     csv_paths = _existing_csv_artifacts(run_state_path.parent)
     usage["csv_artifact_count"] = len(csv_paths)
     csv_bytes = sum(path.stat().st_size for path in csv_paths)
-    run_state_path.write_text(_settle_usage_bytes(run_state, usage, csv_bytes), encoding="utf-8")
+    atomic_write_text(run_state_path, _settle_usage_bytes(run_state, usage, csv_bytes))
 
 
 def _write_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
     if not rows:
-        path.write_text("")
+        atomic_write_text(path, "")
         return
     fieldnames = list(rows[0].keys())
-    with path.open("w", newline="") as handle:
+    with atomic_open_w(path, newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
@@ -2222,7 +2224,18 @@ def _orders_csv_fills(
                     "quantity_filled": qty if qty_valid else None,
                     "amount_usd": amount if amount_valid else None,
                 }
-    except Exception:
+    except (OSError, csv.Error, UnicodeDecodeError):
+        # A corrupt/unreadable orders CSV under-counts prior same-day allocation,
+        # which fails OPEN for the top-up guard (it can permit a re-buy). Losing
+        # the unparsed tail is unrecoverable, but it must never be silent: log
+        # loudly so the operator can reconcile against the broker before the next
+        # run. Rows parsed before the failure are kept -- they only ADD prior
+        # allocation, which is the conservative direction.
+        logger.exception(
+            "failed to parse %s for same-day fill context; prior allocations from "
+            "this file may be undercounted -- reconcile against broker orders",
+            orders_csv,
+        )
         return fills
     return fills
 
@@ -2250,8 +2263,15 @@ def _orders_csv_submitted_notionals(orders_csv: Path) -> Dict[str, float]:
                     notional = None
                 if notional and notional > 0:
                     notionals[ticker] = notionals.get(ticker, 0.0) + notional
-    except Exception:
-        pass
+    except (OSError, csv.Error, UnicodeDecodeError):
+        # Same failure posture as _orders_csv_fills: an unreadable CSV
+        # under-counts submitted-order allocation (fails open for the top-up
+        # guard), so the parse failure must be operator-visible, never silent.
+        logger.exception(
+            "failed to parse %s for submitted-order context; prior allocations "
+            "from this file may be undercounted -- reconcile against broker orders",
+            orders_csv,
+        )
     return notionals
 
 
@@ -2935,17 +2955,26 @@ def build_report(run_result: RunResult, run_label: str, generated_at: datetime) 
             run_result.loop_block_reasons.get(ticker),
         )
 
-    abs_pcts = sorted(abs(r.slippage_pct) for r in filled if r.slippage_pct is not None)
     reason_counts: Dict[str, int] = {reason: 0 for reason in MISSING_FILL_REASONS}
     for reason in missing.values():
         reason_counts[reason] = reason_counts.get(reason, 0) + 1
 
+    # ⚡ Bolt Optimization: Consolidate multiple O(N) generator expression passes
+    # into a single manual loop to calculate notional, slippage cost, and abs_pcts.
+    total_filled_notional = 0.0
+    net_slippage_cost = 0.0
+    abs_pcts = []
+    for r in filled:
+        total_filled_notional += (r.avg_fill_price or 0.0) * (r.quantity_filled or 0.0)
+        net_slippage_cost += r.slippage_cost or 0.0
+        if r.slippage_pct is not None:
+            abs_pcts.append(abs(r.slippage_pct))
+    abs_pcts.sort()
+
     metrics: Dict[str, object] = {
         "filled_order_count": len(filled),
-        "total_filled_notional": round(
-            sum((r.avg_fill_price or 0.0) * (r.quantity_filled or 0.0) for r in filled), 6
-        ),
-        "net_slippage_cost": round(sum(r.slippage_cost or 0.0 for r in filled), 6),
+        "total_filled_notional": round(total_filled_notional, 6),
+        "net_slippage_cost": round(net_slippage_cost, 6),
         "mean_abs_slippage_pct": round(statistics.fmean(abs_pcts), 6) if abs_pcts else 0.0,
         "median_abs_slippage_pct": round(statistics.median(abs_pcts), 6) if abs_pcts else 0.0,
         "p90_abs_slippage_pct": round(_percentile(abs_pcts, 90.0), 6),
@@ -2979,7 +3008,7 @@ def _iso(value: object) -> object:
 def write_execution_csv(records: Sequence[OrderExecutionRecord], path: str) -> str:
     """Write the durable per-order execution/slippage log to CSV."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as handle:
+    with atomic_open_w(path, newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
         writer.writeheader()
         for record in records:
@@ -3064,8 +3093,7 @@ def generate_slippage_report(
     csv_path = os.path.join(output_dir, f"{base}_orders.csv")
     report_path = os.path.join(output_dir, f"{base}_slippage_coverage.md")
     write_execution_csv(run_result.execution_records, csv_path)
-    with open(report_path, "w", encoding="utf-8") as handle:
-        handle.write(render_report_markdown(report, run_result))
+    atomic_write_text(report_path, render_report_markdown(report, run_result))
     report.csv_path = csv_path
     report.report_path = report_path
     return report
@@ -3102,10 +3130,66 @@ def write_run_state(
         "summary_metrics": report.metrics,
     }
     os.makedirs(os.path.dirname(state_path) or ".", exist_ok=True)
-    with open(state_path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
+    atomic_write_text(state_path, json.dumps(payload, indent=2, sort_keys=True))
     return state_path
 
+
+
+# Warn this many approved trading days before the configured window's end, so the
+# hard stop built into APPROVED_TEST_DATES / trading_window.json is never a
+# surprise: past the last approved date every scheduled run is silently blocked.
+APPROVED_WINDOW_EXPIRY_WARN_DAYS = 10
+
+
+def approved_window_status(
+    approved_dates: Iterable[date], trading_day: date
+) -> Tuple[bool, Optional[date], int]:
+    """Return ``(in_window, window_end, remaining_days)`` for the approved-dates gate.
+
+    ``remaining_days`` counts approved dates on or after ``trading_day`` — how
+    many approved trading days are left before the configured window stops all
+    live trading. ``window_end`` is ``None`` when no approved dates are
+    configured (the gate then blocks everything and there is no expiry to warn
+    about).
+    """
+    dates = set(approved_dates)
+    if not dates:
+        return False, None, 0
+    window_end = max(dates)
+    remaining = sum(1 for day in dates if day >= trading_day)
+    return trading_day in dates, window_end, remaining
+
+
+def warn_if_window_expiring(
+    approved_dates: Iterable[date],
+    trading_day: date,
+    *,
+    log: logging.Logger = logger,
+) -> None:
+    """Log loudly when the approved trading window is over or about to end.
+
+    Past the window's end every run is blocked by the date gate; without this
+    the stop is silent (a blocked run is indistinguishable from a holiday).
+    Within :data:`APPROVED_WINDOW_EXPIRY_WARN_DAYS` approved days of the end,
+    every run carries a countdown warning so the operator extends
+    ``config/trading_window.json`` before trading stops.
+    """
+    in_window, window_end, remaining = approved_window_status(approved_dates, trading_day)
+    if window_end is None:
+        return
+    if trading_day > window_end:
+        log.error(
+            "approved trading window ended %s — live trading is hard-stopped; "
+            "extend config/trading_window.json (or approved_test_dates) to resume",
+            window_end,
+        )
+    elif in_window and remaining <= APPROVED_WINDOW_EXPIRY_WARN_DAYS:
+        log.warning(
+            "approved trading window ends %s — %d approved trading day(s) remaining; "
+            "extend config/trading_window.json to avoid a silent stop",
+            window_end,
+            remaining,
+        )
 
 
 def _check_execution_gates(
@@ -3114,6 +3198,7 @@ def _check_execution_gates(
     broker: BrokerAdapter,
     artifacts_dir: Optional[str | Path],
 ) -> bool:
+    warn_if_window_expiring(config.approved_test_dates, trading_day)
     if trading_day not in config.approved_test_dates:
         logger.warning("Date gate blocked execution for %s. No trades.", trading_day)
         if artifacts_dir:
@@ -3123,11 +3208,11 @@ def _check_execution_gates(
             # Never clobber a previously recorded run when a directory is reused;
             # the stub only marks days that produced no artifact at all.
             if not state_path.exists():
-                state_path.write_text(
+                atomic_write_text(
+                    state_path,
                     _serialize_run_state(
                         {"trading_day": trading_day.isoformat(), "status": RUN_STATUS_BLOCKED}
                     ),
-                    encoding="utf-8",
                 )
         return False
 

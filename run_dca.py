@@ -35,7 +35,9 @@ from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from dca_alerts import guarded_run
 from dca_config import DEFAULT_CONFIG_DIR, load_strategy_config
+from dca_fileio import atomic_write_text
 from midday_dca import DEFAULT_MIDDAY_LIVE_STATE_ROOT, load_midday_config
 from morning_dca import DEFAULT_MORNING_LIVE_STATE_ROOT, MORNING_LIVE_MODE, load_morning_config
 from near_close_dca import (
@@ -68,6 +70,11 @@ from scripts.run_classification import (
 )
 
 logger = logging.getLogger("near_close_dca.run")
+
+# Stream label for the scheduled 3:20 PM ET final live run, used for the
+# failure-alert / heartbeat identity (DCA_HEARTBEAT_URL_AFTERNOON). Matches the
+# "afternoon" stream name recorded by scripts/run_classification.py pointers.
+AFTERNOON_STREAM = "afternoon"
 
 # Sibling stream roots the scheduled afternoon top-up guard folds in as prior
 # same-day allocation context (in addition to its own task root): the morning and
@@ -458,10 +465,8 @@ def _run_drift_check(run_dir: Path) -> Optional[Dict[str, Any]]:
         return None
     try:
         report = detect_drift(run_dir)
-        (run_dir / "drift_report.json").write_text(
-            report.to_json(compact=False), encoding="utf-8"
-        )
-        (run_dir / "drift_report.md").write_text(report.to_markdown(), encoding="utf-8")
+        atomic_write_text(run_dir / "drift_report.json", report.to_json(compact=False))
+        atomic_write_text(run_dir / "drift_report.md", report.to_markdown())
         if report.drift_detected:
             logger.warning(
                 "DRIFT DETECTED in %s: %d symbol(s) expected but no order record — %s",
@@ -655,50 +660,72 @@ def run_pipeline(
     function has no visibility into which model/agent actually drove the
     run, so they stay unset unless the scheduler invoking this call
     explicitly knows it used a permitted premium escalation and passes them.
+
+    The whole call runs under ``dca_alerts.guarded_run``: on a scheduled
+    non-dry-run invocation, any escaping exception is logged, alerted to the
+    operator Slack webhook, and pinged as a failed heartbeat before
+    re-raising, and a completed run pings the afternoon success heartbeat
+    (dead-man's switch for the missed-fire failure class). Demo/dry-run and
+    unscheduled calls only get a log handler ensured.
     """
-    result = _run_pipeline_impl(
-        now,
-        config,
-        state,
-        finance_data,
-        robinhood_data,
-        broker,
-        artifacts_dir=artifacts_dir,
-        run_label=run_label,
-        scheduled=scheduled,
-        generate_full_reports=generate_full_reports,
-        ignore_trend_filter=ignore_trend_filter,
-        prior_same_day_allocations=prior_same_day_allocations,
-        prior_allocation_state_root=prior_allocation_state_root,
-        deployment_history_root=deployment_history_root,
-        classification_state_root=classification_state_root,
-        config_dir=config_dir,
-        raw_connector_inputs=raw_connector_inputs,
-        required_raw_filenames=required_raw_filenames,
+
+    def _invoke() -> Dict[str, Any]:
+        result = _run_pipeline_impl(
+            now,
+            config,
+            state,
+            finance_data,
+            robinhood_data,
+            broker,
+            artifacts_dir=artifacts_dir,
+            run_label=run_label,
+            scheduled=scheduled,
+            generate_full_reports=generate_full_reports,
+            ignore_trend_filter=ignore_trend_filter,
+            prior_same_day_allocations=prior_same_day_allocations,
+            prior_allocation_state_root=prior_allocation_state_root,
+            deployment_history_root=deployment_history_root,
+            classification_state_root=classification_state_root,
+            config_dir=config_dir,
+            raw_connector_inputs=raw_connector_inputs,
+            required_raw_filenames=required_raw_filenames,
+        )
+        run_state_path = result.get("run_state_path")
+        run_id = None
+        if run_state_path:
+            try:
+                run_id = json.loads(Path(run_state_path).read_text(encoding="utf-8")).get("run_id")
+            except (OSError, json.JSONDecodeError):
+                run_id = None
+        routing_overrides = {
+            "model_requested": model_usage_model_requested,
+            "model_actual": model_usage_model_actual,
+            "model_routing_mode": model_usage_model_routing_mode,
+            "reason_for_premium_model": model_usage_reason_for_premium_model,
+        }
+        log_model_usage(
+            root=model_usage_log_root,
+            run_id=run_id,
+            cron_id=AFTERNOON_LIVE_CRON_ID,
+            run_origin="scheduled" if scheduled else "manual",
+            artifact_path=run_state_path,
+            triggered_at_utc=now.astimezone(timezone.utc),
+            **{k: v for k, v in routing_overrides.items() if v is not None},
+        )
+        return result
+
+    return guarded_run(
+        AFTERNOON_STREAM,
+        _invoke,
+        enabled=scheduled and not config.dry_run,
+        context=f"artifacts_dir={artifacts_dir}",
+        # The raw-persistence failure path reports its failure as a returned
+        # result (with its own targeted Slack alert) instead of raising; it must
+        # ping a FAILED heartbeat, not clear the dead-man's switch.
+        result_ok=lambda result: not (
+            isinstance(result, dict) and result.get("raw_persistence_error")
+        ),
     )
-    run_state_path = result.get("run_state_path")
-    run_id = None
-    if run_state_path:
-        try:
-            run_id = json.loads(Path(run_state_path).read_text(encoding="utf-8")).get("run_id")
-        except (OSError, json.JSONDecodeError):
-            run_id = None
-    routing_overrides = {
-        "model_requested": model_usage_model_requested,
-        "model_actual": model_usage_model_actual,
-        "model_routing_mode": model_usage_model_routing_mode,
-        "reason_for_premium_model": model_usage_reason_for_premium_model,
-    }
-    log_model_usage(
-        root=model_usage_log_root,
-        run_id=run_id,
-        cron_id=AFTERNOON_LIVE_CRON_ID,
-        run_origin="scheduled" if scheduled else "manual",
-        artifact_path=run_state_path,
-        triggered_at_utc=now.astimezone(timezone.utc),
-        **{k: v for k, v in routing_overrides.items() if v is not None},
-    )
-    return result
 
 
 def _run_pipeline_impl(
@@ -934,7 +961,7 @@ def _run_pipeline_impl(
                     if _prior_orders_csv.exists():
                         failure_state["artifacts"] = {"orders_csv_path": str(_prior_orders_csv)}
                     run_state_path = out / "run_state.json"
-                    run_state_path.write_text(json.dumps(failure_state, indent=2) + "\n", encoding="utf-8")
+                    atomic_write_text(run_state_path, json.dumps(failure_state, indent=2) + "\n")
                     # Route this fail-closed raw-persistence outcome through the same
                     # scheduled artifact contract as the normal finalizer: write the
                     # header-only submitted_orders.csv and the mirrored canonical
@@ -1002,12 +1029,10 @@ def _run_pipeline_impl(
                             out,
                             exc,
                         )
-                        (out / "drift_report.json").write_text(
-                            _fail_report.to_json(compact=False), encoding="utf-8"
+                        atomic_write_text(
+                            out / "drift_report.json", _fail_report.to_json(compact=False)
                         )
-                        (out / "drift_report.md").write_text(
-                            _fail_report.to_markdown(), encoding="utf-8"
-                        )
+                        atomic_write_text(out / "drift_report.md", _fail_report.to_markdown())
                         if scheduled and not config.dry_run:
                             send_slack_alert(_fail_report, env_var=DEFAULT_SLACK_WEBHOOK_ENV)
                         failure_result["drift_report"] = _fail_report.to_dict()
@@ -1134,9 +1159,7 @@ def _run_pipeline_impl(
                     prior_orders = []
             new_ids = {r.get("order_id") or r.get("id") for r in raw_responses} - {None}
             merged = raw_responses + [o for o in prior_orders if (o.get("order_id") or o.get("id")) not in new_ids]
-            oap_path.write_text(
-                json.dumps({"orders": merged}, indent=2) + "\n", encoding="utf-8"
-            )
+            atomic_write_text(oap_path, json.dumps({"orders": merged}, indent=2) + "\n")
             result["orders_after_place_path"] = str(oap_path)
         drift = _run_drift_check(Path(artifacts_dir))
         if drift is not None:
