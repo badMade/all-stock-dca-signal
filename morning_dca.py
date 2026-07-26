@@ -84,6 +84,7 @@ from near_close_dca import (
     latest_bar_at_or_before,
     load_prior_same_day_allocations_multi,
     merge_manual_top_up_context,
+    nyse_holidays,
     quote_spread_pct,
     resolve_top_up_desired_amount_usd,
     select_first_allocation_base_usd,
@@ -291,83 +292,6 @@ def _model_usage_routing_overrides(config: Any) -> Dict[str, Any]:
     }
     return {k: v for k, v in overrides.items() if v is not None}
 
-
-def _nth_weekday_of_month(year: int, month: int, weekday: int, n: int) -> date:
-    """Return the date of the ``n``-th ``weekday`` (0=Mon..6=Sun) in ``year``/``month``."""
-    first = date(year, month, 1)
-    offset = (weekday - first.weekday()) % 7
-    return first + timedelta(days=offset + 7 * (n - 1))
-
-
-def _last_weekday_of_month(year: int, month: int, weekday: int) -> date:
-    """Return the date of the last ``weekday`` (0=Mon..6=Sun) in ``year``/``month``."""
-    if month == 12:
-        next_month_first = date(year + 1, 1, 1)
-    else:
-        next_month_first = date(year, month + 1, 1)
-    last_day = next_month_first - timedelta(days=1)
-    offset = (last_day.weekday() - weekday) % 7
-    return last_day - timedelta(days=offset)
-
-
-def _easter_sunday(year: int) -> date:
-    """Return Easter Sunday for ``year`` via the Anonymous Gregorian algorithm."""
-    a = year % 19
-    b = year // 100
-    c = year % 100
-    d = b // 4
-    e = b % 4
-    f = (b + 8) // 25
-    g = (b - f + 1) // 3
-    h = (19 * a + b - d - g + 15) % 30
-    i = c // 4
-    k = c % 4
-    ll = (32 + 2 * e + 2 * i - h - k) % 7
-    m = (a + 11 * h + 22 * ll) // 451
-    month = (h + ll - 7 * m + 114) // 31
-    day = ((h + ll - 7 * m + 114) % 31) + 1
-    return date(year, month, day)
-
-
-def _observed(holiday: date) -> date:
-    """Shift a fixed-date holiday off a weekend per standard US observance rules."""
-    if holiday.weekday() == 5:  # Saturday -> observed Friday
-        return holiday - timedelta(days=1)
-    if holiday.weekday() == 6:  # Sunday -> observed Monday
-        return holiday + timedelta(days=1)
-    return holiday
-
-
-def nyse_holidays(year: int) -> frozenset[date]:
-    """Return the NYSE's full-market-closure dates for ``year``.
-
-    Computed from the exchange's long-standing, publicly documented holiday
-    rules (fixed dates with weekend observance shifts, or Nth-weekday-of-month
-    rules) rather than a hardcoded per-year list, so the morning stream's
-    holiday gate (unlike :data:`near_close_dca.MARKET_HOLIDAYS`, which is
-    scoped to the afternoon live-test window) stays correct indefinitely into
-    the future without manual updates. Good Friday is included; NYSE has
-    observed it as a full closure every year on record.
-    """
-    holidays = {
-        _observed(date(year, 1, 1)),  # New Year's Day
-        _nth_weekday_of_month(year, 1, 0, 3),  # MLK Day: 3rd Monday of January
-        _nth_weekday_of_month(year, 2, 0, 3),  # Washington's Birthday: 3rd Monday of February
-        _easter_sunday(year) - timedelta(days=2),  # Good Friday
-        _last_weekday_of_month(year, 5, 0),  # Memorial Day: last Monday of May
-        _observed(date(year, 6, 19)),  # Juneteenth
-        _observed(date(year, 7, 4)),  # Independence Day
-        _nth_weekday_of_month(year, 9, 0, 1),  # Labor Day: 1st Monday of September
-        _nth_weekday_of_month(year, 11, 3, 4),  # Thanksgiving: 4th Thursday of November
-        _observed(date(year, 12, 25)),  # Christmas
-    }
-    # When Jan 1 of the *next* year falls on a Saturday, NYSE observes it on the
-    # preceding Friday (Dec 31 of *this* year).  That observed date belongs to
-    # this year's holiday set but would otherwise only appear in nyse_holidays(year+1).
-    next_new_year = date(year + 1, 1, 1)
-    if next_new_year.weekday() == 5:  # Saturday -> observed Friday Dec 31
-        holidays.add(date(year, 12, 31))
-    return frozenset(holidays)
 
 # Morning budget caps. The morning stream owns these; they are intentionally not
 # the afternoon BUDGET_TIERS caps so morning activity is budgeted independently.

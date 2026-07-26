@@ -50,4 +50,10 @@ workflow, and Notion template. **No credentials or secrets are stored here.**
   by **3:40 PM ET**, when the read-only watchdog starts its final verification;
   the watchdog's own check and the Friday weekly Notion refresh at **5:00 PM ET**
   are the only exceptions.
-- **Test window:** through **2026-08-28** inclusive.
+- **Test window:** through **2026-10-30** inclusive per `config/trading_window.json`
+  (extended 2026-07-26 from the original 2026-08-28 end date; stops the Friday
+  before the 2026-11-01 DST change since the live tasks' cron schedules are
+  fixed-UTC/EDT-only — see the window file's `description` for why. This is the
+  in-repo code gate — verify the external scheduler's own
+  `programmatic_trigger_check.sh` trigger window separately, since it lives
+  outside this repo).

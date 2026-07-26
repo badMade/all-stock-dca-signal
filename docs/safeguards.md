@@ -105,11 +105,28 @@ on the day's planned spend and the count of 3x-or-greater signals (multiplier
 
 ## Test window
 
-- Live testing is approved **through Fri Aug 28, 2026, inclusive.**
-- The live task's trigger gate (`programmatic_trigger_check.sh`) enforces
-  weekdays **2026-07-02 → 2026-08-28**, **3:20–3:35 PM ET** (aligned to the
-  15:15–15:35 ET scheduled classification window and the 3:40 PM completion rule).
-- A one-time reminder (`f7411889`) fires 2026-08-15 to decide on continuation.
+- Live testing is approved **through Fri Oct 30, 2026, inclusive**, per
+  `config/trading_window.json` (extended 2026-07-26 from the original Aug 28,
+  2026 end date to avoid a silent hard stop while Phase 2's real market
+  calendar is pending — see `PRODUCTION_READINESS.md`). The window
+  deliberately stops before the **2026-11-01 EDT→EST transition**: the three
+  live tasks' cron schedules (and the external trigger gate below) are
+  fixed-UTC/EDT-only, so trading through that DST change would fire live
+  trades at the wrong ET time (or have them rejected outright) until the
+  external scheduler's cron is made DST-aware — see
+  `config/trading_window.json`'s `description` field.
+- `near_close_dca.py`'s date gate independently blocks full NYSE closures
+  (e.g. Labor Day, Thanksgiving) via a computed holiday calendar
+  (`nyse_holidays()`), regardless of what `config/trading_window.json`
+  approves — see [schedule_manifest.md](schedule_manifest.md).
+- This is the **code-level gate** enforced by `near_close_dca.py`'s date check.
+  The live task's separate trigger gate (`programmatic_trigger_check.sh`) lives
+  outside this repo (scheduler-side) and was last documented as enforcing
+  weekdays **2026-07-02 → 2026-08-28**, **3:20–3:35 PM ET**; confirm/extend it
+  independently, since extending `config/trading_window.json` alone does not
+  change that external script.
+- A one-time reminder (`f7411889`) fires 2026-08-15 to decide on continuation —
+  reschedule it too now that the window runs through Oct 30.
 
 ## Operational rules
 

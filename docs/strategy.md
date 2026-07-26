@@ -321,4 +321,7 @@ See [`docs/safeguards.md`](safeguards.md) for the full list. Summary:
 - One strategy order per ticker per day.
 - Market buy orders with `dollar_amount` notional and `time_in_force = gfd`, only after `review_equity_order` passes.
 - No sells, options, crypto, margin expansion, order replacement, account changes, or trading outside regular hours.
-- Test window approved through **Fri Aug 28, 2026 inclusive**.
+- Test window approved through **Fri Oct 30, 2026 inclusive**, per
+  `config/trading_window.json` (the authoritative gate; extended 2026-07-26
+  from the original Aug 28, 2026 end date). Deliberately stops before the
+  2026-11-01 DST transition — see `docs/safeguards.md` for why.

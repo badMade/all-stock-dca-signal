@@ -143,21 +143,120 @@ def _weekday_range(start: date, end: date) -> set:
     return days
 
 
-# US equity-market full closures that fall inside the live window (weekdays only,
-# so weekend holidays are already excluded). 2026-07-03 is the observed
-# Independence Day (Jul 4 2026 is a Saturday). Labor Day (2026-09-07) is past the
-# window. Excluding these keeps the date gate meaning "an actual trading day."
+# US equity-market full closures that fall inside the original (pre-2026-08-28)
+# live window (weekdays only, so weekend holidays are already excluded).
+# 2026-07-03 is the observed Independence Day (Jul 4 2026 is a Saturday). This
+# hand-maintained set only covers that original window; ``nyse_holidays()``
+# below is the computed, indefinitely-correct calendar used by
+# ``_check_execution_gates`` and the morning/midday streams so extending
+# ``config/trading_window.json`` past this set (e.g. to include Labor Day or
+# Thanksgiving) can never silently reopen a holiday as a trading day.
 MARKET_HOLIDAYS = frozenset({date(2026, 7, 3)})
 
 # Approved live-test window. The original pilot dates (Jun 29 - Jul 1 2026) plus
 # the canonical live window of weekdays 2026-07-02 through 2026-08-28 inclusive
 # (minus market holidays), matching the ce16ba6b/10ce362c trigger_window in
 # config/scheduled_tasks.json. Without this, run_once()'s date gate would mark
-# every scheduled run in the live window blocked/no-trade.
+# every scheduled run in the live window blocked/no-trade. Callers normally
+# override this default via ``config/trading_window.json``
+# (``dca_config.load_approved_dates``); ``nyse_holidays()`` still applies on
+# top of whichever set is active.
 APPROVED_TEST_DATES = (
     {date(2026, 6, 29), date(2026, 6, 30), date(2026, 7, 1)}
     | _weekday_range(date(2026, 7, 2), date(2026, 8, 28))
 ) - MARKET_HOLIDAYS
+
+
+def _nth_weekday_of_month(year: int, month: int, weekday: int, n: int) -> date:
+    """Return the date of the ``n``-th ``weekday`` (0=Mon..6=Sun) in ``year``/``month``."""
+    first = date(year, month, 1)
+    offset = (weekday - first.weekday()) % 7
+    return first + timedelta(days=offset + 7 * (n - 1))
+
+
+def _last_weekday_of_month(year: int, month: int, weekday: int) -> date:
+    """Return the date of the last ``weekday`` (0=Mon..6=Sun) in ``year``/``month``."""
+    if month == 12:
+        next_month_first = date(year + 1, 1, 1)
+    else:
+        next_month_first = date(year, month + 1, 1)
+    last_day = next_month_first - timedelta(days=1)
+    offset = (last_day.weekday() - weekday) % 7
+    return last_day - timedelta(days=offset)
+
+
+def _easter_sunday(year: int) -> date:
+    """Return Easter Sunday for ``year`` via the Anonymous Gregorian algorithm."""
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    ll = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * ll) // 451
+    month = (h + ll - 7 * m + 114) // 31
+    day = ((h + ll - 7 * m + 114) % 31) + 1
+    return date(year, month, day)
+
+
+def _observed(holiday: date) -> date:
+    """Shift a fixed-date holiday off a weekend per standard US observance rules."""
+    if holiday.weekday() == 5:  # Saturday -> observed Friday
+        return holiday - timedelta(days=1)
+    if holiday.weekday() == 6:  # Sunday -> observed Monday
+        return holiday + timedelta(days=1)
+    return holiday
+
+
+def _new_years_day_observed(year: int) -> Optional[date]:
+    """Return the observed New Year's Day closure for ``year``, or ``None``.
+
+    Unlike the other fixed-date holidays here, NYSE Rule 7.2 carves out an
+    explicit year-end-accounting exception for New Year's Day: when January 1
+    falls on a Saturday, the Exchange stays open the preceding Friday (it
+    traded a full session on 2021-12-31 despite 2022-01-01 being a Saturday)
+    rather than observing the holiday early. A Sunday New Year's Day still
+    shifts to the following Monday as normal.
+    """
+    jan_1 = date(year, 1, 1)
+    if jan_1.weekday() == 5:  # Saturday -> NOT observed (Rule 7.2 exception)
+        return None
+    if jan_1.weekday() == 6:  # Sunday -> observed Monday
+        return jan_1 + timedelta(days=1)
+    return jan_1
+
+
+def nyse_holidays(year: int) -> frozenset[date]:
+    """Return the NYSE's full-market-closure dates for ``year``.
+
+    Computed from the exchange's long-standing, publicly documented holiday
+    rules (fixed dates with weekend observance shifts, or Nth-weekday-of-month
+    rules) rather than a hardcoded per-year list, so every stream's holiday
+    gate stays correct indefinitely into the future without manual updates,
+    unlike :data:`MARKET_HOLIDAYS` (hand-maintained, scoped to the original
+    live-test window). Good Friday is included; NYSE has observed it as a full
+    closure every year on record.
+    """
+    holidays = {
+        _nth_weekday_of_month(year, 1, 0, 3),  # MLK Day: 3rd Monday of January
+        _nth_weekday_of_month(year, 2, 0, 3),  # Washington's Birthday: 3rd Monday of February
+        _easter_sunday(year) - timedelta(days=2),  # Good Friday
+        _last_weekday_of_month(year, 5, 0),  # Memorial Day: last Monday of May
+        _observed(date(year, 6, 19)),  # Juneteenth
+        _observed(date(year, 7, 4)),  # Independence Day
+        _nth_weekday_of_month(year, 9, 0, 1),  # Labor Day: 1st Monday of September
+        _nth_weekday_of_month(year, 11, 3, 4),  # Thanksgiving: 4th Thursday of November
+        _observed(date(year, 12, 25)),  # Christmas
+    }
+    new_years = _new_years_day_observed(year)
+    if new_years is not None:
+        holidays.add(new_years)
+    return frozenset(holidays)
 
 
 class Action(str, Enum):
@@ -3201,6 +3300,40 @@ def warn_if_window_expiring(
         )
 
 
+def _write_blocked_run_stub(trading_day: date, artifacts_dir: Optional[str | Path]) -> None:
+    if not artifacts_dir:
+        return
+    out = Path(artifacts_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    state_path = out / "run_state.json"
+    # Never clobber a previously recorded run when a directory is reused; the
+    # stub only marks days that produced no artifact at all.
+    if not state_path.exists():
+        atomic_write_text(
+            state_path,
+            _serialize_run_state(
+                {"trading_day": trading_day.isoformat(), "status": RUN_STATUS_BLOCKED}
+            ),
+        )
+
+
+def _date_or_holiday_blocked(trading_day: date, config: StrategyConfig) -> bool:
+    """Return True if the date/holiday gate stops execution for ``trading_day``.
+
+    Called directly by both :func:`_check_execution_gates` (which acts on it) and
+    :func:`run_daily_compact` (which reports it): both must agree on when only the
+    blocked ``run_state.json`` stub was written, or compact callers can advertise
+    signals/candidates/orders CSV paths for files ``run_once`` never created.
+    """
+    if trading_day not in config.approved_test_dates:
+        return True
+    # Independent of config.approved_test_dates (which config/trading_window.json
+    # can widen to any weekday range with no holiday subtraction of its own): a
+    # full NYSE closure is never a trading day, computed here so extending the
+    # approved window can never silently reopen a holiday for live orders.
+    return trading_day in nyse_holidays(trading_day.year)
+
+
 def _check_execution_gates(
     trading_day: date,
     config: StrategyConfig,
@@ -3208,21 +3341,16 @@ def _check_execution_gates(
     artifacts_dir: Optional[str | Path],
 ) -> bool:
     warn_if_window_expiring(config.approved_test_dates, trading_day)
-    if trading_day not in config.approved_test_dates:
-        logger.warning("Date gate blocked execution for %s. No trades.", trading_day)
-        if artifacts_dir:
-            out = Path(artifacts_dir)
-            out.mkdir(parents=True, exist_ok=True)
-            state_path = out / "run_state.json"
-            # Never clobber a previously recorded run when a directory is reused;
-            # the stub only marks days that produced no artifact at all.
-            if not state_path.exists():
-                atomic_write_text(
-                    state_path,
-                    _serialize_run_state(
-                        {"trading_day": trading_day.isoformat(), "status": RUN_STATUS_BLOCKED}
-                    ),
-                )
+    if _date_or_holiday_blocked(trading_day, config):
+        if trading_day not in config.approved_test_dates:
+            logger.warning("Date gate blocked execution for %s. No trades.", trading_day)
+        else:
+            # Independent of config.approved_test_dates (which config/trading_window.json
+            # can widen to any weekday range with no holiday subtraction of its own): a
+            # full NYSE closure is never a trading day, so extending the approved window
+            # can never silently reopen a holiday for live orders.
+            logger.warning("NYSE holiday gate blocked execution for %s. No trades.", trading_day)
+        _write_blocked_run_stub(trading_day, artifacts_dir)
         return False
 
     if broker.account_number() != config.target_account_number:
@@ -4062,13 +4190,13 @@ def run_daily_compact(
         "run_label": run_label,
         "scheduled": scheduled,
         "compact": True,
-        "blocked": trading_day not in config.approved_test_dates,
+        "blocked": _date_or_holiday_blocked(trading_day, config),
         "artifacts_dir": str(out),
         "run_state_path": str(out / "run_state.json"),
     }
     if result["blocked"]:
-        # Date gate tripped inside run_once: only the blocked run_state stub was
-        # written, so return no CSV paths rather than paths to missing files.
+        # Date or holiday gate tripped inside run_once: only the blocked run_state
+        # stub was written, so return no CSV paths rather than paths to missing files.
         return result
 
     orders_csv = out / "orders.csv"

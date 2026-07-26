@@ -49,7 +49,6 @@ from morning_dca import (
     MorningLedger,
     MorningSignal,
     TopUpOutcome,
-    _nth_weekday_of_month,
     _PersistingBrokerAdapter,
     _PersistingMarketDataProvider,
     _RawInputRecorder,
@@ -60,7 +59,15 @@ from morning_dca import (
     preflight_eligibility,
     preflight_ticker_eligibility_row,
 )
-from near_close_dca import EASTERN, Action, Bar, DryRunBroker, PriorSameDayAllocation, SourceName
+from near_close_dca import (
+    EASTERN,
+    Action,
+    Bar,
+    DryRunBroker,
+    PriorSameDayAllocation,
+    SourceName,
+    _nth_weekday_of_month,
+)
 
 
 def _now_live():
@@ -1674,12 +1681,14 @@ def test_base_executor_is_abstract():
 
 # --- Thread fixes (PR #13 review comments) -----------------------------------
 
-def test_nyse_holidays_includes_observed_next_years_new_year_in_current_year():
-    """When Jan 1 of year+1 falls on Saturday, Dec 31 of year must be in nyse_holidays(year).
-
-    2027-12-31 is the NYSE-observed closure for New Year's Day 2028 (Jan 1 2028
-    is a Saturday).  nyse_holidays(2027) must include it even though the
-    'canonical' New Year's Day is in 2028.
+def test_nyse_holidays_stays_open_dec_31_before_saturday_new_year():
+    """NYSE Rule 7.2 carves out a year-end-accounting exception for New Year's
+    Day: when the following January 1 falls on a Saturday, the Exchange trades
+    a full session on December 31 rather than observing the holiday early
+    (this is why NYSE traded a full, record-setting session on 2021-12-31
+    despite 2022-01-01 being a Saturday). 2027-12-31 sits in the identical
+    position ahead of Saturday 2028-01-01, so neither date should be a
+    computed closure.
     """
     from datetime import date as _date
 
@@ -1687,15 +1696,14 @@ def test_nyse_holidays_includes_observed_next_years_new_year_in_current_year():
     assert _date(2028, 1, 1).weekday() == 5, "test premise: 2028-01-01 should be Saturday"
 
     holidays_2027 = nyse_holidays(2027)
-    assert _date(2027, 12, 31) in holidays_2027, (
-        "nyse_holidays(2027) must include 2027-12-31 (observed New Year\'s Day 2028)"
+    assert _date(2027, 12, 31) not in holidays_2027, (
+        "NYSE Rule 7.2's year-end exception keeps the Exchange open 2027-12-31"
     )
+    assert _date(2028, 1, 1) not in nyse_holidays(2028)
 
-    # Sanity: a year whose next Jan 1 is not Saturday should NOT include Dec 31
-    # (unless Christmas observance lands there, which it doesn't for 2025).
-    assert _date(2026, 1, 1).weekday() != 5
-    holidays_2025 = nyse_holidays(2025)
-    assert _date(2025, 12, 31) not in holidays_2025
+    # Sanity: a Sunday New Year's Day still shifts to the following Monday.
+    assert _date(2034, 1, 1).weekday() == 6, "test premise: 2034-01-01 should be Sunday"
+    assert _date(2034, 1, 2) in nyse_holidays(2034)
 
 
 class _NaNCloseProvider:

@@ -40,13 +40,24 @@ secret manager.
    - Robinhood account `562057042` execution credentials.
    - `NOTION_TOKEN` for the dashboard sync (see
      [`notion_dashboard_template.md`](notion_dashboard_template.md)).
+   - Per-stream heartbeat URLs (`DCA_HEARTBEAT_URL_MORNING` / `_MIDDAY` /
+     `_AFTERNOON`, healthchecks.io-compatible — one check per stream, alerting
+     on missed pings) and `DCA_ALERT_SLACK_WEBHOOK` (failure alerts; falls back
+     to `DCA_DRIFT_SLACK_WEBHOOK` if unset) in the scheduler environment. These
+     are read by `dca_alerts.guarded_run`; until set, the alerting paths are
+     silent no-ops by design (see `PRODUCTION_READINESS.md` Phase 1).
 5. Verify safeguards are enforced: $2 base with tiered caps (Normal $180/$900,
    Elevated $240/$1,200, High-vol $300/$1,500, Stress $360/$1,800 daily/weekly;
    weekly rollover reserve capped at $900), one order per ticker per day, market +
    `gfd` + `review_equity_order`, no sells/options/crypto/margin/cancellations,
    regular hours only.
-6. Confirm the test window (through **2026-08-28**) is still active before
-   enabling live trading.
+6. Confirm the test window (through **2026-10-30**, per
+   `config/trading_window.json`) is still active before enabling live trading,
+   and separately confirm the scheduler-side `programmatic_trigger_check.sh`
+   trigger gate (outside this repo) matches — extending the config here does
+   not extend that external script. The window deliberately ends before the
+   2026-11-01 DST change (fixed-UTC live-task cron); do not extend it past
+   2026-10-30 until the external scheduler's cron is confirmed DST-aware.
 
 ## Refreshing config from a new thread
 
@@ -70,4 +81,4 @@ Then diff and review before committing. See [`scripts/README.md`](../scripts/REA
 - [ ] Afternoon tasks complete by 3:40 PM ET, except Fri 5:00 PM Notion refresh.
 - [ ] Signal rules recorded: below prior close + 60-min trend down + multiplier > 0.
 - [ ] No secrets committed (`git grep` for tokens/keys before pushing).
-- [ ] Notifications: no Slack; in-app + email-where-specified only.
+- [ ] Notifications: no *routine* Slack (in-app + email-where-specified only for normal runs); Slack is permitted, env-gated, and off-by-default for the drift (`DCA_DRIFT_SLACK_WEBHOOK`) and failure-alert/heartbeat (`DCA_ALERT_SLACK_WEBHOOK`) paths only — never for routine success notifications.

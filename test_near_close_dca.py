@@ -921,7 +921,9 @@ def test_deployment_history_root_engages_kill_switch_on_later_run(tmp_path):
     # so its total trivially exceeds the 40% kill-switch threshold.
     history_root = os.path.join(tmp_path, "runs")
     day1_dir = os.path.join(history_root, "2026-06-29")
-    day1_dates = frozenset({date(2026, 6, 29), date(2026, 7, 3)})
+    # 2026-07-02 (not 2026-07-03, the observed Independence Day) so the new
+    # NYSE-holiday execution gate doesn't block day 2 below.
+    day1_dates = frozenset({date(2026, 6, 29), date(2026, 7, 2)})
 
     now1 = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
@@ -949,8 +951,8 @@ def test_deployment_history_root_engages_kill_switch_on_later_run(tmp_path):
 
     # Day 2 (within the trailing 7 days): the kill-switch must engage from day 1's
     # history alone, capping every buy multiplier to 1x.
-    day2_dir = os.path.join(history_root, "2026-07-03")
-    now2 = datetime(2026, 7, 3, 15, 45, tzinfo=EASTERN)
+    day2_dir = os.path.join(history_root, "2026-07-02")
+    now2 = datetime(2026, 7, 2, 15, 45, tzinfo=EASTERN)
     state2 = StrategyState()
     broker2 = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     fin2 = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now2))
@@ -1117,6 +1119,31 @@ def test_run_daily_compact_date_gated_short_circuits(tmp_path):
     with open(result["run_state_path"], encoding="utf-8") as handle:
         assert json.load(handle)["status"] == "blocked"
     # No paths to CSVs that were never written, and no stray artifacts on disk.
+    for key in ["signals_path", "buy_candidates_path", "orders_csv_path"]:
+        assert key not in result
+    assert set(os.listdir(artifacts_dir)) == {"run_state.json"}
+
+
+def test_run_daily_compact_holiday_gated_short_circuits(tmp_path):
+    """An approved date that also lands on a full NYSE closure (e.g. an extended
+    trading_window.json that widens approved_test_dates with no holiday
+    subtraction of its own) must still report blocked=True and never advertise
+    signals/candidates/orders CSV paths that run_once never wrote."""
+    labor_day = date(2026, 9, 7)
+    artifacts_dir = os.path.join(tmp_path, "runs", str(labor_day))
+    _now, _config, state, broker, fin, rh = _compact_setup(tmp_path)
+    holiday_now = datetime(2026, 9, 7, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=_config.tickers,
+        approved_test_dates=frozenset({labor_day}),
+    )
+
+    result = run_daily_compact(holiday_now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir)
+
+    assert result["blocked"] is True
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        assert json.load(handle)["status"] == "blocked"
     for key in ["signals_path", "buy_candidates_path", "orders_csv_path"]:
         assert key not in result
     assert set(os.listdir(artifacts_dir)) == {"run_state.json"}
@@ -3056,6 +3083,33 @@ def test_execution_gate_blocked_after_window_end_logs_error(tmp_path, caplog):
     assert any("hard-stopped" in record.getMessage() for record in caplog.records)
     # The blocked stub artifact is still written as before.
     assert (tmp_path / "run_state.json").exists()
+
+
+def test_execution_gate_blocks_nyse_holiday_even_if_config_approves_it(tmp_path, caplog):
+    """A config-driven window (e.g. an extended trading_window.json) can widen
+    approved_test_dates to any weekday range with no holiday subtraction of its
+    own; the gate must still block full NYSE closures like Labor Day and
+    Thanksgiving via the independently computed calendar."""
+    from near_close_dca import _check_execution_gates
+
+    for holiday in (date(2026, 9, 7), date(2026, 11, 26)):  # Labor Day, Thanksgiving
+        config = StrategyConfig(approved_test_dates=frozenset({holiday}))
+        with caplog.at_level("WARNING", logger="near_close_dca"):
+            allowed = _check_execution_gates(holiday, config, DryRunBroker(), str(tmp_path / str(holiday)))
+        assert allowed is False
+        assert any(
+            "NYSE holiday gate blocked execution" in record.getMessage() for record in caplog.records
+        )
+        caplog.clear()
+
+
+def test_execution_gate_allows_non_holiday_weekday_in_approved_window(tmp_path):
+    from near_close_dca import _check_execution_gates
+
+    trading_day = date(2026, 9, 8)  # Tuesday after Labor Day; not a holiday.
+    config = StrategyConfig(approved_test_dates=frozenset({trading_day}))
+    allowed = _check_execution_gates(trading_day, config, DryRunBroker(), str(tmp_path))
+    assert allowed is True
 
 
 def test_orders_csv_fills_logs_and_keeps_partial_rows_on_corrupt_csv(tmp_path, caplog):
