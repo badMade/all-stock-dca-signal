@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import datetime, time, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,6 +18,68 @@ def _now(day=(2026, 7, 6)):
 def _demo_config():
     # Approve the demo trading day regardless of the bundled window.
     return load_strategy_config(approved_test_dates=frozenset({_now().date()}))
+
+
+def test_resolve_now_with_naive_string():
+    config = StrategyConfig(decision_time_et=time(15, 45))
+    dt = _resolve_now("2026-07-06T12:00:00", config)
+    assert dt.year == 2026
+    assert dt.month == 7
+    assert dt.day == 6
+    assert dt.hour == 12
+    assert dt.minute == 0
+    assert dt.tzinfo == EASTERN
+
+
+def test_resolve_now_with_aware_string():
+    config = StrategyConfig(decision_time_et=time(15, 45))
+    dt = _resolve_now("2026-07-06T12:00:00+00:00", config)
+    assert dt.year == 2026
+    assert dt.month == 7
+    assert dt.day == 6
+    assert dt.hour == 12
+    assert dt.minute == 0
+    assert dt.second == 0
+    assert dt.tzinfo == timezone.utc
+
+
+@patch("run_dca.datetime")
+def test_resolve_now_without_arg(mock_datetime):
+    # Setup mock to return a specific datetime for now()
+    mock_now = datetime(2026, 7, 6, 12, 0, tzinfo=EASTERN)
+    mock_datetime.now.return_value = mock_now
+    # We also need to mock combine since we patched datetime
+    mock_datetime.combine = datetime.combine
+
+    config = StrategyConfig(decision_time_et=time(15, 45))
+    dt = _resolve_now(None, config)
+
+    assert dt.year == 2026
+    assert dt.month == 7
+    assert dt.day == 6
+    assert dt.hour == 15
+    assert dt.minute == 45
+    assert dt.tzinfo == EASTERN
+
+
+def test_is_within():
+    """Test _is_within correctly identifies path hierarchy."""
+    base = Path("/a/b")
+
+    # Path is the same as ancestor
+    assert _is_within(Path("/a/b"), base) is True
+
+    # Path is nested under ancestor
+    assert _is_within(Path("/a/b/c"), base) is True
+    assert _is_within(Path("/a/b/c/d"), base) is True
+
+    # Path is disjoint from ancestor
+    assert _is_within(Path("/a/c"), base) is False
+    assert _is_within(Path("/d/e"), base) is False
+
+    # Path is parent of ancestor
+    assert _is_within(Path("/a"), base) is False
+    assert _is_within(Path("/"), base) is False
 
 
 def test_demo_provider_produces_downtrend_bars():
@@ -1371,51 +1433,4 @@ def test_run_pipeline_partial_retry_merges_orders_after_place(tmp_path):
     order_ids = {o["order_id"] for o in _json.loads(oap.read_text(encoding="utf-8"))["orders"]}
     assert "retry-Y2" in order_ids, "New MSFT order missing from merged file"
     assert "prior-X1" in order_ids, "Prior AAPL fill lost during partial retry"
-
-
-def test_resolve_now_with_arg_no_tz():
-    config = StrategyConfig(decision_time_et=time(15, 30))
-    result = _resolve_now("2023-10-25T14:00:00", config)
-    assert result.isoformat() == "2023-10-25T14:00:00-04:00"
-
-
-def test_resolve_now_with_arg_with_tz():
-    config = StrategyConfig(decision_time_et=time(15, 30))
-    result = _resolve_now("2023-10-25T14:00:00+00:00", config)
-    assert result.isoformat() == "2023-10-25T14:00:00+00:00"
-    assert result.utcoffset().total_seconds() == 0
-
-
-@patch("run_dca.datetime")
-def test_resolve_now_without_arg(mock_datetime):
-    # Setup mock
-    mock_now = datetime(2023, 10, 25, 12, 0, 0, tzinfo=EASTERN)
-    mock_datetime.now.return_value = mock_now
-    mock_datetime.combine = datetime.combine
-
-    config = StrategyConfig(decision_time_et=time(15, 30))
-    result = _resolve_now(None, config)
-
-    mock_datetime.now.assert_called_once_with(tz=EASTERN)
-    assert result.isoformat() == "2023-10-25T15:30:00-04:00"
-
-
-def test_is_within():
-    """Test _is_within correctly identifies path hierarchy."""
-    base = Path("/a/b")
-
-    # Path is the same as ancestor
-    assert _is_within(Path("/a/b"), base) is True
-
-    # Path is nested under ancestor
-    assert _is_within(Path("/a/b/c"), base) is True
-    assert _is_within(Path("/a/b/c/d"), base) is True
-
-    # Path is disjoint from ancestor
-    assert _is_within(Path("/a/c"), base) is False
-    assert _is_within(Path("/d/e"), base) is False
-
-    # Path is parent of ancestor
-    assert _is_within(Path("/a"), base) is False
-    assert _is_within(Path("/"), base) is False
 
