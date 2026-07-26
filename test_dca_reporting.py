@@ -15,6 +15,7 @@ from dca_notion_sync import (
 from dca_reporting import (
     _is_manual_run_state,
     _to_float,
+    build_coverage_report_md,
     build_latest_run_summary,
     build_missing_fills,
     compute_slippage_rows,
@@ -205,6 +206,7 @@ def test_missing_fills_excludes_top_up_skipped_candidates():
     assert {m["ticker"] for m in missing} == set()
 
 
+
 def test_latest_run_summary_excludes_top_up_skipped_from_coverage():
     run_state = _run_state()
     run_state["buy_candidates"][1]["top_up_skipped"] = True
@@ -217,6 +219,51 @@ def test_latest_run_summary_excludes_top_up_skipped_from_coverage():
     assert summary["coverage"]["buy_candidates"] == 2
     assert summary["coverage"]["missing_fills"] == 0
     assert summary["coverage"]["coverage_pct"] == 100.0
+
+
+def test_build_coverage_report_md_populated_tables():
+    run_state = _run_state()
+    rows = compute_slippage_rows(run_state["buy_candidates"], _fills())
+    missing = build_missing_fills(run_state["buy_candidates"], _fills())
+    summary = build_latest_run_summary(run_state, rows, missing)
+
+    md = build_coverage_report_md(summary, rows, missing)
+
+    # Header and metadata
+    assert "# Slippage & Coverage Report" in md
+    assert "2026-06-29" in md
+    assert "2026-06-29-154500" in md
+    assert "robinhood" in md
+
+    # Slippage table rendered (not the empty placeholder)
+    assert "| Ticker | Target | Fill | Slippage % | Note |" in md
+    assert "AAPL" in md
+    assert "_No fills to rank._" not in md
+
+    # Missing-fills table should be absent (all filled)
+    assert "_No missing fills._" in md
+    assert "| Ticker | Planned $ | Status | Reason |" not in md
+
+
+def test_build_coverage_report_md_empty_tables():
+    run_state = _run_state()
+    # No fills at all → all candidates become missing fills; slippage rows are empty.
+    rows = compute_slippage_rows(run_state["buy_candidates"], [])
+    missing = build_missing_fills(run_state["buy_candidates"], [])
+    summary = build_latest_run_summary(run_state, rows, missing)
+
+    md = build_coverage_report_md(summary, rows, missing)
+
+    # Slippage table replaced by empty-state sentinel
+    assert "_No fills to rank._" in md
+    assert "| Ticker | Target | Fill | Slippage % | Note |" not in md
+
+    # Missing-fills table rendered with all three candidates
+    assert "| Ticker | Planned $ | Status | Reason |" in md
+    assert "AAPL" in md
+    assert "NVDA" in md
+    assert "AMD" in md
+    assert "_No missing fills._" not in md
 
 
 def test_compact_notion_markdown_generation():
