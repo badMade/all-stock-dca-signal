@@ -11,6 +11,7 @@ from dca_live_adapters import (
     RobinhoodBroker,
     RobinhoodDataProvider,
     _interpret_review,
+    _is_error_response,
     _parse_rfc3339,
     _response_failure,
     _rh_interval,
@@ -737,6 +738,67 @@ def test_build_broker_refuses_live_run_with_unset_account_sentinel():
         build_broker(StrategyConfig(broker=BrokerName.ROBINHOOD, dry_run=True, target_account_number="")),
         DryRunBroker,
     )
+
+@pytest.mark.parametrize(
+    "data, expected",
+    [
+        # The explicit isError envelope returned by mcp-bridge for network failures.
+        ({"isError": True, "error": "network timeout"}, "network timeout"),
+        ({"isError": True}, "Unknown network/bridge error"),
+        ({"isError": True, "error": None}, "Unknown network/bridge error"),
+        ({"isError": True, "error": ""}, "Unknown network/bridge error"),
+
+        # A top-level "error" is always a failure signal on its own.
+        ({"error": "invalid symbol"}, "error: invalid symbol"),
+        # Empty/falsy error values must not be treated as errors.
+        ({"error": ""}, None),
+        # Truthy non-string error payloads (structured broker errors) must still
+        # be detected, stringified only when building the reason.
+        ({"error": {"code": "service_unavailable"}}, "error: {'code': 'service_unavailable'}"),
+        ({"error": ["timeout", "retry_exhausted"]}, "error: ['timeout', 'retry_exhausted']"),
+
+        # "message"/"detail" alone (no explicit failure flag) are informational,
+        # not error indicators, and must not be treated as failures.
+        ({"message": "rate limited"}, None),
+        ({"detail": "not found"}, None),
+        ({"message": ""}, None),
+        ({"detail": ""}, None),
+
+        # Original wrapper payloads from the codebase
+        ({"error": "some network failure"}, "error: some network failure"),
+        ({"success": False}, "success=false"),
+        ({"ok": False}, "ok=false"),
+        ({"success": False, "data": {}}, "success=false"),
+        ({"ok": False, "data": {}}, "ok=false"),
+        # Concrete error message takes priority over bare flag name.
+        ({"success": False, "error": "permission denied"}, "error: permission denied"),
+        ({"ok": False, "message": "quota exceeded"}, "quota exceeded"),
+        # message/detail only count as a reason once a failure flag establishes
+        # that the envelope actually represents a failure.
+        ({"ok": False, "detail": "not found"}, "not found"),
+
+        # Non-error dictionaries
+        ({"success": True}, None),
+        ({"ok": True}, None),
+        ({"other": "value"}, None),
+        ({}, None),
+        # Explicit failure flag with no concrete message still resolves to a reason.
+        ({"success": False, "message": ""}, "success=false"),
+
+        # Error-ish dictionaries that should still be treated as errors
+        ({"isError": False, "error": "msg"}, "error: msg"),
+
+        # Non-dictionary inputs - should return None
+        ([], None),
+        (None, None),
+        ("string", None),
+        (42, None),
+    ]
+)
+def test_is_error_response(data, expected):
+    """Test that _is_error_response correctly identifies failure envelopes."""
+    assert _is_error_response(data) == expected
+
 
 @pytest.mark.parametrize("response, expected", [
     # Happy paths: no errors should return None

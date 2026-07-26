@@ -103,22 +103,36 @@ def _first_positive_float(mapping: Dict[str, Any], *keys: str) -> float:
     return 0.0
 
 
-def _is_error_response(data: Dict[str, Any]) -> Optional[str]:
-    """Return a reason string if a wrapper reported failure as data, else ``None``.
+def _is_error_response(data: Any) -> Optional[str]:
+    """Check if an un-wrapped response dictionary represents an MCP-level error.
 
-    MCP wrappers sometimes surface an outage as a payload (``{"error": ...}`` /
-    ``{"success": false}``) rather than raising. Broker safeguards must treat these as
-    failures (fail closed), not as "no data / nothing found".
+    Returns the error message if one is found, otherwise None.
     """
     if not isinstance(data, dict):
         return None
-    if data.get("error"):
-        return f"error: {data.get('error')}"
+    # 1. The explicit isError envelope returned by mcp-bridge for network failures.
+    if data.get("isError") is True:
+        msg = data.get("error")
+        return str(msg) if msg else "Unknown network/bridge error"
+
+    # 2. A truthy top-level "error" is always a failure signal on its own, whatever
+    # its shape (string, dict, list, ...) — only its rendering differs, so detection
+    # never depends on it happening to be a string and empty values stay non-errors.
+    error_val = data.get("error")
+    if error_val:
+        return f"error: {error_val}"
+
+    # 3. "message"/"detail" are informational field names, not intrinsic error
+    # indicators — only trust them as a failure reason once an explicit
+    # success=false/ok=false flag has already established that this is a failure.
     for flag in ("success", "ok"):
         if data.get(flag) is False:
+            for key in ("message", "detail"):
+                val = data.get(key)
+                if val:
+                    return str(val)
             return f"{flag}=false"
     return None
-
 
 def _response_failure(response: Any) -> Optional[str]:
     """Extract the error message from a raw MCP response, if any.
