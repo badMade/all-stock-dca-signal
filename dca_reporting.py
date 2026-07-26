@@ -256,14 +256,14 @@ def fills_from_order_history_payload(
     return fills
 
 
-def _order_list_from_payload(payload: Any) -> List[Any]:
-    """Extract the list of order dicts from the accepted payload shapes.
+def _unwrap_payload(payload: Any) -> Any:
+    """Unwrap normalized connector payload envelopes recursively.
 
     ``save_raw_input()`` can normalize a raw broker envelope that is itself
     ``{"data": {...}}``, producing a doubly (or more) nested pointer such as
     ``{"output_path": ..., "data": {"data": {"orders": [...]}}}``. Keep
-    unwrapping ``data`` layers -- not just one -- until an orders/results list
-    is found or the payload stops being an unwrappable dict.
+    unwrapping ``data`` layers -- not just one -- until the payload stops
+    being an unwrappable dict.
     """
     seen_ids: set[int] = set()
     while isinstance(payload, dict) and "data" in payload:
@@ -271,6 +271,12 @@ def _order_list_from_payload(payload: Any) -> List[Any]:
             break  # defend against a cyclic/self-referential payload
         seen_ids.add(id(payload))
         payload = payload["data"]
+    return payload
+
+
+def _order_list_from_payload(payload: Any) -> List[Any]:
+    """Extract the list of order dicts from the accepted payload shapes."""
+    payload = _unwrap_payload(payload)
     if isinstance(payload, list):
         return payload
     if isinstance(payload, dict):
