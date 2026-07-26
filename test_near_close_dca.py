@@ -5,6 +5,7 @@ percentages are converted to fractions before calling graded_buy_multiplier, whi
 expects a fraction of the previous close (2.0% down == 0.02).
 """
 
+import csv
 import json
 import os
 import tempfile
@@ -2994,6 +2995,115 @@ def test_iso_week_key():
     assert iso_week_key(date(2020, 12, 31)) == (2020, 53) # Thursday, week 53
     assert iso_week_key(date(2021, 1, 3)) == (2020, 53)   # Sunday, last day of week 53
     assert iso_week_key(date(2021, 1, 4)) == (2021, 1)    # Monday, starts week 1 of 2021
+
+
+def test_approved_window_status_counts_remaining_days():
+    from near_close_dca import approved_window_status
+
+    approved = frozenset({date(2026, 8, 24), date(2026, 8, 25), date(2026, 8, 26)})
+    in_window, window_end, remaining = approved_window_status(approved, date(2026, 8, 25))
+    assert in_window is True
+    assert window_end == date(2026, 8, 26)
+    assert remaining == 2  # the 25th and 26th
+
+    in_window, window_end, remaining = approved_window_status(approved, date(2026, 9, 1))
+    assert in_window is False
+    assert remaining == 0
+
+    assert approved_window_status(frozenset(), date(2026, 8, 25)) == (False, None, 0)
+
+
+def test_warn_if_window_expiring_warns_near_end(caplog):
+    from near_close_dca import warn_if_window_expiring
+
+    approved = frozenset({date(2026, 8, 27), date(2026, 8, 28)})
+    with caplog.at_level("WARNING", logger="near_close_dca"):
+        warn_if_window_expiring(approved, date(2026, 8, 27))
+    assert any(
+        "approved trading window ends 2026-08-28" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_warn_if_window_expiring_errors_after_end(caplog):
+    from near_close_dca import warn_if_window_expiring
+
+    approved = frozenset({date(2026, 8, 28)})
+    with caplog.at_level("ERROR", logger="near_close_dca"):
+        warn_if_window_expiring(approved, date(2026, 8, 31))
+    assert any(
+        "approved trading window ended 2026-08-28" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_warn_if_window_expiring_quiet_far_from_end(caplog):
+    from near_close_dca import _weekday_range, warn_if_window_expiring
+
+    approved = frozenset(_weekday_range(date(2026, 7, 1), date(2026, 12, 31)))
+    with caplog.at_level("WARNING", logger="near_close_dca"):
+        warn_if_window_expiring(approved, date(2026, 7, 23))
+    assert caplog.records == []
+
+
+def test_execution_gate_blocked_after_window_end_logs_error(tmp_path, caplog):
+    from near_close_dca import _check_execution_gates
+
+    config = StrategyConfig(approved_test_dates=frozenset({date(2026, 8, 28)}))
+    with caplog.at_level("ERROR", logger="near_close_dca"):
+        allowed = _check_execution_gates(date(2026, 8, 31), config, DryRunBroker(), str(tmp_path))
+    assert allowed is False
+    assert any("hard-stopped" in record.getMessage() for record in caplog.records)
+    # The blocked stub artifact is still written as before.
+    assert (tmp_path / "run_state.json").exists()
+
+
+def test_orders_csv_fills_logs_and_keeps_partial_rows_on_corrupt_csv(tmp_path, caplog):
+    """A corrupt orders.csv must be loud (logged) and keep rows parsed before the failure."""
+    from near_close_dca import _orders_csv_fills
+
+    orders_csv = tmp_path / "orders.csv"
+    good = (
+        "ticker,status,avg_fill_price,quantity_filled,order_id\n"
+        "AAPL,filled,100.0,0.02,oid-1\n"
+    )
+    # An oversized field raises csv.Error (field larger than field limit) on the
+    # row AFTER the valid AAPL row, so parsing fails mid-iteration.
+    oversized = "x" * (csv.field_size_limit() + 1)
+    orders_csv.write_text(good + f"MSFT,filled,{oversized},0.01,oid-2\n", encoding="utf-8")
+
+    with caplog.at_level("ERROR", logger="near_close_dca"):
+        fills = _orders_csv_fills(tmp_path)
+
+    assert "AAPL" in fills
+    assert fills["AAPL"]["order_id"] == "oid-1"
+    assert any("failed to parse" in record.message for record in caplog.records)
+
+
+def test_orders_csv_fills_logs_on_undecodable_csv(tmp_path, caplog):
+    from near_close_dca import _orders_csv_fills
+
+    orders_csv = tmp_path / "orders.csv"
+    orders_csv.write_bytes(b"\xff\xfe not utf-8 \xff")
+
+    with caplog.at_level("ERROR", logger="near_close_dca"):
+        fills = _orders_csv_fills(tmp_path)
+
+    assert fills == {}
+    assert any("failed to parse" in record.message for record in caplog.records)
+
+
+def test_orders_csv_submitted_notionals_logs_on_corrupt_csv(tmp_path, caplog):
+    from near_close_dca import _orders_csv_submitted_notionals
+
+    orders_csv = tmp_path / "orders.csv"
+    orders_csv.write_bytes(b"\xff\xfe not utf-8 \xff")
+
+    with caplog.at_level("ERROR", logger="near_close_dca"):
+        notionals = _orders_csv_submitted_notionals(orders_csv)
+
+    assert notionals == {}
+    assert any("failed to parse" in record.message for record in caplog.records)
 
 
 if __name__ == "__main__":

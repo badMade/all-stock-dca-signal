@@ -610,8 +610,9 @@ def build_email_html(
 
     # ---- Helper: ticker card ----
     def ticker_card_html(info: dict) -> str:
-        ticker   = info["ticker"]
-        company  = COMPANY_NAMES.get(ticker, ticker)
+        raw_ticker = str(info["ticker"])
+        ticker   = html.escape(raw_ticker)
+        company  = html.escape(COMPANY_NAMES.get(raw_ticker, raw_ticker))
         zscore   = info.get("zscore", 0.0)
         score    = info.get("score", 0.0)
         mu       = info.get("history_mean", 0.0)
@@ -708,7 +709,9 @@ def build_email_html(
 
     # ---- Helper: summary table row ----
     def summary_row_html(info: dict) -> str:
-        ticker   = info["ticker"]
+        raw_ticker = str(info["ticker"])
+        ticker   = html.escape(raw_ticker)
+        company  = html.escape(COMPANY_NAMES.get(raw_ticker, raw_ticker))
         score    = info.get("score", 0.0)
         zscore   = info.get("zscore")
         status   = info.get("status", "normal")
@@ -732,7 +735,7 @@ def build_email_html(
         return f"""
           <tr style="background:{st_bg};">
             <td style="padding:8px 12px;font-weight:bold;font-family:Arial,sans-serif;font-size:13px;">{ticker}</td>
-            <td style="padding:8px 12px;font-family:Arial,sans-serif;font-size:13px;">{COMPANY_NAMES.get(ticker,ticker)}</td>
+            <td style="padding:8px 12px;font-family:Arial,sans-serif;font-size:13px;">{company}</td>
             <td style="padding:8px 12px;font-family:monospace;font-size:13px;">{score:+.4f}</td>
             <td style="padding:8px 12px;font-family:monospace;font-size:13px;color:{z_color};font-weight:bold;">{z_str}</td>
             <td style="padding:8px 12px;font-family:Arial,sans-serif;font-size:13px;">{st_str}</td>
@@ -744,7 +747,7 @@ def build_email_html(
         cards_html += ticker_card_html(info)
 
     # ---- "No action required" notice ----
-    normal_tickers = [i["ticker"] for i in normal if i.get("status") == "normal"]
+    normal_tickers = [html.escape(str(i["ticker"])) for i in normal if i.get("status") == "normal"]
     if normal_tickers:
         normal_notice = f"""
         <p style="font-size:13px;color:#555;font-family:Arial,sans-serif;margin-top:0;">

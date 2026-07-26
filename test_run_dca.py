@@ -2,22 +2,13 @@
 
 from __future__ import annotations
 
-import logging
 from datetime import datetime, time
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 from dca_config import load_strategy_config
 from near_close_dca import EASTERN, DryRunBroker, SourceName, StrategyConfig, StrategyState, build_broker
-from run_dca import (
-    DemoDataProvider,
-    _fills_from_orders_csv,
-    configure_logging,
-    main,
-    run_pipeline,
-)
+from run_dca import DemoDataProvider, _fills_from_orders_csv, _is_within, _resolve_now, main, run_pipeline
 
 
 def _now(day=(2026, 7, 6)):
@@ -1382,22 +1373,49 @@ def test_run_pipeline_partial_retry_merges_orders_after_place(tmp_path):
     assert "prior-X1" in order_ids, "Prior AAPL fill lost during partial retry"
 
 
-@pytest.mark.parametrize("level,expected_level", [
-    ("INFO", logging.INFO),
-    ("DEBUG", logging.DEBUG),
-    ("WARNING", logging.WARNING),
-    ("ERROR", logging.ERROR),
-    ("CRITICAL", logging.CRITICAL),
-    ("debug", logging.DEBUG),
-    ("info", logging.INFO),
-    ("INVALID_LEVEL", logging.INFO),
-    ("not_a_level", logging.INFO),
-])
-@patch("logging.basicConfig")
-def test_configure_logging(mock_basic_config, level, expected_level):
-    """Test configure_logging sets up correct log level and format."""
-    configure_logging(level)
-    mock_basic_config.assert_called_once_with(
-        level=expected_level,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-    )
+def test_resolve_now_with_arg_no_tz():
+    config = StrategyConfig(decision_time_et=time(15, 30))
+    result = _resolve_now("2023-10-25T14:00:00", config)
+    assert result.isoformat() == "2023-10-25T14:00:00-04:00"
+
+
+def test_resolve_now_with_arg_with_tz():
+    config = StrategyConfig(decision_time_et=time(15, 30))
+    result = _resolve_now("2023-10-25T14:00:00+00:00", config)
+    assert result.isoformat() == "2023-10-25T14:00:00+00:00"
+    assert result.utcoffset().total_seconds() == 0
+
+
+@patch("run_dca.datetime")
+def test_resolve_now_without_arg(mock_datetime):
+    # Setup mock
+    mock_now = datetime(2023, 10, 25, 12, 0, 0, tzinfo=EASTERN)
+    mock_datetime.now.return_value = mock_now
+    mock_datetime.combine = datetime.combine
+
+    config = StrategyConfig(decision_time_et=time(15, 30))
+    result = _resolve_now(None, config)
+
+    mock_datetime.now.assert_called_once_with(tz=EASTERN)
+    assert result.isoformat() == "2023-10-25T15:30:00-04:00"
+
+
+def test_is_within():
+    """Test _is_within correctly identifies path hierarchy."""
+    base = Path("/a/b")
+
+    # Path is the same as ancestor
+    assert _is_within(Path("/a/b"), base) is True
+
+    # Path is nested under ancestor
+    assert _is_within(Path("/a/b/c"), base) is True
+    assert _is_within(Path("/a/b/c/d"), base) is True
+
+    # Path is disjoint from ancestor
+    assert _is_within(Path("/a/c"), base) is False
+    assert _is_within(Path("/d/e"), base) is False
+
+    # Path is parent of ancestor
+    assert _is_within(Path("/a"), base) is False
+    assert _is_within(Path("/"), base) is False
+

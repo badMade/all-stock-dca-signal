@@ -13,11 +13,13 @@ from dca_notion_sync import (
     build_notion_sync_payload,
 )
 from dca_reporting import (
+    _is_manual_run_state,
     build_latest_run_summary,
     build_missing_fills,
     compute_slippage_rows,
     fills_from_order_history_payload,
     generate_reports,
+    load_run_state,
     rank_slippage,
 )
 from dca_weekly_dashboard import (
@@ -1010,6 +1012,85 @@ def test_fills_from_order_history_payload_rejects_non_finite_prices_and_quantiti
         f"non-finite price/quantity orders must be rejected, got {sorted(by_ticker)}"
     )
 
+
+def test_write_csv_happy_path(tmp_path):
+    import csv
+
+    from dca_reporting import _write_csv
+
+    path = tmp_path / "test.csv"
+    rows = [{"A": 1, "B": "foo"}, {"A": 2, "B": "bar"}]
+    fieldnames = ["A", "B"]
+
+    _write_csv(path, rows, fieldnames)
+
+    assert path.exists()
+    with path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        assert reader.fieldnames == ["A", "B"]
+        data = list(reader)
+        assert len(data) == 2
+        assert data[0] == {"A": "1", "B": "foo"}
+        assert data[1] == {"A": "2", "B": "bar"}
+
+
+def test_write_csv_empty_rows(tmp_path):
+    import csv
+
+    from dca_reporting import _write_csv
+
+    path = tmp_path / "test.csv"
+    _write_csv(path, [{"A": 1, "B": "foo"}], ["A", "B"])
+    assert path.exists()
+
+    # Re-writing with an empty row set must still overwrite the file with a
+    # header-only CSV (per generate_reports' four-file contract) rather than
+    # leaving the previous run's stale row behind.
+    _write_csv(path, [], ["A", "B"])
+    assert path.exists()
+    with path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        assert reader.fieldnames == ["A", "B"]
+        assert list(reader) == []
+
+
+def test_run_classification_helpers():
+    from dca_reporting import _run_classification_helpers
+
+    collect_manual_order_ids, select_scheduled_state_for_reporting = _run_classification_helpers()
+
+    assert callable(collect_manual_order_ids)
+    assert callable(select_scheduled_state_for_reporting)
+    assert collect_manual_order_ids.__name__ == "collect_manual_order_ids"
+    assert select_scheduled_state_for_reporting.__name__ == "select_scheduled_state_for_reporting"
+
+
+def test_is_manual_run_state():
+    cases = [
+        ({"run_classification": {"run_origin": "manual"}}, True),
+        ({"run_classification": {"manual_run": True}}, True),
+        ({"run_classification": {"run_origin": "manual", "manual_run": True}}, True),
+        ({"run_classification": {"run_origin": "scheduled"}}, False),
+        ({"run_classification": {"manual_run": False}}, False),
+        ({"run_classification": {}}, False),
+        ({"run_classification": None}, False),
+        ({"run_classification": "invalid_type"}, False),
+        ({}, False),
+        (None, False),
+        ([], False),
+        ("not_a_dict", False),
+    ]
+    for run_state, expected in cases:
+        assert _is_manual_run_state(run_state) is expected
+
+
+def test_load_run_state(tmp_path):
+    expected_data = {"run_id": "test-run", "dry_run": True}
+    state_file = tmp_path / "run_state.json"
+    state_file.write_text(json.dumps(expected_data), encoding="utf-8")
+
+    loaded_data = load_run_state(state_file)
+    assert loaded_data == expected_data
 
 def _run_all():
     import inspect
