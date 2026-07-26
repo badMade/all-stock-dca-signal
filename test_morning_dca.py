@@ -5448,6 +5448,47 @@ def test_run_records_premium_routing_metadata_when_config_supplies_it(tmp_path):
     assert entry["model_actual"] == "claude-opus-4-8"
 
 
+def test_model_usage_routing_overrides():
+    from unittest.mock import Mock
+
+    from morning_dca import _model_usage_routing_overrides
+
+    # Test all fields set
+    config_all = Mock(spec=["model_usage_model_requested", "model_usage_model_actual", "model_usage_model_routing_mode", "model_usage_reason_for_premium_model"])
+    config_all.model_usage_model_requested = "model_a"
+    config_all.model_usage_model_actual = "model_b"
+    config_all.model_usage_model_routing_mode = "fast"
+    config_all.model_usage_reason_for_premium_model = "needed"
+    assert _model_usage_routing_overrides(config_all) == {
+        "model_requested": "model_a",
+        "model_actual": "model_b",
+        "model_routing_mode": "fast",
+        "reason_for_premium_model": "needed",
+    }
+
+    # Test partial fields set
+    config_partial = Mock(spec=["model_usage_model_requested", "model_usage_model_actual", "model_usage_model_routing_mode", "model_usage_reason_for_premium_model"])
+    config_partial.model_usage_model_requested = "model_a"
+    config_partial.model_usage_model_actual = None
+    config_partial.model_usage_model_routing_mode = "fast"
+    config_partial.model_usage_reason_for_premium_model = None
+    assert _model_usage_routing_overrides(config_partial) == {
+        "model_requested": "model_a",
+        "model_routing_mode": "fast",
+    }
+
+    # Test no fields set
+    config_empty = Mock(spec=["model_usage_model_requested", "model_usage_model_actual", "model_usage_model_routing_mode", "model_usage_reason_for_premium_model"])
+    config_empty.model_usage_model_requested = None
+    config_empty.model_usage_model_actual = None
+    config_empty.model_usage_model_routing_mode = None
+    config_empty.model_usage_reason_for_premium_model = None
+    assert _model_usage_routing_overrides(config_empty) == {}
+
+    # Test fields completely missing from config object
+    config_missing = Mock(spec=[])
+    assert _model_usage_routing_overrides(config_missing) == {}
+
 
 def test_nth_weekday_of_month():
     cases = [
