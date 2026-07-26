@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from datetime import datetime, time
 from pathlib import Path
+from unittest.mock import patch
 
 from dca_config import load_strategy_config
 from near_close_dca import EASTERN, DryRunBroker, SourceName, StrategyConfig, StrategyState, build_broker
-from run_dca import DemoDataProvider, _fills_from_orders_csv, _is_within, main, run_pipeline
+from run_dca import DemoDataProvider, _fills_from_orders_csv, _is_within, _resolve_now, main, run_pipeline
 
 
 def _now(day=(2026, 7, 6)):
@@ -1371,6 +1372,34 @@ def test_run_pipeline_partial_retry_merges_orders_after_place(tmp_path):
     assert "retry-Y2" in order_ids, "New MSFT order missing from merged file"
     assert "prior-X1" in order_ids, "Prior AAPL fill lost during partial retry"
 
+
+def test_resolve_now_with_arg_no_tz():
+    config = StrategyConfig(decision_time_et=time(15, 30))
+    result = _resolve_now("2023-10-25T14:00:00", config)
+    assert result.isoformat() == "2023-10-25T14:00:00-04:00"
+
+
+def test_resolve_now_with_arg_with_tz():
+    config = StrategyConfig(decision_time_et=time(15, 30))
+    result = _resolve_now("2023-10-25T14:00:00+00:00", config)
+    assert result.isoformat() == "2023-10-25T14:00:00+00:00"
+    assert result.utcoffset().total_seconds() == 0
+
+
+@patch("run_dca.datetime")
+def test_resolve_now_without_arg(mock_datetime):
+    # Setup mock
+    mock_now = datetime(2023, 10, 25, 12, 0, 0, tzinfo=EASTERN)
+    mock_datetime.now.return_value = mock_now
+    mock_datetime.combine = datetime.combine
+
+    config = StrategyConfig(decision_time_et=time(15, 30))
+    result = _resolve_now(None, config)
+
+    mock_datetime.now.assert_called_once_with(tz=EASTERN)
+    assert result.isoformat() == "2023-10-25T15:30:00-04:00"
+
+
 def test_is_within():
     """Test _is_within correctly identifies path hierarchy."""
     base = Path("/a/b")
@@ -1389,3 +1418,4 @@ def test_is_within():
     # Path is parent of ancestor
     assert _is_within(Path("/a"), base) is False
     assert _is_within(Path("/"), base) is False
+
