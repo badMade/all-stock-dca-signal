@@ -7,7 +7,7 @@ from pathlib import Path
 
 from dca_config import load_strategy_config
 from near_close_dca import EASTERN, DryRunBroker, SourceName, StrategyConfig, StrategyState, build_broker
-from run_dca import DemoDataProvider, _fills_from_orders_csv, main, run_pipeline
+from run_dca import DemoDataProvider, _fills_from_orders_csv, _is_within, main, run_pipeline
 
 
 def _now(day=(2026, 7, 6)):
@@ -1370,3 +1370,22 @@ def test_run_pipeline_partial_retry_merges_orders_after_place(tmp_path):
     order_ids = {o["order_id"] for o in _json.loads(oap.read_text(encoding="utf-8"))["orders"]}
     assert "retry-Y2" in order_ids, "New MSFT order missing from merged file"
     assert "prior-X1" in order_ids, "Prior AAPL fill lost during partial retry"
+
+def test_is_within():
+    """Test _is_within correctly identifies path hierarchy."""
+    base = Path("/a/b")
+
+    # Path is the same as ancestor
+    assert _is_within(Path("/a/b"), base) is True
+
+    # Path is nested under ancestor
+    assert _is_within(Path("/a/b/c"), base) is True
+    assert _is_within(Path("/a/b/c/d"), base) is True
+
+    # Path is disjoint from ancestor
+    assert _is_within(Path("/a/c"), base) is False
+    assert _is_within(Path("/d/e"), base) is False
+
+    # Path is parent of ancestor
+    assert _is_within(Path("/a"), base) is False
+    assert _is_within(Path("/"), base) is False
