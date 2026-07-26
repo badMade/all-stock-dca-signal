@@ -1045,6 +1045,17 @@ def _is_ticker_not_found_error(exc: Exception) -> bool:
     return any(marker in message for marker in _TICKER_NOT_FOUND_MARKERS)
 
 
+def _compute_signal_timestamps(
+    now: datetime, config: StrategyConfig, interval_minutes: int
+) -> tuple[date, datetime, datetime, datetime]:
+    now_et = now.astimezone(EASTERN)
+    trading_day = now_et.date()
+    decision_dt = datetime.combine(trading_day, config.decision_time_et, tzinfo=EASTERN)
+    decision_anchor = completed_bar_anchor(decision_dt, interval_minutes, config)
+    lookback_anchor = decision_anchor - timedelta(minutes=config.trend_lookback_minutes)
+    return trading_day, decision_dt, decision_anchor, lookback_anchor
+
+
 def evaluate_source_signal(
     ticker: str,
     now: datetime,
@@ -1052,11 +1063,9 @@ def evaluate_source_signal(
     data: MarketDataProvider,
     interval_minutes: int,
 ) -> SourceSignal:
-    now_et = now.astimezone(EASTERN)
-    trading_day = now_et.date()
-    decision_dt = datetime.combine(trading_day, config.decision_time_et, tzinfo=EASTERN)
-    decision_anchor = completed_bar_anchor(decision_dt, interval_minutes, config)
-    lookback_anchor = decision_anchor - timedelta(minutes=config.trend_lookback_minutes)
+    trading_day, decision_dt, decision_anchor, lookback_anchor = _compute_signal_timestamps(
+        now, config, interval_minutes
+    )
 
     bars = data.get_intraday_bars(
         ticker=ticker,
