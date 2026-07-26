@@ -78,8 +78,10 @@ def _num(value: Any) -> float:
 def find_run_state_files(root: str | Path) -> List[Path]:
     """Return every ``run_state.json`` at or below ``root`` (sorted)."""
     root_path = Path(root)
-    if root_path.is_file() and root_path.name == "run_state.json":
-        return [root_path]
+    if root_path.is_file():
+        if root_path.name == "run_state.json":
+            return [root_path]
+        return []
     return sorted(root_path.rglob("run_state.json"))
 
 

@@ -177,7 +177,6 @@ def test_generate_cost_tracker_writes_files(tmp_path):
     assert payload["aggregate"]["run_count"] == 2
 
 
-
 def test_num():
     assert _num(10) == 10.0
     assert _num("42.5") == 42.5
@@ -226,6 +225,11 @@ def test_find_run_state_files(tmp_path):
     # Test direct file path
     found_single = find_run_state_files(file_a)
     assert found_single == [file_a]
+
+    # Test non-matching file path
+    other_file = tmp_path / "other.json"
+    other_file.write_text("{}")
+    assert find_run_state_files(other_file) == []
 
     # Test empty directory
     empty_dir = tmp_path / "empty"
