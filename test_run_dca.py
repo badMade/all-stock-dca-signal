@@ -1433,4 +1433,3 @@ def test_run_pipeline_partial_retry_merges_orders_after_place(tmp_path):
     order_ids = {o["order_id"] for o in _json.loads(oap.read_text(encoding="utf-8"))["orders"]}
     assert "retry-Y2" in order_ids, "New MSFT order missing from merged file"
     assert "prior-X1" in order_ids, "Prior AAPL fill lost during partial retry"
-
