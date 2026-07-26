@@ -41,7 +41,7 @@ from datetime import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from dca_config import load_tickers
+from dca_config import get_config_dir, load_tickers
 from morning_dca import (
     DEFAULT_AFTERNOON_TASK_ROOT,
     DEFAULT_MODEL_USAGE_LOG_ROOT,
@@ -149,20 +149,7 @@ def load_midday_config(config_dir=None) -> MiddayConfig:
     ``MiddayConfig()`` defaults.
     """
     if config_dir is None:
-        import os as _os
-        import sys as _sys
-        env_dir = _os.environ.get("DCA_CONFIG_DIR")
-        if env_dir:
-            config_dir_path = Path(env_dir)
-        else:
-            _here = Path(__file__).resolve().parent
-            _installed = Path(_sys.prefix) / "share" / "all-stock-dca" / "config"
-            for candidate in (_here / "config", _installed, Path.cwd() / "config"):
-                if candidate.is_dir():
-                    config_dir_path = candidate
-                    break
-            else:
-                config_dir_path = _here / "config"
+        config_dir_path = get_config_dir()
     else:
         config_dir_path = Path(config_dir)
 

@@ -30,7 +30,7 @@ logger = logging.getLogger("near_close_dca.config")
 _INSTALLED_CONFIG_DIR = Path(sys.prefix) / "share" / "all-stock-dca" / "config"
 
 
-def _default_config_dir() -> Path:
+def get_config_dir() -> Path:
     """Resolve the default config directory across checkout and installed-wheel layouts.
 
     Order: ``$DCA_CONFIG_DIR`` -> ``config/`` beside this module (checkout) -> the wheel's
@@ -47,7 +47,7 @@ def _default_config_dir() -> Path:
     return Path(__file__).resolve().parent / "config"
 
 
-DEFAULT_CONFIG_DIR = _default_config_dir()
+DEFAULT_CONFIG_DIR = get_config_dir()
 
 
 def _read_json(path: Path) -> Optional[Dict[str, Any]]:

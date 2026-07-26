@@ -53,8 +53,6 @@ import csv
 import json
 import logging
 import math
-import os
-import sys
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
@@ -62,7 +60,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from dca_alerts import guarded_run
-from dca_config import load_approved_dates, load_tickers
+from dca_config import get_config_dir, load_approved_dates, load_tickers
 from dca_fileio import atomic_open_w, atomic_write_text
 from near_close_dca import (
     ACTIVE_TICKERS,
@@ -772,25 +770,15 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
 
     ``mode`` selects which artifact root to bind (the watchlist scan and the live
     execution share the morning ladder and budget caps but write to distinct
-    roots). Looks for ``morning_dca.json`` in ``config_dir`` (default: a
-    ``config/`` directory next to this module, falling back to ``./config``). If
-    the file is absent or unreadable the function logs a warning and returns
-    ``MorningConfig()`` with hardcoded defaults -- the same graceful-fallback
-    pattern used by :func:`dca_config.load_strategy_config`.
+    roots). Looks for ``morning_dca.json`` in ``config_dir`` (default: resolved
+    by :func:`dca_config.get_config_dir` -- checks ``$DCA_CONFIG_DIR``, then
+    ``config/`` beside this module, then the installed-wheel share dir, then
+    ``./config``). If the file is absent or unreadable the function logs a
+    warning and returns ``MorningConfig()`` with hardcoded defaults -- the same
+    graceful-fallback pattern used by :func:`dca_config.load_strategy_config`.
     """
     if config_dir is None:
-        env_dir = os.environ.get("DCA_CONFIG_DIR")
-        if env_dir:
-            config_dir_path = Path(env_dir)
-        else:
-            _here = Path(__file__).resolve().parent
-            _installed = Path(sys.prefix) / "share" / "all-stock-dca" / "config"
-            for candidate in (_here / "config", _installed, Path.cwd() / "config"):
-                if candidate.is_dir():
-                    config_dir_path = candidate
-                    break
-            else:
-                config_dir_path = _here / "config"
+        config_dir_path = get_config_dir()
     else:
         config_dir_path = Path(config_dir)
 

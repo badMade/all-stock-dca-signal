@@ -8,8 +8,8 @@ from datetime import date
 import pytest
 
 from dca_config import (
-    _default_config_dir,
     _read_json,
+    get_config_dir,
     load_approved_dates,
     load_backtest_sizing_tiers,
     load_budgets,
@@ -205,9 +205,9 @@ def test_load_backtest_sizing_tiers_negative_values(tmp_path):
         load_backtest_sizing_tiers(tmp_path)
 
 def test_default_config_dir_basic(monkeypatch):
-    """Test that _default_config_dir returns an absolute path ending with 'config' when DCA_CONFIG_DIR is not set."""
+    """Test that get_config_dir returns an absolute path ending with 'config' when DCA_CONFIG_DIR is not set."""
     monkeypatch.delenv("DCA_CONFIG_DIR", raising=False)
-    config_dir = _default_config_dir()
+    config_dir = get_config_dir()
     assert config_dir.is_absolute()
     assert config_dir.name == "config"
 
@@ -215,4 +215,4 @@ def test_default_config_dir_env_override(monkeypatch, tmp_path):
     """DCA_CONFIG_DIR, when set, is returned verbatim even if it doesn't end with 'config'."""
     override_dir = tmp_path / "etc" / "all-stock-dca"
     monkeypatch.setenv("DCA_CONFIG_DIR", str(override_dir))
-    assert _default_config_dir() == override_dir
+    assert get_config_dir() == override_dir
