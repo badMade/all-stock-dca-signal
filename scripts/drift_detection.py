@@ -39,11 +39,35 @@ import csv
 import json
 import os
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Local temp+``os.replace`` write (mirrors ``dca_fileio.atomic_write_text``).
+
+    Deliberately duplicated rather than imported: this module is a documented
+    standalone CLI (``python scripts/drift_detection.py``) whose direct
+    invocation puts only ``scripts/`` on ``sys.path``, so a top-level project
+    import would break it outside an installed/checkout-pytest context.
+    """
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent) or ".", prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            Path(tmp_name).unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 # --- Artifact file names -----------------------------------------------------
 
@@ -717,9 +741,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report = detect_drift(run_dir)
 
     if args.json_out:
-        args.json_out.write_text(report.to_json(compact=True) + "\n", encoding="utf-8")
+        _atomic_write_text(args.json_out, report.to_json(compact=True) + "\n")
     if args.md_out:
-        args.md_out.write_text(report.to_markdown(), encoding="utf-8")
+        _atomic_write_text(args.md_out, report.to_markdown())
 
     print(report.to_json(compact=not args.pretty))
 

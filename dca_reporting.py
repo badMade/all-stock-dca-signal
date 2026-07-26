@@ -26,6 +26,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from dca_fileio import atomic_open_w, atomic_write_text
+
 
 def load_run_state(path: str | Path) -> Dict[str, Any]:
     """Load a ``run_state.json`` artifact produced by the live-run path."""
@@ -479,7 +481,7 @@ def build_coverage_report_md(
 
 
 def _write_csv(path: Path, rows: Sequence[Dict[str, Any]], fieldnames: Sequence[str]) -> None:
-    with path.open("w", newline="") as handle:
+    with atomic_open_w(path, newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(fieldnames))
         writer.writeheader()
         for row in rows:
@@ -554,10 +556,10 @@ def generate_reports(
     )
 
     report_path = out / "slippage_and_coverage_report.md"
-    report_path.write_text(report_md)
+    atomic_write_text(report_path, report_md)
 
     summary_path = out / "latest_run_summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
+    atomic_write_text(summary_path, json.dumps(summary, indent=2, sort_keys=True))
 
     return {
         "slippage_ranked": str(slippage_path),

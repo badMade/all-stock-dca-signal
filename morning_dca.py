@@ -61,7 +61,9 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from dca_alerts import guarded_run
 from dca_config import load_approved_dates, load_tickers
+from dca_fileio import atomic_open_w, atomic_write_text
 from near_close_dca import (
     ACTIVE_TICKERS,
     EASTERN,
@@ -87,6 +89,7 @@ from near_close_dca import (
     quote_spread_pct,
     resolve_top_up_desired_amount_usd,
     select_first_allocation_base_usd,
+    warn_if_window_expiring,
 )
 from scripts.model_usage_log import DEFAULT_LOG_ROOT as DEFAULT_MODEL_USAGE_LOG_ROOT
 from scripts.model_usage_log import log_model_usage
@@ -2349,7 +2352,7 @@ class MorningDCAExecutor(DCAExecutor):
         for pointer_name in pointer_names:
             pointer = Path(self.state_root) / pointer_name
             pointer.parent.mkdir(parents=True, exist_ok=True)
-            pointer.write_text(serialized, encoding="utf-8")
+            atomic_write_text(pointer, serialized)
             paths[pointer_name.replace(".json", "")] = str(pointer)
 
     def write_artifacts(self, artifacts: Dict[str, Any], now: datetime) -> Dict[str, str]:
@@ -2368,7 +2371,7 @@ class MorningDCAExecutor(DCAExecutor):
         out.mkdir(parents=True, exist_ok=True)
 
         run_state_path = out / "run_state.json"
-        run_state_path.write_text(json.dumps(artifacts, indent=2, sort_keys=True), encoding="utf-8")
+        atomic_write_text(run_state_path, json.dumps(artifacts, indent=2, sort_keys=True))
 
         signals_path = out / self.signals_csv_name
         _write_csv(signals_path, artifacts["signal_rows"])
@@ -2383,8 +2386,8 @@ class MorningDCAExecutor(DCAExecutor):
         # bootstrapped rather than treated as an escalation condition.
         if self.mode == MORNING_LIVE_MODE and self.stream == MORNING_STREAM:
             ledger_path = out / self.config.budget_ledger_filename
-            ledger_path.write_text(
-                json.dumps(artifacts["budget"], indent=2, sort_keys=True), encoding="utf-8"
+            atomic_write_text(
+                ledger_path, json.dumps(artifacts["budget"], indent=2, sort_keys=True)
             )
             paths["budget_ledger"] = str(ledger_path)
 
@@ -2410,7 +2413,8 @@ class MorningDCAExecutor(DCAExecutor):
             paths["validation"] = str(validation_path)
             # run_summary.json: a compact roll-up of the pre-flight verdict.
             summary_path = out / "run_summary.json"
-            summary_path.write_text(
+            atomic_write_text(
+                summary_path,
                 json.dumps(
                     {
                         "run_id": artifacts["run_id"],
@@ -2423,7 +2427,6 @@ class MorningDCAExecutor(DCAExecutor):
                     indent=2,
                     sort_keys=True,
                 ),
-                encoding="utf-8",
             )
             paths["run_summary"] = str(summary_path)
 
@@ -2585,6 +2588,17 @@ class MorningDCAExecutor(DCAExecutor):
         is_weekend = trading_day.weekday() >= 5
         is_holiday = trading_day in nyse_holidays(trading_day.year)
         approved = self.config.approved_test_dates
+        # Countdown/expiry alarm for the configured trading window (scheduled
+        # live runs only). The load-failed sentinel is excluded -- that case
+        # already logs its own fail-closed warning and its date.min content
+        # would render a nonsense "window ended 0001-01-01" message.
+        if (
+            self.mode == MORNING_LIVE_MODE
+            and not manual
+            and approved
+            and approved != _APPROVED_DATES_LOAD_FAILED
+        ):
+            warn_if_window_expiring(approved, trading_day, log=_log)
         is_outside_window = (
             self.mode == MORNING_LIVE_MODE
             and bool(approved)
@@ -2624,10 +2638,7 @@ class MorningDCAExecutor(DCAExecutor):
         # for a given date and an older stub without run_id/counts/run_classification
         # would otherwise persist indefinitely. Submitted-evidence cases are
         # already returned above.
-        state_path.write_text(
-            json.dumps(artifacts, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        atomic_write_text(state_path, json.dumps(artifacts, indent=2, sort_keys=True))
         paths = {"run_state": str(state_path)}
         # Codex review r3623389445: this early calendar/window gate bypasses
         # write_artifacts() entirely, so a scheduled LIVE block (weekend,
@@ -3218,18 +3229,42 @@ class MorningDCAExecutor(DCAExecutor):
         scripts/model_usage_log.py) happens exactly once per call, regardless
         of which of ``_run_impl``'s several early-return paths was taken,
         without touching any of that method's trading/safety logic.
+
+        Scheduled live invocations run under ``dca_alerts.guarded_run``: any
+        escaping exception is logged, alerted to the operator Slack webhook,
+        and pinged as a failed heartbeat before re-raising, and a completed
+        run pings this stream's success heartbeat (dead-man's switch for the
+        missed-fire failure class). Watchlist/preflight/manual runs only get
+        a log handler ensured.
         """
-        result = self._run_impl(now, data, broker=broker, data_source=data_source, manual=manual)
-        log_model_usage(
-            root=self.config.model_usage_log_root,
-            run_id=result.get("artifacts", {}).get("run_id"),
-            cron_id=self.profile.get("cron_id"),
-            run_origin="manual" if manual else "scheduled",
-            artifact_path=result.get("paths", {}).get("run_state"),
-            triggered_at_utc=now.astimezone(timezone.utc),
-            **_model_usage_routing_overrides(self.config),
+
+        def _invoke() -> Dict[str, Any]:
+            result = self._run_impl(now, data, broker=broker, data_source=data_source, manual=manual)
+            log_model_usage(
+                root=self.config.model_usage_log_root,
+                run_id=result.get("artifacts", {}).get("run_id"),
+                cron_id=self.profile.get("cron_id"),
+                run_origin="manual" if manual else "scheduled",
+                artifact_path=result.get("paths", {}).get("run_state"),
+                triggered_at_utc=now.astimezone(timezone.utc),
+                **_model_usage_routing_overrides(self.config),
+            )
+            return result
+
+        is_scheduled_live = self.mode == MORNING_LIVE_MODE and self.trades and not manual
+        return guarded_run(
+            self.stream,
+            _invoke,
+            enabled=is_scheduled_live,
+            context=f"cron_id={self.profile.get('cron_id')}",
+            # A run whose raw-persistence recorder failed is surfaced as data on
+            # the artifacts (raw_persistence_error) rather than raised; it must
+            # ping a FAILED heartbeat, not clear the dead-man's switch.
+            result_ok=lambda result: not (
+                isinstance(result, dict)
+                and (result.get("artifacts") or {}).get("raw_persistence_error")
+            ),
         )
-        return result
 
     def _run_impl(
         self,
@@ -3551,10 +3586,8 @@ def _run_drift_check(run_dir: Path) -> None:
         return
     try:
         report = detect_drift(run_dir)
-        (run_dir / "drift_report.json").write_text(
-            report.to_json(compact=False), encoding="utf-8"
-        )
-        (run_dir / "drift_report.md").write_text(report.to_markdown(), encoding="utf-8")
+        atomic_write_text(run_dir / "drift_report.json", report.to_json(compact=False))
+        atomic_write_text(run_dir / "drift_report.md", report.to_markdown())
         if report.drift_detected:
             _log.warning(
                 "DRIFT DETECTED in %s: %d symbol(s) expected but no order record — %s",
@@ -3683,13 +3716,13 @@ def _csv_qualifying_notional_total(csv_path: Path, blank_status_means_filled: bo
 
 def _write_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
     if not rows:
-        path.write_text("", encoding="utf-8")
+        atomic_write_text(path, "")
         return
     seen: Dict[str, None] = {}
     for row in rows:
         seen.update(dict.fromkeys(row))
     fieldnames = list(seen)
-    with path.open("w", newline="", encoding="utf-8") as handle:
+    with atomic_open_w(path, newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, restval="")
         writer.writeheader()
         writer.writerows(rows)

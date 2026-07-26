@@ -42,6 +42,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
+from dca_fileio import atomic_write_text
+
 _EASTERN = ZoneInfo("America/New_York")
 
 CRON_TRACKING_ROOT = "/home/user/workspace/cron_tracking"
@@ -425,7 +427,7 @@ def refresh_latest_pointer(
     )
     path = Path(pointer_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
     return path
 
 

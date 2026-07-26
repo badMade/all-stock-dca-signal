@@ -23,6 +23,8 @@ import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+from dca_fileio import atomic_write_text
+
 
 def _is_manual_run_state(data: Dict[str, Any]) -> bool:
     """True if a run_state is a manual run per its run_classification block.
@@ -396,5 +398,5 @@ def write_weekly_dashboard(
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     path = out / "weekly_performance_dashboard.md"
-    path.write_text(build_weekly_dashboard(run_states, summaries, sector_map, week_label))
+    atomic_write_text(path, build_weekly_dashboard(run_states, summaries, sector_map, week_label))
     return str(path)
