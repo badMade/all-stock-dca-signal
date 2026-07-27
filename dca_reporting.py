@@ -368,6 +368,13 @@ def build_latest_run_summary(
     coverage_pct = round(filled_count / candidate_count * 100.0, 2) if candidate_count else None
 
     budget = run_state.get("budget") or {}
+
+    # ⚡ Bolt Optimization: Pre-compute planned_notional_usd outside the dict literal
+    # to avoid generator-expression overhead during dict construction in this hot path.
+    planned_notional = 0.0
+    for c in buy_candidates:
+        planned_notional += _to_float(c.get("planned_amount_usd")) or 0.0
+
     # run_summary.json MUST mirror the SAME non-null run_classification object as
     # run_state.json for scheduled live runs. The Jul 22 2026 3:20 incident wrote
     # a valid run_state.run_classification but a null run_summary.run_classification,
@@ -409,9 +416,7 @@ def build_latest_run_summary(
         "budget": {
             "budget_tier": budget.get("budget_tier"),
             "day_notional_usd": budget.get("day_notional_usd"),
-            "planned_notional_usd": round(
-                sum(_to_float(c.get("planned_amount_usd")) or 0.0 for c in buy_candidates), 2
-            ),
+            "planned_notional_usd": round(planned_notional, 2),
             "daily_cap_usd": budget.get("daily_cap_usd"),
             "weekly_rollover_reserve_usd": budget.get("weekly_rollover_reserve_usd"),
             "remaining_spend_today_usd": budget.get("remaining_spend_today_usd"),

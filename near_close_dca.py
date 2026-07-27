@@ -1986,10 +1986,26 @@ def build_run_artifacts(
         if _sticker in _reconciled_amount_by_ticker and _srow.get("auto_buy_signal"):
             _srow["suggested_amount_usd"] = _reconciled_amount_by_ticker[_sticker]
 
-    planned_spend = sum(c["planned_amount_usd"] for c in buy_candidates)
-    high_multiplier_signals = sum(
-        1 for c in buy_candidates if (c["buy_multiplier"] or 0.0) >= config.high_multiplier_threshold
-    )
+    # ⚡ Bolt Optimization: Consolidate multiple generator passes into a single loop
+    # to eliminate redundant O(N) scans and generator overhead in this hot aggregation.
+    planned_spend = 0.0
+    high_multiplier_signals = 0
+    submitted_count = 0
+    skipped_count = 0
+    for c in buy_candidates:
+        planned_spend += c["planned_amount_usd"]
+        if (c.get("buy_multiplier") or 0.0) >= config.high_multiplier_threshold:
+            high_multiplier_signals += 1
+        if c.get("status") == "submitted":
+            submitted_count += 1
+        else:
+            skipped_count += 1
+
+    manual_review_count = 0
+    for d in decisions:
+        if d.action == Action.MANUAL_REVIEW:
+            manual_review_count += 1
+
     if state.selected_tier is None:
         state.selected_tier = select_budget_tier(planned_spend, high_multiplier_signals)
     tier = state.selected_tier
@@ -2012,9 +2028,9 @@ def build_run_artifacts(
         "counts": {
             "evaluated": len(decisions),
             "buy_candidates": len(buy_candidates),
-            "submitted": sum(1 for c in buy_candidates if c["status"] == "submitted"),
-            "skipped": sum(1 for c in buy_candidates if c["status"] not in {"submitted"}),
-            "manual_review": sum(1 for d in decisions if d.action == Action.MANUAL_REVIEW),
+            "submitted": submitted_count,
+            "skipped": skipped_count,
+            "manual_review": manual_review_count,
         },
         "signal_rows": signal_rows,
         "buy_candidates": buy_candidates,
@@ -4349,10 +4365,15 @@ def run_once(
     # Higher multiplier -> larger drop -> ticker alphabetical (see allocation_sort_key).
     buy_candidates.sort(key=allocation_sort_key)
 
-    planned_spend = sum(d.suggested_amount_usd for d in buy_candidates)
-    high_multiplier_signals = sum(
-        1 for d in buy_candidates if d.buy_multiplier >= config.high_multiplier_threshold
-    )
+    # ⚡ Bolt Optimization: Use a single pass loop instead of multiple sum() generators
+    # to eliminate O(N) object overhead when iterating DataFrames/lists.
+    planned_spend = 0.0
+    high_multiplier_signals = 0
+    for d in buy_candidates:
+        planned_spend += d.suggested_amount_usd
+        if d.buy_multiplier >= config.high_multiplier_threshold:
+            high_multiplier_signals += 1
+
     state.select_daily_budget(planned_spend, high_multiplier_signals, config)
     # Roll the reserve forward now, before any budget query or day finalization,
     # so a quiet week (no BUY candidates) still carries prior unused Normal-cap

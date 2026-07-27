@@ -161,7 +161,11 @@ def aggregate_usage(
     components: List[Dict[str, Any]] = []
     estimated_total = 0.0
     for name, fields, weight in COMPONENT_DEFINITIONS:
-        count = sum(totals.get(field, 0.0) for field in fields)
+        # ⚡ Bolt Optimization: Replace sum() generator expression with a
+        # manual loop to eliminate generator overhead.
+        count = 0.0
+        for field in fields:
+            count += totals.get(field, 0.0)
         estimated = round(count * weight, 3)
         estimated_total += estimated
         components.append(

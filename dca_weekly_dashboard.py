@@ -198,8 +198,11 @@ def build_graded_vs_fixed(run_states: Sequence[Dict[str, Any]]) -> str:
     for rs in run_states:
         candidates = rs.get("buy_candidates", [])
         base = _require_base_amount(rs)
-        graded = sum(_num(c.get("planned_amount_usd")) for c in candidates)
-        fixed = sum(_candidate_fixed_base_usd(c, base) for c in candidates)
+        graded = 0.0
+        fixed = 0.0
+        for c in candidates:
+            graded += _num(c.get("planned_amount_usd"))
+            fixed += _candidate_fixed_base_usd(c, base)
         graded_total += graded
         fixed_total += fixed
         lines.append(
