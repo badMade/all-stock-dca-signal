@@ -13,6 +13,7 @@ from dca_notion_sync import (
     build_notion_sync_payload,
 )
 from dca_reporting import (
+    _drop_excluded_fills,
     _is_manual_run_state,
     _to_float,
     build_coverage_report_md,
@@ -406,13 +407,13 @@ def test_generate_reports_writes_all_files(tmp_path=None):
     assert "target_price_missing" in report
 
 
-def test_generate_reports_excludes_manual_order_ids(tmp_path=None):
+def test_generate_reports_excludes_fills_by_ticker(tmp_path=None):
     import tempfile
     from pathlib import Path
 
     directory = tmp_path or Path(tempfile.mkdtemp())
-    # O2 (NVDA) is a manual-run order that leaked into same-day broker fills.
-    paths = generate_reports(_run_state(), _fills(), directory, exclude_order_ids={"O2"})
+    # NVDA is a manual-run ticker that leaked into same-day broker fills.
+    paths = generate_reports(_run_state(), _fills(), directory, excluded_tickers=frozenset(["NVDA"]))
     summary = json.loads(Path(paths["latest_run_summary"]).read_text())
     # AAPL + AMD remain filled; NVDA's excluded fill becomes a missing fill.
     assert summary["coverage"]["fills"] == 2
@@ -490,6 +491,41 @@ def test_generate_scheduled_reports_routes_through_classification(tmp_path=None)
     summary = json.loads(Path(paths["latest_run_summary"]).read_text())
     assert summary["coverage"]["fills"] == 1  # only AAPL; NVDA's O2 fill excluded as manual
     assert "NVDA" not in Path(paths["slippage_ranked"]).read_text()
+
+
+def test_generate_scheduled_reports_retains_scheduled_fill_when_manual_order_shares_ticker(tmp_path=None):
+    import tempfile
+    from pathlib import Path
+
+    from dca_reporting import generate_scheduled_reports
+
+    build_sched, build_manual, write_run_artifacts = _classification_helpers()
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-06"
+
+    write_run_artifacts(
+        _sched_state(day, [("AAPL", "O1"), ("NVDA", "O2")], build_sched(day, f"{day}T19:20:01Z")),
+        base=base,
+    )
+    # A manual run that ALSO traded NVDA, but under a distinct order id (O3).
+    # Excluding by ticker would wrongly drop the scheduled NVDA fill (O2) too;
+    # exclusion must stay scoped to the manual order id.
+    manual = _sched_state(day, [("NVDA", "O3")], build_manual(f"{day}T15:00:00Z"))
+    manual["run_id"] = f"{day}-110000"
+    write_run_artifacts(manual, base=base)
+
+    fills = [
+        {"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 0.03, "order_id": "O1"},
+        {"ticker": "NVDA", "fill_price": 49.5, "filled_qty": 0.06, "order_id": "O2"},
+        {"ticker": "NVDA", "fill_price": 50.0, "filled_qty": 0.01, "order_id": "O3"},
+    ]
+    paths = generate_scheduled_reports(day, fills, base / "reports", base=base)
+    summary = json.loads(Path(paths["latest_run_summary"]).read_text())
+    # AAPL (O1) and the scheduled NVDA fill (O2) both survive; only the
+    # manual NVDA order (O3) is excluded.
+    assert summary["coverage"]["fills"] == 2
+    ranked = Path(paths["slippage_ranked"]).read_text()
+    assert "49.5" in ranked
 
 
 def test_generate_scheduled_reports_does_not_write_model_usage_log_by_default(tmp_path=None):
@@ -1059,6 +1095,54 @@ def test_fills_from_order_history_payload_rejects_non_finite_prices_and_quantiti
     assert set(by_ticker) == {"AMZN"}, (
         f"non-finite price/quantity orders must be rejected, got {sorted(by_ticker)}"
     )
+
+
+def test_drop_excluded_fills_empty_excludes():
+    fills = [
+        {"ticker": "AAPL"},
+        {"ticker": "NVDA"},
+    ]
+    # Empty frozenset passed for excluded_tickers should return original fills unaltered
+    assert _drop_excluded_fills(fills, frozenset()) == fills
+
+
+def test_drop_excluded_fills_by_ticker():
+    fills = [
+        {"ticker": "AAPL"},
+        {"ticker": "NVDA"},
+        {"ticker": "GOOG"},
+    ]
+    excluded = frozenset(["AAPL", "GOOG"])
+    filtered = _drop_excluded_fills(fills, excluded)
+    assert len(filtered) == 1
+    assert filtered[0]["ticker"] == "NVDA"
+
+
+def test_drop_excluded_fills_missing_ticker_key():
+    fills = [
+        {"order_id": "O1"},
+        {"ticker": "NVDA"},
+        {"ticker": "GOOG"},
+    ]
+    excluded = frozenset(["AAPL", "GOOG"])
+    filtered = _drop_excluded_fills(fills, excluded)
+    assert len(filtered) == 2
+    assert filtered[0] == {"order_id": "O1"}
+    assert filtered[1] == {"ticker": "NVDA"}
+
+
+def test_drop_excluded_fills_matches_symbol_keyed_fills():
+    # compute_slippage_rows/build_missing_fills resolve identity via
+    # ticker-or-symbol; _drop_excluded_fills must use the same fallback so a
+    # broker fill shaped with "symbol" instead of "ticker" is still excluded.
+    fills = [
+        {"symbol": "AAPL"},
+        {"symbol": "NVDA"},
+        {"ticker": "GOOG"},
+    ]
+    excluded = frozenset(["AAPL", "GOOG"])
+    filtered = _drop_excluded_fills(fills, excluded)
+    assert filtered == [{"symbol": "NVDA"}]
 
 
 def test_to_float():

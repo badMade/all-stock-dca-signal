@@ -24,7 +24,7 @@ import json
 import math
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from dca_fileio import atomic_open_w, atomic_write_text
 
@@ -43,13 +43,15 @@ def _is_manual_run_state(run_state: Dict[str, Any]) -> bool:
 
 
 def _drop_excluded_fills(
-    fills: Sequence[Dict[str, Any]], exclude_order_ids: Optional[Iterable[str]]
+    fills: Sequence[Dict[str, Any]], excluded_tickers: frozenset[str]
 ) -> List[Dict[str, Any]]:
-    """Return fills minus any whose order_id is a known manual-run order."""
-    exclude = {oid for oid in (exclude_order_ids or ()) if oid}
-    if not exclude:
+    """Return fills filtering out any that belong to an excluded ticker."""
+    if not excluded_tickers:
         return list(fills)
-    return [f for f in fills if (f.get("order_id") or f.get("broker_order_id")) not in exclude]
+    return [
+        f for f in fills
+        if (f.get("ticker") or f.get("symbol")) not in excluded_tickers
+    ]
 
 
 def _to_float(value: Any) -> Optional[float]:
@@ -503,23 +505,22 @@ def generate_reports(
     fills: Sequence[Dict[str, Any]],
     output_dir: str | Path,
     *,
-    exclude_order_ids: Optional[Iterable[str]] = None,
+    excluded_tickers: Optional[frozenset[str]] = None,
     require_scheduled: bool = False,
 ) -> Dict[str, str]:
     """Generate all four post-trade report files; return a map of their paths.
 
     Run-classification policy (task 67aa802b): the scheduled post-trade sync
     passes ``require_scheduled=True`` so a manual ``run_state`` is refused rather
-    than published as scheduled-live metrics, and ``exclude_order_ids`` (e.g.
-    ``scripts.run_classification.collect_manual_order_ids()``) drops any fills
-    whose order_id belongs to a manual run so same-day manual fills in broker
+    than published as scheduled-live metrics, and ``excluded_tickers`` drops any fills
+    whose ticker belongs to an excluded list so same-day unrelated fills in broker
     history cannot leak into the scheduled-live slippage/coverage numbers.
     """
     if require_scheduled and _is_manual_run_state(run_state):
         raise ValueError(
             "refusing to generate scheduled-live reports from a manual run_state"
         )
-    fills = _drop_excluded_fills(fills, exclude_order_ids)
+    fills = _drop_excluded_fills(fills, excluded_tickers or frozenset())
 
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -645,15 +646,24 @@ def generate_scheduled_reports(
             + "; ".join(selection.errors)
         )
     manual_ids = collect_manual_order_ids(base_path)
+    manual_ids_set = {oid for oid in manual_ids if oid}
     # Restrict fills to order IDs the classification contract actually attributed
     # to this scheduled run (selection.order_ids is already manual-id-excluded,
     # and is forced empty for a confirmation-blocked run). Without this,
     # compute_slippage_rows joins fills to candidates by ticker alone, so any
     # same-ticker broker fill unrelated to this run -- or any fill at all on a
     # confirmation-blocked run, which by contract placed zero orders -- could be
-    # published as scheduled evidence.
+    # published as scheduled evidence. The manual_ids_set check is a redundant,
+    # order-ID-scoped safety net on top of that: it must stay order-ID-based
+    # (not ticker-based) so a manual order never suppresses a *different*,
+    # legitimately scheduled fill that happens to trade the same ticker the
+    # same day.
     scheduled_ids = set(selection.order_ids)
-    fills = [f for f in fills if (f.get("order_id") or f.get("broker_order_id")) in scheduled_ids]
+    fills = [
+        f for f in fills
+        if (f.get("order_id") or f.get("broker_order_id")) in scheduled_ids
+        and (f.get("order_id") or f.get("broker_order_id")) not in manual_ids_set
+    ]
 
     # Fallback: load fills from the persisted orders_after_place.json for any
     # scheduled order IDs not already covered by the caller-supplied fills.
@@ -735,7 +745,6 @@ def generate_scheduled_reports(
             selection.state,
             fills,
             output_dir,
-            exclude_order_ids=manual_ids,
             require_scheduled=True,
         )
     finally:
