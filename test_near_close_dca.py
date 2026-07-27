@@ -26,9 +26,8 @@ from near_close_dca import (
     MISSING_FILL_FAILED_TRIGGER,
     TOP_UP_INCREMENTAL,
     TOP_UP_MISSING_PRIOR_PRICE,
-    TOP_UP_NO_INCREMENTAL,
     TOP_UP_NO_PRIOR_RUN,
-    TOP_UP_PRICE_NOT_BELOW,
+    TOP_UP_NOT_LOWER_OR_NO_DELTA,
     USAGE_PROXY_FIELDS,
     Action,
     Bar,
@@ -304,6 +303,24 @@ def test_first_allocation_missing_prior_low_treated_as_below_close_only():
     assert signal.selected_base_amount_usd == 1.0
 
 
+def test_first_allocation_zero_multiplier_normalizes_reason_to_no_buy():
+    # Canonical rule item 6: "not lower than close, OR multiplier is 0" -> no buy,
+    # reason not_below_prior_close_no_buy. Decision price IS below the prior close
+    # (100) and not below the prior low (95), so select_first_allocation_base_usd
+    # alone would label this below_prior_close_only -- but the drop (0.05%) is
+    # below the first ladder tier's 0.1% threshold, so buy_multiplier is 0 and the
+    # ticker must not carry a first-buy sizing reason for what the rule says was a
+    # no-buy.
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    data = _FakeDataWithLow(SourceName.FINANCE, close_price=99.95, prev_close=100.0, prev_low=95.0)
+    signal = evaluate_source_signal("AAPL", now, StrategyConfig(), data, interval_minutes=15)
+    assert signal.action != Action.BUY
+    assert signal.buy_multiplier == 0.0
+    assert signal.base_selection_reason == BASE_NOT_BELOW_CLOSE
+    assert signal.selected_base_amount_usd == 0.0
+    assert signal.suggested_amount_usd == 0.0
+
+
 def test_select_first_allocation_base_helper_branches():
     config = StrategyConfig()
     assert select_first_allocation_base_usd(94.0, 100.0, 95.0, config) == (2.0, BASE_BELOW_CLOSE_AND_LOW)
@@ -314,6 +331,57 @@ def test_select_first_allocation_base_helper_branches():
     assert select_first_allocation_base_usd(94.0, 100.0, None, config) == (1.0, BASE_BELOW_CLOSE_ONLY)
     # Per-order ceiling holds: deepest drop (5x) on the $2 scale tops out at $10.
     assert 2.0 * 5.0 == config.max_per_order_usd
+
+
+def test_first_buy_ticker_uses_close_and_low_even_when_other_tickers_have_prior_same_day_buys():
+    # Canonical rule items 1-2, 7-8: the per-ticker first-buy sizing is independent.
+    # AAA has no prior same-day buy, so it must still be sized as a first buy
+    # against yesterday's close (100) and low (95) regardless of any other
+    # ticker's same-day activity.
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig()
+
+    aaa_data = _FakeDataWithLow(SourceName.FINANCE, close_price=94.0, prev_close=100.0, prev_low=95.0)
+    aaa_signal = evaluate_source_signal("AAA", now, config, aaa_data, interval_minutes=15)
+    assert aaa_signal.action == Action.BUY
+    assert aaa_signal.base_selection_reason == BASE_BELOW_CLOSE_AND_LOW
+    assert aaa_signal.selected_base_amount_usd == 2.0
+
+
+def test_run_daily_compact_prior_allocation_scoped_to_its_own_ticker(tmp_path):
+    # Canonical rule items 7-8: same-day buys in one ticker must never suppress
+    # first-allocation evaluation for another ticker. Exercised at the real
+    # orchestration entrypoint (run_daily_compact), not evaluate_top_up_guard in
+    # isolation, with a prior-allocation mapping that actually contains AAPL's
+    # context alongside NVDA/MSFT -- proving the scheduled runner itself never
+    # lets AAPL's presence in that mapping gate NVDA/MSFT.
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-ticker-scope")
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    prior = {
+        "AAPL": PriorSameDayAllocation("AAPL", amount_usd=3.0, reference_price=99.0, run_id="am", source="manual"),
+    }
+
+    result = run_daily_compact(
+        now, config, state, fin, rh, broker,
+        artifacts_dir=artifacts_dir, prior_same_day_allocations=prior,
+    )
+
+    assert result["blocked"] is False
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+
+    # AAPL has its own prior ($3 at ref 99.0); the afternoon price (98.0) is
+    # below that reference, so it tops up only the incremental difference.
+    assert by_ticker["AAPL"]["top_up_guard_result"] == TOP_UP_INCREMENTAL
+    assert by_ticker["AAPL"]["incremental_order_amount"] == 1.0
+
+    # NVDA and MSFT have no prior allocation of their own -- AAPL's presence in
+    # the SAME prior_same_day_allocations mapping must never suppress their
+    # first allocation, which must be the full suggested amount.
+    for ticker in ("NVDA", "MSFT"):
+        assert by_ticker[ticker]["top_up_guard_result"] == TOP_UP_NO_PRIOR_RUN
+        assert by_ticker[ticker]["incremental_order_amount"] == 4.0
 
 
 def test_reconciled_decision_carries_target_fields():
@@ -357,6 +425,100 @@ def test_merge_manual_top_up_context_poisons_base_to_unknown():
     assert merged.amount_usd == 3.0
     assert merged.selected_base_amount_usd is None
     assert merged.selected_base_amount_usd_at is None
+
+
+def test_merge_manual_top_up_context_uses_most_recent_reference_not_merge_order():
+    # Codex review ("Preserve the manual-context timestamp when merging
+    # references"): a bare-CSV manual fill merged last must not automatically
+    # win the reference price merely by being merged last. Here the core
+    # loader's 12:30 scheduled fill ($90) is more recent than the manual
+    # loader's 09:00 fill ($100), so the merged reference must be the more
+    # recent $90 -- a 15:20 decision price of $95 must be blocked against $90,
+    # not incorrectly permitted against a stale $100. The winning (existing)
+    # side's own identity must travel with it too.
+    prior_same_day_allocations = {
+        "AAPL": PriorSameDayAllocation(
+            "AAPL",
+            amount_usd=2.0,
+            reference_price=90.0,
+            run_id="run1",
+            source="scheduled",
+            reference_ts=datetime(2026, 6, 29, 12, 30, tzinfo=EASTERN),
+        ),
+    }
+    manual_context = {
+        "AAPL": PriorAllocation(
+            ticker="AAPL", prior_usd=1.0, reference_price=100.0, sources=["manual_csv"], reference_ts=9 * 3600
+        ),
+    }
+    merge_manual_top_up_context(prior_same_day_allocations, manual_context)
+    merged = prior_same_day_allocations["AAPL"]
+    assert merged.reference_price == 90.0
+    assert merged.run_id == "run1"
+    assert merged.source == "scheduled"
+
+
+def test_merge_manual_top_up_context_manual_wins_when_actually_more_recent():
+    # The inverse of the above: a manual fill genuinely later in the day
+    # (15:05) than the core loader's own reference (10:30) must win, and its
+    # OWN identity must travel with the winning price -- pairing a manual
+    # reference with the scheduled run's run_id/source would point
+    # reconciliation at the wrong artifact (Codex review: "Keep the winning
+    # manual reference's identity").
+    prior_same_day_allocations = {
+        "AAPL": PriorSameDayAllocation(
+            "AAPL",
+            amount_usd=2.0,
+            reference_price=95.0,
+            run_id="run1",
+            source="scheduled",
+            reference_ts=datetime(2026, 6, 29, 10, 30, tzinfo=EASTERN),
+        ),
+    }
+    manual_context = {
+        "AAPL": PriorAllocation(
+            ticker="AAPL",
+            prior_usd=1.0,
+            reference_price=93.0,
+            sources=["manual_csv"],
+            reference_ts=15 * 3600 + 5 * 60,
+        ),
+    }
+    merge_manual_top_up_context(prior_same_day_allocations, manual_context)
+    merged = prior_same_day_allocations["AAPL"]
+    assert merged.reference_price == 93.0
+    assert merged.run_id == "manual_csv"
+    assert merged.source == "manual_top_up_context"
+
+
+def test_merge_manual_top_up_context_sub_minute_precision():
+    # Codex review ("Retain sub-minute generated-at ordering"): two artifacts
+    # in the same ET minute at different seconds must not tie. The core
+    # loader's 12:30:45 fill is more recent than the manual loader's
+    # 12:30:05 fill despite sharing the same minute, so the merged reference
+    # must be the core loader's, not fall through to merge-order.
+    prior_same_day_allocations = {
+        "AAPL": PriorSameDayAllocation(
+            "AAPL",
+            amount_usd=2.0,
+            reference_price=90.0,
+            run_id="run1",
+            source="scheduled",
+            reference_ts=datetime(2026, 6, 29, 12, 30, 45, tzinfo=EASTERN),
+        ),
+    }
+    manual_context = {
+        "AAPL": PriorAllocation(
+            ticker="AAPL",
+            prior_usd=1.0,
+            reference_price=100.0,
+            sources=["manual_csv"],
+            reference_ts=12 * 3600 + 30 * 60 + 5,
+        ),
+    }
+    merge_manual_top_up_context(prior_same_day_allocations, manual_context)
+    merged = prior_same_day_allocations["AAPL"]
+    assert merged.reference_price == 90.0
 
 
 def test_reconcile_signals_agree_preserves_base_from_winning_signal():
@@ -476,6 +638,54 @@ def test_kill_switch_caps_order_at_candidates_own_selected_base():
         run_result=None,
     )
     assert candidate_outcome["submitted_amount_usd"] == 1.0  # capped at $1, not $2
+
+
+def test_kill_switch_caps_guarded_top_up_at_preserved_base():
+    # Codex review ("Cap guarded top-ups using the preserved base"): an
+    # earlier same-day allocation fixed AAPL's base at $1 (below close only).
+    # A deeper afternoon price now crosses the prior low too, so THIS run's
+    # own selected_base_amount_usd recomputes to $2 -- but the top-up guard
+    # must still use the $1 preserved base, and so must the kill-switch cap.
+    # Before the fix, the cap used decision.selected_base_amount_usd ($2)
+    # instead, so a 5x signal's $4 guard delta got min'd against $2 instead of
+    # the correct $1 ceiling, letting a guarded top-up submit double the
+    # reduced-scale risk the kill switch is meant to enforce for this ticker.
+    config = StrategyConfig(monthly_cash_allocation_usd=10.0)
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=5.0,
+        suggested_amount_usd=10.0,  # this run's own $2 base * 5x
+        selected_base_amount_usd=2.0,
+        target_price=98.0,
+    )
+    prior = PriorSameDayAllocation(
+        ticker="AAPL", amount_usd=1.0, reference_price=99.0, selected_base_amount_usd=1.0
+    )
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+    candidate_outcome, top_up_outcome, _, _, _ = _process_buy_candidate(
+        decision,
+        config,
+        state,
+        broker,
+        robinhood_data=None,
+        now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
+        trading_day=date(2026, 6, 29),
+        guard_active=True,
+        prior_same_day_allocations={"AAPL": prior},
+        # Trivially over the kill-switch threshold (fraction * $10 allocation).
+        running_deployed_7d=100.0,
+        scheduled=False,
+        run_result=None,
+    )
+    # The guard's own $4 delta (($1 * 5x) - $1 already bought) must be capped
+    # at the preserved $1 base, not this run's fresh $2 base.
+    assert top_up_outcome.incremental_order_amount == 4.0
+    assert candidate_outcome["submitted_amount_usd"] == 1.0
 
 
 def test_approved_dates_cover_window_and_exclude_holidays():
@@ -1705,24 +1915,27 @@ def test_top_up_guard_lower_price_buys_incremental_difference():
 
 
 def test_top_up_guard_price_not_below_prior_buys_zero():
+    # Canonical rule item 12: not-strictly-lower and zero-delta both carry the
+    # single unified same_day_topup_not_lower_or_no_delta reason.
     prior = PriorSameDayAllocation("AAPL", amount_usd=3.0, reference_price=98.0, run_id="manual_am", source="manual")
     # Equal price -> not strictly below -> $0.
     equal = evaluate_top_up_guard(_buy_decision("AAPL", 6.0, target_price=98.0), prior, StrategyConfig())
-    assert equal.top_up_guard_result == TOP_UP_PRICE_NOT_BELOW
+    assert equal.top_up_guard_result == TOP_UP_NOT_LOWER_OR_NO_DELTA
     assert equal.incremental_order_amount == 0.0
     assert equal.skipped is True
     # Higher price -> also $0.
     higher = evaluate_top_up_guard(_buy_decision("AAPL", 6.0, target_price=98.5), prior, StrategyConfig())
-    assert higher.top_up_guard_result == TOP_UP_PRICE_NOT_BELOW
+    assert higher.top_up_guard_result == TOP_UP_NOT_LOWER_OR_NO_DELTA
     assert higher.incremental_order_amount == 0.0
     assert higher.skipped is True
 
 
 def test_top_up_guard_prior_exceeds_afternoon_desired_buys_zero():
     # Morning bought $6; afternoon only wants $3, even into a lower price -> $0.
+    # Canonical rule item 12: zero-delta also carries the unified reason.
     prior = PriorSameDayAllocation("AAPL", amount_usd=6.0, reference_price=99.0, run_id="manual_am", source="manual")
     outcome = evaluate_top_up_guard(_buy_decision("AAPL", 3.0, target_price=98.0), prior, StrategyConfig())
-    assert outcome.top_up_guard_result == TOP_UP_NO_INCREMENTAL
+    assert outcome.top_up_guard_result == TOP_UP_NOT_LOWER_OR_NO_DELTA
     assert outcome.incremental_order_amount == 0.0
     assert outcome.skipped is True
 
@@ -1822,6 +2035,12 @@ def _write_prior_run(root, subdir, run_state, orders_rows=None):
             for row in orders_rows:
                 handle.write(f"{row['ticker']},{row['status']},{row['avg_fill_price']}\n")
     return run_dir
+
+
+def _stamp_mtime_on_trading_day(path, trading_day):
+    """Set path's mtime to noon Eastern on trading_day (see _mtime_matches_trading_day)."""
+    stamp = datetime.combine(trading_day, time(12, 0), tzinfo=EASTERN).timestamp()
+    os.utime(path, (stamp, stamp))
 
 
 def _manual_run_state(candidates, generated_at="2026-06-29T10:00:00-04:00", run_origin="manual"):
@@ -2219,31 +2438,35 @@ def test_orders_csv_fills_rejects_non_finite_amount_and_price(tmp_path):
     assert fills["MU"]["quantity_filled"] is None
 
 
-def test_load_prior_same_day_multi_merges_roots_sums_amounts_lowest_reference(tmp_path):
+def test_load_prior_same_day_multi_merges_roots_sums_amounts_most_recent_reference(tmp_path):
     # The afternoon guard scans multiple roots (its own + morning + midday). When
-    # a ticker appears in more than one root, amounts sum and the lowest known
-    # reference price wins, so the afternoon must beat the best earlier entry.
+    # a ticker appears in more than one root, amounts sum and the ticker's MOST
+    # RECENT known reference price wins (by generated_at) -- NOT the lowest. Here
+    # the later midday run has the HIGHER price, and it must win to prove the
+    # resolution is recency-based, not lowest-based.
     morning_root = os.path.join(tmp_path, "cron_tracking", "morning_dca")
     _write_prior_run(
         morning_root,
         "20260629_1030ET",
-        _manual_run_state([
-            {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0, "target_price": 99.0},
-        ]),
+        _manual_run_state(
+            [{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0, "target_price": 97.0}],
+            generated_at="2026-06-29T10:30:00-04:00",
+        ),
     )
     midday_root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
     _write_prior_run(
         midday_root,
         "20260629_1230ET",
-        _manual_run_state([
-            {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 4.5, "target_price": 97.0},
-        ]),
+        _manual_run_state(
+            [{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 4.5, "target_price": 99.0}],
+            generated_at="2026-06-29T12:30:00-04:00",
+        ),
     )
     allocations = load_prior_same_day_allocations_multi(
         (morning_root, midday_root), date(2026, 6, 29)
     )
     assert allocations["AAPL"].amount_usd == 7.5
-    assert allocations["AAPL"].reference_price == 97.0
+    assert allocations["AAPL"].reference_price == 99.0
 
 
 def test_load_prior_same_day_multi_missing_reference_poisons_to_none(tmp_path):
@@ -2414,33 +2637,35 @@ def test_load_prior_same_day_includes_morning_scheduled_run(tmp_path):
     assert allocations["AAPL"].amount_usd == 3.0
 
 
-def test_load_prior_same_day_aggregates_amount_and_takes_min_price(tmp_path):
+def test_load_prior_same_day_aggregates_amount_and_takes_most_recent_price(tmp_path):
     # Reference prices only ever come from confirmed orders.csv fills (never
     # target_price/decision_bar_close -- see test_load_prior_same_day_reads_
     # morning_manual_allocation), so both runs here confirm a real fill price.
+    # Amounts sum and the ticker's MOST RECENT reference wins (by generated_at),
+    # NOT the lowest: the later 10:00 run has the HIGHER price and must win.
     root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
     _write_prior_run(
         root,
         "manual_runs/0900",
         _manual_run_state(
-            [{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0, "target_price": 99.0}],
+            [{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0, "target_price": 98.0}],
             generated_at="2026-06-29T09:00:00-04:00",
         ),
-        orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "99.0"}],
+        orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "98.0"}],
     )
     _write_prior_run(
         root,
         "manual_runs/1000",
         _manual_run_state(
-            [{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 4.5, "target_price": 98.0}],
+            [{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 4.5, "target_price": 99.0}],
             generated_at="2026-06-29T10:00:00-04:00",
         ),
-        orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "98.0"}],
+        orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "99.0"}],
     )
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
     assert allocations["AAPL"].amount_usd == 7.5
-    # The afternoon run must beat the best (lowest) earlier entry price.
-    assert allocations["AAPL"].reference_price == 98.0
+    # The afternoon run must beat the ticker's most recent earlier entry price.
+    assert allocations["AAPL"].reference_price == 99.0
 
 
 def test_load_prior_same_day_ignores_other_trading_days(tmp_path):
@@ -2687,7 +2912,7 @@ def test_run_daily_compact_fully_offset_still_writes_valid_state(tmp_path):
     # afternoon incremental is $0 for all (price not below prior).
     assert run_state["budget"]["day_notional_usd"] == 6.0
     for candidate in run_state["buy_candidates"]:
-        assert candidate["top_up_guard_result"] == TOP_UP_PRICE_NOT_BELOW
+        assert candidate["top_up_guard_result"] == TOP_UP_NOT_LOWER_OR_NO_DELTA
         assert candidate["incremental_order_amount"] == 0.0
         assert candidate["top_up_skipped"] is True
 
@@ -2902,6 +3127,107 @@ def test_load_prior_same_day_ignores_unreadable_or_invalid_json(tmp_path):
     assert allocations == {}
 
 
+def test_load_prior_same_day_skip_sink_records_scan_failures(tmp_path):
+    # Codex review ("Detect artifacts skipped during the initial context
+    # scan"): both the OSError (unreadable) and ValueError (invalid JSON)
+    # skip paths above silently drop the file and contribute no ticker to the
+    # returned mapping -- a caller cannot tell "no prior run" apart from "a
+    # same-day artifact exists but this scan couldn't read it" just by
+    # inspecting the mapping. skip_sink is the caller's way to see the latter.
+    root = tmp_path / "state_root"
+    root.mkdir()
+
+    unreadable_json = root / "run_state_unreadable.json"
+    unreadable_json.mkdir()
+    _stamp_mtime_on_trading_day(unreadable_json, date(2026, 6, 29))
+
+    # Matches the trading-day fast-path substring check (so it isn't filtered
+    # out before ever reaching json.loads) but is truncated mid-flush, like a
+    # sibling stream's writer caught mid-write.
+    partial_json = root / "run_state_partial.json"
+    partial_json.write_text('{"trading_day": "2026-06-29", "buy_candidates": [', encoding="utf-8")
+    _stamp_mtime_on_trading_day(partial_json, date(2026, 6, 29))
+
+    skip_sink: list = []
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
+
+    assert allocations == {}
+    assert set(skip_sink) == {unreadable_json, partial_json}
+
+
+def test_load_prior_same_day_skip_sink_records_truncated_prefix_missing_day(tmp_path):
+    # Codex review ("Report truncation before applying the date fast path"):
+    # a write_text() writer can expose an empty file, or a prefix that hasn't
+    # reached the "trading_day" field yet, while a sibling stream's write is
+    # still in flight. Neither ever matches the trading_day_iso substring, so
+    # without a completeness check they would be treated as "belongs to
+    # another day" by the fast path and skipped BEFORE ever reaching the
+    # json.loads() parse-failure handler that records skip_sink.
+    root = tmp_path / "state_root"
+    root.mkdir()
+
+    empty_json = root / "run_state_empty.json"
+    empty_json.write_text("", encoding="utf-8")
+    _stamp_mtime_on_trading_day(empty_json, date(2026, 6, 29))
+
+    truncated_prefix_json = root / "run_state_prefix.json"
+    truncated_prefix_json.write_text('{"trading', encoding="utf-8")
+    _stamp_mtime_on_trading_day(truncated_prefix_json, date(2026, 6, 29))
+
+    skip_sink: list = []
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
+
+    assert allocations == {}
+    assert set(skip_sink) == {empty_json, truncated_prefix_json}
+
+
+def test_load_prior_same_day_skip_sink_records_nested_brace_truncation(tmp_path):
+    # Codex review ("Parse JSON before declaring a brace-terminated prefix
+    # complete"): a truncated write can end at the closing brace of a
+    # NESTED object (e.g. a "artifacts" sub-dict written before the
+    # top-level "trading_day" field, per sorted-key serialization) while the
+    # outer object is still open. Such a prefix ends with "}" -- the old
+    # "looks complete" heuristic would have wrongly trusted it -- but it is
+    # not valid JSON and doesn't yet contain "trading_day" either.
+    root = tmp_path / "state_root"
+    root.mkdir()
+
+    nested_brace_prefix = root / "run_state_nested.json"
+    nested_brace_prefix.write_text(
+        '{"artifacts": {"orders_csv_path": "orders.csv"}', encoding="utf-8"
+    )
+    _stamp_mtime_on_trading_day(nested_brace_prefix, date(2026, 6, 29))
+
+    skip_sink: list = []
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
+
+    assert allocations == {}
+    assert skip_sink == [nested_brace_prefix]
+
+
+def test_load_prior_same_day_skip_sink_excludes_old_historical_parse_failure(tmp_path):
+    # Codex review ("Exclude historical parse failures from reload
+    # completeness"): a permanently corrupted historical artifact from a
+    # long-past trading day -- accumulated anywhere under the recursively
+    # (rglob) scanned root -- must not poison skip_sink forever. Its own
+    # "trading_day" field can't be inspected (that's exactly what failed to
+    # parse), so this must be scoped by something else: mtime. A file whose
+    # mtime is NOT on the target trading_day is excluded from skip_sink even
+    # though it genuinely failed to parse.
+    root = tmp_path / "state_root"
+    root.mkdir()
+
+    old_corrupt_json = root / "run_state_old_corrupt.json"
+    old_corrupt_json.write_text("{this is not valid json at all", encoding="utf-8")
+    _stamp_mtime_on_trading_day(old_corrupt_json, date(2025, 1, 15))  # long-past day
+
+    skip_sink: list = []
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
+
+    assert allocations == {}
+    assert skip_sink == []
+
+
 def test_load_prior_same_day_reads_full_report_run_state_via_orders_csv(tmp_path):
     """load_prior_same_day_allocations must handle full-report run_states that store
     'artifacts.orders_csv_path' instead of a top-level 'buy_candidates' list.
@@ -2947,6 +3273,223 @@ def test_load_prior_same_day_reads_full_report_run_state_via_orders_csv(tmp_path
     alloc = allocations["AAPL"]
     assert abs(alloc.reference_price - 99.0) < 0.001
     assert abs(alloc.amount_usd - 99.0 * 0.0303) < 0.001
+
+
+def test_load_prior_same_day_skip_sink_records_missing_referenced_orders_csv(tmp_path):
+    # Codex review ("Include referenced CSV failures in scan completeness"):
+    # a full-report run_state.json parses fine and RECORDS an
+    # artifacts.orders_csv_path, but the CSV file itself is absent (deleted,
+    # relocated, or still being written by run_and_report). Before this fix,
+    # skip_sink only tracked run_state*.json read/parse failures, so this
+    # run_state was reported as scanned cleanly even though its ONLY fill
+    # evidence (the referenced CSV) is completely invisible. A ticker whose
+    # only same-day fill lives in that missing CSV would then be silently
+    # absent from both the reload trigger and the returned allocations.
+    import json as _json
+
+    root = str(tmp_path / "state_root")
+    run_dir = os.path.join(root, "2026-06-29-full-report")
+    os.makedirs(run_dir, exist_ok=True)
+
+    # Deliberately do NOT write orders.csv -- the run_state references it,
+    # but it isn't there.
+    missing_orders_csv_path = os.path.join(run_dir, "orders.csv")
+
+    run_state = {
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T10:00:00-04:00",
+        "run_classification": {"run_origin": "manual", "run_id": "manual_am"},
+        "artifacts": {
+            "orders_csv_path": missing_orders_csv_path,
+        },
+    }
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as fh:
+        _json.dump(run_state, fh)
+
+    skip_sink: list = []
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
+    assert "AAPL" not in allocations
+    assert skip_sink, (
+        "a full-report run_state referencing a missing orders CSV must be "
+        "recorded in skip_sink so scan_had_failures reflects the incomplete scan"
+    )
+
+
+def test_load_prior_same_day_skip_sink_ignores_stale_path_with_basename_sibling(tmp_path):
+    # Codex review ("Do not flag stale CSV paths after fallback recovery"):
+    # the run_state records a STALE ABSOLUTE artifacts.orders_csv_path (as
+    # if from a relocated deployment) that no longer exists, but a
+    # basename-matched sibling CSV lives right beside the run_state in its
+    # own directory. scripts.run_classification.load_same_day_top_up_context's
+    # own basename/glob fallback (_referenced_orders_csvs) already recovers
+    # this run's fills via that sibling unconditionally, so flagging a scan
+    # failure here would be a permanent false positive -- a stale absolute
+    # path never becomes valid, so scan_had_failures would never clear,
+    # poisoning an already-correctly-recovered allocation on every future
+    # scan.
+    import json as _json
+
+    root = str(tmp_path / "state_root")
+    run_dir = os.path.join(root, "2026-06-29-full-report")
+    os.makedirs(run_dir, exist_ok=True)
+
+    # The basename-matched sibling DOES exist in the run's own directory --
+    # only the recorded (stale, absolute, from-elsewhere) path is missing.
+    sibling_orders_csv = os.path.join(run_dir, "orders.csv")
+    with open(sibling_orders_csv, "w", newline="", encoding="utf-8") as fh:
+        fh.write("ticker,status,order_id,avg_fill_price,quantity_filled\n")
+        fh.write("AAPL,filled,ord1,99.0,0.0303\n")
+
+    stale_orders_csv_path = "/old/relocated/deployment/orders.csv"
+
+    run_state = {
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T10:00:00-04:00",
+        "run_classification": {"run_origin": "manual", "run_id": "manual_am"},
+        "artifacts": {
+            "orders_csv_path": stale_orders_csv_path,
+        },
+    }
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as fh:
+        _json.dump(run_state, fh)
+
+    skip_sink: list = []
+    load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
+    assert not skip_sink, (
+        "a stale recorded orders CSV path must NOT be flagged as a scan "
+        "failure when a basename-matched sibling exists for the manual "
+        "top-up context loader's own fallback to recover"
+    )
+
+
+def test_load_prior_same_day_skip_sink_ignores_stale_path_with_glob_sibling(tmp_path):
+    # Codex review ("Recognize every supported sibling fallback before
+    # flagging failure"): the run_state records a STALE ABSOLUTE
+    # artifacts.orders_csv_path whose basename is "orders.csv", but the real
+    # sibling CSV in this run's own directory is named "submitted_orders.csv"
+    # -- a DIFFERENT basename than the recorded path, so the exact-basename
+    # check alone doesn't find it. scripts.run_classification's
+    # _referenced_orders_csvs also globs "*orders.csv" in the run directory
+    # and WOULD recover this sibling, so flagging a scan failure here is
+    # still a permanent false positive -- the exact-basename check covers
+    # only one of that helper's two supported fallback mechanisms.
+    import json as _json
+
+    root = str(tmp_path / "state_root")
+    run_dir = os.path.join(root, "2026-06-29-full-report")
+    os.makedirs(run_dir, exist_ok=True)
+
+    # A differently-named sibling that only the *orders.csv glob (not an
+    # exact basename match of the recorded path) would find.
+    glob_sibling_csv = os.path.join(run_dir, "submitted_orders.csv")
+    with open(glob_sibling_csv, "w", newline="", encoding="utf-8") as fh:
+        fh.write("ticker,status,order_id,avg_fill_price,quantity_filled\n")
+        fh.write("AAPL,filled,ord1,99.0,0.0303\n")
+
+    stale_orders_csv_path = "/old/relocated/deployment/orders.csv"
+
+    run_state = {
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T10:00:00-04:00",
+        "run_classification": {"run_origin": "manual", "run_id": "manual_am"},
+        "artifacts": {
+            "orders_csv_path": stale_orders_csv_path,
+        },
+    }
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as fh:
+        _json.dump(run_state, fh)
+
+    skip_sink: list = []
+    load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
+    assert not skip_sink, (
+        "a stale recorded orders CSV path must NOT be flagged as a scan "
+        "failure when a *orders.csv glob sibling exists, even if its "
+        "basename doesn't match the recorded path"
+    )
+
+
+def test_load_prior_same_day_skip_sink_records_truncated_orders_csv_row(tmp_path):
+    # Codex review ("Detect silently truncated CSV reads"): the orders CSV
+    # EXISTS (unlike the test above) but was observed mid-rewrite -- its
+    # final row is cut off with only "AAPL,filled" written, missing the
+    # order_id/avg_fill_price/quantity_filled columns entirely.
+    # csv.DictReader does NOT raise for a short row (it fills the missing
+    # trailing columns with None via its `restval`), so the earlier
+    # except-clause skip_sink fix never fires here -- the row simply looks
+    # like "no usable price or amount" and gets silently dropped. If this is
+    # the ticker's ONLY same-day fill, the scan reports itself complete
+    # while missing it entirely.
+    import json as _json
+
+    root = str(tmp_path / "state_root")
+    run_dir = os.path.join(root, "2026-06-29-full-report")
+    os.makedirs(run_dir, exist_ok=True)
+
+    orders_csv_path = os.path.join(run_dir, "orders.csv")
+    with open(orders_csv_path, "w", newline="", encoding="utf-8") as fh:
+        fh.write("ticker,status,order_id,avg_fill_price,quantity_filled\n")
+        fh.write("AAPL,filled")  # truncated mid-write -- no trailing columns, no newline
+
+    run_state = {
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T10:00:00-04:00",
+        "run_classification": {"run_origin": "manual", "run_id": "manual_am"},
+        "artifacts": {
+            "orders_csv_path": orders_csv_path,
+        },
+    }
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as fh:
+        _json.dump(run_state, fh)
+
+    skip_sink: list = []
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
+    assert "AAPL" not in allocations
+    assert skip_sink, (
+        "a truncated final row in a referenced orders CSV must be recorded "
+        "in skip_sink so scan_had_failures reflects the incomplete scan"
+    )
+
+
+def test_load_prior_same_day_skip_sink_records_empty_orders_csv_snapshot(tmp_path):
+    # Codex review ("Treat empty CSV snapshots as incomplete"): the orders
+    # CSV was observed in the instant right after write_execution_csv()'s
+    # truncating open(path, "w") but before even the header row was
+    # flushed -- a completely empty (0-byte) file. The prior fix's
+    # `if rows` check is bypassed entirely here (rows == [] with NO
+    # fieldnames at all), so it's indistinguishable from a legitimately
+    # empty (header-only, zero-orders) day unless fieldnames itself is
+    # inspected: write_execution_csv() unconditionally calls
+    # writer.writeheader(), so a COMPLETE write always has a header even
+    # with zero data rows -- fieldnames is None ONLY when the file was
+    # observed before that header was ever written.
+    import json as _json
+
+    root = str(tmp_path / "state_root")
+    run_dir = os.path.join(root, "2026-06-29-full-report")
+    os.makedirs(run_dir, exist_ok=True)
+
+    orders_csv_path = os.path.join(run_dir, "orders.csv")
+    with open(orders_csv_path, "w", newline="", encoding="utf-8"):
+        pass  # completely empty -- truncated but nothing flushed yet
+
+    run_state = {
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T10:00:00-04:00",
+        "run_classification": {"run_origin": "manual", "run_id": "manual_am"},
+        "artifacts": {
+            "orders_csv_path": orders_csv_path,
+        },
+    }
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as fh:
+        _json.dump(run_state, fh)
+
+    skip_sink: list = []
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
+    assert "AAPL" not in allocations
+    assert skip_sink, (
+        "a completely empty referenced orders CSV (no header at all) must be "
+        "recorded in skip_sink so scan_had_failures reflects the incomplete scan"
+    )
 
 
 def _run_all():

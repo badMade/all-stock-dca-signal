@@ -269,7 +269,7 @@
       "Regular-hours-only, whitelisted ticker only.",
       "Hard circuit breakers still apply."
     ],
-    "same_day_top_up_guard": "Apply the same-day top-up guard across morning, midday, manual, and final override streams: if a ticker was already bought earlier today, buy only the incremental difference max(0, final_desired_amount - prior_same_day_amount), and only if the final decision price is strictly below the LOWEST prior same-day reference price. A missing prior reference => no auto-top-up (conservative $0 / manual_review_candidate).",
+    "same_day_top_up_guard": "Apply the same-day top-up guard across morning, midday, manual, and final override streams: for a ticker with same-day prior buy context, the comparison reference is that ticker's most recent valid same-day buy reference (ordered by generated_at); buy only the incremental difference corrected_delta_usd = max(0, desired_usd - effective_prior_usd), and only if the final decision price is strictly lower than that most recent reference. A missing prior reference => no auto-top-up (conservative $0 / manual_review_candidate).",
     "trend_note": "Morning (10:30) and midday (12:30) live runs still require trend validation. The trend filter is ignored ONLY for the final-buy decision on 10ce362c."
   },
   "final_manual_override": {

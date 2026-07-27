@@ -77,9 +77,10 @@ Contract:
   the full desired amount if it passes the normal signal, budget, spread,
   confidence, tradability, and regular-hours checks. Absence of a prior
   reference is NOT a block.
-- **Prior same-day context exists → top-up only.** Buy `max(0, desired - prior_usd)`
-  and only if the current decision price is strictly below the lowest prior
-  same-day reference price. Otherwise skip.
+- **Prior same-day context exists → top-up only.** Buy
+  `corrected_delta_usd = max(0, desired_usd - effective_prior_usd)` and only if the
+  current decision price is strictly below the ticker's most recent valid same-day
+  reference price (ordered by generated_at). Otherwise skip.
 
 ### 3. Duplicate-submission guard before any fallback placement (pending in tracked runners)
 

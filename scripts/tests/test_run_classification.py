@@ -1046,6 +1046,147 @@ def test_top_up_context_loads_manual_midday_run():
             assert alloc.sources == ["manual_midday_20260721_1345ET"]
 
 
+def test_top_up_context_skip_sink_records_unreadable_bare_manual_csv():
+    # Codex review ("Include bare manual CSV failures in scan completeness"):
+    # a bare manual run (no buy_candidates, no artifacts.orders_csv_path --
+    # the exact shape this loader exists to handle, mirroring
+    # _write_jul21_manual_midday) has its fills live ONLY in a sibling CSV
+    # found via _referenced_orders_csvs' glob fallback. If that CSV fails to
+    # read/parse, _read_csv_rows silently returned [] with no signal
+    # anywhere -- the caller's completeness flag (skip_sink, threaded from
+    # run_dca.py's _compute_auto_derived_prior_allocations) never learned
+    # this scan was incomplete, so the bounded reload never triggered even
+    # though this ticker's only fill evidence was invisible.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        run_dir = _write_jul21_manual_midday(base)
+        csv_path = run_dir / "submitted_orders.csv"
+        # Overwrite with invalid UTF-8 bytes so csv_path.open(encoding="utf-8")
+        # raises UnicodeDecodeError -- it must remain a real file so
+        # _referenced_orders_csvs' own path.is_file() glob filter still lets
+        # it through to _read_csv_rows (a directory of the same name would be
+        # filtered out before ever reaching the read/parse attempt).
+        csv_path.write_bytes(b"ticker,status\n\xff\xfe,filled\n")
+
+        skip_sink: list = []
+        ctx = load_same_day_top_up_context(JUL21, base=base, skip_sink=skip_sink)
+        assert ctx == {}
+        assert skip_sink, (
+            "an unreadable bare manual orders CSV must be recorded in "
+            "skip_sink so the caller's completeness flag reflects it"
+        )
+
+
+def test_top_up_context_skip_sink_records_truncated_bare_manual_csv():
+    # Codex review ("Reject incomplete bare manual CSV snapshots"): a bare
+    # manual CSV read immediately after a writer truncates it (or while its
+    # final row is only partially written) commonly returns zero rows, or a
+    # row with missing trailing fields filled in as None -- csv.DictReader
+    # does not raise for either case, so the exception-only skip_sink fix
+    # from the previous round never fires. _read_csv_rows now mirrors the
+    # same structural checks (fieldnames is None / final row has a None
+    # value) already added to near_close_dca's core CSV readers.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        run_dir = _write_jul21_manual_midday(base)
+        csv_path = run_dir / "submitted_orders.csv"
+        # A complete first row, then a truncated final row missing its
+        # trailing columns entirely (cut off mid-write, no newline).
+        csv_path.write_text(
+            "symbol,amount,order_id,status,average_price,quantity\n"
+            "MSFT,2.0,6a5fb151-043b-4063-b317-40b666bb4bb7,filled,399.1364,0.0\n"
+            "GOOGL,2.0"
+        )
+
+        skip_sink: list = []
+        ctx = load_same_day_top_up_context(JUL21, base=base, skip_sink=skip_sink)
+        assert "GOOGL" not in ctx, "the truncated tail row must not be trusted"
+        assert skip_sink, (
+            "a truncated final row in a bare manual orders CSV must be "
+            "recorded in skip_sink so the caller's completeness flag "
+            "reflects the incomplete scan"
+        )
+
+
+def test_top_up_context_skip_sink_records_empty_bare_manual_csv():
+    # Codex review ("Reject incomplete bare manual CSV snapshots"): a bare
+    # manual CSV observed in the instant right after a truncating open(path,
+    # "w") but before even the header was flushed is completely empty (0
+    # bytes) -- csv.DictReader returns rows == [] here exactly as it does
+    # for a header-only, genuinely empty CSV, so fieldnames is the only
+    # reliable signal to tell them apart.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        run_dir = _write_jul21_manual_midday(base)
+        csv_path = run_dir / "submitted_orders.csv"
+        csv_path.write_text("")
+
+        skip_sink: list = []
+        ctx = load_same_day_top_up_context(JUL21, base=base, skip_sink=skip_sink)
+        assert ctx == {}
+        assert skip_sink, (
+            "a completely empty bare manual orders CSV (no header at all) "
+            "must be recorded in skip_sink so the caller's completeness "
+            "flag reflects the incomplete scan"
+        )
+
+
+def test_top_up_context_skip_sink_records_missing_referenced_manual_csv():
+    # Codex review ("Report missing manual CSVs before filtering them out"):
+    # the run_state records an artifacts.orders_csv_path, but that file is
+    # missing entirely AND no *orders.csv sibling exists in the run's own
+    # directory either. _referenced_orders_csvs filters every candidate out
+    # via `not path.is_file()` before the caller's loop body ever runs, so
+    # _read_csv_rows(..., skip_sink=skip_sink) -- the read-failure signal
+    # fixed two rounds ago -- is never even called. Both the returned
+    # context and skip_sink stayed empty, silently reporting the scan as
+    # complete while this run's only fill evidence was invisible.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        run_dir = base.parent / "midday_dca" / "manual_runs" / "20260721_1400ET"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        # Deliberately do NOT write any CSV at all -- neither the recorded
+        # path nor any *orders.csv glob sibling exists in run_dir.
+        state = {
+            "run_id": "manual_midday_20260721_1400ET",
+            "generated_at": "2026-07-21T14:00:00",
+            "trading_day": JUL21,
+            "broker": "robinhood",
+            "manual_run": True,
+            "run_origin": "manual",
+            "order_submit_status": "submitted",
+            "artifacts": {
+                "orders_csv_path": str(run_dir / "submitted_orders.csv"),
+            },
+            "run_classification": {
+                "run_origin": "manual",
+                "manual_run": True,
+                "run_id": "manual_midday_20260721_1400ET",
+                "stream": "midday_manual",
+                "trading_day": JUL21,
+                "state_schema_version": STATE_SCHEMA_VERSION,
+                "same_day_top_up_context_only": True,
+                "valid_scheduled_evidence": False,
+                "valid_afternoon_scheduled_evidence": False,
+            },
+        }
+        (run_dir / "run_state.json").write_text(json.dumps(state, indent=2))
+
+        skip_sink: list = []
+        ctx = load_same_day_top_up_context(JUL21, base=base, skip_sink=skip_sink)
+        assert ctx == {}
+        assert skip_sink, (
+            "a run_state referencing a completely missing orders CSV (no "
+            "basename or glob sibling either) must be recorded in "
+            "skip_sink even though _referenced_orders_csvs filtered out "
+            "every candidate before _read_csv_rows was ever called"
+        )
+
+
 def test_top_up_context_manual_ids_excluded_from_scheduled_selection():
     # A 3:20/final scheduled run for the same day must still keep the manual
     # midday order IDs out of scheduled evidence / submitted_orders even while
@@ -1163,6 +1304,44 @@ def test_top_up_context_skips_run_already_covered_by_recorded_orders_csv_path():
         )
 
         assert load_same_day_top_up_context(JUL21, base=base) == {}
+
+
+def test_top_up_context_retains_sub_minute_generated_at_ordering():
+    # Codex review ("Retain sub-minute generated-at ordering"): two manual
+    # artifacts generated in the SAME ET minute but different seconds must
+    # not collapse to a tie decided by scan order. The 12:30:05 run is
+    # scanned after (lexically sorts after) the 12:30:45 run, but the
+    # 12:30:45 fill is the genuinely more recent one and must win.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        earlier_dir = base.parent / "midday_dca" / "manual_runs" / "20260721_1230ET_a_earlier"
+        later_dir = base.parent / "midday_dca" / "manual_runs" / "20260721_1230ET_b_later"
+        earlier_dir.mkdir(parents=True)
+        later_dir.mkdir(parents=True)
+        (earlier_dir / "run_state.json").write_text(json.dumps({
+            "trading_day": JUL21,
+            "generated_at": "2026-07-21T12:30:45-04:00",
+            "run_classification": _top_up_classification("manual_midday_1230_45"),
+        }))
+        (earlier_dir / "filled_orders.csv").write_text(
+            "ticker,order_id,status,avg_fill_price,quantity_filled,amount_usd\n"
+            "MSFT,MID-MSFT-EARLIER,filled,90.0,0.01,0.9\n"
+        )
+        (later_dir / "run_state.json").write_text(json.dumps({
+            "trading_day": JUL21,
+            "generated_at": "2026-07-21T12:30:05-04:00",
+            "run_classification": _top_up_classification("manual_midday_1230_05"),
+        }))
+        (later_dir / "filled_orders.csv").write_text(
+            "ticker,order_id,status,avg_fill_price,quantity_filled,amount_usd\n"
+            "MSFT,MID-MSFT-LATER,filled,100.0,0.01,1.0\n"
+        )
+
+        ctx = load_same_day_top_up_context(JUL21, base=base)
+        # The 12:30:45 fill (genuinely later) must win, not the 12:30:05 one
+        # despite scanning after it (directory name sorts later: "_b_later").
+        assert ctx["MSFT"].reference_price == 90.0
 
 
 def test_top_up_context_unconfirmed_row_poisons_reference_price():

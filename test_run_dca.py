@@ -246,6 +246,55 @@ def test_run_pipeline_scheduled_run_auto_loads_prior_allocations(tmp_path):
     assert not (task_root / "latest_run_summary.json").exists()
 
 
+def test_run_pipeline_scheduled_run_loads_intraday_recovery_top_up_context(tmp_path):
+    import json
+
+    # Jul 24 2026 intraday_1430 recovery (config/scheduled_tasks.json
+    # canonical_first_buy_and_topup_rule -> intraday_dca_scheduled_recovery_2026_07_24,
+    # Codex review: "Include the intraday recovery in later top-up context").
+    # An ad hoc intraday scheduled-recovery stream has no dedicated *_dca.py
+    # module, but writes to the same cron_tracking/<stream>_dca/ sibling
+    # layout as morning_dca/midday_dca -- the afternoon runner must fold its
+    # fills in as prior-allocation context even though its run_origin is
+    # 'scheduled' (it is scheduled evidence for ITS OWN stream only).
+    task_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    intraday_dir = tmp_path / "cron_tracking" / "intraday_dca" / "20260706_1430ET"
+    intraday_dir.mkdir(parents=True)
+    (intraday_dir / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": _now().date().isoformat(),
+            "generated_at": f"{_now().date().isoformat()}T14:30:00-04:00",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "manual_run": False,
+                "stream": "intraday_1430",
+                "run_id": "intraday_live_20260706_1430ET",
+            },
+            # A very low reference price guarantees the afternoon price is
+            # never below it, so this ticker's guard result proves the
+            # recovery allocation was loaded without depending on the demo
+            # provider's exact drop-derived price.
+            "buy_candidates": [
+                {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0, "target_price": 0.01},
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    config = _demo_config()
+    scheduled_dir = task_root / "scheduled_runs" / "20260706_1520ET"
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=scheduled_dir,
+    )
+    assert result["blocked"] is False
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    assert by_ticker["AAPL"]["top_up_guard_result"] != "no_prior_run"
+
+
 def test_run_pipeline_scheduled_run_loads_manual_midday_top_up_context(tmp_path):
     import json
 
@@ -607,6 +656,243 @@ def test_resolve_cross_stream_prior_allocation_roots_afternoon_containing_root_k
     assert (cron_base / "morning_dca").resolve() in resolved
 
 
+def test_resolve_cross_stream_prior_allocation_roots_intraday_sibling_fallback(tmp_path):
+    # With no DCA_INTRADAY_LIVE_STATE_ROOT override, the intraday recovery
+    # root still falls back to the sibling-of-afternoon-root convention, same
+    # as morning/midday, so the bundled production layout keeps working.
+    from run_dca import _resolve_cross_stream_prior_allocation_roots
+
+    afternoon_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    roots = _resolve_cross_stream_prior_allocation_roots(None, afternoon_root)
+    resolved = {r.resolve() for r in roots}
+    assert (afternoon_root.parent / "intraday_dca").resolve() in resolved
+
+
+def test_resolve_cross_stream_prior_allocation_roots_intraday_env_override_is_trusted(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Make the intraday recovery root configurable"): unlike
+    # morning/midday, there is no IntradayConfig loader to source a
+    # deployment-specific root from, so a deployment that relocates its
+    # afternoon and intraday artifact trees independently has no way to
+    # override DEFAULT_INTRADAY_LIVE_STATE_ROOT's hard-coded basename-under-
+    # afternoon_root.parent convention. DCA_INTRADAY_LIVE_STATE_ROOT must be
+    # trusted directly even though it lives entirely outside afternoon_root's
+    # cron_base -- that's the whole point of a relocated tree.
+    from run_dca import _resolve_cross_stream_prior_allocation_roots
+
+    custom_intraday_root = tmp_path / "elsewhere" / "intraday_live"
+    monkeypatch.setenv("DCA_INTRADAY_LIVE_STATE_ROOT", str(custom_intraday_root))
+
+    afternoon_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    roots = _resolve_cross_stream_prior_allocation_roots(None, afternoon_root)
+    resolved = {r.resolve() for r in roots}
+    assert custom_intraday_root.resolve() in resolved
+
+
+def test_resolve_cross_stream_prior_allocation_roots_intraday_env_nested_under_afternoon_excluded(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Exclude intraday roots nested under the afternoon
+    # tree"): _compute_auto_derived_prior_allocations already scans
+    # afternoon_root recursively on its own. If DCA_INTRADAY_LIVE_STATE_ROOT
+    # is set to a path NESTED under afternoon_root (an operator
+    # misconfiguration), keeping it as an ALSO-scanned cross-stream root
+    # would load every run_state.json beneath it twice and double the
+    # afternoon top-up guard's prior-allocation amount for those tickers.
+    from run_dca import _resolve_cross_stream_prior_allocation_roots
+
+    afternoon_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    nested_intraday_root = afternoon_root / "intraday_subdir"
+    monkeypatch.setenv("DCA_INTRADAY_LIVE_STATE_ROOT", str(nested_intraday_root))
+
+    roots = _resolve_cross_stream_prior_allocation_roots(None, afternoon_root)
+    resolved = {r.resolve() for r in roots}
+    assert nested_intraday_root.resolve() not in resolved
+
+
+def test_resolve_cross_stream_prior_allocation_roots_intraday_env_nested_under_afternoon_drops_fallback(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Drop the legacy fallback for covered nested
+    # overrides"): DCA_INTRADAY_LIVE_STATE_ROOT is nested under
+    # afternoon_root, so the caller's own recursive afternoon scan already
+    # covers it (the test above confirms it's correctly excluded as a
+    # separate scan entry). But that's a genuinely CONFIGURED override, just
+    # one that doesn't need its own scan entry -- not the absence of an
+    # override. Treating "doesn't need its own entry" as "no override was
+    # configured" incorrectly resurrected the conventional
+    # cron_base/intraday_dca fallback; if that stale legacy tree still held
+    # artifacts from before the relocation, they'd be aggregated on top of
+    # the (already-covered) real data, double-counting and potentially
+    # suppressing valid top-ups.
+    from run_dca import _resolve_cross_stream_prior_allocation_roots
+
+    afternoon_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    cron_base = afternoon_root.parent
+    nested_intraday_root = afternoon_root / "intraday_subdir"
+    monkeypatch.setenv("DCA_INTRADAY_LIVE_STATE_ROOT", str(nested_intraday_root))
+
+    roots = _resolve_cross_stream_prior_allocation_roots(None, afternoon_root)
+    resolved = {r.resolve() for r in roots}
+    assert (cron_base / "intraday_dca").resolve() not in resolved
+
+
+def test_resolve_cross_stream_prior_allocation_roots_intraday_override_replaces_sibling_fallback(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Replace the intraday fallback when an override is
+    # set"): once DCA_INTRADAY_LIVE_STATE_ROOT points at a genuinely
+    # relocated tree, the old cron_base/intraday_dca sibling-convention
+    # path is very likely stale leftover data, not a legitimate second
+    # source. Keeping both would double-count whatever each location still
+    # holds -- the override must REPLACE the sibling fallback, not add to it.
+    from run_dca import _resolve_cross_stream_prior_allocation_roots
+
+    afternoon_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    custom_intraday_root = tmp_path / "elsewhere" / "intraday_live"
+    monkeypatch.setenv("DCA_INTRADAY_LIVE_STATE_ROOT", str(custom_intraday_root))
+
+    roots = _resolve_cross_stream_prior_allocation_roots(None, afternoon_root)
+    resolved = {r.resolve() for r in roots}
+    assert custom_intraday_root.resolve() in resolved
+    assert (afternoon_root.parent / "intraday_dca").resolve() not in resolved
+    # Morning/midday sibling fallbacks are untouched by the intraday override.
+    assert (afternoon_root.parent / "morning_dca").resolve() in resolved
+    assert (afternoon_root.parent / "midday_dca").resolve() in resolved
+
+
+def test_resolve_cross_stream_prior_allocation_roots_conflicting_intraday_override_keeps_sibling_fallback(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Keep the intraday fallback when filtering the
+    # override"): when DCA_INTRADAY_LIVE_STATE_ROOT is set to a path that
+    # CONFLICTS with afternoon_root (here, the shared cron_base itself --
+    # an ancestor of afternoon_root), the bidirectional afternoon-
+    # containment filter correctly drops the override. Deciding to suppress
+    # the conventional cron_base/intraday_dca sibling fallback BEFORE that
+    # filtering runs (purely because the env var was set) would leave
+    # NEITHER root scanned. The fallback must survive since the override
+    # never actually made it into the returned roots.
+    from run_dca import _resolve_cross_stream_prior_allocation_roots
+
+    afternoon_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    cron_base = afternoon_root.parent
+    monkeypatch.setenv("DCA_INTRADAY_LIVE_STATE_ROOT", str(cron_base))
+
+    roots = _resolve_cross_stream_prior_allocation_roots(None, afternoon_root)
+    resolved = {r.resolve() for r in roots}
+    assert cron_base.resolve() not in resolved  # the conflicting override is dropped
+    assert (cron_base / "intraday_dca").resolve() in resolved  # fallback survives
+
+
+def test_resolve_cross_stream_prior_allocation_roots_intraday_override_equals_afternoon_drops_fallback(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Treat an override equal to the afternoon root as
+    # covered"): DCA_INTRADAY_LIVE_STATE_ROOT is set to EXACTLY
+    # afternoon_root. The prior ancestor-or-equal check treated this the
+    # same as the genuine cron_base-ancestor misconfiguration above,
+    # resurrecting the legacy cron_base/intraday_dca fallback -- but an
+    # override equal to afternoon_root is trivially covered by the
+    # caller's own recursive afternoon scan, exactly like a nested
+    # override, not a meaningless whole-tree misconfiguration like an
+    # ancestor. If the legacy fallback location still holds stale
+    # artifacts, they'd be aggregated on top of the already-covered data.
+    from run_dca import _resolve_cross_stream_prior_allocation_roots
+
+    afternoon_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    cron_base = afternoon_root.parent
+    monkeypatch.setenv("DCA_INTRADAY_LIVE_STATE_ROOT", str(afternoon_root))
+
+    roots = _resolve_cross_stream_prior_allocation_roots(None, afternoon_root)
+    resolved = {r.resolve() for r in roots}
+    assert (cron_base / "intraday_dca").resolve() not in resolved
+
+
+def test_resolve_cross_stream_prior_allocation_roots_intraday_override_covered_by_ancestor_drops_fallback(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Drop the intraday fallback when an ancestor covers the
+    # override"): DCA_INTRADAY_LIVE_STATE_ROOT is set to a path NESTED under
+    # the morning stream's own (relocated) configured root. Pass 3 correctly
+    # prunes the override itself as redundant -- its ancestor already scans
+    # it recursively -- but that ancestor's ongoing coverage means the
+    # override's real intent (a relocated tree) still holds, so the now-
+    # genuinely-redundant conventional cron_base/intraday_dca fallback must
+    # still be dropped. An exact-path "did the override survive" check would
+    # wrongly conclude it didn't (only its ancestor remains) and keep the
+    # stale fallback.
+    import json
+
+    from run_dca import _resolve_cross_stream_prior_allocation_roots
+
+    afternoon_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    cron_base = afternoon_root.parent
+    relocated_root = cron_base / "relocated_all_streams"
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "morning_dca.json").write_text(
+        json.dumps({"artifact_paths": {"live_run_state_root": str(relocated_root)}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DCA_INTRADAY_LIVE_STATE_ROOT", str(relocated_root / "intraday_dca"))
+
+    roots = _resolve_cross_stream_prior_allocation_roots(str(config_dir), afternoon_root)
+    resolved = {r.resolve() for r in roots}
+    assert relocated_root.resolve() in resolved  # the ancestor covering the override
+    assert (cron_base / "intraday_dca").resolve() not in resolved  # stale fallback dropped
+
+
+def test_resolve_cross_stream_prior_allocation_roots_intraday_override_equals_fallback_survives(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Preserve an override that equals the intraday
+    # fallback"): DCA_INTRADAY_LIVE_STATE_ROOT is explicitly set to the exact
+    # conventional cron_base/intraday_dca path. Pass 1 dedupes the override
+    # and the sibling fallback into ONE surviving entry (they're the same
+    # path); removing "every entry equal to the fallback key" would delete
+    # that sole entry too, leaving NOTHING scanned for intraday at all.
+    from run_dca import _resolve_cross_stream_prior_allocation_roots
+
+    afternoon_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    cron_base = afternoon_root.parent
+    monkeypatch.setenv("DCA_INTRADAY_LIVE_STATE_ROOT", str(cron_base / "intraday_dca"))
+
+    roots = _resolve_cross_stream_prior_allocation_roots(None, afternoon_root)
+    resolved = {r.resolve() for r in roots}
+    assert (cron_base / "intraday_dca").resolve() in resolved
+
+
+def test_resolve_cross_stream_prior_allocation_roots_intraday_override_nested_under_fallback_scans_only_override(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Scan only the nested intraday override"): when
+    # DCA_INTRADAY_LIVE_STATE_ROOT is set to a path NESTED under the
+    # conventional cron_base/intraday_dca fallback (e.g. a "relocated"
+    # subdirectory), the override must be scanned INSTEAD of the broader
+    # fallback, not merely alongside/covered-by it. An earlier fix kept the
+    # broader fallback in this case (to avoid losing coverage entirely), but
+    # that scans every legacy artifact elsewhere under cron_base/intraday_dca
+    # too -- not just the relocated tree the operator configured -- which can
+    # double-count or pull in stale data during a migration where old and
+    # relocated copies coexist. The upfront override-vs-fallback decision
+    # means the fallback is never a candidate at all once the override is
+    # active, so the narrower override survives on its own.
+    from run_dca import _resolve_cross_stream_prior_allocation_roots
+
+    afternoon_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    cron_base = afternoon_root.parent
+    nested_override = cron_base / "intraday_dca" / "relocated"
+    monkeypatch.setenv("DCA_INTRADAY_LIVE_STATE_ROOT", str(nested_override))
+
+    roots = _resolve_cross_stream_prior_allocation_roots(None, afternoon_root)
+    resolved = {r.resolve() for r in roots}
+    assert nested_override.resolve() in resolved
+    assert (cron_base / "intraday_dca").resolve() not in resolved
+
+
 def test_run_pipeline_explicit_prior_root_uses_run_time_boundary(tmp_path):
     import json
 
@@ -761,6 +1047,1221 @@ def test_default_prior_allocation_state_root_falls_back_to_parent():
     # fall back to the immediate parent.
     artifacts_dir = Path("/tmp/some_root/scheduled")
     assert _default_prior_allocation_state_root(artifacts_dir) == Path("/tmp/some_root")
+
+
+def test_tickers_with_unresolved_same_day_context():
+    from near_close_dca import PriorSameDayAllocation
+    from run_dca import _tickers_with_unresolved_same_day_context
+
+    allocations = {
+        # Known prior amount but no resolvable reference price -> unresolved.
+        "AAPL": PriorSameDayAllocation("AAPL", amount_usd=3.0, reference_price=None),
+        "NVDA": PriorSameDayAllocation("NVDA", amount_usd=2.0, reference_price=97.0),
+        # No prior amount at all -- not "unresolved same-day context", just no context.
+        "MSFT": PriorSameDayAllocation("MSFT", amount_usd=0.0, reference_price=None),
+    }
+    assert _tickers_with_unresolved_same_day_context(allocations) == ["AAPL"]
+
+
+def test_run_pipeline_bounded_reload_resolves_unresolved_same_day_context(tmp_path, monkeypatch):
+    # Canonical rule item 13: "if same-day context cannot be resolved for one
+    # ticker, perform one bounded same-day context reload, then fail only
+    # that ticker closed." Simulate an artifact that only becomes resolvable
+    # on the second scan (e.g. a sibling stream's writer completing between
+    # the first and second pass) by stubbing
+    # _compute_auto_derived_prior_allocations to return an unresolved AAPL on
+    # the first call and a resolved one on the second, then assert
+    # run_pipeline actually used the RELOADED result rather than failing
+    # AAPL's top-up closed on the first, unresolved pass.
+    import run_dca
+    from near_close_dca import PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+        calls.append((now, trading_day, artifacts_dir, config_dir))
+        if len(calls) == 1:
+            return (
+                {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=3.0, reference_price=None)},
+                False,
+            )
+        # Resolved on reload: an extremely low reference price guarantees the
+        # afternoon decision price is never below it, so the guard result
+        # unambiguously reflects this (second-call) data being used.
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", amount_usd=3.0, reference_price=0.01, run_id="am", source="manual"
+                )
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    result = run_dca.run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2  # exactly one bounded reload, not an unbounded retry loop
+    assert result["blocked"] is False
+    import json
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # If the stale (unresolved) first-call result had been used instead of the
+    # reload, this would be "missing_prior_price" with top_up_manual_review=True.
+    assert by_ticker["AAPL"]["top_up_guard_result"] == "same_day_topup_not_lower_or_no_delta"
+    assert by_ticker["AAPL"]["top_up_manual_review"] is False
+
+
+def test_compute_auto_derived_prior_allocations_reports_scan_had_failures(tmp_path):
+    # Codex review ("Detect artifacts skipped during the initial context
+    # scan"): a same-day artifact still being flushed mid-write parses to
+    # nothing at all -- AAPL never appears in the returned mapping, not
+    # merely with a missing price -- so `_tickers_with_unresolved_same_day_context`
+    # alone would see an empty allocations dict and never trigger a reload.
+    # Only the scan_had_failures flag this function now returns lets the
+    # caller tell that apart from a genuine no-prior-run day.
+    from run_dca import _compute_auto_derived_prior_allocations
+
+    task_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    manual_dir = task_root / "manual_runs" / "0900"
+    manual_dir.mkdir(parents=True)
+    trading_day = _now().date()
+    # Contains the trading_day substring (passes the fast-path filter) but is
+    # truncated -- not valid JSON -- simulating a writer caught mid-flush.
+    malformed_path = manual_dir / "run_state.json"
+    malformed_path.write_text(
+        f'{{"trading_day": "{trading_day.isoformat()}", "buy_candidates": [',
+        encoding="utf-8",
+    )
+    # skip_sink is scoped to plausibly same-day artifacts by mtime (Codex
+    # review: "Exclude historical parse failures from reload completeness");
+    # stamp it onto trading_day so this synthetic fixture is recognized as one.
+    import os as _os
+
+    _stamp = datetime.combine(trading_day, time(12, 0), tzinfo=EASTERN).timestamp()
+    _os.utime(malformed_path, (_stamp, _stamp))
+
+    scheduled_dir = task_root / "scheduled_runs" / "20260706_1520ET"
+    allocations, scan_had_failures = _compute_auto_derived_prior_allocations(
+        _now(), trading_day, scheduled_dir, None
+    )
+
+    assert allocations == {}
+    assert scan_had_failures is True
+
+
+def test_run_pipeline_bounded_reload_preserves_already_resolved_ticker(tmp_path, monkeypatch):
+    # Codex review ("Preserve resolved ticker context across the reload"): the
+    # bounded reload exists to give an UNRESOLVED ticker a second chance, not
+    # to let a transient scan hiccup on the SECOND pass silently discard a
+    # DIFFERENT ticker's already-good first-pass data. Simulate AAPL
+    # unresolved on pass one (triggering the reload) and MSFT resolved fine
+    # on pass one but poisoned on pass two (e.g. MSFT's own artifact hit a
+    # transient race during the reload scan) -- MSFT must keep its first-pass
+    # value in the final result.
+    import run_dca
+    from near_close_dca import PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+        calls.append((now, trading_day, artifacts_dir, config_dir))
+        if len(calls) == 1:
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation("AAPL", amount_usd=3.0, reference_price=None),
+                    "MSFT": PriorSameDayAllocation(
+                        "MSFT", amount_usd=2.0, reference_price=0.01, run_id="am", source="manual"
+                    ),
+                },
+                False,
+            )
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", amount_usd=3.0, reference_price=0.01, run_id="am", source="manual"
+                ),
+                "MSFT": PriorSameDayAllocation("MSFT", amount_usd=2.0, reference_price=None),
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    result = run_dca.run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2  # exactly one bounded reload, not an unbounded retry loop
+    assert result["blocked"] is False
+    import json
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # AAPL used the reloaded (resolved) data.
+    assert by_ticker["AAPL"]["top_up_guard_result"] == "same_day_topup_not_lower_or_no_delta"
+    # MSFT kept its first-pass (resolved) data. If the whole mapping had been
+    # replaced with pass two's result, MSFT would fall back to the
+    # missing_prior_price / manual_review $0 path instead.
+    assert by_ticker["MSFT"]["top_up_guard_result"] == "same_day_topup_not_lower_or_no_delta"
+    assert by_ticker["MSFT"]["top_up_manual_review"] is False
+
+
+def test_run_pipeline_bounded_reload_uses_recovered_larger_amount_for_resolved_ticker(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Use recovered allocations when the first scan was
+    # incomplete"): MSFT is already resolved (known price) on pass one, but
+    # only from ONE of its same-day artifacts -- a SIBLING artifact for the
+    # SAME ticker failed to parse on pass one and became readable on the
+    # reload, so pass two's aggregate for MSFT is a strictly LARGER amount.
+    # The merge must take pass two's more-complete total instead of freezing
+    # MSFT at its understated first-pass amount, which would let the top-up
+    # guard compare against too little prior capital and over-buy.
+    import run_dca
+    from near_close_dca import PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+        calls.append((now, trading_day, artifacts_dir, config_dir))
+        if len(calls) == 1:
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation("AAPL", amount_usd=3.0, reference_price=None),
+                    "MSFT": PriorSameDayAllocation(
+                        "MSFT", amount_usd=2.0, reference_price=0.01, run_id="am", source="manual"
+                    ),
+                },
+                False,
+            )
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", amount_usd=3.0, reference_price=0.01, run_id="am", source="manual"
+                ),
+                # Recovered a second, previously-unreadable artifact for
+                # MSFT: the amount grew from $2 to $6, still resolved.
+                "MSFT": PriorSameDayAllocation(
+                    "MSFT", amount_usd=6.0, reference_price=0.01, run_id="am2", source="manual"
+                ),
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    result = run_dca.run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert result["blocked"] is False
+    import json
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # MSFT must reflect the recovered, larger prior amount, not the stale
+    # first-pass $2 that would understate how much capital was already spent.
+    assert by_ticker["MSFT"]["prior_same_day_amount"] == 6.0
+
+
+def test_run_pipeline_bounded_reload_trusts_clean_reload_after_dirty_first_pass(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Use a clean reload after a failed first scan"): AAPL's
+    # first pass reads a known-price $2 fill but misses a same-ticker $3
+    # unconfirmed submission (scan_had_failures=True) -- the reload is
+    # completely CLEAN (second_scan_had_failures=False) and correctly reads
+    # BOTH, aggregating to the true $5/unknown context. A first-pass
+    # failure flag must not by itself block trusting an otherwise-clean
+    # reload: only the RELOAD's own cleanliness determines whether its
+    # total can be trusted as complete, since a clean reload is
+    # definitionally a full read of everything on disk regardless of what
+    # the first pass happened to miss.
+    import run_dca
+    from near_close_dca import PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+        calls.append((now, trading_day, artifacts_dir, config_dir))
+        if len(calls) == 1:
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", amount_usd=2.0, reference_price=98.0, run_id="am", source="manual"
+                    )
+                },
+                True,
+            )
+        return (
+            {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=5.0, reference_price=None)},
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    result = run_dca.run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert result["blocked"] is False
+    import json
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # Must use the clean reload's complete $5/unknown context, not the
+    # stale, understated first-pass $2/known.
+    assert by_ticker["AAPL"]["top_up_guard_result"] == "missing_prior_price"
+    assert by_ticker["AAPL"]["top_up_manual_review"] is True
+    assert by_ticker["AAPL"]["prior_same_day_amount"] == 5.0
+
+
+def test_run_pipeline_bounded_reload_accepts_corrected_reference_price(tmp_path, monkeypatch):
+    # Codex review ("Accept updated references from a clean reload"): AAPL's
+    # first pass reads a full-report CSV-only allocation at a preliminary
+    # fill price ($2 at $100). By the clean reload, the same $2 notional has
+    # been reconciled to the confirmed broker price ($90) -- same amount,
+    # different KNOWN price. The equal-amount branch previously only
+    # accepted a None-to-known transition, so it kept the stale $100
+    # reference even though the clean reload has more current, accurate
+    # data for the identical notional.
+    import run_dca
+    from near_close_dca import PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+        calls.append((now, trading_day, artifacts_dir, config_dir))
+        if len(calls) == 1:
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", amount_usd=2.0, reference_price=100.0, run_id="am", source="manual"
+                    )
+                },
+                True,
+            )
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", amount_usd=2.0, reference_price=90.0, run_id="am2", source="manual"
+                )
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    result = run_dca.run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert result["blocked"] is False
+    import json
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # Must use the reload's corrected $90 reference, not the stale $100.
+    assert by_ticker["AAPL"]["prior_same_day_reference_price"] == 90.0
+    assert by_ticker["AAPL"]["prior_same_day_amount"] == 2.0
+
+
+def test_run_pipeline_bounded_reload_keeps_unresolved_when_reload_is_incomplete(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Preserve unresolved context when the reload is
+    # incomplete"): AAPL's first pass aggregates a known-price fill ($2) and
+    # an unknown-price submission ($3) into amount=5.0/price=None (correctly
+    # unresolved -- the aggregate is poisoned by the unconfirmed submission).
+    # If the RELOAD transiently loses the artifact behind that unconfirmed
+    # submission, its aggregate becomes only amount=2.0/price=98.0 -- smaller
+    # than pass one, and only "resolved" because the very context that made
+    # it uncertain vanished. Blindly trusting any reload result for a
+    # previously-unresolved ticker would treat this SMALLER, less-complete
+    # aggregate as the final answer and route the guard through a straight
+    # top-up comparison instead of failing conservatively closed.
+    import run_dca
+    from near_close_dca import PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+        calls.append((now, trading_day, artifacts_dir, config_dir))
+        if len(calls) == 1:
+            return (
+                {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=5.0, reference_price=None)},
+                False,
+            )
+        # Reload lost the $3 unconfirmed-submission artifact: smaller
+        # amount, but now "resolved" purely because the uncertain
+        # contributor disappeared from this scan.
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", amount_usd=2.0, reference_price=98.0, run_id="am", source="manual"
+                )
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    result = run_dca.run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert result["blocked"] is False
+    import json
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # Must still route through the conservative missing-price path with the
+    # ORIGINAL $5 amount, not the reload's smaller, falsely-resolved $2.
+    assert by_ticker["AAPL"]["top_up_guard_result"] == "missing_prior_price"
+    assert by_ticker["AAPL"]["top_up_manual_review"] is True
+    assert by_ticker["AAPL"]["prior_same_day_amount"] == 5.0
+
+
+def test_run_pipeline_bounded_reload_preserves_uncertainty_on_equal_swapped_totals(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Preserve uncertainty when equal totals swap
+    # contributors"): AAPL genuinely has TWO same-day contributing
+    # artifacts of equal size -- an unknown-price $5 submission and a
+    # known-price $5 filled order -- but each scan only manages to read ONE
+    # of the two (the other fails to parse that pass), so both passes
+    # report the SAME $5 total: pass one via the submission (unresolved),
+    # the reload via the filled order (resolved). Naively trusting "equal
+    # amount, price newly resolved" here would silently understate the
+    # true $10 prior spend as a falsely-confident $5. Both scans report
+    # scan_had_failures=True (each genuinely skipped one artifact), which
+    # is the signal the fix uses to refuse this equal-amount "resolution."
+    import run_dca
+    from near_close_dca import PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+        calls.append((now, trading_day, artifacts_dir, config_dir))
+        if len(calls) == 1:
+            return (
+                {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=5.0, reference_price=None)},
+                True,
+            )
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", amount_usd=5.0, reference_price=98.0, run_id="am", source="manual"
+                )
+            },
+            True,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    result = run_dca.run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert result["blocked"] is False
+    import json
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # Must stay unresolved (the pre-reload $5/unknown-price state), not
+    # silently accept the reload's coincidentally-equal resolved entry.
+    assert by_ticker["AAPL"]["top_up_guard_result"] == "missing_prior_price"
+    assert by_ticker["AAPL"]["top_up_manual_review"] is True
+    assert by_ticker["AAPL"]["prior_same_day_amount"] == 5.0
+
+
+def test_run_pipeline_bounded_reload_preserves_uncertainty_on_unequal_swapped_totals(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Preserve uncertainty when unequal contributors swap"):
+    # AAPL genuinely has TWO same-day contributing artifacts -- an
+    # unknown-price $5 submission and a known-price $6 filled order (true
+    # aggregate: $11/unknown) -- but each scan only manages to read ONE of
+    # the two. Pass one reads the $5 submission (the $6 fill fails to parse
+    # that pass); the reload reads the $6 fill (the $5 submission fails to
+    # parse THIS pass instead). $6 > $5 looks like a strictly more complete
+    # answer by amount alone, but it silently discards the other real
+    # contributor and its unresolved status. Both scans report
+    # scan_had_failures=True, which is the signal the fix uses to refuse
+    # trusting either total as more complete than the other for this ticker.
+    import run_dca
+    from near_close_dca import PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+        calls.append((now, trading_day, artifacts_dir, config_dir))
+        if len(calls) == 1:
+            return (
+                {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=5.0, reference_price=None)},
+                True,
+            )
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", amount_usd=6.0, reference_price=98.0, run_id="am", source="manual"
+                )
+            },
+            True,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    result = run_dca.run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert result["blocked"] is False
+    import json
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # Must stay unresolved -- but now poisoned to the LARGER ($6) of the two
+    # observed amounts (Codex review: "Poison resolved context when an
+    # incomplete reload swaps contributors"), a conservative floor on the
+    # true $11 aggregate, never the reload's resolved $98 reference price.
+    assert by_ticker["AAPL"]["top_up_guard_result"] == "missing_prior_price"
+    assert by_ticker["AAPL"]["top_up_manual_review"] is True
+    assert by_ticker["AAPL"]["prior_same_day_amount"] == 6.0
+
+
+def test_run_pipeline_bounded_reload_keeps_newly_recovered_ticker_uncertain(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Keep recovered tickers uncertain after an incomplete
+    # reload"): AAPL is entirely absent from the first pass -- BOTH of its
+    # real same-day artifacts (a $6 fill and a $5 unknown-price submission)
+    # failed to parse that pass. The reload recovers only the $6 fill (the
+    # $5 submission still fails to parse THIS pass, so
+    # second_scan_had_failures=True) -- a resolved $6, not the true
+    # $11/unknown context. Since AAPL was invisible on the first pass, the
+    # naive "nothing to protect" reasoning would trust this partial
+    # recovery as complete; it must instead be treated as uncertain because
+    # the reload itself wasn't fully clean.
+    import run_dca
+    from near_close_dca import PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+        calls.append((now, trading_day, artifacts_dir, config_dir))
+        if len(calls) == 1:
+            return ({}, True)
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", amount_usd=6.0, reference_price=98.0, run_id="am", source="manual"
+                )
+            },
+            True,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    result = run_dca.run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert result["blocked"] is False
+    import json
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # The recovered $6 amount is kept (more information than none), but the
+    # price must be poisoned to unresolved rather than trusted as complete.
+    assert by_ticker["AAPL"]["top_up_guard_result"] == "missing_prior_price"
+    assert by_ticker["AAPL"]["top_up_manual_review"] is True
+    assert by_ticker["AAPL"]["prior_same_day_amount"] == 6.0
+
+
+def test_run_pipeline_bounded_reload_poisons_resolved_ticker_on_reverse_swap(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Poison resolved context when an incomplete reload swaps
+    # contributors"): the reverse direction of the swap-uncertainty case
+    # above. The first pass reads a known-price $5 artifact for AAPL (a $6
+    # unknown-price sibling artifact fails to parse that pass); the reload
+    # then reads that $6 unknown-price artifact but misses the $5 one this
+    # time. Both passes report scan_had_failures=True. Before this fix,
+    # `elif not _reload_verified_complete: pass` blindly kept the first
+    # pass's resolved $5/known-price allocation -- presenting FALSE
+    # CONFIDENCE (a fully resolved, comparable amount) even though the true
+    # same-day context is $11/unknown. The top-up guard could then submit
+    # excess capital on top of an incomplete picture instead of failing this
+    # ticker closed. The fix must poison the merged result to unresolved,
+    # using the larger ($6) of the two observed amounts as a conservative
+    # floor.
+    import run_dca
+    from near_close_dca import PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+        calls.append((now, trading_day, artifacts_dir, config_dir))
+        if len(calls) == 1:
+            return (
+                {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=5.0, reference_price=50.0)},
+                True,
+            )
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", amount_usd=6.0, reference_price=None, run_id="am", source="manual"
+                )
+            },
+            True,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    result = run_dca.run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert result["blocked"] is False
+    import json
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # Must NOT trust the first pass's resolved $5/known-price value -- the
+    # reload's conflicting $6/unknown reading is direct evidence it wasn't
+    # actually complete. Route through the conservative missing_prior_price
+    # path with the larger ($6) amount as the floor.
+    assert by_ticker["AAPL"]["top_up_guard_result"] == "missing_prior_price"
+    assert by_ticker["AAPL"]["top_up_manual_review"] is True
+    assert by_ticker["AAPL"]["prior_same_day_amount"] == 6.0
+
+
+def test_run_pipeline_bounded_reload_poisons_conflict_after_clean_first_scan(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Poison conflicts even after a clean first scan"): the
+    # first pass is entirely clean (scan_had_failures=False) -- AAPL is
+    # unresolved (triggering the reload) and MSFT is independently resolved
+    # at $2/known. The reload itself hits an unrelated skip elsewhere
+    # (second_scan_had_failures=True), but a sibling writer also lands a NEW
+    # artifact for MSFT in the window between the two scans, so the reload
+    # now sees MSFT at $6/unknown -- a genuine disagreement, not a scan
+    # artifact. Gating the poison on the FIRST pass's scan_had_failures flag
+    # (as the prior fix did) would miss this: that flag says nothing about
+    # whether pass one's snapshot of MSFT specifically is still current.
+    # Any disagreement observed while the reload is unverified must poison
+    # to uncertain, regardless of whether the earlier scan reported a
+    # failure.
+    import run_dca
+    from near_close_dca import PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+        calls.append((now, trading_day, artifacts_dir, config_dir))
+        if len(calls) == 1:
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation("AAPL", amount_usd=5.0, reference_price=None),
+                    "MSFT": PriorSameDayAllocation(
+                        "MSFT", amount_usd=2.0, reference_price=50.0, run_id="am", source="manual"
+                    ),
+                },
+                False,
+            )
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", amount_usd=5.0, reference_price=99.0, run_id="am", source="manual"
+                ),
+                # A sibling writer added a new MSFT artifact between the two
+                # scans -- a real change, not a parse race.
+                "MSFT": PriorSameDayAllocation("MSFT", amount_usd=6.0, reference_price=None),
+            },
+            True,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    result = run_dca.run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert result["blocked"] is False
+    import json
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # MSFT must NOT keep the stale $2/known value -- the reload's
+    # conflicting $6/unknown reading is direct evidence it changed. Route
+    # through the conservative missing_prior_price path with the larger
+    # ($6) amount as the floor.
+    assert by_ticker["MSFT"]["top_up_guard_result"] == "missing_prior_price"
+    assert by_ticker["MSFT"]["top_up_manual_review"] is True
+    assert by_ticker["MSFT"]["prior_same_day_amount"] == 6.0
+
+
+def test_run_pipeline_bounded_reload_poisons_equal_metadata_swap(tmp_path, monkeypatch):
+    # Codex review ("Poison equal-metadata swaps after an incomplete
+    # reload"): AAPL genuinely has TWO same-day $5 fills at the identical
+    # known price $90 -- but each scan only manages to read ONE of them.
+    # Pass one reads the first $5/$90 fill (the second, coincidentally
+    # identical, fill fails to parse that pass); the reload reads the
+    # second $5/$90 fill (the first now fails to parse THIS pass instead).
+    # Both passes report scan_had_failures=True. Comparing amount_usd and
+    # reference_price alone makes this look like "nothing changed" -- they
+    # match exactly -- but there is no per-artifact identity tracked here to
+    # actually prove the two passes read the SAME fill. The true aggregate
+    # is $10, and treating the matching metadata as proof of an unchanged,
+    # resolved $5 context could let the top-up guard compare against too
+    # little prior capital.
+    import run_dca
+    from near_close_dca import PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+        calls.append((now, trading_day, artifacts_dir, config_dir))
+        if len(calls) == 1:
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", amount_usd=5.0, reference_price=90.0, run_id="am", source="manual"
+                    )
+                },
+                True,
+            )
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", amount_usd=5.0, reference_price=90.0, run_id="am2", source="manual"
+                )
+            },
+            True,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    result = run_dca.run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert result["blocked"] is False
+    import json
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # Must NOT trust the matching $5/$90 metadata as proof the same fill was
+    # read twice -- with both scans dirty, poison to unresolved rather than
+    # risk comparing the top-up guard against an understated $5 when the
+    # true aggregate could be $10.
+    assert by_ticker["AAPL"]["top_up_guard_result"] == "missing_prior_price"
+    assert by_ticker["AAPL"]["top_up_manual_review"] is True
+
+
+def test_run_pipeline_bounded_reload_trusts_matching_run_id_despite_unrelated_scan_failures(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Scope reload failures to affected tickers"): both scans
+    # report scan_had_failures=True, but the failure in each pass is an
+    # UNRELATED artifact for a DIFFERENT ticker/stream -- AAPL's own
+    # contributing artifact (run_id "am") was read cleanly and identically by
+    # both passes. Before the fix, the global scan_had_failures flag alone
+    # forced this ticker to poison to missing_prior_price/manual_review even
+    # though nothing about AAPL's own context is actually in doubt, contrary
+    # to the rule that an unresolved context must fail only the affected
+    # ticker closed. Matching run_id across both passes is direct evidence
+    # the SAME contributing artifact was read both times, so this must stay
+    # resolved.
+    import run_dca
+    from near_close_dca import PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+        calls.append((now, trading_day, artifacts_dir, config_dir))
+        allocation = PriorSameDayAllocation(
+            "AAPL",
+            amount_usd=5.0,
+            reference_price=90.0,
+            run_id="am",
+            source="manual",
+            selected_base_amount_usd=1.0,
+            selected_base_amount_usd_at="2026-07-06T09:45:00-04:00",
+        )
+        # Both passes report a failure (e.g. an unrelated MSFT artifact
+        # mid-write), but AAPL's own data is identical and unambiguous both
+        # times.
+        return ({"AAPL": allocation}, True)
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    result = run_dca.run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert result["blocked"] is False
+    import json
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # Must NOT poison: AAPL's own contributing artifact agreed exactly (same
+    # run_id) across both passes, so unrelated failures elsewhere must not
+    # affect it.
+    assert by_ticker["AAPL"]["top_up_guard_result"] == "same_day_topup_not_lower_or_no_delta"
+    assert by_ticker["AAPL"]["top_up_manual_review"] is False
+    assert by_ticker["AAPL"]["prior_same_day_reference_price"] == 90.0
+
+
+def test_run_pipeline_bounded_reload_poisons_first_only_entry_after_incomplete_reload(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Poison first-only entries after an incomplete reload"):
+    # the merge loop only iterates second_pass.items(), so a ticker present
+    # ONLY in first_pass -- entirely absent from an INCOMPLETE reload -- never
+    # passes through any of the poisoning logic and simply keeps its
+    # first-pass value via the `dict(first_pass)` seed. AAPL reads a
+    # known-price $5 fill on pass one while a same-ticker $6 unknown-price
+    # submission fails to parse (scan_had_failures=True, which alone
+    # triggers the bounded reload); the reload then fails to read EITHER
+    # AAPL artifact (second_scan_had_failures=True), so AAPL is entirely
+    # absent from second_pass.
+    import run_dca
+    from near_close_dca import PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+        calls.append((now, trading_day, artifacts_dir, config_dir))
+        if len(calls) == 1:
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", amount_usd=5.0, reference_price=50.0, run_id="am", source="manual"
+                    ),
+                },
+                True,
+            )
+        # AAPL is entirely absent -- the reload failed to read either of its
+        # artifacts this pass.
+        return ({}, True)
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    result = run_dca.run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert result["blocked"] is False
+    import json
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # AAPL must NOT keep its resolved $5/known first-pass value -- the
+    # incomplete reload's total silence about it is not proof it no longer
+    # exists, only that this pass couldn't read it either.
+    assert by_ticker["AAPL"]["top_up_guard_result"] == "missing_prior_price"
+    assert by_ticker["AAPL"]["top_up_manual_review"] is True
+    assert by_ticker["AAPL"]["prior_same_day_amount"] == 5.0
+
+
+def test_run_pipeline_bounded_reload_accepts_corrected_base_from_clean_reload(tmp_path, monkeypatch):
+    # Codex review ("Accept corrected allocation bases from a clean reload"):
+    # AAPL's amount and reference price are unchanged between passes, but its
+    # selected_base_amount_usd is corrected from $2 (a preliminary/estimated
+    # base written by the first pass's artifact) to $1 by a CLEAN reload
+    # (second_scan_had_failures=False, so this artifact is authoritative).
+    # resolve_top_up_desired_amount_usd multiplies the base directly to
+    # compute the top-up target, so keeping the stale $2 base could target
+    # roughly double what the corrected $1 base actually supports.
+    import run_dca
+    from near_close_dca import PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+        calls.append((now, trading_day, artifacts_dir, config_dir))
+        if len(calls) == 1:
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", amount_usd=2.0, reference_price=50.0, run_id="am", source="manual",
+                        selected_base_amount_usd=2.0, selected_base_amount_usd_at="2026-06-29T09:00:00-04:00",
+                    )
+                },
+                True,
+            )
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", amount_usd=2.0, reference_price=50.0, run_id="am2", source="manual",
+                    selected_base_amount_usd=1.0, selected_base_amount_usd_at="2026-06-29T09:00:00-04:00",
+                )
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    result = run_dca.run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert result["blocked"] is False
+    import json
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # Must use the clean reload's corrected $1 base, not the stale $2 -- this
+    # is persisted as the candidate's own selected_base_amount_usd, since
+    # that field records whichever base ACTUALLY produced planned_amount_usd
+    # (guard.effective_base_amount_usd, see resolve_top_up_desired_amount_usd).
+    assert by_ticker["AAPL"]["selected_base_amount_usd"] == 1.0
+
+
+def test_run_pipeline_bounded_reload_poisons_reference_when_accepting_corrected_base(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Avoid combining a stale price with a reloaded base"):
+    # AAPL's amount is unchanged, but the CLEAN reload's own record for this
+    # ticker has an unknown reference price (e.g. a confirmed amount-only
+    # fill with a valid base but no confirmed price yet) alongside a
+    # corrected base ($1 -> $2). The prior fix for "Accept corrected
+    # allocation bases from a clean reload" would have kept the first
+    # pass's stale KNOWN price ($100) while adopting the reload's corrected
+    # base ($2) -- a combination neither pass actually produced. If the
+    # afternoon price falls below that stale $100, the guard would compute
+    # atop the doubled $2 base instead of taking the reload's own
+    # missing_prior_price path.
+    import run_dca
+    from near_close_dca import PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+        calls.append((now, trading_day, artifacts_dir, config_dir))
+        if len(calls) == 1:
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", amount_usd=2.0, reference_price=100.0, run_id="am", source="manual",
+                        selected_base_amount_usd=1.0, selected_base_amount_usd_at="2026-06-29T09:00:00-04:00",
+                    )
+                },
+                True,
+            )
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", amount_usd=2.0, reference_price=None, run_id="am2", source="manual",
+                    selected_base_amount_usd=2.0, selected_base_amount_usd_at="2026-06-29T09:00:00-04:00",
+                )
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    result = run_dca.run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert result["blocked"] is False
+    import json
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # Must NOT combine the stale $100 known price with the reload's
+    # corrected $2 base -- route through missing_prior_price instead.
+    assert by_ticker["AAPL"]["top_up_guard_result"] == "missing_prior_price"
+    assert by_ticker["AAPL"]["top_up_manual_review"] is True
+    assert by_ticker["AAPL"]["selected_base_amount_usd"] == 2.0
+
+
+def test_run_pipeline_bounded_reload_treats_base_only_change_as_conflict(tmp_path, monkeypatch):
+    # Codex review ("Include base metadata in incomplete-reload conflicts"):
+    # MSFT is unresolved on pass one, triggering the bounded reload. AAPL's
+    # pass-one read is clean (amount $2, reference $100, base $2). The
+    # reload reads the SAME amount and reference for AAPL but a CORRECTED
+    # base ($2 -> $1) -- while an unrelated artifact elsewhere in this same
+    # scan fails to parse (second_scan_had_failures=True). The
+    # not-_reload_verified_complete disagreement predicate previously
+    # compared only amount_usd/reference_price, so a base-only correction
+    # looked like "agreement" and kept the stale, larger $2 base. If the
+    # afternoon price falls below $100, resolve_top_up_desired_amount_usd
+    # would then target double what the reload's corrected $1 base supports.
+    import run_dca
+    from near_close_dca import PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+        calls.append((now, trading_day, artifacts_dir, config_dir))
+        if len(calls) == 1:
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", amount_usd=2.0, reference_price=100.0, run_id="am", source="manual",
+                        selected_base_amount_usd=2.0, selected_base_amount_usd_at="2026-06-29T09:00:00-04:00",
+                    ),
+                    "MSFT": PriorSameDayAllocation("MSFT", amount_usd=3.0, reference_price=None),
+                },
+                False,
+            )
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", amount_usd=2.0, reference_price=100.0, run_id="am2", source="manual",
+                    selected_base_amount_usd=1.0, selected_base_amount_usd_at="2026-06-29T09:00:00-04:00",
+                ),
+                "MSFT": PriorSameDayAllocation(
+                    "MSFT", amount_usd=3.0, reference_price=40.0, run_id="am", source="manual"
+                ),
+            },
+            True,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    result = run_dca.run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert result["blocked"] is False
+    import json
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # AAPL's base-only correction must be treated as a conflict -- poisoned
+    # to unresolved, adopting the reload's corrected (smaller) $1 base
+    # rather than keeping the stale $100/known + $2 combination.
+    assert by_ticker["AAPL"]["top_up_guard_result"] == "missing_prior_price"
+    assert by_ticker["AAPL"]["top_up_manual_review"] is True
+    assert by_ticker["AAPL"]["selected_base_amount_usd"] == 1.0
+
+
+def test_run_pipeline_bounded_reload_poisons_stale_reference_on_smaller_clean_reload(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Discard stale references when a clean reload is
+    # smaller"): MSFT is unresolved on pass one, triggering the bounded
+    # reload. AAPL's pass-one read is a $5 fill at a $100 reference. The
+    # CLEAN reload (second_scan_had_failures=False) reconciles this to a
+    # confirmed $4 partial fill at a $90 reference -- a genuine correction,
+    # smaller amount AND a different known reference. The existing
+    # smaller-amount fallthrough kept the stale $5/$100 snapshot entirely
+    # (amount alone can't prove which pass is more complete without
+    # per-artifact identity, already an accepted, SAFE limitation). But
+    # blindly keeping a KNOWN reference the clean reload has since
+    # corrected is actively unsafe: if the afternoon price is $95, the
+    # stale $100 reference passes the price-below-prior check and permits
+    # a top-up, while the reload's own $90 reference would correctly
+    # reject it.
+    import run_dca
+    from near_close_dca import PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+        calls.append((now, trading_day, artifacts_dir, config_dir))
+        if len(calls) == 1:
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", amount_usd=5.0, reference_price=100.0, run_id="am", source="manual"
+                    ),
+                    "MSFT": PriorSameDayAllocation("MSFT", amount_usd=3.0, reference_price=None),
+                },
+                False,
+            )
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", amount_usd=4.0, reference_price=90.0, run_id="am2", source="manual"
+                ),
+                "MSFT": PriorSameDayAllocation(
+                    "MSFT", amount_usd=3.0, reference_price=40.0, run_id="am", source="manual"
+                ),
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    result = run_dca.run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert result["blocked"] is False
+    import json
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # Must NOT keep the stale $100 reference -- poisoned to unresolved,
+    # keeping the first pass's larger $5 amount as the conservative floor.
+    assert by_ticker["AAPL"]["top_up_guard_result"] == "missing_prior_price"
+    assert by_ticker["AAPL"]["top_up_manual_review"] is True
+    assert by_ticker["AAPL"]["prior_same_day_amount"] == 5.0
+
+
+def test_run_pipeline_bounded_reload_poisons_base_change_on_smaller_clean_reload(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Handle base corrections on smaller clean reloads"):
+    # MSFT is unresolved on pass one, triggering the bounded reload. AAPL's
+    # pass-one read is $5 fill / base $2 / reference $100. The CLEAN reload
+    # reduces BOTH the amount ($5 -> $4) AND the base ($2 -> $1) while
+    # leaving the reference UNCHANGED at $100 -- so the earlier
+    # "discard stale references" fix (which only checks reference_price)
+    # doesn't trigger, and the entire stale $5/$2/$100 snapshot survives
+    # unmodified. Kept unpoisoned, the stale $2 base combined with the kept
+    # $5 floor amount can still compute a target that permits a top-up the
+    # reload's own corrected $1 base would not.
+    import run_dca
+    from near_close_dca import PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+        calls.append((now, trading_day, artifacts_dir, config_dir))
+        if len(calls) == 1:
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", amount_usd=5.0, reference_price=100.0, run_id="am", source="manual",
+                        selected_base_amount_usd=2.0, selected_base_amount_usd_at="2026-06-29T09:00:00-04:00",
+                    ),
+                    "MSFT": PriorSameDayAllocation("MSFT", amount_usd=3.0, reference_price=None),
+                },
+                False,
+            )
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", amount_usd=4.0, reference_price=100.0, run_id="am2", source="manual",
+                    selected_base_amount_usd=1.0, selected_base_amount_usd_at="2026-06-29T09:00:00-04:00",
+                ),
+                "MSFT": PriorSameDayAllocation(
+                    "MSFT", amount_usd=3.0, reference_price=40.0, run_id="am", source="manual"
+                ),
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    result = run_dca.run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert result["blocked"] is False
+    import json
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # Must NOT keep the stale $2 base -- poisoned to unresolved, keeping the
+    # first pass's larger $5 amount as the conservative floor.
+    assert by_ticker["AAPL"]["top_up_guard_result"] == "missing_prior_price"
+    assert by_ticker["AAPL"]["top_up_manual_review"] is True
+    assert by_ticker["AAPL"]["prior_same_day_amount"] == 5.0
 
 
 def test_fills_from_orders_csv(tmp_path):

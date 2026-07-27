@@ -259,6 +259,14 @@ def test_signal_amounts_and_actions():
     assert sigs["FLAT"].action == Action.SKIP  # exactly at prior close, no weakness
     assert sigs["TINY"].action == Action.NO_ACTION  # below prior close but under 0.1% min drop
     assert sigs["TINY"].multiplier == 0.0
+    # Codex review ("Reset the morning base reason when the multiplier is
+    # zero"): TINY's price IS below the prior close, so
+    # select_first_allocation_base_usd alone would report a buy-scale reason
+    # (below_prior_close_only/_and_low) even though the minimum-drop check
+    # above zeroed this to a no-buy. The zero-multiplier no-action result must
+    # report the canonical not_below_prior_close_no_buy reason instead.
+    assert sigs["TINY"].selected_base_amount_usd == 0.0
+    assert sigs["TINY"].base_selection_reason == "not_below_prior_close_no_buy"
     assert sigs["SMALL"].action == Action.BUY
     assert sigs["SMALL"].multiplier == 2.5  # 3% drop -> 2.5x on the 0x-to-5x ladder
     assert sigs["SMALL"].hypothetical_amount_usd == 5.0

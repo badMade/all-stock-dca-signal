@@ -139,6 +139,31 @@ def _et_minutes(value: object) -> Optional[int]:
     return hh * 60 + mm
 
 
+def _et_seconds(value: object) -> Optional[int]:
+    """Seconds-since-midnight in **ET** for an order timestamp.
+
+    Same source handling as :func:`_et_minutes`, but preserves sub-minute
+    precision -- needed when comparing recency for same-day reference merging
+    (see :func:`_merge_prior`): two manual artifacts generated in the same ET
+    minute at different seconds must not collapse to a tie decided by scan
+    order (Codex review: "Retain sub-minute generated-at ordering").
+    """
+    dt = value if isinstance(value, datetime) else _parse_iso_datetime(str(value))
+    if dt is not None:
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(_EASTERN)
+        return dt.hour * 3600 + dt.minute * 60 + dt.second
+    # Bare 'HH:MM[:SS]' wall-clock with no date -> treated as ET.
+    match = re.search(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", str(value))
+    if not match:
+        return None
+    hh, mm = int(match.group(1)), int(match.group(2))
+    ss = int(match.group(3)) if match.group(3) else 0
+    if not (0 <= hh < 24 and 0 <= mm < 60 and 0 <= ss < 60):
+        return None
+    return hh * 3600 + mm * 60 + ss
+
+
 _WINDOW_START_MIN = _et_minutes(SCHEDULED_WINDOW_START_ET)  # 15:15
 _WINDOW_END_MIN = _et_minutes(SCHEDULED_WINDOW_END_ET)      # 15:35
 
@@ -997,7 +1022,8 @@ def exclude_manual_orders(
 # The later same-day runs (12:30 midday, 3:20 afternoon/final) must fold earlier
 # same-day MANUAL fills in as prior-allocation context for the top-up guard: a
 # later run buys only max(0, desired - prior_same_day_amount) and only when its
-# decision price is strictly below the LOWEST prior same-day reference price.
+# decision price is strictly below the ticker's most recent prior same-day
+# reference price (resolved by generated_at; see _merge_prior).
 #
 # Jul 21 2026 incident (see config/run_classification.json ->
 # midday_manual_run_2026_07_21): the 3:20 final run under
@@ -1133,6 +1159,12 @@ class PriorAllocation:
     reference_price: Optional[float]
     order_ids: List[str] = field(default_factory=list)
     sources: List[str] = field(default_factory=list)
+    # ET seconds-since-midnight of the run whose reference_price currently owns
+    # this allocation (see _merge_prior). Sub-minute precision matters: two
+    # artifacts generated in the same ET minute at different seconds must not
+    # tie. None when reference_price is unknown or came from a run with no
+    # parseable generated_at.
+    reference_ts: Optional[int] = None
 
 
 def _row_ticker(row: Mapping[str, object]) -> Optional[str]:
@@ -1192,7 +1224,9 @@ def _rows_from_buy_candidates(state: Dict[str, object]) -> List[Dict[str, object
     return rows
 
 
-def _read_csv_rows(csv_path: Path) -> List[Dict[str, object]]:
+def _read_csv_rows(
+    csv_path: Path, *, skip_sink: Optional[List[Path]] = None
+) -> List[Dict[str, object]]:
     """Read one orders CSV's rows, keeping only submitted/filled statuses.
 
     Each returned row is tagged with an internal ``_confirmed_fill`` bool: True
@@ -1202,22 +1236,54 @@ def _read_csv_rows(csv_path: Path) -> List[Dict[str, object]]:
     treats as a confirmed fill without a status column (Codex review: "Treat
     statusless filled-orders rows as confirmed fills"). Only a confirmed row's
     price may be trusted as a reference.
+
+    Pass ``skip_sink`` to record ``csv_path`` when the read/parse fails, so a
+    missing, unreadable, or mid-rewrite CSV is not silently indistinguishable
+    from a genuinely empty one (Codex review: "Include bare manual CSV
+    failures in scan completeness").
     """
-    rows: List[Dict[str, object]] = []
     try:
         with csv_path.open(newline="", encoding="utf-8") as handle:
-            for row in csv.DictReader(handle):
-                status = (row.get("status") or "").strip().lower()
-                if status and status not in ("submitted", "filled"):
-                    continue
-                is_manual_filled_shape = not status and (
-                    csv_path.name == "filled_orders.csv" or "amount_usd" in row
-                )
-                row = dict(row)
-                row["_confirmed_fill"] = status == "filled" or is_manual_filled_shape
-                rows.append(row)
+            reader = csv.DictReader(handle)
+            raw_rows = list(reader)
+            fieldnames = reader.fieldnames
     except (OSError, csv.Error, UnicodeDecodeError):
+        if skip_sink is not None:
+            skip_sink.append(csv_path)
         return []
+    if fieldnames is None:
+        # The file has no header line at all -- observed in the instant
+        # right after a truncating open(path, "w") but before even the
+        # header was flushed. csv.DictReader returns rows == [] here just
+        # as it does for a legitimately empty (zero-orders) file, so
+        # fieldnames is the only reliable signal to tell them apart (Codex
+        # review: "Reject incomplete bare manual CSV snapshots", mirroring
+        # the same check already added to near_close_dca._orders_csv_fills
+        # and _orders_csv_submitted_notionals).
+        if skip_sink is not None:
+            skip_sink.append(csv_path)
+        return []
+    if raw_rows and any(value is None for value in raw_rows[-1].values()):
+        # The final row has FEWER fields than the header -- csv.DictReader
+        # fills any missing trailing columns with None (its `restval`)
+        # rather than raising, so a row observed mid-write with its last
+        # record only partially flushed silently looked like a normal,
+        # complete row instead of a scan failure. Drop the untrustworthy
+        # tail row but keep whatever was already fully flushed before it.
+        if skip_sink is not None:
+            skip_sink.append(csv_path)
+        raw_rows = raw_rows[:-1]
+    rows: List[Dict[str, object]] = []
+    for row in raw_rows:
+        status = (row.get("status") or "").strip().lower()
+        if status and status not in ("submitted", "filled"):
+            continue
+        is_manual_filled_shape = not status and (
+            csv_path.name == "filled_orders.csv" or "amount_usd" in row
+        )
+        row = dict(row)
+        row["_confirmed_fill"] = status == "filled" or is_manual_filled_shape
+        rows.append(row)
     return rows
 
 
@@ -1319,7 +1385,9 @@ def _prior_from_rows(rows: Iterable[Dict[str, object]]) -> Dict[str, Dict[str, o
         elif price is None or entry["reference_price"] is None:
             entry["reference_price"] = None
         else:
-            entry["reference_price"] = min(float(entry["reference_price"]), price)
+            # Rows are read in file order, so the last confirmed-fill row is the
+            # ticker's most recent same-day reference and its price wins.
+            entry["reference_price"] = price
         oid = (row.get("order_id") or "").strip()
         if oid and oid != "-":
             entry["order_ids"].append(oid)
@@ -1403,17 +1471,38 @@ def _already_covered_by_prior_allocation_loader(
     return False
 
 
+# Sentinel for a source run with no parseable generated_at. Sorts before every
+# real ET seconds-since-midnight value (0-86399) so an untimestamped run always
+# loses a recency comparison to any timestamped run, but still wins later
+# scan/merge order against other untimestamped runs -- mirrors
+# near_close_dca._TS_FLOOR.
+_REFERENCE_TS_FLOOR = -1
+
+
 def _merge_prior(
     dst: Dict[str, PriorAllocation],
     src: Dict[str, Dict[str, object]],
     source_label: str,
+    run_ts: Optional[int] = None,
 ) -> None:
     """In-place merge of a raw ticker map into the aggregate PriorAllocation map.
+
+    ``run_ts`` is the contributing run's own ``generated_at`` (ET
+    seconds-since-midnight, see :func:`_et_seconds` -- sub-minute precision
+    matters here: two artifacts generated in the same ET minute at different
+    seconds must not tie and fall through to scan order) so recency is
+    resolved by actual timestamp rather than by artifact scan/path order: a
+    backfilled or manually-copied run directory whose name happens to sort
+    after a genuinely later run must not overwrite that later run's reference
+    price just because it was merged last. Ties and untimestamped runs
+    (``run_ts=None``, treated as :data:`_REFERENCE_TS_FLOOR`) fall back to
+    merge order, matching ``near_close_dca.load_prior_same_day_allocations``.
 
     Same poisoning rule as :func:`_prior_from_rows`: an unknown reference from
     this or any earlier merged source makes the ticker's aggregate reference
     unknown, rather than silently keeping an earlier known price.
     """
+    run_key = run_ts if run_ts is not None else _REFERENCE_TS_FLOOR
     for ticker, entry in src.items():
         alloc = dst.get(ticker)
         if alloc is None:
@@ -1424,10 +1513,18 @@ def _merge_prior(
         price = entry.get("reference_price")
         if first_contribution:
             alloc.reference_price = float(price) if isinstance(price, (int, float)) else None
+            alloc.reference_ts = run_key if alloc.reference_price is not None else None
         elif price is None or alloc.reference_price is None:
             alloc.reference_price = None
+            alloc.reference_ts = None
         else:
-            alloc.reference_price = min(alloc.reference_price, float(price))
+            # Most-recent (by generated_at) reference wins: overwrite only when
+            # this source is at least as recent as whichever source currently
+            # owns the reference.
+            existing_key = alloc.reference_ts if alloc.reference_ts is not None else _REFERENCE_TS_FLOOR
+            if run_key >= existing_key:
+                alloc.reference_price = float(price)
+                alloc.reference_ts = run_key
         for oid in entry.get("order_ids", []) or []:
             if oid not in alloc.order_ids:
                 alloc.order_ids.append(oid)
@@ -1436,7 +1533,11 @@ def _merge_prior(
 
 
 def load_same_day_top_up_context(
-    trading_day: str, base: Optional[Path] = None, *, boundary_et: Optional[time] = None
+    trading_day: str,
+    base: Optional[Path] = None,
+    *,
+    boundary_et: Optional[time] = None,
+    skip_sink: Optional[List[Path]] = None,
 ) -> Dict[str, PriorAllocation]:
     """Load same-day MANUAL fills as per-ticker prior-allocation / top-up context.
 
@@ -1461,9 +1562,11 @@ def load_same_day_top_up_context(
     ``filled_orders.csv`` can both record the same order -- Codex review:
     "Deduplicate orders repeated in sibling CSVs" -- see
     :func:`_dedupe_rows_by_order_id`), and folds the result into a per-ticker
-    :class:`PriorAllocation` (summed ``prior_usd`` and the LOWEST prior
-    ``reference_price``, with any unconfirmed/unknown price poisoning that
-    ticker's reference -- see :func:`_prior_from_rows`).
+    :class:`PriorAllocation` (summed ``prior_usd``; per ticker, the MOST RECENT
+    valid reference price wins, resolved by each contributing run's own
+    ``generated_at`` -- ties and untimestamped runs defer to scan/merge order,
+    see :func:`_merge_prior` -- with any unconfirmed/unknown price poisoning
+    that ticker's reference; see :func:`_prior_from_rows`).
 
     A dry-run artifact (``state['dry_run']``) is always skipped -- it simulates
     submitted/filled rows against no real capital, exactly the reason
@@ -1487,6 +1590,15 @@ def load_same_day_top_up_context(
     These fills are never scheduled evidence; their order IDs remain in
     :func:`collect_manual_order_ids` so they stay out of every scheduled-live
     metric and out of the scheduled run's submitted_orders.csv.
+
+    Pass ``skip_sink`` to record every orders CSV that failed to read/parse
+    (see :func:`_read_csv_rows`). A missing, unreadable, or mid-rewrite CSV
+    here is exactly as unverifiable as a core-loader completeness failure --
+    without this signal a ticker whose only same-day fill lives ONLY in an
+    unreferenced sibling CSV (the case this loader exists to handle) could be
+    silently absent from the caller's completeness flag, skip the bounded
+    reload, and be evaluated as ``no_prior_run`` (Codex review: "Include bare
+    manual CSV failures in scan completeness").
     """
     result: Dict[str, PriorAllocation] = {}
     seen_order_ids: Set[str] = set()
@@ -1507,14 +1619,34 @@ def load_same_day_top_up_context(
             rc = state.get("run_classification")
             label = (rc.get("run_id") if isinstance(rc, dict) else None) or str(path.parent)
             all_rows: List[Dict[str, object]] = []
-            for csv_path in _referenced_orders_csvs(state, path.parent):
-                all_rows.extend(_read_csv_rows(csv_path))
+            referenced_csvs = _referenced_orders_csvs(state, path.parent)
+            for csv_path in referenced_csvs:
+                all_rows.extend(_read_csv_rows(csv_path, skip_sink=skip_sink))
+            if not referenced_csvs and skip_sink is not None:
+                artifacts = state.get("artifacts")
+                recorded = artifacts.get("orders_csv_path") if isinstance(artifacts, dict) else None
+                if recorded:
+                    # The run_state explicitly recorded an orders_csv_path,
+                    # but _referenced_orders_csvs' own basename/glob fallback
+                    # found NOTHING at all -- neither the recorded path, its
+                    # basename in this run's directory, nor any *orders.csv
+                    # sibling exist. Every candidate is filtered out via
+                    # `not path.is_file()` before _read_csv_rows is ever
+                    # called, so the read-failure skip_sink signal added
+                    # last round never fires (Codex review: "Report missing
+                    # manual CSVs before filtering them out"). Record the
+                    # run_state path itself so scan_had_failures reflects
+                    # that this run's fill evidence is completely
+                    # unverifiable, matching the analogous fix already
+                    # applied to the core loader's referenced-CSV handling.
+                    skip_sink.append(path)
             if _outside_core_loader_reach(path.parent):
                 all_rows.extend(_rows_from_buy_candidates(state))
             deduped_rows = _dedupe_rows_by_order_id(all_rows)
             deduped_rows = _exclude_seen_order_ids(deduped_rows, seen_order_ids)
             csv_prior = _prior_from_rows(deduped_rows)
-            _merge_prior(result, csv_prior, str(label))
+            run_ts = _et_seconds(state.get("generated_at"))
+            _merge_prior(result, csv_prior, str(label), run_ts)
     return result
 
 

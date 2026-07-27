@@ -1,7 +1,7 @@
+import asyncio
 import os
 import sys
 import subprocess
-import asyncio
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:

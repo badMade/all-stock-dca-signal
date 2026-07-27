@@ -61,9 +61,9 @@ Only earlier runs generated **before 2:30 PM ET** contribute; scheduled afternoo
 runs are excluded as prior context. Prior allocations are scanned across
 prior_allocation_roots (the morning-live root, which recursively includes the manual missed-morning
 recovery root .../cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*); when a
-ticker appears in more than one root the amounts are summed and the lowest
-reference price wins, so midday must beat the best earlier entry before it tops
-up.
+ticker appears in more than one root the amounts are summed and the most recent
+valid same-day reference price wins (ordered by generated_at), so midday must beat
+that most recent earlier reference before it tops up.
 
 **Missed 10:30 morning run recovery (added Jul 20 2026).** When the 10:30
 scheduled morning live task did not run and a **manual** recovery placed the

@@ -231,8 +231,84 @@
   "base_amount_policy": {
     "policy_file": "config/budgets.json",
     "base_amount_usd": 2.0,
-    "summary": "The graded DCA base amount is exactly $2.00; every candidate dollar amount equals $2.00 x multiplier. Never infer, discover, or fall back to $50.00 or any broker/account default base amount. If the base-amount config is missing or unreadable, continue using $2.00 as a hardcoded, user-confirmed fallback.",
-    "base_amount_change_note_2026_07_19": "On Jul 19 2026 the user changed all future DCA scheduled runs from a $3 base amount to a $2 base amount. The order amount is now $2 x multiplier, and the max per order is $10 under the 5x tier."
+    "base_amount_below_close_usd": 1.0,
+    "summary": "SUPERSEDED for first-buy base selection by canonical_first_buy_and_topup_rule below (JUL 24 2026 EXACT FIRST-BUY AND SAME-DAY TOP-UP RULE), which is the source of truth: the first same-day allocation per ticker selects $2.00 (base_amount_usd) only when below both the prior close and low, $1.00 (base_amount_below_close_usd) when below the prior close only, and no buy otherwise -- NOT a flat $2.00 x multiplier for every candidate. $2.00 remains the ceiling/ladder base and the hardcoded, user-confirmed fallback if the base-amount config is missing or unreadable (never $50.00 or any broker/account default). Never infer or discover a base amount from any other source.",
+    "base_amount_change_note_2026_07_19": "On Jul 19 2026 the user changed all future DCA scheduled runs from a $3 base amount to a $2 base amount. The order amount is now $2 x multiplier, and the max per order is $10 under the 5x tier. This note predates and is refined by canonical_first_buy_and_topup_rule's $1/$2 dynamic first-allocation base, approved 2026-07-24."
+  },
+  "canonical_first_buy_and_topup_rule": {
+    "approved_on_et": "2026-07-24",
+    "title": "JUL 24 2026 EXACT FIRST-BUY AND SAME-DAY TOP-UP RULE",
+    "summary": "Canonical per-ticker rule for selecting the first same-day buy base amount (before the ladder multiplier) and for governing later same-day top-ups. This is the source of truth; the code in near_close_dca.select_first_allocation_base_usd and near_close_dca.evaluate_top_up_guard, the morning mirror in morning_dca.py, and the base_selection_rule blocks in config/budgets.json and config/sizing_ladder.json all implement it, with one tracked exception -- see effective_prior_usd_gap_2026_07_24 below.",
+    "reason_strings": {
+      "below_prior_close_and_low": "First buy sized from the $2.00 base (base_amount_usd): current decision price is below BOTH yesterday's completed regular-session close AND low.",
+      "below_prior_close_only": "First buy sized from the $1.00 base (base_amount_below_close_usd): current decision price is below yesterday's close but NOT below yesterday's low. A missing or unknown prior low is treated conservatively as not-below-low ($1.00).",
+      "not_below_prior_close_no_buy": "No buy: current decision price is not below yesterday's close, or the active multiplier is 0.",
+      "same_day_topup_not_lower_or_no_delta": "Skip a same-day top-up: current decision price is not strictly below this ticker's prior same-day buy reference, or corrected_delta_usd resolves to 0."
+    },
+    "rules": [
+      "1. Apply this rule independently per ticker.",
+      "2. If a ticker has no same-day prior buy, fill, submitted order, valid order artifact, manual recovery fill, or broker-confirmed same-day context, treat the current evaluation as that ticker's first buy of the day.",
+      "3. For that first buy, compare the current decision price against yesterday's completed regular-session close AND yesterday's completed regular-session low for that ticker.",
+      "4. If the current price is lower than yesterday's close but NOT lower than yesterday's low, desired_usd = $1.00 x active multiplier (reason below_prior_close_only).",
+      "5. If the current price is lower than BOTH yesterday's close and yesterday's low, desired_usd = $2.00 x active multiplier (reason below_prior_close_and_low).",
+      "6. If the current price is not lower than yesterday's close, or the multiplier is 0, do not buy that ticker (reason not_below_prior_close_no_buy).",
+      "7. If there were no previous same-day buys for that ticker, always evaluate from yesterday's close and low; do not apply a same-day top-up blocker to a ticker with no prior same-day context.",
+      "8. Same-day buys in other tickers must never block a first allocation for this ticker.",
+      "9. If the ticker DOES have same-day prior buy context, ignore yesterday's low for that ticker and use that ticker's most recent valid same-day buy reference as the comparison reference.",
+      "10. For a subsequent same-day buy, buy again only when the current decision price is strictly lower than that ticker's prior same-day buy reference.",
+      "11. Recompute the desired allocation on the current active ladder, then buy only the difference: corrected_delta_usd = max(0, desired_usd - effective_prior_usd).",
+      "12. If the current price is not strictly lower than the same-day reference, or corrected_delta_usd is 0, skip that ticker with the concrete reason same_day_topup_not_lower_or_no_delta.",
+      "13. If same-day context cannot be resolved for one ticker, perform one bounded same-day context reload, then fail only that ticker closed without blocking other tickers."
+    ],
+    "effective_prior_usd_gap_2026_07_24": "KNOWN GAP, NOT YET IMPLEMENTED: rule 11's effective_prior_usd is specified to combine deduped same-day artifacts PLUS Robinhood same-day broker order history (see the JUL 23 2026 EFFECTIVE PRIOR ALLOCATION PATCH note in near_close_dca.py's module docstring and analysis/2026-07-23-live-reliability-fixes/live_task_reliability_update_2026-07-23.md section 6). near_close_dca.evaluate_top_up_guard does not yet compute effective_prior_usd or read prior_usd_rh; it subtracts only the artifact-derived prior.amount_usd (via PriorSameDayAllocation), so a same-day buy confirmed at the broker but missing or incomplete in the artifact trail is not yet folded into corrected_delta_usd and could be re-ordered as a first allocation. Until this lands, rule 11 is enforced operationally through the scheduled task text, not as a code-level runtime safeguard, matching the runtime-status caveat already tracked for the JUL 23 2026 patch.",
+    "top_up_scope_confirmation": "JUL 24 2026 TOP-UP SCOPE CONFIRMATION: same-day top-up logic is ticker-scoped. Prior same-day buys for one symbol are context for that symbol only and must never suppress first-allocation evaluation for another symbol.",
+    "per_ticker_independence": "Every ticker resolves its own same-day context. A ticker with no valid same-day context is always evaluated as a first buy against yesterday's close and low regardless of other tickers' same-day activity; a ticker with same-day context uses only its own same-day reference for top-up gating.",
+    "same_day_reference_resolution": "The comparison reference is the ticker's most recent valid same-day buy reference, and the runner implements exactly that. near_close_dca.load_prior_same_day_allocations / load_prior_same_day_allocations_multi / merge_manual_top_up_context and scripts.run_classification.load_same_day_top_up_context (via _merge_prior) resolve a ticker's aggregate same-day reference to the most recent valid same-day price by generated_at (ties and untimestamped runs defer to later scan/merge order, which is the more recent contributor); a manual fill folded in last is treated as the most recent reference. If any contributing same-day reference is unknown the aggregate reference is unknown and the guard routes to its conservative missing-price / manual_review $0 path. There is no lowest-price resolution and no lowest-vs-most-recent follow-up outstanding.",
+    "missing_prior_low": "A missing or unknown prior regular-session low is treated conservatively as not-below-low, so the first buy sizes from the $1.00 base when below the close.",
+    "per_order_ceiling_usd": 10.0,
+    "active_universe": {
+      "active": ["DFTX", "TRIN", "AAAU", "SPCX", "EVR", "LUNR", "IRDM", "DXYZ", "LITE", "ASML", "DRAM", "STX", "MSFT", "AAPL", "AMAT", "AMD", "CBRS", "MRVL", "BTX", "STM", "SNDK", "WDC", "TSM", "AVGO", "NVDA", "QBTS", "FLKR", "INTC", "GOOGL", "GOOG", "AMZN", "GLW", "MA", "GS", "MU", "NFLX", "XLG", "TOPT", "QTOP", "SATA", "RGTI", "IBM", "GFUZ", "TXN"],
+      "excluded": ["BYDDY", "VCX", "TRLV", "RVI"],
+      "symbol_corrections": {"IRDMI": "IRDM", "GLWR": "GLW"},
+      "source_of_truth": "config/tickers.json"
+    },
+    "data_provider_roles": {
+      "market_data_primary": "finance",
+      "validation_context": ["alpaca", "robinhood"],
+      "fallback": "yfinance",
+      "gfuz_primary": "robinhood",
+      "gfuz_note": "GFUZ may use Robinhood as the primary quote/prior-close source when the Finance connector cannot resolve it; Alpaca/Finance/Yahoo remain read-only validation/context only. See config/tickers.json:special_handling.GFUZ."
+    },
+    "execution_and_safety": {
+      "execution_broker": "robinhood",
+      "scheduled_live_placement": "Pre-authorized scheduled live execution calls place_equity_order directly after every internal check passes; scheduled live runs do NOT call review_equity_order.",
+      "safety": "Buy only, regular-hours only, whitelist only. No sells, cancellations, margin, options, crypto, or account changes."
+    },
+    "artifact_contract": {
+      "required_files": ["run_state.json", "run_summary.json", "latest_scheduled_run.json", "signals.csv", "submitted_orders.csv"],
+      "empty_orders_headers": "signals.csv and submitted_orders.csv must be written with headers even when no orders are submitted.",
+      "run_classification": "run_classification must be non-null."
+    },
+    "cost_conscious_mode": "Routine daily maintenance uses cost-conscious/default model behavior.",
+    "verified_live_task_ids": {
+      "as_of_et": "2026-07-24",
+      "task_ids": ["2ba19526", "42173154", "7be82b97", "a6239dae", "10ce362c"],
+      "note": "The live scheduled task text has already been updated and verified for these task ids."
+    },
+    "implementation": {
+      "first_buy_selector": "near_close_dca.select_first_allocation_base_usd (mirrored in morning_dca.py)",
+      "top_up_guard": "near_close_dca.evaluate_top_up_guard",
+      "audit_columns": ["previous_close", "previous_low", "selected_base_amount_usd", "base_selection_reason", "buy_multiplier"]
+    },
+    "policy_files": [
+      "config/tickers.json",
+      "config/budgets.json",
+      "config/sizing_ladder.json",
+      "near_close_dca.py",
+      "morning_dca.py",
+      "docs/strategy.md",
+      "docs/live_wiring.md"
+    ]
   },
   "execution_authorization_policy": {
     "approved_on_et": "2026-07-10 11:20 AM ET",
@@ -298,7 +374,7 @@
       "Only scheduled AFTERNOON runs are excluded from prior context; morning/midday-stream scheduled runs remain eligible."
     ],
     "streams_covered": ["morning", "midday", "manual", "final_override"],
-    "final_override_top_up": "The final override stream (final manual buy override) applies the same guard: if a ticker was already bought earlier today, it buys only max(0, final_desired_amount - prior_same_day_amount), and only if the final decision price is strictly below the LOWEST prior same-day reference price. A missing prior reference => no auto-top-up.",
+    "final_override_top_up": "The final override stream (final manual buy override) applies the same guard: for a ticker with same-day prior buy context, the comparison reference is that ticker's most recent valid same-day buy reference (ordered by generated_at). It buys again only when the final decision price is strictly lower than that most recent reference, and then buys only corrected_delta_usd = max(0, desired_usd - effective_prior_usd). A missing prior reference => no auto-top-up.",
     "manual_override_handling": "Manual override fills recorded under /home/user/workspace/cron_tracking/midday_dca/manual_reruns/**/run_state.json and filled_orders.csv, and under /home/user/workspace/cron_tracking/ce16ba6b/manual_runs/final_manual_override_*/ and /home/user/workspace/cron_tracking/final_manual_review/** (run_origin='manual', manual_run=true) are EXCLUDED from all scheduled evidence, slippage, reliability, fill counts, watchdog confirmation, and cost basis, and are used ONLY as prior-allocation context for the same-day top-up guard (they affect afternoon 3:20 PM top-up eligibility, no scheduled metric).",
     "jul9_manual_override_examples": [
       { "ticker": "AMZN", "amount_usd": 3.0, "avg_fill_price": 242.1099, "trading_day": "2026-07-09" },
@@ -704,9 +780,103 @@
     "see": "config/run_classification.json:manual_dry_run_2026_07_21 and same_day_pointer_validation_policy",
     "doc": "docs/schedule_manifest.md"
   },
+  "intraday_dca_scheduled_recovery_2026_07_24": {
+    "added": "2026-07-24",
+    "trading_day": "2026-07-24",
+    "stream": "intraday_1430",
+    "scheduled_slot_et": "14:30",
+    "run_id": "intraday_live_20260724_1430ET",
+    "artifact_root": "/home/user/workspace/cron_tracking/intraday_dca/20260724_1430ET/",
+    "run_origin": "scheduled",
+    "manual_run": false,
+    "recovery_rerun": true,
+    "parent_recovery_submission": true,
+    "valid_scheduled_evidence": true,
+    "same_day_top_up_context_for_later_runs": true,
+    "summary": "On Jul 24 2026 the 2:30 PM ET intraday scheduled run (intraday_1430) prepared market-data and signal artifacts but could not call place_equity_order from the scheduled subagent. Following failure_recovery_policy, the parent submitted the qualifying place_equity_order calls with idempotency keys and reconciled them against Robinhood. This is a scheduled intraday recovery: it is valid scheduled evidence for the intraday_1430 stream and valid same-day prior-allocation / top-up context for later same-day runs.",
+    "recovery_reason": "Scheduled subagent prepared market-data and signal artifacts but could not call place_equity_order. Parent submitted the qualifying place_equity_order calls with idempotency keys and reconciled them against Robinhood.",
+    "recovery_policy_ref": "failure_recovery_policy",
+    "must_not": [
+      "MUST NOT be treated as manual evidence; run_origin stays scheduled and manual_run stays false.",
+      "MUST NOT be counted as proof that any other stream (morning 10:30, midday 12:30, or afternoon 3:20) ran."
+    ],
+    "available_to": "Available to later same-day runs as scheduled prior-allocation / top-up context only, gated by the canonical_first_buy_and_topup_rule.",
+    "broker_account": "robinhood:562057042",
+    "total_orders": 18,
+    "total_recovered_spend_usd": 72.00,
+    "broker_reconciliation": {"filled": 18, "missing": 0},
+    "fills": [
+      {"ticker": "TRIN", "amount_usd": 3.00, "average_fill_price": 17.2164},
+      {"ticker": "IRDM", "amount_usd": 5.00, "average_fill_price": 45.7799},
+      {"ticker": "DXYZ", "amount_usd": 6.00, "average_fill_price": 22.9287},
+      {"ticker": "ASML", "amount_usd": 4.00, "average_fill_price": 1760.8199},
+      {"ticker": "STX", "amount_usd": 8.00, "average_fill_price": 859.2699},
+      {"ticker": "AMAT", "amount_usd": 6.00, "average_fill_price": 536.3400},
+      {"ticker": "AMD", "amount_usd": 4.00, "average_fill_price": 524.7103},
+      {"ticker": "BTX", "amount_usd": 3.00, "average_fill_price": 8.2099},
+      {"ticker": "STM", "amount_usd": 5.00, "average_fill_price": 51.7199},
+      {"ticker": "TSM", "amount_usd": 4.00, "average_fill_price": 405.8750},
+      {"ticker": "AVGO", "amount_usd": 5.00, "average_fill_price": 380.2600},
+      {"ticker": "NVDA", "amount_usd": 1.00, "average_fill_price": 207.0400},
+      {"ticker": "INTC", "amount_usd": 7.00, "average_fill_price": 94.0800},
+      {"ticker": "GS", "amount_usd": 1.50, "average_fill_price": 1062.7200},
+      {"ticker": "XLG", "amount_usd": 1.00, "average_fill_price": 59.9196},
+      {"ticker": "QTOP", "amount_usd": 3.00, "average_fill_price": 35.8067},
+      {"ticker": "RGTI", "amount_usd": 4.00, "average_fill_price": 14.4278},
+      {"ticker": "TXN", "amount_usd": 1.50, "average_fill_price": 280.3527}
+    ],
+    "artifacts_updated": [
+      "submitted_orders.csv",
+      "run_state.json",
+      "run_summary.json",
+      "parent_recovery_submission_summary.json"
+    ],
+    "preserved_rules_note": "The canonical first-buy and same-day top-up rule (canonical_first_buy_and_topup_rule), active universe, exclusions, provider policy, artifact contract, and cost-conscious mode are unchanged by this recovery record.",
+    "doc": "docs/strategy.md"
+  },
   "scheduled_run_outcomes": {
-    "summary": "Dated machine-readable ledger of afternoon scheduled live-run outcomes for task 10ce362c (supersedes ce16ba6b). Scheduled evidence only; manual/override order IDs are excluded from every scheduled metric. See config/run_classification.json for the full per-run records and docs/schedule_manifest.md for the human-readable notes.",
+    "summary": "Dated machine-readable ledger of scheduled live-run outcomes, primarily the afternoon task 10ce362c (supersedes ce16ba6b) and also intraday scheduled recovery runs. Scheduled evidence only; manual/override order IDs are excluded from every scheduled metric. See config/run_classification.json for the full per-run records and docs/schedule_manifest.md for the human-readable notes.",
     "runs": [
+      {
+        "trading_day": "2026-07-24",
+        "run_id": "intraday_live_20260724_1430ET",
+        "stream": "intraday_1430",
+        "scheduled_for_et": "14:30",
+        "run_origin": "scheduled",
+        "manual_run": false,
+        "recovery_rerun": true,
+        "parent_recovery_submission": true,
+        "valid_scheduled_evidence": true,
+        "same_day_top_up_context_for_later_runs": true,
+        "order_submit_status": "filled",
+        "orders_filled": 18,
+        "total_filled_usd": 72.00,
+        "broker_reconciliation": {"filled": 18, "missing": 0},
+        "fills": [
+          {"ticker": "TRIN", "amount_usd": 3.00, "average_fill_price": 17.2164},
+          {"ticker": "IRDM", "amount_usd": 5.00, "average_fill_price": 45.7799},
+          {"ticker": "DXYZ", "amount_usd": 6.00, "average_fill_price": 22.9287},
+          {"ticker": "ASML", "amount_usd": 4.00, "average_fill_price": 1760.8199},
+          {"ticker": "STX", "amount_usd": 8.00, "average_fill_price": 859.2699},
+          {"ticker": "AMAT", "amount_usd": 6.00, "average_fill_price": 536.3400},
+          {"ticker": "AMD", "amount_usd": 4.00, "average_fill_price": 524.7103},
+          {"ticker": "BTX", "amount_usd": 3.00, "average_fill_price": 8.2099},
+          {"ticker": "STM", "amount_usd": 5.00, "average_fill_price": 51.7199},
+          {"ticker": "TSM", "amount_usd": 4.00, "average_fill_price": 405.8750},
+          {"ticker": "AVGO", "amount_usd": 5.00, "average_fill_price": 380.2600},
+          {"ticker": "NVDA", "amount_usd": 1.00, "average_fill_price": 207.0400},
+          {"ticker": "INTC", "amount_usd": 7.00, "average_fill_price": 94.0800},
+          {"ticker": "GS", "amount_usd": 1.50, "average_fill_price": 1062.7200},
+          {"ticker": "XLG", "amount_usd": 1.00, "average_fill_price": 59.9196},
+          {"ticker": "QTOP", "amount_usd": 3.00, "average_fill_price": 35.8067},
+          {"ticker": "RGTI", "amount_usd": 4.00, "average_fill_price": 14.4278},
+          {"ticker": "TXN", "amount_usd": 1.50, "average_fill_price": 280.3527}
+        ],
+        "note": "Intraday 2:30 PM ET scheduled recovery. The scheduled subagent prepared market-data and signal artifacts but could not call place_equity_order; the parent submitted the qualifying orders with idempotency keys and reconciled 18 filled / 0 missing against Robinhood. Valid scheduled evidence and same-day top-up context for later runs; NOT manual evidence and NOT proof any other stream ran. See intraday_dca_scheduled_recovery_2026_07_24.",
+        "artifacts": {
+          "scheduled_run_dir": "/home/user/workspace/cron_tracking/intraday_dca/20260724_1430ET/"
+        }
+      },
       {
         "trading_day": "2026-07-20",
         "run_id": "scheduled_20260720_1520ET",
@@ -1587,11 +1757,11 @@
           "Regular-hours-only, whitelisted ticker only.",
           "Hard circuit breakers still apply."
         ],
-        "same_day_top_up_guard": "Applies across morning, midday, manual, and final override streams: if a ticker was bought earlier today, buy only max(0, final_desired_amount - prior_same_day_amount), and only if the final decision price is strictly below the LOWEST prior same-day reference price. Missing prior reference => no auto-top-up.",
+        "same_day_top_up_guard": "Applies across morning, midday, manual, and final override streams: for a ticker with same-day prior buy context, the comparison reference is that ticker's most recent valid same-day buy reference (ordered by generated_at); buy again only when the final decision price is strictly lower than that most recent reference, and then buy only corrected_delta_usd = max(0, desired_usd - effective_prior_usd). Missing prior reference => no auto-top-up.",
         "trend_scope_note": "Morning (10:30) and midday (12:30) live runs still require trend validation unless changed later. The trend filter is ignored ONLY for the final-buy decision on 10ce362c.",
         "final_manual_override": "When the final-buy behavior is invoked MANUALLY (e.g. after a scheduled 3:20 PM run placed 0 orders), the run is manual: run_type='final_manual_buy_override', run_origin='manual', manual_run=true, valid_afternoon_scheduled_evidence=false, same_day_top_up_context_only=true. It is excluded from every scheduled metric and reported only in the Manual Final Buy Override / Same-Day Top-Up Context section. See config/run_classification.json (final_buy_behavior, final_manual_override, final_manual_override_incident_2026_07_13)."
       },
-      "notes": "Afternoon (3:20 PM ET) live trading task. One of three pre-authorized live trading tasks (morning 42173154, midday a6239dae, afternoon 10ce362c). This is the repaired live task 10ce362c, which supersedes the deleted ce16ba6b; the artifact root stays under .../ce16ba6b for continuity. Approved live Robinhood execution using the $2 base 0x-to-5x ladder (max per order 5x*$2=$10) with tiered daily/weekly caps. Robinhood account 562057042 only; Alpaca/Finance/Yahoo read-only. PRE-AUTHORIZED (user approved 2026-07-10 11:20 AM ET): places real market buy orders automatically within safeguards; MUST NOT fall back to interactive/per-order confirmation and MUST NOT call review_equity_order; calls place_equity_order directly only after every internal validation, signal, budget, spread, confidence, and top-up check passes. Manual/ad hoc runs still use review/confirmation. A SCHEDULED run writes run_state.json (with run_classification run_origin='scheduled', run_type='scheduled_live_test', manual_run=false, scheduled_for_et='15:20', run_id='scheduled_YYYYMMDD_1520ET', and BOTH cron_id='10ce362c' AND supersedes_cron_id='ce16ba6b') under scheduled_runs/YYYYMMDD_1520ET/ AND updates latest_scheduled_run.json. Placeholder/ambiguous ids such as 'ce16ba6b_replacement' are forbidden; for continuity, consumers still accept cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b' as valid evidence. The scheduled run_state is ALWAYS written even when no order is placed; a confirmation-blocked run records order_submit_status='not_submitted_confirmation_required', reviewed_order details, candidate details, and no order_id, and remains valid scheduled-run evidence (but not order/fill evidence). A MANUAL run writes run_state.json (run_origin='manual', manual_run=true, distinct run_id) under manual_runs/<timestamp>/ and MUST NOT update latest_scheduled_run.json. All run_state files carry state_schema_version='run-classification-v1'. Test window through Fri Aug 28 2026 inclusive. Manual runs do not count as scheduled-run evidence. SAME-DAY TOP-UP GUARD: the scheduled afternoon run folds in earlier same-day fills from the morning-live root, the midday-live root, and manual override reruns (midday_dca/manual_reruns/) as prior-allocation context (in addition to its own manual_runs/), buying only max(0, desired - prior) and only when its decision price is strictly below the prior reference price (preference: logged target_price, then decision_price, then average_fill_price; missing reference => manual_review_candidate at $0). These prior-context fills are never scheduled evidence, slippage, reliability, fill counts, or cost basis. Any stale stored display name is superseded by this authoritative 3:20 PM ET schedule. RAW DATA PERSISTENCE FIX ADDED JUL 10 2026 (see raw_data_persistence): before signal computation the run persists every raw connector response under scheduled_runs/YYYYMMDD_1520ET/raw/ (quotes_batchN.json, historicals_batchN.json, tradability_pre_place.json, portfolio_pre_place.json, orders_after_place.json, place_SYMBOL.json), normalizing large output_path pointers into parseable JSON; compute reads only those persisted files, never in-memory tool responses; if persistence/normalization fails the run still writes a valid scheduled run_state (order_submit_status='not_submitted_error', no orders) instead of escalating without state. FINAL-BUY BEHAVIOR ADDED JUL 13 2026 (see final_buy_behavior): as the final live buy of the day this task performs a FULL active-universe scan and ignores the 60-minute downward-trend filter for the FINAL-BUY DECISION ONLY, while still requiring price below the prior completed regular-session close, multiplier>0 on the $2-base 0x-to-5x ladder, data-confidence pass, spread_ok, budget pass, regular-hours-only, whitelisted ticker, and hard circuit breakers. Morning/midday live runs still require trend validation. A same-day top-up guard across morning/midday/manual/final override streams buys only max(0, final_desired - prior_same_day_amount) and only when the final decision price is strictly below the LOWEST prior same-day reference price (missing prior reference => no auto-top-up). When invoked MANUALLY (final manual buy override) the run is manual (run_type='final_manual_buy_override', valid_afternoon_scheduled_evidence=false, same_day_top_up_context_only=true), excluded from every scheduled metric and shown only in the Manual Final Buy Override / Same-Day Top-Up Context section. LIVE RELIABILITY FIX (Jul 17 2026, see live_reliability_fix_2026_07_17): before calling place_equity_order the run describes the needed Robinhood connector schemas in-session (place_equity_order and get_equity_orders); it always writes final run_state.json, run_summary.json, signals.csv, submitted_orders.csv, and filled_orders.csv where applicable even for no-order, blocked, failed, or recovery runs; every actionable signal ends with exactly one persisted result (order_id, broker rejection, top-up block, budget block, cap block, data-confidence block, spread block, trend block, or safety block); if an actionable signal lacks both an order_id and a block/rejection reason the run is classified execution_lineage_incomplete, runs one recovery retry in the same scheduled directory (scheduled_runs/YYYYMMDD_1520ET/) retrying only the missing tickers with the same ref_id values, and reconciles duplicate ref_id or timeout through get_equity_orders before declaring failure; manual overrides stay manual_run=true and never count as scheduled evidence. FINAL BUY BUDGET-TIER FIX (Jul 17 2026, see final_buy_budget_tier_fix and live_reliability_fix_2026_07_17.final_buy_budget_tier_fix): before placing any final-buy order the run computes the budget tier from the full actionable incremental plan and the 3x-or-greater signal count (normal planned spend <=129 and 3x-plus signals <=5 daily cap 180; elevated planned spend >129 or 3x-plus signals 6-10 daily cap 240; high-volatility planned spend >213 or 3x-plus signals 11-17 daily cap 300; stress planned spend >272 or 3x-plus signals >17 daily cap 360 only to the extent unused weekly rollover reserve is available), counts same-day strategy allocation already placed in manual recovery, morning, midday, and earlier final orders as corrected-daily-cap usage for safety while keeping the streams separate for evidence and slippage, and if planned spend exceeds the remaining corrected daily capacity ranks the remaining eligible orders by deepest drop percentage then multiplier then amount, places only the orders fitting the remaining cap and the per-order 10 max, and writes budget_blocked.csv plus per-symbol block_reason='budget_block_corrected_daily_cap' for the rest; if a budget-logic inconsistency is detected after any order is placed the run recovers inside the same scheduled run directory, reconciles the already placed orders, applies the corrected cap logic, and finalizes state rather than escalating without complete artifacts. JUL 17 2026 FINAL-RUN RECOVERY (see live_reliability_fix_2026_07_17.jul17_final_run_recovery): the background final run placed SPCX first then escalated because the budget logic was incomplete; the corrected tier was elevated because planned spend was 187.5 and the 3x-plus count was 6 so the daily cap was 240; prior same-day strategy allocation counted for safety was 207.0 and SPCX assumed 15.0, leaving 18.0 remaining capacity; recovery placed GFUZ 13.50 (order_id 6a5a81d4-d250-43e3-89f3-06c2c4add387, filled, average_fill_price 8.449900, quantity 1.597652) and ASML 4.50 (order_id 6a5a81d4-f921-49c3-9a1c-1f0e43c2002b, filled, average_fill_price 1747.709900, quantity 0.002574), with SPCX (order_id 6a5a8182-9460-4d0d-99c3-86af604192a7, filled, average_fill_price 123.600000, quantity 0.121359) reconciled, then budget-blocked the remaining 27 signals; run_state has valid scheduled evidence for the final 3:20 run and the manual/midday streams remain prior allocation context only where applicable. NESTED RUN_CLASSIFICATION REQUIREMENT (Jul 17 2026, see live_reliability_fix_2026_07_17.scheduled_run_state_classification_requirement): the 3:20 scheduled run_state was repaired to include a nested run_classification object; every future scheduled run_state.json must carry a nested run_classification object (validated against schemas/run_classification.schema.json); scheduled/manual identity fields live only under that nested object, and the 3:40 PM watchdog confirms a scheduled run only when that nested object is present and valid. JUL 17 2026 MANUAL BUDGET-BLOCK OVERRIDES (see live_reliability_fix_2026_07_17.jul17_manual_budget_block_overrides): after the 3:20 scheduled run budget-blocked 27 signals, two manual budget-block override runs filled them - the first (final_manual_review/budget_block_override_20260717_1551ET) attempted all 27 and accepted/submitted 20 (NFLX, AMAT, CBRS, DXYZ, TSM, IBM, EVR, GOOGL, GOOG, GS, NVDA, GLW, INTC, BTX, MA, AMD, MSFT, QTOP, XLG, TOPT), with the remaining 7 failing on Robinhood 429 throttling/do-not-retry; the second (final_manual_review/budget_block_override_20260717_1556ET) placed and verified filled all remaining 7 (SNDK, AVGO, AMZN, STM, MRVL, DFTX, QBTS). These manual overrides are manual_run=true, valid_scheduled_evidence=false, valid_afternoon_evidence=false, excluded from scheduled 3:20 execution evidence, scheduled slippage, scheduled reliability, and scheduled cost basis, and usable only as manual override context and future same-day/top-up allocation context. AUTOMATIC FAILURE RECOVERY ADDED JUL 15 2026 (see failure_recovery): on internal persistence, parsing, wrapper-normalization, transient connector throttling, or raw-file write failure AFTER data was fetched, the run treats it as a recovery trigger (not terminal): it reruns the required read-only inputs once, persists all raw responses first, recomputes only from persisted files, and continues through the same pre-authorized guarded path if all safeguards pass, reusing the same scheduled_runs/YYYYMMDD_1520ET/ dir with recovery_rerun=true and never reclassifying as manual; if the recovery also fails or a safety/account/order rejection occurs, it writes run_state.json with the blocking reason and escalates."
+      "notes": "Afternoon (3:20 PM ET) live trading task. One of three pre-authorized live trading tasks (morning 42173154, midday a6239dae, afternoon 10ce362c). This is the repaired live task 10ce362c, which supersedes the deleted ce16ba6b; the artifact root stays under .../ce16ba6b for continuity. Approved live Robinhood execution using the $2 base 0x-to-5x ladder (max per order 5x*$2=$10) with tiered daily/weekly caps. Robinhood account 562057042 only; Alpaca/Finance/Yahoo read-only. PRE-AUTHORIZED (user approved 2026-07-10 11:20 AM ET): places real market buy orders automatically within safeguards; MUST NOT fall back to interactive/per-order confirmation and MUST NOT call review_equity_order; calls place_equity_order directly only after every internal validation, signal, budget, spread, confidence, and top-up check passes. Manual/ad hoc runs still use review/confirmation. A SCHEDULED run writes run_state.json (with run_classification run_origin='scheduled', run_type='scheduled_live_test', manual_run=false, scheduled_for_et='15:20', run_id='scheduled_YYYYMMDD_1520ET', and BOTH cron_id='10ce362c' AND supersedes_cron_id='ce16ba6b') under scheduled_runs/YYYYMMDD_1520ET/ AND updates latest_scheduled_run.json. Placeholder/ambiguous ids such as 'ce16ba6b_replacement' are forbidden; for continuity, consumers still accept cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b' as valid evidence. The scheduled run_state is ALWAYS written even when no order is placed; a confirmation-blocked run records order_submit_status='not_submitted_confirmation_required', reviewed_order details, candidate details, and no order_id, and remains valid scheduled-run evidence (but not order/fill evidence). A MANUAL run writes run_state.json (run_origin='manual', manual_run=true, distinct run_id) under manual_runs/<timestamp>/ and MUST NOT update latest_scheduled_run.json. All run_state files carry state_schema_version='run-classification-v1'. Test window through Fri Aug 28 2026 inclusive. Manual runs do not count as scheduled-run evidence. SAME-DAY TOP-UP GUARD: the scheduled afternoon run folds in earlier same-day fills from the morning-live root, the midday-live root, and manual override reruns (midday_dca/manual_reruns/) as prior-allocation context (in addition to its own manual_runs/), buying only max(0, desired - prior) and only when its decision price is strictly below the prior reference price (preference: logged target_price, then decision_price, then average_fill_price; missing reference => manual_review_candidate at $0). These prior-context fills are never scheduled evidence, slippage, reliability, fill counts, or cost basis. Any stale stored display name is superseded by this authoritative 3:20 PM ET schedule. RAW DATA PERSISTENCE FIX ADDED JUL 10 2026 (see raw_data_persistence): before signal computation the run persists every raw connector response under scheduled_runs/YYYYMMDD_1520ET/raw/ (quotes_batchN.json, historicals_batchN.json, tradability_pre_place.json, portfolio_pre_place.json, orders_after_place.json, place_SYMBOL.json), normalizing large output_path pointers into parseable JSON; compute reads only those persisted files, never in-memory tool responses; if persistence/normalization fails the run still writes a valid scheduled run_state (order_submit_status='not_submitted_error', no orders) instead of escalating without state. FINAL-BUY BEHAVIOR ADDED JUL 13 2026 (see final_buy_behavior): as the final live buy of the day this task performs a FULL active-universe scan and ignores the 60-minute downward-trend filter for the FINAL-BUY DECISION ONLY, while still requiring price below the prior completed regular-session close, multiplier>0 on the $2-base 0x-to-5x ladder, data-confidence pass, spread_ok, budget pass, regular-hours-only, whitelisted ticker, and hard circuit breakers. Morning/midday live runs still require trend validation. A same-day top-up guard across morning/midday/manual/final override streams buys only corrected_delta_usd = max(0, desired_usd - effective_prior_usd) and only when the final decision price is strictly lower than the ticker's most recent valid same-day buy reference price (ordered by generated_at; missing prior reference => no auto-top-up). When invoked MANUALLY (final manual buy override) the run is manual (run_type='final_manual_buy_override', valid_afternoon_scheduled_evidence=false, same_day_top_up_context_only=true), excluded from every scheduled metric and shown only in the Manual Final Buy Override / Same-Day Top-Up Context section. LIVE RELIABILITY FIX (Jul 17 2026, see live_reliability_fix_2026_07_17): before calling place_equity_order the run describes the needed Robinhood connector schemas in-session (place_equity_order and get_equity_orders); it always writes final run_state.json, run_summary.json, signals.csv, submitted_orders.csv, and filled_orders.csv where applicable even for no-order, blocked, failed, or recovery runs; every actionable signal ends with exactly one persisted result (order_id, broker rejection, top-up block, budget block, cap block, data-confidence block, spread block, trend block, or safety block); if an actionable signal lacks both an order_id and a block/rejection reason the run is classified execution_lineage_incomplete, runs one recovery retry in the same scheduled directory (scheduled_runs/YYYYMMDD_1520ET/) retrying only the missing tickers with the same ref_id values, and reconciles duplicate ref_id or timeout through get_equity_orders before declaring failure; manual overrides stay manual_run=true and never count as scheduled evidence. FINAL BUY BUDGET-TIER FIX (Jul 17 2026, see final_buy_budget_tier_fix and live_reliability_fix_2026_07_17.final_buy_budget_tier_fix): before placing any final-buy order the run computes the budget tier from the full actionable incremental plan and the 3x-or-greater signal count (normal planned spend <=129 and 3x-plus signals <=5 daily cap 180; elevated planned spend >129 or 3x-plus signals 6-10 daily cap 240; high-volatility planned spend >213 or 3x-plus signals 11-17 daily cap 300; stress planned spend >272 or 3x-plus signals >17 daily cap 360 only to the extent unused weekly rollover reserve is available), counts same-day strategy allocation already placed in manual recovery, morning, midday, and earlier final orders as corrected-daily-cap usage for safety while keeping the streams separate for evidence and slippage, and if planned spend exceeds the remaining corrected daily capacity ranks the remaining eligible orders by deepest drop percentage then multiplier then amount, places only the orders fitting the remaining cap and the per-order 10 max, and writes budget_blocked.csv plus per-symbol block_reason='budget_block_corrected_daily_cap' for the rest; if a budget-logic inconsistency is detected after any order is placed the run recovers inside the same scheduled run directory, reconciles the already placed orders, applies the corrected cap logic, and finalizes state rather than escalating without complete artifacts. JUL 17 2026 FINAL-RUN RECOVERY (see live_reliability_fix_2026_07_17.jul17_final_run_recovery): the background final run placed SPCX first then escalated because the budget logic was incomplete; the corrected tier was elevated because planned spend was 187.5 and the 3x-plus count was 6 so the daily cap was 240; prior same-day strategy allocation counted for safety was 207.0 and SPCX assumed 15.0, leaving 18.0 remaining capacity; recovery placed GFUZ 13.50 (order_id 6a5a81d4-d250-43e3-89f3-06c2c4add387, filled, average_fill_price 8.449900, quantity 1.597652) and ASML 4.50 (order_id 6a5a81d4-f921-49c3-9a1c-1f0e43c2002b, filled, average_fill_price 1747.709900, quantity 0.002574), with SPCX (order_id 6a5a8182-9460-4d0d-99c3-86af604192a7, filled, average_fill_price 123.600000, quantity 0.121359) reconciled, then budget-blocked the remaining 27 signals; run_state has valid scheduled evidence for the final 3:20 run and the manual/midday streams remain prior allocation context only where applicable. NESTED RUN_CLASSIFICATION REQUIREMENT (Jul 17 2026, see live_reliability_fix_2026_07_17.scheduled_run_state_classification_requirement): the 3:20 scheduled run_state was repaired to include a nested run_classification object; every future scheduled run_state.json must carry a nested run_classification object (validated against schemas/run_classification.schema.json); scheduled/manual identity fields live only under that nested object, and the 3:40 PM watchdog confirms a scheduled run only when that nested object is present and valid. JUL 17 2026 MANUAL BUDGET-BLOCK OVERRIDES (see live_reliability_fix_2026_07_17.jul17_manual_budget_block_overrides): after the 3:20 scheduled run budget-blocked 27 signals, two manual budget-block override runs filled them - the first (final_manual_review/budget_block_override_20260717_1551ET) attempted all 27 and accepted/submitted 20 (NFLX, AMAT, CBRS, DXYZ, TSM, IBM, EVR, GOOGL, GOOG, GS, NVDA, GLW, INTC, BTX, MA, AMD, MSFT, QTOP, XLG, TOPT), with the remaining 7 failing on Robinhood 429 throttling/do-not-retry; the second (final_manual_review/budget_block_override_20260717_1556ET) placed and verified filled all remaining 7 (SNDK, AVGO, AMZN, STM, MRVL, DFTX, QBTS). These manual overrides are manual_run=true, valid_scheduled_evidence=false, valid_afternoon_evidence=false, excluded from scheduled 3:20 execution evidence, scheduled slippage, scheduled reliability, and scheduled cost basis, and usable only as manual override context and future same-day/top-up allocation context. AUTOMATIC FAILURE RECOVERY ADDED JUL 15 2026 (see failure_recovery): on internal persistence, parsing, wrapper-normalization, transient connector throttling, or raw-file write failure AFTER data was fetched, the run treats it as a recovery trigger (not terminal): it reruns the required read-only inputs once, persists all raw responses first, recomputes only from persisted files, and continues through the same pre-authorized guarded path if all safeguards pass, reusing the same scheduled_runs/YYYYMMDD_1520ET/ dir with recovery_rerun=true and never reclassifying as manual; if the recovery also fails or a safety/account/order rejection occurs, it writes run_state.json with the blocking reason and escalates."
     },
     {
       "id": "d72aa525",

@@ -299,6 +299,13 @@ class MiddayDCAExecutor(MorningDCAExecutor):
         row["top_up_guard_result"] = outcome.top_up_guard_result
         row["top_up_skipped"] = outcome.top_up_skipped
         row["top_up_manual_review"] = outcome.top_up_manual_review
+        # The guard's effective base (the preserved first-allocation base when
+        # reused) actually produced desired/incremental amounts above -- it must
+        # replace to_row()'s freshly recomputed selected_base_amount_usd so a
+        # later reader sees the base that was ACTUALLY used, mirroring
+        # MorningDCAExecutor._augment_buy_candidate_row (Codex review:
+        # "Persist the effective base in midday candidate rows").
+        row["selected_base_amount_usd"] = outcome.effective_base_amount_usd
         if outcome.top_up_manual_review:
             row["execution_status"] = EXEC_MANUAL_REVIEW_CANDIDATE
 

@@ -64,6 +64,7 @@ from dca_config import get_config_dir, load_approved_dates, load_tickers
 from dca_fileio import atomic_open_w, atomic_write_text
 from near_close_dca import (
     ACTIVE_TICKERS,
+    BASE_NOT_BELOW_CLOSE,
     EASTERN,
     EXCLUDED_TICKERS,
     ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
@@ -1781,6 +1782,16 @@ class MorningDCAExecutor(DCAExecutor):
             )
             multiplier = 0.0
             hypothetical = 0.0
+            # select_first_allocation_base_usd only checks decision_price <
+            # previous_close, so a price just below close but under the
+            # minimum-drop threshold above still sets base_selection_reason to
+            # below_prior_close_only/below_prior_close_and_low even though this
+            # branch zeros the multiplier to a no-buy. Reset it to the
+            # canonical zero-multiplier reason so a buy-scale reason is never
+            # serialized alongside a zero-multiplier no-action result (Codex
+            # review: "Reset the morning base reason when the multiplier is
+            # zero").
+            base_selection_reason = BASE_NOT_BELOW_CLOSE
         else:
             action = Action.BUY
             reason = f"morning weakness {drop_pct:.2f}% vs prior close -> {multiplier:g}x ({mode_label})"

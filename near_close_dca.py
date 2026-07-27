@@ -28,7 +28,7 @@ spans four Robinhood-only streams (9:45 preflight, 10:30 morning live, 12:30
 midday live, 3:20 final live). Runners must validate same-day pointers before
 trusting them, treat a ticker with no prior same-day context as a first
 allocation (top-up only when prior same-day context exists and the price is
-strictly below the lowest prior same-day reference), dedupe against same-day
+strictly below that ticker's most recent prior same-day reference), dedupe against same-day
 submitted orders and Robinhood history before any fallback placement, place
 dollar buys as notional market orders (type='market', dollar_amount,
 time_in_force='gfd'; regular session only), and — for live runs that reached
@@ -363,11 +363,26 @@ class ReconciledDecision:
 # slippage, watchdog confirmation, scheduled cost basis, or scheduled fill counts.
 MORNING_MANUAL_BOUNDARY_ET = time(14, 30)
 
+# Sentinel used when a prior run has no parseable generated_at timestamp. It sorts
+# before every real timestamp so that, among untimestamped runs, later scan/merge
+# order (paths are scanned in ascending sorted order) still wins the reference.
+_TS_FLOOR = datetime.min.replace(tzinfo=timezone.utc)
+
 # top_up_guard_result values recorded per candidate on the scheduled afternoon run.
 TOP_UP_NO_PRIOR_RUN = "no_prior_run"  # normal allocation; nothing bought earlier today
 TOP_UP_INCREMENTAL = "incremental_top_up"  # buy only the incremental dollar difference
+# Legacy morning/midday-guard-only codes (scripts.run_classification.incremental_top_up_amount
+# and morning_dca.py's own guard still emit these for their own sessions). The scheduled
+# afternoon guard (evaluate_top_up_guard below) uses the unified canonical code instead --
+# see TOP_UP_NOT_LOWER_OR_NO_DELTA.
 TOP_UP_PRICE_NOT_BELOW = "price_not_below_prior_run"  # afternoon price >= prior ref -> $0
 TOP_UP_NO_INCREMENTAL = "no_incremental_difference"  # afternoon desired <= prior amount -> $0
+# Canonical rule item 12 (config/scheduled_tasks.json canonical_first_buy_and_topup_rule):
+# the scheduled afternoon guard (evaluate_top_up_guard) emits this single unified code
+# whenever a same-day top-up is skipped because the price is not strictly lower than the
+# ticker's same-day reference, OR the recomputed corrected_delta_usd is 0 -- replacing the
+# two legacy codes above for that guard specifically.
+TOP_UP_NOT_LOWER_OR_NO_DELTA = "same_day_topup_not_lower_or_no_delta"  # afternoon price not lower or delta 0 -> $0
 TOP_UP_MISSING_PRIOR_PRICE = "missing_prior_price"  # prior amount known but no ref price -> $0 (manual review)
 
 
@@ -386,6 +401,11 @@ class PriorSameDayAllocation:
     reference_price: Optional[float] = None
     run_id: Optional[str] = None
     source: Optional[str] = None
+    # The contributing run's generated_at, parsed, for the run that established
+    # reference_price -- so merging allocations from different roots/streams can
+    # pick the ticker's MOST RECENT valid same-day reference (canonical rule item
+    # 9) rather than the lowest. None when unresolved/unavailable.
+    reference_ts: Optional[datetime] = None
     # The first same-day allocation's selected_base_amount_usd ($1 or $2), when the
     # contributing artifact recorded one. None for older artifacts that predate this
     # field, or when it could not be resolved -- callers must treat that as "unknown"
@@ -1209,6 +1229,13 @@ def evaluate_source_signal(
     selected_base_amount_usd, base_selection_reason = select_first_allocation_base_usd(
         decision_price, previous_close, previous_low, config
     )
+    if buy_multiplier <= 0:
+        # Canonical rule item 6: "not lower than close, OR multiplier is 0" ->
+        # no-buy. select_first_allocation_base_usd only looks at price vs.
+        # close/low, so a price below the close with a drop too shallow to
+        # clear the first ladder tier (multiplier 0) would otherwise still
+        # carry a below_prior_close_only/and_low reason despite being a no-buy.
+        base_selection_reason = BASE_NOT_BELOW_CLOSE
     suggested_amount_usd = selected_base_amount_usd * buy_multiplier
 
     below_previous_close = decision_price < previous_close
@@ -1326,7 +1353,7 @@ def reconcile_signals(
             buy_multiplier=winning_signal.buy_multiplier,
             suggested_amount_usd=winning_signal.suggested_amount_usd,
             selected_base_amount_usd=winning_signal.selected_base_amount_usd,
-            **_target_fields(finance_signal),
+            **_target_fields(winning_signal),
         )
 
     if finance_action == Action.BUY and robinhood_action != Action.BUY:
@@ -1507,9 +1534,10 @@ def evaluate_top_up_guard(
         full afternoon desired amount).
       * Earlier allocation exists and the afternoon decision price is *below* the
         earlier run's reference price -> buy only the incremental dollar difference
-        (afternoon desired minus the amount already bought), and $0 if that is <= 0.
+        (afternoon desired minus the amount already bought), and $0 (reason
+        ``TOP_UP_NOT_LOWER_OR_NO_DELTA``, canonical rule item 12) if that is <= 0.
       * Earlier allocation exists but the afternoon price is not below the reference
-        price -> buy $0.
+        price -> buy $0 (reason ``TOP_UP_NOT_LOWER_OR_NO_DELTA``).
       * Earlier amount is known but its reference price (or the current afternoon
         price) is missing -> conservative $0 with ``manual_review`` flagged, rather
         than topping up blind.
@@ -1517,6 +1545,15 @@ def evaluate_top_up_guard(
     The full-day target (``desired``) reuses the first allocation's selected base
     when known (see :func:`resolve_top_up_desired_amount_usd`) so a later, lower
     price cannot silently upgrade the whole day's target to the $2 scale.
+
+    KNOWN GAP (config/scheduled_tasks.json canonical_first_buy_and_topup_rule ->
+    effective_prior_usd_gap_2026_07_24, module docstring's JUL 23 2026 EFFECTIVE
+    PRIOR ALLOCATION PATCH note): ``prior.amount_usd`` is the artifact-derived
+    prior allocation only. This does not yet compute the canonical rule's
+    ``effective_prior_usd`` (deduped same-day artifacts PLUS Robinhood same-day
+    broker order history) or read ``prior_usd_rh``, so a same-day buy confirmed
+    at the broker but missing/incomplete in the artifact trail is not yet folded
+    into ``corrected_delta_usd`` here.
     """
     desired, effective_base = resolve_top_up_desired_amount_usd(
         prior, decision.buy_multiplier, decision.suggested_amount_usd, decision.selected_base_amount_usd
@@ -1555,12 +1592,14 @@ def evaluate_top_up_guard(
         return _outcome(0.0, TOP_UP_MISSING_PRIOR_PRICE, skipped=True, manual_review=True)
 
     # Only top up when buying into a lower price than the earlier same-day run.
+    # Canonical rule item 12: not-strictly-lower and zero-delta both use the
+    # single unified TOP_UP_NOT_LOWER_OR_NO_DELTA code.
     if afternoon_price >= prior.reference_price:
-        return _outcome(0.0, TOP_UP_PRICE_NOT_BELOW, skipped=True)
+        return _outcome(0.0, TOP_UP_NOT_LOWER_OR_NO_DELTA, skipped=True)
 
     incremental = desired - round(prior.amount_usd, 2)
     if incremental <= 0:
-        return _outcome(0.0, TOP_UP_NO_INCREMENTAL, skipped=True)
+        return _outcome(0.0, TOP_UP_NOT_LOWER_OR_NO_DELTA, skipped=True)
     return _outcome(incremental, TOP_UP_INCREMENTAL, skipped=False)
 
 
@@ -2145,12 +2184,19 @@ def _prior_run_is_scheduled(run_state: Dict[str, Any]) -> bool:
     ``{'morning', 'midday'}``), however, IS eligible prior context even when its
     own ``run_origin`` is ``'scheduled'``: the 10:30 AM morning live task and the
     12:30 PM midday live task are scheduled within their own streams but must
-    still offset the afternoon top-up. Only afternoon scheduled runs are excluded
-    here.
+    still offset the afternoon top-up. An ad hoc intraday scheduled-recovery
+    stream (``stream`` starting with ``'intraday'`` -- e.g. the Jul 24 2026
+    ``intraday_1430`` recovery, see config/scheduled_tasks.json
+    canonical_first_buy_and_topup_rule -> intraday_dca_scheduled_recovery_2026_07_24)
+    is eligible for the same reason: it is scheduled evidence for ITS OWN
+    stream but must still offset a later same-day run (Codex review: "Include
+    the intraday recovery in later top-up context"). Only afternoon scheduled
+    runs are excluded here.
     """
     classification = run_state.get("run_classification")
     if isinstance(classification, dict):
-        if classification.get("stream") in ("morning", "midday"):
+        stream = classification.get("stream")
+        if stream in ("morning", "midday") or (isinstance(stream, str) and stream.startswith("intraday")):
             return False
         if classification.get("run_origin") == "scheduled":
             return True
@@ -2207,11 +2253,14 @@ def _prior_run_before_boundary(run_state: Dict[str, Any], boundary_et: time) -> 
 
 
 def _prior_run_timestamp(raw: Optional[str]) -> Optional[datetime]:
-    """Parse a run_state ``generated_at`` string for chronological base comparisons.
+    """Parse a run_state ``generated_at`` string into an ET-aware datetime for recency ordering.
 
     Mirrors :func:`_prior_run_before_boundary`'s parsing (a naive timestamp is
-    assumed ET). Returns ``None`` when ``raw`` is missing/unparseable so callers
-    fall back to a conservative default rather than guess at ordering.
+    assumed ET). Returns ``None`` when ``raw`` is missing/unparseable; callers fall
+    back to :data:`_TS_FLOOR` (reference-price recency) or to scan/merge order
+    (first-allocation base recency, see :func:`_earlier_selected_base`) so an
+    untimestamped run loses ties to any timestamped run but still wins later
+    scan/merge order against other untimestamped runs.
     """
     if not isinstance(raw, str):
         return None
@@ -2250,7 +2299,10 @@ def _earlier_selected_base(
 
 
 def _orders_csv_fills(
-    run_dir: Path, *, orders_csv_file: Optional[Path] = None
+    run_dir: Path,
+    *,
+    orders_csv_file: Optional[Path] = None,
+    skip_sink: Optional[List[Path]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Map ticker -> {order_id, avg_fill_price, quantity_filled} for filled rows only.
 
@@ -2264,6 +2316,12 @@ def _orders_csv_fills(
     ``run_state.artifacts.orders_csv_path``) instead of looking for a sibling
     ``orders.csv``; ``run_and_report`` writes files with custom names like
     ``dca_<label>_<day>_<stamp>_orders.csv`` that ``run_dir / "orders.csv"`` won't find.
+
+    Pass ``skip_sink`` when ``orders_csv_file`` names a CSV a caller already
+    knows exists (e.g. just confirmed via ``.exists()``) so a read/parse
+    failure caught mid-rewrite still gets recorded -- otherwise it is
+    indistinguishable from a genuinely empty (zero-fills) day (Codex review:
+    "Include referenced CSV failures in scan completeness").
 
     When no explicit file is given the sibling ``orders.csv`` is used, falling back
     to ``filled_orders.csv`` -- the confirmed-fill record manual override reruns
@@ -2285,102 +2343,214 @@ def _orders_csv_fills(
         orders_csv = filled_csv if filled_csv.exists() else run_dir / "orders.csv"
     if not orders_csv.exists():
         return fills
+    rows = []
+    fieldnames = None
+    had_csv_error = False
     try:
         with orders_csv.open(newline="", encoding="utf-8") as handle:
-            for row in csv.DictReader(handle):
-                ticker = row.get("ticker")
-                if not ticker:
-                    continue
-                status = (row.get("status") or "").lower()
-                is_manual_filled_orders = (orders_csv.name == "filled_orders.csv" or "amount_usd" in row) and not status
-                if status != "filled" and not is_manual_filled_orders:
-                    continue
-                raw_price = row.get("avg_fill_price")
+            reader = csv.DictReader(handle)
+            fieldnames = reader.fieldnames  # reads the header row
+            if fieldnames is not None:
                 try:
-                    price = float(raw_price) if raw_price not in (None, "", "-") else None
-                except (TypeError, ValueError):
-                    price = None
-                # `> 0` alone excludes NaN (NaN > 0 is False) but NOT Infinity
-                # (float('inf') > 0 is True) -- math.isfinite() also rejects a
-                # corrupted/malformed CSV value of "inf"/"Infinity" so it can
-                # never poison the same-day top-up guard with an unbounded
-                # reference price or prior allocation (Gemini review on PR #31).
-                price_valid = price is not None and math.isfinite(price) and price > 0
-                raw_qty = row.get("quantity_filled")
-                try:
-                    qty = float(raw_qty) if raw_qty not in (None, "", "-") else None
-                except (TypeError, ValueError):
-                    qty = None
-                qty_valid = qty is not None and math.isfinite(qty) and qty > 0
-                raw_amount = row.get("amount_usd")
-                try:
-                    amount = float(raw_amount) if raw_amount not in (None, "", "-") else None
-                except (TypeError, ValueError):
-                    amount = None
-                amount_valid = amount is not None and math.isfinite(amount) and amount > 0
-                if not price_valid and not amount_valid:
-                    # No usable price AND no usable amount_usd -- genuinely no
-                    # capital-movement information to preserve for this row.
-                    continue
-                fills[ticker] = {
-                    "order_id": row.get("order_id"),
-                    # Preserve amount-only rows (amount_usd present, price missing/
-                    # invalid) as an unknown-price allocation instead of dropping
-                    # them outright -- the confirmed CSV amount must not be
-                    # silently discarded in favor of a stale planned amount.
-                    "avg_fill_price": price if price_valid else None,
-                    "quantity_filled": qty if qty_valid else None,
-                    "amount_usd": amount if amount_valid else None,
-                }
-    except (OSError, csv.Error, UnicodeDecodeError):
-        # A corrupt/unreadable orders CSV under-counts prior same-day allocation,
-        # which fails OPEN for the top-up guard (it can permit a re-buy). Losing
-        # the unparsed tail is unrecoverable, but it must never be silent: log
-        # loudly so the operator can reconcile against the broker before the next
-        # run. Rows parsed before the failure are kept -- they only ADD prior
-        # allocation, which is the conservative direction.
+                    for row in reader:
+                        rows.append(row)
+                except csv.Error:
+                    had_csv_error = True
+                    logger.exception(
+                        "failed to parse %s for same-day fill context; prior allocations from "
+                        "this file may be undercounted -- reconcile against broker orders",
+                        orders_csv,
+                    )
+                    if skip_sink is not None:
+                        skip_sink.append(orders_csv)
+    except (OSError, UnicodeDecodeError):
         logger.exception(
             "failed to parse %s for same-day fill context; prior allocations from "
             "this file may be undercounted -- reconcile against broker orders",
             orders_csv,
         )
+        if skip_sink is not None:
+            skip_sink.append(orders_csv)
         return fills
+    except Exception:
+        if skip_sink is not None:
+            skip_sink.append(orders_csv)
+        return fills
+    if fieldnames is None:
+        # write_execution_csv() unconditionally calls writer.writeheader(),
+        # so a COMPLETE write always has a header row even on a genuine
+        # zero-orders day (rows == [] with a real header is a legitimate
+        # terminal state, not an error). fieldnames is None only when the
+        # file has no header line at all -- observed in the instant right
+        # after its truncating open(path, "w") but before even the header
+        # was flushed, which `if rows` alone can't distinguish from that
+        # legitimate empty day (Codex review: "Treat empty CSV snapshots as
+        # incomplete").
+        if skip_sink is not None:
+            skip_sink.append(orders_csv)
+        return fills
+    if not had_csv_error and rows and any(value is None for value in rows[-1].values()):
+        # The final row has FEWER fields than the header -- csv.DictReader
+        # fills any missing trailing columns with None (its `restval`)
+        # rather than raising, so a file observed mid-write with its last
+        # record only partially flushed (e.g. "AAPL,filled" with the
+        # price/quantity/order_id columns not yet written) never reaches the
+        # except-clause skip_sink signal above (Codex review: "Detect
+        # silently truncated CSV reads"). Drop the untrustworthy tail row
+        # but keep whatever was already fully flushed before it.
+        if skip_sink is not None:
+            skip_sink.append(orders_csv)
+        rows = rows[:-1]
+    for row in rows:
+        ticker = row.get("ticker")
+        if not ticker:
+            continue
+        status = (row.get("status") or "").lower()
+        is_manual_filled_orders = (orders_csv.name == "filled_orders.csv" or "amount_usd" in row) and not status
+        if status != "filled" and not is_manual_filled_orders:
+            continue
+        raw_price = row.get("avg_fill_price")
+        try:
+            price = float(raw_price) if raw_price not in (None, "", "-") else None
+        except (TypeError, ValueError):
+            price = None
+        # `> 0` alone excludes NaN (NaN > 0 is False) but NOT Infinity
+        # (float('inf') > 0 is True) -- math.isfinite() also rejects a
+        # corrupted/malformed CSV value of "inf"/"Infinity" so it can
+        # never poison the same-day top-up guard with an unbounded
+        # reference price or prior allocation (Gemini review on PR #31).
+        price_valid = price is not None and math.isfinite(price) and price > 0
+        raw_qty = row.get("quantity_filled")
+        try:
+            qty = float(raw_qty) if raw_qty not in (None, "", "-") else None
+        except (TypeError, ValueError):
+            qty = None
+        qty_valid = qty is not None and math.isfinite(qty) and qty > 0
+        raw_amount = row.get("amount_usd")
+        try:
+            amount = float(raw_amount) if raw_amount not in (None, "", "-") else None
+        except (TypeError, ValueError):
+            amount = None
+        amount_valid = amount is not None and math.isfinite(amount) and amount > 0
+        if not price_valid and not amount_valid:
+            # No usable price AND no usable amount_usd -- genuinely no
+            # capital-movement information to preserve for this row.
+            continue
+        fills[ticker] = {
+            "order_id": row.get("order_id"),
+            # Preserve amount-only rows (amount_usd present, price missing/
+            # invalid) as an unknown-price allocation instead of dropping
+            # them outright -- the confirmed CSV amount must not be
+            # silently discarded in favor of a stale planned amount.
+            "avg_fill_price": price if price_valid else None,
+            "quantity_filled": qty if qty_valid else None,
+            "amount_usd": amount if amount_valid else None,
+        }
     return fills
 
 
-def _orders_csv_submitted_notionals(orders_csv: Path) -> Dict[str, float]:
+def _orders_csv_submitted_notionals(
+    orders_csv: Path, *, skip_sink: Optional[List[Path]] = None
+) -> Dict[str, float]:
     """Map ticker -> notional_usd for submitted-but-not-filled rows in an orders CSV.
 
     Used in the full-report fallback to count submitted-but-unconfirmed orders as
     prior allocation with an unknown reference price (the conservative path), matching
     what the buy_candidates path does for status='submitted' candidates with no fill.
+
+    Pass ``skip_sink`` when ``orders_csv`` is a file the caller already knows
+    exists, so a read/parse failure caught mid-rewrite is recorded rather
+    than silently indistinguishable from a genuinely empty CSV (Codex
+    review: "Include referenced CSV failures in scan completeness").
     """
     notionals: Dict[str, float] = {}
     if not orders_csv.exists():
         return notionals
+    rows = []
+    fieldnames = None
+    had_csv_error = False
     try:
         with orders_csv.open(newline="", encoding="utf-8") as handle:
-            for row in csv.DictReader(handle):
-                ticker = row.get("ticker")
-                if not ticker or (row.get("status") or "").lower() != "submitted":
-                    continue
-                raw = row.get("notional_usd")
+            reader = csv.DictReader(handle)
+            fieldnames = reader.fieldnames  # reads the header row
+            if fieldnames is not None:
                 try:
-                    notional = float(raw) if raw not in (None, "", "-") else None
-                except (TypeError, ValueError):
-                    notional = None
-                if notional and notional > 0:
-                    notionals[ticker] = notionals.get(ticker, 0.0) + notional
-    except (OSError, csv.Error, UnicodeDecodeError):
-        # Same failure posture as _orders_csv_fills: an unreadable CSV
-        # under-counts submitted-order allocation (fails open for the top-up
-        # guard), so the parse failure must be operator-visible, never silent.
+                    for row in reader:
+                        rows.append(row)
+                except csv.Error:
+                    had_csv_error = True
+                    logger.exception(
+                        "failed to parse %s for submitted-order context; prior allocations "
+                        "from this file may be undercounted -- reconcile against broker orders",
+                        orders_csv,
+                    )
+                    if skip_sink is not None:
+                        skip_sink.append(orders_csv)
+    except (OSError, UnicodeDecodeError):
         logger.exception(
             "failed to parse %s for submitted-order context; prior allocations "
             "from this file may be undercounted -- reconcile against broker orders",
             orders_csv,
         )
+        if skip_sink is not None:
+            skip_sink.append(orders_csv)
+        return notionals
+    except Exception:
+        if skip_sink is not None:
+            skip_sink.append(orders_csv)
+        return notionals
+    if fieldnames is None:
+        # See the matching check in _orders_csv_fills: a file with no
+        # header line at all was observed before even the header was
+        # flushed, distinct from a header-only file (a legitimate
+        # zero-orders day) that `if rows` alone can't tell apart (Codex
+        # review: "Treat empty CSV snapshots as incomplete").
+        if skip_sink is not None:
+            skip_sink.append(orders_csv)
+        return notionals
+    if not had_csv_error and rows and any(value is None for value in rows[-1].values()):
+        # See the matching check in _orders_csv_fills: a truncated final row
+        # (fewer fields than the header) never raises, so this is the only
+        # way to catch a file observed mid-write (Codex review: "Detect
+        # silently truncated CSV reads").
+        if skip_sink is not None:
+            skip_sink.append(orders_csv)
+        rows = rows[:-1]
+    for row in rows:
+        ticker = row.get("ticker")
+        if not ticker or (row.get("status") or "").lower() != "submitted":
+            continue
+        raw = row.get("notional_usd")
+        try:
+            notional = float(raw) if raw not in (None, "", "-") else None
+        except (TypeError, ValueError):
+            notional = None
+        if notional and notional > 0:
+            notionals[ticker] = notionals.get(ticker, 0.0) + notional
     return notionals
+
+
+def _mtime_matches_trading_day(path: Path, trading_day: date) -> bool:
+    """True if ``path``'s last-modified time falls on ``trading_day`` (Eastern).
+
+    Used to scope ``skip_sink`` to PLAUSIBLY same-day artifacts: a
+    ``run_state*.json`` candidate that fails to read/parse can't have its own
+    ``trading_day`` field inspected (that's exactly what failed), so a
+    permanently corrupted historical artifact from months or years ago --
+    accumulated anywhere under a recursively (``rglob``) scanned root -- would
+    otherwise poison every future scan's skip_sink forever, permanently
+    disabling the bounded-reload recovery this signal exists to enable (Codex
+    review: "Exclude historical parse failures from reload completeness").
+    mtime is an imperfect but universal, cheap proxy: a same-day artifact still
+    being flushed necessarily has a same-day mtime, while old corrupted files
+    do not. If the path can't even be stat'd, err toward still treating it as
+    a possible same-day failure rather than silently dropping the signal.
+    """
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return True
+    return datetime.fromtimestamp(mtime, tz=EASTERN).date() == trading_day
 
 
 def load_prior_same_day_allocations(
@@ -2390,6 +2560,7 @@ def load_prior_same_day_allocations(
     boundary_et: time = MORNING_MANUAL_BOUNDARY_ET,
     additional_state_roots: Sequence[str | Path] = (),
     include_scheduled_afternoon: bool = False,
+    skip_sink: Optional[List[Path]] = None,
 ) -> Dict[str, PriorSameDayAllocation]:
     """Aggregate earlier same-day allocation context for the scheduled afternoon guard.
 
@@ -2413,10 +2584,12 @@ def load_prior_same_day_allocations(
     ``filled_orders.csv``). An unconfirmed submitted candidate is retained as prior
     allocation context with an unknown reference even if it logged target/decision
     prices. When multiple earlier runs touched a ticker the dollar
-    amounts are summed and the *lowest* available reference price wins, so the
-    afternoon run must beat the best earlier entry price before it tops up. If any
-    contributing reference is unknown the aggregate reference is unknown, routing the
-    guard to its conservative missing-price / manual_review $0 path.
+    amounts are summed and the ticker's *most recent* valid same-day reference price
+    wins (by ``generated_at``; ties and untimestamped runs fall back to later scan
+    order), so the afternoon run must beat that ticker's latest earlier entry price
+    before it tops up. If any contributing reference is unknown the aggregate
+    reference is unknown, routing the guard to its conservative missing-price /
+    manual_review $0 path.
 
     ``include_scheduled_afternoon`` defaults to False, matching the normal
     scheduled afternoon run's own guard invocation (which must never see another
@@ -2424,6 +2597,20 @@ def load_prior_same_day_allocations(
     later same-day invocation -- e.g. a final manual buy override -- that needs
     to see the day's already-completed scheduled run so it doesn't double-buy;
     pass a ``boundary_et`` later than that run's timestamp to include it.
+
+    ``skip_sink``, when given, has the path of every ``run_state*.json``
+    candidate that could not be read or parsed appended to it (a file still
+    being flushed by a sibling stream's writer, or a transient read race).
+    Such a file contributes NO ticker to the returned mapping, so a caller
+    that only inspects the mapping for tickers with a known amount but an
+    unresolved reference price can miss this case entirely -- a skipped
+    file may be the ONLY same-day artifact for some ticker, leaving that
+    ticker absent rather than merely unresolved (Codex review: "Detect
+    artifacts skipped during the initial context scan"). Callers that need
+    to distinguish "no prior run" from "prior run present but its artifact
+    could not be scanned this pass" (e.g. run_dca's bounded same-day
+    context reload) should pass a list here and treat any entries in it as
+    reason enough to reload, independent of what the returned mapping shows.
     """
     # Deduplicate roots by resolved path so an additional_state_root that matches
     # state_root (or another additional root) doesn't cause double-counting.
@@ -2454,21 +2641,52 @@ def load_prior_same_day_allocations(
         try:
             raw_text = run_state_path.read_text(encoding="utf-8")
         except (OSError, ValueError):
+            # Transient read failure (e.g. the file is still being flushed by
+            # a sibling stream's writer) -- surfaced via skip_sink rather than
+            # silently dropped, since a caller may need to know this scan was
+            # incomplete even though no ticker in the returned mapping reflects it.
+            # Scoped to plausibly same-day artifacts (by mtime) so a permanently
+            # corrupted HISTORICAL file elsewhere in the recursively scanned
+            # root doesn't poison every future scan's completeness signal forever.
+            if skip_sink is not None and _mtime_matches_trading_day(run_state_path, trading_day):
+                skip_sink.append(run_state_path)
             continue
 
-        # Fast path: skip the expensive JSON parse if this artifact isn't for the
-        # target day. Only trust the raw substring match when the file contains no
-        # JSON unicode escape sequences -- a spec-valid encoder may spell an ASCII
-        # character such as one of the date's hyphens as a unicode escape, which
-        # would not literal-match trading_day_iso even though the parsed value is
-        # identical. Escaped files fall through to a full parse so a
-        # differently-escaped same-day artifact is never silently dropped.
-        if trading_day_iso not in raw_text and "\\u" not in raw_text:
+        # Fast path (restored -- see .jules/bolt.md 2025-01-20: rglob +
+        # json.loads over a large historical artifact corpus is expensive,
+        # so a raw substring check before parsing is worth keeping): skip
+        # the parse ONLY for files whose mtime is NOT on trading_day. Such a
+        # file cannot count toward skip_sink either way (it's scoped to
+        # plausibly same-day artifacts, same as the two skip_sink call
+        # sites below), so skipping its parse produces the exact same
+        # observable outcome as parsing it and then discarding a would-be
+        # failure. A file modified TODAY always gets a full parse regardless
+        # of the substring match -- a "looks like a complete JSON object"
+        # heuristic (e.g. ends with "}") isn't a reliable enough proxy for
+        # real completeness to gate this on for same-day files (a sorted-key
+        # writer can truncate mid-flush at a NESTED object's closing brace
+        # while the outer object -- and "trading_day" -- is never written),
+        # so same-day files skip the substring shortcut entirely and always
+        # reach the parse-failure handler below that records skip_sink
+        # (Codex review: "Parse JSON before declaring a brace-terminated
+        # prefix complete"; Copilot review: restore the fast path safely).
+        # Only trust the substring match when the file contains no JSON
+        # unicode escape sequences -- a spec-valid encoder may spell an
+        # ASCII character such as one of the date's hyphens as a unicode
+        # escape, which would not literal-match trading_day_iso even though
+        # the parsed value is identical.
+        same_day_mtime = _mtime_matches_trading_day(run_state_path, trading_day)
+        if not same_day_mtime and trading_day_iso not in raw_text and "\\u" not in raw_text:
             continue
 
         try:
             run_state = json.loads(raw_text)
         except ValueError:
+            # Partial JSON mid-flush is the other half of the parse-race this
+            # loader must not silently absorb -- same skip_sink signal (and
+            # same same-day scoping) as the read failure above.
+            if skip_sink is not None and same_day_mtime:
+                skip_sink.append(run_state_path)
             continue
 
         if not isinstance(run_state, dict):
@@ -2498,6 +2716,10 @@ def load_prior_same_day_allocations(
             source = classification.get("run_origin")
         run_id = run_id or run_state.get("run_id")
         source = source or "manual"
+        # Recency key for most-recent reference resolution. Untimestamped runs use
+        # the floor so any timestamped run outranks them; equal keys defer to later
+        # scan order (all_run_state_paths is sorted ascending).
+        run_ts = _prior_run_timestamp(run_state.get("generated_at")) or _TS_FLOOR
 
         fills = _orders_csv_fills(run_state_path.parent)
         # A full-report run_state written by run_and_report()/write_run_state()
@@ -2521,8 +2743,12 @@ def load_prior_same_day_allocations(
                     if orders_csv_file.exists():
                         # Pass the exact recorded file rather than run_dir/"orders.csv"
                         # because run_and_report writes custom-named CSVs.
-                        report_fills = _orders_csv_fills(orders_csv_file.parent, orders_csv_file=orders_csv_file)
-                        submitted_notionals = _orders_csv_submitted_notionals(orders_csv_file)
+                        report_fills = _orders_csv_fills(
+                            orders_csv_file.parent, orders_csv_file=orders_csv_file, skip_sink=skip_sink
+                        )
+                        submitted_notionals = _orders_csv_submitted_notionals(
+                            orders_csv_file, skip_sink=skip_sink
+                        )
                         # Merge filled rows (known price) then submitted rows (unknown price).
                         # Filled rows for a ticker win over submitted rows for the same ticker.
                         _csv_tickers: Dict[str, tuple] = {}  # ticker -> (amount, ref_price)
@@ -2545,6 +2771,7 @@ def load_prior_same_day_allocations(
                                 {
                                     "amount": 0.0,
                                     "reference_price": None,
+                                    "reference_ts": None,
                                     "run_id": run_id,
                                     "source": source,
                                     "selected_base_amount_usd": None,
@@ -2559,10 +2786,9 @@ def load_prior_same_day_allocations(
                                 _entry["reference_price"] = None
                                 _entry["reference_price_unknown"] = True
                             else:
-                                if _entry["reference_price"] is None:
+                                if _entry["reference_price"] is None or run_ts >= _entry["reference_ts"]:
                                     _entry["reference_price"] = _ref
-                                else:
-                                    _entry["reference_price"] = min(_entry["reference_price"], _ref)
+                                    _entry["reference_ts"] = run_ts
                             # This CSV-reconstructed shape carries no base info -- if
                             # this is the ticker's first contributing entry, lock the
                             # base permanently unknown (Codex review: "Do not infer a
@@ -2573,6 +2799,45 @@ def load_prior_same_day_allocations(
                                 _entry["selected_base_amount_usd_seen"] = True
                             _entry["run_id"] = run_id
                             _entry["source"] = source
+                    elif skip_sink is not None:
+                        # This full-report run_state RECORDED orders_csv_path
+                        # as its fill source, but the file isn't there at
+                        # that exact path -- deleted, relocated, or still
+                        # being written by run_and_report. Its referenced
+                        # fills are exactly as unverifiable as a
+                        # run_state.json that itself failed to read/parse,
+                        # so this scan must not report itself complete while
+                        # a ticker's only fill evidence is silently invisible
+                        # (Codex review: "Include referenced CSV failures in
+                        # scan completeness"). BUT when a supported sibling
+                        # sits right beside this run_state (e.g. the recorded
+                        # path is a STALE absolute path from a relocated
+                        # deployment, while the real CSV -- under its
+                        # recorded basename, OR a differently-named file like
+                        # submitted_orders.csv/filled_orders.csv -- still
+                        # lives in this run's own directory),
+                        # scripts.run_classification.load_same_day_top_up_context's
+                        # own basename/glob fallback (_referenced_orders_csvs,
+                        # which matches its recorded basename AND any sibling
+                        # matching "*orders.csv") already recovers this run's
+                        # fills unconditionally, within the SAME
+                        # _compute_auto_derived_prior_allocations call that
+                        # merges its result in right after this loop.
+                        # Flagging a failure here anyway would be a permanent
+                        # false positive -- a stale absolute path never
+                        # becomes valid, so scan_had_failures would never
+                        # clear, poisoning an already-correctly-recovered,
+                        # resolved allocation on every future scan (Codex
+                        # review: "Do not flag stale CSV paths after fallback
+                        # recovery"; "Recognize every supported sibling
+                        # fallback before flagging failure" -- the exact-
+                        # basename-only check missed the glob fallback).
+                        # Only flag the failure when NEITHER supported
+                        # fallback has anything to find.
+                        _has_basename_sibling = (run_state_path.parent / orders_csv_file.name).exists()
+                        _has_glob_sibling = any(run_state_path.parent.glob("*orders.csv"))
+                        if not _has_basename_sibling and not _has_glob_sibling:
+                            skip_sink.append(run_state_path)
         for candidate in buy_candidates_raw or []:
             if not isinstance(candidate, dict):
                 continue
@@ -2645,6 +2910,7 @@ def load_prior_same_day_allocations(
                 {
                     "amount": 0.0,
                     "reference_price": None,
+                    "reference_ts": None,
                     "run_id": run_id,
                     "source": source,
                     "selected_base_amount_usd": None,
@@ -2663,10 +2929,12 @@ def load_prior_same_day_allocations(
                 entry["reference_price"] = None
                 entry["reference_price_unknown"] = True
             else:
-                if entry["reference_price"] is None:
+                # Most-recent reference wins: overwrite when this run is at least as
+                # recent as the run that currently owns the reference (equal keys and
+                # untimestamped runs defer to later scan order, which is more recent).
+                if entry["reference_price"] is None or run_ts >= entry["reference_ts"]:
                     entry["reference_price"] = reference_price
-                else:
-                    entry["reference_price"] = min(entry["reference_price"], reference_price)
+                    entry["reference_ts"] = run_ts
             # Only the ticker's FIRST contributing entry sets the base (_parsed_runs
             # is processed in chronological, parsed-generated_at order -- see above)
             # -- gated on a "seen" flag, not on the stored value being None, so a
@@ -2691,6 +2959,7 @@ def load_prior_same_day_allocations(
             reference_price=entry["reference_price"],
             run_id=entry["run_id"],
             source=entry["source"],
+            reference_ts=entry["reference_ts"],
             selected_base_amount_usd=entry.get("selected_base_amount_usd"),
             selected_base_amount_usd_at=entry.get("selected_base_amount_usd_at"),
         )
@@ -2704,20 +2973,25 @@ def load_prior_same_day_allocations_multi(
     *,
     boundary_et: time = MORNING_MANUAL_BOUNDARY_ET,
     include_scheduled_afternoon: bool = False,
+    skip_sink: Optional[List[Path]] = None,
 ) -> Dict[str, PriorSameDayAllocation]:
     """Merge :func:`load_prior_same_day_allocations` across several state roots.
 
     The afternoon guard folds in earlier same-day fills that live under sibling
     stream roots -- the morning-live root, the midday-live root, and the manual
     override reruns under ``.../manual_reruns/`` -- as well as its own task root.
-    Per ticker the dollar amounts are summed and the *lowest* known reference
-    price wins (any unknown reference poisons the aggregate to unknown), so the
-    afternoon run must beat the best earlier entry across every stream before it
-    tops up. Roots that do not exist contribute nothing, so passing production
-    stream roots is safe on days a stream did not run.
+    Per ticker the dollar amounts are summed and the ticker's *most recent* known
+    reference price wins (by ``generated_at``; any unknown reference poisons the
+    aggregate to unknown), so the afternoon run must beat that ticker's latest
+    earlier entry across every stream before it tops up. Roots that do not exist
+    contribute nothing, so passing production stream roots is safe on days a stream
+    did not run.
 
     ``include_scheduled_afternoon`` is forwarded to each per-root call; see
     :func:`load_prior_same_day_allocations` for when to set it True.
+
+    ``skip_sink`` is forwarded to each per-root call and accumulates skipped
+    artifact paths across every root; see :func:`load_prior_same_day_allocations`.
     """
     merged: Dict[str, PriorSameDayAllocation] = {}
     for root in state_roots:
@@ -2726,6 +3000,7 @@ def load_prior_same_day_allocations_multi(
             trading_day,
             boundary_et=boundary_et,
             include_scheduled_afternoon=include_scheduled_afternoon,
+            skip_sink=skip_sink,
         )
         for ticker, alloc in allocations.items():
             existing = merged.get(ticker)
@@ -2734,8 +3009,29 @@ def load_prior_same_day_allocations_multi(
                 continue
             if existing.reference_price is None or alloc.reference_price is None:
                 ref = None
+                ref_ts = None
+                ref_run_id = alloc.run_id or existing.run_id
+                ref_source = alloc.source or existing.source
             else:
-                ref = min(existing.reference_price, alloc.reference_price)
+                # Most-recent reference wins across roots. Untimestamped allocations
+                # use the floor so any timestamped one outranks them; equal keys defer
+                # to the newly folded root (state_roots order = later contributor).
+                existing_ts = existing.reference_ts or _TS_FLOOR
+                alloc_ts = alloc.reference_ts or _TS_FLOOR
+                if alloc_ts >= existing_ts:
+                    ref = alloc.reference_price
+                    ref_ts = alloc.reference_ts
+                    # The run/source that actually supplied the winning reference
+                    # price must be recorded together with it, not whichever side
+                    # happens to be scanned last -- otherwise a top-up audit trail
+                    # can pair a newer reference price with an older run_id.
+                    ref_run_id = alloc.run_id or existing.run_id
+                    ref_source = alloc.source or existing.source
+                else:
+                    ref = existing.reference_price
+                    ref_ts = existing.reference_ts
+                    ref_run_id = existing.run_id or alloc.run_id
+                    ref_source = existing.source or alloc.source
             # Pick the chronologically FIRST allocation's base -- state_roots is
             # not guaranteed to be scanned in true chronological order (Codex
             # review: "Select the base from the chronologically first
@@ -2751,8 +3047,9 @@ def load_prior_same_day_allocations_multi(
                 ticker=ticker,
                 amount_usd=round(existing.amount_usd + alloc.amount_usd, 2),
                 reference_price=ref,
-                run_id=alloc.run_id or existing.run_id,
-                source=alloc.source or existing.source,
+                run_id=ref_run_id,
+                source=ref_source,
+                reference_ts=ref_ts,
                 selected_base_amount_usd=base,
                 selected_base_amount_usd_at=base_at,
             )
@@ -2777,9 +3074,20 @@ def merge_manual_top_up_context(
     but never loaded them as prior-allocation context, leaving ``prior_usd`` blank
     and ``incremental_usd`` 0 for MSFT/GOOGL/GOOG/MA/IBM despite the fills being on
     disk. This merges the two loaders' results the same way ``load_prior_same_day_
-    allocations_multi`` folds in multiple roots: dollar amounts sum, and the lowest
-    reference price wins (an unknown reference from either source poisons the
-    aggregate to unknown, routing the guard to its conservative missing-price path).
+    allocations_multi`` folds in multiple roots: dollar amounts sum, and the ticker's
+    MOST RECENT valid reference wins by comparing each side's own recency (ET
+    seconds-of-day, not just minutes -- Codex review: "Retain sub-minute
+    generated-at ordering" -- two artifacts in the same ET minute must not tie;
+    both loaders are already scoped to the same single trading_day, so a
+    seconds-of-day comparison is sufficient) -- NOT simply the manual fill,
+    which is merged last but is not necessarily more recent (Codex review:
+    "Preserve the manual-context timestamp when merging references" -- a 09:00
+    manual fill must not out-rank a 12:30 scheduled fill just because it is folded
+    in after it). The run_id/source recorded travels with whichever side's
+    reference price actually won (Codex review: "Keep the winning manual
+    reference's identity"), not unconditionally the core loader's. An unknown
+    reference from either source poisons the aggregate to unknown, routing the
+    guard to its conservative missing-price path.
 
     Shared by both ``run_dca.py`` (the 3:20 afternoon guard) and
     ``morning_dca.py``'s ``MorningDCAExecutor._compute_top_up`` (the 10:30/12:30
@@ -2805,17 +3113,55 @@ def merge_manual_top_up_context(
                 source="manual_top_up_context",
             )
             continue
-        ref = (
-            None
-            if existing.reference_price is None or alloc.reference_price is None
-            else min(existing.reference_price, alloc.reference_price)
-        )
+        if existing.reference_price is None or alloc.reference_price is None:
+            # Either side being unknown still poisons the aggregate to unknown.
+            ref = None
+            ref_ts = None
+            ref_run_id = existing.run_id
+            ref_source = existing.source or "manual_top_up_context"
+        else:
+            # Compare actual recency (ET seconds-of-day, not just minutes --
+            # Codex review: "Retain sub-minute generated-at ordering") rather
+            # than always letting the manual fill win merely because it is
+            # merged last. scripts.run_classification.PriorAllocation.reference_ts
+            # is ET seconds-since-midnight; existing.reference_ts (this
+            # module's own datetime) is reduced to the same seconds-of-day for
+            # comparison, since both loaders are already scoped to the same
+            # trading_day. Untimestamped on either side defers to the manual
+            # fill (merged last), matching the "ties/untimestamped defer to
+            # later scan/merge order" convention used elsewhere in this module.
+            existing_seconds = (
+                existing.reference_ts.hour * 3600
+                + existing.reference_ts.minute * 60
+                + existing.reference_ts.second
+                if existing.reference_ts is not None
+                else None
+            )
+            alloc_seconds = alloc.reference_ts
+            if existing_seconds is not None and alloc_seconds is not None and existing_seconds > alloc_seconds:
+                ref = existing.reference_price
+                ref_ts = existing.reference_ts
+                ref_run_id = existing.run_id
+                ref_source = existing.source or "manual_top_up_context"
+            else:
+                ref = alloc.reference_price
+                # The manual side's real datetime isn't available (only its ET
+                # seconds-of-day), so this can't be represented exactly here.
+                ref_ts = None
+                # The manual context's own identity travels with its winning
+                # reference price -- pairing a manual reference with the
+                # scheduled run's identity would point reconciliation at the
+                # wrong artifact (Codex review: "Keep the winning manual
+                # reference's identity").
+                ref_run_id = alloc.sources[0] if alloc.sources else None
+                ref_source = "manual_top_up_context"
         prior_same_day_allocations[ticker] = PriorSameDayAllocation(
             ticker=ticker,
             amount_usd=existing.amount_usd + alloc.prior_usd,
             reference_price=ref,
-            run_id=existing.run_id,
-            source=existing.source or "manual_top_up_context",
+            run_id=ref_run_id,
+            source=ref_source,
+            reference_ts=ref_ts,
             # PriorAllocation (scripts.run_classification) carries no timestamp,
             # so there is no way to tell whether this bare-CSV-only manual fill
             # actually happened before or after `existing`'s already-resolved
@@ -3622,7 +3968,8 @@ def _process_buy_candidate(
 ) -> tuple[Dict[str, Any], Optional[TopUpGuardOutcome], float, int, int]:
     ticker = decision.ticker
     order_amount = decision.suggested_amount_usd
-    ticker_guarded = guard_active and prior_same_day_allocations.get(ticker) is not None
+    prior = prior_same_day_allocations.get(ticker) if guard_active else None
+    ticker_guarded = guard_active and prior is not None
     top_up_outcome = None
     errors_count_inc = 0
     order_reviews_attempted_inc = 0
@@ -3640,13 +3987,26 @@ def _process_buy_candidate(
         # config.base_buy_amount_usd ($2) -- a below-close-only candidate's 1x
         # kill-switch amount is $1, and capping it at $2 would let it submit
         # double the reduced-scale risk cap the kill switch is meant to enforce
-        # (Codex review: "Cap the kill switch at the selected base").
-        order_amount = min(order_amount, decision.selected_base_amount_usd)
+        # (Codex review: "Cap the kill switch at the selected base"). When an
+        # earlier same-day allocation already fixed this ticker's base for the
+        # day (see resolve_top_up_desired_amount_usd), the kill-switch ceiling
+        # must use THAT preserved base, not this run's own freshly recomputed
+        # decision.selected_base_amount_usd -- a deeper price that newly
+        # crosses the prior regular-session low can raise this run's own base
+        # from $1 to $2 for a ticker whose day is still pinned to the $1
+        # scale, and capping at the fresh $2 would let a guarded top-up submit
+        # double the reduced-scale risk the kill switch is meant to enforce
+        # for that ticker (Codex review: "Cap guarded top-ups using the
+        # preserved base").
+        kill_switch_base = (
+            prior.selected_base_amount_usd
+            if prior is not None and prior.selected_base_amount_usd and prior.selected_base_amount_usd > 0
+            else decision.selected_base_amount_usd
+        )
+        order_amount = min(order_amount, kill_switch_base)
 
     if guard_active:
-        outcome = evaluate_top_up_guard(
-            decision, prior_same_day_allocations.get(ticker), config
-        )
+        outcome = evaluate_top_up_guard(decision, prior, config)
         top_up_outcome = outcome
         order_amount = min(outcome.incremental_order_amount, order_amount)
         if outcome.skipped:

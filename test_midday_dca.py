@@ -27,6 +27,7 @@ from morning_dca import (
     DEFAULT_MORNING_LIVE_STATE_ROOT,
     EXEC_AUTO_BUY_ELIGIBLE,
     EXEC_MANUAL_REVIEW_CANDIDATE,
+    MorningSignal,
 )
 from near_close_dca import (
     EASTERN,
@@ -36,6 +37,7 @@ from near_close_dca import (
     TOP_UP_PRICE_NOT_BELOW,
     Action,
     Bar,
+    PriorSameDayAllocation,
     SourceName,
     StrategyConfig,
     graded_buy_multiplier,
@@ -204,6 +206,44 @@ def test_midday_ladder_brackets():
     }
     for drop, expected in cases.items():
         assert ex.multiplier_for_drop(drop) == expected, (drop, expected)
+
+
+def test_midday_augment_buy_candidate_row_persists_effective_base():
+    # Codex review ("Persist the effective base in midday candidate rows"):
+    # MiddayDCAExecutor overrides _augment_buy_candidate_row without calling
+    # super() or assigning outcome.effective_base_amount_usd, unlike
+    # MorningDCAExecutor's own override. An earlier same-day run bought using
+    # the $1 base; this run's own (deeper) price would freshly select the $2
+    # base, but the guard must persist the PRESERVED $1 base it actually used,
+    # not the freshly recomputed $2 -- otherwise later artifact consumers
+    # (and the graded-vs-fixed dashboard) reconstruct the wrong base.
+    ex = MiddayDCAExecutor(MiddayConfig())
+    prior = PriorSameDayAllocation(
+        "AAPL",
+        amount_usd=2.0,
+        reference_price=98.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=1.0,
+    )
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=94.0,
+        previous_close=100.0,
+        drop_pct=6.0,
+        multiplier=4.0,
+        hypothetical_amount_usd=8.0,  # recomputed (incorrectly) at this run's own $2 base: 2.0 * 4.0
+        selected_base_amount_usd=2.0,
+    )
+    outcome = ex._evaluate_top_up(signal, prior)
+    assert outcome.effective_base_amount_usd == 1.0
+
+    row = signal.to_row()
+    ex._augment_buy_candidate_row(row, signal, {"AAPL": outcome})
+    assert row["selected_base_amount_usd"] == 1.0
 
 
 # --- Run-state path + classification ----------------------------------------

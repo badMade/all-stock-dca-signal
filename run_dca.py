@@ -31,7 +31,7 @@ import json
 import logging
 import os
 import shutil
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -41,6 +41,7 @@ from dca_fileio import atomic_write_text
 from midday_dca import DEFAULT_MIDDAY_LIVE_STATE_ROOT, load_midday_config
 from morning_dca import DEFAULT_MORNING_LIVE_STATE_ROOT, MORNING_LIVE_MODE, load_morning_config
 from near_close_dca import (
+    _TS_FLOOR,
     EASTERN,
     Bar,
     BrokerAdapter,
@@ -71,6 +72,39 @@ from scripts.run_classification import (
 
 logger = logging.getLogger("near_close_dca.run")
 
+# Root for ad hoc intraday scheduled-recovery streams (e.g. the Jul 24 2026
+# 2:30 PM ET intraday_1430 recovery -- see config/scheduled_tasks.json
+# canonical_first_buy_and_topup_rule -> intraday_dca_scheduled_recovery_2026_07_24),
+# which have no dedicated *_dca.py module/config of their own but follow the
+# same ``cron_tracking/<stream>_dca/`` layout as the morning/midday roots.
+# Declared as its own root (rather than folded into
+# _CROSS_STREAM_PRIOR_ALLOCATION_ROOTS below, which also drives each stream's
+# OWN configured-root lookup in _resolve_cross_stream_prior_allocation_roots --
+# there is no IntradayConfig to look up) and paired with
+# near_close_dca._prior_run_is_scheduled recognizing any ``stream`` starting
+# with ``"intraday"`` as eligible prior context (Codex review: "Include the
+# intraday recovery in later top-up context" -- without this, that recovery's
+# $72 in fills would never be loaded by a later same-day run's top-up guard,
+# which could then re-submit those tickers' full first allocations).
+#
+# Overridable via the DCA_INTRADAY_LIVE_STATE_ROOT environment variable (see
+# _resolve_cross_stream_prior_allocation_roots): since there is no
+# IntradayConfig loader to source a deployment-specific root from the way
+# morning/midday do, a deployment that relocates its afternoon and intraday
+# artifact trees independently would otherwise have no way to point this root
+# anywhere but the bundled sibling-of-afternoon-root convention (Codex review:
+# "Make the intraday recovery root configurable").
+#
+# Unlike DEFAULT_MORNING_LIVE_STATE_ROOT/DEFAULT_MIDDAY_LIVE_STATE_ROOT (each
+# a real, independently-configurable production path), this constant is only
+# ever consumed for its basename (see sibling_roots below and the ``!=``
+# check that drops it once an env override replaces it) -- there is no
+# stand-alone intraday root to point at outside the sibling-of-afternoon-root
+# convention. Keep it a bare relative name rather than a host-specific
+# absolute path so the module stays portable across deployments (Codex
+# review: "Derive the intraday root without a local absolute path").
+DEFAULT_INTRADAY_LIVE_STATE_ROOT = "intraday_dca"
+
 # Stream label for the scheduled 3:20 PM ET final live run, used for the
 # failure-alert / heartbeat identity (DCA_HEARTBEAT_URL_AFTERNOON). Matches the
 # "afternoon" stream name recorded by scripts/run_classification.py pointers.
@@ -89,6 +123,7 @@ AFTERNOON_STREAM = "afternoon"
 _CROSS_STREAM_PRIOR_ALLOCATION_ROOTS: Tuple[str, ...] = (
     DEFAULT_MORNING_LIVE_STATE_ROOT,
     DEFAULT_MIDDAY_LIVE_STATE_ROOT,
+    DEFAULT_INTRADAY_LIVE_STATE_ROOT,
 )
 
 
@@ -153,15 +188,45 @@ def _resolve_cross_stream_prior_allocation_roots(
       both a root and its child would load the same ``run_state.json`` files
       twice and double the afternoon top-up guard's prior-allocation amount
       (Codex review: "Avoid double-counting nested stream roots").
-    - Any resolved root that is ``afternoon_root`` itself or an ancestor of
-      it is also dropped. The caller scans ``afternoon_root`` separately and
-      sums that result with this function's cross-stream roots (see
-      ``run_pipeline``), so keeping a root that contains -- or equals --
-      ``afternoon_root`` (e.g. a shared ``cron_tracking`` root configured as
-      a stream's ``morning_run_state_root``) would recursively re-scan the
-      same ``afternoon_root`` tree a second time and double-count every
-      manual afternoon allocation beneath it (Codex review: "Exclude the
-      afternoon tree from cross-stream roots").
+    - Any resolved root that is ``afternoon_root`` itself, an ancestor of it,
+      OR a descendant of it is also dropped. The caller scans
+      ``afternoon_root`` separately and sums that result with this
+      function's cross-stream roots (see ``run_pipeline``), so keeping a
+      root that contains -- or equals -- ``afternoon_root`` (e.g. a shared
+      ``cron_tracking`` root configured as a stream's
+      ``morning_run_state_root``) would recursively re-scan the same
+      ``afternoon_root`` tree a second time and double-count every manual
+      afternoon allocation beneath it (Codex review: "Exclude the afternoon
+      tree from cross-stream roots"). The descendant direction matters too:
+      a root NESTED under ``afternoon_root`` (e.g. an operator setting
+      ``DCA_INTRADAY_LIVE_STATE_ROOT`` to a subdirectory of the afternoon
+      tree by mistake) would already be covered by the separate
+      ``afternoon_root`` scan, so keeping it as an ALSO-scanned cross-stream
+      root would double-count every artifact beneath it just the same
+      (Codex review: "Exclude intraday roots nested under the afternoon
+      tree").
+    - An explicit ``DCA_INTRADAY_LIVE_STATE_ROOT`` override REPLACES the
+      conventional ``cron_base/intraday_dca`` sibling fallback rather than
+      adding to it, decided UPFRONT (before the fallback is even added to
+      the candidate list) whenever the override doesn't conflict with
+      ``afternoon_root`` the same way any other cross-stream root would
+      (Codex review, several rounds: "Keep the intraday fallback when
+      filtering the override", "Drop the intraday fallback when an
+      ancestor covers the override", "Preserve an override that equals the
+      intraday fallback", "Preserve a nested intraday override when
+      removing its fallback", "Scan only the nested intraday override").
+      Deciding this after the fact -- by checking whether the override
+      "survived" the general containment/pruning passes below -- kept
+      running into the same family of bug: those passes are built to keep
+      the BROADEST surviving root and prune redundant descendants (correct
+      for the general nested-config case), but for intraday specifically
+      that direction is backwards whenever the override is narrower than
+      the fallback (e.g. a subdirectory of it) -- the operator's whole
+      point in setting the override is often to scan ONLY that narrower,
+      relocated tree, not the possibly-stale broader one. Deciding upfront
+      means the fallback is simply never a candidate at all once an active
+      override exists, so the general pruning passes never get a chance to
+      keep the wrong one of the two.
     """
     cron_base = afternoon_root.parent
 
@@ -210,17 +275,70 @@ def _resolve_cross_stream_prior_allocation_roots(
     except Exception:  # noqa: BLE001 - never let a bad midday config block the afternoon run
         midday_root = None
 
+    # There is no IntradayConfig loader (see DEFAULT_INTRADAY_LIVE_STATE_ROOT
+    # above), so the intraday root has no per-stream JSON config to read the
+    # way morning/midday do. An explicit DCA_INTRADAY_LIVE_STATE_ROOT is the
+    # deployment's own configuration for this root and is trusted directly,
+    # matching how an explicit config_dir/DCA_CONFIG_DIR override is trusted
+    # for morning/midday above -- a relocated intraday tree living outside
+    # cron_base is exactly the case this override exists for.
+    _env_intraday_root = os.environ.get("DCA_INTRADAY_LIVE_STATE_ROOT")
+    intraday_root = Path(_env_intraday_root) if _env_intraday_root else None
+
+    # Resolve UPFRONT whether the override is CONFIGURED at all, and
+    # separately whether it needs its own scan entry (ACTIVE) -- these are
+    # NOT the same question, and conflating them was itself a bug (Codex
+    # review: "Drop the legacy fallback for covered nested overrides"). An
+    # override that is a STRICT ANCESTOR of afternoon_root is a genuine
+    # misconfiguration -- practically the whole cron tree, not a meaningful
+    # "intraday root" -- so it is invalid and treated exactly as if unset.
+    # But an override NESTED under (or EQUAL TO) afternoon_root is a real,
+    # deliberately-configured location; it just doesn't need a separate
+    # scan entry because the caller's own recursive afternoon scan already
+    # covers it -- including the equal case, which is trivially covered by
+    # that same scan (Codex review: "Treat an override equal to the
+    # afternoon root as covered"; an ancestor-or-equal check previously
+    # treated the equal case as the ancestor misconfiguration too).
+    # Suppressing the legacy cron_base/intraday_dca fallback must track the
+    # former (was a valid override configured), not the latter (does it
+    # need its own scan entry) -- otherwise a nested (or equal) override
+    # incorrectly resurrects the legacy fallback, and if that stale tree
+    # still holds artifacts from before the relocation, they get aggregated
+    # alongside the (already-covered) real data.
+    _intraday_is_ancestor_of_afternoon = (
+        intraday_root is not None
+        and _is_within(afternoon_root.resolve(), intraday_root.resolve())
+        and intraday_root.resolve() != afternoon_root.resolve()
+    )
+    _intraday_is_nested_under_afternoon = intraday_root is not None and _is_within(
+        intraday_root.resolve(), afternoon_root.resolve()
+    )
+    intraday_override_configured = intraday_root is not None and not _intraday_is_ancestor_of_afternoon
+    intraday_override_active = intraday_override_configured and not _intraday_is_nested_under_afternoon
+
     configured_roots = tuple(
         r
         for r in (
             _configured_root(morning_root, DEFAULT_MORNING_LIVE_STATE_ROOT),
             _configured_root(midday_root, DEFAULT_MIDDAY_LIVE_STATE_ROOT),
+            intraday_root if intraday_override_active else None,
         )
         if r is not None
     )
-    sibling_roots = tuple(
-        cron_base / Path(r).name for r in _CROSS_STREAM_PRIOR_ALLOCATION_ROOTS
+    # The conventional intraday sibling fallback is included only when there
+    # is no CONFIGURED override -- any valid override (whether it needs its
+    # own scan entry or is already covered by the afternoon tree, equal to
+    # the fallback, or covered by some other ancestor) replaces it outright:
+    # the operator explicitly pointed the intraday root somewhere, and
+    # letting the fallback remain a candidate would risk double-counting
+    # real artifacts, or -- for a narrower/covered override -- scanning a
+    # broader, possibly-stale tree than the operator intended.
+    _cross_stream_defaults = (
+        _CROSS_STREAM_PRIOR_ALLOCATION_ROOTS
+        if not intraday_override_configured
+        else tuple(r for r in _CROSS_STREAM_PRIOR_ALLOCATION_ROOTS if r != DEFAULT_INTRADAY_LIVE_STATE_ROOT)
     )
+    sibling_roots = tuple(cron_base / Path(r).name for r in _cross_stream_defaults)
 
     # Pass 1: dedupe exact-duplicate resolved paths, preserving first-seen order.
     seen: set = set()
@@ -231,21 +349,25 @@ def _resolve_cross_stream_prior_allocation_roots(
             seen.add(key)
             deduped.append((root, key))
 
-    # Pass 2: drop any root that is afternoon_root itself or an ancestor of it --
-    # the caller scans afternoon_root separately and sums that result with this
-    # function's roots (see run_pipeline), so keeping one that contains
-    # afternoon_root would recursively re-scan (and double-count) that tree.
-    # This MUST happen before Pass 3's descendant pruning below, not folded
-    # into the same comparison: if a stream is configured to the shared
-    # cron_base itself, cron_base contains afternoon_root (dropped here) AND
-    # is the ancestor that would otherwise cause the sibling-root fallback
-    # (a genuine descendant of cron_base) to be pruned as "redundant" in Pass
-    # 3 -- leaving nothing scanned for that stream at all. Excluding
+    # Pass 2: drop any root that has ANY containment relationship with
+    # afternoon_root -- it is afternoon_root itself, an ancestor of it, or a
+    # DESCENDANT of it. The caller scans afternoon_root separately and sums
+    # that result with this function's roots (see run_pipeline), so keeping
+    # a root on either side of that relationship would recursively re-scan
+    # (and double-count) the overlapping part of that tree. This MUST happen
+    # before Pass 3's descendant pruning below, not folded into the same
+    # comparison: if a stream is configured to the shared cron_base itself,
+    # cron_base contains afternoon_root (dropped here) AND is the ancestor
+    # that would otherwise cause the sibling-root fallback (a genuine
+    # descendant of cron_base) to be pruned as "redundant" in Pass 3 --
+    # leaving nothing scanned for that stream at all. Excluding
     # afternoon-containing roots first means Pass 3 never sees cron_base as
     # an ancestor candidate, so the sibling fallback survives.
     afternoon_key = afternoon_root.resolve()
     non_afternoon: List[Tuple[Path, Path]] = [
-        (orig, key) for orig, key in deduped if not _is_within(afternoon_key, key)
+        (orig, key)
+        for orig, key in deduped
+        if not _is_within(afternoon_key, key) and not _is_within(key, afternoon_key)
     ]
 
     # Pass 3: prune any root that is a descendant of another surviving root.
@@ -254,6 +376,7 @@ def _resolve_cross_stream_prior_allocation_roots(
         for orig, key in non_afternoon
         if not any(key != other_key and _is_within(key, other_key) for _, other_key in non_afternoon)
     ]
+
     return tuple(resolved)
 
 
@@ -616,6 +739,150 @@ def _default_prior_allocation_state_root(artifacts_dir: Path) -> Path:
         if candidate.name == "scheduled_runs":
             return candidate.parent
     return artifacts_dir.parent
+
+
+def _compute_auto_derived_prior_allocations(
+    now: datetime,
+    trading_day: date,
+    artifacts_dir: str | Path,
+    config_dir: Optional[str | Path],
+) -> Tuple[Dict[str, PriorSameDayAllocation], bool]:
+    """Aggregate same-day prior-allocation context from the auto-derived roots.
+
+    Folds the afternoon task root, the morning/midday cross-stream roots (incl.
+    manual override reruns), and manual CSV-only context
+    (``scripts.run_classification.load_same_day_top_up_context``) into one
+    per-ticker :class:`PriorSameDayAllocation` map. Pure function of the
+    artifact filesystem state at call time -- callers may invoke this more than
+    once for the same run (see the bounded-reload wrapper around this
+    function's call site, canonical rule item 13).
+
+    Returns ``(allocations, scan_had_failures)``. ``scan_had_failures`` is True
+    when any ``run_state*.json`` candidate under the scanned roots could not be
+    read or parsed this pass (see ``load_prior_same_day_allocations``'s
+    ``skip_sink``). Such a file contributes no ticker at all to ``allocations``,
+    so a ticker whose ONLY same-day artifact hit this race is indistinguishable
+    from a ticker with no prior run at all if a caller looks only at
+    ``allocations`` -- the caller must check this flag too to know a reload
+    could still resolve that ticker (Codex review: "Detect artifacts skipped
+    during the initial context scan").
+    """
+    # Each stream's root is read from its OWN config rather than assumed from
+    # directory-naming convention, so a relocated artifact root is still found.
+    afternoon_root = _default_prior_allocation_state_root(Path(artifacts_dir))
+    cross_stream_roots = _resolve_cross_stream_prior_allocation_roots(config_dir, afternoon_root)
+    skip_sink: List[Path] = []
+    # All roots are capped at the actual run time so replayed/backfilled runs
+    # never load fills created after the scheduled execution window. The
+    # current run's own artifact is excluded by classification (run_origin !=
+    # "scheduled" or stream mismatch) not by time, so passing `now` here is
+    # safe and captures late manual fills (e.g. a 15:05 manual override under
+    # ce16ba6b/manual_runs).
+    prior_same_day_allocations = load_prior_same_day_allocations_multi(
+        (afternoon_root,), trading_day,
+        boundary_et=now.astimezone(EASTERN).time(),
+        skip_sink=skip_sink,
+    )
+    cross_stream_allocs = load_prior_same_day_allocations_multi(
+        cross_stream_roots, trading_day,
+        boundary_et=now.astimezone(EASTERN).time(),
+        skip_sink=skip_sink,
+    )
+    for ticker, alloc in cross_stream_allocs.items():
+        existing = prior_same_day_allocations.get(ticker)
+        if existing is None:
+            prior_same_day_allocations[ticker] = alloc
+            continue
+        # Most-recent reference wins: cross-stream vs the afternoon-own
+        # allocation, compared by generated_at (untimestamped -> floor).
+        if existing.reference_price is None or alloc.reference_price is None:
+            ref = None
+            ref_ts = None
+            ref_run_id = alloc.run_id or existing.run_id
+            ref_source = alloc.source or existing.source
+        else:
+            existing_ts = existing.reference_ts or _TS_FLOOR
+            alloc_ts = alloc.reference_ts or _TS_FLOOR
+            if alloc_ts >= existing_ts:
+                ref = alloc.reference_price
+                ref_ts = alloc.reference_ts
+                # The run/source that actually supplied the winning reference
+                # price travels with it, not whichever side is scanned first --
+                # otherwise a top-up audit trail can pair a newer reference
+                # price with an older run_id.
+                ref_run_id = alloc.run_id or existing.run_id
+                ref_source = alloc.source or existing.source
+            else:
+                ref = existing.reference_price
+                ref_ts = existing.reference_ts
+                ref_run_id = existing.run_id or alloc.run_id
+                ref_source = existing.source or alloc.source
+        # Pick the chronologically FIRST allocation's base rather than always
+        # keeping `existing` (the afternoon root, scanned first above) -- an
+        # earlier morning/midday allocation must win over a later same-day
+        # manual override recorded under the afternoon root, even though the
+        # afternoon root loads first (Codex review: "Select the base from the
+        # chronologically first allocation").
+        base, base_at = _earlier_selected_base(
+            existing.selected_base_amount_usd,
+            existing.selected_base_amount_usd_at,
+            alloc.selected_base_amount_usd,
+            alloc.selected_base_amount_usd_at,
+        )
+        prior_same_day_allocations[ticker] = PriorSameDayAllocation(
+            ticker=ticker,
+            amount_usd=existing.amount_usd + alloc.amount_usd,
+            reference_price=ref,
+            run_id=ref_run_id,
+            source=ref_source,
+            reference_ts=ref_ts,
+            selected_base_amount_usd=base,
+            selected_base_amount_usd_at=base_at,
+        )
+    # Manual-context discovery (scripts.run_classification.load_same_day_top_up_context)
+    # only runs for the auto-derived root: it scans SIBLINGS of afternoon_root's
+    # parent (the production cron_tracking layout), which would silently pull in
+    # unrelated trees for a caller that passed an explicit prior_allocation_state_root
+    # to scan ONLY that tree (Codex review: "Respect explicit prior-allocation root
+    # isolation"). Capped at the run time for the same replay-safety reason as above
+    # (Codex review: "Bound manual top-up context to the scheduled execution time").
+    merge_manual_top_up_context(
+        prior_same_day_allocations,
+        load_same_day_top_up_context(
+            trading_day.isoformat(), base=afternoon_root,
+            boundary_et=now.astimezone(EASTERN).time(),
+            # A bare manual CSV (referenced by no run_state at all, the sole
+            # case this loader exists to handle) that fails to read/parse is
+            # exactly as unverifiable as a core-loader completeness failure
+            # -- feed it into the SAME skip_sink so scan_had_failures
+            # reflects it too (Codex review: "Include bare manual CSV
+            # failures in scan completeness").
+            skip_sink=skip_sink,
+        ),
+    )
+    return prior_same_day_allocations, bool(skip_sink)
+
+
+def _tickers_with_unresolved_same_day_context(
+    prior_same_day_allocations: Dict[str, PriorSameDayAllocation],
+) -> List[str]:
+    """Tickers with a known prior same-day amount but no resolvable reference price.
+
+    Canonical rule item 13 (config/scheduled_tasks.json
+    canonical_first_buy_and_topup_rule): "if same-day context cannot be
+    resolved for one ticker, perform one bounded same-day context reload, then
+    fail only that ticker closed." A nonzero amount_usd with reference_price
+    still None means at least one contributing artifact poisoned the
+    aggregate reference to unknown (see load_prior_same_day_allocations) --
+    the case a bounded reload targets, since an artifact still being flushed
+    mid-scan (or a transient parse race with a sibling stream's writer) can
+    resolve on a second pass moments later.
+    """
+    return sorted(
+        ticker
+        for ticker, alloc in prior_same_day_allocations.items()
+        if alloc.amount_usd > 0 and alloc.reference_price is None
+    )
 
 
 def run_pipeline(
@@ -1046,74 +1313,399 @@ def _run_pipeline_impl(
             # Auto-derive the afternoon task root and fold in the morning/midday
             # stream roots (incl. manual override reruns), so morning, midday,
             # and manual override same-day fills all offset the afternoon buy.
-            # Each stream's root is read from its OWN config rather than assumed
-            # from directory-naming convention, so a relocated artifact root is
-            # still found. An explicit prior_allocation_state_root overrides all
-            # of this and scans only the tree the caller named.
-            afternoon_root = _default_prior_allocation_state_root(Path(artifacts_dir))
-            cross_stream_roots = _resolve_cross_stream_prior_allocation_roots(
-                config_dir, afternoon_root
+            # An explicit prior_allocation_state_root overrides all of this and
+            # scans only the tree the caller named (see the else branch below).
+            first_pass, scan_had_failures = _compute_auto_derived_prior_allocations(
+                now, trading_day, artifacts_dir, config_dir
             )
-            # All roots are capped at the actual run time so replayed/backfilled
-            # runs never load fills created after the scheduled execution window.
-            # The current run's own artifact is excluded by classification
-            # (run_origin != "scheduled" or stream mismatch) not by time, so
-            # passing `now` here is safe and captures late manual fills (e.g.
-            # a 15:05 manual override under ce16ba6b/manual_runs).
-            prior_same_day_allocations = load_prior_same_day_allocations_multi(
-                (afternoon_root,), trading_day,
-                boundary_et=now.astimezone(EASTERN).time(),
-            )
-            cross_stream_allocs = load_prior_same_day_allocations_multi(
-                cross_stream_roots, trading_day,
-                boundary_et=now.astimezone(EASTERN).time(),
-            )
-            for ticker, alloc in cross_stream_allocs.items():
-                existing = prior_same_day_allocations.get(ticker)
-                if existing is None:
-                    prior_same_day_allocations[ticker] = alloc
-                else:
-                    ref = (
-                        None
-                        if existing.reference_price is None or alloc.reference_price is None
-                        else min(existing.reference_price, alloc.reference_price)
+            unresolved = _tickers_with_unresolved_same_day_context(first_pass)
+            # Trigger the bounded reload on EITHER signal, not just `unresolved`:
+            # a ticker whose only same-day artifact hit a transient read/parse
+            # race is entirely absent from first_pass (no amount, no price), so
+            # it never shows up in `unresolved` at all -- only scan_had_failures
+            # catches that case (Codex review: "Detect artifacts skipped during
+            # the initial context scan").
+            if unresolved or scan_had_failures:
+                # Canonical rule item 13: perform one bounded same-day context
+                # reload when a ticker's context cannot be resolved (a known
+                # prior amount with a poisoned/unknown reference price), then
+                # fail only that ticker closed -- never block the whole run.
+                # A second immediate scan can pick up a sibling stream's
+                # artifact that was still being flushed (or reads a completed
+                # file past a transient parse race) during the first pass.
+                logger.info(
+                    "same-day context unresolved for %s (scan_had_failures=%s); "
+                    "performing one bounded reload (canonical rule 13)",
+                    unresolved,
+                    scan_had_failures,
+                )
+                second_pass, second_scan_had_failures = _compute_auto_derived_prior_allocations(
+                    now, trading_day, artifacts_dir, config_dir
+                )
+                # Merge by COMPLETENESS rather than replacing wholesale or
+                # trusting the reload just because a ticker was unresolved:
+                # amount_usd is the sum across every contributing artifact
+                # for that ticker, so whichever pass aggregated the LARGER
+                # amount read strictly more of that ticker's artifacts and
+                # is the more complete answer -- whether or not its
+                # reference price happens to be resolved (an unknown-price
+                # contributor can raise the amount while correctly
+                # poisoning the reference, which is itself the safe,
+                # conservative outcome). A SMALLER second-pass amount means
+                # the reload lost an artifact the first pass had -- e.g. an
+                # unconfirmed submission that made the first pass
+                # conservatively unresolved vanished from the reload, which
+                # must not be read as "resolved," only as "incomplete
+                # again" (Codex review: "Preserve unresolved context when
+                # the reload is incomplete"). Equal amounts fall back to
+                # resolution: take the reload ONLY if it turned an unknown
+                # price into a known one, never the reverse (Codex review:
+                # "Preserve resolved ticker context across the reload"). A
+                # ticker entirely absent from the first pass always takes
+                # the reload's result, since there is nothing to protect
+                # there.
+                #
+                # BUT that completeness reasoning only holds when the
+                # RELOAD (second pass) itself had zero skips anywhere.
+                # amount_usd alone cannot tell "the same contributor(s), now
+                # resolved/more complete" apart from "each scan missed a
+                # DIFFERENT real contributor" -- e.g. pass one reads only an
+                # unknown-price $5 submission (a $6 filled artifact for the
+                # SAME ticker fails to parse that pass), and the reload
+                # reads only that $6 fill (the $5 submission fails to parse
+                # THIS pass instead). $6 > $5 looks strictly more complete
+                # by amount alone, but the real aggregate is $11/unknown
+                # (Codex review: "Preserve uncertainty when unequal/equal
+                # contributors swap"). There is no per-artifact identity
+                # tracked here to rule this out directly, so the guard is
+                # gated on `second_scan_had_failures` specifically, NOT on
+                # whether the FIRST pass also had a skip: if the reload
+                # itself is clean, it read every artifact currently on disk
+                # for every ticker with zero exceptions, so its total is
+                # definitionally complete regardless of what the first pass
+                # missed (a first pass that skipped an artifact and a clean
+                # reload that then reads it is exactly the recovery this
+                # bounded reload exists to enable -- gating on the first
+                # pass's flag too would refuse that legitimate recovery
+                # whenever pass one had ANY unrelated skip, Codex review:
+                # "Use a clean reload after a failed first scan"). Only a
+                # reload that ITSELF skipped something can produce the
+                # swapped-contributor false confidence above.
+                _reload_verified_complete = not second_scan_had_failures
+                prior_same_day_allocations = dict(first_pass)
+                for ticker, alloc in second_pass.items():
+                    existing = first_pass.get(ticker)
+                    if existing is None:
+                        if second_scan_had_failures:
+                            # A ticker invisible on the first pass now shows
+                            # up on the reload, but the reload itself wasn't
+                            # fully clean -- a SIBLING artifact for this same
+                            # ticker could be exactly what still failed to
+                            # parse elsewhere in this same scan, so `alloc`
+                            # may only be a PARTIAL recovery, not this
+                            # ticker's whole context (Codex review: "Keep
+                            # recovered tickers uncertain after an
+                            # incomplete reload"). Keep the recovered amount
+                            # (still more information than none) but poison
+                            # the reference so the guard routes through its
+                            # conservative missing_prior_price path instead
+                            # of trusting a possibly-partial total as complete.
+                            # reference_ts must be poisoned to None alongside
+                            # reference_price -- it is documented/used as "the
+                            # timestamp that established reference_price," so
+                            # a non-None reference_ts paired with an unknown
+                            # price is an inconsistent artifact (Copilot
+                            # review: "reference_ts left intact when poisoning
+                            # a recovered ticker").
+                            import dataclasses as _dc
+
+                            prior_same_day_allocations[ticker] = _dc.replace(
+                                alloc, reference_price=None, reference_ts=None
+                            )
+                        else:
+                            # The reload's own scan had zero skips anywhere,
+                            # so it read everything currently on disk for
+                            # this ticker -- a complete, trustworthy answer.
+                            prior_same_day_allocations[ticker] = alloc
+                    elif not _reload_verified_complete:
+                        # The swap-uncertainty note above only defends against
+                        # the FORWARD swap (first pass resolved, reload
+                        # incomplete but shows a DIFFERENT total) by keeping
+                        # `existing`. But an incomplete reload that actively
+                        # DISAGREES with the first pass on this exact ticker
+                        # is direct evidence something changed or was missed,
+                        # regardless of whether the first pass's OWN scan
+                        # happened to be clean elsewhere: a sibling writer can
+                        # add or update this ticker's artifact in the window
+                        # between the two scans, and an incomplete reload
+                        # that then reads a different total for it is proof
+                        # the first pass's "resolved" snapshot is now stale,
+                        # not proof the reload is wrong (Codex review: "Poison
+                        # resolved context when an incomplete reload swaps
+                        # contributors"; "Poison conflicts even after a clean
+                        # first scan"). Only poison when the two passes
+                        # actually DISAGREE on this ticker -- if they agree,
+                        # there is nothing new to account for... UNLESS the
+                        # two passes' agreement isn't proof they read the
+                        # SAME contributing artifact for THIS ticker: pass one
+                        # can read one $5 fill and skip a second,
+                        # coincidentally-identical $5 fill; the reload can
+                        # then read that second fill and skip the first. The
+                        # true aggregate is $10, but matching metadata makes
+                        # it look like $5/unchanged (Codex review: "Poison
+                        # equal-metadata swaps after an incomplete reload").
+                        # The earlier fix for that case gated on the FIRST
+                        # pass's global `scan_had_failures` flag -- true when
+                        # ANY run_state candidate anywhere in the scanned
+                        # trees (any ticker, any stream) failed to read or
+                        # parse -- as a proxy for "this ticker might have a
+                        # same-day sibling artifact neither scan reliably
+                        # read." That proxy is far broader than the ambiguity
+                        # it exists to catch: an unrelated ticker's unrelated
+                        # artifact failing to parse elsewhere in a large
+                        # multi-stream tree would poison THIS ticker's
+                        # already-agreeing, already-verified context too,
+                        # contrary to the bounded-reload's own rule that an
+                        # unresolved context must fail only the affected
+                        # ticker closed (Codex review: "Cap guarded top-ups
+                        # using the preserved base" sibling finding, "Scope
+                        # reload failures to affected tickers"). Use each
+                        # pass's own `run_id` for THIS ticker instead: it is
+                        # the contributing artifact's identity, read directly
+                        # from that artifact's content, so two passes that
+                        # resolved the SAME `run_id` for this ticker read the
+                        # SAME contributing artifact (or an identical-content
+                        # set that produced the same winning `run_id`) --
+                        # genuine agreement, not coincidence. A DIFFERENT (or
+                        # newly None/newly populated) `run_id` for an
+                        # otherwise-matching ticker is exactly the
+                        # coincidentally-equal-swap signature above and still
+                        # poisons.
+                        if (
+                            alloc.amount_usd != existing.amount_usd
+                            or alloc.reference_price != existing.reference_price
+                            # selected_base_amount_usd is sourced from the SAME
+                            # underlying artifact and resolve_top_up_desired_
+                            # amount_usd multiplies it directly to compute the
+                            # top-up target -- an unverified reload that
+                            # corrects the base while amount/price happen to
+                            # match is still direct evidence this ticker's
+                            # record changed, not proof it didn't (Codex
+                            # review: "Include base metadata in
+                            # incomplete-reload conflicts"). Omitting it here
+                            # would let a base-only correction slip through
+                            # as "agreement" and keep the stale, larger base.
+                            or alloc.selected_base_amount_usd != existing.selected_base_amount_usd
+                            or alloc.selected_base_amount_usd_at != existing.selected_base_amount_usd_at
+                            or alloc.run_id != existing.run_id
+                        ):
+                            # Take the larger observed amount as a
+                            # conservative floor on what was actually
+                            # deployed -- never smaller than either pass saw
+                            # -- and force the reference unknown so the guard
+                            # routes through its conservative
+                            # missing_prior_price path.
+                            import dataclasses as _dc
+
+                            base = alloc if alloc.amount_usd >= existing.amount_usd else existing
+                            prior_same_day_allocations[ticker] = _dc.replace(
+                                base, reference_price=None, reference_ts=None
+                            )
+                        # else: keep existing -- the two passes agree on this
+                        # ticker's metadata AND on the contributing artifact's
+                        # own run_id, so this is a trustworthy, complete
+                        # answer for THIS ticker, regardless of unrelated
+                        # failures elsewhere in either scan.
+                    elif alloc.amount_usd > existing.amount_usd:
+                        prior_same_day_allocations[ticker] = alloc
+                    elif alloc.amount_usd == existing.amount_usd:
+                        # Take the reload's reference whenever it's KNOWN and
+                        # DIFFERENT from the first pass's -- not just a
+                        # None-to-known resolution, but also a known-to-
+                        # different-known correction (e.g. a full-report
+                        # CSV-only allocation reconciled between scans from a
+                        # preliminary/estimated fill price to the confirmed
+                        # broker price for the SAME notional). A clean reload
+                        # (guaranteed by _reload_verified_complete above)
+                        # reflects the current state of that -- potentially
+                        # mutable -- underlying artifact, so an updated
+                        # reference for an unchanged amount is a legitimate
+                        # correction to trust (Codex review: "Accept updated
+                        # references from a clean reload"), never the
+                        # reverse: alloc.reference_price is None here always
+                        # keeps existing, protecting the same
+                        # already-resolved-ticker case fixed earlier in this
+                        # PR (Codex review: "Preserve resolved ticker context
+                        # across the reload").
+                        if alloc.reference_price is not None and alloc.reference_price != existing.reference_price:
+                            prior_same_day_allocations[ticker] = alloc
+                        elif (
+                            alloc.selected_base_amount_usd != existing.selected_base_amount_usd
+                            or alloc.selected_base_amount_usd_at != existing.selected_base_amount_usd_at
+                        ):
+                            # The reference price didn't change (or the reload
+                            # doesn't know it), but selected_base_amount_usd is
+                            # ALSO sourced from this same underlying artifact,
+                            # and resolve_top_up_desired_amount_usd multiplies
+                            # it directly to compute the top-up target -- a
+                            # stale base corrected between scans (e.g. $2 ->
+                            # $1) would otherwise let the top-up guard target
+                            # double what the clean reload actually supports
+                            # (Codex review: "Accept corrected allocation
+                            # bases from a clean reload"). The same clean-
+                            # reload trust already established for reference
+                            # corrections above extends to this field.
+                            import dataclasses as _dc
+
+                            if alloc.reference_price is None:
+                                # We only reach this branch when alloc's price
+                                # is None or equal to existing's (a DIFFERENT
+                                # known price already took the `if` above).
+                                # alloc.reference_price is None means the
+                                # artifact backing THIS base correction
+                                # doesn't currently resolve a price -- e.g. a
+                                # confirmed amount-only fill with a valid base
+                                # but no confirmed price yet. Keeping
+                                # existing's known price (necessarily from a
+                                # DIFFERENT read) paired with the reload's
+                                # corrected base would combine two fields
+                                # from different snapshots into a combination
+                                # NEITHER pass actually produced (Codex
+                                # review: "Avoid combining a stale price with
+                                # a reloaded base") -- if the afternoon price
+                                # happens to be below that stale known price,
+                                # the guard would compute atop the doubled
+                                # base instead of taking the reload's own
+                                # missing_prior_price path. Poison the
+                                # reference alongside accepting the base.
+                                prior_same_day_allocations[ticker] = _dc.replace(
+                                    existing,
+                                    reference_price=None,
+                                    reference_ts=None,
+                                    selected_base_amount_usd=alloc.selected_base_amount_usd,
+                                    selected_base_amount_usd_at=alloc.selected_base_amount_usd_at,
+                                )
+                            else:
+                                # alloc.reference_price == existing.reference_price
+                                # here -- same price, corrected base, nothing
+                                # inconsistent to guard against.
+                                prior_same_day_allocations[ticker] = _dc.replace(
+                                    existing,
+                                    selected_base_amount_usd=alloc.selected_base_amount_usd,
+                                    selected_base_amount_usd_at=alloc.selected_base_amount_usd_at,
+                                )
+                    else:
+                        # alloc.amount_usd < existing.amount_usd: the reload
+                        # recovered LESS for this ticker than the first pass
+                        # had, so the first pass's larger amount is still the
+                        # more complete floor -- keep it (we don't have
+                        # per-artifact identity to confirm whether this is a
+                        # legitimate downward correction of the SAME artifact
+                        # or the reload losing one entirely, Codex review:
+                        # "Recognize smaller fills resolved by the reload",
+                        # already declined for that reason -- the failure
+                        # mode of keeping the larger amount is SAFE, only
+                        # ever understating the allowed top-up). But a CLEAN
+                        # reload's own KNOWN reference_price disagreeing with
+                        # existing's is still direct, authoritative evidence
+                        # that reference is stale, regardless of which
+                        # amount is more complete: a $5 fill at $100
+                        # reconciled to a confirmed $4 partial fill at $90 is
+                        # a genuine price correction, and keeping the stale,
+                        # higher $100 reference could pass the
+                        # price-below-prior check and permit a top-up the
+                        # clean reload's own data would reject (Codex
+                        # review: "Discard stale references when a clean
+                        # reload is smaller"). Poison the reference (an
+                        # already-None existing reference no-ops here) but
+                        # keep existing's amount as the conservative floor.
+                        # selected_base_amount_usd is sourced from the SAME
+                        # underlying artifact and resolve_top_up_desired_
+                        # amount_usd multiplies it directly to compute the
+                        # top-up target -- a clean reload correcting the base
+                        # downward while the reference stays unchanged (e.g.
+                        # base $2 -> $1, reference unchanged at $100) is
+                        # still direct evidence the stale base is wrong: kept
+                        # unpoisoned, a stale LARGER base combined with the
+                        # kept LARGER prior amount could still compute a
+                        # target that permits a top-up the reload's own
+                        # (corrected, smaller) base would not (Codex review:
+                        # "Handle base corrections on smaller clean
+                        # reloads").
+                        if (
+                            (alloc.reference_price is not None and alloc.reference_price != existing.reference_price)
+                            or alloc.selected_base_amount_usd != existing.selected_base_amount_usd
+                            or alloc.selected_base_amount_usd_at != existing.selected_base_amount_usd_at
+                        ):
+                            import dataclasses as _dc
+
+                            prior_same_day_allocations[ticker] = _dc.replace(
+                                existing, reference_price=None, reference_ts=None
+                            )
+                        # else: alloc's reference is unknown or matches
+                        # existing's, and the base matches too -- nothing to
+                        # poison, keep existing entirely unchanged.
+                if not _reload_verified_complete:
+                    # The loop above only visits tickers present in
+                    # second_pass -- a ticker that appears ONLY in first_pass
+                    # (entirely absent from an INCOMPLETE reload) never goes
+                    # through any of the poisoning logic above at all, and
+                    # simply keeps its first-pass value untouched via the
+                    # `dict(first_pass)` seed. But an incomplete reload's
+                    # silence about a ticker is not proof nothing exists for
+                    # it -- the reload may simply have failed to read this
+                    # exact ticker's artifact(s), matching every other
+                    # disagreement this bounded reload already treats as
+                    # uncertain rather than trustworthy (Codex review:
+                    # "Poison first-only entries after an incomplete
+                    # reload"). Poison any first-pass-resolved ticker with no
+                    # counterpart in second_pass; an already-unresolved one
+                    # has nothing to poison.
+                    import dataclasses as _dc
+
+                    for ticker, existing in first_pass.items():
+                        if ticker in second_pass or existing.reference_price is None:
+                            continue
+                        prior_same_day_allocations[ticker] = _dc.replace(
+                            existing, reference_price=None, reference_ts=None
+                        )
+                still_unresolved = _tickers_with_unresolved_same_day_context(prior_same_day_allocations)
+                if still_unresolved:
+                    logger.warning(
+                        "same-day context still unresolved for %s after bounded reload; "
+                        "affected tickers route to the top-up guard's conservative "
+                        "missing_prior_price / manual_review $0 path",
+                        still_unresolved,
                     )
-                    # Pick the chronologically FIRST allocation's base rather than
-                    # always keeping `existing` (the afternoon root, scanned first
-                    # above) -- an earlier morning/midday allocation must win over a
-                    # later same-day manual override recorded under the afternoon
-                    # root, even though the afternoon root loads first (Codex
-                    # review: "Select the base from the chronologically first
-                    # allocation").
-                    base, base_at = _earlier_selected_base(
-                        existing.selected_base_amount_usd,
-                        existing.selected_base_amount_usd_at,
-                        alloc.selected_base_amount_usd,
-                        alloc.selected_base_amount_usd_at,
+                if second_scan_had_failures:
+                    # The reload itself could not fully verify this run's
+                    # same-day context either. A ticker whose ONLY artifact is
+                    # unreadable/mid-flush on BOTH passes never appears as a
+                    # key in either mapping, so it is invisible to
+                    # `still_unresolved` above (which only inspects existing
+                    # keys) even though its prior context genuinely could not
+                    # be confirmed -- that ticker will still be evaluated as
+                    # `no_prior_run` downstream (Codex review: "Retain the
+                    # second-pass scan failure signal"). There is no ticker
+                    # name to route conservatively here (the skipped file's
+                    # own content -- and therefore which ticker it belonged to
+                    # -- was exactly what failed to be read), and unilaterally
+                    # blocking the entire run over an unattributed scan
+                    # failure would be a much larger behavior change than a
+                    # bounded-reload fix should make on its own; escalate
+                    # loudly instead so an operator can decide whether the
+                    # affected artifacts warrant a manual hold.
+                    logger.warning(
+                        "same-day context scan for %s still had unreadable/unparseable "
+                        "artifacts after the bounded reload; a ticker whose ONLY "
+                        "same-day artifact was affected would not appear in "
+                        "prior_same_day_allocations at all and may be evaluated "
+                        "as no_prior_run -- verify this run's same-day artifact "
+                        "trees manually before trusting its top-up guard results",
+                        artifacts_dir,
                     )
-                    prior_same_day_allocations[ticker] = PriorSameDayAllocation(
-                        ticker=ticker,
-                        amount_usd=existing.amount_usd + alloc.amount_usd,
-                        reference_price=ref,
-                        run_id=alloc.run_id or existing.run_id,
-                        source=alloc.source or existing.source,
-                        selected_base_amount_usd=base,
-                        selected_base_amount_usd_at=base_at,
-                    )
-            # Manual-context discovery (scripts.run_classification.load_same_day_top_up_context)
-            # only runs for the auto-derived root: it scans SIBLINGS of afternoon_root's
-            # parent (the production cron_tracking layout), which would silently pull in
-            # unrelated trees for a caller that passed an explicit prior_allocation_state_root
-            # to scan ONLY that tree (Codex review: "Respect explicit prior-allocation root
-            # isolation"). Capped at the run time for the same replay-safety reason as above
-            # (Codex review: "Bound manual top-up context to the scheduled execution time").
-            merge_manual_top_up_context(
-                prior_same_day_allocations,
-                load_same_day_top_up_context(
-                    trading_day.isoformat(), base=afternoon_root,
-                    boundary_et=now.astimezone(EASTERN).time(),
-                ),
-            )
+            else:
+                prior_same_day_allocations = first_pass
         else:
             prior_same_day_allocations = load_prior_same_day_allocations(
                 prior_allocation_state_root, trading_day,

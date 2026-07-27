@@ -210,9 +210,28 @@ Only earlier runs generated **before 2:30 PM ET** contribute, and scheduled runs
 are never read as prior context — so morning/manual orders before 2:30 PM ET are
 read for top-up only, never as afternoon scheduled execution evidence,
 slippage, watchdog confirmation, scheduled cost basis, or scheduled fill counts.
-When multiple earlier runs touched a ticker the dollar amounts are summed and the
-**lowest** available reference price wins. The scheduled run always writes a valid
+When multiple earlier runs touched a ticker the dollar amounts are summed and that
+ticker's **most recent** valid reference price wins (near_close_dca loader: by `generated_at` when parseable; manual CSV loader: by artifact scan order).
+Untimestamped runs defer to later scan/merge order, and a manual fill folded in last is
+treated as the most recent reference. Any unknown contributing reference still
+poisons the aggregate to unknown. The scheduled run always writes a valid
 scheduled `run_state` even when every buy is fully offset to $0.
+
+> **Ticker-scoped top-up (Jul 24 2026):** the same-day top-up guard is applied
+> independently per ticker. A ticker with no prior same-day context is always
+> evaluated as a first buy against yesterday's close and low, and prior same-day
+> buys in other symbols must never suppress it. A ticker with same-day context is
+> gated only against its own same-day reference; when the current price is not
+> strictly lower, or the corrected delta is 0, it is skipped with reason
+> `same_day_topup_not_lower_or_no_delta`. The canonical statement of this rule and
+> its reason strings live in
+> [`config/scheduled_tasks.json`](../config/scheduled_tasks.json)
+> (`canonical_first_buy_and_topup_rule`). The runner implements that rule exactly:
+> a ticker's same-day comparison reference is its most recent valid same-day buy
+> reference (by `generated_at`; ties and untimestamped runs defer to later scan
+> order, and a manual fill folded in last is treated as most recent). Any unknown
+> contributing reference poisons the aggregate to unknown and routes the guard to
+> its conservative missing-price / manual review $0 path.
 
 Per candidate, the scheduled `run_state` records `prior_same_day_amount`,
 `prior_same_day_reference_price`, `prior_same_day_run_id`, `prior_same_day_source`,
@@ -311,6 +330,37 @@ normalize, compute, place): **9 incremental scheduled afternoon orders totalling
 $31.50** under
 `/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260710_1520ET/`,
 `recovery_from_escalation=true` — valid afternoon scheduled evidence.
+
+### Intraday 2:30 PM ET scheduled recovery (2026-07-24)
+
+On **2026-07-24** the **2:30 PM ET intraday scheduled run** (stream
+`intraday_1430`, run id `intraday_live_20260724_1430ET`) prepared its
+market-data and signal artifacts but could not call `place_equity_order` from
+the scheduled subagent. Following the failure-recovery policy, the parent
+submitted the qualifying `place_equity_order` calls with idempotency keys and
+reconciled them against Robinhood: **18 orders filled, 0 missing, $72.00 total
+recovered spend**. Artifacts live under
+`/home/user/workspace/cron_tracking/intraday_dca/20260724_1430ET/`
+(`submitted_orders.csv`, `run_state.json`, `run_summary.json`, and
+`parent_recovery_submission_summary.json`).
+
+This is classified as a **scheduled intraday recovery**: `run_origin='scheduled'`,
+`manual_run=false`, `recovery_rerun=true`, `parent_recovery_submission=true`. It
+is valid scheduled evidence for the `intraday_1430` stream and valid same-day
+prior-allocation / top-up context for later same-day runs (gated by the canonical
+first-buy and same-day top-up rule). It **must not** be treated as manual evidence
+and **must not** be counted as proof that any other stream (morning 10:30, midday
+12:30, or afternoon 3:20) ran.
+
+Fills: TRIN $3.00 @ 17.2164, IRDM $5.00 @ 45.7799, DXYZ $6.00 @ 22.9287, ASML
+$4.00 @ 1760.8199, STX $8.00 @ 859.2699, AMAT $6.00 @ 536.3400, AMD $4.00 @
+524.7103, BTX $3.00 @ 8.2099, STM $5.00 @ 51.7199, TSM $4.00 @ 405.8750, AVGO
+$5.00 @ 380.2600, NVDA $1.00 @ 207.0400, INTC $7.00 @ 94.0800, GS $1.50 @
+1062.7200, XLG $1.00 @ 59.9196, QTOP $3.00 @ 35.8067, RGTI $4.00 @ 14.4278, TXN
+$1.50 @ 280.3527. The canonical
+[first-buy and same-day top-up rule](../config/scheduled_tasks.json)
+(`canonical_first_buy_and_topup_rule`), active universe, exclusions, provider
+policy, artifact contract, and cost-conscious mode are unchanged by this record.
 
 ## Execution constraints
 
