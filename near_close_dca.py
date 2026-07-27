@@ -384,6 +384,7 @@ TOP_UP_NO_INCREMENTAL = "no_incremental_difference"  # afternoon desired <= prio
 # two legacy codes above for that guard specifically.
 TOP_UP_NOT_LOWER_OR_NO_DELTA = "same_day_topup_not_lower_or_no_delta"  # afternoon price not lower or delta 0 -> $0
 TOP_UP_MISSING_PRIOR_PRICE = "missing_prior_price"  # prior amount known but no ref price -> $0 (manual review)
+TOP_UP_MISSING_PRIOR_BASE = "missing_prior_base"  # prior amount known but no resolved base -> $0 (manual review)
 
 
 @dataclass(frozen=True)
@@ -408,8 +409,12 @@ class PriorSameDayAllocation:
     reference_ts: Optional[datetime] = None
     # The first same-day allocation's selected_base_amount_usd ($1 or $2), when the
     # contributing artifact recorded one. None for older artifacts that predate this
-    # field, or when it could not be resolved -- callers must treat that as "unknown"
-    # (fall back to recomputing from the current run) rather than as $0.
+    # field, or when it could not be resolved -- never treat that as $0. A caller with
+    # a known prior amount_usd but this still None must fail closed (bounded reload,
+    # then manual review) rather than silently recompute the base from the current
+    # run's own price (Codex review: "Fail closed when the first allocation base is
+    # unknown"); see run_dca._tickers_with_unresolved_same_day_context and
+    # near_close_dca.evaluate_top_up_guard / morning_dca._evaluate_top_up.
     selected_base_amount_usd: Optional[float] = None
     # The contributing run's generated_at (ISO string) that established
     # selected_base_amount_usd, so merging allocations from different roots/streams
@@ -1505,9 +1510,15 @@ def resolve_top_up_desired_amount_usd(
     the $1 to the $2 scale and over-order the incremental difference.
 
     Falls back to ``current_suggested_amount_usd``/``current_base_amount_usd``
-    (the pre-existing behavior) when there is no prior allocation, or it
-    predates this field / could not be resolved -- never treat an unknown
-    preserved base as $0.
+    (the pre-existing behavior) when there is no prior allocation. When a prior
+    allocation exists but predates this field / could not be resolved, this
+    still returns that same fallback -- never treat an unknown preserved base
+    as $0 here -- but callers with a known prior amount (``prior.amount_usd >
+    0``) must not trust this fallback value directly: they fail closed
+    (manual review, $0) instead of using it, since silently recomputing the
+    base from the current run's own price is exactly the bug this function
+    exists to prevent (Codex review: "Fail closed when the first allocation
+    base is unknown"; see evaluate_top_up_guard's own check).
 
     Returns ``(desired_amount_usd, effective_base_amount_usd)`` -- the latter is
     whichever base actually produced ``desired_amount_usd``, so a caller
@@ -1585,6 +1596,17 @@ def evaluate_top_up_guard(
     # No earlier same-day allocation: behave exactly like a normal scheduled run.
     if prior is None or prior.amount_usd <= 0:
         return _outcome(desired, TOP_UP_NO_PRIOR_RUN, skipped=desired <= 0)
+
+    # Prior amount is known but its first-allocation base ($1 or $2) could not
+    # be resolved (legacy artifact predating the field, or an unresolved bare
+    # manual CSV entry) -- resolve_top_up_desired_amount_usd's fallback above
+    # silently recomputed `desired` from THIS run's own freshly selected base,
+    # which is exactly the base-upgrade/downgrade bug the preserved-base rule
+    # exists to prevent. Fail closed like a missing reference price instead of
+    # trusting that silently-recomputed target (Codex review: "Fail closed
+    # when the first allocation base is unknown").
+    if prior.selected_base_amount_usd is None or prior.selected_base_amount_usd <= 0:
+        return _outcome(0.0, TOP_UP_MISSING_PRIOR_BASE, skipped=True, manual_review=True)
 
     # Prior amount is known but we cannot establish a comparable price on either side.
     # Prefer the conservative no-top-up path and flag the ticker for manual review.
@@ -1808,7 +1830,7 @@ def _build_buy_candidates(
             "planned_amount_usd": round(planned_amount_usd, 2),
             "target_price": target_price,
             "target_price_missing": target_price is None,
-            "decision_bar_close": target_price,
+            "decision_bar_close": decision.decision_bar_close,
             "previous_close": (
                 decision.finance_signal.previous_close
                 if decision.finance_signal is not None
@@ -2196,23 +2218,28 @@ def _prior_run_is_scheduled(run_state: Dict[str, Any]) -> bool:
     """True when a run_state is classified as the scheduled *afternoon* run.
 
     The scheduled afternoon run is never read as prior allocation context. A
-    morning- or midday-stream run (``run_classification.stream`` in
-    ``{'morning', 'midday'}``), however, IS eligible prior context even when its
-    own ``run_origin`` is ``'scheduled'``: the 10:30 AM morning live task and the
-    12:30 PM midday live task are scheduled within their own streams but must
-    still offset the afternoon top-up. An ad hoc intraday scheduled-recovery
-    stream (``stream`` starting with ``'intraday'`` -- e.g. the Jul 24 2026
+    morning-, midday-, or market-open-stream run (``run_classification.stream``
+    in ``{'morning', 'midday', 'market_open'}``), however, IS eligible prior
+    context even when its own ``run_origin`` is ``'scheduled'``: the 9:35 AM
+    market-open live task, the 10:30 AM morning live task, and the 12:30 PM
+    midday live task are scheduled within their own streams but must still
+    offset the afternoon top-up (Codex review: "Feed market-open fills into
+    later top-up guards"). An ad hoc intraday scheduled-recovery stream
+    (``stream`` starting with ``'intraday'`` -- e.g. the Jul 24 2026
     ``intraday_1430`` recovery, see config/scheduled_tasks.json
-    canonical_first_buy_and_topup_rule -> intraday_dca_scheduled_recovery_2026_07_24)
-    is eligible for the same reason: it is scheduled evidence for ITS OWN
-    stream but must still offset a later same-day run (Codex review: "Include
-    the intraday recovery in later top-up context"). Only afternoon scheduled
-    runs are excluded here.
+    canonical_first_buy_and_topup_rule -> intraday_dca_scheduled_recovery_2026_07_24,
+    and the recurring 11:30/13:30/14:30 intraday live task 7be82b97) is
+    eligible for the same reason: it is scheduled evidence for ITS OWN stream
+    but must still offset a later same-day run (Codex review: "Include the
+    intraday recovery in later top-up context"). Only afternoon scheduled runs
+    are excluded here.
     """
     classification = run_state.get("run_classification")
     if isinstance(classification, dict):
         stream = classification.get("stream")
-        if stream in ("morning", "midday") or (isinstance(stream, str) and stream.startswith("intraday")):
+        if stream in ("morning", "midday", "market_open") or (
+            isinstance(stream, str) and stream.startswith("intraday")
+        ):
             return False
         if classification.get("run_origin") == "scheduled":
             return True

@@ -32,6 +32,7 @@ from morning_dca import (
 from near_close_dca import (
     EASTERN,
     TOP_UP_INCREMENTAL,
+    TOP_UP_MISSING_PRIOR_BASE,
     TOP_UP_MISSING_PRIOR_PRICE,
     TOP_UP_NO_PRIOR_RUN,
     TOP_UP_PRICE_NOT_BELOW,
@@ -144,15 +145,26 @@ def _write_prior_morning_run(
     quantity=None,
     trading_day=date(2026, 7, 8),
     generated_at="2026-07-08T10:30:00-04:00",
+    selected_base_amount_usd=None,
 ):
     """Write a synthetic morning/manual prior-allocation artifact under ``root``.
 
     When ``fill_price``/``quantity`` are given an ``orders.csv`` fill is written
     too, so ``load_prior_same_day_allocations`` resolves a known reference price;
     otherwise the reference price stays unknown (manual-review path).
+
+    ``selected_base_amount_usd`` mirrors a real artifact's recorded
+    first-allocation base; omitting it (the default) simulates a legacy
+    artifact that predates the field, which now routes the top-up guard to
+    missing_prior_base/manual review (Codex review: "Fail closed when the
+    first allocation base is unknown") rather than silently recomputing from
+    this run's own price.
     """
     run_dir = root / f"{trading_day.strftime('%Y%m%d')}_1030ET"
     run_dir.mkdir(parents=True, exist_ok=True)
+    candidate = {"ticker": ticker, "status": "filled", "planned_amount_usd": planned_amount}
+    if selected_base_amount_usd is not None:
+        candidate["selected_base_amount_usd"] = selected_base_amount_usd
     run_state = {
         "trading_day": trading_day.isoformat(),
         "generated_at": generated_at,
@@ -162,9 +174,7 @@ def _write_prior_morning_run(
             "stream": "morning",
             "run_id": "manual_morning_live_test",
         },
-        "buy_candidates": [
-            {"ticker": ticker, "status": "filled", "planned_amount_usd": planned_amount}
-        ],
+        "buy_candidates": [candidate],
     }
     (run_dir / "run_state.json").write_text(json.dumps(run_state), encoding="utf-8")
     if fill_price is not None and quantity is not None:
@@ -187,6 +197,27 @@ def test_midday_ladder_matches_afternoon_and_morning():
     assert ex.multiplier_for_drop(0.08) == 5.0
     assert graded_buy_multiplier(0.08, StrategyConfig()) == 5.0
     assert MIDDAY_SIZING_TIERS == MORNING_SIZING_TIERS
+
+
+def test_midday_default_prior_allocation_roots_include_market_open_and_intraday():
+    # Codex review ("Feed market-open fills into later top-up guards"; "Include
+    # the 11:30 intraday run in midday context"): the midday guard's own
+    # hardcoded default prior_allocation_roots must scan the 9:35 market-open
+    # and 11:30/13:30/14:30 intraday roots in addition to morning/afternoon,
+    # so those earlier same-day fills offset the 12:30 desired amount instead
+    # of being re-bought as first allocations.
+    from morning_dca import (
+        DEFAULT_AFTERNOON_TASK_ROOT,
+        DEFAULT_INTRADAY_TASK_ROOT,
+        DEFAULT_MARKET_OPEN_TASK_ROOT,
+        DEFAULT_MORNING_LIVE_STATE_ROOT,
+    )
+
+    roots = MiddayConfig().prior_allocation_roots
+    assert DEFAULT_MARKET_OPEN_TASK_ROOT in roots
+    assert DEFAULT_MORNING_LIVE_STATE_ROOT in roots
+    assert DEFAULT_INTRADAY_TASK_ROOT in roots
+    assert DEFAULT_AFTERNOON_TASK_ROOT in roots
 
 
 def test_midday_ladder_brackets():
@@ -385,7 +416,7 @@ def test_top_up_incremental_when_price_below_prior(tmp_path):
     # Morning bought ~$2 at a fill price of 95.0.
     _write_prior_morning_run(
         prior_root, ticker="BIG", planned_amount=2.0,
-        fill_price=95.0, quantity=round(2.0 / 95.0, 6),
+        fill_price=95.0, quantity=round(2.0 / 95.0, 6), selected_base_amount_usd=2.0,
     )
     cfg = MiddayConfig(
         tickers=("BIG",), base_buy_amount_usd=2.0,
@@ -415,6 +446,14 @@ def test_top_up_loads_manual_csv_only_context(tmp_path):
     # multi alone cannot read (no buy_candidates to read, no artifacts block to
     # fall back to). Only scripts.run_classification.load_same_day_top_up_context,
     # wired into the shared _compute_top_up, can see it.
+    #
+    # A bare manual CSV row (the ONLY shape this loader exists for) never
+    # carries a selected_base_amount_usd column, so the guard now fails
+    # closed on the unresolved base (Codex review: "Fail closed when the
+    # first allocation base is unknown") instead of silently recomputing the
+    # full-day target from this run's own price -- it still surfaces the
+    # loaded prior amount/reference for the manual reviewer, just with a $0
+    # order and manual_review flagged rather than a live incremental buy.
     now = _now_midday()
     trading_day_iso = now.astimezone(EASTERN).date().isoformat()
     manual_dir = tmp_path / "midday_dca" / "manual_runs" / "20260708_1145ET"
@@ -447,10 +486,11 @@ def test_top_up_loads_manual_csv_only_context(tmp_path):
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
     res = ex.run(now, data, broker=FakeLiveBroker())
     row = res["artifacts"]["buy_candidates"][0]
-    assert row["top_up_guard_result"] == TOP_UP_INCREMENTAL
+    assert row["top_up_guard_result"] == TOP_UP_MISSING_PRIOR_BASE
     assert row["prior_same_day_amount"] == 2.0
     assert row["prior_same_day_reference_price"] == 95.0
-    assert row["incremental_order_amount"] == 8.0
+    assert row["incremental_order_amount"] == 0.0
+    assert row["top_up_manual_review"] is True
 
 
 def test_top_up_manual_csv_context_respects_explicit_prior_allocation_roots(tmp_path):
@@ -577,7 +617,7 @@ def test_guarded_midday_top_up_checks_same_stream_duplicate_before_placing(tmp_p
     prior_root = tmp_path / "morning"
     _write_prior_morning_run(
         prior_root, ticker="BIG", planned_amount=2.0,
-        fill_price=95.0, quantity=round(2.0 / 95.0, 6),
+        fill_price=95.0, quantity=round(2.0 / 95.0, 6), selected_base_amount_usd=2.0,
     )
     cfg = MiddayConfig(
         tickers=("BIG",), base_buy_amount_usd=2.0,
@@ -613,7 +653,7 @@ def test_manual_retry_of_guarded_top_up_duplicate_is_skipped_not_submitted(tmp_p
     prior_root = tmp_path / "morning"
     _write_prior_morning_run(
         prior_root, ticker="BIG", planned_amount=2.0,
-        fill_price=95.0, quantity=round(2.0 / 95.0, 6),
+        fill_price=95.0, quantity=round(2.0 / 95.0, 6), selected_base_amount_usd=2.0,
     )
     cfg = MiddayConfig(
         tickers=("BIG",), base_buy_amount_usd=2.0,
@@ -644,7 +684,7 @@ def test_guarded_midday_top_up_blocks_when_same_stream_checker_unavailable(tmp_p
     prior_root = tmp_path / "morning"
     _write_prior_morning_run(
         prior_root, ticker="BIG", planned_amount=2.0,
-        fill_price=95.0, quantity=round(2.0 / 95.0, 6),
+        fill_price=95.0, quantity=round(2.0 / 95.0, 6), selected_base_amount_usd=2.0,
     )
     cfg = MiddayConfig(
         tickers=("BIG",), base_buy_amount_usd=2.0,
@@ -668,7 +708,7 @@ def test_guarded_midday_top_up_ignores_cross_stream_duplicate_for_incremental_or
     prior_root = tmp_path / "morning"
     _write_prior_morning_run(
         prior_root, ticker="BIG", planned_amount=2.0,
-        fill_price=95.0, quantity=round(2.0 / 95.0, 6),
+        fill_price=95.0, quantity=round(2.0 / 95.0, 6), selected_base_amount_usd=2.0,
     )
     cfg = MiddayConfig(
         tickers=("BIG",), base_buy_amount_usd=2.0,
@@ -693,7 +733,7 @@ def test_top_up_zero_when_price_not_below_prior(tmp_path):
     # Morning fill price 50.0 (below the midday price of 90.0).
     _write_prior_morning_run(
         prior_root, ticker="BIG", planned_amount=2.0,
-        fill_price=50.0, quantity=round(2.0 / 50.0, 6),
+        fill_price=50.0, quantity=round(2.0 / 50.0, 6), selected_base_amount_usd=2.0,
     )
     cfg = MiddayConfig(
         tickers=("BIG",), base_buy_amount_usd=2.0,
@@ -720,7 +760,9 @@ def test_top_up_zero_when_price_not_below_prior(tmp_path):
 def test_top_up_manual_review_when_prior_price_unknown(tmp_path):
     prior_root = tmp_path / "morning"
     # Prior amount known but no orders.csv -> unknown reference price.
-    _write_prior_morning_run(prior_root, ticker="BIG", planned_amount=2.0)
+    _write_prior_morning_run(
+        prior_root, ticker="BIG", planned_amount=2.0, selected_base_amount_usd=2.0,
+    )
     cfg = MiddayConfig(
         tickers=("BIG",), base_buy_amount_usd=2.0,
         morning_run_state_root=str(tmp_path / "midday"),
@@ -790,7 +832,7 @@ def test_manual_review_candidate_row_keeps_top_up_context_when_trend_unvalidated
     prior_root = tmp_path / "morning"
     _write_prior_morning_run(
         prior_root, ticker="BIG", planned_amount=3.0,
-        fill_price=95.0, quantity=round(3.0 / 95.0, 6),
+        fill_price=95.0, quantity=round(3.0 / 95.0, 6), selected_base_amount_usd=3.0,
     )
     cfg = MiddayConfig(
         tickers=("BIG",), base_buy_amount_usd=3.0,

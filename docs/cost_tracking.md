@@ -100,15 +100,19 @@ behavior **only** — it does **not** relax any trading safety rule (see
 
 | ET | Task | Role |
 |---|---|---|
-| 9:00 AM | `b7961407` | pre-market buying-power dashboard (read-only) |
-| 9:45 AM | `cd45e95b` | volatility outlier scan (read-only) |
+| 9:35 AM | `2ba19526` | market-open live execution |
+| 9:45 AM | `bb4f6ef1` | watchlist early-warning scan (read-only) |
 | 9:45 AM | `morning-dca-0945` | pre-flight validation (read-only) |
 | 10:30 AM | `42173154` | morning live execution |
+| 11:30 AM, 1:30 PM, 2:30 PM | `7be82b97` | intraday live execution (three slots) |
 | 12:30 PM | `a6239dae` | midday live execution |
-| 3:05 PM | `e3e6f09e` | monitor-only signal check (read-only) |
 | 3:20 PM | `10ce362c` | final live execution (final buy of the day) |
 | 3:35 PM | `67aa802b` | post-trade slippage + compact Notion **Latest Run** sync |
 | 3:40 PM | `a46bf007` | live-run watchdog |
+
+The 3:05 PM monitor-only signal check `e3e6f09e` is `paused` and is not in the
+live scheduler, so it is not listed above. The retired tasks `b7961407`,
+`cd45e95b`, `d72aa525`, and `d1f7a2c0` are not covered either.
 
 ### Keep daily runs compact
 
@@ -155,15 +159,21 @@ Covered daily tasks (same set as the routing policy):
 
 | ET | Task | Stream |
 |---|---|---|
-| 9:00 AM | `b7961407` | dashboard |
-| 9:45 AM | `cd45e95b` | scan |
+| 9:35 AM | `2ba19526` | market_open |
+| 9:45 AM | `bb4f6ef1` | watchlist |
 | 9:45 AM | `morning-dca-0945` | preflight |
 | 10:30 AM | `42173154` | morning |
+| 11:30 AM, 1:30 PM, 2:30 PM | `7be82b97` | intraday |
 | 12:30 PM | `a6239dae` | midday |
-| 3:05 PM | `e3e6f09e` | monitor |
 | 3:20 PM | `10ce362c` | afternoon |
 | 3:35 PM | `67aa802b` | slippage |
 | 3:40 PM | `a46bf007` | watchdog |
+
+`7be82b97` fires three times a day from one cron entry, so its manifest row
+carries the combined default `"11:30,13:30,14:30"`. Each run should pass its own
+slot as an explicit `scheduled_for_et` override so the log records the real fire
+time. The manifest keeps exactly one row per `task_id` because
+`_load_task_directory` keys on it.
 
 **Writer implementation:** [`scripts/model_usage_log.py`](../scripts/model_usage_log.py)
 appends the entry; every append is best-effort (never raises into or blocks
@@ -190,9 +200,9 @@ defaults to `None`, so ad-hoc/test construction never touches the real path.
   explicit roots, e.g. `classification_state_root`) so, matching that
   existing pattern, `model_usage_log_root` there stays caller-opt-in rather
   than defaulted.
-- **CLI for the rest:** `b7961407`, `cd45e95b`, `e3e6f09e`, and `a46bf007`
-  are pure agent-run analytics/monitoring tasks with no in-repo executor to
-  wire a call into, so the scheduler/agent appends their entry directly:
+- **CLI for the rest:** `2ba19526`, `bb4f6ef1`, `7be82b97`, and `a46bf007`
+  have no dedicated in-repo entry point to wire a call into; they are driven
+  directly by the external scheduler/agent, which appends their entry itself:
   `python -m scripts.model_usage_log --run-id <id> --task-id <id> --artifact-path <path>`
   (see `--help` for the full option list).
 - **What Python cannot know:** this module has no visibility into which

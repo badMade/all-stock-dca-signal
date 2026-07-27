@@ -44,6 +44,8 @@ from typing import Any, Dict, Optional, Tuple
 from dca_config import get_config_dir, load_tickers
 from morning_dca import (
     DEFAULT_AFTERNOON_TASK_ROOT,
+    DEFAULT_INTRADAY_TASK_ROOT,
+    DEFAULT_MARKET_OPEN_TASK_ROOT,
     DEFAULT_MODEL_USAGE_LOG_ROOT,
     DEFAULT_MORNING_LIVE_STATE_ROOT,
     EXEC_MANUAL_REVIEW_CANDIDATE,
@@ -129,9 +131,15 @@ class MiddayConfig(MorningConfig):
     # both scheduled morning-live runs and manual recovery runs
     # (load_prior_same_day_allocations rglobs recursively). The afternoon task
     # root ensures that manual fills recorded through the afternoon path before
-    # 12:30 PM are also visible to the midday top-up guard.
+    # 12:30 PM are also visible to the midday top-up guard. The market-open
+    # root catches the 9:35 AM fill (Codex review: "Feed market-open fills
+    # into later top-up guards") and the intraday root catches the 11:30 AM
+    # slot's fill (Codex review: "Include the 11:30 intraday run in midday
+    # context") -- both precede the 12:30 midday decision.
     prior_allocation_roots: Tuple[str, ...] = (
+        DEFAULT_MARKET_OPEN_TASK_ROOT,
         DEFAULT_MORNING_LIVE_STATE_ROOT,
+        DEFAULT_INTRADAY_TASK_ROOT,
         DEFAULT_AFTERNOON_TASK_ROOT,
     )
 

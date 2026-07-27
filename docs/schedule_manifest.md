@@ -79,8 +79,9 @@ Feb, Nov, Dec). Re-verify around DST transitions.
 > [drift_detection.md](drift_detection.md) and the `drift_detection_policy` block
 > in [`config/scheduled_tasks.json`](../config/scheduled_tasks.json). The drift
 > detector shipped in **PR #80** (merge commit `3641b90`) and is wired into all
-> three live tasks via their `post_artifact_drift_check` blocks and the
-> `d1f7a2c0` monitoring entry.
+> live trading tasks via their `post_artifact_drift_check` blocks. The former
+> `d1f7a2c0` schedule entry is retired (it was never a scheduler cron); the
+> detector itself is unchanged and still runs in-process after every live run.
 
 > **Cost-saving operating mode (requested Thu Jul 16 2026):** the weekday chain
 > runs in **compact** mode and all heavy analysis is deferred to the **Friday
@@ -329,11 +330,12 @@ Feb, Nov, Dec). Re-verify around DST transitions.
 > premium models unless needed for failure recovery, safety validation, or
 > connector/debug escalation. Keep daily output compact, write JSON/CSV
 > artifacts, suppress no-op notifications, and leave heavy analysis to Friday
-> weekly or monthly review.** It applies to the 9:00 AM pre-market buying-power
-> dashboard (`b7961407`), the 9:45 AM pre-flight / early-warning scans
-> (`morning-dca-0945`, `cd45e95b`), the 10:30 AM morning live execution
-> (`42173154`), the 12:30 PM midday live execution (`a6239dae`), the 3:05 PM
-> monitor-only signal check (`e3e6f09e`), the 3:20 PM final live buy
+> weekly or monthly review.** It applies to the 9:35 AM market-open live
+> execution (`2ba19526`), the 9:45 AM pre-flight / early-warning scans
+> (`morning-dca-0945`, `bb4f6ef1`), the 10:30 AM morning live execution
+> (`42173154`), the 11:30 AM / 1:30 PM / 2:30 PM intraday live executions
+> (`7be82b97`), the 12:30 PM midday live execution (`a6239dae`), the 3:05 PM
+> monitor-only signal check (`e3e6f09e`, paused), the 3:20 PM final live buy
 > (`10ce362c`), the 3:35 PM slippage plus Notion latest-run sync (`67aa802b`),
 > and the 3:40 PM watchdog (`a46bf007`). It is a model-selection and
 > output-compactness rule only and changes no trading, schedule, top-up, budget,
@@ -650,14 +652,14 @@ Feb, Nov, Dec). Re-verify around DST transitions.
 
 | ID | Name | Type | Trades | Cron (UTC) | ET Equivalent | Status |
 |---|---|---|---|---|---|---|
-| `b7961407` | Pre-market DCA buying-power dashboard | analytics | no | `00 13 * * 1-5` | 9:00 AM weekdays | active |
-| `cd45e95b` | Compact DCA volatility outlier scan | analytics | no | `45 13 * * 1-5` | 9:45 AM weekdays | active |
+| `2ba19526` | Market-open graded DCA live Robinhood execution | trading | **yes** | `35 13 * * 1-5` | 9:35 AM weekdays | active |
+| `bb4f6ef1` | Watchlist early-warning scan (read-only) | analytics | no | `45 13 * * 1-5` | 9:45 AM weekdays | active |
 | `morning-dca-0945` | Morning graded DCA pre-flight validation (`MorningDCAExecutor`) | analytics | no | `45 13 * * 1-5` | 9:45 AM weekdays | active |
 | `42173154` | Weekday 10:30 AM morning DCA live Robinhood execution (`MorningDCAExecutor`) | trading | **yes** | `30 14 * * 1-5` | 10:30 AM weekdays | active |
+| `7be82b97` | Intraday graded DCA live Robinhood execution (11:30 / 1:30 / 2:30 PM ET) | trading | **yes** | `30 15,17,18 * * 1-5` | 11:30 AM, 1:30 PM, 2:30 PM weekdays | active |
 | `a6239dae` | Weekday 12:30 PM midday DCA live Robinhood execution (`MiddayDCAExecutor`) | trading | **yes** | `30 16 * * 1-5` | 12:30 PM weekdays | active |
-| `e3e6f09e` | Monitor-only graded DCA signal check | monitoring | no | `5 19 * * 1-5` | 3:05 PM weekdays | active |
+| `e3e6f09e` | Monitor-only graded DCA signal check | monitoring | no | (paused) | was 3:05 PM weekdays | paused |
 | `10ce362c` | Graded DCA automatic live test - $2 allocation (supersedes `ce16ba6b`) | trading | **yes** | `20 19 * * 1-5` | 3:20 PM weekdays | active |
-| `d72aa525` | Capital-priority briefing | analytics | no | `25 19 * * 1-5` | 3:25 PM weekdays | active |
 | `67aa802b` | Post-trade slippage + compact Notion latest-run sync | analytics | no | `35 19 * * 1-5` | 3:35 PM weekdays | active |
 | `a46bf007` | Live-run watchdog | monitoring | no | `40 19 * * 1-5` | 3:40 PM weekdays | active |
 | `041d9d90` | Weekly DCA Notion performance dashboard refresh | analytics | no | `0 21 * * 5` | Fri 5:00 PM | active |
@@ -667,17 +669,49 @@ Feb, Nov, Dec). Re-verify around DST transitions.
 | `c9fb1fb8` | Month-end DCA volatility risk table refresh (EDT months) | analytics | no | `0 21 25-31 3-10 *` | 5:00 PM ET final eligible market day (Mar-Oct) | active |
 | `17a3b2a9` | Month-end DCA volatility risk table refresh (EST months) | analytics | no | `0 22 25-31 1,2,11,12 *` | 5:00 PM ET final eligible market day (Jan, Feb, Nov, Dec) | active |
 
+## Retired / superseded tasks (not in the live scheduler)
+
+Reconciled against the live scheduler on **2026-07-27**. The task IDs below are
+**not** in the live scheduler and are **not active schedule entries**. They are
+listed here as historical records only and must not be treated as expected daily
+evidence. Their absence from a run is not a failure. Machine-readable source:
+[`config/scheduled_tasks.json`](../config/scheduled_tasks.json) →
+`live_scheduler_reconciliation_2026_07_27`.
+
+| ID | Former slot | Name | Status | Note |
+|---|---|---|---|---|
+| `b7961407` | 9:00 AM | Pre-market DCA buying-power dashboard | disabled | Retired. `cron_utc` removed so it cannot be re-registered from the manifest entry. |
+| `cd45e95b` | 9:45 AM | Compact DCA volatility outlier scan | disabled | Superseded by `bb4f6ef1` (watchlist early-warning scan). |
+| `d72aa525` | 3:25 PM | Capital-priority briefing | disabled | Retired. |
+| `d1f7a2c0` | post-artifact hook | Post-artifact DCA drift detector | disabled | Never a scheduler cron. Only the schedule registration is retired: per `drift_detection_policy` each live trading run still invokes `scripts/drift_detection.py` in-process after writing artifacts. |
+
+`e3e6f09e` (monitor-only signal check, formerly 3:05 PM) is **paused**, not
+retired: it is represented but not firing, and is not expected daily evidence
+while paused. `f7411889` remains a one-time reminder, not a recurring stream.
+
 ## Task details
 
-### `b7961407` — Pre-market DCA buying-power dashboard
-- Analytics only, **no trading**. Runs **9:00 AM ET weekdays**.
-- Pre-market buying-power dashboard using the current **$2 base 0x-to-5x ladder**.
+### `b7961407` - Pre-market DCA buying-power dashboard (RETIRED)
+- **RETIRED 2026-07-27, not in the live scheduler and not an active schedule entry.** Historical record only; see the Retired / superseded tasks table above.
+- Formerly analytics only, no trading, at 9:00 AM ET weekdays. Do not treat its absence as a failure and do not re-register it from this entry.
+
+### `cd45e95b` - Compact DCA volatility outlier scan (RETIRED)
+- **RETIRED 2026-07-27, superseded by `bb4f6ef1`.** Not in the live scheduler and not an active schedule entry. Historical record only.
+- Formerly analytics only, no trading, at 9:45 AM ET weekdays. The 9:45 AM read-only slot is now served by the watchlist early-warning scan `bb4f6ef1`.
+
+### `2ba19526` - Market-open graded DCA live Robinhood execution
+- **Live trading**. Runs **9:35 AM ET weekdays** (cron `35 13 * * 1-5`, 13:35 UTC during EDT). Verified in the live scheduler on 2026-07-27.
+- Uses the **$2 base 0x-to-5x ladder**. **Robinhood account 562057042 is the only execution broker**; Alpaca, Finance, and Yahoo are read-only validation/account context only.
+- Applies the canonical first-buy and same-day top-up rule: the first buy of the day for a ticker uses the yesterday close/low base before the ladder, and a ticker with same-day prior buy context compares against **that ticker's most recent valid same-day buy reference** and buys only `corrected_delta_usd = max(0, desired_usd - effective_prior_usd)`. See [`config/scheduled_tasks.json`](../config/scheduled_tasks.json) → `canonical_first_buy_and_topup_rule`.
+- Writes the standard scheduled artifact contract (`run_state.json` with nested `run_classification`, `run_summary.json`, `signals.csv`, `submitted_orders.csv`) under its own scheduled run directory. `run_classification` (`stream='market_open'`, `cron_id='2ba19526'`) validates against [`schemas/market_open_run_classification.schema.json`](../schemas/market_open_run_classification.schema.json).
+- **Prior-allocation context (added 2026-07-27):** a market-open fill is fed into the 10:30 morning, 12:30 midday, and 3:20 afternoon same-day top-up guards as prior-allocation context, so it is never re-bought as a first allocation (Codex review: "Feed market-open fills into later top-up guards"). See `near_close_dca._prior_run_is_scheduled`, `morning_dca.DEFAULT_MARKET_OPEN_TASK_ROOT`, and `run_dca.DEFAULT_MARKET_OPEN_LIVE_STATE_ROOT` (overridable via `DCA_MARKET_OPEN_LIVE_STATE_ROOT`).
+- **Recovery and drift detection (added 2026-07-27):** covered by `failure_recovery_policy` (see `applies_to_tasks`) and has its own `post_artifact_drift_check` block, matching the morning/midday/afternoon live tasks. See [`config/scheduled_tasks.json`](../config/scheduled_tasks.json).
 
 - **Cost-conscious model instruction (Jul 17 2026):** use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review. See the top-of-file cost-conscious model instruction note.
 
-### `cd45e95b` — Compact DCA volatility outlier scan
-- Analytics only, **no trading**. Runs **9:45 AM ET weekdays**.
-- Scans only **>5% outliers**; no full 41+ ticker narrative on no-outlier days. Uses the current $2 base 0x-to-5x ladder.
+### `bb4f6ef1` - Watchlist early-warning scan (read-only)
+- Analytics / **read-only**, **no trading**. Runs **9:45 AM ET weekdays** (cron `45 13 * * 1-5`). Verified in the live scheduler on 2026-07-27.
+- Supersedes the retired compact volatility outlier scan `cd45e95b`. Compact machine-readable output only; no full universe narrative on quiet days.
 
 - **Cost-conscious model instruction (Jul 17 2026):** use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review. See the top-of-file cost-conscious model instruction note.
 
@@ -748,14 +782,27 @@ Feb, Nov, Dec). Re-verify around DST transitions.
 
 - **Cost-conscious model instruction (Jul 17 2026):** use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review. See the top-of-file cost-conscious model instruction note.
 
-### `e3e6f09e` — Monitor-only graded DCA signal check
-- Analytics and notifications only; **no trades**. Runs **3:05 PM ET weekdays**.
+### `7be82b97` - Intraday graded DCA live Robinhood execution (11:30 / 1:30 / 2:30 PM ET)
+- **Live trading**. Fires at **three ET slots: 11:30 AM, 1:30 PM, and 2:30 PM weekdays** (cron `30 15,17,18 * * 1-5` during EDT). Verified in the live scheduler on 2026-07-27.
+- Uses the **$2 base 0x-to-5x ladder**. **Robinhood account 562057042 is the only execution broker**; Alpaca, Finance, and Yahoo are read-only validation/account context only.
+- Applies the canonical first-buy and same-day top-up rule with **ticker-scoped independence**: a ticker with same-day prior buy context compares against **that ticker's most recent valid same-day buy reference** (ordered by `generated_at`) and buys only `corrected_delta_usd = max(0, desired_usd - effective_prior_usd)`.
+- Each slot writes its own scheduled run directory under the intraday artifact root and records the slot that fired in `scheduled_for_et`.
+- The **2026-07-24 2:30 PM ET scheduled recovery** (18 fills, $72.00, 18 filled / 0 missing) belongs to this task. See [`config/scheduled_tasks.json`](../config/scheduled_tasks.json) → `intraday_dca_scheduled_recovery_2026_07_24` and the recovery subsection in [strategy.md](strategy.md).
+- The recurring task's own `run_classification` (`stream='intraday'`, `cron_id='7be82b97'`) validates against [`schemas/intraday_run_classification.schema.json`](../schemas/intraday_run_classification.schema.json), pinning window/`run_id` per fired slot; distinct from the ad hoc `intraday_1430`-style recovery stream name above.
+- **Prior-allocation context (added 2026-07-27):** an 11:30 AM fill is fed into the 12:30 midday and 3:20 afternoon same-day top-up guards as prior-allocation context, so it is never re-bought (Codex review: "Include the 11:30 intraday run in midday context"). See `morning_dca.DEFAULT_INTRADAY_TASK_ROOT` and `midday_dca.MiddayConfig.prior_allocation_roots`.
+- **Recovery and drift detection (added 2026-07-27):** covered by `failure_recovery_policy` (see `applies_to_tasks`) and has its own `post_artifact_drift_check` block, matching the morning/midday/afternoon live tasks. See [`config/scheduled_tasks.json`](../config/scheduled_tasks.json).
+
+- **Cost-conscious model instruction (Jul 17 2026):** use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review. See the top-of-file cost-conscious model instruction note.
+
+### `e3e6f09e` - Monitor-only graded DCA signal check (PAUSED)
+- **PAUSED 2026-07-27:** represented but not firing in the live scheduler. It is **not expected daily evidence** while paused, and its absence from a run is not a failure. Paused, not retired.
+- Analytics and notifications only; **no trades**. Formerly ran **3:05 PM ET weekdays**.
 - Monitor-only signal check that surfaces the planned allocation and tier selection using the current $2 base 0x-to-5x ladder.
 - **Pointer output normalization (Jul 20 2026):** although this task places no orders, it uses connector data, so any connector response returning an `output_path` or `current_session_context` pointer must be copied or normalized into the run raw directory before compute, and compute must read only the persisted raw files. See `config/scheduled_tasks.json` → `pointer_output_normalization_2026_07_20`.
 
 - **Cost-conscious model instruction (Jul 17 2026):** use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review. See the top-of-file cost-conscious model instruction note.
 
-### `10ce362c` — Graded DCA automatic live test - $2 allocation (the only trading task)
+### `10ce362c` - Graded DCA automatic live test - $2 allocation (final buy of the day)
 - Repaired live task `10ce362c`, which **supersedes the deleted `ce16ba6b`**; the artifact root stays under `.../ce16ba6b` for continuity.
 - Approved live trading task running the **$2 base 0x-to-5x ladder with tiered caps**. Places real market buy orders automatically within safeguards. Runs **3:20 PM ET weekdays**.
 - Uses **only** Robinhood account `562057042`; Alpaca is read-only.
@@ -856,9 +903,9 @@ Feb, Nov, Dec). Re-verify around DST transitions.
   (`final_scheduled_run_2026_07_16`, `slippage_reporting.scheduled_slippage_2026_07_16`)
   and `config/scheduled_tasks.json` (`scheduled_run_outcomes.runs`).
 
-### `d72aa525` — Capital-priority briefing
-- Analytics only, **no trading**. Runs **3:25 PM ET weekdays**.
-- Uses the current $2 base 0x-to-5x ladder. Sends **email/in-app notification only if at least one ticker triggers 1.5x or higher**; otherwise silent.
+### `d72aa525` - Capital-priority briefing (RETIRED)
+- **RETIRED 2026-07-27, not in the live scheduler and not an active schedule entry.** Historical record only; see the Retired / superseded tasks table above.
+- Formerly analytics only, no trading, at 3:25 PM ET weekdays. Do not treat its absence as a failure and do not re-register it from this entry.
 
 ### `67aa802b` — Post-trade slippage + compact Notion latest-run sync
 - Analytics only, **no trading**. Runs **3:35 PM ET weekdays**.

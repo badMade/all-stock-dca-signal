@@ -522,8 +522,12 @@ tasks. See the `pointer_output_normalization_2026_07_20` block in
 
 ## Recovery reruns
 
-The three scheduled **live** tasks — morning (`42173154`), midday (`a6239dae`),
-and afternoon (`10ce362c`) — support **automatic failure recovery**. When a run
+The five scheduled **live** tasks — market-open (`2ba19526`), morning
+(`42173154`), midday (`a6239dae`), intraday (`7be82b97`), and afternoon
+(`10ce362c`) — support **automatic failure recovery**. (Market-open and
+intraday were added to this coverage 2026-07-27, Codex review: "Apply
+recovery safeguards to the new live tasks"; they previously had no equivalent
+recovery rule despite being active real-money execution tasks.) When a run
 fails on **internal persistence, parsing, wrapper-normalization, transient
 connector throttling, or raw-file write** problems **after data was fetched**,
 the task treats it as a recovery trigger (not a terminal stop): it reruns the

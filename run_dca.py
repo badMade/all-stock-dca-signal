@@ -105,6 +105,21 @@ logger = logging.getLogger("near_close_dca.run")
 # review: "Derive the intraday root without a local absolute path").
 DEFAULT_INTRADAY_LIVE_STATE_ROOT = "intraday_dca"
 
+# Root for the recurring 9:35 AM ET market-open live task (2ba19526), which
+# like the intraday task above has no dedicated *_dca.py module/config of its
+# own but follows the same ``cron_tracking/<stream>_dca/`` layout. Declared
+# for the same reason as DEFAULT_INTRADAY_LIVE_STATE_ROOT and paired with
+# near_close_dca._prior_run_is_scheduled recognizing ``stream == "market_open"``
+# as eligible prior context (Codex review: "Feed market-open fills into later
+# top-up guards" -- without this, a 9:35 fill would never be loaded by a
+# later same-day run's top-up guard, which could then re-submit that
+# ticker's full first allocation). Overridable via the
+# DCA_MARKET_OPEN_LIVE_STATE_ROOT environment variable, mirroring
+# DCA_INTRADAY_LIVE_STATE_ROOT, for the same reason: there is no
+# MarketOpenConfig loader to source a deployment-specific root from. Kept a
+# bare relative name for the same portability reason as the intraday root.
+DEFAULT_MARKET_OPEN_LIVE_STATE_ROOT = "market_open_dca"
+
 # Stream label for the scheduled 3:20 PM ET final live run, used for the
 # failure-alert / heartbeat identity (DCA_HEARTBEAT_URL_AFTERNOON). Matches the
 # "afternoon" stream name recorded by scripts/run_classification.py pointers.
@@ -121,6 +136,7 @@ AFTERNOON_STREAM = "afternoon"
 # stream's own config can't be loaded (see
 # _resolve_cross_stream_prior_allocation_roots).
 _CROSS_STREAM_PRIOR_ALLOCATION_ROOTS: Tuple[str, ...] = (
+    DEFAULT_MARKET_OPEN_LIVE_STATE_ROOT,
     DEFAULT_MORNING_LIVE_STATE_ROOT,
     DEFAULT_MIDDAY_LIVE_STATE_ROOT,
     DEFAULT_INTRADAY_LIVE_STATE_ROOT,
@@ -285,6 +301,14 @@ def _resolve_cross_stream_prior_allocation_roots(
     _env_intraday_root = os.environ.get("DCA_INTRADAY_LIVE_STATE_ROOT")
     intraday_root = Path(_env_intraday_root) if _env_intraday_root else None
 
+    # Same reasoning as the intraday root above, but for the 9:35 AM
+    # market-open live task (2ba19526): there is no MarketOpenConfig loader
+    # either, so DCA_MARKET_OPEN_LIVE_STATE_ROOT is the deployment's own
+    # configuration for this root (Codex review: "Feed market-open fills
+    # into later top-up guards").
+    _env_market_open_root = os.environ.get("DCA_MARKET_OPEN_LIVE_STATE_ROOT")
+    market_open_root = Path(_env_market_open_root) if _env_market_open_root else None
+
     # Resolve UPFRONT whether the override is CONFIGURED at all, and
     # separately whether it needs its own scan entry (ACTIVE) -- these are
     # NOT the same question, and conflating them was itself a bug (Codex
@@ -316,27 +340,47 @@ def _resolve_cross_stream_prior_allocation_roots(
     intraday_override_configured = intraday_root is not None and not _intraday_is_ancestor_of_afternoon
     intraday_override_active = intraday_override_configured and not _intraday_is_nested_under_afternoon
 
+    # Same ancestor/nested/equal reasoning as intraday above, applied to the
+    # market-open override.
+    _market_open_is_ancestor_of_afternoon = (
+        market_open_root is not None
+        and _is_within(afternoon_root.resolve(), market_open_root.resolve())
+        and market_open_root.resolve() != afternoon_root.resolve()
+    )
+    _market_open_is_nested_under_afternoon = market_open_root is not None and _is_within(
+        market_open_root.resolve(), afternoon_root.resolve()
+    )
+    market_open_override_configured = (
+        market_open_root is not None and not _market_open_is_ancestor_of_afternoon
+    )
+    market_open_override_active = (
+        market_open_override_configured and not _market_open_is_nested_under_afternoon
+    )
+
     configured_roots = tuple(
         r
         for r in (
             _configured_root(morning_root, DEFAULT_MORNING_LIVE_STATE_ROOT),
             _configured_root(midday_root, DEFAULT_MIDDAY_LIVE_STATE_ROOT),
             intraday_root if intraday_override_active else None,
+            market_open_root if market_open_override_active else None,
         )
         if r is not None
     )
-    # The conventional intraday sibling fallback is included only when there
-    # is no CONFIGURED override -- any valid override (whether it needs its
-    # own scan entry or is already covered by the afternoon tree, equal to
-    # the fallback, or covered by some other ancestor) replaces it outright:
-    # the operator explicitly pointed the intraday root somewhere, and
-    # letting the fallback remain a candidate would risk double-counting
-    # real artifacts, or -- for a narrower/covered override -- scanning a
-    # broader, possibly-stale tree than the operator intended.
-    _cross_stream_defaults = (
-        _CROSS_STREAM_PRIOR_ALLOCATION_ROOTS
-        if not intraday_override_configured
-        else tuple(r for r in _CROSS_STREAM_PRIOR_ALLOCATION_ROOTS if r != DEFAULT_INTRADAY_LIVE_STATE_ROOT)
+    # The conventional intraday/market-open sibling fallbacks are included
+    # only when there is no CONFIGURED override for that specific root --
+    # any valid override (whether it needs its own scan entry or is already
+    # covered by the afternoon tree, equal to the fallback, or covered by
+    # some other ancestor) replaces it outright: the operator explicitly
+    # pointed that root somewhere, and letting the fallback remain a
+    # candidate would risk double-counting real artifacts, or -- for a
+    # narrower/covered override -- scanning a broader, possibly-stale tree
+    # than the operator intended.
+    _cross_stream_defaults = tuple(
+        r
+        for r in _CROSS_STREAM_PRIOR_ALLOCATION_ROOTS
+        if not (r == DEFAULT_INTRADAY_LIVE_STATE_ROOT and intraday_override_configured)
+        and not (r == DEFAULT_MARKET_OPEN_LIVE_STATE_ROOT and market_open_override_configured)
     )
     sibling_roots = tuple(cron_base / Path(r).name for r in _cross_stream_defaults)
 
@@ -866,7 +910,7 @@ def _compute_auto_derived_prior_allocations(
 def _tickers_with_unresolved_same_day_context(
     prior_same_day_allocations: Dict[str, PriorSameDayAllocation],
 ) -> List[str]:
-    """Tickers with a known prior same-day amount but no resolvable reference price.
+    """Tickers with a known prior same-day amount but no resolvable reference price or base.
 
     Canonical rule item 13 (config/scheduled_tasks.json
     canonical_first_buy_and_topup_rule): "if same-day context cannot be
@@ -876,12 +920,22 @@ def _tickers_with_unresolved_same_day_context(
     aggregate reference to unknown (see load_prior_same_day_allocations) --
     the case a bounded reload targets, since an artifact still being flushed
     mid-scan (or a transient parse race with a sibling stream's writer) can
-    resolve on a second pass moments later.
+    resolve on a second pass moments later. A known amount with
+    selected_base_amount_usd still None is the same kind of unresolved context
+    (Codex review: "Fail closed when the first allocation base is unknown") --
+    without this, evaluate_top_up_guard's own fallback would silently
+    recompute the day's target from this run's freshly selected base instead
+    of getting a chance to resolve the real one via the bounded reload.
     """
     return sorted(
         ticker
         for ticker, alloc in prior_same_day_allocations.items()
-        if alloc.amount_usd > 0 and alloc.reference_price is None
+        if alloc.amount_usd > 0
+        and (
+            alloc.reference_price is None
+            or alloc.selected_base_amount_usd is None
+            or alloc.selected_base_amount_usd <= 0
+        )
     )
 
 

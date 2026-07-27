@@ -6,8 +6,11 @@ any symbol that carried an auto-buy signal with a positive intended dollar amoun
 but for which no submitted-order record exists.
 
 - Status: **merged in PR #80** (merge commit `3641b90`) and wired into the live
-  task chain — each live task carries a `post_artifact_drift_check` block and the
-  `d1f7a2c0` monitoring entry tracks it.
+  task chain: each live trading task carries a `post_artifact_drift_check` block
+  and invokes this script in-process against its own run directory immediately
+  after writing artifacts. The former `d1f7a2c0` schedule entry is retired
+  because it was never a scheduler cron; the detector itself is unchanged and
+  still required on every live run.
 - Machine-readable policy: [`config/scheduled_tasks.json`](../config/scheduled_tasks.json) → `drift_detection_policy`.
 - Notification routing: [`config/notifications.json`](../config/notifications.json) → `routing.drift_alerts`.
 - Tests: [`scripts/tests/test_drift_detection.py`](../scripts/tests/test_drift_detection.py).
@@ -110,9 +113,15 @@ the detector **immediately after writing artifacts**:
 
 | Task | ET | Run directory |
 |---|---|---|
+| `2ba19526` market-open live | 9:35 AM | `cron_tracking/market_open_dca/YYYYMMDD_0935ET/` |
 | `42173154` morning live | 10:30 AM | `cron_tracking/morning_dca/YYYYMMDD_1030ET/` |
 | `a6239dae` midday live | 12:30 PM | `cron_tracking/midday_dca/YYYYMMDD_1230ET/` |
+| `7be82b97` intraday live | 11:30 AM / 1:30 PM / 2:30 PM | `cron_tracking/intraday_dca/YYYYMMDD_<slot>ET/` |
 | `10ce362c` afternoon live | 3:20 PM | `cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/` |
+
+`2ba19526` and `7be82b97` were added to the live scheduler on 2026-07-27 and now
+carry their own `post_artifact_drift_check` block too (Codex review: "Wire
+drift detection into the new live streams").
 
 The 3:20 PM check must complete before the 3:40 PM watchdog (`a46bf007`). When
 an auto-buy signal exists but no order record does, the task fires the Slack

@@ -69,6 +69,7 @@ from near_close_dca import (
     EXCLUDED_TICKERS,
     ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
     TOP_UP_INCREMENTAL,
+    TOP_UP_MISSING_PRIOR_BASE,
     TOP_UP_MISSING_PRIOR_PRICE,
     TOP_UP_NO_INCREMENTAL,
     TOP_UP_NO_PRIOR_RUN,
@@ -180,6 +181,22 @@ DEFAULT_MORNING_STATE_ROOT = DEFAULT_MORNING_WATCHLIST_STATE_ROOT
 # morning top-up guard so manual/recovery fills recorded before 10:30 AM are
 # detected.
 DEFAULT_AFTERNOON_TASK_ROOT = "/home/user/workspace/cron_tracking/ce16ba6b"
+# The market-open live task (2ba19526, 9:35 AM ET) artifact root. Scanned by
+# the morning (10:30) and midday (12:30) top-up guards so a 9:35 fill is
+# recognized as same-day prior context instead of being re-bought as a first
+# allocation (Codex review: "Feed market-open fills into later top-up
+# guards").
+DEFAULT_MARKET_OPEN_TASK_ROOT = "/home/user/workspace/cron_tracking/market_open_dca"
+# The intraday live task (7be82b97, 11:30/13:30/14:30 ET slots) artifact
+# root. Scanned by the midday (12:30) top-up guard -- an 11:30 fill must
+# offset the 12:30 desired amount the same way a morning fill does (Codex
+# review: "Include the 11:30 intraday run in midday context"). The
+# afternoon (3:20) guard already resolves an equivalent sibling root itself
+# via run_dca.DEFAULT_INTRADAY_LIVE_STATE_ROOT; this constant is the
+# absolute-path form the morning/midday executors' own prior_allocation_roots
+# lists use, distinct in shape (not just basename) from that bare sibling
+# name.
+DEFAULT_INTRADAY_TASK_ROOT = "/home/user/workspace/cron_tracking/intraday_dca"
 
 # Jul 20 2026 pre-flight path fix (see live_task.preflight_artifact_resolution
 # in config/morning_dca.json). The 10:30 live run must never read the same-day
@@ -1344,14 +1361,23 @@ class MorningDCAExecutor(DCAExecutor):
         # opt-out). Cap seeding must still run even when the guard is disabled, so
         # we defer the early return until after the cap-seeding block below.
         explicit_disable = raw_roots is not None and len(raw_roots) == 0
-        configured = list(raw_roots) if raw_roots is not None else [DEFAULT_AFTERNOON_TASK_ROOT]
+        # The market-open root is scanned alongside the afternoon root so a
+        # 9:35 AM market-open fill offsets this run's 10:30 desired amount
+        # instead of being re-bought as a first allocation (Codex review:
+        # "Feed market-open fills into later top-up guards").
+        configured = list(raw_roots) if raw_roots is not None else [
+            DEFAULT_AFTERNOON_TASK_ROOT,
+            DEFAULT_MARKET_OPEN_TASK_ROOT,
+        ]
         # True when the caller left prior_allocation_roots at its class default
         # (None for MorningConfig's own auto-derive marker, or MiddayConfig's own
         # hardcoded production default) rather than pointing it at a specific,
         # narrower tree -- e.g. an isolated replay/staging config (Codex review:
         # "Honor explicit prior-allocation roots in shared executors").
         uses_default_prior_allocation_roots = raw_roots is None or tuple(raw_roots) == (
+            DEFAULT_MARKET_OPEN_TASK_ROOT,
             DEFAULT_MORNING_LIVE_STATE_ROOT,
+            DEFAULT_INTRADAY_TASK_ROOT,
             DEFAULT_AFTERNOON_TASK_ROOT,
         )
         # Append the manual_runs subtree of self.state_root only for the morning
@@ -1503,6 +1529,13 @@ class MorningDCAExecutor(DCAExecutor):
 
         if prior is None or prior.amount_usd <= 0:
             return _outcome(desired, TOP_UP_NO_PRIOR_RUN, skipped=desired <= 0)
+        # Prior amount is known but its first-allocation base could not be
+        # resolved -- the fallback above would otherwise silently recompute
+        # `desired` from this run's own freshly selected base (Codex review:
+        # "Fail closed when the first allocation base is unknown"), matching
+        # the same fix in near_close_dca.evaluate_top_up_guard.
+        if prior.selected_base_amount_usd is None or prior.selected_base_amount_usd <= 0:
+            return _outcome(0.0, TOP_UP_MISSING_PRIOR_BASE, skipped=True, manual_review=True)
         if prior.reference_price is None or price is None:
             return _outcome(0.0, TOP_UP_MISSING_PRIOR_PRICE, skipped=True, manual_review=True)
         if price >= prior.reference_price:

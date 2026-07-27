@@ -933,6 +933,195 @@ def test_resolve_cross_stream_prior_allocation_roots_intraday_override_nested_un
     assert (cron_base / "intraday_dca").resolve() not in resolved
 
 
+def test_resolve_cross_stream_prior_allocation_roots_market_open_sibling_fallback(tmp_path):
+    # With no DCA_MARKET_OPEN_LIVE_STATE_ROOT override, the market-open root
+    # still falls back to the sibling-of-afternoon-root convention, same as
+    # morning/midday/intraday, so the bundled production layout keeps
+    # working (Codex review: "Feed market-open fills into later top-up
+    # guards").
+    from run_dca import _resolve_cross_stream_prior_allocation_roots
+
+    afternoon_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    roots = _resolve_cross_stream_prior_allocation_roots(None, afternoon_root)
+    resolved = {r.resolve() for r in roots}
+    assert (afternoon_root.parent / "market_open_dca").resolve() in resolved
+
+
+def test_resolve_cross_stream_prior_allocation_roots_market_open_env_override_is_trusted(
+    tmp_path, monkeypatch
+):
+    # Mirrors the intraday env-override test: there is no MarketOpenConfig
+    # loader, so DCA_MARKET_OPEN_LIVE_STATE_ROOT must be trusted directly
+    # even when it lives entirely outside afternoon_root's cron_base.
+    from run_dca import _resolve_cross_stream_prior_allocation_roots
+
+    custom_root = tmp_path / "elsewhere" / "market_open_live"
+    monkeypatch.setenv("DCA_MARKET_OPEN_LIVE_STATE_ROOT", str(custom_root))
+
+    afternoon_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    roots = _resolve_cross_stream_prior_allocation_roots(None, afternoon_root)
+    resolved = {r.resolve() for r in roots}
+    assert custom_root.resolve() in resolved
+
+
+def test_resolve_cross_stream_prior_allocation_roots_market_open_env_nested_under_afternoon_excluded(
+    tmp_path, monkeypatch
+):
+    # Mirrors the intraday nested-under-afternoon test: a market-open root
+    # nested under afternoon_root would otherwise be double-scanned since
+    # the caller already recursively scans afternoon_root itself.
+    from run_dca import _resolve_cross_stream_prior_allocation_roots
+
+    afternoon_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    nested_root = afternoon_root / "market_open_subdir"
+    monkeypatch.setenv("DCA_MARKET_OPEN_LIVE_STATE_ROOT", str(nested_root))
+
+    roots = _resolve_cross_stream_prior_allocation_roots(None, afternoon_root)
+    resolved = {r.resolve() for r in roots}
+    assert nested_root.resolve() not in resolved
+
+
+def test_resolve_cross_stream_prior_allocation_roots_market_open_env_nested_under_afternoon_drops_fallback(
+    tmp_path, monkeypatch
+):
+    # Mirrors the intraday test of the same name: a genuinely configured but
+    # already-covered (nested) override must still suppress the legacy
+    # cron_base/market_open_dca fallback, not resurrect it.
+    from run_dca import _resolve_cross_stream_prior_allocation_roots
+
+    afternoon_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    cron_base = afternoon_root.parent
+    nested_root = afternoon_root / "market_open_subdir"
+    monkeypatch.setenv("DCA_MARKET_OPEN_LIVE_STATE_ROOT", str(nested_root))
+
+    roots = _resolve_cross_stream_prior_allocation_roots(None, afternoon_root)
+    resolved = {r.resolve() for r in roots}
+    assert (cron_base / "market_open_dca").resolve() not in resolved
+
+
+def test_resolve_cross_stream_prior_allocation_roots_market_open_override_replaces_sibling_fallback(
+    tmp_path, monkeypatch
+):
+    # Mirrors the intraday override-replaces-fallback test: once
+    # DCA_MARKET_OPEN_LIVE_STATE_ROOT points at a genuinely relocated tree,
+    # the override must REPLACE the sibling fallback, not add to it, and
+    # morning/midday/intraday fallbacks are untouched.
+    from run_dca import _resolve_cross_stream_prior_allocation_roots
+
+    afternoon_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    custom_root = tmp_path / "elsewhere" / "market_open_live"
+    monkeypatch.setenv("DCA_MARKET_OPEN_LIVE_STATE_ROOT", str(custom_root))
+
+    roots = _resolve_cross_stream_prior_allocation_roots(None, afternoon_root)
+    resolved = {r.resolve() for r in roots}
+    assert custom_root.resolve() in resolved
+    assert (afternoon_root.parent / "market_open_dca").resolve() not in resolved
+    assert (afternoon_root.parent / "morning_dca").resolve() in resolved
+    assert (afternoon_root.parent / "midday_dca").resolve() in resolved
+    assert (afternoon_root.parent / "intraday_dca").resolve() in resolved
+
+
+def test_resolve_cross_stream_prior_allocation_roots_conflicting_market_open_override_keeps_sibling_fallback(
+    tmp_path, monkeypatch
+):
+    # Mirrors the intraday conflicting-override test: when
+    # DCA_MARKET_OPEN_LIVE_STATE_ROOT conflicts with afternoon_root (set to
+    # the shared cron_base, an ancestor of afternoon_root), the fallback
+    # must survive since the override never makes it into the returned roots.
+    from run_dca import _resolve_cross_stream_prior_allocation_roots
+
+    afternoon_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    cron_base = afternoon_root.parent
+    monkeypatch.setenv("DCA_MARKET_OPEN_LIVE_STATE_ROOT", str(cron_base))
+
+    roots = _resolve_cross_stream_prior_allocation_roots(None, afternoon_root)
+    resolved = {r.resolve() for r in roots}
+    assert cron_base.resolve() not in resolved  # the conflicting override is dropped
+    assert (cron_base / "market_open_dca").resolve() in resolved  # fallback survives
+
+
+def test_resolve_cross_stream_prior_allocation_roots_market_open_override_equals_afternoon_drops_fallback(
+    tmp_path, monkeypatch
+):
+    # Mirrors the intraday override-equals-afternoon test: an override equal
+    # to afternoon_root is trivially covered by the caller's own recursive
+    # afternoon scan, so the legacy sibling fallback must still be dropped.
+    from run_dca import _resolve_cross_stream_prior_allocation_roots
+
+    afternoon_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    cron_base = afternoon_root.parent
+    monkeypatch.setenv("DCA_MARKET_OPEN_LIVE_STATE_ROOT", str(afternoon_root))
+
+    roots = _resolve_cross_stream_prior_allocation_roots(None, afternoon_root)
+    resolved = {r.resolve() for r in roots}
+    assert (cron_base / "market_open_dca").resolve() not in resolved
+
+
+def test_resolve_cross_stream_prior_allocation_roots_market_open_override_covered_by_ancestor_drops_fallback(
+    tmp_path, monkeypatch
+):
+    # Mirrors the intraday override-covered-by-ancestor test: a market-open
+    # override nested under the morning stream's own (relocated) configured
+    # root is pruned as redundant in Pass 3, but the now-genuinely-redundant
+    # legacy cron_base/market_open_dca fallback must still be dropped.
+    import json
+
+    from run_dca import _resolve_cross_stream_prior_allocation_roots
+
+    afternoon_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    cron_base = afternoon_root.parent
+    relocated_root = cron_base / "relocated_all_streams"
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "morning_dca.json").write_text(
+        json.dumps({"artifact_paths": {"live_run_state_root": str(relocated_root)}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DCA_MARKET_OPEN_LIVE_STATE_ROOT", str(relocated_root / "market_open_dca"))
+
+    roots = _resolve_cross_stream_prior_allocation_roots(str(config_dir), afternoon_root)
+    resolved = {r.resolve() for r in roots}
+    assert relocated_root.resolve() in resolved  # the ancestor covering the override
+    assert (cron_base / "market_open_dca").resolve() not in resolved  # stale fallback dropped
+
+
+def test_resolve_cross_stream_prior_allocation_roots_market_open_override_equals_fallback_survives(
+    tmp_path, monkeypatch
+):
+    # Mirrors the intraday override-equals-fallback test: Pass 1 dedupes the
+    # override and the sibling fallback into ONE surviving entry since
+    # they're the same path.
+    from run_dca import _resolve_cross_stream_prior_allocation_roots
+
+    afternoon_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    cron_base = afternoon_root.parent
+    monkeypatch.setenv("DCA_MARKET_OPEN_LIVE_STATE_ROOT", str(cron_base / "market_open_dca"))
+
+    roots = _resolve_cross_stream_prior_allocation_roots(None, afternoon_root)
+    resolved = {r.resolve() for r in roots}
+    assert (cron_base / "market_open_dca").resolve() in resolved
+
+
+def test_resolve_cross_stream_prior_allocation_roots_market_open_override_nested_under_fallback_scans_only_override(
+    tmp_path, monkeypatch
+):
+    # Mirrors the intraday override-nested-under-fallback test: the override
+    # must be scanned INSTEAD of the broader fallback, not merely
+    # alongside/covered-by it.
+    from run_dca import _resolve_cross_stream_prior_allocation_roots
+
+    afternoon_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    cron_base = afternoon_root.parent
+    nested_override = cron_base / "market_open_dca" / "relocated"
+    monkeypatch.setenv("DCA_MARKET_OPEN_LIVE_STATE_ROOT", str(nested_override))
+
+    roots = _resolve_cross_stream_prior_allocation_roots(None, afternoon_root)
+    resolved = {r.resolve() for r in roots}
+    assert nested_override.resolve() in resolved
+    assert (cron_base / "market_open_dca").resolve() not in resolved
+
+
 def test_run_pipeline_explicit_prior_root_uses_run_time_boundary(tmp_path):
     import json
 
@@ -1096,11 +1285,21 @@ def test_tickers_with_unresolved_same_day_context():
     allocations = {
         # Known prior amount but no resolvable reference price -> unresolved.
         "AAPL": PriorSameDayAllocation("AAPL", amount_usd=3.0, reference_price=None),
-        "NVDA": PriorSameDayAllocation("NVDA", amount_usd=2.0, reference_price=97.0),
+        # Both reference price and base resolved -> not unresolved.
+        "NVDA": PriorSameDayAllocation(
+            "NVDA", amount_usd=2.0, reference_price=97.0, selected_base_amount_usd=1.0
+        ),
         # No prior amount at all -- not "unresolved same-day context", just no context.
         "MSFT": PriorSameDayAllocation("MSFT", amount_usd=0.0, reference_price=None),
+        # Known prior amount and reference price, but no resolvable base (e.g.
+        # a legacy artifact predating selected_base_amount_usd) -> unresolved,
+        # same as a missing reference price (Codex review: "Fail closed when
+        # the first allocation base is unknown").
+        "TSLA": PriorSameDayAllocation(
+            "TSLA", amount_usd=1.0, reference_price=250.0, selected_base_amount_usd=None
+        ),
     }
-    assert _tickers_with_unresolved_same_day_context(allocations) == ["AAPL"]
+    assert _tickers_with_unresolved_same_day_context(allocations) == ["AAPL", "TSLA"]
 
 
 def test_run_pipeline_bounded_reload_resolves_unresolved_same_day_context(tmp_path, monkeypatch):
@@ -1122,7 +1321,11 @@ def test_run_pipeline_bounded_reload_resolves_unresolved_same_day_context(tmp_pa
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return (
-                {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=3.0, reference_price=None)},
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", amount_usd=3.0, reference_price=None, selected_base_amount_usd=2.0
+                    )
+                },
                 False,
             )
         # Resolved on reload: an extremely low reference price guarantees the
@@ -1131,7 +1334,8 @@ def test_run_pipeline_bounded_reload_resolves_unresolved_same_day_context(tmp_pa
         return (
             {
                 "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=3.0, reference_price=0.01, run_id="am", source="manual"
+                    "AAPL", amount_usd=3.0, reference_price=0.01, run_id="am", source="manual",
+                    selected_base_amount_usd=2.0,
                 )
             },
             False,
@@ -1216,19 +1420,17 @@ def test_run_pipeline_bounded_reload_preserves_already_resolved_ticker(tmp_path,
         if len(calls) == 1:
             return (
                 {
-                    "AAPL": PriorSameDayAllocation("AAPL", amount_usd=3.0, reference_price=None),
+                    "AAPL": PriorSameDayAllocation("AAPL", amount_usd=3.0, reference_price=None, selected_base_amount_usd=2.0),
                     "MSFT": PriorSameDayAllocation(
-                        "MSFT", amount_usd=2.0, reference_price=0.01, run_id="am", source="manual"
-                    ),
+                        "MSFT", amount_usd=2.0, reference_price=0.01, run_id="am", source="manual", selected_base_amount_usd=2.0),
                 },
                 False,
             )
         return (
             {
                 "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=3.0, reference_price=0.01, run_id="am", source="manual"
-                ),
-                "MSFT": PriorSameDayAllocation("MSFT", amount_usd=2.0, reference_price=None),
+                    "AAPL", amount_usd=3.0, reference_price=0.01, run_id="am", source="manual", selected_base_amount_usd=2.0),
+                "MSFT": PriorSameDayAllocation("MSFT", amount_usd=2.0, reference_price=None, selected_base_amount_usd=2.0),
             },
             False,
         )
@@ -1345,13 +1547,12 @@ def test_run_pipeline_bounded_reload_trusts_clean_reload_after_dirty_first_pass(
             return (
                 {
                     "AAPL": PriorSameDayAllocation(
-                        "AAPL", amount_usd=2.0, reference_price=98.0, run_id="am", source="manual"
-                    )
+                        "AAPL", amount_usd=2.0, reference_price=98.0, run_id="am", source="manual", selected_base_amount_usd=2.0)
                 },
                 True,
             )
         return (
-            {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=5.0, reference_price=None)},
+            {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=5.0, reference_price=None, selected_base_amount_usd=2.0)},
             False,
         )
 
@@ -1456,7 +1657,7 @@ def test_run_pipeline_bounded_reload_keeps_unresolved_when_reload_is_incomplete(
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return (
-                {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=5.0, reference_price=None)},
+                {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=5.0, reference_price=None, selected_base_amount_usd=2.0)},
                 False,
             )
         # Reload lost the $3 unconfirmed-submission artifact: smaller
@@ -1465,8 +1666,7 @@ def test_run_pipeline_bounded_reload_keeps_unresolved_when_reload_is_incomplete(
         return (
             {
                 "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=2.0, reference_price=98.0, run_id="am", source="manual"
-                )
+                    "AAPL", amount_usd=2.0, reference_price=98.0, run_id="am", source="manual", selected_base_amount_usd=2.0)
             },
             False,
         )
@@ -1517,14 +1717,13 @@ def test_run_pipeline_bounded_reload_preserves_uncertainty_on_equal_swapped_tota
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return (
-                {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=5.0, reference_price=None)},
+                {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=5.0, reference_price=None, selected_base_amount_usd=2.0)},
                 True,
             )
         return (
             {
                 "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=5.0, reference_price=98.0, run_id="am", source="manual"
-                )
+                    "AAPL", amount_usd=5.0, reference_price=98.0, run_id="am", source="manual", selected_base_amount_usd=2.0)
             },
             True,
         )
@@ -1575,14 +1774,13 @@ def test_run_pipeline_bounded_reload_preserves_uncertainty_on_unequal_swapped_to
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return (
-                {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=5.0, reference_price=None)},
+                {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=5.0, reference_price=None, selected_base_amount_usd=2.0)},
                 True,
             )
         return (
             {
                 "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=6.0, reference_price=98.0, run_id="am", source="manual"
-                )
+                    "AAPL", amount_usd=6.0, reference_price=98.0, run_id="am", source="manual", selected_base_amount_usd=2.0)
             },
             True,
         )
@@ -1637,8 +1835,7 @@ def test_run_pipeline_bounded_reload_keeps_newly_recovered_ticker_uncertain(
         return (
             {
                 "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=6.0, reference_price=98.0, run_id="am", source="manual"
-                )
+                    "AAPL", amount_usd=6.0, reference_price=98.0, run_id="am", source="manual", selected_base_amount_usd=2.0)
             },
             True,
         )
@@ -1692,14 +1889,13 @@ def test_run_pipeline_bounded_reload_poisons_resolved_ticker_on_reverse_swap(
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return (
-                {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=5.0, reference_price=50.0)},
+                {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=5.0, reference_price=50.0, selected_base_amount_usd=2.0)},
                 True,
             )
         return (
             {
                 "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=6.0, reference_price=None, run_id="am", source="manual"
-                )
+                    "AAPL", amount_usd=6.0, reference_price=None, run_id="am", source="manual", selected_base_amount_usd=2.0)
             },
             True,
         )
@@ -1755,21 +1951,19 @@ def test_run_pipeline_bounded_reload_poisons_conflict_after_clean_first_scan(
         if len(calls) == 1:
             return (
                 {
-                    "AAPL": PriorSameDayAllocation("AAPL", amount_usd=5.0, reference_price=None),
+                    "AAPL": PriorSameDayAllocation("AAPL", amount_usd=5.0, reference_price=None, selected_base_amount_usd=2.0),
                     "MSFT": PriorSameDayAllocation(
-                        "MSFT", amount_usd=2.0, reference_price=50.0, run_id="am", source="manual"
-                    ),
+                        "MSFT", amount_usd=2.0, reference_price=50.0, run_id="am", source="manual", selected_base_amount_usd=2.0),
                 },
                 False,
             )
         return (
             {
                 "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=5.0, reference_price=99.0, run_id="am", source="manual"
-                ),
+                    "AAPL", amount_usd=5.0, reference_price=99.0, run_id="am", source="manual", selected_base_amount_usd=2.0),
                 # A sibling writer added a new MSFT artifact between the two
                 # scans -- a real change, not a parse race.
-                "MSFT": PriorSameDayAllocation("MSFT", amount_usd=6.0, reference_price=None),
+                "MSFT": PriorSameDayAllocation("MSFT", amount_usd=6.0, reference_price=None, selected_base_amount_usd=2.0),
             },
             True,
         )
@@ -1824,16 +2018,14 @@ def test_run_pipeline_bounded_reload_poisons_equal_metadata_swap(tmp_path, monke
             return (
                 {
                     "AAPL": PriorSameDayAllocation(
-                        "AAPL", amount_usd=5.0, reference_price=90.0, run_id="am", source="manual"
-                    )
+                        "AAPL", amount_usd=5.0, reference_price=90.0, run_id="am", source="manual", selected_base_amount_usd=2.0)
                 },
                 True,
             )
         return (
             {
                 "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=5.0, reference_price=90.0, run_id="am2", source="manual"
-                )
+                    "AAPL", amount_usd=5.0, reference_price=90.0, run_id="am2", source="manual", selected_base_amount_usd=2.0)
             },
             True,
         )
@@ -1945,8 +2137,7 @@ def test_run_pipeline_bounded_reload_poisons_first_only_entry_after_incomplete_r
             return (
                 {
                     "AAPL": PriorSameDayAllocation(
-                        "AAPL", amount_usd=5.0, reference_price=50.0, run_id="am", source="manual"
-                    ),
+                        "AAPL", amount_usd=5.0, reference_price=50.0, run_id="am", source="manual", selected_base_amount_usd=2.0),
                 },
                 True,
             )
@@ -2196,20 +2387,17 @@ def test_run_pipeline_bounded_reload_poisons_stale_reference_on_smaller_clean_re
             return (
                 {
                     "AAPL": PriorSameDayAllocation(
-                        "AAPL", amount_usd=5.0, reference_price=100.0, run_id="am", source="manual"
-                    ),
-                    "MSFT": PriorSameDayAllocation("MSFT", amount_usd=3.0, reference_price=None),
+                        "AAPL", amount_usd=5.0, reference_price=100.0, run_id="am", source="manual", selected_base_amount_usd=2.0),
+                    "MSFT": PriorSameDayAllocation("MSFT", amount_usd=3.0, reference_price=None, selected_base_amount_usd=2.0),
                 },
                 False,
             )
         return (
             {
                 "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=4.0, reference_price=90.0, run_id="am2", source="manual"
-                ),
+                    "AAPL", amount_usd=4.0, reference_price=90.0, run_id="am2", source="manual", selected_base_amount_usd=2.0),
                 "MSFT": PriorSameDayAllocation(
-                    "MSFT", amount_usd=3.0, reference_price=40.0, run_id="am", source="manual"
-                ),
+                    "MSFT", amount_usd=3.0, reference_price=40.0, run_id="am", source="manual", selected_base_amount_usd=2.0),
             },
             False,
         )
@@ -2974,3 +3162,176 @@ def test_run_pipeline_partial_retry_merges_orders_after_place(tmp_path):
     order_ids = {o["order_id"] for o in _json.loads(oap.read_text(encoding="utf-8"))["orders"]}
     assert "retry-Y2" in order_ids, "New MSFT order missing from merged file"
     assert "prior-X1" in order_ids, "Prior AAPL fill lost during partial retry"
+
+# --- New live-stream schema contracts (market_open, intraday) ---------------
+#
+# Codex review ("Define run-classification contracts for the new streams"):
+# schemas/market_open_run_classification.schema.json and
+# schemas/intraday_run_classification.schema.json validate the run_classification
+# shape config/scheduled_tasks.json promises for the 9:35 AM market-open task
+# (2ba19526) and the 11:30/13:30/14:30 intraday task (7be82b97). Neither stream
+# has a dedicated *_dca.py executor module of its own (see
+# run_dca.DEFAULT_MARKET_OPEN_LIVE_STATE_ROOT / DEFAULT_INTRADAY_LIVE_STATE_ROOT),
+# so these documents are hand-constructed to the documented contract shape
+# rather than generated by calling a real executor's run_classification(), the
+# way test_morning_dca.py/test_midday_dca.py do for their own streams.
+
+
+def _market_open_run_classification(*, manual: bool):
+    if manual:
+        return {
+            "run_origin": "manual",
+            "run_type": "market_open_dca_live",
+            "stream": "market_open",
+            "trades": True,
+            "manual_run": True,
+            "cron_id": "2ba19526",
+            "scheduled_for_et": None,
+            "scheduled_window_start_et": None,
+            "scheduled_window_end_et": None,
+            "run_id": "manual_market_open_live_20260727_133501Z_abc123",
+            "triggered_at_utc": "2026-07-27T13:35:01Z",
+            "state_schema_version": "market-open-live-v1",
+            "valid_afternoon_evidence": False,
+        }
+    return {
+        "run_origin": "scheduled",
+        "run_type": "market_open_dca_live",
+        "stream": "market_open",
+        "trades": True,
+        "manual_run": False,
+        "cron_id": "2ba19526",
+        "scheduled_for_et": "09:35",
+        "scheduled_window_start_et": "09:30",
+        "scheduled_window_end_et": "09:40",
+        "run_id": "market_open_live_20260727_0935ET",
+        "triggered_at_utc": "2026-07-27T13:35:00Z",
+        "state_schema_version": "market-open-live-v1",
+        "valid_afternoon_evidence": False,
+    }
+
+
+def test_market_open_run_classification_validates_against_json_schema():
+    try:
+        import jsonschema
+    except ImportError:
+        return
+    import json
+
+    schema_path = Path(__file__).resolve().parent / "schemas" / "market_open_run_classification.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    for rc in (_market_open_run_classification(manual=False), _market_open_run_classification(manual=True)):
+        jsonschema.validate(rc, schema)
+
+
+def test_market_open_run_classification_rejects_wrong_cron_id():
+    try:
+        import jsonschema
+    except ImportError:
+        return
+    import json
+
+    schema_path = Path(__file__).resolve().parent / "schemas" / "market_open_run_classification.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    bad = _market_open_run_classification(manual=False)
+    bad["cron_id"] = "42173154"  # the morning task's cron_id, not market-open's
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(bad, schema)
+
+
+_INTRADAY_SLOT_WINDOWS = {
+    "11:30": ("11:25", "11:35", "1130"),
+    "13:30": ("13:25", "13:35", "1330"),
+    "14:30": ("14:25", "14:35", "1430"),
+}
+
+
+def _intraday_run_classification(slot: str, *, manual: bool):
+    start, end, hhmm = _INTRADAY_SLOT_WINDOWS[slot]
+    if manual:
+        return {
+            "run_origin": "manual",
+            "run_type": "intraday_dca_live",
+            "stream": "intraday",
+            "trades": True,
+            "manual_run": True,
+            "cron_id": "7be82b97",
+            "scheduled_for_et": None,
+            "scheduled_window_start_et": None,
+            "scheduled_window_end_et": None,
+            "run_id": "manual_intraday_live_20260727_133501Z_abc123",
+            "triggered_at_utc": "2026-07-27T18:30:01Z",
+            "state_schema_version": "intraday-live-v1",
+            "valid_afternoon_evidence": False,
+        }
+    return {
+        "run_origin": "scheduled",
+        "run_type": "intraday_dca_live",
+        "stream": "intraday",
+        "trades": True,
+        "manual_run": False,
+        "cron_id": "7be82b97",
+        "scheduled_for_et": slot,
+        "scheduled_window_start_et": start,
+        "scheduled_window_end_et": end,
+        "run_id": f"intraday_live_20260727_{hhmm}ET",
+        "triggered_at_utc": "2026-07-27T18:30:00Z",
+        "state_schema_version": "intraday-live-v1",
+        "valid_afternoon_evidence": False,
+    }
+
+
+def test_intraday_run_classification_validates_against_json_schema():
+    # Every one of the three fired slots (11:30/13:30/14:30 ET, see
+    # config/scheduled_tasks.json:multi_slot_task_note) plus a manual run
+    # must validate.
+    try:
+        import jsonschema
+    except ImportError:
+        return
+    import json
+
+    schema_path = Path(__file__).resolve().parent / "schemas" / "intraday_run_classification.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    docs = [_intraday_run_classification(slot, manual=False) for slot in _INTRADAY_SLOT_WINDOWS]
+    docs.append(_intraday_run_classification("11:30", manual=True))
+    for rc in docs:
+        jsonschema.validate(rc, schema)
+
+
+def test_intraday_run_classification_rejects_mismatched_slot_window():
+    # A run_id/window pair from a DIFFERENT slot than scheduled_for_et must
+    # be rejected -- each slot's window is pinned independently (Codex
+    # review: "Include the 11:30 intraday run in midday context").
+    try:
+        import jsonschema
+    except ImportError:
+        return
+    import json
+
+    schema_path = Path(__file__).resolve().parent / "schemas" / "intraday_run_classification.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    bad = _intraday_run_classification("11:30", manual=False)
+    bad["scheduled_window_start_et"] = "13:25"  # the 13:30 slot's window, not 11:30's
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(bad, schema)
+
+
+def test_intraday_run_classification_rejects_ad_hoc_recovery_stream_suffix():
+    # The ad hoc one-off intraday scheduled-recovery stream (e.g. the
+    # 2026-07-24 'intraday_1430' recovery) uses a slot-suffixed stream value
+    # recognized by near_close_dca._prior_run_is_scheduled's startswith
+    # check, but it is NOT this recurring live task and must not validate
+    # against this schema, which pins stream to exactly 'intraday'.
+    try:
+        import jsonschema
+    except ImportError:
+        return
+    import json
+
+    schema_path = Path(__file__).resolve().parent / "schemas" / "intraday_run_classification.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    bad = _intraday_run_classification("14:30", manual=False)
+    bad["stream"] = "intraday_1430"
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(bad, schema)

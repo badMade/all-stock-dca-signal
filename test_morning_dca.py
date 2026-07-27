@@ -2184,6 +2184,24 @@ def test_morning_scheduled_run_counts_as_afternoon_prior_context():
     assert _prior_run_is_scheduled({"run_classification": afternoon_rc}) is True
 
 
+def test_market_open_scheduled_run_counts_as_afternoon_prior_context():
+    """A market-open-stream scheduled run must be eligible prior-allocation context.
+
+    Codex review ("Feed market-open fills into later top-up guards"): the
+    9:35 AM market-open live task (2ba19526) is scheduled within its own
+    stream but must still be read as prior context by the morning, midday,
+    and afternoon same-day top-up guards, exactly like morning/midday.
+    """
+    from near_close_dca import _prior_run_is_scheduled
+
+    market_open_rc = {
+        "run_origin": "scheduled",
+        "stream": "market_open",
+        "cron_id": "2ba19526",
+    }
+    assert _prior_run_is_scheduled({"run_classification": market_open_rc}) is False
+
+
 # --- 9:45 pre-flight validation + 10:30 live gate ---------------------------
 def _now_preflight():
     """Decision timestamp for the 9:45 AM ET pre-flight validation mode."""
@@ -3404,7 +3422,14 @@ def test_auto_buy_candidates_prioritized_by_multiplier_when_cap_hit(tmp_path):
 
 # ── Morning top-up guard ─────────────────────────────────────────────────────
 
-def _write_prior_run_state(root: Path, ticker: str, *, amount_usd: float, decision_price: float) -> None:
+def _write_prior_run_state(
+    root: Path,
+    ticker: str,
+    *,
+    amount_usd: float,
+    decision_price: float,
+    selected_base_amount_usd=None,
+) -> None:
     """Write a minimal manual prior-run run_state.json under a dated directory.
 
     Uses status="filled": near_close_dca._candidate_logged_reference_price's
@@ -3415,22 +3440,30 @@ def _write_prior_run_state(root: Path, ticker: str, *, amount_usd: float, decisi
     instead of comparing prices, which would make every top-up-guard test in
     this file that asserts a price-comparison outcome (incremental/
     price_not_below) fail against that (correct, safety-hardened) policy.
+
+    ``selected_base_amount_usd`` mirrors a real artifact's recorded
+    first-allocation base; omitting it (the default) simulates a legacy
+    artifact that predates the field, which now routes the top-up guard to
+    missing_prior_base/manual review (Codex review: "Fail closed when the
+    first allocation base is unknown") rather than silently recomputing from
+    this run's own price.
     """
     run_dir = root / "20260708_0900ET"
     run_dir.mkdir(parents=True, exist_ok=True)
+    candidate = {
+        "ticker": ticker,
+        "status": "filled",
+        "planned_amount_usd": amount_usd,
+        "decision_price": decision_price,
+    }
+    if selected_base_amount_usd is not None:
+        candidate["selected_base_amount_usd"] = selected_base_amount_usd
     (run_dir / "run_state.json").write_text(
         json.dumps({
             "trading_day": "2026-07-08",
             "generated_at": "2026-07-08T09:00:00-04:00",
             "run_classification": {"run_origin": "manual", "manual_run": True},
-            "buy_candidates": [
-                {
-                    "ticker": ticker,
-                    "status": "filled",
-                    "planned_amount_usd": amount_usd,
-                    "decision_price": decision_price,
-                }
-            ],
+            "buy_candidates": [candidate],
         }),
         encoding="utf-8",
     )
@@ -3500,7 +3533,9 @@ def test_morning_top_up_guard_buys_incremental_when_prior_fill_exists(tmp_path):
             return f"ORDER-{ticker}"
 
     prior_root = tmp_path / "prior"
-    _write_prior_run_state(prior_root, "TOPUP", amount_usd=4.50, decision_price=99.0)
+    _write_prior_run_state(
+        prior_root, "TOPUP", amount_usd=4.50, decision_price=99.0, selected_base_amount_usd=3.0
+    )
     pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
     cfg = MorningConfig(
         tickers=("TOPUP",),
@@ -3541,7 +3576,9 @@ def test_morning_top_up_guard_skips_when_price_not_below_reference(tmp_path):
             return f"ORDER-{ticker}"
 
     prior_root = tmp_path / "prior"
-    _write_prior_run_state(prior_root, "TOPUP", amount_usd=4.50, decision_price=96.0)
+    _write_prior_run_state(
+        prior_root, "TOPUP", amount_usd=4.50, decision_price=96.0, selected_base_amount_usd=2.0
+    )
     pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
     cfg = MorningConfig(
         tickers=("TOPUP",),
@@ -4234,8 +4271,19 @@ def test_morning_top_up_guard_no_prior_run_when_default_roots_empty(tmp_path):
 # Top-up guard regression tests (scheduled-run path)
 # ---------------------------------------------------------------------------
 
-def _seed_prior(root, ticker, amount_usd, *, status="filled", reference_price=95.0, trading_date=None):
-    """Write a prior-fill run_state.json for one ticker under root."""
+def _seed_prior(
+    root, ticker, amount_usd, *,
+    status="filled", reference_price=95.0, trading_date=None, selected_base_amount_usd=None,
+):
+    """Write a prior-fill run_state.json for one ticker under root.
+
+    ``selected_base_amount_usd`` mirrors a real artifact's recorded
+    first-allocation base; omitting it (the default) simulates a legacy
+    artifact that predates the field, which now routes the top-up guard to
+    missing_prior_base/manual review (Codex review: "Fail closed when the
+    first allocation base is unknown") rather than silently recomputing from
+    this run's own price.
+    """
     if trading_date is None:
         trading_date = _now_live().date()
     folder = trading_date.strftime("%Y%m%d") + "_0900ET"
@@ -4244,6 +4292,8 @@ def _seed_prior(root, ticker, amount_usd, *, status="filled", reference_price=95
     candidate: dict = {"ticker": ticker, "status": status, "planned_amount_usd": amount_usd}
     if status == "filled" and reference_price is not None:
         candidate["target_price"] = reference_price
+    if selected_base_amount_usd is not None:
+        candidate["selected_base_amount_usd"] = selected_base_amount_usd
     state = {
         "trading_day": trading_date.isoformat(),
         "generated_at": f"{trading_date.isoformat()}T09:00:00-04:00",
@@ -4276,7 +4326,9 @@ class _TopUpBroker:
 def test_morning_live_applies_prior_manual_offset_incremental(tmp_path):
     # Prior manual fill: NVDA $3 at $95 reference. Morning price $90 (10% drop, below ref).
     # Desired = 5x * $2 = $10. Incremental = $15 - $3 = $8.
-    prior_root = _seed_prior(tmp_path / "prior", "NVDA", 2.0, reference_price=95.0)
+    prior_root = _seed_prior(
+        tmp_path / "prior", "NVDA", 2.0, reference_price=95.0, selected_base_amount_usd=2.0
+    )
     pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
@@ -4435,7 +4487,7 @@ def test_morning_scheduled_top_up_duplicate_preserves_original_submitted_amount(
     assert first_rows["NVDA"]["top_up_guard_result"] == "no_prior_run"
 
     # A $3 external fill for NVDA appears afterward (new prior-allocation context).
-    _seed_prior(prior_root, "NVDA", 3.0, reference_price=95.0)
+    _seed_prior(prior_root, "NVDA", 3.0, reference_price=95.0, selected_base_amount_usd=2.0)
 
     # Scheduled retry: has_prior_allocation is now True and the freshly
     # recomputed incremental ($15 - $3 = $12) is SMALLER than what was
@@ -4473,7 +4525,9 @@ def test_morning_scheduled_duplicate_check_preserved_when_cap_fully_consumed(tmp
     # ledger already has the first attempt's amount booked), overwriting the
     # dated-slot artifact's "submitted" row with "cap_exceeded" -- erasing
     # evidence a fresh executor's cap-seeding scan depends on.
-    prior_root = _seed_prior(tmp_path / "prior", "NVDA", 3.0, reference_price=95.0)
+    prior_root = _seed_prior(
+        tmp_path / "prior", "NVDA", 3.0, reference_price=95.0, selected_base_amount_usd=3.0
+    )
     pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
@@ -4520,7 +4574,9 @@ def test_morning_scheduled_duplicate_not_rebooked_into_ledger(tmp_path):
     # record_buy_candidates() also books it directly into self.ledger every
     # retry, the ledger balance keeps growing without any new money ever
     # being submitted.
-    prior_root = _seed_prior(tmp_path / "prior", "NVDA", 3.0, reference_price=95.0)
+    prior_root = _seed_prior(
+        tmp_path / "prior", "NVDA", 3.0, reference_price=95.0, selected_base_amount_usd=3.0
+    )
     pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
@@ -4557,7 +4613,9 @@ def test_morning_scheduled_duplicate_not_rebooked_into_ledger(tmp_path):
 def test_morning_live_skips_when_price_not_below_prior_reference(tmp_path):
     # Prior: NVDA $2 at $85 reference. Morning price $90 (10% drop from $100).
     # $90 >= $85 → price_not_below → skip, no order.
-    prior_root = _seed_prior(tmp_path / "prior", "NVDA", 2.0, reference_price=85.0)
+    prior_root = _seed_prior(
+        tmp_path / "prior", "NVDA", 2.0, reference_price=85.0, selected_base_amount_usd=2.0
+    )
     pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
@@ -4620,7 +4678,9 @@ def test_morning_live_missing_price_triggers_manual_review(tmp_path):
 
 def test_morning_live_no_incremental_when_prior_covers_full_desired(tmp_path):
     # Prior: NVDA $20 at $95 reference. Desired = $10. $10 - $20 = -$10 ≤ 0 → no_incremental.
-    prior_root = _seed_prior(tmp_path / "prior", "NVDA", 20.0, reference_price=95.0)
+    prior_root = _seed_prior(
+        tmp_path / "prior", "NVDA", 20.0, reference_price=95.0, selected_base_amount_usd=2.0
+    )
     pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
@@ -4643,8 +4703,10 @@ def test_morning_live_prior_from_configured_root_only(tmp_path):
     # Only roots in prior_allocation_roots contribute; fills under other_root are invisible.
     # configured_root: NVDA $2 at $95 → incremental $8.
     # other_root: NVDA $20 at $95 → would produce no_incremental if scanned.
-    configured_root = _seed_prior(tmp_path / "configured", "NVDA", 2.0, reference_price=95.0)
-    _seed_prior(tmp_path / "other", "NVDA", 20.0, reference_price=95.0)
+    configured_root = _seed_prior(
+        tmp_path / "configured", "NVDA", 2.0, reference_price=95.0, selected_base_amount_usd=2.0
+    )
+    _seed_prior(tmp_path / "other", "NVDA", 20.0, reference_price=95.0, selected_base_amount_usd=2.0)
     pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
@@ -4659,6 +4721,37 @@ def test_morning_live_prior_from_configured_root_only(tmp_path):
     # Configured root contributes $3 only → incremental $8, not no_incremental.
     assert "NVDA" in broker.placed, f"expected incremental order; broker_outcomes={res['artifacts'].get('broker_outcomes')}"
     assert abs(broker.placed["NVDA"] - 8.0) < 0.01, f"expected $8; got {broker.placed['NVDA']}"
+
+
+def test_morning_live_default_roots_include_market_open(tmp_path, monkeypatch):
+    # Codex review ("Feed market-open fills into later top-up guards"): when
+    # prior_allocation_roots is left at its default (None), the morning
+    # 10:30 live guard must still scan the 9:35 market-open root, not just
+    # the afternoon root, so a market-open fill offsets the morning desired
+    # amount instead of being re-bought as a first allocation.
+    import morning_dca
+
+    afternoon_root = tmp_path / "afternoon"
+    market_open_root = tmp_path / "market_open"
+    monkeypatch.setattr(morning_dca, "DEFAULT_AFTERNOON_TASK_ROOT", str(afternoon_root))
+    monkeypatch.setattr(morning_dca, "DEFAULT_MARKET_OPEN_TASK_ROOT", str(market_open_root))
+
+    _seed_prior(market_open_root, "NVDA", 2.0, reference_price=95.0, selected_base_amount_usd=2.0)
+    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
+    cfg = MorningConfig(
+        tickers=("NVDA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        # Left at the class default (None) so the guard auto-derives its
+        # roots, exercising the [DEFAULT_AFTERNOON_TASK_ROOT,
+        # DEFAULT_MARKET_OPEN_TASK_ROOT] fallback directly.
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    broker = _TopUpBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=broker)
+    assert "NVDA" in broker.placed, f"expected incremental order; broker_outcomes={res['artifacts'].get('broker_outcomes')}"
+    assert abs(broker.placed["NVDA"] - 8.0) < 0.01, f"expected $8 incremental; got {broker.placed['NVDA']}"
 
 
 def test_morning_live_scheduled_artifact_not_prior_context_on_retry(tmp_path):
@@ -5136,7 +5229,9 @@ def test_morning_live_same_stream_check_ignores_manual_fill_ref_id(tmp_path):
     # segment comes after `-dca-`, diverging from the plain scheduled prefix
     # `-dca-<date>-` at the fourth segment); _same_stream_order_exists checks
     # `morning-dca-topup-*` and `morning-dca-<date>-*`, so they never match it.
-    prior_root = _seed_prior(tmp_path / "prior", "NVDA", 3.0, reference_price=95.0)
+    prior_root = _seed_prior(
+        tmp_path / "prior", "NVDA", 3.0, reference_price=95.0, selected_base_amount_usd=3.0
+    )
     pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
 
     class _ManualFillBroker(_TopUpBroker):

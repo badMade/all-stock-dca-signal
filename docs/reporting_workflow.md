@@ -6,13 +6,22 @@ private links are stored in this repo.**
 
 ## Daily flow (weekdays, EDT)
 
-1. **9:00 AM ET — Pre-market buying-power dashboard (`b7961407`)**
-   Analytics only. Pre-market buying-power view using the $2 base 0x-to-5x ladder.
-2. **9:45 AM ET — Volatility outlier scan (`cd45e95b`)**
-   Alerts only for >5% outliers or actionable errors.
-3. **3:05 PM ET — Monitor-only signal check (`e3e6f09e`)**
+1. **9:35 AM ET - Market-open live graded DCA task (`2ba19526`)**
+   Places buys (Robinhood `562057042`) and writes the same-day run state artifact.
+2. **9:45 AM ET - Watchlist early-warning scan (`bb4f6ef1`)**
+   Read-only. Compact machine-readable alerts only for >5% outliers or actionable
+   errors. Supersedes the retired compact volatility outlier scan `cd45e95b`.
+3. **10:30 AM ET - Morning live graded DCA task (`42173154`)**
+   Places buys and writes the same-day run state artifact.
+4. **11:30 AM / 1:30 PM / 2:30 PM ET - Intraday live graded DCA task (`7be82b97`)**
+   Three slots on one cron entry. Places buys and writes a run state artifact per
+   slot. The 2026-07-24 2:30 PM ET scheduled recovery (18 fills, $72.00) belongs
+   to this task.
+5. **12:30 PM ET - Midday live graded DCA task (`a6239dae`)**
+   Places buys and writes the same-day run state artifact.
+6. **3:05 PM ET - Monitor-only signal check (`e3e6f09e`, paused)**
    Analytics only. Surfaces the planned allocation and tier selection.
-4. **3:20 PM ET — Live graded DCA task (`10ce362c`, supersedes deleted `ce16ba6b`)**
+7. **3:20 PM ET - Final live graded DCA buy of the day (`10ce362c`, supersedes deleted `ce16ba6b`)**
    Places buys (Robinhood `562057042`) and writes the standardized same-day
    **run state** artifact ([`schemas/run_state.schema.json`](../schemas/run_state.schema.json)).
    A **scheduled** run writes under
@@ -21,9 +30,7 @@ private links are stored in this repo.**
    `latest_scheduled_run.json`. Manual runs write under `manual_runs/<timestamp>/`
    and never update that pointer. See
    [run_classification.md](run_classification.md).
-5. **3:25 PM ET — Capital-priority briefing (`d72aa525`)**
-   Analytics only. Emails/notifies **only if at least one ticker triggers 1.5x or higher**.
-6. **3:35 PM ET — Post-trade slippage + Notion sync (`67aa802b`)**
+8. **3:35 PM ET - Post-trade slippage + Notion sync (`67aa802b`)**
    Reads the **scheduled** run-state artifact and Robinhood order history,
    computes slippage
    ([`schemas/slippage_report.schema.json`](../schemas/slippage_report.schema.json)),
@@ -31,7 +38,7 @@ private links are stored in this repo.**
    Run" section only**. Scheduled-live rows exclude all manual order IDs and any
    `run_origin='manual'` / `manual_run=true` state; manual fills go only in the
    labeled **Manual Test Runs** section.
-7. **3:40 PM ET — Watchdog (`a46bf007`)**
+9. **3:40 PM ET - Watchdog (`a46bf007`)**
    Read-only, the final scheduled afternoon event. Confirms a valid **scheduled**
    run_state exists and that `latest_scheduled_run.json` points at it; flags
    missing/incomplete/error/discrepancy. Never infers a scheduled run from

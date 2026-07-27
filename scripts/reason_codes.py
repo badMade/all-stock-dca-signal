@@ -144,6 +144,7 @@ _TOP_UP_GUARD_TO_CANONICAL: Dict[str, str] = {
     "price_not_below_prior_run": NO_LOWER_PRICE,
     "no_incremental_difference": ALREADY_MET_OR_OVERFILLED,
     "missing_prior_price": MISSING_PRIOR_PRICE,
+    "missing_prior_base": MISSING_PRIOR_PRICE,
 }
 
 

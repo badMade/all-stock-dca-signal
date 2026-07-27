@@ -27,7 +27,7 @@
     "stream": {
       "type": "string",
       "description": "Logical stream/role.",
-      "enum": ["dashboard", "scan", "preflight", "morning", "midday", "monitor", "afternoon", "slippage", "watchdog", "manual"]
+      "enum": ["market_open", "watchlist", "dashboard", "scan", "preflight", "morning", "intraday", "midday", "monitor", "afternoon", "slippage", "watchdog", "manual"]
     },
     "model_requested": { "type": "string", "description": "Model the task requested per policy, e.g. cost_conscious_default or a specific premium model name." },
     "model_actual": {

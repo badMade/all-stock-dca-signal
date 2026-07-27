@@ -25,6 +25,7 @@ from near_close_dca import (
     MISSING_FILL_EXECUTION_GAP,
     MISSING_FILL_FAILED_TRIGGER,
     TOP_UP_INCREMENTAL,
+    TOP_UP_MISSING_PRIOR_BASE,
     TOP_UP_MISSING_PRIOR_PRICE,
     TOP_UP_NO_PRIOR_RUN,
     TOP_UP_NOT_LOWER_OR_NO_DELTA,
@@ -358,7 +359,10 @@ def test_run_daily_compact_prior_allocation_scoped_to_its_own_ticker(tmp_path):
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-ticker-scope")
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
     prior = {
-        "AAPL": PriorSameDayAllocation("AAPL", amount_usd=3.0, reference_price=99.0, run_id="am", source="manual"),
+        "AAPL": PriorSameDayAllocation(
+            "AAPL", amount_usd=3.0, reference_price=99.0, run_id="am", source="manual",
+            selected_base_amount_usd=2.0,
+        ),
     }
 
     result = run_daily_compact(
@@ -1903,7 +1907,10 @@ def test_top_up_guard_no_prior_run_allocates_full_amount():
 
 def test_top_up_guard_lower_price_buys_incremental_difference():
     # Morning bought $3 at 99.0; afternoon wants $6 and the price is below 99.0.
-    prior = PriorSameDayAllocation("AAPL", amount_usd=3.0, reference_price=99.0, run_id="manual_am", source="manual")
+    prior = PriorSameDayAllocation(
+        "AAPL", amount_usd=3.0, reference_price=99.0, run_id="manual_am", source="manual",
+        selected_base_amount_usd=3.0,
+    )
     decision = _buy_decision("AAPL", 6.0, target_price=98.0)
     outcome = evaluate_top_up_guard(decision, prior, StrategyConfig())
     assert outcome.top_up_guard_result == TOP_UP_INCREMENTAL
@@ -1917,7 +1924,10 @@ def test_top_up_guard_lower_price_buys_incremental_difference():
 def test_top_up_guard_price_not_below_prior_buys_zero():
     # Canonical rule item 12: not-strictly-lower and zero-delta both carry the
     # single unified same_day_topup_not_lower_or_no_delta reason.
-    prior = PriorSameDayAllocation("AAPL", amount_usd=3.0, reference_price=98.0, run_id="manual_am", source="manual")
+    prior = PriorSameDayAllocation(
+        "AAPL", amount_usd=3.0, reference_price=98.0, run_id="manual_am", source="manual",
+        selected_base_amount_usd=3.0,
+    )
     # Equal price -> not strictly below -> $0.
     equal = evaluate_top_up_guard(_buy_decision("AAPL", 6.0, target_price=98.0), prior, StrategyConfig())
     assert equal.top_up_guard_result == TOP_UP_NOT_LOWER_OR_NO_DELTA
@@ -1933,7 +1943,10 @@ def test_top_up_guard_price_not_below_prior_buys_zero():
 def test_top_up_guard_prior_exceeds_afternoon_desired_buys_zero():
     # Morning bought $6; afternoon only wants $3, even into a lower price -> $0.
     # Canonical rule item 12: zero-delta also carries the unified reason.
-    prior = PriorSameDayAllocation("AAPL", amount_usd=6.0, reference_price=99.0, run_id="manual_am", source="manual")
+    prior = PriorSameDayAllocation(
+        "AAPL", amount_usd=6.0, reference_price=99.0, run_id="manual_am", source="manual",
+        selected_base_amount_usd=1.5,
+    )
     outcome = evaluate_top_up_guard(_buy_decision("AAPL", 3.0, target_price=98.0), prior, StrategyConfig())
     assert outcome.top_up_guard_result == TOP_UP_NOT_LOWER_OR_NO_DELTA
     assert outcome.incremental_order_amount == 0.0
@@ -1942,7 +1955,10 @@ def test_top_up_guard_prior_exceeds_afternoon_desired_buys_zero():
 
 def test_top_up_guard_missing_prior_price_is_conservative_manual_review():
     # Prior amount known but no comparable reference price -> conservative $0 + manual review.
-    prior = PriorSameDayAllocation("AAPL", amount_usd=3.0, reference_price=None, run_id="manual_am", source="manual")
+    prior = PriorSameDayAllocation(
+        "AAPL", amount_usd=3.0, reference_price=None, run_id="manual_am", source="manual",
+        selected_base_amount_usd=3.0,
+    )
     outcome = evaluate_top_up_guard(_buy_decision("AAPL", 6.0, target_price=98.0), prior, StrategyConfig())
     assert outcome.top_up_guard_result == TOP_UP_MISSING_PRIOR_PRICE
     assert outcome.incremental_order_amount == 0.0
@@ -1952,7 +1968,10 @@ def test_top_up_guard_missing_prior_price_is_conservative_manual_review():
 
 def test_top_up_guard_missing_afternoon_price_is_conservative():
     # Known prior price but no afternoon price (no target, no signals) -> conservative $0.
-    prior = PriorSameDayAllocation("AAPL", amount_usd=3.0, reference_price=99.0, run_id="manual_am", source="manual")
+    prior = PriorSameDayAllocation(
+        "AAPL", amount_usd=3.0, reference_price=99.0, run_id="manual_am", source="manual",
+        selected_base_amount_usd=3.0,
+    )
     outcome = evaluate_top_up_guard(_buy_decision("AAPL", 6.0, target_price=0.0), prior, StrategyConfig())
     assert outcome.top_up_guard_result == TOP_UP_MISSING_PRIOR_PRICE
     assert outcome.incremental_order_amount == 0.0
@@ -1998,10 +2017,13 @@ def test_top_up_guard_reuses_first_allocation_base_for_later_top_up():
     assert outcome.effective_base_amount_usd == 1.0
 
 
-def test_top_up_guard_falls_back_to_current_amount_when_prior_base_unknown():
+def test_top_up_guard_fails_closed_when_prior_base_unknown():
     # An older prior-allocation artifact recorded no selected_base_amount_usd at
-    # all -- must fall back to the pre-existing behavior (this run's own suggested
-    # amount) rather than treat the unknown preserved base as $0.
+    # all -- silently recomputing the full-day target from this run's own base
+    # would risk over/understating the incremental order (Codex review: "Fail
+    # closed when the first allocation base is unknown"), so the guard must
+    # conservatively buy $0 and flag manual review instead, exactly like a
+    # missing reference price.
     prior = PriorSameDayAllocation("AAPL", amount_usd=2.0, reference_price=98.0, run_id="manual_am", source="manual")
     decision = ReconciledDecision(
         ticker="AAPL",
@@ -2015,10 +2037,10 @@ def test_top_up_guard_falls_back_to_current_amount_when_prior_base_unknown():
         target_price=94.0,
     )
     outcome = evaluate_top_up_guard(decision, prior, StrategyConfig())
-    assert outcome.afternoon_desired_amount == 8.0
-    assert outcome.incremental_order_amount == 6.0
-    # Falls back to this run's own base ($2) since no prior base was on record.
-    assert outcome.effective_base_amount_usd == 2.0
+    assert outcome.top_up_guard_result == TOP_UP_MISSING_PRIOR_BASE
+    assert outcome.incremental_order_amount == 0.0
+    assert outcome.skipped is True
+    assert outcome.manual_review is True
 
 
 # --- load_prior_same_day_allocations -----------------------------------------
@@ -2855,7 +2877,12 @@ def test_run_daily_compact_top_up_records_incremental(tmp_path):
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
     # 100 -> 98 is a 2% drop -> 2x -> $4 desired. Morning bought $2 at 99.0; the
     # afternoon quote is 98.0 (< 99.0) so only the $2 difference is bought.
-    prior = {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=2.0, reference_price=99.0, run_id="manual_am", source="manual")}
+    prior = {
+        "AAPL": PriorSameDayAllocation(
+            "AAPL", amount_usd=2.0, reference_price=99.0, run_id="manual_am", source="manual",
+            selected_base_amount_usd=2.0,
+        ),
+    }
 
     run_daily_compact(
         now, config, state, fin, rh, broker,
@@ -2894,7 +2921,10 @@ def test_run_daily_compact_fully_offset_still_writes_valid_state(tmp_path):
     # (price not below prior) so each candidate tops up $0, yet a valid scheduled
     # run_state must still be written.
     prior = {
-        t: PriorSameDayAllocation(t, amount_usd=2.0, reference_price=97.0, run_id="manual_am", source="manual")
+        t: PriorSameDayAllocation(
+            t, amount_usd=2.0, reference_price=97.0, run_id="manual_am", source="manual",
+            selected_base_amount_usd=2.0,
+        )
         for t in config.tickers
     }
 
@@ -2928,7 +2958,12 @@ def test_run_daily_compact_manual_run_does_not_block_scheduled(tmp_path):
             return True
 
     blocking = _BlockingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
-    prior = {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=2.0, reference_price=99.0, run_id="manual_am", source="manual")}
+    prior = {
+        "AAPL": PriorSameDayAllocation(
+            "AAPL", amount_usd=2.0, reference_price=99.0, run_id="manual_am", source="manual",
+            selected_base_amount_usd=2.0,
+        ),
+    }
 
     run_daily_compact(
         now, config, state, fin, rh, blocking,
@@ -3019,6 +3054,7 @@ def test_build_run_artifacts_records_guards_effective_base_not_current_run_base(
         suggested_amount_usd=6.0,
         selected_base_amount_usd=2.0,  # this run's OWN freshly recomputed base
         target_price=94.0,
+        decision_bar_close=93.0,
     )
     guard = TopUpGuardOutcome(
         ticker="AAPL",
@@ -3041,6 +3077,7 @@ def test_build_run_artifacts_records_guards_effective_base_not_current_run_base(
     )
     candidates = {c["ticker"]: c for c in artifacts["buy_candidates"]}
     assert candidates["AAPL"]["selected_base_amount_usd"] == 1.0
+    assert candidates["AAPL"]["decision_bar_close"] == 93.0
 
 
 # --- Fix 2: prior same-day allocations count against the daily/weekly cap ----

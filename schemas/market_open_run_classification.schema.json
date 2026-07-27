@@ -1,0 +1,134 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "market_open_run_classification.schema.json",
+  "title": "Market-open DCA run classification block (9:35 AM ET live execution)",
+  "description": "The run_classification object embedded in every MARKET-OPEN run_state artifact. The market-open stream is a single 9:35 AM ET live Robinhood execution (run_type='market_open_dca_live', trades=true) on account 562057042. It uses the same $2-base 0x-to-5x sizing ladder as the morning/midday/afternoon live streams. It is INDEPENDENT of the afternoon live task 10ce362c (which supersedes ce16ba6b): stream='market_open' and valid_afternoon_evidence=false always, so afternoon slippage/watchdog/weekly reporting never treats a market-open artifact as afternoon scheduled evidence. Market-open scheduled fills count only as prior-allocation context for the morning, midday, and afternoon same-day top-up guards (Codex review: \"Feed market-open fills into later top-up guards\"). Contains no secrets.",
+  "type": "object",
+  "required": [
+    "run_origin",
+    "run_type",
+    "stream",
+    "trades",
+    "manual_run",
+    "cron_id",
+    "run_id",
+    "triggered_at_utc",
+    "state_schema_version",
+    "valid_afternoon_evidence"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "run_origin": {
+      "type": "string",
+      "enum": ["scheduled", "manual"],
+      "description": "Origin of the market-open run. 'scheduled' is the 9:35 AM ET live execution; everything else is 'manual'."
+    },
+    "run_type": {
+      "type": "string",
+      "enum": ["market_open_dca_live"],
+      "description": "'market_open_dca_live' for the 9:35 AM ET live execution. Deliberately never the afternoon 'scheduled_live_test' or any morning/midday/intraday run_type."
+    },
+    "stream": {
+      "type": "string",
+      "const": "market_open",
+      "description": "Stream marker. Always 'market_open' so this artifact is never confused with the morning, midday, intraday, or afternoon stream."
+    },
+    "trades": {
+      "type": "boolean",
+      "const": true,
+      "description": "Always true: the market-open stream is a live Robinhood execution."
+    },
+    "manual_run": {
+      "type": "boolean",
+      "description": "true for manual market-open runs, false for scheduled market-open runs. Must agree with run_origin."
+    },
+    "cron_id": {
+      "type": "string",
+      "enum": ["2ba19526"],
+      "description": "Market-open task id: '2ba19526' for the 9:35 AM ET live execution. Distinct from the morning ('42173154'), midday ('a6239dae'), intraday ('7be82b97'), and afternoon ('10ce362c') live tasks."
+    },
+    "supersedes_cron_id": {
+      "type": ["string", "null"],
+      "description": "Always null: the market-open task supersedes nothing."
+    },
+    "scheduled_for_et": {
+      "type": ["string", "null"],
+      "description": "Nominal ET fire time, HH:MM. '09:35' for scheduled runs; null for manual runs."
+    },
+    "scheduled_window_start_et": {
+      "type": ["string", "null"],
+      "description": "Inclusive start of the accepted market-open window in ET, HH:MM."
+    },
+    "scheduled_window_end_et": {
+      "type": ["string", "null"],
+      "description": "Inclusive end of the accepted market-open window in ET, HH:MM."
+    },
+    "run_id": {
+      "type": "string",
+      "description": "Unique run id. Scheduled: 'market_open_live_YYYYMMDD_0935ET'. Manual: 'manual_market_open_live_YYYYMMDD_HHMMSSZ_<suffix>'."
+    },
+    "triggered_at_utc": {
+      "type": "string",
+      "description": "ISO-8601 UTC timestamp when the run was triggered."
+    },
+    "state_schema_version": {
+      "type": "string",
+      "enum": ["market-open-live-v1"],
+      "description": "Contract version tag: 'market-open-live-v1' for the live execution."
+    },
+    "valid_afternoon_evidence": {
+      "type": "boolean",
+      "const": false,
+      "description": "Always false. A market-open artifact is NEVER valid afternoon scheduled-live evidence; it counts only as prior-allocation context for the morning/midday/afternoon same-day top-up guards."
+    },
+    "afternoon_live_cron_id": {
+      "type": "string",
+      "description": "The afternoon live task id ('10ce362c') recorded for cross-reference only."
+    }
+  },
+  "allOf": [
+    {
+      "comment": "Live execution (9:35 AM ET) invariants.",
+      "if": { "properties": { "run_type": { "const": "market_open_dca_live" } }, "required": ["run_type"] },
+      "then": {
+        "properties": {
+          "cron_id": { "const": "2ba19526" },
+          "state_schema_version": { "const": "market-open-live-v1" },
+          "trades": { "const": true }
+        }
+      }
+    },
+    {
+      "comment": "Scheduled live execution: pinned window and run_id pattern.",
+      "if": {
+        "properties": {
+          "run_origin": { "const": "scheduled" },
+          "run_type": { "const": "market_open_dca_live" }
+        },
+        "required": ["run_origin", "run_type"]
+      },
+      "then": {
+        "required": ["scheduled_for_et", "scheduled_window_start_et", "scheduled_window_end_et"],
+        "properties": {
+          "manual_run": { "const": false },
+          "scheduled_for_et": { "const": "09:35" },
+          "scheduled_window_start_et": { "const": "09:30" },
+          "scheduled_window_end_et": { "const": "09:40" },
+          "run_id": { "pattern": "^market_open_live_[0-9]{8}_0935ET$" }
+        }
+      }
+    },
+    {
+      "comment": "Manual runs never use a scheduled run_id and are always manual_run=true.",
+      "if": { "properties": { "run_origin": { "const": "manual" } }, "required": ["run_origin"] },
+      "then": {
+        "properties": {
+          "manual_run": { "const": true },
+          "run_id": {
+            "not": { "pattern": "^market_open_live_[0-9]{8}_0935ET$" }
+          }
+        }
+      }
+    }
+  ]
+}

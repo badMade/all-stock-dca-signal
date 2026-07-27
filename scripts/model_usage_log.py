@@ -223,9 +223,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         prog="python -m scripts.model_usage_log",
         description=(
             "Append one entry to the model usage audit log. For the covered tasks "
-            "with no in-repo Python entry point (b7961407, cd45e95b, e3e6f09e, "
-            "a46bf007 -- pure agent-run analytics/monitoring), the scheduler/agent "
-            "invokes this directly as a shell command after the run completes."
+            "with no in-repo Python entry point (bb4f6ef1, a46bf007 -- pure "
+            "agent-run analytics/monitoring), the scheduler/agent invokes this "
+            "directly as a shell command after the run completes."
         ),
     )
     parser.add_argument("--run-id", required=True)
