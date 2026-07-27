@@ -1864,9 +1864,21 @@ class DemoDataProvider:
 
 
 def _resolve_now(now_arg: Optional[str], config: StrategyConfig) -> datetime:
-    """Return the decision-time datetime for the run (parsed --now, or today's gate time)."""
+    """Return the decision-time datetime for the run (parsed --now, or today's gate time).
+
+    A trailing RFC3339 ``Z`` is normalised to ``+00:00`` before parsing. The
+    scheduled tasks pass ``--now "$(date -u +%Y-%m-%dT%H:%M:%SZ)"``, and
+    ``datetime.fromisoformat`` only accepts ``Z`` from Python 3.11 onward, so
+    calling it bare makes this entry point silently interpreter-version
+    dependent. This mirrors ``dca_live_adapters._parse_rfc3339`` and
+    ``scripts/run_classification._parse_iso_datetime``. A naive value (no zone
+    suffix) is still read as Eastern, the timezone the strategy operates in.
+    """
     if now_arg:
-        parsed = datetime.fromisoformat(now_arg)
+        text = now_arg.strip()
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=EASTERN)
     today = datetime.now(tz=EASTERN).date()
     return datetime.combine(today, config.decision_time_et, tzinfo=EASTERN)

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from dca_config import load_strategy_config
 from near_close_dca import EASTERN, DryRunBroker, SourceName, StrategyConfig, StrategyState, build_broker
@@ -41,6 +43,44 @@ def test_resolve_now_with_aware_string():
     assert dt.minute == 0
     assert dt.second == 0
     assert dt.tzinfo == timezone.utc
+
+
+def test_resolve_now_with_zulu_suffix():
+    """``--now`` must accept an RFC3339 'Z' suffix.
+
+    Every scheduled DCA task passes ``--now "$(date -u +%Y-%m-%dT%H:%M:%SZ)"``,
+    so the CLI has to normalise a trailing 'Z' the same way the rest of the
+    codebase already does (``dca_live_adapters._parse_rfc3339``,
+    ``scripts/run_classification._parse_iso_datetime``). ``fromisoformat`` only
+    learned 'Z' in Python 3.11, so calling it bare makes the entry point
+    silently interpreter-version dependent.
+    """
+    config = StrategyConfig(decision_time_et=time(15, 45))
+    dt = _resolve_now("2026-07-06T12:00:00Z", config)
+    assert dt.year == 2026
+    assert dt.month == 7
+    assert dt.day == 6
+    assert dt.hour == 12
+    assert dt.minute == 0
+    assert dt.second == 0
+    assert dt.utcoffset() == timedelta(0)
+    # Identical instant to the explicit-offset spelling.
+    assert dt == _resolve_now("2026-07-06T12:00:00+00:00", config)
+
+
+def test_resolve_now_with_zulu_suffix_and_fractional_seconds():
+    """A 'Z' timestamp carrying fractional seconds parses to the same instant."""
+    config = StrategyConfig(decision_time_et=time(15, 45))
+    dt = _resolve_now("2026-07-06T12:00:00.250000Z", config)
+    assert dt.utcoffset() == timedelta(0)
+    assert dt.microsecond == 250000
+
+
+def test_resolve_now_rejects_malformed_value():
+    """A malformed ``--now`` still fails loudly rather than being coerced."""
+    config = StrategyConfig(decision_time_et=time(15, 45))
+    with pytest.raises(ValueError):
+        _resolve_now("not-a-timestamp", config)
 
 
 @patch("run_dca.datetime")
