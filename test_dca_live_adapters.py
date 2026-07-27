@@ -16,6 +16,7 @@ from dca_live_adapters import (
     _response_failure,
     _rh_interval,
     _to_float,
+    _unwrap,
 )
 from near_close_dca import (
     EASTERN,
@@ -825,3 +826,20 @@ def test_is_error_response(data, expected):
 ])
 def test_response_failure(response, expected):
     assert _response_failure(response) == expected
+
+def test_unwrap_valid_dict_with_data():
+    payload = {"data": {"key": "value"}}
+    assert _unwrap(payload) == {"key": "value"}
+
+def test_unwrap_valid_dict_without_data():
+    payload = {"key": "value"}
+    assert _unwrap(payload) == {"key": "value"}
+
+def test_unwrap_non_dict_payload():
+    assert _unwrap("not a dict") == {}
+    assert _unwrap(None) == {}
+    assert _unwrap(["a", "list"]) == {}
+
+def test_unwrap_data_key_not_dict():
+    payload = {"data": "not a dict"}
+    assert _unwrap(payload) == {"data": "not a dict"}

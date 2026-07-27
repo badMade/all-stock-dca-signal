@@ -67,10 +67,17 @@ _LIVE_ORDER_STATES = frozenset(
 
 
 def _unwrap(payload: Any) -> Dict[str, Any]:
-    """Return the inner dict for an MCP response that may be wrapped in ``{"data": ...}``."""
-    if isinstance(payload, dict) and "data" in payload and isinstance(payload["data"], dict):
-        return payload["data"]
-    return payload if isinstance(payload, dict) else {}
+    """Extract the inner data dict from an MCP resource/tool payload.
+
+    Returns ``payload['data']`` when present and a dict; otherwise returns the
+    original payload dict. Non-dict payloads return an empty dict.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return payload
+    return data
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
