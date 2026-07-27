@@ -2104,20 +2104,21 @@ def test_run_pipeline_bounded_reload_poisons_equal_metadata_swap(tmp_path, monke
     assert by_ticker["AAPL"]["top_up_manual_review"] is True
 
 
-def test_run_pipeline_bounded_reload_trusts_matching_run_id_despite_unrelated_scan_failures(
+def test_run_pipeline_bounded_reload_poisons_despite_matching_run_id_when_reload_incomplete(
     tmp_path, monkeypatch
 ):
-    # Codex review ("Scope reload failures to affected tickers"): both scans
-    # report scan_had_failures=True, but the failure in each pass is an
-    # UNRELATED artifact for a DIFFERENT ticker/stream -- AAPL's own
-    # contributing artifact (run_id "am") was read cleanly and identically by
-    # both passes. Before the fix, the global scan_had_failures flag alone
-    # forced this ticker to poison to missing_prior_price/manual_review even
-    # though nothing about AAPL's own context is actually in doubt, contrary
-    # to the rule that an unresolved context must fail only the affected
-    # ticker closed. Matching run_id across both passes is direct evidence
-    # the SAME contributing artifact was read both times, so this must stay
-    # resolved.
+    # Codex review ("Track all contributors before trusting an incomplete
+    # reload"): a matching `run_id` across both passes only proves the
+    # WINNING (most recent) contributor to amount_usd was read identically
+    # both times -- it does NOT prove every artifact summed into amount_usd
+    # was. Two passes can coincidentally agree on amount/reference/base/
+    # run_id while each having missed a DIFFERENT non-winning, equal-dollar
+    # fill for the same ticker, hiding a real undercount that would let the
+    # top-up guard submit excess capital. An incomplete reload
+    # (second_scan_had_failures=True) for a ticker present in both passes
+    # must therefore always poison to the conservative missing_prior_price
+    # path, even when every observed field -- including run_id -- matches
+    # exactly.
     import run_dca
     from near_close_dca import PriorSameDayAllocation
 
@@ -2135,8 +2136,9 @@ def test_run_pipeline_bounded_reload_trusts_matching_run_id_despite_unrelated_sc
             selected_base_amount_usd_at="2026-07-06T09:45:00-04:00",
         )
         # Both passes report a failure (e.g. an unrelated MSFT artifact
-        # mid-write), but AAPL's own data is identical and unambiguous both
-        # times.
+        # mid-write); AAPL's own data happens to read identically both
+        # times, but that agreement is no longer trusted as proof the same
+        # full contributor set was read.
         return ({"AAPL": allocation}, True)
 
     monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
@@ -2155,12 +2157,11 @@ def test_run_pipeline_bounded_reload_trusts_matching_run_id_despite_unrelated_sc
     with open(result["run_state_path"], encoding="utf-8") as handle:
         run_state = json.load(handle)
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
-    # Must NOT poison: AAPL's own contributing artifact agreed exactly (same
-    # run_id) across both passes, so unrelated failures elsewhere must not
-    # affect it.
-    assert by_ticker["AAPL"]["top_up_guard_result"] == "same_day_topup_not_lower_or_no_delta"
-    assert by_ticker["AAPL"]["top_up_manual_review"] is False
-    assert by_ticker["AAPL"]["prior_same_day_reference_price"] == 90.0
+    # Must poison: an incomplete reload is never trusted for a ticker present
+    # in both passes, regardless of field agreement.
+    assert by_ticker["AAPL"]["top_up_guard_result"] == "missing_prior_price"
+    assert by_ticker["AAPL"]["top_up_manual_review"] is True
+    assert by_ticker["AAPL"]["prior_same_day_amount"] == 5.0
 
 
 def test_run_pipeline_bounded_reload_poisons_first_only_entry_after_incomplete_reload(

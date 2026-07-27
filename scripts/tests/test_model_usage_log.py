@@ -226,6 +226,32 @@ def test_cli_appends_entry_for_tasks_with_no_python_entry_point():
         assert entry["stream"] == "watchdog"
 
 
+def test_cli_scheduled_for_et_override_beats_manifest_combined_default():
+    # 7be82b97 fires at three ET slots from one cron entry, so its manifest
+    # row carries the combined default "11:30,13:30,14:30" (Codex review:
+    # "Expose the intraday slot override through the logging CLI"). Without
+    # --scheduled-for-et every CLI-driven append for this task would log that
+    # ambiguous combined value instead of the slot that actually fired.
+    from model_usage_log import _main
+
+    with tempfile.TemporaryDirectory() as td:
+        rc = _main(
+            [
+                "--run-id", "intraday_live_20260727_1330ET",
+                "--task-id", "7be82b97",
+                "--artifact-path", "/tmp/intraday_report.json",
+                "--scheduled-for-et", "13:30",
+                "--triggered-at-utc", TRIGGERED.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "--root", td,
+            ]
+        )
+        assert rc == 0
+        log_path = resolve_log_path(TRIGGERED, root=td)
+        entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+        assert entry["task_id"] == "7be82b97"
+        assert entry["scheduled_for_et"] == "13:30"
+
+
 def test_cli_exits_nonzero_and_writes_nothing_for_unknown_task():
     from model_usage_log import _main
 

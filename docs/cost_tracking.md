@@ -176,10 +176,12 @@ Covered daily tasks (same set as the routing policy):
 | 3:40 PM | `a46bf007` | watchdog |
 
 `7be82b97` fires three times a day from one cron entry, so its manifest row
-carries the combined default `"11:30,13:30,14:30"`. Each run should pass its own
+carries the combined default `"11:30,13:30,14:30"`. Each run must pass its own
 slot as an explicit `scheduled_for_et` override so the log records the real fire
-time. The manifest keeps exactly one row per `task_id` because
-`_load_task_directory` keys on it.
+time -- the Python `log_model_usage()`/`build_entry()` API accepts it as a
+keyword argument, and the CLI accepts it as `--scheduled-for-et` (Codex review:
+"Expose the intraday slot override through the logging CLI"). The manifest
+keeps exactly one row per `task_id` because `_load_task_directory` keys on it.
 
 **Writer implementation:** [`scripts/model_usage_log.py`](../scripts/model_usage_log.py)
 appends the entry; every append is best-effort (never raises into or blocks

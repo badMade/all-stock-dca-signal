@@ -11,10 +11,12 @@ ce16ba6b from being confused with manual runs:
 """
 
 import json
+import os
 import sys
 import tempfile
-from datetime import time
+from datetime import datetime, time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # Repo root too: the scripts modules under test import the shared top-level
@@ -1156,6 +1158,16 @@ def test_final_override_ids_excluded_from_scheduled_selection():
 
 JUL21 = "2026-07-21"
 
+_EASTERN = ZoneInfo("America/New_York")
+
+
+def _stamp_mtime_on_trading_day(path: Path, trading_day: str) -> None:
+    """Set path's mtime to noon Eastern on trading_day (see _mtime_matches_trading_day)."""
+    stamp = datetime.combine(
+        datetime.strptime(trading_day, "%Y-%m-%d").date(), time(12, 0), tzinfo=_EASTERN
+    ).timestamp()
+    os.utime(path, (stamp, stamp))
+
 # The five manual midday fills observed under
 # midday_dca/manual_runs/20260721_1345ET on 2026-07-21.
 _JUL21_MIDDAY_FILLS = [
@@ -1252,6 +1264,64 @@ def test_top_up_context_skip_sink_records_unreadable_bare_manual_csv():
         assert skip_sink, (
             "an unreadable bare manual orders CSV must be recorded in "
             "skip_sink so the caller's completeness flag reflects it"
+        )
+
+
+def test_top_up_context_skip_sink_records_unreadable_manual_run_state():
+    # Codex review ("Record manual run-state parse failures in the skip
+    # sink"): the run_state*.json read at the top of the scan loop (before
+    # the CSV-read/parse handling below it) previously swallowed
+    # JSONDecodeError/OSError with a bare `continue` and no skip_sink
+    # signal. A run_state under a manual-context-only root (e.g.
+    # final_manual_review) that is unreadable or mid-write is exactly as
+    # unverifiable as a referenced CSV read failure -- without recording it,
+    # scan_had_failures (bool(skip_sink) in run_dca.py) stayed False even
+    # though this run's fills, if any, were never actually read. Stamped
+    # same-day (see _mtime_matches_trading_day) so the plausible-same-day
+    # scoping below doesn't itself exclude it.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        run_dir = Path(d) / "final_manual_review" / "20260721_1345ET"
+        run_dir.mkdir(parents=True)
+        run_state_path = run_dir / "run_state.json"
+        run_state_path.write_text("{not valid json")
+        _stamp_mtime_on_trading_day(run_state_path, JUL21)
+
+        skip_sink: list = []
+        ctx = load_same_day_top_up_context(JUL21, base=base, skip_sink=skip_sink)
+        assert ctx == {}
+        assert skip_sink, (
+            "an unreadable/unparseable manual run_state.json must be "
+            "recorded in skip_sink so the caller's completeness flag "
+            "reflects the incomplete scan"
+        )
+
+
+def test_top_up_context_skip_sink_excludes_historical_unreadable_manual_run_state():
+    # Codex review ("Scope parse failures to plausible same-day states"):
+    # these roots are scanned recursively (rglob), so an unconditional
+    # skip_sink record would let a single permanently corrupted historical
+    # run_state (from an unrelated, long-past trading day) poison
+    # scan_had_failures forever, forcing an unnecessary bounded reload on
+    # every future run regardless of trading day. mtime-scoping, mirroring
+    # near_close_dca's core loader, must exclude a file whose mtime falls on
+    # a different day than the one being evaluated.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        run_dir = Path(d) / "final_manual_review" / "20250101_0900ET"
+        run_dir.mkdir(parents=True)
+        run_state_path = run_dir / "run_state.json"
+        run_state_path.write_text("{not valid json")
+        _stamp_mtime_on_trading_day(run_state_path, "2025-01-01")
+
+        skip_sink: list = []
+        ctx = load_same_day_top_up_context(JUL21, base=base, skip_sink=skip_sink)
+        assert ctx == {}
+        assert not skip_sink, (
+            "a corrupted run_state from an unrelated historical trading day "
+            "must not poison this trading day's completeness signal"
         )
 
 

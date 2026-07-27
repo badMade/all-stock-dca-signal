@@ -211,8 +211,8 @@ are never read as prior context — so morning/manual orders before 2:30 PM ET a
 read for top-up only, never as afternoon scheduled execution evidence,
 slippage, watchdog confirmation, scheduled cost basis, or scheduled fill counts.
 When multiple earlier runs touched a ticker the dollar amounts are summed and that
-ticker's **most recent** valid reference price wins (near_close_dca loader: by `generated_at` when parseable; manual CSV loader: by artifact scan order).
-Untimestamped runs defer to later scan/merge order, and a manual fill folded in last is
+ticker's **most recent** valid reference price wins (near_close_dca loader: by `generated_at` when parseable; manual CSV loader: by `generated_at` when parseable, with ties/untimestamped runs deferring to later scan/merge order).
+A manual fill folded in last is
 treated as the most recent reference. Any unknown contributing reference still
 poisons the aggregate to unknown. The scheduled run always writes a valid
 scheduled `run_state` even when every buy is fully offset to $0.

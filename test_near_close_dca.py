@@ -2586,6 +2586,7 @@ def test_load_prior_same_day_multi_missing_reference_poisons_to_none(tmp_path):
     )
     assert allocations["AAPL"].amount_usd == 7.5
     assert allocations["AAPL"].reference_price is None
+    assert allocations["AAPL"].reference_ts is None
 
 
 def test_load_prior_same_day_multi_picks_chronologically_first_base_regardless_of_root_order(tmp_path):
@@ -2757,6 +2758,34 @@ def test_load_prior_same_day_aggregates_amount_and_takes_most_recent_price(tmp_p
     assert allocations["AAPL"].amount_usd == 7.5
     # The afternoon run must beat the ticker's most recent earlier entry price.
     assert allocations["AAPL"].reference_price == 99.0
+
+
+def test_load_prior_same_day_unknown_reference_clears_reference_timestamp(tmp_path):
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    _write_prior_run(
+        root,
+        "manual_runs/0900",
+        _manual_run_state(
+            [{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0}],
+            generated_at="2026-06-29T09:00:00-04:00",
+        ),
+        orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "98.0"}],
+    )
+    _write_prior_run(
+        root,
+        "manual_runs/1000",
+        _manual_run_state(
+            [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 4.5}],
+            generated_at="2026-06-29T10:00:00-04:00",
+        ),
+        orders_rows=[{"ticker": "AAPL", "status": "submitted", "avg_fill_price": ""}],
+    )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["AAPL"].amount_usd == 7.5
+    assert allocations["AAPL"].reference_price is None
+    assert allocations["AAPL"].reference_ts is None
 
 
 def test_load_prior_same_day_ignores_other_trading_days(tmp_path):
@@ -3379,6 +3408,56 @@ def test_load_prior_same_day_reads_full_report_run_state_via_orders_csv(tmp_path
     alloc = allocations["AAPL"]
     assert abs(alloc.reference_price - 99.0) < 0.001
     assert abs(alloc.amount_usd - 99.0 * 0.0303) < 0.001
+
+
+def test_load_prior_same_day_orders_csv_unknown_reference_clears_reference_timestamp(tmp_path):
+    import csv as _csv
+    import json as _json
+
+    root = str(tmp_path / "state_root")
+    known_run_dir = os.path.join(root, "2026-06-29-known")
+    unknown_run_dir = os.path.join(root, "2026-06-29-unknown")
+    os.makedirs(known_run_dir, exist_ok=True)
+    os.makedirs(unknown_run_dir, exist_ok=True)
+
+    known_orders_csv_path = os.path.join(known_run_dir, "orders.csv")
+    with open(known_orders_csv_path, "w", newline="", encoding="utf-8") as fh:
+        writer = _csv.DictWriter(fh, fieldnames=["ticker", "status", "avg_fill_price", "quantity_filled"])
+        writer.writeheader()
+        writer.writerow({"ticker": "AAPL", "status": "filled", "avg_fill_price": "99.0", "quantity_filled": "0.0303"})
+
+    unknown_orders_csv_path = os.path.join(unknown_run_dir, "orders.csv")
+    with open(unknown_orders_csv_path, "w", newline="", encoding="utf-8") as fh:
+        writer = _csv.DictWriter(fh, fieldnames=["ticker", "status", "notional_usd"])
+        writer.writeheader()
+        writer.writerow({"ticker": "AAPL", "status": "submitted", "notional_usd": "4.5"})
+
+    with open(os.path.join(known_run_dir, "run_state.json"), "w", encoding="utf-8") as fh:
+        _json.dump(
+            {
+                "trading_day": "2026-06-29",
+                "generated_at": "2026-06-29T10:00:00-04:00",
+                "run_classification": {"run_origin": "manual", "run_id": "manual_known"},
+                "artifacts": {"orders_csv_path": known_orders_csv_path},
+            },
+            fh,
+        )
+    with open(os.path.join(unknown_run_dir, "run_state.json"), "w", encoding="utf-8") as fh:
+        _json.dump(
+            {
+                "trading_day": "2026-06-29",
+                "generated_at": "2026-06-29T10:30:00-04:00",
+                "run_classification": {"run_origin": "manual", "run_id": "manual_unknown"},
+                "artifacts": {"orders_csv_path": unknown_orders_csv_path},
+            },
+            fh,
+        )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["AAPL"].amount_usd == 7.5
+    assert allocations["AAPL"].reference_price is None
+    assert allocations["AAPL"].reference_ts is None
 
 
 def test_load_prior_same_day_skip_sink_records_missing_referenced_orders_csv(tmp_path):

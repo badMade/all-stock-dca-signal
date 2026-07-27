@@ -1627,6 +1627,34 @@ def _merge_prior(
             alloc.sources.append(source_label)
 
 
+def _mtime_matches_trading_day(path: Path, trading_day: str) -> bool:
+    """True if ``path``'s last-modified time falls on ``trading_day`` (Eastern).
+
+    Mirrors ``near_close_dca._mtime_matches_trading_day``: scopes skip_sink to
+    PLAUSIBLY same-day artifacts. A ``run_state*.json`` that fails to
+    read/parse can't have its own ``trading_day`` field inspected (that's
+    exactly what failed), so a permanently corrupted historical artifact
+    accumulated anywhere under a recursively (``rglob``) scanned root would
+    otherwise poison ``scan_had_failures`` forever, forcing an unconditional
+    bounded reload on every future run regardless of trading day (Codex
+    review: "Scope parse failures to plausible same-day states"). mtime is an
+    imperfect but cheap, universal proxy: a same-day artifact still being
+    flushed necessarily has a same-day mtime, while old corrupted files do
+    not. If the path can't even be stat'd, or ``trading_day`` doesn't parse,
+    err toward still treating it as a possible same-day failure rather than
+    silently dropping the signal.
+    """
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return True
+    try:
+        target = datetime.strptime(trading_day, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return True
+    return datetime.fromtimestamp(mtime, tz=_EASTERN).date() == target
+
+
 def load_same_day_top_up_context(
     trading_day: str,
     base: Optional[Path] = None,
@@ -1702,6 +1730,23 @@ def load_same_day_top_up_context(
             try:
                 state = json.loads(path.read_text())
             except (json.JSONDecodeError, OSError):
+                # An unreadable or mid-write run_state under a manual
+                # top-up-context root is exactly as unverifiable as a
+                # referenced-CSV read failure below -- without recording it,
+                # scan_had_failures (bool(skip_sink) in run_dca.py) stays
+                # False even though this file's fills, if any, were never
+                # actually read, silently defeating the bounded-reload
+                # completeness signal (Codex review: "Record manual
+                # run-state parse failures in the skip sink"). Scoped to
+                # PLAUSIBLY same-day artifacts via mtime, matching the core
+                # loader's own skip_sink scoping -- these roots are scanned
+                # recursively (rglob), so an unconditional record would let a
+                # single permanently corrupted historical file poison
+                # scan_had_failures forever, forcing an unnecessary bounded
+                # reload on every future run (Codex review: "Scope parse
+                # failures to plausible same-day states").
+                if skip_sink is not None and _mtime_matches_trading_day(path, trading_day):
+                    skip_sink.append(path)
                 continue
             if not isinstance(state, dict) or not is_top_up_context_state(state, trading_day):
                 continue

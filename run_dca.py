@@ -1484,94 +1484,36 @@ def _run_pipeline_impl(
                             # this ticker -- a complete, trustworthy answer.
                             prior_same_day_allocations[ticker] = alloc
                     elif not _reload_verified_complete:
-                        # The swap-uncertainty note above only defends against
-                        # the FORWARD swap (first pass resolved, reload
-                        # incomplete but shows a DIFFERENT total) by keeping
-                        # `existing`. But an incomplete reload that actively
-                        # DISAGREES with the first pass on this exact ticker
-                        # is direct evidence something changed or was missed,
-                        # regardless of whether the first pass's OWN scan
-                        # happened to be clean elsewhere: a sibling writer can
-                        # add or update this ticker's artifact in the window
-                        # between the two scans, and an incomplete reload
-                        # that then reads a different total for it is proof
-                        # the first pass's "resolved" snapshot is now stale,
-                        # not proof the reload is wrong (Codex review: "Poison
-                        # resolved context when an incomplete reload swaps
-                        # contributors"; "Poison conflicts even after a clean
-                        # first scan"). Only poison when the two passes
-                        # actually DISAGREE on this ticker -- if they agree,
-                        # there is nothing new to account for... UNLESS the
-                        # two passes' agreement isn't proof they read the
-                        # SAME contributing artifact for THIS ticker: pass one
-                        # can read one $5 fill and skip a second,
-                        # coincidentally-identical $5 fill; the reload can
-                        # then read that second fill and skip the first. The
-                        # true aggregate is $10, but matching metadata makes
-                        # it look like $5/unchanged (Codex review: "Poison
-                        # equal-metadata swaps after an incomplete reload").
-                        # The earlier fix for that case gated on the FIRST
-                        # pass's global `scan_had_failures` flag -- true when
-                        # ANY run_state candidate anywhere in the scanned
-                        # trees (any ticker, any stream) failed to read or
-                        # parse -- as a proxy for "this ticker might have a
-                        # same-day sibling artifact neither scan reliably
-                        # read." That proxy is far broader than the ambiguity
-                        # it exists to catch: an unrelated ticker's unrelated
-                        # artifact failing to parse elsewhere in a large
-                        # multi-stream tree would poison THIS ticker's
-                        # already-agreeing, already-verified context too,
-                        # contrary to the bounded-reload's own rule that an
-                        # unresolved context must fail only the affected
-                        # ticker closed (Codex review: "Cap guarded top-ups
-                        # using the preserved base" sibling finding, "Scope
-                        # reload failures to affected tickers"). Use each
-                        # pass's own `run_id` for THIS ticker instead: it is
-                        # the contributing artifact's identity, read directly
-                        # from that artifact's content, so two passes that
-                        # resolved the SAME `run_id` for this ticker read the
-                        # SAME contributing artifact (or an identical-content
-                        # set that produced the same winning `run_id`) --
-                        # genuine agreement, not coincidence. A DIFFERENT (or
-                        # newly None/newly populated) `run_id` for an
-                        # otherwise-matching ticker is exactly the
-                        # coincidentally-equal-swap signature above and still
-                        # poisons.
-                        if (
-                            alloc.amount_usd != existing.amount_usd
-                            or alloc.reference_price != existing.reference_price
-                            # selected_base_amount_usd is sourced from the SAME
-                            # underlying artifact and resolve_top_up_desired_
-                            # amount_usd multiplies it directly to compute the
-                            # top-up target -- an unverified reload that
-                            # corrects the base while amount/price happen to
-                            # match is still direct evidence this ticker's
-                            # record changed, not proof it didn't (Codex
-                            # review: "Include base metadata in
-                            # incomplete-reload conflicts"). Omitting it here
-                            # would let a base-only correction slip through
-                            # as "agreement" and keep the stale, larger base.
-                            or alloc.selected_base_amount_usd != existing.selected_base_amount_usd
-                            or alloc.selected_base_amount_usd_at != existing.selected_base_amount_usd_at
-                            or alloc.run_id != existing.run_id
-                        ):
-                            # Take the larger observed amount as a
-                            # conservative floor on what was actually
-                            # deployed -- never smaller than either pass saw
-                            # -- and force the reference unknown so the guard
-                            # routes through its conservative
-                            # missing_prior_price path.
-                            import dataclasses as _dc
+                        # An incomplete reload for a ticker present in both
+                        # passes is never fully trustworthy, even when every
+                        # observed field matches. A prior version of this
+                        # branch trusted a matching `run_id` as proof the two
+                        # passes read the SAME contributing artifact -- but
+                        # `run_id` identifies only the WINNING (most recent)
+                        # contributor to amount_usd, not every artifact
+                        # summed into it. Two passes can coincidentally agree
+                        # on amount/reference/base/run_id while each having
+                        # missed a DIFFERENT non-winning, equal-dollar fill
+                        # for the same ticker -- the true aggregate is higher
+                        # than either pass saw, and trusting the match would
+                        # let the top-up guard under-count what was already
+                        # deployed and submit excess capital (Codex review:
+                        # "Track all contributors before trusting an
+                        # incomplete reload"). There is no per-artifact
+                        # contributor identity tracked on
+                        # PriorSameDayAllocation to prove read-set equality
+                        # directly, so always poison here instead of trusting
+                        # a field match: take the larger observed amount as a
+                        # conservative floor on what was actually deployed --
+                        # never smaller than either pass saw -- and force the
+                        # reference unknown so the guard routes through its
+                        # conservative missing_prior_price path.
+                        import dataclasses as _dc
 
-                            base = alloc if alloc.amount_usd >= existing.amount_usd else existing
-                            prior_same_day_allocations[ticker] = _dc.replace(
-                                base, reference_price=None, reference_ts=None
-                            )
-                        # else: keep existing -- the two passes agree on this
-                        # ticker's metadata AND on the contributing artifact's
-                        # own run_id, so this is a trustworthy, complete
-                        # answer for THIS ticker, regardless of unrelated
-                        # failures elsewhere in either scan.
+                        base = alloc if alloc.amount_usd >= existing.amount_usd else existing
+                        prior_same_day_allocations[ticker] = _dc.replace(
+                            base, reference_price=None, reference_ts=None
+                        )
                     elif alloc.amount_usd > existing.amount_usd:
                         prior_same_day_allocations[ticker] = alloc
                     elif alloc.amount_usd == existing.amount_usd:

@@ -2827,6 +2827,7 @@ def load_prior_same_day_allocations(
                                 pass
                             elif _ref is None:
                                 _entry["reference_price"] = None
+                                _entry["reference_ts"] = None
                                 _entry["reference_price_unknown"] = True
                             else:
                                 if _entry["reference_price"] is None or run_ts >= _entry["reference_ts"]:
@@ -2970,6 +2971,7 @@ def load_prior_same_day_allocations(
                 pass  # already poisoned; keep None
             elif reference_price is None:
                 entry["reference_price"] = None
+                entry["reference_ts"] = None
                 entry["reference_price_unknown"] = True
             else:
                 # Most-recent reference wins: overwrite when this run is at least as

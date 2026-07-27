@@ -274,6 +274,31 @@ def test_signal_amounts_and_actions():
     assert sigs["BIG"].hypothetical_amount_usd == 10.0
 
 
+def test_signal_zero_multiplier_below_configured_minimum_drop_normalizes_to_no_action():
+    # Codex review ("Normalize every zero-multiplier morning signal"): a
+    # customized config can set minimum_drop_vs_previous_close BELOW the
+    # first positive sizing tier (0.1%). A drop of 0.05% then clears the
+    # configured minimum (0.01%) but multiplier_for_drop() still returns 0x
+    # for it. Before the fix this fell into the BUY branch with
+    # multiplier=0.0/hypothetical=0.0 -- action=BUY with a zeroed amount,
+    # which downstream serializes auto_buy_signal=true even though
+    # _buy_candidates() (multiplier > 0) still excludes it, a false
+    # execution-gap alert. The signal must be normalized to a genuine
+    # no-action/skip result instead.
+    cfg = MorningConfig(
+        tickers=("BELOWTIER",), base_buy_amount_usd=2.0, minimum_drop_vs_previous_close=0.0001
+    )
+    ex = MorningDCAExecutor(cfg)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BELOWTIER": 0.0005})
+    sig = {s.ticker: s for s in ex.evaluate(_now(), data)}["BELOWTIER"]
+
+    assert sig.action == Action.NO_ACTION
+    assert sig.multiplier == 0.0
+    assert sig.hypothetical_amount_usd == 0.0
+    assert sig.selected_base_amount_usd == 0.0
+    assert sig.base_selection_reason == "not_below_prior_close_no_buy"
+
+
 class FixedDropProviderWithLow(FixedDropProvider):
     """FixedDropProvider whose prior regular-session bar carries a distinct low.
 

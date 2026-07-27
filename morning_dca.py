@@ -1810,12 +1810,24 @@ class MorningDCAExecutor(DCAExecutor):
         trend_validated: Optional[bool] = None
         mode_label = "watchlist" if self.mode == MORNING_WATCHLIST_MODE else "live"
 
-        if drop_fraction < self.config.minimum_drop_vs_previous_close:
+        if drop_fraction < self.config.minimum_drop_vs_previous_close or multiplier <= 0:
+            # Keyed on multiplier <= 0 as well as the configured minimum drop:
+            # a customized config can set minimum_drop_vs_previous_close below
+            # the first positive sizing tier, so a drop can clear the minimum
+            # while multiplier_for_drop() still returns 0. Without this,
+            # _buy_candidates() (which requires multiplier > 0) would still
+            # correctly exclude the ticker, but this branch would have already
+            # serialized action=BUY / auto_buy_signal=true with a nonzero
+            # selected base -- a false execution-gap alert from the drift
+            # detector (Codex review: "Normalize every zero-multiplier morning
+            # signal").
             action = Action.SKIP if current_price >= previous_close else Action.NO_ACTION
-            reason = (
-                "above/at prior close" if current_price >= previous_close
-                else "below prior close but under 0.1% minimum drop"
-            )
+            if current_price >= previous_close:
+                reason = "above/at prior close"
+            elif drop_fraction < self.config.minimum_drop_vs_previous_close:
+                reason = "below prior close but under 0.1% minimum drop"
+            else:
+                reason = f"morning weakness {drop_pct:.2f}% vs prior close but under first sizing tier -> 0x"
             multiplier = 0.0
             hypothetical = 0.0
             # select_first_allocation_base_usd only checks decision_price <
