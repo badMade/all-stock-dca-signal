@@ -64,12 +64,12 @@ spread, whitelist, or circuit-breaker requirements.
 
 ## Active ticker universe
 
-44 active symbols (see [`config/tickers.json`](../config/tickers.json)):
+45 active symbols (see [`config/tickers.json`](../config/tickers.json)):
 
 ```
 DFTX TRIN AAAU SPCX EVR LUNR IRDM DXYZ LITE ASML DRAM STX
 MSFT AAPL AMAT AMD CBRS MRVL BTX STM SNDK WDC TSM AVGO NVDA QBTS FLKR
-INTC GOOGL GOOG AMZN GLW MA GS MU NFLX XLG TOPT QTOP SATA RGTI IBM GFUZ TXN
+INTC GOOGL GOOG AMZN GLW MA GS MU NFLX XLG TOPT QTOP SATA RGTI IBM GFUZ TXN RKLB
 ```
 
 - **Excluded:** `BYDDY`, `VCX`, `TRLV`, `RVI`
@@ -87,6 +87,14 @@ INTC GOOGL GOOG AMZN GLW MA GS MU NFLX XLG TOPT QTOP SATA RGTI IBM GFUZ TXN
 > Existing exclusions remain BYDDY, VCX, TRLV, and RVI; corrected symbols IRDM
 > and GLW remain; IBM and GFUZ remain included (GFUZ with Robinhood primary if
 > finance is unresolved).
+
+> **TICKER UNIVERSE UPDATE JUL 27 2026:** RKLB (Rocket Lab Corporation) is
+> added to the active DCA universe. Robinhood resolved RKLB as Rocket Lab
+> Corporation Common Stock, state active, tradeable true, fractional
+> tradability tradable, regular-hours dollar orders supported, and prior close
+> available ($63.91 as of 2026-07-24). Existing exclusions remain BYDDY, VCX,
+> TRLV, and RVI; corrected symbols IRDM and GLW remain; IBM, GFUZ, and TXN
+> remain included.
 
 ## Sizing ladder (latest, active)
 

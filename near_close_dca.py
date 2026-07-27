@@ -125,7 +125,7 @@ ACTIVE_TICKERS = [
     "DXYZ", "LITE", "ASML", "DRAM", "STX", "MSFT", "AAPL", "AMAT", "AMD", "CBRS",
     "MRVL", "BTX", "STM", "SNDK", "WDC", "TSM", "AVGO", "NVDA", "QBTS", "FLKR",
     "INTC", "GOOGL", "GOOG", "AMZN", "GLW", "MA", "GS", "MU", "NFLX", "XLG",
-    "TOPT", "QTOP", "SATA", "RGTI", "IBM", "GFUZ", "TXN",
+    "TOPT", "QTOP", "SATA", "RGTI", "IBM", "GFUZ", "TXN", "RKLB",
 ]
 
 # BYDDY (ADR wind-down), VCX, TRLV, and RVI are excluded from the active universe.

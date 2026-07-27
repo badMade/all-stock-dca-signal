@@ -29,6 +29,20 @@ Feb, Nov, Dec). Re-verify around DST transitions.
 > existing trading safety, pre-authorization, top-up, run-classification,
 > budget, cost-conscious, manual-exclusion, and recovery text.
 
+> **TICKER UNIVERSE UPDATE JUL 27 2026:** RKLB (Rocket Lab Corporation) is
+> added to the active DCA universe, used by every universe-bearing scheduled
+> task (the pre-market dashboard, the 9:45 scans, the morning/midday/afternoon
+> live streams, the monitor-only signal check, the post-trade slippage sync, the
+> watchdog, and the weekly/monthly refreshes). The active universe is now **45
+> symbols**. Robinhood resolved RKLB as Rocket Lab Corporation Common Stock,
+> state active, tradeable true, fractional tradability tradable, regular-hours
+> dollar orders supported, and prior close available ($63.91 as of 2026-07-24).
+> Existing exclusions remain BYDDY, VCX, TRLV, and RVI; corrected symbols IRDM
+> and GLW remain; IBM, GFUZ, and TXN remain included. This adds a whitelisted
+> symbol only; it preserves all existing trading safety, pre-authorization,
+> top-up, run-classification, budget, cost-conscious, manual-exclusion, and
+> recovery text.
+
 > **Schedule integrity note:** the live trading task runs at **3:30 PM ET**; the
 > post-trade slippage / Notion sync runs at **3:35 PM ET**. These are two
 > different tasks. Do not merge them or move the live trade off 3:30 PM ET.
@@ -1096,12 +1110,12 @@ while paused. `f7411889` remains a one-time reminder, not a recurring stream.
   America/New_York date is the final eligible market day of the month. If it is
   **not**, the run ends **silently** — no notification, no market-data pulls, no
   Notion updates, and no reporting.
-- **Active universe (44 symbols):** DFTX, TRIN, AAAU, SPCX, EVR, LUNR, IRDM, DXYZ,
+- **Active universe (45 symbols):** DFTX, TRIN, AAAU, SPCX, EVR, LUNR, IRDM, DXYZ,
   LITE, ASML, DRAM, STX, MSFT, AAPL, AMAT, AMD, CBRS, MRVL, BTX, STM, SNDK, WDC,
   TSM, AVGO, NVDA, QBTS, FLKR, INTC, GOOGL, GOOG, AMZN, GLW, MA, GS, MU, NFLX, XLG,
-  TOPT, QTOP, SATA, RGTI, IBM, GFUZ, TXN. **Excluded:** BYDDY, VCX, TRLV, RVI.
-  **Corrections:** IRDMI→IRDM, GLWR→GLW. IBM, GFUZ, and TXN remain included unless
-  later removed. Source of truth: [`config/tickers.json`](../config/tickers.json).
+  TOPT, QTOP, SATA, RGTI, IBM, GFUZ, TXN, RKLB. **Excluded:** BYDDY, VCX, TRLV, RVI.
+  **Corrections:** IRDMI→IRDM, GLWR→GLW. IBM, GFUZ, TXN, and RKLB remain included
+  unless later removed. Source of truth: [`config/tickers.json`](../config/tickers.json).
 - **Data source policy:** Finance connector is **primary** for historical market
   data. **Alpaca and Robinhood are read-only** validation/context. **yfinance is a
   fallback only** when connector data is unavailable, stale, incomplete, or

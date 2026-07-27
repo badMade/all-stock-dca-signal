@@ -229,9 +229,10 @@
   "afternoon_completion_rule": "All afternoon trading and artifact-writing tasks complete no later than 3:40 PM ET, when the read-only live-run watchdog (a46bf007) begins its final verification. The watchdog's own post-3:40 PM verification, the Friday weekly Notion performance refresh at 5:00 PM ET, and the month-end volatility risk refresh at 5:00 PM ET (c9fb1fb8 / 17a3b2a9) are the only approved post-3:40 PM DCA-related exceptions.",
   "ticker_universe_policy": {
     "source_of_truth": "config/tickers.json",
-    "active_count": 44,
+    "active_count": 45,
     "summary": "Every universe-bearing scheduled task (pre-market dashboard, 9:45 scans, morning/midday/afternoon live streams, monitor-only signal check, post-trade slippage sync, watchdog, weekly/monthly refreshes) evaluates the active graded DCA universe in config/tickers.json:active. Only whitelisted active-universe tickers may be traded. BYDDY, VCX, TRLV, and RVI remain excluded. IRDMI->IRDM and GLWR->GLW remain corrected upstream.",
-    "ticker_universe_update_2026_07_19": "TICKER UNIVERSE UPDATE JUL 19 2026: TXN is added to the active DCA universe and GFUZ remains active, taking the active universe to 44 symbols. Robinhood resolved TXN as Texas Instruments Incorporated Common Stock, state active, tradeable true, fractional tradability tradable, regular-hours dollar orders supported, and prior close available. Finance lookup resolved TXN as Texas Instruments Incorporated. Existing exclusions remain BYDDY, VCX, TRLV, and RVI; corrected symbols IRDM and GLW remain; IBM and GFUZ remain included (GFUZ with Robinhood primary if finance is unresolved). This adds whitelisted symbols only and preserves all existing trading safety, pre-authorization, same-day top-up, run-classification, budget, cost-conscious, manual-exclusion, and recovery language."
+    "ticker_universe_update_2026_07_19": "TICKER UNIVERSE UPDATE JUL 19 2026: TXN is added to the active DCA universe and GFUZ remains active, taking the active universe to 44 symbols. Robinhood resolved TXN as Texas Instruments Incorporated Common Stock, state active, tradeable true, fractional tradability tradable, regular-hours dollar orders supported, and prior close available. Finance lookup resolved TXN as Texas Instruments Incorporated. Existing exclusions remain BYDDY, VCX, TRLV, and RVI; corrected symbols IRDM and GLW remain; IBM and GFUZ remain included (GFUZ with Robinhood primary if finance is unresolved). This adds whitelisted symbols only and preserves all existing trading safety, pre-authorization, same-day top-up, run-classification, budget, cost-conscious, manual-exclusion, and recovery language.",
+    "ticker_universe_update_2026_07_27": "TICKER UNIVERSE UPDATE JUL 27 2026: RKLB (Rocket Lab Corporation) is added to the active DCA universe, taking the active universe to 45 symbols. Robinhood resolved RKLB as Rocket Lab Corporation Common Stock, state active, tradeable true, fractional tradability tradable, regular-hours dollar orders supported, and prior close available ($63.91 as of 2026-07-24). Existing exclusions remain BYDDY, VCX, TRLV, and RVI; corrected symbols IRDM and GLW remain; IBM, GFUZ, and TXN remain included. This adds a whitelisted symbol only and preserves all existing trading safety, pre-authorization, same-day top-up, run-classification, budget, cost-conscious, manual-exclusion, and recovery language."
   },
   "run_classification_policy": {
     "policy_file": "config/run_classification.json",
@@ -279,7 +280,7 @@
     "missing_prior_low": "A missing or unknown prior regular-session low is treated conservatively as not-below-low, so the first buy sizes from the $1.00 base when below the close.",
     "per_order_ceiling_usd": 10.0,
     "active_universe": {
-      "active": ["DFTX", "TRIN", "AAAU", "SPCX", "EVR", "LUNR", "IRDM", "DXYZ", "LITE", "ASML", "DRAM", "STX", "MSFT", "AAPL", "AMAT", "AMD", "CBRS", "MRVL", "BTX", "STM", "SNDK", "WDC", "TSM", "AVGO", "NVDA", "QBTS", "FLKR", "INTC", "GOOGL", "GOOG", "AMZN", "GLW", "MA", "GS", "MU", "NFLX", "XLG", "TOPT", "QTOP", "SATA", "RGTI", "IBM", "GFUZ", "TXN"],
+      "active": ["DFTX", "TRIN", "AAAU", "SPCX", "EVR", "LUNR", "IRDM", "DXYZ", "LITE", "ASML", "DRAM", "STX", "MSFT", "AAPL", "AMAT", "AMD", "CBRS", "MRVL", "BTX", "STM", "SNDK", "WDC", "TSM", "AVGO", "NVDA", "QBTS", "FLKR", "INTC", "GOOGL", "GOOG", "AMZN", "GLW", "MA", "GS", "MU", "NFLX", "XLG", "TOPT", "QTOP", "SATA", "RGTI", "IBM", "GFUZ", "TXN", "RKLB"],
       "excluded": ["BYDDY", "VCX", "TRLV", "RVI"],
       "symbol_corrections": {"IRDMI": "IRDM", "GLWR": "GLW"},
       "source_of_truth": "config/tickers.json"
@@ -354,7 +355,7 @@
     "missing_prior_low": "A missing or unknown prior regular-session low is treated conservatively as not-below-low, so the first buy sizes from the $1.00 base when below the close.",
     "per_order_ceiling_usd": 10.0,
     "active_universe": {
-      "active": ["DFTX", "TRIN", "AAAU", "SPCX", "EVR", "LUNR", "IRDM", "DXYZ", "LITE", "ASML", "DRAM", "STX", "MSFT", "AAPL", "AMAT", "AMD", "CBRS", "MRVL", "BTX", "STM", "SNDK", "WDC", "TSM", "AVGO", "NVDA", "QBTS", "FLKR", "INTC", "GOOGL", "GOOG", "AMZN", "GLW", "MA", "GS", "MU", "NFLX", "XLG", "TOPT", "QTOP", "SATA", "RGTI", "IBM", "GFUZ", "TXN"],
+      "active": ["DFTX", "TRIN", "AAAU", "SPCX", "EVR", "LUNR", "IRDM", "DXYZ", "LITE", "ASML", "DRAM", "STX", "MSFT", "AAPL", "AMAT", "AMD", "CBRS", "MRVL", "BTX", "STM", "SNDK", "WDC", "TSM", "AVGO", "NVDA", "QBTS", "FLKR", "INTC", "GOOGL", "GOOG", "AMZN", "GLW", "MA", "GS", "MU", "NFLX", "XLG", "TOPT", "QTOP", "SATA", "RGTI", "IBM", "GFUZ", "TXN", "RKLB"],
       "excluded": ["BYDDY", "VCX", "TRLV", "RVI"],
       "symbol_corrections": {"IRDMI": "IRDM", "GLWR": "GLW"},
       "source_of_truth": "config/tickers.json"

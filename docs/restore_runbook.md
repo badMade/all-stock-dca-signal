@@ -71,7 +71,7 @@ Then diff and review before committing. See [`scripts/README.md`](../scripts/REA
 
 ## Audit checklist
 
-- [ ] Active universe = 44 symbols (includes `GFUZ`, `TXN`); `BYDDY`, `VCX`, `TRLV`, `RVI` excluded; `IRDMI→IRDM`, `GLWR→GLW` applied; `GFUZ` included (Robinhood primary data, finance `NOT_FOUND`).
+- [ ] Active universe = 45 symbols (includes `GFUZ`, `TXN`, `RKLB`); `BYDDY`, `VCX`, `TRLV`, `RVI` excluded; `IRDMI→IRDM`, `GLWR→GLW` applied; `GFUZ` included (Robinhood primary data, finance `NOT_FOUND`).
 - [ ] Ladder is the latest (0.1%–8%+, max 5x, no upper cutoff). No 12x-era tiers.
 - [ ] Base amount $2; tiered daily/weekly caps and $900 weekly rollover reserve cap intact.
 - [ ] Only the live trading tasks `2ba19526`, `42173154`, `7be82b97`, `a6239dae`, and `10ce362c` (supersedes deleted `ce16ba6b`) can trade; they use only Robinhood account `562057042`; Alpaca read-only.
