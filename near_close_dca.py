@@ -2,7 +2,7 @@
 Near-close graded DCA strategy skeleton.
 
 This mirrors the scheduled live-test rules:
-    - Run at 3:20 PM America/New_York (the canonical live schedule).
+    - Run at 3:30 PM America/New_York (the canonical live schedule).
     - Use completed regular-session bars only.
     - Compare finance-side and Robinhood-side signals before auto-ordering.
     - Place real orders only through a broker adapter that reviews first.
@@ -25,7 +25,7 @@ trading is the safest mode for connection testing; toggle it with
 
 Live contract note (2026-07-23): the authoritative scheduled live contract now
 spans four Robinhood-only streams (9:45 preflight, 10:30 morning live, 12:30
-midday live, 3:20 final live). Runners must validate same-day pointers before
+midday live, 3:30 final live). Runners must validate same-day pointers before
 trusting them, treat a ticker with no prior same-day context as a first
 allocation (top-up only when prior same-day context exists and the price is
 strictly below that ticker's most recent prior same-day reference), dedupe against same-day
@@ -507,7 +507,7 @@ class StrategyConfig:
     tickers: Sequence[str] = tuple(ACTIVE_TICKERS)
     excluded_tickers: frozenset[str] = frozenset(EXCLUDED_TICKERS)
     approved_test_dates: frozenset[date] = frozenset(APPROVED_TEST_DATES)
-    decision_time_et: time = time(15, 20)  # matches the 3:20 PM ET canonical live schedule
+    decision_time_et: time = time(15, 30)  # matches the 3:30 PM ET canonical live schedule
     trend_lookback_minutes: int = 60
     # First-allocation base amount selected before the ladder multiplier. When the
     # decision price is below the prior regular-session close AND the prior
@@ -528,7 +528,7 @@ class StrategyConfig:
     broker: BrokerName = BrokerName.ROBINHOOD
     dry_run: bool = True
 
-    # Bars from many market-data APIs are start-stamped. At a 3:20 PM decision,
+    # Bars from many market-data APIs are start-stamped. At a 3:30 PM decision,
     # the latest completed 15-minute start-stamped bar is 3:05 PM.
     assume_bar_timestamps_are_start_times: bool = True
     finance_interval_minutes: int = 15
@@ -576,7 +576,7 @@ class StrategyConfig:
     # decision: a ticker below its prior close with multiplier > 0 is bought
     # regardless of whether the 60-minute trend is up or flat. All other guards
     # (minimum drop, spread, budget, data confidence, hard circuit breakers) still
-    # apply. Set to True for the final scheduled live buy of the day (3:20 PM ET)
+    # apply. Set to True for the final scheduled live buy of the day (3:30 PM ET)
     # per the final_buy_behavior policy in config/scheduled_tasks.json.
     ignore_trend_filter: bool = False
 
@@ -1928,7 +1928,7 @@ def build_run_artifacts(
     so downstream consumers -- ``dca_reporting``'s manual-order exclusion and
     ``dca_risk``'s scheduled-stream deployment accounting -- can tell a scheduled
     live run from a manual one from the artifact content alone. ``manual``
-    selects which block is stamped: False (default) is the scheduled 3:20 PM ET
+    selects which block is stamped: False (default) is the scheduled 3:30 PM ET
     live task, True is a manual/ad hoc invocation.
     """
     now_et = now.astimezone(EASTERN)
@@ -1945,7 +1945,7 @@ def build_run_artifacts(
         else build_scheduled_classification(trading_day.isoformat(), triggered_at_utc=triggered_at_utc)
     )
     if not manual:
-        # The scheduled afternoon (3:20 PM ET) artifact contract requires the
+        # The scheduled afternoon (3:30 PM ET) artifact contract requires the
         # run_classification to additionally carry trading_day, same_day_required,
         # and valid_scheduled_evidence (see
         # scripts.scheduled_artifacts.build_afternoon_live_run_classification and
@@ -3132,7 +3132,7 @@ def merge_manual_top_up_context(
     reference from either source poisons the aggregate to unknown, routing the
     guard to its conservative missing-price path.
 
-    Shared by both ``run_dca.py`` (the 3:20 afternoon guard) and
+    Shared by both ``run_dca.py`` (the 3:30 afternoon guard) and
     ``morning_dca.py``'s ``MorningDCAExecutor._compute_top_up`` (the 10:30/12:30
     morning and midday guards -- Codex review: "Wire manual CSV context into the
     midday guard"): the policy documented in config/run_classification.json
@@ -3198,6 +3198,33 @@ def merge_manual_top_up_context(
                 # reference's identity").
                 ref_run_id = alloc.sources[0] if alloc.sources else None
                 ref_source = "manual_top_up_context"
+        # PriorAllocation (scripts.run_classification) carries no full datetime,
+        # but its reference_ts (ET seconds-of-day, same trading_day as
+        # `existing`) DOES let us compare against `existing.selected_base_amount_
+        # usd_at` -- reduced to the same ET seconds-of-day -- to tell whether
+        # this bare-CSV-only manual fill happened before or after the run that
+        # established `existing`'s base (Codex review discussion_r3653976740:
+        # "Preserve the known base when a later manual fill is merged"). Retain
+        # `existing`'s base only when the manual fill is CONFIRMED later: an
+        # earlier scheduled allocation's known base is still the true first
+        # allocation's base regardless of a later manual top-up being merged in.
+        # When the manual fill may be EARLIER (or either timestamp is unknown),
+        # it could itself be the true first allocation, whose base a bare CSV
+        # cannot tell us -- poison to unknown rather than risk a stale/wrong
+        # base doubling the full-day target (Codex review: "Keep the base
+        # unknown after merging an earlier manual fill") -- this mirrors
+        # reference_price's own poison-on-uncertainty policy above.
+        base = None
+        base_at = None
+        if existing.selected_base_amount_usd is not None and alloc.reference_ts is not None:
+            existing_base_dt = _prior_run_timestamp(existing.selected_base_amount_usd_at)
+            if existing_base_dt is not None:
+                existing_base_seconds = (
+                    existing_base_dt.hour * 3600 + existing_base_dt.minute * 60 + existing_base_dt.second
+                )
+                if alloc.reference_ts > existing_base_seconds:
+                    base = existing.selected_base_amount_usd
+                    base_at = existing.selected_base_amount_usd_at
         prior_same_day_allocations[ticker] = PriorSameDayAllocation(
             ticker=ticker,
             amount_usd=existing.amount_usd + alloc.prior_usd,
@@ -3205,16 +3232,8 @@ def merge_manual_top_up_context(
             run_id=ref_run_id,
             source=ref_source,
             reference_ts=ref_ts,
-            # PriorAllocation (scripts.run_classification) carries no timestamp,
-            # so there is no way to tell whether this bare-CSV-only manual fill
-            # actually happened before or after `existing`'s already-resolved
-            # base. Poison to unknown rather than silently keep `existing`'s
-            # base as if it were still the true first allocation's (Codex
-            # review: "Keep the base unknown after merging an earlier manual
-            # fill") -- this mirrors reference_price's own poison-on-uncertainty
-            # policy above.
-            selected_base_amount_usd=None,
-            selected_base_amount_usd_at=None,
+            selected_base_amount_usd=base,
+            selected_base_amount_usd_at=base_at,
         )
 
 
@@ -3813,7 +3832,7 @@ def _write_and_validate_scheduled_contract(
     """Write the remaining scheduled-live contract files, then validate them.
 
     The compact daily path already wrote run_state.json + signals.csv. The
-    scheduled afternoon (3:20 PM ET) contract additionally requires
+    scheduled afternoon (3:30 PM ET) contract additionally requires
     ``submitted_orders.csv`` (header row even with no order) and a canonical
     ``run_summary.json`` whose ``run_classification`` MIRRORS run_state's, and it
     forbids a compute-only terminal state (planned orders but nothing placed). This

@@ -51,9 +51,25 @@ ACCEPTED_STATE_SCHEMA_VERSIONS = (STATE_SCHEMA_VERSION, STATE_SCHEMA_VERSION_V2)
 CRON_ID = "10ce362c"
 SUPERSEDES_CRON_ID = "ce16ba6b"
 SCHEDULED_RUN_TYPE = "scheduled_live_test"
-SCHEDULED_FOR_ET = "15:20"
-SCHEDULED_WINDOW_START_ET = "15:15"
+SCHEDULED_FOR_ET = "15:30"
+SCHEDULED_WINDOW_START_ET = "15:25"
 SCHEDULED_WINDOW_END_ET = "15:35"
+# 10ce362c was retimed from 3:20 PM to the canonical 3:30 PM ET on 2026-07-27. Runs
+# that fired before then carry the old identity, so validation accepts it as legacy
+# and existing artifacts stay valid. Writers only ever emit the canonical values.
+LEGACY_SCHEDULED_FOR_ET = "15:20"
+LEGACY_SCHEDULED_WINDOW_START_ET = "15:15"
+# Date the retime took effect, as the same zero-padded YYYYMMDD string used in
+# run_id (so it can be compared lexicographically without a date parse). The
+# legacy identity tuple is accepted ONLY for a run_id dated strictly before
+# this: a run dated on/after 2026-07-27 must use the canonical tuple, so a
+# stale or incorrectly written post-retime legacy artifact cannot be treated
+# as valid scheduled evidence and mask a missed canonical run (Codex review
+# r3654117261: "Restrict legacy identities to pre-retime dates").
+CANONICAL_RETIME_DATE_YYYYMMDD = "20260727"
+# Order-attribution window. Deliberately wider than the current classification
+# window so orders from legacy 3:20 PM runs are still attributed to their run.
+ORDER_ATTRIBUTION_WINDOW_START_ET = LEGACY_SCHEDULED_WINDOW_START_ET
 
 # Artifact root remains the ce16ba6b path for continuity across the task repair.
 STATE_ROOT = "/home/user/workspace/cron_tracking/ce16ba6b"
@@ -86,10 +102,17 @@ MANUAL_EXCLUSION_SUBROOTS = (
     "midday_dca/manual_runs",
 )
 
-SCHEDULED_RUN_ID_RE = re.compile(r"^scheduled_[0-9]{8}_1520ET$")
+SCHEDULED_RUN_ID_RE = re.compile(r"^scheduled_[0-9]{8}_1530ET$")
+# Pre-2026-07-27 legacy id, paired with LEGACY_SCHEDULED_FOR_ET/LEGACY_SCHEDULED_WINDOW_START_ET
+# below as one coherent legacy identity tuple -- see validate_classification's
+# combined identity check. Captures the YYYYMMDD group so that check can also
+# enforce CANONICAL_RETIME_DATE_YYYYMMDD.
+LEGACY_SCHEDULED_RUN_ID_RE = re.compile(r"^scheduled_([0-9]{8})_1520ET$")
+# Accepts the canonical 1530ET id and the legacy 1520ET id (pre-2026-07-27 runs).
+SCHEDULED_RUN_ID_ANY_RE = re.compile(r"^scheduled_[0-9]{8}_15(?:3|2)0ET$")
 
 # order_submit_status values (mirror schemas/run_state.schema.json). The scheduled
-# 3:20 task always writes a run_state (and updates the pointer) even when nothing is
+# 3:30 task always writes a run_state (and updates the pointer) even when nothing is
 # submitted; this field records why.
 ORDER_SUBMIT_STATUS_SUBMITTED = "submitted"
 ORDER_SUBMIT_STATUS_NO_CANDIDATES = "not_submitted_no_candidates"
@@ -119,10 +142,10 @@ def _parse_iso_datetime(text: str) -> Optional[datetime]:
 def _et_minutes(value: object) -> Optional[int]:
     """Minutes-since-midnight in **ET** for an order timestamp.
 
-    Accepts a bare ET wall-clock ('15:20', '15:20:33'), a naive ISO datetime
+    Accepts a bare ET wall-clock ('15:30', '15:30:33'), a naive ISO datetime
     (assumed already ET), or a tz-aware ISO string / ``datetime`` — which is
-    converted to America/New_York first, so a UTC ``'...T19:20:00Z'`` correctly
-    reads as 15:20 ET rather than being dropped. Returns None if unparseable.
+    converted to America/New_York first, so a UTC ``'...T19:30:00Z'`` correctly
+    reads as 15:30 ET rather than being dropped. Returns None if unparseable.
     """
     dt = value if isinstance(value, datetime) else _parse_iso_datetime(str(value))
     if dt is not None:
@@ -164,16 +187,38 @@ def _et_seconds(value: object) -> Optional[int]:
     return hh * 3600 + mm * 60 + ss
 
 
-_WINDOW_START_MIN = _et_minutes(SCHEDULED_WINDOW_START_ET)  # 15:15
+_CANONICAL_WINDOW_START_MIN = _et_minutes(SCHEDULED_WINDOW_START_ET)  # 15:25
+_LEGACY_WINDOW_START_MIN = _et_minutes(LEGACY_SCHEDULED_WINDOW_START_ET)  # 15:15
+_WINDOW_START_MIN = _et_minutes(ORDER_ATTRIBUTION_WINDOW_START_ET)  # 15:15 (legacy-wide default)
 _WINDOW_END_MIN = _et_minutes(SCHEDULED_WINDOW_END_ET)      # 15:35
 
 
-def _in_scheduled_window_et(submitted_at_et: object) -> bool:
+def _attribution_window_start_min(rc: object) -> int:
+    """Choose the order-attribution window start from the validated state's
+    OWN scheduled identity, not a single window-wide constant.
+
+    Codex review r3654117272 ("Select the fallback attribution window from
+    the run identity"): the window previously always started at the wider
+    legacy 15:15 boundary, even for a canonical 1530ET run whose canonical
+    classification window starts at 15:25. That let an unrelated broker order
+    submitted at 15:15-15:24 be wrongly attributed to a canonical run. Use
+    15:25 whenever the validated state carries the canonical scheduled_for_et
+    ('15:30'); fall back to the wider legacy 15:15 boundary only for a
+    validated legacy ('15:20') identity (or anything unexpected, to stay at
+    least as permissive as prior behavior for data this function has already
+    accepted as a valid scheduled state).
+    """
+    if isinstance(rc, Mapping) and rc.get("scheduled_for_et") == SCHEDULED_FOR_ET:
+        return _CANONICAL_WINDOW_START_MIN
+    return _LEGACY_WINDOW_START_MIN
+
+
+def _in_scheduled_window_et(submitted_at_et: object, window_start_min: int) -> bool:
     """True only if an ET timestamp falls within the scheduled window (inclusive)."""
     minutes = _et_minutes(submitted_at_et)
     if minutes is None:
         return False
-    return _WINDOW_START_MIN <= minutes <= _WINDOW_END_MIN
+    return window_start_min <= minutes <= _WINDOW_END_MIN
 
 SCHEDULED_REQUIRED_FIELDS = (
     "run_origin",
@@ -205,11 +250,11 @@ def _utc_now_iso() -> str:
 
 
 def scheduled_run_id(trading_day: str) -> str:
-    """'2026-07-06' -> 'scheduled_20260706_1520ET'."""
+    """'2026-07-06' -> 'scheduled_20260706_1530ET'."""
     compact = trading_day.replace("-", "")
     if not re.fullmatch(r"[0-9]{8}", compact):
         raise ValueError(f"trading_day must be YYYY-MM-DD, got {trading_day!r}")
-    return f"scheduled_{compact}_1520ET"
+    return f"scheduled_{compact}_1530ET"
 
 
 def manual_run_id(triggered_at_utc: Optional[str] = None) -> str:
@@ -224,7 +269,7 @@ def build_scheduled_classification(
 ) -> Dict[str, object]:
     """Return a fully-populated scheduled run_classification block.
 
-    Stamps ``stream="afternoon"`` (this builder is the 15:20 ET scheduled live
+    Stamps ``stream="afternoon"`` (this builder is the 15:30 ET scheduled live
     task) so ``scripts.same_day_pointer.select_same_day_run_state``'s
     direct-resolution path -- which fails closed when a target's own
     ``run_classification.stream`` is absent -- accepts a real scheduled
@@ -270,7 +315,7 @@ def build_final_manual_override_classification(
     """Return a manual run_classification block for a final manual buy override.
 
     The final-buy behavior (full active-universe scan, trend filter ignored for the
-    final-buy decision only) may be invoked manually after the scheduled 3:20 PM run.
+    final-buy decision only) may be invoked manually after the scheduled 3:30 PM run.
     Such a run is manual by contract and additionally flags itself as NOT valid
     afternoon scheduled evidence, not valid scheduled evidence at all, and same-day
     top-up context only, so downstream reporting shows it only in the Manual Final
@@ -297,6 +342,21 @@ def state_root(base: Optional[Path] = None) -> Path:
 
 
 def scheduled_run_dir(trading_day: str, base: Optional[Path] = None) -> Path:
+    compact = trading_day.replace("-", "")
+    return state_root(base) / "scheduled_runs" / f"{compact}_1530ET"
+
+
+def legacy_scheduled_run_dir(trading_day: str, base: Optional[Path] = None) -> Path:
+    """The pre-retime (3:20 PM ET) scheduled run directory for ``trading_day``.
+
+    10ce362c was retimed from 3:20 PM to the canonical 3:30 PM ET on
+    2026-07-27 (see LEGACY_SCHEDULED_FOR_ET); every run before that date wrote
+    its scheduled_runs/ directory under this legacy ``_1520ET`` suffix, not
+    :func:`scheduled_run_dir`'s canonical ``_1530ET`` one. Writers must never
+    use this -- they only ever emit the canonical directory -- it exists
+    solely for reporting/read paths that need to locate a historical
+    pre-retime artifact (see :func:`select_scheduled_state_for_reporting`).
+    """
     compact = trading_day.replace("-", "")
     return state_root(base) / "scheduled_runs" / f"{compact}_1520ET"
 
@@ -741,17 +801,49 @@ def validate_classification(rc: Dict[str, object]) -> ValidationResult:
                 f"scheduled run must have cron_id={CRON_ID!r} "
                 f"OR supersedes_cron_id={SUPERSEDES_CRON_ID!r}"
             )
-        if rc.get("scheduled_for_et") != SCHEDULED_FOR_ET:
-            errors.append(f"scheduled_for_et must be {SCHEDULED_FOR_ET!r}")
-        if rc.get("scheduled_window_start_et") != SCHEDULED_WINDOW_START_ET:
-            errors.append(f"scheduled_window_start_et must be {SCHEDULED_WINDOW_START_ET!r}")
         if rc.get("scheduled_window_end_et") != SCHEDULED_WINDOW_END_ET:
             errors.append(f"scheduled_window_end_et must be {SCHEDULED_WINDOW_END_ET!r}")
         run_id = rc.get("run_id")
-        if not isinstance(run_id, str):
+        run_id_is_str = isinstance(run_id, str)
+        if not run_id_is_str:
             errors.append(f"scheduled run_id must be a string, got {run_id!r}")
-        elif not SCHEDULED_RUN_ID_RE.match(run_id):
-            errors.append(f"scheduled run_id must match scheduled_YYYYMMDD_1520ET, got {run_id!r}")
+        # scheduled_for_et, scheduled_window_start_et, and run_id must form ONE
+        # coherent identity -- either fully canonical or fully legacy -- rather
+        # than being accepted independently (Codex review discussion_r3653976747:
+        # "Validate canonical and legacy identity fields as a unit"). Checking
+        # each field against (canonical OR legacy) separately let a hybrid
+        # classification such as scheduled_for_et='15:30' paired with a legacy
+        # '..._1520ET' run_id pass as valid scheduled evidence even though no
+        # real scheduled slot ever produces that combination.
+        scheduled_for_et = rc.get("scheduled_for_et")
+        window_start_et = rc.get("scheduled_window_start_et")
+        run_id_ok_canonical = run_id_is_str and bool(SCHEDULED_RUN_ID_RE.match(run_id))
+        legacy_match = LEGACY_SCHEDULED_RUN_ID_RE.match(run_id) if run_id_is_str else None
+        # The legacy tuple is valid ONLY for a run dated strictly before the
+        # 2026-07-27 retime (Codex review r3654117261); a legacy-shaped run_id
+        # dated on/after that date is NOT run_id_ok_legacy, so it falls through
+        # to the "neither identity" error below rather than passing as valid
+        # scheduled evidence.
+        run_id_ok_legacy = bool(legacy_match) and legacy_match.group(1) < CANONICAL_RETIME_DATE_YYYYMMDD
+        is_canonical_identity = (
+            scheduled_for_et == SCHEDULED_FOR_ET
+            and window_start_et == SCHEDULED_WINDOW_START_ET
+            and run_id_ok_canonical
+        )
+        is_legacy_identity = (
+            scheduled_for_et == LEGACY_SCHEDULED_FOR_ET
+            and window_start_et == LEGACY_SCHEDULED_WINDOW_START_ET
+            and run_id_ok_legacy
+        )
+        if run_id_is_str and not (is_canonical_identity or is_legacy_identity):
+            errors.append(
+                "scheduled_for_et, scheduled_window_start_et, and run_id must form a single "
+                f"coherent identity: either the canonical tuple ({SCHEDULED_FOR_ET!r}, "
+                f"{SCHEDULED_WINDOW_START_ET!r}, 'scheduled_YYYYMMDD_1530ET') or the legacy "
+                f"tuple ({LEGACY_SCHEDULED_FOR_ET!r}, {LEGACY_SCHEDULED_WINDOW_START_ET!r}, "
+                f"'scheduled_YYYYMMDD_1520ET'); got scheduled_for_et={scheduled_for_et!r}, "
+                f"scheduled_window_start_et={window_start_et!r}, run_id={run_id!r}"
+            )
     elif origin == "manual":
         if manual_flag is not True:
             errors.append("manual run must have manual_run=true")
@@ -767,8 +859,11 @@ def validate_classification(rc: Dict[str, object]) -> ValidationResult:
         run_id = rc.get("run_id")
         if not isinstance(run_id, str):
             errors.append(f"manual run_id must be a string, got {run_id!r}")
-        elif SCHEDULED_RUN_ID_RE.match(run_id):
-            errors.append("manual run_id must not match the scheduled_YYYYMMDD_1520ET pattern")
+        elif SCHEDULED_RUN_ID_ANY_RE.match(run_id):
+            errors.append(
+                "manual run_id must not match the scheduled_YYYYMMDD_1530ET "
+                "(or legacy 1520ET) pattern"
+            )
 
     return ValidationResult(not errors, errors)
 
@@ -1019,7 +1114,7 @@ def exclude_manual_orders(
 
 # --- Same-day prior-allocation / top-up context ------------------------------
 #
-# The later same-day runs (12:30 midday, 3:20 afternoon/final) must fold earlier
+# The later same-day runs (12:30 midday, 3:30 afternoon/final) must fold earlier
 # same-day MANUAL fills in as prior-allocation context for the top-up guard: a
 # later run buys only max(0, desired - prior_same_day_amount) and only when its
 # decision price is strictly below the ticker's most recent prior same-day
@@ -1035,7 +1130,7 @@ def exclude_manual_orders(
 # gap: the manual roots that are excluded from scheduled evidence are ingested
 # here as prior-allocation context ONLY. A fill loaded here NEVER counts as
 # scheduled evidence, scheduled slippage, scheduled fill counts, reliability,
-# cost-basis evidence, watchdog proof, or proof the 12:30/3:20 tasks ran -- its
+# cost-basis evidence, watchdog proof, or proof the 12:30/3:30 tasks ran -- its
 # order IDs stay in collect_manual_order_ids()'s exclusion set.
 
 # Roots (relative to CRON_TRACKING_ROOT) scanned for same-day MANUAL top-up
@@ -1711,11 +1806,13 @@ def select_scheduled_state_for_reporting(
       * Broker time-window fallback is allowed ONLY when a valid scheduled
         state exists but lacks order IDs due to a known write failure; even
         then manual order IDs are excluded AND only broker orders whose ET
-        timestamp lands inside the 15:15-15:35 scheduled window are attributed.
+        timestamp lands inside the attribution window are attributed -- 15:25-15:35
+        for a canonical 1530ET state, 15:15-15:35 only for a legacy 1520ET state
+        (see _attribution_window_start_min).
 
     ``broker_window_orders`` items are mappings carrying at least ``order_id``
     (or ``broker_order_id``) and ``submitted_at_et``: a bare ET wall-clock
-    (``"15:20"``), a naive ET ISO timestamp, or a tz-aware ISO timestamp /
+    (``"15:30"``), a naive ET ISO timestamp, or a tz-aware ISO timestamp /
     ``datetime`` (converted to ET before the window compare, so UTC order history
     is handled correctly). Orders with no parseable in-window time are dropped
     rather than attributed.
@@ -1723,6 +1820,17 @@ def select_scheduled_state_for_reporting(
     manual_ids = collect_manual_order_ids(base)
     out_dir = scheduled_run_dir(trading_day, base)
     state_path = out_dir / RUN_STATE_FILENAME
+    if not state_path.exists():
+        # Codex review discussion_r3653976743 ("Fall back to legacy
+        # directories for historical reporting"): for every trading day
+        # before the 2026-07-27 retime, the canonical _1530ET directory never
+        # existed -- those runs wrote (and still live) under the legacy
+        # _1520ET suffix. Falling back here lets is_scheduled_state's own
+        # legacy-identity acceptance actually run against that file instead
+        # of reporting "no scheduled run_state" for every pre-retime day.
+        legacy_state_path = legacy_scheduled_run_dir(trading_day, base) / RUN_STATE_FILENAME
+        if legacy_state_path.exists():
+            state_path = legacy_state_path
 
     if not state_path.exists():
         return ScheduledSelection(
@@ -1795,6 +1903,8 @@ def select_scheduled_state_for_reporting(
         # ET window, still excluding manual IDs.
         used_fallback = True
         fallback_reason = "scheduled state present but order IDs missing (known write failure)"
+        rc_for_window = state.get("run_classification") if isinstance(state, dict) else None
+        window_start_min = _attribution_window_start_min(rc_for_window)
         seen_fallback: Set[str] = set()
         kept = []
         for order in broker_window_orders:
@@ -1803,7 +1913,7 @@ def select_scheduled_state_for_reporting(
             oid = order.get("order_id") or order.get("broker_order_id")
             if not (isinstance(oid, str) and oid) or oid in manual_ids or oid in seen_fallback:
                 continue
-            if not _in_scheduled_window_et(order.get("submitted_at_et")):
+            if not _in_scheduled_window_et(order.get("submitted_at_et"), window_start_min):
                 continue
             seen_fallback.add(oid)
             kept.append(oid)

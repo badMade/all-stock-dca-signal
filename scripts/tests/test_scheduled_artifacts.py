@@ -64,7 +64,7 @@ def test_preflight_classification_is_non_null_object_with_required_fields():
     assert rc["scheduled_window_end_et"] == "09:50"
     assert rc["manual_run"] is False
     assert rc["state_schema_version"] == "morning-preflight-v2-machine-complete"
-    assert rc["cron_id"] == PREFLIGHT_CRON_ID == "morning-dca-0945"
+    assert rc["cron_id"] == PREFLIGHT_CRON_ID == "bb4f6ef1"
     assert rc["stream"] == "morning"
     assert rc["valid_afternoon_evidence"] is False
     assert rc["trading_day"] == "2026-07-21"
@@ -124,7 +124,7 @@ def test_morning_live_classification_is_non_null_object_with_required_fields():
 def test_afternoon_live_classification_is_non_null_object_with_required_fields():
     rc = build_afternoon_live_run_classification(
         trading_day="2026-07-22",
-        run_id="scheduled_20260722_1520ET",
+        run_id="scheduled_20260722_1530ET",
         valid_scheduled_evidence=True,
     )
     assert rc is not None and isinstance(rc, dict)
@@ -132,12 +132,12 @@ def test_afternoon_live_classification_is_non_null_object_with_required_fields()
     assert rc["run_type"] == "scheduled_live_test"
     assert rc["manual_run"] is False
     assert rc["stream"] == "afternoon"
-    assert rc["scheduled_for_et"] == "15:20"
-    assert rc["scheduled_window_start_et"] == "15:15"
+    assert rc["scheduled_for_et"] == "15:30"
+    assert rc["scheduled_window_start_et"] == "15:25"
     assert rc["scheduled_window_end_et"] == "15:35"
     assert rc["cron_id"] == AFTERNOON_LIVE_CRON_ID == "10ce362c"
     assert rc["supersedes_cron_id"] == AFTERNOON_LIVE_SUPERSEDES_CRON_ID == "ce16ba6b"
-    assert rc["run_id"] == "scheduled_20260722_1520ET"
+    assert rc["run_id"] == "scheduled_20260722_1530ET"
     assert rc["trading_day"] == "2026-07-22"
     assert rc["same_day_required"] is True
     assert rc["valid_scheduled_evidence"] is True
@@ -148,14 +148,14 @@ def test_afternoon_live_classification_is_non_null_object_with_required_fields()
 def test_afternoon_evidence_defaults_and_derives_from_completed_state():
     # valid_afternoon_scheduled_evidence defaults to valid_scheduled_evidence
     rc = build_afternoon_live_run_classification(
-        trading_day="2026-07-22", run_id="scheduled_20260722_1520ET",
+        trading_day="2026-07-22", run_id="scheduled_20260722_1530ET",
         valid_scheduled_evidence=False,
     )
     assert rc["valid_scheduled_evidence"] is False
     assert rc["valid_afternoon_scheduled_evidence"] is False
     # but can be set independently
     rc2 = build_afternoon_live_run_classification(
-        trading_day="2026-07-22", run_id="scheduled_20260722_1520ET",
+        trading_day="2026-07-22", run_id="scheduled_20260722_1530ET",
         valid_scheduled_evidence=True, valid_afternoon_scheduled_evidence=False,
     )
     assert rc2["valid_scheduled_evidence"] is True
@@ -279,7 +279,7 @@ def test_mirror_check_ignores_stale_latest_run_summary(tmp_path):
     # Only the canonical run_summary.json is mirror-checked, so the stale report
     # summary must NOT fail the newly written run_state.
     rc = build_afternoon_live_run_classification(
-        trading_day="2026-07-22", run_id="scheduled_20260722_1520ET",
+        trading_day="2026-07-22", run_id="scheduled_20260722_1530ET",
         valid_scheduled_evidence=True,
     )
     (tmp_path / "run_state.json").write_text(
@@ -305,7 +305,7 @@ def test_require_summary_rejects_noncanonical_latest_run_summary(tmp_path):
     # require_summary must require the CANONICAL run_summary.json; a report-only
     # latest_run_summary.json left behind is not sufficient.
     rc = build_afternoon_live_run_classification(
-        trading_day="2026-07-22", run_id="scheduled_20260722_1520ET",
+        trading_day="2026-07-22", run_id="scheduled_20260722_1530ET",
         valid_scheduled_evidence=True,
     )
     (tmp_path / "run_state.json").write_text(
@@ -331,7 +331,7 @@ def test_require_submitted_orders_rejects_empty_or_bad_header(tmp_path):
     # Existence is not enough: a zero-byte or wrong-header submitted_orders.csv
     # must fail rather than passing as a valid no-order run.
     rc = build_afternoon_live_run_classification(
-        trading_day="2026-07-22", run_id="scheduled_20260722_1520ET",
+        trading_day="2026-07-22", run_id="scheduled_20260722_1530ET",
         valid_scheduled_evidence=True,
     )
     (tmp_path / "run_state.json").write_text(
@@ -353,7 +353,7 @@ def test_require_submitted_orders_rejects_empty_or_bad_header(tmp_path):
 
 def test_validate_fails_on_partial_unplaced_planned_order(tmp_path):
     rc = build_afternoon_live_run_classification(
-        trading_day="2026-07-22", run_id="scheduled_20260722_1520ET",
+        trading_day="2026-07-22", run_id="scheduled_20260722_1530ET",
         valid_scheduled_evidence=False,
     )
     state = {
@@ -374,7 +374,7 @@ def test_validate_fails_on_partial_unplaced_planned_order(tmp_path):
 
 def test_validate_fails_on_compute_only_terminal_failure(tmp_path):
     rc = build_afternoon_live_run_classification(
-        trading_day="2026-07-22", run_id="scheduled_20260722_1520ET",
+        trading_day="2026-07-22", run_id="scheduled_20260722_1530ET",
         valid_scheduled_evidence=False,
     )
     state = {
@@ -392,7 +392,7 @@ def test_validate_fails_on_compute_only_terminal_failure(tmp_path):
 
 def test_placement_unreachable_is_a_valid_terminal_state(tmp_path):
     rc = build_afternoon_live_run_classification(
-        trading_day="2026-07-22", run_id="scheduled_20260722_1520ET",
+        trading_day="2026-07-22", run_id="scheduled_20260722_1530ET",
         valid_scheduled_evidence=False,
     )
     fields = placement_unreachable_state_fields(detail="fallback runner import failed")
@@ -412,7 +412,7 @@ def test_placement_unreachable_is_a_valid_terminal_state(tmp_path):
 
 def test_validate_fails_when_summary_classification_missing(tmp_path):
     rc = build_afternoon_live_run_classification(
-        trading_day="2026-07-22", run_id="scheduled_20260722_1520ET",
+        trading_day="2026-07-22", run_id="scheduled_20260722_1530ET",
         valid_scheduled_evidence=True,
     )
     (tmp_path / "run_state.json").write_text(
@@ -431,7 +431,7 @@ def test_validate_fails_when_summary_classification_missing(tmp_path):
 
 def test_validate_fails_when_summary_classification_does_not_mirror(tmp_path):
     rc = build_afternoon_live_run_classification(
-        trading_day="2026-07-22", run_id="scheduled_20260722_1520ET",
+        trading_day="2026-07-22", run_id="scheduled_20260722_1530ET",
         valid_scheduled_evidence=True,
     )
     (tmp_path / "run_state.json").write_text(
@@ -451,7 +451,7 @@ def test_validate_fails_when_summary_classification_does_not_mirror(tmp_path):
 
 def test_validate_passes_when_summary_mirrors_state(tmp_path):
     rc = build_afternoon_live_run_classification(
-        trading_day="2026-07-22", run_id="scheduled_20260722_1520ET",
+        trading_day="2026-07-22", run_id="scheduled_20260722_1530ET",
         valid_scheduled_evidence=True,
     )
     (tmp_path / "run_state.json").write_text(
@@ -496,7 +496,7 @@ def test_require_summary_fails_when_no_summary_present(tmp_path):
     # summaries). require_summary=True is what the afternoon live run passes so the
     # missing canonical run_summary.json is detected.
     rc = build_afternoon_live_run_classification(
-        trading_day="2026-07-22", run_id="scheduled_20260722_1520ET",
+        trading_day="2026-07-22", run_id="scheduled_20260722_1530ET",
         valid_scheduled_evidence=True,
     )
     (tmp_path / "run_state.json").write_text(

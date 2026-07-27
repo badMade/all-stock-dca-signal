@@ -7,8 +7,9 @@
   "trend_min_bars": 6,
   "watchlist_task": {
     "mode": "watchlist",
-    "cron_id": "morning-dca-0945",
-    "supersedes_cron_id": null,
+    "cron_id": "bb4f6ef1",
+    "supersedes_cron_id": "morning-dca-0945",
+    "cron_id_note": "Corrected 2026-07-27 (Codex review, P2: 'Synchronize the morning policy with the canonical task ID') to match MORNING_WATCHLIST_CRON_ID in morning_dca.py, which was already 'bb4f6ef1'. This field was stale at the retired 'morning-dca-0945' alias, which config-driven tooling reading this file (rather than the Python constants) could otherwise emit into new artifacts. 'morning-dca-0945' is now only a historical alias via supersedes_cron_id.",
     "name": "Morning graded DCA watchlist / early-warning scan",
     "schedule_et": "09:45",
     "schedule_human": "9:45 AM ET weekdays",
@@ -22,8 +23,9 @@
   },
   "preflight_task": {
     "mode": "preflight",
-    "cron_id": "morning-dca-0945",
-    "supersedes_cron_id": null,
+    "cron_id": "bb4f6ef1",
+    "supersedes_cron_id": "morning-dca-0945",
+    "cron_id_note": "Corrected 2026-07-27 (Codex review, P2: 'Synchronize the morning policy with the canonical task ID') to match MORNING_PREFLIGHT_CRON_ID in morning_dca.py, which was already 'bb4f6ef1'. This field was stale at the retired 'morning-dca-0945' alias, which config-driven tooling reading this file (rather than the Python constants) could otherwise emit into new artifacts. 'morning-dca-0945' is now only a historical alias via supersedes_cron_id.",
     "name": "Morning graded DCA pre-flight validation",
     "schedule_et": "09:45",
     "schedule_human": "9:45 AM ET weekdays",
@@ -278,6 +280,7 @@
     "prior_allocation_roots": [
       "/home/user/workspace/cron_tracking/morning_dca/manual_runs",
       "/home/user/workspace/cron_tracking/morning_dca/manual_recovery",
+      "/home/user/workspace/cron_tracking/market_open_dca",
       "/home/user/workspace/cron_tracking/ce16ba6b"
     ],
     "manual_recovery_root": "/home/user/workspace/cron_tracking/morning_dca/manual_recovery",
@@ -293,8 +296,9 @@
       "run_origin": "scheduled",
       "run_type": "morning_dca_watchlist_scan",
       "stream": "morning",
-      "cron_id": "morning-dca-0945",
-      "supersedes_cron_id": null,
+      "cron_id": "bb4f6ef1",
+      "supersedes_cron_id": "morning-dca-0945",
+      "cron_id_note": "Corrected 2026-07-27 (Codex review, P2: 'Synchronize the morning policy with the canonical task ID') to match watchlist_task.cron_id above and MORNING_WATCHLIST_CRON_ID in morning_dca.py.",
       "scheduled_for_et": "09:45",
       "scheduled_window_start_et": "09:40",
       "scheduled_window_end_et": "09:50",

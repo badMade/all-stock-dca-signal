@@ -18,7 +18,7 @@
   "properties": {
     "run_id": {
       "type": ["string", "null"],
-      "description": "Run identifier of the target run_state, e.g. morning_live_YYYYMMDD_1030ET or scheduled_YYYYMMDD_1520ET."
+      "description": "Run identifier of the target run_state, e.g. morning_live_YYYYMMDD_1030ET or scheduled_YYYYMMDD_1530ET (legacy: scheduled_YYYYMMDD_1520ET)."
     },
     "run_state_path": {
       "type": "string",
@@ -27,7 +27,7 @@
     "stream": {
       "type": "string",
       "description": "Logical stream the pointer belongs to.",
-      "enum": ["morning", "midday", "monitor", "afternoon", "slippage", "watchdog", "preflight", "scan", "dashboard", "manual"]
+      "enum": ["market_open", "watchlist", "morning", "intraday", "midday", "monitor", "afternoon", "slippage", "watchdog", "preflight", "scan", "dashboard", "manual"]
     },
     "trading_day": {
       "type": "string",

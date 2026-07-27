@@ -247,7 +247,7 @@ def test_run_pipeline_scheduled_run_auto_loads_prior_allocations(tmp_path):
 
     # Seed a manual same-day allocation under the cron task root's manual_runs/,
     # mirroring the real production layout from config/scheduled_tasks.json:
-    # <task_root>/scheduled_runs/YYYYMMDD_1520ET/ (artifacts_dir) as a sibling of
+    # <task_root>/scheduled_runs/YYYYMMDD_1530ET/ (artifacts_dir) as a sibling of
     # <task_root>/manual_runs/<timestamp>/. This is nested two levels below the
     # task root, unlike a flat "scheduled" directory -- a naive
     # artifacts_dir.parent would land on scheduled_runs/ itself and never see
@@ -272,7 +272,7 @@ def test_run_pipeline_scheduled_run_auto_loads_prior_allocations(tmp_path):
     )
 
     config = _demo_config()
-    scheduled_dir = task_root / "scheduled_runs" / "20260706_1520ET"
+    scheduled_dir = task_root / "scheduled_runs" / "20260706_1530ET"
     result = run_pipeline(
         _now(), config, StrategyState(),
         DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
@@ -322,7 +322,57 @@ def test_run_pipeline_scheduled_run_loads_intraday_recovery_top_up_context(tmp_p
     )
 
     config = _demo_config()
-    scheduled_dir = task_root / "scheduled_runs" / "20260706_1520ET"
+    scheduled_dir = task_root / "scheduled_runs" / "20260706_1530ET"
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=scheduled_dir,
+    )
+    assert result["blocked"] is False
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    assert by_ticker["AAPL"]["top_up_guard_result"] != "no_prior_run"
+
+
+def test_run_pipeline_scheduled_run_loads_market_open_top_up_context(tmp_path):
+    import json
+
+    # Codex review discussion_r3653976738 ("Include market-open fills in later
+    # top-up context"): the new 9:35 AM market-open task (2ba19526, stream
+    # 'market_open') is the first buy of the day, and its fills must count as
+    # prior-allocation context for every later same-day run -- including the
+    # 3:30 afternoon final. Before the fix, _prior_run_is_scheduled classified
+    # a market_open-stream scheduled run the same as the excluded
+    # scheduled-afternoon run, and market_open_dca was absent from
+    # _CROSS_STREAM_PRIOR_ALLOCATION_ROOTS, so this fill was never loaded and
+    # the afternoon run could re-submit AAPL's full first allocation.
+    task_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    market_open_dir = tmp_path / "cron_tracking" / "market_open_dca" / "20260706_0935ET"
+    market_open_dir.mkdir(parents=True)
+    (market_open_dir / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": _now().date().isoformat(),
+            "generated_at": f"{_now().date().isoformat()}T09:35:00-04:00",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "manual_run": False,
+                "stream": "market_open",
+                "run_id": "market_open_live_20260706_0935ET",
+            },
+            # A very low reference price guarantees the afternoon price is
+            # never below it, so this ticker's guard result proves the
+            # market-open allocation was loaded without depending on the demo
+            # provider's exact drop-derived price.
+            "buy_candidates": [
+                {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0, "target_price": 0.01},
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    config = _demo_config()
+    scheduled_dir = task_root / "scheduled_runs" / "20260706_1530ET"
     result = run_pipeline(
         _now(), config, StrategyState(),
         DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
@@ -379,7 +429,7 @@ def test_run_pipeline_scheduled_run_loads_manual_midday_top_up_context(tmp_path)
     )
 
     config = _demo_config()
-    scheduled_dir = task_root / "scheduled_runs" / "20260706_1520ET"
+    scheduled_dir = task_root / "scheduled_runs" / "20260706_1530ET"
     result = run_pipeline(
         _now(), config, StrategyState(),
         DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
@@ -427,7 +477,7 @@ def test_run_pipeline_honors_configured_morning_artifact_root(tmp_path):
 
     config = _demo_config()
     task_root = tmp_path / "cron_tracking" / "ce16ba6b"
-    scheduled_dir = task_root / "scheduled_runs" / "20260706_1520ET"
+    scheduled_dir = task_root / "scheduled_runs" / "20260706_1530ET"
     result = run_pipeline(
         _now(), config, StrategyState(),
         DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
@@ -454,7 +504,7 @@ def test_run_pipeline_preserves_sibling_root_fallback_when_tree_is_relocated(tmp
     import json
 
     task_root = tmp_path / "cron_tracking" / "ce16ba6b"
-    scheduled_dir = task_root / "scheduled_runs" / "20260706_1520ET"
+    scheduled_dir = task_root / "scheduled_runs" / "20260706_1530ET"
     # Sibling of task_root's parent (cron_base), matching DEFAULT_MORNING_LIVE_STATE_ROOT's
     # directory name ("morning_dca") under this relocated tree.
     sibling_morning_root = tmp_path / "cron_tracking" / "morning_dca"
@@ -1234,7 +1284,7 @@ def test_run_pipeline_scheduled_run_loads_sibling_stream_roots_to_run_time(tmp_p
     )
 
     config = _demo_config()
-    scheduled_dir = afternoon_root / "scheduled_runs" / "20260706_1520ET"
+    scheduled_dir = afternoon_root / "scheduled_runs" / "20260706_1530ET"
     result = run_pipeline(
         _now(), config, StrategyState(),
         DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
@@ -1263,7 +1313,7 @@ def test_default_prior_allocation_state_root_walks_past_scheduled_runs():
     from run_dca import _default_prior_allocation_state_root
 
     task_root = Path("/cron_tracking/ce16ba6b")
-    artifacts_dir = task_root / "scheduled_runs" / "20260706_1520ET"
+    artifacts_dir = task_root / "scheduled_runs" / "20260706_1530ET"
     assert _default_prior_allocation_state_root(artifacts_dir) == task_root
 
 
@@ -2658,7 +2708,7 @@ def test_run_pipeline_persists_raw_inputs_before_compute(tmp_path):
 
     config = _demo_config()
     task_root = tmp_path / "cron_tracking" / "ce16ba6b"
-    scheduled_dir = task_root / "scheduled_runs" / "20260706_1520ET"
+    scheduled_dir = task_root / "scheduled_runs" / "20260706_1530ET"
     quotes_file = tmp_path / "quotes.json"
     quotes_file.write_text('{"symbol": "AAPL", "price": 150.0}', encoding="utf-8")
     result = run_pipeline(
@@ -2686,7 +2736,7 @@ def test_run_pipeline_raw_persistence_failure_preserves_prior_successful_raw_fil
         pass
 
     config = _demo_config()
-    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
     quotes_file = tmp_path / "quotes.json"
     quotes_file.write_text('{"symbol": "AAPL", "price": 150.0}', encoding="utf-8")
 
@@ -2720,7 +2770,7 @@ def test_run_pipeline_raw_persistence_failure_writes_error_state(tmp_path):
 
     config = _demo_config()
     task_root = tmp_path / "cron_tracking" / "ce16ba6b"
-    scheduled_dir = task_root / "scheduled_runs" / "20260706_1520ET"
+    scheduled_dir = task_root / "scheduled_runs" / "20260706_1530ET"
     result = run_pipeline(
         _now(), config, StrategyState(),
         DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
@@ -2751,7 +2801,7 @@ def test_run_pipeline_raw_persistence_failure_writes_contract_artifacts(tmp_path
         pass
 
     config = _demo_config()
-    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
     scheduled_dir.mkdir(parents=True)
     # Seed stale contract artifacts from a prior successful attempt.
     (scheduled_dir / "submitted_orders.csv").write_text("STALE\n", encoding="utf-8")
@@ -2788,7 +2838,7 @@ def test_run_pipeline_raw_persistence_failure_clears_stale_compact_artifacts(tmp
         pass
 
     config = _demo_config()
-    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
     scheduled_dir.mkdir(parents=True)
     # Seed stale derived-report artifacts from a prior attempt.
     # orders.csv and buy_candidates.csv are intentionally NOT seeded here; they are
@@ -2829,7 +2879,7 @@ def test_run_pipeline_raw_persistence_failure_preserves_prior_order_artifacts(tm
         pass
 
     config = _demo_config()
-    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
     scheduled_dir.mkdir(parents=True)
     # Simulate a prior successful run that already wrote real order artifacts.
     prior_orders_csv = scheduled_dir / "orders.csv"
@@ -2856,7 +2906,7 @@ def test_run_pipeline_live_run_missing_raw_inputs_writes_error_state(tmp_path):
     config = load_strategy_config(
         approved_test_dates=frozenset({_now().date()}), dry_run=False
     )
-    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
     # The raw persistence error fires before any broker call, so a DryRunBroker is fine here.
     broker = DryRunBroker(account=config.target_account_number)
     result = run_pipeline(
@@ -2878,7 +2928,7 @@ def test_run_pipeline_live_run_empty_raw_inputs_writes_error_state(tmp_path):
     config = load_strategy_config(
         approved_test_dates=frozenset({_now().date()}), dry_run=False
     )
-    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
     broker = DryRunBroker(account=config.target_account_number)
     result = run_pipeline(
         _now(), config, StrategyState(),
@@ -2899,7 +2949,7 @@ def test_run_pipeline_live_run_partial_raw_inputs_writes_error_state(tmp_path):
     config = load_strategy_config(
         approved_test_dates=frozenset({_now().date()}), dry_run=False
     )
-    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
     quotes_file = tmp_path / "quotes.json"
     quotes_file.write_text('{"symbol": "AAPL", "price": 150.0}', encoding="utf-8")
     broker = DryRunBroker(account=config.target_account_number)
@@ -2930,7 +2980,7 @@ def test_build_frozen_providers_strict_finance_raises_on_live_run(tmp_path):
     config = load_strategy_config(
         approved_test_dates=frozenset({_now().date()}), dry_run=False
     )
-    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
     broker = DryRunBroker(account=config.target_account_number)
     rh_only_inputs = {
         "quotes_batch1.json": {"results": [{"quote": {"symbol": "AAPL"}}]},
@@ -2965,7 +3015,7 @@ def test_build_frozen_providers_strict_robinhood_raises_on_live_run(tmp_path):
     config = load_strategy_config(
         approved_test_dates=frozenset({_now().date()}), dry_run=False
     )
-    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
     broker = DryRunBroker(account=config.target_account_number)
     finance_only_inputs = {
         "finance_bars_batch1.json": {"results": []},
@@ -3079,7 +3129,7 @@ def test_run_pipeline_retry_preserves_orders_after_place(tmp_path):
     lose the durable fill snapshot from the original placement attempt.
     """
     config = _demo_config()
-    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
     scheduled_dir.mkdir(parents=True)
 
     # Seed a prior raw/ with orders_after_place.json as a prior run would leave it.
@@ -3120,7 +3170,7 @@ def test_run_pipeline_partial_retry_merges_orders_after_place(tmp_path):
     config = load_strategy_config(
         approved_test_dates=frozenset({_now().date()}), dry_run=False
     )
-    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1520ET"
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
     scheduled_dir.mkdir(parents=True)
 
     prior_raw = scheduled_dir / "raw"

@@ -122,8 +122,9 @@ on the day's planned spend and the count of 3x-or-greater signals (multiplier
 - This is the **code-level gate** enforced by `near_close_dca.py`'s date check.
   The live task's separate trigger gate (`programmatic_trigger_check.sh`) lives
   outside this repo (scheduler-side) and was last documented as enforcing
-  weekdays **2026-07-02 → 2026-08-28**, **3:20–3:35 PM ET**; confirm/extend it
-  independently, since extending `config/trading_window.json` alone does not
+  weekdays **2026-07-02 → 2026-08-28**, **3:30–3:35 PM ET** (retimed from
+  3:20 PM to align with the canonical 3:30 PM ET final live task); confirm/extend
+  it independently, since extending `config/trading_window.json` alone does not
   change that external script.
 - A one-time reminder (`f7411889`) fires 2026-08-15 to decide on continuation —
   reschedule it too now that the window runs through Oct 30.
@@ -132,8 +133,8 @@ on the day's planned spend and the count of 3x-or-greater signals (multiplier
 
 - The live task **must write standardized same-day state files** and **must not
   fall back to interactive confirmation** — it runs unattended.
-- **3:20 PM state-file guarantee:** the live task **always** writes the scheduled
-  `run_state.json` under `scheduled_runs/YYYYMMDD_1520ET/` and updates
+- **3:30 PM state-file guarantee:** the live task **always** writes the scheduled
+  `run_state.json` under `scheduled_runs/YYYYMMDD_1530ET/` and updates
   `latest_scheduled_run.json` on every fire, **even when no order is placed**. If
   Robinhood review passes but submission is blocked by required post-review user
   confirmation, the run_state stays valid and carries
@@ -146,7 +147,7 @@ on the day's planned spend and the count of 3x-or-greater signals (multiplier
 - **Manual runs do not count as scheduled-run evidence.** Every run_state
   artifact must carry a `run_classification` block distinguishing scheduled from
   manual runs. Scheduled runs write under
-  `cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/` and update
+  `cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1530ET/` and update
   `latest_scheduled_run.json`; manual runs write under `manual_runs/<timestamp>/`
   and **never** update that pointer. Downstream reporting excludes all manual
   order IDs and any `run_origin='manual'` / `manual_run=true` state, and never
@@ -177,7 +178,7 @@ on the day's planned spend and the count of 3x-or-greater signals (multiplier
   `manual_run=true`, `same_day_top_up_context_only=true`,
   `valid_scheduled_evidence=false`): prior-allocation / same-day top-up context
   **only**, never proof the 10:30 scheduled task ran and never scheduled
-  evidence. The **12:30 midday** and **3:20 final** runs must scan this path and
+  evidence. The **12:30 midday** and **3:30 final** runs must scan this path and
   fold any same-day recovery fills into the top-up guard as prior allocation. See
   [run_classification.md](run_classification.md#manual-missed-morning-recovery-added-2026-07-20).
 - **Afternoon completion rule:** all afternoon **trading and artifact-writing**

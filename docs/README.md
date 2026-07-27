@@ -38,11 +38,11 @@ workflow, and Notion template. **No credentials or secrets are stored here.**
   Stress $360/$1,800 (daily/weekly); weekly rollover reserve capped at $900.
 - **Only trading task:** `10ce362c` ("Graded DCA automatic live test - $2
   allocation"; the repaired task that supersedes the deleted `ce16ba6b`, with
-  artifact root kept under `.../ce16ba6b` for continuity), **3:20 PM ET**
+  artifact root kept under `.../ce16ba6b` for continuity), **3:30 PM ET**
   weekdays, Robinhood account `562057042` only;
   Alpaca read-only. The **3:35 PM ET** task is analytics (slippage + Notion sync).
 - **Run classification:** scheduled runs write under
-  `scheduled_runs/YYYYMMDD_1520ET/` and update `latest_scheduled_run.json`;
+  `scheduled_runs/YYYYMMDD_1530ET/` and update `latest_scheduled_run.json`;
   manual runs write under `manual_runs/<timestamp>/` and never do. Reporting
   excludes manual runs/order IDs from scheduled-live metrics. See
   [run_classification.md](run_classification.md).

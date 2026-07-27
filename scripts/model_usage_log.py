@@ -223,9 +223,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         prog="python -m scripts.model_usage_log",
         description=(
             "Append one entry to the model usage audit log. For the covered tasks "
-            "with no in-repo Python entry point (bb4f6ef1, a46bf007 -- pure "
-            "agent-run analytics/monitoring), the scheduler/agent invokes this "
-            "directly as a shell command after the run completes."
+            "with no in-repo Python entry point (2ba19526, 7be82b97, "
+            "e3e6f09e, a46bf007), the scheduler/agent "
+            "invokes this directly as a shell command after the run completes. "
+            "bb4f6ef1 is NOT in this list: both of its sub-invocations go through "
+            "MorningDCAExecutor.run() (preflight mode, then watchlist mode), which "
+            "already appends its own model-usage entry per call -- an additional "
+            "explicit shell append here would triple-log a single 9:45 AM firing "
+            "(Codex review: 'Avoid triple-logging the 9:45 task')."
         ),
     )
     parser.add_argument("--run-id", required=True)
@@ -233,6 +238,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     id_group.add_argument("--cron-id")
     id_group.add_argument("--task-id")
     parser.add_argument("--artifact-path", required=True)
+    parser.add_argument(
+        "--scheduled-for-et",
+        default=None,
+        help=(
+            "Override the manifest-default scheduled_for_et for this run, e.g. "
+            "'11:30' for a multi-slot task like 7be82b97 (see "
+            "applies_to_daily_tasks_et.multi_slot_task_note in config/scheduled_tasks.json). "
+            "Required to make each fired slot's audit record distinguishable; "
+            "omitted, the manifest's combined et string for the task is used."
+        ),
+    )
     parser.add_argument("--run-origin", default="scheduled", choices=("scheduled", "manual"))
     parser.add_argument("--model-requested", default="cost_conscious_default")
     parser.add_argument("--model-actual", default="not_exposed")
@@ -262,6 +278,7 @@ def _main(argv: Optional[list] = None) -> int:
             cron_id=args.cron_id,
             task_id=args.task_id,
             artifact_path=args.artifact_path,
+            scheduled_for_et=args.scheduled_for_et,
             run_origin=args.run_origin,
             model_requested=args.model_requested,
             model_actual=args.model_actual,

@@ -6,31 +6,32 @@ private links are stored in this repo.**
 
 ## Daily flow (weekdays, EDT)
 
-1. **9:35 AM ET - Market-open live graded DCA task (`2ba19526`)**
-   Places buys (Robinhood `562057042`) and writes the same-day run state artifact.
-2. **9:45 AM ET - Watchlist early-warning scan (`bb4f6ef1`)**
-   Read-only. Compact machine-readable alerts only for >5% outliers or actionable
-   errors. Supersedes the retired compact volatility outlier scan `cd45e95b`.
-3. **10:30 AM ET - Morning live graded DCA task (`42173154`)**
-   Places buys and writes the same-day run state artifact.
-4. **11:30 AM / 1:30 PM / 2:30 PM ET - Intraday live graded DCA task (`7be82b97`)**
-   Three slots on one cron entry. Places buys and writes a run state artifact per
-   slot. The 2026-07-24 2:30 PM ET scheduled recovery (18 fills, $72.00) belongs
-   to this task.
-5. **12:30 PM ET - Midday live graded DCA task (`a6239dae`)**
-   Places buys and writes the same-day run state artifact.
-6. **3:05 PM ET - Monitor-only signal check (`e3e6f09e`, paused)**
-   Analytics only. Surfaces the planned allocation and tier selection.
-7. **3:20 PM ET - Final live graded DCA buy of the day (`10ce362c`, supersedes deleted `ce16ba6b`)**
+1. **9:35 AM ET: Market-open live execution (`2ba19526`)**
+   Places the **first buys of the day** (Robinhood `562057042`) using the dynamic first-allocation base ($2 below prior close+low, $1 below prior close only) on the 0x-to-5x ladder. Writes `cron_tracking/market_open_dca/YYYYMMDD_0935ET/`.
+2. **9:45 AM ET: Watchlist early-warning scan (`bb4f6ef1`)**
+   Read-only. Alerts only for actionable early-warning rows. Supersedes the retired
+   `cd45e95b` outlier scan and the retired `morning-dca-0945` alias -- and absorbed
+   its required pre-flight-writer duty too, not just its display name.
+3. **10:30 AM ET: Morning live execution (`42173154`)**
+   Places buys and writes `cron_tracking/morning_dca/YYYYMMDD_1030ET/`.
+4. **11:30 AM, 1:30 PM, 2:30 PM ET: Intraday live executions (`7be82b97`)**
+   One task, three slots. Each run writes
+   `cron_tracking/intraday_dca/YYYYMMDD_<HHMM>ET/` and records the slot that fired.
+   The 2026-07-24 2:30 PM ET scheduled recovery (18 fills, $72.00) belongs to this task.
+5. **12:30 PM ET: Midday live execution (`a6239dae`)**
+   Places buys and writes `cron_tracking/midday_dca/YYYYMMDD_1230ET/`.
+6. **3:05 PM ET: $2-base monitor-only signal check (`e3e6f09e`, PAUSED)**
+   Analytics only. Currently **paused**, so it does not fire.
+7. **3:30 PM ET: Final live graded DCA task (`10ce362c`, supersedes deleted `ce16ba6b`)**
    Places buys (Robinhood `562057042`) and writes the standardized same-day
    **run state** artifact ([`schemas/run_state.schema.json`](../schemas/run_state.schema.json)).
    A **scheduled** run writes under
-   `cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/` with
+   `cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1530ET/` with
    `run_classification.run_origin='scheduled'` and updates
    `latest_scheduled_run.json`. Manual runs write under `manual_runs/<timestamp>/`
    and never update that pointer. See
    [run_classification.md](run_classification.md).
-8. **3:35 PM ET - Post-trade slippage + Notion sync (`67aa802b`)**
+8. **3:35 PM ET: Post-trade slippage + Notion sync (`67aa802b`)**
    Reads the **scheduled** run-state artifact and Robinhood order history,
    computes slippage
    ([`schemas/slippage_report.schema.json`](../schemas/slippage_report.schema.json)),
@@ -38,7 +39,7 @@ private links are stored in this repo.**
    Run" section only**. Scheduled-live rows exclude all manual order IDs and any
    `run_origin='manual'` / `manual_run=true` state; manual fills go only in the
    labeled **Manual Test Runs** section.
-9. **3:40 PM ET - Watchdog (`a46bf007`)**
+9. **3:40 PM ET: Watchdog (`a46bf007`)**
    Read-only, the final scheduled afternoon event. Confirms a valid **scheduled**
    run_state exists and that `latest_scheduled_run.json` points at it; flags
    missing/incomplete/error/discrepancy. Never infers a scheduled run from

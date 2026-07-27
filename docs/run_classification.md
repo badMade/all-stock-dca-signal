@@ -22,14 +22,27 @@ identity fields are correct.
 |---|---|
 | Cron id | `10ce362c` (repaired live task) |
 | Supersedes | `ce16ba6b` (deleted) |
-| Schedule | **3:20 PM ET** weekdays (`20 19 * * 1-5` UTC) |
-| Accepted window | **3:15–3:35 PM ET** |
+| Schedule | **3:30 PM ET** weekdays (`30 19 * * 1-5` UTC) |
+| Accepted window | **3:25–3:35 PM ET** (legacy pre-retime runs: 3:15–3:35 PM ET) |
 | Broker/account | Robinhood `562057042` only (Alpaca read-only) |
 
 The repaired live task `10ce362c` supersedes the deleted `ce16ba6b`. The
 artifact root stays under `.../ce16ba6b` for continuity across the repair.
 
-**Writer contract:** every scheduled 3:20 PM ET run_state must be written with
+**Retimed to 3:30 PM ET on 2026-07-27** (from 3:20 PM ET). Writers emit only the
+canonical identity: `scheduled_for_et='15:30'`,
+`scheduled_window_start_et='15:25'`, and
+`run_id='scheduled_YYYYMMDD_1530ET'` under
+`scheduled_runs/YYYYMMDD_1530ET/`. Validators and schemas also **accept** the
+legacy identity (`'15:20'`, `'15:15'`, `scheduled_YYYYMMDD_1520ET`) so run_states
+written before the retime stay valid scheduled evidence. Order attribution keeps
+its lower bound at **15:15 ET**, deliberately wider than the classification
+window, so orders placed by a legacy 3:20 PM run remain attributable to that run.
+See `SCHEDULED_FOR_ET` / `LEGACY_SCHEDULED_FOR_ET` /
+`ORDER_ATTRIBUTION_WINDOW_START_ET` in
+[`scripts/run_classification.py`](../scripts/run_classification.py).
+
+**Writer contract:** every scheduled 3:30 PM ET run_state must be written with
 **both** `cron_id='10ce362c'` **and** `supersedes_cron_id='ce16ba6b'`.
 Placeholder or ambiguous ids such as `ce16ba6b_replacement` are **forbidden**
 (`supersedes_cron_id` must be exactly `ce16ba6b` when present; consumers may omit it only for continuity with older artifacts).
@@ -43,7 +56,7 @@ artifacts written before/after the repair both remain valid.
 ```
 /home/user/workspace/cron_tracking/ce16ba6b/
 ├── scheduled_runs/
-│   └── YYYYMMDD_1520ET/
+│   └── YYYYMMDD_1530ET/
 │       └── run_state.json          # run_origin = "scheduled"
 ├── manual_runs/
 │   └── <timestamp>/
@@ -51,7 +64,7 @@ artifacts written before/after the repair both remain valid.
 └── latest_scheduled_run.json       # updated ONLY by scheduled runs
 ```
 
-- **Scheduled run** → writes `scheduled_runs/YYYYMMDD_1520ET/run_state.json`
+- **Scheduled run** → writes `scheduled_runs/YYYYMMDD_1530ET/run_state.json`
   **and** updates `latest_scheduled_run.json`.
 - **Manual run** → writes `manual_runs/<timestamp>/run_state.json` and **never**
   touches `latest_scheduled_run.json`.
@@ -66,11 +79,11 @@ artifacts written before/after the repair both remain valid.
   "run_type": "scheduled_live_test",
   "cron_id": "10ce362c",
   "supersedes_cron_id": "ce16ba6b",
-  "scheduled_for_et": "15:20",
-  "scheduled_window_start_et": "15:15",
+  "scheduled_for_et": "15:30",
+  "scheduled_window_start_et": "15:25",
   "scheduled_window_end_et": "15:35",
   "manual_run": false,
-  "run_id": "scheduled_YYYYMMDD_1520ET",
+  "run_id": "scheduled_YYYYMMDD_1530ET",
   "triggered_at_utc": "2026-07-06T19:20:01Z",
   "state_schema_version": "run-classification-v1"
 }
@@ -91,12 +104,12 @@ artifacts written before/after the repair both remain valid.
 ```
 
 The manual `run_id` must be **distinct** and must never match the scheduled
-pattern `scheduled_YYYYMMDD_1520ET`.
+pattern `scheduled_YYYYMMDD_1530ET`.
 
 ### Manual final buy override (`final_manual_buy_override`)
 
 When the **final buy of the day** is requested manually (e.g. the scheduled
-3:20 PM ET run placed 0 orders and the user asks for the final buy by hand), the
+3:30 PM ET run placed 0 orders and the user asks for the final buy by hand), the
 run is a manual run with `run_type='final_manual_buy_override'` and adds two
 explicit flags so downstream reporting can never mistake it for scheduled
 evidence:
@@ -126,8 +139,8 @@ Its order IDs are excluded from all scheduled-live metrics and shown only in the
 
 ## Scheduled state-file guarantee (always write, even with no order)
 
-The 3:20 PM live task (`10ce362c`) **always** writes a scheduled
-`run_state.json` under `scheduled_runs/YYYYMMDD_1520ET/` **and** updates
+The 3:30 PM live task (`10ce362c`) **always** writes a scheduled
+`run_state.json` under `scheduled_runs/YYYYMMDD_1530ET/` **and** updates
 `latest_scheduled_run.json` every time it fires — **even when no order is
 placed**. A run that fired but placed no order is still proof the task ran; it
 is just not proof of an order or fill.
@@ -157,7 +170,7 @@ carries a **valid scheduled** `run_classification` block and adds:
     "state_schema_version": "run-classification-v1",
     "cron_id": "10ce362c",
     "supersedes_cron_id": "ce16ba6b",
-    "scheduled_for_et": "15:20"
+    "scheduled_for_et": "15:30"
   },
   "buy_candidates": [
     {
@@ -198,11 +211,11 @@ The Fri Jul 17 2026 3:20 PM ET scheduled `run_state` was repaired to include a
 1. **Nested object required.** Every scheduled `run_state.json` must contain a
    nested `run_classification` object, validated against
    [`../schemas/run_classification.schema.json`](../schemas/run_classification.schema.json).
-   For the scheduled 3:20 PM run it carries `run_origin='scheduled'`,
+   For the scheduled 3:30 PM run it carries `run_origin='scheduled'`,
    `manual_run=false`, `run_type='scheduled_live_test'`, `cron_id='10ce362c'`,
-   `supersedes_cron_id='ce16ba6b'`, `scheduled_for_et='15:20'`,
-   `scheduled_window_start_et='15:15'`, `scheduled_window_end_et='15:35'`,
-   `run_id='scheduled_YYYYMMDD_1520ET'`, `triggered_at_utc`, and
+   `supersedes_cron_id='ce16ba6b'`, `scheduled_for_et='15:30'`,
+   `scheduled_window_start_et='15:25'`, `scheduled_window_end_et='15:35'`,
+   `run_id='scheduled_YYYYMMDD_1530ET'`, `triggered_at_utc`, and
    `state_schema_version`.
 2. **Nested object is authoritative.** In this repo, scheduled/manual identity fields live
    under `run_classification` (see [`../config/run_classification.json`](../config/run_classification.json));
@@ -226,7 +239,7 @@ computation** — the bash compute step had no `quotes_batchN.json` /
 
 1. **Persist before compute.** Before computing any signal, the scheduled run
    persists every raw Robinhood/Finance/Alpaca/Yahoo connector response it used
-   under `scheduled_runs/YYYYMMDD_1520ET/raw/` with deterministic filenames:
+   under `scheduled_runs/YYYYMMDD_1530ET/raw/` with deterministic filenames:
    `quotes_batchN.json`, `historicals_batchN.json`, `tradability_pre_place.json`,
    `portfolio_pre_place.json`, `orders_after_place.json`, and `place_SYMBOL.json`
    where applicable.
@@ -274,7 +287,7 @@ response before computing slippage** and computes average fill price / execution
 from the saved payload rather than re-querying the broker:
 
 - The payload is saved to
-  `scheduled_runs/YYYYMMDD_1520ET/raw/orders_after_place.json` and its path is
+  `scheduled_runs/YYYYMMDD_1530ET/raw/orders_after_place.json` and its path is
   recorded in the slippage report's `source_order_history_payloads`.
 - Fills are extracted from the saved payload via
   `dca_reporting.fills_from_order_history_payload`, which accepts a bare list,
@@ -326,7 +339,7 @@ manual-classified run.
 
 ## Same-day top-up guard (prior-allocation context only)
 
-The scheduled 3:20 PM ET run may **read** earlier same-day manual/morning runs to
+The scheduled 3:30 PM ET run may **read** earlier same-day manual/morning runs to
 offset its buys (the same-day prior-run offset/top-up guard; see
 [strategy.md](strategy.md#same-day-prior-run-offset--top-up-guard)). This reading
 does **not** reclassify anything:
@@ -368,7 +381,7 @@ those flags:
   rule: a later run buys `max(0, desired - prior)` and only if the later decision
   price is **strictly below** the prior reference price.
 
-The **12:30 midday** (`a6239dae`) and **3:20 final** (`10ce362c`) runs **must
+The **12:30 midday** (`a6239dae`) and **3:30 final** (`10ce362c`) runs **must
 scan** this path for same-day manual recovery artifacts and fold them into the
 top-up guard as prior allocation. The path is also part of the manual exclusion
 roots (rule 2 above), so its order IDs are excluded from all scheduled-live
@@ -432,17 +445,17 @@ watchdog proof, and scheduled afternoon evidence. See the
 [`../config/run_classification.json`](../config/run_classification.json) and
 [`../config/scheduled_tasks.json`](../config/scheduled_tasks.json).
 
-## 3:20 runner self-containment and state-file guarantee (added 2026-07-20)
+## 3:30 runner self-containment and state-file guarantee (added 2026-07-20)
 
 After the Jul 20 2026 10:30 and 12:30 scheduled live runs both failed (they
 invoked saved runners without first generating the same-day raw inputs and
 escalated with no scheduled failure-state artifact), the same self-containment and
-state-file guarantees apply to the 3:20 afternoon final live task (`10ce362c`,
+state-file guarantees apply to the 3:30 afternoon final live task (`10ce362c`,
 supersedes `ce16ba6b`):
 
 **Generate raw inputs first.** The task **must not** assume runner inputs already
 exist. Before invoking any saved runner or order module, it **creates**
-`/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/raw/`
+`/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1530ET/raw/`
 and persists all required raw inputs: portfolio / buying power, quotes, prior
 regular-session close, tradability, `orders_after_1430ET` (for afternoon evidence
 checks), the same-day prior-allocation context from the morning-live, midday,
@@ -455,17 +468,17 @@ unavailable, stale, incomplete, or unresolved. If raw input generation fails onc
 perform **one** bounded recovery attempt on the alternate approved data source
 path, then stop.
 
-**Always write the state files.** The 3:20 scheduled run **always** writes
+**Always write the state files.** The 3:30 scheduled run **always** writes
 `run_state.json`, `run_summary.json`, and `latest_scheduled_run.json`, **even when
 execution is blocked, is a no-op, or errors**. On a blocking condition it writes a
 **valid scheduled** afternoon `run_state` with `run_origin='scheduled'`,
-`manual_run=false`, `stream='afternoon'`, `scheduled_for_et='15:20'`,
+`manual_run=false`, `stream='afternoon'`, `scheduled_for_et='15:30'`,
 `cron_id='10ce362c'`, `supersedes_cron_id='ce16ba6b'`,
 `state_schema_version='run-classification-v1'`, `orders_submitted_count=0`, a
 concrete `order_submit_status`, a concrete `error_class` such as
 `missing_or_invalid_raw_inputs` or `no_incremental_top_up`, and a compact list of
 missing files, block reasons, or failed data sources. This artifact is valid proof
-the 3:20 scheduled task **fired** but is **not** order or fill evidence. If any
+the 3:30 scheduled task **fired** but is **not** order or fill evidence. If any
 step fails after raw collection has started, it writes the `signals.csv` when
 possible, an empty `submitted_orders.csv` with headers when no orders were placed,
 and `run_state.json` (no half-done run without a state file).
@@ -489,7 +502,7 @@ persist those pointer targets into the scheduled raw directory before compute, s
 it **escalated after data collection**. This applies to **all daily scheduled DCA
 tasks that use connector data**, especially the **10:30** morning (`42173154`),
 **12:30** midday (`a6239dae`), **3:05** monitor-only signal check (`e3e6f09e`), and
-**3:20** afternoon (`10ce362c`) tasks:
+**3:30** afternoon (`10ce362c`) tasks:
 
 - Any connector response that returns an `output_path` or
   `current_session_context` pointer must be **immediately copied or normalized into
@@ -515,7 +528,7 @@ computed from the persisted raw files, placed scheduled top-up orders, and wrote
 `orders_filled_count=6`, total **$10.00** (EVR $1.00 @ 333.600800, DXYZ $1.00 @
 24.865000, AMAT $2.00 @ 526.819900, STM $2.00 @ 61.450000, NVDA $2.00 @
 202.771200, GLW $2.00 @ 153.810400). Live task text was updated with **POINTER
-OUTPUT NORMALIZATION ADDED JUL 20 2026** for the 10:30, 12:30, 3:05, and 3:20
+OUTPUT NORMALIZATION ADDED JUL 20 2026** for the 10:30, 12:30, 3:05, and 3:30
 tasks. See the `pointer_output_normalization_2026_07_20` block in
 [`../config/run_classification.json`](../config/run_classification.json) and
 `config/scheduled_tasks.json`.
@@ -538,7 +551,7 @@ pre-authorized guarded path if every safeguard still passes.
 A recovery rerun does **not** change classification:
 
 - It **reuses the same logical scheduled run directory** (afternoon:
-  `scheduled_runs/YYYYMMDD_1520ET/`) and stamps `recovery_rerun=true` on the
+  `scheduled_runs/YYYYMMDD_1530ET/`) and stamps `recovery_rerun=true` on the
   run_state.
 - It keeps `run_origin='scheduled'` and is **never** reclassified as manual. For
   the afternoon task it still carries **both** `cron_id='10ce362c'` **and**
@@ -676,7 +689,7 @@ The contract, one source of truth in
    - **9:45 pre-flight** (`build_preflight_run_classification`): `run_origin='scheduled'`,
      `run_type='morning_dca_preflight'`, `scheduled_for_et='09:45'`,
      `manual_run=false`, `state_schema_version='morning-preflight-v2-machine-complete'`,
-     `run_id`, `triggered_at_utc`, `cron_id='morning-dca-0945'`, `stream='morning'`,
+     `run_id`, `triggered_at_utc`, `cron_id='bb4f6ef1'`, `stream='morning'`,
      `trading_day`, `same_day_required=true`, `valid_scheduled_evidence` derived
      from the completed state. Matches the actual producer
      (`morning_dca.py`'s `MORNING_PREFLIGHT_CRON_ID`/`MORNING_PREFLIGHT_RUN_TYPE`)
@@ -700,17 +713,17 @@ The contract, one source of truth in
    null/absent/not-an-object, or when a required CSV is missing.
    `require_submitted_orders` is True for live runs and False for read-only
    pre-flight runs.
-5. **Same contract for the 3:20 final live run.** The afternoon final live task
+5. **Same contract for the 3:30 final live run.** The afternoon final live task
    (`10ce362c`) also writes a non-null `run_classification` object in both
-   `run_state.json` and `run_summary.json`. For 3:20 the object carries
+   `run_state.json` and `run_summary.json`. For 3:30 the object carries
    `run_origin='scheduled'`, `manual_run=false`, `stream='afternoon'`,
-   `scheduled_for_et='15:20'`, `cron_id='10ce362c'`,
+   `scheduled_for_et='15:30'`, `cron_id='10ce362c'`,
    `supersedes_cron_id='ce16ba6b'`, `run_id`, `trading_day`,
    `same_day_required=true`, and evidence flags derived from the completed
    state. A null `run_summary.run_classification` is an
    `artifact_contract_failure`.
 
-## 3:20 compute-to-placement contract (added 2026-07-22)
+## 3:30 compute-to-placement contract (added 2026-07-22)
 
 The Jul 22 2026 3:20 PM ET scheduled final live run generated 20 planned buy
 orders with `planned_spend=60.0`, but the saved compute module stopped with
@@ -718,7 +731,7 @@ orders with `planned_spend=60.0`, but the saved compute module stopped with
 orders. That is not a valid terminal state for a pre-authorized scheduled live
 run when planned orders remain.
 
-From Jul 22 2026 forward, once the 3:20 task writes `signals.csv`, every
+From Jul 22 2026 forward, once the 3:30 task writes `signals.csv`, every
 eligible row with `incremental_usd > 0` or an equivalent planned order amount
 must enter a placement phase in the same scheduled run. The placement phase
 calls Robinhood `place_equity_order` directly after all ordinary safeguards

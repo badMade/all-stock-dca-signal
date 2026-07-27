@@ -45,6 +45,7 @@ from run_classification import (  # noqa: E402
     is_scheduled_state,
     is_top_up_context_state,
     latest_scheduled_run_path,
+    legacy_scheduled_run_dir,
     list_raw_inputs_saved,
     load_same_day_top_up_context,
     manual_exclusion_roots,
@@ -126,10 +127,10 @@ def _confirmation_blocked_state():
 
 
 def test_run_id_patterns():
-    assert scheduled_run_id(TRADING_DAY) == "scheduled_20260706_1520ET"
+    assert scheduled_run_id(TRADING_DAY) == "scheduled_20260706_1530ET"
     mid = manual_run_id("2026-07-06T11:00:00Z")
     assert mid.startswith("manual_20260706_")
-    assert "1520ET" not in mid
+    assert "1530ET" not in mid
 
 
 def test_scheduled_classification_fields():
@@ -138,11 +139,11 @@ def test_scheduled_classification_fields():
     assert rc["run_type"] == "scheduled_live_test"
     assert rc["cron_id"] == "10ce362c"
     assert rc["supersedes_cron_id"] == "ce16ba6b"
-    assert rc["scheduled_for_et"] == "15:20"
-    assert rc["scheduled_window_start_et"] == "15:15"
+    assert rc["scheduled_for_et"] == "15:30"
+    assert rc["scheduled_window_start_et"] == "15:25"
     assert rc["scheduled_window_end_et"] == "15:35"
     assert rc["manual_run"] is False
-    assert rc["run_id"] == "scheduled_20260706_1520ET"
+    assert rc["run_id"] == "scheduled_20260706_1530ET"
     assert rc["triggered_at_utc"] == "2026-07-06T19:20:01Z"
     assert rc["state_schema_version"] == STATE_SCHEMA_VERSION
     assert validate_classification(rc).ok
@@ -242,7 +243,7 @@ def test_validation_accepts_v2_preauthorized_manual():
 
 def test_validation_rejects_manual_run_id_matching_scheduled():
     rc = build_manual_classification()
-    rc["run_id"] = "scheduled_20260706_1520ET"
+    rc["run_id"] = "scheduled_20260706_1530ET"
     res = validate_classification(rc)
     assert not res.ok
 
@@ -305,7 +306,7 @@ def test_scheduled_write_updates_pointer():
         pointer = latest_scheduled_run_path(base)
         assert pointer.exists()
         ptr = json.loads(pointer.read_text())
-        assert ptr["run_id"] == "scheduled_20260706_1520ET"
+        assert ptr["run_id"] == "scheduled_20260706_1530ET"
         assert ptr["run_state_path"] == str(state_path)
 
 
@@ -349,7 +350,7 @@ def test_update_latest_scheduled_run_pointer_uses_given_path():
         assert pointer == latest_scheduled_run_path(base)
         ptr = json.loads(pointer.read_text())
         assert ptr["run_state_path"] == str(external_path)
-        assert ptr["run_id"] == "scheduled_20260706_1520ET"
+        assert ptr["run_id"] == "scheduled_20260706_1530ET"
         # No second copy of run_state.json was created anywhere under base.
         assert list(base.rglob("run_state.json")) == [external_path]
 
@@ -440,6 +441,41 @@ def test_select_scheduled_excludes_manual_ids():
         assert not sel.used_broker_fallback
 
 
+def test_select_scheduled_falls_back_to_legacy_directory():
+    # Codex review discussion_r3653976743 ("Fall back to legacy directories
+    # for historical reporting"): 10ce362c was retimed from 3:20 PM to 3:30 PM
+    # ET on 2026-07-27. scheduled_run_dir() always resolves the canonical
+    # _1530ET directory, which never existed for a pre-retime trading day --
+    # those runs live under the legacy _1520ET suffix. Before the fix,
+    # select_scheduled_state_for_reporting only ever looked at the canonical
+    # directory, so it reported "no scheduled run_state" for every historical
+    # day even though a valid legacy-identity artifact was on disk.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        legacy_dir = legacy_scheduled_run_dir(TRADING_DAY, base)
+        legacy_dir.mkdir(parents=True)
+        rc = build_scheduled_classification(TRADING_DAY, "2026-07-06T19:20:01Z")
+        rc["scheduled_for_et"] = "15:20"
+        rc["scheduled_window_start_et"] = "15:15"
+        rc["run_id"] = "scheduled_20260706_1520ET"
+        state = _scheduled_state(order_ids=("SCHED-1", "SCHED-2"))
+        state["run_classification"] = rc
+        (legacy_dir / "run_state.json").write_text(json.dumps(state))
+
+        sel = select_scheduled_state_for_reporting(TRADING_DAY, base=base)
+        assert sel.ok
+        assert sel.order_ids == ["SCHED-1", "SCHED-2"]
+        assert sel.state_path == str(legacy_dir / "run_state.json")
+
+        # The canonical directory still wins when both exist -- the retime
+        # only matters for dates that never got a canonical artifact.
+        write_run_artifacts(_scheduled_state(order_ids=("SCHED-3",)), base=base)
+        sel_canonical = select_scheduled_state_for_reporting(TRADING_DAY, base=base)
+        assert sel_canonical.ok
+        assert sel_canonical.order_ids == ["SCHED-3"]
+        assert "1530ET" in sel_canonical.state_path
+
+
 def test_select_requires_valid_scheduled_state():
     with tempfile.TemporaryDirectory() as d:
         base = Path(d)
@@ -457,6 +493,10 @@ def test_select_requires_valid_scheduled_state():
 
 
 def test_broker_fallback_only_with_scheduled_state_and_excludes_manual():
+    # _scheduled_state() carries the canonical 1530ET identity, so the
+    # attribution window starts at 15:25 (Codex review r3654117272: "Select
+    # the fallback attribution window from the run identity") -- 15:20 is
+    # now correctly excluded even though it was accepted before that fix.
     with tempfile.TemporaryDirectory() as d:
         base = Path(d)
         # Scheduled state exists but has no order IDs (simulated write failure).
@@ -466,25 +506,27 @@ def test_broker_fallback_only_with_scheduled_state_and_excludes_manual():
             TRADING_DAY, base=base,
             broker_window_orders=[
                 {"order_id": "BRK-1", "submitted_at_et": "15:20"},
-                {"order_id": "MAN-9", "submitted_at_et": "15:21"},
+                {"order_id": "MAN-9", "submitted_at_et": "15:26"},
                 {"order_id": "BRK-2", "submitted_at_et": "15:34"},
             ],
             scheduled_state_write_failed=True,
         )
         assert sel.ok
         assert sel.used_broker_fallback
-        assert sel.order_ids == ["BRK-1", "BRK-2"]  # MAN-9 still excluded
+        assert sel.order_ids == ["BRK-2"]  # BRK-1 before 15:25, MAN-9 still excluded
 
 
 def test_broker_fallback_excludes_out_of_window_orders():
+    # Canonical 1530ET identity -> window is 15:25-15:35 inclusive.
     with tempfile.TemporaryDirectory() as d:
         base = Path(d)
         write_run_artifacts(_scheduled_state(order_ids=()), base=base)
         sel = select_scheduled_state_for_reporting(
             TRADING_DAY, base=base,
             broker_window_orders=[
-                {"order_id": "EARLY", "submitted_at_et": "15:10"},   # before 15:15
-                {"order_id": "IN-1", "submitted_at_et": "15:15"},    # inclusive start
+                {"order_id": "EARLY", "submitted_at_et": "15:10"},   # before 15:25
+                {"order_id": "PRE-RETIME", "submitted_at_et": "15:20"},  # before 15:25 (legacy-only window)
+                {"order_id": "IN-1", "submitted_at_et": "15:25"},    # inclusive start
                 {"order_id": "IN-2", "submitted_at_et": "2026-07-06T15:35:00-04:00"},  # inclusive end, ISO
                 {"order_id": "LATE", "submitted_at_et": "15:50"},    # after 15:35
                 {"order_id": "NOTIME"},                              # no timestamp -> dropped
@@ -496,6 +538,36 @@ def test_broker_fallback_excludes_out_of_window_orders():
         assert sel.order_ids == ["IN-1", "IN-2"]  # out-of-window and untimed dropped
 
 
+def test_broker_fallback_uses_wider_window_for_legacy_identity():
+    # Codex review r3654117272: a legacy 1520ET state keeps the wider
+    # 15:15-15:35 attribution window (orders from legacy 3:20 PM runs), while
+    # a canonical 1530ET state (covered above) is tighter at 15:25-15:35.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        legacy_dir = legacy_scheduled_run_dir(TRADING_DAY, base)
+        legacy_dir.mkdir(parents=True)
+        rc = build_scheduled_classification(TRADING_DAY, "2026-07-06T19:20:01Z")
+        rc["scheduled_for_et"] = "15:20"
+        rc["scheduled_window_start_et"] = "15:15"
+        rc["run_id"] = "scheduled_20260706_1520ET"
+        state = _scheduled_state(order_ids=())
+        state["run_classification"] = rc
+        (legacy_dir / "run_state.json").write_text(json.dumps(state))
+
+        sel = select_scheduled_state_for_reporting(
+            TRADING_DAY, base=base,
+            broker_window_orders=[
+                {"order_id": "EARLY", "submitted_at_et": "15:10"},   # before 15:15
+                {"order_id": "IN-1", "submitted_at_et": "15:15"},    # inclusive start for legacy
+                {"order_id": "IN-2", "submitted_at_et": "15:34"},
+            ],
+            scheduled_state_write_failed=True,
+        )
+        assert sel.ok
+        assert sel.used_broker_fallback
+        assert sel.order_ids == ["IN-1", "IN-2"]
+
+
 def test_broker_fallback_converts_utc_timestamps_to_et():
     with tempfile.TemporaryDirectory() as d:
         base = Path(d)
@@ -503,7 +575,7 @@ def test_broker_fallback_converts_utc_timestamps_to_et():
         sel = select_scheduled_state_for_reporting(
             TRADING_DAY, base=base,
             broker_window_orders=[
-                {"order_id": "UTC-IN", "submitted_at_et": "2026-07-06T19:20:00Z"},   # 15:20 EDT -> in
+                {"order_id": "UTC-IN", "submitted_at_et": "2026-07-06T19:30:00Z"},   # 15:30 EDT -> in
                 {"order_id": "UTC-OUT", "submitted_at_et": "2026-07-06T19:50:00Z"},  # 15:50 EDT -> out
             ],
             scheduled_state_write_failed=True,
@@ -549,7 +621,7 @@ def test_confirmation_blocked_write_updates_pointer():
         pointer = latest_scheduled_run_path(base)
         assert pointer.exists()
         ptr = json.loads(pointer.read_text())
-        assert ptr["run_id"] == "scheduled_20260706_1520ET"
+        assert ptr["run_id"] == "scheduled_20260706_1530ET"
 
 
 def test_confirmation_blocked_reports_no_fills_and_no_fallback():
@@ -601,11 +673,77 @@ def test_raw_input_filenames_are_deterministic():
     assert "/" not in fname and fname.startswith("place_") and fname.endswith(".json")
 
 
+def test_legacy_1520et_scheduled_classification_still_validates():
+    # 10ce362c was retimed from 3:20 PM to 3:30 PM ET on 2026-07-27. Writers only
+    # emit the canonical identity, but run_states written before the retime must
+    # stay valid scheduled evidence.
+    rc = build_scheduled_classification(TRADING_DAY, "2026-07-06T19:20:01Z")
+    rc["scheduled_for_et"] = "15:20"
+    rc["scheduled_window_start_et"] = "15:15"
+    rc["run_id"] = "scheduled_20260706_1520ET"
+    assert validate_classification(rc).ok
+
+
+def test_validation_rejects_hybrid_canonical_legacy_identity():
+    # Codex review discussion_r3653976747 ("Validate canonical and legacy
+    # identity fields as a unit"): scheduled_for_et, scheduled_window_start_et,
+    # and run_id must be validated as ONE coherent identity tuple, not
+    # independently. Before the fix, each field was checked against
+    # (canonical OR legacy) on its own, so a hybrid classification like
+    # scheduled_for_et='15:30' (canonical) paired with a run_id of
+    # '..._1520ET' (legacy) passed as valid scheduled evidence even though no
+    # real scheduled slot ever produces that combination.
+    rc = build_scheduled_classification(TRADING_DAY, "2026-07-06T19:30:01Z")
+    assert rc["scheduled_for_et"] == "15:30"
+    assert rc["scheduled_window_start_et"] == "15:25"
+    rc["run_id"] = "scheduled_20260706_1520ET"  # legacy run_id, canonical times
+    res = validate_classification(rc)
+    assert not res.ok
+    assert any("coherent identity" in e for e in res.errors)
+
+    # The inverse hybrid (legacy times, canonical run_id) must also be rejected.
+    rc2 = build_scheduled_classification(TRADING_DAY, "2026-07-06T19:30:01Z")
+    rc2["scheduled_for_et"] = "15:20"
+    rc2["scheduled_window_start_et"] = "15:15"
+    # run_id stays canonical '..._1530ET' from build_scheduled_classification.
+    res2 = validate_classification(rc2)
+    assert not res2.ok
+    assert any("coherent identity" in e for e in res2.errors)
+
+
+def test_mixed_canonical_legacy_identity_fields_rejected():
+    # Mixing canonical and legacy scheduled identity fields must be rejected.
+    # e.g. legacy scheduled_for_et with canonical scheduled_window_start_et.
+    rc = build_scheduled_classification(TRADING_DAY, "2026-07-06T19:20:01Z")
+    rc["scheduled_for_et"] = "15:20"          # legacy
+    rc["scheduled_window_start_et"] = "15:25"  # canonical
+    rc["run_id"] = "scheduled_20260706_1530ET"  # canonical
+    res = validate_classification(rc)
+    assert not res.ok
+    assert any("canonical" in e or "legacy" in e for e in res.errors)
+
+    # Legacy for_et, legacy window, but canonical run_id
+    rc2 = build_scheduled_classification(TRADING_DAY, "2026-07-06T19:20:01Z")
+    rc2["scheduled_for_et"] = "15:20"
+    rc2["scheduled_window_start_et"] = "15:15"
+    rc2["run_id"] = "scheduled_20260706_1530ET"  # canonical — mismatched
+    res2 = validate_classification(rc2)
+    assert not res2.ok
+
+    # Canonical for_et, canonical window, but legacy run_id
+    rc3 = build_scheduled_classification(TRADING_DAY, "2026-07-06T19:30:01Z")
+    rc3["scheduled_for_et"] = "15:30"
+    rc3["scheduled_window_start_et"] = "15:25"
+    rc3["run_id"] = "scheduled_20260706_1520ET"  # legacy — mismatched
+    res3 = validate_classification(rc3)
+    assert not res3.ok
+
+
 def test_raw_input_dir_under_scheduled_run():
     with tempfile.TemporaryDirectory() as d:
         base = Path(d)
         assert raw_input_dir(TRADING_DAY, base).name == "raw"
-        assert raw_input_dir(TRADING_DAY, base).parent.name == "20260706_1520ET"
+        assert raw_input_dir(TRADING_DAY, base).parent.name == "20260706_1530ET"
 
 
 def test_save_raw_input_persists_before_compute():
@@ -831,6 +969,45 @@ def test_recovery_state_validates_against_json_schema():
     )
     validator.validate(escalated)
 
+
+def test_schema_rejects_hybrid_canonical_legacy_identity():
+    # Codex review discussion_r3653976747 ("Validate canonical and legacy
+    # identity fields as a unit"): the JSON schema must mirror
+    # validate_classification's coupling -- scheduled_for_et,
+    # scheduled_window_start_et, and run_id must form ONE coherent identity,
+    # not be accepted independently. A hybrid classification (canonical
+    # scheduled_for_et/scheduled_window_start_et paired with a legacy
+    # ..._1520ET run_id) has no coherent scheduled slot and must fail schema
+    # validation, not silently pass as valid scheduled evidence.
+    try:
+        import jsonschema
+        from referencing import Registry, Resource
+    except ImportError:
+        return
+
+    repo_root = Path(__file__).resolve().parents[2]
+    schemas_dir = repo_root / "schemas"
+    rc_schema = json.loads((schemas_dir / "run_classification.schema.json").read_text(encoding="utf-8"))
+    resources = [
+        (name, Resource.from_contents(json.loads((schemas_dir / name).read_text(encoding="utf-8"))))
+        for name in ("run_classification.schema.json",)
+    ]
+    registry = Registry().with_resources(resources)
+    validator = jsonschema.Draft7Validator(rc_schema, registry=registry)
+
+    canonical = build_scheduled_classification(TRADING_DAY, "2026-07-06T19:30:01Z")
+    validator.validate(canonical)  # sanity: the fully-canonical tuple still passes
+
+    legacy = dict(canonical)
+    legacy["scheduled_for_et"] = "15:20"
+    legacy["scheduled_window_start_et"] = "15:15"
+    legacy["run_id"] = "scheduled_20260706_1520ET"
+    validator.validate(legacy)  # sanity: the fully-legacy tuple still passes
+
+    hybrid = dict(canonical)
+    hybrid["run_id"] = "scheduled_20260706_1520ET"  # canonical times, legacy run_id
+    assert not validator.is_valid(hybrid)
+
     # recovery_rerun=true with no recovery block must fail the schema's if/then.
     missing_recovery = _scheduled_state()
     missing_recovery["recovery_rerun"] = True
@@ -865,7 +1042,7 @@ def test_final_manual_override_custom_run_id_not_scheduled():
         "2026-07-13T19:36:00Z", run_id="final_manual_override_20260713_1536ET"
     )
     assert rc["run_id"] == "final_manual_override_20260713_1536ET"
-    # Must never collide with the scheduled_YYYYMMDD_1520ET pattern.
+    # Must never collide with the scheduled_YYYYMMDD_1530ET pattern.
     assert validate_classification(rc).ok
 
 

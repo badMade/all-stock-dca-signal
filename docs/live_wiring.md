@@ -103,7 +103,7 @@ artifact and evaluates only `eligible_to_execute=true` tickers. See
 
 ## Afternoon placement contract (added Jul 22 2026)
 
-The 3:20 PM ET final live task (`10ce362c`) must not stop at compute-only
+The 3:30 PM ET final live task (`10ce362c`) must not stop at compute-only
 planning. The Jul 22 2026 scheduled run produced 20 planned buy orders with
 planned spend of $60, but the saved compute module did not call the placement
 path and wrote `error_class='placement_not_implemented_in_compute_module'`.
@@ -128,7 +128,7 @@ write `order_submit_status='not_submitted'` with
 orders remain.
 
 Both `run_state.json` and `run_summary.json` must contain the same non-null
-`run_classification` object for the 3:20 task. A null
+`run_classification` object for the 3:30 task. A null
 `run_summary.run_classification` is an artifact-contract failure.
 
 ## CLI (dry-run only)

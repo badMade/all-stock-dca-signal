@@ -9,7 +9,7 @@ scheduled live task (cron ``10ce362c``, which supersedes the deleted
       and midday live streams (bound to ``StrategyConfig.sizing_tiers``); the
       former coarser 0x -> 3x morning ladder is historical/superseded.
     - It keeps its OWN budget ledger namespace (:class:`MorningLedger`) so
-      morning activity can never consume the afternoon 3:20 budget ledger.
+      morning activity can never consume the afternoon 3:30 budget ledger.
     - It writes artifacts under its OWN run-state roots and NEVER touches
       ``.../ce16ba6b/latest_scheduled_run.json`` or the afternoon
       ``scheduled_runs/`` folders.
@@ -20,7 +20,7 @@ scheduled live task (cron ``10ce362c``, which supersedes the deleted
 
 The morning stream has two modes (see :data:`MORNING_PROFILES`):
 
-    - ``watchlist`` (9:45 AM ET, ``morning-dca-0945``): a READ-ONLY early-warning
+    - ``watchlist`` (9:45 AM ET, ``bb4f6ef1``): a READ-ONLY early-warning
       watchlist scan. Analytics only, ``trades=false``. It may surface early
       candidates but every dollar figure is HYPOTHETICAL / watchlist-only. It
       writes under ``.../cron_tracking/morning_dca_watchlist/YYYYMMDD_0945ET/``
@@ -111,7 +111,7 @@ _log = logging.getLogger(__name__)
 #
 # The morning stream is INDEPENDENT of the afternoon live task; it never
 # supersedes it and is never valid afternoon evidence. These constants
-# intentionally differ from the afternoon 15:20 classification so the streams can
+# intentionally differ from the afternoon 15:30 classification so the streams can
 # never be confused (see docs/morning_dca.md).
 MORNING_STREAM = "morning"
 # The afternoon live task id, recorded on morning artifacts for cross-reference.
@@ -119,7 +119,9 @@ AFTERNOON_LIVE_CRON_ID = "10ce362c"
 
 # Watchlist (9:45 AM ET) scan identity — analytics-only, no trading.
 MORNING_WATCHLIST_MODE = "watchlist"
-MORNING_WATCHLIST_CRON_ID = "morning-dca-0945"
+# bb4f6ef1 is the canonical 9:45 AM slot. The former repo-internal alias
+# "morning-dca-0945" was retired from the active schedule on 2026-07-27.
+MORNING_WATCHLIST_CRON_ID = "bb4f6ef1"
 MORNING_WATCHLIST_RUN_TYPE = "morning_dca_watchlist_scan"
 MORNING_WATCHLIST_SCHEDULED_FOR_ET = "09:45"
 MORNING_WATCHLIST_WINDOW_START_ET = "09:40"
@@ -142,7 +144,7 @@ MORNING_WATCHLIST_SCHEMA_VERSION = "morning-watchlist-v1"
 # ineligible_reason='unresolved_ticker'; they never force overall_ok=false, which
 # flips false only for global/account/buying-power/auth/schema-write failures.
 MORNING_PREFLIGHT_MODE = "preflight"
-MORNING_PREFLIGHT_CRON_ID = "morning-dca-0945"
+MORNING_PREFLIGHT_CRON_ID = "bb4f6ef1"
 MORNING_PREFLIGHT_RUN_TYPE = "morning_dca_preflight"
 MORNING_PREFLIGHT_SCHEDULED_FOR_ET = "09:45"
 MORNING_PREFLIGHT_WINDOW_START_ET = "09:40"
@@ -273,7 +275,8 @@ MORNING_PROFILES: Dict[str, Dict[str, Any]] = {
 STATE_SCHEMA_VERSION = MORNING_WATCHLIST_SCHEMA_VERSION
 
 # Morning sizing ladder. As of the Fri Jul 10 2026 live-automation update every
-# live stream (morning 10:30, midday 12:30, afternoon 3:20) shares the SAME
+# live stream (market open 9:35, morning 10:30, intraday 11:30/1:30/2:30, midday 12:30,
+# final 3:30) shares the SAME
 # canonical $2-base 0x -> 5x graded ladder defined on
 # ``near_close_dca.StrategyConfig.sizing_tiers``. The former coarser 0x -> 3x
 # morning ladder (0.1-2/2-5/5-8/8+ -> 1x/1.5x/2x/3x) is HISTORICAL/SUPERSEDED and
@@ -463,7 +466,7 @@ class MorningLedger:
     This is a self-contained session that tracks the morning live stream's own
     notional. It shares no state with the afternoon
     :class:`~near_close_dca.StrategyState`, so morning activity can never consume
-    or validate the afternoon 3:20/3:45 daily/weekly budget ledger.
+    or validate the afternoon 3:30/3:45 daily/weekly budget ledger.
     """
 
     namespace: str = MORNING_STREAM

@@ -3,7 +3,8 @@
 The **morning** DCA stream grades each ticker's morning price weakness against
 **yesterday's regular-session close** on the shared **$2-base 0x-to-5x** live
 ladder. As of the **Fri Jul 10 2026** live-automation update every live stream
-(morning 10:30, midday 12:30, afternoon 3:20) shares one ladder (bound to
+(market open 9:35, morning 10:30, intraday 11:30/1:30/2:30, midday 12:30, final
+3:30) shares one ladder (bound to
 `near_close_dca.StrategyConfig.sizing_tiers`); the former morning-only 0x-to-3x
 ladder is **historical/superseded**. It is implemented by
 [`morning_dca.MorningDCAExecutor`](../morning_dca.py) and governed by
@@ -13,9 +14,17 @@ The stream runs in these modes:
 
 | Mode | Task | ET | Trades | run_type | schema | Artifact root |
 |---|---|---|---|---|---|---|
-| `preflight` | `morning-dca-0945` | 9:45 AM | **no** | `morning_dca_preflight` | `morning-preflight-v2-machine-complete` | `.../cron_tracking/morning_dca_preflight/` |
+| `preflight` | `bb4f6ef1` (absorbed from the repo-internal alias `morning-dca-0945`, retired as a standalone schedule entry 2026-07-27 -- REQUIRED by `42173154`'s gate, see below) | 9:45 AM | **no** | `morning_dca_preflight` | `morning-preflight-v2-machine-complete` | `.../cron_tracking/morning_dca_preflight/` |
 | `live` | `42173154` | 10:30 AM | **yes** | `morning_dca_live` | `morning-live-v2-preauthorized` | `.../cron_tracking/morning_dca/` |
-| `watchlist` | (read-only, optional) | 9:45 AM | **no** | `morning_dca_watchlist_scan` | `morning-watchlist-v1` | `.../cron_tracking/morning_dca_watchlist/` |
+| `watchlist` | `bb4f6ef1` (canonical 9:45 AM slot, read-only) | 9:45 AM | **no** | `morning_dca_watchlist_scan` | `morning-watchlist-v1` | `.../cron_tracking/morning_dca_watchlist/` |
+
+**`bb4f6ef1` runs BOTH the `preflight` and `watchlist` rows above at the same 9:45 AM
+ET firing** (added 2026-07-27, Codex review discussion_r3653976736): it fully absorbed
+`morning-dca-0945`, not just its display name, so it must invoke `MorningDCAExecutor`
+in `preflight` mode (writing the artifact `live` mode's gate requires) in addition to
+`watchlist` mode. Retiring `morning-dca-0945` as a standalone schedule entry without
+keeping this writer active at 9:45 would leave `42173154` fail-closed every day (empty
+ticker list) since `_apply_preflight_gate` finds no same-day pre-flight artifact.
 
 ## 9:45 AM pre-flight validation (read-only)
 
@@ -254,7 +263,7 @@ basis, or watchdog confirmation. It may only **reduce or block** additional buys
 through the same-day top-up rule: a later run buys `max(0, desired - prior)` and
 only if the later decision price is **strictly below** the prior reference price.
 
-The **12:30 midday** (`a6239dae`) and **3:20 final** (`10ce362c`) runs **must
+The **12:30 midday** (`a6239dae`) and **3:30 final** (`10ce362c`) runs **must
 scan** `manual_recovery/YYYYMMDD_*` for same-day manual recovery artifacts and
 fold them into the top-up guard as prior allocation. See
 `config/morning_dca.json`'s `manual_missed_run_recovery` and
@@ -355,7 +364,7 @@ isolated on every axis except the same-day top-up guard (see below):
 | Ladder | 0x → **5x** (`config/sizing_ladder.json`) | 0x → **5x** (shared) |
 | Budget ledger | `StrategyState` / `BUDGET_TIERS` | `MorningLedger` namespace `morning` |
 | Artifact root | `.../cron_tracking/ce16ba6b/` | `.../cron_tracking/morning_dca[_watchlist]/` |
-| Run type | `scheduled_live_test` @ `15:20` | `morning_dca_watchlist_scan` @ `09:45` / `morning_dca_live` @ `10:30` |
+| Run type | `scheduled_live_test` @ `15:30` | `morning_dca_watchlist_scan` @ `09:45` / `morning_dca_live` @ `10:30` |
 | Pointer | `latest_scheduled_run.json` | `latest_morning_run.json` (+ `latest_morning_live.json` in live mode) |
 | Trades | **yes** | watchlist **no** / live **yes** (morning-only) |
 
@@ -512,7 +521,7 @@ A scheduled watchlist run:
   "run_type": "morning_dca_watchlist_scan",
   "stream": "morning",
   "trades": false,
-  "cron_id": "morning-dca-0945",
+  "cron_id": "bb4f6ef1",
   "supersedes_cron_id": null,
   "scheduled_for_et": "09:45",
   "scheduled_window_start_et": "09:40",

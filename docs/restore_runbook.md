@@ -74,10 +74,11 @@ Then diff and review before committing. See [`scripts/README.md`](../scripts/REA
 - [ ] Active universe = 44 symbols (includes `GFUZ`, `TXN`); `BYDDY`, `VCX`, `TRLV`, `RVI` excluded; `IRDMI→IRDM`, `GLWR→GLW` applied; `GFUZ` included (Robinhood primary data, finance `NOT_FOUND`).
 - [ ] Ladder is the latest (0.1%–8%+, max 5x, no upper cutoff). No 12x-era tiers.
 - [ ] Base amount $2; tiered daily/weekly caps and $900 weekly rollover reserve cap intact.
-- [ ] Only the live trading tasks `2ba19526`, `42173154`, `7be82b97`, `a6239dae`, and `10ce362c` (supersedes deleted `ce16ba6b`) can trade; they use only account `562057042`; Alpaca read-only.
-- [ ] Final live buy at 3:20 PM ET; slippage/Notion sync at 3:35 PM ET (not merged).
+- [ ] Only the live trading tasks `2ba19526`, `42173154`, `7be82b97`, `a6239dae`, and `10ce362c` (supersedes deleted `ce16ba6b`) can trade; they use only Robinhood account `562057042`; Alpaca read-only.
+- [ ] Final live task at 3:30 PM ET; slippage/Notion sync at 3:35 PM ET (not merged).
 - [ ] Run-classification contract wired: every run_state has a `run_classification` block; scheduled runs update `latest_scheduled_run.json`, manual runs don't; reporting excludes manual runs/order IDs (`python scripts/tests/test_run_classification.py`).
-- [ ] All 15 active tasks present, including `2ba19526` (9:35 AM market open), `bb4f6ef1` (9:45 AM watchlist scan), and `7be82b97` (11:30 AM / 1:30 PM / 2:30 PM intraday). `e3e6f09e` is `paused`. The retired tasks `b7961407`, `cd45e95b`, `d72aa525`, and `d1f7a2c0` are `disabled` and their absence from any active schedule table is expected, not a failure.
+- [ ] The 16 canonical active tasks plus the one-time `f7411889` are present and match `config/scheduled_tasks.json` -> `canonical_schedule_reconciliation_2026_07_27.canonical_schedule_et`: `2ba19526`, `bb4f6ef1`, `42173154`, `7be82b97`, `a6239dae`, `e3e6f09e` (paused), `10ce362c`, `67aa802b`, `a46bf007`, `041d9d90`, `0656657a`, `bec4a6ee`, `c9fb1fb8`, `17a3b2a9`, `f7411889`.
+- [ ] The retired entries `b7961407`, `cd45e95b`, `morning-dca-0945`, `d72aa525`, and `d1f7a2c0` are **absent from every active schedule table** and carry no `cron_utc`.
 - [ ] Afternoon tasks complete by 3:40 PM ET, except Fri 5:00 PM Notion refresh.
 - [ ] Signal rules recorded: below prior close + 60-min trend down + multiplier > 0.
 - [ ] No secrets committed (`git grep` for tokens/keys before pushing).

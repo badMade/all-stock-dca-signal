@@ -2725,7 +2725,7 @@ def test_preflight_classification_matches_morning_schema():
         _now_preflight(), manual=False
     )
     assert rc["run_type"] == "morning_dca_preflight"
-    assert rc["cron_id"] == "morning-dca-0945"
+    assert rc["cron_id"] == "bb4f6ef1"
     assert rc["state_schema_version"] == "morning-preflight-v2-machine-complete"
     assert rc["run_id"] == "morning_preflight_20260708_0945ET"
     assert set(schema["required"]).issubset(rc.keys())

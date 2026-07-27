@@ -115,15 +115,15 @@ the detector **immediately after writing artifacts**:
 |---|---|---|
 | `2ba19526` market-open live | 9:35 AM | `cron_tracking/market_open_dca/YYYYMMDD_0935ET/` |
 | `42173154` morning live | 10:30 AM | `cron_tracking/morning_dca/YYYYMMDD_1030ET/` |
+| `7be82b97` intraday live | 11:30 AM, 1:30 PM, 2:30 PM | `cron_tracking/intraday_dca/YYYYMMDD_<HHMM>ET/` |
 | `a6239dae` midday live | 12:30 PM | `cron_tracking/midday_dca/YYYYMMDD_1230ET/` |
-| `7be82b97` intraday live | 11:30 AM / 1:30 PM / 2:30 PM | `cron_tracking/intraday_dca/YYYYMMDD_<slot>ET/` |
-| `10ce362c` afternoon live | 3:20 PM | `cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/` |
+| `10ce362c` final live | 3:30 PM | `cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1530ET/` |
 
 `2ba19526` and `7be82b97` were added to the live scheduler on 2026-07-27 and now
 carry their own `post_artifact_drift_check` block too (Codex review: "Wire
 drift detection into the new live streams").
 
-The 3:20 PM check must complete before the 3:40 PM watchdog (`a46bf007`). When
+The 3:30 PM check must complete before the 3:40 PM watchdog (`a46bf007`). When
 an auto-buy signal exists but no order record does, the task fires the Slack
 alert (webhook present) and/or the in-app drift alert immediately — it does not
 wait for the next-day review.

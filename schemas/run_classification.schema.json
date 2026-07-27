@@ -25,7 +25,7 @@
     },
     "run_type": {
       "type": "string",
-      "description": "Free-form run type label. Scheduled live runs use 'scheduled_live_test'. Manual final-buy overrides (the 3:20 PM ET final-buy decision requested manually, e.g. the 2026-07-13 incident) use 'final_manual_buy_override' and MUST carry run_origin='manual', manual_run=true, valid_afternoon_scheduled_evidence=false, and same_day_top_up_context_only=true."
+      "description": "Free-form run type label. Scheduled live runs use 'scheduled_live_test'. Manual final-buy overrides (the final-buy decision requested manually, e.g. the 2026-07-13 incident) use 'final_manual_buy_override' and MUST carry run_origin='manual', manual_run=true, valid_afternoon_scheduled_evidence=false, and same_day_top_up_context_only=true."
     },
     "valid_afternoon_scheduled_evidence": {
       "type": "boolean",
@@ -43,11 +43,11 @@
     "supersedes_cron_id": {
       "type": ["string", "null"],
       "enum": ["ce16ba6b", null],
-      "description": "Prior task id this run's task replaced, for lineage/continuity. Must be exactly 'ce16ba6b' (or null/omitted). Placeholder or ambiguous values such as 'ce16ba6b_replacement' are forbidden. This schema validates consumer acceptance/continuity: a scheduled run is accepted as valid evidence when cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b' (see the anyOf below). The stricter writer contract — every newly written scheduled 3:20 PM ET run_state carries BOTH cron_id='10ce362c' AND supersedes_cron_id='ce16ba6b' — is enforced by the writer (scripts/run_classification.py) and documented in docs/run_classification.md, not by this schema."
+      "description": "Prior task id this run's task replaced, for lineage/continuity. Must be exactly 'ce16ba6b' (or null/omitted). Placeholder or ambiguous values such as 'ce16ba6b_replacement' are forbidden. This schema validates consumer acceptance/continuity: a scheduled run is accepted as valid evidence when cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b' (see the anyOf below). The stricter writer contract, that every newly written scheduled 3:30 PM ET run_state carries BOTH cron_id='10ce362c' AND supersedes_cron_id='ce16ba6b', is enforced by the writer (scripts/run_classification.py) and documented in docs/run_classification.md, not by this schema."
     },
     "scheduled_for_et": {
       "type": ["string", "null"],
-      "description": "Nominal ET fire time of the scheduled task, HH:MM. '15:20' for scheduled runs; null/omitted for manual runs."
+      "description": "Nominal ET fire time of the scheduled task, HH:MM. '15:30' for scheduled runs since the 2026-07-27 retime of 10ce362c; '15:20' is accepted only for legacy runs that fired before that retime. Null/omitted for manual runs."
     },
     "scheduled_window_start_et": {
       "type": ["string", "null"],
@@ -59,7 +59,7 @@
     },
     "run_id": {
       "type": "string",
-      "description": "Unique run id. Scheduled: 'scheduled_YYYYMMDD_1520ET'. Manual: a distinct id, e.g. 'manual_YYYYMMDD_HHMMSSZ', that never collides with the scheduled pattern."
+      "description": "Unique run id. Scheduled: 'scheduled_YYYYMMDD_1530ET' (legacy runs before the 2026-07-27 retime use 'scheduled_YYYYMMDD_1520ET'). Manual: a distinct id, e.g. 'manual_YYYYMMDD_HHMMSSZ', that never collides with the scheduled pattern."
     },
     "triggered_at_utc": {
       "type": "string",
@@ -86,19 +86,45 @@
         "properties": {
           "manual_run": { "const": false },
           "run_type": { "const": "scheduled_live_test" },
-          "scheduled_for_et": { "const": "15:20" },
-          "scheduled_window_start_et": { "const": "15:15" },
+          "scheduled_for_et": { "enum": ["15:30", "15:20"] },
+          "scheduled_window_start_et": { "enum": ["15:25", "15:15"] },
           "scheduled_window_end_et": { "const": "15:35" },
-          "run_id": { "pattern": "^scheduled_[0-9]{8}_1520ET$" }
+          "run_id": { "pattern": "^scheduled_[0-9]{8}_15(3|2)0ET$" }
         },
-        "anyOf": [
+        "allOf": [
           {
-            "required": ["cron_id"],
-            "properties": { "cron_id": { "const": "10ce362c" } }
+            "description": "Codex review discussion_r3653976747 ('Validate canonical and legacy identity fields as a unit'): scheduled_for_et, scheduled_window_start_et, and run_id must form ONE coherent identity -- either fully canonical (15:30/15:25/...1530ET) or fully legacy (15:20/15:15/...1520ET, dated strictly before the 2026-07-27 retime) -- rather than being accepted independently via the enum/pattern checks above, which alone would let a hybrid combination (e.g. 15:30 paired with a legacy ...1520ET run_id) pass as valid scheduled evidence for a slot that never actually exists. The legacy run_id pattern below also enforces the retime date (Codex review r3654117261: 'Restrict legacy identities to pre-retime dates') so a stale or incorrectly written post-retime legacy artifact cannot conceal a missed canonical run; it mirrors CANONICAL_RETIME_DATE_YYYYMMDD in scripts/run_classification.py.",
+            "anyOf": [
+              {
+                "properties": {
+                  "scheduled_for_et": { "const": "15:30" },
+                  "scheduled_window_start_et": { "const": "15:25" },
+                  "run_id": { "pattern": "^scheduled_[0-9]{8}_1530ET$" }
+                }
+              },
+              {
+                "properties": {
+                  "scheduled_for_et": { "const": "15:20" },
+                  "scheduled_window_start_et": { "const": "15:15" },
+                  "run_id": {
+                    "pattern": "^scheduled_(?:(?:0[0-9]{3}|1[0-9]{3}|20[0-1][0-9]|202[0-5])[0-9]{4}|2026(?:0[1-6])[0-9]{2}|202607(?:0[1-9]|1[0-9]|2[0-6]))_1520ET$",
+                    "description": "Legacy run_id, restricted to dates strictly before 2026-07-27 (the retime date)."
+                  }
+                }
+              }
+            ]
           },
           {
-            "required": ["supersedes_cron_id"],
-            "properties": { "supersedes_cron_id": { "const": "ce16ba6b" } }
+            "anyOf": [
+              {
+                "required": ["cron_id"],
+                "properties": { "cron_id": { "const": "10ce362c" } }
+              },
+              {
+                "required": ["supersedes_cron_id"],
+                "properties": { "supersedes_cron_id": { "const": "ce16ba6b" } }
+              }
+            ]
           }
         ]
       }
@@ -110,7 +136,7 @@
       "then": {
         "properties": {
           "manual_run": { "const": true },
-          "run_id": { "not": { "pattern": "^scheduled_[0-9]{8}_1520ET$" } }
+          "run_id": { "not": { "pattern": "^scheduled_[0-9]{8}_15(3|2)0ET$" } }
         },
         "anyOf": [
           {

@@ -103,7 +103,7 @@ def derive_valid_scheduled_evidence(run_state: Optional[Dict[str, object]]) -> b
     incomplete classification (e.g. ``{"run_origin": "scheduled"}`` with no
     ``manual_run`` key) can never pass as scheduled evidence. This is
     deliberately looser than run_classification.is_scheduled_state (which pins
-    the 15:20 afternoon window); a stream's own validator can tighten further.
+    the 15:30 afternoon window); a stream's own validator can tighten further.
 
     A run that the artifact contract rejected is NOT valid scheduled evidence,
     even if its classification still says scheduled: a top-level

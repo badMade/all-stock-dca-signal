@@ -51,10 +51,11 @@
     "cron_id": {
       "type": "string",
       "enum": [
+        "bb4f6ef1",
         "morning-dca-0945",
         "42173154"
       ],
-      "description": "Morning task id: 'morning-dca-0945' for the watchlist scan, '42173154' for the live execution. Distinct from the afternoon live task '10ce362c'."
+      "description": "Morning task id: 'bb4f6ef1' for the 9:45 AM watchlist/pre-flight scan, '42173154' for the 10:30 AM live execution. Distinct from the final live task '10ce362c'. The repo-internal alias 'morning-dca-0945' was retired from the active schedule on 2026-07-27 and is accepted only so artifacts written before then stay valid."
     },
     "supersedes_cron_id": {
       "type": [
@@ -154,7 +155,7 @@
       "then": {
         "properties": {
           "cron_id": {
-            "const": "morning-dca-0945"
+            "enum": ["bb4f6ef1", "morning-dca-0945"]
           },
           "state_schema_version": {
             "const": "morning-watchlist-v1"
@@ -179,7 +180,7 @@
       },
       "then": {
         "properties": {
-          "cron_id": { "const": "morning-dca-0945" },
+          "cron_id": { "enum": ["bb4f6ef1", "morning-dca-0945"] },
           "state_schema_version": { "const": "morning-preflight-v2-machine-complete" },
           "trades": { "const": false }
         }

@@ -41,7 +41,7 @@ The **morning (10:30)** and **midday (12:30)** live streams keep requiring all
 three conditions, including the 60-minute downward-trend filter (condition 2),
 unless changed later.
 
-### Final buy of the day (3:20 PM ET, task `10ce362c`)
+### Final buy of the day (3:30 PM ET, task `10ce362c`)
 
 For the **final live buy of the day** the run performs a **full active-universe
 scan** and, **for this final-buy decision only**, **ignores the 60-minute
@@ -166,7 +166,7 @@ selected weekly cap, available buying power, or the broker/order-review limit.
 ### Intraday cap curve backtest (analytics only, under review)
 
 An analytics-only backtest of an intraday cumulative daily cap curve (cumulative
-cap usage limits by 10:30, 12:30, and 3:20, not per-run allocations), layered on
+cap usage limits by 10:30, 12:30, and 3:30, not per-run allocations), layered on
 a $300 weekly-add rollover funding model with a $1 backtest base, is documented in
 [backtest_curve.md](backtest_curve.md) with machine-readable candidate results in
 [`config/backtest_intraday_cap_curve.json`](../config/backtest_intraday_cap_curve.json).
@@ -177,7 +177,7 @@ above.
 ## Same-day prior-run offset / top-up guard
 
 One guard governs the **morning (10:30)**, **midday (12:30)**, and **afternoon
-(3:20 PM ET)** live streams as well as **manual override same-day fills**. An
+(3:30 PM ET)** live streams as well as **manual override same-day fills**. An
 earlier run must **never block** a later run. Instead, each later run treats any
 earlier same-day allocation as prior-allocation context and **tops up** only when
 it is buying into a lower price:
@@ -247,7 +247,7 @@ The morning stream ([morning_dca.md](morning_dca.md)) and the midday stream
 shared dynamic-base 0x-to-5x ladder as the afternoon run — as of the Fri Jul 10 2026
 live-automation update every live stream shares one ladder (the former morning
 0x-to-3x ladder is historical/superseded). Both are independent of the afternoon
-3:20 PM task and never count as afternoon scheduled evidence.
+3:30 PM task and never count as afternoon scheduled evidence.
 
 The scheduled afternoon run auto-loads prior context from its own task root
 **plus** the morning-live root (`.../cron_tracking/morning_dca`), the
@@ -260,7 +260,7 @@ nothing.
 **Manual missed-morning recovery (added Jul 20 2026).** If the 10:30 scheduled
 morning live task did not run, a human may place the missed buys by hand under
 `.../cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*` (example
-`20260720_1048ET`). Both the **12:30 midday** and **3:20 final** runs scan that
+`20260720_1048ET`). Both the **12:30 midday** and **3:30 final** runs scan that
 path and fold any same-day recovery fills into this top-up guard as prior
 allocation. Those artifacts (`run_origin='manual'`, `manual_run=true`,
 `same_day_top_up_context_only=true`, `valid_scheduled_evidence=false`) are
@@ -313,9 +313,9 @@ manual exclusion roots for final-override order IDs: `final_manual_review/**`,
 
 ### Raw connector-input persistence (added 2026-07-10)
 
-Before computing any signal, the scheduled 3:20 PM ET run persists every raw
+Before computing any signal, the scheduled 3:30 PM ET run persists every raw
 Robinhood/Finance/Alpaca/Yahoo connector response it used under
-`scheduled_runs/YYYYMMDD_1520ET/raw/` (deterministic filenames
+`scheduled_runs/YYYYMMDD_1530ET/raw/` (deterministic filenames
 `quotes_batchN.json`, `historicals_batchN.json`, `tradability_pre_place.json`,
 `portfolio_pre_place.json`, `orders_after_place.json`, `place_SYMBOL.json`),
 normalizing large connector `output_path` pointers into parseable JSON, and
@@ -350,7 +350,7 @@ is valid scheduled evidence for the `intraday_1430` stream and valid same-day
 prior-allocation / top-up context for later same-day runs (gated by the canonical
 first-buy and same-day top-up rule). It **must not** be treated as manual evidence
 and **must not** be counted as proof that any other stream (morning 10:30, midday
-12:30, or afternoon 3:20) ran.
+12:30, or afternoon 3:30) ran.
 
 Fills: TRIN $3.00 @ 17.2164, IRDM $5.00 @ 45.7799, DXYZ $6.00 @ 22.9287, ASML
 $4.00 @ 1760.8199, STX $8.00 @ 859.2699, AMAT $6.00 @ 536.3400, AMD $4.00 @

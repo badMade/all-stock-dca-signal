@@ -73,7 +73,13 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 # The per-stream signal CSVs differ in name; check the generic name first, then
 # the stream-specific ones. All share the columns this detector reads.
-SIGNAL_CSV_NAMES = ("signals.csv", "morning_signals.csv", "midday_signals.csv")
+SIGNAL_CSV_NAMES = (
+    "signals.csv",
+    "morning_signals.csv",
+    "midday_signals.csv",
+    "market_open_signals.csv",
+    "intraday_signals.csv",
+)
 # Order-record CSVs, most-authoritative first. submitted_orders.csv is the
 # primary "an order was actually placed" record; the others are fallbacks.
 ORDER_CSV_NAMES = ("submitted_orders.csv", "orders.csv", "filled_orders.csv")

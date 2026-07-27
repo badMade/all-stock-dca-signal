@@ -431,6 +431,75 @@ def test_merge_manual_top_up_context_poisons_base_to_unknown():
     assert merged.selected_base_amount_usd_at is None
 
 
+def test_merge_manual_top_up_context_retains_base_when_manual_fill_is_later():
+    # Codex review discussion_r3653976740 ("Preserve the known base when a
+    # later manual fill is merged"): an earlier scheduled allocation resolved
+    # a $1 base (below close only) at 10:30. A LATER (14:00) bare-CSV manual
+    # fill, whose PriorAllocation.reference_ts now identifies its own time,
+    # must not erase that known base -- it cannot itself be the true first
+    # allocation since it happened after the base was already established.
+    # Before the fix this unconditionally poisoned the base to None, so a
+    # subsequent lower-price run would recompute its own (possibly $2) base,
+    # doubling the full-day target before subtracting prior spend.
+    prior_same_day_allocations = {
+        "AAPL": PriorSameDayAllocation(
+            "AAPL",
+            amount_usd=1.0,
+            reference_price=97.0,
+            run_id="run1",
+            source="scheduled",
+            selected_base_amount_usd=1.0,
+            selected_base_amount_usd_at="2026-06-29T10:30:00-04:00",
+        ),
+    }
+    manual_context = {
+        "AAPL": PriorAllocation(
+            ticker="AAPL",
+            prior_usd=1.0,
+            reference_price=99.0,
+            sources=["manual_csv"],
+            reference_ts=14 * 3600,
+        ),
+    }
+    merge_manual_top_up_context(prior_same_day_allocations, manual_context)
+    merged = prior_same_day_allocations["AAPL"]
+    assert merged.amount_usd == 2.0
+    assert merged.selected_base_amount_usd == 1.0
+    assert merged.selected_base_amount_usd_at == "2026-06-29T10:30:00-04:00"
+
+
+def test_merge_manual_top_up_context_poisons_base_when_manual_fill_may_be_earlier():
+    # The inverse of the above: a bare-CSV manual fill at 09:00, EARLIER than
+    # the existing allocation's base-establishing run at 10:30, could itself
+    # be the true first same-day allocation -- its own base is unknown from a
+    # bare CSV, so the merged base must still be poisoned rather than keep
+    # `existing`'s (possibly wrong, non-first) base.
+    prior_same_day_allocations = {
+        "AAPL": PriorSameDayAllocation(
+            "AAPL",
+            amount_usd=1.0,
+            reference_price=97.0,
+            run_id="run1",
+            source="scheduled",
+            selected_base_amount_usd=1.0,
+            selected_base_amount_usd_at="2026-06-29T10:30:00-04:00",
+        ),
+    }
+    manual_context = {
+        "AAPL": PriorAllocation(
+            ticker="AAPL",
+            prior_usd=1.0,
+            reference_price=99.0,
+            sources=["manual_csv"],
+            reference_ts=9 * 3600,
+        ),
+    }
+    merge_manual_top_up_context(prior_same_day_allocations, manual_context)
+    merged = prior_same_day_allocations["AAPL"]
+    assert merged.selected_base_amount_usd is None
+    assert merged.selected_base_amount_usd_at is None
+
+
 def test_merge_manual_top_up_context_uses_most_recent_reference_not_merge_order():
     # Codex review ("Preserve the manual-context timestamp when merging
     # references"): a bare-CSV manual fill merged last must not automatically
@@ -1223,7 +1292,7 @@ def test_apply_deployment_history_only_counts_trailing_7d(tmp_path):
                 "scheduled_window_start_et": SCHEDULED_WINDOW_START_ET,
                 "scheduled_window_end_et": SCHEDULED_WINDOW_END_ET,
                 "manual_run": False,
-                "run_id": f"scheduled_{day.strftime('%Y%m%d')}_1520ET",
+                "run_id": f"scheduled_{day.strftime('%Y%m%d')}_1530ET",
                 "triggered_at_utc": f"{day.isoformat()}T19:45:00Z",
                 "state_schema_version": "run-classification-v1",
             },

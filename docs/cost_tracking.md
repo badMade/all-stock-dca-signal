@@ -23,10 +23,14 @@ safety rule (see [safeguards.md](safeguards.md)).
 
 | ET | Task | Role |
 |---|---|---|
-| 9:45 AM | `morning-dca-0945` | pre-flight validation (read-only) |
+| 9:35 AM | `2ba19526` | market-open live execution (first buy of the day) |
+| 9:45 AM | `bb4f6ef1` | watchlist early-warning scan (read-only) |
 | 10:30 AM | `42173154` | morning live execution |
+| 11:30 AM | `7be82b97` | intraday live execution |
 | 12:30 PM | `a6239dae` | midday live execution |
-| 3:20 PM | `10ce362c` | final live execution (final buy of the day) |
+| 1:30 PM | `7be82b97` | intraday live execution |
+| 2:30 PM | `7be82b97` | intraday live execution |
+| 3:30 PM | `10ce362c` | final live execution (final buy of the day) |
 | 3:35 PM | `67aa802b` | post-trade slippage + compact Notion **Latest Run** sync |
 | 3:40 PM | `a46bf007` | live-run watchdog |
 
@@ -100,13 +104,15 @@ behavior **only** — it does **not** relax any trading safety rule (see
 
 | ET | Task | Role |
 |---|---|---|
-| 9:35 AM | `2ba19526` | market-open live execution |
-| 9:45 AM | `bb4f6ef1` | watchlist early-warning scan (read-only) |
-| 9:45 AM | `morning-dca-0945` | pre-flight validation (read-only) |
+| 9:35 AM | `2ba19526` | market-open live execution (first buy of the day) |
+| 9:45 AM | `bb4f6ef1` | watchlist early-warning scan (read-only); also runs the required pre-flight writer absorbed from `morning-dca-0945` |
 | 10:30 AM | `42173154` | morning live execution |
-| 11:30 AM, 1:30 PM, 2:30 PM | `7be82b97` | intraday live execution (three slots) |
+| 11:30 AM | `7be82b97` | intraday live execution |
 | 12:30 PM | `a6239dae` | midday live execution |
-| 3:20 PM | `10ce362c` | final live execution (final buy of the day) |
+| 1:30 PM | `7be82b97` | intraday live execution |
+| 2:30 PM | `7be82b97` | intraday live execution |
+| 3:05 PM | `e3e6f09e` | monitor-only signal check (read-only, **paused**) |
+| 3:30 PM | `10ce362c` | final live execution (final buy of the day) |
 | 3:35 PM | `67aa802b` | post-trade slippage + compact Notion **Latest Run** sync |
 | 3:40 PM | `a46bf007` | live-run watchdog |
 
@@ -161,11 +167,11 @@ Covered daily tasks (same set as the routing policy):
 |---|---|---|
 | 9:35 AM | `2ba19526` | market_open |
 | 9:45 AM | `bb4f6ef1` | watchlist |
-| 9:45 AM | `morning-dca-0945` | preflight |
 | 10:30 AM | `42173154` | morning |
 | 11:30 AM, 1:30 PM, 2:30 PM | `7be82b97` | intraday |
 | 12:30 PM | `a6239dae` | midday |
-| 3:20 PM | `10ce362c` | afternoon |
+| 3:05 PM | `e3e6f09e` | monitor |
+| 3:30 PM | `10ce362c` | afternoon |
 | 3:35 PM | `67aa802b` | slippage |
 | 3:40 PM | `a46bf007` | watchdog |
 
@@ -181,18 +187,18 @@ the run it reports on) and opt-in via a `model_usage_log_root` parameter that
 defaults to `None`, so ad-hoc/test construction never touches the real path.
 - **Enabled by default for the two executor-based tasks' normal
   configuration path:** `load_morning_config()`/`load_midday_config()`
-  (`morning-dca-0945`/`42173154`/`a6239dae`) resolve `model_usage_log_root`
+  (`42173154`/`a6239dae`) resolve `model_usage_log_root`
   to the real production path unless `artifact_paths.model_usage_log_root`
   in `morning_dca.json`/`midday_dca.json` overrides or nulls it out. A bare
   `MorningConfig()`/`MiddayConfig()` constructed directly (tests, ad-hoc
   scripts) still defaults to `None` -- only the loader enables it.
-- **Wired directly into the executor** for the five tasks with an in-repo
-  Python entry point: `morning-dca-0945`/`42173154` and (via subclass)
+- **Wired directly into the executor** for the tasks with an in-repo
+  Python entry point: `42173154` and (via subclass)
   `a6239dae` (`MorningDCAExecutor.run` / `MiddayDCAExecutor.run` in
   `morning_dca.py`), `10ce362c` (`run_pipeline` in `run_dca.py`), and
   `67aa802b` (`generate_scheduled_reports` in `dca_reporting.py`, which
   appends even when report generation raises, and logs its own report
-  directory as `artifact_path` rather than the 15:20 live run's
+  directory as `artifact_path` rather than the 15:30 live run's
   `run_state.json` -- that live run's `run_id` is kept in `notes` as an
   explicit reference).
   `run_pipeline`/`generate_scheduled_reports` have no in-repo config-file
@@ -200,9 +206,9 @@ defaults to `None`, so ad-hoc/test construction never touches the real path.
   explicit roots, e.g. `classification_state_root`) so, matching that
   existing pattern, `model_usage_log_root` there stays caller-opt-in rather
   than defaulted.
-- **CLI for the rest:** `2ba19526`, `bb4f6ef1`, `7be82b97`, and `a46bf007`
-  have no dedicated in-repo entry point to wire a call into; they are driven
-  directly by the external scheduler/agent, which appends their entry itself:
+- **CLI for the rest:** `2ba19526`, `bb4f6ef1`, `7be82b97`, `e3e6f09e`, and
+  `a46bf007` have no in-repo executor to wire a call into, so the
+  scheduler/agent appends their entry directly:
   `python -m scripts.model_usage_log --run-id <id> --task-id <id> --artifact-path <path>`
   (see `--help` for the full option list).
 - **What Python cannot know:** this module has no visibility into which

@@ -37,10 +37,17 @@ RUN_STATE_FILENAME = "run_state.json"
 SIGNALS_CSV_FILENAME = "signals.csv"
 SUBMITTED_ORDERS_CSV_FILENAME = "submitted_orders.csv"
 
-# Any of these satisfies the signals contract. The morning/midday runners emit
-# stream-specific names; the drift detector (SIGNAL_CSV_NAMES) accepts the same
-# set, so a stream-specific file still counts as signals.csv for the contract.
-SIGNAL_CSV_NAMES = (SIGNALS_CSV_FILENAME, "morning_signals.csv", "midday_signals.csv")
+# Any of these satisfies the signals contract. The morning/midday/market-open/
+# intraday runners emit stream-specific names; the drift detector
+# (SIGNAL_CSV_NAMES) accepts the same set, so a stream-specific file still
+# counts as signals.csv for the contract.
+SIGNAL_CSV_NAMES = (
+    SIGNALS_CSV_FILENAME,
+    "morning_signals.csv",
+    "midday_signals.csv",
+    "market_open_signals.csv",
+    "intraday_signals.csv",
+)
 
 # Header written for submitted_orders.csv even when there are zero order rows.
 SUBMITTED_ORDERS_FIELDS = ("ticker", "order_id", "submitted_amount_usd", "status")
@@ -66,7 +73,7 @@ ORDER_ATTEMPT_STATUSES = frozenset(
 # stream='morning' -- not an aspirational separate identity, or any consumer
 # adopting this contract to validate/attribute the preflight would reject
 # every real artifact.
-PREFLIGHT_CRON_ID = "morning-dca-0945"
+PREFLIGHT_CRON_ID = "bb4f6ef1"
 PREFLIGHT_RUN_TYPE = "morning_dca_preflight"
 PREFLIGHT_SCHEDULED_FOR_ET = "09:45"
 PREFLIGHT_WINDOW_START_ET = "09:40"
@@ -90,18 +97,22 @@ MIDDAY_LIVE_CRON_ID = "a6239dae"
 MIDDAY_LIVE_SCHEDULED_FOR_ET = "12:30"
 MIDDAY_LIVE_STREAM = "midday"
 
-# Scheduled afternoon final live (3:20 PM / 15:20 ET) identity. This is the
+# Scheduled afternoon final live (3:30 PM / 15:30 ET) identity. This is the
 # repaired live task 10ce362c, which supersedes the deleted ce16ba6b.
 AFTERNOON_LIVE_CRON_ID = "10ce362c"
 AFTERNOON_LIVE_SUPERSEDES_CRON_ID = "ce16ba6b"
 AFTERNOON_LIVE_RUN_TYPE = "scheduled_live_test"
-AFTERNOON_LIVE_SCHEDULED_FOR_ET = "15:20"
-AFTERNOON_LIVE_WINDOW_START_ET = "15:15"
+AFTERNOON_LIVE_SCHEDULED_FOR_ET = "15:30"
+AFTERNOON_LIVE_WINDOW_START_ET = "15:25"
+# Retimed from 3:20 PM ET on 2026-07-27. Legacy runs written before then carry
+# these values; validators accept them so existing artifacts stay valid.
+AFTERNOON_LIVE_LEGACY_SCHEDULED_FOR_ET = "15:20"
+AFTERNOON_LIVE_LEGACY_WINDOW_START_ET = "15:15"
 AFTERNOON_LIVE_WINDOW_END_ET = "15:35"
 AFTERNOON_LIVE_STREAM = "afternoon"
 AFTERNOON_LIVE_STATE_SCHEMA_VERSION = "run-classification-v1"
 
-# order_submit_status / error_class values for the 3:20 placement contract
+# order_submit_status / error_class values for the 3:30 placement contract
 # (Jul 22 2026). A compute-only module that plans orders but never places them
 # is NOT a valid terminal state for the scheduled live task; when the approved
 # fallback placement path is genuinely unreachable, the run records these.
@@ -206,16 +217,16 @@ def build_afternoon_live_run_classification(
     triggered_at_utc: Optional[str] = None,
     state_schema_version: str = AFTERNOON_LIVE_STATE_SCHEMA_VERSION,
 ) -> Dict[str, Any]:
-    """Non-null run_classification for the 3:20 PM ET afternoon final live run.
+    """Non-null run_classification for the 3:30 PM ET afternoon final live run.
 
     Both run_state.json and run_summary.json must carry this same object for a
-    scheduled 3:20 run. ``valid_scheduled_evidence`` and
+    scheduled 3:30 run. ``valid_scheduled_evidence`` and
     ``valid_afternoon_scheduled_evidence`` must be derived from the completed
     run_state (a placed-order outcome), never asserted blindly;
     ``valid_afternoon_scheduled_evidence`` defaults to ``valid_scheduled_evidence``.
     Carries both ``cron_id='10ce362c'`` and ``supersedes_cron_id='ce16ba6b'`` per
     the writer contract. ``run_id`` should be the scheduled id
-    ``scheduled_YYYYMMDD_1520ET``.
+    ``scheduled_YYYYMMDD_1530ET``.
     """
     if valid_afternoon_scheduled_evidence is None:
         valid_afternoon_scheduled_evidence = bool(valid_scheduled_evidence)
@@ -255,7 +266,7 @@ def _planned_amount(candidate: Dict[str, Any]) -> float:
 def has_planned_orders(run_state: Dict[str, Any]) -> bool:
     """True when the run planned at least one order with a positive amount.
 
-    This is the trigger the 3:20 task uses to require a placement phase in the
+    This is the trigger the 3:30 task uses to require a placement phase in the
     same run: once signals.csv exists and any eligible row has
     ``incremental_usd`` (or an equivalent planned amount) > 0, the run must
     attempt placement rather than terminate at compute-only planning.
@@ -297,7 +308,7 @@ _PLACEMENT_ENTERED_STATUSES = frozenset(
 def _has_unplaced_planned_order(run_state: Dict[str, Any]) -> bool:
     """True when any positive planned candidate never entered the placement phase.
 
-    The 3:20 contract requires EVERY positive planned row to enter placement. A
+    The 3:30 contract requires EVERY positive planned row to enter placement. A
     candidate with a positive planned amount still at its default
     ``status='not_submitted'`` (and no order_id) was never placed -- even when a
     *different* candidate in the same run was submitted (e.g. the placement loop
@@ -393,7 +404,7 @@ def artifact_contract_failure(reason: str, *, detail: Optional[str] = None) -> D
 def placement_unreachable_state_fields(*, detail: Optional[str] = None) -> Dict[str, Any]:
     """run_state fields for the approved 'placement phase unreachable' terminal state.
 
-    Used when the 3:20 task planned orders but neither the saved compute module
+    Used when the 3:30 task planned orders but neither the saved compute module
     nor the approved fallback placement path (main live placement runner /
     direct connector) could place them. Completed-order evidence is false, but
     the run still proves the scheduled task fired. Callers still write
@@ -550,7 +561,7 @@ def validate_run_artifacts(
     ``latest_run_summary.json`` left behind after the canonical file was lost is
     NOT sufficient, or the missing-canonical-artifact detection is defeated. The
     mirror check above only validates a summary that exists, so without this a live
-    dir carrying only run_state.json + the CSVs would silently pass despite the 3:20
+    dir carrying only run_state.json + the CSVs would silently pass despite the 3:30
     contract requiring a canonical run_summary.json.
     """
     run_dir = Path(run_dir)

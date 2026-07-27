@@ -120,17 +120,18 @@ DEFAULT_INTRADAY_LIVE_STATE_ROOT = "intraday_dca"
 # bare relative name for the same portability reason as the intraday root.
 DEFAULT_MARKET_OPEN_LIVE_STATE_ROOT = "market_open_dca"
 
-# Stream label for the scheduled 3:20 PM ET final live run, used for the
+# Stream label for the scheduled 3:30 PM ET final live run, used for the
 # failure-alert / heartbeat identity (DCA_HEARTBEAT_URL_AFTERNOON). Matches the
 # "afternoon" stream name recorded by scripts/run_classification.py pointers.
 AFTERNOON_STREAM = "afternoon"
 
 # Sibling stream roots the scheduled afternoon top-up guard folds in as prior
-# same-day allocation context (in addition to its own task root): the morning and
-# midday live roots, the latter of which also holds manual override reruns under
-# ``manual_reruns/``. Absent roots contribute nothing, so this is safe on days a
-# stream did not run. These are prior-allocation context ONLY -- never scheduled
-# afternoon evidence, slippage, reliability, fill counts, or cost basis.
+# same-day allocation context (in addition to its own task root): the market-open,
+# morning, midday, and intraday live roots -- the midday one also holds manual
+# override reruns under ``manual_reruns/``. Absent roots contribute nothing, so
+# this is safe on days a stream did not run. These are prior-allocation context
+# ONLY -- never scheduled afternoon evidence, slippage, reliability, fill counts,
+# or cost basis.
 #
 # Used both as the sibling-of-afternoon-root fallback and as the default when a
 # stream's own config can't be loaded (see
@@ -772,7 +773,7 @@ def _default_prior_allocation_state_root(artifacts_dir: Path) -> Path:
     """Derive the cron task root from a scheduled run's artifacts_dir.
 
     Per config/scheduled_tasks.json the live scheduled path writes into
-    ``<task_root>/scheduled_runs/YYYYMMDD_1520ET/``, and prior same-day
+    ``<task_root>/scheduled_runs/YYYYMMDD_1530ET/``, and prior same-day
     manual/morning allocations live under the sibling
     ``<task_root>/manual_runs/<timestamp>/``. A plain ``.parent`` would land on
     ``scheduled_runs/`` itself (which never contains ``manual_runs/``), so walk
@@ -1123,7 +1124,8 @@ def _run_pipeline_impl(
         import dataclasses as _dc
         config = _dc.replace(config, ignore_trend_filter=True)
     # Auto-apply the final-buy trend override for scheduled runs in the 3:15-3:35 PM ET
-    # window (task 10ce362c, "scheduled_window_et": "15:15-15:35" in scheduled_tasks.json).
+    # window (task 10ce362c, retimed to 3:30 PM ET on 2026-07-27). The lower bound stays
+    # at 15:15 so a legacy 3:20 PM run is still attributable to the scheduled window.
     # This is restricted to scheduled live runs so manual, demo, and morning/midday callers
     # are unaffected — they run outside this window and/or with scheduled=False.
     elif scheduled and not config.dry_run and not config.ignore_trend_filter:

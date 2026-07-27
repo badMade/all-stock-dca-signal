@@ -32,7 +32,6 @@ TRIGGERED = datetime(2026, 7, 21, 14, 30, 0, tzinfo=timezone.utc)
 COVERED_TASK_IDS = (
     "2ba19526",
     "bb4f6ef1",
-    "morning-dca-0945",
     "42173154",
     "7be82b97",
     "a6239dae",
@@ -204,7 +203,7 @@ def test_entry_matches_json_schema():
 
 
 def test_cli_appends_entry_for_tasks_with_no_python_entry_point():
-    # bb4f6ef1/a46bf007 have no in-repo executor to wire a
+    # bb4f6ef1/e3e6f09e/a46bf007 have no in-repo executor to wire a
     # log_model_usage() call into -- they're run directly by the external
     # scheduler/agent, which shells out to this CLI instead.
     from model_usage_log import _main

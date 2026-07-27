@@ -729,7 +729,7 @@ def generate_scheduled_reports(
     # This reporting task's own identity/artifact -- distinct from the live
     # run (selection.state_path) it is reporting ON, so the audit log points
     # an auditor at what THIS task produced (output_dir), not the afternoon
-    # 15:20 live task's run_state.json. The live run's own run_id is kept in
+    # 15:30 live task's run_state.json. The live run's own run_id is kept in
     # `notes` as an explicit input reference.
     report_run_id = f"reporting_{trading_day}_1535ET"
     source_run_id = (selection.state or {}).get("run_id")

@@ -1,18 +1,23 @@
 {
   "$schema": "../schemas/scheduled_tasks.schema.json",
-  "version": "2026-07-20",
-  "verified_on_et": "2026-07-20",
+  "version": "2026-07-27",
+  "verified_on_et": "2026-07-27",
   "timezone_note": "Cron expressions are in UTC. ET equivalents are in America/New_York and vary with DST. Confirm around DST transitions.",
-  "change_note_2026_07_20": "Consolidated the cost-conscious model-routing policy for daily DCA into the authoritative model_routing_policy section and reaffirmed it on every active daily task (9:00 pre-market dashboard, 9:45 volatility scan, 9:45 pre-flight, 10:30 morning live, 12:30 midday live, 3:05 monitor, 3:20 final live, 3:35 slippage/latest-run sync, 3:40 watchdog). Daily DCA uses cost-conscious/default model routing where available; premium models (e.g. ChatGPT 5.5) are reserved for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Documentation/cost-behavior only: preserves the $2.00 base amount, 0x-to-5x ladder, Finance-primary read-only market-data policy, GFUZ/TXN active universe, BYDDY/VCX/TRLV/RVI exclusions, same-day top-up guards, safety rules, and run-classification text unchanged.",
+  "change_note_2026_07_20": "SUPERSEDED for the task list by change_note_2026_07_27 and canonical_schedule_reconciliation_2026_07_27; the cost-conscious model routing policy itself still applies. Consolidated the cost-conscious model-routing policy for daily DCA into the authoritative model_routing_policy section and reaffirmed it on every active daily task (9:00 pre-market dashboard, 9:45 volatility scan, 9:45 pre-flight, 10:30 morning live, 12:30 midday live, 3:05 monitor, 3:20 final live, 3:35 slippage/latest-run sync, 3:40 watchdog). Daily DCA uses cost-conscious/default model routing where available; premium models (e.g. ChatGPT 5.5) are reserved for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Documentation/cost-behavior only: preserves the $2.00 base amount, 0x-to-5x ladder, Finance-primary read-only market-data policy, GFUZ/TXN active universe, BYDDY/VCX/TRLV/RVI exclusions, same-day top-up guards, safety rules, and run-classification text unchanged.",
+  "change_note_2026_07_27": "Aligned this manifest with the user's canonical DCA schedule verified on 2026-07-27. Added the three canonical tasks that were missing (2ba19526 market-open live at 9:35 AM, bb4f6ef1 morning watchlist early-warning scan at 9:45 AM, 7be82b97 intraday live at 11:30 AM / 1:30 PM / 2:30 PM). Retimed 10ce362c from 3:20 PM to the canonical 3:30 PM ET (cron 30 19 * * 1-5 in EDT) and moved current/future scheduled evidence to 15:30 and the YYYYMMDD_1530ET convention, keeping YYYYMMDD_1520ET as a legacy/historical pattern so existing artifacts stay valid and the artifact root stays under ce16ba6b for continuity. Paused e3e6f09e. Retired b7961407, cd45e95b, d72aa525, d1f7a2c0, and the repo-internal morning-dca-0945 alias from every active schedule table; they are status=disabled with in_live_scheduler=false and no cron_utc. The drift detector itself is NOT retired and the 9:45 pre-flight artifact contract is preserved because 42173154 still gates on it. See canonical_schedule_reconciliation_2026_07_27 for the authoritative table. Schedule/config/documentation only: preserves the canonical first-buy and same-day top-up rule, the 2026-07-24 2:30 PM ET intraday recovery fills, the $2.00 base amount, the 0x-to-5x ladder, the active universe and BYDDY/VCX/TRLV/RVI exclusions, the Finance-primary provider policy with yfinance fallback and GFUZ Robinhood-primary handling, Robinhood-only execution on account 562057042, the scheduled run artifact contract, cost-conscious model routing, and the account-number obfuscation policy. No orders are placed by this change.",
   "operating_mode": {
     "mode": "cost_saving_daily_compact",
     "requested_on_et": "2026-07-16",
     "summary": "Cost-saving operating mode requested Thu Jul 16 2026: keep the weekday DCA chain compact and defer all heavy analysis to Friday. Daily weekday tasks write compact machine-readable artifacts (JSON/CSV) only, avoid long narrative summaries, suppress no-op notifications, and rely on the post-artifact drift detector instead of manual checking. Full analysis, dashboards, and narrative reporting move to the Friday 5:00 PM ET weekly refresh. This mode changes cost/reporting behavior ONLY; it does NOT relax any trading safety rule (see preserved_trading_safety_rules).",
     "daily_compact_chain_et": [
-      { "et": "09:45", "task_id": "morning-dca-0945", "role": "pre-flight validation (read-only)" },
+      { "et": "09:35", "task_id": "2ba19526", "role": "market-open live execution" },
+      { "et": "09:45", "task_id": "bb4f6ef1", "role": "morning watchlist early-warning scan (read-only)" },
       { "et": "10:30", "task_id": "42173154", "role": "morning live execution" },
+      { "et": "11:30", "task_id": "7be82b97", "role": "intraday live execution (11:30 slot)" },
       { "et": "12:30", "task_id": "a6239dae", "role": "midday live execution" },
-      { "et": "15:20", "task_id": "10ce362c", "role": "final live execution (final buy of the day)" },
+      { "et": "13:30", "task_id": "7be82b97", "role": "intraday live execution (1:30 slot)" },
+      { "et": "14:30", "task_id": "7be82b97", "role": "intraday live execution (2:30 slot)" },
+      { "et": "15:30", "task_id": "10ce362c", "role": "final live execution (final buy of the day)" },
       { "et": "15:35", "task_id": "67aa802b", "role": "post-trade slippage + compact Notion latest-run sync" },
       { "et": "15:40", "task_id": "a46bf007", "role": "live-run watchdog" }
     ],
@@ -101,14 +106,14 @@
     ],
     "applies_to_daily_tasks_et": [
       { "et": "09:35", "task_id": "2ba19526", "role": "market-open live execution" },
-      { "et": "09:45", "task_id": "bb4f6ef1", "role": "watchlist early-warning scan (read-only)" },
-      { "et": "09:45", "task_id": "morning-dca-0945", "role": "pre-flight validation (read-only)" },
+      { "et": "09:45", "task_id": "bb4f6ef1", "role": "morning watchlist early-warning scan (read-only); also runs the required pre-flight writer absorbed from morning-dca-0945" },
       { "et": "10:30", "task_id": "42173154", "role": "morning live execution" },
       { "et": "11:30", "task_id": "7be82b97", "role": "intraday live execution (11:30 slot)" },
       { "et": "12:30", "task_id": "a6239dae", "role": "midday live execution" },
-      { "et": "13:30", "task_id": "7be82b97", "role": "intraday live execution (13:30 slot)" },
-      { "et": "14:30", "task_id": "7be82b97", "role": "intraday live execution (14:30 slot)" },
-      { "et": "15:20", "task_id": "10ce362c", "role": "final live execution (final buy of the day)" },
+      { "et": "13:30", "task_id": "7be82b97", "role": "intraday live execution (1:30 slot)" },
+      { "et": "14:30", "task_id": "7be82b97", "role": "intraday live execution (2:30 slot)" },
+      { "et": "15:05", "task_id": "e3e6f09e", "role": "monitor-only signal check (read-only, PAUSED)" },
+      { "et": "15:30", "task_id": "10ce362c", "role": "final live execution (final buy of the day)" },
       { "et": "15:35", "task_id": "67aa802b", "role": "post-trade slippage + compact Notion latest-run sync" },
       { "et": "15:40", "task_id": "a46bf007", "role": "live-run watchdog" }
     ],
@@ -144,16 +149,16 @@
     "premium_reason_rule": "reason_for_premium_model is recorded (non-null) only when model_routing_mode='premium', and must be one of failure_recovery, safety_validation, connector_debug_escalation, or explicit_user_request (see model_routing_policy.premium_models_allowed_only_for). For cost_conscious/default routing it is null/omitted.",
     "applies_to_daily_tasks_et": [
       { "et": "09:35", "task_id": "2ba19526", "stream": "market_open", "role": "market-open live execution" },
-      { "et": "09:45", "task_id": "bb4f6ef1", "stream": "watchlist", "role": "watchlist early-warning scan (read-only)" },
-      { "et": "09:45", "task_id": "morning-dca-0945", "stream": "preflight", "role": "pre-flight validation (read-only)" },
+      { "et": "09:45", "task_id": "bb4f6ef1", "stream": "watchlist", "role": "morning watchlist early-warning scan (read-only); also runs the required pre-flight writer absorbed from morning-dca-0945" },
       { "et": "10:30", "task_id": "42173154", "stream": "morning", "role": "morning live execution" },
-      { "et": "11:30,13:30,14:30", "task_id": "7be82b97", "stream": "intraday", "role": "intraday live execution" },
+      { "et": "11:30,13:30,14:30", "task_id": "7be82b97", "stream": "intraday", "role": "intraday live execution (three slots)" },
       { "et": "12:30", "task_id": "a6239dae", "stream": "midday", "role": "midday live execution" },
-      { "et": "15:20", "task_id": "10ce362c", "stream": "afternoon", "role": "final live execution (final buy of the day)" },
+      { "et": "15:05", "task_id": "e3e6f09e", "stream": "monitor", "role": "monitor-only signal check (read-only, PAUSED)" },
+      { "et": "15:30", "task_id": "10ce362c", "stream": "afternoon", "role": "final live execution (final buy of the day)" },
       { "et": "15:35", "task_id": "67aa802b", "stream": "slippage", "role": "post-trade slippage + compact Notion latest-run sync" },
       { "et": "15:40", "task_id": "a46bf007", "stream": "watchdog", "role": "live-run watchdog" }
     ],
-    "multi_slot_task_note": "7be82b97 fires at three ET slots (11:30, 13:30, 14:30). The manifest default records all three; each run passes its actual slot via scheduled_for_et so the logged entry reflects the slot that fired.",
+    "multi_slot_task_note": "7be82b97 fires at three ET slots (11:30, 13:30, 14:30). This directory is keyed by task_id, so the task has one row whose et lists all three slots. Each run MUST pass --scheduled-for-et (or the build_entry scheduled_for_et kwarg) with the actual fired slot ('11:30', '13:30', or '14:30') so the logged entry records that slot instead of the combined '11:30,13:30,14:30' manifest default -- codex review r3654117263.",
     "compact_note": "The entry is compact machine-readable JSONL consistent with the cost-saving daily mode; it adds no narrative reporting and does not trigger notifications.",
     "preserved_note": "Logging metadata only: preserves the $2.00 base amount, the 0x-to-5x ladder, the Finance-primary read-only market-data policy, the GFUZ/TXN active universe with BYDDY/VCX/TRLV/RVI exclusions, the same-day top-up guards, all safety/circuit-breaker rules, live schedules, and run-classification text unchanged. No trades are placed by writing this log.",
     "doc": "docs/cost_tracking.md"
@@ -186,7 +191,7 @@
     "purpose": "The Jul 21 2026 scheduled runs wrote a run_state.json whose top-level run_classification was null and, for the 10:30 live run, dropped signals.csv and submitted_orders.csv even though the summary claimed they were written. A null classification breaks scheduled-vs-manual attribution, and a missing order CSV makes the drift detector report every intended buy as an unsubmitted order. Both are artifact-contract failures, not soft warnings.",
     "helper": "scripts/scheduled_artifacts.py",
     "doc": "docs/run_classification.md",
-    "applies_to": ["morning-dca-0945 (9:45 pre-flight)", "42173154 (10:30 morning live)", "a6239dae (12:30 midday live)", "10ce362c (3:20 afternoon final live)"],
+    "applies_to": ["morning-dca-0945 (9:45 pre-flight)", "42173154 (10:30 morning live)", "a6239dae (12:30 midday live)", "10ce362c (3:30 afternoon final live)"],
     "rules": [
       "run_classification is ALWAYS a non-null top-level object on every scheduled run_state.json; null, absent, or non-object is a contract failure.",
       "The 9:45 pre-flight run_classification carries run_origin='scheduled', run_type='morning_dca_preflight', scheduled_for_et='09:45', manual_run=false, state_schema_version='morning-preflight-v2-machine-complete', run_id, triggered_at_utc, cron_id='morning-dca-0945', stream='morning', trading_day, same_day_required=true, and valid_scheduled_evidence derived from the completed state. This matches the actual producer (morning_dca.py's MORNING_PREFLIGHT_CRON_ID/MORNING_PREFLIGHT_RUN_TYPE) and schemas/morning_preflight.schema.json -- not a separate aspirational identity.",
@@ -194,7 +199,7 @@
       "Every LIVE run writes signals.csv whenever signals can be computed AND submitted_orders.csv with a header row even when no order was submitted.",
       "When an order is placed the submitted_orders.csv contains that row; a pending/unconfirmed broker response keeps its concrete status but still produces a row and a run_state. Deliberate non-orders (skipped, cap_exceeded, dry_run, blocked) are not rows.",
       "The 12:30 midday live run shares the morning runner path, so the same non-null-classification and always-write-both-CSVs guarantees apply, without weakening any trading safeguard.",
-      "The 3:20 afternoon final live run must also carry a non-null run_classification in BOTH run_state.json and run_summary.json. For 3:20 this object carries run_origin='scheduled', manual_run=false, stream='afternoon', scheduled_for_et='15:20', cron_id='10ce362c', supersedes_cron_id='ce16ba6b', run_id, trading_day, same_day_required=true, and valid_scheduled_evidence derived from the completed state.",
+      "The 3:30 afternoon final live run must also carry a non-null run_classification in BOTH run_state.json and run_summary.json. For 3:30 this object carries run_origin='scheduled', manual_run=false, stream='afternoon', scheduled_for_et='15:30', cron_id='10ce362c', supersedes_cron_id='ce16ba6b', run_id, trading_day, same_day_required=true, and valid_scheduled_evidence derived from the completed state.",
       "validate_run_artifacts fails on a missing/unreadable run_state.json, a null/absent/non-object run_classification, or a missing required CSV; require_submitted_orders is True for live runs and False for read-only pre-flight runs."
     ],
     "safety_note": "This is an artifact-integrity contract only; it does NOT relax any trading safety, budget, spread, confidence, or top-up rule. valid_scheduled_evidence is always derived from the completed run_state, never asserted blindly.",
@@ -203,9 +208,9 @@
   "afternoon_placement_contract_2026_07_22": {
     "added_on_et": "2026-07-22",
     "incident": "The Jul 22 2026 3:20 PM ET scheduled final live run generated 20 planned buy orders with planned_spend=60.0, but no orders were submitted because the saved compute module stopped with error_class='placement_not_implemented_in_compute_module'. The run wrote run_state.json, signals.csv, and latest_scheduled_run.json, but submitted_orders.csv was empty and run_summary.json serialized run_classification as null.",
-    "applies_to": ["10ce362c (3:20 afternoon final live)"],
+    "applies_to": ["10ce362c (3:30 afternoon final live)"],
     "rules": [
-      "A compute-only module that produces planned orders is not a valid terminal state for the 3:20 scheduled live task.",
+      "A compute-only module that produces planned orders is not a valid terminal state for the 3:30 scheduled live task.",
       "After signals.csv is written, every eligible row with incremental_usd > 0 or an equivalent planned order amount > 0 must enter a placement phase in the same scheduled run.",
       "The placement phase must call Robinhood place_equity_order directly after every validation, budget, spread, data-confidence, regular-hours, whitelist, buy-only, max-per-order, and same-day top-up check passes.",
       "The scheduled live task must not call review_equity_order and must not request per-order confirmation.",
@@ -215,7 +220,7 @@
       "run_summary.json must include the same non-null run_classification object as run_state.json. Null run_summary.run_classification is an artifact_contract_failure."
     ],
     "safety_note": "This placement contract does not loosen trading rules. It only requires the scheduled live task to continue from planning into the already pre-authorized guarded placement step when planned orders exist.",
-    "manual_recovery_note_2026_07_22": "Manual recovery orders placed after the failed 3:20 run remain manual/top-up context only unless explicitly written under a valid scheduled run_state and submitted_orders.csv from the scheduled evidence window."
+    "manual_recovery_note_2026_07_22": "Manual recovery orders placed after the failed 3:30 run remain manual/top-up context only unless explicitly written under a valid scheduled run_state and submitted_orders.csv from the scheduled evidence window."
   },
   "afternoon_completion_rule": "All afternoon trading and artifact-writing tasks complete no later than 3:40 PM ET, when the read-only live-run watchdog (a46bf007) begins its final verification. The watchdog's own post-3:40 PM verification, the Friday weekly Notion performance refresh at 5:00 PM ET, and the month-end volatility risk refresh at 5:00 PM ET (c9fb1fb8 / 17a3b2a9) are the only approved post-3:40 PM DCA-related exceptions.",
   "ticker_universe_policy": {
@@ -229,7 +234,7 @@
     "schema": "schemas/run_classification.schema.json",
     "doc": "docs/run_classification.md",
     "state_schema_version": "run-classification-v1",
-    "summary": "Every run_state artifact carries a run_classification block. Scheduled runs of the repaired live task 10ce362c (which supersedes the deleted ce16ba6b; artifact root stays under .../ce16ba6b for continuity) write under scheduled_runs/YYYYMMDD_1520ET/ and update latest_scheduled_run.json; manual runs write under manual_runs/<timestamp>/ and never touch that pointer. Every scheduled 3:20 PM ET run_state MUST include BOTH run_classification.cron_id='10ce362c' AND run_classification.supersedes_cron_id='ce16ba6b'; placeholder/ambiguous ids like 'ce16ba6b_replacement' are forbidden. For continuity, downstream analytics accept a scheduled run as valid evidence when cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b'. Downstream analytics validate scheduled state, exclude all manual order IDs and any run_origin='manual'/manual_run=true state, and never infer scheduled status from broker orders alone."
+    "summary": "Every run_state artifact carries a run_classification block. Scheduled runs of the repaired live task 10ce362c (which supersedes the deleted ce16ba6b; artifact root stays under .../ce16ba6b for continuity) write under scheduled_runs/YYYYMMDD_1530ET/ and update latest_scheduled_run.json; manual runs write under manual_runs/<timestamp>/ and never touch that pointer. Every scheduled 3:30 PM ET run_state MUST include BOTH run_classification.cron_id='10ce362c' AND run_classification.supersedes_cron_id='ce16ba6b'; placeholder/ambiguous ids like 'ce16ba6b_replacement' are forbidden. For continuity, downstream analytics accept a scheduled run as valid evidence when cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b'. Downstream analytics validate scheduled state, exclude all manual order IDs and any run_origin='manual'/manual_run=true state, and never infer scheduled status from broker orders alone."
   },
   "base_amount_policy": {
     "policy_file": "config/budgets.json",
@@ -313,9 +318,84 @@
       "docs/live_wiring.md"
     ]
   },
+  "canonical_first_buy_and_topup_rule": {
+    "approved_on_et": "2026-07-24",
+    "title": "JUL 24 2026 EXACT FIRST-BUY AND SAME-DAY TOP-UP RULE",
+    "summary": "Canonical per-ticker rule for selecting the first same-day buy base amount (before the ladder multiplier) and for governing later same-day top-ups. This is the source of truth; the code in near_close_dca.select_first_allocation_base_usd and near_close_dca.evaluate_top_up_guard, the morning mirror in morning_dca.py, and the base_selection_rule blocks in config/budgets.json and config/sizing_ladder.json all implement it, with one tracked exception -- see effective_prior_usd_gap_2026_07_24 below.",
+    "reason_strings": {
+      "below_prior_close_and_low": "First buy sized from the $2.00 base (base_amount_usd): current decision price is below BOTH yesterday's completed regular-session close AND low.",
+      "below_prior_close_only": "First buy sized from the $1.00 base (base_amount_below_close_usd): current decision price is below yesterday's close but NOT below yesterday's low. A missing or unknown prior low is treated conservatively as not-below-low ($1.00).",
+      "not_below_prior_close_no_buy": "No buy: current decision price is not below yesterday's close, or the active multiplier is 0.",
+      "same_day_topup_not_lower_or_no_delta": "Skip a same-day top-up: current decision price is not strictly below this ticker's prior same-day buy reference, or corrected_delta_usd resolves to 0."
+    },
+    "rules": [
+      "1. Apply this rule independently per ticker.",
+      "2. If a ticker has no same-day prior buy, fill, submitted order, valid order artifact, manual recovery fill, or broker-confirmed same-day context, treat the current evaluation as that ticker's first buy of the day.",
+      "3. For that first buy, compare the current decision price against yesterday's completed regular-session close AND yesterday's completed regular-session low for that ticker.",
+      "4. If the current price is lower than yesterday's close but NOT lower than yesterday's low, desired_usd = $1.00 x active multiplier (reason below_prior_close_only).",
+      "5. If the current price is lower than BOTH yesterday's close and yesterday's low, desired_usd = $2.00 x active multiplier (reason below_prior_close_and_low).",
+      "6. If the current price is not lower than yesterday's close, or the multiplier is 0, do not buy that ticker (reason not_below_prior_close_no_buy).",
+      "7. If there were no previous same-day buys for that ticker, always evaluate from yesterday's close and low; do not apply a same-day top-up blocker to a ticker with no prior same-day context.",
+      "8. Same-day buys in other tickers must never block a first allocation for this ticker.",
+      "9. If the ticker DOES have same-day prior buy context, ignore yesterday's low for that ticker and use that ticker's most recent valid same-day buy reference as the comparison reference.",
+      "10. For a subsequent same-day buy, buy again only when the current decision price is strictly lower than that ticker's prior same-day buy reference.",
+      "11. Recompute the desired allocation on the current active ladder, then buy only the difference: corrected_delta_usd = max(0, desired_usd - effective_prior_usd).",
+      "12. If the current price is not strictly lower than the same-day reference, or corrected_delta_usd is 0, skip that ticker with the concrete reason same_day_topup_not_lower_or_no_delta.",
+      "13. If same-day context cannot be resolved for one ticker, perform one bounded same-day context reload, then fail only that ticker closed without blocking other tickers."
+    ],
+    "effective_prior_usd_gap_2026_07_24": "KNOWN GAP, NOT YET IMPLEMENTED: rule 11's effective_prior_usd is specified to combine deduped same-day artifacts PLUS Robinhood same-day broker order history (see the JUL 23 2026 EFFECTIVE PRIOR ALLOCATION PATCH note in near_close_dca.py's module docstring and analysis/2026-07-23-live-reliability-fixes/live_task_reliability_update_2026-07-23.md section 6). near_close_dca.evaluate_top_up_guard does not yet compute effective_prior_usd or read prior_usd_rh; it subtracts only the artifact-derived prior.amount_usd (via PriorSameDayAllocation), so a same-day buy confirmed at the broker but missing or incomplete in the artifact trail is not yet folded into corrected_delta_usd and could be re-ordered as a first allocation. Until this lands, rule 11 is enforced operationally through the scheduled task text, not as a code-level runtime safeguard, matching the runtime-status caveat already tracked for the JUL 23 2026 patch.",
+    "top_up_scope_confirmation": "JUL 24 2026 TOP-UP SCOPE CONFIRMATION: same-day top-up logic is ticker-scoped. Prior same-day buys for one symbol are context for that symbol only and must never suppress first-allocation evaluation for another symbol.",
+    "per_ticker_independence": "Every ticker resolves its own same-day context. A ticker with no valid same-day context is always evaluated as a first buy against yesterday's close and low regardless of other tickers' same-day activity; a ticker with same-day context uses only its own same-day reference for top-up gating.",
+    "same_day_reference_resolution": "The comparison reference is the ticker's most recent valid same-day buy reference, and the runner implements exactly that. near_close_dca.load_prior_same_day_allocations / load_prior_same_day_allocations_multi / merge_manual_top_up_context and scripts.run_classification.load_same_day_top_up_context (via _merge_prior) resolve a ticker's aggregate same-day reference to the most recent valid same-day price by generated_at (ties and untimestamped runs defer to later scan/merge order, which is the more recent contributor); a manual fill folded in last is treated as the most recent reference. If any contributing same-day reference is unknown the aggregate reference is unknown and the guard routes to its conservative missing-price / manual_review $0 path. There is no lowest-price resolution and no lowest-vs-most-recent follow-up outstanding.",
+    "missing_prior_low": "A missing or unknown prior regular-session low is treated conservatively as not-below-low, so the first buy sizes from the $1.00 base when below the close.",
+    "per_order_ceiling_usd": 10.0,
+    "active_universe": {
+      "active": ["DFTX", "TRIN", "AAAU", "SPCX", "EVR", "LUNR", "IRDM", "DXYZ", "LITE", "ASML", "DRAM", "STX", "MSFT", "AAPL", "AMAT", "AMD", "CBRS", "MRVL", "BTX", "STM", "SNDK", "WDC", "TSM", "AVGO", "NVDA", "QBTS", "FLKR", "INTC", "GOOGL", "GOOG", "AMZN", "GLW", "MA", "GS", "MU", "NFLX", "XLG", "TOPT", "QTOP", "SATA", "RGTI", "IBM", "GFUZ", "TXN"],
+      "excluded": ["BYDDY", "VCX", "TRLV", "RVI"],
+      "symbol_corrections": {"IRDMI": "IRDM", "GLWR": "GLW"},
+      "source_of_truth": "config/tickers.json"
+    },
+    "data_provider_roles": {
+      "market_data_primary": "finance",
+      "validation_context": ["alpaca", "robinhood"],
+      "fallback": "yfinance",
+      "gfuz_primary": "robinhood",
+      "gfuz_note": "GFUZ may use Robinhood as the primary quote/prior-close source when the Finance connector cannot resolve it; Alpaca/Finance/Yahoo remain read-only validation/context only. See config/tickers.json:special_handling.GFUZ."
+    },
+    "execution_and_safety": {
+      "execution_broker": "robinhood",
+      "scheduled_live_placement": "Pre-authorized scheduled live execution calls place_equity_order directly after every internal check passes; scheduled live runs do NOT call review_equity_order.",
+      "safety": "Buy only, regular-hours only, whitelist only. No sells, cancellations, margin, options, crypto, or account changes."
+    },
+    "artifact_contract": {
+      "required_files": ["run_state.json", "run_summary.json", "latest_scheduled_run.json", "signals.csv", "submitted_orders.csv"],
+      "empty_orders_headers": "signals.csv and submitted_orders.csv must be written with headers even when no orders are submitted.",
+      "run_classification": "run_classification must be non-null."
+    },
+    "cost_conscious_mode": "Routine daily maintenance uses cost-conscious/default model behavior.",
+    "verified_live_task_ids": {
+      "as_of_et": "2026-07-24",
+      "task_ids": ["2ba19526", "42173154", "7be82b97", "a6239dae", "10ce362c"],
+      "note": "The live scheduled task text has already been updated and verified for these task ids."
+    },
+    "implementation": {
+      "first_buy_selector": "near_close_dca.select_first_allocation_base_usd (mirrored in morning_dca.py)",
+      "top_up_guard": "near_close_dca.evaluate_top_up_guard",
+      "audit_columns": ["previous_close", "previous_low", "selected_base_amount_usd", "base_selection_reason", "buy_multiplier"]
+    },
+    "policy_files": [
+      "config/tickers.json",
+      "config/budgets.json",
+      "config/sizing_ladder.json",
+      "near_close_dca.py",
+      "morning_dca.py",
+      "docs/strategy.md",
+      "docs/live_wiring.md"
+    ]
+  },
   "execution_authorization_policy": {
     "approved_on_et": "2026-07-10 11:20 AM ET",
-    "summary": "Scheduled live DCA tasks (morning 10:30, midday 12:30, afternoon 3:20) are explicitly pre-authorized to automatically place qualifying buy orders within caps. They MUST NOT request per-order confirmation and MUST NOT call Robinhood review_equity_order (which forces preview-plus-confirmation). A scheduled live task may call place_equity_order directly ONLY after every internal validation, signal, budget, spread, confidence, and top-up check passes.",
+    "summary": "Scheduled live DCA tasks (market open 9:35, morning 10:30, intraday 11:30/1:30/2:30, midday 12:30, final 3:30) are explicitly pre-authorized to automatically place qualifying buy orders within caps. They MUST NOT request per-order confirmation and MUST NOT call Robinhood review_equity_order (which forces preview-plus-confirmation). A scheduled live task may call place_equity_order directly ONLY after every internal validation, signal, budget, spread, confidence, and top-up check passes.",
     "manual_runs": "Manual / ad hoc runs still use review_equity_order plus confirmation before submit.",
     "broker_roles": {
       "robinhood": { "account": "562057042", "role": "execution" },
@@ -329,7 +409,7 @@
     "approved_on_et": "2026-07-15",
     "extended_on_et": "2026-07-27",
     "applies_to_tasks": ["2ba19526", "42173154", "a6239dae", "7be82b97", "10ce362c"],
-    "summary": "The five scheduled LIVE Robinhood execution tasks (market-open 9:35 AM ET 2ba19526, morning 10:30 AM ET 42173154, midday 12:30 PM ET a6239dae, intraday 11:30/13:30/14:30 ET 7be82b97, afternoon 3:20 PM ET 10ce362c) treat a mid-run failure as an automatic recovery trigger rather than a terminal stop when the failure is caused by internal persistence, parsing, wrapper-normalization, transient connector throttling, or raw-file write problems that occur AFTER data was already fetched. Extended 2026-07-27 (Codex review: \"Apply recovery safeguards to the new live tasks\") to cover the market-open and intraday tasks added to the live scheduler on 2026-07-27, which previously had no equivalent recovery rule despite being active real-money execution tasks.",
+    "summary": "The five scheduled LIVE Robinhood execution tasks (market-open 9:35 AM ET 2ba19526, morning 10:30 AM ET 42173154, midday 12:30 PM ET a6239dae, intraday 11:30/13:30/14:30 ET 7be82b97, afternoon 3:30 PM ET 10ce362c) treat a mid-run failure as an automatic recovery trigger rather than a terminal stop when the failure is caused by internal persistence, parsing, wrapper-normalization, transient connector throttling, or raw-file write problems that occur AFTER data was already fetched. Extended 2026-07-27 (Codex review: \"Apply recovery safeguards to the new live tasks\") to cover the market-open and intraday tasks added to the live scheduler on 2026-07-27, which previously had no equivalent recovery rule despite being active real-money execution tasks.",
     "recovery_triggers": [
       "internal_persistence_failure",
       "parsing_failure",
@@ -343,7 +423,7 @@
       "Persist all raw responses to disk FIRST, before any computation.",
       "Recompute the run only from the persisted raw files (never from in-memory partial state).",
       "Continue through the SAME pre-authorized guarded execution path; every internal validation, signal, budget, spread, confidence/trend, top-up, and circuit-breaker check must still pass unchanged (nothing is loosened for recovery).",
-      "Reuse the same logical scheduled run directory for the stream (market_open_dca/YYYYMMDD_0935ET/, morning_dca/YYYYMMDD_1030ET/, midday_dca/YYYYMMDD_1230ET/, intraday_dca/YYYYMMDD_<slot>ET/ for the fired slot, or scheduled_runs/YYYYMMDD_1520ET/) and stamp recovery_rerun=true on the run_state.",
+      "Reuse the same logical scheduled run directory for the stream (market_open_dca/YYYYMMDD_0935ET/, morning_dca/YYYYMMDD_1030ET/, midday_dca/YYYYMMDD_1230ET/, intraday_dca/YYYYMMDD_<slot>ET/ for the fired slot, or scheduled_runs/YYYYMMDD_1530ET/) and stamp recovery_rerun=true on the run_state.",
       "Keep the run's scheduled run_classification (run_origin='scheduled'); NEVER reclassify a recovery as manual. For the afternoon task this means keeping BOTH cron_id='10ce362c' AND supersedes_cron_id='ce16ba6b' and still updating latest_scheduled_run.json."
     ],
     "recovery_limits": "Recovery is a within-schedule repair only: it does not change the fire time, does not re-arm after a second failure, and never places more than the one permitted strategy order per ticker per stream.",
@@ -357,7 +437,7 @@
     "summary": "Hard circuit breakers enforced on every scheduled live order. When any breaker trips, the order is skipped (never resized past a cap).",
     "max_per_order_usd": 10.0,
     "max_per_order_note": "5x (max ladder multiplier) * $2 base = $10. No single order may exceed $10.",
-    "budget_caps": "Per-run/day/week caps follow the tiered $2-base budget policy in config/budgets.json (budget_tiers) for the afternoon stream and the per-stream morning/midday ledgers (daily $90 / weekly $450 each).",
+    "budget_caps": "Per-run/day/week caps follow the tiered $2-base budget policy in config/budgets.json (budget_tiers) for the afternoon stream and the per-stream morning/midday/market-open ledgers (daily $90 / weekly $450 each), and the intraday stream's own daily $90 / weekly $450 ledger SHARED across all three of its slots (11:30/13:30/14:30 combined, not $90 each -- see the intraday task's budget_ledger.shared_across_slots_note).",
     "available_buying_power": "Never exceed available Robinhood buying power.",
     "whitelist_only": "Only whitelisted active tickers (config/tickers.json:active) may be traded.",
     "skip_conditions": [
@@ -369,18 +449,18 @@
     ]
   },
   "same_day_top_up_policy": {
-    "summary": "One same-day top-up guard governs the morning (10:30), midday (12:30), and afternoon (3:20) live streams AND manual override same-day fills. Each later run buys only the incremental difference max(0, desired_amount - prior_same_day_amount), and only when its current decision price is strictly below the prior same-day reference price; otherwise it buys $0.",
+    "summary": "One same-day top-up guard governs the market-open (9:35), morning (10:30), intraday (11:30/1:30/2:30), midday (12:30), and afternoon (3:30) live streams AND manual override same-day fills. Each later run buys only the incremental difference max(0, desired_amount - prior_same_day_amount), and only when its current decision price is strictly below the prior same-day reference price; otherwise it buys $0.",
     "reference_price_preference": "The prior same-day reference price is resolved in order: logged target_price, then decision_price, then average_fill_price (from orders.csv or a manual override's filled_orders.csv). A missing reference price (none available) means NO automatic top-up: the candidate is classified execution_status='manual_review_candidate' (top_up_manual_review=true) at $0.",
     "prior_allocation_chain": [
-      "Morning (10:30) folds in market-open-live (9:35) and manual same-day fills as prior context (see morning_dca.DEFAULT_MARKET_OPEN_TASK_ROOT).",
-      "Midday (12:30) folds in market-open-live, morning-live, intraday-live (11:30 slot), manual same-day fills, AND manual missed-morning recovery artifacts (morning_dca/manual_recovery/YYYYMMDD_*) as prior context (Codex review: \"Feed market-open fills into later top-up guards\"; \"Include the 11:30 intraday run in midday context\").",
-      "Afternoon (3:20) folds in market-open-live, morning-live, midday-live, intraday-live, manual override reruns, AND manual missed-morning recovery artifacts as prior context (scans /home/user/workspace/cron_tracking/morning_dca including morning_dca/manual_recovery, /home/user/workspace/cron_tracking/midday_dca, /home/user/workspace/cron_tracking/market_open_dca, and /home/user/workspace/cron_tracking/intraday_dca in addition to its own ce16ba6b task root).",
-      "Both the 12:30 midday run and the 3:20 final run MUST scan /home/user/workspace/cron_tracking/morning_dca/manual_recovery/YYYYMMDD_* for same-day manual missed-morning 10:30 recovery artifacts and fold them into the top-up guard.",
+      "Morning (10:30) folds in market-open-live (market_open_dca) as prior context, in addition to its own morning-stream manual same-day fills and manual missed-morning recovery artifacts (Codex review discussion_r3653976738: \"Feed market-open fills into later top-up guards\").",
+      "Midday (12:30) folds in market-open-live, morning-live, intraday-live (11:30 slot), manual same-day fills, AND manual missed-morning recovery artifacts (morning_dca/manual_recovery/YYYYMMDD_*) as prior context.",
+      "Afternoon (3:30) folds in market-open-live, morning-live, midday-live, intraday-live, manual override reruns, AND manual missed-morning recovery artifacts as prior context (scans /home/user/workspace/cron_tracking/market_open_dca, /home/user/workspace/cron_tracking/morning_dca including morning_dca/manual_recovery, /home/user/workspace/cron_tracking/midday_dca, and /home/user/workspace/cron_tracking/intraday_dca in addition to its own ce16ba6b task root).",
+      "Both the 12:30 midday run and the 3:30 final run MUST scan /home/user/workspace/cron_tracking/morning_dca/manual_recovery/YYYYMMDD_* for same-day manual missed-morning 10:30 recovery artifacts and fold them into the top-up guard.",
       "Only scheduled AFTERNOON runs are excluded from prior context; market-open/morning/midday/intraday-stream scheduled runs remain eligible (see near_close_dca._prior_run_is_scheduled)."
     ],
     "streams_covered": ["market_open", "morning", "midday", "intraday", "manual", "final_override"],
     "final_override_top_up": "The final override stream (final manual buy override) applies the same guard: for a ticker with same-day prior buy context, the comparison reference is that ticker's most recent valid same-day buy reference (ordered by generated_at). It buys again only when the final decision price is strictly lower than that most recent reference, and then buys only corrected_delta_usd = max(0, desired_usd - effective_prior_usd). A missing prior reference => no auto-top-up.",
-    "manual_override_handling": "Manual override fills recorded under /home/user/workspace/cron_tracking/midday_dca/manual_reruns/**/run_state.json and filled_orders.csv, and under /home/user/workspace/cron_tracking/ce16ba6b/manual_runs/final_manual_override_*/ and /home/user/workspace/cron_tracking/final_manual_review/** (run_origin='manual', manual_run=true) are EXCLUDED from all scheduled evidence, slippage, reliability, fill counts, watchdog confirmation, and cost basis, and are used ONLY as prior-allocation context for the same-day top-up guard (they affect afternoon 3:20 PM top-up eligibility, no scheduled metric).",
+    "manual_override_handling": "Manual override fills recorded under /home/user/workspace/cron_tracking/midday_dca/manual_reruns/**/run_state.json and filled_orders.csv, and under /home/user/workspace/cron_tracking/ce16ba6b/manual_runs/final_manual_override_*/ and /home/user/workspace/cron_tracking/final_manual_review/** (run_origin='manual', manual_run=true) are EXCLUDED from all scheduled evidence, slippage, reliability, fill counts, watchdog confirmation, and cost basis, and are used ONLY as prior-allocation context for the same-day top-up guard (they affect afternoon 3:30 PM top-up eligibility, no scheduled metric).",
     "jul9_manual_override_examples": [
       { "ticker": "AMZN", "amount_usd": 3.0, "avg_fill_price": 242.1099, "trading_day": "2026-07-09" },
       { "ticker": "GOOG", "amount_usd": 4.5, "avg_fill_price": 352.1778, "trading_day": "2026-07-09" },
@@ -414,7 +494,7 @@
       "MUST NEVER be written into the midday (a6239dae) or afternoon (10ce362c) scheduled evidence stream.",
       "MUST NEVER be used for scheduled reliability, scheduled fill counts, scheduled slippage, scheduled cost basis, or watchdog confirmation.",
       "MAY ONLY reduce or block additional buys through the same-day top-up rule: a later run buys max(0, desired - prior) and only if the later decision price is strictly below the prior reference price.",
-      "The 12:30 midday run (a6239dae) and the 3:20 final run (10ce362c) MUST scan the artifact_path_pattern for same-day manual recovery artifacts and fold them into the top-up guard as prior allocation.",
+      "The 12:30 midday run (a6239dae) and the 3:30 final run (10ce362c) MUST scan the artifact_path_pattern for same-day manual recovery artifacts and fold them into the top-up guard as prior allocation.",
       "Order IDs found under morning_dca/manual_recovery/** are collected as excluded_manual_order_ids (see run_classification_policy manual_exclusion_roots)."
     ],
     "doc": "docs/schedule_manifest.md"
@@ -534,13 +614,13 @@
       },
       "doc": "docs/morning_dca.md"
     },
-    "afternoon_1520": {
+    "afternoon_1530": {
       "applies_to": ["10ce362c"],
       "supersedes_cron_id": "ce16ba6b",
-      "scheduled_for_et": "15:20",
+      "scheduled_for_et": "15:30",
       "raw_input_generation": {
-        "summary": "The 3:20 scheduled final live task MUST NOT assume runner inputs already exist. Before invoking any saved runner or order module, it MUST create the raw directory and persist all required raw inputs for the current same-day run.",
-        "raw_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/raw/",
+        "summary": "The 3:30 scheduled final live task MUST NOT assume runner inputs already exist. Before invoking any saved runner or order module, it MUST create the raw directory and persist all required raw inputs for the current same-day run.",
+        "raw_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1530ET/raw/",
         "required_inputs": [
           "portfolio / buying power",
           "quotes",
@@ -556,10 +636,10 @@
         "bounded_recovery": "If raw input generation fails once, perform ONE bounded recovery attempt with the alternate approved data source path, then stop."
       },
       "state_file_guarantee": {
-        "summary": "The 3:20 scheduled run MUST always write run_state.json, run_summary.json, and latest_scheduled_run.json even when execution is blocked, is a no-op, or errors.",
+        "summary": "The 3:30 scheduled run MUST always write run_state.json, run_summary.json, and latest_scheduled_run.json even when execution is blocked, is a no-op, or errors.",
         "always_write": [
-          "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/run_state.json",
-          "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/run_summary.json",
+          "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1530ET/run_state.json",
+          "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1530ET/run_summary.json",
           "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/latest_scheduled_run.json"
         ],
         "blocked_state_required_fields": {
@@ -567,7 +647,7 @@
           "run_origin": "scheduled",
           "manual_run": false,
           "stream": "afternoon",
-          "scheduled_for_et": "15:20",
+          "scheduled_for_et": "15:30",
           "cron_id": "10ce362c",
           "supersedes_cron_id": "ce16ba6b",
           "state_schema_version": "run-classification-v1",
@@ -576,7 +656,7 @@
           "error_class": "Concrete class such as missing_or_invalid_raw_inputs or no_incremental_top_up.",
           "missing_inputs_field": "Include a compact list of missing files, block reasons, or failed data sources."
         },
-        "evidence_meaning": "This failure-state artifact is valid proof that the 3:20 scheduled task FIRED, but it is NOT order or fill evidence.",
+        "evidence_meaning": "This failure-state artifact is valid proof that the 3:30 scheduled task FIRED, but it is NOT order or fill evidence.",
         "post_raw_failure_rule": "If any step fails after raw collection has started, write the signals.csv when possible, an empty submitted_orders.csv with headers when no orders were placed, and run_state.json. Do not leave a half-done run with no state file.",
         "manual_recovery_exclusion": "Manual recovery artifacts (missed-morning and manual 12:30 recovery) remain prior-allocation / top-up context only. They are NEVER afternoon scheduled evidence, slippage, reliability, fill-count, or cost-basis evidence."
       },
@@ -661,7 +741,7 @@
   },
   "live_task_text_compactness_policy": {
     "added": "2026-07-20",
-    "applies_to": ["42173154", "a6239dae", "10ce362c"],
+    "applies_to": ["2ba19526", "42173154", "7be82b97", "a6239dae", "10ce362c"],
     "trigger_incident": "The schedule service appears to truncate or drop the tail of very long scheduled-task text. When a live task's stored text runs long, critical guardrails near the end can be pushed past the service truncation boundary and silently lost.",
     "requirement": "Live scheduled task text MUST stay compact enough that critical guardrails are not pushed past the service truncation boundary. Keep every essential safeguard inside the accepted (non-truncated) text; do not rely on trailing text that the service may drop. Prefer compact task text that points at the repo config/docs source of truth for full detail rather than inlining long-form rules that risk truncation.",
     "essential_guardrails_must_stay_in_text": [
@@ -670,7 +750,7 @@
       "same-day top-up guard",
       "manual recovery artifacts are prior-allocation / top-up context only, never scheduled evidence"
     ],
-    "afternoon_1520_compact_text": {
+    "afternoon_1530_compact_text": {
       "task": "10ce362c",
       "replaced_on": "2026-07-20",
       "approx_char_length": 5850,
@@ -682,7 +762,7 @@
         "the Jul 20 midday recovery artifact path /home/user/workspace/cron_tracking/midday_dca/manual_recovery/20260720_1259ET",
         "the filled AAPL/TRIN/ASML/IRDM recovery context (AAPL $1.00, TRIN $2.00, ASML $2.00, IRDM $2.00), prior-allocation / top-up context only"
       ],
-      "see": "live_schedule_hardening_2026_07_20.afternoon_1520 and midday_dca_manual_recovery_2026_07_20"
+      "see": "live_schedule_hardening_2026_07_20.afternoon_1530 and midday_dca_manual_recovery_2026_07_20"
     },
     "doc": "docs/schedule_manifest.md"
   },
@@ -956,7 +1036,7 @@
     "merged_pr": 80,
     "merge_commit": "3641b9041e5ebaefb0e0c3595751f151a06c96fd",
     "wired_into_live_chain": true,
-    "summary": "Every live trading run (market-open 9:35, morning 10:30, midday 12:30, intraday 11:30/13:30/14:30, afternoon 3:20) MUST invoke scripts/drift_detection.py against its own run directory immediately AFTER it finishes writing artifacts. The detector reconciles signals.csv (intended auto-buys) against submitted_orders.csv (actual order records) and alerts when any symbol has auto_buy_signal true (case-insensitive true/1/yes) and incremental_order_amount > 0 or a positive desired amount, but no submitted-order record exists for that symbol. Extended 2026-07-27 (Codex review: \"Wire drift detection into the new live streams\") to the market-open (2ba19526) and intraday (7be82b97) tasks added to the live scheduler on 2026-07-27; see each task's own post_artifact_drift_check block.",
+    "summary": "Every live trading run (market-open 9:35, morning 10:30, midday 12:30, intraday 11:30/13:30/14:30, afternoon 3:30) MUST invoke scripts/drift_detection.py against its own run directory immediately AFTER it finishes writing artifacts. The detector reconciles signals.csv (intended auto-buys) against submitted_orders.csv (actual order records) and alerts when any symbol has auto_buy_signal true (case-insensitive true/1/yes) and incremental_order_amount > 0 or a positive desired amount, but no submitted-order record exists for that symbol. Extended 2026-07-27 (Codex review: \"Wire drift detection into the new live streams\") to the market-open (2ba19526) and intraday (7be82b97) tasks added to the live scheduler on 2026-07-27; see each task's own post_artifact_drift_check block.",
     "detector": "scripts/drift_detection.py",
     "doc": "docs/drift_detection.md",
     "tests": "scripts/tests/test_drift_detection.py",
@@ -1048,7 +1128,7 @@
         "Stress tier: planned spend > $272 or 3x-or-greater signals > 17, corrected daily cap $360 only to the extent unused weekly rollover reserve is available.",
         "Count same-day strategy allocation already placed in manual recovery, morning, midday, and earlier final orders as corrected-daily-cap usage for safety, while keeping the streams separate for evidence and slippage.",
         "If planned spend exceeds the remaining corrected daily capacity, rank the remaining eligible orders by deepest drop percentage, then multiplier, then amount, place only the orders that fit the remaining cap and the per-order $15 max, and write budget_blocked.csv plus per-symbol block_reason='budget_block_corrected_daily_cap' for the rest.",
-        "If a budget-logic inconsistency is detected after any order has already been placed, recover inside the same scheduled run directory (scheduled_runs/YYYYMMDD_1520ET/), reconcile the already placed orders, apply the corrected cap logic, and finalize state rather than escalating without complete artifacts."
+        "If a budget-logic inconsistency is detected after any order has already been placed, recover inside the same scheduled run directory (scheduled_runs/YYYYMMDD_1530ET/), reconcile the already placed orders, apply the corrected cap logic, and finalize state rather than escalating without complete artifacts."
       ],
       "tier_selection_rule": "Pick the highest tier triggered by EITHER planned spend or the count of 3x-or-greater signals. A 3x-or-greater signal is a buy candidate whose ladder multiplier is >= 3.0. Mirrors config/budgets.json budget_tiers.",
       "prior_allocation_counts_as_cap_usage": true,
@@ -1108,9 +1188,9 @@
     "scheduled_run_state_classification_requirement": {
       "applied_on_et": "2026-07-17",
       "applies_to": ["10ce362c"],
-      "summary": "The Jul 17 2026 3:20 PM scheduled run_state was repaired to carry a nested run_classification object. From this date on, the 3:40 PM watchdog (a46bf007) confirms a scheduled run only when the nested object is present and valid.",
+      "summary": "The Jul 17 2026 3:30 PM scheduled run_state was repaired to carry a nested run_classification object. From this date on, the 3:40 PM watchdog (a46bf007) confirms a scheduled run only when the nested object is present and valid.",
       "requirements": [
-        "Every scheduled 3:20 PM run_state.json must include a nested run_classification object with run_origin='scheduled', manual_run=false, run_type='scheduled_live_test', cron_id='10ce362c', supersedes_cron_id='ce16ba6b', scheduled_for_et='15:20', scheduled_window_start_et='15:15', scheduled_window_end_et='15:35', run_id='scheduled_YYYYMMDD_1520ET', triggered_at_utc, and state_schema_version.",
+        "Every scheduled 3:30 PM run_state.json must include a nested run_classification object with run_origin='scheduled', manual_run=false, run_type='scheduled_live_test', cron_id='10ce362c', supersedes_cron_id='ce16ba6b', scheduled_for_et='15:30', scheduled_window_start_et='15:25', scheduled_window_end_et='15:35', run_id='scheduled_YYYYMMDD_1530ET', triggered_at_utc, and state_schema_version. (Corrected 2026-07-27: was previously misstated as 15:15, which validate_classification()/schemas/run_classification.schema.json no longer accept for the canonical 1530ET identity -- codex review r3654117257.)",
         "The nested run_classification object is the authoritative source for scheduled/manual identity (see config/run_classification.json).",
         "The 3:40 PM watchdog (a46bf007) confirms a scheduled run only when the nested run_classification object is present and valid; a run_state missing it is a watchdog discrepancy."
       ],
@@ -1218,44 +1298,216 @@
     "operating_mode_note": "Keeps the daily cost-saving operating mode intact (see operating_mode). Full monthly volatility risk reporting belongs to this month-end task, not to daily execution tasks.",
     "doc": "docs/schedule_manifest.md"
   },
-  "live_scheduler_reconciliation_2026_07_27": {
-    "added_on_et": "2026-07-27",
-    "purpose": "Resolve a reported mismatch between the repo config and the live scheduler. The repo listed scheduled tasks that the live scheduler does not run, and omitted live streams that it does run. This block records the reconciliation so the active schedule in this manifest matches the live scheduler.",
-    "verified_live_task_ids": [
-      { "task_id": "2ba19526", "et": "09:35", "role": "market-open live execution", "trades": true },
-      { "task_id": "bb4f6ef1", "et": "09:45", "role": "watchlist early-warning scan (read-only)", "trades": false },
-      { "task_id": "42173154", "et": "10:30", "role": "morning live execution", "trades": true },
-      { "task_id": "7be82b97", "et": "11:30,13:30,14:30", "role": "intraday live execution", "trades": true },
-      { "task_id": "a6239dae", "et": "12:30", "role": "midday live execution", "trades": true },
-      { "task_id": "10ce362c", "et": "15:20", "role": "final live execution (final buy of the day)", "trades": true },
-      { "task_id": "67aa802b", "et": "15:35", "role": "post-trade slippage + compact Notion latest-run sync", "trades": false },
-      { "task_id": "a46bf007", "et": "15:40", "role": "live-run watchdog", "trades": false },
-      { "task_id": "041d9d90", "et": "Fri 17:00", "role": "weekly Notion performance dashboard refresh", "trades": false },
-      { "task_id": "0656657a", "et": "first weekday 08:45", "role": "monthly dashboard refresh", "trades": false },
-      { "task_id": "bec4a6ee", "et": "first weekday 09:55", "role": "monthly automation cost review", "trades": false },
-      { "task_id": "c9fb1fb8", "et": "month-end 17:00 (EDT months)", "role": "month-end volatility risk table refresh", "trades": false },
-      { "task_id": "17a3b2a9", "et": "month-end 17:00 (EST months)", "role": "month-end volatility risk table refresh", "trades": false }
+  "canonical_schedule_reconciliation_2026_07_27": {
+    "verified_on_et": "2026-07-27",
+    "purpose": "Reconcile this manifest against the user's canonical DCA schedule. The canonical_schedule_et table below is the single source of truth for which tasks are active, at what ET time, and in what state. Any task not listed here is NOT an active schedule entry.",
+    "canonical_schedule_et": [
+      { "et": "09:35", "task_id": "2ba19526", "role": "Market-open DCA live Robinhood execution", "cadence": "Weekdays", "trading": true, "state": "active" },
+      { "et": "09:45", "task_id": "bb4f6ef1", "role": "Morning DCA watchlist early-warning scan", "cadence": "Weekdays", "trading": false, "state": "active" },
+      { "et": "10:30", "task_id": "42173154", "role": "Morning DCA live Robinhood execution", "cadence": "Weekdays", "trading": true, "state": "active" },
+      { "et": "11:30", "task_id": "7be82b97", "role": "Intraday DCA live Robinhood execution", "cadence": "Weekdays", "trading": true, "state": "active" },
+      { "et": "12:30", "task_id": "a6239dae", "role": "Midday DCA live Robinhood execution", "cadence": "Weekdays", "trading": true, "state": "active" },
+      { "et": "13:30", "task_id": "7be82b97", "role": "Intraday DCA live Robinhood execution", "cadence": "Weekdays", "trading": true, "state": "active" },
+      { "et": "14:30", "task_id": "7be82b97", "role": "Intraday DCA live Robinhood execution", "cadence": "Weekdays", "trading": true, "state": "active" },
+      { "et": "15:05", "task_id": "e3e6f09e", "role": "$2-base DCA monitor-only signal check", "cadence": "Weekdays", "trading": false, "state": "paused" },
+      { "et": "15:30", "task_id": "10ce362c", "role": "Final DCA live Robinhood execution", "cadence": "Weekdays", "trading": true, "state": "active" },
+      { "et": "15:35", "task_id": "67aa802b", "role": "Post-trade slippage plus Notion latest-run sync", "cadence": "Weekdays", "trading": false, "state": "active" },
+      { "et": "15:40", "task_id": "a46bf007", "role": "DCA live-run watchdog", "cadence": "Weekdays", "trading": false, "state": "active" },
+      { "et": "17:00", "task_id": "041d9d90", "role": "Weekly DCA Notion performance dashboard refresh", "cadence": "Fridays", "trading": false, "state": "active" },
+      { "et": "08:45", "task_id": "0656657a", "role": "Monthly graded DCA dashboard refresh", "cadence": "Monthly, first weekday gate", "trading": false, "state": "active" },
+      { "et": "09:55", "task_id": "bec4a6ee", "role": "Monthly DCA automation cost review", "cadence": "Monthly, first weekday gate", "trading": false, "state": "active" },
+      { "et": "17:00", "task_id": "c9fb1fb8", "role": "Month-end DCA volatility risk refresh (EDT)", "cadence": "Days 25-31, final eligible market-day gate", "trading": false, "state": "active" },
+      { "et": "17:00", "task_id": "17a3b2a9", "role": "Month-end DCA volatility risk refresh (EST)", "cadence": "Seasonal EST months, final eligible market-day gate", "trading": false, "state": "active" },
+      { "et": "one-time future", "task_id": "f7411889", "role": "Evaluate graded DCA live test continuation", "cadence": "One-time", "trading": false, "state": "active" }
     ],
-    "paused": [
-      { "task_id": "e3e6f09e", "was_et": "15:05", "role": "monitor-only signal check (read-only)", "status": "paused", "note": "Represented but not firing in the live scheduler. Paused, not deleted. Not expected daily evidence while paused." }
+    "added_on_2026_07_27": {
+      "task_ids": ["2ba19526", "bb4f6ef1", "7be82b97"],
+      "reason": "Present in the canonical schedule but previously absent from this manifest."
+    },
+    "retimed_on_2026_07_27": {
+      "task_id": "10ce362c",
+      "from_et": "15:20",
+      "to_et": "15:30",
+      "cron_utc": "30 19 * * 1-5",
+      "artifact_convention": "Current and future scheduled evidence uses the YYYYMMDD_1530ET directory and the scheduled_YYYYMMDD_1530ET run id. YYYYMMDD_1520ET is accepted only as a LEGACY/HISTORICAL pattern for runs that fired before this retime, so existing artifacts stay valid.",
+      "artifact_root_unchanged": "Per scheduled_run_artifact_contract the artifact ROOT stays under /home/user/workspace/cron_tracking/ce16ba6b/ for continuity, exactly as it did when 10ce362c superseded ce16ba6b. Only the per-run directory name and the nominal ET time change."
+    },
+    "paused_on_2026_07_27": {
+      "task_ids": ["e3e6f09e"],
+      "reason": "Paused in the canonical schedule. Still represented at 3:05 PM ET weekdays but does not fire."
+    },
+    "retired_not_in_canonical_schedule": [
+      { "task_id": "b7961407", "former_et": "09:00", "former_role": "pre-market buying-power dashboard" },
+      { "task_id": "cd45e95b", "former_et": "09:45", "former_role": "compact volatility outlier scan", "superseded_by": "bb4f6ef1" },
+      { "task_id": "d72aa525", "former_et": "15:25", "former_role": "capital-priority briefing" },
+      { "task_id": "d1f7a2c0", "former_et": null, "former_role": "post-artifact drift detector", "note": "Never a scheduler cron. The DETECTOR remains required in-process on every live run per drift_detection_policy; only its representation as a schedule entry is retired." },
+      { "task_id": "morning-dca-0945", "former_et": "09:45", "former_role": "morning pre-flight validation (repo-internal alias)", "superseded_by": "bb4f6ef1", "note": "The pre-flight ARTIFACT CONTRACT is preserved because 42173154 still gates on the same-day morning_dca_preflight/YYYYMMDD_0945ET/run_state.json." }
     ],
-    "still_represented": [
-      { "task_id": "f7411889", "role": "one-time reminder: evaluate continuing past Aug 28", "status": "active", "note": "Retained as a one-time reminder, not a recurring daily stream." }
-    ],
-    "retired_not_in_live_scheduler": [
-      { "task_id": "b7961407", "was_et": "09:00", "role": "pre-market buying-power dashboard", "status": "disabled" },
-      { "task_id": "cd45e95b", "was_et": "09:45", "role": "compact volatility outlier scan", "status": "disabled", "superseded_by": "bb4f6ef1" },
-      { "task_id": "d72aa525", "was_et": "15:25", "role": "capital-priority briefing", "status": "disabled" },
-      { "task_id": "d1f7a2c0", "was_et": "post-artifact hook", "role": "post-artifact drift detector", "status": "disabled", "note": "Never a scheduler cron. The detector script is still required in-process by drift_detection_policy; only the schedule registration is retired." }
-    ],
-    "retired_rule": "The retired task ids MUST NOT appear as active rows in any schedule table in config or docs, and their absence is not a failure. They are kept only as historical records with status disabled and no cron_utc.",
-    "repo_internal_entries": [
-      { "task_id": "morning-dca-0945", "et": "09:45", "role": "pre-flight validation (read-only)", "note": "Repo-internal pre-flight entry, not a live scheduler cron id. Left active because it was not reported as stale." }
-    ],
-    "preserved_note": "Schedule metadata only. Preserves the canonical first-buy and same-day top-up rule (see canonical_first_buy_and_topup_rule), the 2026-07-24 14:30 ET intraday scheduled recovery fills (see intraday_dca_scheduled_recovery_2026_07_24), the active universe and BYDDY/VCX/TRLV/RVI exclusions, the Finance-primary provider policy with Alpaca/Robinhood validation and yfinance fallback and GFUZ Robinhood-primary, Robinhood-only execution, the scheduled artifact contract, and cost-conscious model routing. No trades are placed by this change.",
+    "retired_rule": "A retired task has status='disabled', in_live_scheduler=false, and no cron_utc, so it cannot be re-registered from its manifest entry. Its historical record and any artifact contract other tasks still depend on are preserved.",
+    "preserved_note": "Schedule reconciliation only. Preserves the canonical first-buy and same-day top-up rule, the 2026-07-24 2:30 PM ET intraday recovery fills, the $2.00 base amount, the 0x-to-5x ladder, the active universe and BYDDY/VCX/TRLV/RVI exclusions, the Finance-primary market-data provider policy with yfinance fallback and GFUZ Robinhood-primary handling, Robinhood-only execution on account 562057042, the scheduled run artifact contract, cost-conscious model routing, and the account-number obfuscation policy. No orders are placed by this change.",
     "doc": "docs/schedule_manifest.md"
   },
   "tasks": [
+    {
+      "id": "2ba19526",
+      "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
+      "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
+      "name": "Weekday 9:35 AM market-open DCA live Robinhood execution",
+      "type": "trading",
+      "status": "active",
+      "cron_utc": "35 13 * * 1-5",
+      "et_equivalent": "9:35 AM ET weekdays (EDT)",
+      "trades": true,
+      "added_to_manifest_on_et": "2026-07-27",
+      "added_reason": "Present in the canonical live schedule verified on 2026-07-27 but previously absent from this manifest.",
+      "broker_account": "robinhood:562057042",
+      "execution_broker": "robinhood",
+      "execution_account_number": "562057042",
+      "broker_roles": {"robinhood": {"account": "562057042", "role": "execution", "note": "The ONLY execution broker for the 9:35 AM market-open live run."}, "alpaca": {"role": "read_only", "note": "Read-only validation/account context only."}, "finance": {"role": "read_only", "note": "Read-only validation/account context only."}, "yahoo": {"role": "read_only", "note": "Read-only validation/account context only."}},
+      "state_dir": "/home/user/workspace/cron_tracking/market_open_dca",
+      "run_classification": {"run_origin": "scheduled", "run_type": "market_open_dca_live", "stream": "market_open", "manual_run": false, "cron_id": "2ba19526", "supersedes_cron_id": null, "scheduled_for_et": "09:35", "scheduled_window_start_et": "09:30", "scheduled_window_end_et": "09:40", "run_id": "market_open_live_YYYYMMDD_0935ET", "triggered_at_utc": "<ISO-8601 UTC timestamp of the actual 9:35 AM ET firing>", "state_schema_version": "market-open-live-v1", "trades": true, "execution_broker": "robinhood", "account_number": "562057042", "valid_morning_evidence": false, "valid_afternoon_evidence": false, "schema_note": "There is no in-repo executor for this task (see no_python_entry_point below); manual_run, run_id, triggered_at_utc, and state_schema_version must be populated exactly as documented in schemas/market_open_run_classification.schema.json -- codex review r3654173640."},
+      "first_buy_of_day": true,
+      "top_up_role": "As the first buy of the trading day this run normally has no same-day prior allocation, so it places the full desired amount per the canonical first-buy rule. Its fills become prior-allocation context for every later same-day run (10:30, 11:30, 12:30, 1:30, 2:30, 3:30) through the canonical same-day top-up rule. See canonical_first_buy_and_topup_rule.",
+      "artifacts": {"run_dir": "/home/user/workspace/cron_tracking/market_open_dca/YYYYMMDD_0935ET/", "always_write": ["run_state.json", "run_summary.json", "market_open_signals.csv", "submitted_orders.csv"], "always_write_even_when": "blocked, no orders placed, or error. submitted_orders.csv must be header-only (no data rows) when zero orders are submitted, matching the manifest's standard live artifact contract -- codex review r3654173644.", "signal_filename_note": "market_open_signals.csv is also recognized (alongside signals.csv/morning_signals.csv/midday_signals.csv/intraday_signals.csv) by scripts/drift_detection.py and scripts/scheduled_artifacts.py -- codex review r3654117268.", "latest_pointer": "/home/user/workspace/cron_tracking/market_open_dca/latest_market_open_run.json"},
+      "post_artifact_drift_check": {"enabled": true, "detector": "scripts/drift_detection.py", "run_after": "artifact_write", "command": "python scripts/drift_detection.py --run-dir <run_dir> --json-out <run_dir>/drift_report.json --md-out <run_dir>/drift_report.md --slack --fail-on-drift", "note": "Reconcile signals vs submitted orders immediately after writing artifacts. See drift_detection_policy."},
+      "circuit_breakers": {"max_per_order_usd": 10.0, "enforce_budget_caps": true, "enforce_available_buying_power": true, "whitelist_only": true, "require_data_confidence": true, "enforce_spread_threshold": true, "require_trend_validation": false, "regular_hours_only": true, "one_strategy_order_per_ticker_per_run": true},
+      "budget_ledger": {
+        "added": "2026-07-27",
+        "reason": "codex review (P1, 'Define budgets for the new live streams'): enforce_budget_caps=true had no concrete daily/weekly value or ledger to enforce against for this stream, unlike the afternoon tiered caps or the morning/midday per-stream ledgers ($90 daily / $450 weekly each, see config/morning_dca.json:budget_ledger and config/midday_dca.json:budget_ledger). Since this task has no in-repo executor (see no_python_entry_point above), the external scheduler/agent enforcing the cap needs the concrete numbers stated here directly.",
+        "market_open_daily_cap_usd": 90.0,
+        "market_open_weekly_cap_usd": 450.0,
+        "ledger_dir": "/home/user/workspace/cron_tracking/market_open_dca/YYYYMMDD_0935ET/",
+        "ledger_filename": "budget_ledger.json",
+        "separation_note": "Own independent ledger, the same shape as the morning/midday per-stream ledgers. Market-open spend never consumes or validates the morning, midday, intraday, or afternoon caps, and vice versa. User-confirmed 2026-07-27: give market-open its own $90/$450 ledger rather than sharing the morning ledger or using smaller caps.",
+        "do_not_require_preexisting_ledger": true,
+        "bootstrap_note": "The scheduler/agent MAY create budget_ledger.json under ledger_dir if absent; a missing ledger file is not an escalation condition and must be bootstrapped from market_open_daily_cap_usd/market_open_weekly_cap_usd, the same convention documented in config/morning_dca.json:budget_ledger.location_fix."
+      },
+      "trend_validation_exemption": {
+        "added": "2026-07-27",
+        "reason": "codex review r3654173646 (PR #210): at 9:35 AM ET only 5 minutes of regular-session data exist, but the shared strategy contract's trend validation requires a completed 60-minute intraday downtrend. Requiring it here made every market-open buy impossible to validate. Exempted this task only; every other circuit breaker (whitelist, budget caps, buying-power, spread threshold, data confidence, regular-hours-only) stays fully enforced.",
+        "decision": "User-confirmed 2026-07-27: exempt 9:35 from trend validation rather than inventing a market-open-specific trend rule or disabling the task."
+      },
+      "trigger_gate": "programmatic_trigger_check.sh",
+      "trigger_window": "Weekdays within config/trading_window.json's approved_test_dates window (start_date through end_date inclusive), 9:30-9:40 AM ET.",
+      "approved_trading_window": {
+        "added": "2026-07-27",
+        "reason": "codex review (P1, 'Gate the new live schedules by the approved trading window'): unlike the morning (42173154), midday (a6239dae), and afternoon (10ce362c) live tasks -- whose in-repo executors (morning_dca.py, midday_dca.py, near_close_dca.py) each internally load config/trading_window.json via _load_approved_dates_fail_closed() and fail closed outside the approved window -- this task has no in-repo executor (see no_python_entry_point below) and so had NO approved-date gate at all, meaning it would keep placing real-money orders indefinitely past config/trading_window.json's end_date with no code-level cutoff.",
+        "requirement": "Before firing, the external scheduler/agent MUST check that the current America/New_York date is a weekday within [config/trading_window.json:start_date, config/trading_window.json:end_date] inclusive. If the date is outside that window, or trading_window.json cannot be read, FAIL CLOSED: do not place any orders, and write a blocked run_state (see the standard live artifact contract) rather than skipping the artifact write entirely.",
+        "dst_note": "cron_utc for this task is fixed-UTC/EDT-calibrated (see the top-level timezone_note); config/trading_window.json's end_date is deliberately set before the next EDT->EST transition for exactly this reason. This task must stop firing at or before that transition until the external cron/trigger gate is confirmed or updated for EST, the same constraint already documented for the morning/midday/afternoon live tasks.",
+        "schema_file": "schemas/trading_window.schema.json"
+      },
+      "no_python_entry_point": true,
+      "no_python_entry_point_note": "There is no in-repo executor for this task; the external scheduler/agent runs it directly and must populate run_classification (including manual_run, run_id, triggered_at_utc, state_schema_version) and the full artifacts contract exactly as documented above -- codex review r3654173640.",
+      "preserved_note": "Preserves the canonical first-buy and same-day top-up rule, the $2.00 base amount, the 0x-to-5x graded ladder, the Finance-primary read-only market-data policy with Alpaca/Robinhood validation and yfinance fallback only when connector data is unavailable, stale, incomplete, or unresolved, the GFUZ Robinhood-primary handling, the GFUZ/TXN active universe with BYDDY/VCX/TRLV/RVI exclusions, Robinhood-only execution on account 562057042, all budget caps and circuit breakers, and the artifact contract.",
+      "notes": "Live Robinhood execution at 9:35 AM ET weekdays, the first buy of the trading day. Grades each active-universe ticker against yesterday's regular-session close on the shared $2-base 0x-to-5x ladder and places buy-only market-hours orders on Robinhood account 562057042. Never writes into the morning, midday, intraday, or afternoon artifact trees and never updates latest_scheduled_run.json; stream='market_open' and valid_afternoon_evidence=false, so it is never afternoon scheduled evidence."
+    },
+    {
+      "id": "bb4f6ef1",
+      "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
+      "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
+      "name": "Weekday 9:45 AM morning DCA watchlist early-warning scan (read-only)",
+      "type": "analytics",
+      "status": "active",
+      "cron_utc": "45 13 * * 1-5",
+      "et_equivalent": "9:45 AM ET weekdays (EDT)",
+      "trades": false,
+      "added_to_manifest_on_et": "2026-07-27",
+      "added_reason": "Present in the canonical live schedule verified on 2026-07-27 but previously absent from this manifest. It holds the 9:45 AM ET slot formerly attributed to cd45e95b and to the repo-internal morning-dca-0945 alias.",
+      "supersedes_task_ids": ["cd45e95b", "morning-dca-0945"],
+      "read_only": true,
+      "places_orders": false,
+      "state_dir": "/home/user/workspace/cron_tracking/morning_dca_watchlist",
+      "run_classification": {"run_origin": "scheduled", "run_type": "morning_dca_watchlist_scan", "stream": "morning", "stream_note": "Must be 'morning', not 'watchlist': MorningDCAExecutor.run_classification() always emits stream='morning' and schemas/morning_run_classification.schema.json fixes it to 'morning'. The watchlist mode is distinguished by run_type='morning_dca_watchlist_scan' and its own artifact root, not by stream -- codex review r3654173647.", "cron_id": "bb4f6ef1", "supersedes_cron_id": null, "scheduled_for_et": "09:45", "scheduled_window_start_et": "09:40", "scheduled_window_end_et": "09:50", "trades": false, "valid_morning_evidence": true, "valid_morning_evidence_note": "schemas/morning_run_classification.schema.json pins valid_morning_evidence to const true for every stream='morning' artifact, and MorningDCAExecutor.run_classification() sets it from self.stream == MORNING_STREAM (true regardless of watchlist/preflight/live mode) -- codex review (P2, 'Mark watchlist artifacts as valid morning evidence').", "valid_afternoon_evidence": false},
+      "artifacts": {"run_dir": "/home/user/workspace/cron_tracking/morning_dca_watchlist/YYYYMMDD_0945ET/", "always_write": ["run_state.json", "watchlist_signals.csv"]},
+      "also_runs_required_preflight_writer": {
+        "added": "2026-07-27",
+        "reason": "codex review r3653976736 (PR #210): retiring morning-dca-0945 as a standalone schedule entry left no active task writing the required morning_dca_preflight/YYYYMMDD_0945ET/run_state.json artifact that 42173154's requires_preflight_artifact gate (MorningDCAExecutor._apply_preflight_gate) fails closed without -- every scheduled 10:30 run would otherwise return an empty ticker list. bb4f6ef1 fully absorbed morning-dca-0945 (not just cd45e95b), so at the same 9:45 AM ET firing it MUST invoke MorningDCAExecutor in BOTH preflight mode (writing the artifact contract below) AND watchlist mode (writing artifacts.run_dir above), in either order, before 10:30 fires.",
+        "executor": "MorningDCAExecutor",
+        "executor_mode": "preflight",
+        "config_file": "config/morning_dca.json",
+        "state_dir": "/home/user/workspace/cron_tracking/morning_dca_preflight",
+        "preflight_artifacts": {
+          "scheduled_run_dir": "/home/user/workspace/cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/",
+          "files": ["run_state.json", "validation.csv", "signals.csv", "run_summary.json"],
+          "latest_pointer": "/home/user/workspace/cron_tracking/morning_dca_preflight/latest_preflight.json",
+          "run_state_schema_file": "schemas/morning_preflight.schema.json",
+          "state_schema_version": "morning-preflight-v2-machine-complete",
+          "eligibility_field": "eligible_to_execute",
+          "eligibility_semantics": "Per ticker eligible_to_execute=true/false. Eligibility means the ticker is eligible for the 10:30 evaluator, NOT final order approval. The 10:30 live task must still recompute a fresh quote, prior close, spread, trend, signal, and budget before placing.",
+          "machine_complete_contract": "The run_state.json MUST always include top-level overall_ok, eligible_count, ineligible_count, unresolved_tickers, blocking_errors, warnings, run_classification, and per_ticker_eligibility (every active-universe symbol exactly once)."
+        },
+        "preflight_run_classification": {
+          "run_origin": "scheduled",
+          "run_type": "morning_dca_preflight",
+          "stream": "morning",
+          "cron_id": "bb4f6ef1",
+          "supersedes_cron_id": "morning-dca-0945",
+          "scheduled_for_et": "09:45",
+          "scheduled_window_start_et": "09:40",
+          "scheduled_window_end_et": "09:50",
+          "state_schema_version": "morning-preflight-v2-machine-complete",
+          "trades": false,
+          "valid_afternoon_evidence": false,
+          "policy_file": "config/morning_dca.json"
+        }
+      },
+      "no_python_entry_point": true,
+      "no_python_entry_point_note": "There is no single in-repo executor for this task as a whole; the external scheduler/agent invokes MorningDCAExecutor twice at the same 9:45 AM firing (preflight mode then watchlist mode; see also_runs_required_preflight_writer) for the two distinct artifact contracts. Each of those two MorningDCAExecutor.run() calls already appends its own model-usage-log entry internally (see morning_dca.py's log_model_usage call in the run() wrapper) -- do NOT ALSO shell out to scripts/model_usage_log.py directly for this task; that would produce a third, redundant log entry for one scheduler firing (Codex review, P2: 'Avoid triple-logging the 9:45 task'). The two automatic entries (one per mode) are the complete, correct audit record.",
+      "preserved_note": "Preserves the canonical first-buy and same-day top-up rule, the $2.00 base amount, the 0x-to-5x graded ladder, the Finance-primary read-only market-data policy with Alpaca/Robinhood validation and yfinance fallback only when connector data is unavailable, stale, incomplete, or unresolved, the GFUZ Robinhood-primary handling, the GFUZ/TXN active universe with BYDDY/VCX/TRLV/RVI exclusions, Robinhood-only execution on account 562057042, all budget caps and circuit breakers, and the artifact contract.",
+      "notes": "Read-only analytics, no trading and no broker placement path. Two responsibilities at the same 9:45 AM ET slot: (1) the required pre-flight writer absorbed from morning-dca-0945 (see also_runs_required_preflight_writer) that 42173154's 10:30 live gate fails closed without, and (2) an early-warning watchlist scan that flags tickers approaching or already inside a ladder tier against yesterday's regular-session close on the shared $2-base 0x-to-5x ladder, so the later live runs have advance context. Writes compact machine-readable artifacts only for both. Never scheduled order or fill evidence for any live stream."
+    },
+    {
+      "id": "7be82b97",
+      "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
+      "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
+      "name": "Weekday intraday DCA live Robinhood execution (11:30 AM, 1:30 PM, 2:30 PM ET)",
+      "type": "trading",
+      "status": "active",
+      "cron_utc": "30 15,17,18 * * 1-5",
+      "et_equivalent": "11:30 AM, 1:30 PM, and 2:30 PM ET weekdays (EDT)",
+      "et_slots": ["11:30", "13:30", "14:30"],
+      "trades": true,
+      "added_to_manifest_on_et": "2026-07-27",
+      "added_reason": "Present in the canonical live schedule verified on 2026-07-27 but previously absent from this manifest.",
+      "broker_account": "robinhood:562057042",
+      "execution_broker": "robinhood",
+      "execution_account_number": "562057042",
+      "broker_roles": {"robinhood": {"account": "562057042", "role": "execution", "note": "The ONLY execution broker for every intraday live slot."}, "alpaca": {"role": "read_only", "note": "Read-only validation/account context only."}, "finance": {"role": "read_only", "note": "Read-only validation/account context only."}, "yahoo": {"role": "read_only", "note": "Read-only validation/account context only."}},
+      "state_dir": "/home/user/workspace/cron_tracking/intraday_dca",
+      "multi_slot_note": "One task definition fires at three ET slots. Each run records its own slot in scheduled_for_et and writes to its own slot directory, so the three runs never share a run_id or an artifact directory.",
+      "run_classification": {"run_origin": "scheduled", "run_type": "intraday_dca_live", "stream": "intraday", "manual_run": false, "cron_id": "7be82b97", "supersedes_cron_id": null, "scheduled_for_et": "(11:30|13:30|14:30) -- the slot that actually fired; never write this literal pattern string, it must be exactly one of the three values", "scheduled_window_note": "Each slot has a plus or minus 5 minute classification window: 11:25-11:35 for 11:30, 13:25-13:35 for 13:30, 14:25-14:35 for 14:30.", "run_id": "intraday_live_YYYYMMDD_(1130|1330|1430)ET -- matching the fired slot exactly, e.g. intraday_live_20260727_1130ET", "triggered_at_utc": "<ISO-8601 UTC timestamp of the actual firing>", "state_schema_version": "intraday-live-v1", "trades": true, "execution_broker": "robinhood", "account_number": "562057042", "valid_morning_evidence": false, "valid_afternoon_evidence": false, "schema_note": "There is no in-repo executor for this task (see no_python_entry_point below); manual_run, scheduled_for_et, run_id, triggered_at_utc, and state_schema_version must be populated per-slot exactly as documented in schemas/intraday_run_classification.schema.json -- codex review r3654173640."},
+      "top_up_role": "Every intraday slot applies the canonical same-day top-up rule against the ticker's MOST RECENT valid same-day buy reference ordered by generated_at: buy again only when the current decision price is strictly lower than that reference, and then buy only corrected_delta_usd = max(0, desired_usd - effective_prior_usd). A missing prior reference means no automatic top-up. See canonical_first_buy_and_topup_rule and same_day_top_up_policy.",
+      "artifacts": {"run_dir": "/home/user/workspace/cron_tracking/intraday_dca/YYYYMMDD_<HHMM>ET/", "run_dir_examples": ["YYYYMMDD_1130ET", "YYYYMMDD_1330ET", "YYYYMMDD_1430ET"], "always_write": ["run_state.json", "run_summary.json", "intraday_signals.csv", "submitted_orders.csv"], "always_write_even_when": "blocked, no orders placed, or error. submitted_orders.csv must be header-only (no data rows) when zero orders are submitted, matching the manifest's standard live artifact contract -- codex review r3654173644.", "signal_filename_note": "intraday_signals.csv is also recognized (alongside signals.csv/morning_signals.csv/midday_signals.csv/market_open_signals.csv) by scripts/drift_detection.py and scripts/scheduled_artifacts.py -- codex review r3654117268.", "latest_pointer": "/home/user/workspace/cron_tracking/intraday_dca/latest_intraday_run.json"},
+      "post_artifact_drift_check": {"enabled": true, "detector": "scripts/drift_detection.py", "run_after": "artifact_write", "command": "python scripts/drift_detection.py --run-dir <run_dir> --json-out <run_dir>/drift_report.json --md-out <run_dir>/drift_report.md --slack --fail-on-drift", "note": "Reconcile signals vs submitted orders immediately after each slot writes artifacts. See drift_detection_policy."},
+      "circuit_breakers": {"max_per_order_usd": 10.0, "enforce_budget_caps": true, "enforce_available_buying_power": true, "whitelist_only": true, "require_data_confidence": true, "enforce_spread_threshold": true, "require_trend_validation": true, "regular_hours_only": true, "one_strategy_order_per_ticker_per_run": true},
+      "budget_ledger": {
+        "added": "2026-07-27",
+        "reason": "codex review (P1, 'Define budgets for the new live streams'): enforce_budget_caps=true had no concrete daily/weekly value or ledger to enforce against for this stream, unlike the afternoon tiered caps or the morning/midday per-stream ledgers ($90 daily / $450 weekly each). Since this task has no in-repo executor (see no_python_entry_point below), the external scheduler/agent enforcing the cap needs the concrete numbers stated here directly.",
+        "intraday_daily_cap_usd": 90.0,
+        "intraday_weekly_cap_usd": 450.0,
+        "shared_across_slots_note": "ONE ledger shared across all three intraday slots (11:30, 13:30, 14:30) for the trading day -- $90/day and $450/week TOTAL for the intraday stream, not $90 per slot ($270/day if each slot had its own cap). Each slot's run must read and update the same day's ledger file so the second and third firings see spend already recorded by earlier slots that day. User-confirmed 2026-07-27.",
+        "ledger_dir": "/home/user/workspace/cron_tracking/intraday_dca/YYYYMMDD_<HHMM>ET/",
+        "ledger_filename": "budget_ledger.json",
+        "ledger_scope_note": "Although each slot writes to its own YYYYMMDD_<HHMM>ET run directory (per artifacts.run_dir above), the ledger's remaining-capacity state must be tracked across the whole trading day, e.g. by reading the prior slot(s)' budget_ledger.json for the same YYYYMMDD before computing this slot's remaining capacity -- mirroring how the shared same-day top-up context is scanned across intraday_dca's own directory tree.",
+        "separation_note": "Own independent ledger, separate from the market-open, morning, midday, and afternoon ledgers/caps. Intraday spend never consumes or validates those, and vice versa.",
+        "do_not_require_preexisting_ledger": true,
+        "bootstrap_note": "The scheduler/agent MAY create budget_ledger.json for a slot's run_dir if absent; a missing ledger file for the first slot of the day is not an escalation condition and must be bootstrapped from intraday_daily_cap_usd/intraday_weekly_cap_usd, the same convention documented in config/morning_dca.json:budget_ledger.location_fix."
+      },
+      "trigger_gate": "programmatic_trigger_check.sh",
+      "trigger_window": "Weekdays within config/trading_window.json's approved_test_dates window (start_date through end_date inclusive), applied independently to each of the three slots (11:20-11:35, 13:20-13:35, 14:20-14:35 ET).",
+      "approved_trading_window": {
+        "added": "2026-07-27",
+        "reason": "codex review (P1, 'Gate the new live schedules by the approved trading window'): unlike the morning (42173154), midday (a6239dae), and afternoon (10ce362c) live tasks -- whose in-repo executors each internally load config/trading_window.json via _load_approved_dates_fail_closed() and fail closed outside the approved window -- this task has no in-repo executor (see no_python_entry_point below) and so had NO approved-date gate at all, meaning it would keep placing real-money orders indefinitely past config/trading_window.json's end_date with no code-level cutoff.",
+        "requirement": "Before firing ANY of the three slots, the external scheduler/agent MUST check that the current America/New_York date is a weekday within [config/trading_window.json:start_date, config/trading_window.json:end_date] inclusive. If the date is outside that window, or trading_window.json cannot be read, FAIL CLOSED for that slot: do not place any orders, and write a blocked run_state (see the standard live artifact contract) rather than skipping the artifact write entirely.",
+        "dst_note": "cron_utc for this task is fixed-UTC/EDT-calibrated (see the top-level timezone_note); config/trading_window.json's end_date is deliberately set before the next EDT->EST transition for exactly this reason. This task must stop firing at or before that transition until the external cron/trigger gate is confirmed or updated for EST, the same constraint already documented for the morning/midday/afternoon live tasks.",
+        "schema_file": "schemas/trading_window.schema.json"
+      },
+      "no_python_entry_point": true,
+      "no_python_entry_point_note": "There is no in-repo executor for this task; the external scheduler/agent runs it directly for each of the three fired slots and must populate run_classification (including manual_run, scheduled_for_et, run_id, triggered_at_utc, state_schema_version) and the full artifacts contract exactly as documented above -- codex review r3654173640.",
+      "recorded_recovery": "See intraday_dca_scheduled_recovery_2026_07_24 for the 2026-07-24 2:30 PM ET scheduled recovery fills, which are preserved unchanged.",
+      "preserved_note": "Preserves the canonical first-buy and same-day top-up rule, the $2.00 base amount, the 0x-to-5x graded ladder, the Finance-primary read-only market-data policy with Alpaca/Robinhood validation and yfinance fallback only when connector data is unavailable, stale, incomplete, or unresolved, the GFUZ Robinhood-primary handling, the GFUZ/TXN active universe with BYDDY/VCX/TRLV/RVI exclusions, Robinhood-only execution on account 562057042, all budget caps and circuit breakers, and the artifact contract.",
+      "notes": "Live Robinhood execution at 11:30 AM, 1:30 PM, and 2:30 PM ET weekdays on account 562057042 using the shared $2-base 0x-to-5x ladder against yesterday's regular-session close. Each slot is an independent run with its own run_id and artifact directory, and each applies the canonical same-day top-up rule against the most recent valid same-day reference. Never writes into the morning, midday, or afternoon artifact trees and never updates latest_scheduled_run.json; stream='intraday' and valid_afternoon_evidence=false, so intraday fills are prior-allocation context for later same-day runs but never afternoon scheduled evidence."
+    },
     {
       "id": "b7961407",
       "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
@@ -1265,29 +1517,11 @@
       "status": "disabled",
       "in_live_scheduler": false,
       "superseded_on_et": "2026-07-27",
-      "superseded_reason": "Not present in the live scheduler verified on 2026-07-27. Retired from the active schedule; kept as a historical record only.",
+      "superseded_reason": "Not present in the canonical live schedule verified on 2026-07-27. Retired from the active schedule and removed from every active schedule table; kept as a historical record only.",
+      "former_cron_utc": "00 13 * * 1-5",
+      "former_et_equivalent": "9:00 AM ET weekdays (EDT)",
       "trades": false,
-      "notes": "RETIRED, NOT ACTIVE. This 9:00 AM ET pre-market buying-power dashboard is not in the live scheduler and must not be listed in any active schedule table or treated as expected daily evidence. Historical record only; cron_utc intentionally removed so it cannot be re-registered from this entry."
-    },
-    {
-      "id": "2ba19526",
-      "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
-      "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
-      "name": "Market-open graded DCA live Robinhood execution",
-      "type": "trading",
-      "status": "active",
-      "cron_utc": "35 13 * * 1-5",
-      "et_equivalent": "9:35 AM ET weekdays (EDT)",
-      "trades": true,
-      "broker_account": "robinhood:562057042",
-      "post_artifact_drift_check": {
-        "enabled": true,
-        "detector": "scripts/drift_detection.py",
-        "run_after": "artifact_write",
-        "command": "python scripts/drift_detection.py --run-dir <run_dir> --json-out <run_dir>/drift_report.json --md-out <run_dir>/drift_report.md --slack --fail-on-drift",
-        "note": "After writing market-open artifacts, reconcile signals.csv vs submitted_orders.csv. Fire an immediate Slack alert (webhook from DCA_DRIFT_SLACK_WEBHOOK) when an auto-buy signal exists with a positive amount but no submitted order. Added 2026-07-27 (Codex review: \"Wire drift detection into the new live streams\"); see drift_detection_policy."
-      },
-      "notes": "Live market-open execution stream verified in the live scheduler on 2026-07-27. Robinhood-only execution on the $2 base 0x-to-5x ladder; Alpaca/Finance/Yahoo stay read-only. Applies the canonical first-buy and same-day top-up rule (see canonical_first_buy_and_topup_rule): first buy of the day for a ticker uses the yesterday close/low base before the ladder, and a ticker with same-day prior buy context compares against that ticker's most recent valid same-day buy reference and buys only corrected_delta_usd = max(0, desired_usd - effective_prior_usd). Writes the standard scheduled artifact contract (run_state.json with nested run_classification, run_summary.json, signals.csv, submitted_orders.csv) under its own scheduled run directory. run_classification validates against schemas/market_open_run_classification.schema.json (stream='market_open', cron_id='2ba19526'). A market-open fill is fed into the morning (10:30), midday (12:30), and afternoon (3:20) same-day top-up guards as prior-allocation context so it is never re-bought as a first allocation (Codex review: \"Feed market-open fills into later top-up guards\"; see near_close_dca._prior_run_is_scheduled, morning_dca.DEFAULT_MARKET_OPEN_TASK_ROOT, run_dca.DEFAULT_MARKET_OPEN_LIVE_STATE_ROOT/DCA_MARKET_OPEN_LIVE_STATE_ROOT). See failure_recovery_policy and drift_detection_policy for its recovery/drift-alert coverage."
+      "notes": "RETIRED, NOT ACTIVE. Analytics only, no trading. Historical record of the former 9:00 AM ET pre-market buying-power dashboard. cron_utc is intentionally removed so this entry cannot be re-registered as a live cron."
     },
     {
       "id": "cd45e95b",
@@ -1298,32 +1532,28 @@
       "status": "disabled",
       "in_live_scheduler": false,
       "superseded_on_et": "2026-07-27",
+      "superseded_reason": "Not present in the canonical live schedule verified on 2026-07-27. The 9:45 AM ET slot is held by bb4f6ef1, the morning DCA watchlist early-warning scan. Retired from the active schedule and removed from every active schedule table; kept as a historical record only.",
       "superseded_by": "bb4f6ef1",
-      "superseded_reason": "Not present in the live scheduler verified on 2026-07-27. The 9:45 AM ET slot is served by the watchlist early-warning scan bb4f6ef1.",
+      "former_cron_utc": "45 13 * * 1-5",
+      "former_et_equivalent": "9:45 AM ET weekdays (EDT)",
       "trades": false,
-      "notes": "RETIRED, NOT ACTIVE. Superseded by bb4f6ef1 (watchlist early-warning scan). Must not be listed in any active schedule table or treated as expected daily evidence. Historical record only; cron_utc intentionally removed so it cannot be re-registered from this entry."
-    },
-    {
-      "id": "bb4f6ef1",
-      "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
-      "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
-      "name": "Watchlist early-warning scan (read-only)",
-      "type": "analytics",
-      "status": "active",
-      "cron_utc": "45 13 * * 1-5",
-      "et_equivalent": "9:45 AM ET weekdays (EDT)",
-      "trades": false,
-      "notes": "Read-only analytics, no trading. Watchlist early-warning scan verified in the live scheduler on 2026-07-27. Supersedes the retired compact volatility outlier scan cd45e95b. Compact machine-readable output only; no full universe narrative on quiet days."
+      "notes": "RETIRED, NOT ACTIVE. Analytics only, no trading. Historical record of the former compact volatility outlier scan. cron_utc is intentionally removed so this entry cannot be re-registered as a live cron."
     },
     {
       "id": "morning-dca-0945",
       "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
       "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
-      "name": "Morning DCA pre-flight validation (read-only)",
+      "name": "Morning DCA pre-flight validation (read-only, retired as a standalone schedule entry)",
       "type": "analytics",
-      "status": "active",
-      "cron_utc": "45 13 * * 1-5",
-      "et_equivalent": "9:45 AM ET weekdays (EDT)",
+      "status": "disabled",
+      "in_live_scheduler": false,
+      "superseded_on_et": "2026-07-27",
+      "superseded_reason": "Repo-internal alias, not a canonical live schedule entry. The canonical 9:45 AM ET slot is bb4f6ef1, the morning DCA watchlist early-warning scan. Removed from every active schedule table on 2026-07-27. The pre-flight ARTIFACT CONTRACT below is REQUIRED (42173154 fails closed without the same-day morning_dca_preflight/YYYYMMDD_0945ET/run_state.json) and is now actively produced by bb4f6ef1, which absorbed this entry's preflight-writer duty in addition to the watchlist scan -- see bb4f6ef1.also_runs_required_preflight_writer. This entry stays disabled/retired as a standalone schedule row; it is kept only as the historical record of the artifact contract's shape.",
+      "superseded_by": "bb4f6ef1",
+      "artifact_contract_still_required": true,
+      "artifact_contract_fulfilled_by": "bb4f6ef1",
+      "former_cron_utc": "45 13 * * 1-5",
+      "former_et_equivalent": "9:45 AM ET weekdays (EDT)",
       "trades": false,
       "broker_account": "robinhood:562057042",
       "executor": "MorningDCAExecutor",
@@ -1355,7 +1585,7 @@
         "valid_afternoon_evidence": false,
         "policy_file": "config/morning_dca.json"
       },
-      "notes": "Analytics / read-only only, no trading. A 9:45 AM ET morning DCA pre-flight validation vs. yesterday's regular-session close, graded on the shared $2-base 0x-to-5x live ladder. Runs no Robinhood order review and calls no broker placement path. Writes run_state.json, validation.csv, signals.csv, run_summary.json under morning_dca_preflight/YYYYMMDD_0945ET/ and a latest_preflight.json pointer. As of 2026-07-13 the run_state.json is machine-complete (schema morning-preflight-v2-machine-complete): it always writes top-level overall_ok, eligible_count, ineligible_count, unresolved_tickers, blocking_errors, warnings, run_classification, and per_ticker_eligibility (every active-universe symbol exactly once) so the 10:30 live task can gate directly off machine fields — this was added after the 2026-07-13 10:30 run was blocked by a 9:45 artifact missing overall_ok and the per-ticker eligibility list. Unresolved symbols (e.g. AAAU, SPCX) become rows with eligible_to_execute=false, ineligible_reason='unresolved_ticker' and never set overall_ok=false; overall_ok is false only for global/account/buying-power/auth/schema-write failures. Eligibility marks a ticker as eligible for the 10:30 evaluator ONLY, not final order approval: 10:30 recomputes fresh quote/prior close/spread/trend/signal/budget. Never touches the afternoon ce16ba6b artifact tree or latest_scheduled_run.json. stream='morning', valid_afternoon_evidence=false."
+      "notes": "NOT AN ACTIVE SCHEDULE ENTRY as of 2026-07-27 (repo-internal alias; the canonical 9:45 slot is bb4f6ef1, which now also runs this preflight writer -- see bb4f6ef1.also_runs_required_preflight_writer). The pre-flight artifact contract described here is required by 42173154 and is produced by bb4f6ef1 at the same 9:45 AM ET slot, not by this disabled entry. Analytics / read-only only, no trading. A 9:45 AM ET morning DCA pre-flight validation vs. yesterday's regular-session close, graded on the shared $2-base 0x-to-5x live ladder. Runs no Robinhood order review and calls no broker placement path. Writes run_state.json, validation.csv, signals.csv, run_summary.json under morning_dca_preflight/YYYYMMDD_0945ET/ and a latest_preflight.json pointer. As of 2026-07-13 the run_state.json is machine-complete (schema morning-preflight-v2-machine-complete): it always writes top-level overall_ok, eligible_count, ineligible_count, unresolved_tickers, blocking_errors, warnings, run_classification, and per_ticker_eligibility (every active-universe symbol exactly once) so the 10:30 live task can gate directly off machine fields. This was added after the 2026-07-13 10:30 run was blocked by a 9:45 artifact missing overall_ok and the per-ticker eligibility list. Unresolved symbols (e.g. AAAU, SPCX) become rows with eligible_to_execute=false, ineligible_reason='unresolved_ticker' and never set overall_ok=false; overall_ok is false only for global/account/buying-power/auth/schema-write failures. Eligibility marks a ticker as eligible for the 10:30 evaluator ONLY, not final order approval: 10:30 recomputes fresh quote/prior close/spread/trend/signal/budget. Never touches the afternoon ce16ba6b artifact tree or latest_scheduled_run.json. stream='morning', valid_afternoon_evidence=false."
     },
     {
       "id": "42173154",
@@ -1552,27 +1782,6 @@
       "notes": "Live morning Robinhood execution moved from the former 9:45 AM slot to 10:30 AM ET (cron 30 14 * * 1-5 = 14:30 UTC weekdays during EDT) to give a true 60-minute intraday trend window. EXECUTION BROKER: Robinhood account 562057042 is the ONLY execution broker; Alpaca/Finance/Yahoo are read-only validation/account context only. Uses the shared $2 base 0x-to-5x live ladder (max per order 5x*$2=$10) and the morning budget ledger. PRE-FLIGHT GATE: depends on the same-day 9:45 pre-flight artifact and only evaluates/places for eligible_to_execute=true tickers, recomputing a fresh price/prior close/spread/60-minute downtrend/signal/budget before placing; skip / manual-review if trend cannot be validated. PRE-FLIGHT PATH FIX (added Jul 20 2026, see preflight_artifact_resolution): the same-day 9:45 pre-flight artifact MUST be read from /home/user/workspace/cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/run_state.json (or latest_preflight.json only when it points to that same-day file); it MUST NOT be sought under /home/user/workspace/cron_tracking/42173154 or the 10:30 live output directory (morning_dca/YYYYMMDD_1030ET/). If missing from the correct path, do exactly ONE bounded recovery lookup scanning /home/user/workspace/cron_tracking/morning_dca_preflight/ for today's YYYYMMDD_0945ET directory before escalating. IMPLEMENTED 2026-07-21 in morning_dca.py (load_morning_config(), load_same_day_preflight(), _apply_preflight_gate()); see preflight_artifact_resolution.implementation_status. MORNING BUDGET LEDGER (added Jul 20 2026, see budget_ledger_bootstrap): the morning budget ledger lives under /home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/; the task may create budget_ledger.json there if absent (note: run_summary.json is preflight-only), must not require a pre-existing ledger file, and if none exists initializes from the configured morning daily/weekly caps and writes the calculations into the 10:30 run_state.json. Neither Jul 20 fix weakens the budget caps, top-up guard, data-confidence rule, spread rule, whitelist, buy-only, regular-hours-only, Robinhood-execution-only, or any other safety control. IMPLEMENTED 2026-07-21 in morning_dca.py (write_artifacts() always writes budget_ledger.json under the run's own output directory); see budget_ledger_bootstrap.implementation_status. PRE-AUTHORIZED direct placement (user approved 2026-07-10 11:20 AM ET) for scheduled live runs only: MUST NOT request per-order confirmation and MUST NOT call Robinhood review_equity_order; calls place_equity_order directly ONLY after every safeguard passes. Manual/ad hoc runs still go through Robinhood's review + confirmation path: review_equity_order (review_market_buy) must pass before place_equity_order (place_market_buy) is attempted; if Robinhood's own review requires additional post-review confirmation (e.g. a step-up/2FA gate), placement raises OrderConfirmationRequiredError and the run records not_submitted_confirmation_required with no order placed -- there is no separate confirmation step implemented in this code beyond that broker-driven gate. GFUZ special handling (see gfuz_special_handling): Robinhood primary because Finance may not resolve GFUZ; an unresolved GFUZ on Finance does not block the run; if the 9:45 pre-flight lacks GFUZ, run supplemental GFUZ read-only validation and persist gfuz_supplemental_preflight.json before decisioning. CONFIDENCE RULE: if a candidate's price/drop passes but the intraday trend cannot be validated, it does NOT auto-buy; it is classified execution_status='manual_review_candidate' (no loosened trend-unavailable execution path). RAW DATA PERSISTENCE FIX (added Jul 15 2026, confirmed Jul 16 2026; see raw_data_persistence): before any signal/budget/top-up computation or placement, persist every raw connector response under morning_dca/YYYYMMDD_1030ET/raw/ (normalizing output_path/wrapped outputs); the decision engine reads only from persisted files; if fetch succeeds but persistence/normalization fails, place no orders and still write run_state.json with the blocking reason. NOT YET IMPLEMENTED in code as of 2026-07-19 (see raw_data_persistence.implementation_status) -- this is the intended contract, not current behavior. AUTOMATIC FAILURE RECOVERY (see automatic_failure_recovery): on recoverable internal/persistence/parsing/normalization/throttling/raw-write failures after data was fetched, rerun read-only inputs once, persist raw first, recompute only from persisted files, continue guarded execution if safeguards pass, reuse the same logical run directory with recovery_rerun=true, and never classify recovery as manual; if recovery also fails or a safety/account/order rejection occurs, write run_state with the blocking reason and escalate. Also NOT YET IMPLEMENTED in code as of 2026-07-19 (see automatic_failure_recovery.implementation_status and failure_recovery.implementation_status). LIVE RELIABILITY FIX (Jul 17 2026, see live_reliability_fix_2026_07_17): before calling place_equity_order the run is intended to describe the needed Robinhood connector schemas in-session (place_equity_order and get_equity_orders) and to end every actionable signal with exactly one persisted result (order_id, broker rejection, top-up block, budget block, cap block, data-confidence block, spread block, trend block, or safety block), reconciling any signal that lacks both an order_id and a block/rejection reason as execution_lineage_incomplete via one same-directory recovery retry through get_equity_orders; manual overrides stay manual_run=true and never count as scheduled evidence. This is manifest metadata only and not yet consumed by morning_dca.py (see the top-level live_reliability_fix_2026_07_17.implementation_status); the artifacts this task actually writes remain governed by artifacts.manifest_accuracy_note above. Hard circuit breakers: max per order $10, budget caps, available buying power, whitelist only, data confidence, spread threshold, trend validation, regular-hours only, one strategy order per ticker per run. ARTIFACTS: always writes run_state.json, morning_signals.csv, and budget_ledger.json under morning_dca/YYYYMMDD_1030ET/ (run_id='morning_live_YYYYMMDD_1030ET') -- NOT run_summary.json/validation.csv, which are preflight-only -- plus submitted_orders.csv when at least one order was actually submitted; filled_orders.csv is never written by this task (see artifacts.manifest_accuracy_note); run_classification carries run_origin='scheduled', run_type='morning_dca_live', scheduled_for_et='10:30', manual_run=false, state_schema_version='morning-live-v2-preauthorized', run_id='morning_live_YYYYMMDD_1030ET', cron_id='42173154', execution_broker='robinhood', account_number='562057042', preauthorized_direct_place=true, valid_morning_evidence=true, valid_afternoon_evidence=false. Never touches the afternoon ce16ba6b tree or latest_scheduled_run.json. SAME-DAY TOP-UP GUARD: earlier same-day manual/order fills are prior-allocation context only; buy only if the current decision price is strictly below the prior reference price and only the incremental difference; morning evidence must never count as afternoon evidence. Morning fills count only as prior-allocation context for the midday/afternoon same-day top-up guard."
     },
     {
-      "id": "7be82b97",
-      "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
-      "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
-      "name": "Intraday graded DCA live Robinhood execution (11:30 / 1:30 / 2:30 PM ET)",
-      "type": "trading",
-      "status": "active",
-      "cron_utc": "30 15,17,18 * * 1-5",
-      "et_equivalent": "11:30 AM, 1:30 PM, and 2:30 PM ET weekdays (EDT)",
-      "fires_at_et": "11:30, 13:30, 14:30",
-      "trades": true,
-      "broker_account": "robinhood:562057042",
-      "post_artifact_drift_check": {
-        "enabled": true,
-        "detector": "scripts/drift_detection.py",
-        "run_after": "artifact_write",
-        "command": "python scripts/drift_detection.py --run-dir <run_dir> --json-out <run_dir>/drift_report.json --md-out <run_dir>/drift_report.md --slack --fail-on-drift",
-        "note": "After writing artifacts for whichever slot fired (11:30/13:30/14:30), reconcile signals.csv vs submitted_orders.csv. Fire an immediate Slack alert (webhook from DCA_DRIFT_SLACK_WEBHOOK) when an auto-buy signal exists with a positive amount but no submitted order. Added 2026-07-27 (Codex review: \"Wire drift detection into the new live streams\"); see drift_detection_policy."
-      },
-      "notes": "Live intraday execution stream verified in the live scheduler on 2026-07-27; fires at three ET slots (11:30, 13:30, 14:30). Robinhood-only execution on the $2 base 0x-to-5x ladder; Alpaca/Finance/Yahoo stay read-only. Applies the canonical first-buy and same-day top-up rule (see canonical_first_buy_and_topup_rule) with ticker-scoped independence: a ticker with same-day prior buy context compares against that ticker's most recent valid same-day buy reference and buys only corrected_delta_usd = max(0, desired_usd - effective_prior_usd). Each slot writes its own scheduled run directory under the intraday artifact root and records its actual slot in scheduled_for_et. The 2026-07-24 14:30 ET scheduled recovery recorded in intraday_dca_scheduled_recovery_2026_07_24 belongs to this task. The recurring task's own run_classification (stream='intraday', cron_id='7be82b97') validates against schemas/intraday_run_classification.schema.json, distinct from the ad hoc 'intraday_1430'-style recovery stream name. An 11:30 fill is fed into the midday (12:30) and afternoon (3:20) same-day top-up guards as prior-allocation context so it is never re-bought (Codex review: \"Include the 11:30 intraday run in midday context\"; see morning_dca.DEFAULT_INTRADAY_TASK_ROOT, midday_dca.MiddayConfig.prior_allocation_roots). See failure_recovery_policy and drift_detection_policy for its recovery/drift-alert coverage."
-    },
-    {
       "id": "a6239dae",
       "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
       "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
@@ -1693,16 +1902,16 @@
       "id": "e3e6f09e",
       "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
       "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
-      "name": "Monitor-only graded DCA signal check",
+      "name": "Monitor-only graded DCA signal check ($2 base)",
       "type": "monitoring",
       "status": "paused",
       "in_live_scheduler": false,
       "paused_on_et": "2026-07-27",
-      "paused_reason": "Not firing in the live scheduler verified on 2026-07-27. Paused, not deleted; it is not expected daily evidence while paused.",
+      "paused_reason": "Paused in the canonical live schedule verified on 2026-07-27. It remains a represented schedule entry at 3:05 PM ET weekdays but does not fire.",
       "cron_utc": "5 19 * * 1-5",
       "et_equivalent": "3:05 PM ET weekdays (EDT)",
       "trades": false,
-      "notes": "Analytics and notifications only; places no trades. Monitor-only signal check that surfaces the planned allocation and tier selection using the current $2 base 0x-to-5x ladder."
+      "notes": "PAUSED as of 2026-07-27; it does not fire while paused. Analytics and notifications only; places no trades. Monitor-only signal check that surfaces the planned allocation and tier selection using the current $2 base 0x-to-5x ladder."
     },
     {
       "id": "10ce362c",
@@ -1712,22 +1921,25 @@
       "name": "Graded DCA automatic live test - $2 allocation",
       "type": "trading",
       "status": "active",
-      "cron_utc": "20 19 * * 1-5",
-      "et_equivalent": "3:20 PM ET weekdays (EDT)",
+      "cron_utc": "30 19 * * 1-5",
+      "et_equivalent": "3:30 PM ET weekdays (EDT)",
+      "retimed_on_et": "2026-07-27",
+      "retimed_from_et": "3:20 PM ET",
+      "retimed_note": "Canonical active fire time is 3:30 PM ET (cron 30 19 * * 1-5 in EDT). Current and future scheduled evidence uses 15:30 and the YYYYMMDD_1530ET directory/run-id convention. YYYYMMDD_1520ET references that remain elsewhere in this manifest are historical/superseded records of runs that fired at the old 3:20 PM time. Per the artifact contract the artifact ROOT stays under .../ce16ba6b/ for continuity, exactly as it did when 10ce362c superseded ce16ba6b.",
       "trades": true,
       "broker_account": "robinhood:562057042",
       "trigger_gate": "programmatic_trigger_check.sh",
-      "trigger_window": "Weekdays 2026-07-02 through 2026-08-28, 3:20-3:35 PM ET (aligned to the 15:15-15:35 ET scheduled classification window so a late-but-permitted start cannot place buys after the 3:35 PM post-trade sync or outside the attributable window).",
+      "trigger_window": "Weekdays 2026-07-02 through 2026-08-28, 3:30-3:32 PM ET START window (narrowed from 3:30-3:35 PM on 2026-07-27 -- codex review r3654117274: the previous 3:35 PM start boundary was exactly when the 3:35 PM post-trade sync task (67aa802b) begins reading this task's run state, and neither generate_scheduled_reports() nor select_scheduled_state_for_reporting() waits or retries for an in-progress run, so a late-but-permitted start could make the sync report a missing or partial scheduled run. The 15:25-15:35 ET scheduled CLASSIFICATION window in run_classification/schemas is unchanged; only the allowed START time is tightened, leaving at least 3 minutes of completion headroom before the 3:35 PM sync fires).",
       "state_dir": "/home/user/workspace/cron_tracking/ce16ba6b",
       "scans_missed_morning_recovery": {
         "path_pattern": "/home/user/workspace/cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*",
-        "purpose": "The 3:20 final run scans same-day manual missed-morning 10:30 recovery artifacts (run_origin='manual', manual_run=true, same_day_top_up_context_only=true, valid_scheduled_evidence=false) and folds them into the same-day top-up guard as prior allocation only. They are never afternoon scheduled evidence, never prove the 10:30 scheduled task ran, and never counted in scheduled reliability, fill counts, slippage, cost basis, or watchdog confirmation. See missed_morning_run_recovery_policy.",
+        "purpose": "The 3:30 final run scans same-day manual missed-morning 10:30 recovery artifacts (run_origin='manual', manual_run=true, same_day_top_up_context_only=true, valid_scheduled_evidence=false) and folds them into the same-day top-up guard as prior allocation only. They are never afternoon scheduled evidence, never prove the 10:30 scheduled task ran, and never counted in scheduled reliability, fill counts, slippage, cost basis, or watchdog confirmation. See missed_morning_run_recovery_policy.",
         "also_scans": "Also scans the manual 12:30 recovery root /home/user/workspace/cron_tracking/midday_dca/manual_recovery/YYYYMMDD_* (e.g. 20260720_1259ET) as same-day prior-allocation / top-up context only; never afternoon scheduled evidence. See midday_dca_manual_recovery_2026_07_20."
       },
       "raw_input_generation": {
         "added": "2026-07-20",
-        "raw_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/raw/",
-        "summary": "Before invoking any saved runner or order module, the 3:20 final scheduled task must create raw_dir and persist all required raw inputs for the same-day run. Do NOT reuse stale files.",
+        "raw_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1530ET/raw/",
+        "summary": "Before invoking any saved runner or order module, the 3:30 final scheduled task must create raw_dir and persist all required raw inputs for the same-day run. Do NOT reuse stale files.",
         "required_inputs": [
           "portfolio / buying power",
           "quotes",
@@ -1740,13 +1952,13 @@
         "run_date_arg": "If a runner requires RUN_DATE_ET, pass the current America/New_York date as YYYYMMDD.",
         "data_sources": "Finance connector primary, Alpaca and Robinhood validation/context, yfinance fallback ONLY when connector data is unavailable, stale, incomplete, or unresolved (see market_data_source_policy).",
         "bounded_recovery": "One bounded recovery attempt with the alternate approved data source path, then stop.",
-        "see": "live_schedule_hardening_2026_07_20.afternoon_1520"
+        "see": "live_schedule_hardening_2026_07_20.afternoon_1530"
       },
       "state_file_guarantee": {
         "added": "2026-07-20",
         "always_write": [
-          "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/run_state.json",
-          "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/run_summary.json",
+          "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1530ET/run_state.json",
+          "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1530ET/run_summary.json",
           "/home/user/workspace/cron_tracking/ce16ba6b/latest_scheduled_run.json"
         ],
         "always_write_even_when": "blocked, no-op, or error.",
@@ -1754,7 +1966,7 @@
           "run_origin": "scheduled",
           "manual_run": false,
           "stream": "afternoon",
-          "scheduled_for_et": "15:20",
+          "scheduled_for_et": "15:30",
           "cron_id": "10ce362c",
           "supersedes_cron_id": "ce16ba6b",
           "state_schema_version": "run-classification-v1",
@@ -1766,44 +1978,44 @@
         "evidence_meaning": "It proves the task FIRED but is NOT order/fill evidence.",
         "post_raw_failure_rule": "If any step fails AFTER raw collection starts, write signals.csv when possible, an empty submitted_orders.csv with headers if no orders, and run_state.json.",
         "manual_recovery_exclusion": "Manual recovery artifacts remain prior-allocation / top-up context only and must NEVER be scheduled evidence, slippage evidence, reliability evidence, fill counts, or cost-basis evidence.",
-        "see": "live_schedule_hardening_2026_07_20.afternoon_1520"
+        "see": "live_schedule_hardening_2026_07_20.afternoon_1530"
       },
       "post_artifact_drift_check": {
         "enabled": true,
         "detector": "scripts/drift_detection.py",
         "run_after": "artifact_write",
         "command": "python scripts/drift_detection.py --run-dir <scheduled_run_dir> --json-out <scheduled_run_dir>/drift_report.json --md-out <scheduled_run_dir>/drift_report.md --slack --fail-on-drift",
-        "note": "After the 3:20 PM scheduled run writes its run_state/CSVs and raw/, reconcile signals.csv vs submitted_orders.csv. Because raw/ persistence and order placement have both silently failed before (Jul 16 2026), a missing raw/ or empty submitted_orders.csv while auto-buy signals exist must fire an immediate Slack alert. Must complete before the 3:40 PM watchdog. See drift_detection_policy."
+        "note": "After the 3:30 PM scheduled run writes its run_state/CSVs and raw/, reconcile signals.csv vs submitted_orders.csv. Because raw/ persistence and order placement have both silently failed before (Jul 16 2026), a missing raw/ or empty submitted_orders.csv while auto-buy signals exist must fire an immediate Slack alert. Must complete before the 3:40 PM watchdog. See drift_detection_policy."
       },
       "run_classification": {
         "role": "writer",
         "cron_id": "10ce362c",
         "supersedes_cron_id": "ce16ba6b",
         "scheduled_window_et": "15:15-15:35",
-        "scheduled_for_et": "15:20",
-        "scheduled_run_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/",
+        "scheduled_for_et": "15:30",
+        "scheduled_run_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1530ET/",
         "manual_run_dir": "/home/user/workspace/cron_tracking/ce16ba6b/manual_runs/<timestamp>/",
         "latest_scheduled_run_pointer": "/home/user/workspace/cron_tracking/ce16ba6b/latest_scheduled_run.json",
-        "scheduled_run_id_pattern": "scheduled_YYYYMMDD_1520ET",
+        "scheduled_run_id_pattern": "scheduled_YYYYMMDD_1530ET",
         "policy_file": "config/run_classification.json",
         "nested_run_classification_required": "As of Jul 17 2026 every scheduled run_state.json must contain a nested run_classification object (validated against schemas/run_classification.schema.json). The 3:40 PM watchdog (a46bf007) confirms a scheduled run only when the nested run_classification object is present and valid; a run_state missing it is a watchdog discrepancy. See live_reliability_fix_2026_07_17.scheduled_run_state_classification_requirement.",
-        "state_file_guarantee": "Always writes a scheduled run_state.json under scheduled_runs/YYYYMMDD_1520ET/ and updates latest_scheduled_run.json every time it fires, even when no order is placed. If Robinhood review passes but submission is blocked by required post-review user confirmation, the run_state is still valid and carries order_submit_status='not_submitted_confirmation_required', reviewed_order details where available, candidate details, and NO order_id. Such a run is valid scheduled-run evidence that the task ran, but NOT evidence of an order/fill."
+        "state_file_guarantee": "Always writes a scheduled run_state.json under scheduled_runs/YYYYMMDD_1530ET/ and updates latest_scheduled_run.json every time it fires, even when no order is placed. If Robinhood review passes but submission is blocked by required post-review user confirmation, the run_state is still valid and carries order_submit_status='not_submitted_confirmation_required', reviewed_order details where available, candidate details, and NO order_id. Such a run is valid scheduled-run evidence that the task ran, but NOT evidence of an order/fill."
       },
       "failure_recovery": {
         "policy": "failure_recovery_policy",
         "enabled": true,
-        "recovery_run_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/",
+        "recovery_run_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1530ET/",
         "recovery_rerun_flag": "recovery_rerun",
         "reclassify_as_manual": false,
-        "summary": "On internal persistence, parsing, wrapper-normalization, transient connector throttling, or raw-file write failure AFTER data was fetched, treat it as a recovery trigger (not terminal): rerun required read-only inputs once, persist all raw responses first, recompute only from persisted files, and continue through the same pre-authorized guarded path if all safeguards pass. Reuse the same scheduled_runs/YYYYMMDD_1520ET/ dir with recovery_rerun=true, keep run_origin='scheduled' with BOTH cron_id='10ce362c' AND supersedes_cron_id='ce16ba6b', and still update latest_scheduled_run.json (never reclassified as manual). If the recovery also fails or a safety/account/order rejection occurs, write run_state.json with the blocking reason and escalate."
+        "summary": "On internal persistence, parsing, wrapper-normalization, transient connector throttling, or raw-file write failure AFTER data was fetched, treat it as a recovery trigger (not terminal): rerun required read-only inputs once, persist all raw responses first, recompute only from persisted files, and continue through the same pre-authorized guarded path if all safeguards pass. Reuse the same scheduled_runs/YYYYMMDD_1530ET/ dir with recovery_rerun=true, keep run_origin='scheduled' with BOTH cron_id='10ce362c' AND supersedes_cron_id='ce16ba6b', and still update latest_scheduled_run.json (never reclassified as manual). If the recovery also fails or a safety/account/order rejection occurs, write run_state.json with the blocking reason and escalate."
       },
       "raw_data_persistence": {
         "added": "2026-07-10",
-        "reason": "RAW DATA PERSISTENCE FIX ADDED JUL 10 2026: the 3:20 PM run escalated because quotes and historicals were fetched successfully but the raw connector responses were never persisted to disk before signal computation; the bash compute step had no quotes_batchN.json / historicals_batchN.json to read.",
-        "raw_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1520ET/raw/",
+        "reason": "RAW DATA PERSISTENCE FIX ADDED JUL 10 2026: the 3:30 PM run escalated because quotes and historicals were fetched successfully but the raw connector responses were never persisted to disk before signal computation; the bash compute step had no quotes_batchN.json / historicals_batchN.json to read.",
+        "raw_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1530ET/raw/",
         "deterministic_filenames": ["quotes_batchN.json", "historicals_batchN.json", "tradability_pre_place.json", "portfolio_pre_place.json", "orders_after_place.json", "place_SYMBOL.json"],
         "rules": [
-          "Before computing any signal, persist every raw Robinhood/Finance/Alpaca/Yahoo connector response used by the run under scheduled_runs/YYYYMMDD_1520ET/raw/ with the deterministic filenames above.",
+          "Before computing any signal, persist every raw Robinhood/Finance/Alpaca/Yahoo connector response used by the run under scheduled_runs/YYYYMMDD_1530ET/raw/ with the deterministic filenames above.",
           "Normalize large connector output_path pointers into parseable JSON before persisting (referenced contents under 'data', original pointer preserved under 'output_path').",
           "Compute must read only the persisted/normalized files, never in-memory tool responses. Order of operations: fetch -> persist -> normalize -> compute -> place.",
           "If raw persistence or normalization fails, still write a valid scheduled run_state (run_origin='scheduled', manual_run=false) with order_submit_status='not_submitted_error', raw_persistence_error set, empty raw_inputs_saved, and no orders placed, rather than escalating without state."
@@ -1823,7 +2035,7 @@
         "describe_schemas_before_place": ["place_equity_order", "get_equity_orders"],
         "always_write_artifacts": ["run_state.json", "run_summary.json", "signals.csv", "submitted_orders.csv", "filled_orders.csv"],
         "single_persisted_result_per_signal": "Every actionable signal ends with exactly one persisted result: order_id, broker rejection, top-up block, budget block, cap block, data-confidence block, spread block, trend block, or safety block.",
-        "execution_lineage_incomplete_recovery": "If an actionable signal lacks both an order_id and a block/rejection reason, classify the run execution_lineage_incomplete, run one recovery retry in the same scheduled directory (scheduled_runs/YYYYMMDD_1520ET/), retry only the missing tickers with the same ref_id values, and reconcile duplicate ref_id or timeout through get_equity_orders before declaring failure.",
+        "execution_lineage_incomplete_recovery": "If an actionable signal lacks both an order_id and a block/rejection reason, classify the run execution_lineage_incomplete, run one recovery retry in the same scheduled directory (scheduled_runs/YYYYMMDD_1530ET/), retry only the missing tickers with the same ref_id values, and reconcile duplicate ref_id or timeout through get_equity_orders before declaring failure.",
         "manual_override_rule": "Manual overrides stay manual_run=true and never count as scheduled evidence."
       },
       "final_buy_budget_tier_fix": {
@@ -1839,7 +2051,7 @@
         ],
         "prior_allocation_counts_as_cap_usage": "Count same-day strategy allocation already placed in manual recovery, morning, midday, and earlier final orders as corrected-daily-cap usage for safety, while keeping the streams separate for evidence and slippage.",
         "overflow_rule": "If planned spend exceeds the remaining corrected daily capacity, rank remaining eligible orders by deepest drop percentage, then multiplier, then amount, place only orders fitting the remaining cap and the per-order $15 max, and write budget_blocked.csv plus per-symbol block_reason='budget_block_corrected_daily_cap' for the rest.",
-        "post_placement_inconsistency_recovery": "If a budget-logic inconsistency is detected after any order is placed, recover inside the same scheduled run directory (scheduled_runs/YYYYMMDD_1520ET/), reconcile already placed orders, apply the corrected cap logic, and finalize state rather than escalating without complete artifacts.",
+        "post_placement_inconsistency_recovery": "If a budget-logic inconsistency is detected after any order is placed, recover inside the same scheduled run directory (scheduled_runs/YYYYMMDD_1530ET/), reconcile already placed orders, apply the corrected cap logic, and finalize state rather than escalating without complete artifacts.",
         "overflow_block_artifact": "budget_blocked.csv",
         "overflow_block_reason": "budget_block_corrected_daily_cap"
       },
@@ -1860,9 +2072,9 @@
         ],
         "same_day_top_up_guard": "Applies across morning, midday, manual, and final override streams: for a ticker with same-day prior buy context, the comparison reference is that ticker's most recent valid same-day buy reference (ordered by generated_at); buy again only when the final decision price is strictly lower than that most recent reference, and then buy only corrected_delta_usd = max(0, desired_usd - effective_prior_usd). Missing prior reference => no auto-top-up.",
         "trend_scope_note": "Morning (10:30) and midday (12:30) live runs still require trend validation unless changed later. The trend filter is ignored ONLY for the final-buy decision on 10ce362c.",
-        "final_manual_override": "When the final-buy behavior is invoked MANUALLY (e.g. after a scheduled 3:20 PM run placed 0 orders), the run is manual: run_type='final_manual_buy_override', run_origin='manual', manual_run=true, valid_afternoon_scheduled_evidence=false, same_day_top_up_context_only=true. It is excluded from every scheduled metric and reported only in the Manual Final Buy Override / Same-Day Top-Up Context section. See config/run_classification.json (final_buy_behavior, final_manual_override, final_manual_override_incident_2026_07_13)."
+        "final_manual_override": "When the final-buy behavior is invoked MANUALLY (e.g. after a scheduled 3:30 PM run placed 0 orders), the run is manual: run_type='final_manual_buy_override', run_origin='manual', manual_run=true, valid_afternoon_scheduled_evidence=false, same_day_top_up_context_only=true. It is excluded from every scheduled metric and reported only in the Manual Final Buy Override / Same-Day Top-Up Context section. See config/run_classification.json (final_buy_behavior, final_manual_override, final_manual_override_incident_2026_07_13)."
       },
-      "notes": "Afternoon (3:20 PM ET) live trading task. One of three pre-authorized live trading tasks (morning 42173154, midday a6239dae, afternoon 10ce362c). This is the repaired live task 10ce362c, which supersedes the deleted ce16ba6b; the artifact root stays under .../ce16ba6b for continuity. Approved live Robinhood execution using the $2 base 0x-to-5x ladder (max per order 5x*$2=$10) with tiered daily/weekly caps. Robinhood account 562057042 only; Alpaca/Finance/Yahoo read-only. PRE-AUTHORIZED (user approved 2026-07-10 11:20 AM ET): places real market buy orders automatically within safeguards; MUST NOT fall back to interactive/per-order confirmation and MUST NOT call review_equity_order; calls place_equity_order directly only after every internal validation, signal, budget, spread, confidence, and top-up check passes. Manual/ad hoc runs still use review/confirmation. A SCHEDULED run writes run_state.json (with run_classification run_origin='scheduled', run_type='scheduled_live_test', manual_run=false, scheduled_for_et='15:20', run_id='scheduled_YYYYMMDD_1520ET', and BOTH cron_id='10ce362c' AND supersedes_cron_id='ce16ba6b') under scheduled_runs/YYYYMMDD_1520ET/ AND updates latest_scheduled_run.json. Placeholder/ambiguous ids such as 'ce16ba6b_replacement' are forbidden; for continuity, consumers still accept cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b' as valid evidence. The scheduled run_state is ALWAYS written even when no order is placed; a confirmation-blocked run records order_submit_status='not_submitted_confirmation_required', reviewed_order details, candidate details, and no order_id, and remains valid scheduled-run evidence (but not order/fill evidence). A MANUAL run writes run_state.json (run_origin='manual', manual_run=true, distinct run_id) under manual_runs/<timestamp>/ and MUST NOT update latest_scheduled_run.json. All run_state files carry state_schema_version='run-classification-v1'. Test window through Fri Aug 28 2026 inclusive. Manual runs do not count as scheduled-run evidence. SAME-DAY TOP-UP GUARD: the scheduled afternoon run folds in earlier same-day fills from the morning-live root, the midday-live root, and manual override reruns (midday_dca/manual_reruns/) as prior-allocation context (in addition to its own manual_runs/), buying only max(0, desired - prior) and only when its decision price is strictly below the prior reference price (preference: logged target_price, then decision_price, then average_fill_price; missing reference => manual_review_candidate at $0). These prior-context fills are never scheduled evidence, slippage, reliability, fill counts, or cost basis. Any stale stored display name is superseded by this authoritative 3:20 PM ET schedule. RAW DATA PERSISTENCE FIX ADDED JUL 10 2026 (see raw_data_persistence): before signal computation the run persists every raw connector response under scheduled_runs/YYYYMMDD_1520ET/raw/ (quotes_batchN.json, historicals_batchN.json, tradability_pre_place.json, portfolio_pre_place.json, orders_after_place.json, place_SYMBOL.json), normalizing large output_path pointers into parseable JSON; compute reads only those persisted files, never in-memory tool responses; if persistence/normalization fails the run still writes a valid scheduled run_state (order_submit_status='not_submitted_error', no orders) instead of escalating without state. FINAL-BUY BEHAVIOR ADDED JUL 13 2026 (see final_buy_behavior): as the final live buy of the day this task performs a FULL active-universe scan and ignores the 60-minute downward-trend filter for the FINAL-BUY DECISION ONLY, while still requiring price below the prior completed regular-session close, multiplier>0 on the $2-base 0x-to-5x ladder, data-confidence pass, spread_ok, budget pass, regular-hours-only, whitelisted ticker, and hard circuit breakers. Morning/midday live runs still require trend validation. A same-day top-up guard across morning/midday/manual/final override streams buys only corrected_delta_usd = max(0, desired_usd - effective_prior_usd) and only when the final decision price is strictly lower than the ticker's most recent valid same-day buy reference price (ordered by generated_at; missing prior reference => no auto-top-up). When invoked MANUALLY (final manual buy override) the run is manual (run_type='final_manual_buy_override', valid_afternoon_scheduled_evidence=false, same_day_top_up_context_only=true), excluded from every scheduled metric and shown only in the Manual Final Buy Override / Same-Day Top-Up Context section. LIVE RELIABILITY FIX (Jul 17 2026, see live_reliability_fix_2026_07_17): before calling place_equity_order the run describes the needed Robinhood connector schemas in-session (place_equity_order and get_equity_orders); it always writes final run_state.json, run_summary.json, signals.csv, submitted_orders.csv, and filled_orders.csv where applicable even for no-order, blocked, failed, or recovery runs; every actionable signal ends with exactly one persisted result (order_id, broker rejection, top-up block, budget block, cap block, data-confidence block, spread block, trend block, or safety block); if an actionable signal lacks both an order_id and a block/rejection reason the run is classified execution_lineage_incomplete, runs one recovery retry in the same scheduled directory (scheduled_runs/YYYYMMDD_1520ET/) retrying only the missing tickers with the same ref_id values, and reconciles duplicate ref_id or timeout through get_equity_orders before declaring failure; manual overrides stay manual_run=true and never count as scheduled evidence. FINAL BUY BUDGET-TIER FIX (Jul 17 2026, see final_buy_budget_tier_fix and live_reliability_fix_2026_07_17.final_buy_budget_tier_fix): before placing any final-buy order the run computes the budget tier from the full actionable incremental plan and the 3x-or-greater signal count (normal planned spend <=129 and 3x-plus signals <=5 daily cap 180; elevated planned spend >129 or 3x-plus signals 6-10 daily cap 240; high-volatility planned spend >213 or 3x-plus signals 11-17 daily cap 300; stress planned spend >272 or 3x-plus signals >17 daily cap 360 only to the extent unused weekly rollover reserve is available), counts same-day strategy allocation already placed in manual recovery, morning, midday, and earlier final orders as corrected-daily-cap usage for safety while keeping the streams separate for evidence and slippage, and if planned spend exceeds the remaining corrected daily capacity ranks the remaining eligible orders by deepest drop percentage then multiplier then amount, places only the orders fitting the remaining cap and the per-order 10 max, and writes budget_blocked.csv plus per-symbol block_reason='budget_block_corrected_daily_cap' for the rest; if a budget-logic inconsistency is detected after any order is placed the run recovers inside the same scheduled run directory, reconciles the already placed orders, applies the corrected cap logic, and finalizes state rather than escalating without complete artifacts. JUL 17 2026 FINAL-RUN RECOVERY (see live_reliability_fix_2026_07_17.jul17_final_run_recovery): the background final run placed SPCX first then escalated because the budget logic was incomplete; the corrected tier was elevated because planned spend was 187.5 and the 3x-plus count was 6 so the daily cap was 240; prior same-day strategy allocation counted for safety was 207.0 and SPCX assumed 15.0, leaving 18.0 remaining capacity; recovery placed GFUZ 13.50 (order_id 6a5a81d4-d250-43e3-89f3-06c2c4add387, filled, average_fill_price 8.449900, quantity 1.597652) and ASML 4.50 (order_id 6a5a81d4-f921-49c3-9a1c-1f0e43c2002b, filled, average_fill_price 1747.709900, quantity 0.002574), with SPCX (order_id 6a5a8182-9460-4d0d-99c3-86af604192a7, filled, average_fill_price 123.600000, quantity 0.121359) reconciled, then budget-blocked the remaining 27 signals; run_state has valid scheduled evidence for the final 3:20 run and the manual/midday streams remain prior allocation context only where applicable. NESTED RUN_CLASSIFICATION REQUIREMENT (Jul 17 2026, see live_reliability_fix_2026_07_17.scheduled_run_state_classification_requirement): the 3:20 scheduled run_state was repaired to include a nested run_classification object; every future scheduled run_state.json must carry a nested run_classification object (validated against schemas/run_classification.schema.json); scheduled/manual identity fields live only under that nested object, and the 3:40 PM watchdog confirms a scheduled run only when that nested object is present and valid. JUL 17 2026 MANUAL BUDGET-BLOCK OVERRIDES (see live_reliability_fix_2026_07_17.jul17_manual_budget_block_overrides): after the 3:20 scheduled run budget-blocked 27 signals, two manual budget-block override runs filled them - the first (final_manual_review/budget_block_override_20260717_1551ET) attempted all 27 and accepted/submitted 20 (NFLX, AMAT, CBRS, DXYZ, TSM, IBM, EVR, GOOGL, GOOG, GS, NVDA, GLW, INTC, BTX, MA, AMD, MSFT, QTOP, XLG, TOPT), with the remaining 7 failing on Robinhood 429 throttling/do-not-retry; the second (final_manual_review/budget_block_override_20260717_1556ET) placed and verified filled all remaining 7 (SNDK, AVGO, AMZN, STM, MRVL, DFTX, QBTS). These manual overrides are manual_run=true, valid_scheduled_evidence=false, valid_afternoon_evidence=false, excluded from scheduled 3:20 execution evidence, scheduled slippage, scheduled reliability, and scheduled cost basis, and usable only as manual override context and future same-day/top-up allocation context. AUTOMATIC FAILURE RECOVERY ADDED JUL 15 2026 (see failure_recovery): on internal persistence, parsing, wrapper-normalization, transient connector throttling, or raw-file write failure AFTER data was fetched, the run treats it as a recovery trigger (not terminal): it reruns the required read-only inputs once, persists all raw responses first, recomputes only from persisted files, and continues through the same pre-authorized guarded path if all safeguards pass, reusing the same scheduled_runs/YYYYMMDD_1520ET/ dir with recovery_rerun=true and never reclassifying as manual; if the recovery also fails or a safety/account/order rejection occurs, it writes run_state.json with the blocking reason and escalates."
+      "notes": "Afternoon (3:30 PM ET) live trading task. One of three pre-authorized live trading tasks (morning 42173154, midday a6239dae, afternoon 10ce362c). This is the repaired live task 10ce362c, which supersedes the deleted ce16ba6b; the artifact root stays under .../ce16ba6b for continuity. Approved live Robinhood execution using the $2 base 0x-to-5x ladder (max per order 5x*$2=$10) with tiered daily/weekly caps. Robinhood account 562057042 only; Alpaca/Finance/Yahoo read-only. PRE-AUTHORIZED (user approved 2026-07-10 11:20 AM ET): places real market buy orders automatically within safeguards; MUST NOT fall back to interactive/per-order confirmation and MUST NOT call review_equity_order; calls place_equity_order directly only after every internal validation, signal, budget, spread, confidence, and top-up check passes. Manual/ad hoc runs still use review/confirmation. A SCHEDULED run writes run_state.json (with run_classification run_origin='scheduled', run_type='scheduled_live_test', manual_run=false, scheduled_for_et='15:30', run_id='scheduled_YYYYMMDD_1530ET', and BOTH cron_id='10ce362c' AND supersedes_cron_id='ce16ba6b') under scheduled_runs/YYYYMMDD_1530ET/ AND updates latest_scheduled_run.json. Placeholder/ambiguous ids such as 'ce16ba6b_replacement' are forbidden; for continuity, consumers still accept cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b' as valid evidence. The scheduled run_state is ALWAYS written even when no order is placed; a confirmation-blocked run records order_submit_status='not_submitted_confirmation_required', reviewed_order details, candidate details, and no order_id, and remains valid scheduled-run evidence (but not order/fill evidence). A MANUAL run writes run_state.json (run_origin='manual', manual_run=true, distinct run_id) under manual_runs/<timestamp>/ and MUST NOT update latest_scheduled_run.json. All run_state files carry state_schema_version='run-classification-v1'. Test window through Fri Aug 28 2026 inclusive. Manual runs do not count as scheduled-run evidence. SAME-DAY TOP-UP GUARD: the scheduled afternoon run folds in earlier same-day fills from the morning-live root, the midday-live root, and manual override reruns (midday_dca/manual_reruns/) as prior-allocation context (in addition to its own manual_runs/), buying only max(0, desired - prior) and only when its decision price is strictly below the prior reference price (preference: logged target_price, then decision_price, then average_fill_price; missing reference => manual_review_candidate at $0). These prior-context fills are never scheduled evidence, slippage, reliability, fill counts, or cost basis. Any stale stored display name is superseded by this authoritative 3:30 PM ET schedule. RAW DATA PERSISTENCE FIX ADDED JUL 10 2026 (see raw_data_persistence): before signal computation the run persists every raw connector response under scheduled_runs/YYYYMMDD_1530ET/raw/ (quotes_batchN.json, historicals_batchN.json, tradability_pre_place.json, portfolio_pre_place.json, orders_after_place.json, place_SYMBOL.json), normalizing large output_path pointers into parseable JSON; compute reads only those persisted files, never in-memory tool responses; if persistence/normalization fails the run still writes a valid scheduled run_state (order_submit_status='not_submitted_error', no orders) instead of escalating without state. FINAL-BUY BEHAVIOR ADDED JUL 13 2026 (see final_buy_behavior): as the final live buy of the day this task performs a FULL active-universe scan and ignores the 60-minute downward-trend filter for the FINAL-BUY DECISION ONLY, while still requiring price below the prior completed regular-session close, multiplier>0 on the $2-base 0x-to-5x ladder, data-confidence pass, spread_ok, budget pass, regular-hours-only, whitelisted ticker, and hard circuit breakers. Morning/midday live runs still require trend validation. A same-day top-up guard across morning/midday/manual/final override streams buys only corrected_delta_usd = max(0, desired_usd - effective_prior_usd) and only when the final decision price is strictly lower than the ticker's most recent valid same-day buy reference price (ordered by generated_at; missing prior reference => no auto-top-up). When invoked MANUALLY (final manual buy override) the run is manual (run_type='final_manual_buy_override', valid_afternoon_scheduled_evidence=false, same_day_top_up_context_only=true), excluded from every scheduled metric and shown only in the Manual Final Buy Override / Same-Day Top-Up Context section. LIVE RELIABILITY FIX (Jul 17 2026, see live_reliability_fix_2026_07_17): before calling place_equity_order the run describes the needed Robinhood connector schemas in-session (place_equity_order and get_equity_orders); it always writes final run_state.json, run_summary.json, signals.csv, submitted_orders.csv, and filled_orders.csv where applicable even for no-order, blocked, failed, or recovery runs; every actionable signal ends with exactly one persisted result (order_id, broker rejection, top-up block, budget block, cap block, data-confidence block, spread block, trend block, or safety block); if an actionable signal lacks both an order_id and a block/rejection reason the run is classified execution_lineage_incomplete, runs one recovery retry in the same scheduled directory (scheduled_runs/YYYYMMDD_1530ET/) retrying only the missing tickers with the same ref_id values, and reconciles duplicate ref_id or timeout through get_equity_orders before declaring failure; manual overrides stay manual_run=true and never count as scheduled evidence. FINAL BUY BUDGET-TIER FIX (Jul 17 2026, see final_buy_budget_tier_fix and live_reliability_fix_2026_07_17.final_buy_budget_tier_fix): before placing any final-buy order the run computes the budget tier from the full actionable incremental plan and the 3x-or-greater signal count (normal planned spend <=129 and 3x-plus signals <=5 daily cap 180; elevated planned spend >129 or 3x-plus signals 6-10 daily cap 240; high-volatility planned spend >213 or 3x-plus signals 11-17 daily cap 300; stress planned spend >272 or 3x-plus signals >17 daily cap 360 only to the extent unused weekly rollover reserve is available), counts same-day strategy allocation already placed in manual recovery, morning, midday, and earlier final orders as corrected-daily-cap usage for safety while keeping the streams separate for evidence and slippage, and if planned spend exceeds the remaining corrected daily capacity ranks the remaining eligible orders by deepest drop percentage then multiplier then amount, places only the orders fitting the remaining cap and the per-order 10 max, and writes budget_blocked.csv plus per-symbol block_reason='budget_block_corrected_daily_cap' for the rest; if a budget-logic inconsistency is detected after any order is placed the run recovers inside the same scheduled run directory, reconciles the already placed orders, applies the corrected cap logic, and finalizes state rather than escalating without complete artifacts. JUL 17 2026 FINAL-RUN RECOVERY (see live_reliability_fix_2026_07_17.jul17_final_run_recovery): the background final run placed SPCX first then escalated because the budget logic was incomplete; the corrected tier was elevated because planned spend was 187.5 and the 3x-plus count was 6 so the daily cap was 240; prior same-day strategy allocation counted for safety was 207.0 and SPCX assumed 15.0, leaving 18.0 remaining capacity; recovery placed GFUZ 13.50 (order_id 6a5a81d4-d250-43e3-89f3-06c2c4add387, filled, average_fill_price 8.449900, quantity 1.597652) and ASML 4.50 (order_id 6a5a81d4-f921-49c3-9a1c-1f0e43c2002b, filled, average_fill_price 1747.709900, quantity 0.002574), with SPCX (order_id 6a5a8182-9460-4d0d-99c3-86af604192a7, filled, average_fill_price 123.600000, quantity 0.121359) reconciled, then budget-blocked the remaining 27 signals; run_state has valid scheduled evidence for the final 3:30 run and the manual/midday streams remain prior allocation context only where applicable. NESTED RUN_CLASSIFICATION REQUIREMENT (Jul 17 2026, see live_reliability_fix_2026_07_17.scheduled_run_state_classification_requirement): the 3:30 scheduled run_state was repaired to include a nested run_classification object; every future scheduled run_state.json must carry a nested run_classification object (validated against schemas/run_classification.schema.json); scheduled/manual identity fields live only under that nested object, and the 3:40 PM watchdog confirms a scheduled run only when that nested object is present and valid. JUL 17 2026 MANUAL BUDGET-BLOCK OVERRIDES (see live_reliability_fix_2026_07_17.jul17_manual_budget_block_overrides): after the 3:30 scheduled run budget-blocked 27 signals, two manual budget-block override runs filled them - the first (final_manual_review/budget_block_override_20260717_1551ET) attempted all 27 and accepted/submitted 20 (NFLX, AMAT, CBRS, DXYZ, TSM, IBM, EVR, GOOGL, GOOG, GS, NVDA, GLW, INTC, BTX, MA, AMD, MSFT, QTOP, XLG, TOPT), with the remaining 7 failing on Robinhood 429 throttling/do-not-retry; the second (final_manual_review/budget_block_override_20260717_1556ET) placed and verified filled all remaining 7 (SNDK, AVGO, AMZN, STM, MRVL, DFTX, QBTS). These manual overrides are manual_run=true, valid_scheduled_evidence=false, valid_afternoon_evidence=false, excluded from scheduled 3:30 execution evidence, scheduled slippage, scheduled reliability, and scheduled cost basis, and usable only as manual override context and future same-day/top-up allocation context. AUTOMATIC FAILURE RECOVERY ADDED JUL 15 2026 (see failure_recovery): on internal persistence, parsing, wrapper-normalization, transient connector throttling, or raw-file write failure AFTER data was fetched, the run treats it as a recovery trigger (not terminal): it reruns the required read-only inputs once, persists all raw responses first, recomputes only from persisted files, and continues through the same pre-authorized guarded path if all safeguards pass, reusing the same scheduled_runs/YYYYMMDD_1530ET/ dir with recovery_rerun=true and never reclassifying as manual; if the recovery also fails or a safety/account/order rejection occurs, it writes run_state.json with the blocking reason and escalates."
     },
     {
       "id": "d72aa525",
@@ -1871,9 +2083,11 @@
       "status": "disabled",
       "in_live_scheduler": false,
       "superseded_on_et": "2026-07-27",
-      "superseded_reason": "Not present in the live scheduler verified on 2026-07-27. Retired from the active schedule; kept as a historical record only.",
+      "superseded_reason": "Not present in the canonical live schedule verified on 2026-07-27. Retired from the active schedule and removed from every active schedule table; kept as a historical record only.",
+      "former_cron_utc": "25 19 * * 1-5",
+      "former_et_equivalent": "3:25 PM ET weekdays (EDT)",
       "trades": false,
-      "notes": "RETIRED, NOT ACTIVE. This 3:25 PM ET capital-priority briefing is not in the live scheduler and must not be listed in any active schedule table or treated as expected daily evidence. Historical record only; cron_utc intentionally removed so it cannot be re-registered from this entry."
+      "notes": "RETIRED, NOT ACTIVE. cron_utc is intentionally removed so this entry cannot be re-registered as a live cron. Analytics only, no trading. Capital-priority briefing using the current $2 base 0x-to-5x ladder. Sends email/in-app notification only if at least one ticker triggers 1.5x or higher."
     },
     {
       "id": "67aa802b",
@@ -1969,24 +2183,25 @@
     },
     {
       "id": "d1f7a2c0",
-      "name": "Post-artifact DCA drift detector (signals vs submitted orders)",
+      "name": "Post-artifact DCA drift detector (signals vs submitted orders) (not a schedule entry)",
       "type": "monitoring",
       "status": "disabled",
       "in_live_scheduler": false,
       "scheduler_task": false,
       "retired_from_active_schedule_on_et": "2026-07-27",
-      "retired_reason": "Never a scheduler cron and not present in the live scheduler verified on 2026-07-27. It must not appear as an active schedule entry. The drift detector itself is NOT retired: per drift_detection_policy each live trading run still invokes scripts/drift_detection.py in-process against its own run directory immediately after writing artifacts.",
+      "retired_reason": "Never a scheduler cron and not present in the canonical live schedule verified on 2026-07-27, so it must not appear as an active schedule entry. The DETECTOR ITSELF IS NOT RETIRED: per drift_detection_policy every live trading run still invokes scripts/drift_detection.py in-process against its own run directory immediately after writing artifacts.",
+      "detector_still_required": true,
       "trades": false,
       "merged_pr": 80,
       "merge_commit": "3641b9041e5ebaefb0e0c3595751f151a06c96fd",
       "wired_into_live_chain": true,
       "detector": "scripts/drift_detection.py",
       "doc": "docs/drift_detection.md",
-      "invoked_by": ["42173154", "a6239dae", "10ce362c"],
+      "invoked_by": ["2ba19526", "42173154", "7be82b97", "a6239dae", "10ce362c"],
       "run_after": "artifact_write",
       "command": "python scripts/drift_detection.py --run-dir <run_dir> --json-out <run_dir>/drift_report.json --md-out <run_dir>/drift_report.md --slack --fail-on-drift",
       "slack_webhook_env": "DCA_DRIFT_SLACK_WEBHOOK",
-      "notes": "Read-only, no trading. Not an independent cron: each live trading task (morning 10:30, midday 12:30, afternoon 3:20) calls this detector immediately after it writes artifacts, per drift_detection_policy. Reconciles signals.csv (auto-buy intent) against submitted_orders.csv (order records) and, when an auto-buy signal with a positive amount has no submitted order, writes a JSON+markdown diagnostic and (with --slack) fires an immediate Slack alert. Covers the Jul 16 2026 failure mode (8 auto-buy signals, empty submitted_orders.csv, missing raw/). No secrets: the Slack webhook is read from DCA_DRIFT_SLACK_WEBHOOK, never hardcoded."
+      "notes": "NOT AN ACTIVE SCHEDULE ENTRY. The detector is still required in-process (see detector_still_required). Read-only, no trading. Not an independent cron: each live trading task (market open 9:35, morning 10:30, intraday 11:30/1:30/2:30, midday 12:30, final 3:30) calls this detector immediately after it writes artifacts, per drift_detection_policy. Reconciles signals.csv (auto-buy intent) against submitted_orders.csv (order records) and, when an auto-buy signal with a positive amount has no submitted order, writes a JSON+markdown diagnostic and (with --slack) fires an immediate Slack alert. Covers the Jul 16 2026 failure mode (8 auto-buy signals, empty submitted_orders.csv, missing raw/). No secrets: the Slack webhook is read from DCA_DRIFT_SLACK_WEBHOOK, never hardcoded."
     },
     {
       "id": "f7411889",

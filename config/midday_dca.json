@@ -104,7 +104,7 @@
       "Earlier allocation exists but the midday price is not below the reference price -> buy $0.",
       "Earlier amount known but no comparable price (missing prior reference or current midday price) -> conservative $0 with top_up_manual_review flagged (manual_review_candidate)."
     ],
-    "prior_allocation_sources": "Morning live and manual runs under the morning-live root, plus MANUAL missed-morning 10:30 recovery artifacts under morning_dca/manual_recovery/YYYYMMDD_* (run_origin='manual', manual_run=true, same_day_top_up_context_only=true, valid_scheduled_evidence=false); scheduled afternoon runs are ignored as prior context. Midday's own scheduled runs and its manual override reruns (manual_reruns/) are eligible prior context for the afternoon guard only. Manual missed-morning recovery artifacts are prior-allocation / top-up context only and never scheduled evidence."
+    "prior_allocation_sources": "Market-open (9:35) live fills under market_open_dca, morning live and manual runs under the morning-live root, plus MANUAL missed-morning 10:30 recovery artifacts under morning_dca/manual_recovery/YYYYMMDD_* (run_origin='manual', manual_run=true, same_day_top_up_context_only=true, valid_scheduled_evidence=false); scheduled afternoon runs are ignored as prior context. Midday's own scheduled runs and its manual override reruns (manual_reruns/) are eligible prior context for the afternoon guard only. Manual missed-morning recovery artifacts are prior-allocation / top-up context only and never scheduled evidence."
   },
   "artifact_paths": {
     "live_run_state_root": "/home/user/workspace/cron_tracking/midday_dca",
@@ -116,7 +116,9 @@
     "run_state_filename": "run_state.json",
     "run_state_filename": "run_state.json",
     "prior_allocation_roots": [
+      "/home/user/workspace/cron_tracking/market_open_dca",
       "/home/user/workspace/cron_tracking/morning_dca",
+      "/home/user/workspace/cron_tracking/intraday_dca",
       "/home/user/workspace/cron_tracking/ce16ba6b"
     ],
     "manual_recovery_root": "/home/user/workspace/cron_tracking/morning_dca/manual_recovery",

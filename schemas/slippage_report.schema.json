@@ -18,7 +18,7 @@
     },
     "scheduled_run_id": {
       "type": ["string", "null"],
-      "description": "run_classification.run_id of the scheduled run these rows were derived from (scheduled_YYYYMMDD_1520ET)."
+      "description": "run_classification.run_id of the scheduled run these rows were derived from (scheduled_YYYYMMDD_1530ET; legacy runs use scheduled_YYYYMMDD_1520ET)."
     },
     "excluded_manual_order_ids": {
       "type": "array",
@@ -37,7 +37,7 @@
     "source_order_history_payloads": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "Paths to persisted Robinhood order-history payloads (e.g. scheduled_runs/YYYYMMDD_1520ET/raw/orders_after_place.json) used to compute average fill price / executions. Added 2026-07-10: the slippage task persists broker order-history responses before computation and computes fills from the saved payloads rather than re-querying the broker."
+      "description": "Paths to persisted Robinhood order-history payloads (e.g. scheduled_runs/YYYYMMDD_1530ET/raw/orders_after_place.json) used to compute average fill price / executions. Added 2026-07-10: the slippage task persists broker order-history responses before computation and computes fills from the saved payloads rather than re-querying the broker."
     },
     "manual_test_runs": {
       "type": "object",

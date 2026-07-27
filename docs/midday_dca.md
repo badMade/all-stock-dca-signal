@@ -84,7 +84,7 @@ lists `top_up_offset_tickers` and `top_up_manual_review_tickers`.
 
 ## Why it is fully separate from the other streams
 
-The midday stream is **independent** of the afternoon 3:20 PM live task
+The midday stream is **independent** of the afternoon 3:30 PM live task
 (`10ce362c`, which supersedes the deleted `ce16ba6b`) and of the morning stream:
 
 | Axis | Afternoon live (`10ce362c`) | Morning stream | Midday stream |
@@ -92,7 +92,7 @@ The midday stream is **independent** of the afternoon 3:20 PM live task
 | Ladder | 0x → **5x** | 0x → **3x** | 0x → **5x** |
 | Budget ledger | `StrategyState` / `BUDGET_TIERS` | namespace `morning` | namespace `midday` |
 | Artifact root | `.../ce16ba6b/` | `.../morning_dca[_watchlist]/` | `.../midday_dca/` |
-| Run type | `scheduled_live_test` @ `15:20` | `morning_dca_*` @ `09:45`/`10:30` | `midday_dca_live` @ `12:30` |
+| Run type | `scheduled_live_test` @ `15:30` | `morning_dca_*` @ `09:45`/`10:30` | `midday_dca_live` @ `12:30` |
 | Pointer | `latest_scheduled_run.json` | `latest_morning_run.json` | `latest_midday_run.json` |
 
 The midday stream never writes into the morning or `ce16ba6b` trees, never
@@ -120,7 +120,7 @@ manual branch of
 
 Manual override reruns are **excluded** from every scheduled metric — evidence,
 slippage, reliability, fill counts, watchdog confirmation, and cost basis — and
-are used **only** as prior-allocation context for the **afternoon** 3:20 PM
+are used **only** as prior-allocation context for the **afternoon** 3:30 PM
 same-day top-up guard (the afternoon guard scans the midday root, which contains
 `manual_reruns/`). They do **not** affect the midday run itself (they post-date the
 12:30 PM decision).
@@ -156,7 +156,7 @@ Fills in that recovery:
 The artifact carries `run_origin='manual'`, `manual_run=true`,
 `same_day_top_up_context_only=true`, and `valid_scheduled_evidence=false`. It is
 prior-allocation / same-day top-up context **only** and must be available to the
-**3:20 afternoon** run as such. It is **never** midday scheduled evidence, never
+**3:30 afternoon** run as such. It is **never** midday scheduled evidence, never
 proof the 12:30 scheduled task ran, and never counted in scheduled reliability,
 fill counts, slippage, cost basis, or watchdog confirmation. See
 `config/scheduled_tasks.json`'s `midday_dca_manual_recovery_2026_07_20`.
@@ -168,10 +168,10 @@ A human placed a manual midday run at **1:45 PM ET on 2026-07-21** under
 carries `run_origin='manual'`, `manual_run=true`, `stream='midday_manual'`,
 `same_day_top_up_context_only=true`, `valid_scheduled_evidence=false`, and
 `valid_afternoon_scheduled_evidence=false`. It is same-day top-up context **only**:
-it is **never** proof the 12:30 or 3:20 scheduled tasks ran, and it is **excluded**
+it is **never** proof the 12:30 or 3:30 scheduled tasks ran, and it is **excluded**
 from scheduled slippage, scheduled fill counts, scheduled reliability, scheduled
 cost-basis evidence, watchdog proof, and scheduled afternoon evidence. It may be
-used by the later same-day **3:20** top-up logic as prior-allocation context only.
+used by the later same-day **3:30** top-up logic as prior-allocation context only.
 Filled orders (total **$9.00**):
 
 | Ticker | Amount | Order id | Avg price | Quantity |
