@@ -244,6 +244,21 @@ top-up guards, and safety rules unchanged.
 | `manual_runs` | Ad-hoc manual runs (should trend to zero) |
 | `approx_tokens` | Rough token usage estimate, if available |
 
+### Proxy bands
+
+Where a report summarizes usage intensity rather than counting it, use the
+bands `low`, `moderate`, and `high`, and name the observed proxy value and the
+threshold that produced the band. **Never** state an exact credit count, an
+estimated credit count, or a dollar/billing figure: exact Perplexity credit
+consumption is not exposed.
+
+### One-time 2026-07-27 credit-usage proxy report
+
+`onetime-1630-credit-usage-proxy-2026-07-27` fires once at **2026-07-27 4:30 PM
+ET** to summarize the day's automation usage in proxy bands, with a separate
+section for every recovery, retry, escalation, and repair run. Analytics only,
+no trading. See [credit_usage_proxy_report.md](credit_usage_proxy_report.md).
+
 ## Levers
 
 - Prefer compact Notion "Latest Run" updates daily; full dashboard only weekly/monthly.

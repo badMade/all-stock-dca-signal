@@ -2891,6 +2891,42 @@ def test_live_gate_permits_when_in_approved_window(tmp_path):
     assert res["artifacts"].get("status") != "blocked"
 
 
+def test_scheduled_live_run_writing_run_state_then_failing_is_a_late_error(tmp_path):
+    # guarded_run's run_artifact_written probe was never wired into this
+    # scheduled call site (the afternoon run_dca.py call already had it): a
+    # run that persisted run_state.json and only then failed writing
+    # morning_signals.csv/submitted_orders.csv/a same-day pointer was
+    # unconditionally recorded as failure_phase='before_run_artifact',
+    # fabricating an earlier failed start plus a successful retry -- codex
+    # review discussion_r3660858010.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    now = _now_live()
+    run_state_path = ex.run_state_dir(now) / "run_state.json"
+
+    def _boom(*args, **kwargs):
+        run_state_path.parent.mkdir(parents=True, exist_ok=True)
+        run_state_path.write_text('{"run_id": "morning_live_written_then_crashed"}', encoding="utf-8")
+        raise RuntimeError("crashed after writing run_state.json")
+
+    ex._run_impl = _boom
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    with pytest.raises(RuntimeError, match="crashed after writing run_state.json"):
+        ex.run(now, data, manual=False, broker=FakeLiveBroker())
+
+    attempt_log_root = Path(os.environ["DCA_ATTEMPT_LOG_ROOT"])
+    marker_path = next(attempt_log_root.glob("*/morning.json"))
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker["failure_phase"] == "after_run_artifact"
+
+
 def test_live_gate_manual_bypasses_approved_window(tmp_path):
     # Manual runs are never blocked by the approved_test_dates gate.
     pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))

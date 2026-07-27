@@ -35,7 +35,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from dca_alerts import guarded_run
+from dca_alerts import artifact_freshness_probe, attempt_log_root_sibling_to, guarded_run
 from dca_config import DEFAULT_CONFIG_DIR, load_strategy_config
 from dca_fileio import atomic_write_text
 from midday_dca import DEFAULT_MIDDAY_LIVE_STATE_ROOT, load_midday_config
@@ -60,15 +60,19 @@ from near_close_dca import (
 )
 from scripts.model_usage_log import log_model_usage
 from scripts.run_classification import (
-    CRON_ID as AFTERNOON_LIVE_CRON_ID,
-)
-from scripts.run_classification import (
+    CANONICAL_RETIME_DATE_YYYYMMDD,
+    LEGACY_SCHEDULED_WINDOW_START_ET,
+    SCHEDULED_WINDOW_START_ET,
     build_raw_persistence_state,
     load_same_day_top_up_context,
     raw_persistence_failure_run_state,
     save_raw_input,
     update_latest_scheduled_run_pointer,
 )
+from scripts.run_classification import (
+    CRON_ID as AFTERNOON_LIVE_CRON_ID,
+)
+from scripts.scheduled_artifacts import RUN_STATE_FILENAME
 
 logger = logging.getLogger("near_close_dca.run")
 
@@ -991,6 +995,12 @@ def run_pipeline(
     unscheduled calls only get a log handler ensured.
     """
 
+    # Snapshotted BEFORE _invoke() runs, so the probe passed to guarded_run
+    # below can tell this invocation's own write from a stale run_state.json
+    # a retry's directory reuse left behind from an earlier attempt -- codex
+    # review discussion_r3660858013.
+    run_artifact_written = artifact_freshness_probe(Path(artifacts_dir) / RUN_STATE_FILENAME)
+
     def _invoke() -> Dict[str, Any]:
         result = _run_pipeline_impl(
             now,
@@ -1041,6 +1051,23 @@ def run_pipeline(
         _invoke,
         enabled=scheduled and not config.dry_run,
         context=f"artifacts_dir={artifacts_dir}",
+        # Keep the failed-start marker under the same custom base as a
+        # configured model_usage_log_root, so a non-default artifacts root
+        # doesn't split the writer and the report's reader across two
+        # different attempt_log locations -- codex review
+        # discussion_r3658373966.
+        attempt_log_root=attempt_log_root_sibling_to(model_usage_log_root),
+        # _run_pipeline_impl persists run_state.json directly under
+        # artifacts_dir (see the `out = Path(artifacts_dir)` writers above)
+        # before generate_full_reports=True's later report-generation phase
+        # runs; probing that path lets guarded_run tell a crash AFTER the run
+        # completed its work from a genuine failed start, instead of always
+        # recording the latter -- codex review discussion_r3660464501. The
+        # probe is mtime-snapshotted (not existence-only) so a retry reusing
+        # this slot's directory after an earlier invocation already wrote it
+        # is not credited with a write it never made itself -- codex review
+        # discussion_r3660858013.
+        run_artifact_written=run_artifact_written,
         # The raw-persistence failure path reports its failure as a returned
         # result (with its own targeted Slack alert) instead of raising; it must
         # ping a FAILED heartbeat, not clear the dead-man's switch.
@@ -1048,6 +1075,27 @@ def run_pipeline(
             isinstance(result, dict) and result.get("raw_persistence_error")
         ),
     )
+
+
+def _final_buy_trend_override_window_start(now: datetime) -> time:
+    """Lower bound of the final-buy trend-override window for ``now``'s ET date.
+
+    Pre-retime dates (before ``CANONICAL_RETIME_DATE_YYYYMMDD``) keep the
+    legacy 15:15 ET bound so a legacy 3:20 PM run stays covered. On/after the
+    retime, the bound narrows to the canonical classification window start
+    (15:25 ET) so a delayed/replayed or misfired scheduled invocation between
+    15:15 and 15:24 ET does not skip the downtrend check outside the window
+    the manifest actually permits (15:30-15:32 ET starts) -- codex review
+    discussion_r3657271692.
+    """
+    now_et = now.astimezone(EASTERN)
+    window_start_et = (
+        LEGACY_SCHEDULED_WINDOW_START_ET
+        if now_et.strftime("%Y%m%d") < CANONICAL_RETIME_DATE_YYYYMMDD
+        else SCHEDULED_WINDOW_START_ET
+    )
+    hh, mm = (int(part) for part in window_start_et.split(":"))
+    return time(hh, mm)
 
 
 def _run_pipeline_impl(
@@ -1123,14 +1171,20 @@ def _run_pipeline_impl(
     if ignore_trend_filter and not config.ignore_trend_filter:
         import dataclasses as _dc
         config = _dc.replace(config, ignore_trend_filter=True)
-    # Auto-apply the final-buy trend override for scheduled runs in the 3:15-3:35 PM ET
-    # window (task 10ce362c, retimed to 3:30 PM ET on 2026-07-27). The lower bound stays
-    # at 15:15 so a legacy 3:20 PM run is still attributable to the scheduled window.
+    # Auto-apply the final-buy trend override for scheduled runs in the final-buy
+    # window (task 10ce362c, retimed to 3:30 PM ET on 2026-07-27). The lower bound
+    # is 15:15 ET only for pre-retime legacy dates, so a legacy 3:20 PM run stays
+    # attributable to the scheduled window; on/after the retime it narrows to the
+    # canonical 15:25 ET classification window start, so a delayed/replayed or
+    # misfired invocation between 15:15 and 15:24 ET does not skip the downtrend
+    # check outside the window the manifest actually permits (15:30-15:32 ET
+    # starts) -- codex review discussion_r3657271692.
     # This is restricted to scheduled live runs so manual, demo, and morning/midday callers
     # are unaffected — they run outside this window and/or with scheduled=False.
     elif scheduled and not config.dry_run and not config.ignore_trend_filter:
         _now_et = now.astimezone(EASTERN).time()
-        if time(15, 15) <= _now_et <= time(15, 35):
+        _window_start = _final_buy_trend_override_window_start(now)
+        if _window_start <= _now_et <= time(15, 35):
             import dataclasses as _dc
             config = _dc.replace(config, ignore_trend_filter=True)
             logger.info(
@@ -1508,6 +1562,23 @@ def _run_pipeline_impl(
                         # never smaller than either pass saw -- and force the
                         # reference unknown so the guard routes through its
                         # conservative missing_prior_price path.
+                        #
+                        # This is deliberately scoped to EVERY ticker present
+                        # in both passes, not just the ticker(s) whose own
+                        # artifact failed to parse (Codex review r3657960333:
+                        # "Scope incomplete reload failures to affected
+                        # tickers"). Narrower scoping isn't safely possible
+                        # with the data this loader has: a single
+                        # run_state.json's `buy_candidates` (and a single
+                        # manual override's orders CSV rows) can name MANY
+                        # tickers per file, so the one file that failed to
+                        # parse this pass could, for all we know, be the file
+                        # that would have added another contributor to THIS
+                        # ticker too -- we cannot enumerate the ticker set of
+                        # a file we failed to read. Any ticker in the active
+                        # universe is therefore a candidate, not just the
+                        # ticker(s) whose OWN artifact is the one visibly
+                        # missing/corrupt.
                         import dataclasses as _dc
 
                         base = alloc if alloc.amount_usd >= existing.amount_usd else existing

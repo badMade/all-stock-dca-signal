@@ -2969,6 +2969,96 @@ def test_run_pipeline_live_run_partial_raw_inputs_writes_error_state(tmp_path):
     assert run_state["raw_inputs_saved"] == []
 
 
+def test_run_pipeline_late_failure_after_run_artifact_written_is_not_a_failed_start(tmp_path, monkeypatch):
+    # guarded_run's run_artifact_written probe distinguishes a crash BEFORE any
+    # artifact exists from an ordinary late error AFTER run_state.json was
+    # already persisted (the generate_full_reports=True path can fail during
+    # report generation, well after run_daily_compact() wrote the run). This
+    # production call site never passed the probe, so every escaping
+    # exception recorded failure_phase='before_run_artifact' regardless --
+    # codex review discussion_r3660464501.
+    import json
+
+    import run_dca as run_dca_module
+
+    config = load_strategy_config(
+        approved_test_dates=frozenset({_now().date()}), dry_run=False
+    )
+    artifacts_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
+    broker = DryRunBroker(account=config.target_account_number)
+    model_usage_log_root = tmp_path / "model_usage"
+
+    real_impl = run_dca_module._run_pipeline_impl
+
+    def _boom(*args, **kwargs):
+        real_impl(*args, **kwargs)
+        raise RuntimeError("report generation exploded after the run was written")
+
+    monkeypatch.setattr(run_dca_module, "_run_pipeline_impl", _boom)
+
+    with pytest.raises(RuntimeError, match="report generation exploded"):
+        run_pipeline(
+            _now(), config, StrategyState(),
+            DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+            broker, artifacts_dir=artifacts_dir, generate_full_reports=True,
+            model_usage_log_root=model_usage_log_root,
+        )
+
+    assert (artifacts_dir / "run_state.json").exists()
+    attempt_log_root = model_usage_log_root.parent / "attempt_log"
+    marker_path = next(attempt_log_root.glob("*/afternoon.json"))
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker["failure_phase"] == "after_run_artifact"
+
+
+def test_run_pipeline_stale_run_artifact_is_not_credited_to_a_later_failed_invocation(tmp_path, monkeypatch):
+    # A retry can reuse the SAME artifacts_dir as the attempt before it. An
+    # existence-only probe would see the earlier invocation's run_state.json
+    # and wrongly report after_run_artifact for a crash that THIS invocation
+    # never got far enough to write anything of its own, attributing the
+    # failure to a wholly unrelated earlier attempt's artifact -- codex
+    # review discussion_r3660858013.
+    import json
+    import os
+
+    import run_dca as run_dca_module
+
+    config = load_strategy_config(
+        approved_test_dates=frozenset({_now().date()}), dry_run=False
+    )
+    artifacts_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
+    artifacts_dir.mkdir(parents=True)
+    stale_run_state = artifacts_dir / "run_state.json"
+    stale_run_state.write_text('{"run_id": "stale_earlier_attempt"}', encoding="utf-8")
+    # Force the stale file's mtime clearly into the past so this test cannot
+    # flake on filesystem timestamp resolution.
+    old = (datetime.now() - timedelta(hours=1)).timestamp()
+    os.utime(stale_run_state, (old, old))
+
+    broker = DryRunBroker(account=config.target_account_number)
+    model_usage_log_root = tmp_path / "model_usage"
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("crashed before writing anything of its own")
+
+    monkeypatch.setattr(run_dca_module, "_run_pipeline_impl", _boom)
+
+    with pytest.raises(RuntimeError, match="crashed before writing anything"):
+        run_pipeline(
+            _now(), config, StrategyState(),
+            DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+            broker, artifacts_dir=artifacts_dir, generate_full_reports=True,
+            model_usage_log_root=model_usage_log_root,
+        )
+
+    # The stale file is untouched -- still exactly the earlier attempt's content.
+    assert stale_run_state.read_text(encoding="utf-8") == '{"run_id": "stale_earlier_attempt"}'
+    attempt_log_root = model_usage_log_root.parent / "attempt_log"
+    marker_path = next(attempt_log_root.glob("*/afternoon.json"))
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker["failure_phase"] == "before_run_artifact"
+
+
 def test_build_frozen_providers_strict_finance_raises_on_live_run(tmp_path):
     """A live run (dry_run=False) must fail closed when finance raw files are absent.
 

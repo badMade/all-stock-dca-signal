@@ -33,6 +33,8 @@ import logging
 import os
 import traceback
 import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Optional, TypeVar
 from urllib.parse import urlsplit
 
@@ -44,11 +46,48 @@ FAILURE_WEBHOOK_ENV = "DCA_ALERT_SLACK_WEBHOOK"
 # duplicated as a literal so this module stays free of project imports and is
 # usable from any module without cycles.
 FALLBACK_WEBHOOK_ENV = "DCA_DRIFT_SLACK_WEBHOOK"
+# Root for the failed-start attempt log (see _write_failed_start_marker).
+# Same cron_tracking root scripts/run_classification.CRON_TRACKING_ROOT uses,
+# duplicated as a literal for the same no-project-imports reason as
+# FALLBACK_WEBHOOK_ENV above.
+ATTEMPT_LOG_ROOT_ENV = "DCA_ATTEMPT_LOG_ROOT"
+DEFAULT_ATTEMPT_LOG_ROOT = "/home/user/workspace/cron_tracking/attempt_log"
+# Suffix of the append-only per-attempt history written alongside the single
+# latest-attempt <stream>.json marker, so a stream that fails more than once
+# on the same trading day keeps every failure rather than overwriting all but
+# the last -- codex review discussion_r3659140585.
+ATTEMPT_LOG_HISTORY_SUFFIX = ".attempts.jsonl"
 
 _DEFAULT_TIMEOUT_SECONDS = 10.0
 _TRACEBACK_CHAR_LIMIT = 1500
 
 T = TypeVar("T")
+
+
+def attempt_log_root_sibling_to(model_usage_log_root: Optional[str]) -> Optional[str]:
+    """Derive the attempt_log root as a sibling of a configured model_usage_log_root.
+
+    A deployment that overrides model_usage_log_root (e.g. a non-default
+    artifacts_dir/cron_tracking root) but doesn't separately set
+    DCA_ATTEMPT_LOG_ROOT would otherwise have write_failed_start_marker fall
+    back to DEFAULT_ATTEMPT_LOG_ROOT while the report reads attempt_log from
+    the custom root, missing every marker -- codex review
+    discussion_r3658373966. Returns None (let write_failed_start_marker use
+    its own env-var/default) when model_usage_log_root itself isn't set.
+
+    An explicit DCA_ATTEMPT_LOG_ROOT env var always takes precedence over a
+    derived sibling: returning None here (rather than the derived path) lets
+    write_failed_start_marker's own ``root or env-var or default`` resolution
+    fall through to that env var, instead of this helper unconditionally
+    deriving a sibling path that would otherwise always win (an explicit
+    ``root=`` argument beats the env var) and silently shadow a deployment's
+    intentional override -- codex review discussion_r3659124650.
+    """
+    if os.environ.get(ATTEMPT_LOG_ROOT_ENV):
+        return None
+    if not model_usage_log_root:
+        return None
+    return str(Path(model_usage_log_root).parent / "attempt_log")
 
 
 def ensure_log_handler(level: int = logging.INFO) -> None:
@@ -143,6 +182,134 @@ def alert_failure(
         return False
 
 
+def write_failed_start_marker(
+    stream: str,
+    exc: BaseException,
+    *,
+    triggered_at_utc: Optional[datetime] = None,
+    root: Optional[str] = None,
+    run_artifact_written: bool = False,
+) -> Optional[Path]:
+    """Persist a compact local record that ``stream`` was attempted and crashed
+    before writing any run artifact of its own.
+
+    ``run_artifact_written`` records WHICH PHASE the failure happened in, and
+    is the difference between a genuine failed start and an ordinary late
+    error. A scheduled invocation can persist a valid run_state.json and only
+    then raise -- the supported ``generate_full_reports=True`` path, for
+    instance, fails after ``run_daily_compact()`` has already written the run
+    -- and an unconditional marker claims "failed before writing any run
+    artifact" about a run whose artifact plainly exists. The report then sees
+    a valid run directory plus a marker and fabricates an earlier failed start
+    followed by a successful retry, inflating recovery/error counts and
+    forcing the high error band off a run that actually completed its work
+    (codex review discussion_r3659298031). Pass True when the run's own
+    artifact is already on disk; the marker records
+    ``failure_phase='after_run_artifact'`` and readers must not treat it as a
+    failed start.
+
+    Slack alerts and heartbeat pings are external, fire-and-forget calls with
+    no local trace, so a report reading only cron_tracking artifacts cannot
+    tell a scheduled invocation that raised before writing anything apart from
+    a slot the scheduler never triggered at all -- both look like a totally
+    empty run directory (Codex review: "Persist evidence that distinguishes
+    failed starts from missed slots"). This marker is the durable, locally
+    readable signal that closes that gap: written under
+    ``<root>/YYYYMMDD/<stream>.json`` (root defaults to
+    ``DCA_ATTEMPT_LOG_ROOT`` env var, then ``DEFAULT_ATTEMPT_LOG_ROOT``), it
+    records the concrete failure so classification can key off it rather than
+    guessing from an empty directory.
+
+    A stream can fail more than once on the same trading day (the scheduler
+    retries, or a multi-slot task such as 7be82b97 fires again later), and
+    ``<day>/<stream>.json`` is a single fixed path, so each failure used to
+    overwrite the previous one and the report could only ever observe the
+    LAST attempt -- undercounting error_count, retry evidence, and recovery
+    rows for exactly the repeated-failure case they matter most for (codex
+    review discussion_r3659140585, discussion_r3659124633). Every attempt is therefore ALSO appended
+    as one line to ``<day>/<stream>.attempts.jsonl``, which is append-only and
+    never rewritten. ``<stream>.json`` is still written, holding the latest
+    attempt, so existing readers keep working unchanged; readers that need
+    every attempt (see the report's ``_read_attempt_markers``) prefer the
+    JSONL.
+
+    Best-effort and never raises: a broken/unwritable attempt log must not
+    mask (or break) the original run failure, exactly like alert_failure and
+    send_heartbeat above. Returns the written ``<stream>.json`` path, or None
+    if the write failed or was skipped.
+    """
+    try:
+        triggered = triggered_at_utc or datetime.now(timezone.utc)
+        log_root = root or os.environ.get(ATTEMPT_LOG_ROOT_ENV) or DEFAULT_ATTEMPT_LOG_ROOT
+        day_dir = Path(log_root) / triggered.strftime("%Y%m%d")
+        day_dir.mkdir(parents=True, exist_ok=True)
+        trace = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        if len(trace) > _TRACEBACK_CHAR_LIMIT:
+            trace = "…" + trace[-_TRACEBACK_CHAR_LIMIT:]
+        marker = {
+            "stream": stream,
+            "error_class": type(exc).__name__,
+            "error_message": str(exc),
+            "traceback": trace,
+            "triggered_at_utc": triggered.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            # See run_artifact_written above: 'before_run_artifact' is the
+            # true failed start this marker was built for; 'after_run_artifact'
+            # is an ordinary late error on a run that DID persist its artifact,
+            # and must never be reported as a failed start.
+            "failure_phase": "after_run_artifact" if run_artifact_written else "before_run_artifact",
+        }
+        serialized = json.dumps(marker, sort_keys=True)
+        # Append-only history first: if the single-marker write below fails,
+        # the attempt is still recorded somewhere rather than lost entirely.
+        try:
+            with (day_dir / f"{stream}{ATTEMPT_LOG_HISTORY_SUFFIX}").open("a", encoding="utf-8") as handle:
+                handle.write(serialized + "\n")
+        except OSError:
+            logger.exception("failed-start attempt-history append failed for %s", stream)
+        path = day_dir / f"{stream}.json"
+        path.write_text(serialized, encoding="utf-8")
+        return path
+    except Exception:  # noqa: BLE001 - see alert_failure/send_heartbeat above
+        logger.exception("failed-start marker write raised for %s", stream)
+        return None
+
+
+def artifact_freshness_probe(path: "str | Path") -> Callable[[], bool]:
+    """Build a ``run_artifact_written`` probe for :func:`guarded_run` that
+    proves THIS invocation wrote ``path`` -- not that a stale file from an
+    earlier invocation happens to already sit there.
+
+    A scheduled slot's own run_state.json can already exist when a call is
+    made: an external-scheduler retry reuses the SAME directory as the
+    attempt before it, so a bare existence check would report
+    ``after_run_artifact`` for a crash that this invocation's own work never
+    reached, attributing the failure to a wholly earlier, unrelated attempt's
+    artifact instead of recording a genuine failed start -- codex review
+    discussion_r3660858013. Snapshotting ``path``'s mtime (or absence) at
+    call time and comparing against it later distinguishes the two: only a
+    path that is newly created, or modified since this snapshot, counts as
+    this invocation's own write.
+
+    Call this BEFORE invoking the guarded function (so the snapshot predates
+    any write it could make) and pass the returned callable as
+    ``guarded_run(..., run_artifact_written=...)``.
+    """
+    p = Path(path)
+    try:
+        before = p.stat().st_mtime
+    except OSError:
+        before = None
+
+    def _probe() -> bool:
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            return False
+        return before is None or mtime > before
+
+    return _probe
+
+
 def guarded_run(
     stream: str,
     fn: Callable[..., T],
@@ -150,6 +317,8 @@ def guarded_run(
     enabled: bool = True,
     context: Optional[str] = None,
     result_ok: Optional[Callable[[T], bool]] = None,
+    attempt_log_root: Optional[str] = None,
+    run_artifact_written: Optional[Callable[[], bool]] = None,
     **kwargs: Any,
 ) -> T:
     """Run ``fn`` with guaranteed logging, failure alerting, and heartbeats.
@@ -169,6 +338,33 @@ def guarded_run(
     the structured-failure paths already emit their own targeted alerts, and a
     duplicate here would double-page. The result is returned unchanged either
     way.
+
+    An escaping ``Exception`` also gets a durable local marker via
+    :func:`write_failed_start_marker`, in addition to the Slack alert and
+    failed heartbeat: those two are fire-and-forget external calls with no
+    local trace, so this is the only locally readable evidence that
+    distinguishes an attempted-and-crashed run from a slot the scheduler never
+    triggered at all. ``attempt_log_root`` overrides where that marker is
+    written (see :func:`attempt_log_root_sibling_to`); ``None`` lets
+    :func:`write_failed_start_marker` fall back to its own env-var/default.
+
+    ``run_artifact_written`` is an optional zero-argument probe reporting
+    whether the run's own artifact is already on disk when the exception
+    escapes. A scheduled run can persist a valid run_state.json and only then
+    raise (the ``generate_full_reports=True`` path fails after
+    ``run_daily_compact()`` has written the run), and a marker that
+    unconditionally means "failed before writing any artifact" makes the
+    report fabricate an earlier failed start plus a successful retry --
+    inflating recovery/error counts and forcing the high error band on a run
+    that completed its work. The probe's answer is recorded as the marker's
+    ``failure_phase``; it fails closed to a plain failed start if the probe
+    itself raises -- codex review discussion_r3659298031.
+
+    Each of the three failure-path actions below (Slack alert, heartbeat,
+    marker) runs in its OWN try/except: alert_failure raising (e.g. malformed
+    webhook URL) must not prevent the heartbeat or the marker from still
+    being attempted, since the marker especially is the only durable evidence
+    this failure ever happened -- codex review discussion_r3658373974.
     """
     ensure_log_handler()
     if not enabled:
@@ -179,9 +375,31 @@ def guarded_run(
         logger.exception("live %s run failed", stream)
         try:
             alert_failure(stream, exc, context=context)
+        except Exception:  # noqa: BLE001 - alerting bugs must not mask the run failure
+            logger.exception("alert_failure raised while handling a %s run failure", stream)
+        try:
             send_heartbeat(stream, ok=False)
         except Exception:  # noqa: BLE001 - alerting bugs must not mask the run failure
-            logger.exception("alert delivery raised while handling a %s run failure", stream)
+            logger.exception("send_heartbeat raised while handling a %s run failure", stream)
+        try:
+            # Probe whether the run already persisted its own artifact, so
+            # the marker records the failure PHASE rather than unconditionally
+            # claiming a failed start for an exception raised long after the
+            # run wrote its run_state.json -- codex review
+            # discussion_r3659298031. Fails CLOSED to False (a plain failed
+            # start) if the probe itself raises: that is the pre-existing
+            # behavior and never loses the failure record.
+            artifact_written = False
+            if run_artifact_written is not None:
+                try:
+                    artifact_written = bool(run_artifact_written())
+                except Exception:  # noqa: BLE001 - a broken probe must not lose the marker
+                    logger.exception("run_artifact_written probe raised for %s; recording a failed start", stream)
+            write_failed_start_marker(
+                stream, exc, root=attempt_log_root, run_artifact_written=artifact_written
+            )
+        except Exception:  # noqa: BLE001 - alerting bugs must not mask the run failure
+            logger.exception("write_failed_start_marker raised while handling a %s run failure", stream)
         raise
     ok = True
     if result_ok is not None:

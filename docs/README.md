@@ -12,12 +12,13 @@ workflow, and Notion template. **No credentials or secrets are stored here.**
 | [strategy.md](strategy.md) | Strategy overview, ticker universe, latest sizing ladder, budgets |
 | [live_wiring.md](live_wiring.md) | Live providers/broker adapters, orchestrator/CLI, and the two placement safety gates |
 | [safeguards.md](safeguards.md) | Broker/account, trading constraints, budget caps, test window |
-| [schedule_manifest.md](schedule_manifest.md) | All 11 scheduled tasks (only `10ce362c`, which supersedes `ce16ba6b`, trades) |
+| [schedule_manifest.md](schedule_manifest.md) | The canonical 17-row recurring schedule verified 2026-07-27, one-time tasks, and retired entries |
 | [run_classification.md](run_classification.md) | Scheduled-vs-manual run contract (paths, required fields, exclusion rules) |
 | [drift_detection.md](drift_detection.md) | Post-artifact signals-vs-submitted-orders drift detector + Slack alerting |
 | [reporting_workflow.md](reporting_workflow.md) | Daily/periodic artifact + Notion flow |
 | [notion_dashboard_template.md](notion_dashboard_template.md) | Notion page template + conceptual API sync |
 | [cost_tracking.md](cost_tracking.md) | Cost-control policy and usage proxies |
+| [credit_usage_proxy_report.md](credit_usage_proxy_report.md) | One-time 2026-07-27 4:30 PM ET credit-usage proxy report contract, including the separate recovery-run section |
 | [restore_runbook.md](restore_runbook.md) | Restore procedure + audit checklist |
 | [backtest_curve.md](backtest_curve.md) | Analytics-only weekly-rollover intraday cap curve backtest (35 / 65 / 100 candidate) |
 

@@ -149,7 +149,7 @@
     "premium_reason_rule": "reason_for_premium_model is recorded (non-null) only when model_routing_mode='premium', and must be one of failure_recovery, safety_validation, connector_debug_escalation, or explicit_user_request (see model_routing_policy.premium_models_allowed_only_for). For cost_conscious/default routing it is null/omitted.",
     "applies_to_daily_tasks_et": [
       { "et": "09:35", "task_id": "2ba19526", "stream": "market_open", "role": "market-open live execution" },
-      { "et": "09:45", "task_id": "bb4f6ef1", "stream": "watchlist", "role": "morning watchlist early-warning scan (read-only); also runs the required pre-flight writer absorbed from morning-dca-0945" },
+      { "et": "09:45", "task_id": "bb4f6ef1", "stream": "watchlist", "role": "morning watchlist early-warning scan (read-only); also runs the required pre-flight writer absorbed from morning-dca-0945", "stream_note": "This directory entry (keyed by cron_id, looked up via scripts/model_usage_log.py's _load_task_directory) covers only the watchlist sub-invocation's default. Both of bb4f6ef1's 9:45 AM sub-invocations (preflight mode, then watchlist mode) share this one cron_id, so MorningDCAExecutor.run() passes stream='preflight' explicitly for the preflight call (self.mode, a valid schemas/model_usage_log.schema.json stream value) instead of relying on this lookup, so the preflight execution's model-usage-log row is not misattributed as stream='watchlist' -- codex review discussion_r3657271722." },
       { "et": "10:30", "task_id": "42173154", "stream": "morning", "role": "morning live execution" },
       { "et": "11:30,13:30,14:30", "task_id": "7be82b97", "stream": "intraday", "role": "intraday live execution (three slots)" },
       { "et": "12:30", "task_id": "a6239dae", "stream": "midday", "role": "midday live execution" },
@@ -168,12 +168,16 @@
     "purpose": "Stop a leftover, half-written, or wrong-stream latest_*.json pointer from being mistaken for proof that today's scheduled run happened. A latest pointer is trusted as same-day scheduled evidence ONLY when its trading_day and run_state_path match the current America/New_York date and the expected stream directory.",
     "schema": "schemas/latest_pointer.schema.json",
     "helper": "scripts/same_day_pointer.py",
-    "applies_to_streams": ["morning", "midday", "monitor", "afternoon", "slippage", "watchdog"],
+    "applies_to_streams": ["market_open", "morning", "midday", "intraday", "monitor", "afternoon", "slippage", "watchdog"],
     "pointer_files": {
+      "market_open": "/home/user/workspace/cron_tracking/market_open_dca/latest_market_open_run.json",
       "morning": "/home/user/workspace/cron_tracking/morning_dca/latest_morning_run.json",
       "midday": "/home/user/workspace/cron_tracking/midday_dca/latest_midday_run.json",
+      "intraday": "/home/user/workspace/cron_tracking/intraday_dca/latest_intraday_run.json",
       "afternoon": "/home/user/workspace/cron_tracking/ce16ba6b/latest_scheduled_run.json"
     },
+    "market_open_and_intraday_added_on_et": "2026-07-27",
+    "market_open_and_intraday_added_reason": "2ba19526 (market-open live) and 7be82b97 (intraday live) each write a latest_*_run.json pointer (see their artifacts.latest_pointer), but this policy's applies_to_streams/pointer_files omitted both streams, leaving a consumer driven by this policy with no expected-root entry to validate those pointers against, so a stale or wrong-stream pointer could pass unchallenged -- codex review discussion_r3657271707.",
     "validation_rules": [
       "A latest pointer is valid only when trading_day and run_state_path match the current ET date and the expected stream root.",
       "Stale, malformed, missing, pending, prior-date, future-date, outside-root, and wrong-stream pointers are ignored and must NOT be used as scheduled evidence, fill evidence, top-up proof, slippage evidence, reliability evidence, or confirmation that a stream ran.",
@@ -1300,7 +1304,7 @@
   },
   "canonical_schedule_reconciliation_2026_07_27": {
     "verified_on_et": "2026-07-27",
-    "purpose": "Reconcile this manifest against the user's canonical DCA schedule. The canonical_schedule_et table below is the single source of truth for which tasks are active, at what ET time, and in what state. Any task not listed here is NOT an active schedule entry.",
+    "purpose": "Reconcile this manifest against the user's canonical DCA schedule. The canonical_schedule_et table below is the single source of truth for which RECURRING tasks are active, at what ET time, and in what state. A task is an active schedule entry only if it appears in canonical_schedule_et OR in one_time_additions_after_canonical_verification (for one-time tasks added after the 2026-07-27 verification); a task in neither list is NOT an active schedule entry.",
     "canonical_schedule_et": [
       { "et": "09:35", "task_id": "2ba19526", "role": "Market-open DCA live Robinhood execution", "cadence": "Weekdays", "trading": true, "state": "active" },
       { "et": "09:45", "task_id": "bb4f6ef1", "role": "Morning DCA watchlist early-warning scan", "cadence": "Weekdays", "trading": false, "state": "active" },
@@ -1319,6 +1323,11 @@
       { "et": "17:00", "task_id": "c9fb1fb8", "role": "Month-end DCA volatility risk refresh (EDT)", "cadence": "Days 25-31, final eligible market-day gate", "trading": false, "state": "active" },
       { "et": "17:00", "task_id": "17a3b2a9", "role": "Month-end DCA volatility risk refresh (EST)", "cadence": "Seasonal EST months, final eligible market-day gate", "trading": false, "state": "active" },
       { "et": "one-time future", "task_id": "f7411889", "role": "Evaluate graded DCA live test continuation", "cadence": "One-time", "trading": false, "state": "active" }
+    ],
+    "canonical_schedule_et_row_count": 17,
+    "canonical_schedule_et_immutability_note": "The canonical_schedule_et table above is the user's verified schedule, held at exactly 17 rows and byte-identical since the 2026-07-27 verification; zero rows are added, removed, or edited by later changes. It already contains one pre-existing one-time entry (f7411889) from before this verification, which stays in place. Starting with this change, NEW one-time, non-recurring tasks are no longer appended to canonical_schedule_et; they are recorded in one_time_additions_after_canonical_verification below instead, so the verified 17-row table stays intact, diffable, and byte-identical going forward. Both canonical_schedule_et and one_time_additions_after_canonical_verification are active-schedule sources; see canonical_schedule_reconciliation_2026_07_27.purpose.",
+    "one_time_additions_after_canonical_verification": [
+      { "task_id": "onetime-1630-credit-usage-proxy-2026-07-27", "fires_at_et": "2026-07-27 4:30 PM ET", "role": "One-time 4:30 PM DCA credit-usage proxy report with recovery runs", "cadence": "One-time", "trading": false, "state": "active", "cron_utc": "30 20 27 7 *", "scheduler_registered": true, "executor": "scripts/generate_credit_usage_proxy_report.py", "contract": "credit_usage_proxy_report_2026_07_27" }
     ],
     "added_on_2026_07_27": {
       "task_ids": ["2ba19526", "bb4f6ef1", "7be82b97"],
@@ -1346,6 +1355,258 @@
     "retired_rule": "A retired task has status='disabled', in_live_scheduler=false, and no cron_utc, so it cannot be re-registered from its manifest entry. Its historical record and any artifact contract other tasks still depend on are preserved.",
     "preserved_note": "Schedule reconciliation only. Preserves the canonical first-buy and same-day top-up rule, the 2026-07-24 2:30 PM ET intraday recovery fills, the $2.00 base amount, the 0x-to-5x ladder, the active universe and BYDDY/VCX/TRLV/RVI exclusions, the Finance-primary market-data provider policy with yfinance fallback and GFUZ Robinhood-primary handling, Robinhood-only execution on account 562057042, the scheduled run artifact contract, cost-conscious model routing, and the account-number obfuscation policy. No orders are placed by this change.",
     "doc": "docs/schedule_manifest.md"
+  },
+  "credit_usage_proxy_report_2026_07_27": {
+    "added_on_et": "2026-07-27",
+    "task_id": "onetime-1630-credit-usage-proxy-2026-07-27",
+    "fires_at_et": "2026-07-27 4:30 PM ET",
+    "timezone": "America/New_York",
+    "one_time": true,
+    "trading": false,
+    "purpose": "Summarize 2026-07-27 DCA automation usage using measurable proxy metrics. Exact Perplexity credit totals are not exposed to this repo or to the tasks, so the report reports PROXIES and usage BANDS and must never state or imply an exact credit number, dollar cost, or billing figure.",
+    "safety": {
+      "no_trading": true,
+      "no_order_review": true,
+      "no_order_submission": true,
+      "no_cancellations": true,
+      "no_sells": true,
+      "no_broker_or_account_modification": true,
+      "read_only": true,
+      "writes_run_state": false,
+      "valid_scheduled_evidence": false,
+      "evidence_note": "This task produces a report artifact only. It is never scheduled evidence for any trading task, never top-up context, and never manual context. It must not create, update, or invalidate latest_scheduled_run.json or any same-day pointer."
+    },
+    "must_cover_active_daily_chain": [
+      "2ba19526",
+      "bb4f6ef1",
+      "42173154",
+      "7be82b97",
+      "a6239dae",
+      "10ce362c",
+      "67aa802b",
+      "a46bf007"
+    ],
+    "active_daily_chain_note": "All eight ids above must appear in the scheduled-runs section even when a task did not fire, was a no-op, or failed to start. A task with no run for the day is reported explicitly as did_not_run with the reason, never omitted. 7be82b97 must be broken out per ET slot (11:30, 13:30, 14:30), not collapsed into one line. bb4f6ef1 must be broken out into its two 9:45 AM sub-invocations (preflight mode and watchlist mode, per also_runs_required_preflight_writer), each with its own run_id, artifacts_written, and model_usage_rows -- listing only one would either omit an execution or merge two distinct run IDs into one row, corrupting the run and artifact counts -- codex review discussion_r3657271716. e3e6f09e is paused and is reported as paused rather than missing. When a slot was ATTEMPTED and failed before writing any artifact, its scheduled_runs row is a cross-reference only (see failed_start_scheduled_slot_rule): the id still appears here so every one of the eight ids is covered, but it carries no independent classification or counts of its own, and the full failed_start_no_evidence record lives exclusively in recovery_and_escalation_runs.",
+    "required_sections": [
+      {
+        "order": 1,
+        "section": "scheduled_runs",
+        "content": "One row per scheduled run of the active daily chain, per ET slot."
+      },
+      {
+        "order": 2,
+        "section": "recovery_and_escalation_runs",
+        "content": "Every recovery and non-scheduled artifact from the current trading day, enumerated in recovery_artifact_types. Counting only normal scheduled runs is a contract violation.",
+        "separate_section_required": true,
+        "must_not_be_folded_into": "scheduled_runs"
+      },
+      {
+        "order": 3,
+        "section": "usage_counts",
+        "content": "The aggregate counters listed in required_counts."
+      },
+      {
+        "order": 4,
+        "section": "proxy_bands",
+        "content": "Low / moderate / high band per proxy dimension, with the observed value that drove the band."
+      },
+      {
+        "order": 5,
+        "section": "biggest_usage_drivers",
+        "content": "Ranked list of what consumed the most work today, with the proxy evidence for each."
+      },
+      {
+        "order": 6,
+        "section": "caveats",
+        "content": "Explicitly restate that credits are not exposed and that all figures are proxies, plus any metric that could not be measured."
+      },
+      {
+        "order": 7,
+        "section": "actionable_issues",
+        "content": "Every condition in output_mode.actionable_issue_definition observed today, or an empty list. An empty list is what the Markdown renderer turns into output_mode.narrative_rule's single 'no actionable issues were found' line -- without an explicit derived section, a deliberately clean report and a generator that simply skipped actionable-issue analysis were indistinguishable to a reader -- codex review discussion_r3658688924."
+      }
+    ],
+    "recovery_section_rule": "Recovery, retry, escalation, and repair runs are reported in their OWN section and are excluded from the scheduled_runs counts, EXCEPT the in-place scheduled recovery case covered by scheduled_recovery_rule below. Aggregate totals must state scheduled and recovery counts separately and must not silently sum them. A recovery run never upgrades its own classification beyond what its own source artifact actually records: see manual_recovery_classification_rule for which classification a manual recovery artifact keeps.",
+    "scheduled_recovery_rule": "failure_recovery_policy defines an in-place scheduled recovery: it reuses the SAME logical scheduled run directory, stamps recovery_rerun=true, and keeps run_origin='scheduled' (never reclassified as manual). When this succeeds, the resulting artifact IS the scheduled slot's own valid_scheduled_evidence, not a separate recovery run, so it is reported ONCE, as the substantive row in scheduled_runs (classification=valid_scheduled_evidence), and counts toward run_count_scheduled, not run_count_recovery. It is ALSO cross-referenced in recovery_and_escalation_runs, noting recovery_rerun=true and the trigger reason, satisfying the requirement that every same-day recovery appear there; that cross-reference counts toward recovery_and_escalation_count (which tracks recovery/escalation EVENTS broadly) but not toward run_count_recovery or run_count_scheduled again. run_count_recovery is reserved for a recovery that is its own separate run/artifact, distinct from the slot's own retry: e.g. a parent recovery submission, a subagent escalation, or a manual override recorded under its own manual_recovery/manual_runs path.",
+    "manual_recovery_classification_rule": "A manual recovery's classification is read from its OWN source artifact, not assumed from being a recovery. missed_morning_run_recovery_policy and midday_dca_manual_recovery_2026_07_20 both stamp same_day_top_up_context_only=true and valid_scheduled_evidence=false on their manual recovery artifacts: those runs are classified top_up_context_only, matching the source, not manual_context_only. manual_context_only is reserved for a manual run whose source artifact is NOT marked same_day_top_up_context_only=true (e.g. a manual dry run or diagnostic that participates in no same-day guard). Relabeling a same_day_top_up_context_only=true artifact as manual_context_only would contradict the source and lose the distinction top_up_context_only exists to preserve.",
+    "per_run_required_fields": [
+      "run_id",
+      "stream",
+      "triggering_issue",
+      "artifacts_written",
+      "order_attempts",
+      "connector_calls",
+      "model_usage_rows",
+      "classification"
+    ],
+    "per_run_field_rules": {
+      "run_id": "Exact run id as written in the artifact. If a run failed before writing any artifact, record 'no_run_id_written' plus the expected id it would have used.",
+      "stream": "One of market_open, watchlist, preflight, morning, intraday, midday, afternoon, slippage, watchdog, or recovery. slippage (not post_trade) matches the value the 67aa802b post-trade task's own model-usage directory entry and same_day_pointer_validation_policy already persist -- codex review discussion_r3657657882. preflight matches bb4f6ef1's separately-logged preflight sub-invocation (see model_usage_log.applies_to_daily_tasks_et stream_note).",
+      "triggering_issue": "For scheduled runs this is 'scheduled'. For everything in the recovery section this is the concrete failure or gap that caused the run, not a generic label.",
+      "order_attempts": "Count of order placement ATTEMPTS recorded in the artifact, with fills if recorded. Read from persisted artifacts only. This report never calls a broker and never reviews orders.",
+      "connector_calls": "Count of connector or provider pulls only where they were actually logged. notification_count is sourced the same way, from usage_proxy.notifications_sent.  Where not logged, write 'not_logged' rather than estimating. The persisted source is the run's own usage_proxy.finance_calls_attempted plus usage_proxy.robinhood_calls_attempted (near_close_dca.build_usage_proxy); connector_pull_count_where_logged sums these over exactly the runs that recorded them, which is what 'where_logged' scopes it to -- a run lacking that telemetry is out of scope, not an unknown that voids the total. Only when NO covered run persisted a connector count is the counter 'not_logged' and the connector_load band 'not_available'; a fabricated 0/low is never emitted -- codex review discussion_r3659298016.",
+      "model_usage_rows": "Count of appended rows for this run in model_usage/YYYYMM/model_usage.jsonl, but ONLY when at least one row for this exact run_id is found: in that case write the exact matching count (normally 1). If NO row matches this run_id -- whether because the model_usage/YYYYMM/model_usage.jsonl file itself is absent, OR the file exists (other runs logged successfully) but has no row for this specific run -- do NOT write 0: write 'not_available' with a one-line reason, per unavailable_data_rule. scripts/model_usage_log.py's log_model_usage() is deliberately best-effort and silently swallows its own append failures (unknown task, bad entry, disk error) so a run's own logging bug can never break that run; a missing row for one run therefore never proves zero usage, and treating it as 0 could hide a premium-routed run and understate model_load -- codex review discussion_r3658096711.",
+      "classification": "Exactly one of valid_scheduled_evidence, top_up_context_only, manual_context_only, failed_start_no_evidence, or did_not_run."
+    },
+    "classification_values": [
+      "valid_scheduled_evidence",
+      "top_up_context_only",
+      "manual_context_only",
+      "failed_start_no_evidence",
+      "did_not_run"
+    ],
+    "failed_start_no_evidence_rule": "A scheduled run that was ATTEMPTED and failed before writing any artifact (run_id='no_run_id_written') is classified failed_start_no_evidence. It is never classified valid_scheduled_evidence (no artifact exists to serve as evidence) and never top_up_context_only or manual_context_only (it is neither a top-up input nor a manual run). Its one full per-run record (with all per_run_required_fields populated) lives in the recovery_and_escalation_runs section, and it alone counts toward recovery_and_escalation_count and error_count.",
+    "failed_start_scheduled_slot_rule": "This case must appear in BOTH sections, but only ONCE as a substantive record. must_cover_active_daily_chain requires the id to appear in scheduled_runs; failed_start_no_evidence_rule requires its only real record to live in recovery_and_escalation_runs. Resolve this by making the scheduled_runs row a CROSS-REFERENCE only: classification='failed_start_no_evidence', run_id='no_run_id_written', triggering_issue='see recovery_and_escalation_runs', and every other per_run_required_field (stream is the one exception -- always populated, since it identifies which slot the cross-reference is for) set to the literal string 'cross_reference_only' rather than a real measurement -- codex review discussion_r3658096697. This cross-reference row is not counted again: it does not add to run_count_scheduled, recovery_and_escalation_count, or error_count, since those are already incremented once by the row's real record in the recovery section. did_not_run does not apply here because it means no attempt occurred at all, which is not the case for an attempted-and-failed start.",
+    "did_not_run_rule": "A scheduled slot that never fired at all (no attempt was made: the scheduler never triggered it, it was gated out, or it is simply absent from the day's artifacts, as distinct from an attempted-and-failed start) is classified did_not_run, with run_id='not_applicable_did_not_run' plus the concrete reason in triggering_issue. It is recorded in the scheduled_runs section (per active_daily_chain_note, every one of the eight active ids must appear even with no run) and does NOT count toward recovery_and_escalation_count or error_count, since no attempt occurred to recover from or error on.",
+    "did_not_run_vs_failed_start_evidence_rule": "An empty run directory alone cannot distinguish 'never triggered' from 'triggered and crashed before writing anything' (Codex review: 'Persist evidence that distinguishes failed starts from missed slots' -- Slack alerts and heartbeat pings are external, fire-and-forget calls with no local trace). dca_alerts.guarded_run now closes this for the streams it wraps: on an escaping exception it calls dca_alerts.write_failed_start_marker(stream, exc), persisting a durable local record under attempt_log/YYYYMMDD/<stream>.json (see data_sources). The report reads that marker FIRST: if a same-day marker exists for a slot with no run directory, classify failed_start_no_evidence (using the marker's error_class/error_message as triggering_issue) per failed_start_scheduled_slot_rule; only when neither a run directory nor a marker exists is the slot did_not_run. Failure phase: not every escaping exception is a failed START -- a scheduled run can persist a valid run_state.json and only then raise (the supported generate_full_reports=true path fails after run_daily_compact() has written the run), so each marker records failure_phase='before_run_artifact' (the genuine failed start) or 'after_run_artifact' (an ordinary late error on a run that completed its artifact). Only the former is classified failed_start_no_evidence; a late-phase marker becomes that run's own recorded_error, so it still counts toward error_count without fabricating an earlier failed start plus a successful retry, which would inflate the recovery/error counters and force error_load high for a run that did its work -- codex review discussion_r3659298031. A marker with no failure_phase field at all (written before the field existed) is read as a failed start, preserving prior behavior. Coverage note: guarded_run wraps the in-repo Python entrypoints for 42173154 (morning), a6239dae (midday, inherits MorningDCAExecutor.run()), and 10ce362c (afternoon, via run_dca.py). 2ba19526, bb4f6ef1 (both sub-invocations), and 7be82b97 have no_python_entry_point=true -- the external scheduler/agent invokes them directly, so no in-repo code exists to write a marker for them -- and 67aa802b/a46bf007 are read-only consumers of other tasks' artifacts. For those five, an attempted-and-crashed invocation genuinely remains indistinguishable from a missed slot from this repo's own artifacts; the report states this limitation explicitly in caveats for any of those five classified did_not_run, rather than silently assuming a clean miss.",
+    "required_counts": [
+      "run_count_scheduled",
+      "run_count_recovery",
+      "no_op_count",
+      "placed_order_count",
+      "recovery_and_escalation_count",
+      "notification_count",
+      "notion_updates",
+      "drive_updates",
+      "model_usage_jsonl_row_count",
+      "artifact_count",
+      "artifact_bytes_approx",
+      "connector_pull_count_where_logged",
+      "error_count",
+      "retry_count",
+      "recovery_run_count_by_stream",
+      "recovery_count_by_artifact_type",
+      "connector_retry_count_where_logged",
+      "connector_error_count_where_logged"
+    ],
+    "counts_rule": "Every counter is derived from persisted same-day artifacts and logs. A counter that cannot be measured is reported as 'not_logged' or 'not_available' with a one-line reason. Counters are never estimated, inferred, or backfilled from expectation. artifact_bytes_approx is explicitly approximate and is rounded, for example to the nearest KB.",
+    "recovery_counter_membership_rule": "recovery_and_escalation_count is the total number of ROWS in recovery_and_escalation_runs: one row per distinct artifact found across every type in recovery_artifact_types (recovery_artifact_types_rule already requires a type with nothing found to contribute 0, never be omitted). run_count_recovery is the subset of those rows that represent an actual additional EXECUTION with its own run_id: every recovery_artifact_types value counts toward it EXCEPT failed_scheduled_start (by definition zero successful execution -- see failed_start_no_evidence_rule) and subagent_escalation (a delegation/escalation event, not the executor's own additional run). Deduplication: a single underlying artifact is one row under whichever recovery_artifact_types label is most specific to it (e.g. a recovery rerun that is also a retry is filed once, as scheduled_recovery_attempt or same_day_recovery_run, not listed again under retry) -- it is never counted twice into either counter for matching more than one type description. recovery_run_count_by_stream (see recovery_counts_by_stream_rule) must sum to recovery_and_escalation_count, not run_count_recovery, since it breaks down every row including failed_scheduled_start/subagent_escalation rows -- codex review discussion_r3658096704.",
+    "proxy_bands": {
+      "values": [
+        "low",
+        "moderate",
+        "high",
+        "not_available"
+      ],
+      "unavailable_band_rule": "If the counter(s) a dimension's band is derived from are reported not_logged or not_available (source absent) for one or more covered runs, that dimension's band is reported not_available with the same reason, never guessed, defaulted to low, or omitted. This applies in particular to model_load when model_usage/YYYYMM/model_usage.jsonl itself is absent (see model_usage_rows rule) and to connector_load or error_load when a run's counter is not_logged.",
+      "exact_credits_forbidden": true,
+      "exact_credits_rule": "Exact Perplexity credit totals are not exposed. The report states a band plus the measurable proxy value behind it. It must not print an exact credit count, an estimated credit count, a dollar cost, or any billing figure, and must not imply one by arithmetic.",
+      "dimensions": [
+        {
+          "dimension": "run_volume",
+          "proxy": "run_count_scheduled plus run_count_recovery (the combined total, regardless of composition)",
+          "low": "total at or below 11 runs (the 11-execution scheduled baseline: eight active ids, with bb4f6ef1 firing twice -- preflight and watchlist -- and 7be82b97 firing 3 slots, and e3e6f09e paused/contributing none; any mix of scheduled and recovery runs at or below 11 total is low). Previously stated as 10 before bb4f6ef1's preflight execution was required to appear as its own row -- codex review discussion_r3658332746.",
+          "moderate": "total 12 to 17 runs",
+          "high": "total 18 or more runs"
+        },
+        {
+          "dimension": "recovery_load",
+          "proxy": "recovery_and_escalation_count",
+          "low": "0",
+          "moderate": "1 to 2",
+          "high": "3 or more"
+        },
+        {
+          "dimension": "connector_load",
+          "proxy": "connector_pull_count_where_logged",
+          "low": "at or below 50 (routine per-run pulls across the 10-run baseline)",
+          "moderate": "51 to 90 (roughly one additional full-universe refetch beyond routine)",
+          "high": "91 or more",
+          "note": "Bands are derived solely from the connector_pull_count_where_logged count. This report's per-run fields do not capture call scope or provider identity, so a qualitative cause (a full-universe refetch, a provider failover) is not itself a band determinant; if known, name it in biggest_usage_drivers or caveats as narrative context alongside the count-derived band."
+        },
+        {
+          "dimension": "model_load",
+          "proxy": "count of premium-routed rows in model_usage_jsonl (model_routing_mode='premium')",
+          "low": "0 premium rows (cost_conscious/default routing only)",
+          "moderate": "exactly 1 premium row (with a recorded reason_for_premium_model)",
+          "high": "2 or more premium rows",
+          "note": "'Sustained escalation' was removed as a high-band trigger: it named no count, duration, or persisted field, so it could select high with fewer than 2 premium rows and left one-premium-row-plus-escalation ambiguous between moderate and high. The band is now a pure count of premium rows, reproducible from model_usage_jsonl_row_count's premium subset alone."
+        },
+        {
+          "dimension": "artifact_load",
+          "proxy": "artifact_count and artifact_bytes_approx",
+          "precedence_rule": "Evaluate in this fixed order and stop at the first match: high, then moderate, then low. The three predicates are mutually exclusive by construction; a measurement never matches more than one.",
+          "high": "artifact_count strictly above 80, OR artifact_bytes_approx strictly above 5 MB, OR retry_count 2 or more. Checked first: this predicate overrides low/moderate even if the count/bytes alone would otherwise read as low.",
+          "moderate": "not high, AND (artifact_count is 51 to 80 inclusive, OR artifact_bytes_approx is strictly above 2 MB and at most 5 MB)",
+          "low": "not high and not moderate: artifact_count at or below 50 (5 files per scheduled run x the 10-run baseline: run_state.json, run_summary.json, signals.csv, submitted_orders.csv, plus one of filled_orders.csv/drift_report) AND artifact_bytes_approx at or below 2 MB",
+          "note": "The prior high predicate ('any single artifact path rewritten 2 or more times') is not observable from a persisted same-day artifact: this contract defines no write-history log or rewrite counter, and a report reading only final file contents/mtimes cannot tell a once-written file from a twice-rewritten one with identical final content. retry_count is the one already-required, already-persisted counter that reflects repeated rewrites in practice (a retry reuses and rewrites the same run directory's artifacts per the scheduled_run_artifact_contract's recovery_rerun convention), so it replaces the unobservable predicate rather than removing repeated-rewrite coverage entirely."
+        },
+        {
+          "dimension": "error_load",
+          "proxy": "error_count plus retry_count",
+          "precedence_rule": "Evaluate in this fixed order and stop at the first match: high, then moderate, then low, mirroring artifact_load's precedence_rule so the predicates are mutually exclusive.",
+          "high": "error_count plus retry_count is 4 or more, OR any failed scheduled start (any failed_start_no_evidence record) occurred today. Checked first: a single failed scheduled start is high even when the count alone would read as moderate (e.g. count=1).",
+          "moderate": "not high: error_count plus retry_count is 1 to 3",
+          "low": "not high and not moderate: 0"
+        }
+      ],
+      "band_derivation_rule": "Each reported band names the dimension, the observed proxy value, and the threshold it crossed, so the band is reproducible from the artifacts rather than asserted."
+    },
+    "data_sources": [
+      "cron_tracking artifact roots for the 2026-07-27 trading day: run_state.json, run_summary.json, signals.csv, submitted_orders.csv",
+      "raw connector response captures under each run's raw/ directory",
+      "notification records emitted today (Slack drift alerts, watchdog alerts, Notion latest-run sync)",
+      "model_usage/202607/model_usage.jsonl",
+      "attempt_log/20260727/<stream>.attempts.jsonl -- append-only history of EVERY failed start dca_alerts.guarded_run recorded for that stream today, one JSON object per line; read in preference to the single marker below, since <stream>.json is one fixed path each same-day failure overwrites and reading only it undercounted repeated failures -- codex review discussion_r3659140585",
+      "attempt_log/20260727/<stream>.json -- the LATEST durable local failed-start marker written by dca_alerts.guarded_run (see did_not_run_vs_failed_start_evidence_rule); still written for existing readers and used as the fallback when no .attempts.jsonl history exists; read before concluding a task with no run directory did_not_run",
+      "latest_scheduled_run.json and same-day pointers, read only",
+      "recovery, manual rerun, missed-run recovery, and repair artifact roots for 2026-07-27"
+    ],
+    "unavailable_data_rule": "If a source is absent for 2026-07-27, the report says so explicitly in the caveats section and reports the affected metric as not_available. It never substitutes a prior day, never reuses the 2026-07-24 intraday recovery as if it were today, and never fabricates a run.",
+    "account_number_obfuscation_rule": "A repository-wide search found no prior implemented account-number masking transformation. This report defines its own concrete rule rather than deferring to an unwritten one: if an account number appears in any source artifact this report reads, the report shows only the last 4 digits and replaces every preceding digit with '*' (example, using a SYNTHETIC placeholder rather than any real account number: 123456789 becomes *****6789). This applies to every account number the report would otherwise surface in biggest_usage_drivers or caveats narrative text; the report never prints a full, unmasked account number, and this contract itself never restates a real account number for illustration.",
+    "preserved_note": "Reporting only. Preserves the canonical first-buy and same-day top-up rule, the active universe and exclusions, the provider policy, the scheduled-run artifact contract, cost-conscious mode, and Robinhood-only execution. Account numbers appearing in any artifact are obfuscated per account_number_obfuscation_rule above.",
+    "doc": "docs/credit_usage_proxy_report.md",
+    "recovery_artifact_types": [
+      "same_day_recovery_run",
+      "manual_recovery_artifact",
+      "manual_rerun",
+      "scheduled_recovery_attempt",
+      "order_placement_recovery_artifact",
+      "missed_run_recovery_artifact",
+      "parent_recovery_run",
+      "subagent_escalation",
+      "failed_scheduled_start",
+      "retry",
+      "repair_artifact"
+    ],
+    "recovery_artifact_types_rule": "Each type above is searched for explicitly on the current trading day. A type with nothing found is reported as zero, not omitted, so a silent miss is distinguishable from a real zero. order_placement_recovery_artifact covers any re-submission, repair, or reconciliation artifact touching submitted_orders.csv, and is read only: this report never reviews or submits an order.",
+    "recovery_context_only_label_rule": "Every recovery, manual recovery, manual rerun, and missed-run recovery artifact is labeled 'recovery context only' in the report. The label is mandatory and appears on the artifact row itself, not only in section prose. Such an artifact is never presented as valid scheduled evidence for any trading task, and no completeness of its artifact set can promote it.",
+    "recovery_counts_by_stream_rule": "The recovery section reports recovery run counts BROKEN DOWN BY STREAM, keyed by the SAME canonical stream names per_run_field_rules.stream declares: market_open, preflight, watchlist, morning, intraday, midday, afternoon, slippage, watchdog, recovery. This rule previously said 'post_trade' where every other part of the contract -- and the report itself -- says 'slippage', so the promised key never appeared in a generated report and a consumer following this rule could not tell an omitted stream from a confirmed zero, while a consumer following per_run_field_rules.stream expected a different name entirely -- codex review discussion_r3660192634. preflight and recovery are listed too, since the report emits a key for each: preflight is bb4f6ef1's separately-logged sub-invocation, and recovery is the fallback bucket for a manual artifact whose scanned root maps to no chain stream. A stream with no recovery activity is reported as 0. The per-stream counts must sum to recovery_and_escalation_count.",
+    "output_mode": {
+      "mode": "compact_cost_conscious",
+      "reads_local_artifacts_only": true,
+      "no_network_calls": true,
+      "no_broker_calls": true,
+      "rule": "The report reads local artifacts already on disk and the model usage log. It performs no network fetch, no connector pull, and no broker call of its own, so producing the report adds negligible usage on top of the day it is measuring.",
+      "suppress_narrative_unless_actionable": true,
+      "narrative_rule": "Default output is compact: tables and counts. Long narrative prose is SUPPRESSED unless there is an actionable issue. When nothing is actionable the report emits the tables plus a single line stating no actionable issues were found.",
+      "actionable_issue_definition": [
+        "any failed scheduled start",
+        "any recovery, manual rerun, or repair artifact present today",
+        "any connector error or retry",
+        "any error_count or retry_count above zero",
+        "any required artifact missing for a task that was expected to run",
+        "any proxy band evaluating to high"
+      ],
+      "narrative_scope_when_actionable": "Narrative is written only for the specific actionable issues found, not for the whole day."
+    },
+    "separate_from_friday_heavy_reporting": {
+      "friday_task_id": "041d9d90",
+      "friday_slot_et": "17:00 Fridays",
+      "note": "This one-time 4:30 PM ET report is SEPARATE from the Friday 5:00 PM ET weekly heavy reporting task 041d9d90. It does not replace it, does not satisfy it, does not consume its budget, and does not write to its artifacts or its Notion dashboard. 2026-07-27 is a Monday, so 041d9d90 does not run today and there is no overlap."
+    },
+    "must_not_reintroduce": {
+      "task_ids": [
+        "b7961407",
+        "cd45e95b",
+        "d72aa525",
+        "d1f7a2c0",
+        "morning-dca-0945"
+      ],
+      "note": "These are retired and must not be reintroduced as active by this task or its report. In particular the 9:00 AM pre-market buying-power dashboard b7961407 stays removed: the report neither expects a 9:00 AM run nor flags its absence as a missing run."
+    },
+    "universe_and_source_policy_unchanged": "This task adds no ticker, removes no ticker, and changes no provider ordering. The active universe, the exclusions, and market_data_source_policy are read-only inputs to the report and are left intact.",
+    "no_secrets_rule": "The report never emits a secret. No raw Robinhood account number, no API key, no token, no webhook URL, and no credential may appear in the report or in any artifact it writes, even if present in a source artifact it reads. Account numbers follow account_number_obfuscation_rule; every other secret class is omitted entirely rather than masked. Environment variable NAMES may be referenced, never their values."
   },
   "tasks": [
     {
@@ -2202,6 +2463,30 @@
       "command": "python scripts/drift_detection.py --run-dir <run_dir> --json-out <run_dir>/drift_report.json --md-out <run_dir>/drift_report.md --slack --fail-on-drift",
       "slack_webhook_env": "DCA_DRIFT_SLACK_WEBHOOK",
       "notes": "NOT AN ACTIVE SCHEDULE ENTRY. The detector is still required in-process (see detector_still_required). Read-only, no trading. Not an independent cron: each live trading task (market open 9:35, morning 10:30, intraday 11:30/1:30/2:30, midday 12:30, final 3:30) calls this detector immediately after it writes artifacts, per drift_detection_policy. Reconciles signals.csv (auto-buy intent) against submitted_orders.csv (order records) and, when an auto-buy signal with a positive amount has no submitted order, writes a JSON+markdown diagnostic and (with --slack) fires an immediate Slack alert. Covers the Jul 16 2026 failure mode (8 auto-buy signals, empty submitted_orders.csv, missing raw/). No secrets: the Slack webhook is read from DCA_DRIFT_SLACK_WEBHOOK, never hardcoded."
+    },
+    {
+      "id": "onetime-1630-credit-usage-proxy-2026-07-27",
+      "name": "One-time 4:30 PM DCA credit-usage proxy report with recovery runs",
+      "type": "analytics",
+      "status": "active",
+      "fires_at_et": "2026-07-27 4:30 PM ET",
+      "timezone": "America/New_York",
+      "cadence": "one_time",
+      "one_time": true,
+      "trades": false,
+      "cron_utc": "30 20 27 7 *",
+      "cron_utc_note": "4:30 PM America/New_York on 2026-07-27 is EDT (UTC-4): 16:30 + 4h = 20:30 UTC. Day-of-month/month are pinned to 27/7 (like the month-end tasks' day-range fields) since this fires once, not every weekday.",
+      "cron_recurrence_caveat": "A 5-field cron expression has no year field, so 30 20 27 7 * recurs every July 27, not only in 2026, unless the external scheduler independently removes or disables this entry after it fires once -- codex review discussion_r3658332755. TWO script-side guards close the re-fire hole. (1) generate_report() content-gates itself to trading_day='2026-07-27' (SUPPORTED_TRADING_DAY) and raises for any other value. (2) Because the command below HARDCODES --trading-day 2026-07-27, guard (1) alone could never fire on a 2027 re-run -- the hardcoded argument satisfies it, and the run would re-read the 2026 artifact tree and overwrite the 2026 outputs -- so _main() additionally compares the ACTUAL America/New_York execution date and refuses (exit code 2, nothing written) when its calendar year differs from the trading day's; the year, not the exact date, so a legitimate same-year manual re-run still works -- codex review discussion_r3659140568. A deliberate later replay must pass --allow-execution-date-mismatch explicitly; the scheduler entry never does. The external scheduler side of this gap still requires either a scheduler-native one-shot trigger or a manual retirement step after 2026-07-27, since a cron field alone cannot express a single year -- but an unretired entry now fails closed instead of republishing over the real report.",
+      "command": "python -m scripts.generate_credit_usage_proxy_report --trading-day 2026-07-27 --cron-tracking-root \"${DCA_CRON_TRACKING_ROOT:-/home/user/workspace/cron_tracking}\" --json-out \"${DCA_CRON_TRACKING_ROOT:-/home/user/workspace/cron_tracking}/credit_usage_proxy_report/20260727/credit_usage_proxy_report_20260727.json\" --md-out \"${DCA_CRON_TRACKING_ROOT:-/home/user/workspace/cron_tracking}/credit_usage_proxy_report/20260727/credit_usage_proxy_report_20260727.md\"",
+      "command_note": "Invoked as a module (python -m scripts.generate_credit_usage_proxy_report), not as a bare script path: direct execution (python scripts/generate_credit_usage_proxy_report.py) puts scripts/ rather than the repo root on sys.path, so the script's `from scripts.*` absolute imports raise ModuleNotFoundError before argument parsing -- codex review discussion_r3658332750. Output paths are concrete, real paths under cron_tracking, not bracketed placeholders: a prior <artifacts_root> placeholder would have been parsed by the shell as input/output redirection and failed before Python even started -- codex review discussion_r3658263837. Run from the repository root (the external scheduler's working directory for every other command in this manifest). ARTIFACT ROOT IS CONFIGURABLE: the three paths expand ${DCA_CRON_TRACKING_ROOT:-/home/user/workspace/cron_tracking} rather than hardcoding the production tree, so a deployment with a different home or artifact root sets DCA_CRON_TRACKING_ROOT and both the tree the report READS and the outputs it WRITES move together. Previously the literals were baked in, so such a deployment read the wrong tree and reported every run missing, or failed to write its outputs, while bypassing the configurable roots the Python entry point already supported -- codex review discussion_r3660021363. The bundled production path stays as the :- default, so a deployment that sets nothing behaves exactly as before. The expansion is POSIX shell parameter substitution inside double quotes, not a bracketed placeholder: the earlier <artifacts_root> form was parsed by the shell as redirection and failed before Python started (see the note above). scripts/generate_credit_usage_proxy_report.py independently defaults --cron-tracking-root to $DCA_CRON_TRACKING_ROOT (see _default_cron_tracking_root), so a bare invocation honours the same override even if the scheduler drops the flags.",
+      "executor": "scripts/generate_credit_usage_proxy_report.py",
+      "scheduler_registered": true,
+      "scheduler_registration_note": "Registered per the same convention every other active task in this manifest uses (cron_utc + an executable command); like every task's cron_utc, actually invoking it at the scheduled time is the external scheduler's responsibility, not something this repo runs on its own. Previously this entry had no cron_utc and no executable command at all -- codex review discussion_r3657271687 -- both gaps are now closed: cron_utc above, and scripts/generate_credit_usage_proxy_report.py is a real, tested script that reads persisted same-day artifacts and produces the six required_sections. If the external scheduler is not wired to run this command by 2026-07-27 4:30 PM ET, this task must still be reported as did_not_run rather than assumed to have fired. See cron_recurrence_caveat and command_note for follow-on gaps in the registration itself.",
+      "id_is_repo_internal": true,
+      "id_note": "No 8-hex scheduler id was supplied for this task, so this is a descriptive repo-internal id in the same spirit as the retired morning-dca-0945 alias. If the scheduler later issues a real id, rename this entry and the contract block together.",
+      "report_contract": "credit_usage_proxy_report_2026_07_27",
+      "notes": "Analytics and reporting only, no trading. Summarizes 2026-07-27 DCA automation usage with measurable PROXY metrics because exact Perplexity credit totals are not exposed, so the report must never claim exact credits. Covers the full active daily chain (2ba19526, bb4f6ef1, 42173154, 7be82b97, a6239dae, 10ce362c, 67aa802b, a46bf007) and reports every same-day recovery, manual recovery, parent recovery, subagent escalation, failed scheduled start, retry, and repair artifact in a SEPARATE recovery section that is never folded into the normal scheduled-run section. Performs no order review, no order submission, no cancellation, no sells, and no broker or account modification. Writes no run_state.json and is never valid scheduled evidence for any trading task.",
+      "doc": "docs/credit_usage_proxy_report.md"
     },
     {
       "id": "f7411889",

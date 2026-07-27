@@ -189,7 +189,6 @@ def _et_seconds(value: object) -> Optional[int]:
 
 _CANONICAL_WINDOW_START_MIN = _et_minutes(SCHEDULED_WINDOW_START_ET)  # 15:25
 _LEGACY_WINDOW_START_MIN = _et_minutes(LEGACY_SCHEDULED_WINDOW_START_ET)  # 15:15
-_WINDOW_START_MIN = _et_minutes(ORDER_ATTRIBUTION_WINDOW_START_ET)  # 15:15 (legacy-wide default)
 _WINDOW_END_MIN = _et_minutes(SCHEDULED_WINDOW_END_ET)      # 15:35
 
 

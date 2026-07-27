@@ -686,6 +686,20 @@ active. Machine-readable source:
 2:30 PM). Each run records the slot that actually fired in its own
 `scheduled_for_et`.
 
+### One-time tasks added after the 2026-07-27 canonical verification
+
+The canonical table above is the verified schedule and is held at exactly 17
+rows, byte-identical since verification; it already contains one pre-existing
+one-time entry (`f7411889`) from before this verification, which stays in
+place. Starting with this change, new one-time, non-recurring tasks are
+recorded here instead of being appended to the canonical table, so it stays
+intact and diffable. Both this table and the canonical table above are active
+schedule sources.
+
+| Fires | Task | ID | Trades | Status | Scheduler-registered |
+|---|---|---|---|---|---|
+| 2026-07-27 4:30 PM ET | One-time DCA credit-usage proxy report with recovery runs | `onetime-1630-credit-usage-proxy-2026-07-27` | no | active | **yes**: `cron_utc` `30 20 27 7 *`, executor `scripts/generate_credit_usage_proxy_report.py` |
+
 ### Retired from the active schedule on 2026-07-27
 
 These entries are **not active** and must never appear in an active schedule
@@ -1046,6 +1060,20 @@ while paused. `f7411889` remains a one-time reminder, not a recurring stream.
 ### `bec4a6ee`: Monthly DCA automation cost review
 - Analytics only, **no trading**. First weekday of the month **9:55 AM ET**.
 - Reports **usage proxies only**; exact Perplexity credit consumption is not exposed, so do not claim exact credits.
+
+### `onetime-1630-credit-usage-proxy-2026-07-27`: One-time DCA credit-usage proxy report
+- **Analytics and reporting only, no trading.** Fires once at **2026-07-27 4:30 PM ET** (America/New_York). No order review, no order submission, no cancellations, no sells, no broker or account modification.
+- Summarizes today's DCA automation usage with **measurable proxy metrics and low/moderate/high bands**. Exact Perplexity credit totals are not exposed, so the report must never claim an exact credit count, an estimated credit count, or any dollar/billing figure.
+- Covers the full active daily chain: `2ba19526`, `bb4f6ef1`, `42173154`, `7be82b97` (broken out per 11:30 / 1:30 / 2:30 slot), `a6239dae`, `10ce362c`, `67aa802b`, `a46bf007`. A task that did not fire is reported as `did_not_run`, never omitted.
+- Reports every recovery artifact from the current trading day in a **separate recovery section** whose counts are never folded into the scheduled-run counts: same-day recoveries, manual recovery artifacts, manual reruns, scheduled recovery attempts, order-placement recovery artifacts, missed-run recovery artifacts, parent recoveries, subagent escalations, failed scheduled starts, retries, and repair artifacts. Counting only normal scheduled runs is a contract violation. Recovery counts are broken down **by stream**, and every recovery or manual artifact is labeled `recovery context only`.
+- **Compact cost-conscious output.** Reads local artifacts only, makes no network, connector, or broker call of its own, and suppresses long narrative unless there is an actionable issue (failed start, any recovery artifact, connector error or retry, missing expected artifact, or a `high` band).
+- **Separate from the Friday 5:00 PM ET weekly heavy reporting task `041d9d90`.** It does not replace, satisfy, or draw budget from it. 2026-07-27 is a Monday, so `041d9d90` does not run today.
+- Emits **no secrets**: no raw account number, API key, token, webhook URL, or credential. Account numbers are masked to the last 4 digits; other secret classes are omitted entirely.
+- Does not reintroduce the retired 9:00 AM pre-market buying-power dashboard `b7961407`, and neither expects a 9:00 AM run nor flags its absence.
+- Per run it records `run_id`, `stream`, `triggering_issue`, `artifacts_written`, `order_attempts`, `connector_calls`, `model_usage_rows`, and a classification of `valid_scheduled_evidence`, `top_up_context_only`, `manual_context_only`, `failed_start_no_evidence` (an attempted scheduled start that failed before writing any artifact), or `did_not_run` (a scheduled slot that never fired at all).
+- Writes no `run_state.json`, is **never** valid scheduled evidence, and never creates, updates, or invalidates `latest_scheduled_run.json` or any same-day pointer. It may read `latest_scheduled_run.json` and same-day pointers as a data source (read only, see `credit_usage_proxy_report.md`'s Data sources), but never writes to them.
+- **Registered with the scheduler:** `cron_utc` `30 20 27 7 *` (20:30 UTC = 4:30 PM EDT on 2026-07-27) and an executable command now run [`scripts/generate_credit_usage_proxy_report.py`](../scripts/generate_credit_usage_proxy_report.py), a real script that reads persisted same-day artifacts and produces the report. As with every task's `cron_utc`, invoking it at the scheduled time is the external scheduler's responsibility.
+- The id is **repo-internal**: no 8-hex scheduler id was supplied for this task. Full contract: [credit_usage_proxy_report.md](credit_usage_proxy_report.md), machine-readable source `credit_usage_proxy_report_2026_07_27`.
 
 ### `f7411889` — One-time reminder
 - Reminder only, **no trading**. Fires **2026-08-15 11:45 AM ET** to evaluate continuing live testing past 2026-08-28. Stale as of the 2026-07-26 extension of `config/trading_window.json` to 2026-10-30 — this scheduler-side task needs to be rescheduled (or re-scoped) to match; it was not touched by that config change. A good target is mid-to-late October, ahead of the 2026-10-30 end date and the 2026-11-01 DST transition the window deliberately stops before.

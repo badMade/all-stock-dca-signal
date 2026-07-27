@@ -114,7 +114,6 @@
     "manual_rerun_run_state_glob": "/home/user/workspace/cron_tracking/midday_dca/manual_reruns/**/run_state.json",
     "manual_rerun_fills_filename": "filled_orders.csv",
     "run_state_filename": "run_state.json",
-    "run_state_filename": "run_state.json",
     "prior_allocation_roots": [
       "/home/user/workspace/cron_tracking/market_open_dca",
       "/home/user/workspace/cron_tracking/morning_dca",

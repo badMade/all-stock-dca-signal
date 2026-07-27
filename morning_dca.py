@@ -59,7 +59,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from dca_alerts import guarded_run
+from dca_alerts import artifact_freshness_probe, attempt_log_root_sibling_to, guarded_run
 from dca_config import get_config_dir, load_approved_dates, load_tickers
 from dca_fileio import atomic_open_w, atomic_write_text
 from near_close_dca import (
@@ -3211,10 +3211,23 @@ class MorningDCAExecutor(DCAExecutor):
 
         def _invoke() -> Dict[str, Any]:
             result = self._run_impl(now, data, broker=broker, data_source=data_source, manual=manual)
+            # bb4f6ef1 shares one cron_id across both its 9:45 AM sub-invocations
+            # (preflight mode, then watchlist mode), so the manifest's
+            # model_usage_log directory (keyed by cron_id) cannot tell them apart
+            # on its own and always resolves to its single stream="watchlist"
+            # entry. Pass the mode itself (MORNING_PREFLIGHT_MODE="preflight" /
+            # MORNING_WATCHLIST_MODE="watchlist" are both valid
+            # schemas/model_usage_log.schema.json stream values) so the
+            # preflight execution is not misattributed as a watchlist run.
+            # MORNING_LIVE_MODE ("live") is not a stream value; live runs keep
+            # falling back to the manifest's per-cron_id lookup (42173154 ->
+            # "morning") -- codex review discussion_r3657271722.
+            mode_stream = self.mode if self.mode in (MORNING_PREFLIGHT_MODE, MORNING_WATCHLIST_MODE) else None
             log_model_usage(
                 root=self.config.model_usage_log_root,
                 run_id=result.get("artifacts", {}).get("run_id"),
                 cron_id=self.profile.get("cron_id"),
+                stream=mode_stream,
                 run_origin="manual" if manual else "scheduled",
                 artifact_path=result.get("paths", {}).get("run_state"),
                 triggered_at_utc=now.astimezone(timezone.utc),
@@ -3223,11 +3236,31 @@ class MorningDCAExecutor(DCAExecutor):
             return result
 
         is_scheduled_live = self.mode == MORNING_LIVE_MODE and self.trades and not manual
+        # Snapshotted BEFORE _invoke() runs, so the probe below can tell this
+        # invocation's own write from a stale run_state.json an earlier
+        # attempt already left in this same run_state_dir (e.g. an
+        # external-scheduler retry) -- codex review discussion_r3660858013,
+        # discussion_r3660858010.
+        run_artifact_written = artifact_freshness_probe(self.run_state_dir(now) / "run_state.json")
         return guarded_run(
             self.stream,
             _invoke,
             enabled=is_scheduled_live,
             context=f"cron_id={self.profile.get('cron_id')}",
+            # Keep the failed-start marker under the same custom base as a
+            # configured model_usage_log_root, so a non-default artifacts
+            # root doesn't split the writer and the report's reader across
+            # two different attempt_log locations -- codex review
+            # discussion_r3658373966.
+            attempt_log_root=attempt_log_root_sibling_to(self.config.model_usage_log_root),
+            # A scheduled morning/midday run that persists run_state.json and
+            # only then fails writing morning_signals.csv/submitted_orders.csv/
+            # a same-day pointer left the marker unconditionally recording
+            # failure_phase='before_run_artifact', fabricating an earlier
+            # failed start plus a successful retry -- codex review
+            # discussion_r3660858010 (the afternoon call already had this
+            # probe; this call never did).
+            run_artifact_written=run_artifact_written,
             # A run whose raw-persistence recorder failed is surfaced as data on
             # the artifacts (raw_persistence_error) rather than raised; it must
             # ping a FAILED heartbeat, not clear the dead-man's switch.
