@@ -18,8 +18,15 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
+# Must precede the conftest/scripts imports below: the documented standalone
+# invocation (python scripts/tests/test_scheduled_artifacts.py) puts THIS
+# directory on sys.path, not the repository root, so importing either before
+# the bootstrap raises ModuleNotFoundError (Codex review, PR #219).
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from conftest import FIXTURE_ACCOUNT_NUMBER  # noqa: E402
 from scripts.scheduled_artifacts import (  # noqa: E402
     AFTERNOON_LIVE_CRON_ID,
     AFTERNOON_LIVE_SUPERSEDES_CRON_ID,
@@ -42,6 +49,7 @@ from scripts.scheduled_artifacts import (  # noqa: E402
     mirror_run_classification,
     nested_only_artifacts,
     placement_unreachable_state_fields,
+    resolve_live_account_number,
     submitted_order_rows,
     validate_run_artifacts,
     write_scheduled_run_artifacts,
@@ -105,7 +113,7 @@ def test_morning_live_classification_is_non_null_object_with_required_fields():
     assert rc["scheduled_window_end_et"] == "10:35"
     assert rc["cron_id"] == MORNING_LIVE_CRON_ID == "42173154"
     assert rc["execution_broker"] == "robinhood"
-    assert rc["account_number"] == "562057042"
+    assert rc["account_number"] == "999000111"
     assert rc["preauthorized_direct_place"] is True
     assert rc["valid_morning_evidence"] is True
     assert rc["trading_day"] == "2026-07-21"
@@ -876,3 +884,80 @@ def test_a_genuinely_missing_file_still_reports_missing(tmp_path):
 
     assert not result
     assert f"missing {SIGNALS_CSV_FILENAME}" in result.errors
+
+
+# --- The live account is resolved per call, not bound at import --------------
+# This module is a standalone scripts/ helper, so an import that happened before
+# the environment was populated used to freeze the unresolved value into every
+# artifact built later in the process -- and that value satisfies neither the
+# schema's ^[0-9]{6,12}$ account pattern nor its fail-closed form, so the
+# blocked/dry-run artifact it was reasoned to be safe for was invalid evidence
+# (Codex review, PR #219).
+
+MORNING_LIVE_KWARGS = {
+    "trading_day": "2026-07-28",
+    "run_id": "morning_live_20260728_1030ET",
+    "valid_scheduled_evidence": True,
+}
+
+
+def _validate_morning_live(monkeypatch, account_value):
+    jsonschema = pytest.importorskip("jsonschema")
+    if account_value is None:
+        monkeypatch.delenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", raising=False)
+    else:
+        monkeypatch.setenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", account_value)
+    rc = build_morning_live_run_classification(**MORNING_LIVE_KWARGS)
+    jsonschema.validate(rc, _morning_run_classification_schema())
+    return rc
+
+
+def test_a_populated_environment_is_read_at_call_time(monkeypatch):
+    """The staleness case: the variable is set AFTER this module was imported."""
+    rc = _validate_morning_live(monkeypatch, FIXTURE_ACCOUNT_NUMBER)
+    assert rc["account_number"] == FIXTURE_ACCOUNT_NUMBER
+    assert "account_pinning_failed" not in rc
+
+
+@pytest.mark.parametrize("account_value", [None, "", "   ", "not-an-account", "12345", "0" * 13])
+def test_an_unusable_account_emits_the_fail_closed_form(monkeypatch, account_value):
+    """No placeholder is ever stamped in: the schema defines a form for this."""
+    rc = _validate_morning_live(monkeypatch, account_value)
+    assert rc["account_pinning_failed"] is True
+    assert "account_number" not in rc
+
+
+def test_an_explicit_account_argument_still_wins(monkeypatch):
+    monkeypatch.setenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", FIXTURE_ACCOUNT_NUMBER)
+    rc = build_morning_live_run_classification(**MORNING_LIVE_KWARGS, account_number="123456789")
+    assert rc["account_number"] == "123456789"
+
+
+def test_resolve_returns_none_rather_than_a_placeholder(monkeypatch):
+    monkeypatch.delenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", raising=False)
+    assert resolve_live_account_number() is None
+
+
+def test_a_pinning_failure_is_not_counted_as_valid_scheduled_evidence(monkeypatch):
+    """A run that could not pin an account placed nothing, so it is not evidence
+    that the slot executed. Leaving the caller's valid_scheduled_evidence=True
+    beside the failure marker made the credit-usage report -- which rejects only
+    an explicit false -- count the blocked slot as a healthy one (Codex review,
+    PR #219)."""
+    jsonschema = pytest.importorskip("jsonschema")
+    monkeypatch.delenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", raising=False)
+    rc = build_morning_live_run_classification(**MORNING_LIVE_KWARGS)
+
+    assert rc["account_pinning_failed"] is True
+    assert rc["valid_scheduled_evidence"] is False
+    # Pinned to const true by the schema for every stream='morning' document:
+    # it identifies the stream, it does not claim the run succeeded.
+    assert rc["valid_morning_evidence"] is True
+    jsonschema.validate(rc, _morning_run_classification_schema())
+
+
+def test_a_pinned_run_keeps_the_evidence_flag_it_was_given(monkeypatch):
+    monkeypatch.setenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", FIXTURE_ACCOUNT_NUMBER)
+    rc = build_morning_live_run_classification(**MORNING_LIVE_KWARGS)
+    assert rc["valid_scheduled_evidence"] is True
+    assert "account_pinning_failed" not in rc

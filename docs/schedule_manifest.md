@@ -119,7 +119,7 @@ Feb, Nov, Dec). Re-verify around DST transitions.
 > writes to the Latest Run section (full page weekly), and cap automated retries
 > at **one** targeted recovery rerun (recover only failed tickers/steps). This
 > mode changes cost/reporting behavior only — **all trading safety rules are
-> preserved** (Robinhood-only execution on `562057042`; Alpaca/Yahoo/Finance
+> preserved** (Robinhood-only execution on `<ROBINHOOD_ACCOUNT_NUMBER>`; Alpaca/Yahoo/Finance
 > read-only; buy-only, no options/crypto/margin; active universe includes IBM and GFUZ
 > and excludes BYDDY/VCX/TRLV/RVI; manual/morning/midday/final streams stay
 > separated; prior-run fills are same-day top-up context only, never scheduled
@@ -405,7 +405,7 @@ Feb, Nov, Dec). Re-verify around DST transitions.
 > `morning_dca_live`, `state_schema_version='morning-live-v2-preauthorized'`,
 > **trades=yes**) writing under `cron_tracking/morning_dca/YYYYMMDD_1030ET/`
 > (`run_id='morning_live_YYYYMMDD_1030ET'`), giving a true **60-minute intraday
-> trend window**. **Robinhood account 562057042 is the only execution broker**;
+> trend window**. **Robinhood account <ROBINHOOD_ACCOUNT_NUMBER> is the only execution broker**;
 > Alpaca/Finance/Yahoo are read-only. It **depends on the same-day 9:45
 > pre-flight artifact and evaluates only `eligible_to_execute=true` tickers**,
 > then **recomputes a fresh price/prior close/spread/60-minute downtrend/signal/
@@ -454,7 +454,7 @@ Feb, Nov, Dec). Re-verify around DST transitions.
 >
 > **Midday stream note:** the midday `MiddayDCAExecutor` (`a6239dae`, run_type
 > `midday_dca_live`, `state_schema_version='midday-live-v1'`, **trades=yes**)
-> is a single **12:30 PM ET live Robinhood execution** on account `562057042`,
+> is a single **12:30 PM ET live Robinhood execution** on account `<ROBINHOOD_ACCOUNT_NUMBER>`,
 > writing under `cron_tracking/midday_dca/YYYYMMDD_1230ET/`
 > (`run_id='midday_live_YYYYMMDD_1230ET'`). It reuses the **afternoon 0x-to-5x
 > ladder** and the same $2 base (the shared live ladder used by all streams as
@@ -826,7 +826,7 @@ never estimated, inferred, or defaulted.
 
 ### `2ba19526`: Market-open DCA live Robinhood execution (9:35 AM ET)
 - **Live trading**. Runs **9:35 AM ET weekdays**, cron `35 13 * * 1-5` (13:35 UTC during EDT).
-- Uses the shared **$2 base 0x-to-5x live ladder**. **Robinhood account 562057042 is the
+- Uses the shared **$2 base 0x-to-5x live ladder**. **Robinhood account <ROBINHOOD_ACCOUNT_NUMBER> is the
   only execution broker**; Alpaca, Finance, and Yahoo are read-only validation/account
   context only. Provider policy is unchanged: Finance primary, Alpaca/Robinhood
   validation, `yfinance` fallback, GFUZ Robinhood-primary.
@@ -1152,7 +1152,7 @@ never estimated, inferred, or defaulted.
 
 ### `42173154`: Weekday 10:30 AM morning DCA live Robinhood execution (`MorningDCAExecutor`)
 - **Live trading** (executor mode `live`). Runs **10:30 AM ET weekdays** — cron `30 14 * * 1-5` (**14:30 UTC weekdays** during EDT) — moved from the former 9:45 AM live slot to give a true **60-minute intraday trend window**.
-- Uses the shared **$2 base 0x-to-5x live ladder** and the `morning` budget ledger (`config/morning_dca.json`). **Robinhood account 562057042 is the only execution broker**; **Alpaca, Finance, and Yahoo are read-only** validation/account context only.
+- Uses the shared **$2 base 0x-to-5x live ladder** and the `morning` budget ledger (`config/morning_dca.json`). **Robinhood account <ROBINHOOD_ACCOUNT_NUMBER> is the only execution broker**; **Alpaca, Finance, and Yahoo are read-only** validation/account context only.
 - **Depends on the same-day 9:45 pre-flight artifact** (`cron_tracking/morning_dca_preflight/`) and evaluates **only `eligible_to_execute=true` tickers**, then **recomputes a fresh price, prior close, spread, 60-minute downtrend, signal, and budget before placing** — and **skips / routes to manual review if the trend cannot be validated**. If the pre-flight artifact is missing, a **scheduled** run fails closed (`_apply_preflight_gate()` returns zero tickers and writes a blocked `run_state.json`); only a **manual** run degrades to the full universe with a warning.
 - **Pre-flight artifact location (added Jul 20 2026):** the same-day 9:45 pre-flight artifact **must be loaded from** `/home/user/workspace/cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/run_state.json`, or from `latest_preflight.json` **only when that pointer points to the same-day** file. It **must not** be sought under `/home/user/workspace/cron_tracking/42173154` or under the morning live output directory `/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/`; the morning live output directory holds this task's own artifacts only. If the artifact is missing from the correct path, perform exactly **one** bounded recovery lookup before escalating: scan `/home/user/workspace/cron_tracking/morning_dca_preflight/` for today's `YYYYMMDD_0945ET` directory and load its `run_state.json`. This fixes the **Jul 20 2026 escalation** where the run looked under the 10:30 live directory instead of the pre-flight root. It is a path-resolution fix only and does not weaken the budget caps, top-up guard, data-confidence rule, spread rule, whitelist, buy-only, regular-hours-only, Robinhood-execution-only, or any other safety control. **Implemented (2026-07-21)** in `morning_dca.py` (`load_morning_config()`, `load_same_day_preflight()`, `MorningDCAExecutor._apply_preflight_gate()`). See the `42173154` `preflight_artifact_resolution` block in [`config/scheduled_tasks.json`](../config/scheduled_tasks.json) and [morning_dca.md](morning_dca.md).
 - **Morning budget ledger location (added Jul 20 2026):** the morning stream budget ledger lives under the morning live output directory `/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/`; the task may create `budget_ledger.json` there if absent. It **does not require a pre-existing ledger file**: if none exists it initializes from the configured `morning_daily_cap_usd` (90.0) and `morning_weekly_cap_usd` (450.0) caps and writes the resulting budget calculations into the 10:30 `run_state.json`. A missing ledger file is bootstrapped, **not** escalated, and bootstrapping weakens no cap or safety control. **Implemented (2026-07-21)**: `MorningDCAExecutor.write_artifacts()` always writes `budget_ledger.json` under the run's own output directory as a snapshot of the same budget object written into `run_state.json`. See the `42173154` `budget_ledger_bootstrap` block in [`config/scheduled_tasks.json`](../config/scheduled_tasks.json).
@@ -1175,7 +1175,7 @@ never estimated, inferred, or defaulted.
   **NOT** confirmation that any scheduled task ran.
 - **Coverage:** scanned the full **44-symbol** active universe. Finance lookup
   completed with expected unresolved fallback cases **AAAU, SPCX, GFUZ**.
-  Robinhood account access completed with configured account **562057042** present;
+  Robinhood account access completed with configured account **<ROBINHOOD_ACCOUNT_NUMBER>** present;
   portfolio read completed; **3** quote batches and **5** tradability batches
   completed; `quote_available_count=44`, `prior_close_available_count=44`,
   `tradability_returned_count=44`. Alpaca account read completed, status **ACTIVE**,
@@ -1195,7 +1195,7 @@ never estimated, inferred, or defaulted.
 
 ### `a6239dae`: Weekday 12:30 PM midday DCA live Robinhood execution (`MiddayDCAExecutor`)
 - **Live trading** (executor mode `live`). Runs **12:30 PM ET weekdays** (window 12:25–12:35 PM ET).
-- Uses the shared **$2 base 0x-to-5x live ladder** (`config/midday_dca.json`, the same ladder used by all live streams as of Jul 10 2026) and its own `midday` budget ledger. **Robinhood account 562057042 only**; Alpaca is read-only for validation/context.
+- Uses the shared **$2 base 0x-to-5x live ladder** (`config/midday_dca.json`, the same ladder used by all live streams as of Jul 10 2026) and its own `midday` budget ledger. **Robinhood account <ROBINHOOD_ACCOUNT_NUMBER> only**; Alpaca is read-only for validation/context.
 - Same active universe (excludes BYDDY/VCX/TRLV/RVI). **Confidence rule:** if a candidate's price/drop passes the ladder but the **intraday trend cannot be validated** (fewer than `trend_min_bars` usable intraday bars at/before 12:30), the run does **not** auto-buy; it classifies the candidate as `execution_status='manual_review_candidate'`.
 - Writes live artifacts under `/home/user/workspace/cron_tracking/midday_dca/YYYYMMDD_1230ET/` (`run_id='midday_live_YYYYMMDD_1230ET'`) and updates its own `latest_midday_run.json` pointer.
 - `stream='midday'`, `run_type='midday_dca_live'`, `state_schema_version='midday-live-v1'`, `cron_id='a6239dae'`, `supersedes_cron_id=null`, `valid_afternoon_evidence=false`. Never writes into the morning or afternoon (`ce16ba6b`) trees or updates `latest_scheduled_run.json`.
@@ -1245,7 +1245,7 @@ never estimated, inferred, or defaulted.
 ### `10ce362c`: Final DCA live Robinhood execution, $2 allocation (3:30 PM ET)
 - Repaired live task `10ce362c`, which **supersedes the deleted `ce16ba6b`**; the artifact root stays under `.../ce16ba6b` for continuity.
 - Approved live trading task running the **$2 base 0x-to-5x ladder with tiered caps**. Places real market buy orders automatically within safeguards. Runs **3:30 PM ET weekdays**.
-- Uses **only** Robinhood account `562057042`; Alpaca is read-only.
+- Uses **only** Robinhood account `<ROBINHOOD_ACCOUNT_NUMBER>`; Alpaca is read-only.
 - Trigger gate: `programmatic_trigger_check.sh`, last documented as allowing weekdays **2026-07-02 through 2026-08-28**, **3:30–3:35 PM ET** (retimed from 3:20 PM; aligned to the 15:25–15:35 ET scheduled classification window; order attribution keeps its lower bound at 15:15 ET so legacy 3:20 PM runs stay attributable) so a late-but-permitted start cannot place buys after the 3:35 PM post-trade sync). This script is scheduler-side (outside this repo); it was **not** updated by the 2026-07-26 extension of `config/trading_window.json` to 2026-10-30 and needs separate verification/extension so the two gates stay in sync. Note that `config/trading_window.json` deliberately stops at 2026-10-30 (the Friday before the 2026-11-01 DST change) rather than going further, since this task's `30 19 * * 1-5` cron (retimed from `20 19 * * 1-5`) and this trigger gate are fixed-UTC/EDT-only — do not extend either past that date without first making them DST-aware.
 - Independent of both gates above, `_check_execution_gates` in `near_close_dca.py` also blocks on any full NYSE closure (via the computed `nyse_holidays()` calendar) even on a date `config/trading_window.json` approves, so extending the window can never silently reopen a holiday like Labor Day or Thanksgiving for live orders.
 - Writes standardized same-day state files under `/home/user/workspace/cron_tracking/ce16ba6b` ([`schemas/run_state.schema.json`](../schemas/run_state.schema.json)); must **not** fall back to interactive confirmation.
@@ -1315,7 +1315,7 @@ never estimated, inferred, or defaulted.
   `supersedes_cron_id='ce16ba6b'`,
   `state_schema_version='run-classification-v2-preauthorized'`. This was the
   **final Robinhood scheduled buy run of the day**, using **Robinhood account
-  `562057042` as the only execution broker** (Alpaca/Finance/Yahoo read-only).
+  `<ROBINHOOD_ACCOUNT_NUMBER>` as the only execution broker** (Alpaca/Finance/Yahoo read-only).
 - Used the current **$3 base 0x-to-5x ladder** (`<0.1%=0x`; `0.1–<1%=1x`;
   `1–<2%=1.5x`; `2–<3%=2x`; `3–<4%=2.5x`; `4–<5%=3x`; `5–<6%=3.5x`; `6–<7%=4x`;
   `7–<8%=4.5x`; `>=8%=5x`). As the final buy of the day it **ignored the

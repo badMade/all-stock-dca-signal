@@ -39,35 +39,26 @@ import csv
 import json
 import os
 import sys
-import tempfile
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+# This module is a documented standalone CLI (``python scripts/drift_detection.py``),
+# and direct invocation puts only ``scripts/`` on sys.path -- so the repo root is
+# added here before the shared helpers below are imported. It previously carried a
+# private copy of dca_fileio.atomic_write_text to sidestep that, and the copy had
+# drifted: it omitted the parent-directory fsync that dca_fileio documents as
+# required ("without the directory fsync the rename itself could be lost on power
+# failure"), leaving this detector's own output strictly less durable than every
+# other artifact this repo writes. Importing the one implementation is what keeps
+# them from diverging again. Mirrors what scripts/tests/* already do.
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
-def _atomic_write_text(path: Path, text: str) -> None:
-    """Local temp+``os.replace`` write (mirrors ``dca_fileio.atomic_write_text``).
-
-    Deliberately duplicated rather than imported: this module is a documented
-    standalone CLI (``python scripts/drift_detection.py``) whose direct
-    invocation puts only ``scripts/`` on ``sys.path``, so a top-level project
-    import would break it outside an installed/checkout-pytest context.
-    """
-    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent) or ".", prefix=path.name + ".", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_name, path)
-    except BaseException:
-        try:
-            Path(tmp_name).unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+from dca_fileio import atomic_write_text  # noqa: E402 - needs the sys.path setup above
 
 # --- Artifact file names -----------------------------------------------------
 
@@ -794,9 +785,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report = detect_drift(run_dir)
 
     if args.json_out:
-        _atomic_write_text(args.json_out, report.to_json(compact=True) + "\n")
+        atomic_write_text(args.json_out, report.to_json(compact=True) + "\n")
     if args.md_out:
-        _atomic_write_text(args.md_out, report.to_markdown())
+        atomic_write_text(args.md_out, report.to_markdown())
 
     print(report.to_json(compact=not args.pretty))
 

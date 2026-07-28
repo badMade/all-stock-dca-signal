@@ -17,6 +17,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -48,6 +49,96 @@ def get_config_dir() -> Path:
 
 
 DEFAULT_CONFIG_DIR = get_config_dir()
+
+# ``${VAR}`` references inside config string values, expanded by
+# :func:`expand_config_env`. Deliberately narrower than ``os.path.expandvars``:
+# only the explicit braced form is recognised, so a literal ``$`` in a note or a
+# Windows-style path can never be mistaken for a variable reference.
+_ENV_PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+class MissingConfigEnvError(ValueError):
+    """A config value references an environment variable that is not set."""
+
+
+def expand_config_env(value: str, *, source: str) -> str:
+    """Expand ``${VAR}`` references in a config string, or raise if one is unset.
+
+    Sensitive identifiers (the live brokerage account number) must not be
+    committed to this repository, so ``config/*.json`` stores them as
+    ``"${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}"`` and the value is supplied by the
+    environment at run time.
+
+    Raises :class:`MissingConfigEnvError` rather than substituting an empty
+    string: an empty account number is exactly the value that used to disable
+    account pinning (see ``near_close_dca.account_pinning_failure``), so a
+    missing variable must fail loudly at config-load time instead of producing a
+    config that silently permits trading any account.
+    """
+
+    def _sub(match: "re.Match[str]") -> str:
+        name = match.group(1)
+        resolved = os.environ.get(name)
+        if not resolved:
+            raise MissingConfigEnvError(
+                f"{source} references ${{{name}}} but that environment variable is "
+                f"unset or empty. Export {name} before loading config."
+            )
+        return resolved
+
+    return _ENV_PLACEHOLDER.sub(_sub, value)
+
+
+# The digit shape schemas/*_run_classification.schema.json pins account_number
+# to. Shared so the loader's validation and the artifact's schema cannot drift.
+ACCOUNT_NUMBER_SHAPE = re.compile(r"^[0-9]{6,12}$")
+
+# The literal the read-only morning modes carry instead of an account.
+READ_ONLY_ACCOUNT = "read_only"
+
+
+class InvalidAccountNumberError(ValueError):
+    """A configured broker account is present but not a usable account number."""
+
+
+def resolve_broker_account(value: Any, *, source: str) -> str:
+    """Expand and validate a configured ``broker_account``.
+
+    Rejecting a malformed account here, at pinning time, is what keeps the
+    artifact honest. ``expand_config_env`` only guarantees the variable was set
+    to something non-empty, so a value like ``" 123456789 "`` or ``"acct-12"``
+    used to flow through into execution and into the run artifact, and the live
+    classification schema requires ``account_number`` to match
+    :data:`ACCOUNT_NUMBER_SHAPE` for every ``*_dca_live`` run. Emitting a
+    malformed value (or omitting the field to avoid emitting one) produced
+    schema-invalid evidence for exactly the runs that matter most -- an
+    account-mismatch or connector failure -- so a downstream watchdog would
+    report the scheduled run as missing or invalid instead of surfacing its real
+    block reason (Codex review, PR #219).
+
+    Surrounding whitespace is stripped rather than rejected: an account exported
+    with a stray newline is unambiguous, and failing on it would be a needless
+    outage. Anything else that does not match the shape raises.
+    """
+    expanded = expand_config_env(str(value), source=source).strip()
+    if expanded == READ_ONLY_ACCOUNT:
+        return expanded
+    if not ACCOUNT_NUMBER_SHAPE.fullmatch(expanded):
+        # The VALUE is deliberately absent from this message. It comes from the
+        # environment, and a malformed one is often malformed precisely because
+        # something sensitive landed in the wrong variable -- a token, a
+        # password. Embedding it copied that straight into any scheduler, CLI, or
+        # CI log that records the exception (Codex review, PR #219). The length
+        # is enough to debug a truncated or padded value without reproducing it.
+        raise InvalidAccountNumberError(
+            f"{source} resolved to a {len(expanded)}-character value that is not a "
+            f"valid account number (expected 6-12 digits, or {READ_ONLY_ACCOUNT!r} "
+            f"for a read-only mode). The value is withheld from this message "
+            f"because it may be a secret pasted into the wrong variable. Refusing "
+            f"to trade or to write an artifact claiming an account that does not "
+            f"exist."
+        )
+    return expanded
 
 
 def _read_json(path: Path) -> Optional[Dict[str, Any]]:

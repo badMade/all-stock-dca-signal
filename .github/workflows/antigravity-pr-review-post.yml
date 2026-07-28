@@ -1,0 +1,385 @@
+name: Antigravity PR Review (Post)
+
+# TRUST BOUNDARY -- read this before editing. See also
+# antigravity-pr-review.yml's header and docs/pr_review_workflow.md.
+#
+# This is the PRIVILEGED half of a two-workflow split. It holds
+# GEMINI_API_KEY and pull-requests: write, and it is triggered by
+# `workflow_run`, which -- unlike `pull_request` -- always runs the version of
+# THIS file that lives on the repository's default branch, never the version
+# in whatever branch triggered it. A PR cannot edit this workflow and have
+# that edit take effect in its own run; an edit here only takes effect once
+# merged. That is the property the earlier single-workflow design could not
+# achieve no matter how the individual steps were hardened.
+#
+# Two structural rules keep that property real rather than nominal:
+#
+#   1. No step in this file may ever check out PR-head-controlled code. The
+#      `review` job's checkout step below intentionally has no `ref:` --
+#      omitting it means "check out github.sha", which for a workflow_run
+#      event IS the default branch, not the branch that triggered it. The PR
+#      still reaches this job, but only as DATA (the diff text, downloaded as
+#      an artifact), never as CODE that gets executed.
+#      scripts/tests/test_pr_review_workflow_trust_boundary.py fails CI if any
+#      checkout step here ever gains a `ref:` at all.
+#
+#   2. The `review` job structurally depends on (`needs:`) the
+#      `validate-provenance` job, so it cannot run before that job has
+#      confirmed the triggering run is what it claims to be: the expected
+#      analyzer workflow, triggered by a real `pull_request` event, on this
+#      repository (not a fork), that completed successfully. The same test
+#      file above fails CI if that `needs:` edge is ever removed.
+#
+# Downloading another workflow run's artifact by run ID is itself a place
+# confusion could creep in (an attacker-influenced run ID, or two runs racing
+# on the same PR), so the downloaded metadata.json is cross-checked against
+# the validated PR number and head SHA before anything in it is trusted.
+
+on:
+  workflow_run:
+    workflows: ["Antigravity PR Review (Analyze)"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  validate-provenance:
+    name: Validate run provenance
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event.workflow_run.conclusion == 'success'
+    concurrency:
+      group: antigravity-post-validate-${{ github.event.workflow_run.id }}
+      cancel-in-progress: false
+    outputs:
+      pr_number: ${{ steps.provenance.outputs.pr_number }}
+      head_sha: ${{ steps.provenance.outputs.head_sha }}
+      base_sha: ${{ steps.provenance.outputs.base_sha }}
+    steps:
+      - name: Validate the triggering run
+        id: provenance
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Re-validated here even though the `workflows:` filter above
+            // already restricts by name: that filter is a trigger-time
+            // convenience, not a substitute for checking the fields this job
+            // actually relies on before it acts on them.
+            const run = context.payload.workflow_run;
+            const failures = [];
+
+            const expectedNames = ["Antigravity PR Review (Analyze)"];
+            if (!expectedNames.includes(run.name)) {
+              failures.push(`unexpected workflow name: ${run.name} (expected one of ${expectedNames.join(", ")})`);
+            }
+            if (run.event !== "pull_request") {
+              failures.push(`unexpected triggering event: ${run.event} (expected pull_request)`);
+            }
+            if (run.conclusion !== "success") {
+              failures.push(`triggering run did not succeed (conclusion: ${run.conclusion})`);
+            }
+            const expectedRepo = `${context.repo.owner}/${context.repo.repo}`;
+            const actualRepo = run.head_repository && run.head_repository.full_name;
+            if (actualRepo !== expectedRepo) {
+              failures.push(
+                `triggering run's head repository (${actualRepo}) is not ${expectedRepo} -- ` +
+                "cross-fork PRs are not supported by this reviewer"
+              );
+            }
+            // GitHub leaves pull_requests empty for cross-fork PRs (already
+            // caught above) and also if the PR's branch was deleted before
+            // this ran, so this check catches both.
+            const prs = run.pull_requests || [];
+            if (prs.length === 0) {
+              failures.push("no associated pull_requests on the triggering run");
+            }
+
+            if (failures.length > 0) {
+              for (const f of failures) core.error(f);
+              core.setFailed(`provenance validation failed (${failures.length} check(s)):\n${failures.join("\n")}`);
+              return;
+            }
+
+            const pr = prs[0];
+            core.info(
+              `provenance OK: workflow="${run.name}" event=${run.event} ` +
+              `repo=${actualRepo} pr=#${pr.number} head=${pr.head.sha} base=${pr.base.sha}`
+            );
+            core.setOutput("pr_number", String(pr.number));
+            core.setOutput("head_sha", pr.head.sha);
+            core.setOutput("base_sha", pr.base.sha);
+
+  review:
+    name: Generate and post review (privileged)
+    needs: validate-provenance
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: antigravity-post-review-${{ needs.validate-provenance.outputs.pr_number }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: write
+      actions: read # required to download an artifact from a different workflow run
+    steps:
+      - name: Check for existing review
+        id: check
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ needs.validate-provenance.outputs.pr_number }}
+          REVIEWED_HEAD_SHA: ${{ needs.validate-provenance.outputs.head_sha }}
+          REVIEWED_BASE_SHA: ${{ needs.validate-provenance.outputs.base_sha }}
+        with:
+          script: |
+            // The completion marker carries the SHA it reviewed, so a
+            // re-triggered run for the same head short-circuits here while a
+            // genuinely new push (a different head SHA) still gets reviewed
+            // (Codex review, PR #219).
+            //
+            // Trusted authorship: only THIS job ever posts the marker (via
+            // github.token, i.e. the github-actions[bot] actor), but any PR
+            // commenter can post arbitrary text -- without this check, a PR
+            // author could paste the marker themselves to permanently
+            // suppress the automated review for their own PR (Codex review,
+            // PR #219: "Trust completion markers only from the review bot").
+            const TRUSTED_MARKER_AUTHOR = "github-actions[bot]";
+            const prNumber = Number(process.env.PR_NUMBER);
+            const headSha = process.env.REVIEWED_HEAD_SHA;
+            const baseSha = process.env.REVIEWED_BASE_SHA;
+            const doneMarker = `<!-- antigravity-review:complete:${headSha} -->`;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              per_page: 100,
+            });
+            const done = comments.some(
+              (c) =>
+                typeof c.body === "string" &&
+                c.body.includes(doneMarker) &&
+                c.user &&
+                c.user.login === TRUSTED_MARKER_AUTHOR,
+            );
+            if (done) {
+              core.info(`Antigravity has already reviewed ${headSha}; skipping.`);
+              core.setOutput("reviewed", "true");
+              return;
+            }
+
+            // Supersession: the per-PR concurrency group above does not
+            // cancel an in-progress run (cancel-in-progress: false, so an
+            // already-running review always finishes rather than losing
+            // partial work), so an older run queued behind a newer one can
+            // still be sitting here once the newer run has already posted.
+            // Without this check it would go on to generate and post a
+            // review for a diff the PR has since moved past (Codex review,
+            // PR #219: "Skip reviews for superseded head SHAs"). Checked for
+            // BOTH head and base: the analyzer now diffs against the exact
+            // recorded base_sha rather than the base branch's moving tip
+            // (see antigravity-pr-review.yml), so a base that has since
+            // advanced means the posted review would describe a diff against
+            // a base revision the PR is no longer actually based on (Codex
+            // review, PR #219: "Pin and recheck the reviewed base SHA").
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+            if (pr.data.head.sha !== headSha) {
+              core.info(
+                `PR head is now ${pr.data.head.sha}, superseding the reviewed ` +
+                `commit ${headSha}; skipping this stale run.`,
+              );
+              core.setOutput("reviewed", "true");
+              return;
+            }
+            if (pr.data.base.sha !== baseSha) {
+              core.info(
+                `PR base is now ${pr.data.base.sha}, superseding the reviewed ` +
+                `base ${baseSha}; skipping this stale run.`,
+              );
+              core.setOutput("reviewed", "true");
+              return;
+            }
+
+            core.setOutput("reviewed", "false");
+
+      # No `ref:` here. See this file's header, rule 1. This checks out the
+      # repository's default branch -- never the PR's code.
+      - name: Checkout base branch (never PR head)
+        if: steps.check.outputs.reviewed != 'true'
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify reviewer script is present
+        if: steps.check.outputs.reviewed != 'true'
+        run: |
+          set -euo pipefail
+          if [ ! -f .github/scripts/pr_review.py ]; then
+            echo "::error::.github/scripts/pr_review.py is missing after checking out the default branch"
+            exit 1
+          fi
+
+      - name: Download review input artifact
+        if: steps.check.outputs.reviewed != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: pr-review-input
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: review_input
+
+      - name: Cross-check artifact metadata against provenance
+        if: steps.check.outputs.reviewed != 'true'
+        env:
+          EXPECTED_PR_NUMBER: ${{ needs.validate-provenance.outputs.pr_number }}
+          EXPECTED_HEAD_SHA: ${{ needs.validate-provenance.outputs.head_sha }}
+          EXPECTED_BASE_SHA: ${{ needs.validate-provenance.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          # Defends against artifact/run confusion: the artifact just
+          # downloaded by run ID must describe the exact PR, head SHA, and
+          # base SHA the provenance job already validated, not merely SOME
+          # PR -- the base check also confirms the diff this artifact carries
+          # was actually computed against the pinned base_sha, not a moving
+          # branch tip (Codex review, PR #219: "Pin and recheck the reviewed
+          # base SHA").
+          python3 - <<'PYEOF'
+          import json
+          import os
+          import sys
+
+          meta = json.load(open("review_input/metadata.json"))
+          expected_pr = int(os.environ["EXPECTED_PR_NUMBER"])
+          expected_sha = os.environ["EXPECTED_HEAD_SHA"]
+          expected_base = os.environ["EXPECTED_BASE_SHA"]
+          if (
+              int(meta["pr_number"]) != expected_pr
+              or meta["head_sha"] != expected_sha
+              or meta["base_sha"] != expected_base
+          ):
+              print(
+                  f"::error::artifact metadata {meta} does not match validated "
+                  f"provenance (pr=#{expected_pr}, head={expected_sha}, base={expected_base})"
+              )
+              sys.exit(1)
+          print(
+              f"artifact metadata matches provenance: "
+              f"pr=#{expected_pr} head={expected_sha} base={expected_base}"
+          )
+          PYEOF
+
+      - name: Set up Python
+        if: steps.check.outputs.reviewed != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Antigravity SDK
+        if: steps.check.outputs.reviewed != 'true'
+        # Exact-pinned, matching every other CI dependency in this repo
+        # (requirements-dev.txt): this step runs with GEMINI_API_KEY in its
+        # environment, so an unpinned `pip install` would let an unreviewed
+        # upstream release -- compromised or merely incompatible -- run with
+        # that key on every PR without a corresponding change in this repo
+        # (Codex review, PR #219).
+        run: |
+          python -m pip install --upgrade pip
+          pip install google-antigravity==0.1.8
+
+      - name: Generate PR Review
+        id: run_review
+        if: steps.check.outputs.reviewed != 'true'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DIFF_FILE: review_input/diff.patch
+        run: |
+          python .github/scripts/pr_review.py > review_output.md
+
+      - name: Post PR Comment
+        if: steps.check.outputs.reviewed != 'true'
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ needs.validate-provenance.outputs.pr_number }}
+          REVIEWED_HEAD_SHA: ${{ needs.validate-provenance.outputs.head_sha }}
+          REVIEWED_BASE_SHA: ${{ needs.validate-provenance.outputs.base_sha }}
+        with:
+          script: |
+            const fs = require("fs");
+            const prNumber = Number(process.env.PR_NUMBER);
+            const headSha = process.env.REVIEWED_HEAD_SHA;
+            const baseSha = process.env.REVIEWED_BASE_SHA;
+
+            // Rechecked here, not just by "Check for existing review" before
+            // generation: the SDK call in between can take long enough for a
+            // new push to land, and that earlier check is stale by the time
+            // this step runs -- posting now would attach feedback and a
+            // completion marker to a diff the PR has already moved past
+            // (Codex review, PR #219: "Recheck the PR head immediately
+            // before posting"). Base is rechecked too, for the same reason
+            // it's rechecked before generation above (Codex review, PR #219:
+            // "Pin and recheck the reviewed base SHA").
+            const currentPr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+            if (currentPr.data.head.sha !== headSha) {
+              core.info(
+                `PR head is now ${currentPr.data.head.sha}, superseding the ` +
+                `reviewed commit ${headSha}; not posting this stale review.`,
+              );
+              return;
+            }
+            if (currentPr.data.base.sha !== baseSha) {
+              core.info(
+                `PR base is now ${currentPr.data.base.sha}, superseding the ` +
+                `reviewed base ${baseSha}; not posting this stale review.`,
+              );
+              return;
+            }
+
+            const reviewText = fs.readFileSync("review_output.md", "utf8");
+            if (!reviewText.trim()) {
+              core.info("Empty review output; nothing to post.");
+              return;
+            }
+            if (reviewText.includes("No changes found in PR diff")) {
+              core.info("No diff to review; nothing to post.");
+              return;
+            }
+            const doneMarker = `<!-- antigravity-review:complete:${headSha} -->`;
+            const skipMarker = "<!-- antigravity-review:skipped -->";
+            const skipRe = /Automated AI review (was skipped|could not be generated)/;
+            if (skipRe.test(reviewText)) {
+              // Rate-limited or errored: do NOT block future runs (no
+              // completion marker), so a later push can still land a real
+              // review. Post at most one skip note to avoid spamming the PR.
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                per_page: 100,
+              });
+              if (comments.some((c) => typeof c.body === "string" && c.body.includes(skipMarker))) {
+                core.info("Skip note already present; not re-posting.");
+                return;
+              }
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: `${skipMarker}\n## 🤖 Antigravity AI Code Review\n\n${reviewText}`,
+              });
+              return;
+            }
+            // A real review: tag it with the completion marker so every later
+            // run on this PR sees it and skips.
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: `${doneMarker}\n## 🤖 Antigravity AI Code Review\n\n${reviewText}`,
+            });

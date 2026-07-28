@@ -478,7 +478,7 @@ def test_broker_place_raises_when_live_gate_disabled():
     # run_once only reaches a live broker's place_market_buy on the non-dry-run path, so a
     # disabled gate here is a misconfiguration that must fail loudly, not book a phantom buy.
     calls = []
-    broker = RobinhoodBroker(account="562057042", place_fn=lambda **k: calls.append(k) or {"data": {"order": {"id": "X"}}})
+    broker = RobinhoodBroker(account="999000111", place_fn=lambda **k: calls.append(k) or {"data": {"order": {"id": "X"}}})
     with pytest.raises(RuntimeError, match="live gate disabled"):
         broker.place_market_buy("AAPL", 1.0, "ref1")
     assert calls == []  # place_fn never invoked while disabled
@@ -486,7 +486,7 @@ def test_broker_place_raises_when_live_gate_disabled():
 
 def test_broker_place_live_when_gated_on():
     broker = RobinhoodBroker(
-        account="562057042",
+        account="999000111",
         enable_live_orders=True,
         place_fn=lambda **k: {"data": {"order": {"id": "ORD-42"}}},
     )
@@ -496,7 +496,7 @@ def test_broker_place_live_when_gated_on():
 def test_broker_place_raises_on_outer_failure_envelope():
     # A failure envelope carrying an inner order id must not be read as a successful submit.
     broker = RobinhoodBroker(
-        account="562057042",
+        account="999000111",
         enable_live_orders=True,
         place_fn=lambda **k: {"success": False, "data": {"order": {"id": "ORD-9"}}},
     )
@@ -507,7 +507,7 @@ def test_broker_place_raises_on_outer_failure_envelope():
 def test_broker_place_live_raises_on_terminal_state():
     # An id in a terminal-failure state means no live order exists -> must not report success.
     broker = RobinhoodBroker(
-        account="562057042",
+        account="999000111",
         enable_live_orders=True,
         place_fn=lambda **k: {"data": {"order": {"id": "ORD-7", "state": "rejected"}}},
     )
@@ -519,7 +519,7 @@ def test_broker_place_live_raises_on_missing_order_id():
     # A live placement that returns no id must fail fast, not report false success —
     # otherwise run_once books the notional against budget with no order to reconcile.
     broker = RobinhoodBroker(
-        account="562057042",
+        account="999000111",
         enable_live_orders=True,
         place_fn=lambda **k: {"data": {"order": {"status": "rejected"}}},
     )
@@ -601,8 +601,8 @@ def test_broker_buying_power_keyword_call_and_failure():
         seen["acct"] = account_number
         return 137.0
 
-    assert RobinhoodBroker(account="562057042", buying_power_fn=kw_only).available_buying_power() == 137.0
-    assert seen["acct"] == "562057042"
+    assert RobinhoodBroker(account="999000111", buying_power_fn=kw_only).available_buying_power() == 137.0
+    assert seen["acct"] == "999000111"
 
     def boom(*, account_number):
         raise RuntimeError("network down")

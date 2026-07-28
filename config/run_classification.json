@@ -23,7 +23,7 @@
     "retimed_on_et": "2026-07-27",
     "retimed_from_et": "15:20",
     "retimed_note": "10ce362c was retimed from 3:20 PM ET to the canonical 3:30 PM ET on 2026-07-27. Newly written scheduled evidence uses scheduled_for_et='15:30', scheduled_window_start_et='15:25', and run ids of the form scheduled_YYYYMMDD_1530ET. The artifact root stays under .../ce16ba6b for continuity.",
-    "broker_account": "robinhood:562057042"
+    "broker_account": "robinhood:${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}"
   },
   "artifact_paths": {
     "state_root": "/home/user/workspace/cron_tracking/ce16ba6b",
@@ -196,8 +196,8 @@
     "scheduled_window_end_et": "15:35",
     "state_schema_version": "run-classification-v2-preauthorized",
     "is_final_buy_of_day": true,
-    "broker_account": "robinhood:562057042",
-    "broker_roles_note": "Robinhood account 562057042 was the only execution broker; Alpaca/Finance/Yahoo remained read-only.",
+    "broker_account": "robinhood:${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}",
+    "broker_roles_note": "Robinhood account <ROBINHOOD_ACCOUNT_NUMBER> was the only execution broker; Alpaca/Finance/Yahoo remained read-only.",
     "base_amount_usd": 3.0,
     "ladder": "0x-to-5x ($3 base): <0.1%=0x; 0.1-<1%=1x; 1-<2%=1.5x; 2-<3%=2x; 3-<4%=2.5x; 4-<5%=3x; 5-<6%=3.5x; 6-<7%=4x; 7-<8%=4.5x; >=8%=5x.",
     "final_buy_behavior_applied": "Final buy of the day: full active-universe scan with the 60-minute downward-trend filter ignored for the final-buy decision only. All other gates still enforced: current/decision price strictly below the prior completed regular-session close, ladder multiplier > 0, data-confidence pass, spread_ok=true, budget/tiered-cap pass, regular-hours-only, whitelisted (active-universe) ticker, hard circuit breakers, and the same-day top-up guard.",
@@ -246,7 +246,7 @@
       "Exclude final manual buy overrides (run_type='final_manual_buy_override', valid_afternoon_scheduled_evidence=false, same_day_top_up_context_only=true) from scheduled slippage, scheduled fills, scheduled reliability, scheduled cost basis, and watchdog confirmation. Show them only in a labeled Manual Final Buy Override / Same-Day Top-Up Context section (see manual_reporting).",
       "Exclude manual missed-morning recovery artifacts (under morning_dca/manual_recovery/**, run_origin='manual', manual_run=true, same_day_top_up_context_only=true, valid_scheduled_evidence=false) from scheduled slippage, scheduled fills, scheduled reliability, scheduled cost basis, and watchdog confirmation. They never prove the 10:30 scheduled task ran and are used only as same-day prior-allocation / top-up context (see manual_missed_morning_recovery).",
       "Exclude the 2026-07-21 manual midday run (under midday_dca/manual_runs/**, run_origin='manual', manual_run=true, stream='midday_manual', same_day_top_up_context_only=true, valid_scheduled_evidence=false, valid_afternoon_scheduled_evidence=false) from scheduled slippage, scheduled fill counts, scheduled reliability, scheduled cost-basis evidence, watchdog proof, and scheduled afternoon evidence. It never proves the 12:30 or 3:30 scheduled tasks ran and is used only as same-day prior-allocation / top-up context by the later 3:30 top-up logic (see midday_manual_run_2026_07_21).",
-      "The watchdog (a46bf007) queries ALL same-day Robinhood equity orders for account 562057042 WITHOUT a placed_agent filter first, then classifies every order by scheduled evidence, manual artifacts, same-day top-up roots, placed_agent, and order IDs; orders with placed_agent='user' or any non-agentic value appear in a Manual/User Orders section and count as scheduled fills only when their order IDs are in a valid scheduled submitted_orders.csv from the same-day scheduled run (see watchdog_all_orders_fix_2026_07_21)."
+      "The watchdog (a46bf007) queries ALL same-day Robinhood equity orders for account <ROBINHOOD_ACCOUNT_NUMBER> WITHOUT a placed_agent filter first, then classifies every order by scheduled evidence, manual artifacts, same-day top-up roots, placed_agent, and order IDs; orders with placed_agent='user' or any non-agentic value appear in a Manual/User Orders section and count as scheduled fills only when their order IDs are in a valid scheduled submitted_orders.csv from the same-day scheduled run (see watchdog_all_orders_fix_2026_07_21)."
     ],
     "manual_exclusion_roots": {
       "reason": "The 2026-07-13 final manual buy override backfilled live artifacts under midday_dca/manual_reruns/final_manual_override_* and a final_manual_review/** tree, both OUTSIDE the ce16ba6b task root. Slippage/watchdog/reporting must scan these as manual exclusions so their order IDs never leak into scheduled-live metrics.",
@@ -647,7 +647,7 @@
   "watchdog_reconciliation_scope_patch_2026_07_27": {
     "added": "2026-07-27",
     "applies_to_tasks": ["a46bf007", "67aa802b"],
-    "broker_account": "robinhood:<ROBINHOOD_ACCOUNT_NUMBER_OBFUSCATED>",
+    "broker_account": "robinhood:<ROBINHOOD_ACCOUNT_NUMBER>",
     "trigger_incident": "The 3:40 PM ET watchdog FAILED the 2026-07-27 3:30 PM ET final run even though that run's artifact was internally consistent with zero orders. The cause was reconciliation SCOPE, not a trading defect and not an artifact defect.",
     "artifact_was_consistent": {
       "orders_submitted_count": 0,
@@ -731,9 +731,9 @@
   "watchdog_all_orders_fix_2026_07_21": {
     "added": "2026-07-21",
     "applies_to_tasks": ["a46bf007"],
-    "broker_account": "robinhood:562057042",
+    "broker_account": "robinhood:${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}",
     "trigger_incident": "The 3:40 PM live-run watchdog queried the agentic (placed_agent='agent') order subset first, so same-day user/manual Robinhood orders could be missed by primary reconciliation.",
-    "requirement": "The watchdog MUST query ALL same-day Robinhood equity orders for account 562057042 WITHOUT any placed_agent filter FIRST, then classify every returned order. The agentic-only (placed_agent='agent') subset MAY be reported separately, but primary reconciliation runs over the full order set.",
+    "requirement": "The watchdog MUST query ALL same-day Robinhood equity orders for account <ROBINHOOD_ACCOUNT_NUMBER> WITHOUT any placed_agent filter FIRST, then classify every returned order. The agentic-only (placed_agent='agent') subset MAY be reported separately, but primary reconciliation runs over the full order set.",
     "classify_every_order_by": [
       "scheduled evidence (a validated scheduled run_state whose submitted_orders.csv/filled_orders.csv contains the order ID)",
       "manual artifacts (the manual-exclusion roots)",
@@ -742,7 +742,7 @@
       "order IDs"
     ],
     "rules": [
-      "Query all same-day equity orders for robinhood:562057042 with NO placed_agent filter before any reconciliation; do not start from the agentic-only subset.",
+      "Query all same-day equity orders for robinhood:<ROBINHOOD_ACCOUNT_NUMBER> with NO placed_agent filter before any reconciliation; do not start from the agentic-only subset.",
       "Classify every returned order by scheduled evidence, manual artifacts, same-day top-up roots, placed_agent, and order IDs.",
       "Orders with placed_agent='user' or any non-agentic value are reported in a dedicated Manual/User Orders section and MUST NOT count as scheduled fills unless their order IDs appear in a valid scheduled submitted_orders.csv from the same-day scheduled run.",
       "The agentic-only (placed_agent='agent') subset MAY be reported separately as context but is never the primary reconciliation set.",

@@ -53,7 +53,7 @@
   "selection_rule": "Pick the highest tier triggered by EITHER planned spend or the count of 3x-or-greater signals. A 3x-or-greater signal is a buy candidate whose ladder multiplier is >= 3.0.",
   "allocation_priority": "Prioritize allocations by higher multiplier first, then larger percent drop, then ticker (alphabetical) for a deterministic tie-break. Flag any capped tickers.",
   "broker_roles": {
-    "robinhood": { "account": "562057042", "role": "execution", "note": "Only execution broker/account for live and manual runs." },
+    "robinhood": { "account": "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}", "role": "execution", "note": "Only execution broker/account for live and manual runs." },
     "alpaca": { "role": "read_only", "note": "Read-only validation and account context only; never execution unless explicitly changed later." },
     "finance": { "role": "read_only", "note": "Read-only market-data/validation context only; never execution." },
     "yahoo": { "role": "read_only", "note": "Read-only market-data/validation context only; never execution." }

@@ -1,0 +1,35 @@
+version: 2
+
+updates:
+  # requirements-dev.txt is pinned exactly (a floating `ruff>=0.5` lets an
+  # upstream release add a rule to the selected E/F/I/B sets and turn main red
+  # with no commit here). Pinning only works if something keeps the pins moving,
+  # which is this.
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    labels:
+      - dependencies
+
+  # Workflow actions are currently pinned by tag, which is mutable. These PRs
+  # keep them current; converting the pins to commit SHAs is the stronger
+  # posture and dependabot maintains those too.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies
+      - ci
+
+# trading-strategies/requirements.txt is intentionally NOT tracked here. It is
+# fully unpinned research tooling (torch, transformers, vectorbt) that never
+# runs in CI and has no tests; dependabot cannot meaningfully update
+# requirements that specify no versions. Pinning that file is the prerequisite,
+# and is tracked separately.

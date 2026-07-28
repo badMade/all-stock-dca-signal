@@ -24,7 +24,7 @@ identity fields are correct.
 | Supersedes | `ce16ba6b` (deleted) |
 | Schedule | **3:30 PM ET** weekdays (`30 19 * * 1-5` UTC) |
 | Accepted window | **3:25–3:35 PM ET** (legacy pre-retime runs: 3:15–3:35 PM ET) |
-| Broker/account | Robinhood `562057042` only (Alpaca read-only) |
+| Broker/account | Robinhood `<ROBINHOOD_ACCOUNT_NUMBER>` only (Alpaca read-only) |
 
 The repaired live task `10ce362c` supersedes the deleted `ce16ba6b`. The
 artifact root stays under `.../ce16ba6b` for continuity across the repair.
@@ -405,7 +405,7 @@ signal is a hypothetical sizing preview, not an order.
 
 The **2026-07-21 09:05 ET** run is the canonical example: 44 tickers scanned,
 Finance lookup completed with expected unresolved fallback cases AAAU/SPCX/GFUZ,
-Robinhood account 562057042 present with 44 quotes / 44 prior closes / 44
+Robinhood account <ROBINHOOD_ACCOUNT_NUMBER> present with 44 quotes / 44 prior closes / 44
 tradability results, Alpaca ACTIVE with buying_power 0, one hypothetical
 positive signal (CBRS drop_pct 0.1074, 1x, $2), and no orders placed. Artifacts
 under `/home/user/workspace/cron_tracking/dry_runs/20260721_0905ET/`. See the
@@ -419,7 +419,7 @@ under `/home/user/workspace/cron_tracking/dry_runs/20260721_0905ET/`. See the
 The 3:40 PM live-run watchdog (`a46bf007`) previously queried the **agentic**
 (`placed_agent='agent'`) order subset first, so same-day **user/manual** Robinhood
 orders could be missed by primary reconciliation. From **2026-07-21** the watchdog
-**must query ALL same-day Robinhood equity orders for account 562057042 without any
+**must query ALL same-day Robinhood equity orders for account <ROBINHOOD_ACCOUNT_NUMBER> without any
 `placed_agent` filter first**, then classify every returned order. It **may**
 report the agentic-only subset separately, but the primary reconciliation runs over
 the **full** order set.

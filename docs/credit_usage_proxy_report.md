@@ -648,9 +648,8 @@ A repository-wide search found no prior implemented account-number masking
 transformation. This report defines its own concrete rule instead of
 deferring to an unwritten one: if an account number appears in any source
 artifact this report reads, the report shows only the **last 4 digits** and
-replaces every preceding digit with `*` (example, using a **synthetic**
-placeholder rather than any real account number: `123456789` becomes
-`*****6789`). This applies to any account number the report would otherwise
+replaces every preceding digit with `*`. Example, using a **synthetic** placeholder rather than any real account number: `123456789` becomes `*****6789`.
+This applies to any account number the report would otherwise
 surface in `biggest_usage_drivers` or `caveats` narrative text; the report
 never prints a full, unmasked account number, and this doc never restates a
 real account number for illustration.

@@ -1,7 +1,8 @@
 import asyncio
 import os
-import sys
 import subprocess
+import sys
+from pathlib import Path
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:
@@ -39,19 +40,54 @@ def _emit_skipped_note(exc: Exception) -> None:
         )
 
 
-async def review_pr():
-    base_ref = os.getenv("GITHUB_BASE_REF", "main")
+def _load_diff() -> "str | None":
+    """The PR diff text, or None (having already emitted a skip note).
 
-    # Diff generation. A missing base ref (git exits 128 when origin/<base> is not
-    # in the checkout) or a missing git binary is an environment issue, not a code
+    Two sources, chosen by DIFF_FILE:
+
+      * set -- reads a precomputed diff file. This is the privileged
+        workflow_run job's path: that job's checkout never touches PR code
+        (see antigravity-pr-review-post.yml's header), so there is no local
+        git history to diff against. The diff arrives as TEXT, computed
+        earlier by the unprivileged analyzer job and downloaded as an
+        artifact.
+      * unset -- runs `git diff` against a live checkout, exactly as this
+        script did before the two-workflow split. Kept for local/manual runs
+        against a real PR checkout; nothing in the shipped workflows relies on
+        this path anymore.
+    """
+    diff_file = os.getenv("DIFF_FILE")
+    if diff_file:
+        try:
+            # errors="replace", not the default "strict": `git diff` preserves
+            # whatever bytes a PR's files contain, including a source file
+            # that isn't valid UTF-8 (e.g. Latin-1), so a PR's own encoding
+            # choice must not be able to crash this job instead of producing a
+            # review. This is prompt text for the model, not data written back
+            # anywhere, so lossy replacement of the undecodable bytes is the
+            # right tradeoff (Codex review, PR #219).
+            return Path(diff_file).read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            _emit_skipped_note(exc)
+            return None
+
+    base_ref = os.getenv("GITHUB_BASE_REF", "main")
+    # A missing base ref (git exits 128 when origin/<base> is not in the
+    # checkout) or a missing git binary is an environment issue, not a code
     # problem in the PR, so skip the review rather than fail the check.
     try:
-        diff_output = subprocess.check_output(
+        return subprocess.check_output(
             ["git", "diff", f"origin/{base_ref}...HEAD"],
             text=True,
         )
     except (subprocess.CalledProcessError, OSError) as exc:
         _emit_skipped_note(exc)
+        return None
+
+
+async def review_pr():
+    diff_output = _load_diff()
+    if diff_output is None:
         return
 
     if not diff_output.strip():

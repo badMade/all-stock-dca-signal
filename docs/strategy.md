@@ -19,7 +19,7 @@ below the prior close is **no buy**. All buys pass a review gate and respect the
 selected tiered daily/weekly budget caps. It never sells.
 
 The strategy identity is the **All Stock graded DCA live test**. Live execution
-is on **Robinhood account `562057042` only**; Alpaca is read-only validation /
+is on **Robinhood account `<ROBINHOOD_ACCOUNT_NUMBER>` only**; Alpaca is read-only validation /
 account context only.
 
 ## Signal rules
@@ -278,7 +278,7 @@ ran and never scheduled evidence. See
 
 ### Manual override same-day fills
 
-Manual override reruns (e.g. an out-of-band manual buy on account 562057042) are
+Manual override reruns (e.g. an out-of-band manual buy on account <ROBINHOOD_ACCOUNT_NUMBER>) are
 recorded under `.../cron_tracking/midday_dca/manual_reruns/<timestamp>/` as
 `run_state.json` plus a confirmed-fill `filled_orders.csv` (`run_origin='manual'`,
 `manual_run=true`). They are **excluded** from every scheduled metric — evidence,
@@ -374,7 +374,7 @@ policy, artifact contract, and cost-conscious mode are unchanged by this record.
 
 See [`docs/safeguards.md`](safeguards.md) for the full list. Summary:
 
-- Only broker/account for live/manual runs: **Robinhood Agentic account `562057042`**.
+- Only broker/account for live/manual runs: **Robinhood Agentic account `<ROBINHOOD_ACCOUNT_NUMBER>`**.
 - Alpaca is read-only validation / account context only (unless explicitly changed later).
 - One strategy order per ticker per day.
 - Market buy orders with `dollar_amount` notional and `time_in_force = gfd`, only after `review_equity_order` passes.

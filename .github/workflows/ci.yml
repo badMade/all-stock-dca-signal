@@ -6,21 +6,41 @@ on:
   pull_request:
     branches: ["main"]
 
+# A rapid series of pushes to the same branch should leave one running build,
+# not N. Never cancel on main -- those runs are the record of what landed.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Read-only by default; no job here needs to write to the repository.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Lint & test (core DCA)
     runs-on: ubuntu-latest
+    # The suite runs in well under a minute. A generous ceiling that still stops
+    # a hung job from burning the full 6-hour runner default.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
+      # NOTE: actions are pinned by tag, not commit SHA. Tags are mutable, so
+      # SHA pinning is the stronger posture; the dependabot config in this
+      # directory keeps these current in the meantime.
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
 
       - name: Install dev tooling
         run: |
@@ -30,8 +50,52 @@ jobs:
       - name: Ruff lint (core modules)
         run: ruff check .
 
-      - name: Run tests
-        run: pytest
+      # --cov-fail-under guards the live decision path against silent erosion.
+      # The threshold is set just under the current figure so a genuine drop
+      # fails the build without flapping on a one-line change.
+      - name: Run tests with coverage
+        run: |
+          pytest \
+            --cov=. \
+            --cov-report=term-missing:skip-covered \
+            --cov-fail-under=90
 
       - name: Smoke-test orchestrator (dry-run demo)
         run: python run_dca.py --demo --report --now 2026-07-06T15:45 --artifacts-dir "$RUNNER_TEMP/dca-demo"
+
+  audit:
+    name: Dependency & secret audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      # The core strategy has no runtime third-party dependencies, so this
+      # audits the dev/CI tooling -- the only third-party code that actually
+      # runs here. trading-strategies/requirements.txt is deliberately excluded:
+      # it is unpinned research tooling that never runs in CI, and auditing
+      # floating requirements produces noise rather than signal.
+      - name: Audit pinned dev dependencies
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip-audit --requirement requirements-dev.txt --strict
+
+      # Secret scanning is NOT a step here on purpose. The specific leak this
+      # repo actually had -- the brokerage account number in config/, docs/, and
+      # schemas/ -- is now blocked by test_config_invariants.py, which runs in
+      # the test job above and fails on any account-shaped literal.
+      #
+      # For the general class (tokens, keys, webhook URLs), enable GitHub's
+      # native secret scanning and push protection in
+      # Settings -> Code security. That scans history as well as new pushes,
+      # needs no third-party action in the pipeline, and rejects the commit at
+      # push time rather than after it has already landed.
+

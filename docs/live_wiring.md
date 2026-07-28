@@ -77,7 +77,7 @@ artifact records the same figures for audit but is not auto-rehydrated into `Str
    `place_fn` is wired in.
 
 Additional invariants enforced by `run_once`: the broker account must equal
-`config.target_account_number` (`562057042`), the trading day must be in
+`config.target_account_number` (`<ROBINHOOD_ACCOUNT_NUMBER>`), the trading day must be in
 `config.approved_test_dates` (the weekday window in `config/trading_window.json`), and
 one order per ticker per stream per day within the daily/weekly/reserve caps and
 the **$10 max-per-order** circuit breaker.

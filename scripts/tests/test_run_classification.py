@@ -12,11 +12,14 @@ ce16ba6b from being confused with manual runs:
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from datetime import datetime, time
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # Repo root too: the scripts modules under test import the shared top-level
@@ -1282,11 +1285,9 @@ def test_recovery_triggers_match_config_and_schema():
 
 
 def test_recovery_state_validates_against_json_schema():
-    try:
-        import jsonschema
-        from referencing import Registry, Resource
-    except ImportError:
-        return
+    jsonschema = pytest.importorskip("jsonschema")
+    referencing = pytest.importorskip("referencing")
+    Registry, Resource = referencing.Registry, referencing.Resource
 
     repo_root = Path(__file__).resolve().parents[2]
     schemas_dir = repo_root / "schemas"
@@ -1319,11 +1320,9 @@ def test_schema_rejects_hybrid_canonical_legacy_identity():
     # scheduled_for_et/scheduled_window_start_et paired with a legacy
     # ..._1520ET run_id) has no coherent scheduled slot and must fail schema
     # validation, not silently pass as valid scheduled evidence.
-    try:
-        import jsonschema
-        from referencing import Registry, Resource
-    except ImportError:
-        return
+    jsonschema = pytest.importorskip("jsonschema")
+    referencing = pytest.importorskip("referencing")
+    Registry, Resource = referencing.Registry, referencing.Resource
 
     repo_root = Path(__file__).resolve().parents[2]
     schemas_dir = repo_root / "schemas"
@@ -3149,10 +3148,7 @@ def test_recovery_state_schema_version_stays_out_of_accepted_versions():
 
 
 def test_recovery_classification_validates_against_its_schema():
-    try:
-        import jsonschema
-    except ImportError:
-        return
+    jsonschema = pytest.importorskip("jsonschema")
 
     repo_root = Path(__file__).resolve().parents[2]
     schema = json.loads(
@@ -3173,10 +3169,7 @@ def test_recovery_classification_validates_against_its_schema():
 def test_scheduled_midday_schema_still_rejects_recovery_classification():
     # The recovery values must stay OUT of the scheduled midday contract, so a
     # scheduled consumer rejects the artifact rather than ingesting it.
-    try:
-        import jsonschema
-    except ImportError:
-        return
+    jsonschema = pytest.importorskip("jsonschema")
 
     repo_root = Path(__file__).resolve().parents[2]
     schema = json.loads(
@@ -3328,10 +3321,7 @@ def test_validate_recovery_classification_rejects_flag_violations():
 
 def test_recovery_contract_matches_its_schema():
     # The code tables and the schema enums must not drift apart.
-    try:
-        import jsonschema  # noqa: F401
-    except ImportError:
-        pass
+    pytest.importorskip("jsonschema")
     repo_root = Path(__file__).resolve().parents[2]
     schema = json.loads(
         (repo_root / "schemas" / "recovery_run_classification.schema.json").read_text(
@@ -3466,10 +3456,7 @@ def test_recovery_schema_binds_the_identity_triple():
     # Codex review: "Couple recovery identity fields in the schema". Three
     # independent enums let a cross-stream combination validate, so a
     # schema-only consumer would accept what every in-repo consumer rejects.
-    try:
-        import jsonschema
-    except ImportError:
-        return
+    jsonschema = pytest.importorskip("jsonschema")
 
     repo_root = Path(__file__).resolve().parents[2]
     schema = json.loads(
@@ -3929,10 +3916,19 @@ def test_recovery_trading_day_must_be_iso_date():
     # accepted trading_day='bogus', so a caller that omitted the expected day --
     # the default for collect_recovery_context_order_ids() -- trusted a
     # schema-invalid state and hid its order IDs from watchdog discrepancies.
-    for bad in ("bogus", "2026/07/27", "20260727", "2026-7-27", "  ", "2026-07-27T00:00:00Z"):
-        assert validate_recovery_classification(_recovery_classification(trading_day=bad)) is False, bad
-        state = {"run_classification": _recovery_classification(trading_day=bad)}
-        assert is_valid_recovery_context_state(state) is False, bad
+    # Loop variable named for what these are: the secrets guard in
+    # test_config_invariants exempts a date-shaped literal only when a date cue
+    # sits near it, and the compact-date fixture below is a malformed-FORMAT
+    # case, not an account (Codex review, PR #219).
+    for bad_trading_day in ("bogus", "2026/07/27", "20260727", "2026-7-27", "  ", "2026-07-27T00:00:00Z"):
+        assert (
+            validate_recovery_classification(
+                _recovery_classification(trading_day=bad_trading_day)
+            )
+            is False
+        ), bad_trading_day
+        state = {"run_classification": _recovery_classification(trading_day=bad_trading_day)}
+        assert is_valid_recovery_context_state(state) is False, bad_trading_day
     assert validate_recovery_classification(_recovery_classification()) is True
     # The state's OWN day is format-checked too, not merely compared.
     conforming = _recovery_classification()
@@ -3983,10 +3979,7 @@ def test_recovery_schema_rejects_whitespace_only_run_id():
     # Codex review: "Require a nonblank recovery run ID in the schema".
     # minLength:1 counted whitespace, so '   ' validated against the schema while
     # validate_recovery_classification() rejected it via run_id.strip().
-    try:
-        import jsonschema
-    except ImportError:
-        return
+    jsonschema = pytest.importorskip("jsonschema")
     repo_root = Path(__file__).resolve().parents[2]
     schema = json.loads(
         (repo_root / "schemas" / "recovery_run_classification.schema.json").read_text(
@@ -4172,3 +4165,46 @@ def test_a_denied_state_with_no_orders_is_rejected():
 
     assert derive_valid_scheduled_evidence(state) is False
     assert not is_scheduled_state(state)
+
+
+def test_state_root_and_cron_tracking_root_resolve_at_call_time():
+    """state_root()/cron_tracking_root() (no explicit base) used to return
+    STATE_ROOT/CRON_TRACKING_ROOT -- module constants bound once at import.
+    generate_credit_usage_proxy_report.py already resolves the shared
+    $DCA_CRON_TRACKING_ROOT override per call (see
+    test_cron_tracking_root_honours_the_env_override in
+    test_generate_credit_usage_proxy_report.py), so a $DCA_CRON_TRACKING_ROOT
+    set after this module's import left every no-base writer here (e.g.
+    write_run_artifacts()/pointer updates) writing under the OLD tree while
+    that reader looked in the new one -- valid afternoon scheduled evidence
+    then appeared to be missing (Codex review, PR #219: "Resolve the
+    classification state root at call time")."""
+    probe = (
+        "import os\n"
+        "import sys\n"
+        f"sys.path.insert(0, {str(Path(__file__).resolve().parents[1])!r})\n"
+        f"sys.path.insert(1, {str(Path(__file__).resolve().parents[2])!r})\n"
+        "import run_classification\n"  # imported BEFORE the override
+        "os.environ['DCA_CRON_TRACKING_ROOT'] = os.environ['PROBE_ROOT']\n"
+        "print(run_classification.state_root())\n"
+        "print(run_classification.cron_tracking_root())\n"
+        "print(run_classification.STATE_ROOT)\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "DCA_CRON_TRACKING_ROOT"}
+    env["PROBE_ROOT"] = "/srv/run-classification-probe"
+    out = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=str(Path(__file__).resolve().parents[2]),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    lines = out.stdout.splitlines()
+    assert lines[0] == "/srv/run-classification-probe/ce16ba6b", out.stdout
+    assert lines[1] == "/srv/run-classification-probe", out.stdout
+    # STATE_ROOT itself is untouched by the override -- it is still an
+    # import-time constant used elsewhere (e.g. its own module docstring
+    # references) -- which is exactly why state_root() naming it directly
+    # was wrong.
+    assert lines[2] == "/home/user/workspace/cron_tracking/ce16ba6b", out.stdout

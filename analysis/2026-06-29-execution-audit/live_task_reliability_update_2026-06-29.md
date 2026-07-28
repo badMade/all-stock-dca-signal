@@ -14,7 +14,7 @@ The existing 3:45 PM ET live graded DCA task `ce16ba6b` was updated on 2026-06-2
 
 ## Safety constraints unchanged
 
-- Robinhood Agentic account `562057042` only.
+- Robinhood Agentic account `[account redacted]` only.
 - Buy-only equities.
 - No sells, options, crypto, margin expansion, or order replacement.
 - Regular-hours only.

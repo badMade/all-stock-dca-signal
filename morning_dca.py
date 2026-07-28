@@ -42,7 +42,8 @@ is NOT auto-bought. It is classified as a ``manual_review_candidate``. The
 loosened "buy anyway when trend is unavailable" rule is deliberately NOT
 implemented.
 
-Robinhood account 562057042 remains the only execution broker; Alpaca stays
+Robinhood remains the only execution broker (the account number comes from
+$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, never from git); Alpaca stays
 read-only. Morning fills are never afternoon scheduled evidence; they count only
 as prior-allocation context for the afternoon same-day top-up guard.
 """
@@ -60,8 +61,18 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from dca_alerts import artifact_freshness_probe, attempt_log_root_sibling_to, guarded_run
-from dca_config import get_config_dir, load_approved_dates, load_tickers
+from dca_config import (
+    ACCOUNT_NUMBER_SHAPE,
+    READ_ONLY_ACCOUNT,
+    InvalidAccountNumberError,
+    MissingConfigEnvError,
+    get_config_dir,
+    load_approved_dates,
+    load_tickers,
+    resolve_broker_account,
+)
 from dca_fileio import atomic_open_w, atomic_write_text
+from dca_paths import rebase_bundled_roots_in, stream_root
 from near_close_dca import (
     ACTIVE_TICKERS,
     BASE_NOT_BELOW_CLOSE,
@@ -80,6 +91,7 @@ from near_close_dca import (
     OrderConfirmationRequiredError,
     PriorSameDayAllocation,
     StrategyConfig,
+    account_pinning_failure,
     completed_bar_anchor,
     graded_buy_multiplier,
     iso_week_key,
@@ -92,7 +104,6 @@ from near_close_dca import (
     select_first_allocation_base_usd,
     warn_if_window_expiring,
 )
-from scripts.model_usage_log import DEFAULT_LOG_ROOT as DEFAULT_MODEL_USAGE_LOG_ROOT
 from scripts.model_usage_log import log_model_usage
 from scripts.run_classification import (
     BLOCKED_BY_SPREAD_GATE,
@@ -137,6 +148,7 @@ from scripts.scheduled_artifacts import (
 )
 
 _log = logging.getLogger(__name__)
+
 
 # --- Morning stream identity / classification constants ---------------------
 #
@@ -228,9 +240,9 @@ MORNING_WINDOW_END_ET = MORNING_WATCHLIST_WINDOW_END_ET
 # Artifact roots. Both are siblings of, and never nested under, the afternoon
 # ce16ba6b root. The watchlist scan and live execution use distinct roots so a
 # read-only scan can never be confused with a live-execution artifact.
-DEFAULT_MORNING_WATCHLIST_STATE_ROOT = "/home/user/workspace/cron_tracking/morning_dca_watchlist"
-DEFAULT_MORNING_PREFLIGHT_STATE_ROOT = "/home/user/workspace/cron_tracking/morning_dca_preflight"
-DEFAULT_MORNING_LIVE_STATE_ROOT = "/home/user/workspace/cron_tracking/morning_dca"
+DEFAULT_MORNING_WATCHLIST_STATE_ROOT = stream_root("morning_dca_watchlist")
+DEFAULT_MORNING_PREFLIGHT_STATE_ROOT = stream_root("morning_dca_preflight")
+DEFAULT_MORNING_LIVE_STATE_ROOT = stream_root("morning_dca")
 # Legacy alias: the default root historically pointed at the morning stream.
 DEFAULT_MORNING_STATE_ROOT = DEFAULT_MORNING_WATCHLIST_STATE_ROOT
 # The afternoon live task artifact root. The afternoon scheduled live task
@@ -238,13 +250,13 @@ DEFAULT_MORNING_STATE_ROOT = DEFAULT_MORNING_WATCHLIST_STATE_ROOT
 # under the historical ce16ba6b directory for continuity. Scanned by the
 # morning top-up guard so manual/recovery fills recorded before 10:30 AM are
 # detected.
-DEFAULT_AFTERNOON_TASK_ROOT = "/home/user/workspace/cron_tracking/ce16ba6b"
+DEFAULT_AFTERNOON_TASK_ROOT = stream_root("ce16ba6b")
 # The market-open live task (2ba19526, 9:35 AM ET) artifact root. Scanned by
 # the morning (10:30) and midday (12:30) top-up guards so a 9:35 fill is
 # recognized as same-day prior context instead of being re-bought as a first
 # allocation (Codex review: "Feed market-open fills into later top-up
 # guards").
-DEFAULT_MARKET_OPEN_TASK_ROOT = "/home/user/workspace/cron_tracking/market_open_dca"
+DEFAULT_MARKET_OPEN_TASK_ROOT = stream_root("market_open_dca")
 # The intraday live task (7be82b97, 11:30/13:30/14:30 ET slots) artifact
 # root. Scanned by the midday (12:30) top-up guard -- an 11:30 fill must
 # offset the 12:30 desired amount the same way a morning fill does (Codex
@@ -254,7 +266,7 @@ DEFAULT_MARKET_OPEN_TASK_ROOT = "/home/user/workspace/cron_tracking/market_open_
 # absolute-path form the morning/midday executors' own prior_allocation_roots
 # lists use, distinct in shape (not just basename) from that bare sibling
 # name.
-DEFAULT_INTRADAY_TASK_ROOT = "/home/user/workspace/cron_tracking/intraday_dca"
+DEFAULT_INTRADAY_TASK_ROOT = stream_root("intraday_dca")
 
 # Jul 20 2026 pre-flight path fix (see live_task.preflight_artifact_resolution
 # in config/morning_dca.json). The 10:30 live run must never read the same-day
@@ -263,7 +275,7 @@ DEFAULT_INTRADAY_TASK_ROOT = "/home/user/workspace/cron_tracking/intraday_dca"
 # output directory). _apply_preflight_gate() fails closed rather than reading
 # from a preflight_run_state_root that resolves under one of these.
 DEFAULT_PREFLIGHT_FORBIDDEN_ROOTS: Tuple[str, ...] = (
-    "/home/user/workspace/cron_tracking/42173154",
+    stream_root("42173154"),
     DEFAULT_MORNING_LIVE_STATE_ROOT,
 )
 
@@ -286,6 +298,7 @@ MORNING_PROFILES: Dict[str, Dict[str, Any]] = {
         "window_end_et": MORNING_WATCHLIST_WINDOW_END_ET,
         "state_schema_version": MORNING_WATCHLIST_SCHEMA_VERSION,
         "state_root": DEFAULT_MORNING_WATCHLIST_STATE_ROOT,
+        "state_root_stream": "morning_dca_watchlist",
         "folder_suffix": "0945ET",
         "scheduled_run_id_prefix": "morning",
         "manual_run_id_prefix": "manual_morning",
@@ -303,6 +316,7 @@ MORNING_PROFILES: Dict[str, Dict[str, Any]] = {
         "window_end_et": MORNING_PREFLIGHT_WINDOW_END_ET,
         "state_schema_version": MORNING_PREFLIGHT_SCHEMA_VERSION,
         "state_root": DEFAULT_MORNING_PREFLIGHT_STATE_ROOT,
+        "state_root_stream": "morning_dca_preflight",
         "folder_suffix": "0945ET",
         "scheduled_run_id_prefix": "morning_preflight",
         "manual_run_id_prefix": "manual_morning_preflight",
@@ -320,6 +334,7 @@ MORNING_PROFILES: Dict[str, Dict[str, Any]] = {
         "window_end_et": MORNING_LIVE_WINDOW_END_ET,
         "state_schema_version": MORNING_LIVE_SCHEMA_VERSION,
         "state_root": DEFAULT_MORNING_LIVE_STATE_ROOT,
+        "state_root_stream": "morning_dca",
         "folder_suffix": "1030ET",
         "scheduled_run_id_prefix": "morning_live",
         "manual_run_id_prefix": "manual_morning_live",
@@ -773,7 +788,76 @@ def _load_approved_dates_fail_closed(config_dir_path: Path) -> "frozenset[date]"
         return _APPROVED_DATES_LOAD_FAILED
 
 
-def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
+def default_prior_allocation_roots() -> tuple[str, ...]:
+    """The default prior-allocation roots, resolved at CALL time.
+
+    Must not be the DEFAULT_*_ROOT module constants: those bind when this module
+    is imported, while the roots loaded from ``config/*.json`` are rebased when
+    the config is READ. Setting ``$DCA_CRON_TRACKING_ROOT`` between those two
+    moments -- an import, then an override, then a load -- moved the loaded
+    values and left the constants behind, so the exact-tuple comparison in
+    ``_prior_allocation_roots`` saw a mismatch and concluded the caller had
+    explicitly overridden the roots. That skips the same-day manual top-up merge,
+    and a midday run can then re-buy a ticker an earlier manual allocation
+    already covered (Codex review, PR #219).
+
+    Deriving both sides from ``stream_root`` at the same moment keeps them in
+    step regardless of when the override lands.
+    """
+    return (
+        stream_root("market_open_dca"),
+        stream_root("morning_dca"),
+        stream_root("intraday_dca"),
+        stream_root("ce16ba6b"),
+    )
+
+
+def default_cap_seed_roots() -> tuple[str, str]:
+    """The default (afternoon, market-open) cap-seeding roots, at CALL time.
+
+    ``_compute_top_up`` used to name ``DEFAULT_AFTERNOON_TASK_ROOT`` and
+    ``DEFAULT_MARKET_OPEN_TASK_ROOT`` directly inside its body. Both are
+    module-level constants bound once at import, so a ``$DCA_CRON_TRACKING_ROOT``
+    set afterward left the cap-seeding scan reading the OLD tree on every run
+    that leaves ``prior_allocation_roots`` at its default -- not just the
+    "config file missing" fallback, the common case (Codex review, PR #219).
+
+    A separate function from :func:`default_prior_allocation_roots` because the
+    two lists are genuinely different: this one is the pair
+    ``_compute_top_up`` actually scans for cap-seeding, not the four-root tuple
+    used to detect whether the caller left ``prior_allocation_roots`` at its
+    class default.
+
+    Named and public, not inlined, so a test can redirect it the same way
+    :func:`default_prior_allocation_roots` is redirected -- monkeypatching the
+    now-unused ``DEFAULT_AFTERNOON_TASK_ROOT``/``DEFAULT_MARKET_OPEN_TASK_ROOT``
+    module constants would no longer have any effect on this function.
+    """
+    return stream_root("ce16ba6b"), stream_root("market_open_dca")
+
+
+def default_preflight_forbidden_roots() -> tuple[str, ...]:
+    """The default must-not-look-under roots for the preflight gate, at CALL time.
+
+    ``_apply_preflight_gate`` already resolves its OWN ``root`` fresh via
+    ``stream_root("morning_dca_preflight")`` at call time, but used to compare
+    it against ``DEFAULT_PREFLIGHT_FORBIDDEN_ROOTS`` directly -- a module-level
+    tuple bound once at import. A ``$DCA_CRON_TRACKING_ROOT`` set afterward
+    moved ``root`` to the new tree while these forbidden roots stayed under the
+    old one, so a ``preflight_run_state_root`` that relocated into the (now
+    unguarded) old live-output directory passed the ``must_not_look_under``
+    check it exists to enforce (Codex review, PR #219: "Resolve forbidden
+    preflight roots at call time").
+    """
+    return stream_root("42173154"), stream_root("morning_dca")
+
+
+def load_morning_config(
+    config_dir=None,
+    mode: str = MORNING_WATCHLIST_MODE,
+    *,
+    allow_unpinned_account: bool = False,
+):
     """Read ``config/morning_dca.json`` and return a :class:`MorningConfig`.
 
     ``mode`` selects which artifact root to bind (the watchlist scan and the live
@@ -784,6 +868,25 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
     ``./config``). If the file is absent or unreadable the function logs a
     warning and returns ``MorningConfig()`` with hardcoded defaults -- the same
     graceful-fallback pattern used by :func:`dca_config.load_strategy_config`.
+
+    ``allow_unpinned_account`` decides what happens when the configured
+    ``broker_account`` cannot be resolved -- almost always because
+    ``$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`` is unset in the scheduler's
+    environment. The default raises, which is right for a caller that only wants
+    a path or a report. It is WRONG for the scheduled live path: the raise
+    happens inside ``MorningDCAExecutor.__init__``, before an executor exists, so
+    the fail-closed machinery that exists for exactly this case
+    (``account_pinning_failure`` -> ``_blocked_live_result``) was unreachable for
+    the most common pinning failure, and the slot produced no artifact at all --
+    monitoring saw a MISSING run rather than a blocked one, which is the
+    distinction the blocked-evidence path exists to preserve (Codex review,
+    PR #219).
+
+    With it set, ``target_account_number`` is left unset instead. That is not a
+    weakening: an unset account is precisely what ``account_pinning_failure``
+    refuses to trade on, and ``build_broker`` refuses to construct a live adapter
+    without one. The run still places nothing -- it just leaves evidence saying
+    so.
     """
     if config_dir is None:
         config_dir_path = get_config_dir()
@@ -796,13 +899,65 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
             "morning_dca.json not found at %s; using MorningConfig defaults", cfg_path
         )
         approved_dates = _load_approved_dates_fail_closed(config_dir_path)
+        # morning_run_state_root/preflight_run_state_root deliberately stay
+        # None here rather than being resolved via stream_root() at load
+        # time the way model_usage_log_root is just below: run_dca.py's
+        # _resolve_cross_stream_prior_allocation_roots reads this exact
+        # field to tell "this stream's config actually configured a root"
+        # (truthy) apart from "no config, use the default" (None/falsy) --
+        # baking a real path in here made every config-missing fallback look
+        # explicitly configured, which defeated that containment check and
+        # let a relocated (test/demo/staging) run's cross-stream scan trust
+        # the bundled production default (Codex/self-review, PR #219: "Keep
+        # relocated runs contained" regressed by an earlier fix here). The
+        # staleness this was meant to fix -- self.state_root and the
+        # preflight-gate root falling back to an import-time DEFAULT_*
+        # constant instead of a fresh stream_root() call -- is fixed at
+        # those actual call sites instead (see MorningDCAExecutor.__init__
+        # and _apply_preflight_gate).
+        #
+        # target_account_number is resolved fresh here too, mirroring the
+        # config-present path below: MorningConfig's dataclass default is
+        # ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, an import-time constant, so a
+        # config-missing live run either pinned a stale account or blocked on
+        # a stale unset sentinel instead of reflecting the account actually
+        # set in the environment right now (Codex review, PR #219: "Resolve
+        # the account when falling back to defaults"). Watchlist/preflight
+        # never trade, so they get the READ_ONLY_ACCOUNT literal rather than
+        # a real account -- the same value the bundled config's own
+        # watchlist_task/preflight_task blocks use -- as defense in depth
+        # alongside run_classification's own profile["trades"] gate (Codex
+        # review, PR #219: "Omit account numbers from read-only
+        # classifications").
+        if mode == MORNING_LIVE_MODE:
+            try:
+                account_number = resolve_broker_account(
+                    "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}",
+                    source="morning_dca.json missing; live_task fallback",
+                )
+            except (MissingConfigEnvError, InvalidAccountNumberError):
+                if not allow_unpinned_account:
+                    raise
+                # See this function's docstring: an unset account here is
+                # exactly what account_pinning_failure() fails closed on.
+                account_number = None
+        else:
+            account_number = READ_ONLY_ACCOUNT
         return MorningConfig(
-            approved_test_dates=approved_dates, model_usage_log_root=DEFAULT_MODEL_USAGE_LOG_ROOT
+            approved_test_dates=approved_dates,
+            model_usage_log_root=stream_root("model_usage"),
+            target_account_number=account_number,
         )
 
     approved_date_overrides = {
         "approved_test_dates": _load_approved_dates_fail_closed(config_dir_path),
-        "model_usage_log_root": DEFAULT_MODEL_USAGE_LOG_ROOT,
+        # stream_root() at LOAD time, not the import-time constant:
+        # $DCA_CRON_TRACKING_ROOT set between import and config load
+        # rebased the run-state roots while leaving model-usage evidence
+        # (and the attempt-log sibling derived from it) under the old
+        # tree, where the call-time credit-usage report never looks
+        # (Codex review, PR #219).
+        "model_usage_log_root": stream_root("model_usage"),
     }
 
     try:
@@ -810,6 +965,14 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
     except (json.JSONDecodeError, OSError) as exc:
         logger.warning("could not parse %s (%s); using MorningConfig defaults", cfg_path, exc)
         return MorningConfig(**approved_date_overrides)
+
+    # The bundled artifact_paths / prior_allocation_roots / preflight-resolution
+    # values are absolute paths under the default cron_tracking tree, and they
+    # are loaded into the executor -- overriding the stream_root()-derived
+    # defaults. Without this, setting $DCA_CRON_TRACKING_ROOT moved every
+    # dca_paths consumer but left the executors reading and writing the bundled
+    # production tree. No-op when the variable is unset.
+    raw = rebase_bundled_roots_in(raw)
 
     kwargs = dict(approved_date_overrides)
 
@@ -844,8 +1007,58 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
         kwargs["trend_min_bars"] = int(raw["trend_min_bars"])
 
     live_task = raw.get("live_task", {})
-    if "broker_account" in live_task:
-        kwargs["target_account_number"] = str(live_task["broker_account"])
+
+    # The broker account comes from THIS mode's task block, not unconditionally
+    # from live_task. Each block already carries the right value -- live_task has
+    # the "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}" reference, watchlist_task and
+    # preflight_task have the literal "read_only" -- but this used to read
+    # live_task for every mode, so the read-only scans silently bound the live
+    # trading account.
+    #
+    # That became load-breaking once the account moved into the environment:
+    # expand_config_env raises when the variable is unset, so constructing a
+    # watchlist or preflight executor started failing on a host where the secret
+    # is scoped only to the trading jobs -- and the 9:45 preflight artifact is a
+    # hard dependency of the 10:30 live run (Codex review, PR #219: "Require the
+    # account variable only for live mode"). Reading the mode's own block fixes
+    # both: read-only modes get "read_only" and never touch the variable.
+    mode_task_key = {
+        MORNING_WATCHLIST_MODE: "watchlist_task",
+        MORNING_PREFLIGHT_MODE: "preflight_task",
+        MORNING_LIVE_MODE: "live_task",
+    }.get(mode)
+    account_task = raw.get(mode_task_key) if mode_task_key else None
+    if not isinstance(account_task, dict) or "broker_account" not in account_task:
+        # No block for this mode (or an older config without the per-mode
+        # blocks): fall back to live_task, preserving the previous behavior.
+        account_task, account_task_key = live_task, "live_task"
+    else:
+        account_task_key = mode_task_key
+    if "broker_account" in account_task:
+        source = f"{mode} {account_task_key}.broker_account"
+        try:
+            kwargs["target_account_number"] = resolve_broker_account(
+                account_task["broker_account"], source=source
+            )
+        except (MissingConfigEnvError, InvalidAccountNumberError):
+            if not allow_unpinned_account:
+                raise
+            # Explicitly None, NOT merely left out: the dataclass default is the
+            # IMPORT-TIME module constant, so omitting the kwarg would silently
+            # fall back to whatever account the environment held when this module
+            # was first imported -- which for a malformed configured account is a
+            # real, usable account number. That would turn a pinning failure into
+            # a live run against an unintended account, the exact bypass this
+            # whole path exists to close.
+            kwargs["target_account_number"] = None
+            # Leave target_account_number unset so the caller's live path reaches
+            # account_pinning_failure() and writes a durable blocked artifact.
+            # See load_morning_config's `allow_unpinned_account` note.
+            logging.warning(
+                "%s could not be resolved to a usable account; the live run will "
+                "fail closed and record account_pinning_failed",
+                source,
+            )
     # preflight_artifact_resolution (added Jul 20 2026): pins where the 10:30
     # live gate is and is not allowed to read the same-day 9:45 pre-flight
     # artifact from, and whether it performs the single bounded recovery scan.
@@ -879,7 +1092,8 @@ def load_morning_config(config_dir=None, mode: str = MORNING_WATCHLIST_MODE):
     if isinstance(cap_roots, list) and cap_roots:
         kwargs["cap_seed_roots"] = tuple(str(r) for r in cap_roots)
     # model_usage_log_root (see scripts/model_usage_log.py, config/scheduled_tasks.json
-    # -> model_usage_log): defaults to DEFAULT_MODEL_USAGE_LOG_ROOT above so the audit
+    # -> model_usage_log): defaults to stream_root("model_usage"), resolved when
+    # this loader RUNS rather than at import, so the audit
     # log is enabled for every real load_morning_config() caller; an explicit
     # artifact_paths.model_usage_log_root overrides it, and null/empty-string disables
     # the append entirely for this stream.
@@ -1371,7 +1585,15 @@ class MorningDCAExecutor(DCAExecutor):
             weekly_cap_usd=self.config.morning_weekly_cap_usd,
         )
         self._sizing_config = self.config.as_strategy_config()
-        self.state_root = self.config.morning_run_state_root or self.profile["state_root"]
+        # stream_root() at CALL time, not self.profile["state_root"] (an
+        # import-time constant): a $DCA_CRON_TRACKING_ROOT set between
+        # import and this executor's construction must still be honored for
+        # a stream whose config didn't itself set morning_run_state_root
+        # (Codex review, PR #219). See load_morning_config's config-missing
+        # fallback for why that resolution can't happen there instead.
+        self.state_root = self.config.morning_run_state_root or stream_root(
+            self.profile["state_root_stream"]
+        )
         self.decision_time = self.config.decision_time_et or self.profile["decision_time_et"]
         # run_ids already folded into self.ledger by _seed_ledger_from_prior_runs
         # -- including this instance's OWN completed runs (added in run() right
@@ -1408,8 +1630,17 @@ class MorningDCAExecutor(DCAExecutor):
         self._prior_daily_spend_seeded = 0.0
 
     def _load_default_config(self, config_dir: Optional[str], mode: str) -> MorningConfig:
-        """Load this executor's config when none is passed. Overridable per stream."""
-        return load_morning_config(config_dir, mode=mode)
+        """Load this executor's config when none is passed. Overridable per stream.
+
+        A live run tolerates an unresolvable account so it can reach its own
+        fail-closed path and leave a blocked artifact; see
+        :func:`load_morning_config`'s ``allow_unpinned_account`` note. Read-only
+        modes keep the strict behavior -- nothing downstream of them can produce
+        block evidence, so a raise is the clearest failure they have.
+        """
+        return load_morning_config(
+            config_dir, mode=mode, allow_unpinned_account=mode == MORNING_LIVE_MODE
+        )
 
     # -- Top-up guard (same-day prior-allocation offset) ---------------------
     def _compute_top_up(
@@ -1452,20 +1683,14 @@ class MorningDCAExecutor(DCAExecutor):
         # 9:35 AM market-open fill offsets this run's 10:30 desired amount
         # instead of being re-bought as a first allocation (Codex review:
         # "Feed market-open fills into later top-up guards").
-        configured = list(raw_roots) if raw_roots is not None else [
-            DEFAULT_AFTERNOON_TASK_ROOT,
-            DEFAULT_MARKET_OPEN_TASK_ROOT,
-        ]
+        configured = list(raw_roots) if raw_roots is not None else list(default_cap_seed_roots())
         # True when the caller left prior_allocation_roots at its class default
         # (None for MorningConfig's own auto-derive marker, or MiddayConfig's own
         # hardcoded production default) rather than pointing it at a specific,
         # narrower tree -- e.g. an isolated replay/staging config (Codex review:
         # "Honor explicit prior-allocation roots in shared executors").
-        uses_default_prior_allocation_roots = raw_roots is None or tuple(raw_roots) == (
-            DEFAULT_MARKET_OPEN_TASK_ROOT,
-            DEFAULT_MORNING_LIVE_STATE_ROOT,
-            DEFAULT_INTRADAY_TASK_ROOT,
-            DEFAULT_AFTERNOON_TASK_ROOT,
+        uses_default_prior_allocation_roots = (
+            raw_roots is None or tuple(raw_roots) == default_prior_allocation_roots()
         )
         # Append the manual_runs subtree of self.state_root only for the morning
         # stream. Midday manual reruns are prior context for the afternoon guard,
@@ -1784,9 +2009,8 @@ class MorningDCAExecutor(DCAExecutor):
             "run_id": self.run_id(now, manual=manual),
             "triggered_at_utc": triggered_iso,
             "state_schema_version": profile["state_schema_version"],
-            # The execution broker and account for all morning stream modes; always Robinhood.
+            # The execution broker for all morning stream modes; always Robinhood.
             "execution_broker": "robinhood",
-            "account_number": ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
             # Pre-authorized direct placement is only for scheduled LIVE runs; read-only
             # (watchlist/preflight) and manual runs are never pre-authorized.
             "preauthorized_direct_place": bool(profile["trades"]) and not manual,
@@ -1810,6 +2034,65 @@ class MorningDCAExecutor(DCAExecutor):
             "same_day_required": not manual,
             "valid_scheduled_evidence": False,
         }
+
+        # Stamp the account this run is actually pinned to, read from the loaded
+        # config rather than the import-time module constant. The constant is
+        # captured when morning_dca is imported, so a process that populated or
+        # changed $ROBINHOOD_AGENTIC_ACCOUNT_NUMBER before calling
+        # load_morning_config() would execute against the loaded account while
+        # the artifact claimed the stale import-time value -- including the
+        # "UNSET_..." sentinel, which also violates the schema's
+        # ^[0-9]{6,12}$ pattern (Codex review, PR #219).
+        #
+        # The presence rule mirrors the schema, which REQUIRES account_number for
+        # every *_dca_live run_type and leaves it optional otherwise:
+        #
+        #   * A well-formed account is always stamped.
+        #   * A trading mode whose account is NOT well-formed records
+        #     ``account_pinning_failed: true`` and omits the field.
+        #   * Read-only modes simply omit it. Loaded watchlist/preflight configs
+        #     carry the literal "read_only", which is not an account and must
+        #     never be recorded as one; the field is optional for them anyway.
+        #
+        # The marker exists because a blocked live run is otherwise
+        # unrepresentable. account_pinning_failure() deliberately does not abort
+        # the run -- _blocked_live_result() routes through build_artifacts() so
+        # operators get durable evidence explaining why the scheduled stream
+        # placed nothing. But the schema REQUIRES account_number to match the
+        # digit shape for every *_dca_live run, so that evidence had no valid
+        # form: stamping the bad value fails the pattern, omitting it fails the
+        # conditional `required` (Codex review, PR #219). Raising instead would
+        # trade a schema-invalid artifact for no artifact at all, losing exactly
+        # the block evidence the fail-closed path exists to produce.
+        #
+        # So the schema now admits the third state explicitly, and the marker
+        # makes it machine-checkable: a watchdog can tell "blocked, account not
+        # pinnable" apart from "field missing", which is the distinction that was
+        # being lost. Normal live runs are unaffected -- account_number stays
+        # required for them.
+        #
+        # The sole consumer (generate_credit_usage_proxy_report's
+        # _account_number_from) falls back to the run_state value when absent.
+        account_number = getattr(self.config, "target_account_number", None)
+        pinnable = isinstance(account_number, str) and ACCOUNT_NUMBER_SHAPE.fullmatch(
+            account_number
+        )
+        # profile["trades"] gates BOTH branches, not just the failure marker:
+        # target_account_number's dataclass default is the import-time
+        # ROBINHOOD_AGENTIC_ACCOUNT_NUMBER env constant, and a watchlist/
+        # preflight config load that hits load_morning_config's config-missing
+        # fallback never overrides it (that fallback only seeds
+        # approved_test_dates/model_usage_log_root), so a read-only executor
+        # can end up holding a real, well-formed account number. Without this
+        # gate `pinnable` alone would stamp that live account into a read-only
+        # classification the documented contract above says must omit it
+        # entirely (Codex review, PR #219: "Omit account numbers from
+        # read-only classifications").
+        if pinnable and profile["trades"]:
+            classification["account_number"] = account_number
+        elif profile["trades"]:
+            classification["account_pinning_failed"] = True
+
         return classification
 
     # -- Evaluation ----------------------------------------------------------
@@ -2076,8 +2359,15 @@ class MorningDCAExecutor(DCAExecutor):
         if not (self.mode == MORNING_LIVE_MODE and self.stream == MORNING_STREAM):
             return tickers
         trading_day = now.astimezone(EASTERN).date()
-        root = self.config.preflight_run_state_root or DEFAULT_MORNING_PREFLIGHT_STATE_ROOT
-        forbidden_roots = self.config.preflight_forbidden_roots or DEFAULT_PREFLIGHT_FORBIDDEN_ROOTS
+        # stream_root() at CALL time, not the import-time
+        # DEFAULT_MORNING_PREFLIGHT_STATE_ROOT constant -- same staleness
+        # reasoning as self.state_root above (Codex review, PR #219).
+        root = self.config.preflight_run_state_root or stream_root("morning_dca_preflight")
+        # default_preflight_forbidden_roots() at CALL time, not the
+        # import-time DEFAULT_PREFLIGHT_FORBIDDEN_ROOTS constant -- same
+        # staleness reasoning as root above (Codex review, PR #219: "Resolve
+        # forbidden preflight roots at call time").
+        forbidden_roots = self.config.preflight_forbidden_roots or default_preflight_forbidden_roots()
         forbidden_reason = _forbidden_preflight_root_reason(root, forbidden_roots)
         if forbidden_reason is not None:
             # must_not_look_under: treat a misconfigured root the same as
@@ -3954,6 +4244,19 @@ class MorningDCAExecutor(DCAExecutor):
             )
         if broker is not None and self.mode == MORNING_LIVE_MODE:
             expected_account = getattr(self.config, "target_account_number", None)
+            # Fail closed BEFORE the comparison below. `expected_account and ...`
+            # short-circuits on a falsy value, so an empty/absent
+            # target_account_number used to skip account pinning altogether and let
+            # a live run place against whatever account the adapter was wired to.
+            # near_close_dca.build_broker refuses to even construct a live adapter
+            # in that state; this path shares its predicate so both live streams
+            # enforce the same rule.
+            pinning_failure = account_pinning_failure(expected_account)
+            if pinning_failure:
+                blocked = f"live account pinning unavailable: {pinning_failure}"
+                if not manual:
+                    return self._blocked_live_result(now, blocked, signals, source)
+                raise RuntimeError(blocked)
             try:
                 actual_account = broker.account_number()
             except Exception as exc:  # noqa: BLE001 - broker adapters raise arbitrary connector errors
@@ -3962,7 +4265,7 @@ class MorningDCAExecutor(DCAExecutor):
                         now, f"failed to retrieve broker account number: {exc}", signals, source
                     )
                 raise RuntimeError(f"Failed to retrieve broker account number: {exc}") from exc
-            if expected_account and actual_account != expected_account:
+            if actual_account != expected_account:
                 mismatch = f"broker account mismatch: expected {expected_account}, got {actual_account}"
                 if not manual:
                     return self._blocked_live_result(now, mismatch, signals, source)

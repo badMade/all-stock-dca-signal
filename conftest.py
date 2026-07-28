@@ -1,21 +1,37 @@
 """Repo-wide pytest configuration.
 
-``near_close_dca.py`` reads ``ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`` from the
-environment at import time (falling back to a clearly-invalid placeholder
-when unset) instead of hardcoding the real account number in source, per the
-security fix in this branch. Tests that assert on the account number
-(e.g. ``test_morning_dca.py::test_run_state_path_and_classification``) need a
-deterministic value to compare against, so set it here before any test module
-gets collected/imported -- this keeps the fixture value out of production
-source while still giving the test suite a stable, known account number to
-assert on.
+The live brokerage account number is never committed. ``near_close_dca.py``
+reads ``ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`` from the environment at import time
+(falling back to a clearly-invalid placeholder when unset), and
+``config/*.json`` stores it as the ``${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}``
+reference that ``dca_config.expand_config_env`` resolves at load time.
+
+Tests need a deterministic value to assert against, so one is set here before
+any test module is collected/imported.
+
+``FIXTURE_ACCOUNT_NUMBER`` is a synthetic, obviously-fake number, and it is
+assigned UNCONDITIONALLY rather than via ``setdefault``. That is deliberate and
+does two things at once:
+
+  * the suite is hermetic -- it passes identically on a developer machine whose
+    shell exports a real account number, instead of failing with a confusing
+    account-mismatch diff;
+  * a real account number in the ambient environment can never be picked up by a
+    test and written into a fixture artifact, an assertion message, or CI logs.
+
+Any test that needs a *different* account (the account-mismatch and
+unpinned-account cases) sets it explicitly on the config object it builds.
 """
 
 import os
 
 import pytest
 
-os.environ.setdefault("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "562057042")
+# Synthetic. Nine digits so it satisfies the account_number shape pinned by
+# schemas/morning_run_classification.schema.json.
+FIXTURE_ACCOUNT_NUMBER = "999000111"
+
+os.environ["ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"] = FIXTURE_ACCOUNT_NUMBER
 
 
 @pytest.fixture(autouse=True)

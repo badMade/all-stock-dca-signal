@@ -53,6 +53,7 @@ import json
 import logging
 import math
 import os
+import re
 import statistics
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
@@ -132,6 +133,16 @@ logger = logging.getLogger("near_close_dca")
 # Security Enhancement: Fetch account number from environment variable
 # to prevent exposing sensitive identifiers in version control.
 _UNSET_ACCOUNT_SENTINEL = "UNSET_ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"
+
+# The digit shape the run-classification schemas pin account_number to. Enforced
+# at the shared pinning gate, not only in the config loader: the loaders'
+# graceful-fallback paths (config file absent or unparseable) and any direct
+# MorningConfig/StrategyConfig construction bypass resolve_broker_account
+# entirely, so a malformed environment value like "acct-123" reached live
+# execution and was stamped into the artifact as an account, which the schema
+# then rejects -- turning a connector or mismatch failure into evidence a
+# watchdog reads as missing rather than blocked (Codex review, PR #219).
+_ACCOUNT_NUMBER_SHAPE = re.compile(r"^[0-9]{6,12}$")
 _env_account = os.environ.get("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER")
 ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = _env_account or _UNSET_ACCOUNT_SENTINEL
 
@@ -516,33 +527,44 @@ BUDGET_TIERS: tuple[BudgetTier, ...] = (
 
 NORMAL_WEEKLY_CAP_USD = BUDGET_TIERS[0].weekly_cap_usd
 
+# Escalation thresholds, named rather than inlined as bare numbers in the
+# branches below. Each entry is the value a run must EXCEED to reach the tier at
+# the same index + 1, so both tuples are read low-to-high alongside BUDGET_TIERS
+# and the "> threshold" boundary is stated once instead of per branch.
+#
+# Both are "headroom" triggers: escalate before the current tier's ceiling is
+# actually hit, so a run that is trending large gets its larger cap before it
+# starts refusing buys. $129 is ~72% of the normal tier's $180 daily cap, $213
+# ~89% of elevated's $240, $272 ~91% of high_volatility's $300. The signal counts
+# are the matching "how broad is the selloff" trigger — 6, 11, and 18+ tickers
+# at 3x-or-greater. Mirrored in config/budgets.json -> budget_tiers[].select_when
+# and pinned against it by test_config_invariants.py.
+TIER_SPEND_THRESHOLDS_USD: tuple[float, ...] = (129.0, 213.0, 272.0)
+TIER_HIGH_MULTIPLIER_SIGNAL_THRESHOLDS: tuple[int, ...] = (5, 10, 17)
+
+
+def _escalation_index(value: float, thresholds: Sequence[float]) -> int:
+    """Number of ``thresholds`` strictly exceeded by ``value`` — i.e. the tier index."""
+    return sum(1 for threshold in thresholds if value > threshold)
+
 
 def select_budget_tier(planned_spend_usd: float, high_multiplier_signal_count: int) -> BudgetTier:
     """Select the budget tier for a run from planned spend and 3x+ signal count.
 
-    Each dimension maps to a tier index; the higher of the two wins:
+    Each dimension independently maps to a tier index and the HIGHER of the two
+    wins, so either a large planned spend or a broad selloff can escalate the
+    day's caps on its own:
+
         spend:   <=129 -> 0, >129 -> 1, >213 -> 2, >272 -> 3
         signals: <=5   -> 0, 6-10 -> 1, 11-17 -> 2, >17 -> 3
+
+    See TIER_SPEND_THRESHOLDS_USD / TIER_HIGH_MULTIPLIER_SIGNAL_THRESHOLDS for
+    where the boundaries come from.
     """
-    if planned_spend_usd > 272.0:
-        spend_idx = 3
-    elif planned_spend_usd > 213.0:
-        spend_idx = 2
-    elif planned_spend_usd > 129.0:
-        spend_idx = 1
-    else:
-        spend_idx = 0
-
-    n = high_multiplier_signal_count
-    if n > 17:
-        signal_idx = 3
-    elif n >= 11:
-        signal_idx = 2
-    elif n >= 6:
-        signal_idx = 1
-    else:
-        signal_idx = 0
-
+    spend_idx = _escalation_index(planned_spend_usd, TIER_SPEND_THRESHOLDS_USD)
+    signal_idx = _escalation_index(
+        high_multiplier_signal_count, TIER_HIGH_MULTIPLIER_SIGNAL_THRESHOLDS
+    )
     return BUDGET_TIERS[max(spend_idx, signal_idx)]
 
 
@@ -1039,6 +1061,61 @@ class AlpacaBroker:
         return f"ALPACA-DRYRUN-{mode}-{ticker}-{payload['input']['notional']}-{ref_id}"
 
 
+def account_pinning_failure(
+    target_account_number: Optional[str],
+    broker: "BrokerName | str | None" = None,
+) -> Optional[str]:
+    """Return why ``target_account_number`` cannot pin a live run, or ``None`` if it can.
+
+    A live run must know, explicitly, which brokerage account it is allowed to trade.
+    Three values fail that test:
+
+      * falsy (``None``/``""``) — nothing was configured, so a
+        ``configured != actual`` comparison short-circuits and silently permits
+        ANY account the adapter happens to be wired to;
+      * :data:`_UNSET_ACCOUNT_SENTINEL` — ``ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`` was
+        not set in the environment, so the module-level default is a placeholder,
+        not an account;
+      * for Robinhood only, anything that is not 6-12 digits.
+
+    The digit shape is Robinhood's, not every broker's. Applying it unconditionally
+    made ``build_broker`` reject a perfectly normal Alpaca identifier (a ``PA...``
+    paper account) before execution ever reached the ALPACA branch, so the
+    documented broker-agnostic live adapter could not be constructed at all
+    (Codex review, PR #219). ``broker`` defaults to Robinhood because every
+    caller that omits it -- the morning and midday streams -- is a Robinhood
+    stream, and the artifact schema requires the digit shape for those runs.
+    The nonempty/placeholder checks above are broker-agnostic and always apply:
+    no backend may trade an account nobody named.
+
+    Shared by both live execution paths on purpose. ``build_broker`` refuses to
+    construct a live adapter, and ``morning_dca``'s class-based executor refuses to
+    place, on exactly the same condition — previously the executor guarded with
+    ``if expected_account and ...``, so an empty configured value disabled its
+    account check entirely rather than blocking the run.
+    """
+    if not target_account_number:
+        return (
+            "config.target_account_number is unset "
+            f"({target_account_number!r}), so the live account cannot be pinned"
+        )
+    if target_account_number == _UNSET_ACCOUNT_SENTINEL:
+        return (
+            "config.target_account_number is the unset placeholder "
+            f"({target_account_number!r}); the ROBINHOOD_AGENTIC_ACCOUNT_NUMBER "
+            "environment variable is not set"
+        )
+    if broker is None or BrokerName(broker) == BrokerName.ROBINHOOD:
+        if not _ACCOUNT_NUMBER_SHAPE.fullmatch(target_account_number):
+            return (
+                f"config.target_account_number is a {len(target_account_number)}-character "
+                "value that is not a valid Robinhood account number (expected 6-12 "
+                "digits); the value is withheld because a malformed one is often a "
+                "secret pasted into the wrong variable"
+            )
+    return None
+
+
 def build_broker(
     config: StrategyConfig,
     alpaca_config: Optional[AlpacaConfig] = None,
@@ -1061,15 +1138,14 @@ def build_broker(
     Refuse to build a live broker (the ALPACA branch, and the ROBINHOOD branch when adapter
     callables are wired) here instead, before any live adapter is constructed.
     """
-    if not config.dry_run and (
-        not config.target_account_number or config.target_account_number == _UNSET_ACCOUNT_SENTINEL
-    ):
-        raise RuntimeError(
-            "build_broker: config.dry_run is False but config.target_account_number is "
-            f"unset ({config.target_account_number!r}). Set the ROBINHOOD_AGENTIC_ACCOUNT_NUMBER "
-            "environment variable (or otherwise configure a real account number) before running "
-            "live, or set dry_run=True."
-        )
+    if not config.dry_run:
+        pinning_failure = account_pinning_failure(config.target_account_number, config.broker)
+        if pinning_failure:
+            raise RuntimeError(
+                f"build_broker: config.dry_run is False but {pinning_failure}. Set the "
+                "ROBINHOOD_AGENTIC_ACCOUNT_NUMBER environment variable (or otherwise "
+                "configure a real account number) before running live, or set dry_run=True."
+            )
     if config.broker == BrokerName.ALPACA:
         return AlpacaBroker(
             config=alpaca_config or AlpacaConfig(),
@@ -4877,6 +4953,22 @@ def _check_execution_gates(
         _write_blocked_run_stub(trading_day, artifacts_dir, classification_state_root)
         return False
 
+    # Validate the CONFIGURED account before comparing it to the broker's. The
+    # equality check below is satisfied by any two values that happen to match,
+    # including two empty ones -- so a live StrategyConfig(target_account_number="")
+    # paired with an injected adapter whose account_number() is also "" sailed
+    # through and reached placement. build_broker refuses to construct such an
+    # adapter, but callers may inject a BrokerAdapter into run_once directly and
+    # bypass the factory entirely, so the same condition has to hold here at the
+    # execution gate, which every path crosses (Codex review, PR #219).
+    if not config.dry_run:
+        pinning_failure = account_pinning_failure(config.target_account_number, config.broker)
+        if pinning_failure:
+            raise RuntimeError(
+                f"Refusing to trade live: {pinning_failure}. Configure a real account "
+                "number (ROBINHOOD_AGENTIC_ACCOUNT_NUMBER) before running live, or set "
+                "dry_run=True."
+            )
     if broker.account_number() != config.target_account_number:
         raise RuntimeError(
             f"Refusing to trade account {broker.account_number()}; expected {config.target_account_number}"

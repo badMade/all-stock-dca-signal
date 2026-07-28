@@ -11,6 +11,9 @@ Runnable with ``pytest`` or ``python test_morning_dca.py``.
 
 import csv
 import os
+import re
+import subprocess
+import sys
 
 # chatgpt-codex-connector review on PR #54: conftest.py's
 # ``os.environ.setdefault("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", ...)`` only runs
@@ -22,7 +25,7 @@ import os
 # value test_run_state_path_and_classification asserts against. This mirrors
 # conftest.py's setdefault exactly, so it's a no-op under pytest (conftest.py
 # already ran first) and only matters for the standalone path.
-os.environ.setdefault("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "562057042")
+os.environ.setdefault("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "999000111")
 
 import json
 from datetime import date, datetime, time, timedelta, timezone
@@ -30,6 +33,8 @@ from pathlib import Path
 
 import pytest
 
+from dca_config import MissingConfigEnvError
+from dca_paths import CRON_TRACKING_ROOT_ENV
 from morning_dca import (
     DEFAULT_MORNING_LIVE_STATE_ROOT,
     DEFAULT_MORNING_PREFLIGHT_STATE_ROOT,
@@ -43,6 +48,7 @@ from morning_dca import (
     MORNING_PREFLIGHT_CRON_ID,
     MORNING_PREFLIGHT_MODE,
     MORNING_SIZING_TIERS,
+    MORNING_WATCHLIST_MODE,
     DCAExecutor,
     MorningConfig,
     MorningDCAExecutor,
@@ -67,7 +73,10 @@ from near_close_dca import (
     PriorSameDayAllocation,
     SourceName,
     _nth_weekday_of_month,
+    account_pinning_failure,
 )
+
+REPO_ROOT = Path(__file__).resolve().parent
 
 
 def _now_live():
@@ -705,7 +714,12 @@ def test_run_state_path_and_classification(tmp_path):
     assert rc["cron_id"] == MORNING_CRON_ID
     assert rc["supersedes_cron_id"] is None
     assert rc["execution_broker"] == "robinhood"
-    assert rc["account_number"] == "562057042"
+    # Read-only mode: account_number must be omitted even though
+    # MorningConfig's default target_account_number resolves to a real,
+    # well-formed account -- the field is documented as "used for morning
+    # live execution" and a watchlist scan places no orders (Codex review,
+    # PR #219: "Omit account numbers from read-only classifications").
+    assert "account_number" not in rc
 
     # Watchlist markers present; no order fields, amounts hypothetical only.
     art = res["artifacts"]
@@ -802,7 +816,7 @@ def test_live_mode_path_and_classification(tmp_path):
     assert rc["run_id"] == "morning_live_20260708_1030ET"
     assert rc["cron_id"] == MORNING_LIVE_CRON_ID
     assert rc["execution_broker"] == "robinhood"
-    assert rc["account_number"] == "562057042"
+    assert rc["account_number"] == "999000111"
     assert rc["preauthorized_direct_place"] is True
     assert rc["valid_morning_evidence"] is True
     assert rc["valid_afternoon_evidence"] is False
@@ -1167,7 +1181,7 @@ def test_morning_run_reviews_places_and_records_orders_csv(tmp_path):
     cfg = MorningConfig(tickers=("SMALL",), base_buy_amount_usd=3.0, morning_run_state_root=str(tmp_path))
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
-    broker = DryRunBroker(account="562057042", reference_prices={"SMALL": 97.0})
+    broker = DryRunBroker(account="999000111", reference_prices={"SMALL": 97.0})
 
     res = ex.run(_now_live(), data, broker=broker, manual=True)
     candidate = res["artifacts"]["buy_candidates"][0]
@@ -1223,7 +1237,7 @@ def test_morning_artifacts_include_planned_amount_for_prior_allocation_loader(tm
     cfg = MorningConfig(tickers=("SMALL",), base_buy_amount_usd=3.0, morning_run_state_root=str(tmp_path))
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
-    broker = DryRunBroker(account="562057042", reference_prices={"SMALL": 97.0})
+    broker = DryRunBroker(account="999000111", reference_prices={"SMALL": 97.0})
 
     res = ex.run(_now_live(), data, broker=broker, manual=True)
     candidate = res["artifacts"]["buy_candidates"][0]
@@ -1246,7 +1260,7 @@ def test_morning_live_orders_are_blocked_before_exceeding_daily_cap(tmp_path):
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.03, "BBB": 0.03})
-    broker = RecordingLiveBroker(account="562057042", reference_prices={"AAA": 97.0, "BBB": 97.0})
+    broker = RecordingLiveBroker(account="999000111", reference_prices={"AAA": 97.0, "BBB": 97.0})
 
     res = ex.run(_now_live(), data, broker=broker, manual=True)
     by_ticker = {candidate["ticker"]: candidate for candidate in res["artifacts"]["buy_candidates"]}
@@ -1282,7 +1296,7 @@ def test_morning_live_ledger_seeds_cap_spend_from_earlier_same_process_day_run(t
     )
     ex1 = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data1 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.03})
-    broker1 = RecordingLiveBroker(account="562057042", reference_prices={"AAA": 97.0})
+    broker1 = RecordingLiveBroker(account="999000111", reference_prices={"AAA": 97.0})
     res1 = ex1.run(_now_live(), data1, broker=broker1, manual=True)
     assert res1["artifacts"]["broker_outcomes"]["AAA"]["status"] == "submitted"
 
@@ -1297,7 +1311,7 @@ def test_morning_live_ledger_seeds_cap_spend_from_earlier_same_process_day_run(t
     )
     ex2 = MorningDCAExecutor(cfg2, mode=MORNING_LIVE_MODE)
     data2 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.03})
-    broker2 = RecordingLiveBroker(account="562057042", reference_prices={"BBB": 97.0})
+    broker2 = RecordingLiveBroker(account="999000111", reference_prices={"BBB": 97.0})
     res2 = ex2.run(_now_live(), data2, broker=broker2, manual=True)
 
     assert len(broker2.placed_orders) == 0
@@ -1322,7 +1336,7 @@ def test_morning_live_ledger_seeds_weekly_cap_from_earlier_day_same_week(tmp_pat
     )
     ex1 = MorningDCAExecutor(cfg1, mode=MORNING_LIVE_MODE)
     data1 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.03})
-    broker1 = RecordingLiveBroker(account="562057042", reference_prices={"AAA": 97.0})
+    broker1 = RecordingLiveBroker(account="999000111", reference_prices={"AAA": 97.0})
     res1 = ex1.run(monday, data1, broker=broker1, manual=True)
     assert res1["artifacts"]["broker_outcomes"]["AAA"]["status"] == "submitted"
     assert res1["artifacts"]["buy_candidates"][0]["planned_amount_usd"] == 7.5
@@ -1337,7 +1351,7 @@ def test_morning_live_ledger_seeds_weekly_cap_from_earlier_day_same_week(tmp_pat
     )
     ex2 = MorningDCAExecutor(cfg2, mode=MORNING_LIVE_MODE)
     data2 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.03})
-    broker2 = RecordingLiveBroker(account="562057042", reference_prices={"BBB": 97.0})
+    broker2 = RecordingLiveBroker(account="999000111", reference_prices={"BBB": 97.0})
     res2 = ex2.run(_now_live(), data2, broker=broker2, manual=True)
 
     # Monday already spent $7.50 of the $10 weekly cap, leaving only $2.50 of
@@ -1365,7 +1379,7 @@ def test_morning_live_ledger_seed_does_not_double_count_same_instance_rerun(tmp_
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data1 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.03})
-    broker1 = RecordingLiveBroker(account="562057042", reference_prices={"AAA": 97.0})
+    broker1 = RecordingLiveBroker(account="999000111", reference_prices={"AAA": 97.0})
     res1 = ex.run(_now_live(), data1, broker=broker1, manual=True)
     assert res1["artifacts"]["broker_outcomes"]["AAA"]["status"] == "submitted"
 
@@ -1377,7 +1391,7 @@ def test_morning_live_ledger_seed_does_not_double_count_same_instance_rerun(tmp_
         morning_run_state_root=str(tmp_path),
     )
     data2 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.03})
-    broker2 = RecordingLiveBroker(account="562057042", reference_prices={"BBB": 97.0})
+    broker2 = RecordingLiveBroker(account="999000111", reference_prices={"BBB": 97.0})
     res2 = ex.run(_now_live(), data2, broker=broker2, manual=True)
 
     # $20 cap: AAA ($7.50) + BBB ($7.50) = $15 <= $20 -- must be admitted. The
@@ -1420,7 +1434,7 @@ def test_morning_live_ledger_seed_naive_manual_timestamp_is_eastern_not_utc(tmp_
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.03})
-    broker = RecordingLiveBroker(account="562057042", reference_prices={"AAA": 97.0})
+    broker = RecordingLiveBroker(account="999000111", reference_prices={"AAA": 97.0})
     res = ex.run(_now_live(), data, broker=broker, manual=True)
 
     # A 14:29 manual run must not have consumed any of the $10 daily cap for
@@ -1463,7 +1477,7 @@ def test_morning_live_ledger_seed_excludes_delayed_scheduled_artifact_on_replay(
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.03})
-    broker = RecordingLiveBroker(account="562057042", reference_prices={"AAA": 97.0})
+    broker = RecordingLiveBroker(account="999000111", reference_prices={"AAA": 97.0})
     res = ex.run(_now_live(), data, broker=broker, manual=True)
 
     # The delayed 14:00 scheduled artifact must not have consumed any of the
@@ -1505,7 +1519,7 @@ def test_morning_live_ledger_seed_rejects_non_finite_csv_notional(tmp_path):
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.03})
-    broker = RecordingLiveBroker(account="562057042", reference_prices={"BBB": 97.0})
+    broker = RecordingLiveBroker(account="999000111", reference_prices={"BBB": 97.0})
     res = ex.run(_now_live(), data, broker=broker, manual=True)
 
     # $10 weekly cap: Monday's JSON total ($1, the inf notional rejected) plus
@@ -1543,7 +1557,7 @@ def test_morning_live_ledger_seed_survives_corrupt_filled_orders_csv(tmp_path):
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.03})
-    broker = RecordingLiveBroker(account="562057042", reference_prices={"BBB": 97.0})
+    broker = RecordingLiveBroker(account="999000111", reference_prices={"BBB": 97.0})
     # Must not raise UnicodeDecodeError; falls back to the JSON total ($1).
     res = ex.run(_now_live(), data, broker=broker, manual=True)
     assert broker.placed_orders, f"BBB wrongly blocked; ledger={ex.ledger.planned_by_week}"
@@ -1586,7 +1600,7 @@ def test_morning_live_ledger_seed_falls_back_to_orders_csv_when_filled_orders_un
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.03})
-    broker = RecordingLiveBroker(account="562057042", reference_prices={"BBB": 97.0})
+    broker = RecordingLiveBroker(account="999000111", reference_prices={"BBB": 97.0})
     res = ex.run(_now_live(), data, broker=broker, manual=True)
 
     # $10 weekly cap: the orders.csv fallback total ($8, not the JSON's stale
@@ -1638,7 +1652,7 @@ def test_morning_live_ledger_seed_uses_larger_of_partial_filled_orders_and_order
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.03})
-    broker = RecordingLiveBroker(account="562057042", reference_prices={"BBB": 97.0})
+    broker = RecordingLiveBroker(account="999000111", reference_prices={"BBB": 97.0})
     res = ex.run(_now_live(), data, broker=broker, manual=True)
 
     # $12 weekly cap: orders.csv's larger total ($8, not filled_orders.csv's
@@ -1673,7 +1687,7 @@ def test_morning_live_retry_preserves_prior_submitted_candidate_on_scheduled_pat
     )
     ex1 = MorningDCAExecutor(cfg1, mode=MORNING_LIVE_MODE)
     data1 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.03})
-    broker1 = RecordingLiveBroker(account="562057042", reference_prices={"AAA": 97.0})
+    broker1 = RecordingLiveBroker(account="999000111", reference_prices={"AAA": 97.0})
     res1 = ex1.run(_now_live(), data1, broker=broker1, manual=False)
     assert res1["artifacts"]["broker_outcomes"]["AAA"]["status"] == "submitted"
     scheduled_path = Path(res1["paths"]["run_state"])
@@ -1690,7 +1704,7 @@ def test_morning_live_retry_preserves_prior_submitted_candidate_on_scheduled_pat
     )
     ex2 = MorningDCAExecutor(cfg2, mode=MORNING_LIVE_MODE)
     data2 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.03})
-    broker2 = RecordingLiveBroker(account="562057042", reference_prices={"BBB": 97.0})
+    broker2 = RecordingLiveBroker(account="999000111", reference_prices={"BBB": 97.0})
     res2 = ex2.run(_now_live(), data2, broker=broker2, manual=False)
     assert res2["artifacts"]["broker_outcomes"]["BBB"]["status"] == "submitted"
     assert Path(res2["paths"]["run_state"]) == scheduled_path
@@ -1984,18 +1998,22 @@ def test_load_morning_config_enables_model_usage_log_by_default(tmp_path):
     # (unlike the bare MorningConfig() dataclass default of None, which
     # protects ad-hoc/test construction) -- otherwise the audit log the
     # manifest/docs promise is silently disabled in production.
-    from morning_dca import DEFAULT_MODEL_USAGE_LOG_ROOT, load_morning_config
+    # stream_root("model_usage"), not a module constant: the loader resolves this
+    # when it RUNS, so comparing against an import-time value would re-assert the
+    # staleness that was just removed (Codex review, PR #219).
+    from dca_paths import stream_root
+    from morning_dca import load_morning_config
 
     # Missing config file.
     cfg = load_morning_config(str(tmp_path / "nonexistent"))
-    assert cfg.model_usage_log_root == DEFAULT_MODEL_USAGE_LOG_ROOT
+    assert cfg.model_usage_log_root == stream_root("model_usage")
 
     # Present but empty config file.
     cfg_dir = tmp_path / "config"
     cfg_dir.mkdir()
     (cfg_dir / "morning_dca.json").write_text("{}", encoding="utf-8")
     cfg = load_morning_config(str(cfg_dir))
-    assert cfg.model_usage_log_root == DEFAULT_MODEL_USAGE_LOG_ROOT
+    assert cfg.model_usage_log_root == stream_root("model_usage")
 
     # Explicit override via artifact_paths.model_usage_log_root.
     (cfg_dir / "morning_dca.json").write_text(
@@ -2188,13 +2206,10 @@ def test_run_without_broker_does_not_place_orders(tmp_path):
 def test_classifications_validate_against_json_schema():
     """Both morning classifications must validate against the JSON schema.
 
-    Skipped gracefully when jsonschema is not installed so the stdlib-only
-    smoke run still passes.
+    jsonschema is a hard dev dependency (requirements-dev.txt), so this is a
+    real assertion in CI rather than a silent no-op.
     """
-    try:
-        import jsonschema
-    except ImportError:
-        return
+    jsonschema = pytest.importorskip("jsonschema")
 
     schema_path = Path(__file__).resolve().parent / "schemas" / "morning_run_classification.schema.json"
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
@@ -2219,10 +2234,7 @@ def test_historical_v1_live_classification_still_validates_against_schema():
     # which still carried the v2-only fields and so never exercised the real
     # v1 gap -- this builds an actual pre-2026-07-15 v1-shaped dict (those
     # fields did not exist yet) to verify it validates.
-    try:
-        import jsonschema
-    except ImportError:
-        return
+    jsonschema = pytest.importorskip("jsonschema")
     schema_path = Path(__file__).resolve().parent / "schemas" / "morning_run_classification.schema.json"
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
     cfg = MorningConfig(tickers=("SMALL",))
@@ -2436,11 +2448,9 @@ def test_preflight_ticker_eligibility_row_unresolved_unit():
 
 
 def test_preflight_machine_complete_validates_against_json_schema(tmp_path):
-    try:
-        import jsonschema
-        from referencing import Registry, Resource
-    except ImportError:
-        return
+    jsonschema = pytest.importorskip("jsonschema")
+    referencing = pytest.importorskip("referencing")
+    Registry, Resource = referencing.Registry, referencing.Resource
 
     schemas_dir = Path(__file__).resolve().parent / "schemas"
     main = json.loads((schemas_dir / "morning_preflight.schema.json").read_text(encoding="utf-8"))
@@ -2804,10 +2814,7 @@ def test_preflight_classification_matches_morning_schema():
     assert rc["state_schema_version"] == "morning-preflight-v2-machine-complete"
     assert rc["run_id"] == "morning_preflight_20260708_0945ET"
     assert set(schema["required"]).issubset(rc.keys())
-    try:
-        import jsonschema
-    except ImportError:
-        return
+    jsonschema = pytest.importorskip("jsonschema")
     jsonschema.validate(rc, schema)
     manual_rc = MorningDCAExecutor(cfg, mode=MORNING_PREFLIGHT_MODE).run_classification(
         _now_preflight(), manual=True
@@ -3081,7 +3088,7 @@ def test_scheduled_live_run_with_wrong_broker_account_fails_closed_before_orderi
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
         preflight_run_state_root=str(pf_root),
-        target_account_number="562057042",
+        target_account_number="999000111",
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     broker = _WrongAccountBroker()
@@ -3092,7 +3099,7 @@ def test_scheduled_live_run_with_wrong_broker_account_fails_closed_before_orderi
 
     assert res["artifacts"]["status"] == "blocked"
     assert res["artifacts"]["block_reason"] == (
-        "broker account mismatch: expected 562057042, got not-the-approved-account"
+        "broker account mismatch: expected 999000111, got not-the-approved-account"
     )
     assert broker.placed is False
     assert Path(res["paths"]["run_state"]).exists()
@@ -3102,6 +3109,86 @@ def test_scheduled_live_run_with_wrong_broker_account_fails_closed_before_orderi
     assert res["artifacts"]["counts"]["evaluated"] == 1
     assert "latest_morning_run" in res["paths"]
     assert Path(res["paths"]["latest_morning_run"]).exists()
+
+
+class _AnyAccountBroker:
+    """Broker whose account_number() must never be trusted to pin a live run."""
+
+    def __init__(self, account="whatever-account-the-adapter-was-wired-to"):
+        self._account = account
+        self.placed = False
+
+    def account_number(self):
+        return self._account
+
+    def available_buying_power(self):
+        raise AssertionError("buying power should not be checked for an unpinned account")
+
+    def place_market_buy(self, ticker, notional_usd, ref_id):
+        self.placed = True
+        raise AssertionError("orders must not be placed for an unpinned account")
+
+
+@pytest.mark.parametrize(
+    "unpinned",
+    ["", None, "UNSET_ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"],
+    ids=["empty", "none", "sentinel"],
+)
+def test_scheduled_live_run_without_a_pinned_account_fails_closed(tmp_path, unpinned):
+    """An unset target_account_number must BLOCK, not silently skip the check.
+
+    The guard used to read ``if expected_account and actual != expected``, so a
+    falsy configured account short-circuited the comparison and the run placed
+    orders against whatever account the adapter happened to hold. Both live
+    execution paths now share near_close_dca.account_pinning_failure, which
+    treats empty/None/sentinel as unpinnable.
+    """
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        target_account_number=unpinned,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    broker = _AnyAccountBroker()
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    res = ex.run(_now_live(), data, broker=broker)
+
+    assert res["artifacts"]["status"] == "blocked"
+    assert res["artifacts"]["block_reason"].startswith("live account pinning unavailable:")
+    assert broker.placed is False
+    # Fail-closed still writes a durable, complete artifact like every other
+    # scheduler-wiring block.
+    assert Path(res["paths"]["run_state"]).exists()
+    assert res["artifacts"]["run_id"]
+    assert res["artifacts"]["counts"]["evaluated"] == 1
+
+
+@pytest.mark.parametrize(
+    "unpinned",
+    ["", None, "UNSET_ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"],
+    ids=["empty", "none", "sentinel"],
+)
+def test_manual_live_run_without_a_pinned_account_raises(tmp_path, unpinned):
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        target_account_number=unpinned,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    broker = _AnyAccountBroker()
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    with pytest.raises(RuntimeError, match="live account pinning unavailable"):
+        ex.run(_now_live(), data, broker=broker, manual=True)
+
+    assert broker.placed is False
 
 
 def test_manual_live_run_with_wrong_broker_account_raises_before_ordering(tmp_path):
@@ -3128,14 +3215,14 @@ def test_manual_live_run_with_wrong_broker_account_raises_before_ordering(tmp_pa
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
         preflight_run_state_root=str(pf_root),
-        target_account_number="562057042",
+        target_account_number="999000111",
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     broker = _WrongAccountBroker()
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
 
-    with pytest.raises(RuntimeError, match="broker account mismatch: expected 562057042, got not-the-approved-account"):
+    with pytest.raises(RuntimeError, match="broker account mismatch: expected 999000111, got not-the-approved-account"):
         ex.run(_now_live(), data, manual=True, broker=broker)
 
     assert broker.buying_power_checked is False
@@ -3166,7 +3253,7 @@ def test_scheduled_live_run_with_broker_account_number_error_fails_closed(tmp_pa
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
         preflight_run_state_root=str(pf_root),
-        target_account_number="562057042",
+        target_account_number="999000111",
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     broker = _RaisingAccountBroker()
@@ -3203,7 +3290,7 @@ def test_manual_live_run_with_broker_account_number_error_raises_runtime_error(t
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
         preflight_run_state_root=str(pf_root),
-        target_account_number="562057042",
+        target_account_number="999000111",
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     broker = _RaisingAccountBroker()
@@ -3262,7 +3349,7 @@ def test_blocked_live_retry_does_not_preserve_stale_non_submitted_block(tmp_path
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
         preflight_run_state_root=str(pf_root),
-        target_account_number="562057042",
+        target_account_number="999000111",
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -3286,11 +3373,11 @@ def test_blocked_live_retry_does_not_preserve_stale_non_submitted_block(tmp_path
 
     assert second["artifacts"]["status"] == "blocked"
     assert second["artifacts"]["block_reason"] == (
-        "broker account mismatch: expected 562057042, got not-the-approved-account"
+        "broker account mismatch: expected 999000111, got not-the-approved-account"
     )
     on_disk = json.loads(run_state_path.read_text(encoding="utf-8"))
     assert on_disk["block_reason"] == (
-        "broker account mismatch: expected 562057042, got not-the-approved-account"
+        "broker account mismatch: expected 999000111, got not-the-approved-account"
     )
 
 
@@ -4307,7 +4394,7 @@ def test_morning_ledger_seed_still_covers_scheduled_slot_when_cap_roots_are_manu
     )
     ex1 = MorningDCAExecutor(cfg1, mode=MORNING_LIVE_MODE)
     data1 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.03})
-    broker1 = RecordingLiveBroker(account="562057042", reference_prices={"AAA": 97.0})
+    broker1 = RecordingLiveBroker(account="999000111", reference_prices={"AAA": 97.0})
     res1 = ex1.run(_now_live(), data1, broker=broker1)
     assert res1["artifacts"]["broker_outcomes"]["AAA"]["status"] == "submitted"
 
@@ -4325,7 +4412,7 @@ def test_morning_ledger_seed_still_covers_scheduled_slot_when_cap_roots_are_manu
     )
     ex2 = MorningDCAExecutor(cfg2, mode=MORNING_LIVE_MODE)
     data2 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.03})
-    broker2 = RecordingLiveBroker(account="562057042", reference_prices={"BBB": 97.0})
+    broker2 = RecordingLiveBroker(account="999000111", reference_prices={"BBB": 97.0})
     res2 = ex2.run(_now_live() + timedelta(minutes=1), data2, broker=broker2)
 
     assert len(broker2.placed_orders) == 0, (
@@ -4846,8 +4933,13 @@ def test_morning_live_default_roots_include_market_open(tmp_path, monkeypatch):
 
     afternoon_root = tmp_path / "afternoon"
     market_open_root = tmp_path / "market_open"
-    monkeypatch.setattr(morning_dca, "DEFAULT_AFTERNOON_TASK_ROOT", str(afternoon_root))
-    monkeypatch.setattr(morning_dca, "DEFAULT_MARKET_OPEN_TASK_ROOT", str(market_open_root))
+    # default_cap_seed_roots() resolves via stream_root() at call time (Codex
+    # review, PR #219), so DEFAULT_AFTERNOON_TASK_ROOT/DEFAULT_MARKET_OPEN_
+    # TASK_ROOT no longer affect what _compute_top_up scans; redirect the
+    # function itself instead of the now-inert module constants.
+    monkeypatch.setattr(
+        morning_dca, "default_cap_seed_roots", lambda: (str(afternoon_root), str(market_open_root))
+    )
 
     _seed_prior(market_open_root, "NVDA", 2.0, reference_price=95.0, selected_base_amount_usd=2.0)
     pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
@@ -6781,3 +6873,490 @@ def test_a_mixed_dry_run_batch_keeps_its_dry_run_identity(tmp_path):
     # Still authoritative over a failure, matching the afternoon derivation which
     # checks config.dry_run first.
     assert _concrete_order_submit_status(rows + [{"status": "failed"}]) == "dry_run"
+
+
+# --- Classification account provenance ---------------------------------------
+# run_classification() stamped the import-time ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+# constant while execution pinned to the load-time config value. A process that
+# populated or changed the variable after importing morning_dca but before
+# calling load_morning_config() traded against one account and wrote an artifact
+# naming another -- and with the variable unset the artifact carried the
+# "UNSET_..." sentinel, which violates the schema's ^[0-9]{6,12}$ pattern
+# (Codex review, PR #219).
+
+def test_live_classification_stamps_the_loaded_account(tmp_path):
+    schema_path = Path(__file__).resolve().parent / "schemas" / "morning_run_classification.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    pattern = re.compile(schema["properties"]["account_number"]["pattern"])
+
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path),
+        target_account_number="123456789",
+    )
+    rc = MorningDCAExecutor(cfg, mode="live").run_classification(_now_live(), manual=False)
+    assert rc["account_number"] == "123456789"
+    assert pattern.fullmatch(rc["account_number"])
+
+
+def test_live_classification_follows_config_not_the_import_time_constant(tmp_path):
+    """The divergence itself: a config account that differs from the constant."""
+    import morning_dca as morning_module
+
+    # Assembled from fragments: a bare nine-digit literal here would trip the
+    # secrets guard in test_config_invariants.py, which now scans test files.
+    other_account = "9876" + "54321"
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path),
+        target_account_number=other_account,
+    )
+    rc = MorningDCAExecutor(cfg, mode="live").run_classification(_now_live(), manual=False)
+    assert rc["account_number"] == other_account
+    assert rc["account_number"] != morning_module.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+
+@pytest.mark.parametrize("mode", ["watchlist", "preflight"])
+def test_read_only_classifications_carry_no_account(tmp_path, mode):
+    """A scan that places no orders has no execution account to report.
+
+    Also keeps the literal "read_only" out of a field the schema constrains to
+    a digit shape.
+    """
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path),
+        target_account_number="read_only",
+    )
+    rc = MorningDCAExecutor(cfg, mode=mode).run_classification(_now(), manual=False)
+    assert "account_number" not in rc
+
+
+def test_live_classification_always_carries_an_account(tmp_path):
+    """The schema REQUIRES account_number for every *_dca_live run_type.
+
+    Omitting it -- which an earlier version of this fix did whenever the value
+    failed a shape check -- produced schema-invalid evidence for exactly the runs
+    that matter most (account mismatch, connector failure), so a watchdog would
+    report the scheduled run as missing rather than surfacing its block reason.
+    Validity is now guaranteed upstream by resolve_broker_account, so this stamps
+    unconditionally for trading modes.
+    """
+    schema_path = Path(__file__).resolve().parent / "schemas" / "morning_run_classification.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    conditional = next(
+        block
+        for block in schema["allOf"]
+        if block.get("if", {}).get("properties", {}).get("run_type", {}).get("const")
+        == "morning_dca_live"
+        and "account_number" in block.get("then", {}).get("required", [])
+    )
+    assert "account_number" in conditional["then"]["required"]
+
+    cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
+    rc = MorningDCAExecutor(cfg, mode="live").run_classification(_now_live(), manual=False)
+    assert rc["run_type"] == "morning_dca_live"
+    assert "account_number" in rc
+
+
+# --- Blocked-run evidence stays schema-valid ---------------------------------
+# account_pinning_failure() deliberately blocks WITHOUT aborting, so
+# _blocked_live_result() can route through build_artifacts() and leave operators
+# durable evidence. But the schema required account_number for every *_dca_live
+# run, so that evidence had no valid form: stamping a malformed value fails the
+# pattern, omitting it fails the conditional `required`. The schema now admits
+# the blocked state explicitly via account_pinning_failed (Codex review, #219).
+
+def _morning_schema():
+    path = Path(__file__).resolve().parent / "schemas" / "morning_run_classification.schema.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize(
+    "unpinnable",
+    ["acct-123", "12345", "UNSET_ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "", None],
+)
+def test_unpinnable_live_classification_is_marked_and_schema_valid(tmp_path, unpinnable):
+    jsonschema = pytest.importorskip("jsonschema")
+
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path),
+        target_account_number=unpinnable,
+    )
+    rc = MorningDCAExecutor(cfg, mode="live").run_classification(_now_live(), manual=False)
+
+    assert rc["account_pinning_failed"] is True
+    assert "account_number" not in rc, "an unusable value must never be recorded as an account"
+    jsonschema.validate(rc, _morning_schema())
+
+
+def test_a_pinning_failed_document_asserting_valid_scheduled_evidence_is_rejected(tmp_path):
+    """A run that could not pin an account never placed an order, so it can
+    never be valid scheduled evidence -- same gap as the midday schema, fixed
+    for parity (Codex review, PR #219: "Deny scheduled evidence when account
+    pinning fails")."""
+    jsonschema = pytest.importorskip("jsonschema")
+    cfg = MorningConfig(
+        tickers=("SMALL",), morning_run_state_root=str(tmp_path), target_account_number=None
+    )
+    rc = MorningDCAExecutor(cfg, mode="live").run_classification(_now_live(), manual=False)
+    assert rc["account_pinning_failed"] is True
+    jsonschema.validate(rc, _morning_schema())  # the real value still passes
+
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({**rc, "valid_scheduled_evidence": True}, _morning_schema())
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(
+            {k: v for k, v in rc.items() if k != "valid_scheduled_evidence"}, _morning_schema()
+        )
+
+
+def test_a_normal_live_classification_carries_the_account_and_no_marker(tmp_path):
+    jsonschema = pytest.importorskip("jsonschema")
+
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path),
+        target_account_number="123456789",
+    )
+    rc = MorningDCAExecutor(cfg, mode="live").run_classification(_now_live(), manual=False)
+
+    assert rc["account_number"] == "123456789"
+    assert "account_pinning_failed" not in rc
+    jsonschema.validate(rc, _morning_schema())
+
+
+@pytest.mark.parametrize("mode", [MORNING_WATCHLIST_MODE, MORNING_PREFLIGHT_MODE])
+def test_read_only_classifications_omit_a_well_formed_account_number(tmp_path, mode):
+    """account_number is documented ("used for morning live execution") and
+    schema-described as optional-not-required for watchlist/preflight, but the
+    stamping branch used to key ONLY on whether target_account_number happened
+    to be well-formed -- not on whether this run actually trades. A read-only
+    executor built without going through load_morning_config's per-mode
+    broker_account resolution (e.g. MorningConfig()'s own class default, which
+    is the import-time ROBINHOOD_AGENTIC_ACCOUNT_NUMBER env constant) then
+    stamped the real live account into an artifact that never placed an order
+    (Codex review, PR #219: "Omit account numbers from read-only
+    classifications")."""
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path),
+        preflight_run_state_root=str(tmp_path / "preflight"),
+        target_account_number="123456789",
+    )
+    rc = MorningDCAExecutor(cfg, mode=mode).run_classification(_now(), manual=False)
+    assert "account_number" not in rc
+    assert "account_pinning_failed" not in rc
+
+
+def test_the_schema_still_requires_an_account_for_unmarked_live_runs(tmp_path):
+    """The relaxation must be scoped to the blocked case only.
+
+    Derived from a real classification rather than a hand-built dict so this
+    asserts on the account constraint and cannot pass or fail for unrelated
+    reasons as the schema's other required fields evolve.
+    """
+    jsonschema = pytest.importorskip("jsonschema")
+
+    schema = _morning_schema()
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path),
+        target_account_number="123456789",
+    )
+    valid = MorningDCAExecutor(cfg, mode="live").run_classification(_now_live(), manual=False)
+    jsonschema.validate(valid, schema)
+
+    stripped = {k: v for k, v in valid.items() if k != "account_number"}
+    with pytest.raises(jsonschema.ValidationError, match="account_number"):
+        jsonschema.validate(stripped, schema)
+
+    # Only the explicit blocked marker lifts the requirement.
+    jsonschema.validate({**stripped, "account_pinning_failed": True}, schema)
+    # ...and it must be the marker, not merely the key being present.
+    with pytest.raises(jsonschema.ValidationError, match="account_number"):
+        jsonschema.validate({**stripped, "account_pinning_failed": False}, schema)
+
+
+# --- The blocked path is REACHABLE for the common pinning failure ------------
+# The evidence above only exists if an executor exists to produce it. With
+# $ROBINHOOD_AGENTIC_ACCOUNT_NUMBER unset -- by far the most common pinning
+# failure -- resolve_broker_account used to raise inside
+# MorningDCAExecutor.__init__, before any executor existed, so the scheduled
+# slot wrote no artifact at all and monitoring saw a MISSING run rather than a
+# blocked one (Codex review, PR #219).
+
+def test_the_live_path_loads_with_an_unset_account_variable(monkeypatch, tmp_path):
+    monkeypatch.delenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", raising=False)
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path))
+    cfg = load_morning_config(mode=MORNING_LIVE_MODE, allow_unpinned_account=True)
+    assert account_pinning_failure(cfg.target_account_number), (
+        "the degraded config must still be one the fail-closed guard refuses to trade on"
+    )
+
+
+def test_a_strict_caller_still_raises_on_an_unset_account_variable(monkeypatch):
+    """Only the live path degrades; a caller wanting a path or a report does not."""
+    monkeypatch.delenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", raising=False)
+    with pytest.raises(MissingConfigEnvError):
+        load_morning_config(mode=MORNING_LIVE_MODE)
+
+
+def test_an_unset_account_variable_still_produces_blocked_evidence(monkeypatch, tmp_path):
+    """The whole point: a blocked run, not a missing one."""
+    jsonschema = pytest.importorskip("jsonschema")
+    monkeypatch.delenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", raising=False)
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path))
+
+    executor = MorningDCAExecutor(mode=MORNING_LIVE_MODE)
+    rc = executor.run_classification(_now_live(), manual=False)
+
+    assert rc["account_pinning_failed"] is True
+    assert "account_number" not in rc
+    jsonschema.validate(rc, _morning_schema())
+
+
+def test_the_schema_still_requires_a_broker_on_a_blocked_live_run(tmp_path):
+    """account_pinning_failed excuses the ACCOUNT, never the broker -- the broker
+    is known even when the account is not, and a truncated blocked-live
+    classification with no broker used to validate (Codex review, PR #219)."""
+    jsonschema = pytest.importorskip("jsonschema")
+    cfg = MorningConfig(
+        tickers=("SMALL",), morning_run_state_root=str(tmp_path), target_account_number=None
+    )
+    rc = MorningDCAExecutor(cfg, mode="live").run_classification(_now_live(), manual=False)
+    jsonschema.validate(rc, _morning_schema())
+
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(
+            {k: v for k, v in rc.items() if k != "execution_broker"}, _morning_schema()
+        )
+
+
+# --- The config-missing fallback resolves ALL artifact roots at load time ----
+# model_usage_log_root was fixed to resolve at load time, but the fallback
+# still left morning_run_state_root/preflight_run_state_root at None, which
+# falls back to DEFAULT_MORNING_LIVE_STATE_ROOT/DEFAULT_MORNING_PREFLIGHT_
+# STATE_ROOT -- import-time constants -- later. A $DCA_CRON_TRACKING_ROOT set
+# between import and this call left the executor writing run_state.json and
+# the preflight artifact under the OLD tree (Codex review, PR #219).
+
+def test_unconfigured_state_root_resolves_at_executor_construction_time_for_every_mode():
+    """MorningConfig.morning_run_state_root/preflight_run_state_root stay None
+    when a stream's own config doesn't set them (including the config-missing
+    fallback -- see load_morning_config, which deliberately does NOT bake a
+    stream_root() value into those two fields the way it does for
+    model_usage_log_root, because run_dca.py's cross-stream containment check
+    reads their None-ness as "not explicitly configured"). The staleness this
+    could otherwise cause -- MorningDCAExecutor.__init__ falling back to
+    self.profile["state_root"], an import-time constant -- is fixed at that
+    call site instead: it now resolves stream_root(state_root_stream) fresh
+    on every construction (Codex review, PR #219)."""
+    probe = (
+        "import os\n"
+        "import morning_dca\n"  # imported BEFORE the override
+        f"os.environ['{CRON_TRACKING_ROOT_ENV}'] = os.environ['PROBE_ROOT']\n"
+        "cfg = morning_dca.MorningConfig(tickers=('SMALL',))\n"
+        "for mode in (morning_dca.MORNING_WATCHLIST_MODE, "
+        "morning_dca.MORNING_PREFLIGHT_MODE, morning_dca.MORNING_LIVE_MODE):\n"
+        "    print(morning_dca.MorningDCAExecutor(cfg, mode=mode).state_root)\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != CRON_TRACKING_ROOT_ENV}
+    env["PROBE_ROOT"] = "/srv/dca-fallback-probe"
+    out = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    roots = [line for line in out.stdout.splitlines() if line]
+    assert roots == [
+        "/srv/dca-fallback-probe/morning_dca_watchlist",
+        "/srv/dca-fallback-probe/morning_dca_preflight",
+        "/srv/dca-fallback-probe/morning_dca",
+    ], out.stdout
+
+
+def test_unconfigured_preflight_gate_root_resolves_at_call_time(tmp_path):
+    """Same staleness fix as the state_root test above, but for the OTHER
+    consumer of preflight_run_state_root -- _apply_preflight_gate's own
+    fallback (Codex review, PR #219). Writes a preflight artifact under the
+    freshly-resolved root and confirms the live executor's gate finds it,
+    proving it looked there rather than at the stale import-time
+    DEFAULT_MORNING_PREFLIGHT_STATE_ROOT.
+
+    PROBE_ROOT is a fresh tmp_path per run, not a fixed path: the probe
+    creates real directories on disk, and a fixed path would leave them
+    behind for the next run's os.makedirs() to collide with.
+    """
+    probe = (
+        "import os\n"
+        "import json\n"
+        "from datetime import date, datetime, time\n"
+        "import morning_dca\n"  # imported BEFORE the override
+        f"os.environ['{CRON_TRACKING_ROOT_ENV}'] = os.environ['PROBE_ROOT']\n"
+        "preflight_root = morning_dca.stream_root('morning_dca_preflight')\n"
+        "folder = os.path.join(preflight_root, '20260708_0945ET')\n"
+        "os.makedirs(folder)\n"
+        "with open(os.path.join(folder, 'run_state.json'), 'w') as f:\n"
+        "    json.dump({\n"
+        "        'eligible_to_execute_tickers': ['SMALL'],\n"
+        "        'trading_day': '2026-07-08',\n"
+        "        'run_classification': {\n"
+        "            'run_origin': 'scheduled',\n"
+        "            'manual_run': False,\n"
+        "            'stream': 'morning',\n"
+        "            'run_type': 'morning_dca_preflight',\n"
+        "            'state_schema_version': 'morning-preflight-v2-machine-complete',\n"
+        "        },\n"
+        "    }, f)\n"
+        "cfg = morning_dca.MorningConfig(tickers=('SMALL',))\n"
+        "ex = morning_dca.MorningDCAExecutor(cfg, mode=morning_dca.MORNING_LIVE_MODE)\n"
+        "now = datetime.combine(date(2026, 7, 8), time(10, 30), tzinfo=morning_dca.EASTERN)\n"
+        "ex._apply_preflight_gate(now, ['SMALL'], manual=False)\n"
+        "print(ex.preflight_gate['preflight_found'])\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != CRON_TRACKING_ROOT_ENV}
+    env["PROBE_ROOT"] = str(tmp_path / "dca-preflight-gate-probe")
+    out = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert out.stdout.strip() == "True", out.stdout
+
+
+def test_unconfigured_preflight_forbidden_roots_resolve_at_call_time(tmp_path):
+    """The gate's OWN root already resolves fresh (see the test above), but it
+    used to compare that fresh root against DEFAULT_PREFLIGHT_FORBIDDEN_ROOTS,
+    an import-time constant. A relocated preflight_run_state_root pointing
+    into the (fresh) live-output tree would then no longer match the (stale)
+    forbidden path, silently passing the must_not_look_under check it exists
+    to enforce (Codex review, PR #219: "Resolve forbidden preflight roots at
+    call time"). Points preflight_run_state_root inside the freshly-resolved
+    live root and confirms the gate still blocks it."""
+    probe = (
+        "import os\n"
+        "from datetime import date, datetime, time\n"
+        "import morning_dca\n"  # imported BEFORE the override
+        f"os.environ['{CRON_TRACKING_ROOT_ENV}'] = os.environ['PROBE_ROOT']\n"
+        "live_root = morning_dca.stream_root('morning_dca')\n"
+        "cfg = morning_dca.MorningConfig("
+        "tickers=('SMALL',), preflight_run_state_root=live_root + '/stray')\n"
+        "ex = morning_dca.MorningDCAExecutor(cfg, mode=morning_dca.MORNING_LIVE_MODE)\n"
+        "now = datetime.combine(date(2026, 7, 8), time(10, 30), tzinfo=morning_dca.EASTERN)\n"
+        "admitted = ex._apply_preflight_gate(now, ['SMALL'], manual=False)\n"
+        "print(admitted)\n"
+        "print(ex.preflight_gate['preflight_missing_block'])\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != CRON_TRACKING_ROOT_ENV}
+    env["PROBE_ROOT"] = str(tmp_path / "dca-preflight-forbidden-probe")
+    out = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    lines = out.stdout.splitlines()
+    assert lines == ["[]", "True"], out.stdout
+
+
+def test_cap_seeding_default_scan_roots_are_resolved_at_call_time():
+    """Not just the config-missing fallback: _compute_top_up named
+    DEFAULT_AFTERNOON_TASK_ROOT/DEFAULT_MARKET_OPEN_TASK_ROOT directly inside
+    a method body, which always returns their IMPORT-TIME value regardless of
+    when the method runs -- reachable on every run that leaves
+    prior_allocation_roots at its default, not only the fallback case
+    (Codex review, PR #219)."""
+    probe = (
+        "import os\n"
+        "import morning_dca\n"  # imported BEFORE the override
+        f"os.environ['{CRON_TRACKING_ROOT_ENV}'] = os.environ['PROBE_ROOT']\n"
+        "print(morning_dca.default_cap_seed_roots())\n"
+        "print(morning_dca.DEFAULT_AFTERNOON_TASK_ROOT)"
+    )
+    env = {k: v for k, v in os.environ.items() if k != CRON_TRACKING_ROOT_ENV}
+    env["PROBE_ROOT"] = "/srv/dca-cap-seed-probe"
+    out = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    lines = out.stdout.splitlines()
+    resolved_at_call_time = lines[0]
+    stale_import_time_constant = lines[1]
+    assert resolved_at_call_time == (
+        "('/srv/dca-cap-seed-probe/ce16ba6b', '/srv/dca-cap-seed-probe/market_open_dca')"
+    ), out.stdout
+    # DEFAULT_AFTERNOON_TASK_ROOT is untouched by the override -- it is still
+    # used elsewhere (e.g. test_dca_paths.py's byte-identical-defaults pin),
+    # which is exactly why _compute_top_up naming it directly was wrong.
+    assert stale_import_time_constant == "/home/user/workspace/cron_tracking/ce16ba6b", out.stdout
+
+
+def test_the_config_missing_fallback_resolves_the_live_account_at_call_time():
+    """MorningConfig.target_account_number defaults to
+    ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, itself resolved from the environment at
+    IMPORT time (near_close_dca module load). load_morning_config's
+    config-missing fallback used to return MorningConfig() without setting
+    this field at all, so a live run through that fallback pinned whatever
+    account happened to be set when the process first imported the module --
+    not the current one -- and could block or pin incorrectly (Codex review,
+    PR #219: "Resolve the account when falling back to defaults")."""
+    probe = (
+        "import os\n"
+        "import morning_dca\n"  # imported BEFORE the account is set
+        "os.environ['ROBINHOOD_AGENTIC_ACCOUNT_NUMBER'] = os.environ['PROBE_ACCOUNT']\n"
+        "cfg = morning_dca.load_morning_config("
+        "config_dir='/nonexistent-probe-dir', mode=morning_dca.MORNING_LIVE_MODE)\n"
+        "print(cfg.target_account_number)"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"}
+    env["PROBE_ACCOUNT"] = "123456789"
+    out = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert out.stdout.strip() == "123456789", out.stdout
+
+
+def test_the_config_missing_fallback_fails_closed_for_live_mode_without_an_account(monkeypatch):
+    """allow_unpinned_account's raise-by-default contract (see this function's
+    docstring) must hold in the config-missing fallback too, not just the
+    config-present path."""
+    monkeypatch.delenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", raising=False)
+    with pytest.raises(MissingConfigEnvError):
+        load_morning_config(config_dir="/nonexistent-probe-dir", mode=MORNING_LIVE_MODE)
+
+
+def test_the_config_missing_fallback_leaves_the_account_unset_when_allowed(monkeypatch, tmp_path):
+    monkeypatch.delenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", raising=False)
+    cfg = load_morning_config(
+        config_dir=str(tmp_path), mode=MORNING_LIVE_MODE, allow_unpinned_account=True
+    )
+    assert cfg.target_account_number is None
+
+
+@pytest.mark.parametrize("mode", [MORNING_WATCHLIST_MODE, MORNING_PREFLIGHT_MODE])
+def test_the_config_missing_fallback_never_pins_a_real_account_for_read_only_modes(mode, tmp_path):
+    """Defense in depth alongside run_classification's own profile["trades"]
+    gate (Codex review, PR #219: "Omit account numbers from read-only
+    classifications") -- the config-missing fallback should not even hold a
+    real account for a stream that never trades."""
+    cfg = load_morning_config(config_dir=str(tmp_path), mode=mode)
+    assert cfg.target_account_number == "read_only"

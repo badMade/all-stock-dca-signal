@@ -8,7 +8,7 @@ should skip rather than trade. Machine-readable copies live in
 
 ## Broker / account
 
-- **Robinhood Agentic account `562057042` is the only execution broker/account**
+- **Robinhood Agentic account `<ROBINHOOD_ACCOUNT_NUMBER>` is the only execution broker/account**
   for live and manual runs.
 - **Alpaca, Finance, and Yahoo are read-only** — validation, market-data, and
   account context only; never execution — unless the user explicitly changes this

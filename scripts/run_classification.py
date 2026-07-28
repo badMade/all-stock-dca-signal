@@ -38,6 +38,14 @@ from zoneinfo import ZoneInfo
 
 from dca_fileio import atomic_write_text
 
+# Aliased: this module defines its own cron_tracking_root(base=...) below
+# (a distinct signature -- this one supports a test-only base override),
+# which shadows this import at module scope once that def executes. The
+# alias lets the local function still reach dca_paths's version at CALL
+# time instead of recursing into itself.
+from dca_paths import cron_tracking_root as _dca_cron_tracking_root
+from dca_paths import stream_root
+
 # --- Contract constants (mirror config/run_classification.json) --------------
 
 STATE_SCHEMA_VERSION = "run-classification-v1"
@@ -346,11 +354,11 @@ CANONICAL_RETIME_DATE_YYYYMMDD = "20260727"
 ORDER_ATTRIBUTION_WINDOW_START_ET = LEGACY_SCHEDULED_WINDOW_START_ET
 
 # Artifact root remains the ce16ba6b path for continuity across the task repair.
-STATE_ROOT = "/home/user/workspace/cron_tracking/ce16ba6b"
+STATE_ROOT = stream_root("ce16ba6b")
 # Parent directory holding every per-task cron_tracking tree (ce16ba6b, morning_dca,
 # midday_dca, final_manual_review, ...). Used to reach the out-of-task manual-exclusion
 # roots below.
-CRON_TRACKING_ROOT = "/home/user/workspace/cron_tracking"
+CRON_TRACKING_ROOT = _dca_cron_tracking_root()
 RUN_STATE_FILENAME = "run_state.json"
 LATEST_SCHEDULED_RUN_FILENAME = "latest_scheduled_run.json"
 
@@ -699,7 +707,15 @@ def build_final_manual_override_classification(
 # --- Path helpers ------------------------------------------------------------
 
 def state_root(base: Optional[Path] = None) -> Path:
-    return Path(base) if base is not None else Path(STATE_ROOT)
+    # stream_root("ce16ba6b") at CALL time, not the import-time STATE_ROOT
+    # constant: generate_credit_usage_proxy_report.py already resolves the
+    # shared $DCA_CRON_TRACKING_ROOT override per call, so a
+    # $DCA_CRON_TRACKING_ROOT set after this module's import left every
+    # no-base write_run_artifacts()/pointer update here writing under the
+    # OLD tree while that reader looked in the new one -- valid afternoon
+    # scheduled evidence then appeared to be missing (Codex review, PR #219:
+    # "Resolve the classification state root at call time").
+    return Path(base) if base is not None else Path(stream_root("ce16ba6b"))
 
 
 def scheduled_run_dir(trading_day: str, base: Optional[Path] = None) -> Path:
@@ -735,13 +751,17 @@ def cron_tracking_root(base: Optional[Path] = None) -> Path:
     """Parent directory holding every per-task cron_tracking tree.
 
     With an explicit ``base`` (tests point ``base`` at a temporary ce16ba6b root) this
-    is ``base.parent``; otherwise the canonical ``CRON_TRACKING_ROOT``. Used to reach
-    the out-of-task manual-exclusion roots (``final_manual_review``,
+    is ``base.parent``; otherwise the canonical, freshly-resolved cron-tracking root.
+    Used to reach the out-of-task manual-exclusion roots (``final_manual_review``,
     ``midday_dca/manual_reruns``).
+
+    Resolves ``dca_paths.cron_tracking_root()`` at CALL time, not the
+    import-time ``CRON_TRACKING_ROOT`` constant -- same staleness reasoning
+    as :func:`state_root` above (Codex review, PR #219).
     """
     if base is not None:
         return Path(base).parent
-    return Path(CRON_TRACKING_ROOT)
+    return Path(_dca_cron_tracking_root())
 
 
 def manual_exclusion_roots(base: Optional[Path] = None) -> List[Path]:
@@ -2339,9 +2359,9 @@ def recovery_context_roots(
             continue
     # Override paths are scanned exactly like explicitly-supplied stream roots;
     # the dedupe below collapses the overlap when a caller passes them too.
-    for stream_root in (*override_roots, *(stream_roots or ())):
+    for supplied_root in (*override_roots, *(stream_roots or ())):
         try:
-            candidate = Path(stream_root)
+            candidate = Path(supplied_root)
             roots.extend(p for p in candidate.glob(RECOVERY_DIR_GLOB) if p.is_dir())
             # A caller may pass the recovery directory itself rather than its
             # parent stream root; accept that instead of silently ignoring it.

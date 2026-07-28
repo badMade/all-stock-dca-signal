@@ -33,6 +33,8 @@ from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from dca_alerts import ATTEMPT_LOG_HISTORY_SUFFIX, ATTEMPT_LOG_ROOT_ENV
+from dca_paths import CRON_TRACKING_ROOT_ENV as _CRON_TRACKING_ROOT_ENV
+from dca_paths import cron_tracking_root
 from scripts.model_usage_log import MODEL_ROUTING_MODE_VALUES
 from scripts.run_classification import (
     CRON_TRACKING_ROOT,
@@ -3209,19 +3211,25 @@ def render_markdown(report: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-# Deployment override for the artifact tree, mirroring the DCA_* convention
-# used by DCA_CONFIG_DIR / DCA_INTRADAY_LIVE_STATE_ROOT elsewhere in the repo.
-# The bundled CRON_TRACKING_ROOT is a production absolute path, so a
-# deployment with a different home or artifact root needs a way to redirect
-# both the tree this reads and the outputs it writes without editing the
-# registered scheduler command (Codex review: "Make the scheduled report paths
-# configurable").
-CRON_TRACKING_ROOT_ENV = "DCA_CRON_TRACKING_ROOT"
+# Deployment override for the artifact tree (Codex review: "Make the scheduled
+# report paths configurable"), so a deployment with a different home or artifact
+# root can redirect both the tree this reads and the outputs it writes without
+# editing the registered scheduler command.
+#
+# This module defined the variable name and the resolution rule first; both now
+# live in dca_paths, which every stream module shares. Re-exported here because
+# the CLI --help text and the tests reference it by this name.
+CRON_TRACKING_ROOT_ENV = _CRON_TRACKING_ROOT_ENV
 
 
 def _default_cron_tracking_root() -> str:
-    """Artifact-tree root: the env override when set and non-empty, else bundled."""
-    return os.environ.get(CRON_TRACKING_ROOT_ENV) or CRON_TRACKING_ROOT
+    """Artifact-tree root: the env override when set and non-empty, else bundled.
+
+    Unlike the module-level ``CRON_TRACKING_ROOT`` (resolved at import), this
+    reads the environment on every call, so a caller that sets the variable
+    late -- notably the tests -- still gets the redirected tree.
+    """
+    return cron_tracking_root()
 
 
 def default_report_paths(trading_day: str, cron_tracking_root: str | Path | None = None) -> Dict[str, Path]:

@@ -38,6 +38,8 @@ from pathlib import Path
 from typing import Any, Callable, Optional, TypeVar
 from urllib.parse import urlsplit
 
+from dca_paths import stream_root
+
 logger = logging.getLogger("near_close_dca.alerts")
 
 HEARTBEAT_URL_ENV_PREFIX = "DCA_HEARTBEAT_URL"
@@ -51,7 +53,13 @@ FALLBACK_WEBHOOK_ENV = "DCA_DRIFT_SLACK_WEBHOOK"
 # duplicated as a literal for the same no-project-imports reason as
 # FALLBACK_WEBHOOK_ENV above.
 ATTEMPT_LOG_ROOT_ENV = "DCA_ATTEMPT_LOG_ROOT"
-DEFAULT_ATTEMPT_LOG_ROOT = "/home/user/workspace/cron_tracking/attempt_log"
+# Resolved at IMPORT time and kept only as the module's advertised default for
+# callers that read the constant. The write path below deliberately does NOT use
+# it: $DCA_CRON_TRACKING_ROOT set after this module was imported would leave the
+# marker under the old tree while the credit-usage report, which resolves the
+# shared root per call, scans the relocated one -- and a fired-but-failed slot
+# then reads as a MISSING run rather than a failed one (Codex review, PR #219).
+DEFAULT_ATTEMPT_LOG_ROOT = stream_root("attempt_log")
 # Suffix of the append-only per-attempt history written alongside the single
 # latest-attempt <stream>.json marker, so a stream that fails more than once
 # on the same trading day keeps every failure rather than overwriting all but
@@ -240,7 +248,10 @@ def write_failed_start_marker(
     """
     try:
         triggered = triggered_at_utc or datetime.now(timezone.utc)
-        log_root = root or os.environ.get(ATTEMPT_LOG_ROOT_ENV) or DEFAULT_ATTEMPT_LOG_ROOT
+        # stream_root() per call, not DEFAULT_ATTEMPT_LOG_ROOT: see that
+        # constant's note -- the writer and the report must resolve the shared
+        # root at the same moment or they disagree about where the marker lives.
+        log_root = root or os.environ.get(ATTEMPT_LOG_ROOT_ENV) or stream_root("attempt_log")
         day_dir = Path(log_root) / triggered.strftime("%Y%m%d")
         day_dir.mkdir(parents=True, exist_ok=True)
         trace = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))

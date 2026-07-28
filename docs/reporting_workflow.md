@@ -7,7 +7,7 @@ private links are stored in this repo.**
 ## Daily flow (weekdays, EDT)
 
 1. **9:35 AM ET: Market-open live execution (`2ba19526`)**
-   Places the **first buys of the day** (Robinhood `562057042`) using the dynamic first-allocation base ($2 below prior close+low, $1 below prior close only) on the 0x-to-5x ladder. Writes `cron_tracking/market_open_dca/YYYYMMDD_0935ET/`.
+   Places the **first buys of the day** (Robinhood `<ROBINHOOD_ACCOUNT_NUMBER>`) using the dynamic first-allocation base ($2 below prior close+low, $1 below prior close only) on the 0x-to-5x ladder. Writes `cron_tracking/market_open_dca/YYYYMMDD_0935ET/`.
 2. **9:45 AM ET: Watchlist early-warning scan (`bb4f6ef1`)**
    Read-only. Alerts only for actionable early-warning rows. Supersedes the retired
    `cd45e95b` outlier scan and the retired `morning-dca-0945` alias -- and absorbed
@@ -23,7 +23,7 @@ private links are stored in this repo.**
 6. **3:05 PM ET: $2-base monitor-only signal check (`e3e6f09e`, PAUSED)**
    Analytics only. Currently **paused**, so it does not fire.
 7. **3:30 PM ET: Final live graded DCA task (`10ce362c`, supersedes deleted `ce16ba6b`)**
-   Places buys (Robinhood `562057042`) and writes the standardized same-day
+   Places buys (Robinhood `<ROBINHOOD_ACCOUNT_NUMBER>`) and writes the standardized same-day
    **run state** artifact ([`schemas/run_state.schema.json`](../schemas/run_state.schema.json)).
    A **scheduled** run writes under
    `cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1530ET/` with

@@ -44,10 +44,11 @@ from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from dca_fileio import atomic_write_text
+from dca_paths import cron_tracking_root
 
 _EASTERN = ZoneInfo("America/New_York")
 
-CRON_TRACKING_ROOT = "/home/user/workspace/cron_tracking"
+CRON_TRACKING_ROOT = cron_tracking_root()
 
 # pointer_status values recorded on a refreshed pointer and returned by
 # validate_pointer. Mirrors schemas/latest_pointer.schema.json.

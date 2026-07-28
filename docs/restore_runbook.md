@@ -37,7 +37,7 @@ secret manager.
      scheduled-live metrics. `scripts/run_classification.py` is the reference
      implementation.
 4. Re-provision secrets **outside** the repo:
-   - Robinhood account `562057042` execution credentials.
+   - Robinhood account `<ROBINHOOD_ACCOUNT_NUMBER>` execution credentials.
    - `NOTION_TOKEN` for the dashboard sync (see
      [`notion_dashboard_template.md`](notion_dashboard_template.md)).
    - Per-stream heartbeat URLs (`DCA_HEARTBEAT_URL_MORNING` / `_MIDDAY` /
@@ -74,7 +74,7 @@ Then diff and review before committing. See [`scripts/README.md`](../scripts/REA
 - [ ] Active universe = 45 symbols (includes `GFUZ`, `TXN`, `RKLB`); `BYDDY`, `VCX`, `TRLV`, `RVI` excluded; `IRDMI→IRDM`, `GLWR→GLW` applied; `GFUZ` included (Robinhood primary data, finance `NOT_FOUND`).
 - [ ] Ladder is the latest (0.1%–8%+, max 5x, no upper cutoff). No 12x-era tiers.
 - [ ] Base amount $2; tiered daily/weekly caps and $900 weekly rollover reserve cap intact.
-- [ ] Only the live trading tasks `2ba19526`, `42173154`, `7be82b97`, `a6239dae`, and `10ce362c` (supersedes deleted `ce16ba6b`) can trade; they use only Robinhood account `562057042`; Alpaca read-only.
+- [ ] Only the live trading tasks `2ba19526`, `42173154`, `7be82b97`, `a6239dae`, and `10ce362c` (supersedes deleted `ce16ba6b`) can trade; they use only Robinhood account `<ROBINHOOD_ACCOUNT_NUMBER>`; Alpaca read-only.
 - [ ] Final live task at 3:30 PM ET; slippage/Notion sync at 3:35 PM ET (not merged).
 - [ ] Run-classification contract wired: every run_state has a `run_classification` block; scheduled runs update `latest_scheduled_run.json`, manual runs don't; reporting excludes manual runs/order IDs (`python scripts/tests/test_run_classification.py`).
 - [ ] The 16 canonical active tasks plus the one-time `f7411889` are present and match `config/scheduled_tasks.json` -> `canonical_schedule_reconciliation_2026_07_27.canonical_schedule_et`: `2ba19526`, `bb4f6ef1`, `42173154`, `7be82b97`, `a6239dae`, `e3e6f09e` (paused), `10ce362c`, `67aa802b`, `a46bf007`, `041d9d90`, `0656657a`, `bec4a6ee`, `c9fb1fb8`, `17a3b2a9`, `f7411889`.

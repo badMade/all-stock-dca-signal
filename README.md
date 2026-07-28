@@ -11,7 +11,33 @@ This project preserves the live DCA strategy in a reproducible form so humans an
 - make small, auditable changes;
 - restore or validate scheduled trading/reporting workflows without storing secrets.
 
-No credentials or secret values are stored in this repository.
+No credentials, tokens, or account identifiers are stored in this repository.
+
+### Required environment
+
+The live brokerage account number is supplied by the environment, never by git.
+`config/*.json` stores it as the reference `"${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}"`,
+which `dca_config.expand_config_env` resolves when a config file is loaded.
+
+```bash
+export ROBINHOOD_AGENTIC_ACCOUNT_NUMBER='<your account number>'  # 6-12 digits
+```
+
+A missing or empty value is a hard error at config-load time rather than an
+empty-string substitution, and `near_close_dca.account_pinning_failure` refuses
+to start any live run that cannot pin its account. Dry runs, the `--demo` CLI,
+and the test suite do not need the variable set — the test suite assigns its own
+synthetic value in `conftest.py`.
+
+### Optional environment
+
+| Variable | Default | Effect |
+|---|---|---|
+| `DCA_CRON_TRACKING_ROOT` | `/home/user/workspace/cron_tracking` | Root of the per-stream run-artifact tree. Every stream root (`morning_dca`, `midday_dca`, `intraday_dca`, `market_open_dca`, `ce16ba6b`, `attempt_log`, `model_usage`, …) derives from it via `dca_paths`, so one variable relocates the whole tree. Read at import time — export it before invoking the task. |
+| `DCA_CONFIG_DIR` | `config/` beside the modules | Directory holding `config/*.json`. |
+| `DCA_ATTEMPT_LOG_ROOT` | `<cron root>/attempt_log` | Overrides just the failed-start marker tree. Read at call time. |
+| `DCA_INTRADAY_LIVE_STATE_ROOT`, `DCA_MARKET_OPEN_LIVE_STATE_ROOT` | derived from the cron root | Replace (not extend) the recovery/prior-allocation search roots for those streams. |
+| `DCA_DRIFT_SLACK_WEBHOOK` | unset | Slack webhook for `scripts/drift_detection.py --slack`. |
 
 ## Installation
 

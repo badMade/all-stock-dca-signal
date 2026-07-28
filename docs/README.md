@@ -2,7 +2,10 @@
 
 Version-controlled, human-readable backup of the graded DCA strategy: its
 sizing ladder, ticker universe, budgets, safeguards, scheduled tasks, reporting
-workflow, and Notion template. **No credentials or secrets are stored here.**
+workflow, and Notion template. **No credentials, secrets, or account identifiers
+are stored here.** The live account number is referenced as
+`"${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}"` in `config/*.json` and supplied by the
+environment (see the repository README).
 
 ## Docs
 
@@ -21,6 +24,7 @@ workflow, and Notion template. **No credentials or secrets are stored here.**
 | [credit_usage_proxy_report.md](credit_usage_proxy_report.md) | One-time 2026-07-27 4:30 PM ET credit-usage proxy report contract, including the separate recovery-run section |
 | [restore_runbook.md](restore_runbook.md) | Restore procedure + audit checklist |
 | [backtest_curve.md](backtest_curve.md) | Analytics-only weekly-rollover intraday cap curve backtest (35 / 65 / 100 candidate) |
+| [pr_review_workflow.md](pr_review_workflow.md) | The two-workflow PR review split, its trust boundary, and the CI-enforced workflow policy checks |
 
 ## Machine-readable backup
 
@@ -40,7 +44,7 @@ workflow, and Notion template. **No credentials or secrets are stored here.**
 - **Only trading task:** `10ce362c` ("Graded DCA automatic live test - $2
   allocation"; the repaired task that supersedes the deleted `ce16ba6b`, with
   artifact root kept under `.../ce16ba6b` for continuity), **3:30 PM ET**
-  weekdays, Robinhood account `562057042` only;
+  weekdays, Robinhood account `<ROBINHOOD_ACCOUNT_NUMBER>` only;
   Alpaca read-only. The **3:35 PM ET** task is analytics (slippage + Notion sync).
 - **Run classification:** scheduled runs write under
   `scheduled_runs/YYYYMMDD_1530ET/` and update `latest_scheduled_run.json`;

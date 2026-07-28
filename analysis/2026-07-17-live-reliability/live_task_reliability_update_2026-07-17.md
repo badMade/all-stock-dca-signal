@@ -197,7 +197,7 @@ exclusion root, so their order IDs are collected as `excluded_manual_order_ids`.
 
 ## Safety constraints unchanged
 
-- Robinhood account `562057042` only; Alpaca, Finance, and Yahoo read-only.
+- Robinhood account `[account redacted]` only; Alpaca, Finance, and Yahoo read-only.
 - Buy-only, regular-hours-only market orders. No sells, options, crypto,
   margin, account changes, or cancellations.
 - No more than one strategy order per ticker per stream.

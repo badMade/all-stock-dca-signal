@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import csv
 import json
+import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -95,7 +97,12 @@ MORNING_LIVE_WINDOW_END_ET = "10:35"
 MORNING_LIVE_STREAM = "morning"
 MORNING_LIVE_STATE_SCHEMA_VERSION = "morning-live-v2-preauthorized"
 MORNING_LIVE_EXECUTION_BROKER = "robinhood"
-MORNING_LIVE_ACCOUNT_NUMBER = "562057042"
+# The account number is sourced from the environment and never committed. It is
+# deliberately NOT bound to a module constant: this is a standalone scripts/
+# helper, and an import that happened before the environment was populated would
+# freeze the unresolved value into every artifact built later in the process
+# (Codex review, PR #219). resolve_live_account_number() reads it per call.
+ACCOUNT_NUMBER_PATTERN = re.compile(r"[0-9]{6,12}")
 
 # Scheduled midday live (12:30 ET) identity.
 MIDDAY_LIVE_CRON_ID = "a6239dae"
@@ -195,7 +202,7 @@ def build_morning_live_run_classification(
     valid_scheduled_evidence: bool,
     triggered_at_utc: Optional[str] = None,
     state_schema_version: str = MORNING_LIVE_STATE_SCHEMA_VERSION,
-    account_number: str = MORNING_LIVE_ACCOUNT_NUMBER,
+    account_number: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Non-null run_classification for the 10:30 morning live run.
 
@@ -206,8 +213,16 @@ def build_morning_live_run_classification(
     preauthorized_direct_place/valid_morning_evidence (required for the
     default v2-preauthorized state_schema_version) -- not just the same-day
     pointer fields.
+
+    ``account_number`` defaults to resolving ``$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER``
+    at CALL time. When it cannot be resolved to a schema-valid account the
+    document carries ``account_pinning_failed: True`` and omits
+    ``account_number`` entirely -- the fail-closed form the schema defines for
+    exactly this case -- rather than stamping in a placeholder that no validator
+    would accept (Codex review, PR #219).
     """
-    return {
+    resolved = account_number if account_number is not None else resolve_live_account_number()
+    classification: Dict[str, Any] = {
         "run_origin": "scheduled",
         "run_type": MORNING_LIVE_RUN_TYPE,
         "trades": True,
@@ -221,7 +236,6 @@ def build_morning_live_run_classification(
         "triggered_at_utc": triggered_at_utc or _utc_now_iso(),
         "state_schema_version": state_schema_version,
         "execution_broker": MORNING_LIVE_EXECUTION_BROKER,
-        "account_number": account_number,
         "preauthorized_direct_place": True,
         "valid_morning_evidence": True,
         "trading_day": trading_day,
@@ -229,6 +243,36 @@ def build_morning_live_run_classification(
         "valid_afternoon_evidence": False,
         "valid_scheduled_evidence": bool(valid_scheduled_evidence),
     }
+    if resolved is not None and ACCOUNT_NUMBER_PATTERN.fullmatch(resolved):
+        classification["account_number"] = resolved
+    else:
+        classification["account_pinning_failed"] = True
+        # A run that could not pin an account placed nothing, so it is not
+        # evidence that the scheduled slot executed. Leaving the caller's
+        # valid_scheduled_evidence=True alongside the failure marker produced a
+        # document that asserted both, passed the schema, and was then counted
+        # as a valid scheduled run by the credit-usage report -- which rejects
+        # only an explicit false. The blocked slot read as a healthy one
+        # (Codex review, PR #219).
+        #
+        # valid_morning_evidence is deliberately NOT touched: the schema pins it
+        # to const true for every stream='morning' artifact, so it says "this is
+        # a morning-stream document", not "this run succeeded".
+        classification["valid_scheduled_evidence"] = False
+    return classification
+
+
+def resolve_live_account_number() -> Optional[str]:
+    """The approved account number from the environment, or None if unusable.
+
+    Read per call rather than at import so a process that populates the
+    environment after importing this module still stamps the real account.
+    Returns None for unset, blank, or non-conforming values so the caller emits
+    the schema's fail-closed form instead of an account no validator accepts;
+    the shape mirrors the schema's own ``^[0-9]{6,12}$`` pattern.
+    """
+    value = (os.environ.get("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER") or "").strip()
+    return value if ACCOUNT_NUMBER_PATTERN.fullmatch(value) else None
 
 
 def build_afternoon_live_run_classification(

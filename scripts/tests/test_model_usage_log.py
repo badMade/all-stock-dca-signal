@@ -16,6 +16,8 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from model_usage_log import (  # noqa: E402
@@ -180,10 +182,7 @@ def test_log_model_usage_writes_when_root_given():
 
 
 def test_entry_matches_json_schema():
-    try:
-        import jsonschema
-    except ImportError:
-        return  # jsonschema is a dev-only convenience check, not a runtime dependency
+    jsonschema = pytest.importorskip("jsonschema")
     schema = json.loads((REPO_ROOT / "schemas" / "model_usage_log.schema.json").read_text(encoding="utf-8"))
     validator = jsonschema.Draft7Validator(schema)
     for task_id in COVERED_TASK_IDS:
@@ -267,3 +266,41 @@ if __name__ == "__main__":
     import pytest
 
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_module_is_importable_with_only_scripts_on_sys_path():
+    """The documented direct invocation must keep working.
+
+    ``python scripts/model_usage_log.py --run-id ...`` (and this test file, which
+    the module docstring says is runnable the same way) puts only ``scripts/`` on
+    sys.path. When this module gained a top-level ``from dca_paths import ...``
+    it started dying with ModuleNotFoundError before argparse ran; the fix is the
+    repo-root bootstrap at the top of the module (Codex review, PR #219).
+    """
+    import subprocess
+    import sys
+
+    scripts_dir = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, "-c", "import model_usage_log; print(model_usage_log.DEFAULT_LOG_ROOT)"],
+        cwd=scripts_dir,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("model_usage")
+
+
+def test_cli_help_works_from_a_direct_invocation():
+    import subprocess
+    import sys
+
+    scripts_dir = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, "model_usage_log.py", "--help"],
+        cwd=scripts_dir,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--run-id" in result.stdout

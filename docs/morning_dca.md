@@ -86,7 +86,7 @@ fields were written.
 
 The live execution runs at **10:30 AM ET** (`cron_id=42173154`, cron
 `30 14 * * 1-5` = **14:30 UTC weekdays** during EDT) so the trend read has a true
-**60-minute intraday window**. It uses **Robinhood account `562057042`** as the
+**60-minute intraday window**. It uses **Robinhood account `<ROBINHOOD_ACCOUNT_NUMBER>`** as the
 **only execution broker** (Alpaca, Finance, and Yahoo stay **read-only** for
 validation/account context), the shared **$2 base 0x-to-5x live ladder**, and the
 `morning` budget ledger.
@@ -500,7 +500,7 @@ and `gfuz_supplemental_preflight.json` are both **not yet implemented** (see
 `run_type='morning_dca_live'`, `scheduled_for_et='10:30'`, `manual_run=false`,
 `state_schema_version='morning-live-v2-preauthorized'`,
 `run_id='morning_live_YYYYMMDD_1030ET'`, `cron_id='42173154'`,
-`execution_broker='robinhood'`, `account_number='562057042'`,
+`execution_broker='robinhood'`, `account_number='<ROBINHOOD_ACCOUNT_NUMBER>'`,
 `preauthorized_direct_place=true`, `valid_morning_evidence=true`, and
 `valid_afternoon_evidence=false`.
 
@@ -550,7 +550,7 @@ A scheduled live run:
   "run_id": "morning_live_YYYYMMDD_1030ET",
   "state_schema_version": "morning-live-v2-preauthorized",
   "execution_broker": "robinhood",
-  "account_number": "562057042",
+  "account_number": "<ROBINHOOD_ACCOUNT_NUMBER>",
   "preauthorized_direct_place": true,
   "valid_morning_evidence": true,
   "valid_afternoon_evidence": false

@@ -31,9 +31,30 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
+# This module is directly executable (``python scripts/model_usage_log.py
+# --run-id ...``, and its test is documented as runnable the same way), which
+# puts only ``scripts/`` on sys.path -- so the repo root is added here before
+# the shared helper below is imported, or the CLI dies with ModuleNotFoundError
+# before it can parse an argument (Codex review, PR #219: "Preserve direct
+# execution of the model-usage CLI"). Same bootstrap as
+# scripts/drift_detection.py.
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from dca_paths import stream_root  # noqa: E402 - needs the sys.path setup above
+
 logger = logging.getLogger(__name__)
 
-DEFAULT_LOG_ROOT = "/home/user/workspace/cron_tracking/model_usage"
+# Resolved at IMPORT time and kept only as the module's advertised default for
+# callers that read the constant. The functions below deliberately do NOT default
+# to it: $DCA_CRON_TRACKING_ROOT set after this module was imported would leave
+# model-usage evidence appended under the old tree while the credit-usage
+# report, which resolves the shared root per call, scans the relocated one -- and
+# the run's usage then reads as MISSING (Codex review, PR #219). The bundled
+# morning and midday configs omit artifact_paths.model_usage_log_root, so their
+# loaders take this default path and would have inherited the same staleness.
+DEFAULT_LOG_ROOT = stream_root("model_usage")
 DEFAULT_MANIFEST_PATH = Path(__file__).resolve().parent.parent / "config" / "scheduled_tasks.json"
 
 REQUIRED_FIELDS = (
@@ -164,15 +185,18 @@ def build_entry(
     return entry
 
 
-def resolve_log_path(triggered_at_utc: datetime, *, root: str | Path = DEFAULT_LOG_ROOT) -> Path:
+def resolve_log_path(triggered_at_utc: datetime, *, root: str | Path | None = None) -> Path:
     """.../model_usage/YYYYMM/model_usage.jsonl per config/scheduled_tasks.json
     -> model_usage_log.path_template (YYYYMM is the ET month of the run;
     ``triggered_at_utc`` is close enough for the monthly bucket in practice)."""
     yyyymm = triggered_at_utc.strftime("%Y%m")
-    return Path(root) / yyyymm / "model_usage.jsonl"
+    # stream_root() per call when the caller did not name a root, so the writer
+    # and the credit-usage report resolve the shared root at the same moment.
+    # See DEFAULT_LOG_ROOT's note.
+    return Path(root if root is not None else stream_root("model_usage")) / yyyymm / "model_usage.jsonl"
 
 
-def append_model_usage_entry(entry: Mapping[str, Any], *, root: str | Path = DEFAULT_LOG_ROOT) -> Path:
+def append_model_usage_entry(entry: Mapping[str, Any], *, root: str | Path | None = None) -> Path:
     """Append one already-validated entry as a JSONL line. Creates the monthly
     directory if needed. Raises on I/O failure -- use ``log_model_usage`` for
     a call site that must never raise."""
@@ -260,7 +284,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="ISO 8601 UTC timestamp (e.g. 2026-07-21T15:20:05Z); defaults to now.",
     )
-    parser.add_argument("--root", default=DEFAULT_LOG_ROOT, help="Log root (default: the production cron_tracking path).")
+    parser.add_argument(
+        "--root",
+        default=None,
+        help="Log root (default: the shared cron_tracking path, resolved at run time).",
+    )
     parser.add_argument("--manifest-path", default=DEFAULT_MANIFEST_PATH)
     return parser
 

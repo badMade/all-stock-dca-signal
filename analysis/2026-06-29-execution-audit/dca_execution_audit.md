@@ -2,7 +2,7 @@
 
 ## Scope
 
-This audit reviewed the 3:45 PM ET graded DCA live strategy task `ce16ba6b` over the last 10 weekdays ending 2026-06-29. Evidence sources were the scheduled-task registry, local task tracking files under `/home/user/workspace/cron_tracking/ce16ba6b`, and Robinhood Agentic equity order history for account `562057042` since 2026-06-16.
+This audit reviewed the 3:45 PM ET graded DCA live strategy task `ce16ba6b` over the last 10 weekdays ending 2026-06-29. Evidence sources were the scheduled-task registry, local task tracking files under `/home/user/workspace/cron_tracking/ce16ba6b`, and Robinhood Agentic equity order history for account `[account redacted]` since 2026-06-16.
 
 ## Scheduler state at audit time
 

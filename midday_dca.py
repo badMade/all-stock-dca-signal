@@ -11,7 +11,8 @@ Key properties (see ``config/midday_dca.json`` and
 
     - **Live Robinhood-only execution** (cron ``a6239dae``, 12:30 PM ET
       weekdays, ``run_type='midday_dca_live'``, ``trades=true``) on account
-      ``562057042``; Alpaca stays read-only.
+      ``$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`` (supplied by the environment, never
+      committed); Alpaca stays read-only.
     - Uses the **afternoon 0x -> 5x sizing ladder** (NOT the morning 0x -> 3x
       ladder) and the same $2 base amount.
     - Same active universe (excludes BYDDY/VCX/TRLV/RVI) and the same confidence
@@ -28,7 +29,7 @@ Key properties (see ``config/midday_dca.json`` and
       otherwise $0 (mirrors the afternoon top-up rule).
 
 Writes ONLY under its own run-state root
-``/home/user/workspace/cron_tracking/midday_dca/YYYYMMDD_1230ET/`` and never
+``<cron_tracking_root>/midday_dca/YYYYMMDD_1230ET/`` and never
 touches the morning or afternoon artifact trees.
 """
 
@@ -36,24 +37,27 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from dca_config import get_config_dir, load_tickers
+from dca_config import (
+    InvalidAccountNumberError,
+    MissingConfigEnvError,
+    get_config_dir,
+    load_tickers,
+    resolve_broker_account,
+)
+from dca_paths import rebase_bundled_roots_in, stream_root
 from morning_dca import (
-    DEFAULT_AFTERNOON_TASK_ROOT,
-    DEFAULT_INTRADAY_TASK_ROOT,
-    DEFAULT_MARKET_OPEN_TASK_ROOT,
-    DEFAULT_MODEL_USAGE_LOG_ROOT,
-    DEFAULT_MORNING_LIVE_STATE_ROOT,
     EXEC_MANUAL_REVIEW_CANDIDATE,
     MorningConfig,
     MorningDCAExecutor,
     MorningSignal,
     TopUpOutcome,
     _load_approved_dates_fail_closed,
+    default_prior_allocation_roots,
     load_max_per_order_usd,
 )
 from near_close_dca import (
@@ -77,7 +81,7 @@ MIDDAY_LIVE_SCHEMA_VERSION = "midday-live-v1"
 
 # Artifact root: a sibling of, and never nested under, the morning or afternoon
 # roots.
-DEFAULT_MIDDAY_LIVE_STATE_ROOT = "/home/user/workspace/cron_tracking/midday_dca"
+DEFAULT_MIDDAY_LIVE_STATE_ROOT = stream_root("midday_dca")
 
 # Per-mode identity/profile. The midday stream has a single live mode.
 MIDDAY_PROFILES: Dict[str, Dict[str, Any]] = {
@@ -92,6 +96,7 @@ MIDDAY_PROFILES: Dict[str, Dict[str, Any]] = {
         "window_end_et": MIDDAY_LIVE_WINDOW_END_ET,
         "state_schema_version": MIDDAY_LIVE_SCHEMA_VERSION,
         "state_root": DEFAULT_MIDDAY_LIVE_STATE_ROOT,
+        "state_root_stream": "midday_dca",
         "folder_suffix": "1230ET",
         "scheduled_run_id_prefix": "midday_live",
         "manual_run_id_prefix": "manual_midday_live",
@@ -136,12 +141,21 @@ class MiddayConfig(MorningConfig):
     # into later top-up guards") and the intraday root catches the 11:30 AM
     # slot's fill (Codex review: "Include the 11:30 intraday run in midday
     # context") -- both precede the 12:30 midday decision.
-    prior_allocation_roots: Tuple[str, ...] = (
-        DEFAULT_MARKET_OPEN_TASK_ROOT,
-        DEFAULT_MORNING_LIVE_STATE_ROOT,
-        DEFAULT_INTRADAY_TASK_ROOT,
-        DEFAULT_AFTERNOON_TASK_ROOT,
-    )
+    #
+    # default_factory, not a literal tuple: a literal binds
+    # DEFAULT_MARKET_OPEN_TASK_ROOT/etc at CLASS-DEFINITION (import) time, so a
+    # $DCA_CRON_TRACKING_ROOT set afterward left every MiddayConfig() built
+    # without an explicit override -- including load_midday_config's
+    # config-missing fallback -- scanning the OLD tree for same-day prior
+    # allocations, and _compute_top_up.uses_default_prior_allocation_roots'
+    # exact-tuple comparison then read that staleness as "the caller
+    # explicitly configured a different root," missing earlier same-day fills
+    # instead of merging them (Codex review, PR #219).
+    # default_prior_allocation_roots() -- called fresh for each new instance
+    # -- returns the identical four roots in the identical order, so this is
+    # a no-op under an unmodified environment and a real fix once the
+    # variable is set between import and construction.
+    prior_allocation_roots: Tuple[str, ...] = field(default_factory=default_prior_allocation_roots)
 
 
 # Backwards-compatibility alias; the type now lives in morning_dca so both
@@ -149,7 +163,7 @@ class MiddayConfig(MorningConfig):
 MiddayTopUpOutcome = TopUpOutcome
 
 
-def load_midday_config(config_dir=None) -> MiddayConfig:
+def load_midday_config(config_dir=None, *, allow_unpinned_account: bool = False) -> MiddayConfig:
     """Read ``config/midday_dca.json`` and return a :class:`MiddayConfig`.
 
     Mirrors :func:`morning_dca.load_morning_config`'s graceful-fallback pattern:
@@ -164,14 +178,28 @@ def load_midday_config(config_dir=None) -> MiddayConfig:
     cfg_path = config_dir_path / "midday_dca.json"
     if not cfg_path.exists():
         _log.warning("midday_dca.json not found at %s; using MiddayConfig defaults", cfg_path)
+        # morning_run_state_root deliberately stays None here: see
+        # morning_dca.load_morning_config's equivalent fallback for why
+        # baking a real path in at this point defeats run_dca.py's
+        # "did this stream's config actually configure a root" containment
+        # check (Codex/self-review, PR #219). The staleness that would
+        # otherwise cause is fixed at the call site instead (inherited
+        # MorningDCAExecutor.__init__, via state_root_stream in
+        # MIDDAY_PROFILES).
         return MiddayConfig(
             approved_test_dates=_load_approved_dates_fail_closed(config_dir_path),
-            model_usage_log_root=DEFAULT_MODEL_USAGE_LOG_ROOT,
+            model_usage_log_root=stream_root("model_usage"),
         )
 
     approved_date_overrides = {
         "approved_test_dates": _load_approved_dates_fail_closed(config_dir_path),
-        "model_usage_log_root": DEFAULT_MODEL_USAGE_LOG_ROOT,
+        # stream_root() at LOAD time, not the import-time constant:
+        # $DCA_CRON_TRACKING_ROOT set between import and config load
+        # rebased the run-state roots while leaving model-usage evidence
+        # (and the attempt-log sibling derived from it) under the old
+        # tree, where the call-time credit-usage report never looks
+        # (Codex review, PR #219).
+        "model_usage_log_root": stream_root("model_usage"),
     }
 
     try:
@@ -179,6 +207,10 @@ def load_midday_config(config_dir=None) -> MiddayConfig:
     except (json.JSONDecodeError, OSError) as exc:
         _log.warning("could not parse %s (%s); using MiddayConfig defaults", cfg_path, exc)
         return MiddayConfig(**approved_date_overrides)
+
+    # See load_morning_config: bundled absolute artifact paths follow
+    # $DCA_CRON_TRACKING_ROOT instead of overriding it. No-op when unset.
+    raw = rebase_bundled_roots_in(raw)
 
     kwargs: Dict[str, Any] = dict(approved_date_overrides)
     if "trend_min_bars" in raw:
@@ -210,7 +242,33 @@ def load_midday_config(config_dir=None) -> MiddayConfig:
 
     live_task = raw.get("live_task", {})
     if "broker_account" in live_task:
-        kwargs["target_account_number"] = str(live_task["broker_account"])
+        # See load_morning_config: the account number lives in the environment,
+        # not in git. Midday is a live-only stream, so an unresolvable account
+        # takes the same route the morning live path takes -- left unset so the
+        # executor reaches account_pinning_failure() and writes durable blocked
+        # evidence, rather than raising before an executor exists and leaving the
+        # scheduled slot with no artifact at all (Codex review, PR #219).
+        source = "midday live_task.broker_account"
+        try:
+            kwargs["target_account_number"] = resolve_broker_account(
+                live_task["broker_account"], source=source
+            )
+        except (MissingConfigEnvError, InvalidAccountNumberError):
+            if not allow_unpinned_account:
+                raise
+            # Explicitly None, NOT merely left out: the dataclass default is the
+            # IMPORT-TIME module constant, so omitting the kwarg would silently
+            # fall back to whatever account the environment held when this module
+            # was first imported -- which for a malformed configured account is a
+            # real, usable account number. That would turn a pinning failure into
+            # a live run against an unintended account, the exact bypass this
+            # whole path exists to close.
+            kwargs["target_account_number"] = None
+            logging.warning(
+                "%s could not be resolved to a usable account; the live run will "
+                "fail closed and record account_pinning_failed",
+                source,
+            )
 
     artifact_paths = raw.get("artifact_paths", {})
     if "live_run_state_root" in artifact_paths:
@@ -222,7 +280,8 @@ def load_midday_config(config_dir=None) -> MiddayConfig:
         # the guard (consistent with load_morning_config).
         kwargs["prior_allocation_roots"] = tuple(str(r) for r in roots)
 
-    # model_usage_log_root: defaults to DEFAULT_MODEL_USAGE_LOG_ROOT above
+    # model_usage_log_root: defaults to stream_root("model_usage") resolved above
+    # when this loader runs
     # (consistent with load_morning_config); an explicit
     # artifact_paths.model_usage_log_root overrides it, null/empty disables it.
     if "model_usage_log_root" in artifact_paths:
@@ -288,7 +347,10 @@ class MiddayDCAExecutor(MorningDCAExecutor):
         super().__init__(config, ledger, mode=mode, config_dir=config_dir)
 
     def _load_default_config(self, config_dir: Optional[str], mode: str) -> MiddayConfig:
-        return load_midday_config(config_dir)
+        # Midday is live-only: tolerate an unresolvable account so the run
+        # reaches its fail-closed path and leaves blocked evidence. See
+        # load_morning_config's allow_unpinned_account note.
+        return load_midday_config(config_dir, allow_unpinned_account=True)
 
     # -- Reuse hooks (stream-specific field names) ---------------------------
     def _augment_buy_candidate_row(

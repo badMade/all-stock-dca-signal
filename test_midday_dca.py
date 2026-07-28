@@ -10,11 +10,16 @@ Runnable with ``pytest`` or ``python test_midday_dca.py``.
 """
 
 import json
+import os
+import subprocess
+import sys
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 import pytest
 
+from conftest import FIXTURE_ACCOUNT_NUMBER
+from dca_paths import CRON_TRACKING_ROOT_ENV
 from midday_dca import (
     DEFAULT_MIDDAY_LIVE_STATE_ROOT,
     MIDDAY_LIVE_CRON_ID,
@@ -229,6 +234,41 @@ def test_midday_default_prior_allocation_roots_include_market_open_and_intraday(
     assert DEFAULT_MORNING_LIVE_STATE_ROOT in roots
     assert DEFAULT_INTRADAY_TASK_ROOT in roots
     assert DEFAULT_AFTERNOON_TASK_ROOT in roots
+
+
+def test_midday_default_prior_allocation_roots_resolve_at_construction_time():
+    """MiddayConfig.prior_allocation_roots used to default to a literal tuple
+    binding DEFAULT_MARKET_OPEN_TASK_ROOT/etc at CLASS-DEFINITION (import)
+    time. A $DCA_CRON_TRACKING_ROOT set afterward left every MiddayConfig()
+    built without an explicit override -- including load_midday_config's
+    config-missing fallback -- scanning the OLD tree, and
+    _compute_top_up's exact-tuple staleness check then read that mismatch as
+    "the caller explicitly configured a different root," skipping the
+    same-day manual top-up merge and risking a duplicate allocation (Codex
+    review, PR #219). Now a default_factory, so it resolves fresh on every
+    construction instead."""
+    probe = (
+        "import os\n"
+        "import midday_dca\n"  # imported BEFORE the override
+        f"os.environ['{CRON_TRACKING_ROOT_ENV}'] = os.environ['PROBE_ROOT']\n"
+        "print(midday_dca.MiddayConfig().prior_allocation_roots)\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != CRON_TRACKING_ROOT_ENV}
+    env["PROBE_ROOT"] = "/srv/midday-prior-allocation-probe"
+    out = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=Path(__file__).resolve().parent,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert out.stdout.strip() == (
+        "('/srv/midday-prior-allocation-probe/market_open_dca', "
+        "'/srv/midday-prior-allocation-probe/morning_dca', "
+        "'/srv/midday-prior-allocation-probe/intraday_dca', "
+        "'/srv/midday-prior-allocation-probe/ce16ba6b')"
+    ), out.stdout
 
 
 def test_midday_ladder_brackets():
@@ -1000,10 +1040,10 @@ def test_load_midday_config_enables_model_usage_log_by_default(tmp_path):
     # Mirrors load_morning_config: the normal configuration path must resolve
     # a working model_usage_log_root by default so the audit log isn't
     # silently disabled in production.
-    from morning_dca import DEFAULT_MODEL_USAGE_LOG_ROOT
+    from dca_paths import stream_root
 
     cfg = load_midday_config(str(tmp_path / "nonexistent"))
-    assert cfg.model_usage_log_root == DEFAULT_MODEL_USAGE_LOG_ROOT
+    assert cfg.model_usage_log_root == stream_root("model_usage")
 
     cfg_dir = tmp_path / "config"
     cfg_dir.mkdir()
@@ -1101,14 +1141,14 @@ def test_manual_midday_run_with_wrong_broker_account_raises_before_ordering(tmp_
     cfg = MiddayConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "midday"),
-        target_account_number="562057042",
+        target_account_number="999000111",
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     broker = _WrongAccountBroker()
     ex = MiddayDCAExecutor(cfg)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
 
-    with pytest.raises(RuntimeError, match="broker account mismatch: expected 562057042, got not-the-approved-account"):
+    with pytest.raises(RuntimeError, match="broker account mismatch: expected 999000111, got not-the-approved-account"):
         ex.run(_now_midday(), data, manual=True, broker=broker)
 
     assert broker.buying_power_checked is False
@@ -1117,10 +1157,7 @@ def test_manual_midday_run_with_wrong_broker_account_raises_before_ordering(tmp_
 
 # --- Schema validation ------------------------------------------------------
 def test_midday_classification_validates_against_json_schema():
-    try:
-        import jsonschema
-    except ImportError:
-        return
+    jsonschema = pytest.importorskip("jsonschema")
     schema_path = Path(__file__).resolve().parent / "schemas" / "midday_run_classification.schema.json"
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
     cfg = MiddayConfig(tickers=("SMALL",))
@@ -1166,3 +1203,125 @@ if __name__ == "__main__":
                 failures += 1
                 print(f"FAIL {name}: {exc}")
     sys.exit(1 if failures else 0)
+
+
+# --- The midday schema defines the account-pinning contract ------------------
+# The midday executor shares MorningDCAExecutor's classification builder and so
+# emits account_pinning_failed, but the midday schema defined neither that field
+# nor account_number. With additionalProperties true, the intended blocked
+# document, a truncated live document missing both, and a contradictory one all
+# validated identically -- so the marker was not machine-checkable at all on
+# this stream (Codex review, PR #219).
+
+def _midday_schema():
+    path = Path(__file__).resolve().parent / "schemas" / "midday_run_classification.schema.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _a_valid_midday_live_classification():
+    cfg = MiddayConfig(tickers=("SMALL",), target_account_number=FIXTURE_ACCOUNT_NUMBER)
+    return MiddayDCAExecutor(cfg).run_classification(_now_midday(), manual=False)
+
+
+def test_a_blocked_midday_classification_is_schema_valid():
+    jsonschema = pytest.importorskip("jsonschema")
+    cfg = MiddayConfig(tickers=("SMALL",), target_account_number=None)
+    rc = MiddayDCAExecutor(cfg).run_classification(_now_midday(), manual=False)
+    assert rc["account_pinning_failed"] is True
+    assert "account_number" not in rc
+    jsonschema.validate(rc, _midday_schema())
+
+
+def test_a_truncated_midday_live_document_is_rejected():
+    jsonschema = pytest.importorskip("jsonschema")
+    rc = _a_valid_midday_live_classification()
+    truncated = {k: v for k, v in rc.items() if k != "account_number"}
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(truncated, _midday_schema())
+
+
+def test_a_contradictory_midday_document_is_rejected():
+    """A run cannot both report that no account was pinnable and name one."""
+    jsonschema = pytest.importorskip("jsonschema")
+    rc = _a_valid_midday_live_classification()
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({**rc, "account_pinning_failed": True}, _midday_schema())
+
+
+def test_a_pinning_failed_document_asserting_valid_scheduled_evidence_is_rejected():
+    """A run that could not pin an account never placed an order, so it can
+    never be valid scheduled evidence -- the builder always ties these
+    together (account_pinning_failure() routes through _blocked_live_result(),
+    which denies scheduled evidence), but nothing enforced it at the schema
+    layer. generate_credit_usage_proxy_report.py's consumer rejects only an
+    explicit valid_scheduled_evidence=False, so an artifact from another
+    producer (or a corrupted document) asserting both would have been counted
+    as valid scheduled evidence for a run that never traded (Codex review,
+    PR #219: "Deny scheduled evidence when account pinning fails")."""
+    jsonschema = pytest.importorskip("jsonschema")
+    cfg = MiddayConfig(tickers=("SMALL",), target_account_number=None)
+    rc = MiddayDCAExecutor(cfg).run_classification(_now_midday(), manual=False)
+    assert rc["account_pinning_failed"] is True
+    jsonschema.validate(rc, _midday_schema())  # the real value still passes
+
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({**rc, "valid_scheduled_evidence": True}, _midday_schema())
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(
+            {k: v for k, v in rc.items() if k != "valid_scheduled_evidence"}, _midday_schema()
+        )
+
+
+def test_a_blocked_midday_document_still_requires_the_broker():
+    jsonschema = pytest.importorskip("jsonschema")
+    cfg = MiddayConfig(tickers=("SMALL",), target_account_number=None)
+    rc = MiddayDCAExecutor(cfg).run_classification(_now_midday(), manual=False)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(
+            {k: v for k, v in rc.items() if k != "execution_broker"}, _midday_schema()
+        )
+
+
+@pytest.mark.parametrize("bad", [None, 42, "alpaca", ""])
+def test_the_midday_schema_constrains_the_execution_broker(bad):
+    """Requiring the key did not validate its VALUE: execution_broker had no
+    entry in properties and additionalProperties is true, so a corrupted or
+    wrong-broker artifact validated as genuine evidence (Codex review,
+    PR #219)."""
+    jsonschema = pytest.importorskip("jsonschema")
+    rc = _a_valid_midday_live_classification()
+    jsonschema.validate(rc, _midday_schema())  # the real value still passes
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({**rc, "execution_broker": bad}, _midday_schema())
+
+
+def test_unconfigured_state_root_resolves_at_executor_construction_time():
+    """MiddayConfig.morning_run_state_root stays None when a stream's own
+    config doesn't set it (including the config-missing fallback -- see
+    load_midday_config, which deliberately does NOT bake a stream_root()
+    value into this field, because run_dca.py's cross-stream containment
+    check reads its None-ness as "not explicitly configured"; mirrors
+    morning_dca.load_morning_config's equivalent fallback). The staleness
+    this could otherwise cause -- MorningDCAExecutor.__init__ (inherited by
+    MiddayDCAExecutor) falling back to self.profile["state_root"], an
+    import-time constant -- is fixed at that call site instead: it now
+    resolves stream_root(state_root_stream) fresh on every construction
+    (Codex review, PR #219)."""
+    probe = (
+        "import os\n"
+        "import midday_dca\n"  # imported BEFORE the override
+        f"os.environ['{CRON_TRACKING_ROOT_ENV}'] = os.environ['PROBE_ROOT']\n"
+        "cfg = midday_dca.MiddayConfig(tickers=('SMALL',))\n"
+        "print(midday_dca.MiddayDCAExecutor(cfg).state_root)\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != CRON_TRACKING_ROOT_ENV}
+    env["PROBE_ROOT"] = "/srv/midday-fallback-probe"
+    out = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=Path(__file__).resolve().parent,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert out.stdout.strip() == "/srv/midday-fallback-probe/midday_dca", out.stdout

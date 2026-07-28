@@ -18,7 +18,7 @@ adding the same-day top-up guard.
 
 ## 12:30 PM live Robinhood execution
 
-Uses **Robinhood account `562057042`** as the sole execution broker (Alpaca stays
+Uses **Robinhood account `<ROBINHOOD_ACCOUNT_NUMBER>`** as the sole execution broker (Alpaca stays
 read-only for validation/context), the **$2 base afternoon 0x-to-5x ladder**, the
 same active universe (excludes BYDDY/VCX/TRLV/RVI), and its own `midday` budget
 ledger. Writes under `.../cron_tracking/midday_dca/YYYYMMDD_1230ET/`
@@ -109,7 +109,7 @@ scheduled fill counts. See
 
 ## Manual override reruns
 
-An out-of-band manual buy of the midday stream on account `562057042` is written
+An out-of-band manual buy of the midday stream on account `<ROBINHOOD_ACCOUNT_NUMBER>` is written
 under `.../cron_tracking/midday_dca/manual_reruns/<timestamp>/` as `run_state.json`
 plus a confirmed-fill `filled_orders.csv`. Such a run is a **manual invocation** of
 the same executor: `run_origin='manual'`, `manual_run=true`, `run_type` stays

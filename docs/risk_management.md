@@ -89,7 +89,7 @@ operator can confirm the manual and other streams are excluded from the guard.
 
 The guard changes sizing only. It does **not** relax any standing constraint:
 
-- **Robinhood** account `562057042` remains the **only** execution broker.
+- **Robinhood** account `<ROBINHOOD_ACCOUNT_NUMBER>` remains the **only** execution broker.
 - **Alpaca** stays **read-only** validation/account context.
 - No sells, options, crypto, margin, cancellations; buys only, regular hours,
   one order per ticker per day.

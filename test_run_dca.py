@@ -3570,10 +3570,7 @@ def _market_open_run_classification(*, manual: bool):
 
 
 def test_market_open_run_classification_validates_against_json_schema():
-    try:
-        import jsonschema
-    except ImportError:
-        return
+    jsonschema = pytest.importorskip("jsonschema")
     import json
 
     schema_path = Path(__file__).resolve().parent / "schemas" / "market_open_run_classification.schema.json"
@@ -3583,10 +3580,7 @@ def test_market_open_run_classification_validates_against_json_schema():
 
 
 def test_market_open_run_classification_rejects_wrong_cron_id():
-    try:
-        import jsonschema
-    except ImportError:
-        return
+    jsonschema = pytest.importorskip("jsonschema")
     import json
 
     schema_path = Path(__file__).resolve().parent / "schemas" / "market_open_run_classification.schema.json"
@@ -3643,10 +3637,7 @@ def test_intraday_run_classification_validates_against_json_schema():
     # Every one of the three fired slots (11:30/13:30/14:30 ET, see
     # config/scheduled_tasks.json:multi_slot_task_note) plus a manual run
     # must validate.
-    try:
-        import jsonschema
-    except ImportError:
-        return
+    jsonschema = pytest.importorskip("jsonschema")
     import json
 
     schema_path = Path(__file__).resolve().parent / "schemas" / "intraday_run_classification.schema.json"
@@ -3661,10 +3652,7 @@ def test_intraday_run_classification_rejects_mismatched_slot_window():
     # A run_id/window pair from a DIFFERENT slot than scheduled_for_et must
     # be rejected -- each slot's window is pinned independently (Codex
     # review: "Include the 11:30 intraday run in midday context").
-    try:
-        import jsonschema
-    except ImportError:
-        return
+    jsonschema = pytest.importorskip("jsonschema")
     import json
 
     schema_path = Path(__file__).resolve().parent / "schemas" / "intraday_run_classification.schema.json"
@@ -3681,10 +3669,7 @@ def test_intraday_run_classification_rejects_ad_hoc_recovery_stream_suffix():
     # recognized by near_close_dca._prior_run_is_scheduled's startswith
     # check, but it is NOT this recurring live task and must not validate
     # against this schema, which pins stream to exactly 'intraday'.
-    try:
-        import jsonschema
-    except ImportError:
-        return
+    jsonschema = pytest.importorskip("jsonschema")
     import json
 
     schema_path = Path(__file__).resolve().parent / "schemas" / "intraday_run_classification.schema.json"

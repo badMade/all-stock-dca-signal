@@ -14,6 +14,7 @@ from datetime import date, datetime, time, timedelta
 
 import pytest
 
+from conftest import FIXTURE_ACCOUNT_NUMBER
 from near_close_dca import (
     ACTIVE_TICKERS,
     BASE_BELOW_CLOSE_AND_LOW,
@@ -34,7 +35,9 @@ from near_close_dca import (
     TOP_UP_NOT_LOWER_OR_NO_DELTA,
     USAGE_PROXY_FIELDS,
     Action,
+    AlpacaBroker,
     Bar,
+    BrokerName,
     DryRunBroker,
     PriorSameDayAllocation,
     ReconciledDecision,
@@ -43,10 +46,13 @@ from near_close_dca import (
     SourceSignal,
     StrategyConfig,
     StrategyState,
+    _check_execution_gates,
     _earlier_selected_base,
     _iso_or_none,
     _process_buy_candidate,
+    account_pinning_failure,
     allocation_sort_key,
+    build_broker,
     build_execution_record,
     build_report,
     build_usage_proxy,
@@ -5724,17 +5730,13 @@ def test_a_failure_synthesized_candidate_row_satisfies_the_schema():
         (_Path(__file__).parent / "schemas" / "run_state.schema.json").read_text(encoding="utf-8")
     )
     item_schema = schema["properties"]["buy_candidates"]["items"]
-    # The required-field check runs everywhere, since that IS the defect and
-    # jsonschema is optional tooling here (requirements-dev.txt is pytest+ruff;
-    # the core strategy carries no third-party runtime dependency).
+    # The required-field check is the defect this test was written for, so it
+    # runs before the full schema pass below.
     for field in item_schema["required"]:
         assert field in row, field
-    # Full validation when the optional dependency is present, matching how the
-    # other schema tests in this repo guard it.
-    try:
-        import jsonschema
-    except ImportError:
-        return
+    # Full schema validation, matching how the other schema tests in this repo
+    # are gated (importorskip: a real SKIP, never a false PASS).
+    jsonschema = pytest.importorskip("jsonschema")
     jsonschema.validate(row, item_schema)
 
 
@@ -5897,3 +5899,139 @@ def test_a_synthesized_state_with_no_rows_still_gets_a_ticker_header(tmp_path):
         _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
     assert (out / "signals.csv").read_text(encoding="utf-8").splitlines()[0] == "ticker"
+
+
+# --- Account pinning rejects malformed values --------------------------------
+# resolve_broker_account validates what the config LOADER parses, but the
+# loaders' graceful-fallback paths (config absent or unparseable) and any direct
+# MorningConfig/StrategyConfig construction bypass it. This shared gate is on
+# every live path, so the shape check belongs here too (Codex review, PR #219).
+
+@pytest.mark.parametrize(
+    "bad", ["acct-123", "12345", "1234567890123", " 123456789 ", "read_only", "12a456789"]
+)
+def test_account_pinning_rejects_malformed_accounts(bad):
+    from near_close_dca import account_pinning_failure
+
+    reason = account_pinning_failure(bad)
+    assert reason is not None, f"{bad!r} was accepted for live execution"
+    assert "not a valid Robinhood account number" in reason
+
+
+@pytest.mark.parametrize("good", ["123456", "123456789", "123456789012"])
+def test_account_pinning_accepts_well_formed_accounts(good):
+    from near_close_dca import account_pinning_failure
+
+    assert account_pinning_failure(good) is None
+
+
+def test_a_malformed_account_from_the_fallback_path_cannot_go_live(tmp_path):
+    """End-to-end, in a fresh interpreter: mirrors how MorningDCAExecutor
+    actually invokes the config-missing fallback for a scheduled live run
+    (allow_unpinned_account=True -- see _load_default_config).
+
+    The loader's own fallback used to build target_account_number straight
+    from the (possibly stale, import-time-bound) environment with no
+    validation at all, so the runtime account_pinning_failure() gate was the
+    ONLY thing standing between a malformed account and a live run. The
+    fallback now resolves and validates the account itself too (Codex
+    review, PR #219: "Resolve the account when falling back to defaults"),
+    so a malformed value is caught at load time -- target_account_number is
+    left None rather than passing "acct-123" through -- and this test now
+    confirms the SAME malformed input is still blocked at the runtime gate
+    as well, i.e. two independent layers instead of relying on the pinning
+    gate alone.
+    """
+    import os as _os
+    import subprocess as _subprocess
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    probe = (
+        "from morning_dca import load_morning_config;"
+        "from near_close_dca import account_pinning_failure;"
+        f"cfg = load_morning_config(config_dir={str(tmp_path)!r}, mode='live', "
+        "allow_unpinned_account=True);"
+        "print(repr(cfg.target_account_number));"
+        "print(account_pinning_failure(cfg.target_account_number) is not None)"
+    )
+    env = dict(_os.environ, ROBINHOOD_AGENTIC_ACCOUNT_NUMBER="acct-123")
+    out = _subprocess.run(
+        [_sys.executable, "-c", probe],
+        cwd=_Path(__file__).resolve().parent,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    configured, blocked = out.stdout.strip().splitlines()[-2:]
+    assert configured == "None", (
+        f"malformed account should be caught at load time, not passed through: {out.stdout}"
+    )
+    assert blocked == "True", f"malformed account was accepted for live execution: {out.stdout}"
+
+
+# --- The digit shape is Robinhood's, not every broker's ----------------------
+# Applying it unconditionally at the shared pinning gate rejected a normal
+# Alpaca identifier before execution reached the ALPACA branch, so the
+# documented broker-agnostic live adapter could not be built at all
+# (Codex review, PR #219).
+
+def test_an_alpaca_account_is_not_held_to_the_robinhood_digit_shape():
+    config = StrategyConfig(
+        dry_run=False, broker=BrokerName.ALPACA, target_account_number="PA3ABCDEF123"
+    )
+    assert account_pinning_failure(config.target_account_number, config.broker) is None
+    assert isinstance(build_broker(config), AlpacaBroker)
+
+
+@pytest.mark.parametrize("broker", [BrokerName.ALPACA, BrokerName.ROBINHOOD, None])
+@pytest.mark.parametrize("unusable", [None, "", "UNSET_ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"])
+def test_no_backend_may_trade_an_account_nobody_named(broker, unusable):
+    """The nonempty/placeholder half of the gate stays broker-agnostic."""
+    assert account_pinning_failure(unusable, broker)
+
+
+def test_robinhood_still_requires_the_digit_shape():
+    assert account_pinning_failure("PA3ABCDEF123", BrokerName.ROBINHOOD)
+    assert account_pinning_failure("PA3ABCDEF123") is not None, "default must stay Robinhood"
+
+
+# --- The execution gate fails closed on an injected broker -------------------
+# build_broker refuses to construct an unpinned live adapter, but callers may
+# inject a BrokerAdapter into run_once directly and bypass the factory. The gate
+# only compared broker.account_number() to the configured value, and two empty
+# strings compare equal -- so an unpinned live run reached placement
+# (Codex review, PR #219).
+
+class _InjectedBroker:
+    def __init__(self, account: str) -> None:
+        self._account = account
+
+    def account_number(self) -> str:
+        return self._account
+
+
+def _an_approved_day(config):
+    return sorted(config.approved_test_dates)[0] if config.approved_test_dates else date(2026, 7, 6)
+
+
+@pytest.mark.parametrize(
+    "account", ["", "UNSET_ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "acct-1", "12345"]
+)
+def test_an_injected_broker_cannot_trade_an_unpinned_live_account(account):
+    config = StrategyConfig(dry_run=False, target_account_number=account)
+    with pytest.raises(RuntimeError, match="Refusing to trade live"):
+        _check_execution_gates(_an_approved_day(config), config, _InjectedBroker(account), None)
+
+
+def test_a_properly_pinned_injected_broker_still_passes():
+    config = StrategyConfig(dry_run=False, target_account_number=FIXTURE_ACCOUNT_NUMBER)
+    assert _check_execution_gates(
+        _an_approved_day(config), config, _InjectedBroker(FIXTURE_ACCOUNT_NUMBER), None
+    )
+
+
+def test_a_dry_run_is_unaffected_by_the_pinning_gate():
+    config = StrategyConfig(dry_run=True, target_account_number="")
+    assert _check_execution_gates(_an_approved_day(config), config, _InjectedBroker(""), None)

@@ -8,7 +8,9 @@ from datetime import date
 import pytest
 
 from dca_config import (
+    MissingConfigEnvError,
     _read_json,
+    expand_config_env,
     get_config_dir,
     load_approved_dates,
     load_backtest_sizing_tiers,
@@ -234,3 +236,142 @@ def test_default_config_dir_env_override(monkeypatch, tmp_path):
     override_dir = tmp_path / "etc" / "all-stock-dca"
     monkeypatch.setenv("DCA_CONFIG_DIR", str(override_dir))
     assert get_config_dir() == override_dir
+
+
+# --- ${VAR} expansion in config values ---------------------------------------
+# The live brokerage account number lives in the environment, not in git, so
+# config/*.json carries "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}" and the loaders
+# resolve it. These pin the resolution rules.
+
+def test_expand_config_env_substitutes_a_set_variable(monkeypatch):
+    monkeypatch.setenv("DCA_TEST_ACCOUNT", "123456789")
+    assert expand_config_env("${DCA_TEST_ACCOUNT}", source="t") == "123456789"
+    assert expand_config_env("robinhood:${DCA_TEST_ACCOUNT}", source="t") == "robinhood:123456789"
+
+
+def test_expand_config_env_passes_through_plain_values(monkeypatch):
+    """A value with no ${...} reference is returned verbatim.
+
+    config/morning_dca.json's watchlist/preflight tasks carry the literal
+    "read_only" in the same field the live task uses for the account reference.
+    """
+    monkeypatch.delenv("DCA_TEST_ACCOUNT", raising=False)
+    assert expand_config_env("read_only", source="t") == "read_only"
+    assert expand_config_env("", source="t") == ""
+    # A bare $ is not a reference -- only the braced form is recognised, so a
+    # note or a path containing '$' can never be misread as a variable.
+    assert expand_config_env("cost is $5", source="t") == "cost is $5"
+
+
+@pytest.mark.parametrize("value", ["", None], ids=["empty", "unset"])
+def test_expand_config_env_raises_when_the_variable_is_missing(monkeypatch, value):
+    """Fail loudly rather than substituting "".
+
+    An empty account number is precisely the value that used to disable account
+    pinning (near_close_dca.account_pinning_failure), so silently expanding to
+    "" would reintroduce that hole through the config path.
+    """
+    if value is None:
+        monkeypatch.delenv("DCA_TEST_ACCOUNT", raising=False)
+    else:
+        monkeypatch.setenv("DCA_TEST_ACCOUNT", value)
+    with pytest.raises(MissingConfigEnvError, match="DCA_TEST_ACCOUNT"):
+        expand_config_env("${DCA_TEST_ACCOUNT}", source="budgets.json broker_roles")
+
+
+def test_expand_config_env_names_its_source_in_the_error(monkeypatch):
+    monkeypatch.delenv("DCA_TEST_ACCOUNT", raising=False)
+    with pytest.raises(MissingConfigEnvError, match="midday live_task.broker_account"):
+        expand_config_env("${DCA_TEST_ACCOUNT}", source="midday live_task.broker_account")
+
+
+# --- Per-mode broker-account binding -----------------------------------------
+# load_morning_config used to read raw["live_task"]["broker_account"] for EVERY
+# mode, so the read-only watchlist/preflight scans silently bound the live
+# trading account. Once the account moved into the environment that became
+# load-breaking: constructing a read-only executor raised MissingConfigEnvError
+# on a host where the secret is scoped only to the trading jobs -- and the 9:45
+# preflight artifact is a hard dependency of the 10:30 live run (Codex review,
+# PR #219).
+
+@pytest.mark.parametrize("mode", ["watchlist", "preflight"])
+def test_read_only_morning_modes_do_not_need_the_account_variable(monkeypatch, mode):
+    from morning_dca import load_morning_config
+
+    monkeypatch.delenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", raising=False)
+    config = load_morning_config(mode=mode)
+    assert config.target_account_number == "read_only"
+
+
+def test_live_morning_mode_still_requires_the_account_variable(monkeypatch):
+    from dca_config import MissingConfigEnvError
+    from morning_dca import load_morning_config
+
+    monkeypatch.delenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", raising=False)
+    with pytest.raises(MissingConfigEnvError, match="ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"):
+        load_morning_config(mode="live")
+
+
+def test_live_morning_mode_binds_the_configured_account(monkeypatch):
+    from morning_dca import load_morning_config
+
+    monkeypatch.setenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "123456789")
+    assert load_morning_config(mode="live").target_account_number == "123456789"
+
+
+# --- Broker-account validation at pinning time -------------------------------
+# expand_config_env only guarantees the variable was set to something non-empty,
+# so a malformed value used to flow into execution AND into the artifact. The
+# live classification schema requires account_number to match ^[0-9]{6,12}$ for
+# every *_dca_live run, so emitting a malformed value -- or omitting the field to
+# avoid emitting one -- produced schema-invalid evidence for exactly the runs
+# that matter most (Codex review, PR #219).
+
+@pytest.mark.parametrize(
+    "bad",
+    ["not-an-account", "12345", "1234567890123", "5620 57042", "acct-562", "-123456789"],
+)
+def test_malformed_accounts_are_rejected_at_load(monkeypatch, bad):
+    from dca_config import InvalidAccountNumberError, resolve_broker_account
+
+    monkeypatch.setenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", bad)
+    with pytest.raises(InvalidAccountNumberError):
+        resolve_broker_account(
+            "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}", source="test broker_account"
+        )
+
+
+def test_surrounding_whitespace_is_stripped_not_rejected(monkeypatch):
+    """An account exported with a stray newline is unambiguous; failing on it
+    would be a needless outage."""
+    from dca_config import resolve_broker_account
+
+    monkeypatch.setenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "  123456789\n")
+    resolved = resolve_broker_account(
+        "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}", source="test broker_account"
+    )
+    assert resolved == "123456789"
+
+
+def test_read_only_literal_passes_through(monkeypatch):
+    from dca_config import resolve_broker_account
+
+    assert resolve_broker_account("read_only", source="watchlist") == "read_only"
+
+
+def test_the_live_loader_rejects_a_malformed_account(monkeypatch):
+    from dca_config import InvalidAccountNumberError
+    from morning_dca import load_morning_config
+
+    monkeypatch.setenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "not-an-account")
+    with pytest.raises(InvalidAccountNumberError):
+        load_morning_config(mode="live")
+
+
+def test_the_midday_loader_rejects_a_malformed_account(monkeypatch):
+    from dca_config import InvalidAccountNumberError
+    from midday_dca import load_midday_config
+
+    monkeypatch.setenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "12")
+    with pytest.raises(InvalidAccountNumberError):
+        load_midday_config()

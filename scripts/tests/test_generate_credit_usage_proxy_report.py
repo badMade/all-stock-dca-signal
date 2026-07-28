@@ -973,9 +973,13 @@ def test_run_volume_low_band_covers_all_eleven_baseline_executions(tmp_path):
     # 67aa802b needs its COMPLETE documented output set to count as a
     # successful invocation (discussion_r3660192605); a46bf007 has no such
     # documented set, so any current-day file suffices.
-    slip_out = _write_slippage_outputs(tmp_path / "reports" / "slippage")
+    # Neither path carries the day stamp, so both are judged by mtime -- back
+    # them onto TRADING_DAY rather than leaving them at "now", which is what
+    # made this test fail every day after the one it was written on.
+    slip_out = _stamp_to_trading_day(_write_slippage_outputs(tmp_path / "reports" / "slippage"))
     watch_out = tmp_path / "reports" / "watchdog.json"
     watch_out.write_text("{}", encoding="utf-8")
+    _stamp_to_trading_day(watch_out)
     model_usage_dir = tmp_path / "model_usage" / "202607"
     model_usage_dir.mkdir(parents=True)
     entries = [
@@ -3274,6 +3278,27 @@ SLIPPAGE_OUTPUTS = (
     "slippage_and_coverage_report.md",
     "latest_run_summary.json",
 )
+
+
+def _stamp_to_trading_day(path, trading_day=None):
+    """Backdate ``path`` (file or directory tree) to noon ET on ``trading_day``.
+
+    _is_current_day_artifact accepts an artifact either because its PATH carries
+    the day stamp or because its MTIME falls on the trading day in ET. A fixture
+    writing to a path without the day stamp therefore depended on the wall-clock
+    date: it passed only while the suite ran on the pinned TRADING_DAY, and
+    started failing at the following ET midnight with no code change. Stamping
+    the mtime makes such a fixture hermetic (Codex review, PR #219).
+    """
+    when = datetime.fromisoformat(f"{trading_day or TRADING_DAY}T12:00:00").replace(
+        tzinfo=ZoneInfo("America/New_York")
+    )
+    stamp = when.timestamp()
+    path = Path(path)
+    targets = [path, *path.rglob("*")] if path.is_dir() else [path]
+    for target in targets:
+        os.utime(target, (stamp, stamp))
+    return path
 
 
 def _write_slippage_outputs(out_dir, names=SLIPPAGE_OUTPUTS):

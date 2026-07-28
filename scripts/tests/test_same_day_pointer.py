@@ -15,6 +15,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # Repo root too: the scripts modules under test import the shared top-level
 # dca_fileio helper, which direct invocation (python scripts/tests/test_*.py)
@@ -892,10 +894,7 @@ def test_recovery_pointer_rejects_contradictory_metadata():
 def test_recovery_pointer_helper_agrees_with_its_schema():
     # Pin the two together: anything the helper accepts must also satisfy
     # latest_pointer.schema.json, and the contradictory cases must fail both.
-    try:
-        import jsonschema
-    except ImportError:
-        return
+    jsonschema = pytest.importorskip("jsonschema")
 
     from same_day_pointer import validate_recovery_pointer
 
