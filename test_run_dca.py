@@ -3476,3 +3476,30 @@ def test_intraday_run_classification_rejects_ad_hoc_recovery_stream_suffix():
     bad["stream"] = "intraday_1430"
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(bad, schema)
+
+def test_fallback_discovery_roots_keep_nested_configured_roots(tmp_path, monkeypatch):
+    # Codex review (P1): "Preserve nested configured roots for fallback
+    # discovery". _resolve_cross_stream_prior_allocation_roots prunes a
+    # configured root nested under afternoon_root because the CORE recursive
+    # scan already covers its state files -- but the bare-CSV fallback never
+    # scans afternoon_root, so it still needs that root. Without it, a recovery
+    # whose fills exist only in an unreferenced sibling CSV is invisible to
+    # both, and the full amount gets bought again.
+    from run_dca import _resolve_cross_stream_prior_allocation_roots
+
+    cron_base = tmp_path / "cron_tracking"
+    afternoon_root = cron_base / "ce16ba6b"
+    afternoon_root.mkdir(parents=True)
+    nested = afternoon_root / "intraday_dca"
+    nested.mkdir()
+    monkeypatch.setenv("DCA_INTRADAY_LIVE_STATE_ROOT", str(nested))
+
+    core = _resolve_cross_stream_prior_allocation_roots(None, afternoon_root)
+    fallback = _resolve_cross_stream_prior_allocation_roots(
+        None, afternoon_root, for_fallback_discovery=True
+    )
+
+    # Pruned from the core scan (afternoon_root covers it recursively)...
+    assert nested not in core
+    # ...but preserved for fallback discovery.
+    assert nested in fallback

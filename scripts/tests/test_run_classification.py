@@ -27,17 +27,35 @@ sys.path.insert(1, str(Path(__file__).resolve().parents[2]))
 from run_classification import (  # noqa: E402
     ACCEPTED_STATE_SCHEMA_VERSIONS,
     FINAL_MANUAL_OVERRIDE_RUN_TYPE,
+    INTRADAY_RECOVERY_SLOTS,
     ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED,
     ORDER_SUBMIT_STATUS_ERROR,
+    RECOVERY_RUN_TYPES,
+    RECOVERY_STATE_SCHEMA_VERSIONS,
+    RECOVERY_STREAM_CONTRACTS,
+    RECOVERY_STREAMS,
     RECOVERY_TRIGGER_REASONS,
+    RUN_ORIGIN_SCHEDULED_RECOVERY,
     STATE_SCHEMA_VERSION,
     STATE_SCHEMA_VERSION_V2,
+    _already_covered_by_prior_allocation_loader,
+    _dedupe_rows_by_order_id,
+    _order_ids_from_state,
+    _prior_from_rows,
+    _read_csv_rows,
+    _referenced_orders_csvs,
+    _referenced_orders_csvs_within,
+    _rows_from_buy_candidates,
     build_final_manual_override_classification,
     build_manual_classification,
     build_raw_persistence_state,
     build_recovery_state,
     build_scheduled_classification,
+    classify_non_scheduled_order_ids,
+    collect_earlier_scheduled_order_ids,
     collect_manual_order_ids,
+    collect_recovery_context_order_ids,
+    cron_tracking_root,
     exclude_manual_orders,
     historicals_batch_filename,
     incremental_top_up_amount,
@@ -46,6 +64,7 @@ from run_classification import (  # noqa: E402
     is_preauthorized_v2,
     is_scheduled_state,
     is_top_up_context_state,
+    is_valid_recovery_context_state,
     latest_scheduled_run_path,
     legacy_scheduled_run_dir,
     list_raw_inputs_saved,
@@ -58,11 +77,15 @@ from run_classification import (  # noqa: E402
     quotes_batch_filename,
     raw_input_dir,
     raw_persistence_failure_run_state,
+    recovery_context_roots,
     recovery_escalation_run_state,
+    recovery_root_for,
     save_raw_input,
     scheduled_run_id,
     select_scheduled_state_for_reporting,
+    top_up_context_roots,
     validate_classification,
+    validate_recovery_classification,
     write_run_artifacts,
 )
 
@@ -516,6 +539,299 @@ def test_broker_fallback_only_with_scheduled_state_and_excludes_manual():
         assert sel.ok
         assert sel.used_broker_fallback
         assert sel.order_ids == ["BRK-2"]  # BRK-1 before 15:25, MAN-9 still excluded
+
+
+def test_broker_fallback_excludes_recovery_context_orders():
+    # Codex review: "Exclude recovery IDs from the reporting window fallback".
+    # This branch attributes orders purely on their timestamp, so a delayed
+    # earlier-stream recovery landing inside the afternoon window was assigned
+    # to the afternoon scheduled run and flowed into scheduled slippage and
+    # reliability -- contradicting the contract that declares recovery IDs
+    # non-scheduled.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        write_run_artifacts(_scheduled_state(order_ids=()), base=base)
+
+        # A 14:30 intraday recovery that actually ran at 15:27, same trading day.
+        run_dir = cron_tracking_root(base) / "intraday_dca" / f"{TRADING_DAY.replace('-', '')}_1430ET_recovery_1527ET"
+        run_dir.mkdir(parents=True)
+        (run_dir / "run_state.json").write_text(
+            json.dumps({
+                "run_id": "intraday_recovery_1527ET",
+                "trading_day": TRADING_DAY,
+                "run_classification": _recovery_classification(
+                    run_type="intraday_dca_live_recovery",
+                    stream="intraday_1430_recovery",
+                    state_schema_version="intraday-live-v2-recovery",
+                    run_id="intraday_recovery_1527ET",
+                    trading_day=TRADING_DAY,
+                ),
+                "buy_candidates": [
+                    {"ticker": "EVR", "status": "filled", "order_id": "REC-1527"}
+                ],
+            }),
+            encoding="utf-8",
+        )
+
+        sel = select_scheduled_state_for_reporting(
+            TRADING_DAY, base=base,
+            broker_window_orders=[
+                {"order_id": "REC-1527", "submitted_at_et": "15:27"},
+                {"order_id": "BRK-2", "submitted_at_et": "15:30"},
+            ],
+            scheduled_state_write_failed=True,
+        )
+
+        assert sel.used_broker_fallback
+        # In-window, but recovery context -- not the afternoon run's order.
+        assert sel.order_ids == ["BRK-2"]
+        assert "REC-1527" in sel.excluded_recovery_context_order_ids
+
+
+def test_fallback_excludes_normal_earlier_stream_scheduled_orders():
+    # Codex review: "Exclude all earlier-stream claims from the broker
+    # fallback". The contract excludes any order already claimed by an earlier
+    # stream artifact, but only manual and RECOVERY claims were collected. A
+    # delayed NORMAL 14:30 scheduled run placing at 15:27 falls inside the
+    # canonical 15:25-15:35 window, so it was attributed to the final run and
+    # flowed into final-run slippage and reliability.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        write_run_artifacts(_scheduled_state(order_ids=()), base=base)
+
+        # A NORMAL intraday 14:30 scheduled run -- no _recovery_ in the path.
+        run_dir = (
+            cron_tracking_root(base)
+            / "intraday_dca"
+            / f"{TRADING_DAY.replace('-', '')}_1430ET"
+        )
+        run_dir.mkdir(parents=True)
+        (run_dir / "run_state.json").write_text(
+            json.dumps({
+                "run_id": "intraday_20260706_1430ET",
+                "trading_day": TRADING_DAY,
+                "run_classification": build_scheduled_classification(
+                    TRADING_DAY, "2026-07-06T18:30:00Z"
+                ),
+                "buy_candidates": [
+                    {"ticker": "EVR", "status": "submitted", "order_id": "INTRA-1527"}
+                ],
+            }),
+            encoding="utf-8",
+        )
+
+        # A GENUINE intraday state, with the intraday stream's own run_type,
+        # cron_id, schema version, and 14:30 slot -- NOT the afternoon shape.
+        # is_scheduled_state() rejects this (its validator hard-requires
+        # run_type='scheduled_live_test', the 15:30 cron lineage, and a
+        # scheduled_YYYYMMDD_1530ET run_id), so the collector saw nothing in
+        # production while an afternoon-shaped fixture made the test pass
+        # (Codex review: "Validate earlier streams with their own contracts").
+        real_dir = (
+            cron_tracking_root(base)
+            / "intraday_dca"
+            / f"{TRADING_DAY.replace('-', '')}_1130ET"
+        )
+        real_dir.mkdir(parents=True)
+        (real_dir / "run_state.json").write_text(
+            json.dumps({
+                "run_id": "intraday_20260706_1130ET",
+                "trading_day": TRADING_DAY,
+                "run_classification": {
+                    "run_origin": "scheduled",
+                    "run_type": "intraday_dca_live",
+                    "stream": "intraday",
+                    "cron_id": "7be82b97",
+                    "manual_run": False,
+                    "trading_day": TRADING_DAY,
+                    "run_id": "intraday_20260706_1130ET",
+                    "scheduled_for_et": "11:30",
+                    "state_schema_version": "intraday-live-v2",
+                },
+                "buy_candidates": [
+                    {"ticker": "GS", "status": "submitted", "order_id": "REAL-1527"}
+                ],
+            }),
+            encoding="utf-8",
+        )
+        assert not is_scheduled_state(json.loads((real_dir / "run_state.json").read_text()))
+
+        assert "INTRA-1527" in collect_earlier_scheduled_order_ids(base, TRADING_DAY)
+        assert "REAL-1527" in collect_earlier_scheduled_order_ids(base, TRADING_DAY)
+
+        sel = select_scheduled_state_for_reporting(
+            TRADING_DAY, base=base,
+            broker_window_orders=[
+                {"order_id": "INTRA-1527", "submitted_at_et": "15:27"},
+                {"order_id": "REAL-1527", "submitted_at_et": "15:28"},
+                {"order_id": "BRK-2", "submitted_at_et": "15:30"},
+            ],
+            scheduled_state_write_failed=True,
+        )
+
+        assert sel.used_broker_fallback
+        # In-window, but already claimed by the 14:30 stream.
+        assert sel.order_ids == ["BRK-2"]
+
+
+def test_earlier_scheduled_collector_honors_a_relocated_stream_root():
+    # Codex review: "Honor relocated roots when excluding earlier scheduled
+    # orders". DCA_INTRADAY_LIVE_STATE_ROOT REPLACES the conventional
+    # intraday_dca tree. Both callers default stream_roots to None, so scanning
+    # only cron_tracking/*_dca meant a delayed normal run under the relocated
+    # tree was never collected and stayed eligible for the final-run time
+    # fallback -- misattributed to the afternoon run.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        write_run_artifacts(_scheduled_state(order_ids=()), base=base)
+        cron_tracking_root(base).mkdir(parents=True, exist_ok=True)
+
+        relocated = Path(d) / "elsewhere" / "intraday"
+        slot = relocated / "20260706_1430ET"
+        slot.mkdir(parents=True)
+        (slot / "run_state.json").write_text(
+            json.dumps({
+                "run_id": "intraday_20260706_1430ET",
+                "trading_day": TRADING_DAY,
+                "run_classification": {
+                    "run_origin": "scheduled",
+                    "run_type": "intraday_dca_live",
+                    "cron_id": "7be82b97",
+                    "manual_run": False,
+                    "trading_day": TRADING_DAY,
+                    "run_id": "intraday_20260706_1430ET",
+                    "scheduled_for_et": "14:30",
+                },
+                "buy_candidates": [
+                    {"ticker": "EVR", "status": "submitted", "order_id": "MOVED-1527"}
+                ],
+            }),
+            encoding="utf-8",
+        )
+
+        prior = os.environ.get("DCA_INTRADAY_LIVE_STATE_ROOT")
+        os.environ["DCA_INTRADAY_LIVE_STATE_ROOT"] = str(relocated)
+        try:
+            # Found with stream_roots omitted, which is how both callers call it.
+            assert "MOVED-1527" in collect_earlier_scheduled_order_ids(base, TRADING_DAY)
+
+            sel = select_scheduled_state_for_reporting(
+                TRADING_DAY, base=base,
+                broker_window_orders=[
+                    {"order_id": "MOVED-1527", "submitted_at_et": "15:27"},
+                    {"order_id": "BRK-2", "submitted_at_et": "15:30"},
+                ],
+                scheduled_state_write_failed=True,
+            )
+            assert sel.used_broker_fallback
+            assert sel.order_ids == ["BRK-2"]
+
+            # An override naming the cron-tracking root is a misconfiguration,
+            # not a relocation: the conventional fallback must survive it.
+            os.environ["DCA_INTRADAY_LIVE_STATE_ROOT"] = str(cron_tracking_root(base))
+            assert "MOVED-1527" not in collect_earlier_scheduled_order_ids(base, TRADING_DAY)
+        finally:
+            if prior is None:
+                os.environ.pop("DCA_INTRADAY_LIVE_STATE_ROOT", None)
+            else:
+                os.environ["DCA_INTRADAY_LIVE_STATE_ROOT"] = prior
+
+
+def test_earlier_scheduled_collector_requires_a_valid_same_day_state():
+    # A directory-name match is not evidence, matching the recovery collector.
+    # A prior-DAY artifact must not explain away today's orders, and a manual
+    # state contributes nothing even when it claims a scheduled origin.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        cron_tracking_root(base).mkdir(parents=True, exist_ok=True)
+
+        stale = cron_tracking_root(base) / "midday_dca" / "20260705_1230ET"
+        stale.mkdir(parents=True)
+        (stale / "run_state.json").write_text(
+            json.dumps({
+                "run_id": "midday_20260705",
+                "trading_day": "2026-07-05",
+                "run_classification": build_scheduled_classification(
+                    "2026-07-05", "2026-07-05T16:30:00Z"
+                ),
+                "buy_candidates": [
+                    {"ticker": "AAPL", "status": "submitted", "order_id": "STALE-1"}
+                ],
+            }),
+            encoding="utf-8",
+        )
+
+        rejected = cron_tracking_root(base) / "morning_dca" / "20260706_0935ET"
+        rejected.mkdir(parents=True)
+        (rejected / "run_state.json").write_text(
+            json.dumps({
+                "run_id": "morning_20260706",
+                "trading_day": TRADING_DAY,
+                "artifact_contract_failure": "root artifacts missing",
+                "run_classification": build_scheduled_classification(
+                    TRADING_DAY, "2026-07-06T13:35:00Z"
+                ),
+                "buy_candidates": [
+                    {"ticker": "MSFT", "status": "submitted", "order_id": "REJECTED-1"}
+                ],
+            }),
+            encoding="utf-8",
+        )
+
+        ids = collect_earlier_scheduled_order_ids(base, TRADING_DAY)
+
+        manual_shaped = cron_tracking_root(base) / "intraday_dca" / "20260706_1130ET"
+        manual_shaped.mkdir(parents=True)
+        (manual_shaped / "run_state.json").write_text(
+            json.dumps({
+                "run_id": "intraday_manual",
+                "trading_day": TRADING_DAY,
+                "run_classification": {
+                    "run_origin": "scheduled",
+                    "run_type": "intraday_dca_live",
+                    "manual_run": True,
+                    "trading_day": TRADING_DAY,
+                    "run_id": "intraday_manual",
+                },
+                "buy_candidates": [
+                    {"ticker": "GS", "status": "submitted", "order_id": "MANUAL-1"}
+                ],
+            }),
+            encoding="utf-8",
+        )
+
+        ids = collect_earlier_scheduled_order_ids(base, TRADING_DAY)
+
+        assert "STALE-1" not in ids
+        # Revised for "Exclude contract-failed earlier orders from final
+        # attribution": an artifact_contract_failure marker means the run is not
+        # valid scheduled EVIDENCE, not that it placed no orders. A contract
+        # failure recorded after submission leaves real orders owned by that
+        # earlier stream, and dropping them from the exclusion set handed them
+        # to the final run's time fallback. Ownership, not evidence validity, is
+        # what an exclusion set answers.
+        assert "REJECTED-1" in ids
+        # manual_run wins over a 'scheduled' origin, as everywhere else.
+        assert "MANUAL-1" not in ids
+
+
+def test_non_fallback_paths_do_not_collect_recovery_ids():
+    # The recovery scan runs ONLY in the fallback branch: the other paths use
+    # the scheduled state's own order IDs, and filtering those against a
+    # recovery set could drop a genuine scheduled order.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        write_run_artifacts(_scheduled_state(order_ids=("SCHED-1",)), base=base)
+
+        sel = select_scheduled_state_for_reporting(TRADING_DAY, base=base)
+
+        assert sel.order_ids == ["SCHED-1"]
+        assert sel.excluded_recovery_context_order_ids == []
 
 
 def test_broker_fallback_excludes_out_of_window_orders():
@@ -1995,6 +2311,1597 @@ def test_incremental_top_up_amount_guard():
     assert incremental_top_up_amount(3.0, 2.0, None, None) == (0.0, "missing_prior_price")
     # Desired already covered by prior -> $0.
     assert incremental_top_up_amount(2.0, 3.0, 390.0, 399.1364) == (0.0, "no_incremental_difference")
+
+
+
+# --- Scheduled-recovery context roots ----------------------------------------
+#
+# Codex review: "Add the recovery root to watchdog classification". A recovery
+# pass writes a dated sibling of the scheduled slot dir it recovered, which sits
+# outside every manual root, so its orders reconciled against nothing and
+# surfaced as an unexplained broker/log discrepancy.
+
+
+def _recovery_classification(**overrides):
+    rc = {
+        "run_origin": "scheduled_recovery",
+        "run_type": "midday_dca_live_recovery",
+        "stream": "midday_recovery",
+        "manual_run": False,
+        "run_id": "midday_recovery_20260727_1305ET",
+        "trading_day": "2026-07-27",
+        "state_schema_version": "midday-live-v2-recovery",
+        "valid_scheduled_evidence": False,
+        "valid_recovery_context": True,
+        "same_day_top_up_context_only": True,
+    }
+    rc.update(overrides)
+    return rc
+
+
+def _write_recovery_run(base, subdir, order_ids=("REC-1",)):
+    """Write a recovery run_state under cron_tracking_root(base)/subdir."""
+    run_dir = cron_tracking_root(base) / subdir
+    run_dir.mkdir(parents=True, exist_ok=True)
+    state = {
+        "run_id": "midday_recovery_20260727_1305ET",
+        "trading_day": "2026-07-27",
+        "run_classification": _recovery_classification(),
+        "buy_candidates": [
+            {"ticker": "SPCX", "status": "filled", "order_id": oid} for oid in order_ids
+        ],
+    }
+    (run_dir / "run_state.json").write_text(json.dumps(state), encoding="utf-8")
+    return run_dir
+
+
+def test_recovery_context_roots_match_dated_recovery_dirs():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        _write_recovery_run(base, "midday_dca/20260727_1230ET_recovery_1305ET")
+        _write_recovery_run(base, "morning_dca/20260727_1030ET_recovery_1105ET")
+        # A plain scheduled slot dir must NOT match -- otherwise the whole
+        # scheduled tree would be pulled into the context/manual scan.
+        _write_recovery_run(base, "midday_dca/20260727_1230ET")
+
+        names = sorted(p.name for p in recovery_context_roots(base))
+
+        assert names == [
+            "20260727_1030ET_recovery_1105ET",
+            "20260727_1230ET_recovery_1305ET",
+        ]
+
+
+def test_recovery_context_roots_skips_env_overridden_subroots():
+    # Codex review: "Honor stream overrides when scanning recovery fallbacks".
+    # run_dca._resolve_cross_stream_prior_allocation_roots DROPS the conventional
+    # sibling root when its env override is configured, but this function
+    # re-added it unconditionally -- so a stale recovery in the old tree could
+    # still be merged into the afternoon prior allocation and suppress a top-up.
+    for env_var, overridden, kept in (
+        ("DCA_INTRADAY_LIVE_STATE_ROOT", "intraday_dca", "midday_dca"),
+        ("DCA_MARKET_OPEN_LIVE_STATE_ROOT", "market_open_dca", "morning_dca"),
+    ):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d) / "ce16ba6b"
+            base.mkdir()
+            _write_recovery_run(base, f"{overridden}/20260727_1130ET_recovery_1205ET")
+            _write_recovery_run(base, f"{kept}/20260727_1230ET_recovery_1305ET")
+
+            # Without the override BOTH conventional trees are scanned.
+            prior = os.environ.pop(env_var, None)
+            try:
+                assert len(recovery_context_roots(base)) == 2, env_var
+                # With it configured, only the non-overridden tree survives.
+                os.environ[env_var] = str(Path(d) / "elsewhere")
+                names = [p.name for p in recovery_context_roots(base)]
+                assert names == ["20260727_1230ET_recovery_1305ET"], env_var
+                # A blank value is not a configuration; the tree stays scanned.
+                os.environ[env_var] = "   "
+                assert len(recovery_context_roots(base)) == 2, env_var
+            finally:
+                os.environ.pop(env_var, None)
+                if prior is not None:
+                    os.environ[env_var] = prior
+
+
+def test_recovery_context_roots_scans_the_override_path_by_default():
+    # Codex review: "Scan the active override when stream roots are omitted".
+    # Suppressing the conventional tree without substituting the override left
+    # every caller that omits stream_roots -- classify_non_scheduled_order_ids()
+    # and select_scheduled_state_for_reporting() both default it to None --
+    # discovering NEITHER tree, so recovery IDs went unexplained.
+    env_var = "DCA_INTRADAY_LIVE_STATE_ROOT"
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        # The relocated tree, outside the conventional cron-tracking layout.
+        elsewhere = Path(d) / "relocated" / "intraday"
+        moved = elsewhere / "20260727_1430ET_recovery_1432ET"
+        moved.mkdir(parents=True)
+        (moved / "run_state.json").write_text(
+            json.dumps({
+                "run_id": "intraday_recovery_20260727_1432ET",
+                "trading_day": "2026-07-27",
+                "run_classification": _recovery_classification(
+                    run_type="intraday_dca_live_recovery",
+                    stream="intraday_1430_recovery",
+                    state_schema_version="intraday-live-v2-recovery",
+                ),
+                "buy_candidates": [
+                    {"ticker": "EVR", "status": "filled", "order_id": "REC-MOVED"}
+                ],
+            }),
+            encoding="utf-8",
+        )
+        # A stale copy left behind in the conventional tree.
+        _write_recovery_run(base, "intraday_dca/20260727_1130ET_recovery_1205ET", ("REC-STALE",))
+
+        prior = os.environ.pop(env_var, None)
+        try:
+            os.environ[env_var] = str(elsewhere)
+
+            names = [p.name for p in recovery_context_roots(base)]
+            assert names == ["20260727_1430ET_recovery_1432ET"], names
+
+            # The default-argument path -- no stream_roots -- must find the
+            # relocated recovery's IDs and must NOT find the stale tree's.
+            ids = collect_recovery_context_order_ids(base, "2026-07-27")
+            assert "REC-MOVED" in ids
+            assert "REC-STALE" not in ids
+
+            # Passing the same root explicitly is idempotent, not duplicated.
+            assert len(recovery_context_roots(base, [str(elsewhere)])) == 1
+        finally:
+            os.environ.pop(env_var, None)
+            if prior is not None:
+                os.environ[env_var] = prior
+
+
+def test_already_covered_requires_an_actual_candidate_list():
+    # Codex review: "Propagate normalized candidates to fallback coverage". The
+    # core loader normalizes a non-list buy_candidates to [] and falls through
+    # to its orders-CSV path, but this check used truthiness -- so a populated
+    # dict reported "covered" and the run was dropped from BOTH loaders.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        run_dir = cron_tracking_root(base) / "midday_dca" / "20260727_1230ET_recovery_1305ET"
+        run_dir.mkdir(parents=True)
+
+        for malformed in (1, 1.5, "candidates", {"SPCX": 3.0}, True):
+            state = {"run_classification": _recovery_classification(), "buy_candidates": malformed}
+            assert _already_covered_by_prior_allocation_loader(state, run_dir) is False, malformed
+        # A real non-empty list still reports covered; empty and absent do not.
+        assert _already_covered_by_prior_allocation_loader(
+            {"buy_candidates": [{"ticker": "SPCX", "status": "filled"}]}, run_dir
+        ) is True
+        assert _already_covered_by_prior_allocation_loader({"buy_candidates": []}, run_dir) is False
+        assert _already_covered_by_prior_allocation_loader({}, run_dir) is False
+
+
+def test_prior_from_rows_sizes_a_partial_by_executed_quantity():
+    # Codex review: "Compute partial-fill notional from executed quantity".
+    # _read_csv_rows now KEEPS a partially-executed row, but _prior_from_rows
+    # still preferred its recorded amount_usd -- the amount REQUESTED. A $10
+    # order with $2 executed loaded as $10 of prior allocation and suppressed
+    # the remaining $8 top-up, diverging from near_close_dca._orders_csv_fills.
+    with tempfile.TemporaryDirectory() as d:
+        csv_path = Path(d) / "filled_orders.csv"
+        csv_path.write_text(
+            "ticker,amount_usd,state,average_fill_price,quantity\n"
+            # $10 requested, only 0.2 x $10 = $2 executed.
+            "GFUZ,10.00,partially_filled,10.000000,0.200000\n"
+            # A genuine full fill still uses its recorded amount.
+            "SPCX,3.50,filled,109.989900,0.031821\n",
+            encoding="utf-8",
+        )
+
+        prior = _prior_from_rows(_read_csv_rows(csv_path))
+
+        assert abs(prior["GFUZ"]["prior_usd"] - 2.00) < 1e-9
+        assert abs(prior["SPCX"]["prior_usd"] - 3.50) < 1e-9
+
+
+def test_recovery_root_contains_a_root_level_sibling_csv():
+    # Codex review (P1): "Resolve recovery CSVs against the artifact root".
+    # A recovery run may write artifacts/run_state.json beside a ROOT-level
+    # filled_orders.csv and record it as '../filled_orders.csv' -- in-root and
+    # legitimate. Containing against run_state.json's OWN directory rejected it
+    # and retried a basename one level down that does not exist, so both
+    # allocation loaders omitted real deployed capital while the watchdog
+    # collector called its order ID explained.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        recovery_root = (
+            cron_tracking_root(base) / "intraday_dca" / "20260727_1430ET_recovery_1432ET"
+        )
+        (recovery_root / "artifacts").mkdir(parents=True)
+        (recovery_root / "filled_orders.csv").write_text(
+            "ticker,order_id,state,amount_usd,average_fill_price,quantity\n"
+            "EVR,REC-EVR,filled,1.00,336.916900,0.002968\n",
+            encoding="utf-8",
+        )
+        state = {
+            "run_id": "intraday_recovery_20260727_1432ET",
+            "trading_day": "2026-07-27",
+            "run_classification": _recovery_classification(
+                run_type="intraday_dca_live_recovery",
+                stream="intraday_1430_recovery",
+                state_schema_version="intraday-live-v2-recovery",
+            ),
+            "artifacts": {"orders_csv_path": "../filled_orders.csv"},
+        }
+        state_dir = recovery_root / "artifacts"
+        (state_dir / "run_state.json").write_text(json.dumps(state), encoding="utf-8")
+
+        assert recovery_root_for(state_dir) == recovery_root
+        # The in-root sibling survives containment instead of being rejected.
+        kept = _referenced_orders_csvs_within(
+            state, state_dir, recovery_root_for(state_dir)
+        )
+        assert [p.name for p in kept] == ["filled_orders.csv"], kept
+
+        # A path OUTSIDE the recovery root is still rejected.
+        outside = Path(d) / "elsewhere"
+        outside.mkdir()
+        (outside / "other_orders.csv").write_text("ticker,order_id\nAAPL,X\n", encoding="utf-8")
+        escaping = dict(state, artifacts={"orders_csv_path": str(outside / "other_orders.csv")})
+        assert _referenced_orders_csvs_within(
+            escaping, state_dir, recovery_root_for(state_dir)
+        ) == []
+
+
+def test_coverage_check_uses_the_recovery_root_boundary():
+    # Codex review: "Use the recovery root when checking loader coverage".
+    # Last round moved the core loader and the fallback's CSV resolution onto
+    # recovery_root_for(); this site still compared against run_dir, so a
+    # legitimate '../filled_orders.csv' from an artifacts/run_state.json was
+    # rewritten to a nonexistent artifacts/filled_orders.csv and reported NOT
+    # covered. The fallback then re-read the SAME root CSV the core loader had
+    # already read, and merge_manual_top_up_context() double-counted the fill.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        recovery_root = (
+            cron_tracking_root(base) / "midday_dca" / "20260727_1230ET_recovery_1305ET"
+        )
+        state_dir = recovery_root / "artifacts"
+        state_dir.mkdir(parents=True)
+        (recovery_root / "filled_orders.csv").write_text(
+            "ticker,order_id,state,amount_usd\nSPCX,REC-1,filled,3.50\n", encoding="utf-8"
+        )
+        state = {
+            "run_classification": _recovery_classification(),
+            "artifacts": {"orders_csv_path": "../filled_orders.csv"},
+        }
+
+        # The core loader reads this CSV, so the fallback must report COVERED
+        # and leave it alone.
+        assert _already_covered_by_prior_allocation_loader(state, state_dir) is True
+
+        # A path outside the recovery root is still not covered: the core loader
+        # will not follow it, so the fallback must still process the run.
+        outside = Path(d) / "elsewhere"
+        outside.mkdir()
+        (outside / "other_orders.csv").write_text("ticker,order_id\nAAPL,X\n", encoding="utf-8")
+        escaping = dict(state, artifacts={"orders_csv_path": str(outside / "other_orders.csv")})
+        assert _already_covered_by_prior_allocation_loader(escaping, state_dir) is False
+
+
+def test_recovery_root_falls_back_to_the_run_dir():
+    # No ancestor looks like a recovery directory: keep the narrower boundary
+    # rather than walking up into an unrelated tree.
+    with tempfile.TemporaryDirectory() as d:
+        plain = Path(d) / "scheduled_runs" / "20260727_1530ET"
+        plain.mkdir(parents=True)
+        assert recovery_root_for(plain) == plain
+
+
+def test_recovery_optional_fields_are_validated_when_present():
+    # Codex review: "Validate optional recovery fields before returning true".
+    # The schema constrains scheduled_slot_et / recovery_pass_started_et to
+    # HH:MM and the root/cron fields to strings, but this validator returned
+    # true without looking, so a schema-aware consumer and this helper
+    # disagreed about the same artifact.
+    for bad_clock in ("bogus", {}, [], 1430, "14:3", "2:30", "14:30:00", " 14:30", "14:30\n"):
+        for field in ("scheduled_slot_et", "recovery_pass_started_et"):
+            rc = _recovery_classification(**{field: bad_clock})
+            assert validate_recovery_classification(rc) is False, (field, bad_clock)
+    for bad_root in ([], {}, 1, True, None):
+        for field in ("cron_id", "recovered_slot_artifact_root", "artifact_root"):
+            rc = _recovery_classification(**{field: bad_root})
+            assert validate_recovery_classification(rc) is False, (field, bad_root)
+    # Well-formed optional values, and absence, both still pass.
+    assert validate_recovery_classification(
+        _recovery_classification(
+            scheduled_slot_et="14:30",
+            recovery_pass_started_et="14:32",
+            cron_id="7be82b97",
+            artifact_root="/home/user/workspace/cron_tracking/intraday_dca/x_recovery_y",
+        )
+    ) is True
+    assert validate_recovery_classification(_recovery_classification()) is True
+
+
+def test_rows_from_buy_candidates_survives_a_malformed_collection():
+    # Codex review: "Validate final-review candidate arrays before iterating".
+    # `state.get(k, []) or []` returns the raw value for buy_candidates: 1, and
+    # iterating it raised TypeError out of load_same_day_top_up_context() --
+    # aborting the whole afternoon context scan over one corrupt artifact.
+    for malformed in (1, 1.5, "candidates", {"AAPL": 3.0}, True, None):
+        assert _rows_from_buy_candidates({"buy_candidates": malformed}) == [], malformed
+    assert _rows_from_buy_candidates({}) == []
+    # A well-formed list is still converted.
+    rows = _rows_from_buy_candidates(
+        {"buy_candidates": [{"ticker": "AAPL", "status": "filled", "amount_usd": 3.0}]}
+    )
+    assert [r["ticker"] for r in rows] == ["AAPL"]
+    assert rows[0]["_confirmed_fill"] is True
+
+
+def test_partial_notional_uses_the_execution_price_not_the_target():
+    # Codex review: "Use the executed fill price when sizing partials".
+    # _PRICE_COLS leads with target_price/decision_price -- correct for a
+    # REFERENCE price, wrong for sizing cash. Multiplying executed quantity by
+    # the target sized the row by what we hoped to pay: target 12, fill 10,
+    # quantity 0.2 gave $2.40 instead of $2.00, overstating prior allocation.
+    with tempfile.TemporaryDirectory() as d:
+        csv_path = Path(d) / "filled_orders.csv"
+        csv_path.write_text(
+            "ticker,amount_usd,state,target_price,average_fill_price,quantity\n"
+            "GFUZ,10.00,partially_filled,12.000000,10.000000,0.200000\n",
+            encoding="utf-8",
+        )
+
+        prior = _prior_from_rows(_read_csv_rows(csv_path))
+
+        assert abs(prior["GFUZ"]["prior_usd"] - 2.00) < 1e-9, prior["GFUZ"]
+
+
+def test_broker_state_filled_confirms_a_submitted_row():
+    # Codex review: "Let the broker state confirm filled recovery rows".
+    # status is what we ASKED for; state is what the broker DID. A row carrying
+    # status='submitted' with state='filled' was treated as unconfirmed, which
+    # poisoned the ticker's reference price to unknown and forced the
+    # conservative $0 manual-review path despite a real fill price and quantity.
+    with tempfile.TemporaryDirectory() as d:
+        csv_path = Path(d) / "submitted_orders.csv"
+        csv_path.write_text(
+            "ticker,status,state,amount_usd,average_fill_price,quantity\n"
+            "EVR,submitted,filled,1.00,336.916900,0.002968\n",
+            encoding="utf-8",
+        )
+
+        rows = _read_csv_rows(csv_path)
+
+        assert len(rows) == 1
+        assert rows[0]["_confirmed_fill"] is True
+        # A confirmed fill contributes a known reference price.
+        assert _prior_from_rows(rows)["EVR"]["reference_price"] == 336.9169
+
+
+def test_recovery_context_roots_ignores_an_ancestor_override():
+    # Codex review: "Keep the fallback for invalid ancestor overrides".
+    # _resolve_cross_stream_prior_allocation_roots rejects an override that is a
+    # strict ancestor of the tree -- it names the whole deployment, not a stream
+    # -- and KEEPS the conventional fallback. Treating it as a valid replacement
+    # here suppressed the conventional pattern and then found nothing, so
+    # recovery IDs went unexplained.
+    env_var = "DCA_INTRADAY_LIVE_STATE_ROOT"
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        _write_recovery_run(base, "intraday_dca/20260727_1430ET_recovery_1432ET", ("REC-CONV",))
+        parent = cron_tracking_root(base)
+
+        prior = os.environ.pop(env_var, None)
+        try:
+            # A STRICT ANCESTOR of the cron-tracking root: invalid, so the
+            # conventional tree must still be scanned.
+            os.environ[env_var] = str(parent.parent)
+            names = [p.name for p in recovery_context_roots(base)]
+            assert names == ["20260727_1430ET_recovery_1432ET"], names
+            assert "REC-CONV" in collect_recovery_context_order_ids(base, "2026-07-27")
+
+            # EQUAL to the cron-tracking root is ALSO too broad, and this
+            # assertion previously read `== []` on the mistaken reasoning that
+            # equal is not an ancestor. That carve-out belongs one level down:
+            # _resolve_cross_stream_prior_allocation_roots compares against the
+            # AFTERNOON root, and the cron root is a strict ancestor of that, so
+            # the resolver rejects an override equal to the cron root and keeps
+            # the conventional fallback. Accepting it here suppressed
+            # intraday_dca/*_recovery_* and then found nothing (Codex review:
+            # "Keep the fallback when an override equals the cron root").
+            os.environ[env_var] = str(parent)
+            assert [p.name for p in recovery_context_roots(base)] == [
+                "20260727_1430ET_recovery_1432ET"
+            ]
+            assert "REC-CONV" in collect_recovery_context_order_ids(base, "2026-07-27")
+        finally:
+            os.environ.pop(env_var, None)
+            if prior is not None:
+                os.environ[env_var] = prior
+
+
+def test_referenced_csvs_resolve_relative_paths_from_the_run_dir():
+    # Codex review: "Resolve relative recovery CSV paths from the run
+    # directory". Path(recorded) resolved against the PROCESS cwd, so a
+    # subdirectory path like 'artifacts/executions.csv' was missed here while
+    # near_close_dca's core loader (which joins onto the run dir) found it --
+    # the fills reduced a later top-up while the order IDs stayed out of the
+    # watchdog exclusion set and were reported as unexplained.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        run_dir = cron_tracking_root(base) / "intraday_dca" / "20260727_1430ET_recovery_1432ET"
+        (run_dir / "artifacts").mkdir(parents=True)
+        nested = run_dir / "artifacts" / "executions.csv"
+        nested.write_text(
+            "ticker,order_id,status,amount_usd\nEVR,REC-EVR,filled,1.00\n", encoding="utf-8"
+        )
+        state = {
+            "run_id": "intraday_recovery_20260727_1432ET",
+            "trading_day": "2026-07-27",
+            "run_classification": _recovery_classification(
+                run_type="intraday_dca_live_recovery",
+                stream="intraday_1430_recovery",
+                state_schema_version="intraday-live-v2-recovery",
+            ),
+            "artifacts": {"orders_csv_path": "artifacts/executions.csv"},
+        }
+        (run_dir / "run_state.json").write_text(json.dumps(state), encoding="utf-8")
+
+        found = _referenced_orders_csvs(state, run_dir)
+        assert nested in [p for p in found], found
+
+        # Containment still holds: the resolved path is inside the run root, so
+        # the constrained variant keeps it rather than filtering it out.
+        assert nested in _referenced_orders_csvs_within(state, run_dir, run_dir)
+
+        # And the IDs now reach the watchdog exclusion set.
+        assert "REC-EVR" in collect_recovery_context_order_ids(base, "2026-07-27")
+
+
+def test_fallback_csv_reader_honors_the_recovery_state_column():
+    # Codex review: "Filter recovery state in the fallback CSV reader". The
+    # state gate was added to near_close_dca._orders_csv_fills but not here, so
+    # a recovery discoverable only through the bare-CSV fallback still counted a
+    # state='rejected' row as deployed capital.
+    #
+    # Revised for "Preserve executed partial fills in recovery CSVs": the gate is
+    # on EXECUTED QUANTITY, not the state name. A rejected/canceled row that
+    # executed nothing is dropped; one that executed real shares before ending is
+    # kept, because that is deployed capital and discarding it would let the
+    # later run re-buy the full amount.
+    with tempfile.TemporaryDirectory() as d:
+        csv_path = Path(d) / "filled_orders.csv"
+        csv_path.write_text(
+            "ticker,amount_usd,state,average_fill_price,quantity\n"
+            "SPCX,3.50,filled,109.989900,0.031821\n"
+            "EVR,1.00,rejected,250.000000,0\n"
+            "DXYZ,1.00,canceled,22.601700,\n"
+            "GS,1.00,,1041.181500,-\n"
+            # Executed capital despite a non-'filled' state -- both must survive.
+            "FLKR,4.00,partially_filled,51.627900,0.040000\n"
+            "AMZN,1.00,canceled,231.429900,0.002000\n",
+            encoding="utf-8",
+        )
+
+        rows = _read_csv_rows(csv_path)
+
+        # Revised again for "Retain nonterminal submitted rows in the fallback
+        # reader": only a TERMINAL non-fill state with zero execution is
+        # dropped. GS carries a BLANK state, which means the order is still
+        # live and may yet fill -- dropping it let a later run see no prior
+        # allocation and re-submit the full amount against a live order.
+        # Revised again for "Require explicit zero before dropping submitted
+        # notionals": only EVR states a definitive zero (quantity=0) and is
+        # dropped. DXYZ is canceled with a BLANK quantity -- the artifact does
+        # not establish whether it executed, so it stays as unresolved context
+        # rather than being assumed to have filled nothing.
+        assert [r["ticker"] for r in rows] == ["SPCX", "DXYZ", "GS", "FLKR", "AMZN"]
+
+        by_ticker = {r["ticker"]: r for r in rows}
+        # A row kept ONLY because its state is still live is conservative
+        # context, never a confirmed fill: it executed nothing, so its logged
+        # price must not become a trusted reference.
+        for ticker in ("GS", "DXYZ"):
+            assert by_ticker[ticker]["_confirmed_fill"] is False, ticker
+            assert by_ticker[ticker]["_partial_execution"] is False, ticker
+        # Only a FULL fill is confirmed. Revised for "Keep statusless partial
+        # executions unconfirmed": FLKR (partially_filled) and AMZN (canceled
+        # after executing) moved real capital, so their notionals count, but
+        # their remainders were still live or cancelled -- their prices never
+        # settled, so neither may serve as a reference price. The earlier
+        # version of this test asserted True for both, encoding that bug.
+        assert by_ticker["SPCX"]["_confirmed_fill"] is True
+        for ticker in ("FLKR", "AMZN"):
+            assert by_ticker[ticker]["_confirmed_fill"] is False, ticker
+            assert by_ticker[ticker]["_partial_execution"] is True, ticker
+
+        # No state column: the statusless manual-fill shape is unchanged.
+        plain = Path(d) / "plain_filled_orders.csv"
+        plain.write_text("ticker,amount_usd\nAAPL,5.00\n", encoding="utf-8")
+        plain_rows = _read_csv_rows(plain)
+        assert [r["ticker"] for r in plain_rows] == ["AAPL"]
+        assert plain_rows[0]["_confirmed_fill"] is True
+
+
+def test_recovery_context_roots_excludes_afternoon_tree():
+    # An afternoon recovery is the afternoon run's own repair, never prior
+    # context for it.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        _write_recovery_run(base, "ce16ba6b/scheduled_runs/20260727_1530ET_recovery_1605ET")
+
+        assert recovery_context_roots(base) == []
+
+
+def test_recovery_context_roots_empty_when_no_recovery_dirs():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+
+        assert recovery_context_roots(base) == []
+
+
+def test_top_up_context_roots_includes_recovery_dirs():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        _write_recovery_run(base, "midday_dca/20260727_1230ET_recovery_1305ET")
+
+        roots = top_up_context_roots(base)
+
+        assert any(p.name == "20260727_1230ET_recovery_1305ET" for p in roots)
+        # The fixed manual subroots are still returned.
+        assert any(p.name == "final_manual_review" for p in roots)
+
+
+def test_collect_recovery_context_order_ids():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        _write_recovery_run(
+            base, "midday_dca/20260727_1230ET_recovery_1305ET", order_ids=("REC-1", "REC-2")
+        )
+
+        assert collect_recovery_context_order_ids(base) == {"REC-1", "REC-2"}
+
+
+def test_classify_non_scheduled_order_ids_separates_manual_and_recovery():
+    # The watchdog needs both buckets: an ID in either is classified-and-excluded
+    # rather than an unexplained broker/log discrepancy, but a recovery ID must
+    # not be reported as manual.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        _write_recovery_run(base, "midday_dca/20260727_1230ET_recovery_1305ET", order_ids=("REC-1",))
+
+        buckets = classify_non_scheduled_order_ids(base)
+
+        assert buckets["recovery_context"] == {"REC-1"}
+        assert "REC-1" not in buckets["manual"]
+
+
+def test_is_top_up_context_state_accepts_recovery_classification():
+    # The top-level trading_day is now REQUIRED on a recovery state (Codex
+    # review: "Require a top-level trading day on recovery states") -- the
+    # allocation loader filters on it, so accepting a state without one made
+    # the two consumers disagree about which artifacts exist.
+    state = {"trading_day": "2026-07-27", "run_classification": _recovery_classification()}
+    assert is_top_up_context_state(state, "2026-07-27") is True
+    assert is_top_up_context_state({"run_classification": _recovery_classification()}) is False
+
+
+def test_is_top_up_context_state_rejects_recovery_missing_positive_flags():
+    # A recovery run must positively assert recovery context and disclaim
+    # scheduled evidence; failing closed keeps a half-written or misclassified
+    # artifact from reducing a later buy.
+    for override in (
+        {"valid_recovery_context": None},
+        {"valid_scheduled_evidence": True},
+        {"manual_run": True},
+        {"same_day_top_up_context_only": False},
+    ):
+        state = {"run_classification": _recovery_classification(**override)}
+        assert is_top_up_context_state(state, "2026-07-27") is False, override
+
+
+def test_is_top_up_context_state_still_rejects_plain_scheduled_run():
+    state = {
+        "run_classification": _recovery_classification(
+            run_origin="scheduled", valid_recovery_context=None
+        )
+    }
+    assert is_top_up_context_state(state, "2026-07-27") is False
+
+
+def test_recovery_state_schema_version_stays_out_of_accepted_versions():
+    # The recovery version must never be ingestible as scheduled evidence.
+    assert "midday-live-v2-recovery" not in ACCEPTED_STATE_SCHEMA_VERSIONS
+    assert RUN_ORIGIN_SCHEDULED_RECOVERY == "scheduled_recovery"
+    assert RUN_ORIGIN_SCHEDULED_RECOVERY != "scheduled"
+
+
+def test_recovery_classification_validates_against_its_schema():
+    try:
+        import jsonschema
+    except ImportError:
+        return
+
+    repo_root = Path(__file__).resolve().parents[2]
+    schema = json.loads(
+        (repo_root / "schemas" / "recovery_run_classification.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    validator = jsonschema.Draft7Validator(schema)
+
+    assert list(validator.iter_errors(_recovery_classification())) == []
+    # A scheduled classification, one claiming scheduled evidence, and one
+    # claiming the policy recovery_rerun flag must all be rejected.
+    assert list(validator.iter_errors(_recovery_classification(run_origin="scheduled")))
+    assert list(validator.iter_errors(_recovery_classification(valid_scheduled_evidence=True)))
+    assert list(validator.iter_errors(_recovery_classification(recovery_rerun=True)))
+
+
+def test_scheduled_midday_schema_still_rejects_recovery_classification():
+    # The recovery values must stay OUT of the scheduled midday contract, so a
+    # scheduled consumer rejects the artifact rather than ingesting it.
+    try:
+        import jsonschema
+    except ImportError:
+        return
+
+    repo_root = Path(__file__).resolve().parents[2]
+    schema = json.loads(
+        (repo_root / "schemas" / "midday_run_classification.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert list(jsonschema.Draft7Validator(schema).iter_errors(_recovery_classification()))
+
+
+
+def test_collect_recovery_context_order_ids_validates_states():
+    # Codex review: "Validate states before excluding recovery order IDs". A
+    # directory-name match is not evidence: these are glob-matched dated dirs,
+    # so a malformed, manual, or scheduled-evidence artifact accidentally
+    # written under one must NOT be labelled recovery context and silently
+    # excluded from discrepancy reporting.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        root = cron_tracking_root(base) / "midday_dca" / "20260727_1230ET_recovery_1305ET"
+        root.mkdir(parents=True)
+
+        def write(name, classification, order_id):
+            (root / name).write_text(
+                json.dumps({
+                    "run_id": "r",
+                    "trading_day": "2026-07-27",
+                    "run_classification": classification,
+                    "buy_candidates": [
+                        {"ticker": "SPCX", "status": "filled", "order_id": order_id}
+                    ],
+                }),
+                encoding="utf-8",
+            )
+
+        # A scheduled-evidence state must not be laundered into recovery context.
+        write(
+            "run_state_scheduled.json",
+            {
+                "run_origin": "scheduled",
+                "manual_run": False,
+                "stream": "midday",
+                "valid_scheduled_evidence": True,
+            },
+            "SCHEDULED-1",
+        )
+        # Nor a state missing the positive recovery assertions.
+        write(
+            "run_state_partial.json",
+            {"run_origin": "scheduled_recovery", "manual_run": False},
+            "PARTIAL-1",
+        )
+        # Nor a manual state (it belongs in the manual bucket, not this one).
+        write(
+            "run_state_manual.json",
+            {
+                "run_origin": "manual",
+                "manual_run": True,
+                "same_day_top_up_context_only": True,
+                "valid_scheduled_evidence": False,
+            },
+            "MANUAL-1",
+        )
+        # A well-formed recovery state IS collected.
+        write("run_state.json", _recovery_classification(), "REC-1")
+
+        ids = collect_recovery_context_order_ids(base)
+
+        assert ids == {"REC-1"}
+
+
+def test_collect_recovery_context_order_ids_honors_trading_day():
+    # A stale prior-day recovery directory must not explain away today's orders.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        _write_recovery_run(base, "midday_dca/20260727_1230ET_recovery_1305ET", order_ids=("REC-1",))
+
+        assert collect_recovery_context_order_ids(base, "2026-07-27") == {"REC-1"}
+        assert collect_recovery_context_order_ids(base, "2026-07-28") == set()
+
+
+# --- The canonical recovery contract -----------------------------------------
+
+
+def test_validate_recovery_classification_accepts_conforming():
+    assert validate_recovery_classification(_recovery_classification()) is True
+    assert validate_recovery_classification(_recovery_classification(), "2026-07-27") is True
+
+
+def test_validate_recovery_classification_rejects_bogus_identity_values():
+    # Codex review: "Validate recovery identity values against the contract".
+    # Non-blank is not enough -- the values must be the contract's own.
+    for override in (
+        {"run_type": "bogus"},
+        {"state_schema_version": "bogus"},
+        {"stream": "midday"},
+        {"stream": "afternoon_recovery"},
+        {"run_id": "   "},
+        {"run_id": None},
+    ):
+        assert validate_recovery_classification(_recovery_classification(**override)) is False, override
+
+
+def test_validate_recovery_classification_requires_stream_correspondence():
+    # A stream paired with ANOTHER stream's run_type or schema version is
+    # rejected, so a recovery artifact cannot borrow a different slot's identity.
+    assert validate_recovery_classification(
+        _recovery_classification(run_type="morning_dca_live_recovery")
+    ) is False
+    assert validate_recovery_classification(
+        _recovery_classification(state_schema_version="morning-live-v2-recovery")
+    ) is False
+    # The morning triple, fully consistent, passes.
+    assert validate_recovery_classification({
+        **_recovery_classification(),
+        "stream": "morning_recovery",
+        "run_type": "morning_dca_live_recovery",
+        "state_schema_version": "morning-live-v2-recovery",
+    }) is True
+
+
+def test_validate_recovery_classification_requires_classification_trading_day():
+    # A top-level state trading_day must not substitute for the classification's
+    # own, and a mismatch against the expected day is rejected.
+    rc = _recovery_classification()
+    del rc["trading_day"]
+    assert validate_recovery_classification(rc) is False
+    assert validate_recovery_classification(_recovery_classification(), "2026-07-28") is False
+
+
+def test_validate_recovery_classification_rejects_flag_violations():
+    for override in (
+        {"run_origin": "scheduled"},
+        {"manual_run": True},
+        {"valid_recovery_context": None},
+        {"valid_scheduled_evidence": True},
+        {"same_day_top_up_context_only": False},
+        {"recovery_rerun": True},
+        {"valid_afternoon_scheduled_evidence": True},
+        {"use_for_slippage_scheduled_proof": True},
+    ):
+        assert validate_recovery_classification(_recovery_classification(**override)) is False, override
+    assert validate_recovery_classification(None) is False
+    assert validate_recovery_classification("nope") is False
+
+
+def test_recovery_contract_matches_its_schema():
+    # The code tables and the schema enums must not drift apart.
+    try:
+        import jsonschema  # noqa: F401
+    except ImportError:
+        pass
+    repo_root = Path(__file__).resolve().parents[2]
+    schema = json.loads(
+        (repo_root / "schemas" / "recovery_run_classification.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    props = schema["properties"]
+    assert tuple(props["stream"]["enum"]) == RECOVERY_STREAMS
+    assert sorted(props["run_type"]["enum"]) == sorted(RECOVERY_RUN_TYPES)
+    assert sorted(props["state_schema_version"]["enum"]) == sorted(
+        RECOVERY_STATE_SCHEMA_VERSIONS
+    )
+
+
+def test_all_three_consumers_share_one_contract():
+    # The guard, the pointer validator, and is_top_up_context_state must agree
+    # on every artifact: three hand-rolled copies had already drifted apart.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from same_day_pointer import derive_valid_recovery_context
+
+    from near_close_dca import _is_scheduled_recovery_context
+
+    for rc in (
+        _recovery_classification(),
+        _recovery_classification(run_type="bogus"),
+        _recovery_classification(recovery_rerun=True),
+        _recovery_classification(valid_scheduled_evidence=True),
+    ):
+        state = {"trading_day": "2026-07-27", "run_classification": rc}
+        expected = is_valid_recovery_context_state(state)
+        assert validate_recovery_classification(rc, "2026-07-27") is expected, rc
+        assert _is_scheduled_recovery_context(state) is expected, rc
+        assert derive_valid_recovery_context(state) is expected, rc
+        assert is_top_up_context_state(state) is expected, rc
+
+    # And the state-level marker every consumer must now honour: a
+    # contract-failed artifact is never recovery context, however valid its
+    # classification looks.
+    failed = {
+        "trading_day": "2026-07-27",
+        "run_classification": _recovery_classification(),
+        "artifact_contract_failure": {"reason": "missing artifact"},
+    }
+    assert is_valid_recovery_context_state(failed) is False
+    assert _is_scheduled_recovery_context(failed) is False
+    assert derive_valid_recovery_context(failed) is False
+    assert is_top_up_context_state(failed) is False
+
+
+def test_recovery_state_day_must_match_classification_day():
+    # A state accepted on today's top-level day whose classification names a
+    # different day is rejected, so both identities must agree.
+    assert is_valid_recovery_context_state({
+        "trading_day": "2026-07-27",
+        "run_classification": _recovery_classification(trading_day="2026-07-24"),
+    }) is False
+    assert is_valid_recovery_context_state({
+        "trading_day": "2026-07-27",
+        "run_classification": _recovery_classification(),
+    }) is True
+
+
+def test_recovery_context_roots_honors_explicit_stream_roots():
+    # Codex review: "Honor configured stream roots when discovering recoveries".
+    # A relocated stream root (configured artifact_paths.live_run_state_root, or
+    # DCA_INTRADAY_LIVE_STATE_ROOT / DCA_MARKET_OPEN_LIVE_STATE_ROOT) lives
+    # outside the cron-tracking tree entirely.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        relocated = Path(d) / "elsewhere" / "intraday_dca"
+        recovery_dir = relocated / "20260727_1130ET_recovery_1205ET"
+        recovery_dir.mkdir(parents=True)
+        (recovery_dir / "run_state.json").write_text(
+            json.dumps({
+                "run_id": "r",
+                "trading_day": "2026-07-27",
+                "run_classification": _recovery_classification(),
+                "buy_candidates": [
+                    {"ticker": "SPCX", "status": "filled", "order_id": "RELOCATED-1"}
+                ],
+            }),
+            encoding="utf-8",
+        )
+
+        # Not found by the conventional layout alone.
+        assert recovery_context_roots(base) == []
+        assert collect_recovery_context_order_ids(base) == set()
+
+        # Found once the configured stream root is supplied.
+        assert recovery_dir in recovery_context_roots(base, [relocated])
+        assert collect_recovery_context_order_ids(base, None, [relocated]) == {"RELOCATED-1"}
+        assert classify_non_scheduled_order_ids(base, None, [relocated])[
+            "recovery_context"
+        ] == {"RELOCATED-1"}
+
+
+def test_recovery_context_roots_accepts_a_recovery_dir_directly():
+    # A caller may pass the recovery directory itself rather than its parent.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        recovery_dir = Path(d) / "elsewhere" / "20260727_1130ET_recovery_1205ET"
+        recovery_dir.mkdir(parents=True)
+
+        assert recovery_context_roots(base, [recovery_dir]) == [recovery_dir]
+
+
+def test_recovery_context_roots_dedupes_overlapping_roots():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        run_dir = _write_recovery_run(base, "midday_dca/20260727_1230ET_recovery_1305ET")
+        stream_root = cron_tracking_root(base) / "midday_dca"
+
+        roots = recovery_context_roots(base, [stream_root])
+
+        assert roots.count(run_dir) == 1
+        assert len(roots) == 1
+
+
+def test_validate_recovery_classification_survives_unhashable_stream():
+    # Codex review: "Reject unhashable recovery stream values". Persisted JSON
+    # can hold a list/object here; an unhashable dict key would raise TypeError
+    # and abort the afternoon guard, the pointer validator, and the watchdog
+    # collector instead of failing closed.
+    for bad in ([], {}, ["midday_recovery"], {"a": 1}, 3, None, True):
+        assert validate_recovery_classification(_recovery_classification(stream=bad)) is False, bad
+
+
+def test_recovery_schema_binds_the_identity_triple():
+    # Codex review: "Couple recovery identity fields in the schema". Three
+    # independent enums let a cross-stream combination validate, so a
+    # schema-only consumer would accept what every in-repo consumer rejects.
+    try:
+        import jsonschema
+    except ImportError:
+        return
+
+    repo_root = Path(__file__).resolve().parents[2]
+    schema = json.loads(
+        (repo_root / "schemas" / "recovery_run_classification.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    validator = jsonschema.Draft7Validator(schema)
+
+    # Every conforming triple validates against the schema AND the code.
+    for stream, (run_type, version) in RECOVERY_STREAM_CONTRACTS.items():
+        rc = _recovery_classification(
+            stream=stream, run_type=run_type, state_schema_version=version
+        )
+        assert list(validator.iter_errors(rc)) == [], stream
+        assert validate_recovery_classification(rc) is True, stream
+
+    # Every cross-stream mismatch is rejected by BOTH, so the schema and the
+    # validator can never disagree about an artifact's identity.
+    for stream, (run_type, version) in RECOVERY_STREAM_CONTRACTS.items():
+        for other, (other_type, other_version) in RECOVERY_STREAM_CONTRACTS.items():
+            # Skip same-contract pairs: the four intraday streams (bare plus the
+            # three slot-qualified ones) deliberately SHARE one run_type and
+            # schema version, so pairing them is not a mismatch.
+            if (other_type, other_version) == (run_type, version):
+                continue
+            for rc in (
+                _recovery_classification(
+                    stream=stream, run_type=other_type, state_schema_version=version
+                ),
+                _recovery_classification(
+                    stream=stream, run_type=run_type, state_schema_version=other_version
+                ),
+            ):
+                assert list(validator.iter_errors(rc)), (stream, other)
+                assert validate_recovery_classification(rc) is False, (stream, other)
+
+
+def test_load_same_day_top_up_context_honors_configured_stream_roots():
+    # Codex review (P1): "Thread configured roots into top-up loading". The
+    # earlier fix reached the watchdog collector but NOT this loader, which is
+    # what actually feeds the top-up guard. A recovery whose fills live only in
+    # a bare sibling CSV under a relocated stream root was therefore missed by
+    # the core loader AND this fallback, so the later run treated the ticker as
+    # untouched and allocated the full amount again.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        relocated = Path(d) / "elsewhere" / "midday_dca"
+        recovery_dir = relocated / "20260727_1230ET_recovery_1305ET"
+        recovery_dir.mkdir(parents=True)
+        # A run_state with NO buy_candidates and no artifacts.orders_csv_path,
+        # so only this loader can pick the fills up (the bare-CSV shape).
+        (recovery_dir / "run_state.json").write_text(
+            json.dumps({
+                "run_id": "midday_recovery_20260727_1305ET",
+                "trading_day": "2026-07-27",
+                "generated_at": "2026-07-27T13:05:00-04:00",
+                "run_classification": _recovery_classification(),
+            }),
+            encoding="utf-8",
+        )
+        (recovery_dir / "filled_orders.csv").write_text(
+            "ticker,amount_usd,state,average_fill_price,quantity\n"
+            "SPCX,3.50,filled,109.989900,0.031821\n",
+            encoding="utf-8",
+        )
+
+        # Invisible with the conventional roots alone.
+        assert load_same_day_top_up_context("2026-07-27", base) == {}
+
+        # Picked up once the resolved stream root is passed through.
+        ctx = load_same_day_top_up_context("2026-07-27", base, stream_roots=[relocated])
+
+        assert "SPCX" in ctx
+        assert ctx["SPCX"].prior_usd == 3.50
+        assert ctx["SPCX"].reference_price == 109.9899
+
+
+def test_recorded_context_flags_agree_with_the_runtime_validator():
+    """Every committed record's context flags must match what the code decides.
+
+    Ten separate copies of the recovery-classification flags were corrected one
+    review round at a time during PR #216, each found by a human reader rather
+    than by a check: the same artifact is described in config/run_classification.json,
+    in two collections inside config/scheduled_tasks.json, and in
+    docs/schedule_manifest.md, with nothing keeping them consistent. This walks
+    every record in both configs that declares a run_origin and asserts its
+    valid_recovery_context agrees with is_top_up_context_state() applied to that
+    record's OWN origin -- turning "you corrected N of N+1 copies" from a review
+    finding into a test failure.
+
+    A record marked residual_only is expected to DISAGREE, because that marker
+    exists precisely to record an artifact the runtime rejects; asserting the
+    negative keeps residual_only from becoming a way to opt out of the check.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    checked = 0
+    for rel in ("config/run_classification.json", "config/scheduled_tasks.json"):
+        cfg = json.loads((repo_root / rel).read_text(encoding="utf-8"))
+        for name, record, flags in _records_with_context_flags(cfg):
+            origin = record.get("run_origin")
+            claimed = flags.get("valid_recovery_context")
+            if claimed is None:
+                continue
+            # What the RUNTIME would say for an artifact with this origin. Only
+            # 'manual' and 'scheduled_recovery' can ever be top-up context; any
+            # other origin (notably 'manual_live_recovery_rerun') is rejected
+            # outright, so a record claiming true is contradicting the loaders.
+            runtime_can_load = origin in ("manual", RUN_ORIGIN_SCHEDULED_RECOVERY)
+            where = f"{rel}:{name}"
+            if record.get("residual_only") is True or flags.get("residual_only") is True:
+                assert claimed is False, (
+                    f"{where} is residual_only but claims valid_recovery_context=true"
+                )
+                checked += 1
+                continue
+            if not runtime_can_load:
+                assert claimed is False, (
+                    f"{where} claims valid_recovery_context=true but run_origin={origin!r} "
+                    f"is rejected by is_top_up_context_state()"
+                )
+                # The SIBLING eligibility flags must agree too. Correcting only
+                # valid_recovery_context left same_day_top_up_context_only,
+                # topup_context_eligible, and later_stream_topup_context still
+                # declaring the artifact usable, so a consumer keying on any of
+                # them got the opposite answer from the runtime -- the same
+                # "N of N+1 copies" failure one level down (codex review:
+                # "Clear the remaining rerun context flags"). Both spellings of
+                # the top-up flag are checked because both are in use.
+                for sibling in _CONTEXT_ELIGIBILITY_FLAGS:
+                    assert flags.get(sibling) is not True, (
+                        f"{where} sets {sibling}=true but run_origin={origin!r} "
+                        f"is rejected by is_top_up_context_state()"
+                    )
+            # The PROSE contract has to agree too. Two rounds running, the flags
+            # were corrected while a valid_only_as string one line away still
+            # told a consumer the artifact was usable context (codex review:
+            # "Mark the remaining rerun descriptions as ineligible context").
+            # Convention: when the record is not loadable, valid_only_as must
+            # SAY so rather than describing what the pass was for.
+            if claimed is False:
+                prose = record.get("valid_only_as")
+                if isinstance(prose, str) and prose.strip():
+                    assert prose.lstrip().upper().startswith("NOT "), (
+                        f"{where} has valid_recovery_context=false but its "
+                        f"valid_only_as asserts usable context: {prose[:80]!r}"
+                    )
+            checked += 1
+    assert checked >= 6, f"expected the committed recovery/rerun records, found {checked}"
+
+
+# Flags a consumer reads to decide whether an artifact may be applied as
+# same-day top-up context. Deliberately excludes
+# same_day_top_up_context_for_later_runs, which a NORMAL scheduled run sets to
+# mean "later runs should count my fills" -- that travels the scheduled path,
+# not is_top_up_context_state(), and is legitimately true there.
+_CONTEXT_ELIGIBILITY_FLAGS = (
+    "same_day_top_up_context_only",
+    "same_day_topup_context_only",
+    "topup_context_eligible",
+    "later_stream_topup_context",
+    "loadable_by_afternoon_guard",
+)
+
+
+def _records_with_context_flags(node, name="<root>"):
+    """Yield (name, record, flags) for every dict carrying run_origin + context flags.
+
+    Walks nested collections (recovery_context_run_outcomes.runs, the intraday
+    events/recovery_pass/rerun_pass blocks) rather than only top-level records,
+    since that nesting is exactly where the stale copies kept hiding.
+    """
+    if isinstance(node, dict):
+        flags = node.get("flags") if isinstance(node.get("flags"), dict) else node
+        if node.get("run_origin") is not None and "valid_recovery_context" in flags:
+            yield name, node, flags
+        for key, value in node.items():
+            yield from _records_with_context_flags(value, f"{name}.{key}")
+    elif isinstance(node, list):
+        for i, value in enumerate(node):
+            yield from _records_with_context_flags(value, f"{name}[{i}]")
+
+
+def test_recorded_recovery_records_satisfy_the_contract():
+    # Codex review: "Use a recovery stream accepted by the recovery contract".
+    # The Jul 27 2:32 PM intraday pass persisted stream='intraday_1430_recovery'
+    # -- the intraday task fires at 11:30/13:30/14:30, so its recovery stream is
+    # slot-qualified. The contract accepted only the bare 'intraday_recovery',
+    # so it REJECTED a real recorded artifact: its fills would not have offset
+    # the 3:30 run and the watchdog could not have classified its order IDs.
+    #
+    # This walks the actual committed records rather than a fixture, so a future
+    # recovery recorded with a stream the contract does not accept fails here.
+    repo_root = Path(__file__).resolve().parents[2]
+    cfg = json.loads((repo_root / "config" / "run_classification.json").read_text(encoding="utf-8"))
+
+    checked = 0
+    residual = 0
+    for name, rec in cfg.items():
+        if not isinstance(rec, dict) or rec.get("run_origin") != RUN_ORIGIN_SCHEDULED_RECOVERY:
+            continue
+        rc = {
+            k: rec[k]
+            for k in (
+                "run_origin", "run_type", "stream", "manual_run",
+                "trading_day", "run_id", "state_schema_version",
+            )
+            if k in rec
+        }
+        rc.update(rec.get("flags", {}))
+        if rec.get("residual_only") is True:
+            # A residual record deliberately MIRRORS an artifact that fails the
+            # contract (the 2:32 EVR pass, whose persisted classification omits
+            # same_day_top_up_context_only). Asserting the negative matters as
+            # much as the positive: residual_only must not become a way to
+            # exempt a record from the walk, so a record marked residual that
+            # actually conforms fails here and the marker has to be removed.
+            assert not validate_recovery_classification(rc), (
+                f"{name} is marked residual_only but SATISFIES the contract; "
+                f"drop residual_only and restore its context flags: {rc}"
+            )
+            residual += 1
+            continue
+        assert validate_recovery_classification(rc), f"{name} is not accepted by the contract: {rc}"
+        checked += 1
+
+    # Guard against the walk silently matching nothing. Both counters are
+    # checked: `checked` alone would pass if every record were marked residual,
+    # and the total catches the walk matching no records at all.
+    assert checked >= 1, f"expected a conforming recorded recovery pass, found {checked}"
+    assert residual >= 1, "expected the recorded residual recovery record"
+    assert checked + residual >= 2, f"expected the recorded recovery passes, found {checked + residual}"
+
+
+def test_intraday_recovery_slots_are_accepted():
+    for slot in INTRADAY_RECOVERY_SLOTS:
+        rc = _recovery_classification(
+            stream=f"intraday_{slot}_recovery",
+            run_type="intraday_dca_live_recovery",
+            state_schema_version="intraday-live-v2-recovery",
+        )
+        assert validate_recovery_classification(rc) is True, slot
+    # A slot the intraday task does not fire is not a recovery stream.
+    assert validate_recovery_classification(
+        _recovery_classification(
+            stream="intraday_0935_recovery",
+            run_type="intraday_dca_live_recovery",
+            state_schema_version="intraday-live-v2-recovery",
+        )
+    ) is False
+
+
+def test_recovery_state_rejects_dry_runs():
+    # Codex review discussion_r3660101905: a simulated run moved no capital, so
+    # its "fills" are not context and its order IDs are not real broker orders.
+    # near_close_dca's allocation loader already skips dry runs; every consumer
+    # must agree.
+    state = {"trading_day": "2026-07-27", "run_classification": _recovery_classification()}
+    assert is_valid_recovery_context_state(state) is True
+    assert is_valid_recovery_context_state({**state, "dry_run": True}) is False
+    # Only an explicit True is a dry run.
+    assert is_valid_recovery_context_state({**state, "dry_run": False}) is True
+
+
+def test_recovery_state_compares_top_level_day_even_when_expected_day_given():
+    # Codex review discussion_r3660101876: with trading_day supplied the
+    # top-level state day was never inspected, so a state whose classification
+    # said today but whose own day was stale still passed.
+    stale_top_level = {
+        "trading_day": "2026-07-24",
+        "run_classification": _recovery_classification(),  # says 2026-07-27
+    }
+    assert is_valid_recovery_context_state(stale_top_level, "2026-07-27") is False
+    assert is_top_up_context_state(stale_top_level, "2026-07-27") is False
+    # Agreement across all three passes.
+    agreeing = {"trading_day": "2026-07-27", "run_classification": _recovery_classification()}
+    assert is_valid_recovery_context_state(agreeing, "2026-07-27") is True
+    # A blank/non-string top-level day is a malformed identity, not an absence.
+    assert is_valid_recovery_context_state({**agreeing, "trading_day": "  "}, "2026-07-27") is False
+    assert is_valid_recovery_context_state({**agreeing, "trading_day": 20260727}, "2026-07-27") is False
+    # No top-level day at all is now REJECTED, not tolerated (Codex review:
+    # "Require a top-level trading day on recovery states"). This assertion
+    # previously read `is True`: near_close_dca.load_prior_same_day_allocations
+    # filters on the top-level day outright, so accepting a state without one
+    # let the watchdog classify its order IDs as explained while the allocation
+    # loader omitted the same artifact's capital.
+    assert is_valid_recovery_context_state(
+        {"run_classification": _recovery_classification()}, "2026-07-27"
+    ) is False
+    assert is_valid_recovery_context_state(
+        {"run_classification": _recovery_classification()}
+    ) is False
+
+
+def test_recovery_order_ids_ignore_csvs_outside_the_run_root():
+    # Codex review discussion_r3660200494: a recovery state can carry a stale
+    # ABSOLUTE artifacts.orders_csv_path naming a run it was copied from. Those
+    # IDs must not be classified as this pass's recovery context, or the
+    # watchdog would exclude genuinely unexplained broker orders.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        root = cron_tracking_root(base) / "midday_dca" / "20260727_1230ET_recovery_1305ET"
+        root.mkdir(parents=True)
+
+        # An unrelated CSV OUTSIDE the recovery root.
+        outside = Path(d) / "elsewhere" / "other_run"
+        outside.mkdir(parents=True)
+        (outside / "submitted_orders.csv").write_text(
+            "ticker,order_id\nAAPL,OUTSIDE-1\n", encoding="utf-8"
+        )
+        # A real CSV beside the state.
+        (root / "filled_orders.csv").write_text(
+            "ticker,order_id\nSPCX,INSIDE-1\n", encoding="utf-8"
+        )
+        (root / "run_state.json").write_text(
+            json.dumps({
+                "run_id": "midday_recovery_20260727_1305ET",
+                "trading_day": "2026-07-27",
+                "run_classification": _recovery_classification(),
+                "artifacts": {"orders_csv_path": str(outside / "submitted_orders.csv")},
+            }),
+            encoding="utf-8",
+        )
+
+        ids = collect_recovery_context_order_ids(base)
+
+        assert "INSIDE-1" in ids
+        assert "OUTSIDE-1" not in ids
+
+
+def test_recovery_order_ids_keep_the_local_basename_fallback():
+    # The stale-path basename fallback still resolves the real CSV sitting next
+    # to the state that referenced it.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        root = cron_tracking_root(base) / "midday_dca" / "20260727_1230ET_recovery_1305ET"
+        root.mkdir(parents=True)
+        (root / "submitted_orders.csv").write_text(
+            "ticker,order_id\nSPCX,LOCAL-1\n", encoding="utf-8"
+        )
+        (root / "run_state.json").write_text(
+            json.dumps({
+                "run_id": "midday_recovery_20260727_1305ET",
+                "trading_day": "2026-07-27",
+                "run_classification": _recovery_classification(),
+                # Stale absolute path; only its basename resolves locally.
+                "artifacts": {"orders_csv_path": "/gone/old_run/submitted_orders.csv"},
+            }),
+            encoding="utf-8",
+        )
+
+        assert collect_recovery_context_order_ids(base) == {"LOCAL-1"}
+
+
+def test_recovery_optional_proof_flags_require_exact_constants():
+    # Codex review: "Enforce all optional recovery-proof flags". The schema pins
+    # each optional proof flag to an exact constant when present, so a
+    # non-boolean is schema-invalid too -- rejecting only a literal True left
+    # such an artifact trusted here while a schema consumer refused it.
+    # exclude_from_watchdog_scheduled_confirmation is pinned TRUE: a recovery
+    # pass claiming it may confirm the scheduled slot ran contradicts the
+    # contract outright.
+    assert validate_recovery_classification(_recovery_classification()) is True
+
+    for override in (
+        {"exclude_from_watchdog_scheduled_confirmation": False},
+        {"exclude_from_watchdog_scheduled_confirmation": "true"},
+        {"valid_afternoon_scheduled_evidence": True},
+        {"valid_afternoon_scheduled_evidence": "false"},
+        {"valid_afternoon_scheduled_evidence": 0},
+        {"use_for_slippage_scheduled_proof": True},
+        {"use_for_slippage_scheduled_proof": "false"},
+        {"use_for_slippage_scheduled_proof": 1},
+    ):
+        assert validate_recovery_classification(_recovery_classification(**override)) is False, override
+
+    # The conforming constants, and absence, both still pass.
+    for override in (
+        {"exclude_from_watchdog_scheduled_confirmation": True},
+        {"valid_afternoon_scheduled_evidence": False},
+        {"use_for_slippage_scheduled_proof": False},
+    ):
+        assert validate_recovery_classification(_recovery_classification(**override)) is True, override
+
+
+def test_recorded_recovery_records_still_satisfy_the_tightened_flags():
+    # The committed records must survive the tightening -- this is the same
+    # walk as test_recorded_recovery_records_satisfy_the_contract, re-asserted
+    # here so a flag tightening that breaks real data fails loudly.
+    repo_root = Path(__file__).resolve().parents[2]
+    cfg = json.loads((repo_root / "config" / "run_classification.json").read_text(encoding="utf-8"))
+    checked = 0
+    residual = 0
+    for name, rec in cfg.items():
+        if not isinstance(rec, dict) or rec.get("run_origin") != RUN_ORIGIN_SCHEDULED_RECOVERY:
+            continue
+        rc = {
+            k: rec[k]
+            for k in ("run_origin", "run_type", "stream", "manual_run",
+                      "trading_day", "run_id", "state_schema_version")
+            if k in rec
+        }
+        rc.update(rec.get("flags", {}))
+        if rec.get("residual_only") is True:
+            # See test_recorded_recovery_records_satisfy_the_contract: a residual
+            # record mirrors an artifact that fails the contract by design, and
+            # is asserted to fail rather than merely skipped.
+            assert not validate_recovery_classification(rc), f"{name} residual but conforming: {rc}"
+            residual += 1
+            continue
+        assert validate_recovery_classification(rc), f"{name}: {rc}"
+        checked += 1
+    assert checked >= 1
+    assert checked + residual >= 2
+
+
+def test_recovery_proof_flags_reject_explicit_null():
+    # Codex review: "Reject explicit null recovery proof flags". `.get(flag) is
+    # not None` made a MISSING key and a persisted JSON null indistinguishable,
+    # so null passed while the schema requires the boolean constant whenever the
+    # property is present. Key absence is the only exemption.
+    for flag in (
+        "valid_afternoon_scheduled_evidence",
+        "use_for_slippage_scheduled_proof",
+        "exclude_from_watchdog_scheduled_confirmation",
+    ):
+        assert validate_recovery_classification(_recovery_classification(**{flag: None})) is False, flag
+        # Absent is still fine.
+        rc = _recovery_classification()
+        rc.pop(flag, None)
+        assert validate_recovery_classification(rc) is True, flag
+
+
+def test_recovery_rerun_rejects_present_non_false_values():
+    # Codex review: "Reject non-boolean recovery-rerun values". The membership
+    # test `not in (None, False)` compared by EQUALITY, so 0 and 0.0 passed as
+    # boolean false and an explicitly persisted null passed as absence. The
+    # schema permits only boolean false when the property is present.
+    for value in (None, 0, 0.0, "false", "", [], {}, 1, True):
+        rc = _recovery_classification()
+        rc["recovery_rerun"] = value
+        assert validate_recovery_classification(rc) is False, value
+    # Present-and-false and genuinely absent both remain valid.
+    ok = _recovery_classification()
+    ok["recovery_rerun"] = False
+    assert validate_recovery_classification(ok) is True
+    absent = _recovery_classification()
+    absent.pop("recovery_rerun", None)
+    assert validate_recovery_classification(absent) is True
+
+
+def test_recovery_trading_day_must_be_iso_date():
+    # Codex review: "Validate the recovery trading-day format". A non-blank check
+    # accepted trading_day='bogus', so a caller that omitted the expected day --
+    # the default for collect_recovery_context_order_ids() -- trusted a
+    # schema-invalid state and hid its order IDs from watchdog discrepancies.
+    for bad in ("bogus", "2026/07/27", "20260727", "2026-7-27", "  ", "2026-07-27T00:00:00Z"):
+        assert validate_recovery_classification(_recovery_classification(trading_day=bad)) is False, bad
+        state = {"run_classification": _recovery_classification(trading_day=bad)}
+        assert is_valid_recovery_context_state(state) is False, bad
+    assert validate_recovery_classification(_recovery_classification()) is True
+    # The state's OWN day is format-checked too, not merely compared.
+    conforming = _recovery_classification()
+    assert is_valid_recovery_context_state(
+        {"trading_day": "bogus", "run_classification": conforming}
+    ) is False
+
+
+def test_recovery_trading_day_rejects_surrounding_whitespace():
+    # Codex review: "Reject padded recovery trading days". The check ran against
+    # day.strip(), so ' 2026-07-27 ' was repaired into validity here while the
+    # schema's anchored pattern rejects it -- validation must not normalize
+    # malformed metadata. Both the classification day and the state's own
+    # top-level day are checked against the PERSISTED value.
+    for padded in (" 2026-07-27", "2026-07-27 ", " 2026-07-27 ", "\t2026-07-27", "2026-07-27\n"):
+        assert validate_recovery_classification(
+            _recovery_classification(trading_day=padded)
+        ) is False, padded
+        assert validate_recovery_classification(
+            _recovery_classification(trading_day=padded), "2026-07-27"
+        ) is False, padded
+        # A padded TOP-LEVEL day alongside a conforming classification also fails.
+        assert is_valid_recovery_context_state(
+            {"trading_day": padded, "run_classification": _recovery_classification()}
+        ) is False, padded
+
+
+def test_recovery_dry_run_must_be_boolean_false_when_present():
+    # Codex review: "Reject non-boolean dry-run markers". `is True` rejected only
+    # the literal boolean, so dry_run=1 / "false" / "true" were accepted as real
+    # recovery context here while the allocation loaders -- which test
+    # truthiness -- skipped those same states.
+    rc = _recovery_classification()
+    for value in (True, 1, 1.0, "false", "true", "", 0, 0.0, None, [], {}):
+        assert is_valid_recovery_context_state(
+            {"trading_day": "2026-07-27", "dry_run": value, "run_classification": rc}
+        ) is False, value
+    # Present-and-False, and genuinely absent, both remain valid.
+    assert is_valid_recovery_context_state(
+        {"trading_day": "2026-07-27", "dry_run": False, "run_classification": rc}
+    ) is True
+    assert is_valid_recovery_context_state(
+        {"trading_day": "2026-07-27", "run_classification": rc}
+    ) is True
+
+
+def test_recovery_schema_rejects_whitespace_only_run_id():
+    # Codex review: "Require a nonblank recovery run ID in the schema".
+    # minLength:1 counted whitespace, so '   ' validated against the schema while
+    # validate_recovery_classification() rejected it via run_id.strip().
+    try:
+        import jsonschema
+    except ImportError:
+        return
+    repo_root = Path(__file__).resolve().parents[2]
+    schema = json.loads(
+        (repo_root / "schemas" / "recovery_run_classification.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    validator = jsonschema.Draft7Validator(schema)
+    for blank in ("", " ", "   ", "\t", "\n"):
+        rc = _recovery_classification(run_id=blank)
+        assert list(validator.iter_errors(rc)), blank
+        # The helper and the schema now agree on every one of these.
+        assert validate_recovery_classification(rc) is False, blank
+    assert list(validator.iter_errors(_recovery_classification())) == []
+
+
+def test_order_ids_survive_malformed_order_collections():
+    # Codex review: "Reject malformed order collections before collecting IDs".
+    # `state.get(k, []) or []` returned the raw value for buy_candidates=1, and
+    # iterating it raised TypeError out of the whole watchdog collection loop --
+    # one corrupt artifact aborted the scan of every other run.
+    for bad in (1, 1.5, "abc", {"a": 1}, True):
+        assert _order_ids_from_state({"buy_candidates": bad}) == set(), bad
+        assert _order_ids_from_state({"orders": bad}) == set(), bad
+    # A well-formed collection alongside a malformed one still contributes.
+    assert _order_ids_from_state(
+        {"buy_candidates": 1, "orders": [{"order_id": "abc123"}]}
+    ) == {"abc123"}
+
+
+def test_fallback_loader_ignores_external_recovery_csv():
+    # Codex review (P1): "Keep external recovery CSVs out of the fallback
+    # loader". _already_covered_... only decides whether to PROCESS the run;
+    # the fallback then read _referenced_orders_csvs unfiltered, so a copied
+    # recovery artifact with a stale absolute path and NO same-named local file
+    # merged an unrelated CSV's fills into prior allocation.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        run_dir = cron_tracking_root(base) / "midday_dca" / "20260727_1230ET_recovery_1305ET"
+        run_dir.mkdir(parents=True)
+
+        outside = Path(d) / "elsewhere" / "other_run"
+        outside.mkdir(parents=True)
+        external = outside / "some_other_orders.csv"
+        external.write_text(
+            "ticker,amount_usd,average_fill_price\nAAPL,99.00,100.0\n", encoding="utf-8"
+        )
+        # No same-named local file, so the basename fallback finds nothing.
+        (run_dir / "run_state.json").write_text(
+            json.dumps({
+                "run_id": "midday_recovery_20260727_1305ET",
+                "trading_day": "2026-07-27",
+                "generated_at": "2026-07-27T13:05:00-04:00",
+                "run_classification": _recovery_classification(),
+                "artifacts": {"orders_csv_path": str(external)},
+            }),
+            encoding="utf-8",
+        )
+
+        ctx = load_same_day_top_up_context("2026-07-27", base)
+
+        assert "AAPL" not in ctx
+
+def test_dedupe_prefers_a_partial_execution_over_a_submission_only_row():
+    # Codex review: "Prefer partial executions over duplicate submission rows".
+    # The same order can appear as a plain submission row in one sibling CSV and
+    # as partially_filled in another (e.g. a stale recorded submitted_orders.csv
+    # recovered by basename BEFORE the sibling filled_orders.csv). Preferring
+    # only _confirmed_fill kept the submission row, whose amount is what was
+    # REQUESTED -- so a $2 partial against a $10 request loaded as $10 of prior
+    # allocation and suppressed the remaining $8 top-up.
+    submission = {
+        "ticker": "EVR",
+        "order_id": "ORD-1",
+        "notional_usd": "10.00",
+        "_confirmed_fill": False,
+        "_partial_execution": False,
+    }
+    partial = {
+        "ticker": "EVR",
+        "order_id": "ORD-1",
+        "notional_usd": "10.00",
+        "avg_fill_price": "250.00",
+        "quantity_filled": "0.008",
+        "_confirmed_fill": False,
+        "_partial_execution": True,
+    }
+
+    # Either encounter order must resolve to the partial.
+    for rows in ([submission, partial], [partial, submission]):
+        kept = _dedupe_rows_by_order_id(rows)
+        assert len(kept) == 1
+        assert kept[0]["_partial_execution"] is True
+
+    # A CONFIRMED fill still outranks a partial, in both encounter orders.
+    confirmed = dict(partial, _confirmed_fill=True, _partial_execution=False)
+    for rows in ([partial, confirmed], [confirmed, partial]):
+        kept = _dedupe_rows_by_order_id(rows)
+        assert len(kept) == 1
+        assert kept[0]["_confirmed_fill"] is True
+
+    # And the partial is sized by EXECUTED quantity, not the requested amount.
+    prior = _prior_from_rows([partial])
+    assert abs(prior["EVR"]["prior_usd"] - 2.00) < 1e-9
+
+
+def test_fallback_reader_keeps_live_submitted_rows_but_drops_terminal_ones():
+    # Codex review: "Retain nonterminal submitted rows in the fallback reader".
+    # This reader feeds _prior_from_rows, whose job is CONSERVATIVE submitted
+    # context. A 'pending'/'queued'/blank-state row may still fill, so dropping
+    # it let a later run see no prior allocation and re-submit the full amount
+    # against a live order. Only a terminal state with zero execution is dropped.
+    with tempfile.TemporaryDirectory() as d:
+        csv_path = Path(d) / "orders.csv"
+        csv_path.write_text(
+            "ticker,status,state,notional_usd,cumulative_quantity\n"
+            "AAPL,submitted,pending,5.00,0\n"
+            "MSFT,submitted,queued,6.00,0\n"
+            "NVDA,submitted,,7.00,0\n"
+            "EVR,submitted,rejected,8.00,0\n"
+            "GS,submitted,canceled,9.00,0\n",
+            encoding="utf-8",
+        )
+
+        rows = _read_csv_rows(csv_path)
+
+        assert [r["ticker"] for r in rows] == ["AAPL", "MSFT", "NVDA"]
+        # Live, not filled: conservative context with no trusted reference price.
+        for row in rows:
+            assert row["_confirmed_fill"] is False, row["ticker"]
+            assert row["_partial_execution"] is False, row["ticker"]
+
+        prior = _prior_from_rows(rows)
+        assert prior["AAPL"]["reference_price"] is None
+        assert abs(prior["AAPL"]["prior_usd"] - 5.00) < 1e-9
 
 
 def _run_all():

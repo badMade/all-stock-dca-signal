@@ -65,6 +65,7 @@ from typing import (
     Dict,
     Iterable,
     List,
+    Mapping,
     Optional,
     Protocol,
     Sequence,
@@ -2214,6 +2215,109 @@ def _candidate_logged_reference_price(candidate: Dict[str, Any]) -> Optional[flo
     return None
 
 
+# Streams whose runs are scheduled evidence for THEIR OWN slot but still count
+# as prior same-day allocation context for a later run. intraday* is matched by
+# prefix in _prior_run_is_scheduled since that stream carries a per-slot suffix.
+# The afternoon stream is deliberately absent.
+_PRIOR_CONTEXT_ELIGIBLE_STREAMS = (
+    "morning",
+    "midday",
+    "market_open",
+)
+
+# Recovery-context counterparts of the eligible streams above. Handled on a
+# separate branch because, unlike the streams above, being named is NOT
+# sufficient: the artifact must also satisfy the scheduled-recovery contract
+# before its fills may reduce a later buy. No afternoon entry -- an afternoon
+# recovery is the afternoon run's own repair, not prior context for it.
+_RECOVERY_PRIOR_CONTEXT_STREAMS = (
+    "market_open_recovery",
+    "morning_recovery",
+    "midday_recovery",
+    # The intraday task fires at 11:30/13:30/14:30, so its recovery stream is
+    # slot-qualified (e.g. intraday_1430_recovery, the Jul 27 2:32 PM pass).
+    "intraday_recovery",
+    "intraday_1130_recovery",
+    "intraday_1330_recovery",
+    "intraday_1430_recovery",
+)
+
+
+def _recovery_root_for(run_dir: Path) -> Path:
+    """Delegate to run_classification's canonical recovery-root resolver.
+
+    Imported lazily and by both module paths, matching
+    :func:`_is_scheduled_recovery_context`. On ImportError we fall back to
+    ``run_dir`` -- the narrower boundary, and moot in practice: the same module
+    must already have imported successfully for the recovery branch that calls
+    this to have been entered at all.
+    """
+    try:
+        from scripts.run_classification import recovery_root_for
+    except ImportError:  # pragma: no cover - exercised via the scripts/ path
+        try:
+            from run_classification import recovery_root_for
+        except ImportError:
+            return run_dir
+    return recovery_root_for(run_dir)
+
+
+def _path_within(path: Path, root: Path) -> bool:
+    """True when ``path`` resolves inside ``root`` (or is ``root`` itself).
+
+    Resolved on both sides, so a symlink or ``..`` segment cannot escape.
+    """
+    try:
+        resolved = path.resolve()
+        root_key = root.resolve()
+    except OSError:
+        return False
+    return resolved == root_key or root_key in resolved.parents
+
+
+def _is_scheduled_recovery_context(
+    run_state: Dict[str, Any], trading_day: Optional[str] = None
+) -> bool:
+    """True only for a classification satisfying the scheduled-recovery contract.
+
+    Delegates to ``scripts.run_classification.validate_recovery_classification``,
+    the single source of truth, rather than re-deriving the rules here. An
+    earlier local copy checked only the origin and boolean flags, so a
+    recursively discovered ``midday_recovery`` state could omit or fake
+    ``run_type``, ``run_id``, ``state_schema_version``, and the classification
+    ``trading_day`` and still have its fills reduce or block the 3:30
+    allocation (Codex review: "Enforce the full recovery contract before
+    loading fills"). This module already imports from ``scripts/`` on
+    neighbouring guard paths (see ``derive_valid_scheduled_evidence`` below),
+    so there is no reason to keep a second, drifting implementation.
+
+    Takes the whole RUN_STATE, not just its classification. The state-level
+    entry point derives the expected day from the state's own top-level
+    ``trading_day`` -- so a state dated for today whose recovery classification
+    names a stale or bogus day is rejected rather than loaded (Codex review:
+    "Pass the state day into recovery validation") -- and fails closed on a
+    top-level ``artifact_contract_failure`` marker, which a classification-only
+    check would have accepted as usable prior context (Codex review: "Reject
+    artifact-contract failures as recovery context").
+
+    Fails CLOSED on an import error: an artifact that cannot be validated is
+    not trusted as prior context.
+
+    See schemas/recovery_run_classification.schema.json for the full contract.
+    """
+    if not isinstance(run_state, dict):
+        return False
+    try:
+        from scripts.run_classification import is_valid_recovery_context_state
+    except ImportError:
+        logger.exception(
+            "could not import the recovery-contract validator; treating the "
+            "recovery artifact as untrusted (it will NOT offset a later buy)"
+        )
+        return False
+    return is_valid_recovery_context_state(run_state, trading_day)
+
+
 def _prior_run_is_scheduled(run_state: Dict[str, Any]) -> bool:
     """True when a run_state is classified as the scheduled *afternoon* run.
 
@@ -2233,13 +2337,87 @@ def _prior_run_is_scheduled(run_state: Dict[str, Any]) -> bool:
     but must still offset a later same-day run (Codex review: "Include the
     intraday recovery in later top-up context"). Only afternoon scheduled runs
     are excluded here.
+
+    A recovery stream for one of those earlier slots (``morning_recovery``,
+    ``midday_recovery``, ``market_open_recovery`` -- e.g. the Jul 27 2026 12:30
+    recovery pass, see config/scheduled_tasks.json ->
+    midday_dca_scheduled_recovery_2026_07_27) is eligible for the same reason:
+    it moved real capital that day and must offset a later run, while never
+    being scheduled evidence for the slot it recovered. It is matched
+    explicitly rather than left to the ``run_origin`` fallthrough below -- a
+    recovery artifact carries ``run_origin='scheduled_recovery'``, which merely
+    happens not to equal ``'scheduled'``, so today it lands on eligible by
+    accident. Naming it means a future recovery classification that DOES use
+    ``run_origin='scheduled'`` cannot silently flip to ineligible (Codex
+    review: "Add the recovery root to watchdog classification"). An
+    *afternoon* recovery is deliberately NOT listed: like any afternoon
+    scheduled run it must stay invisible to the afternoon guard's own pass.
     """
     classification = run_state.get("run_classification")
     if isinstance(classification, dict):
         stream = classification.get("stream")
-        if stream in ("morning", "midday", "market_open") or (
-            isinstance(stream, str) and stream.startswith("intraday")
+        # Dispatch on the ORIGIN first, then the stream. Keying the recovery
+        # branch off the stream name alone left every malformed-stream shape
+        # unvalidated: a state with run_origin='scheduled_recovery' but a
+        # missing or non-string stream fell through to the generic arms, and
+        # one naming e.g. 'intraday_bogus' was even accepted as eligible by the
+        # startswith('intraday') arm below -- so a corrupted artifact under a
+        # recursively scanned root had its fills loaded without ever reaching
+        # the canonical recovery validator (Codex review: "Gate every
+        # scheduled-recovery origin before loading fills").
+        if (
+            classification.get("run_origin") == "scheduled_recovery"
+            or (isinstance(stream, str) and stream.endswith("_recovery"))
         ):
+            # A recovery stream is eligible prior context ONLY when it is one of
+            # the earlier-slot recovery streams AND the artifact satisfies the
+            # scheduled-recovery contract. Naming the stream is not enough: the
+            # recovery dirs are dated siblings under the recursively scanned
+            # midday/morning roots, and _prior_run_is_valid_manual_recovery_artifact
+            # only guards paths containing "manual_recovery", so a corrupted or
+            # misclassified file that merely sets stream='midday_recovery' would
+            # otherwise be read as prior context and could wrongly reduce or
+            # block the 3:30 allocation (Codex review: "Gate recovery streams
+            # before loading their fills").
+            #
+            # Returning True means "treated as a scheduled run", i.e. NOT prior
+            # context -- the safe direction, since the artifact is then ignored
+            # rather than trusted. An afternoon recovery lands here too: it is
+            # absent from the eligible set, so it stays invisible to the
+            # afternoon guard's own pass.
+            if stream not in _RECOVERY_PRIOR_CONTEXT_STREAMS:
+                return True
+            # The top-level state day is what load_prior_same_day_allocations
+            # already accepted this artifact on, so require the classification
+            # to name the SAME day rather than merely a non-blank one.
+            return not _is_scheduled_recovery_context(run_state)
+        if stream in _PRIOR_CONTEXT_ELIGIBLE_STREAMS:
+            # Explicitly named streams are unchanged. A MANUAL artifact under
+            # morning/midday/market_open is legitimate prior context and is
+            # validated by _prior_run_is_valid_manual_recovery_artifact, so the
+            # origin check below must not reach it.
+            return False
+        if isinstance(stream, str) and stream.startswith("intraday"):
+            # Naming the stream is NOT enough, for the same reason it is not
+            # enough on the recovery branch above. 'intraday_1430_rerun' starts
+            # with 'intraday' but carries run_origin='manual_live_recovery_rerun'
+            # -- the shape every manifest in this PR records as rejected by
+            # is_top_up_context_state() -- and it ends in '_rerun', so it misses
+            # the '_recovery' branch and was admitted here unvalidated. A rerun
+            # carrying a submitted-but-never-filled candidate would then load as
+            # unresolved prior context and suppress the legitimate final buy
+            # (Codex review: "Validate ordinary intraday origins before loading
+            # context").
+            #
+            # Only the ORDINARY scheduled identity is admitted here. Returning
+            # True for anything else means "treated as a scheduled run", i.e.
+            # ignored -- the safe direction, and it leaves manual and
+            # scheduled-recovery artifacts to the validators that own them.
+            origin = classification.get("run_origin")
+            if classification.get("manual_run") is True:
+                return True
+            if origin not in (None, "scheduled"):
+                return True
             return False
         if classification.get("run_origin") == "scheduled":
             return True
@@ -2339,6 +2517,156 @@ def _earlier_selected_base(
     if existing_dt is not None and alloc_dt is not None:
         return (alloc_base, alloc_at) if alloc_dt < existing_dt else (existing_base, existing_at)
     return (existing_base, existing_at) if existing_base is not None else (alloc_base, alloc_at)
+
+
+# Confirmed-fill column aliases. The codebase-standard writers (_CSV_FIELDS,
+# the scheduled artifact writers) emit avg_fill_price/quantity_filled, but a
+# recovery-context artifact persists the broker's own field names,
+# average_fill_price/quantity -- the shape recorded for the Jul 27 2026 12:30
+# recovery pass (config/scheduled_tasks.json ->
+# midday_dca_scheduled_recovery_2026_07_27.fills). Without these aliases such a
+# filled_orders.csv parses to no usable price or quantity, so the ticker either
+# drops out of the same-day context entirely or lands in the guard's
+# conservative missing_prior_price / $0 manual_review path -- silently
+# re-allocating capital already spent that day (Codex review: "Teach the
+# final-run loader the recovery fill shape"). scripts/run_classification.py's
+# _PRICE_COLS/_QUANTITY_COLS already accept both spellings; these mirror it for
+# the core loader. Canonical name first: an artifact carrying both wins on the
+# codebase-standard column.
+# Broker outcomes in the recovery shape's `state` column that mean the order
+# will NEVER fill. Used by _orders_csv_submitted_notionals to drop a row whose
+# status still says 'submitted'; a pending/queued/unrecognized state is
+# deliberately NOT here, because an order that may yet fill must keep counting
+# as prior allocation.
+def _load_terminal_order_states() -> frozenset:
+    """The canonical broker terminal-state set, from broker_reconciliation.
+
+    Sourced rather than re-declared. This set had been hand-copied here and
+    into scripts/run_classification, and both copies silently omitted `voided`
+    and `expired` -- so a zero-execution order that could no longer fill was
+    still carried as live unknown context, forcing its ticker onto the $0
+    manual-review path and suppressing a legitimate top-up (Codex review:
+    "Treat voided and expired broker orders as terminal"). Any state the broker
+    normalizer learns about now reaches both readers automatically.
+
+    The literal is a fallback for the import failing, not a second source of
+    truth; it is kept identical to the canonical set.
+    """
+    try:
+        from scripts.broker_reconciliation import _TERMINAL_ORDER_STATES
+    except ImportError:  # pragma: no cover - exercised via the scripts/ path
+        try:
+            from broker_reconciliation import _TERMINAL_ORDER_STATES
+        except ImportError:
+            return frozenset(
+                {"cancelled", "canceled", "rejected", "failed", "voided", "expired"}
+            )
+    return frozenset(_TERMINAL_ORDER_STATES)
+
+
+_TERMINAL_NON_FILL_STATES = _load_terminal_order_states()
+
+# Submitted-amount aliases, canonical first. `amount_usd` is the broker-native
+# recovery spelling; _orders_csv_fills already reads it.
+_SUBMITTED_NOTIONAL_COLS = ("notional_usd", "amount_usd")
+_FILL_PRICE_COLS = ("avg_fill_price", "average_fill_price")
+# EXECUTED-quantity columns, in precedence order. `quantity` is deliberately
+# absent: in the broker-native shape it is the REQUESTED size and
+# `cumulative_quantity` is what actually filled -- exactly the distinction
+# scripts/broker_reconciliation.py._normalize_order() already draws, including
+# its warning that an `x or y` fallthrough misreads a 0-filled order as fully
+# executed. Treating `quantity` as executed meant a canceled zero-fill row
+# (`quantity=1`, `cumulative_quantity=0`) reported executed capital and its full
+# request was retained as prior allocation, suppressing a legitimate later
+# top-up; partially filled rows were overstated the same way (Codex review:
+# "Prefer cumulative quantity over requested quantity").
+_EXECUTED_QUANTITY_COLS = ("quantity_filled", "cumulative_quantity")
+# `quantity` remains a LAST-RESORT alias, used only when neither executed column
+# is present at all. That is the recovery artifact shape recorded in
+# config/scheduled_tasks.json -> recovery_context_run_outcomes, whose `quantity`
+# IS the filled amount because it carries no cumulative_quantity column.
+_FILL_QUANTITY_COLS = (*_EXECUTED_QUANTITY_COLS, "quantity")
+
+
+def _first_present(row: Mapping[str, Any], cols: Sequence[str]) -> Any:
+    """First non-blank value among ``cols``, else None.
+
+    Blank ("", "-") and missing columns are skipped rather than returned, so a
+    CSV that carries BOTH spellings with the canonical one left empty still
+    resolves via the alias instead of yielding a blank that the caller would
+    read as "no value".
+    """
+    for col in cols:
+        value = row.get(col)
+        if value not in (None, "", "-"):
+            return value
+    return None
+
+
+def _has_executed_quantity(row: Mapping[str, object]) -> bool:
+    """True when an orders-CSV row records a positive executed quantity.
+
+    The test that decides whether a non-``filled`` row still represents deployed
+    capital. A ``partially_filled`` row, or a ``canceled`` one that executed some
+    quantity before it ended, carries real shares; only a row with no executed
+    quantity can be discarded. math.isfinite rejects a corrupted 'inf'/'nan' cell
+    so it cannot pass as executed size.
+
+    An EXPLICIT ZERO in an executed column is authoritative and stops the search
+    -- it says the order filled nothing, which is the whole answer. Falling
+    through to the requested ``quantity`` on a 0 would report a canceled
+    zero-fill row as executed capital, the exact trap
+    ``broker_reconciliation._normalize_order()`` documents.
+    """
+    for col in _EXECUTED_QUANTITY_COLS:
+        value = row.get(col)
+        if value in (None, "", "-"):
+            continue
+        try:
+            executed = float(value)
+        except (TypeError, ValueError):
+            return False
+        return math.isfinite(executed) and executed > 0
+    raw = _first_present(row, _FILL_QUANTITY_COLS)
+    if raw in (None, "", "-"):
+        return False
+    try:
+        qty = float(raw)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(qty) and qty > 0
+
+def _executed_quantity_is_explicit_zero(row: Mapping[str, object]) -> bool:
+    """True only when an executed column states a definitive numeric ZERO.
+
+    Stricter than ``not _has_executed_quantity(row)``, which also returns true
+    for an absent, blank, non-finite, or unparsable value. Those say "unknown",
+    not "nothing filled" -- and a caller that REMOVES prior allocation must not
+    read the first as the second: `cumulative_quantity='oops'` on a canceled row
+    does not establish that the order failed to execute, so treating it as a
+    zero fill drops a candidate that may really have partially filled and lets
+    the later run buy the full amount again (Codex review: "Require an explicit
+    zero before excluding terminal candidates").
+    """
+    for col in _EXECUTED_QUANTITY_COLS:
+        value = row.get(col)
+        if value in (None, "", "-"):
+            continue
+        try:
+            executed = float(value)
+        except (TypeError, ValueError):
+            return False
+        return math.isfinite(executed) and executed == 0
+    raw = _first_present(row, _FILL_QUANTITY_COLS)
+    if raw in (None, "", "-"):
+        # No quantity column at all. The row says nothing about execution, so it
+        # is unresolved rather than a zero fill.
+        return False
+    try:
+        qty = float(raw)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(qty) and qty == 0
 
 
 def _orders_csv_fills(
@@ -2449,10 +2777,57 @@ def _orders_csv_fills(
         if not ticker:
             continue
         status = (row.get("status") or "").lower()
+        # The broker-native recovery shape records the outcome in `state`, not
+        # `status`. Without this, a recovery filled_orders.csv row with
+        # state='rejected'/'canceled' hit the statusless is_manual_filled_orders
+        # heuristic below and was counted as deployed capital -- amount and
+        # reference price included -- which reduces or entirely suppresses that
+        # ticker's 3:30 allocation for an order that never filled (Codex review:
+        # "Honor the recovery row state before counting fills"). When the column
+        # is present it is authoritative: anything other than 'filled',
+        # including a blank cell, is not a confirmed fill.
+        # EXECUTED QUANTITY decides, not the state name. Requiring state=='filled'
+        # discarded a 'partially_filled' row, and a 'canceled' row that executed
+        # some quantity before it ended -- both of which are real deployed
+        # capital. Dropping them made the loader report no prior buy and let the
+        # later run purchase the full amount again, the expensive direction and
+        # exactly what this guard exists to prevent.
+        # scripts/broker_reconciliation.py already treats partially_filled as
+        # live exposure and a terminal order with executed dollars as prior
+        # exposure, for the same reason (Codex review: "Preserve executed partial
+        # fills in recovery CSVs").
+        row_state = (row.get("state") or "").strip().lower() if "state" in row else None
+        # `state` is the BROKER's answer; `status` is what we asked for. When the
+        # broker says filled, that settles it -- a row carrying
+        # status='submitted' with state='filled' was being dropped here by the
+        # status gate below, then kept by _orders_csv_submitted_notionals as an
+        # unknown-price notional, forcing the ticker onto the conservative $0
+        # manual-review path despite having a real fill price and quantity
+        # (Codex review: "Let the broker state confirm filled recovery rows").
+        state_confirms_fill = row_state == "filled"
+        partial_execution = False
+        if row_state is not None and not state_confirms_fill:
+            if not _has_executed_quantity(row):
+                continue
+            partial_execution = True
         is_manual_filled_orders = (orders_csv.name == "filled_orders.csv" or "amount_usd" in row) and not status
-        if status != "filled" and not is_manual_filled_orders:
+        # partial_execution passes too. Last round taught this gate about
+        # state='filled' but not about a row still carrying status='submitted'
+        # while the broker reports partially_filled (or canceled after executing
+        # some quantity). Such a row was dropped here while
+        # _orders_csv_submitted_notionals kept its FULL requested notional, so a
+        # $10 request with $2 executed counted as $10 deployed and suppressed
+        # the remaining $8 top-up. Letting it through means the executed
+        # price * quantity recompute below wins instead (Codex review: "Let
+        # submitted partial executions reach the fill reader").
+        if (
+            status != "filled"
+            and not state_confirms_fill
+            and not partial_execution
+            and not is_manual_filled_orders
+        ):
             continue
-        raw_price = row.get("avg_fill_price")
+        raw_price = _first_present(row, _FILL_PRICE_COLS)
         try:
             price = float(raw_price) if raw_price not in (None, "", "-") else None
         except (TypeError, ValueError):
@@ -2463,7 +2838,7 @@ def _orders_csv_fills(
         # never poison the same-day top-up guard with an unbounded
         # reference price or prior allocation (Gemini review on PR #31).
         price_valid = price is not None and math.isfinite(price) and price > 0
-        raw_qty = row.get("quantity_filled")
+        raw_qty = _first_present(row, _FILL_QUANTITY_COLS)
         try:
             qty = float(raw_qty) if raw_qty not in (None, "", "-") else None
         except (TypeError, ValueError):
@@ -2475,12 +2850,29 @@ def _orders_csv_fills(
         except (TypeError, ValueError):
             amount = None
         amount_valid = amount is not None and math.isfinite(amount) and amount > 0
+        if partial_execution and price_valid and qty_valid:
+            # For a row that did NOT reach state='filled', amount_usd is the
+            # amount that was REQUESTED; only price * executed-quantity is the
+            # cash that actually moved. Using the recorded amount would overstate
+            # prior allocation and suppress a legitimate top-up. When the two
+            # agree (amount_usd already being executed cash) this changes
+            # nothing.
+            amount = price * qty
+            amount_valid = math.isfinite(amount) and amount > 0
         if not price_valid and not amount_valid:
             # No usable price AND no usable amount_usd -- genuinely no
             # capital-movement information to preserve for this row.
             continue
         fills[ticker] = {
             "order_id": row.get("order_id"),
+            # A PARTIAL execution's notional is real and must count, but its
+            # price is not a settled reference: the unexecuted remainder may
+            # still reprice or be cancelled. Callers that resolve a reference
+            # price check this flag; _read_csv_rows draws the same line with
+            # _partial_execution, and the two readers disagreed until now
+            # (Codex review: "Keep partial executions from confirming a
+            # reference price").
+            "_partial_execution": partial_execution,
             # Preserve amount-only rows (amount_usd present, price missing/
             # invalid) as an unknown-price allocation instead of dropping
             # them outright -- the confirmed CSV amount must not be
@@ -2490,6 +2882,160 @@ def _orders_csv_fills(
             "amount_usd": amount if amount_valid else None,
         }
     return fills
+
+
+def _fill_rank(fill: Mapping[str, Any]) -> int:
+    """How authoritative a fill entry is about an order's outcome. Higher wins.
+
+    Mirrors ``scripts.run_classification._dedupe_rank``: a CONFIRMED full fill
+    outranks a partial execution. Used when the same ticker appears in more than
+    one of a recovery's CSVs -- a stale ``partially_filled`` snapshot beside
+    run_state.json versus the explicitly recorded CSV's final ``filled`` state.
+    Keeping whichever was read first preserved the partial's notional and its
+    unresolved reference price, forcing an unnecessary manual-review stop for an
+    order that had since completed (Codex review: "Reconcile overlapping ticker
+    fills instead of keeping the first").
+    """
+    return 0 if fill.get("_partial_execution") else 1
+
+
+def _fill_order_id(fill: Mapping[str, Any]) -> str:
+    """The fill's order_id, normalized; empty string when it carries none."""
+    oid = fill.get("order_id")
+    oid = oid.strip() if isinstance(oid, str) else ""
+    return "" if oid == "-" else oid
+
+
+def _combined_fill(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    """Aggregate two DISTINCT orders for one ticker into a single entry.
+
+    Amounts and quantities add, because both orders really moved capital. The
+    reference price becomes the quantity-weighted average of the two fills --
+    the cost basis a later top-up should be measured against. When either side
+    lacks a usable price or quantity the aggregate price is unknowable, so it
+    is left None and the guard routes to its conservative manual-review path
+    rather than comparing against a price that was never paid.
+    """
+    def _num(value):
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return None
+        return out if math.isfinite(out) else None
+
+    amounts = [_num(a.get("amount_usd")), _num(b.get("amount_usd"))]
+    qtys = [_num(a.get("quantity_filled")), _num(b.get("quantity_filled"))]
+    prices = [_num(a.get("avg_fill_price")), _num(b.get("avg_fill_price"))]
+
+    amount = sum(x for x in amounts if x) or None
+    quantity = sum(x for x in qtys if x) or None
+    price = None
+    if all(p and p > 0 for p in prices) and all(q and q > 0 for q in qtys):
+        price = (prices[0] * qtys[0] + prices[1] * qtys[1]) / (qtys[0] + qtys[1])
+    return {
+        # No single order_id describes the pair; the aggregate is what matters
+        # downstream, and a wrong single ID would be worse than none.
+        "order_id": None,
+        # Unresolved if EITHER leg is, since the combined remainder is live.
+        "_partial_execution": bool(
+            a.get("_partial_execution") or b.get("_partial_execution")
+        ),
+        "avg_fill_price": price,
+        "quantity_filled": quantity,
+        "amount_usd": amount,
+    }
+
+
+def _merge_fill(fills: Dict[str, Dict[str, Any]], ticker: str, fill: Dict[str, Any]) -> None:
+    """Reconcile a fill into ``fills``, keyed by ORDER, not merely by ticker.
+
+    Three cases, and conflating them is what went wrong before:
+
+    * **Same order** seen again in another sibling CSV -- replace when the new
+      snapshot is strictly more authoritative (a completed fill over a stale
+      partial), otherwise keep the incumbent. Never sums: the same order in two
+      files is one order, and adding would double-count the capital this guard
+      exists to count once.
+    * **A distinct order** for a ticker already present -- ADD it. Keeping only
+      the first understated deployed capital and let the candidate loop apply
+      one order's fill to every candidate for that ticker, permitting an
+      excessive top-up (Codex review: "Merge recovery fills by order ID before
+      aggregating tickers").
+    * **Unidentifiable** -- either side missing an order_id. Fall back to
+      rank-replacement rather than adding, since two rows that cannot be told
+      apart may well be the same order, and double-counting is the direction
+      that spends real money twice.
+    """
+    existing = fills.get(ticker)
+    if existing is None:
+        fills[ticker] = fill
+        return
+    new_oid, old_oid = _fill_order_id(fill), _fill_order_id(existing)
+    if new_oid and old_oid and new_oid != old_oid:
+        fills[ticker] = _combined_fill(existing, fill)
+        return
+    if _fill_rank(fill) > _fill_rank(existing):
+        fills[ticker] = fill
+
+
+def _orders_csv_terminal_non_fills(
+    orders_csv: Path,
+) -> tuple[set, set]:
+    """(order_ids, tickers) the CSV reports as TERMINALLY not filled.
+
+    A row whose ``state`` is rejected/canceled/failed AND that executed no
+    quantity is authoritative evidence that no capital moved for that order.
+    Rows that executed something before ending are excluded -- a
+    cancelled-after-partial-fill is real deployed capital.
+
+    The tickers set is a fallback for rows carrying no usable ``order_id``; a
+    caller must only apply it when nothing else claims the ticker, since a
+    ticker can have both a rejected order and a separate real fill.
+    """
+    order_ids: set = set()
+    tickers: set = set()
+    if not orders_csv.exists():
+        return order_ids, tickers
+    try:
+        with open(orders_csv, newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                # csv.DictReader fills omitted TRAILING cells with None rather
+                # than raising, so a row observed mid-write can look like a
+                # zero-execution terminal outcome purely because its
+                # cumulative_quantity has not been flushed yet -- and this
+                # helper would then delete a candidate whose order really did
+                # partially fill, letting the later run buy its full amount.
+                # _orders_csv_fills drops such a tail row; here ANY row with a
+                # missing field is refused, not just the last one, because this
+                # collector only ever REMOVES prior allocation and so must be
+                # strictly more conservative (Codex review: "Reject truncated
+                # terminal rows before excluding candidates").
+                if any(value is None for value in row.values()):
+                    continue
+                state = (row.get("state") or "").strip().lower()
+                if state not in _TERMINAL_NON_FILL_STATES:
+                    continue
+                # An EXPLICIT numeric zero is required, not merely the absence
+                # of a positive quantity. A malformed or missing cell means the
+                # artifact does not establish whether the order executed, and
+                # this collector only ever REMOVES prior allocation -- so an
+                # unresolved row must stay unresolved rather than be read as a
+                # definitive zero fill.
+                if not _executed_quantity_is_explicit_zero(row):
+                    continue
+                oid = (row.get("order_id") or "").strip()
+                if oid and oid != "-":
+                    order_ids.add(oid)
+                else:
+                    ticker = (row.get("ticker") or "").strip().upper()
+                    if ticker:
+                        tickers.add(ticker)
+    except (OSError, csv.Error, UnicodeDecodeError):
+        # Unreadable means "no terminal evidence", never "everything is
+        # terminal": this set only ever REMOVES prior allocation, so failing to
+        # read it must not be able to drop a real prior buy.
+        return set(), set()
+    return order_ids, tickers
 
 
 def _orders_csv_submitted_notionals(
@@ -2561,9 +3107,71 @@ def _orders_csv_submitted_notionals(
         rows = rows[:-1]
     for row in rows:
         ticker = row.get("ticker")
-        if not ticker or (row.get("status") or "").lower() != "submitted":
+        if not ticker:
             continue
-        raw = row.get("notional_usd")
+        row_status = (row.get("status") or "").strip().lower()
+        row_state_raw = (row.get("state") or "").strip().lower() if "state" in row else None
+        # A broker-native recovery CSV may omit `status` entirely and report the
+        # outcome only in `state` -- a shape _orders_csv_fills already treats as
+        # authoritative. Requiring status=='submitted' dropped such a row even
+        # when its state was still LIVE ('pending', 'queued'), so a candidate-
+        # less recovery contributed no prior allocation at all and a later run
+        # could submit the full amount while that order was outstanding (Codex
+        # review: "Retain statusless nonterminal recovery rows").
+        #
+        # 'filled' is excluded because _orders_csv_fills owns that row and
+        # reports a real price; this reader only carries UNRESOLVED context.
+        statusless_live = (
+            not row_status
+            and row_state_raw is not None
+            and row_state_raw != "filled"
+            and row_state_raw not in _TERMINAL_NON_FILL_STATES
+        )
+        if row_status != "submitted" and not statusless_live:
+            continue
+        # The recovery shape's authoritative `state` column, applied with the
+        # opposite polarity to _orders_csv_fills. A row can carry BOTH
+        # status='submitted' (what we asked the broker for) and a broker outcome
+        # in `state`; the broker's outcome outranks our request. Without this a
+        # state='rejected' row still contributed its notional as unknown-price
+        # prior allocation, pushing that ticker onto the conservative $0
+        # manual-review path for an order known not to have filled (Codex
+        # review: "Apply the recovery state gate to submitted notionals").
+        #
+        # Only TERMINAL NON-FILL states are dropped -- deliberately not
+        # `state != 'filled'`. This function's whole job is to count a submitted
+        # order whose outcome is not yet known, so discarding a pending/queued
+        # row would UNDERCOUNT prior allocation and risk re-buying a ticker
+        # whose order is still live. Fail-closed here means keeping the
+        # unknown, not dropping it.
+        #
+        # And a terminal row that EXECUTED some quantity before ending is kept
+        # too: cancelled-after-partial-fill is real deployed capital, which
+        # scripts/broker_reconciliation.py already counts as prior exposure for
+        # exactly this reason (Codex review: "Preserve executed partial fills in
+        # recovery CSVs").
+        # An EXPLICIT numeric zero is required to drop the row. `not
+        # _has_executed_quantity(row)` also matches a missing column and an
+        # unparsable cell, and those say UNKNOWN, not "nothing filled" --
+        # dropping an unresolved terminal row removes its notional entirely, so
+        # a later run sees no prior allocation and can buy the full amount again
+        # (Codex review: "Require explicit zero before dropping submitted
+        # notionals"). My earlier note claiming this reader RETAINED such a row
+        # was wrong: this gate drops it.
+        if (
+            (row.get("state") or "").strip().lower() in _TERMINAL_NON_FILL_STATES
+            and _executed_quantity_is_explicit_zero(row)
+        ):
+            continue
+        # The broker-native recovery shape records the amount as `amount_usd`,
+        # which _orders_csv_fills already accepts. Reading only `notional_usd`
+        # meant a statusless live recovery row passed the gate above and then
+        # contributed NOTHING, so its ticker carried no prior allocation and a
+        # later run could submit the full amount while that order was still
+        # outstanding (Codex review: "Read amount_usd for unresolved recovery
+        # submissions"). Canonical column first, so an artifact carrying both
+        # wins on the codebase-standard name.
+        raw = _first_present(row, _SUBMITTED_NOTIONAL_COLS)
         try:
             notional = float(raw) if raw not in (None, "", "-") else None
         except (TypeError, ValueError):
@@ -2594,6 +3202,89 @@ def _mtime_matches_trading_day(path: Path, trading_day: date) -> bool:
     except OSError:
         return True
     return datetime.fromtimestamp(mtime, tz=EASTERN).date() == trading_day
+
+
+def _resolve_recorded_orders_csv(
+    run_state: Dict[str, Any],
+    run_state_path: Path,
+    *,
+    skip_sink: Optional[List[Path]] = None,
+) -> Optional[Path]:
+    """Resolve ``run_state.artifacts.orders_csv_path`` to a concrete path, or None.
+
+    Shared by both readers of the recorded CSV so they cannot disagree about
+    which file a recovery artifact points at. ``run_and_report`` writes custom
+    names like ``dca_<label>_<day>_<stamp>_orders.csv``, which neither
+    ``run_dir / "orders.csv"`` nor ``filled_orders.csv`` will find.
+
+    A RECOVERY artifact's recorded path must resolve inside its own run root.
+    A copied one can carry a stale ABSOLUTE path still naming the run it was
+    copied from -- following it verbatim would load an unrelated CSV's fills as
+    this pass's recovery fills and reduce or block the 3:30 buy (Codex review:
+    "Constrain recovery fill paths to their run root"). Mirrors the containment
+    ``scripts.run_classification._referenced_orders_csvs_within`` already
+    applies for the watchdog collector.
+
+    Contained against the enclosing RECOVERY ROOT, not the run_state's own
+    directory: a recovery run may write ``artifacts/run_state.json`` beside a
+    root-level ``filled_orders.csv`` and record it as ``../filled_orders.csv``,
+    which is in-root and legitimate (Codex review: "Resolve recovery CSVs
+    against the artifact root").
+
+    Containment is scoped to recovery states: a manual full-report run
+    legitimately records a custom-named CSV that ``run_and_report`` may have
+    written elsewhere, and that path has always been followed.
+    """
+    artifacts_block = run_state.get("artifacts")
+    if not isinstance(artifacts_block, dict):
+        return None
+    orders_csv_path = artifacts_block.get("orders_csv_path")
+    if orders_csv_path is None:
+        return None
+    # The recovery classification schema does not constrain the nested
+    # artifacts block, so this value can be any JSON shape. Path([]) raises
+    # TypeError, and that exception escaped load_prior_same_day_allocations()
+    # and aborted the WHOLE same-day context scan -- taking the afternoon run
+    # with it -- rather than treating one artifact as unreadable (Codex review:
+    # "Validate recorded CSV path types before constructing Path"). A malformed
+    # value is a broken artifact, not an absent one, so it goes to skip_sink:
+    # the run's fills are exactly as unverifiable as an unparseable
+    # run_state.json, and the scan must not report itself complete.
+    if not isinstance(orders_csv_path, (str, os.PathLike)):
+        logger.warning(
+            "run_state %s records a non-path orders_csv_path (%r); treating the "
+            "artifact as unreadable",
+            run_state_path,
+            orders_csv_path,
+        )
+        if skip_sink is not None:
+            skip_sink.append(run_state_path)
+        return None
+    if isinstance(orders_csv_path, str) and not orders_csv_path.strip():
+        # Absent rather than malformed: nothing was recorded to follow.
+        return None
+    orders_csv_file = Path(orders_csv_path)
+    if not orders_csv_file.is_absolute():
+        orders_csv_file = run_state_path.parent / orders_csv_file
+    if _is_scheduled_recovery_context(run_state) and not _path_within(
+        orders_csv_file, _recovery_root_for(run_state_path.parent)
+    ):
+        # Fall back to the SAME basename inside the run's own directory rather
+        # than giving up. Rejecting the external path outright turned a wrong
+        # allocation into NO allocation, which has the same money outcome: a
+        # copied recovery state with a stale absolute path plus a valid local
+        # filled_orders.csv contributed nothing from either loader, so the
+        # ticker got bought again (Codex review: "Fall back to the recovery
+        # run's local CSV"). Mirrors the basename fallback
+        # scripts.run_classification._referenced_orders_csvs already applies.
+        logger.warning(
+            "recovery orders_csv_path %s is outside its run directory %s; "
+            "falling back to the local file of the same name",
+            orders_csv_file,
+            run_state_path.parent,
+        )
+        orders_csv_file = run_state_path.parent / orders_csv_file.name
+    return orders_csv_file
 
 
 def load_prior_same_day_allocations(
@@ -2775,113 +3466,195 @@ def load_prior_same_day_allocations(
         if run_state.get("dry_run"):
             continue
         buy_candidates_raw = run_state.get("buy_candidates")
+        # Persisted JSON can hold any shape here. A scalar such as 1 raised
+        # TypeError out of the whole final-run context scan at the iteration
+        # below, and a truthy non-list (a populated dict) was silently treated
+        # as "this run's candidates were read" -- skipping the orders-CSV
+        # fallback, so the run's real fills went unseen and its ticker could be
+        # bought again at 3:30. Normalizing to [] routes both cases into the CSV
+        # fallback, which is the fail-closed direction (Codex review: "Reject
+        # malformed candidate collections in recovery states").
+        if not isinstance(buy_candidates_raw, list):
+            buy_candidates_raw = []
+        # A recovery run may write artifacts/run_state.json beside a ROOT-level
+        # filled_orders.csv, so the fills lookup beside the state found nothing.
+        # Such a state can ALSO carry non-empty buy_candidates, in which case
+        # the recorded orders_csv_path branch below is skipped and the fallback
+        # loader treats the run as already covered -- an authoritative partial
+        # fill was therefore replaced by the candidate's full planned amount at
+        # an unknown price, suppressing the remaining top-up (Codex review:
+        # "Read recovery fill CSVs even when candidates are embedded").
+        #
+        # Scoped to CANDIDATE-BACKED states because that is the only shape that
+        # falls through: with no candidates the branch below already reads the
+        # recorded path, and ``fills`` is never consulted there since the
+        # candidate loop iterates nothing. Gated on ``not fills`` so it can only
+        # ADD fills where the state's own directory had none, never
+        # double-count.
+        #
+        # The recorded path is tried FIRST and the fixed-name scan second:
+        # _orders_csv_fills() without an explicit file knows only
+        # filled_orders.csv and orders.csv, so a recovery recording an in-root
+        # CUSTOM name (artifacts.orders_csv_path='../executions.csv') was still
+        # missed by the root retry alone -- the same suppressed top-up, one
+        # filename away (Codex review: "Follow the recorded CSV for
+        # candidate-backed recoveries").
+        terminal_order_ids: set = set()
+        terminal_tickers: set = set()
+        if buy_candidates_raw and _is_scheduled_recovery_context(run_state):
+            recorded_csv = _resolve_recorded_orders_csv(
+                run_state, run_state_path, skip_sink=skip_sink
+            )
+            # MERGED per ticker, not gated on `fills` being empty. A single
+            # fill beside run_state.json made the whole recorded CSV invisible,
+            # so any OTHER ticker it confirmed fell back to its candidate's full
+            # planned amount -- a $3 partial of a $10 candidate counted as $10,
+            # suppressing the remaining top-up (Codex review: "Merge recorded
+            # recovery fills even when sibling fills exist"). setdefault means a
+            # later source can only ADD tickers, never overwrite what the
+            # state's own directory already answered, so the path that already
+            # worked is untouched.
+            if recorded_csv is not None and recorded_csv.exists():
+                for _t, _f in _orders_csv_fills(
+                    recorded_csv.parent, orders_csv_file=recorded_csv, skip_sink=skip_sink
+                ).items():
+                    _merge_fill(fills, _t, _f)
+            recovery_root = _recovery_root_for(run_state_path.parent)
+            if recovery_root != run_state_path.parent:
+                for _t, _f in _orders_csv_fills(recovery_root).items():
+                    _merge_fill(fills, _t, _f)
+            # The same CSV also carries TERMINAL non-fill outcomes, and dropping
+            # them left the candidate loop below holding the full planned amount
+            # with an unknown reference price -- routing a ticker whose order is
+            # KNOWN rejected to the $0 manual-review guard and suppressing a
+            # legitimate top-up. The no-candidate path already honors this via
+            # _orders_csv_submitted_notionals (Codex review: "Honor terminal
+            # rejections for candidate-backed recoveries").
+            for _csv in (
+                recorded_csv if recorded_csv is not None else None,
+                recovery_root / "filled_orders.csv",
+                recovery_root / "orders.csv",
+                run_state_path.parent / "filled_orders.csv",
+                run_state_path.parent / "orders.csv",
+            ):
+                if _csv is None:
+                    continue
+                _oids, _tks = _orders_csv_terminal_non_fills(_csv)
+                terminal_order_ids |= _oids
+                terminal_tickers |= _tks
         if not buy_candidates_raw:
-            artifacts_block = run_state.get("artifacts")
-            if isinstance(artifacts_block, dict):
-                orders_csv_path = artifacts_block.get("orders_csv_path")
-                if orders_csv_path:
-                    orders_csv_file = Path(orders_csv_path)
-                    if not orders_csv_file.is_absolute():
-                        orders_csv_file = run_state_path.parent / orders_csv_file
-                    if orders_csv_file.exists():
-                        # Pass the exact recorded file rather than run_dir/"orders.csv"
-                        # because run_and_report writes custom-named CSVs.
-                        report_fills = _orders_csv_fills(
-                            orders_csv_file.parent, orders_csv_file=orders_csv_file, skip_sink=skip_sink
+            orders_csv_file = _resolve_recorded_orders_csv(
+                run_state, run_state_path, skip_sink=skip_sink
+            )
+            if orders_csv_file is not None:
+                if orders_csv_file.exists():
+                    # Pass the exact recorded file rather than run_dir/"orders.csv"
+                    # because run_and_report writes custom-named CSVs.
+                    report_fills = _orders_csv_fills(
+                        orders_csv_file.parent, orders_csv_file=orders_csv_file, skip_sink=skip_sink
+                    )
+                    submitted_notionals = _orders_csv_submitted_notionals(
+                        orders_csv_file, skip_sink=skip_sink
+                    )
+                    # Merge filled rows (known price) then submitted rows (unknown price).
+                    # Filled rows for a ticker win over submitted rows for the same ticker.
+                    _csv_tickers: Dict[str, tuple] = {}  # ticker -> (amount, ref_price)
+                    for _ticker, _fill in report_fills.items():
+                        # None keeps the reference UNRESOLVED for a partial, the
+                        # same rule the candidate loop applies: the executed
+                        # notional counts, but the price does not settle until
+                        # the order fully fills or is terminally reconciled.
+                        _ref = (
+                            None
+                            if _fill.get("_partial_execution")
+                            else _fill["avg_fill_price"]
                         )
-                        submitted_notionals = _orders_csv_submitted_notionals(
-                            orders_csv_file, skip_sink=skip_sink
-                        )
-                        # Merge filled rows (known price) then submitted rows (unknown price).
-                        # Filled rows for a ticker win over submitted rows for the same ticker.
-                        _csv_tickers: Dict[str, tuple] = {}  # ticker -> (amount, ref_price)
-                        for _ticker, _fill in report_fills.items():
-                            if _fill.get("amount_usd"):
-                                _csv_tickers[_ticker] = (_fill["amount_usd"], _fill["avg_fill_price"])
-                            elif _fill["quantity_filled"]:
-                                _csv_tickers[_ticker] = (
-                                    _fill["avg_fill_price"] * _fill["quantity_filled"],
-                                    _fill["avg_fill_price"],
-                                )
-                        for _ticker, _notional in submitted_notionals.items():
-                            if _ticker not in _csv_tickers:
-                                _csv_tickers[_ticker] = (_notional, None)
-                        for _ticker, (_amount, _ref) in _csv_tickers.items():
-                            if _amount <= 0:
-                                continue
-                            _entry = aggregated.setdefault(
-                                _ticker,
-                                {
-                                    "amount": 0.0,
-                                    "reference_price": None,
-                                    "reference_ts": None,
-                                    "run_id": run_id,
-                                    "source": source,
-                                    "selected_base_amount_usd": None,
-                                    "selected_base_amount_usd_at": None,
-                                    "selected_base_amount_usd_seen": False,
-                                },
+                        if _fill.get("amount_usd"):
+                            _csv_tickers[_ticker] = (_fill["amount_usd"], _ref)
+                        elif _fill["quantity_filled"]:
+                            _csv_tickers[_ticker] = (
+                                _fill["avg_fill_price"] * _fill["quantity_filled"],
+                                _ref,
                             )
-                            _entry["amount"] += _amount
-                            if _entry.get("reference_price_unknown"):
-                                pass
-                            elif _ref is None:
-                                _entry["reference_price"] = None
-                                _entry["reference_ts"] = None
-                                _entry["reference_price_unknown"] = True
-                            else:
-                                if _entry["reference_price"] is None or run_ts >= _entry["reference_ts"]:
-                                    _entry["reference_price"] = _ref
-                                    _entry["reference_ts"] = run_ts
-                            # This CSV-reconstructed shape carries no base info -- if
-                            # this is the ticker's first contributing entry, lock the
-                            # base permanently unknown (Codex review: "Do not infer a
-                            # first-allocation base from a later run") rather than
-                            # leaving it open for a later run's own base to fill in.
-                            if not _entry["selected_base_amount_usd_seen"]:
-                                _entry["selected_base_amount_usd_at"] = run_state.get("generated_at")
-                                _entry["selected_base_amount_usd_seen"] = True
-                            _entry["run_id"] = run_id
-                            _entry["source"] = source
-                    elif skip_sink is not None:
-                        # This full-report run_state RECORDED orders_csv_path
-                        # as its fill source, but the file isn't there at
-                        # that exact path -- deleted, relocated, or still
-                        # being written by run_and_report. Its referenced
-                        # fills are exactly as unverifiable as a
-                        # run_state.json that itself failed to read/parse,
-                        # so this scan must not report itself complete while
-                        # a ticker's only fill evidence is silently invisible
-                        # (Codex review: "Include referenced CSV failures in
-                        # scan completeness"). BUT when a supported sibling
-                        # sits right beside this run_state (e.g. the recorded
-                        # path is a STALE absolute path from a relocated
-                        # deployment, while the real CSV -- under its
-                        # recorded basename, OR a differently-named file like
-                        # submitted_orders.csv/filled_orders.csv -- still
-                        # lives in this run's own directory),
-                        # scripts.run_classification.load_same_day_top_up_context's
-                        # own basename/glob fallback (_referenced_orders_csvs,
-                        # which matches its recorded basename AND any sibling
-                        # matching "*orders.csv") already recovers this run's
-                        # fills unconditionally, within the SAME
-                        # _compute_auto_derived_prior_allocations call that
-                        # merges its result in right after this loop.
-                        # Flagging a failure here anyway would be a permanent
-                        # false positive -- a stale absolute path never
-                        # becomes valid, so scan_had_failures would never
-                        # clear, poisoning an already-correctly-recovered,
-                        # resolved allocation on every future scan (Codex
-                        # review: "Do not flag stale CSV paths after fallback
-                        # recovery"; "Recognize every supported sibling
-                        # fallback before flagging failure" -- the exact-
-                        # basename-only check missed the glob fallback).
-                        # Only flag the failure when NEITHER supported
-                        # fallback has anything to find.
-                        _has_basename_sibling = (run_state_path.parent / orders_csv_file.name).exists()
-                        _has_glob_sibling = any(run_state_path.parent.glob("*orders.csv"))
-                        if not _has_basename_sibling and not _has_glob_sibling:
-                            skip_sink.append(run_state_path)
+                    for _ticker, _notional in submitted_notionals.items():
+                        if _ticker not in _csv_tickers:
+                            _csv_tickers[_ticker] = (_notional, None)
+                    for _ticker, (_amount, _ref) in _csv_tickers.items():
+                        if _amount <= 0:
+                            continue
+                        _entry = aggregated.setdefault(
+                            _ticker,
+                            {
+                                "amount": 0.0,
+                                "reference_price": None,
+                                "reference_ts": None,
+                                "run_id": run_id,
+                                "source": source,
+                                "selected_base_amount_usd": None,
+                                "selected_base_amount_usd_at": None,
+                                "selected_base_amount_usd_seen": False,
+                            },
+                        )
+                        _entry["amount"] += _amount
+                        if _entry.get("reference_price_unknown"):
+                            pass
+                        elif _ref is None:
+                            _entry["reference_price"] = None
+                            _entry["reference_ts"] = None
+                            _entry["reference_price_unknown"] = True
+                        else:
+                            if _entry["reference_price"] is None or run_ts >= _entry["reference_ts"]:
+                                _entry["reference_price"] = _ref
+                                _entry["reference_ts"] = run_ts
+                        # This CSV-reconstructed shape carries no base info -- if
+                        # this is the ticker's first contributing entry, lock the
+                        # base permanently unknown (Codex review: "Do not infer a
+                        # first-allocation base from a later run") rather than
+                        # leaving it open for a later run's own base to fill in.
+                        if not _entry["selected_base_amount_usd_seen"]:
+                            _entry["selected_base_amount_usd_at"] = run_state.get("generated_at")
+                            _entry["selected_base_amount_usd_seen"] = True
+                        _entry["run_id"] = run_id
+                        _entry["source"] = source
+                elif skip_sink is not None:
+                    # This full-report run_state RECORDED orders_csv_path
+                    # as its fill source, but the file isn't there at
+                    # that exact path -- deleted, relocated, or still
+                    # being written by run_and_report. Its referenced
+                    # fills are exactly as unverifiable as a
+                    # run_state.json that itself failed to read/parse,
+                    # so this scan must not report itself complete while
+                    # a ticker's only fill evidence is silently invisible
+                    # (Codex review: "Include referenced CSV failures in
+                    # scan completeness"). BUT when a supported sibling
+                    # sits right beside this run_state (e.g. the recorded
+                    # path is a STALE absolute path from a relocated
+                    # deployment, while the real CSV -- under its
+                    # recorded basename, OR a differently-named file like
+                    # submitted_orders.csv/filled_orders.csv -- still
+                    # lives in this run's own directory),
+                    # scripts.run_classification.load_same_day_top_up_context's
+                    # own basename/glob fallback (_referenced_orders_csvs,
+                    # which matches its recorded basename AND any sibling
+                    # matching "*orders.csv") already recovers this run's
+                    # fills unconditionally, within the SAME
+                    # _compute_auto_derived_prior_allocations call that
+                    # merges its result in right after this loop.
+                    # Flagging a failure here anyway would be a permanent
+                    # false positive -- a stale absolute path never
+                    # becomes valid, so scan_had_failures would never
+                    # clear, poisoning an already-correctly-recovered,
+                    # resolved allocation on every future scan (Codex
+                    # review: "Do not flag stale CSV paths after fallback
+                    # recovery"; "Recognize every supported sibling
+                    # fallback before flagging failure" -- the exact-
+                    # basename-only check missed the glob fallback).
+                    # Only flag the failure when NEITHER supported
+                    # fallback has anything to find.
+                    _has_basename_sibling = (run_state_path.parent / orders_csv_file.name).exists()
+                    _has_glob_sibling = any(run_state_path.parent.glob("*orders.csv"))
+                    if not _has_basename_sibling and not _has_glob_sibling:
+                        skip_sink.append(run_state_path)
         for candidate in buy_candidates_raw or []:
             if not isinstance(candidate, dict):
                 continue
@@ -2890,6 +3663,25 @@ def load_prior_same_day_allocations(
                 continue
             ticker = candidate.get("ticker")
             if not ticker:
+                continue
+
+            # The recovery CSV said this order ended REJECTED/CANCELED having
+            # executed nothing, which outranks the candidate's submission-time
+            # status: no capital moved, so counting its planned amount as prior
+            # allocation forces the $0 manual-review guard and suppresses a
+            # legitimate top-up (Codex review: "Honor terminal rejections for
+            # candidate-backed recoveries"). Ticker-level evidence applies only
+            # when the row carried no order_id AND nothing confirms a fill for
+            # that ticker, since one ticker can have both a rejected order and a
+            # separate real fill.
+            _cand_oid = (candidate.get("order_id") or "").strip()
+            if _cand_oid and _cand_oid in terminal_order_ids:
+                continue
+            if (
+                not _cand_oid
+                and ticker in terminal_tickers
+                and fills.get(ticker) is None
+            ):
                 continue
 
             # A "submitted" candidate in run_state.json only means an order_id was
@@ -2933,7 +3725,8 @@ def load_prior_same_day_allocations(
             # routes to missing_prior_price -> $0 + manual review.
             reference_price = None
             base_amount_usd = None
-            if status == "filled" or fill is not None:
+            fill_is_partial = bool(fill and fill.get("_partial_execution"))
+            if (status == "filled" or fill is not None) and not fill_is_partial:
                 reference_price = _candidate_logged_reference_price(candidate)
                 if reference_price is None and fill is not None:
                     reference_price = fill["avg_fill_price"]

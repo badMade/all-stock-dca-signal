@@ -160,6 +160,8 @@ def _is_within(path: Path, ancestor: Path) -> bool:
 def _resolve_cross_stream_prior_allocation_roots(
     config_dir: Optional[str | Path],
     afternoon_root: Path,
+    *,
+    for_fallback_discovery: bool = False,
 ) -> Tuple[Path, ...]:
     """Resolve the morning/midday live roots the afternoon top-up guard scans.
 
@@ -362,13 +364,29 @@ def _resolve_cross_stream_prior_allocation_roots(
         market_open_override_configured and not _market_open_is_nested_under_afternoon
     )
 
+    # For FALLBACK discovery, include an override that is merely "configured"
+    # rather than "active". The active gate drops an override nested under
+    # afternoon_root because the core recursive scan of that tree already covers
+    # its state files -- true for the core scan, false for the bare-CSV fallback,
+    # which never scans afternoon_root and looks only inside `*_recovery_*`
+    # directories (Codex review: "Preserve nested configured roots for fallback
+    # discovery"). An override that is an ANCESTOR of afternoon_root stays
+    # excluded either way: *_override_configured is already false for it.
+    _intraday_included = (
+        intraday_override_configured if for_fallback_discovery else intraday_override_active
+    )
+    _market_open_included = (
+        market_open_override_configured
+        if for_fallback_discovery
+        else market_open_override_active
+    )
     configured_roots = tuple(
         r
         for r in (
             _configured_root(morning_root, DEFAULT_MORNING_LIVE_STATE_ROOT),
             _configured_root(midday_root, DEFAULT_MIDDAY_LIVE_STATE_ROOT),
-            intraday_root if intraday_override_active else None,
-            market_open_root if market_open_override_active else None,
+            intraday_root if _intraday_included else None,
+            market_open_root if _market_open_included else None,
         )
         if r is not None
     )
@@ -412,6 +430,25 @@ def _resolve_cross_stream_prior_allocation_roots(
     # leaving nothing scanned for that stream at all. Excluding
     # afternoon-containing roots first means Pass 3 never sees cron_base as
     # an ancestor candidate, so the sibling fallback survives.
+    if for_fallback_discovery:
+        # Passes 2 and 3 exist to stop the CORE recursive scan double-counting:
+        # the caller scans afternoon_root separately and sums the results, and
+        # Pass 3 drops descendants of another surviving root for the same
+        # reason. Neither applies to the bare-CSV fallback
+        # (run_classification.load_same_day_top_up_context), which does NOT
+        # recursively scan afternoon_root and only looks inside `*_recovery_*`
+        # directories, deduping rows by order_id.
+        #
+        # With DCA_INTRADAY_LIVE_STATE_ROOT or DCA_MARKET_OPEN_LIVE_STATE_ROOT
+        # configured NESTED under afternoon_root, Pass 2 would drop that root
+        # here even though the fallback still needs it: a recovery whose fills
+        # exist only in an unreferenced sibling CSV is invisible to the core
+        # loader by construction and to the conventional recovery globs by
+        # location, so the combined loader would return no allocation AND no
+        # scan failure -- and the full amount gets bought again (Codex review:
+        # "Preserve nested configured roots for fallback discovery").
+        return tuple(orig for orig, _ in deduped)
+
     afternoon_key = afternoon_root.resolve()
     non_afternoon: List[Tuple[Path, Path]] = [
         (orig, key)
@@ -820,6 +857,10 @@ def _compute_auto_derived_prior_allocations(
     # directory-naming convention, so a relocated artifact root is still found.
     afternoon_root = _default_prior_allocation_state_root(Path(artifacts_dir))
     cross_stream_roots = _resolve_cross_stream_prior_allocation_roots(config_dir, afternoon_root)
+    # Unpruned companion set for the bare-CSV fallback below; see that call site.
+    fallback_discovery_roots = _resolve_cross_stream_prior_allocation_roots(
+        config_dir, afternoon_root, for_fallback_discovery=True
+    )
     skip_sink: List[Path] = []
     # All roots are capped at the actual run time so replayed/backfilled runs
     # never load fills created after the scheduled execution window. The
@@ -907,6 +948,21 @@ def _compute_auto_derived_prior_allocations(
             # reflects it too (Codex review: "Include bare manual CSV
             # failures in scan completeness").
             skip_sink=skip_sink,
+            # The configured stream roots for FALLBACK discovery, so a
+            # scheduled-recovery directory under a relocated
+            # morning/midday/intraday/market-open root is picked up here as
+            # well. Without this, a recovery whose fills live only in a bare
+            # sibling CSV is invisible to both loaders in such a deployment
+            # and the ticker is re-allocated in full (Codex review: "Thread
+            # configured roots into top-up loading").
+            #
+            # Deliberately NOT `cross_stream_roots`: that tuple is pruned of
+            # roots contained by afternoon_root because the core scan covers
+            # that tree, but this fallback never scans afternoon_root, so a
+            # configured root nested there would go undiscovered (Codex
+            # review: "Preserve nested configured roots for fallback
+            # discovery").
+            stream_roots=fallback_discovery_roots,
         ),
     )
     return prior_same_day_allocations, bool(skip_sink)

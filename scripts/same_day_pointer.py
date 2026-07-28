@@ -36,6 +36,7 @@ result object describing *why* a pointer was rejected rather than throwing.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -59,8 +60,36 @@ STATUS_FUTURE_DATE = "future_date"
 STATUS_PENDING = "pending"
 STATUS_OUTSIDE_ROOT = "outside_root"
 STATUS_WRONG_STREAM = "wrong_stream"
+# A resolvable pointer to an explicitly NON-scheduled recovery artifact (e.g.
+# latest_midday_recovery_run.json for the Jul 27 2026 12:30 recovery pass). The
+# target exists, is same-day, and sits inside its expected root -- but it must
+# never be scheduled evidence, and STATUS_VALID is pinned by both this module
+# and schemas/latest_pointer.schema.json to valid_scheduled_evidence=true. Such
+# a pointer therefore had no representable state before this status existed:
+# 'valid' was forbidden by the invariant and every other status means unusable,
+# so schema-aware consumers could not discover the artifact at all (Codex
+# review: "Define a usable contract for the recovery pointer").
+STATUS_VALID_RECOVERY_CONTEXT = "valid_recovery_context"
 
-# Statuses that never count as same-day scheduled evidence.
+# Recovery streams. A pointer on one of these is context only, never scheduled
+# evidence for the slot it recovered.
+# Mirrors run_classification.RECOVERY_STREAMS, including the slot-qualified
+# intraday variants (the intraday task fires at 11:30/13:30/14:30, so its
+# recovery stream names the slot -- e.g. intraday_1430_recovery).
+RECOVERY_STREAMS = (
+    "market_open_recovery",
+    "morning_recovery",
+    "midday_recovery",
+    "intraday_recovery",
+    "intraday_1130_recovery",
+    "intraday_1330_recovery",
+    "intraday_1430_recovery",
+)
+
+# Statuses that never count as same-day SCHEDULED evidence. STATUS_VALID_RECOVERY_CONTEXT
+# is listed because it is exactly that: usable, but not scheduled evidence. A
+# scheduled consumer must keep rejecting it; a recovery-context consumer selects
+# on it explicitly (see is_recovery_context_status).
 REJECTED_STATUSES = (
     STATUS_MISSING,
     STATUS_MALFORMED,
@@ -70,7 +99,22 @@ REJECTED_STATUSES = (
     STATUS_PENDING,
     STATUS_OUTSIDE_ROOT,
     STATUS_WRONG_STREAM,
+    STATUS_VALID_RECOVERY_CONTEXT,
 )
+
+
+def is_recovery_stream(stream: Optional[str]) -> bool:
+    """True for a recovery-context stream name."""
+    return isinstance(stream, str) and stream in RECOVERY_STREAMS
+
+
+def is_recovery_context_status(status: Optional[str]) -> bool:
+    """True for the one status that marks a usable recovery-context pointer.
+
+    The positive counterpart to :data:`REJECTED_STATUSES`: a recovery-context
+    consumer selects on this, while a scheduled consumer keeps rejecting it.
+    """
+    return status == STATUS_VALID_RECOVERY_CONTEXT
 
 # Keys a well-formed pointer must carry to be considered at all.
 _REQUIRED_POINTER_KEYS = ("run_id", "run_state_path", "trading_day", "stream")
@@ -124,6 +168,98 @@ def derive_valid_scheduled_evidence(run_state: Optional[Dict[str, object]]) -> b
     return rc.get("run_origin") == "scheduled"
 
 
+# The full RFC 3339 date-time grammar the schema's `format: date-time` means:
+# extended-format date, 'T' separator, two-digit time, optional fractional
+# seconds, and a 'Z' or +/-HH:MM offset with no seconds field.
+_RFC3339_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt]"
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?"
+    # \Z, not $: Python's `$` also matches before a trailing newline.
+    r"([Zz]|[+-][0-9]{2}:[0-9]{2})\Z"
+)
+
+
+def _is_iso_utc_timestamp(value: object) -> bool:
+    """True only for an RFC 3339 date-time that establishes a UTC instant.
+
+    The schema marks updated_at_utc ``format: date-time``, which requires BOTH
+    a time component and a timezone offset. ``datetime.fromisoformat`` alone is
+    far looser: it happily accepts a bare date (``2026-07-27``) and a naive
+    timestamp (``2026-07-27T12:00:00``), neither of which pins an instant, so
+    the helper trusted pointers a schema-aware consumer rejects (Codex review:
+    "Require a timezone-bearing date-time for recovery pointers").
+
+    Accepts the trailing ``Z`` spelling the pointer writer emits, which
+    fromisoformat rejects before Python 3.11.
+    """
+    if not isinstance(value, str):
+        return False
+    # SYNTAX first, against the PERSISTED value -- no strip(), because the
+    # schema's pattern is the whole string and a padded timestamp is invalid
+    # there too. Presence-of-'T' plus a tz-aware parse was not the same test as
+    # `format: date-time`: fromisoformat also accepts basic-format
+    # '20260727T120000+00:00', ISO week dates '2026-W31-1T12:00:00+00:00', and
+    # offsets carrying seconds, none of which RFC 3339 permits, so the helper
+    # still trusted pointers a schema-aware consumer rejects (Codex review:
+    # "Enforce RFC 3339 syntax for recovery timestamps").
+    if not _RFC3339_RE.match(value):
+        return False
+    # Then SEMANTICS: the regex cannot rule out month 13 or day 32. Normalize
+    # the trailing Z, which fromisoformat rejects before Python 3.11.
+    text = value[:-1] + "+00:00" if value.endswith(("Z", "z")) else value
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+def _validate_recovery_state(state: object, trading_day: Optional[str] = None) -> bool:
+    """Delegate to run_classification's canonical recovery-contract validator.
+
+    Imported lazily and by both module paths: this file is imported as
+    ``same_day_pointer`` (tests, with scripts/ on sys.path) and as
+    ``scripts.same_day_pointer`` (near_close_dca, with the repo root on
+    sys.path), and only one of the two spellings resolves in each case.
+    """
+    try:
+        from run_classification import is_valid_recovery_context_state
+    except ImportError:  # pragma: no cover - exercised via the package path
+        from scripts.run_classification import is_valid_recovery_context_state
+    return is_valid_recovery_context_state(state, trading_day)
+
+
+def derive_valid_recovery_context(
+    run_state: Optional[Dict[str, object]], trading_day: Optional[str] = None
+) -> bool:
+    """True only when a run_state is a valid scheduled-RECOVERY context run.
+
+    The recovery-side counterpart to :func:`derive_valid_scheduled_evidence`,
+    and deliberately not a relaxation of it: a run must POSITIVELY assert
+    recovery context to pass here, and must simultaneously disclaim scheduled
+    evidence. The artifact-contract failure marker fails closed here exactly as
+    it does for scheduled evidence.
+
+    Delegates the classification check to
+    ``run_classification.validate_recovery_classification``, the single source
+    of truth for the recovery contract, so this module cannot drift into
+    trusting artifacts the top-up guard rejects (or vice versa). That contract
+    covers the origin/flag markers, ``stream``/``run_type``/
+    ``state_schema_version`` mutual correspondence (so ``run_type='bogus'`` is
+    rejected rather than merely non-blank), ``run_id``, and the classification's
+    own ``trading_day`` (Codex review: "Validate recovery identity values
+    against the contract").
+
+    Adds this module's own state-level check on top: the
+    ``artifact_contract_failure`` marker fails closed here exactly as it does
+    for scheduled evidence.
+
+    A run that passes here is still NEVER scheduled evidence: it is valid only
+    as same-day, ticker-scoped top-up context for later same-day streams.
+    """
+    return _validate_recovery_state(run_state, trading_day)
+
+
 def build_pointer_metadata(
     *,
     run_id: Optional[str],
@@ -169,14 +305,41 @@ class PointerValidation:
     run_state_path: Optional[str] = None
     stream: Optional[str] = None
     reasons: List[str] = field(default_factory=list)
+    # True only on a result produced by the RECOVERY validation path
+    # (validate_recovery_pointer / validate_pointer(recovery_context=True)).
+    # Deliberately NOT inferred from `status`: validate_pointer in its normal
+    # scheduled mode returns STATUS_VALID_RECOVERY_CONTEXT when it rejects a
+    # recovery pointer's declared status, and that rejection must stay falsey
+    # for the scheduled consumer that asked. Only the caller who explicitly
+    # asked for recovery validation gets a truthy result.
+    recovery_context: bool = False
 
     @property
     def is_valid(self) -> bool:
         """True only for a fully-valid, same-day, scheduled-evidence pointer."""
         return self.status == STATUS_VALID and self.valid_scheduled_evidence
 
+    @property
+    def is_valid_recovery_context(self) -> bool:
+        """True only for a fully-valid, same-day RECOVERY-context pointer.
+
+        Never true for a scheduled pointer, and never implies scheduled
+        evidence -- ``valid_scheduled_evidence`` stays False on these results.
+        """
+        return (
+            self.recovery_context
+            and self.status == STATUS_VALID_RECOVERY_CONTEXT
+            and not self.valid_scheduled_evidence
+        )
+
     def __bool__(self) -> bool:  # allow `if validate_pointer(...):`
-        return self.is_valid
+        # Both entry points support the `if validate_...(...)` idiom. Without
+        # the recovery arm a caller of validate_recovery_pointer would discard
+        # every valid recovery pointer, since is_valid requires scheduled
+        # evidence the artifact must never claim (Codex review: "Expose a
+        # truthy recovery-validation result"). A scheduled consumer is
+        # unaffected: recovery_context is False on every result it can get.
+        return self.is_valid or self.is_valid_recovery_context
 
 
 def _load_pointer(pointer: str | Path | Dict[str, object]) -> Optional[Dict[str, object]]:
@@ -210,6 +373,7 @@ def validate_pointer(
     today: Optional[str] = None,
     now: Optional[datetime] = None,
     require_run_state_exists: bool = True,
+    recovery_context: bool = False,
 ) -> PointerValidation:
     """Validate a latest pointer as same-day scheduled evidence.
 
@@ -224,6 +388,15 @@ def validate_pointer(
     ``valid_scheduled_evidence=True`` may be used as scheduled/fill/top-up/
     slippage/reliability/ran-confirmation evidence. Every rejection path
     reports ``valid_scheduled_evidence=False``.
+
+    Set ``recovery_context=True`` to validate a recovery pointer instead (see
+    :func:`validate_recovery_pointer`, the preferred entry point). The same
+    structural checks run -- required keys, stream identity, root containment,
+    same-day on both the pointer and its target -- but the accepted declared
+    status becomes ``STATUS_VALID_RECOVERY_CONTEXT`` and the target is checked
+    against the recovery contract. A recovery result ALWAYS reports
+    ``valid_scheduled_evidence=False``; this mode can never return
+    ``STATUS_VALID``.
     """
     day = today or today_et(now)
     root = Path(expected_root)
@@ -243,7 +416,18 @@ def validate_pointer(
         )
 
     ptr_day = str(data.get("trading_day", "")).strip()
-    ptr_stream = str(data.get("stream", "")).strip()
+    # The PERSISTED stream, deliberately NOT stripped. latest_pointer.schema.json
+    # constrains `stream` by an exact enum, so ' midday_recovery ' is
+    # schema-invalid; normalizing it here made this helper accept a pointer a
+    # schema-aware consumer rejects, and recovery discovery then depended on
+    # which validator a caller reached for (Codex review: "Reject padded
+    # recovery pointer stream names"). Rejecting is the fail-closed direction --
+    # the pointer is reported wrong_stream and ignored, never wrongly trusted.
+    # Applied to every stream, not just recovery: the enum is exact for all of
+    # them, and no in-repo writer emits a padded stream (they are module
+    # constants), so this cannot invalidate a pointer the codebase produces.
+    ptr_stream = data.get("stream")
+    ptr_stream = ptr_stream if isinstance(ptr_stream, str) else str(ptr_stream or "")
     ptr_path_raw = str(data.get("run_state_path", "")).strip()
     ptr_path = Path(ptr_path_raw)
 
@@ -290,7 +474,26 @@ def validate_pointer(
     # altogether (written before this contract existed) fall through to the
     # checks below rather than being rejected outright.
     declared_status = data.get("pointer_status")
-    if declared_status is not None and declared_status != STATUS_VALID:
+    accepted_status = STATUS_VALID_RECOVERY_CONTEXT if recovery_context else STATUS_VALID
+    if recovery_context and declared_status is None:
+        # The missing-status allowance below exists only for LEGACY scheduled
+        # pointers written before pointer_status was contractual. A recovery
+        # pointer cannot predate a status introduced alongside it, so a recovery
+        # pointer with no pointer_status is schema-invalid and must not be
+        # promoted to a usable result just because its target validates (Codex
+        # review: "Require the recovery pointer status discriminator").
+        return PointerValidation(
+            STATUS_MALFORMED,
+            False,
+            trading_day=ptr_day,
+            run_state_path=ptr_path_raw,
+            stream=ptr_stream,
+            reasons=[
+                "recovery pointer must declare pointer_status="
+                f"{STATUS_VALID_RECOVERY_CONTEXT!r}"
+            ],
+        )
+    if declared_status is not None and declared_status != accepted_status:
         status = declared_status if declared_status in REJECTED_STATUSES else STATUS_MALFORMED
         return PointerValidation(
             status,
@@ -372,6 +575,117 @@ def validate_pointer(
                 ],
             )
 
+    if recovery_context:
+        # The pointer's OWN declared invariants, checked before the target is
+        # accepted. schemas/latest_pointer.schema.json pins same_day_required to
+        # true for every pointer and valid_scheduled_evidence to false for a
+        # recovery one, so a pointer contradicting either is schema-invalid;
+        # accepting it here would make helper validation and schema validation
+        # disagree and let recovery discovery vary by consumer (Codex review:
+        # "Reject contradictory recovery pointer metadata"). Scoped to the
+        # recovery path deliberately: the scheduled path intentionally derives
+        # evidence from the TARGET and ignores the pointer's own claim, and it
+        # carries legacy pointers this status cannot have.
+        contradictions = []
+        if data.get("valid_scheduled_evidence") is not False:
+            # The schema pins this to the boolean constant false for a recovery
+            # pointer, so an omitted field or a non-boolean like the STRING
+            # "false" is schema-invalid too. Rejecting only literal True would
+            # leave the helper trusting pointers a schema-aware consumer
+            # refuses (Codex review: "Require the recovery pointer evidence
+            # field").
+            contradictions.append(
+                "recovery pointer must declare valid_scheduled_evidence=false "
+                f"(got {data.get('valid_scheduled_evidence')!r})"
+            )
+        if data.get("same_day_required") is not True:
+            # Same reasoning: the schema pins same_day_required to the boolean
+            # constant true and marks it required, so omitted / "true" / 1 are
+            # all schema-invalid, not just an explicit false.
+            contradictions.append(
+                "recovery pointer must declare same_day_required=true "
+                f"(got {data.get('same_day_required')!r})"
+            )
+        if not _is_iso_utc_timestamp(data.get("updated_at_utc")):
+            # updated_at_utc is required with format date-time in the schema.
+            # A recovery pointer cannot be a legacy artifact, so it is held to
+            # that here too -- otherwise a pointer missing or mangling the
+            # field is trusted by this helper and rejected by a schema-aware
+            # consumer, making discovery depend on which validator ran (Codex
+            # review: "Require recovery pointer update timestamps").
+            contradictions.append(
+                "recovery pointer must declare a valid ISO-8601 updated_at_utc "
+                f"(got {data.get('updated_at_utc')!r})"
+            )
+        if contradictions:
+            return PointerValidation(
+                STATUS_MALFORMED,
+                False,
+                trading_day=ptr_day,
+                run_state_path=ptr_path_raw,
+                stream=ptr_stream,
+                reasons=contradictions,
+            )
+        # Recovery targets are validated against the recovery contract, never
+        # the scheduled one, and always report valid_scheduled_evidence=False:
+        # the whole point of the status is that the artifact is usable WITHOUT
+        # being scheduled evidence for the slot it recovered.
+        if not derive_valid_recovery_context(run_state, day):
+            return PointerValidation(
+                STATUS_PENDING,
+                False,
+                trading_day=ptr_day,
+                run_state_path=ptr_path_raw,
+                stream=ptr_stream,
+                reasons=["target run_state is not a valid scheduled-recovery context run"],
+            )
+        # The pointer's run_id must name the run its run_state_path resolves to.
+        # Nothing above compares them, so stale or corrupted metadata could
+        # attribute discovered recovery context to one run while the target is
+        # another, producing inconsistent audit and reconciliation lineage. A
+        # recovery pointer has no legacy-compatibility reason to omit it, so a
+        # null or mismatched run_id is rejected rather than tolerated (Codex
+        # review: "Match the recovery pointer run ID to its target").
+        target_rc = run_state.get("run_classification") if isinstance(run_state, dict) else None
+        target_run_id = target_rc.get("run_id") if isinstance(target_rc, dict) else None
+        if not isinstance(target_run_id, str) or not target_run_id.strip():
+            target_run_id = run_state.get("run_id") if isinstance(run_state, dict) else None
+        ptr_run_id = data.get("run_id")
+        # Non-blank checks still use strip(), because "is this string empty in
+        # substance" is genuinely a whitespace-insensitive question. The
+        # IDENTITY comparison does not: both recovery schemas accept a padded
+        # non-blank ID (`pattern: "\\S"`), so ' run-1 ' and 'run-1' are each
+        # schema-valid yet are DIFFERENT persisted strings. Comparing stripped
+        # copies let this validator promise an identity match while the audit
+        # and reconciliation metadata named two different runs (Codex review:
+        # "Compare recovery run IDs without normalizing them").
+        if (
+            not isinstance(ptr_run_id, str)
+            or not ptr_run_id.strip()
+            or not isinstance(target_run_id, str)
+            or not target_run_id.strip()
+            or ptr_run_id != target_run_id
+        ):
+            return PointerValidation(
+                STATUS_MALFORMED,
+                False,
+                trading_day=ptr_day,
+                run_state_path=ptr_path_raw,
+                stream=ptr_stream,
+                reasons=[
+                    "recovery pointer run_id must match its target's run_id "
+                    f"(pointer {ptr_run_id!r}, target {target_run_id!r})"
+                ],
+            )
+        return PointerValidation(
+            STATUS_VALID_RECOVERY_CONTEXT,
+            False,
+            trading_day=ptr_day,
+            run_state_path=ptr_path_raw,
+            stream=ptr_stream,
+            recovery_context=True,
+        )
+
     evidence = derive_valid_scheduled_evidence(run_state)
     if not evidence:
         return PointerValidation(
@@ -389,6 +703,48 @@ def validate_pointer(
         trading_day=ptr_day,
         run_state_path=ptr_path_raw,
         stream=ptr_stream,
+    )
+
+
+def validate_recovery_pointer(
+    pointer: str | Path | Dict[str, object],
+    *,
+    expected_stream: str,
+    expected_root: str | Path,
+    today: Optional[str] = None,
+    now: Optional[datetime] = None,
+    require_run_state_exists: bool = True,
+) -> PointerValidation:
+    """Validate a recovery pointer (e.g. latest_midday_recovery_run.json).
+
+    The entry point a recovery-context consumer should use to DISCOVER a
+    recovery artifact. ``expected_stream`` must be one of
+    :data:`RECOVERY_STREAMS`; anything else is rejected outright rather than
+    silently validated under the scheduled contract.
+
+    A success returns ``STATUS_VALID_RECOVERY_CONTEXT`` with
+    ``valid_scheduled_evidence=False``. There is no code path here that returns
+    ``STATUS_VALID``, so a recovery pointer can never be mistaken for the
+    scheduled pointer of the slot it recovered.
+    """
+    if not is_recovery_stream(expected_stream):
+        return PointerValidation(
+            STATUS_WRONG_STREAM,
+            False,
+            stream=expected_stream,
+            reasons=[
+                f"expected_stream {expected_stream!r} is not a recovery stream "
+                f"{RECOVERY_STREAMS!r}"
+            ],
+        )
+    return validate_pointer(
+        pointer,
+        expected_stream=expected_stream,
+        expected_root=expected_root,
+        today=today,
+        now=now,
+        require_run_state_exists=require_run_state_exists,
+        recovery_context=True,
     )
 
 
@@ -510,6 +866,12 @@ __all__ = [
     "STATUS_PENDING",
     "STATUS_OUTSIDE_ROOT",
     "STATUS_WRONG_STREAM",
+    "STATUS_VALID_RECOVERY_CONTEXT",
+    "RECOVERY_STREAMS",
+    "is_recovery_stream",
+    "is_recovery_context_status",
+    "derive_valid_recovery_context",
+    "validate_recovery_pointer",
     "REJECTED_STATUSES",
     "today_et",
     "derive_valid_scheduled_evidence",

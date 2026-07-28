@@ -391,6 +391,343 @@
     "see": "config/scheduled_tasks.json:midday_dca_manual_run_2026_07_21",
     "doc": "docs/midday_dca.md"
   },
+  "midday_scheduled_recovery_2026_07_27": {
+    "added": "2026-07-27",
+    "trading_day": "2026-07-27",
+    "scheduled_slot_et": "12:30",
+    "cron_id": "a6239dae",
+    "run_at_et": "13:05",
+    "run_origin": "scheduled_recovery",
+    "run_type": "midday_dca_live_recovery",
+    "state_schema_version": "midday-live-v2-recovery",
+    "manual_run": false,
+    "stream": "midday_recovery",
+    "run_id": "midday_recovery_20260727_1305ET",
+    "flags": {
+      "valid_scheduled_evidence": false,
+      "valid_recovery_context": true,
+      "valid_afternoon_scheduled_evidence": false,
+      "use_for_slippage_scheduled_proof": false,
+      "exclude_from_watchdog_scheduled_confirmation": true,
+      "same_day_top_up_context_only": true,
+      "topup_context_eligible": true,
+      "later_stream_topup_context": true
+    },
+    "artifact_root": "/home/user/workspace/cron_tracking/midday_dca/20260727_1230ET_recovery_1305ET",
+    "missing_scheduled_artifact_root": "/home/user/workspace/cron_tracking/midday_dca/20260727_1230ET",
+    "summary": "The 12:30 PM ET scheduled midday DCA live task failed to start, or failed before writing the normal same-day scheduled artifacts, so 20260727_1230ET/ was never created. A recovery pass ran at about 1:05 PM ET into its own artifact root and used the 11:30 intraday fills and the 9:35 market-open fills as ticker-scoped same-day top-up context only. Six orders submitted, six filled, 20.50 USD total.",
+    "total_filled_usd": 20.5,
+    "fills": [
+      {"ticker": "SPCX", "amount_usd": 3.5, "order_id": "6a679049-d567-45c3-b47e-270ebcf6f7e2", "status": "filled", "average_price": 109.9899, "quantity": 0.031821},
+      {"ticker": "DXYZ", "amount_usd": 1.0, "order_id": "6a679049-f3df-4185-9d84-30e9b5b4abb4", "status": "filled", "average_price": 22.6017, "quantity": 0.044244},
+      {"ticker": "FLKR", "amount_usd": 4.0, "order_id": "6a67904a-d595-4c2e-aca2-3a6ccd9191c0", "status": "filled", "average_price": 51.6279, "quantity": 0.077477},
+      {"ticker": "AMZN", "amount_usd": 1.0, "order_id": "6a679049-3017-4b37-984e-4cd4b581f0a3", "status": "filled", "average_price": 231.4299, "quantity": 0.00432},
+      {"ticker": "GS", "amount_usd": 1.0, "order_id": "6a679049-15ed-4607-869b-17adae1673ee", "status": "filled", "average_price": 1041.1815, "quantity": 0.00096},
+      {"ticker": "GFUZ", "amount_usd": 10.0, "order_id": "6a679049-7914-49b7-b2a6-2b13159da126", "status": "filled", "average_price": 6.2499, "quantity": 1.600025}
+    ],
+    "rules": [
+      "Recovery context only. NEVER valid scheduled evidence for the 12:30 scheduled midday task a6239dae.",
+      "NEVER slippage scheduled proof, NEVER watchdog scheduled-run confirmation, NEVER afternoon scheduled proof.",
+      "No completeness of its artifact set promotes it to scheduled evidence. valid_scheduled_evidence stays false.",
+      "Valid only as ticker-scoped same-day top-up context for later same-day streams, including the 3:30 PM final buy 10ce362c.",
+      "The 3:30 PM final buy reads the 9:35 market-open fills, the 11:30 intraday fills, and this recovery pass as ticker-scoped top-up context only. A prior buy in one ticker adjusts only that ticker's remaining top-up delta and MUST NEVER suppress another ticker's first-allocation path.",
+      "Excluded from scheduled slippage, scheduled fill counts, scheduled reliability, and scheduled cost-basis evidence.",
+      "The 12:30 slot itself remains unfilled scheduled evidence: it is recorded as a failed start with no artifacts, not as a completed scheduled run.",
+      "state_schema_version 'midday-live-v2-recovery' is deliberately NOT added to accepted_state_schema_versions, so no downstream scheduled consumer can ingest this artifact as scheduled evidence.",
+      "This pass is NOT a failure_recovery_policy recovery_rerun and is recorded with recovery_rerun=false: that policy covers only a failure after data was fetched, repaired in place under midday_dca/YYYYMMDD_1230ET/ with run_origin='scheduled', and this pass matches neither condition. See config/scheduled_tasks.json:midday_dca_scheduled_recovery_2026_07_27.recovery_policy_conformance.",
+      "Its fills live in config/scheduled_tasks.json:recovery_context_run_outcomes, NOT in scheduled_run_outcomes, so a consumer aggregating the scheduled-evidence ledger never picks them up."
+    ],
+    "pointer_note": "latest_midday_recovery_run.json was written. latest_midday_run.json was NOT overwritten.",
+    "see": "config/scheduled_tasks.json:midday_dca_scheduled_recovery_2026_07_27"
+  },
+  "intraday_no_order_skip_2026_07_27_1330": {
+    "added": "2026-07-27",
+    "trading_day": "2026-07-27",
+    "scheduled_slot_et": "13:30",
+    "cron_id": "7be82b97",
+    "run_id": "intraday_live_20260727_1333ET",
+    "run_origin": "scheduled",
+    "manual_run": false,
+    "stream": "intraday_1330",
+    "outcome_classification": "completed_no_orders",
+    "outcome_classification_note": "This record's OUTCOME label, not the artifact's nested run_classification object. Renamed from run_classification because that key collides with the artifact field every in-repo validator reads as an object -- codex review discussion_r3660200506.",
+    "order_submit_status": "completed_no_orders",
+    "error_class": "missing_spread_data_nonfatal",
+    "completion_reason": "completed_no_orders_missing_spread_data_nonfatal",
+    "completion_reason_source_note": "Transcribed from the repaired artifact. The task brief cited 'completed_no_orders_after_missing_spread_data_fail_closed'; both persisted state files record 'completed_no_orders_missing_spread_data_nonfatal'. The persisted value is authoritative.",
+    "flags": {
+      "valid_scheduled_evidence": true,
+      "slot_executed": true,
+      "artifacts_complete": true,
+      "artifact_contract_conformant": false,
+      "is_trading_failure": false,
+      "outcome": "safe_no_order_skip"
+    },
+    "valid_scheduled_evidence_note": "TRUE again as of the 2026-07-27 artifact repair, which is the exact condition the earlier correction named when it set this false on codex review discussion_r3660200506: 'set true again only if the historical artifact is repaired to satisfy the contract'. The flag stays DERIVED, not asserted: scripts.same_day_pointer.derive_valid_scheduled_evidence() returns True for the repaired root run_state.json and False for the superseded artifacts/run_state.json.",
+    "slot_executed_note": "Still TRUE and still a separate question from the evidence flag. valid_scheduled_evidence asks whether a consumer can validate the artifact; slot_executed asks whether the task ran. Both are now true for this slot.",
+    "artifacts_complete_note": "TRUE as of the repair, and scoped to FILE PRESENCE AND STATE SHAPE ONLY: all four required files exist at the artifact ROOT and run_classification is a non-null object in both run_state.json and run_summary.json. It does NOT assert header conformance -- read artifact_contract_conformant for that.",
+    "artifact_contract_conformant_note": "FALSE: config/scheduled_tasks.json -> intraday_task_patch_2026_07_27.artifact_contract.submitted_orders_rule defines a non-canonical header set as a contract violation, and the root submitted_orders.csv still carries the 6-column header (see residual_artifact_gaps). valid_scheduled_evidence stays TRUE because it is DERIVED from derive_valid_scheduled_evidence(), which reads run_origin/manual_run on the run_state and never inspects a CSV header; flipping it here would put this ledger back into disagreement with the code. A consumer aggregating on artifact-contract conformance must key on this flag, not on artifacts_complete (codex review: 'Keep the incomplete artifact out of scheduled evidence').",
+    "artifact_repair_2026_07_27": {
+      "repaired": true,
+      "problem": "The run originally wrote its four files ONLY under the artifacts/ subfolder, leaving the artifact root with no state files.",
+      "actions": [
+        "run_state.json, run_summary.json, signals.csv, and submitted_orders.csv now exist at the artifact ROOT.",
+        "run_state.json and run_summary.json were normalized so run_classification is a non-null OBJECT in both.",
+        "Top-level run_origin, manual_run, stream, scheduled_for_et, cron_id, valid_scheduled_evidence, valid_recovery_context, order_submit_status, orders_submitted_count, orders_candidate_count, completion_reason, and error_class are present."
+      ],
+      "zero_orders": "Zero orders before and after. The repair changed only how the outcome is persisted, never what was traded."
+    },
+    "residual_artifact_gaps": [
+      "submitted_orders.csv at the root still carries the non-canonical 6-column header (ticker,order_usd,ref_id,order_id,status,reason) rather than the canonical 23-column submitted_orders schema. It is header-present and zero-row, which satisfies the headers-even-when-zero-orders requirement, and no consumer reads it for this run because zero orders were submitted."
+    ],
+    "error_class_corrected_reading": "AUTHORITATIVE PERSISTED VALUE: both repaired state files record error_class='missing_spread_data_nonfatal' and completion_reason='completed_no_orders_missing_spread_data_nonfatal', which is what the error_class and completion_reason fields above carry. This note previously opened by citing the pre-repair 'missing_spread_data', contradicting its own record and the matching scheduled-task entry (codex review: 'Align the corrected reading with the persisted error class'). The 'nonfatal' suffix is the point: missing spread data closed each ticker's row rather than failing the run, which is what spread_data_availability_policy requires. HYPOTHETICAL POLICY-CORRECT READING, recorded for audit and never persisted: under spread_data_availability_policy.evaluation_order as patched, the strictly correct record would have been completion_reason='no_ladder_candidates' with error_class null, because no ticker qualified on the ladder and therefore none ever reached the spread gate. The historical artifact is left as written.",
+    "artifact_root": "/home/user/workspace/cron_tracking/intraday_dca/20260727_1330ET",
+    "summary": "The 1:30 PM ET intraday run fired and wrote a complete scheduled artifact set, but bid/ask spread inputs were not captured or persisted, so the required spread_ok safety check could not be satisfied. All 44 signal rows recorded spread_ok=false and spread_status='missing_bid_ask' and every ticker was conservatively skipped. Zero orders submitted.",
+    "rules": [
+      "This is a SAFE NO-ORDER SKIP, not a trading failure, not a failed run, and not a missed slot.",
+      "It IS valid scheduled evidence that the 1:30 slot executed, because the run fired and persisted the full artifact set.",
+      "It MUST NOT be counted as an error in scheduled reliability metrics.",
+      "Conservative skip is the correct behavior when the spread gate cannot be evaluated. Spread is never estimated, inferred, or defaulted."
+    ],
+    "see": "config/scheduled_tasks.json:spread_data_availability_policy and intraday_dca_scheduled_recovery_2026_07_27"
+  },
+  "intraday_rerun_2026_07_27_1535": {
+    "added": "2026-07-27",
+    "trading_day": "2026-07-27",
+    "scheduled_slot_et": "14:30",
+    "cron_id": "7be82b97",
+    "run_at_et": "15:35",
+    "run_origin": "manual_live_recovery_rerun",
+    "run_type": "intraday_dca_live_recovery_rerun",
+    "state_schema_version": "intraday-recovery-rerun-v2",
+    "manual_run": false,
+    "stream": "intraday_1430_rerun",
+    "run_id": "intraday_rerun_20260727_1535ET",
+    "connector_native": true,
+    "flags": {
+      "valid_scheduled_evidence": false,
+      "valid_recovery_context": false,
+      "context_flags_note": "valid_recovery_context is FALSE, and was true until codex review 'Mark the primary rerun mirrors as rejected context'. run_origin='manual_live_recovery_rerun' is neither 'manual' nor 'scheduled_recovery', the only two origins scripts.run_classification.is_top_up_context_state() accepts, so the afternoon guard rejects this artifact -- which this record's own top_up_context_loadability_note already stated. These flags describe what a CONSUMER may do, so they follow the loaders, not the intent. This pass placed ZERO orders, so no capital is affected; the flag is corrected because a flag that is wrong only where it happens not to matter is the one that gets copied into the next record where it does.", "loadable_by_afternoon_guard": false,
+      "valid_afternoon_scheduled_evidence": false,
+      "use_for_slippage_scheduled_proof": false,
+      "exclude_from_watchdog_scheduled_confirmation": true,
+      "same_day_topup_context_only": false,
+      "sibling_context_flags_note": "These context-eligibility flags are FALSE for the same reason valid_recovery_context is: run_origin='manual_live_recovery_rerun' is neither 'manual' nor 'scheduled_recovery', so is_top_up_context_state() rejects this artifact and NO loader will apply its fills. Correcting valid_recovery_context alone left these siblings still telling a consumer the opposite (codex review: 'Clear the remaining rerun context flags').",
+      "is_trading_failure": false
+    },
+    "artifact_root": "/home/user/workspace/cron_tracking/intraday_dca/20260727_1430ET_rerun_1535ET",
+    "summary": "A second rerun of the 2:30 PM ET slot ran at about 3:35 PM ET, after the corrected same-day top-up evaluation. It wrote a complete root-level artifact set plus raw/robinhood_quotes.json and raw/robinhood_same_day_orders.json, and found zero new qualifying orders.",
+    "order_submit_status": "completed_no_orders",
+    "completion_reason": "no_orders_after_corrected_same_day_topup",
+    "orders_candidate_count": 0,
+    "orders_submitted_count": 0,
+    "orders_filled": 0,
+    "total_filled_usd": 0,
+    "fills": [],
+    "reason_counts": {
+      "not_below_prior_close_or_zero_multiplier": 13,
+      "same_day_topup_not_lower": 31
+    },
+    "supersedes_note": "This does NOT replace the 2:32 PM ET recovery pass or the 2:55 PM ET rerun. All three passes are distinct records and all three stand.",
+    "rules": [
+      "Recovery context only. NEVER valid scheduled evidence that the 2:30 PM ET intraday scheduled task ran successfully.",
+      "NEVER slippage scheduled evidence, NEVER afternoon scheduled evidence, NEVER scheduled cost-basis evidence, NEVER watchdog scheduled-run confirmation.",
+      "It placed zero orders, so it adds no same-day cost basis and cannot change any ticker's remaining top-up delta.",
+      "NOT loadable as same-day top-up context either: run_origin='manual_live_recovery_rerun' is rejected by is_top_up_context_state(), so no later stream, including the 3:30 PM final buy 10ce362c, can apply anything from this pass. It placed zero orders, so nothing is lost by that.",
+      "The 2:30 slot itself remains a failed scheduled startup path with no scheduled artifacts.",
+      "state_schema_version 'intraday-recovery-rerun-v2' is deliberately NOT added to accepted_state_schema_versions, so no downstream scheduled consumer can ingest this artifact as scheduled evidence.",
+      "This pass is NOT a failure_recovery_policy recovery_rerun and is recorded with recovery_rerun=false.",
+      "It is recorded in config/scheduled_tasks.json:recovery_context_run_outcomes, NOT in scheduled_run_outcomes."
+    ],
+    "top_up_context_loadability_note": "run_origin='manual_live_recovery_rerun' is neither 'manual' nor 'scheduled_recovery', so is_top_up_context_state() returns false and the afternoon guard will not load this artifact. That has no capital impact here because the pass placed zero orders and therefore has no fills to contribute.",
+    "see": "config/scheduled_tasks.json:intraday_dca_scheduled_recovery_2026_07_27.rerun_pass_1535"
+  },
+  "intraday_rerun_2026_07_27_1455": {
+    "added": "2026-07-27",
+    "trading_day": "2026-07-27",
+    "scheduled_slot_et": "14:30",
+    "cron_id": "7be82b97",
+    "run_at_et": "14:55",
+    "run_origin": "manual_live_recovery_rerun",
+    "run_type": "intraday_dca_live_recovery_rerun",
+    "state_schema_version": "intraday-recovery-rerun-v1",
+    "manual_run": false,
+    "user_requested": true,
+    "stream": "intraday_1430_rerun",
+    "run_id": "intraday_rerun_20260727_1455ET",
+    "recovery_reason": "user_requested_fix_1330_1430_and_rerun_1430",
+    "connector_native": true,
+    "flags": {
+      "valid_scheduled_evidence": false,
+      "valid_recovery_context": false,
+      "context_flags_note": "valid_recovery_context is FALSE, and was true until codex review 'Mark the primary rerun mirrors as rejected context'. run_origin='manual_live_recovery_rerun' is neither 'manual' nor 'scheduled_recovery', the only two origins scripts.run_classification.is_top_up_context_state() accepts, so the afternoon guard rejects this artifact -- which this record's own top_up_context_loadability_note already stated. These flags describe what a CONSUMER may do, so they follow the loaders, not the intent. This pass placed ZERO orders, so no capital is affected; the flag is corrected because a flag that is wrong only where it happens not to matter is the one that gets copied into the next record where it does.", "loadable_by_afternoon_guard": false,
+      "valid_afternoon_scheduled_evidence": false,
+      "use_for_slippage_scheduled_proof": false,
+      "exclude_from_watchdog_scheduled_confirmation": true,
+      "same_day_top_up_context_only": false,
+      "topup_context_eligible": false,
+      "later_stream_topup_context": false,
+      "sibling_context_flags_note": "These context-eligibility flags are FALSE for the same reason valid_recovery_context is: run_origin='manual_live_recovery_rerun' is neither 'manual' nor 'scheduled_recovery', so is_top_up_context_state() rejects this artifact and NO loader will apply its fills. Correcting valid_recovery_context alone left these siblings still telling a consumer the opposite (codex review: 'Clear the remaining rerun context flags')."
+    },
+    "artifact_root": "/home/user/workspace/cron_tracking/intraday_dca/20260727_1430ET_rerun_1455ET",
+    "summary": "A user-requested rerun of the 2:30 PM ET slot ran at about 2:55 PM ET, immediately after the intraday task 7be82b97 was patched to fix the 1:30 and 2:30 behavior. It used fresh Robinhood quotes and treated the same-day fills from the 9:35 AM, 11:30 AM, 12:30 PM recovery, and 2:32 PM recovery streams as ticker-scoped top-up context only. It placed zero new orders because no ticker had a positive same-day top-up delta at a price lower than its relevant prior same-day reference.",
+    "orders_submitted_count": 0,
+    "orders_filled": 0,
+    "total_filled_usd": 0,
+    "fills": [],
+    "skip_reason_counts": {
+      "same_day_topup_not_lower": 25,
+      "not_below_prior_close_or_zero_multiplier": 17,
+      "same_day_topup_no_delta": 2
+    },
+    "rules": [
+      "Recovery context only. NEVER valid scheduled evidence that the 2:30 PM ET intraday scheduled task ran successfully.",
+      "NEVER slippage scheduled proof, NEVER watchdog scheduled-run confirmation, NEVER afternoon scheduled proof.",
+      "It does NOT replace or supersede the 2:32 PM ET connector-native recovery pass. Both passes stand as separate records.",
+      "It placed zero orders, so it adds no same-day cost basis and cannot change any ticker's remaining top-up delta.",
+      "NOT loadable as same-day top-up context either: run_origin='manual_live_recovery_rerun' is rejected by is_top_up_context_state(), so no later stream, including the 3:30 PM final buy 10ce362c, can apply anything from this pass. It placed zero orders, so nothing is lost by that.",
+      "The 2:30 slot itself remains a failed scheduled startup path with no scheduled artifacts.",
+      "state_schema_version 'intraday-recovery-rerun-v1' is deliberately NOT added to accepted_state_schema_versions, so no downstream scheduled consumer can ingest this artifact as scheduled evidence.",
+      "This pass is NOT a failure_recovery_policy recovery_rerun and is recorded with recovery_rerun=false: it fetched fresh data into a separate artifact root with run_origin='manual_live_recovery_rerun', and the 2:30 scheduled run persisted no files to recompute from.",
+      "It is recorded in config/scheduled_tasks.json:recovery_context_run_outcomes, NOT in scheduled_run_outcomes."
+    ],
+    "see": "config/scheduled_tasks.json:intraday_dca_scheduled_recovery_2026_07_27.rerun_pass and intraday_task_patch_2026_07_27"
+  },
+  "intraday_scheduled_recovery_2026_07_27": {
+    "added": "2026-07-27",
+    "trading_day": "2026-07-27",
+    "scheduled_slot_et": "14:30",
+    "cron_id": "7be82b97",
+    "run_at_et": "14:32",
+    "run_origin": "scheduled_recovery",
+    "run_type": "intraday_dca_live_recovery",
+    "state_schema_version": "intraday-live-v2-recovery",
+    "manual_run": false,
+    "stream": "intraday_1430_recovery",
+    "run_id": "intraday_recovery_20260727_1432ET",
+    "parent_escalated_run": "intraday_live_20260727_1430ET",
+    "recovery_reason": "background_escalation_no_order_submission_implementation",
+    "connector_native": true,
+    "flags": {
+      "valid_scheduled_evidence": false,
+      "valid_recovery_context": false,
+      "valid_afternoon_scheduled_evidence": false,
+      "use_for_slippage_scheduled_proof": false,
+      "exclude_from_watchdog_scheduled_confirmation": true,
+      "same_day_top_up_context_only": false,
+      "topup_context_eligible": false,
+      "later_stream_topup_context": false
+    },
+    "residual_only": true,
+    "context_flags_note": "valid_recovery_context, same_day_top_up_context_only, topup_context_eligible, and later_stream_topup_context are all FALSE, and were true until codex review 'Mark the invalid EVR artifact as residual in this mirror'. This record is an INDEPENDENT MIRROR of the same artifact tracked by config/scheduled_tasks.json -> recovery_context_run_outcomes and by residual_reconciliation_gap in this file; correcting those two left this third copy still asserting the artifact is usable context, so a consumer following this mirror could apply the $1.00 EVR fill that every runtime loader refuses. The persisted classification omits same_day_top_up_context_only=true, so validate_recovery_classification() rejects it, is_top_up_context_state() returns false, and collect_recovery_context_order_ids() does not bucket its order. These flags describe what a CONSUMER may do, so they follow the loaders, not the intent.",
+    "intended_classification": "valid_recovery_context=true, same_day_top_up_context_only=true, topup_context_eligible=true, later_stream_topup_context=true. What this pass WAS, and what the flags should read once the PERSISTED artifact carries same_day_top_up_context_only=true. Repairing the artifact is then a flag flip here, in the scheduled_tasks.json ledger row, and a deletion of residual_reconciliation_gap -- all three clear together.",
+    "residual_only_note": "The EVR fill below is recorded for audit and cost-basis history and must NOT be applied as same-day top-up context while residual_only is true. Tracked as the one unexplained broker order in watchdog_reconciliation_scope_patch_2026_07_27.residual_reconciliation_gap.",
+    "artifact_root": "/home/user/workspace/cron_tracking/intraday_dca/20260727_1430ET_recovery_1432ET",
+    "missing_scheduled_artifact_root": "/home/user/workspace/cron_tracking/intraday_dca/20260727_1430ET",
+    "summary": "The 2:30 PM ET intraday scheduled run escalated before live order placement because it reported no existing run script and no internal implementation for order submission, so no scheduled artifact set exists for the 2:30 slot. A connector-native recovery pass ran at about 2:32 PM ET into its own artifact root: it gathered fresh Finance and Robinhood quotes, captured Robinhood bid and ask spread inputs, used the same-day 11:30 fills and the 12:30 recovery fills as ticker-scoped top-up context only, and placed exactly one qualifying EVR top-up for 1.00 USD after spread_ok and all safety checks passed.",
+    "total_filled_usd": 1.0,
+    "fills": [
+      {"ticker": "EVR", "amount_usd": 1.0, "order_id": "6a67a495-699e-4e4f-bef1-f6bbb5954571", "status": "filled", "average_price": 336.9169, "quantity": 0.002968}
+    ],
+    "rules": [
+      "Recovery context only. NEVER valid scheduled evidence that the 2:30 PM ET intraday scheduled task ran successfully.",
+      "NEVER slippage scheduled proof, NEVER watchdog scheduled-run confirmation, NEVER afternoon scheduled proof.",
+      "No completeness of its artifact set promotes it to scheduled evidence. valid_scheduled_evidence stays false.",
+      "NOT loadable as same-day top-up context as PERSISTED: the artifact omits same_day_top_up_context_only=true, so validate_recovery_classification() rejects it and the 3:30 PM final buy 10ce362c will not apply its $1.00 EVR fill. See residual_reconciliation_gap and intended_classification -- this rule reads as it does because the flags above are false, and a rule promising usable context is exactly what a consumer would have followed.",
+      "A prior buy in one ticker adjusts only that ticker's remaining top-up delta and MUST NEVER suppress another ticker's first-allocation path.",
+      "Excluded from scheduled slippage, scheduled fill counts, scheduled reliability, and scheduled cost-basis evidence.",
+      "The 2:30 slot itself remains a failed scheduled startup/execution path with no scheduled artifacts, not a completed scheduled run.",
+      "state_schema_version 'intraday-live-v2-recovery' is deliberately NOT added to accepted_state_schema_versions, so no downstream scheduled consumer can ingest this artifact as scheduled evidence.",
+      "This pass is NOT a failure_recovery_policy recovery_rerun and is recorded with recovery_rerun=false: that policy covers only a failure after data was fetched and repaired in place under intraday_dca/YYYYMMDD_1430ET/ with run_origin='scheduled', whereas this pass fetched fresh data into a separate root with run_origin='scheduled_recovery'.",
+      "Its fills live in config/scheduled_tasks.json:recovery_context_run_outcomes, NOT in scheduled_run_outcomes, so a consumer aggregating the scheduled-evidence ledger never picks them up."
+    ],
+    "pointer_note": "latest_intraday_1430_recovery_run.json was written. No scheduled same-day pointer was overwritten.",
+    "see": "config/scheduled_tasks.json:intraday_dca_scheduled_recovery_2026_07_27 and intraday_connector_native_recovery_policy"
+  },
+  "watchdog_reconciliation_scope_patch_2026_07_27": {
+    "added": "2026-07-27",
+    "applies_to_tasks": ["a46bf007", "67aa802b"],
+    "broker_account": "robinhood:<ROBINHOOD_ACCOUNT_NUMBER_OBFUSCATED>",
+    "trigger_incident": "The 3:40 PM ET watchdog FAILED the 2026-07-27 3:30 PM ET final run even though that run's artifact was internally consistent with zero orders. The cause was reconciliation SCOPE, not a trading defect and not an artifact defect.",
+    "artifact_was_consistent": {
+      "orders_submitted_count": 0,
+      "order_submit_status": "completed_no_orders",
+      "submitted_orders_csv": "canonical header present, zero data rows",
+      "valid_scheduled_evidence": true,
+      "valid_scheduled_evidence_derivation": "scripts.same_day_pointer.derive_valid_scheduled_evidence() returns True for this artifact. The flag is derived, not asserted.",
+      "conclusion": "All three internal signals agree on zero orders. There was nothing to reconcile."
+    },
+    "root_cause": "The watchdog compared the final run against raw/final1530_rh_orders.json, a BROAD same-day broker snapshot containing 40 earlier same-day orders, and read their presence as unreconciled final-run submissions. Every one of those 40 orders was created before the final-run window opened, and 39 of the 40 are claimed by an earlier stream artifact that a validator can actually resolve. The 40th is a KNOWN RESIDUAL -- see residual_reconciliation_gap.",
+    "residual_reconciliation_gap": {
+      "order_id": "6a67a495-699e-4e4f-bef1-f6bbb5954571",
+      "ticker": "EVR",
+      "amount_usd": 1.00,
+      "created_et": "14:33",
+      "human_attribution": "The 2:32 PM ET intraday 14:30 recovery pass (intraday_recovery_20260727_1432ET). Its origin is not in doubt.",
+      "machine_classified": false,
+      "reason": "The persisted recovery classification does not carry same_day_top_up_context_only=true, which scripts.run_classification.validate_recovery_classification() requires. is_top_up_context_state() therefore returns false for that artifact and collect_recovery_context_order_ids() will not place this order in the recovery-context bucket.",
+      "consequence": "The ALL-ORDERS reconciliation still has exactly one unexplained broker order. This is a reporting residual, not a capital or safety issue: the order is correctly excluded from final-run submissions by every other rule here, and the fill is correctly recorded as recovery context for top-up purposes.",
+      "why_not_asserted_instead": "Adding same_day_top_up_context_only=true to this record would claim something about an artifact this repository cannot inspect (it lives under /home/user/workspace/cron_tracking/). Recording the gap is the honest option; the alternative is to repair the persisted artifact on the box, after which this block should be deleted and the count returned to 40 (codex review: 'Do not mark the invalid EVR recovery as already claimed').",
+      "resolution": "Repair the persisted run_classification to satisfy the recovery contract, then re-verify with is_top_up_context_state(run_state, '2026-07-27')."
+    },
+    "snapshot_facts": {
+      "order_count": 40,
+      "time_range_utc": "2026-07-27T13:37:57Z to 2026-07-27T18:33:57Z",
+      "orders_at_or_after_1930z": 0,
+      "attribution": "6 orders at 09:37 ET to the morning 9:35 run, 27 at 11:36-11:37 ET to the intraday 11:30 run, 6 at 13:07 ET to the midday 12:30 SCHEDULED RECOVERY that ran at 1:05 PM ET, and 1 at 14:33 ET to the intraday 2:30 recovery (the EVR $1.00 top-up, order 6a67a495-699e-4e4f-bef1-f6bbb5954571).",
+      "attribution_note": "This is the HUMAN attribution and is accurate for all 40. It is not the same as machine classification: the EVR order's recovery artifact fails the recovery contract, so a validator cannot resolve it. See residual_reconciliation_gap.",
+      "machine_classifiable_count": 39
+    },
+    "attribution_correction": "The 6 orders created at 1:07 PM ET belong to the 12:30 midday SCHEDULED RECOVERY, not to the 1:30 slot. Their order IDs match that recovery's recorded fills (AMZN, DXYZ, GFUZ, GS, SPCX, FLKR). The 1:30 intraday run submitted ZERO orders on 2026-07-27; it was a safe no-order skip. See intraday_no_order_skip_2026_07_27_1330.",
+    "utc_window_rule": {
+      "requirement": "Final-run reconciliation MUST use the true final-run scheduled window. 3:30 PM ET is 19:30Z during EDT, so the lower bound is 19:30Z.",
+      "forbidden": "18:30Z MUST NOT be used as the final-run lower bound. 18:30Z is 2:30 PM ET, a different scheduled slot, and using it sweeps the entire afternoon intraday window into the final run.",
+      "dst_note": "3:30 PM ET is 19:30Z during EDT and 20:30Z during EST. Derive the instant from the ET slot; do NOT hardcode 19:30Z year-round.",
+      "consistency_with_existing_fallback": "broker_time_window_fallback scopes attribution to a CLOSED window whose start depends on the run identity: 15:25-15:35 ET (19:25Z-19:35Z during EDT) for a CANONICAL scheduled_YYYYMMDD_1530ET state, and 15:15-15:35 ET (19:15Z-19:35Z during EDT) ONLY for a LEGACY scheduled_YYYYMMDD_1520ET state -- see scripts.run_classification._attribution_window_start_min. This field previously reported 15:15-15:35 for all runs, which would let a consumer attribute an otherwise-unclaimed 15:15-15:24 order to a current 3:30 run that the code correctly refuses (codex review: 'Report the canonical broker fallback window accurately'). Both variants remain narrower than, and consistent with, the rule above; all of them exclude 18:30Z."
+    },
+    "final_run_evidence_definition": [
+      "an order_id present in the final run's own submitted_orders.csv",
+      "a ref_id present in the final run's own submitted_orders.csv",
+      "a ref_id carrying the final-run ref_id prefix, when the final run stamps one",
+      "an order created INSIDE the true final-run scheduled UTC window -- at or after 19:30Z AND at or before 19:35Z during EDT -- that is NOT already claimed by an earlier stream artifact"
+    ],
+    "time_fallback_window_bounds": {
+      "lower_et": "15:30",
+      "upper_et": "15:35",
+      "lower_utc_edt": "19:30Z",
+      "upper_utc_edt": "19:35Z",
+      "dst_note": "Both bounds are DERIVED from the ET slot and must be recomputed under EST (20:30Z-20:35Z). Do NOT hardcode the Z values year-round; the same rule already stated for the lower bound applies to the upper.",
+      "why_bounded": "The rule previously stated only a lower bound, so ANY later same-day order not already claimed qualified indefinitely -- a manual or unrelated order placed at 16:00 ET would be attributed to the 3:30 scheduled run and swept into scheduled watchdog and slippage results. An unbounded 'final-run evidence' test is not a window (codex review: 'Cap the final-run time fallback at the window end').",
+      "consistency_with_code": "scripts.run_classification._in_scheduled_window_et enforces a CLOSED window for the same fallback -- 15:25-15:35 for a canonical 1530ET run, 15:15-15:35 for a legacy 1520ET one. This rule's upper bound is that same 15:35 end; its lower bound is deliberately the slot time itself, which is the stricter of the two.",
+      "precedence": "Unchanged: this is still the LAST resort. Artifact-linked evidence (order_id, ref_id, final-run ref_id prefix) is checked first, and the earlier-stream-claim exclusion still applies before the window test runs."
+    },
+    "evidence_ordering": "Check artifact-linked evidence FIRST (order_id, then ref_id, then final-run ref_id prefix). The time-window test is the LAST resort and is valid only after the earlier-stream-claim exclusion has been applied.",
+    "snapshot_classification": {
+      "broker_context_all_same_day": "A broad same-day raw broker snapshot. Useful as context and required for the all-orders reconciliation, but never a substitute for final-run submissions.",
+      "final_run_submissions": "Only orders satisfying final_run_evidence_definition.",
+      "filename_is_not_scope": "A raw file named for the final run, such as raw/final1530_rh_orders.json, records only WHEN the snapshot was taken, not WHICH stream placed the orders in it. The filename MUST NOT be read as a scope claim."
+    },
+    "zero_order_pass_rule": {
+      "condition": "submitted_orders.csv empty (header-only) AND run_state order_submit_status='completed_no_orders'.",
+      "classification": "same_day_prior_context_present",
+      "outcome": "PASS. Earlier same-day orders present in raw broker context MUST NOT fail the watchdog.",
+      "escape_hatch": "Fail only if MATCHING final-run order evidence contradicts the artifact, meaning an order satisfying final_run_evidence_definition exists while the artifact claims zero orders. That remains a real discrepancy and must alert.",
+      "rationale": "A zero-order final run is a legitimate outcome. On any day with earlier activity the broad snapshot is never empty, so treating a non-empty snapshot as a contradiction would fail every zero-order final run on every active day."
+    },
+    "rules": [
+      "Compare ONLY final-run evidence when reconciling the final run against the broker.",
+      "Never treat a broad same-day raw broker snapshot as the final run's submission set; it is broker_context_all_same_day.",
+      "Never use 18:30Z as the final-run lower bound; the true EDT lower bound is 19:30Z, derived from the 15:30 ET slot.",
+      "Never apply the time-window test with a lower bound alone. The window is CLOSED at both ends (15:30-15:35 ET, 19:30Z-19:35Z during EDT); an order created after the window closed is not final-run evidence no matter what else is true of it.",
+      "Never record a broker order as reconciled on the strength of a HUMAN attribution alone. If no validator can resolve the owning artifact, it stays a residual discrepancy until the artifact is repaired.",
+      "Never count an order already claimed by an earlier stream artifact as final-run evidence.",
+      "A zero-order final run with earlier same-day context present is same_day_prior_context_present and PASSES.",
+      "The 2:33 PM ET EVR recovery order stays same-day top-up context ONLY: never final-run evidence, never afternoon scheduled evidence, never slippage scheduled proof, never scheduled cost-basis evidence.",
+      "This does NOT weaken watchdog_all_orders_fix_2026_07_21. The all-orders query with no placed_agent filter and the per-order classification are unchanged; this patch governs only which classified orders count as FINAL-RUN submissions."
+    ],
+    "relationship_to_all_orders_fix": "Complementary, not contradictory. watchdog_all_orders_fix_2026_07_21 widened what the watchdog must LOOK AT. This patch narrows what may be COUNTED as final-run submissions. Both are required.",
+    "see": "config/scheduled_tasks.json:final_run_reconciliation_scope_2026_07_27"
+  },
   "watchdog_all_orders_fix_2026_07_21": {
     "added": "2026-07-21",
     "applies_to_tasks": ["a46bf007"],
@@ -517,7 +854,7 @@
     "conditions": [
       "A valid scheduled run_state exists (run_origin='scheduled', passes schema validation).",
       "The scheduled run_state lacks order IDs due to a known/recorded write failure.",
-      "Only broker orders inside the scheduled window (15:15-15:35 ET) on the scheduled trading day may be attributed."
+      "Only broker orders inside the scheduled window on the scheduled trading day may be attributed. The window START depends on the run identity: 15:25-15:35 ET for a CANONICAL scheduled_YYYYMMDD_1530ET state, and 15:15-15:35 ET ONLY for a LEGACY scheduled_YYYYMMDD_1520ET state. This condition previously read 15:15-15:35 for every run, which permitted attributing an otherwise-unclaimed 15:15-15:24 order to a canonical 3:30 run that scripts.run_classification._attribution_window_start_min() correctly refuses -- the authoritative block has to state the rule the code enforces, not a superset of it (codex review: 'Correct the actual broker fallback contract')."
     ],
     "constraints": [
       "Manual order IDs (from manual_runs/**/run_state*.json) must still be excluded even under fallback.",

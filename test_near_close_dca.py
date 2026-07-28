@@ -2172,6 +2172,40 @@ def test_load_prior_same_day_includes_scheduled_morning_live_allocation(tmp_path
     assert allocations["AAPL"].source == "scheduled"
 
 
+def test_load_prior_same_day_survives_malformed_buy_candidates(tmp_path):
+    # Codex review: "Reject malformed candidate collections in recovery states".
+    # A scalar buy_candidates raised TypeError out of the whole scan, and a
+    # truthy non-list was silently read as "candidates handled" -- skipping the
+    # orders-CSV fallback, so the run's real fills went unseen and its ticker
+    # could be bought again at 3:30. Both now route into the CSV fallback.
+    for malformed in (1, 1.5, "candidates", {"AAPL": 3.0}, True):
+        root = os.path.join(tmp_path, f"cron_tracking_{type(malformed).__name__}_{malformed}", "morning_dca")
+        _write_prior_run(
+            root,
+            "20260629_0945ET",
+            {
+                "trading_day": "2026-06-29",
+                "generated_at": "2026-06-29T09:45:00-04:00",
+                "run_classification": {
+                    "run_origin": "scheduled",
+                    "run_type": "morning_dca_live",
+                    "stream": "morning",
+                    "run_id": "morning_live_20260629_0945ET",
+                },
+                "buy_candidates": malformed,
+                "artifacts": {"orders_csv_path": "orders.csv"},
+            },
+        )
+        with open(os.path.join(root, "20260629_0945ET", "orders.csv"), "w", encoding="utf-8") as handle:
+            handle.write("ticker,status,amount_usd,avg_fill_price\nAAPL,filled,3.00,98.25\n")
+
+        # No TypeError, and the sibling CSV's fill is still counted.
+        allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+        assert "AAPL" in allocations, malformed
+        assert allocations["AAPL"].reference_price == 98.25, malformed
+
+
 def test_load_prior_same_day_reads_morning_manual_allocation(tmp_path):
     # No orders.csv at all (legacy/older artifact layout). A submitted row still
     # contributes prior-allocation amount, but without a confirmed fill its logged
@@ -2502,6 +2536,943 @@ def test_load_prior_same_day_reads_documented_manual_filled_orders_shape(tmp_pat
     assert allocations["AMZN"].amount_usd == 4.25
     assert allocations["AMZN"].reference_price == 242.1099
     assert allocations["AMZN"].source == "manual"
+
+
+def _recovery_run_state(candidates, generated_at="2026-06-29T13:05:00-04:00"):
+    """A scheduled-recovery run_state, the Jul 27 2026 12:30 recovery shape."""
+    return {
+        "trading_day": "2026-06-29",
+        "generated_at": generated_at,
+        "run_classification": {
+            "run_origin": "scheduled_recovery",
+            "run_type": "midday_dca_live_recovery",
+            "stream": "midday_recovery",
+            "manual_run": False,
+            "trading_day": "2026-06-29",
+            "run_id": "midday_recovery_20260629_1305ET",
+            "state_schema_version": "midday-live-v2-recovery",
+            "valid_scheduled_evidence": False,
+            "valid_recovery_context": True,
+            "same_day_top_up_context_only": True,
+        },
+        "buy_candidates": candidates,
+    }
+
+
+def test_orders_csv_fills_reads_recovery_fill_column_shape(tmp_path):
+    # Codex review: "Teach the final-run loader the recovery fill shape". A
+    # recovery artifact persists the broker's own column names
+    # (average_fill_price / quantity) rather than the codebase-standard
+    # avg_fill_price / quantity_filled. _orders_csv_fills recognized only the
+    # latter, so every such row parsed to no price AND no quantity.
+    from near_close_dca import _orders_csv_fills
+
+    run_dir = tmp_path / "20260629_1230ET_recovery_1305ET"
+    run_dir.mkdir(parents=True)
+    (run_dir / "filled_orders.csv").write_text(
+        "ticker,amount_usd,state,average_fill_price,quantity\n"
+        "SPCX,3.50,filled,109.989900,0.031821\n"
+        "GFUZ,10.00,filled,6.249900,1.600025\n",
+        encoding="utf-8",
+    )
+
+    fills = _orders_csv_fills(run_dir)
+
+    assert fills["SPCX"]["avg_fill_price"] == 109.9899
+    assert fills["SPCX"]["quantity_filled"] == 0.031821
+    assert fills["SPCX"]["amount_usd"] == 3.50
+    assert fills["GFUZ"]["avg_fill_price"] == 6.2499
+    assert fills["GFUZ"]["quantity_filled"] == 1.600025
+
+
+def test_orders_csv_fills_honors_recovery_state_column(tmp_path):
+    # Codex review: "Honor the recovery row state before counting fills". The
+    # broker-native recovery shape records the outcome in `state`, not `status`.
+    # A statusless row in filled_orders.csv hit the is_manual_filled_orders
+    # heuristic and was counted as deployed capital regardless of state, so a
+    # rejected or canceled order reduced -- or entirely suppressed -- that
+    # ticker's later 3:30 allocation for capital that never moved.
+    from near_close_dca import _orders_csv_fills
+
+    run_dir = tmp_path / "20260629_1230ET_recovery_1305ET"
+    run_dir.mkdir(parents=True)
+    # Revised for "Preserve executed partial fills in recovery CSVs": the gate is
+    # on EXECUTED QUANTITY, not the state name. A non-'filled' row that executed
+    # nothing is dropped; one that executed real shares is kept, because
+    # discarding deployed capital lets the later run re-buy the full amount.
+    (run_dir / "filled_orders.csv").write_text(
+        "ticker,amount_usd,state,average_fill_price,quantity\n"
+        "SPCX,3.50,filled,109.989900,0.031821\n"
+        "EVR,1.00,rejected,250.000000,0\n"
+        "DXYZ,1.00,canceled,22.601700,\n"
+        "GS,1.00,,1041.181500,-\n",  # blank state, nothing executed
+        encoding="utf-8",
+    )
+
+    fills = _orders_csv_fills(run_dir)
+
+    assert "SPCX" in fills
+    for ticker in ("EVR", "DXYZ", "GS"):
+        assert ticker not in fills, ticker
+
+
+def test_orders_csv_fills_keeps_executed_partial_and_canceled_rows(tmp_path):
+    # Codex review (P1): "Preserve executed partial fills in recovery CSVs".
+    # An exact state=='filled' gate discarded a partially_filled row and a
+    # canceled-after-partial-execution row, both of which are real deployed
+    # capital -- scripts/broker_reconciliation.py already counts them as prior
+    # exposure precisely so a later FIRST_ALLOCATION cannot re-buy the full
+    # amount on top of shares already held.
+    from near_close_dca import _orders_csv_fills
+
+    run_dir = tmp_path / "20260727_1430ET_recovery_1432ET"
+    run_dir.mkdir(parents=True)
+    (run_dir / "filled_orders.csv").write_text(
+        "ticker,amount_usd,state,average_fill_price,quantity\n"
+        # amount_usd is the REQUESTED $4.00; only half the quantity executed.
+        "FLKR,4.00,partially_filled,50.000000,0.040000\n"
+        "AMZN,1.00,canceled,200.000000,0.002500\n",
+        encoding="utf-8",
+    )
+
+    fills = _orders_csv_fills(run_dir)
+
+    assert set(fills) == {"FLKR", "AMZN"}
+    # The executed cash is price * executed quantity, NOT the requested
+    # amount_usd -- using the request would overstate prior allocation and
+    # suppress a legitimate top-up.
+    assert abs(fills["FLKR"]["amount_usd"] - 2.00) < 1e-9
+    assert fills["FLKR"]["avg_fill_price"] == 50.0
+    assert fills["FLKR"]["quantity_filled"] == 0.04
+    assert abs(fills["AMZN"]["amount_usd"] - 0.50) < 1e-9
+
+
+def test_submitted_notionals_drop_terminal_non_fill_states(tmp_path):
+    # Codex review: "Apply the recovery state gate to submitted notionals". A
+    # recovery row can carry BOTH status='submitted' and a broker outcome in
+    # `state`. The fill reader drops a rejected row, but this reader still added
+    # its notional as unknown-price prior allocation, pushing that ticker onto
+    # the conservative $0 manual-review path for an order known not to have
+    # filled.
+    from near_close_dca import _orders_csv_submitted_notionals
+
+    csv_path = tmp_path / "submitted_orders.csv"
+    csv_path.write_text(
+        "ticker,status,state,notional_usd,quantity\n"
+        "SPCX,submitted,rejected,3.50,0\n"
+        "DXYZ,submitted,canceled,1.00,\n"
+        "GS,submitted,cancelled,1.00,-\n"
+        "FLKR,submitted,failed,4.00,0\n"
+        # Still live or already done -- both must keep counting.
+        "AMZN,submitted,pending,1.00,\n"
+        "GFUZ,submitted,queued,10.00,\n"
+        "EVR,submitted,filled,1.00,0.002968\n"
+        # Terminal BUT executed: real deployed capital, must keep counting
+        # (Codex review: "Preserve executed partial fills in recovery CSVs").
+        "TRIN,submitted,canceled,2.00,0.010000\n",
+        encoding="utf-8",
+    )
+
+    notionals = _orders_csv_submitted_notionals(csv_path)
+
+    # Revised for "Require explicit zero before dropping submitted notionals":
+    # only SPCX and FLKR state a definitive numeric zero. DXYZ (blank) and GS
+    # ('-') are terminal with an UNRESOLVED quantity -- the artifact does not
+    # establish whether they partially executed, and dropping them removes
+    # their notional entirely, letting a later run re-buy the full amount.
+    assert set(notionals) == {"AMZN", "GFUZ", "EVR", "TRIN", "DXYZ", "GS"}
+    for dropped in ("SPCX", "FLKR"):
+        assert dropped not in notionals, dropped
+
+
+def test_submitted_notionals_keep_statusless_live_recovery_rows(tmp_path):
+    # Codex review: "Retain statusless nonterminal recovery rows". A
+    # broker-native recovery CSV may omit `status` entirely and report its
+    # outcome only in `state` -- a shape _orders_csv_fills already treats as
+    # authoritative. Requiring status=='submitted' dropped a still-LIVE row, so
+    # a candidate-less recovery contributed no prior allocation and a later run
+    # could submit the full amount while that order was outstanding.
+    from near_close_dca import _orders_csv_submitted_notionals
+
+    csv_path = tmp_path / "submitted_orders.csv"
+    csv_path.write_text(
+        "ticker,state,notional_usd,quantity\n"
+        "AMZN,pending,1.00,\n"
+        "GFUZ,queued,10.00,\n"
+        # Terminal with an explicit zero: no capital moved, still dropped.
+        "SPCX,rejected,3.50,0\n"
+        # _orders_csv_fills owns a filled row and reports a real price, so this
+        # unresolved-context reader must not also claim it.
+        "EVR,filled,1.00,0.002968\n",
+        encoding="utf-8",
+    )
+
+    notionals = _orders_csv_submitted_notionals(csv_path)
+
+    assert set(notionals) == {"AMZN", "GFUZ"}
+
+
+def test_submitted_notionals_keep_rows_without_a_state_column(tmp_path):
+    # The gate is scoped to terminal non-fill states, so an ordinary
+    # submitted_orders.csv with no `state` column is untouched. Dropping an
+    # unknown-outcome row would UNDERCOUNT prior allocation and risk re-buying.
+    from near_close_dca import _orders_csv_submitted_notionals
+
+    csv_path = tmp_path / "submitted_orders.csv"
+    csv_path.write_text(
+        "ticker,status,notional_usd\nAAPL,submitted,5.00\n", encoding="utf-8"
+    )
+
+    assert _orders_csv_submitted_notionals(csv_path) == {"AAPL": 5.00}
+
+
+def test_orders_csv_fills_accepts_broker_state_filled_over_submitted_status(tmp_path):
+    # Codex review: "Let the broker state confirm filled recovery rows".
+    # status='submitted' with state='filled' was dropped by the status gate, so
+    # only _orders_csv_submitted_notionals saw it -- as an unknown-price
+    # notional, forcing the ticker to the conservative $0 manual-review path
+    # despite a real fill price and quantity being right there in the row.
+    from near_close_dca import _orders_csv_fills
+
+    run_dir = tmp_path / "20260727_1430ET_recovery_1432ET"
+    run_dir.mkdir(parents=True)
+    (run_dir / "filled_orders.csv").write_text(
+        "ticker,status,state,amount_usd,average_fill_price,quantity\n"
+        "EVR,submitted,filled,1.00,336.916900,0.002968\n",
+        encoding="utf-8",
+    )
+
+    fills = _orders_csv_fills(run_dir)
+
+    assert fills["EVR"]["avg_fill_price"] == 336.9169
+    assert fills["EVR"]["quantity_filled"] == 0.002968
+    # A full fill keeps its recorded amount -- the partial recompute must not
+    # fire for a row the broker confirmed as filled.
+    assert fills["EVR"]["amount_usd"] == 1.00
+
+
+def test_orders_csv_fills_accepts_submitted_partial_executions(tmp_path):
+    # Codex review: "Let submitted partial executions reach the fill reader".
+    # The previous round taught the status gate about state='filled' but not
+    # about a row still carrying status='submitted' while the broker reports
+    # partially_filled (or canceled after executing). Such a row was dropped
+    # here while _orders_csv_submitted_notionals kept the FULL requested
+    # notional, so a $10 request with $2 executed counted as $10 deployed and
+    # suppressed the remaining $8 top-up.
+    from near_close_dca import _orders_csv_fills
+
+    run_dir = tmp_path / "20260727_1430ET_recovery_1432ET"
+    run_dir.mkdir(parents=True)
+    (run_dir / "filled_orders.csv").write_text(
+        "ticker,status,state,amount_usd,average_fill_price,quantity\n"
+        "GFUZ,submitted,partially_filled,10.00,10.000000,0.200000\n"
+        "AMZN,submitted,canceled,1.00,200.000000,0.002500\n"
+        # Nothing executed: still dropped.
+        "EVR,submitted,rejected,1.00,250.000000,0\n",
+        encoding="utf-8",
+    )
+
+    fills = _orders_csv_fills(run_dir)
+
+    assert set(fills) == {"GFUZ", "AMZN"}
+    # Executed price * quantity wins over the requested amount.
+    assert abs(fills["GFUZ"]["amount_usd"] - 2.00) < 1e-9
+    assert abs(fills["AMZN"]["amount_usd"] - 0.50) < 1e-9
+
+
+def test_orders_csv_fills_without_state_column_is_unchanged(tmp_path):
+    # The state gate applies only when the column is PRESENT. A manual-override
+    # filled_orders.csv carrying neither status nor state must keep parsing as
+    # confirmed, exactly as before.
+    from near_close_dca import _orders_csv_fills
+
+    run_dir = tmp_path / "20260629_1530ET"
+    run_dir.mkdir(parents=True)
+    (run_dir / "filled_orders.csv").write_text(
+        "ticker,amount_usd,avg_fill_price,quantity_filled\nAAPL,5.00,100.0,0.05\n",
+        encoding="utf-8",
+    )
+
+    assert _orders_csv_fills(run_dir)["AAPL"]["amount_usd"] == 5.00
+
+
+def test_orders_csv_fills_prefers_canonical_column_over_recovery_alias(tmp_path):
+    # An artifact carrying BOTH spellings must resolve on the codebase-standard
+    # column, so adding the aliases cannot change how existing artifacts parse.
+    from near_close_dca import _orders_csv_fills
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(parents=True)
+    (run_dir / "filled_orders.csv").write_text(
+        "ticker,amount_usd,status,avg_fill_price,average_fill_price,quantity_filled,quantity\n"
+        "SPCX,3.50,filled,100.0,999.0,0.5,42.0\n",
+        encoding="utf-8",
+    )
+
+    fills = _orders_csv_fills(run_dir)
+
+    assert fills["SPCX"]["avg_fill_price"] == 100.0
+    assert fills["SPCX"]["quantity_filled"] == 0.5
+
+
+def test_orders_csv_fills_falls_back_when_canonical_column_is_blank(tmp_path):
+    # Both spellings present but the canonical one empty: the alias must still
+    # resolve rather than the blank being read as "no value".
+    from near_close_dca import _orders_csv_fills
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(parents=True)
+    (run_dir / "filled_orders.csv").write_text(
+        "ticker,amount_usd,status,avg_fill_price,average_fill_price,quantity_filled,quantity\n"
+        "SPCX,3.50,filled,,109.9899,,0.031821\n",
+        encoding="utf-8",
+    )
+
+    fills = _orders_csv_fills(run_dir)
+
+    assert fills["SPCX"]["avg_fill_price"] == 109.9899
+    assert fills["SPCX"]["quantity_filled"] == 0.031821
+
+
+def test_load_prior_same_day_reads_midday_recovery_artifact(tmp_path):
+    # End-to-end for the Jul 27 2026 12:30 recovery pass: the artifact sits in a
+    # dated sibling of the scheduled slot dir, carries the recovery
+    # classification, and records fills in the recovery column shape. All three
+    # had to work for the 3:30 final buy to see the $20.50 already spent --
+    # otherwise those tickers look untouched and get re-allocated in full.
+    root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    run_dir = os.path.join(root, "20260629_1230ET_recovery_1305ET")
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(
+            _recovery_run_state([
+                {"ticker": "SPCX", "status": "filled", "planned_amount_usd": 3.5},
+            ]),
+            handle,
+        )
+    with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+        handle.write(
+            "ticker,amount_usd,state,average_fill_price,quantity\n"
+            "SPCX,3.50,filled,109.989900,0.031821\n"
+        )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["SPCX"].amount_usd == 3.50
+    assert allocations["SPCX"].reference_price == 109.9899
+
+
+def test_load_prior_same_day_follows_recorded_csv_for_candidate_backed_recovery(tmp_path):
+    # Codex review: "Follow the recorded CSV for candidate-backed recoveries".
+    # A recovery can write artifacts/run_state.json beside a ROOT-level CSV
+    # under a CUSTOM name and record it as ../executions.csv, while ALSO
+    # carrying non-empty buy_candidates. Three separate paths then miss it:
+    # the fills lookup beside the state finds nothing, the recorded-path branch
+    # is gated on candidates being EMPTY, and the fallback loader reports the
+    # run covered because the candidates are there. The fixed-name root retry
+    # does not save it either -- _orders_csv_fills() knows only
+    # filled_orders.csv and orders.csv, not executions.csv.
+    #
+    # The candidate's PLANNED $3.50 would then stand in for an authoritative
+    # PARTIAL $1.20 fill, overstating deployed capital and suppressing the
+    # remaining 3:30 top-up.
+    root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    run_dir = os.path.join(root, "20260629_1230ET_recovery_1305ET")
+    state_dir = os.path.join(run_dir, "artifacts")
+    os.makedirs(state_dir, exist_ok=True)
+    state = _recovery_run_state([
+        {"ticker": "SPCX", "status": "submitted", "planned_amount_usd": 3.5},
+    ])
+    state["artifacts"] = {"orders_csv_path": "../executions.csv"}
+    with open(os.path.join(state_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(state, handle)
+    with open(os.path.join(run_dir, "executions.csv"), "w", encoding="utf-8") as handle:
+        handle.write(
+            "ticker,amount_usd,state,average_fill_price,quantity\n"
+            "SPCX,1.20,partially_filled,109.989900,0.010910\n"
+        )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert abs(allocations["SPCX"].amount_usd - 1.20) < 1e-9
+    # Revised for "Keep partial executions from confirming a reference price":
+    # the executed $1.20 counts as deployed capital, but a partial's price does
+    # NOT settle the reference -- the unexecuted remainder may still reprice or
+    # be cancelled, so a later top-up must not be authorized against it. The
+    # earlier version of this test asserted 109.9899 here, encoding that bug.
+    assert allocations["SPCX"].reference_price is None
+
+
+def test_load_prior_same_day_survives_malformed_recorded_csv_path(tmp_path):
+    # Codex review: "Validate recorded CSV path types before constructing Path".
+    # The recovery classification schema does not constrain the nested artifacts
+    # block, so orders_csv_path can hold any JSON shape. Path([]) raises
+    # TypeError, and that escaped load_prior_same_day_allocations() and aborted
+    # the WHOLE same-day scan -- taking the afternoon run with it -- instead of
+    # treating one artifact as unreadable. A GOOD sibling artifact must still
+    # load, which is what proves the scan was not aborted.
+    root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    bad_dir = os.path.join(root, "20260629_1230ET_recovery_1305ET")
+    os.makedirs(bad_dir, exist_ok=True)
+    bad_state = _recovery_run_state([
+        {"ticker": "SPCX", "status": "filled", "planned_amount_usd": 3.5},
+    ])
+    bad_state["artifacts"] = {"orders_csv_path": []}
+    with open(os.path.join(bad_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(bad_state, handle)
+
+    good_dir = os.path.join(root, "manual_reruns", "1505")
+    os.makedirs(good_dir, exist_ok=True)
+    with open(os.path.join(good_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(
+            _manual_run_state([
+                {"ticker": "AMZN", "status": "filled", "planned_amount_usd": 3.0},
+            ]),
+            handle,
+        )
+    with open(os.path.join(good_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+        handle.write("ticker,amount_usd,avg_fill_price\nAMZN,2.5,242.1099\n")
+
+    skipped = []
+    allocations = load_prior_same_day_allocations(
+        root, date(2026, 6, 29), skip_sink=skipped
+    )
+
+    # The scan completed rather than raising, and the good artifact loaded.
+    assert allocations["AMZN"].amount_usd == 2.5
+    # The malformed artifact is surfaced as unreadable, not silently ignored.
+    assert any("20260629_1230ET_recovery_1305ET" in str(p) for p in skipped)
+
+
+def test_load_prior_same_day_honors_terminal_rejection_for_candidate_recovery(tmp_path):
+    # Codex review: "Honor terminal rejections for candidate-backed recoveries".
+    # The recovery's recorded CSV says the order ended REJECTED having executed
+    # nothing. _orders_csv_fills correctly returns no fill, but the candidate
+    # loop then kept the full planned amount with an unknown reference price --
+    # routing a ticker whose order is KNOWN not to have filled into the $0
+    # manual-review guard and suppressing a legitimate later top-up. No capital
+    # moved, so the ticker must carry no prior allocation at all.
+    root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    run_dir = os.path.join(root, "20260629_1230ET_recovery_1305ET")
+    os.makedirs(run_dir, exist_ok=True)
+    state = _recovery_run_state([
+        {
+            "ticker": "EVR",
+            "status": "submitted",
+            "order_id": "ORD-REJECTED",
+            "planned_amount_usd": 5.0,
+        },
+        {
+            "ticker": "SPCX",
+            "status": "submitted",
+            "order_id": "ORD-FILLED",
+            "planned_amount_usd": 3.5,
+        },
+    ])
+    state["artifacts"] = {"orders_csv_path": "filled_orders.csv"}
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(state, handle)
+    with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+        handle.write(
+            "ticker,order_id,amount_usd,state,average_fill_price,quantity\n"
+            "EVR,ORD-REJECTED,5.00,rejected,,0\n"
+            "SPCX,ORD-FILLED,3.50,filled,109.989900,0.031821\n"
+        )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    # Rejected with zero execution: no capital moved, so no prior allocation.
+    assert "EVR" not in allocations
+    # The genuine fill in the same CSV is unaffected.
+    assert allocations["SPCX"].amount_usd == 3.50
+    assert allocations["SPCX"].reference_price == 109.9899
+
+
+def test_terminal_non_fill_states_match_the_canonical_broker_set():
+    # Codex review: "Treat voided and expired broker orders as terminal". The
+    # set was hand-copied into two modules and BOTH copies omitted 'voided' and
+    # 'expired', so an order that could no longer fill was carried as live
+    # unknown context and forced its ticker onto the $0 manual-review path.
+    # Both readers now source the canonical set, so a future addition to the
+    # broker normalizer reaches them without a third edit.
+    import sys
+
+    from near_close_dca import _TERMINAL_NON_FILL_STATES
+    from scripts.broker_reconciliation import _TERMINAL_ORDER_STATES
+
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts"))
+    from run_classification import _TERMINAL_NON_FILL_STATES as rc_terminal
+
+    assert _TERMINAL_NON_FILL_STATES == frozenset(_TERMINAL_ORDER_STATES)
+    assert rc_terminal == frozenset(_TERMINAL_ORDER_STATES)
+    for state in ("voided", "expired"):
+        assert state in _TERMINAL_NON_FILL_STATES
+        assert state in rc_terminal
+
+
+def test_terminal_collector_refuses_truncated_rows(tmp_path):
+    # Codex review: "Reject truncated terminal rows before excluding
+    # candidates". csv.DictReader fills omitted TRAILING cells with None rather
+    # than raising, so a canceled row read mid-write -- before its positive
+    # cumulative_quantity was flushed -- looked like a zero-execution terminal
+    # outcome. Acting on that would delete a candidate whose order really did
+    # partially fill, letting the later run re-buy its full amount.
+    from near_close_dca import _orders_csv_terminal_non_fills
+
+    csv_path = tmp_path / "filled_orders.csv"
+    csv_path.write_text(
+        "ticker,order_id,amount_usd,state,average_fill_price,cumulative_quantity\n"
+        "EVR,ORD-COMPLETE,5.00,rejected,,0\n"
+        # Mid-write: the trailing columns were never flushed.
+        "SPCX,ORD-TRUNCATED,3.50,canceled\n",
+        encoding="utf-8",
+    )
+
+    order_ids, tickers = _orders_csv_terminal_non_fills(csv_path)
+
+    # The complete rejection is authoritative; the truncated row is refused.
+    assert order_ids == {"ORD-COMPLETE"}
+    assert "ORD-TRUNCATED" not in order_ids
+    assert tickers == set()
+
+
+def test_load_prior_same_day_merges_recorded_fills_with_sibling_fills(tmp_path):
+    # Codex review: "Merge recorded recovery fills even when sibling fills
+    # exist". Gating the recorded CSV on `fills` being EMPTY meant a single fill
+    # beside run_state.json made the whole recorded CSV invisible, so any other
+    # ticker it confirmed fell back to its candidate's full planned amount --
+    # here a $3.00 executed partial of a $10.00 candidate counting as $10.00.
+    root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    run_dir = os.path.join(root, "20260629_1230ET_recovery_1305ET")
+    state_dir = os.path.join(run_dir, "artifacts")
+    os.makedirs(state_dir, exist_ok=True)
+    state = _recovery_run_state([
+        {"ticker": "AMZN", "status": "filled", "planned_amount_usd": 1.0},
+        {"ticker": "GFUZ", "status": "submitted", "planned_amount_usd": 10.0},
+    ])
+    state["artifacts"] = {"orders_csv_path": "../executions.csv"}
+    with open(os.path.join(state_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(state, handle)
+    # A fill sits BESIDE run_state.json, so `fills` is already truthy.
+    with open(os.path.join(state_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+        handle.write(
+            "ticker,amount_usd,state,average_fill_price,quantity\n"
+            "AMZN,1.00,filled,231.429900,0.004320\n"
+        )
+    # The recorded in-root CSV confirms a DIFFERENT ticker.
+    with open(os.path.join(run_dir, "executions.csv"), "w", encoding="utf-8") as handle:
+        handle.write(
+            "ticker,amount_usd,state,average_fill_price,quantity\n"
+            "GFUZ,10.00,partially_filled,6.249900,0.480000\n"
+        )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    # The sibling fill is unchanged -- merging must never overwrite it.
+    assert abs(allocations["AMZN"].amount_usd - 1.00) < 1e-9
+    assert allocations["AMZN"].reference_price == 231.4299
+    # And the recorded CSV's ticker is sized by EXECUTED capital, not the $10
+    # planned amount its candidate carries.
+    assert abs(allocations["GFUZ"].amount_usd - 3.00) < 1e-9
+    # Partial: notional counts, reference price stays unresolved.
+    assert allocations["GFUZ"].reference_price is None
+
+
+def test_terminal_collector_requires_an_explicit_zero(tmp_path):
+    # Codex review: "Require an explicit zero before excluding terminal
+    # candidates". A COMPLETE row with a malformed executed-quantity value says
+    # "unknown", not "nothing filled". Reading it as a definitive zero removes a
+    # candidate whose order may really have partially executed, and the later
+    # run then buys its full amount again.
+    from near_close_dca import _orders_csv_terminal_non_fills
+
+    csv_path = tmp_path / "filled_orders.csv"
+    csv_path.write_text(
+        "ticker,order_id,amount_usd,state,average_fill_price,cumulative_quantity\n"
+        "EVR,ORD-ZERO,5.00,canceled,,0\n"
+        "SPCX,ORD-GARBAGE,3.50,canceled,,oops\n"
+        "GS,ORD-BLANK,1.00,canceled,,\n",
+        encoding="utf-8",
+    )
+
+    order_ids, _tickers = _orders_csv_terminal_non_fills(csv_path)
+
+    # Only the explicit numeric zero is definitive evidence of no execution.
+    assert order_ids == {"ORD-ZERO"}
+
+
+def test_load_prior_same_day_prefers_a_final_fill_over_a_stale_partial(tmp_path):
+    # Codex review: "Reconcile overlapping ticker fills instead of keeping the
+    # first". A stale partially_filled snapshot beside run_state.json and the
+    # recorded CSV's final filled state describe the SAME order. setdefault kept
+    # the partial, preserving its smaller notional and unresolved reference
+    # price -- an unnecessary manual-review stop for an order that completed.
+    root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    run_dir = os.path.join(root, "20260629_1230ET_recovery_1305ET")
+    state_dir = os.path.join(run_dir, "artifacts")
+    os.makedirs(state_dir, exist_ok=True)
+    state = _recovery_run_state([
+        {
+            "ticker": "GFUZ",
+            "status": "submitted",
+            "order_id": "ORD-GFUZ",
+            "planned_amount_usd": 10.0,
+        },
+    ])
+    state["artifacts"] = {"orders_csv_path": "../executions.csv"}
+    with open(os.path.join(state_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(state, handle)
+    # Stale snapshot beside the state: only part of the order had executed.
+    with open(os.path.join(state_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+        handle.write(
+            "ticker,order_id,amount_usd,state,average_fill_price,quantity\n"
+            "GFUZ,ORD-GFUZ,10.00,partially_filled,6.249900,0.480000\n"
+        )
+    # The recorded CSV holds the same order's FINAL state.
+    with open(os.path.join(run_dir, "executions.csv"), "w", encoding="utf-8") as handle:
+        handle.write(
+            "ticker,order_id,amount_usd,state,average_fill_price,quantity\n"
+            "GFUZ,ORD-GFUZ,10.00,filled,6.249900,1.600025\n"
+        )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    # The completed fill wins: full notional, and a settled reference price.
+    assert abs(allocations["GFUZ"].amount_usd - 10.00) < 1e-9
+    assert allocations["GFUZ"].reference_price == 6.2499
+    # And never summed -- the same order appearing twice is one allocation.
+    assert allocations["GFUZ"].amount_usd < 20.0
+
+
+def test_prior_run_is_scheduled_rejects_a_rerun_named_like_an_intraday_stream():
+    # Codex review: "Validate ordinary intraday origins before loading context".
+    # 'intraday_1430_rerun' starts with 'intraday' but ends in '_rerun', so it
+    # missed the '_recovery' branch and was admitted here with NO validation --
+    # even though run_origin='manual_live_recovery_rerun' is exactly the shape
+    # every manifest in this PR records as rejected by is_top_up_context_state().
+    from near_close_dca import _prior_run_is_scheduled
+
+    rerun = {
+        "trading_day": "2026-06-29",
+        "run_classification": {
+            "stream": "intraday_1430_rerun",
+            "run_origin": "manual_live_recovery_rerun",
+            "manual_run": False,
+            "trading_day": "2026-06-29",
+        },
+    }
+    # True == "treated as a scheduled run", i.e. NOT loaded as prior context.
+    assert _prior_run_is_scheduled(rerun) is True
+
+    # An ordinary scheduled intraday run is still eligible prior context.
+    for stream in ("intraday", "intraday_1130", "intraday_1430"):
+        ordinary = {
+            "trading_day": "2026-06-29",
+            "run_classification": {
+                "stream": stream,
+                "run_origin": "scheduled",
+                "manual_run": False,
+                "trading_day": "2026-06-29",
+            },
+        }
+        assert _prior_run_is_scheduled(ordinary) is False, stream
+
+    # A manual_run flag wins over the stream name, as everywhere else.
+    manual = {
+        "trading_day": "2026-06-29",
+        "run_classification": {
+            "stream": "intraday_1130",
+            "run_origin": "scheduled",
+            "manual_run": True,
+            "trading_day": "2026-06-29",
+        },
+    }
+    assert _prior_run_is_scheduled(manual) is True
+
+
+def test_submitted_notionals_read_the_recovery_amount_column(tmp_path):
+    # Codex review: "Read amount_usd for unresolved recovery submissions". The
+    # broker-native recovery shape records amount_usd, which _orders_csv_fills
+    # already accepts. Reading only notional_usd meant a statusless live row
+    # passed the gate and then contributed NOTHING, so a later run could submit
+    # the full allocation while that order was still outstanding.
+    from near_close_dca import _orders_csv_submitted_notionals
+
+    csv_path = tmp_path / "submitted_orders.csv"
+    csv_path.write_text(
+        "ticker,state,amount_usd\n"
+        "AMZN,pending,1.00\n"
+        "GFUZ,queued,10.00\n",
+        encoding="utf-8",
+    )
+    notionals = _orders_csv_submitted_notionals(csv_path)
+    assert abs(notionals["AMZN"] - 1.00) < 1e-9
+    assert abs(notionals["GFUZ"] - 10.00) < 1e-9
+
+    # Canonical column wins when an artifact carries both.
+    both = tmp_path / "orders.csv"
+    both.write_text(
+        "ticker,status,notional_usd,amount_usd\nEVR,submitted,3.00,99.00\n",
+        encoding="utf-8",
+    )
+    assert abs(_orders_csv_submitted_notionals(both)["EVR"] - 3.00) < 1e-9
+
+
+def test_load_prior_same_day_sums_two_distinct_orders_for_one_ticker(tmp_path):
+    # Codex review: "Merge recovery fills by order ID before aggregating
+    # tickers". Two DISTINCT orders for one ticker across sibling and recorded
+    # CSVs are two real capital movements. Keying the merge only by ticker kept
+    # the first and discarded the second, understating deployed capital and
+    # letting the candidate loop apply one order's fill to every candidate for
+    # that ticker -- permitting an excessive top-up.
+    root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    run_dir = os.path.join(root, "20260629_1230ET_recovery_1305ET")
+    state_dir = os.path.join(run_dir, "artifacts")
+    os.makedirs(state_dir, exist_ok=True)
+    state = _recovery_run_state([
+        {"ticker": "GFUZ", "status": "filled", "order_id": "ORD-A", "planned_amount_usd": 4.0},
+    ])
+    state["artifacts"] = {"orders_csv_path": "../executions.csv"}
+    with open(os.path.join(state_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(state, handle)
+    with open(os.path.join(state_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+        handle.write(
+            "ticker,order_id,amount_usd,state,average_fill_price,quantity\n"
+            "GFUZ,ORD-A,4.00,filled,4.000000,1.000000\n"
+        )
+    with open(os.path.join(run_dir, "executions.csv"), "w", encoding="utf-8") as handle:
+        handle.write(
+            "ticker,order_id,amount_usd,state,average_fill_price,quantity\n"
+            "GFUZ,ORD-B,6.00,filled,2.000000,3.000000\n"
+        )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    # Both orders count: $4.00 + $6.00.
+    assert abs(allocations["GFUZ"].amount_usd - 10.00) < 1e-9
+    # Quantity-weighted average of 4.00 x 1 and 2.00 x 3 = 10/4 = 2.50.
+    assert abs(allocations["GFUZ"].reference_price - 2.50) < 1e-9
+
+
+def test_load_prior_same_day_does_not_sum_the_same_order_twice(tmp_path):
+    # The other half of the same rule: one order appearing in two sibling CSVs
+    # is ONE order. Summing there would double-count real capital, which is the
+    # direction that spends money twice.
+    root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    run_dir = os.path.join(root, "20260629_1230ET_recovery_1305ET")
+    state_dir = os.path.join(run_dir, "artifacts")
+    os.makedirs(state_dir, exist_ok=True)
+    state = _recovery_run_state([
+        {"ticker": "GFUZ", "status": "filled", "order_id": "ORD-A", "planned_amount_usd": 4.0},
+    ])
+    state["artifacts"] = {"orders_csv_path": "../executions.csv"}
+    with open(os.path.join(state_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(state, handle)
+    with open(os.path.join(state_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+        handle.write(
+            "ticker,order_id,amount_usd,state,average_fill_price,quantity\n"
+            "GFUZ,ORD-A,4.00,partially_filled,4.000000,1.000000\n"
+        )
+    with open(os.path.join(run_dir, "executions.csv"), "w", encoding="utf-8") as handle:
+        handle.write(
+            "ticker,order_id,amount_usd,state,average_fill_price,quantity\n"
+            "GFUZ,ORD-A,4.00,filled,4.000000,1.000000\n"
+        )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert abs(allocations["GFUZ"].amount_usd - 4.00) < 1e-9
+    # The completed snapshot won the tie, so the price is settled.
+    assert allocations["GFUZ"].reference_price == 4.0
+
+
+def _recovery_classification(stream="midday_recovery", **overrides):
+    # stream/run_type/state_schema_version must correspond, so derive the two
+    # dependent values from the stream rather than only swapping the name.
+    base = stream[: -len("_recovery")]
+    rc = dict(_recovery_run_state([])["run_classification"])
+    rc["stream"] = stream
+    rc["run_type"] = f"{base}_dca_live_recovery"
+    rc["state_schema_version"] = f"{base.replace('_', '-')}-live-v2-recovery"
+    rc.update(overrides)
+    return rc
+
+
+def test_prior_run_is_scheduled_treats_recovery_streams_as_prior_context():
+    # A recovery stream for an earlier slot is eligible prior context, but only
+    # when it satisfies the full scheduled-recovery contract.
+    from near_close_dca import _prior_run_is_scheduled
+
+    for stream in ("midday_recovery", "morning_recovery", "market_open_recovery"):
+        # The top-level trading_day is REQUIRED on a recovery state (Codex
+        # review: "Require a top-level trading day on recovery states"),
+        # matching the day filter load_prior_same_day_allocations applies.
+        state = {
+            "trading_day": "2026-06-29",
+            "run_classification": _recovery_classification(stream),
+        }
+        assert _prior_run_is_scheduled(state) is False, stream
+        # Without it the artifact is ignored (True = treated as scheduled), the
+        # safe direction and the one the allocation loader already takes.
+        assert _prior_run_is_scheduled(
+            {"run_classification": _recovery_classification(stream)}
+        ) is True, stream
+
+    afternoon = {"run_classification": {"stream": "afternoon", "run_origin": "scheduled"}}
+    assert _prior_run_is_scheduled(afternoon) is True
+
+
+def test_prior_run_is_scheduled_gates_recovery_streams_on_the_contract():
+    # Codex review: "Gate recovery streams before loading their fills". A
+    # corrupted or misclassified artifact that merely NAMES a recovery stream
+    # must not be read as prior context -- it could otherwise wrongly reduce or
+    # block the 3:30 allocation. True here means "treated as scheduled", i.e.
+    # ignored, which is the safe direction.
+    from near_close_dca import _prior_run_is_scheduled
+
+    # The bare shape: a recovery stream name and nothing else.
+    assert _prior_run_is_scheduled(
+        {"run_classification": {"stream": "midday_recovery", "run_origin": "scheduled"}}
+    ) is True
+
+    for override in (
+        {"valid_recovery_context": None},
+        {"valid_scheduled_evidence": True},
+        {"same_day_top_up_context_only": False},
+        {"manual_run": True},
+        {"run_origin": "scheduled"},
+        {"recovery_rerun": True},
+    ):
+        state = {"run_classification": _recovery_classification(**override)}
+        assert _prior_run_is_scheduled(state) is True, override
+
+
+def test_prior_run_is_scheduled_excludes_afternoon_recovery():
+    # An afternoon recovery is the afternoon run's own repair, never prior
+    # context for it -- even when perfectly well-formed.
+    from near_close_dca import _prior_run_is_scheduled
+
+    state = {"run_classification": _recovery_classification("afternoon_recovery")}
+
+    assert _prior_run_is_scheduled(state) is True
+
+
+
+def test_recovery_orders_csv_path_outside_run_dir_is_ignored(tmp_path):
+    # Codex review: "Constrain recovery fill paths to their run root". Recovery
+    # artifacts became eligible prior context, and a copied one can carry a
+    # stale ABSOLUTE orders_csv_path naming the run it was copied from.
+    # Following it verbatim loads an unrelated CSV's fills as this pass's
+    # recovery fills, which can reduce or block the later 3:30 buy.
+    root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    run_dir = os.path.join(root, "20260629_1230ET_recovery_1305ET")
+    os.makedirs(run_dir, exist_ok=True)
+
+    # An unrelated CSV OUTSIDE the recovery run directory.
+    outside_dir = os.path.join(tmp_path, "elsewhere", "other_run")
+    os.makedirs(outside_dir, exist_ok=True)
+    outside_csv = os.path.join(outside_dir, "filled_orders.csv")
+    with open(outside_csv, "w", encoding="utf-8") as handle:
+        handle.write(
+            "ticker,amount_usd,state,average_fill_price,quantity\n"
+            "AAPL,99.00,filled,100.0,0.99\n"
+        )
+
+    state = _recovery_run_state([])  # no buy_candidates -> the CSV branch
+    state["artifacts"] = {"orders_csv_path": outside_csv}
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(state, handle)
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    # The unrelated ticker must not appear as recovery context.
+    assert "AAPL" not in allocations
+
+
+def test_recovery_orders_csv_path_inside_run_dir_is_loaded(tmp_path):
+    # The containment check must not break the legitimate case: a recorded path
+    # that does resolve inside the recovery run directory is still followed.
+    root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    run_dir = os.path.join(root, "20260629_1230ET_recovery_1305ET")
+    os.makedirs(run_dir, exist_ok=True)
+    inside_csv = os.path.join(run_dir, "dca_recovery_20260629_orders.csv")
+    with open(inside_csv, "w", encoding="utf-8") as handle:
+        handle.write(
+            "ticker,amount_usd,state,average_fill_price,quantity\n"
+            "SPCX,3.50,filled,109.9899,0.031821\n"
+        )
+
+    state = _recovery_run_state([])
+    state["artifacts"] = {"orders_csv_path": inside_csv}
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(state, handle)
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["SPCX"].amount_usd == 3.50
+    assert allocations["SPCX"].reference_price == 109.9899
+
+
+def test_recovery_external_csv_path_falls_back_to_the_local_sibling(tmp_path):
+    # Codex review: "Fall back to the recovery run's local CSV". Rejecting the
+    # external path outright turned a wrong allocation into NO allocation --
+    # the same money outcome, since the ticker gets bought again. A copied
+    # recovery state with a stale absolute path AND a valid local
+    # filled_orders.csv must load the local one.
+    root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    run_dir = os.path.join(root, "20260629_1230ET_recovery_1305ET")
+    os.makedirs(run_dir, exist_ok=True)
+
+    outside_dir = os.path.join(tmp_path, "elsewhere", "other_run")
+    os.makedirs(outside_dir, exist_ok=True)
+    outside_csv = os.path.join(outside_dir, "filled_orders.csv")
+    with open(outside_csv, "w", encoding="utf-8") as handle:
+        handle.write(
+            "ticker,amount_usd,state,average_fill_price,quantity\n"
+            "AAPL,99.00,filled,100.0,0.99\n"
+        )
+    # The SAME basename, locally, with this run's real fills.
+    with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+        handle.write(
+            "ticker,amount_usd,state,average_fill_price,quantity\n"
+            "SPCX,3.50,filled,109.9899,0.031821\n"
+        )
+
+    state = _recovery_run_state([])
+    state["artifacts"] = {"orders_csv_path": outside_csv}
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(state, handle)
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    # The local sibling is loaded...
+    assert allocations["SPCX"].amount_usd == 3.50
+    assert allocations["SPCX"].reference_price == 109.9899
+    # ...and the unrelated external CSV still contributes nothing.
+    assert "AAPL" not in allocations
+
+
+def test_prior_run_is_scheduled_gates_on_recovery_origin_not_stream_name():
+    # Codex review (P1): "Gate every scheduled-recovery origin before loading
+    # fills". Keying the recovery branch off the stream NAME left every
+    # malformed-stream shape unvalidated -- and 'intraday_bogus' was even
+    # accepted as eligible by the startswith('intraday') arm. True here means
+    # "treated as scheduled", i.e. ignored, which is the safe direction.
+    from near_close_dca import _prior_run_is_scheduled
+
+    for stream in ("intraday_bogus", None, 123, "", "midday", [], {}):
+        state = {"run_classification": {"run_origin": "scheduled_recovery", "stream": stream}}
+        assert _prior_run_is_scheduled(state) is True, stream
+
+    # A conforming recovery artifact is still eligible prior context. It needs
+    # its top-level trading_day, which the contract now requires (Codex review:
+    # "Require a top-level trading day on recovery states").
+    assert _prior_run_is_scheduled(
+        {
+            "trading_day": "2026-06-29",
+            "run_classification": _recovery_classification("midday_recovery"),
+        }
+    ) is False
 
 
 def test_orders_csv_fills_rejects_non_finite_amount_and_price(tmp_path):

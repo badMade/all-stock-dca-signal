@@ -27,7 +27,7 @@
     "stream": {
       "type": "string",
       "description": "Logical stream the pointer belongs to.",
-      "enum": ["market_open", "watchlist", "morning", "intraday", "midday", "monitor", "afternoon", "slippage", "watchdog", "preflight", "scan", "dashboard", "manual"]
+      "enum": ["market_open", "watchlist", "morning", "intraday", "midday", "monitor", "afternoon", "slippage", "watchdog", "preflight", "scan", "dashboard", "manual", "market_open_recovery", "morning_recovery", "midday_recovery", "intraday_recovery", "intraday_1130_recovery", "intraday_1330_recovery", "intraday_1430_recovery"]
     },
     "trading_day": {
       "type": "string",
@@ -35,8 +35,8 @@
     },
     "pointer_status": {
       "type": "string",
-      "description": "Lifecycle status. Only 'valid' is trusted; the rest are ignored as scheduled evidence.",
-      "enum": ["valid", "pending", "stale", "prior_date", "future_date", "missing", "malformed", "outside_root", "wrong_stream"]
+      "description": "Lifecycle status. Only 'valid' is trusted as scheduled evidence; every other status, including 'valid_recovery_context', is ignored by a scheduled consumer. 'valid_recovery_context' marks a pointer whose target is a usable but explicitly NON-scheduled recovery artifact: it is resolvable (the target exists, is same-day, and is inside its expected root) yet must never be scheduled evidence, so it cannot use 'valid' -- see the allOf below, which pins 'valid' to valid_scheduled_evidence=true. Without this status a recovery pointer had no representable state at all: 'valid' was forbidden by the invariant and every other status means unusable, so schema-aware consumers could not discover the artifact (Codex review: \"Define a usable contract for the recovery pointer\").",
+      "enum": ["valid", "valid_recovery_context", "pending", "stale", "prior_date", "future_date", "missing", "malformed", "outside_root", "wrong_stream"]
     },
     "same_day_required": {
       "type": "boolean",
@@ -65,6 +65,41 @@
       },
       "then": {
         "properties": { "valid_scheduled_evidence": { "const": true } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "pointer_status": { "const": "valid_recovery_context" } },
+        "required": ["pointer_status"]
+      },
+      "then": {
+        "description": "The mirror invariant: a recovery-context pointer must positively disclaim scheduled evidence and name a recovery stream, so it can never be read as the scheduled pointer for the slot it recovered.",
+        "properties": {
+          "valid_scheduled_evidence": { "const": false },
+          "stream": {
+            "enum": ["market_open_recovery", "morning_recovery", "midday_recovery", "intraday_recovery", "intraday_1130_recovery", "intraday_1330_recovery", "intraday_1430_recovery"]
+          },
+          "run_id": {
+            "type": "string",
+            "pattern": "\\S",
+            "description": "A recovery pointer must NAME its target run. run_id is globally nullable for legacy scheduled pointers, but validate_recovery_pointer() requires the pointer and target run_ids to be the same non-blank string, so it is narrowed here: without this a pointer with run_id=null satisfied the schema while the preferred helper rejected it, and schema-aware discovery disagreed with the helper -- codex review discussion_r3660418840."
+          }
+        },
+        "required": ["stream", "run_id"]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "stream": {
+            "enum": ["market_open_recovery", "morning_recovery", "midday_recovery", "intraday_recovery", "intraday_1130_recovery", "intraday_1330_recovery", "intraday_1430_recovery"]
+          }
+        },
+        "required": ["stream"]
+      },
+      "then": {
+        "description": "A recovery-stream pointer is never scheduled evidence regardless of status, so it can never satisfy the pointer_status='valid' branch above.",
+        "properties": { "valid_scheduled_evidence": { "const": false } }
       }
     }
   ]
