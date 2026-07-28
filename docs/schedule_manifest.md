@@ -715,7 +715,6 @@ schedule sources.
 | 2026-07-27 4:30 PM ET | One-time DCA credit-usage proxy report with recovery runs | `onetime-1630-credit-usage-proxy-2026-07-27` | no | active | **yes**: `cron_utc` `30 20 27 7 *`, executor `scripts/generate_credit_usage_proxy_report.py` |
 
 ### Retired from the active schedule on 2026-07-27
-
 These entries are **not active** and must never appear in an active schedule
 table. They are kept as historical records only.
 

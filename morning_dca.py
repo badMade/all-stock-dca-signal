@@ -946,6 +946,27 @@ def load_same_day_preflight(
     target_stream = target_rc.get("stream") if isinstance(target_rc, dict) else None
     if target_stream is not None and target_stream != MORNING_STREAM:
         return None
+    # bb4f6ef1 now fires BOTH the preflight and watchlist sub-invocations at
+    # the same 9:45 ET slot, sharing task ID, scheduled_for_et, and
+    # stream='morning' -- exactly the fields checked above -- so those checks
+    # alone can no longer tell a preflight artifact from a watchlist one. A
+    # watchlist state copied or misrouted into the preflight directory would
+    # otherwise pass every check above and its rows (watchlist artifacts
+    # never populate per_ticker_eligibility) would yield an empty eligibility
+    # set, causing the 10:30 live gate to shut out the entire universe.
+    # run_type and state_schema_version are the two fields that DO
+    # distinguish the pair -- always stamped by run_classification() (see
+    # MORNING_PROFILES) -- so requiring both here cannot reject a
+    # legitimately-completed preflight run -- codex review
+    # discussion_r3659738862.
+    target_run_type = target_rc.get("run_type") if isinstance(target_rc, dict) else None
+    if target_run_type != MORNING_PREFLIGHT_RUN_TYPE:
+        return None
+    target_schema_version = state.get("state_schema_version")
+    if target_schema_version is None and isinstance(target_rc, dict):
+        target_schema_version = target_rc.get("state_schema_version")
+    if target_schema_version != MORNING_PREFLIGHT_SCHEMA_VERSION:
+        return None
     per_ticker = state.get("per_ticker_eligibility")
     if isinstance(per_ticker, list) and per_ticker:
         eligible = [
@@ -1825,7 +1846,8 @@ class MorningDCAExecutor(DCAExecutor):
             if current_price >= previous_close:
                 reason = "above/at prior close"
             elif drop_fraction < self.config.minimum_drop_vs_previous_close:
-                reason = "below prior close but under 0.1% minimum drop"
+                min_drop_pct = self.config.minimum_drop_vs_previous_close * 100.0
+                reason = f"below prior close but under {min_drop_pct:.2f}% minimum drop"
             else:
                 reason = f"morning weakness {drop_pct:.2f}% vs prior close but under first sizing tier -> 0x"
             multiplier = 0.0
