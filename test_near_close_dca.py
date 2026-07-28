@@ -8,8 +8,11 @@ expects a fraction of the previous close (2.0% down == 0.02).
 import csv
 import json
 import os
+import pathlib
 import tempfile
 from datetime import date, datetime, time, timedelta
+
+import pytest
 
 from near_close_dca import (
     ACTIVE_TICKERS,
@@ -1391,6 +1394,13 @@ def test_manual_run_submissions_do_not_advance_in_batch_burn(tmp_path):
     assert run_state["risk_guard"]["kill_switch_engaged"] is False
 
 
+def _assert_csv_header(path):
+    """The file exists AND carries a non-empty header row, not a zero-byte stub."""
+    with open(path, newline="", encoding="utf-8") as handle:
+        header = next(csv.reader(handle), None)
+    assert header and any(col.strip() for col in header), f"{path} has no header row"
+
+
 def test_run_daily_compact_date_gated_short_circuits(tmp_path):
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-07-01")
     _now, config, state, broker, fin, rh = _compact_setup(tmp_path)
@@ -1402,17 +1412,26 @@ def test_run_daily_compact_date_gated_short_circuits(tmp_path):
     assert os.path.exists(result["run_state_path"])
     with open(result["run_state_path"], encoding="utf-8") as handle:
         assert json.load(handle)["status"] == "blocked"
-    # No paths to CSVs that were never written, and no stray artifacts on disk.
-    for key in ["signals_path", "buy_candidates_path", "orders_csv_path"]:
+    # A blocked run still writes the COMPLETE root-level artifact set, but never
+    # advertises buy_candidates/orders CSVs that run_once genuinely never wrote.
+    for key in ["buy_candidates_path", "orders_csv_path"]:
         assert key not in result
-    assert set(os.listdir(artifacts_dir)) == {"run_state.json"}
+    assert set(os.listdir(artifacts_dir)) == {
+        "run_state.json",
+        "run_summary.json",
+        "signals.csv",
+        "submitted_orders.csv",
+    }
+    _assert_csv_header(os.path.join(artifacts_dir, "submitted_orders.csv"))
+    _assert_csv_header(os.path.join(artifacts_dir, "signals.csv"))
 
 
 def test_run_daily_compact_holiday_gated_short_circuits(tmp_path):
     """An approved date that also lands on a full NYSE closure (e.g. an extended
     trading_window.json that widens approved_test_dates with no holiday
-    subtraction of its own) must still report blocked=True and never advertise
-    signals/candidates/orders CSV paths that run_once never wrote."""
+    subtraction of its own) must still report blocked=True, write the complete
+    root-level artifact set, and never advertise buy_candidates/orders CSV paths
+    that run_once never wrote."""
     labor_day = date(2026, 9, 7)
     artifacts_dir = os.path.join(tmp_path, "runs", str(labor_day))
     _now, _config, state, broker, fin, rh = _compact_setup(tmp_path)
@@ -1428,9 +1447,42 @@ def test_run_daily_compact_holiday_gated_short_circuits(tmp_path):
     assert result["blocked"] is True
     with open(result["run_state_path"], encoding="utf-8") as handle:
         assert json.load(handle)["status"] == "blocked"
-    for key in ["signals_path", "buy_candidates_path", "orders_csv_path"]:
+    for key in ["buy_candidates_path", "orders_csv_path"]:
         assert key not in result
-    assert set(os.listdir(artifacts_dir)) == {"run_state.json"}
+    assert set(os.listdir(artifacts_dir)) == {
+        "run_state.json",
+        "run_summary.json",
+        "signals.csv",
+        "submitted_orders.csv",
+    }
+
+
+def test_blocked_stub_is_contract_valid_but_never_scheduled_evidence(tmp_path):
+    """A null-classification stub reads as malformed and fails the contract; one
+    that passed as evidence would manufacture an evidence-shaped artifact for a
+    day the market was shut. It must be neither (Codex review)."""
+    from scripts.same_day_pointer import derive_valid_scheduled_evidence
+    from scripts.scheduled_artifacts import validate_run_artifacts
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-07-01")
+    _now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    gated_now = datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN)  # not an approved date
+
+    run_daily_compact(gated_now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    # Well-formed and attributable...
+    assert isinstance(run_state["run_classification"], dict)
+    assert run_state["order_submit_status"] == "no_orders_submitted"
+    assert run_state["completion_reason"] == "date_or_holiday_gate_blocked"
+    assert validate_run_artifacts(artifacts_dir, require_summary=True)
+    # ...but never scheduled evidence.
+    assert run_state["scheduled_evidence_denied"] is True
+    assert derive_valid_scheduled_evidence(run_state) is False
+    # And no top-level run_id: no run happened, so nothing keys off one.
+    assert "run_id" not in run_state
 
 
 def test_run_daily_compact_date_gate_does_not_clobber_prior_artifacts(tmp_path):
@@ -1713,6 +1765,690 @@ def test_confirmation_required_broker_response_recorded_distinctly(tmp_path):
     # Not counted as an error: the broker responded normally, just requiring
     # confirmation, so nothing needs retrying and no alert should fire on this basis.
     assert run_state["usage_proxy"]["errors_count"] == 0
+
+
+def test_scheduled_no_order_run_records_completed_no_orders_not_a_failure(tmp_path):
+    """No ticker qualifies on the ladder, so nothing reaches the spread gate: the
+    run completed with no orders and must NOT be blamed on missing spread data
+    (Jul 27 2026 1:30 PM ET)."""
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
+    )
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 100.0})
+    # Price at the prior close: a 0% drop earns no ladder multiplier.
+    fin = _FakeData(SourceName.FINANCE, 100.0, 100.0, quote=(100.0, now))
+    rh = _FakeData(SourceName.ROBINHOOD, 100.0, 100.0, quote=(100.0, now))
+    artifacts_dir = os.path.join(tmp_path, "runs", "no-candidates")
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    assert run_state["run_classification_outcome"] == "completed_no_orders"
+    assert run_state["completion_reason"] == "no_ladder_candidates"
+    # The contract assigns this case 'no_orders_submitted'; the legacy
+    # not_submitted_no_candidates status would contradict it and disagree with
+    # the morning stream for the same situation.
+    assert run_state["order_submit_status"] == "no_orders_submitted"
+    assert run_state["error_class"] is None
+    assert run_state["candidates_reaching_spread_gate"] == 0
+    assert run_state["candidates_blocked_missing_spread"] == 0
+    assert run_state["is_trading_failure"] is False
+    assert run_state["orders_submitted_count"] == 0
+
+
+def test_scheduled_run_blocked_only_by_missing_spread_records_missing_spread_data(tmp_path):
+    """Candidates DID reach the gate and every one was failed closed there, so the
+    run legitimately carries error_class='missing_spread_data' -- still a safe
+    no-order skip, not a trading failure."""
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
+    )
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+    fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    # Plain _FakeData has no get_bid_ask at all, so the spread cannot be proven.
+    rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+    artifacts_dir = os.path.join(tmp_path, "runs", "spread-blocked")
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    [candidate] = run_state["buy_candidates"]
+    assert candidate["spread_ok"] is False
+    assert candidate["spread_status"] == "spread_unavailable"
+    assert run_state["run_classification_outcome"] == "completed_no_orders"
+    assert run_state["error_class"] == "missing_spread_data"
+    assert run_state["completion_reason"] is None
+    assert run_state["candidates_reaching_spread_gate"] == 1
+    assert run_state["candidates_blocked_missing_spread"] == 1
+    assert run_state["is_trading_failure"] is False
+
+
+def test_confirmation_required_status_survives_the_no_order_classification(tmp_path):
+    """A concrete status the placement path derived is more specific than
+    'no orders' and must not be overwritten, or is_confirmation_blocked breaks."""
+    from near_close_dca import OrderConfirmationRequiredError
+
+    class _ConfirmationRequiredBroker(DryRunBroker):
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise OrderConfirmationRequiredError("broker requires step-up confirmation")
+
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=False, tickers=config.tickers, approved_test_dates=config.approved_test_dates
+    )
+    broker = _ConfirmationRequiredBroker(
+        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
+    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "confirmation")
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    assert run_state["order_submit_status"] == "not_submitted_confirmation_required"
+    # The outcome fields are still recorded alongside it.
+    assert run_state["run_classification_outcome"] == "completed_no_orders"
+    assert run_state["orders_submitted_count"] == 0
+
+
+def test_afternoon_placement_failures_are_recorded_as_a_trading_failure(tmp_path):
+    """Every qualifying placement raised: a genuine failure, not a healthy
+    no-order run (Codex review)."""
+
+    class _FailingBroker(DryRunBroker):
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise RuntimeError("broker rejected the order")
+
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=False, tickers=config.tickers, approved_test_dates=config.approved_test_dates
+    )
+    broker = _FailingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    artifacts_dir = os.path.join(tmp_path, "runs", "placement-failed")
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    assert run_state["run_classification_outcome"] == "failed_after_connector_native_recovery_attempt"
+    assert run_state["error_class"] == "failed_after_connector_native_recovery_attempt"
+    assert run_state["is_trading_failure"] is True
+    assert run_state["order_submit_status"] == "not_submitted_error"
+
+
+def test_afternoon_run_summary_carries_the_no_order_outcome_fields(tmp_path):
+    """A summary-only consumer must be able to tell a healthy zero-order run from
+    a failure (Codex review)."""
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=False, tickers=("AAPL",), approved_test_dates=frozenset({date(2026, 6, 29)})
+    )
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 100.0})
+    fin = _FakeData(SourceName.FINANCE, 100.0, 100.0, quote=(100.0, now))
+    rh = _FakeData(SourceName.ROBINHOOD, 100.0, 100.0, quote=(100.0, now))
+    artifacts_dir = os.path.join(tmp_path, "runs", "summary-fields")
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+
+    with open(os.path.join(artifacts_dir, "run_summary.json"), encoding="utf-8") as handle:
+        summary = json.load(handle)
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    assert summary["run_classification_outcome"] == "completed_no_orders"
+    assert summary["completion_reason"] == "no_ladder_candidates"
+    assert summary["error_class"] is None
+    assert summary["is_trading_failure"] is False
+    assert summary["orders_submitted_count"] == 0
+    assert summary["run_classification"] == run_state["run_classification"]
+
+
+def test_blocked_stub_completes_a_partial_legacy_directory(tmp_path):
+    """A directory left holding only run_state.json (interrupted or legacy write)
+    must be COMPLETED on the next blocked pass, not left partial forever
+    (Codex review)."""
+    artifacts_dir = pathlib.Path(tmp_path) / "runs" / "partial"
+    artifacts_dir.mkdir(parents=True)
+    legacy = json.dumps({"trading_day": "2026-07-01", "status": "blocked"})
+    (artifacts_dir / "run_state.json").write_text(legacy, encoding="utf-8")
+
+    _now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    gated_now = datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN)  # not an approved date
+
+    run_daily_compact(gated_now, config, state, fin, rh, broker, artifacts_dir=str(artifacts_dir))
+
+    # The pre-existing run_state is preserved byte for byte...
+    assert (artifacts_dir / "run_state.json").read_text(encoding="utf-8") == legacy
+    # ...and the missing companions are now written.
+    for name in ("run_summary.json", "signals.csv", "submitted_orders.csv"):
+        assert (artifacts_dir / name).exists(), f"{name} still missing"
+    _assert_csv_header(str(artifacts_dir / "signals.csv"))
+    _assert_csv_header(str(artifacts_dir / "submitted_orders.csv"))
+    summary = json.loads((artifacts_dir / "run_summary.json").read_text(encoding="utf-8"))
+    # The summary mirrors what is actually on disk, not the fresh stub.
+    assert summary["trading_day"] == "2026-07-01"
+
+
+def test_provider_errors_are_not_recorded_as_a_healthy_no_order_run(tmp_path):
+    """_evaluate_all_signals degrades a raising provider's tickers to NO_DATA and
+    bumps errors_count; the zero-order result must not read as a clean ladder
+    no-op (Codex review)."""
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=False, tickers=("AAPL",), approved_test_dates=frozenset({date(2026, 6, 29)})
+    )
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+
+    class _RaisingProvider(_FakeData):
+        def get_previous_close_bar(self, ticker, as_of):
+            raise RuntimeError("provider is down")
+
+    fin = _RaisingProvider(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    rh = _RaisingProvider(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+    artifacts_dir = os.path.join(tmp_path, "runs", "provider-errors")
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    assert run_state["usage_proxy"]["errors_count"] > 0
+    assert run_state["run_classification_outcome"] == "completed_no_orders"
+    # Not a null error_class: the run was degraded, not a clean ladder no-op.
+    assert run_state["error_class"] == "degraded_market_data"
+
+
+def test_empty_universe_still_writes_a_signals_header(tmp_path):
+    """No active tickers previously wrote a zero-byte signals.csv, which the new
+    header requirement would reject, failing the run and blocking the pointer
+    update (Codex review)."""
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=True, tickers=(), approved_test_dates=frozenset({date(2026, 6, 29)})
+    )
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={})
+    fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+    artifacts_dir = os.path.join(tmp_path, "runs", "empty-universe")
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+
+    _assert_csv_header(os.path.join(artifacts_dir, "signals.csv"))
+    _assert_csv_header(os.path.join(artifacts_dir, "buy_candidates.csv"))
+
+    from scripts.scheduled_artifacts import validate_run_artifacts
+
+    assert validate_run_artifacts(artifacts_dir, require_summary=True)
+
+
+def test_a_manual_afternoon_placement_failure_is_not_a_scheduled_recovery_failure(tmp_path):
+    """run_once(scheduled=False) never runs the connector-native recovery policy,
+    so its broker failures must not be attributed to it (Codex review)."""
+
+    class _FailingBroker(DryRunBroker):
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise RuntimeError("broker rejected the order")
+
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=False, tickers=config.tickers, approved_test_dates=config.approved_test_dates
+    )
+    broker = _FailingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    artifacts_dir = os.path.join(tmp_path, "runs", "manual-placement-failed")
+
+    run_daily_compact(
+        now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=False
+    )
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    assert run_state["run_classification_outcome"] == "failed_placement"
+    assert run_state["error_class"] == "failed_placement"
+    assert run_state["is_trading_failure"] is True
+
+
+def test_afternoon_partially_submitted_batch_records_the_failed_placement(tmp_path):
+    """One order landed and another ticker raised: an ordinary success record
+    would hide the failed order (Codex review)."""
+
+    class _PartlyFailingBroker(DryRunBroker):
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            if ticker == "NVDA":
+                raise RuntimeError("broker rejected NVDA")
+            return super().place_market_buy(ticker, notional_usd, ref_id)
+
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=False, tickers=config.tickers, approved_test_dates=config.approved_test_dates
+    )
+    broker = _PartlyFailingBroker(
+        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
+    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "partial-batch")
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    assert run_state["orders_submitted_count"] >= 1
+    assert run_state["orders_failed_count"] == 1
+    assert run_state["run_classification_outcome"] == "failed_after_partial_submission"
+    assert run_state["is_trading_failure"] is True
+    # The summary carries it too, so a summary-only consumer sees the failure.
+    with open(os.path.join(artifacts_dir, "run_summary.json"), encoding="utf-8") as handle:
+        summary = json.load(handle)
+    assert summary["is_trading_failure"] is True
+
+
+def test_a_retry_keeps_an_earlier_attempts_orders_in_the_aggregate(tmp_path):
+    """A scheduled retry overwrites the fixed-path artifact; counting only the
+    current broker_outcomes would record a zero-order run for a slot that had
+    already placed orders (Codex review). Morning-stream behavior."""
+    import morning_dca as _m
+
+    outcomes = {"AAA": {"status": "submitted", "order_id": "o-new"}}
+    carried = [
+        {"ticker": "AAA", "status": "submitted", "order_id": "o-new"},
+        {"ticker": "BBB", "status": "submitted", "order_id": "o-earlier",
+         "planned_amount_usd": 2.0},
+    ]
+
+    # Counted once for AAA (present in both) plus once for the carried-forward BBB.
+    assert len(_m._submitted_keys(outcomes, carried)) == 2
+    extra = _m._carried_forward_order_rows(outcomes, carried)
+    assert [row["ticker"] for row in extra] == ["BBB"]
+    assert extra[0]["order_id"] == "o-earlier"
+    assert extra[0]["submitted_amount_usd"] == 2.0
+
+
+def test_afternoon_startup_failure_still_writes_the_complete_artifact_set(tmp_path):
+    """Nothing wrapped run_once, so an exception before _finalize_and_write_artifacts
+    left the slot with no artifacts at all (Codex review)."""
+    from scripts.same_day_pointer import derive_valid_scheduled_evidence
+    from scripts.scheduled_artifacts import validate_run_artifacts
+
+    class _ExplodingBroker(DryRunBroker):
+        def account_number(self):
+            raise RuntimeError("account lookup exploded")
+
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    broker = _ExplodingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    artifacts_dir = os.path.join(tmp_path, "runs", "afternoon-startup-failure")
+
+    with pytest.raises(RuntimeError):
+        run_daily_compact(
+            now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True
+        )
+
+    for name in ("run_state.json", "run_summary.json", "signals.csv", "submitted_orders.csv"):
+        assert os.path.exists(os.path.join(artifacts_dir, name)), f"{name} missing"
+    assert validate_run_artifacts(artifacts_dir, require_summary=True)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    assert run_state["status"] == "failed"
+    assert run_state["error_class"] == "scheduled_run_startup_failure"
+    assert run_state["is_trading_failure"] is True
+    assert run_state["orders_submitted_count"] == 0
+    # Proof the slot fired, never scheduled evidence.
+    assert derive_valid_scheduled_evidence(run_state) is False
+
+
+def test_an_afternoon_failure_after_placement_preserves_the_order(tmp_path):
+    """A later ticker raising must not erase an earlier accepted order, or a
+    same-day guard would re-allocate that capital (Codex review)."""
+
+    class _FailAfterFirstBroker(DryRunBroker):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._placed = 0
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            if self._placed >= 1:
+                raise RuntimeError("connector died mid-batch")
+            self._placed += 1
+            return super().place_market_buy(ticker, notional_usd, ref_id)
+
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=False, tickers=config.tickers, approved_test_dates=config.approved_test_dates
+    )
+    broker = _FailAfterFirstBroker(
+        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
+    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "afternoon-mid-batch")
+
+    # The batch catches per-candidate placement errors, so this completes rather
+    # than raising; either way the accepted order must survive in the artifact.
+    try:
+        run_daily_compact(
+            now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True
+        )
+    except RuntimeError:
+        pass
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    assert run_state["orders_submitted_count"] >= 1
+    submitted = [c for c in run_state["buy_candidates"] if c.get("status") == "submitted"]
+    assert submitted and submitted[0].get("order_id")
+
+
+def test_an_evidence_denied_stub_is_not_selected_for_scheduled_reporting(tmp_path):
+    """is_scheduled_state must honor the denial marker too, or the reporting
+    selector returns a blocked stub as a valid scheduled run (Codex review)."""
+    from scripts.run_classification import build_scheduled_classification, is_scheduled_state
+
+    denied = {
+        "trading_day": "2026-07-01",
+        "status": "blocked",
+        "run_classification": build_scheduled_classification("2026-07-01"),
+        "scheduled_evidence_denied": True,
+    }
+    assert is_scheduled_state(denied) is False
+    # The same state without the marker is still a normal scheduled state.
+    allowed = dict(denied)
+    allowed.pop("scheduled_evidence_denied")
+    assert is_scheduled_state(allowed) is True
+
+
+def test_an_accepted_order_survives_a_raise_in_post_placement_work(tmp_path):
+    """The batch only records an outcome once _process_buy_candidate RETURNS, so a
+    raise in the fill lookup between placement and return would lose a real,
+    already-accepted order (Codex review)."""
+
+    class _FillLookupExplodes(DryRunBroker):
+        def get_order_fill(self, order_id):
+            raise RuntimeError("fill lookup exploded after the order was accepted")
+
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=False, tickers=("AAPL",), approved_test_dates=config.approved_test_dates
+    )
+    broker = _FillLookupExplodes(cash=500.0, reference_prices={"AAPL": 98.0})
+    artifacts_dir = os.path.join(tmp_path, "runs", "post-placement-raise")
+
+    try:
+        run_daily_compact(
+            now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True
+        )
+    except RuntimeError:
+        pass
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    # The accepted order is in the artifact no matter which path wrote it.
+    assert run_state["orders_submitted_count"] >= 1
+    submitted = [
+        c for c in run_state.get("buy_candidates", []) if c.get("status") == "submitted"
+    ]
+    assert submitted and submitted[0].get("order_id"), run_state.get("buy_candidates")
+
+
+def test_an_afternoon_failure_refreshes_the_latest_scheduled_pointer(tmp_path):
+    """Otherwise latest_scheduled_run.json keeps targeting the previous trading
+    day even though today's failed slot has artifacts (Codex review)."""
+    from scripts.run_classification import latest_scheduled_run_path
+
+    class _ExplodingBroker(DryRunBroker):
+        def account_number(self):
+            raise RuntimeError("account lookup exploded")
+
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    broker = _ExplodingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    artifacts_dir = os.path.join(tmp_path, "runs", "pointer-on-failure")
+    classification_root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+
+    with pytest.raises(RuntimeError):
+        run_daily_compact(
+            now, config, state, fin, rh, broker,
+            artifacts_dir=artifacts_dir, scheduled=True,
+            classification_state_root=classification_root,
+        )
+
+    pointer = latest_scheduled_run_path(pathlib.Path(classification_root))
+    assert pointer.exists(), "the scheduled pointer was never refreshed"
+    payload = json.loads(pointer.read_text(encoding="utf-8"))
+    assert payload["run_state_path"] == os.path.join(artifacts_dir, "run_state.json")
+    # The state it points at denies its own evidence, so following the pointer
+    # still refuses to count the run.
+    assert payload["valid_scheduled_evidence"] is False
+
+
+def test_an_afternoon_failure_state_carries_the_scheduled_run_id(tmp_path):
+    """schemas/run_state.schema.json requires it and build_run_summary reads it
+    (Codex review)."""
+
+    class _ExplodingBroker(DryRunBroker):
+        def account_number(self):
+            raise RuntimeError("boom")
+
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    broker = _ExplodingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    artifacts_dir = os.path.join(tmp_path, "runs", "failure-run-id")
+
+    with pytest.raises(RuntimeError):
+        run_daily_compact(
+            now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True
+        )
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    assert run_state["run_id"], "failure state has no top-level run_id"
+    with open(os.path.join(artifacts_dir, "run_summary.json"), encoding="utf-8") as handle:
+        summary = json.load(handle)
+    assert summary["run_id"] == run_state["run_id"]
+
+
+def test_an_unreadable_blocked_state_is_replaced_not_wrapped(tmp_path):
+    """A truncated or non-object run_state.json must not be left in place with a
+    fresh summary and CSVs written around it (Codex review)."""
+    artifacts_dir = pathlib.Path(tmp_path) / "runs" / "corrupt"
+    artifacts_dir.mkdir(parents=True)
+    (artifacts_dir / "run_state.json").write_text("{ truncated", encoding="utf-8")
+
+    _now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    gated_now = datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN)  # not an approved date
+
+    run_daily_compact(gated_now, config, state, fin, rh, broker, artifacts_dir=str(artifacts_dir))
+
+    run_state = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert run_state["status"] == "blocked"
+    assert run_state["completion_reason"] == "date_or_holiday_gate_blocked"
+
+    from scripts.scheduled_artifacts import validate_run_artifacts
+
+    assert validate_run_artifacts(str(artifacts_dir), require_summary=True)
+
+
+def test_a_failing_afternoon_run_with_broken_companions_denies_its_own_evidence(tmp_path):
+    """The failure handler must not publish a valid pointer for a state whose
+    four-file set is incomplete or corrupt (Codex review)."""
+    from scripts.run_classification import latest_scheduled_run_path
+
+    class _ExplodingBroker(DryRunBroker):
+        def account_number(self):
+            raise RuntimeError("boom")
+
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    broker = _ExplodingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    artifacts_dir = pathlib.Path(tmp_path) / "runs" / "broken-companions"
+    artifacts_dir.mkdir(parents=True)
+    classification_root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    # A state from an earlier attempt, with a summary that does not mirror it.
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps({"run_id": "earlier", "trading_day": "2026-06-29",
+                    "run_classification": {"run_origin": "scheduled", "manual_run": False,
+                                           "stream": "afternoon"}}),
+        encoding="utf-8",
+    )
+    (artifacts_dir / "run_summary.json").write_text(
+        json.dumps({"run_id": "stale", "run_classification": {"run_origin": "scheduled",
+                                                              "manual_run": False,
+                                                              "stream": "morning"}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError):
+        run_daily_compact(
+            now, config, state, fin, rh, broker,
+            artifacts_dir=str(artifacts_dir), scheduled=True,
+            classification_state_root=classification_root,
+        )
+
+    run_state = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert run_state["artifact_contract_failure"]["failure"] == "artifact_contract_failure"
+    assert run_state["scheduled_evidence_denied"] is True
+    payload = json.loads(
+        latest_scheduled_run_path(pathlib.Path(classification_root)).read_text(encoding="utf-8")
+    )
+    assert payload["valid_scheduled_evidence"] is False
+
+
+def test_a_cap_blocked_candidate_never_reaches_the_spread_gate(tmp_path):
+    """A run stopped only by caps must not be misreported as missing_spread_data:
+    the contract says a cap-blocked candidate carries no spread verdict (Codex
+    review)."""
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
+    )
+    state = StrategyState()
+    # Exhaust today's remaining budget so within_caps() rejects the candidate.
+    state.select_daily_budget(0.0, 0, config)
+    state.record_buy("ZZZ", date(2026, 6, 29), state.current_tier().daily_cap_usd)
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+    fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    # No bid/ask at all: if the cap check ran AFTER the spread lookup this run
+    # would be blamed on the spread.
+    rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+    artifacts_dir = os.path.join(tmp_path, "runs", "cap-before-spread")
+
+    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    [candidate] = run_state["buy_candidates"]
+    assert candidate["skip_reason"] == "cap would be exceeded"
+    # No spread verdict: it never reached the gate.
+    assert candidate["spread_status"] == "not_evaluated"
+    assert run_state["candidates_reaching_spread_gate"] == 0
+    assert run_state["error_class"] != "missing_spread_data"
+    assert run_state["completion_reason"] == "blocked_before_spread_gate"
+
+
+def _afternoon_merge(preserved, placed, exc=None, tmp_path=None):
+    """Drive _write_afternoon_failure_artifacts over a preserved state."""
+    import near_close_dca as _n
+
+    if exc is None:
+        exc = RuntimeError("boom")
+
+    out = pathlib.Path(tmp_path) / "slot"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "run_state.json").write_text(json.dumps(preserved), encoding="utf-8")
+    _n._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = placed
+    try:
+        _n._write_afternoon_failure_artifacts(out, _now_et(), exc)
+    finally:
+        _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+    return out, json.loads((out / "run_state.json").read_text(encoding="utf-8"))
+
+
+def _now_et():
+    return datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+
+def _preserved_state():
+    return {
+        "run_id": "earlier",
+        "trading_day": "2026-06-29",
+        "status": "completed",
+        "run_classification": {"run_origin": "scheduled", "manual_run": False,
+                               "stream": "afternoon"},
+        "run_classification_outcome": "completed_no_orders",
+        "order_submit_status": "submitted",
+        "is_trading_failure": False,
+        "broker_outcomes": {"AAA": {"status": "submitted", "order_id": "o-earlier",
+                                    "submitted_amount_usd": 2.0}},
+        "buy_candidates": [{"ticker": "AAA", "status": "submitted", "order_id": "o-earlier"}],
+        "orders_submitted_count": 1,
+    }
+
+
+def test_a_retrys_second_order_for_the_same_ticker_is_not_dropped(tmp_path):
+    """A ticker-keyed merge kept only the earlier order while the count and CSV
+    are derived from those outcomes (Codex review)."""
+    placed = {"AAA": {"status": "submitted", "order_id": "o-retry",
+                      "submitted_amount_usd": 1.0}}
+
+    out, run_state = _afternoon_merge(_preserved_state(), placed, tmp_path=tmp_path)
+
+    assert run_state["orders_submitted_count"] == 2
+    order_ids = {c.get("order_id") for c in run_state["buy_candidates"]}
+    assert order_ids == {"o-earlier", "o-retry"}
+    with (out / "submitted_orders.csv").open(newline="", encoding="utf-8") as handle:
+        csv_ids = {row["order_id"] for row in csv.DictReader(handle)}
+    assert csv_ids == {"o-earlier", "o-retry"}
+
+
+def test_a_merged_retry_is_recorded_as_a_post_submission_failure(tmp_path):
+    """Retaining the earlier attempt's successful classification would let the
+    canonical state claim the retry succeeded (Codex review)."""
+    placed = {"BBB": {"status": "submitted", "order_id": "o-retry",
+                      "submitted_amount_usd": 1.0}}
+
+    _out, run_state = _afternoon_merge(_preserved_state(), placed, tmp_path=tmp_path)
+
+    assert run_state["status"] == "failed"
+    assert run_state["run_classification_outcome"] == "failed_after_partial_submission"
+    assert run_state["error_class"] == "scheduled_run_failed_after_submission"
+    assert run_state["is_trading_failure"] is True
+    assert run_state["scheduled_evidence_denied"] is True
+    assert run_state["run_classification"]["valid_scheduled_evidence"] is False
+
+
+def test_the_summary_is_regenerated_after_a_merge(tmp_path):
+    """A pre-merge summary passes validation while reporting the previous
+    attempt's count and outcome (Codex review)."""
+    out = pathlib.Path(tmp_path) / "slot"
+    out.mkdir(parents=True)
+    (out / "run_summary.json").write_text(
+        json.dumps({"run_id": "earlier", "orders_submitted_count": 1,
+                    "run_classification_outcome": "completed_no_orders"}),
+        encoding="utf-8",
+    )
+    placed = {"BBB": {"status": "submitted", "order_id": "o-retry",
+                      "submitted_amount_usd": 1.0}}
+
+    _out, run_state = _afternoon_merge(_preserved_state(), placed, tmp_path=tmp_path)
+
+    summary = json.loads((out / "run_summary.json").read_text(encoding="utf-8"))
+    assert summary["orders_submitted_count"] == run_state["orders_submitted_count"] == 2
+    assert summary["run_classification_outcome"] == "failed_after_partial_submission"
 
 
 def test_scheduled_afternoon_blocks_wide_spread_before_ordering(tmp_path):
@@ -4860,5 +5596,304 @@ def test_orders_csv_submitted_notionals_logs_on_corrupt_csv(tmp_path, caplog):
     assert any("failed to parse" in record.message for record in caplog.records)
 
 
+def test_blocked_stub_refreshes_the_latest_scheduled_pointer(tmp_path):
+    """The calendar gate returns before the normal finalizer, so it must run the
+    validation and pointer refresh itself: a pointer-based watchdog has to see
+    today's slot resolved as blocked rather than still targeting the previous
+    trading day (Codex review)."""
+    from near_close_dca import _write_blocked_run_stub
+    from scripts.run_classification import latest_scheduled_run_path
+
+    artifacts_dir = pathlib.Path(tmp_path) / "runs" / "2026-07-01"
+    state_root = pathlib.Path(tmp_path) / "classification"
+
+    _write_blocked_run_stub(date(2026, 7, 1), artifacts_dir, state_root)
+
+    pointer = json.loads(latest_scheduled_run_path(state_root).read_text(encoding="utf-8"))
+    assert pointer["trading_day"] == "2026-07-01"
+    assert pointer["run_state_path"] == str(artifacts_dir / "run_state.json")
+    # A market-closed day proves the slot fired but is never scheduled evidence.
+    assert pointer["valid_scheduled_evidence"] is False
+    assert pointer["pointer_status"] == "pending"
+
+
+def test_blocked_stub_withholds_the_pointer_when_the_contract_fails(tmp_path, caplog):
+    """Failing closed means the directory is not advertised. The preserved
+    run_state is never rewritten -- including a legacy one this helper leaves
+    byte for byte -- so the pointer is what gates on validation."""
+    from near_close_dca import _write_blocked_run_stub
+    from scripts.run_classification import latest_scheduled_run_path
+
+    artifacts_dir = pathlib.Path(tmp_path) / "runs" / "corrupt"
+    artifacts_dir.mkdir(parents=True)
+    legacy = json.dumps({"trading_day": "2026-07-01", "status": "blocked"})
+    (artifacts_dir / "run_state.json").write_text(legacy, encoding="utf-8")
+    state_root = pathlib.Path(tmp_path) / "classification"
+
+    with caplog.at_level("ERROR", logger="near_close_dca"):
+        _write_blocked_run_stub(date(2026, 7, 1), artifacts_dir, state_root)
+
+    # No run_classification on the preserved legacy state, so the contract fails.
+    assert not latest_scheduled_run_path(state_root).exists()
+    assert (artifacts_dir / "run_state.json").read_text(encoding="utf-8") == legacy
+    assert any("not refreshing the latest scheduled pointer" in r.message for r in caplog.records)
+
+
+def test_placement_failure_outranks_a_confirmation_hold(tmp_path):
+    """A zero-submission batch where one order awaits confirmation and another
+    placement RAISED is a placement failure, not an ordinary confirmation block:
+    is_confirmation_blocked() must not claim the run (Codex review)."""
+    from near_close_dca import _apply_no_order_classification, _derive_order_submit_status
+    from scripts.run_classification import is_confirmation_blocked
+
+    config = StrategyConfig(dry_run=False, tickers=("AAPL", "MSFT"))
+    buy_candidates = [
+        {"ticker": "AAPL", "status": "not_submitted_confirmation_required"},
+        {"ticker": "MSFT", "status": "failed"},
+    ]
+
+    assert _derive_order_submit_status(config, buy_candidates, 0) == "not_submitted_error"
+
+    artifacts = {
+        "buy_candidates": buy_candidates,
+        "order_submit_status": _derive_order_submit_status(config, buy_candidates, 0),
+    }
+    outcomes = {
+        "AAPL": {"status": "not_submitted_confirmation_required"},
+        "MSFT": {"status": "failed"},
+    }
+    _apply_no_order_classification(artifacts, outcomes)
+
+    assert artifacts["order_submit_status"] == "not_submitted_error"
+    assert artifacts["is_trading_failure"] is True
+    assert is_confirmation_blocked(artifacts) is False
+
+
+def test_confirmation_hold_survives_when_no_placement_failed(tmp_path):
+    """The failure precedence must not swallow a genuine confirmation block."""
+    from near_close_dca import _apply_no_order_classification, _derive_order_submit_status
+
+    config = StrategyConfig(dry_run=False, tickers=("AAPL",))
+    buy_candidates = [{"ticker": "AAPL", "status": "not_submitted_confirmation_required"}]
+
+    assert (
+        _derive_order_submit_status(config, buy_candidates, 0)
+        == "not_submitted_confirmation_required"
+    )
+
+    artifacts = {
+        "buy_candidates": buy_candidates,
+        "order_submit_status": "not_submitted_confirmation_required",
+    }
+    _apply_no_order_classification(
+        artifacts, {"AAPL": {"status": "not_submitted_confirmation_required"}}
+    )
+
+    assert artifacts["order_submit_status"] == "not_submitted_confirmation_required"
+
+
 if __name__ == "__main__":
     _run_all()
+
+
+def test_a_failure_synthesized_candidate_row_satisfies_the_schema():
+    """schemas/run_state.schema.json requires ticker, buy_multiplier,
+    planned_amount_usd, and status on every candidate row. validate_run_artifacts
+    does not run schema validation, so an omission produced an artifact that read
+    as a complete failure record while schema-based reporting rejected it (Codex
+    review). One builder serves both failure paths so a field cannot land on one
+    and miss the other."""
+    import json as _json
+    from pathlib import Path as _Path
+
+    from near_close_dca import _failure_candidate_row
+
+    row = _failure_candidate_row(
+        "AAA",
+        {
+            "status": "submitted",
+            "order_id": "o-1",
+            "submitted_amount_usd": 2.0,
+            "buy_multiplier": 1.5,
+            "skip_reason": None,
+        },
+    )
+
+    assert row["buy_multiplier"] == 1.5
+    schema = _json.loads(
+        (_Path(__file__).parent / "schemas" / "run_state.schema.json").read_text(encoding="utf-8")
+    )
+    item_schema = schema["properties"]["buy_candidates"]["items"]
+    # The required-field check runs everywhere, since that IS the defect and
+    # jsonschema is optional tooling here (requirements-dev.txt is pytest+ruff;
+    # the core strategy carries no third-party runtime dependency).
+    for field in item_schema["required"]:
+        assert field in row, field
+    # Full validation when the optional dependency is present, matching how the
+    # other schema tests in this repo guard it.
+    try:
+        import jsonschema
+    except ImportError:
+        return
+    jsonschema.validate(row, item_schema)
+
+
+def test_a_placement_outcome_carries_the_multiplier_for_the_failure_path():
+    """The failure handlers synthesize candidate rows from outcomes alone, so the
+    real multiplier has to travel on the outcome to survive a raise."""
+    import inspect
+
+    import near_close_dca
+
+    src = inspect.getsource(near_close_dca._process_buy_candidate)
+    submitted_block = src.split('"status": "submitted"')[1].split("}")[0]
+    assert "buy_multiplier" in submitted_block
+
+
+def test_replacing_an_unreadable_afternoon_state_regenerates_its_companions(tmp_path):
+    """A synthesized state describes THIS failure, so a companion left in a
+    reused directory belongs to an earlier attempt. state_was_mutated is only set
+    by the merge path, so replacing an unreadable run_state.json preserved a
+    stale summary whose classification does not match the new state, failing a
+    contract this handler could have repaired (Codex review)."""
+    import near_close_dca as _n
+    from scripts.scheduled_artifacts import validate_run_artifacts
+
+    out = pathlib.Path(tmp_path) / "slot"
+    out.mkdir(parents=True, exist_ok=True)
+    # Unreadable state plus a full set of an earlier attempt's leftovers.
+    (out / "run_state.json").write_text("{not json", encoding="utf-8")
+    (out / "run_summary.json").write_text(
+        json.dumps({"run_classification": None, "stale": True}), encoding="utf-8"
+    )
+    (out / "signals.csv").write_text("", encoding="utf-8")
+    (out / "submitted_orders.csv").write_text("stale,garbage\n", encoding="utf-8")
+
+    _n._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    try:
+        _n._write_afternoon_failure_artifacts(out, _now_et(), RuntimeError("boom"))
+    finally:
+        _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    summary = json.loads((out / "run_summary.json").read_text(encoding="utf-8"))
+    assert "stale" not in summary
+    assert summary["run_classification"] is not None
+    assert (out / "signals.csv").read_text(encoding="utf-8").strip() != ""
+    assert "stale" not in (out / "submitted_orders.csv").read_text(encoding="utf-8")
+    # The repaired set validates, so the handler no longer denies an artifact set
+    # it could have fixed.
+    assert validate_run_artifacts(out, require_summary=True)
+    run_state = json.loads((out / "run_state.json").read_text(encoding="utf-8"))
+    assert "artifact_contract_failure" not in run_state
+
+
+def test_the_afternoon_failure_set_is_validated_without_a_pointer_root(tmp_path):
+    """The contract failure is stamped INTO the state, which needs no pointer
+    root, so gating validation on classification_state_root left a broken
+    companion set advertised unchecked (Codex review)."""
+    import near_close_dca as _n
+
+    out = pathlib.Path(tmp_path) / "slot"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "run_state.json").write_text("{not json", encoding="utf-8")
+
+    _n._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    try:
+        _n._write_afternoon_failure_artifacts(out, _now_et(), RuntimeError("boom"))
+    finally:
+        _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    # Companions were regenerated, so the set is valid and nothing is stamped.
+    run_state = json.loads((out / "run_state.json").read_text(encoding="utf-8"))
+    assert "artifact_contract_failure" not in run_state
+
+    # Break a companion after the fact and re-enter: validation still runs with
+    # no classification_state_root, and the breach is recorded in the state.
+    (out / "signals.csv").unlink()
+    (out / "run_state.json").write_text("{not json again", encoding="utf-8")
+    (out / "submitted_orders.csv").write_text("stale,garbage\n", encoding="utf-8")
+    _n._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    try:
+        _n._write_afternoon_failure_artifacts(out, _now_et(), RuntimeError("boom"))
+    finally:
+        _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+    assert (out / "signals.csv").exists()
+
+
+def test_an_afternoon_connector_failure_beside_a_submission_is_not_clean():
+    """Sibling of the morning fix, flagged in the same finding: a pre-placement
+    broker check that raised is a non-deliberate block, and the submitted branch
+    ignored those entirely (Codex review)."""
+    from near_close_dca import _apply_no_order_classification
+
+    artifacts = {"signal_rows": []}
+    outcomes = {
+        "AAA": {"status": "submitted", "order_id": "o-1"},
+        "BBB": {"status": "blocked", "skip_reason": "spread quote failed: boom"},
+    }
+
+    _apply_no_order_classification(artifacts, outcomes, scheduled=True)
+
+    assert artifacts["orders_submitted_count"] == 1
+    assert artifacts["is_trading_failure"] is True
+    assert artifacts["run_classification_outcome"] == "failed_after_partial_submission"
+    assert artifacts["error_class"] == "degraded_market_data"
+
+
+def test_an_afternoon_deliberate_skip_beside_a_submission_stays_clean():
+    """A cap or ceiling block carries deliberate_skip=True and is not a failure."""
+    from near_close_dca import _apply_no_order_classification
+
+    artifacts = {"signal_rows": []}
+    outcomes = {
+        "AAA": {"status": "submitted", "order_id": "o-1"},
+        "BBB": {"status": "blocked", "skip_reason": "cap exceeded", "deliberate_skip": True},
+    }
+
+    _apply_no_order_classification(artifacts, outcomes, scheduled=True)
+
+    assert artifacts["orders_submitted_count"] == 1
+    assert "is_trading_failure" not in artifacts
+
+
+def test_completing_a_preserved_state_keeps_the_rich_signal_columns(tmp_path):
+    """Pinning fieldnames=("ticker",) truncated a PRESERVED state's signal_rows,
+    dropping auto_buy_signal and the amounts the drift detector reads. The writer
+    already derives fieldnames from the rows and falls back to ticker when there
+    are none (Copilot review)."""
+    import near_close_dca as _n
+
+    preserved = _preserved_state()
+    preserved["signal_rows"] = [
+        {"ticker": "AAA", "auto_buy_signal": True, "suggested_amount_usd": 2.0},
+    ]
+    out = pathlib.Path(tmp_path) / "slot"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "run_state.json").write_text(json.dumps(preserved), encoding="utf-8")
+
+    _n._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    try:
+        _n._write_afternoon_failure_artifacts(out, _now_et(), RuntimeError("boom"))
+    finally:
+        _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    header = (out / "signals.csv").read_text(encoding="utf-8").splitlines()[0]
+    assert "ticker" in header
+    assert "auto_buy_signal" in header
+    assert "suggested_amount_usd" in header
+
+
+def test_a_synthesized_state_with_no_rows_still_gets_a_ticker_header(tmp_path):
+    """The fallback the removed explicit fieldnames used to provide."""
+    import near_close_dca as _n
+
+    out = pathlib.Path(tmp_path) / "slot"
+    out.mkdir(parents=True, exist_ok=True)
+
+    _n._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    try:
+        _n._write_afternoon_failure_artifacts(out, _now_et(), RuntimeError("boom"))
+    finally:
+        _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    assert (out / "signals.csv").read_text(encoding="utf-8").splitlines()[0] == "ticker"

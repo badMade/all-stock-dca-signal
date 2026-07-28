@@ -195,7 +195,52 @@
     "purpose": "The Jul 21 2026 scheduled runs wrote a run_state.json whose top-level run_classification was null and, for the 10:30 live run, dropped signals.csv and submitted_orders.csv even though the summary claimed they were written. A null classification breaks scheduled-vs-manual attribution, and a missing order CSV makes the drift detector report every intended buy as an unsubmitted order. Both are artifact-contract failures, not soft warnings.",
     "helper": "scripts/scheduled_artifacts.py",
     "doc": "docs/run_classification.md",
-    "applies_to": ["morning-dca-0945 (9:45 pre-flight)", "42173154 (10:30 morning live)", "a6239dae (12:30 midday live)", "10ce362c (3:30 afternoon final live)"],
+    "applies_to": ["morning-dca-0945 (9:45 pre-flight)", "2ba19526 (9:35 market-open live)", "42173154 (10:30 morning live)", "a6239dae (12:30 midday live)", "7be82b97 (11:30 / 1:30 / 2:30 intraday live)", "10ce362c (3:30 afternoon final live)"],
+    "root_level_artifact_set_2026_07_27": {
+      "added_on_et": "2026-07-27",
+      "incident": "The 12:30 PM ET midday run failed at startup before writing any scheduled artifact, and the 1:30 PM ET intraday run wrote its four files only under an artifacts/ subfolder with NOTHING at the artifact root, alongside an effectively empty submitted_orders.csv. Every consumer that discovers a run by directory path therefore saw an empty or missing slot for two runs that had actually fired.",
+      "applies_to_cron_ids": ["2ba19526", "42173154", "a6239dae", "7be82b97", "10ce362c"],
+      "root_level_required": true,
+      "required_files": ["run_state.json", "run_summary.json", "signals.csv", "submitted_orders.csv"],
+      "required_every_time": "On EVERY outcome, including a zero-order run, a blocked run (weekend, holiday, outside the approved window), and a failed run. Blocked is an outcome, not an excuse for a partial artifact set.",
+      "header_rule": "Both CSVs carry their header row even at zero data rows. A zero-byte or truncated file is a contract failure, not a valid no-order artifact: a reader cannot tell it from an interrupted write, and the drift detector sees no columns at all. This holds for an EMPTY UNIVERSE too (no active tickers, or every configured ticker excluded), which must still produce a header rather than a zero-byte file.",
+      "signals_filename_note": "The stream-specific names (morning_signals.csv, midday_signals.csv, market_open_signals.csv, intraday_signals.csv) satisfy the signals.csv requirement; they are recognized by scripts/drift_detection.py and scripts/scheduled_artifacts.py.",
+      "must_not": [
+        "MUST NOT write any required file only under an artifacts/ (or out/, output/) subfolder. Nesting is a contract failure, not a partial pass.",
+        "MUST NOT omit run_summary.json on a live run. Before 2026-07-27 only the read-only 9:45 pre-flight wrote one, so every live morning/midday run directory failed require_summary.",
+        "MUST NOT write a headerless signals.csv or submitted_orders.csv on a no-candidate run.",
+        "MUST NOT skip artifact creation because the run is escalating; see connector_native_execution_policy.escalation_still_writes_artifacts."
+      ],
+      "enforced_by": "scripts/scheduled_artifacts.py: write_scheduled_run_artifacts writes the complete set at the run root, and validate_run_artifacts reports a nested-only required file by name rather than as an unexplained missing file.",
+      "enforcement_by_stream": {
+        "note": "This contract binds all five live streams, but only the three with an in-repo producer can be enforced by repo code. The other two have no_python_entry_point=true: an external scheduler/agent runs them directly from this manifest, exactly as the watchdog a46bf007 does, so for them the contract is the task text the executor must follow and the repo supplies tested helpers rather than a producer.",
+        "code_enforced": {
+          "42173154": "morning_dca.py MorningDCAExecutor writes and validates the root-level set, including the failure path.",
+          "a6239dae": "midday_dca.py runs the same MorningDCAExecutor path.",
+          "10ce362c": "near_close_dca.py _write_and_validate_scheduled_contract writes and validates it."
+        },
+        "contract_only_no_in_repo_producer": {
+          "2ba19526": "Market-open 9:35. No in-repo executor; the external agent task must call the same helpers.",
+          "7be82b97": "Intraday 11:30 / 1:30 / 2:30. No in-repo executor; same requirement. This is the stream in the 2026-07-27 1:30 and 2:30 incidents, so its task text is the enforcement surface."
+        },
+        "helpers_for_external_executors": [
+          "scripts/scheduled_artifacts.py:write_scheduled_run_artifacts writes all four files at the run root with headers at zero rows.",
+          "scripts/scheduled_artifacts.py:validate_run_artifacts checks the set, including the nested-artifact and missing-header cases.",
+          "scripts/run_classification.py:classify_no_order_run turns the run's counts into the recorded outcome."
+        ]
+      },
+      "startup_failure_rule": {
+        "condition": "The scheduled live run raises before reaching its normal writer, which is how the 12:30 slot produced no artifact root at all.",
+        "required_behavior": "Write the complete root-level artifact set from the failure path with error_class='scheduled_run_startup_failure', is_trading_failure=true, orders_submitted_count=0, and a non-null run_classification carrying valid_scheduled_evidence=false, THEN re-raise so the scheduler still sees the failure.",
+        "evidence_meaning": "Proof the scheduled slot FIRED. Never order or fill evidence, and never valid scheduled evidence.",
+        "must_not": [
+          "MUST NOT overwrite artifacts a run already wrote. A failure late in the run, possibly after orders were placed, must never erase that record.",
+          "MUST NOT let an artifact-writing error mask the original failure; writing is best-effort and the original exception is what propagates."
+        ],
+        "enforced_by": "morning_dca.py: MorningDCAExecutor.run wraps guarded_run and calls _write_startup_failure_artifacts before re-raising."
+      },
+      "tests": ["scripts/tests/test_scheduled_artifacts.py"]
+    },
     "rules": [
       "run_classification is ALWAYS a non-null top-level object on every scheduled run_state.json; null, absent, or non-object is a contract failure.",
       "The 9:45 pre-flight run_classification carries run_origin='scheduled', run_type='morning_dca_preflight', scheduled_for_et='09:45', manual_run=false, state_schema_version='morning-preflight-v2-machine-complete', run_id, triggered_at_utc, cron_id='morning-dca-0945', stream='morning', trading_day, same_day_required=true, and valid_scheduled_evidence derived from the completed state. This matches the actual producer (morning_dca.py's MORNING_PREFLIGHT_CRON_ID/MORNING_PREFLIGHT_RUN_TYPE) and schemas/morning_preflight.schema.json -- not a separate aspirational identity.",
@@ -204,10 +249,169 @@
       "When an order is placed the submitted_orders.csv contains that row; a pending/unconfirmed broker response keeps its concrete status but still produces a row and a run_state. Deliberate non-orders (skipped, cap_exceeded, dry_run, blocked) are not rows.",
       "The 12:30 midday live run shares the morning runner path, so the same non-null-classification and always-write-both-CSVs guarantees apply, without weakening any trading safeguard.",
       "The 3:30 afternoon final live run must also carry a non-null run_classification in BOTH run_state.json and run_summary.json. For 3:30 this object carries run_origin='scheduled', manual_run=false, stream='afternoon', scheduled_for_et='15:30', cron_id='10ce362c', supersedes_cron_id='ce16ba6b', run_id, trading_day, same_day_required=true, and valid_scheduled_evidence derived from the completed state.",
-      "validate_run_artifacts fails on a missing/unreadable run_state.json, a null/absent/non-object run_classification, or a missing required CSV; require_submitted_orders is True for live runs and False for read-only pre-flight runs."
+      "validate_run_artifacts fails on a missing/unreadable run_state.json, a null/absent/non-object run_classification, or a missing required CSV; require_submitted_orders is True for live runs and False for read-only pre-flight runs.",
+      "Every LIVE run writes the four required files at the RUN ROOT on every outcome, with a header row on both CSVs even at zero rows. See root_level_artifact_set_2026_07_27.",
+      "A run that submits nothing records how it completed, never a bare failure: run_classification_outcome='completed_no_orders' with a completion_reason (ladder produced no candidate) or with error_class='missing_spread_data' (candidates reached the spread gate and every one was failed closed there). See spread_gate_outcome_contract_2026_07_27."
     ],
     "safety_note": "This is an artifact-integrity contract only; it does NOT relax any trading safety, budget, spread, confidence, or top-up rule. valid_scheduled_evidence is always derived from the completed run_state, never asserted blindly.",
     "tests": ["scripts/tests/test_scheduled_artifacts.py", "test_morning_dca.py"]
+  },
+  "connector_native_execution_policy": {
+    "added_on_et": "2026-07-27",
+    "incident": "Two scheduled slots the same day failed the same way. The 12:30 PM ET midday live task a6239dae failed at startup before writing any scheduled artifact, and the 2:30 PM ET intraday slot on 7be82b97 escalated before order placement reporting no existing run script and no internal implementation for order submission. Both left no artifact root at all. In both cases a connector-native pass minutes later did the work successfully, which proves the work was doable inside the scheduled run.",
+    "applies_to_cron_ids": ["2ba19526", "42173154", "a6239dae", "7be82b97", "10ce362c"],
+    "scope_note": "Every LIVE scheduled stream, not just the intraday task. Missing local tooling is a property of the environment, not of a slot, so a policy scoped to one cron id leaves every other slot able to fail the identical way.",
+    "rule": "A missing repo runner script, a missing entry point, or a missing internal order-submission implementation is NOT a blocking condition and NOT a reason to escalate. It is the TRIGGER for connector-native execution.",
+    "in_place_requirement": "Connector-native execution runs IN PLACE: inside the scheduled run, under the scheduled slot's OWN artifact root, with run_origin='scheduled' and manual_run=false. It is not a separate later pass, not a recovery root, and not an escalation.",
+    "must_not_escalate_before_artifact_creation": true,
+    "required_inputs": [
+      "Robinhood live quotes including bid and ask.",
+      "Finance quotes where available.",
+      "Prior completed regular-session close and OHLC where available.",
+      "Same-day order context from ALL prior streams of the trading day, not just the immediately preceding one.",
+      "Tradability for each candidate ticker.",
+      "Account-specific same-day Robinhood orders."
+    ],
+    "required_steps": [
+      "Gather every entry in required_inputs.",
+      "Persist the raw connector responses BEFORE computing, and compute only from the persisted files, per the existing raw input persistence contract.",
+      "Evaluate the first-allocation and ticker-scoped same-day top-up rules per ticker.",
+      "Place only qualifying orders with place_equity_order, and only after spread_ok and every other internal safety check passes.",
+      "Write the complete root-level artifact set defined in scheduled_run_artifact_contract.root_level_artifact_set_2026_07_27."
+    ],
+    "order_placement_tool": "place_equity_order",
+    "if_orders_cannot_be_placed": {
+      "condition": "Connector-native execution ran but could not place orders it had otherwise qualified.",
+      "required_behavior": "Record run_classification_outcome='failed_after_connector_native_recovery_attempt' with error_class set to the same code, and STILL write the complete artifact set.",
+      "note": "This is for a genuine placement failure after the connector-native path was attempted. It MUST NOT be used for a run that simply had no qualifying candidates; that is completed_no_orders with a completion_reason. See spread_gate_outcome_contract_2026_07_27."
+    },
+    "escalate_only_when": [
+      "A safety, account, or order rejection occurs.",
+      "Connector data is still unavailable after the allowed bounded recovery attempt.",
+      "The workspace itself is unavailable."
+    ],
+    "escalation_still_writes_artifacts": "Even in the escalate_only_when cases the complete artifact set is written FIRST. Escalation reports an outcome; it never replaces the artifact.",
+    "must_not": [
+      "MUST NOT escalate with the sole reason 'no run script found' or 'no internal implementation for order submission'.",
+      "MUST NOT escalate before creating the artifact root and writing the complete artifact set.",
+      "MUST NOT place any order that has not passed spread_ok and every other safety check.",
+      "MUST NOT reclassify itself as manual; run_origin stays scheduled and manual_run stays false."
+    ],
+    "safety_note": "This changes only what a run does when its local tooling is missing. It does not relax any budget cap, circuit breaker, whitelist, ordering, spread, confidence, or top-up rule; a connector-native run passes exactly the same gates as a runner-driven one.",
+    "supersedes_note": "Generalizes the intraday-only connector-native requirement to every live stream. Where both apply, the stricter reading governs.",
+    "doc": "docs/schedule_manifest.md"
+  },
+  "spread_gate_outcome_contract_2026_07_27": {
+    "added_on_et": "2026-07-27",
+    "incident": "The 1:30 PM ET intraday run recorded error_class='missing_spread_data' on a run where no ticker had qualified on the ladder at all, so nothing ever reached the spread gate and the missing spread was irrelevant to the outcome. A healthy zero-order run was recorded as a data failure.",
+    "applies_to_cron_ids": ["2ba19526", "42173154", "a6239dae", "7be82b97", "10ce362c"],
+    "evaluation_order": "Evaluate the ladder and same-day top-up rules FIRST, then the spread gate. Only candidates that qualify reach the gate, and only rows that reach the gate carry a spread verdict.",
+    "no_candidates_before_spread_gate": {
+      "condition": "No ticker qualifies, so no candidate ever reaches the spread gate.",
+      "run_classification_outcome": "completed_no_orders",
+      "order_submit_status": "no_orders_submitted",
+      "completion_reason": "no_ladder_candidates",
+      "error_class": null,
+      "is_trading_failure": false,
+      "valid_scheduled_evidence": true,
+      "note": "A normal, healthy zero-order run. It MUST NOT record error_class='missing_spread_data', MUST NOT be recorded as a trading failure or a missed slot, and MUST NOT count as an error in scheduled reliability."
+    },
+    "blocked_before_the_spread_gate": {
+      "condition": "Tickers DID qualify on the ladder and top-up rules, but every one was stopped by a budget, cap, per-order ceiling, already-bought-today, or same-day-duplicate check that runs BEFORE the spread lookup, so none carries a spread verdict.",
+      "run_classification_outcome": "completed_no_orders",
+      "order_submit_status": "no_orders_submitted",
+      "completion_reason": "blocked_before_spread_gate",
+      "error_class": null,
+      "is_trading_failure": false,
+      "valid_scheduled_evidence": true,
+      "note": "Distinguished from no_ladder_candidates by the CANDIDATE count, not the spread-gate count. Recording it as no_ladder_candidates would claim the ladder produced nothing when it did."
+    },
+    "placement_attempted_and_failed": {
+      "condition": "Qualifying candidates reached placement and every attempt raised.",
+      "run_classification_outcome": "failed_after_connector_native_recovery_attempt",
+      "order_submit_status": "not_submitted_error",
+      "error_class": "failed_after_connector_native_recovery_attempt",
+      "is_trading_failure": true,
+      "note": "A zero-order run is not automatically a healthy one. A run whose placements all raised is a genuine failure and MUST NOT be recorded as completed_no_orders. The complete artifact set is still written."
+    },
+    "raised_before_reaching_placement": {
+      "condition": "The run raised before placement was attempted at all: a startup failure, a data failure, or an account lookup failure.",
+      "run_classification_outcome": "failed_scheduled_run_startup",
+      "order_submit_status": "not_submitted_error",
+      "error_class": "scheduled_run_startup_failure",
+      "is_trading_failure": true,
+      "note": "Deliberately distinct from failed_after_connector_native_recovery_attempt, which means placement WAS attempted. Reporting keyed on the placement outcome would otherwise misattribute a startup or data failure as a broker-placement failure."
+    },
+    "blocked_before_placement": {
+      "condition": "A precondition or wiring gate stopped the run before placement: no same-day pre-flight artifact, no broker adapter, the wrong live account, or a raw-input persistence failure.",
+      "run_classification_outcome": "failed_scheduled_run_startup",
+      "order_submit_status": "not_submitted_error",
+      "error_class": "scheduled_run_blocked_before_placement",
+      "is_trading_failure": true,
+      "note": "These paths write and return before the run's normal classification step, so each stamps these fields itself. A more specific error_class the path already set, such as missing_or_invalid_raw_inputs, is kept."
+    },
+    "failed_after_submitting": {
+      "condition": "The run raised AFTER at least one order was accepted by the broker.",
+      "run_classification_outcome": "failed_after_partial_submission",
+      "order_submit_status": "submitted",
+      "is_trading_failure": true,
+      "note": "The aggregate fields MUST NOT contradict orders_submitted_count and the submitted_orders.csv rows. A run that failed after placing an order did submit; recording not_submitted_error there would let a summary consumer report no submission while the CSV holds the order. The retained outcomes also carry placement_evidence_incomplete=true: they are a floor on what was placed, never proof nothing else was."
+    },
+    "manual_placement_failure": {
+      "condition": "A MANUAL run's broker placement failed.",
+      "run_classification_outcome": "failed_placement",
+      "error_class": "failed_placement",
+      "is_trading_failure": true,
+      "note": "The manual path never runs the scheduled connector-native recovery policy, so its broker failures MUST NOT be recorded as failed_after_connector_native_recovery_attempt or reporting keyed on that outcome misattributes them as failed scheduled recovery attempts."
+    },
+    "concrete_status_precedence": {
+      "rule": "A concrete terminal order_submit_status the placement path produced always survives the no-order classification.",
+      "preserved": ["not_submitted_confirmation_required", "dry_run", "not_submitted_error", "not_submitted_no_candidates"],
+      "note": "Replacing not_submitted_confirmation_required with the generic no-order status would make is_confirmation_blocked() return false and lose the fact that broker confirmation is pending. Only the not_submitted_budget_exhausted catch-all is replaced, and only when no candidate was really blocked on a budget, cap, or buying-power check."
+    },
+    "degraded_market_data": {
+      "condition": "The run completed with zero orders while one or more market-data providers were raising, so its tickers degraded to NO_DATA or manual review rather than being genuinely evaluated.",
+      "run_classification_outcome": "completed_no_orders",
+      "order_submit_status": "no_orders_submitted",
+      "error_class": "degraded_market_data",
+      "is_trading_failure": false,
+      "sources": [
+        "A market-data provider that raised. The runner catches it and degrades the ticker to a NO_DATA signal carrying a 'provider error' warning, so that ticker was never genuinely evaluated.",
+        "A pre-placement broker check that raised (same-day order lookup, tradability, review), recorded as a NON-deliberate block. A deliberate safety gate carries deliberate_skip=true and is not an error."
+      ],
+      "note": "A zero-order run with errors_count > 0 is NOT a clean ladder no-op and MUST NOT be recorded with a null error_class, or a summary or reliability consumer reads a data-failure run as healthy. A concrete spread cause is more specific and takes precedence."
+    },
+    "row_blocking_gate_attribution": {
+      "rule": "A row counts toward candidates_blocked_missing_spread ONLY when the spread gate itself blocked it, recorded on the row as blocked_by='spread_gate'.",
+      "must_not": "MUST NOT infer a spread block from spread_status alone. A manual run does not fail closed on an unproven spread, so a row can carry spread_status='spread_unavailable' and still be stopped later by human review or broker confirmation, which is not a spread-caused outcome."
+    },
+    "all_candidates_blocked_at_spread_gate": {
+      "condition": "Candidates qualified and reached the gate, and EVERY one was failed closed because its bid/ask spread could not be proven.",
+      "run_classification_outcome": "completed_no_orders",
+      "order_submit_status": "no_orders_submitted",
+      "error_class": "missing_spread_data",
+      "is_trading_failure": false,
+      "valid_scheduled_evidence": true,
+      "note": "Still a safe no-order skip and still valid scheduled evidence that the slot executed. The complete artifact set is written."
+    },
+    "partially_unavailable": {
+      "condition": "Some qualifying rows have a proven spread and others do not.",
+      "required_behavior": "Fail ONLY the unproven rows closed, recording spread_ok=false and spread_status='spread_unavailable' (no bid/ask captured) or 'spread_not_ok' (captured but outside tolerance) on those rows, and continue evaluating and submitting every other qualifying row that passes every check.",
+      "must_not": [
+        "MUST NOT abort the whole run because spread is missing or bad for a subset of tickers.",
+        "MUST NOT suppress an otherwise-qualifying ticker whose own spread was proven because a different ticker's spread was unavailable.",
+        "MUST NOT place an order for a ticker whose spread could not be proven."
+      ]
+    },
+    "row_level_fields": ["spread_ok", "spread_pct", "spread_status"],
+    "row_level_statuses": ["spread_ok", "spread_unavailable", "spread_not_ok", "not_evaluated"],
+    "not_evaluated_note": "A row that never reached the gate records spread_status='not_evaluated' and is never counted as blocked for a missing spread. It is never recorded as spread_ok=true.",
+    "run_level_counts": ["candidates_reaching_spread_gate", "candidates_blocked_missing_spread"],
+    "never": "Spread inputs are never estimated, inferred, or defaulted. A ticker with unproven spread is skipped, not approximated.",
+    "enforced_by": "scripts/run_classification.py: spread_gate_fields stamps the per-row verdict and classify_no_order_run turns the two run-level counts into the recorded outcome. Both the morning/midday runner (morning_dca.py) and the afternoon runner (near_close_dca.py) route through them.",
+    "morning_stream_fix": "Before 2026-07-27 the morning/midday runner blocked only on a spread that was captured AND too wide, so a scheduled candidate whose bid/ask was never captured could still be placed. It now fails that row closed for scheduled runs, matching the afternoon runner. Manual runs still go through review_market_buy as a human-reviewed safety net.",
+    "tests": ["scripts/tests/test_run_classification.py", "test_morning_dca.py", "test_near_close_dca.py"],
+    "doc": "docs/run_classification.md"
   },
   "afternoon_placement_contract_2026_07_22": {
     "added_on_et": "2026-07-22",
@@ -536,12 +740,16 @@
       "bounded_recovery": "If raw input generation fails once, perform ONE bounded recovery attempt with the alternate approved data source path, then stop."
     },
     "state_file_guarantee": {
-      "summary": "The 12:30 scheduled run MUST always write run_state.json, run_summary.json, and latest_midday_run.json under the midday root even when no orders are placed or execution is blocked.",
+      "summary": "The 12:30 scheduled run MUST always write the complete ROOT-LEVEL artifact set (run_state.json, run_summary.json, midday_signals.csv, submitted_orders.csv) under YYYYMMDD_1230ET/ plus latest_midday_run.json, even when no orders are placed or execution is blocked.",
       "always_write": [
         "/home/user/workspace/cron_tracking/midday_dca/YYYYMMDD_1230ET/run_state.json",
         "/home/user/workspace/cron_tracking/midday_dca/YYYYMMDD_1230ET/run_summary.json",
+        "/home/user/workspace/cron_tracking/midday_dca/YYYYMMDD_1230ET/midday_signals.csv",
+        "/home/user/workspace/cron_tracking/midday_dca/YYYYMMDD_1230ET/submitted_orders.csv",
         "/home/user/workspace/cron_tracking/midday_dca/latest_midday_run.json"
       ],
+      "root_level_required": true,
+      "header_rule": "Both CSVs carry their header row even at zero data rows. See scheduled_run_artifact_contract.root_level_artifact_set_2026_07_27.",
       "missing_or_invalid_raw_inputs_state": {
         "when": "If raw inputs are missing, malformed, stale, or not generated, write a valid scheduled midday run_state.",
         "run_origin": "scheduled",
@@ -2444,6 +2652,11 @@
   "tasks": [
     {
       "id": "2ba19526",
+      "connector_native_fallback": {
+        "policy": "connector_native_execution_policy",
+        "enabled": true,
+        "summary": "If this scheduled run cannot find a repo runner script, an entry point, or an internal order-submission implementation, it MUST NOT escalate for that reason. It runs the connector-native path IN PLACE under this slot's own artifact root with run_origin='scheduled' and manual_run=false, gathers Robinhood quotes with bid/ask plus Finance data, prior close, same-day order context from all prior streams, tradability and account context, persists the raw responses first, and places only qualifying orders after spread_ok and every other safety check passes. It writes the complete root-level artifact set on every outcome, and escalation never happens before the artifacts exist."
+      },
       "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
       "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
       "name": "Weekday 9:35 AM market-open DCA live Robinhood execution",
@@ -2552,6 +2765,11 @@
     },
     {
       "id": "7be82b97",
+      "connector_native_fallback": {
+        "policy": "connector_native_execution_policy",
+        "enabled": true,
+        "summary": "If this scheduled run cannot find a repo runner script, an entry point, or an internal order-submission implementation, it MUST NOT escalate for that reason. It runs the connector-native path IN PLACE under this slot's own artifact root with run_origin='scheduled' and manual_run=false, gathers Robinhood quotes with bid/ask plus Finance data, prior close, same-day order context from all prior streams, tradability and account context, persists the raw responses first, and places only qualifying orders after spread_ok and every other safety check passes. It writes the complete root-level artifact set on every outcome, and escalation never happens before the artifacts exist."
+      },
       "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
       "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
       "name": "Weekday intraday DCA live Robinhood execution (11:30 AM, 1:30 PM, 2:30 PM ET)",
@@ -2683,6 +2901,11 @@
     },
     {
       "id": "42173154",
+      "connector_native_fallback": {
+        "policy": "connector_native_execution_policy",
+        "enabled": true,
+        "summary": "If this scheduled run cannot find a repo runner script, an entry point, or an internal order-submission implementation, it MUST NOT escalate for that reason. It runs the connector-native path IN PLACE under this slot's own artifact root with run_origin='scheduled' and manual_run=false, gathers Robinhood quotes with bid/ask plus Finance data, prior close, same-day order context from all prior streams, tradability and account context, persists the raw responses first, and places only qualifying orders after spread_ok and every other safety check passes. It writes the complete root-level artifact set on every outcome, and escalation never happens before the artifacts exist."
+      },
       "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
       "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
       "name": "Weekday 10:30 AM morning DCA live Robinhood execution",
@@ -2857,9 +3080,9 @@
       },
       "artifacts": {
         "run_dir": "/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/",
-        "always_write": ["run_state.json", "morning_signals.csv"],
-        "write_if_applicable": ["submitted_orders.csv"],
-        "manifest_accuracy_note": "Corrected 2026-07-19 (Codex/Copilot review, PR #78) to match MorningDCAExecutor.write_artifacts(): the scheduled 10:30 live run writes run_state.json and morning_signals.csv (via signals_csv_name) ONLY as always_write -- not 'signals.csv', and NOT run_summary.json/validation.csv (those are written only in preflight mode). submitted_orders.csv IS written, but conditionally: write_artifacts() emits it whenever at least one broker_outcomes entry has status=='submitted'. filled_orders.csv is never written by this task; there is no fill-confirmation step in morning_dca.py. live_reliability_fix_2026_07_17.always_write_artifacts above documents the intended contract, not current behavior -- see live_reliability_fix_2026_07_17 implementation_status at the top-level policy. See config/morning_dca.json's artifacts.manifest_accuracy_note.",
+        "always_write": ["run_state.json", "run_summary.json", "morning_signals.csv", "submitted_orders.csv", "budget_ledger.json"],
+        "root_level_required": true,
+        "manifest_accuracy_note": "Updated 2026-07-27 to match MorningDCAExecutor.write_artifacts() after the root-level artifact contract landed, superseding the 2026-07-19 note that recorded pre-contract behavior. A scheduled 10:30 LIVE run now ALWAYS writes the complete root-level set: run_state.json, run_summary.json, the signals CSV under its stream-specific name morning_signals.csv, and submitted_orders.csv with its canonical header even at zero orders. It also always writes budget_ledger.json. run_summary.json was previously preflight-only, which is why every live run directory failed the contract's require_summary check, and submitted_orders.csv was previously conditional on at least one submitted broker outcome; both are now unconditional for live runs, so a no-order run is a well-formed artifact rather than a contract failure. validation.csv stays preflight-only. filled_orders.csv is never written by this task; morning_dca.py has no fill-confirmation step. live_reliability_fix_2026_07_17.always_write_artifacts is now implemented for this stream. See scheduled_run_artifact_contract.root_level_artifact_set_2026_07_27 and config/morning_dca.json's artifacts.manifest_accuracy_note.",
         "gfuz_supplemental": "gfuz_supplemental_preflight.json (only when the 9:45 pre-flight lacked GFUZ). NOT YET IMPLEMENTED -- see gfuz_special_handling."
       },
       "circuit_breakers": {
@@ -2873,10 +3096,15 @@
         "regular_hours_only": true,
         "one_strategy_order_per_ticker_per_run": true
       },
-      "notes": "Live morning Robinhood execution moved from the former 9:45 AM slot to 10:30 AM ET (cron 30 14 * * 1-5 = 14:30 UTC weekdays during EDT) to give a true 60-minute intraday trend window. EXECUTION BROKER: Robinhood account 562057042 is the ONLY execution broker; Alpaca/Finance/Yahoo are read-only validation/account context only. Uses the shared $2 base 0x-to-5x live ladder (max per order 5x*$2=$10) and the morning budget ledger. PRE-FLIGHT GATE: depends on the same-day 9:45 pre-flight artifact and only evaluates/places for eligible_to_execute=true tickers, recomputing a fresh price/prior close/spread/60-minute downtrend/signal/budget before placing; skip / manual-review if trend cannot be validated. PRE-FLIGHT PATH FIX (added Jul 20 2026, see preflight_artifact_resolution): the same-day 9:45 pre-flight artifact MUST be read from /home/user/workspace/cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/run_state.json (or latest_preflight.json only when it points to that same-day file); it MUST NOT be sought under /home/user/workspace/cron_tracking/42173154 or the 10:30 live output directory (morning_dca/YYYYMMDD_1030ET/). If missing from the correct path, do exactly ONE bounded recovery lookup scanning /home/user/workspace/cron_tracking/morning_dca_preflight/ for today's YYYYMMDD_0945ET directory before escalating. IMPLEMENTED 2026-07-21 in morning_dca.py (load_morning_config(), load_same_day_preflight(), _apply_preflight_gate()); see preflight_artifact_resolution.implementation_status. MORNING BUDGET LEDGER (added Jul 20 2026, see budget_ledger_bootstrap): the morning budget ledger lives under /home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/; the task may create budget_ledger.json there if absent (note: run_summary.json is preflight-only), must not require a pre-existing ledger file, and if none exists initializes from the configured morning daily/weekly caps and writes the calculations into the 10:30 run_state.json. Neither Jul 20 fix weakens the budget caps, top-up guard, data-confidence rule, spread rule, whitelist, buy-only, regular-hours-only, Robinhood-execution-only, or any other safety control. IMPLEMENTED 2026-07-21 in morning_dca.py (write_artifacts() always writes budget_ledger.json under the run's own output directory); see budget_ledger_bootstrap.implementation_status. PRE-AUTHORIZED direct placement (user approved 2026-07-10 11:20 AM ET) for scheduled live runs only: MUST NOT request per-order confirmation and MUST NOT call Robinhood review_equity_order; calls place_equity_order directly ONLY after every safeguard passes. Manual/ad hoc runs still go through Robinhood's review + confirmation path: review_equity_order (review_market_buy) must pass before place_equity_order (place_market_buy) is attempted; if Robinhood's own review requires additional post-review confirmation (e.g. a step-up/2FA gate), placement raises OrderConfirmationRequiredError and the run records not_submitted_confirmation_required with no order placed -- there is no separate confirmation step implemented in this code beyond that broker-driven gate. GFUZ special handling (see gfuz_special_handling): Robinhood primary because Finance may not resolve GFUZ; an unresolved GFUZ on Finance does not block the run; if the 9:45 pre-flight lacks GFUZ, run supplemental GFUZ read-only validation and persist gfuz_supplemental_preflight.json before decisioning. CONFIDENCE RULE: if a candidate's price/drop passes but the intraday trend cannot be validated, it does NOT auto-buy; it is classified execution_status='manual_review_candidate' (no loosened trend-unavailable execution path). RAW DATA PERSISTENCE FIX (added Jul 15 2026, confirmed Jul 16 2026; see raw_data_persistence): before any signal/budget/top-up computation or placement, persist every raw connector response under morning_dca/YYYYMMDD_1030ET/raw/ (normalizing output_path/wrapped outputs); the decision engine reads only from persisted files; if fetch succeeds but persistence/normalization fails, place no orders and still write run_state.json with the blocking reason. NOT YET IMPLEMENTED in code as of 2026-07-19 (see raw_data_persistence.implementation_status) -- this is the intended contract, not current behavior. AUTOMATIC FAILURE RECOVERY (see automatic_failure_recovery): on recoverable internal/persistence/parsing/normalization/throttling/raw-write failures after data was fetched, rerun read-only inputs once, persist raw first, recompute only from persisted files, continue guarded execution if safeguards pass, reuse the same logical run directory with recovery_rerun=true, and never classify recovery as manual; if recovery also fails or a safety/account/order rejection occurs, write run_state with the blocking reason and escalate. Also NOT YET IMPLEMENTED in code as of 2026-07-19 (see automatic_failure_recovery.implementation_status and failure_recovery.implementation_status). LIVE RELIABILITY FIX (Jul 17 2026, see live_reliability_fix_2026_07_17): before calling place_equity_order the run is intended to describe the needed Robinhood connector schemas in-session (place_equity_order and get_equity_orders) and to end every actionable signal with exactly one persisted result (order_id, broker rejection, top-up block, budget block, cap block, data-confidence block, spread block, trend block, or safety block), reconciling any signal that lacks both an order_id and a block/rejection reason as execution_lineage_incomplete via one same-directory recovery retry through get_equity_orders; manual overrides stay manual_run=true and never count as scheduled evidence. This is manifest metadata only and not yet consumed by morning_dca.py (see the top-level live_reliability_fix_2026_07_17.implementation_status); the artifacts this task actually writes remain governed by artifacts.manifest_accuracy_note above. Hard circuit breakers: max per order $10, budget caps, available buying power, whitelist only, data confidence, spread threshold, trend validation, regular-hours only, one strategy order per ticker per run. ARTIFACTS: always writes run_state.json, morning_signals.csv, and budget_ledger.json under morning_dca/YYYYMMDD_1030ET/ (run_id='morning_live_YYYYMMDD_1030ET') -- NOT run_summary.json/validation.csv, which are preflight-only -- plus submitted_orders.csv when at least one order was actually submitted; filled_orders.csv is never written by this task (see artifacts.manifest_accuracy_note); run_classification carries run_origin='scheduled', run_type='morning_dca_live', scheduled_for_et='10:30', manual_run=false, state_schema_version='morning-live-v2-preauthorized', run_id='morning_live_YYYYMMDD_1030ET', cron_id='42173154', execution_broker='robinhood', account_number='562057042', preauthorized_direct_place=true, valid_morning_evidence=true, valid_afternoon_evidence=false. Never touches the afternoon ce16ba6b tree or latest_scheduled_run.json. SAME-DAY TOP-UP GUARD: earlier same-day manual/order fills are prior-allocation context only; buy only if the current decision price is strictly below the prior reference price and only the incremental difference; morning evidence must never count as afternoon evidence. Morning fills count only as prior-allocation context for the midday/afternoon same-day top-up guard."
+      "notes": "Live morning Robinhood execution moved from the former 9:45 AM slot to 10:30 AM ET (cron 30 14 * * 1-5 = 14:30 UTC weekdays during EDT) to give a true 60-minute intraday trend window. EXECUTION BROKER: Robinhood account 562057042 is the ONLY execution broker; Alpaca/Finance/Yahoo are read-only validation/account context only. Uses the shared $2 base 0x-to-5x live ladder (max per order 5x*$2=$10) and the morning budget ledger. PRE-FLIGHT GATE: depends on the same-day 9:45 pre-flight artifact and only evaluates/places for eligible_to_execute=true tickers, recomputing a fresh price/prior close/spread/60-minute downtrend/signal/budget before placing; skip / manual-review if trend cannot be validated. PRE-FLIGHT PATH FIX (added Jul 20 2026, see preflight_artifact_resolution): the same-day 9:45 pre-flight artifact MUST be read from /home/user/workspace/cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/run_state.json (or latest_preflight.json only when it points to that same-day file); it MUST NOT be sought under /home/user/workspace/cron_tracking/42173154 or the 10:30 live output directory (morning_dca/YYYYMMDD_1030ET/). If missing from the correct path, do exactly ONE bounded recovery lookup scanning /home/user/workspace/cron_tracking/morning_dca_preflight/ for today's YYYYMMDD_0945ET directory before escalating. IMPLEMENTED 2026-07-21 in morning_dca.py (load_morning_config(), load_same_day_preflight(), _apply_preflight_gate()); see preflight_artifact_resolution.implementation_status. MORNING BUDGET LEDGER (added Jul 20 2026, see budget_ledger_bootstrap): the morning budget ledger lives under /home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/; the task may create budget_ledger.json there if absent (note: run_summary.json is ALSO written on every live run -- see artifacts.manifest_accuracy_note and scheduled_run_artifact_contract.root_level_artifact_set_2026_07_27 -- superseding the earlier preflight-only statement), must not require a pre-existing ledger file, and if none exists initializes from the configured morning daily/weekly caps and writes the calculations into the 10:30 run_state.json. Neither Jul 20 fix weakens the budget caps, top-up guard, data-confidence rule, spread rule, whitelist, buy-only, regular-hours-only, Robinhood-execution-only, or any other safety control. IMPLEMENTED 2026-07-21 in morning_dca.py (write_artifacts() always writes budget_ledger.json under the run's own output directory); see budget_ledger_bootstrap.implementation_status. PRE-AUTHORIZED direct placement (user approved 2026-07-10 11:20 AM ET) for scheduled live runs only: MUST NOT request per-order confirmation and MUST NOT call Robinhood review_equity_order; calls place_equity_order directly ONLY after every safeguard passes. Manual/ad hoc runs still go through Robinhood's review + confirmation path: review_equity_order (review_market_buy) must pass before place_equity_order (place_market_buy) is attempted; if Robinhood's own review requires additional post-review confirmation (e.g. a step-up/2FA gate), placement raises OrderConfirmationRequiredError and the run records not_submitted_confirmation_required with no order placed -- there is no separate confirmation step implemented in this code beyond that broker-driven gate. GFUZ special handling (see gfuz_special_handling): Robinhood primary because Finance may not resolve GFUZ; an unresolved GFUZ on Finance does not block the run; if the 9:45 pre-flight lacks GFUZ, run supplemental GFUZ read-only validation and persist gfuz_supplemental_preflight.json before decisioning. CONFIDENCE RULE: if a candidate's price/drop passes but the intraday trend cannot be validated, it does NOT auto-buy; it is classified execution_status='manual_review_candidate' (no loosened trend-unavailable execution path). RAW DATA PERSISTENCE FIX (added Jul 15 2026, confirmed Jul 16 2026; see raw_data_persistence): before any signal/budget/top-up computation or placement, persist every raw connector response under morning_dca/YYYYMMDD_1030ET/raw/ (normalizing output_path/wrapped outputs); the decision engine reads only from persisted files; if fetch succeeds but persistence/normalization fails, place no orders and still write run_state.json with the blocking reason. NOT YET IMPLEMENTED in code as of 2026-07-19 (see raw_data_persistence.implementation_status) -- this is the intended contract, not current behavior. AUTOMATIC FAILURE RECOVERY (see automatic_failure_recovery): on recoverable internal/persistence/parsing/normalization/throttling/raw-write failures after data was fetched, rerun read-only inputs once, persist raw first, recompute only from persisted files, continue guarded execution if safeguards pass, reuse the same logical run directory with recovery_rerun=true, and never classify recovery as manual; if recovery also fails or a safety/account/order rejection occurs, write run_state with the blocking reason and escalate. Also NOT YET IMPLEMENTED in code as of 2026-07-19 (see automatic_failure_recovery.implementation_status and failure_recovery.implementation_status). LIVE RELIABILITY FIX (Jul 17 2026, see live_reliability_fix_2026_07_17): before calling place_equity_order the run is intended to describe the needed Robinhood connector schemas in-session (place_equity_order and get_equity_orders) and to end every actionable signal with exactly one persisted result (order_id, broker rejection, top-up block, budget block, cap block, data-confidence block, spread block, trend block, or safety block), reconciling any signal that lacks both an order_id and a block/rejection reason as execution_lineage_incomplete via one same-directory recovery retry through get_equity_orders; manual overrides stay manual_run=true and never count as scheduled evidence. This is manifest metadata only and not yet consumed by morning_dca.py (see the top-level live_reliability_fix_2026_07_17.implementation_status); the artifacts this task actually writes remain governed by artifacts.manifest_accuracy_note above. Hard circuit breakers: max per order $10, budget caps, available buying power, whitelist only, data confidence, spread threshold, trend validation, regular-hours only, one strategy order per ticker per run. ARTIFACTS (updated 2026-07-27, superseding the pre-contract wording that listed run_summary.json as preflight-only and submitted_orders.csv as conditional): always writes the COMPLETE ROOT-LEVEL set under morning_dca/YYYYMMDD_1030ET/ (run_id='morning_live_YYYYMMDD_1030ET') on EVERY outcome -- run_state.json, run_summary.json, morning_signals.csv (header row even at zero signals), and submitted_orders.csv with its canonical header even at zero orders -- plus budget_ledger.json, and never any of them only under a nested subfolder. validation.csv stays preflight-only. filled_orders.csv is never written by this task (see artifacts.manifest_accuracy_note and scheduled_run_artifact_contract.root_level_artifact_set_2026_07_27); run_classification carries run_origin='scheduled', run_type='morning_dca_live', scheduled_for_et='10:30', manual_run=false, state_schema_version='morning-live-v2-preauthorized', run_id='morning_live_YYYYMMDD_1030ET', cron_id='42173154', execution_broker='robinhood', account_number='562057042', preauthorized_direct_place=true, valid_morning_evidence=true, valid_afternoon_evidence=false. Never touches the afternoon ce16ba6b tree or latest_scheduled_run.json. SAME-DAY TOP-UP GUARD: earlier same-day manual/order fills are prior-allocation context only; buy only if the current decision price is strictly below the prior reference price and only the incremental difference; morning evidence must never count as afternoon evidence. Morning fills count only as prior-allocation context for the midday/afternoon same-day top-up guard."
     },
     {
       "id": "a6239dae",
+      "connector_native_fallback": {
+        "policy": "connector_native_execution_policy",
+        "enabled": true,
+        "summary": "If this scheduled run cannot find a repo runner script, an entry point, or an internal order-submission implementation, it MUST NOT escalate for that reason. It runs the connector-native path IN PLACE under this slot's own artifact root with run_origin='scheduled' and manual_run=false, gathers Robinhood quotes with bid/ask plus Finance data, prior close, same-day order context from all prior streams, tradability and account context, persists the raw responses first, and places only qualifying orders after spread_ok and every other safety check passes. It writes the complete root-level artifact set on every outcome, and escalation never happens before the artifacts exist."
+      },
       "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
       "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
       "name": "Weekday 12:30 PM midday DCA live Robinhood execution",
@@ -2914,9 +3142,11 @@
         "always_write": [
           "/home/user/workspace/cron_tracking/midday_dca/YYYYMMDD_1230ET/run_state.json",
           "/home/user/workspace/cron_tracking/midday_dca/YYYYMMDD_1230ET/run_summary.json",
+          "/home/user/workspace/cron_tracking/midday_dca/YYYYMMDD_1230ET/midday_signals.csv",
+          "/home/user/workspace/cron_tracking/midday_dca/YYYYMMDD_1230ET/submitted_orders.csv",
           "/home/user/workspace/cron_tracking/midday_dca/latest_midday_run.json"
         ],
-        "always_write_even_when": "no orders are placed or execution is blocked.",
+        "always_write_even_when": "no orders are placed or execution is blocked, on EVERY outcome including a failed startup. Both CSVs carry their header row even at zero data rows, and every file lives at the artifact ROOT, not under an artifacts/ subfolder. See scheduled_run_artifact_contract.root_level_artifact_set_2026_07_27.",
         "missing_or_invalid_raw_inputs_state": {
           "run_origin": "scheduled",
           "manual_run": false,
@@ -3009,6 +3239,11 @@
     },
     {
       "id": "10ce362c",
+      "connector_native_fallback": {
+        "policy": "connector_native_execution_policy",
+        "enabled": true,
+        "summary": "If this scheduled run cannot find a repo runner script, an entry point, or an internal order-submission implementation, it MUST NOT escalate for that reason. It runs the connector-native path IN PLACE under this slot's own artifact root with run_origin='scheduled' and manual_run=false, gathers Robinhood quotes with bid/ask plus Finance data, prior close, same-day order context from all prior streams, tradability and account context, persists the raw responses first, and places only qualifying orders after spread_ok and every other safety check passes. It writes the complete root-level artifact set on every outcome, and escalation never happens before the artifacts exist."
+      },
       "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
       "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
       "supersedes_cron_id": "ce16ba6b",

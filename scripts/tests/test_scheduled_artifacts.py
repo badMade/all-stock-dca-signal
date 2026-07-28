@@ -9,6 +9,8 @@ Covers the scheduled-run artifact contract:
   * validate_run_artifacts fails on a missing signals.csv / submitted_orders.csv
   * submitted_orders.csv is written with a header row even when no order was
     submitted, and pending/unconfirmed responses still produce a row
+  * the four required files are written at the RUN ROOT on every outcome, and a
+    file nested under artifacts/ is reported as a nested-artifact failure
 """
 
 import csv
@@ -21,22 +23,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.scheduled_artifacts import (  # noqa: E402
     AFTERNOON_LIVE_CRON_ID,
     AFTERNOON_LIVE_SUPERSEDES_CRON_ID,
+    CANONICAL_RUN_SUMMARY_FILENAME,
     ERROR_CLASS_COMPUTE_ONLY_NO_PLACEMENT,
     ERROR_CLASS_PLACEMENT_PHASE_UNREACHABLE,
     MORNING_LIVE_CRON_ID,
     ORDER_SUBMIT_STATUS_PLACEMENT_UNREACHABLE,
     PREFLIGHT_CRON_ID,
     PREFLIGHT_RUN_TYPE,
+    SCHEDULED_LIVE_REQUIRED_FILENAMES,
+    SIGNALS_CSV_FILENAME,
     SUBMITTED_ORDERS_FIELDS,
     build_afternoon_live_run_classification,
     build_morning_live_run_classification,
     build_preflight_run_classification,
+    build_run_summary,
     has_planned_orders,
     is_compute_only_terminal_failure,
     mirror_run_classification,
+    nested_only_artifacts,
     placement_unreachable_state_fields,
     submitted_order_rows,
     validate_run_artifacts,
+    write_scheduled_run_artifacts,
     write_signals_csv,
     write_submitted_orders_csv,
 )
@@ -589,7 +597,282 @@ def test_submitted_order_rows_include_pending_and_unconfirmed():
     assert statuses["UNCON"] == "unconfirmed"
 
 
+# --- Root-level artifact set (Jul 27 2026 12:30 / 1:30 incidents) -----------
+
+
+def _live_run_state():
+    return {
+        "run_id": "midday_live_20260727_1230ET",
+        "trading_day": "2026-07-27",
+        "generated_at": "2026-07-27T16:30:00+00:00",
+        "broker": "robinhood",
+        "dry_run": False,
+        "order_submit_status": "no_orders_submitted",
+        "completion_reason": "no_ladder_candidates",
+        "error_class": None,
+        "orders_submitted_count": 0,
+        "run_classification": build_morning_live_run_classification(
+            trading_day="2026-07-27",
+            run_id="midday_live_20260727_1230ET",
+            valid_scheduled_evidence=True,
+        ),
+    }
+
+
+def test_write_scheduled_run_artifacts_writes_all_four_at_the_root(tmp_path):
+    paths = write_scheduled_run_artifacts(tmp_path, _live_run_state())
+
+    for name in SCHEDULED_LIVE_REQUIRED_FILENAMES:
+        assert (tmp_path / name).exists(), f"{name} missing at the run root"
+    assert set(paths) == {"run_state", "run_summary", "signals", "submitted_orders"}
+    assert all(path.parent == tmp_path for path in paths.values())
+    assert validate_run_artifacts(tmp_path, require_summary=True)
+
+
+def test_zero_order_run_still_writes_both_csv_headers(tmp_path):
+    """A run that evaluated nothing is still a complete artifact, not empty files."""
+    write_scheduled_run_artifacts(tmp_path, _live_run_state(), signal_rows=[], order_rows=[])
+
+    for name in ("signals.csv", "submitted_orders.csv"):
+        rows = list(csv.reader((tmp_path / name).open(newline="")))
+        assert len(rows) == 1, f"{name} should be header-only"
+        assert rows[0] and any(col.strip() for col in rows[0]), f"{name} has no header"
+    assert validate_run_artifacts(tmp_path, require_summary=True)
+
+
+def test_run_summary_mirrors_run_classification_and_carries_the_no_order_outcome(tmp_path):
+    state = _live_run_state()
+    write_scheduled_run_artifacts(tmp_path, state)
+
+    summary = json.loads((tmp_path / "run_summary.json").read_text(encoding="utf-8"))
+    assert summary["run_classification"] == state["run_classification"]
+    assert summary["order_submit_status"] == "no_orders_submitted"
+    assert summary["completion_reason"] == "no_ladder_candidates"
+    assert summary["error_class"] is None
+
+
+def test_build_run_summary_omits_absent_outcome_fields():
+    summary = build_run_summary({"run_id": "r1", "run_classification": {"run_origin": "scheduled"}})
+    assert "completion_reason" not in summary
+    assert summary["run_classification"] == {"run_origin": "scheduled"}
+
+
+def test_artifacts_written_only_under_a_nested_subfolder_fail_the_contract(tmp_path):
+    """Jul 27 2026 1:30 PM ET: all four files landed under artifacts/ and the run
+    root was empty, so every path-based consumer saw a slot that never fired."""
+    nested = tmp_path / "artifacts"
+    write_scheduled_run_artifacts(nested, _live_run_state())
+
+    reported = nested_only_artifacts(tmp_path)
+    assert set(reported) == set(SCHEDULED_LIVE_REQUIRED_FILENAMES)
+
+    result = validate_run_artifacts(tmp_path, require_summary=True)
+    assert not result
+    assert all("only at" in err for err in result.errors if "exists" in err)
+    assert any("run_state.json exists only at" in err for err in result.errors)
+
+
+def test_root_level_artifacts_are_not_reported_as_nested(tmp_path):
+    write_scheduled_run_artifacts(tmp_path, _live_run_state())
+    (tmp_path / "artifacts").mkdir()
+    (tmp_path / "artifacts" / "run_state.json").write_text("{}", encoding="utf-8")
+
+    assert nested_only_artifacts(tmp_path) == {}
+    assert validate_run_artifacts(tmp_path, require_summary=True)
+
+
+def test_stream_specific_signals_filename_satisfies_the_root_contract(tmp_path):
+    write_scheduled_run_artifacts(
+        tmp_path, _live_run_state(), signals_filename="midday_signals.csv"
+    )
+
+    assert (tmp_path / "midday_signals.csv").exists()
+    assert not (tmp_path / "signals.csv").exists()
+    assert nested_only_artifacts(tmp_path) == {}
+    assert validate_run_artifacts(tmp_path, require_summary=True)
+
+
+def test_headerless_signals_csv_fails_the_contract(tmp_path):
+    write_scheduled_run_artifacts(tmp_path, _live_run_state())
+    (tmp_path / "signals.csv").write_text("", encoding="utf-8")
+
+    result = validate_run_artifacts(tmp_path, require_summary=True)
+    assert not result
+    assert any("no header row" in err for err in result.errors)
+
+
+def test_a_stale_empty_signals_csv_does_not_invalidate_a_valid_stream_file(tmp_path):
+    """A reused/recovery directory can hold a stale empty signals.csv beside a
+    valid morning_signals.csv; any recognized name satisfies the contract
+    (Codex review)."""
+    write_scheduled_run_artifacts(
+        tmp_path, _live_run_state(), signals_filename="morning_signals.csv"
+    )
+    (tmp_path / "signals.csv").write_text("", encoding="utf-8")
+
+    assert validate_run_artifacts(tmp_path, require_summary=True)
+
+
+def test_all_signals_candidates_headerless_still_fails(tmp_path):
+    write_scheduled_run_artifacts(
+        tmp_path, _live_run_state(), signals_filename="morning_signals.csv"
+    )
+    (tmp_path / "signals.csv").write_text("", encoding="utf-8")
+    (tmp_path / "morning_signals.csv").write_text("", encoding="utf-8")
+
+    result = validate_run_artifacts(tmp_path, require_summary=True)
+    assert not result
+    assert any("no header row" in err for err in result.errors)
+
+
+def test_a_waived_artifact_is_not_failed_by_a_stale_nested_copy(tmp_path):
+    """The raw-persistence failure path validates with require_signals=False
+    because no signal could be computed; a stale artifacts/signals.csv in a
+    reused directory must not fail it (Codex review)."""
+    write_scheduled_run_artifacts(tmp_path, _live_run_state())
+    (tmp_path / "signals.csv").unlink()
+    (tmp_path / "artifacts").mkdir()
+    (tmp_path / "artifacts" / "signals.csv").write_text("ticker\n", encoding="utf-8")
+
+    assert validate_run_artifacts(tmp_path, require_signals=False, require_summary=True)
+    # Still reported when the caller does require it.
+    assert not validate_run_artifacts(tmp_path, require_signals=True, require_summary=True)
+
+
+def test_nested_scan_can_be_narrowed_to_the_required_filenames(tmp_path):
+    nested = tmp_path / "artifacts"
+    write_scheduled_run_artifacts(nested, _live_run_state())
+
+    assert set(nested_only_artifacts(tmp_path)) == set(SCHEDULED_LIVE_REQUIRED_FILENAMES)
+    narrowed = nested_only_artifacts(tmp_path, filenames=["run_state.json"])
+    assert set(narrowed) == {"run_state.json"}
+
+
+def test_a_signals_header_without_a_symbol_column_fails(tmp_path):
+    """An arbitrary non-blank header would otherwise pass while the drift detector
+    reads no ticker from it, hiding expected-order drift (Codex review)."""
+    write_scheduled_run_artifacts(tmp_path, _live_run_state())
+    (tmp_path / "signals.csv").write_text("garbage\n", encoding="utf-8")
+
+    result = validate_run_artifacts(tmp_path, require_summary=True)
+    assert not result
+    assert any("no symbol column" in err for err in result.errors)
+
+
+def test_either_recognized_symbol_column_satisfies_the_signals_header(tmp_path):
+    write_scheduled_run_artifacts(tmp_path, _live_run_state())
+    for header in ("ticker,action\n", "symbol,action\n", "Symbol,Action\n"):
+        (tmp_path / "signals.csv").write_text(header, encoding="utf-8")
+        assert validate_run_artifacts(tmp_path, require_summary=True), header
+
+
+def test_a_synthetic_outcome_key_does_not_become_the_ticker():
+    """A retry placing a SECOND order for a ticker keys that outcome
+    ``AAPL:<order-id>`` so it is not lost to a collision. Taking the key as the
+    symbol wrote that string into the canonical order row (Codex review)."""
+    rows = submitted_order_rows(
+        {
+            "AAPL": {"status": "submitted", "order_id": "o-1", "submitted_amount_usd": 2.0},
+            "AAPL:o-2": {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "order_id": "o-2",
+                "submitted_amount_usd": 3.0,
+            },
+        }
+    )
+
+    assert [row["ticker"] for row in rows] == ["AAPL", "AAPL"]
+    # Both orders survive; only the key disambiguates them.
+    assert sorted(row["order_id"] for row in rows) == ["o-1", "o-2"]
+
+
+def test_a_corrupt_signals_body_under_a_valid_header_fails_the_contract(tmp_path):
+    """Validating only the header accepted a file the drift detector cannot read.
+
+    read_csv_rows() consumes the whole CSV and its wrapper merely logs a detector
+    failure, so a valid header over a corrupt body published valid scheduled
+    evidence while missing-order drift went unreconciled (Codex review).
+    """
+    write_scheduled_run_artifacts(tmp_path, _live_run_state())
+    limit = csv.field_size_limit()
+    (tmp_path / "signals.csv").write_text(
+        "ticker,action\nAAPL," + "x" * (limit + 1024) + "\n", encoding="utf-8"
+    )
+
+    result = validate_run_artifacts(tmp_path, require_summary=True)
+    assert not result
+    assert any("not readable" in err for err in result.errors)
+
+
+def test_a_corrupt_submitted_orders_body_fails_the_contract(tmp_path):
+    """Same standard for the orders CSV; the detector reads its rows too."""
+    write_scheduled_run_artifacts(tmp_path, _live_run_state())
+    limit = csv.field_size_limit()
+    (tmp_path / "submitted_orders.csv").write_text(
+        "ticker,order_id,submitted_amount_usd,status\nAAPL," + "x" * (limit + 1024) + "\n",
+        encoding="utf-8",
+    )
+
+    result = validate_run_artifacts(tmp_path, require_summary=True)
+    assert not result
+    assert any("not readable" in err for err in result.errors)
+
+
+def test_a_csv_parser_error_is_a_contract_failure_not_an_exception(tmp_path):
+    """A corrupt file whose header field exceeds the CSV field-size limit raised
+    csv.Error out of the validator, turning validation itself into another
+    scheduled-run exception (Codex review)."""
+    write_scheduled_run_artifacts(tmp_path, _live_run_state())
+    limit = csv.field_size_limit()
+    (tmp_path / "signals.csv").write_text("x" * (limit + 1024) + "\n", encoding="utf-8")
+
+    result = validate_run_artifacts(tmp_path, require_summary=True)
+    assert not result
+    assert any("not readable" in err for err in result.errors)
+
+
+def test_a_recognized_sibling_still_satisfies_the_contract_after_a_parser_error(tmp_path):
+    write_scheduled_run_artifacts(
+        tmp_path, _live_run_state(), signals_filename="morning_signals.csv"
+    )
+    limit = csv.field_size_limit()
+    (tmp_path / "signals.csv").write_text("x" * (limit + 1024) + "\n", encoding="utf-8")
+
+    assert validate_run_artifacts(tmp_path, require_summary=True)
+
+
 if __name__ == "__main__":  # pragma: no cover
     import pytest
 
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_a_nested_only_artifact_is_reported_once_not_twice(tmp_path):
+    """Naming the nested case and THEN repeating "missing X" for the same file
+    gave the caller two errors for one cause and buried the specific one
+    (Copilot review)."""
+    nested = tmp_path / "artifacts"
+    write_scheduled_run_artifacts(nested, _live_run_state())
+
+    result = validate_run_artifacts(tmp_path, require_summary=True)
+
+    assert not result
+    for name in SCHEDULED_LIVE_REQUIRED_FILENAMES:
+        nested_errs = [e for e in result.errors if e.startswith(f"{name} exists only at")]
+        assert len(nested_errs) == 1, name
+        # The redundant generic error is gone.
+        assert f"missing {name}" not in result.errors
+    assert not any(e.startswith(f"missing {CANONICAL_RUN_SUMMARY_FILENAME}") for e in result.errors)
+
+
+def test_a_genuinely_missing_file_still_reports_missing(tmp_path):
+    """Suppression is scoped to files the nested scan explained; anything else
+    still gets the plain error."""
+    write_scheduled_run_artifacts(tmp_path, _live_run_state())
+    (tmp_path / "signals.csv").unlink()
+
+    result = validate_run_artifacts(tmp_path, require_summary=True)
+
+    assert not result
+    assert f"missing {SIGNALS_CSV_FILENAME}" in result.errors

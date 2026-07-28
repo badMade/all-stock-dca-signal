@@ -62,6 +62,9 @@ from scripts.model_usage_log import log_model_usage
 from scripts.run_classification import (
     CANONICAL_RETIME_DATE_YYYYMMDD,
     LEGACY_SCHEDULED_WINDOW_START_ET,
+    ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED,
+    ORDER_SUBMIT_STATUS_SUBMITTED,
+    RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION,
     SCHEDULED_WINDOW_START_ET,
     build_raw_persistence_state,
     load_same_day_top_up_context,
@@ -72,7 +75,11 @@ from scripts.run_classification import (
 from scripts.run_classification import (
     CRON_ID as AFTERNOON_LIVE_CRON_ID,
 )
-from scripts.scheduled_artifacts import RUN_STATE_FILENAME
+from scripts.scheduled_artifacts import (
+    ORDER_ATTEMPT_STATUSES,
+    RUN_STATE_FILENAME,
+    write_signals_csv,
+)
 
 logger = logging.getLogger("near_close_dca.run")
 
@@ -1000,6 +1007,86 @@ def _tickers_with_unresolved_same_day_context(
     )
 
 
+def _prior_submitted_order_rows(run_dir: Path) -> List[Dict[str, Any]]:
+    """Submitted-order rows already recorded for this slot by an earlier attempt.
+
+    Read from the run directory's own submitted_orders.csv, which a prior
+    successful attempt wrote. Used so a fail-closed retry state does not overwrite
+    the slot's canonical record with a zero-order one.
+    """
+    path = run_dir / "submitted_orders.csv"
+    if not path.exists():
+        return []
+    rows: List[Dict[str, Any]] = []
+    try:
+        with path.open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                # Same bar submitted_order_rows() applies: a concrete order_id, or
+                # a placed/in-flight status. Accepting only submitted/filled would
+                # drop a pending or unconfirmed order the broker may well have
+                # taken, letting a later run allocate it again (Codex review).
+                status = str(row.get("status", "")).strip()
+                # Stripped BEFORE the gate, so a whitespace-only id cannot pass as
+                # a concrete order id and then be normalized away to None below.
+                order_id = str(row.get("order_id") or "").strip() or None
+                if not order_id and status not in ORDER_ATTEMPT_STATUSES:
+                    continue
+                # These dicts are assigned straight to run_state["buy_candidates"],
+                # so they must satisfy run_state.schema.json's candidate shape.
+                # csv.DictReader hands back every field as a STRING, and the
+                # schema requires planned_amount_usd to be a number and
+                # buy_multiplier to be present, so carrying the raw row through
+                # produced a canonical failure state that schema-based consumers
+                # reject while the lightweight validator still passed (Codex
+                # review).
+                try:
+                    amount = float(str(row.get("submitted_amount_usd") or "").strip() or 0.0)
+                except (TypeError, ValueError):
+                    amount = 0.0
+                # A blank ticker would produce a schema-valid but meaningless
+                # candidate row in the canonical state, and the same-day guards
+                # key on the ticker (Copilot review). Whitespace is stripped for
+                # the same reason: " AAA" is not the ticker any consumer matches.
+                ticker = str(row.get("ticker") or "").strip()
+                if not ticker:
+                    continue
+                rows.append(
+                    {
+                        "ticker": ticker,
+                        "status": status,
+                        "order_id": order_id,
+                        # Not recoverable from submitted_orders.csv, which does not
+                        # carry it. Null is schema-valid and honest.
+                        "buy_multiplier": None,
+                        "planned_amount_usd": max(0.0, amount),
+                    }
+                )
+    except (OSError, UnicodeDecodeError, csv.Error):
+        return []
+    return rows
+
+
+def _accepted_order_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The subset of prior rows that represent an order the broker actually took.
+
+    ``not_submitted_confirmation_required`` earns a submitted_orders.csv row --
+    the attempt is part of the slot's record -- but it means the opposite of an
+    accepted order: the placement stopped at the confirmation gate and nothing
+    reached the broker, which is why such a row has no order id. Counting it
+    would report ``orders_submitted_count=1`` and a post-submission failure for
+    a slot that submitted nothing (Codex review).
+
+    A row carrying a concrete order id is kept whatever its status: an id can
+    only come from the broker.
+    """
+    return [
+        row
+        for row in rows
+        if row.get("order_id")
+        or str(row.get("status", "")).strip() != ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED
+    ]
+
+
 def run_pipeline(
     now: datetime,
     config: StrategyConfig,
@@ -1393,21 +1480,69 @@ def _run_pipeline_impl(
                     _prior_orders_csv = out / "orders.csv"
                     if _prior_orders_csv.exists():
                         failure_state["artifacts"] = {"orders_csv_path": str(_prior_orders_csv)}
+                    # Carry forward the SLOT's prior order evidence BEFORE the state
+                    # is serialized. This state overwrites the fixed-path
+                    # run_state.json, and the contract writer regenerates
+                    # submitted_orders.csv from its buy_candidates, so a retry after
+                    # a successful attempt would otherwise erase real accepted orders
+                    # from the canonical scheduled record. Mutating after the write
+                    # left the on-disk state without them while the companions had
+                    # them, which is worse than either (Codex review).
+                    _prior_rows = _prior_submitted_order_rows(out)
+                    # Every prior row is kept as the slot's record; only the ones
+                    # the broker actually took are COUNTED. A confirmation-required
+                    # attempt belongs in the record and is not a submission
+                    # (Codex review).
+                    _accepted = _accepted_order_rows(_prior_rows)
+                    if _prior_rows:
+                        failure_state["buy_candidates"] = _prior_rows
+                        failure_state["placement_evidence_incomplete"] = True
+                        failure_state["orders_submitted_count"] = len(_accepted)
+                        failure_state["counts"] = {
+                            **(failure_state.get("counts") or {}),
+                            "submitted": len(_accepted),
+                            "buy_candidates": len(_prior_rows),
+                        }
+                    if _accepted:
+                        # The denial STAYS. This run failed, so it is not
+                        # evidence the slot executed -- and its accepted orders
+                        # are still attributable to the slot, because
+                        # is_scheduled_state rejects a denied state only when it
+                        # has no order to attribute. Clearing the marker here to
+                        # keep the fills reportable was the same seam handled by
+                        # hand in one place; it now lives in the predicate.
+                        # Keep the aggregate fields consistent with the carried
+                        # count. Leaving order_submit_status='not_submitted_error'
+                        # and the startup outcome beside a non-zero count makes the
+                        # state claim simultaneously that orders were and were not
+                        # submitted, so status-based reliability reporting reads a
+                        # partially submitted slot as a pre-submission failure
+                        # (Codex review). It is still a failure, just an honest one.
+                        failure_state["order_submit_status"] = ORDER_SUBMIT_STATUS_SUBMITTED
+                        failure_state["run_classification_outcome"] = (
+                            RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
+                        )
                     run_state_path = out / "run_state.json"
                     atomic_write_text(run_state_path, json.dumps(failure_state, indent=2) + "\n")
+                    # A stale signals.csv from a prior attempt was deleted above so
+                    # it is not mistaken for this run's output, but the scheduled
+                    # contract requires all four root-level files on EVERY outcome.
+                    # Write a fresh header-only one: honest (no signal was computed)
+                    # and contract-valid, where an absent file would publish valid
+                    # latest scheduled evidence with a required file missing (Codex
+                    # review). detect_drift still finds an empty expected set, so the
+                    # direct raw-persistence alert below remains the operator signal.
+                    write_signals_csv(out, [], fieldnames=("ticker",))
                     # Route this fail-closed raw-persistence outcome through the same
-                    # scheduled artifact contract as the normal finalizer: write the
+                    # scheduled artifact contract as the normal finalizer: the
                     # header-only submitted_orders.csv and the mirrored canonical
-                    # run_summary.json (no signals were computed, so signals.csv is
-                    # not required), overwriting any stale copies from a prior attempt.
-                    # Without this the early return bypassed the contract entirely
-                    # while still updating the scheduled pointer. A contract breach
-                    # here (persisted as a blocked/invalid state) also blocks the
-                    # pointer, so it is not recorded as valid scheduled evidence.
+                    # run_summary.json, overwriting any stale copies from a prior
+                    # attempt. Without this the early return bypassed the contract
+                    # entirely while still updating the scheduled pointer. A contract
+                    # breach here (persisted as a blocked/invalid state) also blocks
+                    # the pointer, so it is not recorded as valid scheduled evidence.
                     contract_ok = bool(
-                        _write_and_validate_scheduled_contract(
-                            failure_state, out, require_signals=False
-                        )
+                        _write_and_validate_scheduled_contract(failure_state, out)
                     )
                     if classification_state_root is not None and contract_ok:
                         update_latest_scheduled_run_pointer(
@@ -1418,8 +1553,8 @@ def _run_pipeline_impl(
                             "Not updating latest_scheduled_run.json: raw-persistence "
                             "failure-state artifact contract failed."
                         )
-                    # signals.csv was already deleted above, so detect_drift()
-                    # finds an empty expected set and returns drift_detected=False —
+                    # signals.csv carries only its header, so detect_drift() finds an
+                    # empty expected set and returns drift_detected=False:
                     # _run_drift_check() would log nothing and send no Slack alert.
                     # Emit the raw-persistence alert directly instead so operators
                     # are paged on the documented missing-raw failure mode.

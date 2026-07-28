@@ -149,8 +149,9 @@ def derive_valid_scheduled_evidence(run_state: Optional[Dict[str, object]]) -> b
     deliberately looser than run_classification.is_scheduled_state (which pins
     the 15:30 afternoon window); a stream's own validator can tighten further.
 
-    A run that the artifact contract rejected is NOT valid scheduled evidence,
-    even if its classification still says scheduled: a top-level
+    A run that explicitly denies its own evidence (``scheduled_evidence_denied``)
+    is NOT valid scheduled evidence, and neither is one the artifact contract
+    rejected: a top-level
     ``artifact_contract_failure`` marker (persisted when validate_run_artifacts
     fails, e.g. the compute-only terminal state) fails closed here so every
     consumer that discovers the run_state directly -- not just the latest-run
@@ -159,6 +160,16 @@ def derive_valid_scheduled_evidence(run_state: Optional[Dict[str, object]]) -> b
     if not isinstance(run_state, dict):
         return False
     if run_state.get("artifact_contract_failure") is not None:
+        return False
+    # An explicit denial from the writer, mirroring artifact_contract_failure.
+    # A synthesized startup-failure artifact proves the slot FIRED but is never
+    # scheduled evidence, and select_same_day_run_state prefers the date-specific
+    # state over the pointer, so without this the failure artifact would be
+    # returned as valid evidence to every consumer (Codex review). The nested
+    # classification's own valid_scheduled_evidence field cannot carry this: the
+    # morning writer seeds it False as a placeholder and finalizes it from THIS
+    # derivation, so honoring that field here would lock every run to False.
+    if run_state.get("scheduled_evidence_denied") is True:
         return False
     rc = run_state.get("run_classification")
     if not isinstance(rc, dict):

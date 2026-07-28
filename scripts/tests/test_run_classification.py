@@ -26,16 +26,29 @@ sys.path.insert(1, str(Path(__file__).resolve().parents[2]))
 
 from run_classification import (  # noqa: E402
     ACCEPTED_STATE_SCHEMA_VERSIONS,
+    COMPLETION_REASON_BLOCKED_BEFORE_SPREAD_GATE,
+    COMPLETION_REASON_NO_LADDER_CANDIDATES,
+    COMPLETION_REASON_NO_QUALIFYING_ORDERS,
+    ERROR_CLASS_DEGRADED_MARKET_DATA,
+    ERROR_CLASS_MISSING_SPREAD_DATA,
     FINAL_MANUAL_OVERRIDE_RUN_TYPE,
     INTRADAY_RECOVERY_SLOTS,
     ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED,
     ORDER_SUBMIT_STATUS_ERROR,
+    ORDER_SUBMIT_STATUS_NO_ORDERS,
     RECOVERY_RUN_TYPES,
     RECOVERY_STATE_SCHEMA_VERSIONS,
     RECOVERY_STREAM_CONTRACTS,
     RECOVERY_STREAMS,
     RECOVERY_TRIGGER_REASONS,
+    RUN_CLASSIFICATION_COMPLETED_NO_ORDERS,
+    RUN_CLASSIFICATION_PLACEMENT_FAILED,
     RUN_ORIGIN_SCHEDULED_RECOVERY,
+    SPREAD_STATUS_MISSING_BID_ASK,
+    SPREAD_STATUS_NOT_EVALUATED,
+    SPREAD_STATUS_NOT_OK,
+    SPREAD_STATUS_OK,
+    SPREAD_STATUS_UNAVAILABLE,
     STATE_SCHEMA_VERSION,
     STATE_SCHEMA_VERSION_V2,
     _already_covered_by_prior_allocation_loader,
@@ -51,6 +64,7 @@ from run_classification import (  # noqa: E402
     build_raw_persistence_state,
     build_recovery_state,
     build_scheduled_classification,
+    classify_no_order_run,
     classify_non_scheduled_order_ids,
     collect_earlier_scheduled_order_ids,
     collect_manual_order_ids,
@@ -80,9 +94,11 @@ from run_classification import (  # noqa: E402
     recovery_context_roots,
     recovery_escalation_run_state,
     recovery_root_for,
+    row_blocked_for_missing_spread,
     save_raw_input,
     scheduled_run_id,
     select_scheduled_state_for_reporting,
+    spread_gate_fields,
     top_up_context_roots,
     validate_classification,
     validate_recovery_classification,
@@ -1173,13 +1189,17 @@ def test_raw_persistence_failure_still_writes_valid_scheduled_state():
         assert state["buy_candidates"] == []
         assert state["raw_inputs_saved"] == []
         assert state["raw_persistence_error"]
-        assert is_scheduled_state(state)
         assert not is_manual_state(state)
-        # It writes to the scheduled path and updates the pointer like any scheduled run.
+        # NOT a valid scheduled run: it fired, it never computed a signal or
+        # reached placement, and it must not be published as evidence the slot
+        # executed (Codex review). The state is still written to the scheduled
+        # path and still refreshes the pointer -- proving the slot fired is the
+        # whole reason it exists -- but the pointer records it as invalid.
+        assert state["scheduled_evidence_denied"] is True
+        assert not is_scheduled_state(state)
         written = write_run_artifacts(state, base=base)
         assert "latest_scheduled_run" in written
         sel = select_scheduled_state_for_reporting(TRADING_DAY, base=base)
-        assert sel.ok
         assert sel.order_ids == []
 
 
@@ -1235,15 +1255,17 @@ def test_recovery_escalation_run_state_shape():
     assert state["recovery_rerun"] is True
     assert state["recovery"]["escalated"] is True
     assert state["recovery"]["blocking_reason"] == "recovery attempt also failed to persist run_state"
-    assert is_scheduled_state(state)
     assert not is_manual_state(state)
-    # It still writes to the scheduled path and updates the pointer like any scheduled run.
+    # Same denial as the raw-persistence sibling: an escalated recovery fired but
+    # never completed the slot (Codex review).
+    assert state["scheduled_evidence_denied"] is True
+    assert not is_scheduled_state(state)
+    # It still writes to the scheduled path and refreshes the pointer.
     with tempfile.TemporaryDirectory() as d:
         base = Path(d)
         written = write_run_artifacts(state, base=base)
         assert "latest_scheduled_run" in written
         sel = select_scheduled_state_for_reporting(TRADING_DAY, base=base)
-        assert sel.ok
         assert sel.order_ids == []
 
 
@@ -2313,6 +2335,204 @@ def test_incremental_top_up_amount_guard():
     assert incremental_top_up_amount(2.0, 3.0, 390.0, 399.1364) == (0.0, "no_incremental_difference")
 
 
+# --- No-order outcome vs failure (Jul 27 2026 1:30 PM ET) -------------------
+
+
+def test_no_candidate_reaches_the_spread_gate_is_not_a_spread_failure():
+    """The 1:30 PM ET incident: no ticker qualified on the ladder, so nothing ever
+    reached the spread gate. Recording missing_spread_data there blamed the spread
+    for an outcome it did not produce."""
+    outcome = classify_no_order_run(
+        candidates_reaching_spread_gate=0, candidates_blocked_missing_spread=0
+    )
+
+    assert outcome.run_classification == RUN_CLASSIFICATION_COMPLETED_NO_ORDERS
+    assert outcome.order_submit_status == ORDER_SUBMIT_STATUS_NO_ORDERS
+    assert outcome.completion_reason == COMPLETION_REASON_NO_LADDER_CANDIDATES
+    assert outcome.error_class is None
+    assert outcome.is_trading_failure is False
+
+
+def test_all_candidates_blocked_at_the_gate_records_missing_spread_data():
+    outcome = classify_no_order_run(
+        candidates_reaching_spread_gate=4, candidates_blocked_missing_spread=4
+    )
+
+    assert outcome.run_classification == RUN_CLASSIFICATION_COMPLETED_NO_ORDERS
+    assert outcome.error_class == ERROR_CLASS_MISSING_SPREAD_DATA
+    assert outcome.completion_reason is None
+    # Still a safe no-order skip: the run fired, evaluated, and wrote artifacts.
+    assert outcome.is_trading_failure is False
+
+
+def test_partial_spread_availability_does_not_blame_the_spread_for_the_run():
+    """Only the unproven rows fail closed; the rest were evaluated and simply did
+    not qualify, so the run as a whole is not a missing-spread outcome."""
+    outcome = classify_no_order_run(
+        candidates_reaching_spread_gate=5, candidates_blocked_missing_spread=2
+    )
+
+    assert outcome.run_classification == RUN_CLASSIFICATION_COMPLETED_NO_ORDERS
+    assert outcome.error_class is None
+    assert outcome.completion_reason == COMPLETION_REASON_NO_QUALIFYING_ORDERS
+    assert outcome.candidates_blocked_missing_spread == 2
+    assert outcome.is_trading_failure is False
+
+
+def test_placement_failure_after_connector_native_attempt_is_a_failure():
+    outcome = classify_no_order_run(
+        candidates_reaching_spread_gate=3,
+        candidates_blocked_missing_spread=0,
+        placement_attempted_and_failed=True,
+    )
+
+    assert outcome.run_classification == RUN_CLASSIFICATION_PLACEMENT_FAILED
+    assert outcome.error_class == RUN_CLASSIFICATION_PLACEMENT_FAILED
+    assert outcome.is_trading_failure is True
+
+
+def test_blocked_count_can_never_exceed_the_rows_that_reached_the_gate():
+    outcome = classify_no_order_run(
+        candidates_reaching_spread_gate=2, candidates_blocked_missing_spread=9
+    )
+
+    assert outcome.candidates_blocked_missing_spread == 2
+    assert outcome.error_class == ERROR_CLASS_MISSING_SPREAD_DATA
+
+
+def test_no_order_outcome_run_state_fields_are_complete():
+    fields = classify_no_order_run(
+        candidates_reaching_spread_gate=0, candidates_blocked_missing_spread=0
+    ).as_run_state_fields()
+
+    assert fields["run_classification_outcome"] == RUN_CLASSIFICATION_COMPLETED_NO_ORDERS
+    assert fields["orders_submitted_count"] == 0
+    assert fields["candidates_reaching_spread_gate"] == 0
+    assert fields["candidates_blocked_missing_spread"] == 0
+    assert fields["is_trading_failure"] is False
+
+
+def test_spread_gate_fields_classify_each_row_outcome():
+    ok = spread_gate_fields(spread_pct=0.2, max_spread_pct=1.0)
+    assert ok == {"spread_ok": True, "spread_pct": 0.2, "spread_status": SPREAD_STATUS_OK}
+
+    unavailable = spread_gate_fields(spread_pct=None, max_spread_pct=1.0)
+    assert unavailable["spread_ok"] is False
+    assert unavailable["spread_status"] == SPREAD_STATUS_UNAVAILABLE
+
+    too_wide = spread_gate_fields(spread_pct=3.5, max_spread_pct=1.0)
+    assert too_wide["spread_ok"] is False
+    assert too_wide["spread_status"] == SPREAD_STATUS_NOT_OK
+
+
+def test_a_row_that_never_reached_the_gate_is_never_marked_spread_ok():
+    fields = spread_gate_fields(spread_pct=None, max_spread_pct=1.0, evaluated=False)
+
+    assert fields["spread_ok"] is None
+    assert fields["spread_status"] == SPREAD_STATUS_NOT_EVALUATED
+    assert row_blocked_for_missing_spread(fields) is False
+
+
+def test_row_blocked_for_missing_spread_accepts_the_legacy_status():
+    assert row_blocked_for_missing_spread({"spread_status": SPREAD_STATUS_UNAVAILABLE})
+    # The Jul 27 2026 intraday runs persisted this spelling.
+    assert row_blocked_for_missing_spread({"spread_status": SPREAD_STATUS_MISSING_BID_ASK})
+    assert not row_blocked_for_missing_spread({"spread_status": SPREAD_STATUS_NOT_OK})
+    assert not row_blocked_for_missing_spread(None)
+
+
+def test_candidates_blocked_before_the_gate_are_not_no_ladder_candidates():
+    """They DID qualify on the ladder; a cap/ceiling check stopped them before the
+    spread lookup, so nothing carries a spread verdict (Codex review)."""
+    outcome = classify_no_order_run(
+        candidates_evaluated=3,
+        candidates_reaching_spread_gate=0,
+        candidates_blocked_missing_spread=0,
+    )
+
+    assert outcome.completion_reason == COMPLETION_REASON_BLOCKED_BEFORE_SPREAD_GATE
+    assert outcome.error_class is None
+    assert outcome.is_trading_failure is False
+
+
+def test_candidates_evaluated_defaults_to_the_reaching_gate_count():
+    """Omitting the count preserves the older two-argument behavior."""
+    assert (
+        classify_no_order_run(
+            candidates_reaching_spread_gate=0, candidates_blocked_missing_spread=0
+        ).completion_reason
+        == COMPLETION_REASON_NO_LADDER_CANDIDATES
+    )
+
+
+def test_candidates_evaluated_can_never_be_below_the_reaching_gate_count():
+    outcome = classify_no_order_run(
+        candidates_evaluated=0,
+        candidates_reaching_spread_gate=4,
+        candidates_blocked_missing_spread=4,
+    )
+
+    assert outcome.error_class == ERROR_CLASS_MISSING_SPREAD_DATA
+
+
+def test_provider_errors_are_not_recorded_as_a_clean_ladder_no_op():
+    """Tickers degraded to NO_DATA by a raising provider were not genuinely
+    evaluated, so the zero-order result must not read as healthy (Codex review)."""
+    outcome = classify_no_order_run(
+        candidates_evaluated=0,
+        candidates_reaching_spread_gate=0,
+        candidates_blocked_missing_spread=0,
+        data_errors=3,
+    )
+
+    assert outcome.run_classification == RUN_CLASSIFICATION_COMPLETED_NO_ORDERS
+    assert outcome.completion_reason == COMPLETION_REASON_NO_LADDER_CANDIDATES
+    assert outcome.error_class == ERROR_CLASS_DEGRADED_MARKET_DATA
+
+
+def test_a_concrete_spread_cause_outranks_the_degraded_data_marker():
+    outcome = classify_no_order_run(
+        candidates_reaching_spread_gate=2,
+        candidates_blocked_missing_spread=2,
+        data_errors=5,
+    )
+
+    assert outcome.error_class == ERROR_CLASS_MISSING_SPREAD_DATA
+
+
+def test_no_data_errors_leaves_the_error_class_null():
+    outcome = classify_no_order_run(
+        candidates_evaluated=0,
+        candidates_reaching_spread_gate=0,
+        candidates_blocked_missing_spread=0,
+        data_errors=0,
+    )
+
+    assert outcome.error_class is None
+
+
+def test_completed_no_order_status_suppresses_the_broker_window_fallback():
+    """A run that submitted nothing by design must never absorb unrelated broker
+    orders from the attribution window (Codex review)."""
+    import run_classification as rc_module
+
+    assert ORDER_SUBMIT_STATUS_NO_ORDERS in _no_submit_statuses_in_fallback_guard(rc_module)
+
+
+def _no_submit_statuses_in_fallback_guard(rc_module):
+    """The literal status set select_scheduled_state_for_reporting excludes.
+
+    Read from the source so the test fails if a status is dropped from the guard,
+    which no behavioral fixture would catch without a full write-failure setup.
+    """
+    import inspect
+    import re
+
+    src = inspect.getsource(rc_module.select_scheduled_state_for_reporting)
+    guard = re.search(r"oss not in \{(.*?)\}", src, re.S)
+    assert guard, "the no-submit guard is no longer a literal set"
+    names = re.findall(r"ORDER_SUBMIT_STATUS_[A-Z_]+", guard.group(1))
+    return {getattr(rc_module, name) for name in names}
 
 # --- Scheduled-recovery context roots ----------------------------------------
 #
@@ -3914,3 +4134,41 @@ def _run_all():
 
 if __name__ == "__main__":
     _run_all()
+
+
+def test_a_denied_state_with_orders_is_still_attributable_for_reporting():
+    """Denial and attribution are different questions.
+
+    A scheduled run that submits a real order and then raises is denied as
+    evidence by both failure handlers -- it did not complete. Rejecting it for
+    ATTRIBUTION too made select_scheduled_state_for_reporting discard the whole
+    state, so the preserved fills vanished from scheduled fill and slippage
+    reporting (Codex review).
+    """
+    from same_day_pointer import derive_valid_scheduled_evidence
+
+    state = {
+        "run_classification": build_scheduled_classification(TRADING_DAY, "2026-07-06T19:20:01Z"),
+        "scheduled_evidence_denied": True,
+        "buy_candidates": [{"ticker": "AAA", "order_id": "o-1", "status": "submitted"}],
+    }
+
+    # Not evidence the slot executed...
+    assert derive_valid_scheduled_evidence(state) is False
+    # ...but its order is still the scheduled slot's to report.
+    assert is_scheduled_state(state)
+
+
+def test_a_denied_state_with_no_orders_is_rejected():
+    """The date/holiday-gated stub this check was added for: it says outright
+    that the slot never executed and has nothing to attribute."""
+    from same_day_pointer import derive_valid_scheduled_evidence
+
+    state = {
+        "run_classification": build_scheduled_classification(TRADING_DAY, "2026-07-06T19:20:01Z"),
+        "scheduled_evidence_denied": True,
+        "buy_candidates": [],
+    }
+
+    assert derive_valid_scheduled_evidence(state) is False
+    assert not is_scheduled_state(state)

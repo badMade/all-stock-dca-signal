@@ -26,6 +26,7 @@ from drift_detection import (  # noqa: E402
     DEFAULT_SLACK_WEBHOOK_ENV,
     build_slack_payload,
     detect_drift,
+    load_run_artifacts,
     main,
     parse_amount,
     parse_bool,
@@ -354,6 +355,72 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(parse_amount(""), 0.0)
         self.assertEqual(parse_amount("bad"), 0.0)
         self.assertEqual(parse_amount(9), 9.0)
+
+
+class LoadRunArtifactsSignalSelectionTest(unittest.TestCase):
+    """The detector must read the signals file the artifact contract validated.
+
+    The contract accepts any recognized name with a usable header, so a reused
+    run directory can hold a stale signals.csv beside a valid stream-specific
+    file. Picking the first file that merely EXISTS would read the malformed one,
+    see no symbols, and report no expected orders while the contract advertises
+    the run as valid (Codex review).
+    """
+
+    def test_prefers_a_usable_sibling_over_a_malformed_higher_priority_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "signals.csv").write_text("", encoding="utf-8")
+            (run_dir / "morning_signals.csv").write_text(
+                "ticker,auto_buy_signal\nAAA,true\n", encoding="utf-8"
+            )
+
+            artifacts = load_run_artifacts(run_dir)
+
+            self.assertEqual(artifacts.signals_path.name, "morning_signals.csv")
+            self.assertEqual(len(artifacts.signal_rows), 1)
+
+    def test_prefers_a_usable_sibling_over_a_corrupt_body(self):
+        """A valid header over an unreadable body is not usable. Selecting on
+        the header alone picked the corrupt canonical file, then read_csv_rows()
+        raised and the wrapper logged a detector failure with no drift
+        reconciled (Codex review)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "signals.csv").write_text(
+                "ticker,auto_buy_signal\nAAA," + "x" * (csv.field_size_limit() + 1024) + "\n",
+                encoding="utf-8",
+            )
+            (run_dir / "morning_signals.csv").write_text(
+                "ticker,auto_buy_signal\nBBB,true\n", encoding="utf-8"
+            )
+
+            artifacts = load_run_artifacts(run_dir)
+
+            self.assertEqual(artifacts.signals_path.name, "morning_signals.csv")
+            self.assertEqual(len(artifacts.signal_rows), 1)
+
+    def test_prefers_the_canonical_name_when_it_is_usable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "signals.csv").write_text(
+                "ticker,auto_buy_signal\nAAA,true\n", encoding="utf-8"
+            )
+            (run_dir / "morning_signals.csv").write_text(
+                "ticker,auto_buy_signal\nBBB,true\n", encoding="utf-8"
+            )
+
+            self.assertEqual(load_run_artifacts(run_dir).signals_path.name, "signals.csv")
+
+    def test_falls_back_to_the_first_existing_when_none_are_usable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "signals.csv").write_text("", encoding="utf-8")
+
+            artifacts = load_run_artifacts(run_dir)
+
+            self.assertEqual(artifacts.signals_path.name, "signals.csv")
+            self.assertEqual(artifacts.signal_rows, [])
 
 
 if __name__ == "__main__":

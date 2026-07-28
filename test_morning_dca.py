@@ -99,6 +99,17 @@ class FixedDropProvider:
             cursor += timedelta(minutes=interval_minutes)
         return bars
 
+    def get_bid_ask(self, ticker, as_of):
+        """A tight, well-inside-tolerance quote (0.1% spread).
+
+        A scheduled live run fails a candidate closed when its spread cannot be
+        proven, so a provider double that exposes no bid/ask would block every
+        placement. Tests that specifically exercise an unavailable or wide spread
+        override this.
+        """
+        price = self._prev * (1.0 - self._drops.get(ticker, 0.0))
+        return (price * 0.9995, price * 1.0005)
+
 
 class DecliningBarsProvider(FixedDropProvider):
     """Provider that generates strictly declining intraday bars.
@@ -834,9 +845,41 @@ def test_live_run_refreshes_both_morning_pointers(tmp_path):
         assert payload["stream"] == "morning"
         assert payload["same_day_required"] is True
         assert payload["pointer_status"] == "valid"
-        assert payload["valid_scheduled_evidence"] is True
+        # The pointer is valid -- it exists, it is same-day, and it resolves --
+        # and the run it points at is NOT evidence the slot executed: with no
+        # broker adapter this run is failed_scheduled_run_startup, blocked
+        # before placement. Those are two different questions and the pointer
+        # answers both (Codex review).
+        assert payload["valid_scheduled_evidence"] is False
         assert "trading_day" in payload
         assert "updated_at_utc" in payload
+
+
+def test_a_run_blocked_before_placement_is_not_scheduled_evidence(tmp_path):
+    """A missing pre-flight, absent broker, or account mismatch stops the run
+    before placement. build_artifacts() has already stamped the scheduled
+    identity and these paths write immediately, so without an explicit denial
+    the pointer publishes them as valid scheduled runs (Codex review)."""
+    from scripts.same_day_pointer import derive_valid_scheduled_evidence
+
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path),
+        preflight_run_state_root=str(tmp_path / "missing_preflight"),
+    )
+    ex = MorningDCAExecutor(cfg, mode="live")
+    res = ex.run(_now_live(), FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03}))
+
+    run_state = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
+    assert run_state["run_classification_outcome"] == "failed_scheduled_run_startup"
+    assert run_state["is_trading_failure"] is True
+    assert run_state["scheduled_evidence_denied"] is True
+    assert run_state["run_classification"]["valid_scheduled_evidence"] is False
+    assert derive_valid_scheduled_evidence(run_state) is False
+    # The artifact is still written and the pointer still refreshed: proving the
+    # slot fired is the whole reason this state exists.
+    payload = json.loads((Path(tmp_path) / "latest_morning_run.json").read_text(encoding="utf-8"))
+    assert payload["valid_scheduled_evidence"] is False
 
 
 # --- Jul 20 2026 pre-flight path fix + budget ledger bootstrap --------------
@@ -5683,6 +5726,904 @@ def test_nth_weekday_of_month():
         assert _nth_weekday_of_month(year, month, weekday, n) == expected
 
 
+
+# --- Root-level artifact set and the spread gate (Jul 27 2026 12:30 / 1:30) ---
+
+
+class _NoBidAskProvider(DecliningBarsProvider):
+    """A live provider that captures no bid/ask, exactly as on 2026-07-27."""
+
+    def get_bid_ask(self, ticker, as_of):
+        return None
+
+
+class _PartialBidAskProvider(DecliningBarsProvider):
+    """Bid/ask for some tickers only; the rest must keep being evaluated."""
+
+    def __init__(self, source, previous_close, drops, *, with_quote):
+        super().__init__(source, previous_close, drops)
+        self._with_quote = set(with_quote)
+
+    def get_bid_ask(self, ticker, as_of):
+        if ticker not in self._with_quote:
+            return None
+        return super().get_bid_ask(ticker, as_of)
+
+
+def _live_executor(tmp_path, tickers):
+    pf_root = _seed_preflight(tmp_path / "pf", tickers)
+    cfg = MorningConfig(
+        tickers=tuple(tickers),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        prior_allocation_roots=(str(tmp_path / "empty_prior"),),
+    )
+    return MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+
+
+def test_morning_live_run_writes_the_complete_root_level_artifact_set(tmp_path):
+    """Before this, only the read-only 9:45 pre-flight wrote run_summary.json, so
+    every live morning/midday run directory failed the scheduled artifact
+    contract's require_summary check."""
+    from scripts.scheduled_artifacts import validate_run_artifacts
+
+    ex = _live_executor(tmp_path, ("NVDA",))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=_TopUpBroker())
+
+    run_dir = Path(res["paths"]["run_state"]).parent
+    for name in ("run_state.json", "run_summary.json", "morning_signals.csv", "submitted_orders.csv"):
+        assert (run_dir / name).exists(), f"{name} missing at the run root"
+    assert validate_run_artifacts(run_dir, require_summary=True)
+
+    summary = json.loads((run_dir / "run_summary.json").read_text(encoding="utf-8"))
+    assert summary["run_classification"] == res["artifacts"]["run_classification"]
+
+
+def test_morning_live_no_signal_run_writes_csv_headers_not_empty_files(tmp_path):
+    """A run that evaluated nothing previously wrote a zero-byte signals CSV."""
+    ex = _live_executor(tmp_path, ("NVDA",))
+    # No drop at all: nothing qualifies, so no signal row makes it to the CSV.
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.0})
+    res = ex.run(_now_live(), data, broker=_TopUpBroker())
+
+    run_dir = Path(res["paths"]["run_state"]).parent
+    for name in ("morning_signals.csv", "submitted_orders.csv"):
+        with (run_dir / name).open(newline="", encoding="utf-8") as handle:
+            header = next(csv.reader(handle), None)
+        assert header and any(col.strip() for col in header), f"{name} has no header row"
+
+
+def test_scheduled_live_run_fails_a_row_closed_when_its_spread_is_unproven(tmp_path):
+    """A scheduled run is pre-authorized to place without review, so an unproven
+    spread must block that row rather than be placed on."""
+    ex = _live_executor(tmp_path, ("NVDA",))
+    broker = _TopUpBroker()
+    data = _NoBidAskProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=broker)
+
+    assert broker.placed == {}, "placed an order on an unproven spread"
+    outcome = res["artifacts"]["broker_outcomes"]["NVDA"]
+    assert outcome["status"] == "blocked"
+    assert outcome["spread_ok"] is False
+    assert outcome["spread_status"] == "spread_unavailable"
+    # Every candidate reached the gate and every one was failed closed there.
+    assert res["artifacts"]["error_class"] == "missing_spread_data"
+    assert res["artifacts"]["run_classification_outcome"] == "completed_no_orders"
+    assert res["artifacts"]["order_submit_status"] == "no_orders_submitted"
+    assert res["artifacts"]["is_trading_failure"] is False
+
+
+def test_missing_spread_for_one_ticker_does_not_suppress_another(tmp_path):
+    """Fail only the unproven rows closed; every other qualifying ticker proceeds."""
+    ex = _live_executor(tmp_path, ("NVDA", "AMD"))
+    broker = _TopUpBroker()
+    data = _PartialBidAskProvider(
+        SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10, "AMD": 0.10}, with_quote={"AMD"}
+    )
+    res = ex.run(_now_live(), data, broker=broker)
+
+    assert "AMD" in broker.placed, "a proven-spread ticker must still be submitted"
+    assert "NVDA" not in broker.placed
+    outcomes = res["artifacts"]["broker_outcomes"]
+    assert outcomes["NVDA"]["spread_status"] == "spread_unavailable"
+    assert outcomes["AMD"]["spread_status"] == "spread_ok"
+    # The run submitted an order, so it is not a no-order run at all.
+    assert res["artifacts"]["orders_submitted_count"] == 1
+    assert "run_classification_outcome" not in res["artifacts"]
+
+
+def test_no_ladder_candidate_records_a_completion_reason_not_a_spread_error(tmp_path):
+    """The 1:30 PM ET incident: nothing qualified, so nothing reached the spread
+    gate and the missing spread was irrelevant to the outcome."""
+    ex = _live_executor(tmp_path, ("NVDA",))
+    broker = _TopUpBroker()
+    # No drop: no ticker qualifies on the ladder, and the provider has no bid/ask
+    # either -- the outcome must still be attributed to the ladder, not the spread.
+    data = _NoBidAskProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.0})
+    res = ex.run(_now_live(), data, broker=broker)
+
+    assert broker.placed == {}
+    assert res["artifacts"]["run_classification_outcome"] == "completed_no_orders"
+    assert res["artifacts"]["completion_reason"] == "no_ladder_candidates"
+    assert res["artifacts"]["error_class"] is None
+    assert res["artifacts"]["candidates_reaching_spread_gate"] == 0
+    assert res["artifacts"]["is_trading_failure"] is False
+
+
+def test_manual_run_is_not_blocked_by_an_unproven_spread(tmp_path):
+    """Manual runs still go through review_market_buy as a human-reviewed safety
+    net, so they are not blocked on a missing spread alone."""
+    ex = _live_executor(tmp_path, ("NVDA",))
+    broker = _TopUpBroker()
+    data = _NoBidAskProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    ex.run(_now_live(), data, broker=broker, manual=True)
+
+    assert "NVDA" in broker.placed
+
+
+def test_scheduled_startup_failure_still_writes_the_complete_artifact_set(tmp_path):
+    """The 2026-07-27 12:30 failure mode: the run raised BEFORE any writer, so the
+    slot produced no artifact root at all and looked like it never fired."""
+    from scripts.scheduled_artifacts import validate_run_artifacts
+
+    ex = _live_executor(tmp_path, ("NVDA",))
+    # No qualifying drop, so the run reaches no placement at all: a true startup
+    # failure with nothing to preserve.
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.0})
+
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("connector exploded before any artifact was written")
+
+    # Fails after the run starts but before write_artifacts is ever reached --
+    # the shape of the 12:30 startup failure.
+    ex.build_artifacts = _explode
+
+    with pytest.raises(RuntimeError):
+        ex.run(_now_live(), data, broker=_TopUpBroker())
+
+    run_dir = ex.run_state_dir(_now_live())
+    for name in ("run_state.json", "run_summary.json", "morning_signals.csv", "submitted_orders.csv"):
+        assert (run_dir / name).exists(), f"{name} missing after a startup failure"
+    assert validate_run_artifacts(run_dir, require_summary=True)
+
+    run_state = json.loads((run_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert run_state["status"] == "failed"
+    assert run_state["error_class"] == "scheduled_run_startup_failure"
+    # NOT the placement-failure outcome: no placement was attempted, so reporting
+    # keyed on that would misattribute a startup failure as a broker failure.
+    assert run_state["run_classification_outcome"] == "failed_scheduled_run_startup"
+    assert run_state["is_trading_failure"] is True
+    assert run_state["orders_submitted_count"] == 0
+    # Still attributable to its stream, but never scheduled evidence.
+    assert run_state["run_classification"]["stream"] == "morning"
+    assert run_state["run_classification"]["valid_scheduled_evidence"] is False
+
+
+def test_a_late_failure_never_erases_already_written_artifacts(tmp_path):
+    """A failure AFTER artifacts were written (possibly after orders were placed)
+    must not overwrite that record with a failure stub."""
+    ex = _live_executor(tmp_path, ("NVDA",))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=_TopUpBroker())
+    run_dir = Path(res["paths"]["run_state"]).parent
+    original = (run_dir / "run_state.json").read_text(encoding="utf-8")
+
+    ex._write_startup_failure_artifacts(_now_live(), RuntimeError("later boom"))
+
+    assert (run_dir / "run_state.json").read_text(encoding="utf-8") == original
+
+
+def test_placement_failures_are_recorded_as_a_trading_failure(tmp_path):
+    """Every qualifying placement raised: a genuine failure, not a healthy
+    no-order run (Codex review)."""
+
+    class _FailingBroker(_TopUpBroker):
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise RuntimeError("broker rejected the order")
+
+    ex = _live_executor(tmp_path, ("NVDA",))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=_FailingBroker())
+
+    artifacts = res["artifacts"]
+    assert artifacts["broker_outcomes"]["NVDA"]["status"] == "failed"
+    assert artifacts["run_classification_outcome"] == "failed_after_connector_native_recovery_attempt"
+    assert artifacts["is_trading_failure"] is True
+    assert artifacts["error_class"] == "failed_after_connector_native_recovery_attempt"
+    assert artifacts["order_submit_status"] == "not_submitted_error"
+
+
+def test_candidates_blocked_before_the_spread_gate_are_not_no_ladder_candidates(tmp_path):
+    """A cap-blocked candidate DID qualify on the ladder; it just never reached
+    the spread lookup (Codex review)."""
+
+    # The daily cap is checked BEFORE the spread lookup, so the candidate never
+    # reaches the gate and carries no spread verdict.
+    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
+    cfg = MorningConfig(
+        tickers=("NVDA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        prior_allocation_roots=(str(tmp_path / "empty_prior"),),
+        morning_daily_cap_usd=0.0,
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=_TopUpBroker())
+
+    artifacts = res["artifacts"]
+    assert artifacts["broker_outcomes"]["NVDA"]["status"] == "cap_exceeded"
+    assert "spread_status" not in artifacts["broker_outcomes"]["NVDA"]
+    assert artifacts["run_classification_outcome"] == "completed_no_orders"
+    assert artifacts["completion_reason"] == "blocked_before_spread_gate"
+    assert artifacts["error_class"] is None
+    assert artifacts["is_trading_failure"] is False
+
+
+def test_calendar_blocked_live_run_carries_the_blocked_no_order_outcome(tmp_path):
+    """This path writes state and summary directly and returns before the
+    classification call, so it must stamp the outcome itself (Codex review)."""
+    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",), trading_date=date(2026, 7, 4))
+    cfg = MorningConfig(
+        tickers=("NVDA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        prior_allocation_roots=(str(tmp_path / "empty_prior"),),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    # 2026-07-04 is a Saturday: the calendar gate blocks before any evaluation.
+    holiday_now = datetime.combine(date(2026, 7, 4), time(10, 30), tzinfo=EASTERN)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(holiday_now, data, broker=_TopUpBroker())
+
+    artifacts = res["artifacts"]
+    assert artifacts["status"] == "blocked"
+    assert artifacts["run_classification_outcome"] == "completed_no_orders"
+    assert artifacts["completion_reason"] == "date_or_holiday_gate_blocked"
+    assert artifacts["is_trading_failure"] is False
+    assert artifacts["orders_submitted_count"] == 0
+
+    run_dir = Path(res["paths"]["run_state"]).parent
+    summary = json.loads((run_dir / "run_summary.json").read_text(encoding="utf-8"))
+    assert summary["completion_reason"] == "date_or_holiday_gate_blocked"
+
+
+def test_manual_review_block_is_not_recorded_as_a_missing_spread_block(tmp_path):
+    """A manual run does not fail closed on an unproven spread, so a row can carry
+    spread_status='spread_unavailable' and still be stopped by review. That is not
+    a spread-caused no-order run (Codex review)."""
+
+    class _ReviewBlockingBroker(_TopUpBroker):
+        def review_market_buy(self, ticker, notional_usd):
+            return False, "review declined"
+
+    ex = _live_executor(tmp_path, ("NVDA",))
+    broker = _ReviewBlockingBroker()
+    data = _NoBidAskProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=broker, manual=True)
+
+    artifacts = res["artifacts"]
+    outcome = artifacts["broker_outcomes"]["NVDA"]
+    assert outcome["status"] == "blocked"
+    assert "review blocked" in outcome["skip_reason"]
+    # The row still carries the unproven-spread verdict...
+    assert outcome["spread_status"] == "spread_unavailable"
+    # ...but the spread gate is not what blocked it, so the run is not a
+    # missing-spread outcome.
+    assert outcome.get("blocked_by") != "spread_gate"
+    assert artifacts["error_class"] != "missing_spread_data"
+    assert artifacts["candidates_blocked_missing_spread"] == 0
+
+
+def test_preflight_blocked_run_carries_the_blocked_outcome_fields(tmp_path):
+    """This path writes and returns before the classifier, so it must stamp the
+    outcome itself (Codex review)."""
+    cfg = MorningConfig(
+        tickers=("NVDA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        # Empty preflight root: no same-day pre-flight artifact exists.
+        preflight_run_state_root=str(tmp_path / "no_preflight"),
+        prior_allocation_roots=(str(tmp_path / "empty_prior"),),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=_TopUpBroker())
+
+    artifacts = res["artifacts"]
+    assert artifacts["status"] == "blocked"
+    # Never reached placement, so NOT the placement-failure outcome.
+    assert artifacts["run_classification_outcome"] == "failed_scheduled_run_startup"
+    assert artifacts["order_submit_status"] == "not_submitted_error"
+    assert artifacts["is_trading_failure"] is True
+    assert artifacts["orders_submitted_count"] == 0
+    assert artifacts["error_class"] is not None
+
+    run_dir = Path(res["paths"]["run_state"]).parent
+    summary = json.loads((run_dir / "run_summary.json").read_text(encoding="utf-8"))
+    assert summary["run_classification_outcome"] == "failed_scheduled_run_startup"
+
+
+def test_confirmation_required_survives_the_morning_no_order_classification(tmp_path):
+    """Replacing it would make is_confirmation_blocked() return false and lose the
+    fact that broker confirmation is pending (Codex review)."""
+    from near_close_dca import OrderConfirmationRequiredError
+
+    class _ConfirmationRequiredBroker(_TopUpBroker):
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise OrderConfirmationRequiredError("broker requires step-up confirmation")
+
+    ex = _live_executor(tmp_path, ("NVDA",))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=_ConfirmationRequiredBroker())
+
+    artifacts = res["artifacts"]
+    assert artifacts["broker_outcomes"]["NVDA"]["status"] == "not_submitted_confirmation_required"
+    assert artifacts["order_submit_status"] == "not_submitted_confirmation_required"
+    # The outcome fields are still recorded alongside it.
+    assert artifacts["run_classification_outcome"] == "completed_no_orders"
+    assert artifacts["orders_submitted_count"] == 0
+
+
+def test_morning_provider_errors_are_not_a_clean_ladder_no_op(tmp_path):
+    """evaluate_signal catches a raising provider and emits NO_DATA, so the run
+    looks empty without any ticker having been evaluated (Codex review)."""
+
+    class _RaisingProvider(DecliningBarsProvider):
+        def get_previous_close_bar(self, ticker, as_of):
+            raise RuntimeError("provider is down")
+
+    ex = _live_executor(tmp_path, ("NVDA",))
+    data = _RaisingProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=_TopUpBroker())
+
+    artifacts = res["artifacts"]
+    assert artifacts["run_classification_outcome"] == "completed_no_orders"
+    assert artifacts["error_class"] == "degraded_market_data"
+    assert artifacts["is_trading_failure"] is False
+
+
+def test_a_raising_broker_check_is_not_a_healthy_no_order_run(tmp_path):
+    """A caught pre-placement connector error is recorded as a non-deliberate
+    block; broker availability prevented execution (Codex review)."""
+
+    class _RaisingCheckBroker(_TopUpBroker):
+        def is_tradable_for_fractional_buy(self, ticker):
+            raise RuntimeError("tradability lookup exploded")
+
+    ex = _live_executor(tmp_path, ("NVDA",))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=_RaisingCheckBroker())
+
+    artifacts = res["artifacts"]
+    outcome = artifacts["broker_outcomes"]["NVDA"]
+    assert outcome["status"] == "blocked"
+    assert not outcome.get("deliberate_skip")
+    assert artifacts["error_class"] == "degraded_market_data"
+
+
+def test_a_deliberate_safety_skip_is_still_a_clean_no_order_run(tmp_path):
+    """The counterpart: a deliberate gate is not an error and must not degrade
+    the run's classification."""
+
+    class _NotTradableBroker(_TopUpBroker):
+        def is_tradable_for_fractional_buy(self, ticker):
+            return False
+
+    ex = _live_executor(tmp_path, ("NVDA",))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=_NotTradableBroker())
+
+    artifacts = res["artifacts"]
+    outcome = artifacts["broker_outcomes"]["NVDA"]
+    assert outcome["status"] == "blocked" and outcome["deliberate_skip"] is True
+    assert artifacts["run_classification_outcome"] == "completed_no_orders"
+    assert artifacts["error_class"] is None
+    assert artifacts["is_trading_failure"] is False
+
+
+def test_a_late_failure_never_erases_an_order_already_placed(tmp_path):
+    """The handler wraps the WHOLE run, so an order can be accepted and a later
+    step can then raise before run_state.json exists. Asserting zero orders there
+    would hide a real fill from the same-day top-up guard and let a later run
+    re-allocate that capital (Codex review)."""
+    ex = _live_executor(tmp_path, ("NVDA",))
+    broker = _TopUpBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("blew up after placement, before any artifact")
+
+    # build_artifacts runs AFTER _place_broker_orders.
+    ex.build_artifacts = _explode
+
+    with pytest.raises(RuntimeError):
+        ex.run(_now_live(), data, broker=broker)
+
+    assert "NVDA" in broker.placed, "fixture precondition: the order was placed"
+    run_dir = ex.run_state_dir(_now_live())
+    run_state = json.loads((run_dir / "run_state.json").read_text(encoding="utf-8"))
+
+    assert run_state["orders_submitted_count"] == 1
+    assert run_state["broker_outcomes"]["NVDA"]["status"] == "submitted"
+    assert run_state["broker_outcomes"]["NVDA"]["order_id"]
+    # A prior-allocation reader walks buy_candidates, so the row must be there.
+    [candidate] = run_state["buy_candidates"]
+    assert candidate["ticker"] == "NVDA"
+    assert candidate["status"] == "submitted"
+    assert candidate["planned_amount_usd"] == broker.placed["NVDA"]
+    # Flagged as a floor on what was placed, never proof nothing else was.
+    assert run_state["placement_evidence_incomplete"] is True
+    # And the order appears in submitted_orders.csv.
+    with (run_dir / "submitted_orders.csv").open(newline="", encoding="utf-8") as handle:
+        order_rows = list(csv.DictReader(handle))
+    assert [row["ticker"] for row in order_rows] == ["NVDA"]
+
+
+def test_a_partial_artifact_set_is_completed_after_a_mid_write_failure(tmp_path):
+    """write_artifacts can write run_state.json and then raise on a later file;
+    the existing state is preserved but the companions are still written."""
+    from scripts.scheduled_artifacts import validate_run_artifacts
+
+    ex = _live_executor(tmp_path, ("NVDA",))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.0})
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    # write_artifacts serializes the full artifacts dict first, so a genuinely
+    # partial directory holds a complete run_state and nothing else.
+    partial = json.dumps(
+        {
+            "run_id": "partial",
+            "trading_day": "2026-07-08",
+            "run_classification": {"run_origin": "scheduled", "manual_run": False,
+                                   "stream": "morning"},
+        },
+        sort_keys=True,
+    )
+    (run_dir / "run_state.json").write_text(partial, encoding="utf-8")
+
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("raised after run_state.json landed")
+
+    ex.build_artifacts = _explode
+    with pytest.raises(RuntimeError):
+        ex.run(_now_live(), data, broker=_TopUpBroker())
+
+    # The already-written state is preserved byte for byte...
+    assert (run_dir / "run_state.json").read_text(encoding="utf-8") == partial
+    # ...and every missing companion is now present.
+    for name in ("run_summary.json", "morning_signals.csv", "submitted_orders.csv"):
+        assert (run_dir / name).exists(), f"{name} still missing"
+    assert validate_run_artifacts(run_dir, require_summary=True)
+
+
+def test_startup_failure_refreshes_the_same_day_pointer(tmp_path):
+    """Otherwise a pointer-based watchdog keeps reporting that today's slot never
+    fired, even though the failure state exists (Codex review)."""
+    ex = _live_executor(tmp_path, ("NVDA",))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.0})
+
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    ex.build_artifacts = _explode
+    with pytest.raises(RuntimeError):
+        ex.run(_now_live(), data, broker=_TopUpBroker())
+
+    pointer = Path(ex.state_root) / ex.latest_pointer_name
+    assert pointer.exists(), "the stream pointer was never refreshed"
+    payload = json.loads(pointer.read_text(encoding="utf-8"))
+    assert payload["valid_scheduled_evidence"] is False
+    assert payload["trading_day"] == "2026-07-08"
+
+
+def test_stale_in_flight_outcomes_never_leak_into_a_later_run(tmp_path):
+    """The executor is reused across calls, so a startup failure on a later run
+    must not copy the previous run's placements into the new day's artifact and
+    record them as current-day allocations (Codex review)."""
+    ex = _live_executor(tmp_path, ("NVDA",))
+    broker = _TopUpBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+
+    # First run places a real order and completes.
+    ex.run(_now_live(), data, broker=broker)
+    assert "NVDA" in broker.placed
+
+    # A LATER day's run on the same executor raises during evaluation.
+    later = datetime.combine(date(2026, 7, 9), time(10, 30), tzinfo=EASTERN)
+    _seed_preflight(tmp_path / "pf", ("NVDA",), trading_date=later.date())
+
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("blew up during evaluation")
+
+    ex.evaluate = _explode
+    with pytest.raises(RuntimeError):
+        ex.run(later, data, broker=broker)
+
+    later_state = json.loads(
+        (ex.run_state_dir(later) / "run_state.json").read_text(encoding="utf-8")
+    )
+    assert later_state["orders_submitted_count"] == 0
+    assert later_state["broker_outcomes"] == {}
+    assert later_state["buy_candidates"] == []
+
+
+def test_a_failure_after_submission_does_not_contradict_the_order_it_recorded(tmp_path):
+    """orders_submitted_count and submitted_orders.csv say an order was placed, so
+    the aggregate status must not say no submission occurred (Codex review)."""
+    ex = _live_executor(tmp_path, ("NVDA",))
+    broker = _TopUpBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("blew up after placement")
+
+    ex.build_artifacts = _explode
+    with pytest.raises(RuntimeError):
+        ex.run(_now_live(), data, broker=broker)
+
+    run_state = json.loads(
+        (ex.run_state_dir(_now_live()) / "run_state.json").read_text(encoding="utf-8")
+    )
+    assert run_state["orders_submitted_count"] == 1
+    assert run_state["order_submit_status"] == "submitted"
+    assert run_state["run_classification_outcome"] == "failed_after_partial_submission"
+    # Still a failure, just an honest one.
+    assert run_state["is_trading_failure"] is True
+    # The error class matches the outcome: a late post-trade failure is not
+    # startup trouble.
+    assert run_state["error_class"] == "scheduled_run_failed_after_submission"
+
+
+def test_a_completed_run_keeps_a_valid_pointer_when_only_the_pointer_write_fails(tmp_path):
+    """validate_pointer rejects any non-'valid' status, so forcing pending here
+    would make a successfully completed run read as unavailable (Codex review)."""
+    ex = _live_executor(tmp_path, ("NVDA",))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.0})
+
+    calls = {"n": 0}
+    real_write = ex._write_same_day_pointers
+
+    def _fail_first(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("pointer write failed")
+        return real_write(*args, **kwargs)
+
+    ex._write_same_day_pointers = _fail_first
+    with pytest.raises(RuntimeError):
+        ex.run(_now_live(), data, broker=_TopUpBroker())
+
+    pointer = Path(ex.state_root) / ex.latest_pointer_name
+    payload = json.loads(pointer.read_text(encoding="utf-8"))
+    # The run itself completed, so its pointer stays valid evidence.
+    assert payload["pointer_status"] == "valid"
+    assert payload["valid_scheduled_evidence"] is True
+
+
+def test_a_manual_placement_failure_is_not_a_failed_scheduled_recovery(tmp_path):
+    """The manual path never runs the connector-native recovery policy (Codex
+    review)."""
+
+    class _FailingBroker(_TopUpBroker):
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise RuntimeError("broker rejected the order")
+
+    ex = _live_executor(tmp_path, ("NVDA",))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=_FailingBroker(), manual=True)
+
+    artifacts = res["artifacts"]
+    assert artifacts["run_classification_outcome"] == "failed_placement"
+    assert artifacts["error_class"] == "failed_placement"
+    assert artifacts["is_trading_failure"] is True
+
+
+def test_a_synthesized_failure_state_is_never_valid_scheduled_evidence(tmp_path):
+    """select_same_day_run_state prefers the date-specific state over the pending
+    pointer, so the failure artifact needs a marker the derivation honors, not
+    just a false flag inside the classification (Codex review)."""
+    from scripts.same_day_pointer import derive_valid_scheduled_evidence
+
+    ex = _live_executor(tmp_path, ("NVDA",))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.0})
+
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    ex.build_artifacts = _explode
+    with pytest.raises(RuntimeError):
+        ex.run(_now_live(), data, broker=_TopUpBroker())
+
+    run_state = json.loads(
+        (ex.run_state_dir(_now_live()) / "run_state.json").read_text(encoding="utf-8")
+    )
+    assert run_state["scheduled_evidence_denied"] is True
+    assert derive_valid_scheduled_evidence(run_state) is False
+
+
+def test_a_healthy_scheduled_run_is_still_valid_evidence(tmp_path):
+    """The denial marker must not disturb the normal path."""
+    from scripts.same_day_pointer import derive_valid_scheduled_evidence
+
+    ex = _live_executor(tmp_path, ("NVDA",))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=_TopUpBroker())
+
+    assert "scheduled_evidence_denied" not in res["artifacts"]
+    assert derive_valid_scheduled_evidence(res["artifacts"]) is True
+
+
+def test_a_partially_submitted_batch_records_the_failed_placement(tmp_path):
+    """One order landed and another ticker raised: an ordinary success record
+    would hide the failed order (Codex review)."""
+
+    class _PartlyFailingBroker(_TopUpBroker):
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            if ticker == "AMD":
+                raise RuntimeError("broker rejected AMD")
+            return super().place_market_buy(ticker, notional_usd, ref_id)
+
+    ex = _live_executor(tmp_path, ("NVDA", "AMD"))
+    broker = _PartlyFailingBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10, "AMD": 0.10})
+    res = ex.run(_now_live(), data, broker=broker)
+
+    artifacts = res["artifacts"]
+    assert "NVDA" in broker.placed and "AMD" not in broker.placed
+    # The submitted count and status survive...
+    assert artifacts["orders_submitted_count"] == 1
+    # ...and the failure is recorded rather than silently dropped.
+    assert artifacts["orders_failed_count"] == 1
+    assert artifacts["run_classification_outcome"] == "failed_after_partial_submission"
+    assert artifacts["is_trading_failure"] is True
+    assert artifacts["error_class"] == "partial_placement_failure"
+
+
+def test_a_stale_companion_blocks_a_valid_pointer_on_the_preserved_path(tmp_path):
+    """In a reused directory the summary can belong to an earlier attempt, so the
+    full set is revalidated before a valid pointer is published (Codex review)."""
+    ex = _live_executor(tmp_path, ("NVDA",))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.0})
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps({"run_id": "fresh", "trading_day": "2026-07-08",
+                    "run_classification": {"run_origin": "scheduled", "manual_run": False,
+                                           "stream": "morning"}}),
+        encoding="utf-8",
+    )
+    # A summary left from an earlier attempt whose classification does not mirror.
+    (run_dir / "run_summary.json").write_text(
+        json.dumps({"run_id": "stale", "run_classification": {"run_origin": "scheduled",
+                                                              "manual_run": False,
+                                                              "stream": "afternoon"}}),
+        encoding="utf-8",
+    )
+
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("raised after the state landed")
+
+    ex.build_artifacts = _explode
+    with pytest.raises(RuntimeError):
+        ex.run(_now_live(), data, broker=_TopUpBroker())
+
+    payload = json.loads(
+        (Path(ex.state_root) / ex.latest_pointer_name).read_text(encoding="utf-8")
+    )
+    # The mismatched summary must not be advertised as valid scheduled evidence.
+    assert payload["pointer_status"] == "pending"
+    assert payload["valid_scheduled_evidence"] is False
+
+
+def test_a_broken_companion_set_denies_evidence_in_the_state_itself(tmp_path):
+    """select_same_day_run_state prefers the state file over the pointer, so
+    downgrading only the pointer still hands the run to consumers as valid
+    evidence (Codex review)."""
+    from scripts.same_day_pointer import derive_valid_scheduled_evidence
+
+    ex = _live_executor(tmp_path, ("NVDA",))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.0})
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps({"run_id": "fresh", "trading_day": "2026-07-08",
+                    "run_classification": {"run_origin": "scheduled", "manual_run": False,
+                                           "stream": "morning"}}),
+        encoding="utf-8",
+    )
+    (run_dir / "run_summary.json").write_text(
+        json.dumps({"run_id": "stale", "run_classification": {"run_origin": "scheduled",
+                                                              "manual_run": False,
+                                                              "stream": "afternoon"}}),
+        encoding="utf-8",
+    )
+
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("raised after the state landed")
+
+    ex.build_artifacts = _explode
+    with pytest.raises(RuntimeError):
+        ex.run(_now_live(), data, broker=_TopUpBroker())
+
+    persisted = json.loads((run_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert persisted["artifact_contract_failure"]["failure"] == "artifact_contract_failure"
+    assert persisted["scheduled_evidence_denied"] is True
+    assert derive_valid_scheduled_evidence(persisted) is False
+
+
+def test_a_successful_batch_records_the_submitted_aggregate_status(tmp_path):
+    """build_artifacts never sets this field, so a fully successful batch used to
+    write a null order_submit_status in both artifacts (Codex review)."""
+    ex = _live_executor(tmp_path, ("NVDA",))
+    broker = _TopUpBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=broker)
+
+    assert "NVDA" in broker.placed
+    assert res["artifacts"]["order_submit_status"] == "submitted"
+    assert res["artifacts"]["orders_submitted_count"] == 1
+    # And it reaches the summary a status-based consumer reads.
+    run_dir = Path(res["paths"]["run_state"]).parent
+    summary = json.loads((run_dir / "run_summary.json").read_text(encoding="utf-8"))
+    assert summary["order_submit_status"] == "submitted"
+
+
+def test_a_retry_that_raises_merges_its_order_into_the_preserved_state(tmp_path):
+    """The preserved run_state can belong to an EARLIER invocation. Discarding
+    this retry's placement would hide an accepted order from the same-day guards
+    and let a later run buy it again (Codex review)."""
+    import morning_dca as _m
+
+    earlier = {
+        "run_id": "earlier",
+        "trading_day": "2026-07-08",
+        "broker_outcomes": {"AAA": {"status": "submitted", "order_id": "o-earlier"}},
+        "buy_candidates": [{"ticker": "AAA", "status": "submitted", "order_id": "o-earlier"}],
+        "orders_submitted_count": 1,
+    }
+    placed = {"BBB": {"status": "submitted", "order_id": "o-retry",
+                      "submitted_amount_usd": 2.0}}
+    rows = [{"ticker": "BBB", "status": "submitted", "order_id": "o-retry",
+             "planned_amount_usd": 2.0}]
+
+    merged = _m._merge_placements_into_state(earlier, placed, rows)
+
+    assert merged["run_id"] == "earlier", "the earlier state's identity is preserved"
+    assert set(merged["broker_outcomes"]) == {"AAA", "BBB"}
+    assert {r["order_id"] for r in merged["buy_candidates"]} == {"o-earlier", "o-retry"}
+    assert merged["orders_submitted_count"] == 2
+    assert merged["placement_evidence_incomplete"] is True
+
+
+def test_a_placement_failure_outranks_a_confirmation_required_row(tmp_path):
+    """A batch where another order RAISED is not an ordinary confirmation hold
+    (Codex review)."""
+    import morning_dca as _m
+
+    rows = [
+        {"status": "not_submitted_confirmation_required"},
+        {"status": "failed"},
+    ]
+    assert _m._concrete_order_submit_status(rows) is None
+    # Without the failure it is still a confirmation block.
+    assert (
+        _m._concrete_order_submit_status([{"status": "not_submitted_confirmation_required"}])
+        == "not_submitted_confirmation_required"
+    )
+
+
+def test_a_stale_order_csv_does_not_satisfy_companion_validation(tmp_path):
+    """validate_run_artifacts checks only the order CSV's header, so a stale file
+    omitting the state's orders would otherwise be published as canonical
+    (Codex review)."""
+    import morning_dca as _m
+    from scripts.scheduled_artifacts import write_scheduled_run_artifacts
+
+    run_dir = tmp_path / "slot"
+    state = {
+        "run_id": "r1",
+        "trading_day": "2026-07-08",
+        "run_classification": {"run_origin": "scheduled", "manual_run": False,
+                               "stream": "morning"},
+        "broker_outcomes": {"AAA": {"status": "submitted", "order_id": "o-new",
+                                    "submitted_amount_usd": 2.0}},
+        "buy_candidates": [],
+    }
+    write_scheduled_run_artifacts(run_dir, state)
+    # Replace the order CSV with a header-only file from an "earlier attempt".
+    (run_dir / "submitted_orders.csv").write_text(
+        "ticker,order_id,submitted_amount_usd,status\n", encoding="utf-8"
+    )
+
+    assert _m.MorningDCAExecutor._companions_match_state(run_dir, state) is False
+
+
+def test_dry_run_simulations_never_reach_the_morning_order_csv(tmp_path):
+    """DryRunBroker assigns synthetic DRY-RUN-* ids and submitted_order_rows
+    includes any outcome with an id, so without a filter a dry-run report writes
+    simulations into submitted_orders.csv and the drift detector counts them as
+    genuine submissions (Codex review)."""
+
+    class _DryRunBroker(_TopUpBroker):
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            return f"DRY-RUN-{ticker}"
+
+    ex = _live_executor(tmp_path, ("NVDA",))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=_DryRunBroker())
+
+    outcome = res["artifacts"]["broker_outcomes"]["NVDA"]
+    assert outcome["status"] == "dry_run" and outcome["order_id"].startswith("DRY-RUN")
+
+    run_dir = Path(res["paths"]["run_state"]).parent
+    with (run_dir / "submitted_orders.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows == [], "a simulated order was written as a broker submission"
+
+
+def test_a_merged_morning_retry_is_stamped_as_a_failure(tmp_path):
+    """Leaving the earlier attempt's classification would republish a prior
+    successful state as valid though the retry failed (Codex review)."""
+    import morning_dca as _m
+
+    earlier = {
+        "run_id": "earlier",
+        "status": "completed",
+        "run_classification": {"run_origin": "scheduled", "manual_run": False,
+                               "stream": "morning", "valid_scheduled_evidence": True},
+        "run_classification_outcome": "completed_no_orders",
+        "order_submit_status": "no_orders_submitted",
+        "is_trading_failure": False,
+        "broker_outcomes": {},
+        "buy_candidates": [],
+    }
+    placed = {"NVDA": {"status": "submitted", "order_id": "o-retry",
+                       "submitted_amount_usd": 2.0}}
+    rows = [{"ticker": "NVDA", "status": "submitted", "order_id": "o-retry"}]
+
+    merged = _m._merge_placements_into_state(earlier, placed, rows, error_detail="RuntimeError: x")
+
+    assert merged["status"] == "failed"
+    assert merged["run_classification_outcome"] == "failed_after_partial_submission"
+    assert merged["order_submit_status"] == "submitted"
+    assert merged["is_trading_failure"] is True
+    assert merged["scheduled_evidence_denied"] is True
+    assert merged["run_classification"]["valid_scheduled_evidence"] is False
+
+
+def test_a_merge_that_adds_nothing_leaves_the_state_untouched(tmp_path):
+    """A run that wrote its own artifacts and then had a later step raise has
+    nothing to add and nothing to re-label."""
+    import morning_dca as _m
+
+    state = {
+        "run_id": "done",
+        "status": "completed",
+        "broker_outcomes": {"NVDA": {"status": "submitted", "order_id": "o-1"}},
+        "buy_candidates": [{"ticker": "NVDA", "status": "submitted", "order_id": "o-1"}],
+    }
+    placed = {"NVDA": {"status": "submitted", "order_id": "o-1"}}
+
+    merged = _m._merge_placements_into_state(state, placed, [], error_detail="x")
+
+    assert merged is state
+    assert merged["status"] == "completed"
+
+
+def test_a_merged_retry_that_placed_nothing_is_not_a_post_submission_failure():
+    """Only blocked/failed outcomes to merge: no order landed, so the label must
+    not claim one did (Codex review)."""
+    from scripts.run_classification import stamp_failure_classification
+
+    stamped = stamp_failure_classification({}, submitted=0, error_detail="RuntimeError: x")
+
+    assert stamped["run_classification_outcome"] == "failed_scheduled_run_startup"
+    assert stamped["order_submit_status"] == "not_submitted_error"
+    assert stamped["error_class"] == "scheduled_run_startup_failure"
+    assert stamped["is_trading_failure"] is True
+
+
 if __name__ == "__main__":
     import sys
     import tempfile
@@ -5701,3 +6642,142 @@ if __name__ == "__main__":
                 failures += 1
                 print(f"FAIL {name}: {exc}")
     sys.exit(1 if failures else 0)
+
+
+def test_a_synthesized_morning_failure_state_carries_the_schema_required_fields(tmp_path):
+    """schemas/run_state.schema.json requires broker, budget, and counts on every
+    run_state. validate_run_artifacts does not run schema validation, so omitting
+    them let this handler advertise a complete failure artifact set whose
+    canonical state schema-based reporting then rejects (Codex review)."""
+    ex = _live_executor(tmp_path, ("NVDA",))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.0})
+
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("boom before any writer")
+
+    ex.build_artifacts = _explode
+    with pytest.raises(RuntimeError):
+        ex.run(_now_live(), data, broker=_TopUpBroker())
+
+    run_dir = ex.run_state_dir(_now_live())
+    run_state = json.loads((run_dir / "run_state.json").read_text(encoding="utf-8"))
+
+    schema = json.loads(
+        (Path(__file__).resolve().parent / "schemas" / "run_state.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    for field in schema["required"]:
+        assert field in run_state, field
+    # Real values from the executor's configuration, not placeholders.
+    assert run_state["broker"] == "robinhood"
+    for field in schema["properties"]["budget"]["required"]:
+        assert field in run_state["budget"], field
+    assert run_state["counts"]["submitted"] == 0
+    # Not run through jsonschema: run_state.schema.json $refs
+    # run_classification.schema.json and needs a resolver this assertion does not
+    # need. The required-field check IS the defect.
+
+
+def test_a_synthesized_morning_failure_replaces_stale_companions(tmp_path):
+    """A synthesized state describes THIS failure, so every companion left in a
+    reused directory belongs to an earlier attempt. Preserving them on existence
+    alone advertised stale or zero-byte files as this run's record, and because
+    the state was synthesized the companion check was skipped too (Codex
+    review)."""
+    from scripts.scheduled_artifacts import validate_run_artifacts
+
+    ex = _live_executor(tmp_path, ("NVDA",))
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    # A reused directory holding an earlier attempt's leftovers and no usable
+    # run_state.json.
+    (run_dir / "morning_signals.csv").write_text("", encoding="utf-8")
+    (run_dir / "submitted_orders.csv").write_text("stale,garbage\n", encoding="utf-8")
+    (run_dir / "run_summary.json").write_text(
+        json.dumps({"run_classification": None, "stale": True}), encoding="utf-8"
+    )
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.0})
+
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("boom before any writer")
+
+    ex.build_artifacts = _explode
+    with pytest.raises(RuntimeError):
+        ex.run(_now_live(), data, broker=_TopUpBroker())
+
+    assert (run_dir / "morning_signals.csv").read_text(encoding="utf-8").strip() != ""
+    orders = (run_dir / "submitted_orders.csv").read_text(encoding="utf-8")
+    assert "stale" not in orders
+    summary = json.loads((run_dir / "run_summary.json").read_text(encoding="utf-8"))
+    assert "stale" not in summary
+    assert summary["run_classification"] is not None
+    assert validate_run_artifacts(run_dir, require_summary=True)
+
+
+def test_a_connector_failure_beside_a_submission_is_not_a_clean_run(tmp_path):
+    """A pre-placement broker check that RAISES is recorded as a non-deliberate
+    block, not 'failed'. The zero-order path already counted these as errors; the
+    submitted path did not, so a batch that placed one order and lost another
+    ticker to a connector failure persisted as an ordinary success (Codex
+    review)."""
+    from morning_dca import _apply_no_order_classification
+
+    artifacts = {
+        "broker_outcomes": {
+            "AAA": {"status": "submitted", "order_id": "o-1"},
+            # Raised inside a pre-placement lookup: blocked WITHOUT
+            # deliberate_skip.
+            "BBB": {"status": "blocked", "skip_reason": "spread quote failed: boom"},
+        },
+        "buy_candidates": [],
+        "signal_rows": [],
+    }
+
+    _apply_no_order_classification(artifacts)
+
+    assert artifacts["orders_submitted_count"] == 1
+    assert artifacts["order_submit_status"] == "submitted"
+    assert artifacts["is_trading_failure"] is True
+    assert artifacts["run_classification_outcome"] == "failed_after_partial_submission"
+    assert artifacts["error_class"] == "degraded_market_data"
+
+
+def test_a_deliberate_skip_beside_a_submission_stays_a_clean_run(tmp_path):
+    """A safety gate is not a failure: cap, ceiling, and review blocks carry
+    deliberate_skip=True and must leave a submitted batch clean."""
+    from morning_dca import _apply_no_order_classification
+
+    artifacts = {
+        "broker_outcomes": {
+            "AAA": {"status": "submitted", "order_id": "o-1"},
+            "BBB": {"status": "blocked", "skip_reason": "cap exceeded", "deliberate_skip": True},
+        },
+        "buy_candidates": [],
+        "signal_rows": [],
+    }
+
+    _apply_no_order_classification(artifacts)
+
+    assert artifacts["order_submit_status"] == "submitted"
+    assert "is_trading_failure" not in artifacts
+    assert "run_classification_outcome" not in artifacts
+
+
+def test_a_mixed_dry_run_batch_keeps_its_dry_run_identity(tmp_path):
+    """One broker per run, so a single dry_run row proves DryRunBroker was used.
+    Requiring EVERY row to be dry_run meant one cap-blocked ticker beside a
+    simulated order persisted the run as a genuine live no-order evaluation
+    (Codex review)."""
+    from morning_dca import _concrete_order_submit_status
+
+    rows = [
+        {"status": "dry_run", "order_id": "DRY-RUN-SIM-AAA"},
+        {"status": "blocked", "skip_reason": "cap exceeded", "deliberate_skip": True},
+    ]
+
+    assert _concrete_order_submit_status(rows) == "dry_run"
+    # Still authoritative over a failure, matching the afternoon derivation which
+    # checks config.dry_run first.
+    assert _concrete_order_submit_status(rows + [{"status": "failed"}]) == "dry_run"

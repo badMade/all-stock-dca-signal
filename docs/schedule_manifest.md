@@ -730,6 +730,68 @@ table. They are kept as historical records only.
 retired: it is represented but not firing, and is not expected daily evidence
 while paused. `f7411889` remains a one-time reminder, not a recurring stream.
 
+## Run-plumbing contracts for every live stream (added 2026-07-27)
+
+These apply to **all five live trading tasks** (`2ba19526`, `42173154`,
+`a6239dae`, `7be82b97`, `10ce362c`), not to one slot. On 2026-07-27 the 12:30
+midday task and the 2:30 intraday slot failed the identical way minutes apart, so
+a contract scoped to one cron id would have left the other able to fail again.
+Machine-readable source:
+[`config/scheduled_tasks.json`](../config/scheduled_tasks.json) →
+`connector_native_execution_policy`,
+`scheduled_run_artifact_contract.root_level_artifact_set_2026_07_27`, and
+`spread_gate_outcome_contract_2026_07_27`.
+
+### Connector-native execution runs in place, never as an escalation
+
+A missing repo runner script, a missing entry point, or a missing internal
+order-submission implementation is **not** a blocking condition and **not** a
+reason to escalate. It is the **trigger** for connector-native execution, which
+runs **in place**: inside the scheduled run, under the slot's own artifact root,
+with `run_origin='scheduled'` and `manual_run=false`.
+
+The run gathers Robinhood quotes **including bid and ask**, Finance quotes where
+available, the prior completed regular-session close, same-day order context from
+**all** prior streams of the day, tradability, and account-specific same-day
+Robinhood orders. It persists the raw responses **before** computing, computes
+only from the persisted files, evaluates the first-allocation and ticker-scoped
+same-day top-up rules, and places only qualifying orders with
+`place_equity_order` after `spread_ok` and every other safety check passes.
+
+**Escalating before artifact creation is a contract violation.** Escalation stays
+correct for a safety/account/order rejection, connector data still unavailable
+after the bounded retry, or an unavailable workspace, and even then the complete
+artifact set is written **first**. Escalation reports an outcome; it never
+replaces the artifact.
+
+This changes only what a run does when its local tooling is missing. Every
+budget cap, circuit breaker, whitelist, ordering, spread, confidence, and top-up
+rule is unchanged: a connector-native run passes exactly the same gates.
+
+### Root-level artifacts, every run, every outcome
+
+Every live run writes `run_state.json`, `run_summary.json`, `signals.csv` (or the
+stream-specific name), and `submitted_orders.csv` **at the artifact root**, with
+a header row on both CSVs even at zero rows, on every outcome including a
+zero-order, blocked, or failed run. Writing them only under an `artifacts/`
+subfolder does **not** satisfy the contract; `validate_run_artifacts` names the
+nested path rather than reporting four unrelated missing files. See
+[run_classification.md](run_classification.md).
+
+### A no-order run is not a failure
+
+Evaluate the ladder **first**, then the spread gate. When no ticker qualifies,
+nothing reaches the spread gate and the run records
+`completed_no_orders` with `completion_reason='no_ladder_candidates'` and a
+**null** `error_class`. `error_class='missing_spread_data'` is recorded only when
+candidates actually reached the gate and every one was failed closed there.
+Either way it is a safe no-order skip, valid scheduled evidence that the slot
+executed, never a missed slot, and never an error in scheduled reliability.
+
+When spread is missing for only some tickers, **only those rows fail closed**;
+every other qualifying ticker keeps being evaluated and submitted. Spread is
+never estimated, inferred, or defaulted.
+
 ## Task details
 
 ### `b7961407`: Pre-market DCA buying-power dashboard (RETIRED 2026-07-27, NOT ACTIVE)

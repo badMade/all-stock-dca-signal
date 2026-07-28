@@ -271,9 +271,56 @@ def _first_existing(run_dir: Path, names: Sequence[str]) -> Optional[Path]:
     return None
 
 
+def _has_usable_header(path: Path) -> bool:
+    """True when the CSV opens and its header carries a symbol column.
+
+    Deliberately the SAME bar scripts/scheduled_artifacts.py's
+    _signals_csv_errors() applies. A looser "any non-blank header" test would
+    call a file such as ``garbage\n`` usable, select it over a valid sibling,
+    read no symbols from it, and suppress missing-order alerts while the artifact
+    contract passes on the sibling (Codex review).
+    """
+    try:
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.reader(handle)
+            header = next(reader, None)
+            # The BODY must parse too, matching the validator. Selection happens
+            # here but the rows are read later by read_csv_rows(), so a valid
+            # header over a corrupt body would select the broken canonical file
+            # over a valid sibling, raise inside load_run_artifacts(), and leave
+            # the wrapper logging a detector failure with no drift reconciled
+            # (Codex review). Usable has to mean "this consumer can read it".
+            for _ in reader:
+                pass
+    except (OSError, UnicodeDecodeError, csv.Error):
+        return False
+    if not header or not any(str(column).strip() for column in header):
+        return False
+    return bool({str(column).strip().lower() for column in header} & set(SYMBOL_COLUMNS))
+
+
+def _first_usable(run_dir: Path, names: Sequence[str]) -> Optional[Path]:
+    """The first recognized file with a usable header, else the first existing.
+
+    The artifact contract accepts any recognized signals filename that carries a
+    usable header, so a reused run directory can legitimately hold a stale or
+    truncated ``signals.csv`` beside a valid ``morning_signals.csv``. Picking the
+    first file that merely EXISTS would read the malformed one, see no symbols,
+    and report no expected orders while the contract advertises the run as valid
+    (Codex review). Falling back to the first existing file keeps the old
+    behavior when nothing is usable, so a genuinely broken directory still
+    surfaces through the normal empty-signals path rather than as "no file".
+    """
+    for name in names:
+        candidate = run_dir / name
+        if candidate.exists() and _has_usable_header(candidate):
+            return candidate
+    return _first_existing(run_dir, names)
+
+
 def load_run_artifacts(run_dir: Path) -> RunArtifacts:
     """Locate and parse the signal/order/error artifacts under ``run_dir``."""
-    signals_path = _first_existing(run_dir, SIGNAL_CSV_NAMES)
+    signals_path = _first_usable(run_dir, SIGNAL_CSV_NAMES)
     orders_path = _first_existing(run_dir, ORDER_CSV_NAMES)
     error_path = _first_existing(run_dir, ERROR_CSV_NAMES)
     buy_candidates_path = run_dir / BUY_CANDIDATES_CSV_NAME

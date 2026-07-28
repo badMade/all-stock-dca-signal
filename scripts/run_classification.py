@@ -396,6 +396,94 @@ ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED = "not_submitted_confirmation_required
 ORDER_SUBMIT_STATUS_ERROR = "not_submitted_error"
 ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED = "not_submitted_budget_exhausted"
 ORDER_SUBMIT_STATUS_DRY_RUN = "dry_run"
+# A run that fired, evaluated every ticker, and deliberately submitted nothing --
+# distinct from an error and from budget exhaustion. See classify_no_order_run.
+ORDER_SUBMIT_STATUS_NO_ORDERS = "no_orders_submitted"
+
+# --- No-order outcome contract (config/scheduled_tasks.json:
+# spread_data_availability_policy) -------------------------------------------
+#
+# A scheduled run that submits nothing is NOT a failure. The Jul 27 2026 1:30 PM
+# run recorded error_class='missing_spread_data' when in fact no ticker had
+# qualified on the ladder at all, so nothing ever reached the spread gate: the
+# missing spread was irrelevant to the outcome. The policy fixes the evaluation
+# order -- ladder FIRST, then the spread gate -- and this module is the single
+# place that turns those two counts into a recorded outcome.
+RUN_CLASSIFICATION_COMPLETED_NO_ORDERS = "completed_no_orders"
+RUN_CLASSIFICATION_PLACEMENT_FAILED = "failed_after_connector_native_recovery_attempt"
+# A run that never reached placement: it raised at startup, or a precondition /
+# wiring gate stopped it (missing same-day pre-flight artifact, absent broker,
+# wrong live account). Distinct from RUN_CLASSIFICATION_PLACEMENT_FAILED, which
+# means placement WAS attempted and failed: reporting keyed on that outcome would
+# otherwise misattribute a startup, data, or precondition failure as a broker
+# placement failure. The specific cause is carried by error_class.
+RUN_CLASSIFICATION_STARTUP_FAILED = "failed_scheduled_run_startup"
+# A run that raised AFTER submitting at least one order. Distinct from
+# RUN_CLASSIFICATION_STARTUP_FAILED so the aggregate outcome never contradicts a
+# non-zero orders_submitted_count and a submitted_orders.csv row.
+RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION = "failed_after_partial_submission"
+# Placement failure on a MANUAL run. The manual path never runs the scheduled
+# connector-native recovery policy, so recording its broker failures under
+# RUN_CLASSIFICATION_PLACEMENT_FAILED would misattribute an ordinary manual
+# failure as a failed scheduled recovery attempt.
+RUN_CLASSIFICATION_MANUAL_PLACEMENT_FAILED = "failed_placement"
+
+# completion_reason values for a completed_no_orders run (error_class stays null).
+COMPLETION_REASON_NO_LADDER_CANDIDATES = "no_ladder_candidates"
+COMPLETION_REASON_NO_QUALIFYING_ORDERS = "no_qualifying_orders_after_safety_checks"
+# Candidates DID qualify on the ladder but every one was stopped by a safety or
+# budget check that runs BEFORE the spread lookup (daily/weekly cap, per-order
+# ceiling, already-bought-today, same-day duplicate). Recording that as
+# 'no_ladder_candidates' would claim the ladder produced nothing when it did.
+COMPLETION_REASON_BLOCKED_BEFORE_SPREAD_GATE = "blocked_before_spread_gate"
+# The date/holiday gate stopped the run before any evaluation.
+COMPLETION_REASON_DATE_GATE_BLOCKED = "date_or_holiday_gate_blocked"
+
+# error_class for a run whose candidates DID reach the spread gate and were all
+# failed closed there. Never used when no candidate reached the gate.
+ERROR_CLASS_MISSING_SPREAD_DATA = "missing_spread_data"
+# A run that completed with no orders while market-data providers were raising:
+# tickers degraded to NO_DATA/manual review rather than being genuinely evaluated,
+# so the zero-order result is NOT a clean ladder no-op and must not read as one.
+ERROR_CLASS_DEGRADED_MARKET_DATA = "degraded_market_data"
+# At least one order landed and another ticker's placement raised in the same
+# batch. The run is a partial success AND a failure; both must be recorded.
+ERROR_CLASS_PARTIAL_PLACEMENT_FAILURE = "partial_placement_failure"
+# A scheduled live run that raised before reaching any writer.
+ERROR_CLASS_STARTUP_FAILURE = "scheduled_run_startup_failure"
+# Raw connector responses were missing, unwritable, or failed normalization, so
+# the run fail-closed before computing anything. Mirrors the concrete code the
+# morning runner already emits (morning_dca's missing_or_invalid_raw_inputs).
+ERROR_CLASS_MISSING_RAW_INPUTS = "missing_or_invalid_raw_inputs"
+# The single permitted recovery attempt itself failed, or a safety/account/order
+# rejection ended it. Distinct from the raw-input class: the cause is the failed
+# recovery, not the inputs.
+ERROR_CLASS_RECOVERY_FAILURE = "recovery_failure"
+# A run that raised AFTER at least one order was submitted. Kept distinct from
+# the startup class so a reliability consumer grouping by error_class never
+# reports a late post-trade failure as startup trouble.
+ERROR_CLASS_POST_SUBMISSION_FAILURE = "scheduled_run_failed_after_submission"
+# A scheduled live run stopped by a precondition or wiring gate before placement:
+# no same-day pre-flight artifact, no broker adapter, or the wrong live account.
+ERROR_CLASS_BLOCKED_BEFORE_PLACEMENT = "scheduled_run_blocked_before_placement"
+
+# Marker stamped on a candidate outcome by the spread gate itself, so the run
+# classifier counts a row as spread-blocked only when the spread gate is what
+# blocked it. Inferring that from ``spread_status`` alone is wrong on a manual
+# run, where an unproven spread does NOT block placement and the row can later be
+# stopped by human review while still carrying spread_status='spread_unavailable'.
+BLOCKED_BY_SPREAD_GATE = "spread_gate"
+
+# Row-level spread outcome recorded on every evaluated signal/candidate row.
+SPREAD_STATUS_OK = "spread_ok"
+SPREAD_STATUS_UNAVAILABLE = "spread_unavailable"
+SPREAD_STATUS_NOT_OK = "spread_not_ok"
+SPREAD_STATUS_NOT_EVALUATED = "not_evaluated"
+# Legacy alias persisted by the Jul 27 2026 intraday runs; accepted on read.
+SPREAD_STATUS_MISSING_BID_ASK = "missing_bid_ask"
+SPREAD_UNAVAILABLE_STATUSES = frozenset(
+    {SPREAD_STATUS_UNAVAILABLE, SPREAD_STATUS_MISSING_BID_ASK}
+)
 
 
 _EASTERN = ZoneInfo("America/New_York")
@@ -869,12 +957,35 @@ def raw_persistence_failure_run_state(
     out_dir = raw_dir if raw_dir is not None else raw_input_dir(trading_day, base)
     ts = triggered_at_utc or _utc_now_iso()
     _generated_at = generated_at or datetime.now(_EASTERN).strftime("%Y-%m-%dT%H:%M:%S")
-    return {
+    state = {
         "run_id": scheduled_run_id(trading_day),
         "generated_at": _generated_at,
         "trading_day": trading_day,
         "broker": broker,
         "order_submit_status": ORDER_SUBMIT_STATUS_ERROR,
+        # The run never reached placement, so it carries the same outcome fields
+        # every other blocked-before-placement path stamps. Without these the
+        # state and its summary pass validation while saying nothing about the
+        # outcome, and could still update the latest-run pointer (Codex review).
+        "run_classification_outcome": RUN_CLASSIFICATION_STARTUP_FAILED,
+        "completion_reason": None,
+        # A concrete cause, not just the generic outcome: build_run_summary only
+        # mirrors error_class when present, so without it the state and summary
+        # carry a startup-failure outcome with no identifiable failure mode and
+        # error-class-based reporting cannot group it (Codex review).
+        "error_class": ERROR_CLASS_MISSING_RAW_INPUTS,
+        "is_trading_failure": True,
+        # Deliberately NO orders_submitted_count. This state overwrites the
+        # SLOT's canonical run_state.json, and a same-slot retry whose earlier
+        # attempt already placed orders would have those orders erased by an
+        # asserted zero: the reporting selector does not read the preserved
+        # orders.csv and disables broker fallback for not_submitted_error, so
+        # they would vanish from scheduled fill and slippage results. THIS
+        # attempt placed nothing, but the slot's count is unknown here, and an
+        # absent field is honest where a zero is wrong (Codex review). The caller
+        # fills it in when it can establish the real figure.
+        "candidates_reaching_spread_gate": 0,
+        "candidates_blocked_missing_spread": 0,
         "budget": budget or {"budget_tier": "normal", "daily_cap_usd": 0, "weekly_cap_usd": 0},
         "counts": {"evaluated": 0, "buy_candidates": 0, "submitted": 0},
         "buy_candidates": [],
@@ -884,6 +995,16 @@ def raw_persistence_failure_run_state(
         "recovery_from_escalation": bool(recovery_from_escalation),
         "raw_persistence_error": str(error),
     }
+    # The pointer writer publishes whatever this state derives, and the
+    # derivation reads only run_origin/manual_run -- both of which say
+    # "scheduled", because the slot really did fire. Denying evidence is what
+    # separates "the slot fired and failed" from "the slot executed", and
+    # without it a raw-persistence failure that never computed a signal is
+    # published as a successful slot to every watchdog and reliability consumer
+    # (Codex review). The same-day prior-allocation loader reads these
+    # artifacts as context regardless of the marker, so denying evidence here
+    # cannot hide a carried order from the top-up guard.
+    return deny_scheduled_evidence(state)
 
 
 # --- Automatic failure recovery for scheduled live tasks (2026-07-15) --------
@@ -986,12 +1107,35 @@ def recovery_escalation_run_state(
     _validate_recovery_trigger_reason(trigger_reason)
     ts = triggered_at_utc or _utc_now_iso()
     _generated_at = generated_at or datetime.now(_EASTERN).strftime("%Y-%m-%dT%H:%M:%S")
-    return {
+    state = {
         "run_id": scheduled_run_id(trading_day),
         "generated_at": _generated_at,
         "trading_day": trading_day,
         "broker": broker,
         "order_submit_status": ORDER_SUBMIT_STATUS_ERROR,
+        # The run never reached placement, so it carries the same outcome fields
+        # every other blocked-before-placement path stamps. Without these the
+        # state and its summary pass validation while saying nothing about the
+        # outcome, and could still update the latest-run pointer (Codex review).
+        "run_classification_outcome": RUN_CLASSIFICATION_STARTUP_FAILED,
+        "completion_reason": None,
+        # A concrete cause, not just the generic outcome: build_run_summary only
+        # mirrors error_class when present, so without it the state and summary
+        # carry a startup-failure outcome with no identifiable failure mode and
+        # error-class-based reporting cannot group it (Codex review).
+        "error_class": ERROR_CLASS_RECOVERY_FAILURE,
+        "is_trading_failure": True,
+        # Deliberately NO orders_submitted_count. This state overwrites the
+        # SLOT's canonical run_state.json, and a same-slot retry whose earlier
+        # attempt already placed orders would have those orders erased by an
+        # asserted zero: the reporting selector does not read the preserved
+        # orders.csv and disables broker fallback for not_submitted_error, so
+        # they would vanish from scheduled fill and slippage results. THIS
+        # attempt placed nothing, but the slot's count is unknown here, and an
+        # absent field is honest where a zero is wrong (Codex review). The caller
+        # fills it in when it can establish the real figure.
+        "candidates_reaching_spread_gate": 0,
+        "candidates_blocked_missing_spread": 0,
         "budget": budget or {"budget_tier": "normal", "daily_cap_usd": 0, "weekly_cap_usd": 0},
         "counts": {"evaluated": 0, "buy_candidates": 0, "submitted": 0},
         "buy_candidates": [],
@@ -1006,6 +1150,10 @@ def recovery_escalation_run_state(
             "blocking_reason": str(blocking_reason),
         },
     }
+    # Same denial as the raw-persistence builder, and for the same reason: an
+    # escalated recovery attempt fired but never completed the slot, so it must
+    # not be published as the slot's valid scheduled evidence.
+    return deny_scheduled_evidence(state)
 
 
 # --- Validation --------------------------------------------------------------
@@ -1165,9 +1313,26 @@ def is_scheduled_state(state: Dict[str, object]) -> bool:
     contract rejected (top-level ``artifact_contract_failure`` marker) also fails
     closed here, so the 15:35 reporting selector never publishes a contract-rejected
     partial-placement run's submitted subset as valid scheduled fills.
+
+    ``scheduled_evidence_denied`` is honored here too, but NOT unconditionally.
+    This predicate answers a different question from
+    ``derive_valid_scheduled_evidence``: that one asks whether the slot executed
+    (reliability, watchdogs, missed-slot accounting), while this one decides
+    whether a state's orders are attributable to the scheduled slot (fill and
+    slippage reporting). A failed run can honestly answer no to the first and
+    yes to the second, and the two must not be collapsed: a run that placed a
+    real order and then raised is denied as evidence by both failure handlers,
+    and rejecting it here as well made the reporting selector discard the whole
+    state so the preserved fills vanished from scheduled reporting (Codex
+    review). So a denied state is rejected only when it has no order to
+    attribute -- which is exactly the date/holiday-gated stub this check was
+    added for.
     """
     if isinstance(state, dict) and state.get("artifact_contract_failure") is not None:
         return False
+    if isinstance(state, dict) and state.get("scheduled_evidence_denied") is True:
+        if not _order_ids_from_state(state):
+            return False
     rc = state.get("run_classification") if isinstance(state, dict) else None
     if not isinstance(rc, dict):
         return False
@@ -1194,6 +1359,263 @@ def is_confirmation_blocked(state: Optional[Dict[str, object]]) -> bool:
     return order_submit_status(state) == ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED
 
 
+@dataclass(frozen=True)
+class NoOrderOutcome:
+    """How a run that submitted zero orders must be recorded.
+
+    ``run_classification`` here is the OUTCOME string that goes in the run_state's
+    ``run_classification_outcome`` field; it is deliberately not the nested
+    ``run_classification`` identity object, which stays a non-null object on every
+    scheduled run (see scripts/scheduled_artifacts.py).
+    """
+
+    run_classification: str
+    order_submit_status: str
+    completion_reason: Optional[str]
+    error_class: Optional[str]
+    is_trading_failure: bool
+    candidates_reaching_spread_gate: int
+    candidates_blocked_missing_spread: int
+
+    def as_run_state_fields(self) -> Dict[str, object]:
+        """The exact top-level run_state fields this outcome requires."""
+        return {
+            "run_classification_outcome": self.run_classification,
+            "order_submit_status": self.order_submit_status,
+            "completion_reason": self.completion_reason,
+            "error_class": self.error_class,
+            "is_trading_failure": self.is_trading_failure,
+            "orders_submitted_count": 0,
+            "candidates_reaching_spread_gate": self.candidates_reaching_spread_gate,
+            "candidates_blocked_missing_spread": self.candidates_blocked_missing_spread,
+        }
+
+
+def classify_no_order_run(
+    *,
+    candidates_reaching_spread_gate: int,
+    candidates_blocked_missing_spread: int,
+    candidates_evaluated: Optional[int] = None,
+    placement_attempted_and_failed: bool = False,
+    data_errors: int = 0,
+    scheduled: bool = True,
+) -> NoOrderOutcome:
+    """Classify a zero-order run, separating no-order logic from failures.
+
+    Implements config/scheduled_tasks.json:spread_data_availability_policy, whose
+    ``evaluation_order`` is: evaluate the ladder FIRST, then the spread gate. The
+    recorded outcome depends on whether any ticker qualified BEFORE reaching the
+    spread gate:
+
+    * No ticker qualified at all -> ``completed_no_orders`` with
+      ``completion_reason='no_ladder_candidates'`` and a NULL ``error_class``.
+      Missing spread did not produce this outcome, so recording
+      ``missing_spread_data`` here would be misleading. This is a normal, healthy
+      zero-order run and valid scheduled evidence that the slot executed.
+    * Candidates qualified but every one was stopped BEFORE the spread lookup, by
+      a budget/cap/ceiling/duplicate check -> ``completed_no_orders`` with
+      ``completion_reason='blocked_before_spread_gate'``. Those tickers DID
+      qualify on the ladder, so calling it ``no_ladder_candidates`` would
+      misreport what happened (Codex review). ``candidates_evaluated`` is what
+      separates the two; when it is omitted the caller has no candidate count and
+      the reaching-gate count stands in, preserving the older behavior.
+    * Candidates reached the gate and EVERY one was failed closed for want of a
+      proven spread -> ``completed_no_orders`` with
+      ``error_class='missing_spread_data'``. Still a safe no-order skip, still
+      valid scheduled evidence, still not a trading failure.
+    * Candidates reached the gate, some were failed closed for spread and others
+      were evaluated through -> ``completed_no_orders`` with a null
+      ``error_class``: the spread-blocked rows failed closed individually
+      (``candidates_blocked_missing_spread`` records how many) and the rest simply
+      did not qualify. Never abort the whole run for a subset.
+    * ``placement_attempted_and_failed`` -> placement ran on qualifying candidates
+      and could not place them. That IS a failure; the complete artifact set is
+      still written. A scheduled run records
+      ``failed_after_connector_native_recovery_attempt``, a manual one the
+      generic ``failed_placement``: the manual path never runs the
+      connector-native recovery policy, so attributing its broker failures to
+      that policy would be wrong (Codex review).
+
+    None of these outcomes is a trading failure except the last, and none of them
+    is a missed slot: the run fired and wrote its artifacts.
+
+    ``data_errors`` is the run's provider/error count. A zero-order run that
+    happened while market-data providers were raising is NOT a clean ladder no-op:
+    its tickers degraded to NO_DATA/manual review rather than being genuinely
+    evaluated, so it keeps its ``completed_no_orders`` classification but carries
+    ``error_class='degraded_market_data'`` instead of a null one, and summary and
+    reliability consumers can see the run was degraded (Codex review). A concrete
+    spread error_class already established above wins, since that is the more
+    specific cause.
+    """
+    reaching = max(0, int(candidates_reaching_spread_gate))
+    blocked = max(0, int(candidates_blocked_missing_spread))
+    # A row cannot be blocked at a gate it never reached.
+    blocked = min(blocked, reaching)
+    evaluated = reaching if candidates_evaluated is None else max(0, int(candidates_evaluated))
+    # A candidate cannot reach the gate without having been evaluated.
+    evaluated = max(evaluated, reaching)
+
+    if placement_attempted_and_failed:
+        # The connector-native outcome belongs to the SCHEDULED path only: a
+        # manual run never runs that policy, so reporting keyed on it would
+        # misattribute an ordinary manual broker failure as a failed scheduled
+        # recovery attempt (Codex review).
+        failure = (
+            RUN_CLASSIFICATION_PLACEMENT_FAILED
+            if scheduled
+            else RUN_CLASSIFICATION_MANUAL_PLACEMENT_FAILED
+        )
+        return NoOrderOutcome(
+            run_classification=failure,
+            order_submit_status=ORDER_SUBMIT_STATUS_ERROR,
+            completion_reason=None,
+            error_class=failure,
+            is_trading_failure=True,
+            candidates_reaching_spread_gate=reaching,
+            candidates_blocked_missing_spread=blocked,
+        )
+    # A zero-order run that ran while providers were raising is not a clean
+    # no-op. It keeps its completed_no_orders classification (it did complete and
+    # did submit nothing) but never a null error_class, so a summary or
+    # reliability consumer can see the run was degraded. A concrete spread cause
+    # below is more specific and wins.
+    degraded = ERROR_CLASS_DEGRADED_MARKET_DATA if int(data_errors) > 0 else None
+
+    if reaching == 0:
+        return NoOrderOutcome(
+            run_classification=RUN_CLASSIFICATION_COMPLETED_NO_ORDERS,
+            order_submit_status=ORDER_SUBMIT_STATUS_NO_ORDERS,
+            completion_reason=(
+                COMPLETION_REASON_NO_LADDER_CANDIDATES
+                if evaluated == 0
+                else COMPLETION_REASON_BLOCKED_BEFORE_SPREAD_GATE
+            ),
+            error_class=degraded,
+            is_trading_failure=False,
+            candidates_reaching_spread_gate=0,
+            candidates_blocked_missing_spread=0,
+        )
+    if blocked == reaching:
+        return NoOrderOutcome(
+            run_classification=RUN_CLASSIFICATION_COMPLETED_NO_ORDERS,
+            order_submit_status=ORDER_SUBMIT_STATUS_NO_ORDERS,
+            completion_reason=None,
+            error_class=ERROR_CLASS_MISSING_SPREAD_DATA,
+            is_trading_failure=False,
+            candidates_reaching_spread_gate=reaching,
+            candidates_blocked_missing_spread=blocked,
+        )
+    return NoOrderOutcome(
+        run_classification=RUN_CLASSIFICATION_COMPLETED_NO_ORDERS,
+        order_submit_status=ORDER_SUBMIT_STATUS_NO_ORDERS,
+        completion_reason=COMPLETION_REASON_NO_QUALIFYING_ORDERS,
+        error_class=degraded,
+        is_trading_failure=False,
+        candidates_reaching_spread_gate=reaching,
+        candidates_blocked_missing_spread=blocked,
+    )
+
+
+def deny_scheduled_evidence(state: Dict[str, object]) -> Dict[str, object]:
+    """Mark ``state`` as something no consumer may count as scheduled evidence.
+
+    Two markers, because two different consumers read two different places:
+    the top-level ``scheduled_evidence_denied`` flag that
+    ``derive_valid_scheduled_evidence`` honors, and the nested classification's
+    own ``valid_scheduled_evidence``, which a consumer reading the block
+    directly would otherwise trust.
+
+    A synthesized failure artifact proves the slot FIRED. That is worth
+    recording, and it is not the same claim as "the slot executed" -- without
+    the denial the pointer publishes a run that never computed signals or
+    reached placement as a successful slot.
+
+    One implementation on purpose: every builder that fails a scheduled run
+    closed must deny it the same way, and hand-copying the two markers is how
+    ``raw_persistence_failure_run_state`` and ``recovery_escalation_run_state``
+    ended up carrying neither (Codex review).
+    """
+    state = dict(state)
+    state["scheduled_evidence_denied"] = True
+    rc = state.get("run_classification")
+    if isinstance(rc, dict):
+        rc = dict(rc)
+        rc["valid_scheduled_evidence"] = False
+        state["run_classification"] = rc
+    return state
+
+
+def stamp_failure_classification(
+    state: Dict[str, object], *, submitted: int, error_detail: str
+) -> Dict[str, object]:
+    """Mark ``state`` as a run that FAILED, choosing the label from ``submitted``.
+
+    Both runners merge an in-flight placement into a state an earlier attempt at
+    the same slot wrote. That merge must also re-label the state: the earlier
+    attempt's successful or no-order classification would otherwise be
+    republished as valid even though this attempt raised.
+
+    The label is gated on the merged submitted count, not on merely having some
+    outcome to merge. A retry whose only outcomes were blocked or failed placed
+    nothing, so calling it a post-submission failure would claim an order landed
+    when none did (Codex review).
+
+    Shared by morning_dca and near_close_dca deliberately: keeping one copy per
+    runner is how the two drifted apart in the first place.
+    """
+    state = dict(state)
+    if submitted:
+        state["run_classification_outcome"] = RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
+        state["order_submit_status"] = ORDER_SUBMIT_STATUS_SUBMITTED
+        state["error_class"] = ERROR_CLASS_POST_SUBMISSION_FAILURE
+    else:
+        state["run_classification_outcome"] = RUN_CLASSIFICATION_STARTUP_FAILED
+        state["order_submit_status"] = ORDER_SUBMIT_STATUS_ERROR
+        state["error_class"] = ERROR_CLASS_STARTUP_FAILURE
+    state["status"] = "failed"
+    state["error_detail"] = error_detail
+    state["is_trading_failure"] = True
+    state["placement_evidence_incomplete"] = True
+    return deny_scheduled_evidence(state)
+
+
+def spread_gate_fields(
+    *, spread_pct: Optional[float], max_spread_pct: float, evaluated: bool = True
+) -> Dict[str, object]:
+    """Row-level spread fields for a signal/candidate row.
+
+    Every row that reaches the spread gate records whether its own spread was
+    proven, so a later reader can separate "no candidate ever reached the gate"
+    from "this row was failed closed for want of a spread" without re-deriving it
+    from prose skip reasons. A row that never reached the gate records
+    ``not_evaluated`` -- never ``spread_ok=true``.
+    """
+    if not evaluated:
+        return {"spread_ok": None, "spread_pct": None, "spread_status": SPREAD_STATUS_NOT_EVALUATED}
+    if spread_pct is None:
+        return {"spread_ok": False, "spread_pct": None, "spread_status": SPREAD_STATUS_UNAVAILABLE}
+    if spread_pct > max_spread_pct:
+        return {
+            "spread_ok": False,
+            "spread_pct": float(spread_pct),
+            "spread_status": SPREAD_STATUS_NOT_OK,
+        }
+    return {"spread_ok": True, "spread_pct": float(spread_pct), "spread_status": SPREAD_STATUS_OK}
+
+
+def row_blocked_for_missing_spread(row: Optional[Mapping[str, object]]) -> bool:
+    """True when a persisted row was failed closed because its spread was unproven.
+
+    Accepts the legacy ``missing_bid_ask`` status persisted by the Jul 27 2026
+    intraday runs alongside the canonical ``spread_unavailable``.
+    """
+    if not isinstance(row, Mapping):
+        return False
+    status = row.get("spread_status")
+    return isinstance(status, str) and status in SPREAD_UNAVAILABLE_STATUSES
+
+
 # --- Writing artifacts -------------------------------------------------------
 
 def update_latest_scheduled_run_pointer(
@@ -1209,6 +1631,11 @@ def update_latest_scheduled_run_pointer(
     potentially differently-located copy of run_state.json being written.
     Callers must validate ``run_state["run_classification"]`` themselves first.
     """
+    try:  # pragma: no cover - import shim for flat sys.path
+        from scripts.same_day_pointer import derive_valid_scheduled_evidence
+    except ImportError:  # pragma: no cover
+        from same_day_pointer import derive_valid_scheduled_evidence  # type: ignore
+
     rc = run_state.get("run_classification") or {}
     day = str(run_state.get("trading_day", "")).strip()
     pointer = latest_scheduled_run_path(base)
@@ -1219,7 +1646,13 @@ def update_latest_scheduled_run_pointer(
     # same_day_pointer_validation_policy). manual_run must be the explicit
     # boolean False -- an incomplete classification that omits the key must
     # not default to non-manual.
-    valid_scheduled_evidence = rc.get("run_origin") == "scheduled" and rc.get("manual_run") is False
+    #
+    # Routed through the SHARED derivation rather than repeating the rule here,
+    # so this pointer honors artifact_contract_failure and the explicit
+    # scheduled_evidence_denied marker too. A failure state pointed at by this
+    # helper would otherwise be published as valid evidence by the one predicate
+    # that still had its own inline copy (Codex review).
+    valid_scheduled_evidence = derive_valid_scheduled_evidence(run_state)
     pointer_status = "valid" if valid_scheduled_evidence else "pending"
     atomic_write_text(
         pointer,
@@ -3027,6 +3460,12 @@ def select_scheduled_state_for_reporting(
             ORDER_SUBMIT_STATUS_ERROR,
             ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED,
             ORDER_SUBMIT_STATUS_DRY_RUN,
+            # A completed no-order run submitted nothing by design. Without this,
+            # a healthy zero-order afternoon state combined with
+            # scheduled_state_write_failed would attribute unrelated broker orders
+            # in the window to this run, corrupting fill and slippage reporting
+            # (Codex review).
+            ORDER_SUBMIT_STATUS_NO_ORDERS,
         }
     ):
         # Valid scheduled state exists but has no usable order IDs due to a known
@@ -3101,6 +3540,37 @@ __all__ = [
     "ORDER_SUBMIT_STATUS_ERROR",
     "ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED",
     "ORDER_SUBMIT_STATUS_DRY_RUN",
+    "ORDER_SUBMIT_STATUS_NO_ORDERS",
+    "RUN_CLASSIFICATION_COMPLETED_NO_ORDERS",
+    "RUN_CLASSIFICATION_PLACEMENT_FAILED",
+    "RUN_CLASSIFICATION_STARTUP_FAILED",
+    "RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION",
+    "RUN_CLASSIFICATION_MANUAL_PLACEMENT_FAILED",
+    "COMPLETION_REASON_NO_LADDER_CANDIDATES",
+    "COMPLETION_REASON_NO_QUALIFYING_ORDERS",
+    "COMPLETION_REASON_BLOCKED_BEFORE_SPREAD_GATE",
+    "COMPLETION_REASON_DATE_GATE_BLOCKED",
+    "ERROR_CLASS_MISSING_SPREAD_DATA",
+    "ERROR_CLASS_DEGRADED_MARKET_DATA",
+    "ERROR_CLASS_STARTUP_FAILURE",
+    "ERROR_CLASS_POST_SUBMISSION_FAILURE",
+    "ERROR_CLASS_MISSING_RAW_INPUTS",
+    "ERROR_CLASS_RECOVERY_FAILURE",
+    "ERROR_CLASS_PARTIAL_PLACEMENT_FAILURE",
+    "ERROR_CLASS_BLOCKED_BEFORE_PLACEMENT",
+    "BLOCKED_BY_SPREAD_GATE",
+    "SPREAD_STATUS_OK",
+    "SPREAD_STATUS_UNAVAILABLE",
+    "SPREAD_STATUS_NOT_OK",
+    "SPREAD_STATUS_NOT_EVALUATED",
+    "SPREAD_STATUS_MISSING_BID_ASK",
+    "SPREAD_UNAVAILABLE_STATUSES",
+    "NoOrderOutcome",
+    "classify_no_order_run",
+    "deny_scheduled_evidence",
+    "stamp_failure_classification",
+    "spread_gate_fields",
+    "row_blocked_for_missing_spread",
     "order_submit_status",
     "is_confirmation_blocked",
     "build_scheduled_classification",

@@ -49,6 +49,11 @@ SIGNAL_CSV_NAMES = (
     "intraday_signals.csv",
 )
 
+# The symbol column a signals CSV must carry, mirroring
+# scripts/drift_detection.py's SYMBOL_COLUMNS. Without one the drift detector
+# reads no ticker from the file and cannot reconcile signals against orders.
+SIGNAL_SYMBOL_COLUMNS = ("ticker", "symbol")
+
 # Header written for submitted_orders.csv even when there are zero order rows.
 SUBMITTED_ORDERS_FIELDS = ("ticker", "order_id", "submitted_amount_usd", "status")
 
@@ -126,6 +131,24 @@ ERROR_CLASS_COMPUTE_ONLY_NO_PLACEMENT = "placement_not_implemented_in_compute_mo
 # is the report-only variant dca_reporting writes and is only mirror-checked when present.
 CANONICAL_RUN_SUMMARY_FILENAME = "run_summary.json"
 SUMMARY_FILENAMES = (CANONICAL_RUN_SUMMARY_FILENAME, "latest_run_summary.json")
+
+# The four files every scheduled LIVE run writes at the ROOT of its artifact
+# directory, on every outcome, including a zero-order or blocked run. Jul 27 2026
+# 1:30 PM ET: the run wrote its four files only under an ``artifacts/`` subfolder
+# with nothing at the root, so every consumer that discovers a run directory by
+# path saw an empty slot. Nesting them is not a partial pass, it is a contract
+# failure. See config/scheduled_tasks.json:scheduled_run_artifact_contract.
+SCHEDULED_LIVE_REQUIRED_FILENAMES = (
+    RUN_STATE_FILENAME,
+    CANONICAL_RUN_SUMMARY_FILENAME,
+    SIGNALS_CSV_FILENAME,
+    SUBMITTED_ORDERS_CSV_FILENAME,
+)
+
+# Subdirectories a run may also write into. A required file found ONLY here is
+# reported as a nested-artifact contract failure naming the file, rather than the
+# generic "missing" error, so the operator sees the real cause.
+NESTED_ARTIFACT_SUBDIRS = ("artifacts", "out", "output")
 
 
 def build_preflight_run_classification(
@@ -429,16 +452,23 @@ def submitted_order_rows(
     :data:`ORDER_ATTEMPT_STATUSES`) or that carries a concrete order_id. The
     concrete status is preserved so a pending/unconfirmed response is still
     recorded rather than dropped.
+
+    The symbol comes from the outcome's own ``ticker`` when it carries one, and
+    only otherwise from the mapping key. A retry that places a SECOND order for a
+    ticker the earlier attempt already bought needs a distinct key, so the
+    afternoon merge keys that outcome ``AAPL:<order-id>``; taking the key as the
+    symbol would write that string into the canonical order row (Codex review).
+    The key is an identity, the ticker is data.
     """
     rows: List[Dict[str, Any]] = []
-    for ticker, outcome in (broker_outcomes or {}).items():
+    for key, outcome in (broker_outcomes or {}).items():
         if not isinstance(outcome, dict):
             continue
         status = outcome.get("status")
         if status in ORDER_ATTEMPT_STATUSES or outcome.get("order_id"):
             rows.append(
                 {
-                    "ticker": ticker,
+                    "ticker": outcome.get("ticker") or key,
                     "order_id": outcome.get("order_id"),
                     "submitted_amount_usd": outcome.get("submitted_amount_usd"),
                     "status": status,
@@ -495,6 +525,96 @@ def write_submitted_orders_csv(
     return path
 
 
+def build_run_summary(
+    run_state: Dict[str, Any], *, extra: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """The canonical root-level run_summary.json payload for a live run.
+
+    Carries the SAME non-null ``run_classification`` object as run_state.json (a
+    null summary classification breaks scheduled-vs-manual attribution downstream)
+    plus the no-order outcome fields, so a reader can tell a healthy zero-order run
+    from a failure without opening run_state.json.
+    """
+    summary: Dict[str, Any] = {
+        "run_id": run_state.get("run_id"),
+        "trading_day": run_state.get("trading_day"),
+        "generated_at": run_state.get("generated_at"),
+        "broker": run_state.get("broker"),
+        "dry_run": run_state.get("dry_run"),
+        "order_submit_status": run_state.get("order_submit_status"),
+        "run_classification": mirror_run_classification(run_state),
+    }
+    for key in (
+        "run_classification_outcome",
+        "completion_reason",
+        "error_class",
+        "is_trading_failure",
+        "orders_submitted_count",
+        "orders_failed_count",
+        "scheduled_evidence_denied",
+        "candidates_reaching_spread_gate",
+        "candidates_blocked_missing_spread",
+        "counts",
+        "status",
+        "block_reason",
+    ):
+        if key in run_state:
+            summary[key] = run_state[key]
+    if extra:
+        summary.update(extra)
+    return summary
+
+
+def write_scheduled_run_artifacts(
+    run_dir: Path | str,
+    run_state: Dict[str, Any],
+    *,
+    signal_rows: Optional[Iterable[Dict[str, Any]]] = None,
+    order_rows: Optional[Iterable[Dict[str, Any]]] = None,
+    signals_filename: str = SIGNALS_CSV_FILENAME,
+    summary: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Path]:
+    """Write the complete root-level artifact set for a scheduled live run.
+
+    Writes ``run_state.json``, ``run_summary.json``, the signals CSV, and
+    ``submitted_orders.csv`` directly under ``run_dir`` -- never under a nested
+    ``artifacts/`` subfolder -- on EVERY outcome, including a zero-order, blocked,
+    or failed run. Both CSVs get their header row even with zero data rows, so a
+    no-order run is a well-formed artifact rather than an empty file that reads as
+    a missing slot.
+
+    This is the single entry point a runner should use so that no code path can
+    write a partial set: callers that hand-roll a subset are exactly how the Jul 27
+    2026 12:30 and 1:30 gaps happened.
+    """
+    out = Path(run_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    state_path = out / RUN_STATE_FILENAME
+    with atomic_open_w(state_path) as handle:
+        json.dump(run_state, handle, indent=2, sort_keys=True, default=str)
+
+    signals_path = write_signals_csv(out, signal_rows or [], filename=signals_filename)
+    orders_path = write_submitted_orders_csv(out, order_rows or [])
+
+    summary_path = out / CANONICAL_RUN_SUMMARY_FILENAME
+    with atomic_open_w(summary_path) as handle:
+        json.dump(
+            summary if summary is not None else build_run_summary(run_state),
+            handle,
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+
+    return {
+        "run_state": state_path,
+        "run_summary": summary_path,
+        "signals": signals_path,
+        "submitted_orders": orders_path,
+    }
+
+
 @dataclass
 class ArtifactContractResult:
     """Outcome of validating a scheduled run's artifact contract."""
@@ -510,6 +630,109 @@ def _has_signal_csv(run_dir: Path) -> bool:
     return any((run_dir / name).exists() for name in SIGNAL_CSV_NAMES)
 
 
+def _signal_csv_paths(run_dir: Path) -> List[Path]:
+    """Every recognized signals CSV present at the run root, in preference order.
+
+    ALL of them are returned, not just the first: a reused or recovery directory
+    can hold a stale empty ``signals.csv`` beside a valid stream-specific
+    ``morning_signals.csv``, and the contract says any recognized name satisfies
+    the requirement. Stopping at the first match would let the stale file
+    invalidate an otherwise-valid run.
+    """
+    return [run_dir / name for name in SIGNAL_CSV_NAMES if (run_dir / name).exists()]
+
+
+def nested_only_artifacts(
+    run_dir: Path | str, *, filenames: Optional[Sequence[str]] = None
+) -> Dict[str, Path]:
+    """Required artifacts present only under a nested subdir, keyed by filename.
+
+    The Jul 27 2026 1:30 PM ET run wrote its four files under ``artifacts/`` and
+    left the run root empty. Reporting that as four independent "missing file"
+    errors hides the single real cause, so the contract names it directly.
+
+    ``filenames`` narrows the scan to the artifacts the caller actually requires.
+    A caller that deliberately waives one -- the raw-persistence failure path
+    validates with ``require_signals=False`` because no signal could be computed
+    -- must not be failed by a stale nested copy of a file it never wanted
+    (Codex review).
+    """
+    root = Path(run_dir)
+    nested: Dict[str, Path] = {}
+    for name in filenames if filenames is not None else SCHEDULED_LIVE_REQUIRED_FILENAMES:
+        candidates = (
+            SIGNAL_CSV_NAMES if name == SIGNALS_CSV_FILENAME else (name,)
+        )
+        if any((root / candidate).exists() for candidate in candidates):
+            continue
+        for subdir in NESTED_ARTIFACT_SUBDIRS:
+            for candidate in candidates:
+                path = root / subdir / candidate
+                if path.exists():
+                    nested[name] = path
+                    break
+            if name in nested:
+                break
+    return nested
+
+
+def _signals_csv_errors(run_dir: Path) -> List[str]:
+    """Contract errors for the signals CSV: it must exist AND carry a header row.
+
+    A zero-byte signals CSV -- what a naive "no rows, write nothing" writer
+    produces on a no-candidate run -- is not a valid no-signal artifact: a reader
+    cannot tell it from a truncated write, and the drift detector sees no columns
+    at all. The header is required even when the run evaluated nothing.
+    """
+    paths = _signal_csv_paths(run_dir)
+    if not paths:
+        return [f"missing {SIGNALS_CSV_FILENAME}"]
+    unusable: List[str] = []
+    for path in paths:
+        try:
+            with path.open(newline="", encoding="utf-8") as handle:
+                reader = csv.reader(handle)
+                header = next(reader, None)
+                # Consume the BODY too, not just the header. The drift detector
+                # reads these rows with csv.DictReader and its wrapper only logs
+                # a detector failure, so a file with a valid header over a corrupt
+                # body would be published as valid scheduled evidence while
+                # missing-order drift silently goes unreconciled (Codex review).
+                # Validation must fail on exactly what the consumer cannot read.
+                for _ in reader:
+                    pass
+        except (OSError, UnicodeDecodeError, csv.Error) as exc:
+            # csv.Error covers a corrupt/interrupted file whose field exceeds the
+            # CSV field-size limit. Without it validate_run_artifacts would RAISE
+            # instead of returning a result, turning validation of a reused
+            # recovery directory into another scheduled-run exception rather than
+            # a safe rejection (Codex review).
+            unusable.append(f"{path.name} is not readable: {exc}")
+            continue
+        if not header or not any(str(column).strip() for column in header):
+            unusable.append(
+                f"{path.name} has no header row (empty or corrupt file); the contract "
+                "requires a header even when no signal row was written"
+            )
+            continue
+        columns = {str(column).strip().lower() for column in header}
+        if not (columns & set(SIGNAL_SYMBOL_COLUMNS)):
+            # A header of arbitrary non-blank text would otherwise pass while the
+            # drift detector reads no symbol from it, letting a malformed signals
+            # artifact be accepted as scheduled evidence and hiding expected-order
+            # drift (Codex review).
+            unusable.append(
+                f"{path.name} header {header!r} has no symbol column; the contract "
+                f"requires one of {list(SIGNAL_SYMBOL_COLUMNS)!r} so the drift "
+                "detector can reconcile signals against submitted orders"
+            )
+            continue
+        # One usable signals CSV satisfies the contract. A stale sibling left in a
+        # reused directory must not invalidate otherwise-valid scheduled evidence.
+        return []
+    return unusable
+
+
 def _submitted_orders_errors(run_dir: Path) -> List[str]:
     """Contract errors for submitted_orders.csv: it must exist AND carry the header.
 
@@ -523,8 +746,14 @@ def _submitted_orders_errors(run_dir: Path) -> List[str]:
         return [f"missing {SUBMITTED_ORDERS_CSV_FILENAME}"]
     try:
         with path.open(newline="", encoding="utf-8") as handle:
-            header = next(csv.reader(handle), None)
-    except (OSError, UnicodeDecodeError) as exc:
+            reader = csv.reader(handle)
+            header = next(reader, None)
+            # The body is parsed for the same reason as the signals CSV: the
+            # drift detector reads these rows, and a header-only check would
+            # accept a file it cannot load.
+            for _ in reader:
+                pass
+    except (OSError, UnicodeDecodeError, csv.Error) as exc:
         return [f"{SUBMITTED_ORDERS_CSV_FILENAME} is not readable: {exc}"]
     if header != list(SUBMITTED_ORDERS_FIELDS):
         return [
@@ -549,6 +778,12 @@ def validate_run_artifacts(
     should be True for live runs and False for read-only pre-flight runs; when True,
     submitted_orders.csv must not only exist but carry the SUBMITTED_ORDERS_FIELDS
     header row (a zero-byte/truncated file fails rather than passing as no-order).
+    The signals CSV is held to the same standard: present at the run root with a
+    header row even when the run evaluated no signal.
+
+    Every required file is checked at the RUN ROOT. A file written only under a
+    nested ``artifacts/`` subfolder fails with an error naming that path (Jul 27
+    2026 1:30 PM ET), rather than being reported as four unrelated missing files.
 
     The run_summary.json <-> run_state run_classification mirror check is only
     enforced for scheduled LIVE runs (``require_submitted_orders=True``). Read-only
@@ -567,9 +802,39 @@ def validate_run_artifacts(
     run_dir = Path(run_dir)
     errors: List[str] = []
 
+    # Name the nested-artifact case directly instead of emitting four independent
+    # "missing file" errors that hide the single real cause. Only the artifacts
+    # this call actually requires are scanned, so waiving one (e.g.
+    # require_signals=False on the raw-persistence failure path) also waives its
+    # nested check.
+    required_filenames = [RUN_STATE_FILENAME]
+    if require_summary:
+        required_filenames.append(CANONICAL_RUN_SUMMARY_FILENAME)
+    if require_signals:
+        required_filenames.append(SIGNALS_CSV_FILENAME)
+    if require_submitted_orders:
+        required_filenames.append(SUBMITTED_ORDERS_CSV_FILENAME)
+    nested_only = nested_only_artifacts(run_dir, filenames=required_filenames)
+    for name, path in nested_only.items():
+        errors.append(
+            f"{name} exists only at {path}; the contract requires it at the run "
+            "root, not under a nested subfolder"
+        )
+
+    def _suppress_missing(name: str, found: List[str]) -> List[str]:
+        """Drop a plain "missing X" when the nested scan already explained X.
+
+        Naming the nested case and THEN repeating "missing X" for the same file
+        left the caller with two errors for one cause and buried the specific one
+        (Copilot review). Any other error about that file still surfaces.
+        """
+        if name not in nested_only:
+            return found
+        return [err for err in found if err != f"missing {name}"]
+
     state_path = run_dir / RUN_STATE_FILENAME
     if not state_path.exists():
-        errors.append(f"missing {RUN_STATE_FILENAME}")
+        errors.extend(_suppress_missing(RUN_STATE_FILENAME, [f"missing {RUN_STATE_FILENAME}"]))
     else:
         state: Any = None
         try:
@@ -643,11 +908,17 @@ def validate_run_artifacts(
         elif state is not None:
             errors.append(f"{RUN_STATE_FILENAME} is not a JSON object")
 
-    if require_signals and not _has_signal_csv(run_dir):
-        errors.append(f"missing {SIGNALS_CSV_FILENAME}")
+    if require_signals:
+        errors.extend(_suppress_missing(SIGNALS_CSV_FILENAME, _signals_csv_errors(run_dir)))
     if require_submitted_orders:
-        errors.extend(_submitted_orders_errors(run_dir))
-    if require_summary and not (run_dir / CANONICAL_RUN_SUMMARY_FILENAME).exists():
+        errors.extend(
+            _suppress_missing(SUBMITTED_ORDERS_CSV_FILENAME, _submitted_orders_errors(run_dir))
+        )
+    if (
+        require_summary
+        and CANONICAL_RUN_SUMMARY_FILENAME not in nested_only
+        and not (run_dir / CANONICAL_RUN_SUMMARY_FILENAME).exists()
+    ):
         # Specifically the canonical run_summary.json -- a report-only
         # latest_run_summary.json left behind after the canonical file was lost is
         # NOT sufficient, or the missing-canonical-artifact detection is defeated.
@@ -664,6 +935,7 @@ __all__ = [
     "SIGNALS_CSV_FILENAME",
     "SUBMITTED_ORDERS_CSV_FILENAME",
     "SIGNAL_CSV_NAMES",
+    "SIGNAL_SYMBOL_COLUMNS",
     "SUBMITTED_ORDERS_FIELDS",
     "ORDER_ATTEMPT_STATUSES",
     "PREFLIGHT_CRON_ID",
@@ -686,6 +958,11 @@ __all__ = [
     "ERROR_CLASS_COMPUTE_ONLY_NO_PLACEMENT",
     "SUMMARY_FILENAMES",
     "CANONICAL_RUN_SUMMARY_FILENAME",
+    "SCHEDULED_LIVE_REQUIRED_FILENAMES",
+    "NESTED_ARTIFACT_SUBDIRS",
+    "nested_only_artifacts",
+    "build_run_summary",
+    "write_scheduled_run_artifacts",
     "build_preflight_run_classification",
     "build_morning_live_run_classification",
     "build_afternoon_live_run_classification",

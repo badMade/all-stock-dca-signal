@@ -2733,6 +2733,7 @@ def test_run_pipeline_raw_persistence_failure_preserves_prior_successful_raw_fil
     # durable raw/ files -- those are the audit/replay record for any live
     # orders that attempt already placed.
 
+
     class ExplodingPayload:
         pass
 
@@ -2846,13 +2847,16 @@ def test_run_pipeline_raw_persistence_failure_clears_stale_compact_artifacts(tmp
     # preserved across retry failures so a successful prior run's fill records survive
     # (see test_run_pipeline_raw_persistence_failure_preserves_prior_order_artifacts).
     cleared_files = (
-        "signals.csv",
         "latest_run_summary.json", "slippage_and_coverage_report.md",
         "slippage_ranked.csv", "missing_fills_report.csv",
         "notion_latest_run_compact.md", "notion_latest_run_payload.json",
     )
     for name in cleared_files:
         (scheduled_dir / name).write_text("stale", encoding="utf-8")
+    # signals.csv is REPLACED rather than removed: the stale content must not
+    # survive, but the scheduled contract requires all four root-level files on
+    # every outcome, so a fresh header-only file takes its place.
+    (scheduled_dir / "signals.csv").write_text("stale", encoding="utf-8")
 
     result = run_pipeline(
         _now(), config, StrategyState(),
@@ -2863,10 +2867,223 @@ def test_run_pipeline_raw_persistence_failure_clears_stale_compact_artifacts(tmp
     assert "raw_persistence_error" in result
     for name in cleared_files:
         assert not (scheduled_dir / name).exists(), f"{name} was not removed"
+    # The stale signals content is gone, replaced by a header-only file so the
+    # failure directory still satisfies the four-file contract.
+    signals_text = (scheduled_dir / "signals.csv").read_text(encoding="utf-8")
+    assert "stale" not in signals_text
+    assert signals_text.splitlines() == ["ticker"]
+    from scripts.scheduled_artifacts import validate_run_artifacts
+
+    assert validate_run_artifacts(scheduled_dir, require_summary=True)
     with open(result["run_state_path"], encoding="utf-8") as handle:
         run_state = json.load(handle)
     assert run_state["order_submit_status"] == "not_submitted_error"
     assert run_state["broker"] == "robinhood"
+
+
+def test_raw_persistence_retry_keeps_the_slots_prior_submitted_orders(tmp_path):
+    """The failure state overwrites the slot's canonical run_state.json, so
+    asserting zero orders would erase a prior attempt's accepted orders from
+    scheduled fill and slippage results (Codex review)."""
+    import run_dca as _r
+
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
+    scheduled_dir.mkdir(parents=True)
+    (scheduled_dir / "submitted_orders.csv").write_text(
+        "ticker,order_id,submitted_amount_usd,status\n"
+        "AAA,o-earlier,2.0,submitted\n"
+        "BBB,,0,skipped\n",
+        encoding="utf-8",
+    )
+
+    rows = _r._prior_submitted_order_rows(scheduled_dir)
+
+    # Only the real submission is carried forward.
+    assert [r["ticker"] for r in rows] == ["AAA"]
+    assert rows[0]["order_id"] == "o-earlier"
+    assert rows[0]["status"] == "submitted"
+
+
+def test_prior_order_rows_keep_pending_and_unconfirmed_submissions(tmp_path):
+    """An uncertain-but-possibly-accepted order must not be erased, or a later
+    run can allocate it again (Codex review)."""
+    import run_dca as _r
+
+    run_dir = tmp_path / "slot"
+    run_dir.mkdir()
+    (run_dir / "submitted_orders.csv").write_text(
+        "ticker,order_id,submitted_amount_usd,status\n"
+        "AAA,o-1,2.0,pending\n"
+        "BBB,o-2,2.0,unconfirmed\n"
+        "CCC,,0,skipped\n",
+        encoding="utf-8",
+    )
+
+    rows = _r._prior_submitted_order_rows(run_dir)
+
+    assert {r["ticker"] for r in rows} == {"AAA", "BBB"}
+
+
+def test_the_raw_failure_state_on_disk_carries_the_prior_orders(tmp_path):
+    """The mutation must happen BEFORE the state is serialized, or the on-disk
+    state lacks the orders its companions record (Codex review)."""
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
+    scheduled_dir.mkdir(parents=True)
+    (scheduled_dir / "submitted_orders.csv").write_text(
+        "ticker,order_id,submitted_amount_usd,status\n" "AAA,o-earlier,2.0,submitted\n",
+        encoding="utf-8",
+    )
+    import json as _json
+
+    class ExplodingPayload:
+        pass
+
+    config = _demo_config()
+
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=scheduled_dir,
+        raw_connector_inputs={"quotes_batch1.json": ExplodingPayload()},
+    )
+
+    assert "raw_persistence_error" in result
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = _json.load(handle)
+    assert run_state["orders_submitted_count"] == 1
+    assert [c["order_id"] for c in run_state["buy_candidates"]] == ["o-earlier"]
+    # The aggregate fields agree with the carried count: the state must not claim
+    # simultaneously that orders were and were not submitted (Codex review).
+    assert run_state["order_submit_status"] == "submitted"
+    assert run_state["run_classification_outcome"] == "failed_after_partial_submission"
+    assert run_state["counts"]["submitted"] == 1
+    assert run_state["is_trading_failure"] is True
+    # The builder denies its own evidence, which is right for a run that placed
+    # nothing. Here the slot DID place, and is_scheduled_state honors the same
+    # marker, so leaving it denied would drop these fills from scheduled fill and
+    # slippage reporting -- the exact loss the carry-forward prevents.
+    from scripts.run_classification import is_scheduled_state
+    from scripts.same_day_pointer import derive_valid_scheduled_evidence
+
+    # The denial STAYS -- this run failed, so it is not evidence the slot
+    # executed -- and the orders remain ATTRIBUTABLE, so reporting still sees
+    # the fills. Two questions, two answers (Codex review).
+    assert run_state["scheduled_evidence_denied"] is True
+    assert derive_valid_scheduled_evidence(run_state) is False
+    assert is_scheduled_state(run_state)
+
+
+def test_a_carried_confirmation_required_row_leaves_the_denial_in_place(tmp_path):
+    """Nothing reached the broker, so the slot did not execute and the state
+    stays denied as evidence (Codex review)."""
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
+    scheduled_dir.mkdir(parents=True)
+    (scheduled_dir / "submitted_orders.csv").write_text(
+        "ticker,order_id,submitted_amount_usd,status\n"
+        "AAA,,2.0,not_submitted_confirmation_required\n",
+        encoding="utf-8",
+    )
+    import json as _json
+
+    class ExplodingPayload:
+        pass
+
+    config = _demo_config()
+
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=scheduled_dir,
+        raw_connector_inputs={"quotes_batch1.json": ExplodingPayload()},
+    )
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = _json.load(handle)
+    # Kept as the slot's record...
+    assert [c["ticker"] for c in run_state["buy_candidates"]] == ["AAA"]
+    # ...but never counted as a submission.
+    assert run_state["orders_submitted_count"] == 0
+    assert run_state["counts"]["submitted"] == 0
+    assert run_state["order_submit_status"] == "not_submitted_error"
+    assert run_state["scheduled_evidence_denied"] is True
+
+
+def test_the_raw_persistence_state_does_not_assert_zero_orders():
+    """An absent count is honest where a zero is wrong: this attempt placed
+    nothing, but the slot's total is unknown to the builder (Codex review)."""
+    from scripts.run_classification import raw_persistence_failure_run_state
+
+    state = raw_persistence_failure_run_state("2026-07-06", "boom")
+
+    assert "orders_submitted_count" not in state
+    assert state["is_trading_failure"] is True
+    assert state["order_submit_status"] == "not_submitted_error"
+    # A concrete cause, not just the generic outcome: build_run_summary mirrors
+    # error_class only when present (Codex review).
+    assert state["error_class"] == "missing_or_invalid_raw_inputs"
+
+
+def test_the_recovery_escalation_state_carries_its_own_error_class():
+    """A failed recovery is not a raw-input failure."""
+    from scripts.run_classification import recovery_escalation_run_state
+
+    state = recovery_escalation_run_state(
+        "2026-07-06", "internal_persistence_failure", "boom"
+    )
+
+    assert state["error_class"] == "recovery_failure"
+
+
+@pytest.mark.parametrize("which", ["raw_persistence", "recovery_escalation"])
+def test_a_fail_closed_builder_denies_its_own_scheduled_evidence(which):
+    """The slot FIRED, which is not the same claim as the slot EXECUTED.
+
+    Both states are stamped run_origin='scheduled'/manual_run=False, which is
+    all derive_valid_scheduled_evidence reads, so without an explicit denial the
+    pointer publishes a run that never computed a signal as valid evidence
+    (Codex review). Both markers are checked: the top-level flag the derivation
+    honors, and the nested value a consumer reading the block would trust.
+    """
+    from scripts.run_classification import (
+        raw_persistence_failure_run_state,
+        recovery_escalation_run_state,
+    )
+    from scripts.same_day_pointer import derive_valid_scheduled_evidence
+
+    if which == "raw_persistence":
+        state = raw_persistence_failure_run_state("2026-07-06", "boom")
+    else:
+        state = recovery_escalation_run_state(
+            "2026-07-06", "internal_persistence_failure", "boom"
+        )
+
+    assert state["scheduled_evidence_denied"] is True
+    assert state["run_classification"]["valid_scheduled_evidence"] is False
+    assert derive_valid_scheduled_evidence(state) is False
+
+
+def test_a_confirmation_required_row_is_carried_but_never_counted():
+    """It belongs in the slot's record and is the opposite of a submission.
+
+    The confirmation gate stopped the placement before the broker saw it, which
+    is why the row has no order id. Counting it would report an accepted order
+    for a slot that submitted nothing (Codex review).
+    """
+    from run_dca import _accepted_order_rows
+
+    rows = [
+        {"ticker": "AAPL", "status": "not_submitted_confirmation_required", "order_id": ""},
+        {"ticker": "MSFT", "status": "pending", "order_id": "ord-1"},
+    ]
+
+    accepted = _accepted_order_rows(rows)
+
+    assert [row["ticker"] for row in accepted] == ["MSFT"]
+    # An id can only come from the broker, so a row carrying one is kept
+    # whatever its status.
+    assert _accepted_order_rows(
+        [{"ticker": "AAPL", "status": "not_submitted_confirmation_required", "order_id": "ord-9"}]
+    )
 
 
 def test_run_pipeline_raw_persistence_failure_preserves_prior_order_artifacts(tmp_path):
@@ -3476,6 +3693,102 @@ def test_intraday_run_classification_rejects_ad_hoc_recovery_stream_suffix():
     bad["stream"] = "intraday_1430"
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(bad, schema)
+
+
+def test_carried_prior_order_rows_are_schema_valid_candidates(tmp_path):
+    """These dicts are assigned straight to run_state["buy_candidates"], so they
+    must satisfy the schema's candidate shape. csv.DictReader returns every field
+    as a string and the row carries no buy_multiplier, so the raw row produced a
+    canonical failure state schema-based consumers reject while the lightweight
+    validator still passed (Codex review)."""
+    import json as _json
+
+    import run_dca as _r
+
+    run_dir = tmp_path / "slot"
+    run_dir.mkdir()
+    (run_dir / "submitted_orders.csv").write_text(
+        "ticker,order_id,submitted_amount_usd,status\n"
+        "AAA,o-1,2.50,submitted\n"
+        "BBB,o-2,3.00,unconfirmed\n",
+        encoding="utf-8",
+    )
+
+    rows = _r._prior_submitted_order_rows(run_dir)
+
+    schema = _json.loads(
+        (Path(__file__).resolve().parent / "schemas" / "run_state.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    item_schema = schema["properties"]["buy_candidates"]["items"]
+    for row in rows:
+        for field in item_schema["required"]:
+            assert field in row, field
+        assert isinstance(row["planned_amount_usd"], float)
+        assert row["planned_amount_usd"] >= 0
+        # The concrete broker status is preserved, never remapped: the same-day
+        # guard counts 'submitted'/'filled' and deliberately does not count
+        # 'unconfirmed', so rewriting it would change which rows book capital.
+        assert row["status"] in item_schema["properties"]["status"]["enum"]
+    assert [r["status"] for r in rows] == ["submitted", "unconfirmed"]
+    assert rows[0]["planned_amount_usd"] == 2.5
+
+
+def test_a_malformed_amount_does_not_break_the_carried_row(tmp_path):
+    """A truncated or non-numeric amount still has to produce a schema-valid
+    number rather than propagating a string into the canonical state."""
+    import run_dca as _r
+
+    run_dir = tmp_path / "slot"
+    run_dir.mkdir()
+    (run_dir / "submitted_orders.csv").write_text(
+        "ticker,order_id,submitted_amount_usd,status\nAAA,o-1,notanumber,submitted\n",
+        encoding="utf-8",
+    )
+
+    rows = _r._prior_submitted_order_rows(run_dir)
+
+    assert rows[0]["planned_amount_usd"] == 0.0
+    assert isinstance(rows[0]["planned_amount_usd"], float)
+
+
+def test_a_blank_or_padded_ticker_never_reaches_the_canonical_state(tmp_path):
+    """A blank ticker would produce a schema-valid but meaningless candidate row,
+    and the same-day guards key on the ticker (Copilot review)."""
+    import run_dca as _r
+
+    run_dir = tmp_path / "slot"
+    run_dir.mkdir()
+    (run_dir / "submitted_orders.csv").write_text(
+        "ticker,order_id,submitted_amount_usd,status\n"
+        "  AAA  , o-1 , 2.50 ,submitted\n"
+        ",o-2,3.00,submitted\n"
+        "   ,o-3,3.00,submitted\n",
+        encoding="utf-8",
+    )
+
+    rows = _r._prior_submitted_order_rows(run_dir)
+
+    assert [r["ticker"] for r in rows] == ["AAA"]
+    assert rows[0]["order_id"] == "o-1"
+    assert rows[0]["planned_amount_usd"] == 2.5
+
+
+def test_a_whitespace_only_order_id_is_not_a_concrete_order(tmp_path):
+    """Stripped before the gate, so it cannot pass as a real id and then be
+    normalized away to None afterwards."""
+    import run_dca as _r
+
+    run_dir = tmp_path / "slot"
+    run_dir.mkdir()
+    (run_dir / "submitted_orders.csv").write_text(
+        "ticker,order_id,submitted_amount_usd,status\nAAA,   ,2.00,skipped\n",
+        encoding="utf-8",
+    )
+
+    assert _r._prior_submitted_order_rows(run_dir) == []
+
 
 def test_fallback_discovery_roots_keep_nested_configured_roots(tmp_path, monkeypatch):
     # Codex review (P1): "Preserve nested configured roots for fallback

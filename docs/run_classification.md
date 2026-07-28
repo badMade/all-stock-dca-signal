@@ -723,6 +723,303 @@ The contract, one source of truth in
    state. A null `run_summary.run_classification` is an
    `artifact_contract_failure`.
 
+### Root-level artifact set (added 2026-07-27)
+
+Two slots failed the same day in ways the rules above did not catch. The 12:30
+midday run failed at startup **before writing any artifact**, and the 1:30
+intraday run wrote its four files **only under an `artifacts/` subfolder** with
+nothing at the run root, alongside an effectively empty `submitted_orders.csv`.
+Both runs had fired; every consumer that discovers a run by directory path saw an
+empty slot.
+
+Every live scheduled run (`2ba19526`, `42173154`, `a6239dae`, `7be82b97`,
+`10ce362c`) therefore writes these four files **at the run root**, on **every**
+outcome, including a zero-order, blocked, or failed run:
+
+| File | Rule |
+|---|---|
+| `run_state.json` | Non-null `run_classification` object, never a bare string. |
+| `run_summary.json` | Mirrors run_state's `run_classification` and carries the outcome fields. |
+| `signals.csv` | Header row even at zero signal rows. The stream-specific names (`morning_signals.csv`, `midday_signals.csv`, `market_open_signals.csv`, `intraday_signals.csv`) satisfy this. |
+| `submitted_orders.csv` | Canonical header row even at zero orders. |
+
+- **Nesting is a contract failure, not a partial pass.** A required file found
+  only under `artifacts/` (or `out/`, `output/`) is reported by name:
+  `nested_only_artifacts()` names the offending path so the operator sees the one
+  real cause instead of four unrelated "missing file" errors.
+- **A zero-byte CSV is not a valid no-signal artifact.** A reader cannot tell it
+  from an interrupted write, and the drift detector sees no columns at all.
+  `validate_run_artifacts` requires a header row on both CSVs.
+- **Blocked is an outcome, not an excuse.** The date/holiday gate stub and the
+  early calendar/window block both write the complete set. The afternoon stub
+  carries a non-null `run_classification` and an `order_submit_status` so it
+  passes the contract and is attributable, *and* `scheduled_evidence_denied` so
+  it is never counted as evidence: a null-classification stub reads as
+  malformed, while one that passed as evidence would manufacture an
+  evidence-shaped artifact for a day the market was shut. It deliberately omits
+  a top-level `run_id`, since model-usage logging keys off that to decide
+  whether a run happened at all.
+- `write_scheduled_run_artifacts()` is the single entry point that writes all
+  four; hand-rolling a subset is exactly how the two gaps above happened.
+- **Only three of the five live streams have an in-repo producer**, so only those
+  can be enforced by repo code: `42173154` and `a6239dae` through
+  `MorningDCAExecutor`, and `10ce362c` through `near_close_dca`. The market-open
+  `2ba19526` and intraday `7be82b97` tasks carry `no_python_entry_point=true`:
+  an external scheduler/agent runs them directly from the manifest, the same
+  arrangement as the watchdog `a46bf007`. For those two the contract is the task
+  text the executor must follow, and the repo supplies the tested helpers
+  (`write_scheduled_run_artifacts`, `validate_run_artifacts`,
+  `classify_no_order_run`) rather than a producer. See
+  `scheduled_run_artifact_contract.root_level_artifact_set_2026_07_27.enforcement_by_stream`.
+- **A run that raises before reaching its writer still writes them, in both
+  runners.** The 12:30 failure raised during startup, so `guarded_run` alerted
+  and re-raised and the slot produced no artifact root at all. `run_once` had the
+  same gap on the afternoon side: an exception from the account lookup, signal
+  evaluation, or any per-candidate broker check escaped before
+  `_finalize_and_write_artifacts` ran. Both scheduled live paths now write the
+  complete set from the failure handler with
+  `error_class='scheduled_run_startup_failure'`, `is_trading_failure=true`, and a
+  non-null `run_classification` carrying `valid_scheduled_evidence=false`, then
+  re-raises so the scheduler still sees the failure. Both also refresh their
+  same-day pointer (the afternoon one refreshes `latest_scheduled_run.json` when
+  a `classification_state_root` is configured), so a pointer-based watchdog sees
+  today's slot as fired-and-failed rather than still targeting the previous
+  trading day. The artifact proves the slot fired; it is never order evidence and
+  never scheduled evidence, and it carries the scheduled `run_id` the schema
+  requires. A failure *after* artifacts were written (possibly after orders were
+  placed) never overwrites them.
+- **A preserved state is merged, not substituted.** The run_state a failure
+  handler finds can belong to an EARLIER invocation at the same slot. Preserving
+  it is right, but this attempt's placements are folded into it rather than
+  discarded, or an order the broker just accepted would be invisible to the
+  same-day guards and a later run would buy it again.
+- **Companion validation compares order rows, not just headers.**
+  `validate_run_artifacts` checks the order CSV's header; a stale CSV from an
+  earlier attempt passes that while omitting orders the fresh state records. Both
+  handlers additionally require the CSV to cover the state's submissions before
+  publishing a valid pointer, and rewrite it when it does not.
+- **An accepted order is published the instant it exists.** Both placement loops
+  expose their outcomes by reference before placing anything, and the afternoon
+  path additionally records a submitted outcome *immediately after*
+  `place_market_buy` returns, before the fill lookup or any other fallible
+  follow-up. The batch otherwise only stores an outcome once the per-candidate
+  call returns, so a raise in between would drop a real, already-accepted order
+  from the failure artifact and let a later same-day run re-allocate it.
+- **Three predicates, one rule.** `derive_valid_scheduled_evidence()`,
+  `is_scheduled_state()`, and `update_latest_scheduled_run_pointer()` all decide
+  whether a state is scheduled evidence, and each honors
+  `artifact_contract_failure` and `scheduled_evidence_denied`. The pointer helper
+  routes through the shared derivation rather than repeating the rule, since an
+  inline copy is exactly how a denied state got published as valid.
+- Validation accepts **any** recognized signals filename with a usable header, so
+  a stale empty `signals.csv` left in a reused directory cannot invalidate a valid
+  `morning_signals.csv` beside it. The drift detector picks the same file:
+  `load_run_artifacts()` selects the first recognized name with a usable header
+  (falling back to the first existing one), so the validator and the consumer
+  never disagree about which file the run's signals live in.
+- The nested-artifact scan covers only what the caller actually requires. A path
+  that deliberately waives one file (the raw-persistence failure path validates
+  with `require_signals=False` because no signal could be computed) is not failed
+  by a stale nested copy of a file it never wanted.
+
+## Completed no-order runs vs failures (added 2026-07-27)
+
+The 1:30 intraday run recorded `error_class='missing_spread_data'` on a run where
+**no ticker had qualified on the ladder at all**, so nothing ever reached the
+spread gate and the missing spread was irrelevant to the outcome. A healthy
+zero-order run was recorded as a data failure.
+
+The fix is an explicit evaluation order: **ladder first, then the spread gate.**
+Only qualifying candidates reach the gate, and only rows that reach the gate
+carry a spread verdict. `scripts/run_classification.py` turns the two resulting
+counts into the recorded outcome:
+
+| Situation | `run_classification_outcome` | `completion_reason` | `error_class` |
+|---|---|---|---|
+| No ticker qualified at all | `completed_no_orders` | `no_ladder_candidates` | `null` |
+| Qualified, but all stopped by a budget/cap check **before** the spread lookup | `completed_no_orders` | `blocked_before_spread_gate` | `null` |
+| Reached the gate, all failed closed for an unproven spread | `completed_no_orders` | `null` | `missing_spread_data` |
+| Reached the gate, some blocked and the rest simply did not qualify | `completed_no_orders` | `no_qualifying_orders_after_safety_checks` | `null` |
+| Placement attempted on qualifying candidates and every one raised | `failed_after_connector_native_recovery_attempt` | `null` | same code |
+| Raised before reaching placement at all | `failed_scheduled_run_startup` | `null` | `scheduled_run_startup_failure` |
+| Stopped by a precondition or wiring gate before placement | `failed_scheduled_run_startup` | `null` | `scheduled_run_blocked_before_placement` |
+| Raised **after** at least one order was accepted | `failed_after_partial_submission` | `null` | `scheduled_run_failed_after_submission` |
+| Some orders submitted, another ticker's placement raised | `failed_after_partial_submission` | `null` | `partial_placement_failure` |
+| A **manual** run's placement failed | `failed_placement` | `null` | same code |
+
+Everything from the placement-failure row down is a **failure**, each carrying
+`is_trading_failure=true`: failed placement, startup, precondition, post-submission,
+partial placement, and manual placement. The first four rows are **safe no-order
+skips**:
+the run fired, evaluated, and wrote its artifacts, so each is valid scheduled
+evidence that the slot executed, is never a missed slot, and never counts as an
+error in scheduled reliability. The two failure outcomes stay distinct so
+reporting keyed on the placement outcome cannot misattribute a startup or data
+failure as a broker-placement failure.
+
+Two qualifiers on the "healthy" rows:
+
+- **Provider errors are never a clean no-op.** When a market-data provider
+  raises, its tickers degrade to `NO_DATA`/manual review rather than being
+  genuinely evaluated. A zero-order run with `errors_count > 0` keeps
+  `completed_no_orders` but carries `error_class='degraded_market_data'` instead
+  of a null one, so summary and reliability consumers can see it was degraded. A
+  concrete spread cause is more specific and wins.
+- **The spread gate marks its own blocks.** A row blocked there carries
+  `blocked_by='spread_gate'`, and only those rows count toward
+  `candidates_blocked_missing_spread`. Inferring it from `spread_status` alone is
+  wrong on a manual run, where an unproven spread does not block placement, so a
+  row can carry `spread_status='spread_unavailable'` and still be stopped later
+  by human review, which is not a spread-caused outcome.
+
+Three paths write and return before the classifier runs, so each stamps its own
+outcome: the calendar/window block
+(`completion_reason='date_or_holiday_gate_blocked'`), the preflight-missing
+block, and the wiring blocks (absent broker, wrong live account, raw-input
+persistence failure). The last two share
+`error_class='scheduled_run_blocked_before_placement'` unless the caller already
+set a more specific one, such as `missing_or_invalid_raw_inputs`.
+
+`degraded_market_data` covers two sources in the morning/midday runner, both of
+which leave a run looking empty without a clean evaluation: a market-data
+provider that raised (caught by `evaluate_signal`, degraded to a `NO_DATA` signal
+carrying a `provider error` warning) and a pre-placement broker check that raised
+(same-day order lookup, tradability, review), recorded as a **non-deliberate**
+block. A deliberate safety gate carries `deliberate_skip=True` and is not an
+error, so it leaves the run's clean classification intact.
+
+A concrete terminal `order_submit_status` the placement path produced survives
+the no-order classification: replacing `not_submitted_confirmation_required`
+would make `is_confirmation_blocked()` return false and lose the fact that broker
+confirmation is pending, and a dry run deliberately places nothing. Two are
+replaced instead. `not_submitted_budget_exhausted` is the fallback the afternoon
+deriver reaches when nothing else matched, so it only stands when a candidate
+really was blocked on a budget, cap, or buying-power check. And
+`not_submitted_no_candidates` describes exactly the case the contract assigns
+`no_orders_submitted`; keeping it would make the afternoon aggregate disagree
+with both the contract and the morning stream for the same situation, and its
+specificity is preserved by `completion_reason='no_ladder_candidates'`.
+
+Two rules keep failure records internally consistent:
+
+- **The aggregate never contradicts the orders.** A run that raised after placing
+  an order records `order_submit_status='submitted'` and
+  `failed_after_partial_submission`, not `not_submitted_error`. Otherwise a
+  summary consumer would report no submission while `submitted_orders.csv` holds
+  the order.
+- **A partially submitted batch is both.** When some orders land and another
+  ticker's placement raises, the submitted count and status are preserved *and*
+  `is_trading_failure=true` with `orders_failed_count` is recorded. Returning the
+  run as an ordinary success would hide the failed order entirely.
+- **A retry counts the whole slot, not just its own call.** A scheduled retry
+  overwrites the fixed-path artifact, and the earlier attempt's submitted rows
+  are carried forward into it. Both `orders_submitted_count` and
+  `submitted_orders.csv` are derived from the union of this call's
+  `broker_outcomes` and those carried-forward rows, deduplicated by order id, so
+  a retry that places nothing new is never recorded as a zero-order run for a
+  slot that did place orders.
+- **Every batch that submits sets `order_submit_status='submitted'`.**
+  `build_artifacts()` does not initialize that field, so without this even a
+  fully successful morning or midday batch wrote a `run_state.json` with no
+  aggregate submit status and a `run_summary.json` whose status was null.
+- **The error class matches the outcome.** A failure after submission records
+  `scheduled_run_failed_after_submission`, not the startup class, so a consumer
+  grouping by `error_class` does not read a late post-trade failure as startup
+  trouble.
+
+The fail-closed raw-persistence states (`raw_persistence_failure_run_state` and
+`recovery_escalation_run_state`) stamp the same blocked-before-placement outcome
+fields, so the afternoon early-return path that writes them through the contract
+writer carries them too rather than passing validation while saying nothing about
+the outcome. They deliberately do **not** carry `orders_submitted_count`: that
+state overwrites the slot's canonical run_state, and a same-slot retry whose
+earlier attempt already placed orders would have them erased by an asserted zero.
+The caller fills the count in from the slot's preserved `submitted_orders.csv`
+when it can establish the real figure, and an absent field is honest where a zero
+is wrong.
+- **Connector-native outcomes are scheduled-only.** A manual run never runs that
+  policy, so its broker failures record the generic `failed_placement`. Both
+  runners pass `scheduled=not manual` into the classifier.
+
+The in-flight placement state is cleared at the start of every `run()`. The
+executor is reused across calls, so without that reset a startup failure on a
+later run (a later trading day, even) would copy the previous run's outcomes into
+the new day's artifact and record those orders as current-day allocations.
+
+The failure path forces a pending pointer only for a **newly synthesized**
+failure state. When a complete valid state already exists and only a later step
+raised, its pointer evidence is derived normally: `validate_pointer()` rejects
+any non-`valid` status, so forcing pending would make a successfully completed
+run read as unavailable. That branch first revalidates the **full** artifact set,
+not just the state file's existence: in a reused same-day directory the summary
+or CSVs left in place can belong to an earlier attempt, and advertising a
+mismatched summary as valid scheduled evidence is what this contract forbids.
+
+When companion revalidation fails, the **state itself** is failed closed too, not
+just the pointer: `select_same_day_run_state()` prefers the date-specific state
+and calls `derive_valid_scheduled_evidence()` on it directly, so a pointer-only
+downgrade would still hand the run to consumers as valid evidence. The preserved
+state gains an `artifact_contract_failure` marker and
+`scheduled_evidence_denied`, mirroring what `near_close_dca` does on a failed
+contract check.
+
+A synthesized failure state carries `scheduled_evidence_denied=true`, which
+`derive_valid_scheduled_evidence()` honors exactly as it honors
+`artifact_contract_failure`. This has to be a top-level marker rather than the
+nested `run_classification.valid_scheduled_evidence`: the morning writer seeds
+that nested field to `false` as a placeholder and then finalizes it *from* the
+derivation, so honoring it there would lock every run to `false`. Without the
+marker, `select_same_day_run_state()` prefers the date-specific state over the
+pending pointer and would hand a failed run to every consumer as valid evidence.
+
+**Denial is not de-attribution.** `derive_valid_scheduled_evidence()` and
+`is_scheduled_state()` answer two different questions and must not be collapsed:
+the first asks whether the slot *executed* (reliability, watchdogs, missed-slot
+accounting), the second decides whether a state's orders are *attributable* to
+the scheduled slot (fill and slippage reporting). A run that placed a real order
+and then raised answers no to the first and yes to the second. Both failure
+handlers deny such a run as evidence while preserving its orders, so
+`is_scheduled_state()` rejects a denied state **only when it has no order id to
+attribute**, which is exactly the date/holiday-gated stub the check was added
+for. Rejecting every denied state made the reporting selector discard the whole
+record, and the preserved fills disappeared from scheduled reporting.
+
+Both writers emit a header row for a zero-row `signals.csv` and
+`buy_candidates.csv`, so an empty universe (no active tickers, or every
+configured ticker excluded) still produces a contract-valid artifact instead of a
+zero-byte file that would fail the run and block the latest-pointer update.
+
+The `blocked_before_spread_gate` row matters because the cap, per-order ceiling,
+already-bought-today, and same-day-duplicate checks all run **before** the spread
+lookup: those tickers carry no spread verdict, but they did qualify on the
+ladder, so reporting them as `no_ladder_candidates` would misstate what happened.
+The candidate count, not the spread-gate count, is what separates the two.
+
+A run whose placements all **raised** is a failure, not a healthy no-order run,
+even though it also submitted nothing. Any candidate left at `status='failed'`
+marks the run `failed_after_connector_native_recovery_attempt` with
+`is_trading_failure=true`.
+
+Per-row fields (`spread_ok`, `spread_pct`, `spread_status`) record each
+candidate's own verdict: `spread_ok`, `spread_unavailable`, `spread_not_ok`, or
+`not_evaluated` for a row that never reached the gate. A `not_evaluated` row is
+never marked `spread_ok=true` and is never counted as blocked for a missing
+spread. Run-level counts `candidates_reaching_spread_gate` and
+`candidates_blocked_missing_spread` make the classification auditable from the
+artifact alone.
+
+**Partial availability fails only the affected rows.** A ticker whose spread was
+never captured is skipped; every other qualifying ticker keeps being evaluated
+and submitted. The run is never aborted for a subset, and spread is never
+estimated, inferred, or defaulted.
+
+**Morning/midday now fail closed too.** Before this the morning runner blocked
+only on a spread that was captured *and* too wide, so a scheduled candidate whose
+bid/ask was never captured could still be placed. It now fails that row closed,
+matching the afternoon runner. Manual runs still go through `review_market_buy`
+as a human-reviewed safety net, so they are not blocked on a missing spread
+alone.
+
 ## 3:30 compute-to-placement contract (added 2026-07-22)
 
 The Jul 22 2026 3:20 PM ET scheduled final live run generated 20 planned buy

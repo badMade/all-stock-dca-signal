@@ -103,6 +103,17 @@ class FixedDropProvider:
             cursor += timedelta(minutes=interval_minutes)
         return bars
 
+    def get_bid_ask(self, ticker, as_of):
+        """A tight, well-inside-tolerance quote (0.1% spread).
+
+        A scheduled live run fails a candidate closed when its spread cannot be
+        proven, so a provider double that exposes no bid/ask would block every
+        placement. Tests that specifically exercise an unavailable or wide spread
+        override this.
+        """
+        price = self._prev * (1.0 - self._drops.get(ticker, 0.0))
+        return (price * 0.9995, price * 1.0005)
+
 
 class DecliningBarsProvider(FixedDropProvider):
     """Provider that generates strictly declining intraday bars.

@@ -94,13 +94,44 @@ from near_close_dca import (
 )
 from scripts.model_usage_log import DEFAULT_LOG_ROOT as DEFAULT_MODEL_USAGE_LOG_ROOT
 from scripts.model_usage_log import log_model_usage
-from scripts.run_classification import load_same_day_top_up_context, save_raw_input
+from scripts.run_classification import (
+    BLOCKED_BY_SPREAD_GATE,
+    COMPLETION_REASON_DATE_GATE_BLOCKED,
+    ERROR_CLASS_BLOCKED_BEFORE_PLACEMENT,
+    ERROR_CLASS_DEGRADED_MARKET_DATA,
+    ERROR_CLASS_PARTIAL_PLACEMENT_FAILURE,
+    ERROR_CLASS_POST_SUBMISSION_FAILURE,
+    ERROR_CLASS_STARTUP_FAILURE,
+    ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED,
+    ORDER_SUBMIT_STATUS_DRY_RUN,
+    ORDER_SUBMIT_STATUS_ERROR,
+    ORDER_SUBMIT_STATUS_NO_ORDERS,
+    ORDER_SUBMIT_STATUS_SUBMITTED,
+    RUN_CLASSIFICATION_COMPLETED_NO_ORDERS,
+    RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION,
+    RUN_CLASSIFICATION_STARTUP_FAILED,
+    SPREAD_STATUS_NOT_EVALUATED,
+    classify_no_order_run,
+    deny_scheduled_evidence,
+    load_same_day_top_up_context,
+    save_raw_input,
+    spread_gate_fields,
+    stamp_failure_classification,
+)
+from scripts.same_day_pointer import (
+    STATUS_PENDING as POINTER_STATUS_PENDING,
+)
+from scripts.same_day_pointer import (
+    STATUS_VALID as POINTER_STATUS_VALID,
+)
 from scripts.same_day_pointer import (
     build_pointer_metadata,
     derive_valid_scheduled_evidence,
     validate_pointer,
 )
 from scripts.scheduled_artifacts import (
+    SIGNAL_CSV_NAMES,
+    build_run_summary,
     submitted_order_rows,
     write_submitted_orders_csv,
 )
@@ -116,6 +147,31 @@ _log = logging.getLogger(__name__)
 MORNING_STREAM = "morning"
 # The afternoon live task id, recorded on morning artifacts for cross-reference.
 AFTERNOON_LIVE_CRON_ID = "10ce362c"
+
+# Stable signal-CSV column order, mirroring MorningSignal.to_row(). Used as the
+# header for a run that evaluated no signal at all, so the file still carries
+# columns instead of being written empty.
+SIGNAL_CSV_FIELDS = (
+    "ticker",
+    "source",
+    "action",
+    "reason",
+    "current_price",
+    "previous_close",
+    "drop_pct",
+    "multiplier",
+    "previous_low",
+    "selected_base_amount_usd",
+    "base_selection_reason",
+    "hypothetical_amount_usd",
+    "warnings",
+    "execution_status",
+    "trend_validated",
+    "auto_buy_signal",
+    "spread_ok",
+    "spread_pct",
+    "spread_status",
+)
 
 # Watchlist (9:45 AM ET) scan identity — analytics-only, no trading.
 MORNING_WATCHLIST_MODE = "watchlist"
@@ -626,6 +682,13 @@ class MorningSignal:
         row["execution_status"] = self.execution_status
         row["trend_validated"] = self.trend_validated
         row["auto_buy_signal"] = self.execution_status == EXEC_AUTO_BUY_ELIGIBLE
+        # Row-level spread outcome, filled in by the placement loop for the rows
+        # that actually reach the spread gate. Present on every row so the CSV
+        # header is stable and a reader can tell "never reached the gate"
+        # (not_evaluated) from "failed closed there" without parsing skip prose.
+        row.setdefault("spread_ok", None)
+        row.setdefault("spread_pct", None)
+        row.setdefault("spread_status", SPREAD_STATUS_NOT_EVALUATED)
         return row
 
 
@@ -2300,7 +2363,12 @@ class MorningDCAExecutor(DCAExecutor):
         return artifacts
 
     def _same_day_pointer_payload(
-        self, artifacts: Dict[str, Any], run_state_path: Any
+        self,
+        artifacts: Dict[str, Any],
+        run_state_path: Any,
+        *,
+        valid_scheduled_evidence: Optional[bool] = None,
+        pointer_status: str = POINTER_STATUS_VALID,
     ) -> Dict[str, Any]:
         """Build the same-day latest-pointer payload for a scheduled run.
 
@@ -2309,13 +2377,22 @@ class MorningDCAExecutor(DCAExecutor):
         being pointed at) so downstream consumers can validate the pointer
         against the current ET day and stream (see scripts/same_day_pointer.py
         and config/scheduled_tasks.json -> same_day_pointer_validation_policy).
+
+        ``valid_scheduled_evidence`` overrides the derivation, and
+        ``pointer_status`` the default 'valid'. The failure path uses both: it
+        points at a run that fired and failed, which proves the slot ran but is
+        NOT scheduled evidence, and the generic derivation only inspects the
+        scheduled/manual identity so it cannot see that on its own.
         """
+        if valid_scheduled_evidence is None:
+            valid_scheduled_evidence = derive_valid_scheduled_evidence(artifacts)
         return build_pointer_metadata(
             run_id=artifacts.get("run_id"),
             run_state_path=str(run_state_path),
             stream=artifacts.get("stream", self.stream),
             trading_day=artifacts.get("trading_day"),
-            valid_scheduled_evidence=derive_valid_scheduled_evidence(artifacts),
+            valid_scheduled_evidence=valid_scheduled_evidence,
+            pointer_status=pointer_status,
         )
 
     def _scheduled_pointer_names(self, is_preflight: bool) -> List[str]:
@@ -2392,7 +2469,24 @@ class MorningDCAExecutor(DCAExecutor):
         # contract failure; pending/unconfirmed broker responses keep their concrete
         # status but still produce a row (see scripts/scheduled_artifacts.py).
         broker_outcomes: Dict[str, Any] = artifacts.get("broker_outcomes") or {}
-        submitted_rows = submitted_order_rows(broker_outcomes)
+        # Exclude simulated dry-run placements, matching the afternoon contract
+        # writer. DryRunBroker assigns each a synthetic DRY-RUN-* order id, and
+        # submitted_order_rows() includes any outcome carrying an order id, so
+        # without this filter a dry-run report writes simulations into
+        # submitted_orders.csv and the drift detector counts them as genuine
+        # submissions, reporting no missing-order drift (Codex review).
+        placed_outcomes = {
+            ticker: outcome
+            for ticker, outcome in broker_outcomes.items()
+            if not (isinstance(outcome, dict) and outcome.get("status") == "dry_run")
+        }
+        submitted_rows = submitted_order_rows(placed_outcomes)
+        # Plus any submission carried forward from an earlier attempt at this same
+        # scheduled slot, so a retry never rewrites the canonical order record
+        # without the orders that attempt actually placed (Codex review).
+        submitted_rows.extend(
+            _carried_forward_order_rows(placed_outcomes, artifacts.get("buy_candidates") or [])
+        )
         is_live_execution = self.mode == MORNING_LIVE_MODE and self.trades
         if is_live_execution or submitted_rows:
             orders_path = write_submitted_orders_csv(out, submitted_rows)
@@ -2421,6 +2515,19 @@ class MorningDCAExecutor(DCAExecutor):
                     sort_keys=True,
                 ),
             )
+            paths["run_summary"] = str(summary_path)
+        elif is_live_execution:
+            # A LIVE run (10:30 morning, 12:30 midday) must also write the
+            # canonical root-level run_summary.json mirroring run_state's non-null
+            # run_classification. Before this, only the read-only pre-flight wrote
+            # one, so every live morning/midday run directory failed the scheduled
+            # artifact contract's require_summary check and downstream readers had
+            # no summary to attribute the run by (Jul 27 2026 12:30 and 1:30).
+            summary_path = out / "run_summary.json"
+            summary = build_run_summary(
+                artifacts, extra={"stream": self.stream, "mode": artifacts.get("mode")}
+            )
+            atomic_write_text(summary_path, json.dumps(summary, indent=2, sort_keys=True))
             paths["run_summary"] = str(summary_path)
 
         orders_rows = [
@@ -2508,6 +2615,9 @@ class MorningDCAExecutor(DCAExecutor):
         if error_class is not None:
             artifacts["error_class"] = error_class
         artifacts["broker_outcomes"] = {}
+        # This path writes and returns before _run_impl's classification call, so
+        # it stamps the outcome itself (Codex review).
+        _apply_blocked_before_placement_fields(artifacts)
         paths = self.write_artifacts(artifacts, now)
         # A blocked scheduled live run may have committed signals but placed no
         # orders — exactly the scenario the drift detector guards against. Run the
@@ -2624,6 +2734,22 @@ class MorningDCAExecutor(DCAExecutor):
         artifacts["block_reason"] = block_reason
         artifacts["trades"] = False
         artifacts["broker_outcomes"] = {}
+        # This path writes the state and summary directly and returns before
+        # _run_impl's classification call, so it stamps the blocked no-order
+        # outcome itself. Without this both artifacts would omit the outcome
+        # fields the contract requires of every no-order run (Codex review).
+        artifacts.update(
+            {
+                "run_classification_outcome": RUN_CLASSIFICATION_COMPLETED_NO_ORDERS,
+                "order_submit_status": ORDER_SUBMIT_STATUS_NO_ORDERS,
+                "completion_reason": COMPLETION_REASON_DATE_GATE_BLOCKED,
+                "error_class": None,
+                "is_trading_failure": False,
+                "orders_submitted_count": 0,
+                "candidates_reaching_spread_gate": 0,
+                "candidates_blocked_missing_spread": 0,
+            }
+        )
         out = self.run_state_dir(now)
         out.mkdir(parents=True, exist_ok=True)
         state_path = out / "run_state.json"
@@ -2635,13 +2761,30 @@ class MorningDCAExecutor(DCAExecutor):
         paths = {"run_state": str(state_path)}
         # Codex review r3623389445: this early calendar/window gate bypasses
         # write_artifacts() entirely, so a scheduled LIVE block (weekend,
-        # holiday, outside approved window) must still write submitted_orders.csv
-        # (header only -- no orders were ever attempted) or the run directory
-        # fails scripts/scheduled_artifacts.py's live artifact contract and
-        # detect_drift() sees a missing-CSV failure instead of a clean no-op.
+        # holiday, outside approved window) must still write the COMPLETE
+        # root-level set -- run_summary.json, the signals CSV, and a header-only
+        # submitted_orders.csv (no orders were ever attempted) -- or the run
+        # directory fails scripts/scheduled_artifacts.py's live artifact contract
+        # and detect_drift() sees a missing-CSV failure instead of a clean no-op.
+        # "Blocked" is an outcome, not an excuse for a partial artifact set.
         if self.mode == MORNING_LIVE_MODE and self.trades:
             orders_path = write_submitted_orders_csv(out, [])
             paths["submitted_orders"] = str(orders_path)
+            signals_path = out / self.signals_csv_name
+            _write_csv(signals_path, artifacts.get("signal_rows") or [])
+            paths["signals"] = str(signals_path)
+            summary_path = out / "run_summary.json"
+            atomic_write_text(
+                summary_path,
+                json.dumps(
+                    build_run_summary(
+                        artifacts, extra={"stream": self.stream, "mode": artifacts.get("mode")}
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                ),
+            )
+            paths["run_summary"] = str(summary_path)
         self._write_same_day_pointers(
             self._scheduled_pointer_names(is_preflight),
             self._same_day_pointer_payload(artifacts, state_path),
@@ -2898,6 +3041,13 @@ class MorningDCAExecutor(DCAExecutor):
         if not candidates:
             return {}
         outcomes: Dict[str, Any] = {}
+        # Published on the executor by reference BEFORE any placement, so a
+        # failure part-way through the loop can still see every order that landed.
+        # Without this the startup-failure writer would assert zero orders on a
+        # run that had already placed some, and a later same-day top-up guard
+        # would re-allocate that capital (Codex review).
+        self._in_flight_broker_outcomes = outcomes
+        self._in_flight_signals_by_ticker = {s.ticker: s for s in candidates}
         submitted_today = 0.0
         submitted_this_week = 0.0
         # Prior-submitted amounts by ticker from the CURRENT on-disk dated-slot
@@ -2938,6 +3088,11 @@ class MorningDCAExecutor(DCAExecutor):
         # makes an unnecessary broker/account round-trip.
         batch_buying_power: Optional[float] = None
         reserved_buying_power = 0.0
+        # Spread verdict per ticker that actually reached the spread gate. Only
+        # these tickers can be counted as blocked for want of a proven spread; a
+        # ticker that never qualified on the ladder never reaches the gate at all
+        # (config/scheduled_tasks.json:spread_data_availability_policy).
+        spread_by_ticker: Dict[str, Dict[str, Any]] = {}
         for signal in candidates:
             ticker = signal.ticker
             top_up = (top_up_outcomes or {}).get(ticker)
@@ -3086,6 +3241,12 @@ class MorningDCAExecutor(DCAExecutor):
                 outcomes[ticker] = {"status": "cap_exceeded", "skip_reason": "weekly cap would be exceeded"}
                 continue
 
+            # This ticker qualified on the ladder and top-up rules, so it reaches
+            # the spread gate. Every row that gets this far records its own spread
+            # outcome, and only rows that get this far can be counted as blocked
+            # for want of a spread (config/scheduled_tasks.json:
+            # spread_data_availability_policy.evaluation_order).
+            max_spread = self.config.max_bid_ask_spread_pct
             if data is not None and now is not None:
                 try:
                     spread_pct = quote_spread_pct(data, ticker, now)
@@ -3093,10 +3254,36 @@ class MorningDCAExecutor(DCAExecutor):
                     outcomes[ticker] = {
                         "status": "blocked",
                         "skip_reason": f"spread quote error: {exc}",
+                        **spread_gate_fields(spread_pct=None, max_spread_pct=max_spread),
                     }
                     _log.warning("Spread quote error for %s: %s", ticker, exc)
                     continue
-                max_spread = self.config.max_bid_ask_spread_pct
+                spread_fields = spread_gate_fields(
+                    spread_pct=spread_pct, max_spread_pct=max_spread
+                )
+                if spread_pct is None and not manual:
+                    # A scheduled run is pre-authorized to place without review, so
+                    # the spread breaker is the only thing standing between an
+                    # unproven quote and a live order: fail this row closed rather
+                    # than placing on an unproven spread. Only THIS row fails; every
+                    # other ticker keeps being evaluated. Manual runs still go
+                    # through review_market_buy as a human-reviewed safety net, so
+                    # they are not blocked on a missing spread alone (mirrors
+                    # near_close_dca's scheduled spread gate).
+                    outcomes[ticker] = {
+                        "status": "blocked",
+                        "skip_reason": (
+                            "bid/ask spread unavailable; scheduled runs require spread_ok"
+                        ),
+                        "deliberate_skip": True,
+                        # The spread gate is what stopped this row. Recorded
+                        # explicitly rather than inferred from spread_status,
+                        # which a manual run can carry on a row the gate let
+                        # through (Codex review).
+                        "blocked_by": BLOCKED_BY_SPREAD_GATE,
+                        **spread_fields,
+                    }
+                    continue
                 if spread_pct is not None and spread_pct > max_spread:
                     outcomes[ticker] = {
                         "status": "blocked",
@@ -3104,8 +3291,14 @@ class MorningDCAExecutor(DCAExecutor):
                             f"bid/ask spread {spread_pct:.2f}% exceeds {max_spread:.2f}% limit"
                         ),
                         "deliberate_skip": True,
+                        **spread_fields,
                     }
                     continue
+                spread_by_ticker[ticker] = spread_fields
+            else:
+                spread_by_ticker[ticker] = spread_gate_fields(
+                    spread_pct=None, max_spread_pct=max_spread, evaluated=False
+                )
             try:
                 tradable = broker.is_tradable_for_fractional_buy(ticker)
             except Exception as exc:  # noqa: BLE001
@@ -3197,6 +3390,14 @@ class MorningDCAExecutor(DCAExecutor):
             submitted_this_week += notional
             reserved_buying_power += notional
             _log.info("Placed morning buy for %s: $%.2f, order_id=%s", ticker, notional, order_id)
+        # Stamp the spread verdict onto every outcome for a ticker that reached the
+        # gate but was decided after it (tradability, buying power, review,
+        # placement). The rows blocked AT the gate already carry their own verdict
+        # and are left untouched.
+        for gate_ticker, gate_fields in spread_by_ticker.items():
+            outcome = outcomes.get(gate_ticker)
+            if isinstance(outcome, dict) and "spread_status" not in outcome:
+                outcome.update(gate_fields)
         return outcomes
 
     def run(
@@ -3264,33 +3465,376 @@ class MorningDCAExecutor(DCAExecutor):
         # external-scheduler retry) -- codex review discussion_r3660858013,
         # discussion_r3660858010.
         run_artifact_written = artifact_freshness_probe(self.run_state_dir(now) / "run_state.json")
-        return guarded_run(
-            self.stream,
-            _invoke,
-            enabled=is_scheduled_live,
-            context=f"cron_id={self.profile.get('cron_id')}",
-            # Keep the failed-start marker under the same custom base as a
-            # configured model_usage_log_root, so a non-default artifacts
-            # root doesn't split the writer and the report's reader across
-            # two different attempt_log locations -- codex review
-            # discussion_r3658373966.
-            attempt_log_root=attempt_log_root_sibling_to(self.config.model_usage_log_root),
-            # A scheduled morning/midday run that persists run_state.json and
-            # only then fails writing morning_signals.csv/submitted_orders.csv/
-            # a same-day pointer left the marker unconditionally recording
-            # failure_phase='before_run_artifact', fabricating an earlier
-            # failed start plus a successful retry -- codex review
-            # discussion_r3660858010 (the afternoon call already had this
-            # probe; this call never did).
-            run_artifact_written=run_artifact_written,
-            # A run whose raw-persistence recorder failed is surfaced as data on
-            # the artifacts (raw_persistence_error) rather than raised; it must
-            # ping a FAILED heartbeat, not clear the dead-man's switch.
-            result_ok=lambda result: not (
-                isinstance(result, dict)
-                and (result.get("artifacts") or {}).get("raw_persistence_error")
-            ),
+        # Clear any in-flight placement state from a PREVIOUS invocation before
+        # anything in this run can fail. These attributes live on the executor,
+        # which is reused across calls, so a startup failure on a later run (a
+        # later trading day, even) would otherwise copy the prior run's outcomes
+        # into the new day's artifact and record those orders as current-day
+        # allocations (Codex review).
+        self._in_flight_broker_outcomes = {}
+        self._in_flight_signals_by_ticker = {}
+        try:
+            return guarded_run(
+                self.stream,
+                _invoke,
+                enabled=is_scheduled_live,
+                context=f"cron_id={self.profile.get('cron_id')}",
+                # Keep the failed-start marker under the same custom base as a
+                # configured model_usage_log_root, so a non-default artifacts
+                # root doesn't split the writer and the report's reader across
+                # two different attempt_log locations -- codex review
+                # discussion_r3658373966.
+                attempt_log_root=attempt_log_root_sibling_to(self.config.model_usage_log_root),
+                # A scheduled morning/midday run that persists run_state.json and
+                # only then fails writing morning_signals.csv/submitted_orders.csv/
+                # a same-day pointer left the marker unconditionally recording
+                # failure_phase='before_run_artifact', fabricating an earlier
+                # failed start plus a successful retry -- codex review
+                # discussion_r3660858010 (the afternoon call already had this
+                # probe; this call never did).
+                run_artifact_written=run_artifact_written,
+                # A run whose raw-persistence recorder failed is surfaced as data on
+                # the artifacts (raw_persistence_error) rather than raised; it must
+                # ping a FAILED heartbeat, not clear the dead-man's switch.
+                result_ok=lambda result: not (
+                    isinstance(result, dict)
+                    and (result.get("artifacts") or {}).get("raw_persistence_error")
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - see below; always re-raised
+            # The 2026-07-27 12:30 failure mode: the run raised BEFORE reaching any
+            # writer (evaluate() can raise, as can the broker/account lookups), so
+            # guarded_run alerted and re-raised and the slot produced no artifact
+            # root at all. Every consumer that discovers a run by path then saw a
+            # slot that never fired. Write the complete root-level artifact set
+            # here, recording the failure, then re-raise so the scheduler still
+            # sees it (Codex review: the writer had no production caller).
+            #
+            # Artifact writing must never mask the original failure, so this is
+            # best-effort: a writer error is logged and the original exception is
+            # what propagates.
+            if is_scheduled_live:
+                try:
+                    self._write_startup_failure_artifacts(now, exc)
+                except Exception:  # noqa: BLE001
+                    _log.exception(
+                        "failed to write startup-failure artifacts for the %s stream; "
+                        "re-raising the original run failure",
+                        self.stream,
+                    )
+            raise
+
+    def _write_startup_failure_artifacts(self, now: datetime, exc: BaseException) -> None:
+        """Write the complete root-level artifact set for a run that raised.
+
+        A failed run is still evidence that the scheduled slot fired, so it gets
+        the same four root-level files as any other outcome: a run_state carrying
+        a non-null ``run_classification`` (so the run stays attributable to its
+        stream), a mirroring run_summary, and the CSVs. It is NOT valid scheduled
+        evidence.
+
+        Three properties matter more than the artifact itself (Codex review):
+
+        * **Real placements are never erased.** This handler wraps the WHOLE live
+          run, so an order can be accepted by the broker and a later candidate,
+          ledger update, or artifact build can then raise before run_state.json
+          exists. Asserting ``orders_submitted_count=0`` there would hide a real
+          fill from the same-day top-up guard and let a later run re-allocate that
+          capital. The placement loop publishes its outcomes by reference before
+          placing anything, so whatever landed is recorded here, with matching
+          buy_candidates rows the prior-allocation loader can read.
+        * **A partial set is completed, not accepted.** ``write_artifacts`` can
+          write run_state.json and then raise on a later file. An existing
+          run_state is preserved untouched, but every missing companion is still
+          written.
+        * **The same-day pointer is refreshed**, so a pointer-based watchdog sees
+          today's slot as fired-and-failed rather than still showing yesterday.
+        """
+        out = self.run_state_dir(now)
+        out.mkdir(parents=True, exist_ok=True)
+        state_path = out / "run_state.json"
+        trading_day = now.astimezone(EASTERN).date()
+
+        # Orders this run had already placed when it raised, if any.
+        placed: Dict[str, Any] = {
+            ticker: outcome
+            for ticker, outcome in (getattr(self, "_in_flight_broker_outcomes", None) or {}).items()
+            if isinstance(outcome, dict)
+        }
+        submitted = sum(1 for oc in placed.values() if oc.get("status") == "submitted")
+        signals_by_ticker = getattr(self, "_in_flight_signals_by_ticker", None) or {}
+        buy_candidates = []
+        for ticker, outcome in placed.items():
+            signal = signals_by_ticker.get(ticker)
+            row = {
+                "ticker": ticker,
+                "status": outcome.get("status", "not_submitted"),
+                "order_id": outcome.get("order_id"),
+                # run_state.schema.json requires buy_multiplier on every
+                # candidate row, and validate_run_artifacts does not run schema
+                # validation, so omitting it produces an artifact that reads as
+                # a complete failure record while schema-based reporting rejects
+                # it (Codex review, raised against the afternoon sibling; the
+                # same omission was here). The in-flight signal already carries
+                # the real multiplier.
+                "buy_multiplier": getattr(signal, "multiplier", None),
+                "planned_amount_usd": outcome.get("submitted_amount_usd"),
+                "skip_reason": outcome.get("skip_reason"),
+            }
+            if signal is not None and signal.current_price:
+                row["decision_price"] = signal.current_price
+            buy_candidates.append(row)
+
+        state_was_merged = False
+        existing_state: Optional[Dict[str, Any]] = None
+        if state_path.exists():
+            # A failure AFTER the run wrote its own state: that record is
+            # authoritative and is never overwritten. Its companions may still be
+            # missing if write_artifacts raised part-way, so they are completed
+            # from what is on disk.
+            try:
+                loaded = json.loads(state_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                loaded = None
+            if isinstance(loaded, dict):
+                existing_state = loaded
+            _log.warning(
+                "%s run failed after run_state.json was written; preserving it and "
+                "completing any missing companion artifacts",
+                self.stream,
+            )
+
+        if existing_state is not None:
+            # The preserved file can belong to an EARLIER invocation at this same
+            # slot. If this retry placed a new ticker and then raised before
+            # overwriting it, discarding `placed` would make that accepted order
+            # invisible to the same-day guards and let a later run buy it again
+            # (Codex review). Merge this invocation's placements in instead;
+            # everything else about the earlier state is left exactly as it was.
+            run_state = _merge_placements_into_state(
+                existing_state,
+                placed,
+                buy_candidates,
+                error_detail=f"{type(exc).__name__}: {exc}",
+            )
+            state_was_merged = placed and run_state is not existing_state
+        else:
+            classification = dict(self.run_classification(now, manual=False))
+            classification["valid_scheduled_evidence"] = False
+            run_state = {
+                "run_id": self.run_id(now, manual=False),
+                "trading_day": trading_day.isoformat(),
+                "generated_at": now.isoformat(),
+                # broker/budget/counts are REQUIRED by run_state.schema.json.
+                # validate_run_artifacts does not run schema validation, so
+                # omitting them let this handler advertise a complete failure
+                # artifact set whose canonical state schema-based reporting then
+                # rejects (Codex review). Real values from the executor's own
+                # configuration, not placeholders.
+                "broker": classification.get("execution_broker") or "robinhood",
+                "budget": {
+                    "budget_tier": "normal",
+                    "daily_cap_usd": self.ledger.daily_cap_usd,
+                    "weekly_cap_usd": self.ledger.weekly_cap_usd,
+                },
+                "counts": {
+                    "evaluated": len(buy_candidates),
+                    "buy_candidates": len(buy_candidates),
+                    "submitted": submitted,
+                },
+                "status": "failed",
+                "run_classification": classification,
+                # NOT the placement-failure outcome unless placement really was
+                # reached and failed: reporting keyed on that would otherwise
+                # misattribute a startup or data failure as a broker failure.
+                # The aggregate must never contradict orders_submitted_count and
+                # the submitted_orders.csv row: a run that failed AFTER placing an
+                # order did submit, so it takes the after-submission outcome and
+                # the submitted status (Codex review).
+                "run_classification_outcome": (
+                    RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
+                    if submitted
+                    else RUN_CLASSIFICATION_STARTUP_FAILED
+                ),
+                "order_submit_status": (
+                    ORDER_SUBMIT_STATUS_SUBMITTED if submitted else ORDER_SUBMIT_STATUS_ERROR
+                ),
+                "error_class": (
+                    ERROR_CLASS_POST_SUBMISSION_FAILURE if submitted else ERROR_CLASS_STARTUP_FAILURE
+                ),
+                "error_detail": f"{type(exc).__name__}: {exc}",
+                "is_trading_failure": True,
+                # Explicit denial the derivation honors. select_same_day_run_state
+                # prefers this date-specific state over the pending pointer, so
+                # without the marker every consumer would read a failed run as
+                # valid scheduled evidence (Codex review).
+                "scheduled_evidence_denied": True,
+                "orders_submitted_count": submitted,
+                "candidates_reaching_spread_gate": 0,
+                "candidates_blocked_missing_spread": 0,
+                "signal_rows": [],
+                "buy_candidates": buy_candidates,
+                "broker_outcomes": placed,
+            }
+            if placed:
+                # The run died mid-flight, so this record is complete only as far
+                # as it got. Flagged so a consumer treats it as a floor on what
+                # was placed, never as proof that nothing else was.
+                run_state["placement_evidence_incomplete"] = True
+            atomic_write_text(state_path, json.dumps(run_state, indent=2, sort_keys=True))
+
+        paths: Dict[str, str] = {"run_state": str(state_path)}
+        # A SYNTHESIZED state describes this failure and nothing else, so every
+        # companion in a reused directory belongs to some earlier attempt.
+        # Preserving them on existence alone left stale, zero-byte, or
+        # mismatched files advertised as this run's record -- and because
+        # existing_state is None the companion check below was skipped too, so
+        # nothing caught it (Codex review). Regenerate them all instead.
+        state_is_synthesized = existing_state is None
+        signals_path = out / self.signals_csv_name
+        if state_is_synthesized or not any((out / name).exists() for name in SIGNAL_CSV_NAMES):
+            _write_csv(signals_path, run_state.get("signal_rows") or [])
+        paths["signals"] = str(signals_path)
+        orders_path = out / "submitted_orders.csv"
+        order_rows = submitted_order_rows(run_state.get("broker_outcomes") or {})
+        order_rows.extend(
+            _carried_forward_order_rows(
+                run_state.get("broker_outcomes") or {}, run_state.get("buy_candidates") or []
+            )
         )
+        # Rewrite whenever the state records an order the CSV may not: a stale
+        # file from an earlier attempt would otherwise be advertised as the
+        # canonical order record for a state that knows about more (Codex review).
+        # _order_csv_covers returns True for an empty expected set without ever
+        # reading the file, so on a synthesized state that placed nothing a stale
+        # CSV would survive untouched.
+        if (
+            state_is_synthesized
+            or not orders_path.exists()
+            or not _order_csv_covers(orders_path, order_rows)
+        ):
+            write_submitted_orders_csv(out, order_rows)
+        paths["submitted_orders"] = str(orders_path)
+        summary_path = out / "run_summary.json"
+        # Regenerate whenever the merge mutated the state: the companion
+        # validator compares only the nested classification, so a pre-merge
+        # summary passes while reporting the previous attempt's order count and
+        # status (Codex review).
+        if state_is_synthesized or state_was_merged or not summary_path.exists():
+            atomic_write_text(
+                summary_path,
+                json.dumps(
+                    build_run_summary(
+                        run_state, extra={"stream": self.stream, "mode": run_state.get("mode")}
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                ),
+            )
+        paths["run_summary"] = str(summary_path)
+
+        # Refresh the stream's same-day pointer so a pointer-based watchdog sees
+        # today's slot as fired-and-failed rather than still showing the prior
+        # trading day. The payload derives valid_scheduled_evidence from this
+        # state, which is False.
+        try:
+            # Validated for a synthesized state too. Short-circuiting to True
+            # there meant the one case that rewrites every companion was also
+            # the one case that never checked them (Codex review).
+            companions_ok = self._companions_match_state(out, run_state)
+            if not companions_ok:
+                # select_same_day_run_state prefers this date-specific state over
+                # the pointer and calls derive_valid_scheduled_evidence on it
+                # directly, so downgrading only the pointer would still hand the
+                # run to consumers as valid evidence despite its broken companion
+                # set. Fail the state closed too (Codex review).
+                self._deny_evidence_in_state(state_path, run_state)
+            if existing_state is not None and companions_ok:
+                # The run had already written a complete, valid state and only a
+                # later step (e.g. the pointer write itself) raised. Forcing a
+                # pending/invalid pointer here would make validate_pointer reject
+                # it and a completed run read as unavailable, so its evidence is
+                # derived normally (Codex review).
+                #
+                # Guarded on the FULL artifact set validating, not just on the
+                # state file existing: in a reused same-day directory the summary
+                # or CSVs left in place can belong to an earlier attempt, and
+                # advertising a mismatched summary or a stale order CSV as valid
+                # scheduled evidence is exactly what this contract forbids.
+                payload = self._same_day_pointer_payload(run_state, state_path)
+            else:
+                # A freshly synthesized failure state: the slot fired, but a
+                # failed run is never scheduled evidence. The generic derivation
+                # only inspects the scheduled/manual identity, so it is told.
+                payload = self._same_day_pointer_payload(
+                    run_state,
+                    state_path,
+                    valid_scheduled_evidence=False,
+                    pointer_status=POINTER_STATUS_PENDING,
+                )
+            self._write_same_day_pointers(
+                self._scheduled_pointer_names(is_preflight=False), payload, paths
+            )
+        except Exception:  # noqa: BLE001 - never mask the original run failure
+            _log.exception("failed to refresh the %s same-day pointer", self.stream)
+
+        _log.error(
+            "%s run failed; wrote the failure artifact set to %s (orders already placed: %d)",
+            self.stream,
+            state_path,
+            submitted,
+        )
+
+    @staticmethod
+    def _deny_evidence_in_state(state_path: Path, run_state: Dict[str, Any]) -> None:
+        """Persist the contract failure INTO a preserved state whose companions broke.
+
+        Mirrors what near_close_dca does on a failed contract check: a consumer
+        that discovers the run_state directly must refuse it, not just one that
+        goes through the latest-run pointer.
+        """
+        try:
+            from scripts.scheduled_artifacts import artifact_contract_failure
+
+            run_state["artifact_contract_failure"] = artifact_contract_failure(
+                "scheduled-run artifact contract failed",
+                detail="companion artifacts do not match the run_state written for this slot",
+            )
+            run_state["scheduled_evidence_denied"] = True
+            rc = run_state.get("run_classification")
+            if isinstance(rc, dict):
+                rc["valid_scheduled_evidence"] = False
+            atomic_write_text(state_path, json.dumps(run_state, indent=2, sort_keys=True))
+        except Exception:  # noqa: BLE001 - never mask the original run failure
+            _log.exception("could not record the contract failure in %s", state_path)
+
+    @staticmethod
+    def _companions_match_state(run_dir: Path, run_state: Dict[str, Any]) -> bool:
+        """True when the run directory passes the contract AND its orders agree.
+
+        Existence alone is not enough for a reused same-day directory: a summary
+        or order CSV left from an earlier attempt can disagree with the state
+        just written. validate_run_artifacts catches a mismatched summary through
+        the classification mirror, but it only checks the order CSV's HEADER, so a
+        stale order CSV that omits orders the fresh state records would still pass
+        and be advertised as the canonical order record (Codex review).
+        """
+        try:
+            from scripts.scheduled_artifacts import validate_run_artifacts
+
+            if not validate_run_artifacts(run_dir, require_summary=True):
+                return False
+            expected = submitted_order_rows(run_state.get("broker_outcomes") or {})
+            expected.extend(
+                _carried_forward_order_rows(
+                    run_state.get("broker_outcomes") or {},
+                    run_state.get("buy_candidates") or [],
+                )
+            )
+            return _order_csv_covers(run_dir / "submitted_orders.csv", expected)
+        except Exception:  # noqa: BLE001 - fail closed; never mask the run failure
+            _log.exception("could not validate the artifact set at %s", run_dir)
+            return False
 
     def _run_impl(
         self,
@@ -3351,6 +3895,9 @@ class MorningDCAExecutor(DCAExecutor):
             artifacts["block_reason"] = block_reason
             artifacts["trades"] = False
             artifacts["broker_outcomes"] = {}
+            # Writes and returns before the classification call, so it stamps the
+            # blocked-before-placement outcome itself (Codex review).
+            _apply_blocked_before_placement_fields(artifacts)
             paths = self.write_artifacts(artifacts, now)
             if self.mode == MORNING_LIVE_MODE and self.trades:
                 _run_drift_check(Path(paths["run_state"]).parent)
@@ -3582,6 +4129,8 @@ class MorningDCAExecutor(DCAExecutor):
                 # disk, so this does not retroactively block the run; it is
                 # surfaced here for operator visibility instead.
                 artifacts["raw_persistence_error"] = raw_recorder.error
+        if self.mode == MORNING_LIVE_MODE and self.trades:
+            _apply_no_order_classification(artifacts, scheduled=not manual)
         paths = self.write_artifacts(artifacts, now)
         # Fold this run's own run_id into the seen-set so a LATER run() call on
         # this SAME executor instance never re-reads this just-written artifact
@@ -3591,6 +4140,337 @@ class MorningDCAExecutor(DCAExecutor):
         if self.mode == MORNING_LIVE_MODE and self.trades and not manual:
             _run_drift_check(Path(paths["run_state"]).parent)
         return {"artifacts": artifacts, "paths": paths}
+
+
+def _order_csv_covers(path: Path, expected_rows: Sequence[Dict[str, Any]]) -> bool:
+    """True when every expected order already appears in the CSV at ``path``.
+
+    validate_run_artifacts checks only the header, so a stale order CSV from an
+    earlier attempt passes it while omitting orders the freshly-written state
+    records. Comparing the actual rows is what catches that (Codex review).
+    """
+    expected = {
+        str(row.get("order_id") or f"ticker:{row.get('ticker')}") for row in expected_rows
+    }
+    if not expected:
+        return True
+    try:
+        with path.open(newline="", encoding="utf-8") as handle:
+            present = {
+                str(row.get("order_id") or f"ticker:{row.get('ticker')}")
+                for row in csv.DictReader(handle)
+            }
+    except (OSError, UnicodeDecodeError, csv.Error):
+        return False
+    return expected.issubset(present)
+
+
+def _merge_placements_into_state(
+    state: Dict[str, Any],
+    placed: Dict[str, Any],
+    buy_candidates: Sequence[Dict[str, Any]],
+    *,
+    error_detail: str = "",
+) -> Dict[str, Any]:
+    """Fold this invocation's placements into a state written by an earlier one.
+
+    A same-slot retry can raise before overwriting the previous attempt's
+    run_state.json. Preserving that file is right, but dropping the orders this
+    attempt actually placed is not: they would be invisible to the same-day
+    allocation guards and a later run would buy them again.
+    """
+    if not placed:
+        return state
+    merged = dict(state)
+    added = False
+    outcomes = dict(merged.get("broker_outcomes") or {})
+    for ticker, outcome in placed.items():
+        if ticker not in outcomes:
+            outcomes[ticker] = outcome
+            added = True
+    merged["broker_outcomes"] = outcomes
+
+    existing_rows = list(merged.get("buy_candidates") or [])
+    seen = {
+        row.get("order_id") or f"ticker:{row.get('ticker')}"
+        for row in existing_rows
+        if isinstance(row, dict)
+    }
+    for row in buy_candidates:
+        key = row.get("order_id") or f"ticker:{row.get('ticker')}"
+        if key not in seen:
+            seen.add(key)
+            existing_rows.append(row)
+            added = True
+    if not added:
+        # Every placement is already recorded in the preserved state: this run
+        # wrote its own artifacts and only a later step raised. There is nothing
+        # to add and nothing to re-label, so the record stands untouched.
+        return state
+    merged["buy_candidates"] = existing_rows
+    merged["orders_submitted_count"] = len(_submitted_keys(outcomes, existing_rows))
+    merged["counts"] = {
+        **(merged.get("counts") or {}),
+        "submitted": merged["orders_submitted_count"],
+    }
+    # THIS invocation raised, so the merged state is a failure. Leaving the
+    # earlier attempt's successful or no-order classification in place would let
+    # it be republished as valid even though the retry failed after accepting an
+    # order (Codex review). Shared with near_close_dca so the two cannot drift.
+    return stamp_failure_classification(
+        merged,
+        submitted=merged["orders_submitted_count"],
+        error_detail=error_detail,
+    )
+
+
+def _submitted_keys(
+    broker_outcomes: Dict[str, Any], buy_candidates: Sequence[Dict[str, Any]]
+) -> set:
+    """Distinct submissions for this slot, from this call AND earlier attempts.
+
+    A scheduled retry overwrites the fixed-path artifact, and _run_impl prepends
+    the earlier attempt's submitted rows so their evidence survives. Counting only
+    the current ``broker_outcomes`` would let a retry that places nothing new be
+    recorded as a zero-order run for a slot that did place orders, and would drop
+    those orders from submitted_orders.csv (Codex review).
+
+    Keyed by order_id when present, else by ticker, so a row appearing in both
+    collections is counted once.
+    """
+    keys: set = set()
+    for ticker, outcome in (broker_outcomes or {}).items():
+        if isinstance(outcome, dict) and outcome.get("status") == "submitted":
+            keys.add(outcome.get("order_id") or f"ticker:{ticker}")
+    for row in buy_candidates or []:
+        if not isinstance(row, dict) or row.get("status") not in ("submitted", "filled"):
+            continue
+        keys.add(row.get("order_id") or f"ticker:{row.get('ticker')}")
+    return keys
+
+
+def _carried_forward_order_rows(
+    broker_outcomes: Dict[str, Any], buy_candidates: Sequence[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """submitted_orders.csv rows for submissions only the candidate rows carry.
+
+    The canonical order record must include an earlier attempt's accepted orders,
+    or a retry that placed nothing new would rewrite the CSV without them.
+    """
+    current = {
+        outcome.get("order_id") or f"ticker:{ticker}"
+        for ticker, outcome in (broker_outcomes or {}).items()
+        if isinstance(outcome, dict) and outcome.get("status") == "submitted"
+    }
+    extra: List[Dict[str, Any]] = []
+    for row in buy_candidates or []:
+        if not isinstance(row, dict) or row.get("status") not in ("submitted", "filled"):
+            continue
+        key = row.get("order_id") or f"ticker:{row.get('ticker')}"
+        if key in current:
+            continue
+        current.add(key)
+        extra.append(
+            {
+                "ticker": row.get("ticker"),
+                "order_id": row.get("order_id"),
+                "submitted_amount_usd": row.get("planned_amount_usd"),
+                "status": row.get("status"),
+            }
+        )
+    return extra
+
+
+def _apply_blocked_before_placement_fields(artifacts: Dict[str, Any]) -> None:
+    """Stamp the outcome for a live run stopped BEFORE placement.
+
+    Used by the paths that write and return without reaching
+    :func:`_apply_no_order_classification`: a missing same-day pre-flight
+    artifact, an absent broker adapter, a wrong live account, or a raw-input
+    persistence failure. None of these is a completed no-order run, and none is a
+    placement failure either, so they take the "never reached placement" outcome
+    and the specific cause stays in ``error_class`` (a concrete one the caller
+    already set is kept).
+    """
+    artifacts.update(
+        {
+            "run_classification_outcome": RUN_CLASSIFICATION_STARTUP_FAILED,
+            "order_submit_status": ORDER_SUBMIT_STATUS_ERROR,
+            "completion_reason": None,
+            "is_trading_failure": True,
+            "orders_submitted_count": 0,
+            "candidates_reaching_spread_gate": 0,
+            "candidates_blocked_missing_spread": 0,
+        }
+    )
+    if artifacts.get("error_class") is None:
+        artifacts["error_class"] = ERROR_CLASS_BLOCKED_BEFORE_PLACEMENT
+    # None of these paths reached placement, so none is evidence the slot
+    # executed. build_artifacts() has already stamped the scheduled identity and
+    # the callers write immediately, so without the denial the pointer publishes
+    # a missing pre-flight or an account mismatch as a valid scheduled run
+    # (Codex review). Same denial the escaping-exception path applies, through
+    # the same helper.
+    artifacts.update(deny_scheduled_evidence(artifacts))
+
+
+def _apply_no_order_classification(
+    artifacts: Dict[str, Any], *, scheduled: bool = True
+) -> None:
+    """Record how a live run that submitted zero orders is classified.
+
+    Separates no-order logic from failures per
+    config/scheduled_tasks.json:spread_data_availability_policy. The spread verdict
+    is carried per row by ``_place_broker_orders``, so the two counts this needs --
+    how many candidates reached the spread gate, and how many of those were failed
+    closed for want of a proven spread -- are read straight off the outcomes rather
+    than re-derived from skip-reason prose.
+
+    Also mirrors each row's spread verdict onto the matching signal row so the
+    signals CSV carries it. A run that DID submit an order is left untouched: it is
+    not a no-order run and keeps whatever status the placement path recorded.
+    """
+    outcomes = artifacts.get("broker_outcomes") or {}
+    if not isinstance(outcomes, dict):
+        outcomes = {}
+
+    spread_by_ticker = {
+        ticker: outcome
+        for ticker, outcome in outcomes.items()
+        if isinstance(outcome, dict) and outcome.get("spread_status")
+    }
+    for row in artifacts.get("signal_rows") or []:
+        outcome = spread_by_ticker.get(row.get("ticker"))
+        if outcome is None:
+            continue
+        for key in ("spread_ok", "spread_pct", "spread_status"):
+            row[key] = outcome.get(key)
+
+    rows = [outcome for outcome in outcomes.values() if isinstance(outcome, dict)]
+    failed = sum(1 for outcome in rows if outcome.get("status") == "failed")
+    # A pre-placement broker check that RAISED (duplicate lookup, spread quote,
+    # tradability, review) is recorded as a non-deliberate block, not as 'failed'.
+    # The zero-order path already counts these as errors; the submitted path did
+    # not, so a batch that placed one order and lost another ticker to a
+    # connector failure persisted as an ordinary success with no failure outcome
+    # and no error class (Codex review). Deliberate safety gates carry
+    # deliberate_skip=True and are never errors.
+    connector_errors = sum(
+        1
+        for outcome in rows
+        if outcome.get("status") == "blocked" and not outcome.get("deliberate_skip")
+    )
+    # Count THIS call's submissions plus any carried forward from an earlier
+    # attempt at the same scheduled slot. _run_impl prepends those rows so the
+    # fixed-path artifact keeps their evidence; counting only the current
+    # broker_outcomes would let a retry that places nothing new be recorded as a
+    # zero-order run for a slot that did place orders (Codex review).
+    submitted = len(
+        _submitted_keys(outcomes, artifacts.get("buy_candidates") or [])
+    )
+    if submitted:
+        artifacts["orders_submitted_count"] = submitted
+        # build_artifacts does not set this field, so without it even a fully
+        # successful batch wrote a run_state with no aggregate submit status and
+        # a run_summary whose order_submit_status was null (Codex review).
+        artifacts["order_submit_status"] = ORDER_SUBMIT_STATUS_SUBMITTED
+        if failed or connector_errors:
+            # A partially submitted batch: some orders landed and another ticker
+            # was lost -- either its placement raised, or a pre-placement broker
+            # check did. Returning here as an ordinary success would leave the
+            # run with no is_trading_failure and no failure outcome even though
+            # an intended order never happened (Codex review). The submitted
+            # count and status are preserved; only the failure is added.
+            artifacts["run_classification_outcome"] = RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
+            artifacts["is_trading_failure"] = True
+            artifacts["orders_failed_count"] = failed
+            artifacts.setdefault(
+                "error_class",
+                ERROR_CLASS_PARTIAL_PLACEMENT_FAILURE
+                if failed
+                else ERROR_CLASS_DEGRADED_MARKET_DATA,
+            )
+        return
+
+    reaching_gate = sum(
+        1
+        for outcome in spread_by_ticker.values()
+        if outcome.get("spread_status") != SPREAD_STATUS_NOT_EVALUATED
+    )
+    # Only rows the SPREAD GATE itself stopped count here. A manual run does not
+    # fail closed on an unproven spread, so a row can carry
+    # spread_status='spread_unavailable' and still be stopped later by human
+    # review or broker confirmation; counting that as a spread block would record
+    # error_class='missing_spread_data' for a non-spread cause (Codex review).
+    blocked_missing_spread = sum(
+        1 for outcome in rows if outcome.get("blocked_by") == BLOCKED_BY_SPREAD_GATE
+    )
+    # Degraded inputs, from two sources that both leave the run looking empty
+    # without being a clean ladder no-op (Codex review):
+    #   * a market-data provider that RAISED, which evaluate_signal() catches and
+    #     degrades to a NO_DATA signal carrying a "provider error" warning, so the
+    #     ticker was never genuinely evaluated; and
+    #   * a pre-placement broker check that raised (same-day order lookup,
+    #     tradability, review), which the placement loop records as a
+    #     non-deliberate block. Deliberate safety skips carry deliberate_skip=True
+    #     and are NOT errors.
+    data_errors = sum(
+        1
+        for row in artifacts.get("signal_rows") or []
+        if "provider error" in str(row.get("warnings") or "")
+    ) + sum(
+        1
+        for row in rows
+        if row.get("status") == "blocked" and not row.get("deliberate_skip")
+    )
+    outcome = classify_no_order_run(
+        candidates_reaching_spread_gate=reaching_gate,
+        candidates_blocked_missing_spread=blocked_missing_spread,
+        # Candidates stopped by a cap/ceiling/duplicate check BEFORE the spread
+        # lookup did qualify on the ladder, so they must not be reported as
+        # 'no_ladder_candidates' (Codex review).
+        candidates_evaluated=len(rows),
+        # Every placement raised: a genuine failure, not a healthy no-order run.
+        placement_attempted_and_failed=any(row.get("status") == "failed" for row in rows),
+        data_errors=data_errors,
+        # A manual run never runs the scheduled connector-native recovery policy,
+        # so its broker failures must not be recorded under that outcome.
+        scheduled=scheduled,
+    )
+    fields = outcome.as_run_state_fields()
+    # A concrete terminal status the placement path produced is more specific
+    # than the generic no-order result and must survive: replacing
+    # 'not_submitted_confirmation_required' would make is_confirmation_blocked()
+    # return false and lose the fact that broker confirmation is pending, and a
+    # dry run deliberately places nothing (Codex review).
+    concrete = _concrete_order_submit_status(rows)
+    if concrete is not None:
+        fields["order_submit_status"] = concrete
+    artifacts.update(fields)
+
+
+def _concrete_order_submit_status(rows: Sequence[Dict[str, Any]]) -> Optional[str]:
+    """The specific terminal status a zero-order run must keep, if any.
+
+    Mirrors near_close_dca._derive_order_submit_status's precedence for the cases
+    that are more specific than "no orders were submitted".
+    """
+    # Dry-run mode is authoritative and outranks everything, matching
+    # near_close_dca._derive_order_submit_status, which checks config.dry_run
+    # first. A single dry_run row proves the run used DryRunBroker -- there is one
+    # broker per run -- so requiring EVERY row to be dry_run meant one cap-blocked
+    # or skipped ticker beside a simulated order persisted the run as a genuine
+    # live no-order evaluation (Codex review).
+    if any(row.get("status") == "dry_run" for row in rows):
+        return ORDER_SUBMIT_STATUS_DRY_RUN
+    # A genuine placement failure outranks a confirmation block: reporting must
+    # not treat a batch where another order RAISED as an ordinary confirmation
+    # hold (Codex review).
+    if any(row.get("status") == "failed" for row in rows):
+        return None
+    if any(row.get("status") == "not_submitted_confirmation_required" for row in rows):
+        return ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED
+    return None
 
 
 def _run_drift_check(run_dir: Path) -> None:
@@ -3740,9 +4620,24 @@ def _csv_qualifying_notional_total(csv_path: Path, blank_status_means_filled: bo
     return total
 
 
-def _write_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
+def _write_csv(
+    path: Path,
+    rows: Sequence[Dict[str, Any]],
+    *,
+    empty_fieldnames: Optional[Sequence[str]] = None,
+) -> None:
+    """Write ``rows`` as CSV, ALWAYS emitting a header row.
+
+    A no-row run previously wrote a zero-byte file. That is not a valid
+    "evaluated nothing" artifact: a reader cannot tell it from a truncated write,
+    the drift detector sees no columns, and the scheduled artifact contract
+    requires the header even at zero rows. ``empty_fieldnames`` supplies the
+    columns for that case (defaulting to the signal-row schema).
+    """
     if not rows:
-        atomic_write_text(path, "")
+        fieldnames = list(empty_fieldnames or SIGNAL_CSV_FIELDS)
+        with atomic_open_w(path, newline="") as handle:
+            csv.DictWriter(handle, fieldnames=fieldnames, restval="").writeheader()
         return
     seen: Dict[str, None] = {}
     for row in rows:
