@@ -13,7 +13,7 @@ ruff==0.16.0
 # whole schema suite silently passed while asserting nothing. It is a hard dev
 # dependency now and the tests use pytest.importorskip, which reports a real
 # SKIP instead of a false PASS.
-jsonschema==4.25.1
+jsonschema==4.26.0
 # jsonschema>=4.18 resolves $ref through referencing; the multi-schema tests
 # (run_state -> run_classification, morning_preflight) build a Registry directly.
 referencing==0.36.2
