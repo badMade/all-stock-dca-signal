@@ -224,7 +224,7 @@ jobs:
 
       - name: Download review input artifact
         if: steps.check.outputs.reviewed != 'true'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: pr-review-input
           run-id: ${{ github.event.workflow_run.id }}
