@@ -26,4 +26,4 @@ pytest-cov==7.0.0
 # implicit reliance this file's pinning discipline exists to rule out -- a
 # clean `pip install -r requirements-dev.txt` must not depend on what else
 # happened to pull it in.
-pyyaml==6.0.1
+pyyaml==6.0.3
