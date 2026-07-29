@@ -31,7 +31,7 @@ jobs:
       # NOTE: actions are pinned by tag, not commit SHA. Tags are mutable, so
       # SHA pinning is the stronger posture; the dependabot config in this
       # directory keeps these current in the meantime.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -68,7 +68,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
