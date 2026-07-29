@@ -18,7 +18,7 @@ jsonschema==4.26.0
 # (run_state -> run_classification, morning_preflight) build a Registry directly.
 referencing==0.36.2
 # Coverage gate for the CI `pytest --cov` run.
-pytest-cov==7.0.0
+pytest-cov==7.1.0
 # scripts/workflow_policy.py parses .github/workflows/*.yml to enforce the
 # timeout/concurrency/persist-credentials policies as ordinary pytest tests.
 # PyYAML happens to be present in some environments as a transitive
