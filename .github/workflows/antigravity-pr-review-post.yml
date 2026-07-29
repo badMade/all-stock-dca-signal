@@ -308,6 +308,13 @@ jobs:
         with:
           script: |
             const fs = require("fs");
+            // Same trust model as the "Check for existing review" step: only
+            // this job ever posts either marker (via github.token, i.e. the
+            // github-actions[bot] actor), but any PR commenter can post
+            // arbitrary text. Without this check here too, a PR author could
+            // plant a fake skipMarker comment to suppress this step's own
+            // rate-limit/error notice (Antigravity review, PR #221).
+            const TRUSTED_MARKER_AUTHOR = "github-actions[bot]";
             const prNumber = Number(process.env.PR_NUMBER);
             const headSha = process.env.REVIEWED_HEAD_SHA;
             const baseSha = process.env.REVIEWED_BASE_SHA;
@@ -363,7 +370,15 @@ jobs:
                 issue_number: prNumber,
                 per_page: 100,
               });
-              if (comments.some((c) => typeof c.body === "string" && c.body.includes(skipMarker))) {
+              if (
+                comments.some(
+                  (c) =>
+                    typeof c.body === "string" &&
+                    c.body.includes(skipMarker) &&
+                    c.user &&
+                    c.user.login === TRUSTED_MARKER_AUTHOR,
+                )
+              ) {
                 core.info("Skip note already present; not re-posting.");
                 return;
               }

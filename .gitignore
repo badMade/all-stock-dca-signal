@@ -24,5 +24,13 @@ dist/
 artifacts/
 .coverage
 
+# production-safe-agent-loop/ defaults to relative db paths (spec.db,
+# ledger.db); if a script or REPL is ever run from the repo root instead of
+# from within that subdirectory, SQLite creates the file here instead of
+# under production-safe-agent-loop/.gitignore's tree, so it needs its own
+# rule at this level too.
+*.db
+*.db-journal
+
 # Claude Code agent directory
 .claude/

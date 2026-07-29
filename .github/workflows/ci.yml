@@ -99,3 +99,36 @@ jobs:
       # needs no third-party action in the pipeline, and rejects the commit at
       # push time rather than after it has already landed.
 
+  production-safe-agent-loop:
+    name: Lint & test (production-safe-agent-loop)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt -r production-safe-agent-loop/requirements.txt
+
+      - name: Ruff lint
+        # This subproject is excluded from the root pyproject.toml's ruff
+        # scope (own deps/conventions, see pyproject.toml's extend-exclude
+        # comment), so lint it standalone with the same rule set instead of
+        # relying on root config discovery. --isolated avoids the root
+        # config's exclude silently turning this into a no-op; "I" (import
+        # sorting) is dropped because ruff can't infer local-package imports
+        # like `spec_writer` as first-party without a project config here,
+        # which makes it flag correctly-grouped imports as unsorted.
+        run: ruff check --isolated --select=E,F,B --line-length=120 production-safe-agent-loop
+
+      - name: Run tests
+        working-directory: production-safe-agent-loop
+        run: python -m pytest tests/
