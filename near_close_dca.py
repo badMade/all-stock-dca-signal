@@ -2250,16 +2250,24 @@ def _apply_no_order_classification(
     ``order_submit_status`` the placement path derived.
     """
     outcomes = [oc for oc in (candidate_outcomes or {}).values() if isinstance(oc, dict)]
-    submitted = sum(1 for oc in outcomes if oc.get("status") == "submitted")
-    failed = sum(1 for oc in outcomes if oc.get("status") == "failed")
+
+    submitted = 0
+    failed = 0
+    connector_errors = 0
+    for oc in outcomes:
+        status = oc.get("status")
+        if status == "submitted":
+            submitted += 1
+        elif status == "failed":
+            failed += 1
+        elif status == "blocked" and not oc.get("deliberate_skip"):
+            connector_errors += 1
+
     # A pre-placement broker check that RAISED is recorded as a non-deliberate
-    # block, not as 'failed'. The zero-order path below already counts these as
-    # errors; this branch did not, so a batch that placed one order and lost
-    # another ticker to a connector failure persisted as an ordinary success
-    # (Codex review). Same rule as the morning runner.
-    connector_errors = sum(
-        1 for oc in outcomes if oc.get("status") == "blocked" and not oc.get("deliberate_skip")
-    )
+    # block, not as 'failed'. We count these as connector errors here too so a batch
+    # that placed one order but lost another ticker to a connector failure is not
+    # recorded as an ordinary success with no error class (Codex review).
+    # Same rule as the morning runner.
     artifacts["orders_submitted_count"] = submitted
     if submitted:
         if failed or connector_errors:

@@ -2642,8 +2642,10 @@ class MorningDCAExecutor(DCAExecutor):
             ]
             blocking_errors: List[str] = []
             artifacts["per_ticker_eligibility"] = ticker_rows
-            artifacts["eligible_count"] = sum(1 for r in ticker_rows if r["eligible_to_execute"])
-            artifacts["ineligible_count"] = sum(1 for r in ticker_rows if not r["eligible_to_execute"])
+
+            eligible_count = sum(1 for r in ticker_rows if r["eligible_to_execute"])
+            artifacts["eligible_count"] = eligible_count
+            artifacts["ineligible_count"] = len(ticker_rows) - eligible_count
             artifacts["unresolved_tickers"] = unresolved
             artifacts["blocking_errors"] = blocking_errors
             # overall_ok is false ONLY for global/account/auth/schema-write
@@ -4650,19 +4652,22 @@ def _apply_no_order_classification(
             row[key] = outcome.get(key)
 
     rows = [outcome for outcome in outcomes.values() if isinstance(outcome, dict)]
-    failed = sum(1 for outcome in rows if outcome.get("status") == "failed")
+
+    failed = 0
+    connector_errors = 0
+    for outcome in rows:
+        status = outcome.get("status")
+        if status == "failed":
+            failed += 1
+        elif status == "blocked" and not outcome.get("deliberate_skip"):
+            connector_errors += 1
+
     # A pre-placement broker check that RAISED (duplicate lookup, spread quote,
     # tradability, review) is recorded as a non-deliberate block, not as 'failed'.
-    # The zero-order path already counts these as errors; the submitted path did
-    # not, so a batch that placed one order and lost another ticker to a
-    # connector failure persisted as an ordinary success with no failure outcome
-    # and no error class (Codex review). Deliberate safety gates carry
+    # Both zero-order and submitted paths count these as errors, so batches that
+    # lose a ticker to connector failure are classified as failures instead of
+    # ordinary successes (Codex review). Deliberate safety gates carry
     # deliberate_skip=True and are never errors.
-    connector_errors = sum(
-        1
-        for outcome in rows
-        if outcome.get("status") == "blocked" and not outcome.get("deliberate_skip")
-    )
     # Count THIS call's submissions plus any carried forward from an earlier
     # attempt at the same scheduled slot. _run_impl prepends those rows so the
     # fixed-path artifact keeps their evidence; counting only the current
