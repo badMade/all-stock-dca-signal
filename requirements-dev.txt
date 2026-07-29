@@ -16,7 +16,7 @@ ruff==0.16.0
 jsonschema==4.26.0
 # jsonschema>=4.18 resolves $ref through referencing; the multi-schema tests
 # (run_state -> run_classification, morning_preflight) build a Registry directly.
-referencing==0.36.2
+referencing==0.37.0
 # Coverage gate for the CI `pytest --cov` run.
 pytest-cov==7.1.0
 # scripts/workflow_policy.py parses .github/workflows/*.yml to enforce the
