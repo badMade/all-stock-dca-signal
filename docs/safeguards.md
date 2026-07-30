@@ -38,9 +38,13 @@ Cowork scheduled tasks on the Mac Studio (weekdays, ET):
 | 7 | 3:30 PM | final (decision anchor; matches `config/trading_window.json`'s authoritative `decision_time_et: "15:30"`) |
 
 Every one of these seven Claude prompts ends every fire at Gate 5 with the
-non-alerting `GATE5_DISABLED` verdict — no callable signal-generation entry
-point exists yet; see `claude/GATE5-PROPOSAL.md` — so none of them can place
-a single order today. They run, if created, **alongside** the five
+`GATE5_DISABLED` verdict — no callable signal-generation entry point exists
+yet; see `claude/GATE5-PROPOSAL.md` — so none of them can place a single
+order today. As of 2026-07-30 this verdict alerts on every fire (see
+`claude/GATE5-PROPOSAL.md` and each prompt's Gate 5/Gate 9): a blocked entry
+point read as indistinguishable from an evaluated, empty universe when four
+of seven slots fired silently the same day, and a silent executor is worse
+than an aborting one. They run, if created, **alongside** the five
 Perplexity-era tasks above, not instead of them (see
 `claude/dca-executor-prompts/0-setup-card.md`). Because all seven slots share
 their exact windows with a Perplexity-era task, each prompt's Gate 4 (sole-
@@ -54,7 +58,9 @@ against their OWN slot's specific legacy prefix: `morning-dca-<trading_day>-
 this roster's own `dca-runner-<slot_id>-<trading_day>-<ticker>` (`dca_runner.py`,
 once Gate 5 is wired) and from each other. Only when EVERY order in the window
 carries that slot's own legacy prefix is it classified
-`GATE4_EXPECTED_OVERLAP` — silently, like `GATE5_DISABLED`; an unrecognized
+`GATE4_EXPECTED_OVERLAP` — which, like `GATE5_DISABLED`, alerts on every
+fire as of 2026-07-30 (see above; Codex review: "Continue past expected
+overlap to report blocked Gate 5"); an unrecognized
 ref_id or one carrying this roster's own prefix stays on the real
 abort-and-alert path (Codex review, PR #232: "Recognize the real legacy
 stream ref-id prefixes"; "Distinguish legacy orders before suppressing
@@ -267,8 +273,9 @@ on the day's planned spend and the count of 3x-or-greater signals (multiplier
 - **Automatic failure recovery (live trading tasks):** each currently-live
   scheduled trading task (see [Live execution roster](#live-execution-roster)
   — today, the five Perplexity-era tasks, since the seven Claude tasks still
-  end every fire at the non-alerting `GATE5_DISABLED` verdict and place no
-  orders; this extends to those seven too once Gate 5 is wired and enabled)
+  end every fire at the `GATE5_DISABLED` verdict and place no orders (this
+  verdict alerts as of 2026-07-30, but still never reaches a trade); this
+  extends to those seven too once Gate 5 is wired and enabled)
   treats a mid-run failure caused by **internal persistence, parsing, wrapper-normalization,
   transient connector throttling, or raw-file write** problems **after data was
   fetched** as a **recovery trigger, not a terminal stop**. The task reruns the

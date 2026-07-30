@@ -7,6 +7,20 @@ code/config inconsistency left for a human decision (§3). The original
 draft's "confirmed deviation" conclusion did not survive review; this
 version is a materially weaker, more hedged claim.**
 
+**Superseded, in part, by `claude/GATE5-WATCHDOG-FIXES-2026-07-30.md` (later
+the same day).** Everywhere below that describes Gate 5's `GATE5_DISABLED`
+path as silent — most directly §3's "the original draft treated any alert
+on this slot as automatically wrong, citing only Gate 5's silent
+`GATE5_DISABLED` path" and its surrounding comparison against "the current,
+committed prompt" — is a snapshot of the prompt text as committed *before*
+that later fix. As of 2026-07-30, `GATE5_DISABLED` alerts on every fire; it
+is no longer the silent path this document analyzes. Nothing else here is
+affected: §1's account of what the 10:30 alert itself said, §2's point that
+the compared-against prompt postdated the incident, and §4-§6's findings
+about alert-file durability and the legacy `42173154` task stand
+unchanged. Read this document as history of the prompt as it stood on
+2026-07-29/30, not as a description of the currently committed contract.
+
 See `claude/GATE5-PROPOSAL.md` for the underlying (and still unapplied)
 design proposal this incident references.
 

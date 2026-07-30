@@ -19,10 +19,12 @@ prompt text. Select all, copy, paste. No trimming.
 live-execution tasks from the prior three(ish)-stream scheduler (`2ba19526` 9:35
 market-open, `42173154` 10:30 morning, `7be82b97` 11:30/1:30/2:30 intraday, `a6239dae`
 12:30 midday, `10ce362c` 3:30 final) -- these are the account's ONLY currently-functioning
-scheduled DCA execution. Every one of the seven new prompt files below ends silently at
-Gate 5 with the non-alerting `GATE5_DISABLED` verdict (no callable signal-generation entry
-point exists yet; see `claude/GATE5-PROPOSAL.md`), so none of them can place a single
-order today. Retiring the five old tasks before Gate 5 is resolved leaves the account
+scheduled DCA execution. Every one of the seven new prompt files below ends every fire at
+Gate 5 with the `GATE5_DISABLED` verdict (no callable signal-generation entry point exists
+yet; see `claude/GATE5-PROPOSAL.md`), so none of them can place a single order today. As of
+2026-07-30 this verdict alerts on every fire (see each file's Gate 5/Gate 9 and
+`claude/GATE5-WATCHDOG-FIXES-2026-07-30.md`) -- it no longer places nothing silently, only
+places nothing. Retiring the five old tasks before Gate 5 is resolved leaves the account
 with zero functioning scheduled execution for however long that takes (Codex review:
 "Keep the old executors until replacements can pass Gate 5") -- create and schedule all
 seven new tasks below ALONGSIDE the five old ones, not instead of them.
@@ -40,8 +42,8 @@ order's ref_id against their own slot's known legacy prefix -- `morning-dca-` (`
 (`10ce362c`, `near_close_dca.py`) respectively -- distinct from this roster's own
 `dca-runner-<slot_id>-<trading_day>-<ticker>` (per `dca_runner.py`, once Gate 5 is
 wired). Only when EVERY order in the window carries that slot's specific legacy prefix does the prompt
-classify it `GATE4_EXPECTED_OVERLAP` and stay silent -- the same non-alerting treatment
-as `GATE5_DISABLED` below. An order with no recognizable ref_id, or one carrying this
+classify it `GATE4_EXPECTED_OVERLAP` -- which, like `GATE5_DISABLED` below, alerts on every
+fire (2026-07-30). An order with no recognizable ref_id, or one carrying this
 roster's OWN prefix, stays on the real abort-and-alert path: that's either an untrusted
 collision or, worse, a genuine duplicate execution of this roster, and blanket-silencing
 "any order in the window" (or trusting a single, roster-wide prefix that doesn't match
@@ -53,22 +55,33 @@ Gate 4 alerts"; "Avoid expected Gate 4 alerts during roster overlap"). The 9:35,
 `config/scheduled_tasks.json` -- an external scheduler/agent runs them directly, with no
 committed, documented ref_id convention to verify against -- so those four prompts
 cannot safely attribute a same-window order to them and their Gate 4 alerts on every
-collision exactly as it always has, with no silent classification attempted. Both
-`GATE5_DISABLED` and, where applicable, `GATE4_EXPECTED_OVERLAP` are deliberately silent
--- no message-center post, no alert file, no email draft -- because they are known,
-expected outcomes on every fire of the prompts that can reach them, not a failure to
-escalate; scheduling all seven alongside the old roster without at least the
-`GATE5_DISABLED` exception would mean up to seven expected abort alerts a day from Gate 5
-alone (35/week), burying any real safety failure under routine noise (Codex review: "Do
-not schedule tasks that are guaranteed to alert"). The Gate 4 sole-executor-interlock
+collision exactly as it always has, with no silent classification attempted. Where
+applicable, `GATE4_EXPECTED_OVERLAP` alerts on every fire it triggers, on the same three
+channels as any abort -- it is a known, expected outcome on every fire of the three prompts
+that can reach it, not a failure to escalate, but known-and-expected no longer means silent
+(Codex review: "Continue past expected overlap to report blocked Gate 5"). `GATE5_DISABLED`
+used to be silent for the same reason (scheduling all seven alongside the old roster without
+that exception meant up to seven expected abort alerts a day from Gate 5 alone -- 35/week,
+burying any real safety failure under routine noise; Codex review, PR #232/#238: "Do not
+schedule tasks that are guaranteed to alert"). **That was reversed 2026-07-30**: four of
+seven slots fired silently the same day and a blocked entry point read as indistinguishable
+from an evaluated, empty universe -- a silent executor is worse than an aborting one.
+`GATE5_DISABLED` now alerts on every fire, on the same channels as any abort, in all seven
+prompt files below, and `GATE4_EXPECTED_OVERLAP` was brought in line with it the same day for
+the same reason, in the three prompts where it applies; **repaste all seven prompts from this
+repo into their live Cowork tasks to pick up both changes** -- editing the committed `.txt`
+files alone does not change what a task already pasted into Cowork does (see
+`claude/GATE5-WATCHDOG-FIXES-2026-07-30.md`). Accept the resulting alert volume (up to seven
+alerts a day, every weekday, until a real entry point exists) as the cost of that trade-off.
+The Gate 4 sole-executor-interlock
 double-order risk this section used to warn about only becomes real once a human
 finishes `claude/GATE5-PROPOSAL.md` and wires a real signal-generation entry point into
 these prompts -- **that** is the point to retire the five old tasks, and it must happen
 before (not after) the new prompts can place real orders, or the two schedules really
 could both submit in the same window. It is also the point where Gate 4 (in the three
 prompts where it has an exception) and Gate 5 (in all seven) must revert from their
-disabled/silent classifications back to real abort-and-alert checks on failure, the same
-as every other gate.
+disabled classifications (`GATE4_EXPECTED_OVERLAP` and `GATE5_DISABLED`, both alerting) back
+to real abort-and-alert checks on failure, the same as every other gate.
 
 **Truncation risk:** `config/scheduled_tasks.json`'s `live_task_text_compactness_policy`
 documents that the scheduling service can silently truncate long task text --
@@ -85,9 +98,16 @@ including the `LIVE EXECUTOR` line -- stating unconditionally that no real
 order may be placed today and, if the fuller gate sequence below is missing
 or incomplete, to treat that as this task's own `GATE5_DISABLED` verdict and
 write whatever evidence is possible (Codex review: "Move the disabled gate
-ahead of the truncation boundary"). This closes the immediate safety risk
-(an accidental live placement surviving truncation) regardless of prompt
-length. It does NOT address the underlying length problem: shrinking each
+ahead of the truncation boundary"). Since 2026-07-30 that same opening
+paragraph also inlines the three Gate 9 alert channels in compact form
+(in-app message center, repo alert file path, email draft) rather than only
+referring to Gate 9 by name -- referring to a section that may itself be
+past the truncation boundary would not actually tell a truncated fire how or
+where to alert (Codex review: "Put the alert-channel instructions before
+truncation"). This closes the immediate safety risk (an accidental live
+placement surviving truncation, or a truncated fire that goes to place
+nothing but also alert nothing) regardless of prompt length. It does NOT
+address the underlying length problem: shrinking each
 prompt down toward the ~5,850-character precedent -- replacing inlined
 long-form explanations with compact references to `docs/safeguards.md`,
 `claude/GATE5-PROPOSAL.md`, and the other repo sources already cited

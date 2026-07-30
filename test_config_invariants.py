@@ -949,3 +949,175 @@ def test_runtime_parsed_broker_account_fields_use_the_expandable_placeholder():
         "dca_config.expand_config_env), not an angle-bracket placeholder that "
         f"is never substituted: {offenders}"
     )
+
+
+# --- The seven-slot executor prompts stay structurally in sync --------------
+# claude/dca-executor-prompts/[1-7]-executor-*.txt are seven independently
+# pasted prompt files (0-setup-card.md's manual-paste deployment model -- there
+# is no shared template at runtime, by design: each prompt must carry its own
+# complete, self-contained alert contract so a truncated fire still has it,
+# rather than referencing a shared doc that could itself be truncated away).
+# That duplication is deliberate, but it is also exactly the kind of text that
+# can drift silently across seven copy-pasted files with no runtime code to
+# catch it -- two review rounds on PR #246 found real drift this way (a Gate 4
+# alert channel left silent after GATE5_DISABLED was fixed to alert; the
+# truncation-safe header's channel list left scoped to only its final
+# fallback), each caught by a human/Codex reading all seven files side by
+# side rather than by any check. This is that check (Codex review: "Add a
+# Prompt Consistency / Lint Test").
+
+PROMPTS_DIR = REPO_ROOT / "claude" / "dca-executor-prompts"
+
+_SLOT_FILES = [
+    "1-executor-0935-cron_35_13.txt",
+    "2-executor-1030-cron_30_14.txt",
+    "3-executor-1130-cron_30_15.txt",
+    "4-executor-1230-cron_30_16.txt",
+    "5-executor-1330-cron_30_17.txt",
+    "6-executor-1430-cron_30_18.txt",
+    "7-executor-1530-cron_30_19.txt",
+]
+
+# Each slot's Gate 1 window, as it must appear both in the truncation-safe
+# header and in Gate 1's own body section -- derived from the slot's own
+# filename, so a copy-pasted neighbor's window landing in the wrong file is
+# caught even though nothing at runtime ever reads these files as config.
+_SLOT_TIME_WINDOWS = {
+    "1-executor-0935-cron_35_13.txt": "9:30-10:00 AM ET",
+    "2-executor-1030-cron_30_14.txt": "10:30-11:00 AM ET",
+    "3-executor-1130-cron_30_15.txt": "11:30 AM-12:00 PM ET",
+    "4-executor-1230-cron_30_16.txt": "12:30-1:00 PM ET",
+    "5-executor-1330-cron_30_17.txt": "1:30-2:00 PM ET",
+    "6-executor-1430-cron_30_18.txt": "2:30-3:00 PM ET",
+    "7-executor-1530-cron_30_19.txt": "3:30-4:00 PM ET",
+}
+
+# Slots whose legacy counterpart has a committed, verifiable ref_id convention
+# to attribute a same-window order to (see each prompt's Gate 4 and
+# 0-setup-card.md) -- the other four slots have no such committed convention
+# and must never attempt the classification, per Codex review ("Recognize the
+# real legacy stream ref-id prefixes").
+_SLOTS_WITH_GATE4_EXPECTED_OVERLAP = {
+    "2-executor-1030-cron_30_14.txt",
+    "4-executor-1230-cron_30_16.txt",
+    "7-executor-1530-cron_30_19.txt",
+}
+
+
+def _prompt_text(filename: str) -> str:
+    return (PROMPTS_DIR / filename).read_text(encoding="utf-8")
+
+
+def test_seven_executor_prompt_files_all_exist():
+    missing = [f for f in _SLOT_FILES if not (PROMPTS_DIR / f).is_file()]
+    assert not missing, f"missing executor prompt files: {missing}"
+
+
+def test_every_executor_prompt_opens_with_the_standing_gate5_override():
+    for filename in _SLOT_FILES:
+        header = _prompt_text(filename).split("\n", 1)[0]
+        assert header.startswith("STANDING GATE 5 OVERRIDE"), (
+            f"{filename} must open with the truncation-safe STANDING GATE 5 "
+            "OVERRIDE header, or an off-schedule/ambiguous-repo/expired-window "
+            "fire that gets truncated has no alert contract to fall back on"
+        )
+
+
+def test_gate5_override_header_defines_alert_channels_before_any_abort():
+    # Codex review: "Route pre-Gate-5 fallback alerts to all required
+    # channels" -- the whole point of moving the channel list to the front of
+    # the header is that a truncated fire, cut off anywhere in this paragraph,
+    # still has the channel list in view for whichever abort branch it stopped
+    # on. If the channel list ever drifts back after an abort branch, that
+    # guarantee silently breaks again.
+    abort_phrase = "abort and alert (all three channels above)"
+    for filename in _SLOT_FILES:
+        header = _prompt_text(filename).split("\n", 1)[0]
+        channel_index = header.find("(1) IN-APP MESSAGE CENTER")
+        assert channel_index != -1, f"{filename}: header is missing the channel list"
+        abort_indices = [
+            match.start() for match in re.finditer(re.escape(abort_phrase), header)
+        ]
+        assert abort_indices, f"{filename}: header is missing an abort branch"
+        assert all(index > channel_index for index in abort_indices), (
+            f"{filename}: the three-channel alert list must be defined before "
+            "every abort branch in the truncation-safe header, not after one"
+        )
+
+
+def test_gate5_disabled_alerts_every_fire_in_header_and_gate9_of_every_prompt():
+    header_phrase = "GATE5_DISABLED alerts every fire as of 2026-07-30"
+    gate9_phrase = (
+        "GATE5_DISABLED: alert on ALL THREE channels above, in order, "
+        "exactly like any abort or skip"
+    )
+    for filename in _SLOT_FILES:
+        text = _prompt_text(filename)
+        assert header_phrase in text, (
+            f"{filename}: truncation-safe header must state that GATE5_DISABLED "
+            "alerts every fire, or a truncated fire falling back to "
+            "GATE5_DISABLED has no way to know it must still alert"
+        )
+        assert gate9_phrase in text, (
+            f"{filename}: Gate 9 must alert on GATE5_DISABLED, not treat it as "
+            "the silent verdict it was before the 2026-07-30 reversal"
+        )
+
+
+def test_gate4_expected_overlap_classification_matches_the_documented_three_slots():
+    for filename in _SLOT_FILES:
+        text = _prompt_text(filename)
+        classifies = "Classify GATE4_EXPECTED_OVERLAP" in text
+        if filename in _SLOTS_WITH_GATE4_EXPECTED_OVERLAP:
+            assert classifies, (
+                f"{filename}: this slot's legacy counterpart has a committed "
+                "ref_id convention (see 0-setup-card.md) and must classify "
+                "GATE4_EXPECTED_OVERLAP when every order in the window carries it"
+            )
+        else:
+            assert not classifies, (
+                f"{filename}: this slot has no legacy counterpart with a "
+                "committed ref_id convention to verify against and must never "
+                "attempt the GATE4_EXPECTED_OVERLAP classification"
+            )
+            assert "does NOT attempt a GATE4_EXPECTED_OVERLAP classification" in text, (
+                f"{filename}: must explicitly say it does not attempt the "
+                "classification, not merely omit it"
+            )
+
+
+def test_gate4_expected_overlap_alerts_where_it_applies():
+    # Codex review: "Continue past expected overlap to report blocked Gate 5"
+    # -- GATE4_EXPECTED_OVERLAP used to end these three slots' runs silently,
+    # which meant three of seven slots could go quiet on an ordinary overlap
+    # day even after GATE5_DISABLED itself was fixed to alert on every fire.
+    for filename in _SLOTS_WITH_GATE4_EXPECTED_OVERLAP:
+        text = _prompt_text(filename)
+        assert "GATE4_EXPECTED_OVERLAP: alert on ALL THREE channels above" in text, (
+            f"{filename}: GATE4_EXPECTED_OVERLAP must alert on all three "
+            "channels, the same as GATE5_DISABLED, not end the run silently"
+        )
+
+
+def test_no_prompt_still_treats_gate4_expected_overlap_as_silent():
+    for filename in _SLOT_FILES:
+        assert "GATE4_EXPECTED_OVERLAP: stay silent" not in _prompt_text(filename), (
+            f"{filename}: GATE4_EXPECTED_OVERLAP must not be documented as "
+            "silent -- it alerts on every fire it triggers, as of 2026-07-30"
+        )
+
+
+def test_every_executor_prompt_declares_the_correct_gate1_time_window():
+    for filename in _SLOT_FILES:
+        text = _prompt_text(filename)
+        expected = _SLOT_TIME_WINDOWS[filename]
+        header, _, body = text.partition("\n\n")
+        assert f"falls outside {expected}" in header, (
+            f"{filename}: truncation-safe header's Gate 1 window must be "
+            f"{expected!r}, matching this slot's filename, not a "
+            "copy-pasted neighbor's"
+        )
+        assert f"It must fall inside {expected}" in body, (
+            f"{filename}: Gate 1's own body section must declare the same "
+            f"{expected!r} window as the header"
+        )
