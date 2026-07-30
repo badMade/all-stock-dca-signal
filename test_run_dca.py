@@ -1973,13 +1973,13 @@ def test_run_pipeline_bounded_reload_poisons_resolved_ticker_on_reverse_swap(
     # above. The first pass reads a known-price $5 artifact for AAPL (a $6
     # unknown-price sibling artifact fails to parse that pass); the reload
     # then reads that $6 unknown-price artifact but misses the $5 one this
-    # time. Both passes report scan_had_failures=True. Before this fix,
+    # time. Both passes report scan_had_failures=True. Before this correction,
     # `elif not _reload_verified_complete: pass` blindly kept the first
     # pass's resolved $5/known-price allocation -- presenting FALSE
     # CONFIDENCE (a fully resolved, comparable amount) even though the true
     # same-day context is $11/unknown. The top-up guard could then submit
     # excess capital on top of an incomplete picture instead of failing this
-    # ticker closed. The fix must poison the merged result to unresolved,
+    # ticker closed. The merged result must be poisoned to unresolved,
     # using the larger ($6) of the two observed amounts as a conservative
     # floor.
     import run_dca
