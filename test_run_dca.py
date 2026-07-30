@@ -740,7 +740,7 @@ def test_resolve_cross_stream_prior_allocation_roots_afternoon_containing_root_k
     tmp_path,
 ):
     # Codex follow-up review ("Filter afternoon-containing roots before
-    # descendant pruning"): a residual case after the fix above. When a
+    # descendant pruning"): a residual case after the previous adjustment. When a
     # stream is configured to the shared cron_base itself, the sibling
     # cron_base/morning_dca root is a genuine DESCENDANT of cron_base, so the
     # descendant-pruning pass would discard it as "redundant" with cron_base
