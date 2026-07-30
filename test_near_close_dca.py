@@ -454,7 +454,7 @@ def test_merge_manual_top_up_context_retains_base_when_manual_fill_is_later():
     # fill, whose PriorAllocation.reference_ts now identifies its own time,
     # must not erase that known base -- it cannot itself be the true first
     # allocation since it happened after the base was already established.
-    # Before the fix this unconditionally poisoned the base to None, so a
+    # Previously, this unconditionally poisoned the base to None, so a
     # subsequent lower-price run would recompute its own (possibly $2) base,
     # doubling the full-day target before subtracting prior spend.
     prior_same_day_allocations = {
