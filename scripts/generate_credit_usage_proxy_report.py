@@ -2486,6 +2486,8 @@ def _usage_counts(
     for r in scheduled_rows:
         if r.get("recorded_error"):
             recorded_error_count += 1
+        # Use .get() consistently: did_not_run and failed-start rows omit
+        # "classification" entirely, so strict key access would KeyError.
         if r.get("classification") == "valid_scheduled_evidence":
             run_count_scheduled += 1
         if r.get("order_attempts") == 0:
@@ -2506,7 +2508,7 @@ def _usage_counts(
         # the known ones -- codex review discussion_r3658263811,
         # discussion_r3658511891.
         "placed_order_count": _sum_int(
-            [r.get("order_attempts") for r in scheduled_rows if r["classification"] == "valid_scheduled_evidence"]
+            [r.get("order_attempts") for r in scheduled_rows if r.get("classification") == "valid_scheduled_evidence"]
             + [r.get("order_attempts") for r in recovery_rows if r.get("source") == "manual"]
         ),
         # failed_start_scheduled_slot_rule: the scheduled_runs cross-reference

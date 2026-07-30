@@ -22,10 +22,10 @@ name: Antigravity PR Review (Analyze)
 # closed the "PR adds a shadowing module" hole but not the "PR edits the
 # workflow file itself" one).
 #
-# BOOTSTRAPPING NOTE: because workflow_run needs the consumer workflow to
-# already exist on the default branch, no PR gets a posted review until AFTER
-# this two-workflow split itself is merged. Until then, this workflow still
-# runs (computing diffs, uploading artifacts) but nothing consumes them.
+# BOOTSTRAPPING NOTE: the two-workflow split is now live on the default branch
+# (merged in the same commit that introduced this file). All PRs will receive
+# an AI review via the consumer workflow (antigravity-pr-review-post.yml),
+# provided the AI provider is not rate-limited.
 
 on:
   pull_request:
