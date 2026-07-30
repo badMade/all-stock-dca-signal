@@ -780,6 +780,24 @@ This changes only what a run does when its local tooling is missing. Every
 budget cap, circuit breaker, whitelist, ordering, spread, confidence, and top-up
 rule is unchanged: a connector-native run passes exactly the same gates.
 
+**Disabled for the seven-slot Claude roster (2026-07-30).** `config/scheduled_tasks.json`'s
+`connector_native_execution_policy` and `intraday_connector_native_recovery_policy`
+are both marked `status: disabled_for_seven_slot_claude_roster`. Repeated
+2026-07-29 abort reports across all seven Claude executor slots cited this
+policy against Gate 5 (`claude/dca-executor-prompts/*.txt`, "Use the repo
+entry point, never a reimplementation") as an unresolved conflict. It is
+resolved: for the seven-slot Claude roster this policy does **not** authorize
+hand-building a buy list or calling `place_equity_order` outside
+`run_dca.py`/`run_pipeline()`. A missing entry point for that roster is Gate
+5's known, silent `GATE5_DISABLED` verdict (see
+[safeguards.md](safeguards.md#live-execution-roster), which documents the
+verdict itself; the underlying gap it exists for is analyzed in
+`claude/GATE5-PROPOSAL.md`), not a trigger for connector-native execution. The
+policy above may still describe the separate, non-Claude, external
+("Perplexity-era") scheduler this repo's config also tracks (see
+[safeguards.md](safeguards.md#live-execution-roster)); this change does not
+touch that system.
+
 ### Root-level artifacts, every run, every outcome
 
 Every live run writes `run_state.json`, `run_summary.json`, `signals.csv` (or the

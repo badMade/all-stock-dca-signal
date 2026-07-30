@@ -258,6 +258,10 @@
   },
   "connector_native_execution_policy": {
     "added_on_et": "2026-07-27",
+    "status": "disabled_for_seven_slot_claude_roster",
+    "disabled_on_et": "2026-07-30",
+    "disabled_reason": "This policy's rule ('missing entry point is the TRIGGER for connector-native execution') was being read as authorizing a seven-slot-roster Claude executor to hand-build a buy list from live connector quotes and call place_equity_order directly whenever run_dca.py's CLI refuses (it is demo-only by design). That directly contradicts Gate 5 in every claude/dca-executor-prompts/*.txt ('Use the repo entry point, never a reimplementation... never build a buy list from broker data, watchlists, quotes, scanners, or your own judgment') and its STANDING GATE 5 OVERRIDE, and it contradicts Gate 9's instruction that a missing-entry-point Gate 5 fire is the silent, non-alerting GATE5_DISABLED verdict, not an abort. Repeated 2026-07-29 abort/alert reports across all seven slots cited this policy as an 'unresolved conflict needing a human decision' -- it is resolved here: for the seven-slot Claude roster, this policy does NOT apply and does NOT authorize placing an order or constructing a buy list outside run_dca.py/run_pipeline(). Superseded, not deleted -- the incident record below and the applies_to_cron_ids list stay as the historical reason this was added, and this may still be read as describing the separate, non-Claude, external ('Perplexity-era') scheduler docs/safeguards.md documents as the account's actually-functioning live execution today, which this change does not touch. Re-enabling any connector-native path for the seven-slot Claude roster requires a human decision on claude/GATE5-PROPOSAL.md sec 4 (the morning/midday boundary and the per-ticker-per-day rule across seven slots) and a reviewed, tested signal-generation entry point to call -- not a config edit alone.",
+    "see_also": "claude/GATE5-PROPOSAL.md; claude/dca-executor-prompts/*.txt (STANDING GATE 5 OVERRIDE, Gate 5, Gate 9); docs/safeguards.md#live-execution-roster",
     "incident": "Two scheduled slots the same day failed the same way. The 12:30 PM ET midday live task a6239dae failed at startup before writing any scheduled artifact, and the 2:30 PM ET intraday slot on 7be82b97 escalated before order placement reporting no existing run script and no internal implementation for order submission. Both left no artifact root at all. In both cases a connector-native pass minutes later did the work successfully, which proves the work was doable inside the scheduled run.",
     "applies_to_cron_ids": ["2ba19526", "42173154", "a6239dae", "7be82b97", "10ce362c"],
     "scope_note": "Every LIVE scheduled stream, not just the intraday task. Missing local tooling is a property of the environment, not of a slot, so a policy scoped to one cron id leaves every other slot able to fail the identical way.",
@@ -1587,6 +1591,10 @@
   },
   "intraday_connector_native_recovery_policy": {
     "added": "2026-07-27",
+    "status": "disabled_for_seven_slot_claude_roster",
+    "disabled_on_et": "2026-07-30",
+    "disabled_reason": "Same disposition and reason as connector_native_execution_policy.disabled_reason above, which this policy duplicates for the 11:30/1:30/2:30 intraday slots specifically: it does NOT authorize a seven-slot-roster Claude executor to hand-build a buy list or place an order outside run_dca.py/run_pipeline(). Gate 5 in claude/dca-executor-prompts/3-executor-1130-cron_30_15.txt, 5-executor-1330-cron_30_17.txt, and 6-executor-1430-cron_30_18.txt governs those three slots and requires the silent GATE5_DISABLED verdict, never a connector-native reimplementation.",
+    "superseded_by": "connector_native_execution_policy.disabled_reason (2026-07-30)",
     "applies_to_cron_id": "7be82b97",
     "applies_to_slots_et": ["11:30", "13:30", "14:30"],
     "rule": "If the intraday background run cannot find an existing repo runner script or an internal order-submission implementation, it MUST NOT escalate. Missing local tooling or a missing repo runner script is not a blocking condition; it is the trigger for connector-native execution.",
