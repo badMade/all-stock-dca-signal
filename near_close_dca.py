@@ -4527,19 +4527,11 @@ def classify_execution_quality(slippage_pct: Optional[float]) -> str:
 
 
 def build_execution_record(
-    *,
-    ticker: str,
-    target_price: float,
-    target_price_source: str,
-    decision_bar_close: float,
+    decision: ReconciledDecision,
     notional_usd: float,
-    action_reason: str = "",
+    *,
     order_id: Optional[str] = None,
-    target_quote_time: Optional[datetime] = None,
-    order_submitted_at: Optional[datetime] = None,
-    order_filled_at: Optional[datetime] = None,
-    avg_fill_price: Optional[float] = None,
-    quantity_filled: Optional[float] = None,
+    fill: Optional[OrderFill] = None,
 ) -> OrderExecutionRecord:
     """Compute slippage and latency for a submitted order against its target price.
 
@@ -4547,34 +4539,38 @@ def build_execution_record(
     (unfavorable). slippage_cost is the extra dollars paid versus target across the
     filled quantity. Records without a fill are marked ``unfilled``.
     """
-    filled = avg_fill_price is not None and quantity_filled is not None
+    filled = (
+        fill is not None
+        and fill.avg_fill_price is not None
+        and fill.quantity_filled is not None
+    )
     slippage_abs: Optional[float] = None
     slippage_pct: Optional[float] = None
     slippage_cost: Optional[float] = None
     latency_seconds: Optional[float] = None
 
     if filled:
-        slippage_abs = avg_fill_price - target_price
-        if target_price:
-            slippage_pct = slippage_abs / target_price * 100.0
-        slippage_cost = slippage_abs * quantity_filled
-    if order_submitted_at is not None and order_filled_at is not None:
-        latency_seconds = (order_filled_at - order_submitted_at).total_seconds()
+        slippage_abs = fill.avg_fill_price - decision.target_price
+        if decision.target_price:
+            slippage_pct = slippage_abs / decision.target_price * 100.0
+        slippage_cost = slippage_abs * fill.quantity_filled
+    if fill and fill.order_submitted_at is not None and fill.order_filled_at is not None:
+        latency_seconds = (fill.order_filled_at - fill.order_submitted_at).total_seconds()
 
     return OrderExecutionRecord(
-        ticker=ticker,
-        status="filled" if filled else "submitted",
+        ticker=decision.ticker,
+        status="filled" if filled else "unfilled",
         order_id=order_id,
         notional_usd=notional_usd,
-        action_reason=action_reason,
-        target_price=target_price,
-        target_price_source=target_price_source,
-        target_quote_time=target_quote_time,
-        decision_bar_close=decision_bar_close,
-        order_submitted_at=order_submitted_at,
-        order_filled_at=order_filled_at,
-        avg_fill_price=avg_fill_price,
-        quantity_filled=quantity_filled,
+        action_reason=decision.reason,
+        target_price=decision.target_price,
+        target_price_source=decision.target_price_source,
+        target_quote_time=decision.target_quote_time,
+        decision_bar_close=decision.decision_bar_close,
+        order_submitted_at=fill.order_submitted_at if fill else None,
+        order_filled_at=fill.order_filled_at if fill else None,
+        avg_fill_price=fill.avg_fill_price if fill else None,
+        quantity_filled=fill.quantity_filled if fill else None,
         slippage_abs=slippage_abs,
         slippage_pct=slippage_pct,
         slippage_cost=slippage_cost,
@@ -4605,18 +4601,10 @@ def _log_execution(
         if isinstance(res, OrderFill):
             fill = res
     record = build_execution_record(
-        ticker=decision.ticker,
-        target_price=decision.target_price,
-        target_price_source=decision.target_price_source,
-        target_quote_time=decision.target_quote_time,
-        decision_bar_close=decision.decision_bar_close,
+        decision,
         notional_usd=notional_usd if notional_usd is not None else decision.suggested_amount_usd,
-        action_reason=decision.reason,
         order_id=order_id,
-        order_submitted_at=fill.order_submitted_at if fill else None,
-        order_filled_at=fill.order_filled_at if fill else None,
-        avg_fill_price=fill.avg_fill_price if fill else None,
-        quantity_filled=fill.quantity_filled if fill else None,
+        fill=fill,
     )
     run_result.execution_records.append(record)
     # A submitted order that never returned a fill is an execution gap, not a

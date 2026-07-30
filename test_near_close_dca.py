@@ -1839,16 +1839,26 @@ def test_plain_no_data_still_allows_robinhood_only_buy():
 def test_slippage_calculations_unfavorable_buy():
     submitted = datetime(2026, 6, 29, 15, 45, 0, tzinfo=EASTERN)
     filled = submitted + timedelta(seconds=3)
-    record = build_execution_record(
+    decision = ReconciledDecision(
         ticker="AAPL",
+        action=Action.BUY,
+        reason="",
+        finance_signal=None,
+        robinhood_signal=None,
         target_price=100.0,
         target_price_source="finance:signal_quote",
         decision_bar_close=100.5,
-        notional_usd=10.0,
-        order_submitted_at=submitted,
-        order_filled_at=filled,
+    )
+    fill = OrderFill(
         avg_fill_price=101.0,
         quantity_filled=2.0,
+        order_submitted_at=submitted,
+        order_filled_at=filled,
+    )
+    record = build_execution_record(
+        decision,
+        notional_usd=10.0,
+        fill=fill,
     )
     assert record.status == "filled"
     assert abs(record.slippage_abs - 1.0) < 1e-9
@@ -1859,14 +1869,24 @@ def test_slippage_calculations_unfavorable_buy():
 
 
 def test_slippage_favorable_and_quality_buckets():
-    record = build_execution_record(
+    decision = ReconciledDecision(
         ticker="MSFT",
+        action=Action.BUY,
+        reason="",
+        finance_signal=None,
+        robinhood_signal=None,
         target_price=200.0,
         target_price_source="finance:signal_quote",
         decision_bar_close=200.0,
-        notional_usd=10.0,
+    )
+    fill = OrderFill(
         avg_fill_price=199.9,  # filled below target -> favorable (negative)
         quantity_filled=1.0,
+    )
+    record = build_execution_record(
+        decision,
+        notional_usd=10.0,
+        fill=fill,
     )
     assert record.slippage_abs < 0
     assert abs(record.slippage_pct - (-0.05)) < 1e-9
@@ -1883,16 +1903,22 @@ def test_execution_quality_buckets():
 
 
 def test_unfilled_record_has_no_slippage():
-    record = build_execution_record(
+    decision = ReconciledDecision(
         ticker="NVDA",
+        action=Action.BUY,
+        reason="",
+        finance_signal=None,
+        robinhood_signal=None,
         target_price=50.0,
         target_price_source="finance:signal_quote",
         decision_bar_close=50.0,
-        notional_usd=5.0,
-        avg_fill_price=None,
-        quantity_filled=None,
     )
-    assert record.status == "submitted"
+    record = build_execution_record(
+        decision,
+        notional_usd=5.0,
+        fill=None,
+    )
+    assert record.status == "unfilled"
     assert record.slippage_pct is None
     assert record.execution_quality == "unfilled"
 
@@ -1927,10 +1953,25 @@ def test_missing_fill_classification():
 
 def test_build_report_metrics_and_ranking():
     records = [
-        build_execution_record(ticker="A", target_price=100.0, target_price_source="finance:signal_quote",
-                               decision_bar_close=100.0, notional_usd=10.0, avg_fill_price=101.0, quantity_filled=1.0),
-        build_execution_record(ticker="B", target_price=100.0, target_price_source="finance:signal_quote",
-                               decision_bar_close=100.0, notional_usd=10.0, avg_fill_price=100.2, quantity_filled=1.0),
+        build_execution_record(
+            ReconciledDecision(
+                ticker="A",
+                action=Action.BUY,
+                reason="",
+                finance_signal=None,
+                robinhood_signal=None,
+                target_price=100.0,
+                target_price_source="finance:signal_quote",
+                decision_bar_close=100.0,
+            ),
+            notional_usd=10.0,
+            fill=OrderFill(avg_fill_price=101.0, quantity_filled=1.0),
+        ),
+        build_execution_record(
+            ReconciledDecision(ticker="B", action=Action.BUY, reason="", finance_signal=None, robinhood_signal=None, target_price=100.0, target_price_source="finance:signal_quote", decision_bar_close=100.0),
+            notional_usd=10.0,
+            fill=OrderFill(avg_fill_price=100.2, quantity_filled=1.0)
+        ),
     ]
     run_result = RunResult(
         trading_day=date(2026, 6, 29),
