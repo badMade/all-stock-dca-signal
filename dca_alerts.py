@@ -351,7 +351,7 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
     resolved-address check before it is followed.
     """
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: PLR0913
         try:
             _assert_safe_destination(newurl)
         except _UnsafeDestinationError as exc:
