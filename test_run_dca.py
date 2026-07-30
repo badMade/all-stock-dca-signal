@@ -10,7 +10,15 @@ import pytest
 
 from dca_config import load_strategy_config
 from near_close_dca import EASTERN, DryRunBroker, SourceName, StrategyConfig, StrategyState, build_broker
-from run_dca import DemoDataProvider, _fills_from_orders_csv, _is_within, _resolve_now, main, run_pipeline
+from run_dca import (
+    DemoDataProvider,
+    _demo_runtime,
+    _fills_from_orders_csv,
+    _is_within,
+    _resolve_now,
+    main,
+    run_pipeline,
+)
 
 
 def _now(day=(2026, 7, 6)):
@@ -20,6 +28,19 @@ def _now(day=(2026, 7, 6)):
 def _demo_config():
     # Approve the demo trading day regardless of the bundled window.
     return load_strategy_config(approved_test_dates=frozenset({_now().date()}))
+
+
+def test_demo_runtime():
+    config = StrategyConfig(decision_time_et=time(15, 45))
+    finance, robinhood, broker = _demo_runtime(config)
+
+    assert isinstance(finance, DemoDataProvider)
+    assert finance.source == SourceName.FINANCE
+
+    assert isinstance(robinhood, DemoDataProvider)
+    assert robinhood.source == SourceName.ROBINHOOD
+
+    assert isinstance(broker, DryRunBroker)
 
 
 def test_resolve_now_with_naive_string():
