@@ -15,6 +15,7 @@ from run_dca import (
     DemoDataProvider,
     _demo_runtime,
     _fills_from_orders_csv,
+    _final_buy_trend_override_window_start,
     _is_within,
     _resolve_now,
     configure_logging,
@@ -4302,6 +4303,29 @@ def test_cli_still_refuses_to_run_a_slot_live(tmp_path, capsys):
         "--now", "2026-07-06T15:45:00",
     ])
     assert exit_code == 2
+
+
+@pytest.mark.parametrize(
+    "dt, expected_time",
+    [
+        # Pre-retime: Keep legacy 15:15 window
+        (datetime(2026, 7, 26, 12, 0, tzinfo=EASTERN), time(15, 15)),
+        # Exact retime date: Canonical 15:25 window
+        (datetime(2026, 7, 27, 12, 0, tzinfo=EASTERN), time(15, 25)),
+        # Post-retime date: Canonical 15:25 window
+        (datetime(2026, 7, 28, 12, 0, tzinfo=EASTERN), time(15, 25)),
+        # Pre-retime but provided in UTC (16:00 UTC -> 12:00 EDT)
+        (datetime(2026, 7, 26, 16, 0, tzinfo=timezone.utc), time(15, 15)),
+        # UTC retime-date timestamp that is still pre-retime in ET (00:30 UTC -> 20:30 EDT previous day)
+        (datetime(2026, 7, 27, 0, 30, tzinfo=timezone.utc), time(15, 15)),
+        # Post-retime but provided in UTC (16:00 UTC -> 12:00 EDT)
+        (datetime(2026, 7, 28, 16, 0, tzinfo=timezone.utc), time(15, 25)),
+        # UTC post-retime timestamp that is still on retime date in ET (00:30 UTC -> 20:30 EDT)
+        (datetime(2026, 7, 28, 0, 30, tzinfo=timezone.utc), time(15, 25))
+    ]
+)
+def test_final_buy_trend_override_window_start(dt, expected_time):
+    assert _final_buy_trend_override_window_start(dt) == expected_time
 
 
 @patch("run_dca.logging.basicConfig")
