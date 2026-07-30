@@ -7805,8 +7805,21 @@ def test_assess_output_is_json_serialisable():
     assert json.loads(json.dumps(r))["verdict"] == "PROCEED"
 
 
-def test_assess_never_reports_placement_enabled():
+def test_assess_reports_placement_enabled_only_on_proceed():
     r = dca_runner.assess(**_clean_kwargs(candidates=[("AAPL", 4.0)]))
+    assert r["verdict"] == "PROCEED"
+    assert r["placement_enabled"] is True
+
+
+def test_assess_reports_placement_disabled_on_abort():
+    r = dca_runner.assess(**_clean_kwargs(now=datetime(2026, 7, 28, 11, 15, tzinfo=ET)))
+    assert r["verdict"] == "ABORT"
+    assert r["placement_enabled"] is False
+
+
+def test_assess_reports_placement_disabled_on_end_silently():
+    r = dca_runner.assess(**_clean_kwargs(now=datetime(2026, 8, 1, 9, 43, tzinfo=ET)))
+    assert r["verdict"] == "END_SILENTLY"
     assert r["placement_enabled"] is False
 
 

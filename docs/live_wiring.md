@@ -137,7 +137,16 @@ which is what `state_transaction` is for.
 weekly_rollover_reserve_week_key=None, buying_power_usd=None)` runs Gates 0, 1, 3, 4 and 6
 and returns one of three verdicts:
 `END_SILENTLY` (weekend, holiday, early-close afternoon), `ABORT` (alert, place nothing,
-never retry) or `PROCEED` (with a costed plan attached). `candidates` are `(ticker,
+never retry) or `PROCEED` (with a costed plan attached). The returned `placement_enabled`
+mirrors the verdict -- `True` only for `PROCEED`, `False` otherwise -- but reports this
+assessment's own gate outcome only; it is not authorization to call `place_equity_order`
+directly. Real placement must go through `execute_plan()`, which reruns the
+clock/order-history/budget/account checks fresh immediately before submission, since a
+delayed caller or an order placed elsewhere after this assessment ran can make a stale
+`placement_enabled=True` no longer true. `execute_plan()` also requires a live `Plan`
+object, not this call's JSON `plan` dict, so no caller reaches it by round-tripping
+through `assess`'s output -- see "Not yet wired to the live prompts" below: none of the
+seven scheduled prompts currently acts on this field at all. `candidates` are `(ticker,
 amount_usd)` pairs, `(ticker, amount_usd, multiplier)` triples, or `(ticker, amount_usd,
 multiplier, drop_pct)` quadruples; passing the real ladder multiplier and drop is
 preferred so a reduced-base high-multiplier signal is not undercounted and the

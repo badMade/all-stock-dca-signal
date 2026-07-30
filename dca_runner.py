@@ -3743,6 +3743,20 @@ def assess(
         ABORT         something is wrong. Alert, place nothing, never retry.
         PROCEED       gates pass. ``plan`` holds what would be placed.
 
+    ``placement_enabled`` mirrors the verdict: ``True`` only for ``PROCEED``,
+    ``False`` for ``END_SILENTLY``/``ABORT``. It reports this ASSESSMENT's own
+    gate outcome only -- it is not authorization to call
+    ``place_equity_order`` directly. Real placement must go through
+    ``execute_plan()``, which reruns the clock/order-history/budget/account
+    checks fresh immediately before submission, since a delayed caller or an
+    order placed elsewhere after this assessment ran can make a stale
+    ``placement_enabled=True`` no longer true; ``execute_plan()`` also
+    requires a live ``Plan`` object, not this dict's ``plan``, so no caller
+    reaches it by round-tripping through ``assess()``'s JSON output (see the
+    "Returns a JSON-serialisable dict" note below). See
+    docs/live_wiring.md's "Not yet wired to the live prompts" section: none
+    of the seven scheduled prompts currently acts on this field at all.
+
     ``candidates`` are ``(ticker, amount_usd)`` pairs, ``(ticker, amount_usd,
     multiplier)`` triples, or ``(ticker, amount_usd, multiplier, drop_pct)``
     quadruples from the repo's own signal generation. This function never
@@ -3873,7 +3887,7 @@ def assess(
             "trading_day": trading_day.isoformat(),
             "verdict": verdict,
             "reason": reason,
-            "placement_enabled": False,
+            "placement_enabled": verdict == "PROCEED",
         }
         payload.update(extra)
         return payload
