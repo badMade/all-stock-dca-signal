@@ -152,17 +152,14 @@ def aggregate_usage(
         if usage.get("manual_recovery_required"):
             manual_recovery_runs += 1
 
-    # ⚡ Jules Optimization: Fast aggregation using sum() across each target field.
-    # Restructures logic to process each target field once across all dictionaries.
-    # Uses a generator expression to avoid allocating an intermediate list.
+    # Field-wise sum() is retained here (rather than a manual nested loop) because
+    # it benchmarks faster for the larger record counts this rollup sees in practice.
     for field in _NUMERIC_PROXY_FIELDS:
         totals[field] = sum(_num(u.get(field)) for u in valid_usages)
 
     components: List[Dict[str, Any]] = []
     estimated_total = 0.0
     for name, fields, weight in COMPONENT_DEFINITIONS:
-        # ⚡ Bolt Optimization: Replace sum() generator expression with a
-        # manual loop to eliminate generator overhead.
         count = 0.0
         for field in fields:
             count += totals.get(field, 0.0)

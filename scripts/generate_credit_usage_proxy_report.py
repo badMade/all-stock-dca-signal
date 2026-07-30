@@ -2468,15 +2468,35 @@ def _usage_counts(
     # into its scheduled row's own recorded_error above -- the earlier
     # attempts are real, distinct error events of their own and must not be
     # collapsed away -- codex review discussion_r3661312397.
-    failed_start_escalation_count = sum(1 for r in recovery_rows if r.get("source") == "failed_start_escalation")
-    late_error_escalation_count = sum(1 for r in recovery_rows if r.get("source") == "late_error_escalation")
-    recorded_error_count = sum(1 for r in scheduled_rows if r.get("recorded_error"))
+    # ⚡ Bolt Optimization: Replace multiple O(N) generator passes with manual loops
+    # (one pass over recovery_rows and one pass over scheduled_rows) to avoid
+    # redundant iteration overhead when computing multiple counters.
+    failed_start_escalation_count = 0
+    late_error_escalation_count = 0
+    for r in recovery_rows:
+        src = r.get("source")
+        if src == "failed_start_escalation":
+            failed_start_escalation_count += 1
+        elif src == "late_error_escalation":
+            late_error_escalation_count += 1
+
+    recorded_error_count = 0
+    run_count_scheduled = 0
+    no_op_count = 0
+    for r in scheduled_rows:
+        if r.get("recorded_error"):
+            recorded_error_count += 1
+        if r.get("classification") == "valid_scheduled_evidence":
+            run_count_scheduled += 1
+        if r.get("order_attempts") == 0:
+            no_op_count += 1
+
     error_count = failed_start_escalation_count + late_error_escalation_count + recorded_error_count
 
     return {
-        "run_count_scheduled": sum(1 for r in scheduled_rows if r["classification"] == "valid_scheduled_evidence"),
+        "run_count_scheduled": run_count_scheduled,
         "run_count_recovery": len(run_rows),
-        "no_op_count": sum(1 for r in scheduled_rows if r.get("order_attempts") == 0),
+        "no_op_count": no_op_count,
         # Only rows that actually ran (valid_scheduled_evidence, or a manual
         # recovery execution) could have placed an order; did_not_run/
         # failed-start-cross-reference rows contribute nothing and are
