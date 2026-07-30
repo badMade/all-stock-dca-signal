@@ -4335,6 +4335,26 @@ def test_cli_still_refuses_to_run_a_slot_live(tmp_path, capsys):
     ])
     assert exit_code == 2
 
+@patch("run_dca.atomic_write_text")
+@patch("scripts.drift_detection.send_slack_alert")
+@patch("scripts.drift_detection.detect_drift")
+def test_run_drift_check(mock_detect_drift, mock_send_slack_alert, mock_atomic_write_text, tmp_path):
+    """Test _run_drift_check handles drift reporting without invoking slack."""
+    from run_dca import _run_drift_check
+
+    report = mock_detect_drift.return_value
+    report.drift_detected = False
+    report.to_dict.return_value = {"status": "ok"}
+    report.to_json.return_value = "{\"status\": \"ok\"}\n"
+    report.to_markdown.return_value = "status: ok\n"
+
+    assert _run_drift_check(tmp_path) == {"status": "ok"}
+    mock_detect_drift.assert_called_once_with(tmp_path)
+    mock_atomic_write_text.assert_any_call(tmp_path / "drift_report.json", "{\"status\": \"ok\"}\n")
+    mock_atomic_write_text.assert_any_call(tmp_path / "drift_report.md", "status: ok\n")
+    assert mock_atomic_write_text.call_count == 2
+    mock_send_slack_alert.assert_not_called()
+
 
 @pytest.mark.parametrize(
     "dt, expected_time",
