@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -16,6 +17,7 @@ from run_dca import (
     _fills_from_orders_csv,
     _is_within,
     _resolve_now,
+    configure_logging,
     main,
     run_pipeline,
 )
@@ -4300,3 +4302,31 @@ def test_cli_still_refuses_to_run_a_slot_live(tmp_path, capsys):
         "--now", "2026-07-06T15:45:00",
     ])
     assert exit_code == 2
+
+
+@patch("run_dca.logging.basicConfig")
+def test_configure_logging_default(mock_basic_config):
+    configure_logging()
+    mock_basic_config.assert_called_once_with(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    )
+
+
+@patch("run_dca.logging.basicConfig")
+def test_configure_logging_custom_level(mock_basic_config):
+    configure_logging("DEBUG")
+    mock_basic_config.assert_called_once_with(
+        level=logging.DEBUG,
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    )
+
+
+@patch("run_dca.logging.basicConfig")
+def test_configure_logging_invalid_level(mock_basic_config):
+    # If the level doesn't exist, getattr returns the default, which is INFO
+    configure_logging("INVALID")
+    mock_basic_config.assert_called_once_with(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    )
