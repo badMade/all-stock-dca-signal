@@ -318,7 +318,7 @@ def _resolve_cross_stream_prior_allocation_roots(
       removing its fallback", "Scan only the nested intraday override").
       Deciding this after the fact -- by checking whether the override
       "survived" the general containment/pruning passes below -- kept
-      running into the same family of bug: those passes are built to keep
+      running into the same family of issues: those passes are built to keep
       the BROADEST surviving root and prune redundant descendants (correct
       for the general nested-config case), but for intraday specifically
       that direction is backwards whenever the override is narrower than
@@ -396,7 +396,7 @@ def _resolve_cross_stream_prior_allocation_roots(
 
     # Resolve UPFRONT whether the override is CONFIGURED at all, and
     # separately whether it needs its own scan entry (ACTIVE) -- these are
-    # NOT the same question, and conflating them was itself a bug (Codex
+    # NOT the same question, and conflating them was itself an issue (Codex
     # review: "Drop the legacy fallback for covered nested overrides"). An
     # override that is a STRICT ANCESTOR of afternoon_root is a genuine
     # misconfiguration -- practically the whole cron tree, not a meaningful
