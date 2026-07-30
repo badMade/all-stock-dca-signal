@@ -794,11 +794,15 @@ def _fills_from_orders_csv(orders_csv: Path) -> List[Dict[str, Any]]:
         for row in csv.DictReader(handle):
             if (row.get("status") or "").lower() != "filled":
                 continue
+            fill_price = (row.get("avg_fill_price") or "").strip()
+            filled_qty = (row.get("quantity_filled") or "").strip()
+            if fill_price in ("", "-") or filled_qty in ("", "-"):
+                continue
             fills.append(
                 {
                     "ticker": row.get("ticker"),
-                    "fill_price": row.get("avg_fill_price"),
-                    "filled_qty": row.get("quantity_filled"),
+                    "fill_price": fill_price,
+                    "filled_qty": filled_qty,
                     "order_id": row.get("order_id"),
                 }
             )

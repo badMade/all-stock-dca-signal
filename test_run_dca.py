@@ -2581,6 +2581,35 @@ def test_fills_from_orders_csv(tmp_path):
     assert fills[0]["order_id"] == "O1"
 
 
+def test_fills_from_orders_csv_malformed(tmp_path):
+    csv_path = tmp_path / "malformed_orders.csv"
+    csv_path.write_text(
+        "ticker,status,order_id,avg_fill_price,quantity_filled\n"
+        "AAPL,,O1,100.0,0.5\n"
+        "MSFT,filled,O2,,\n"
+        "TSLA,FiLleD,O3,200.0,0.1\n"
+        "GOOG\nAMZN,filled,O4,150.0,\nNFLX,filled,O5,,0.2\n",
+        encoding="utf-8",
+    )
+    fills = _fills_from_orders_csv(csv_path)
+
+    assert len(fills) == 1
+
+    assert fills[0]["ticker"] == "TSLA"
+    assert fills[0]["fill_price"] == "200.0"
+    assert fills[0]["filled_qty"] == "0.1"
+    assert fills[0]["order_id"] == "O3"
+
+    csv_path2 = tmp_path / "missing_cols_orders.csv"
+    csv_path2.write_text(
+        "ticker,order_id,avg_fill_price,quantity_filled\n"
+        "AAPL,O1,100.0,0.5\n",
+        encoding="utf-8",
+    )
+    fills2 = _fills_from_orders_csv(csv_path2)
+    assert len(fills2) == 0
+
+
 def test_execution_targets_from_orders_csv(tmp_path):
     from run_dca import _execution_targets_from_orders_csv
 
