@@ -2588,7 +2588,9 @@ def test_fills_from_orders_csv_malformed(tmp_path):
         "AAPL,,O1,100.0,0.5\n"
         "MSFT,filled,O2,,\n"
         "TSLA,FiLleD,O3,200.0,0.1\n"
-        "GOOG\nAMZN,filled,O4,150.0,\nNFLX,filled,O5,,0.2\n",
+        "GOOG\n"
+        "AMZN,filled,O4,150.0,\n"
+        "NFLX,filled,O5,,0.2\n",
         encoding="utf-8",
     )
     fills = _fills_from_orders_csv(csv_path)
