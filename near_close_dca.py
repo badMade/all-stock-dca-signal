@@ -5364,25 +5364,42 @@ def _write_and_validate_scheduled_contract(
     return result
 
 
+
+@dataclass(frozen=True)
+class ArtifactWriteContext:
+    """Bundles :func:`_finalize_and_write_artifacts`'s tracking counters, run
+    directories, and persistence overrides into one object.
+
+    ``artifacts_dir`` gates the whole write (``None`` skips it entirely);
+    ``scheduled`` selects the manual-vs-scheduled artifact contract and, when
+    true, whether the scheduled-run pointer at ``classification_state_root``
+    gets updated. The remaining fields are optional annotations/overrides
+    forwarded to :func:`build_run_artifacts` -- see that function for what
+    each defaults to when left unset.
+    """
+
+    order_reviews_attempted: int
+    errors_count: int
+    scheduled: bool
+    artifacts_dir: Optional[str | Path]
+    classification_state_root: Optional[str | Path]
+    notifications_sent: Optional[int] = None
+    cost_control_notes: Optional[Sequence[str]] = None
+    top_up_outcomes: Optional[Dict[str, TopUpGuardOutcome]] = None
+    raw_persistence_state: Optional[Dict[str, object]] = None
+    classification_overrides: Optional[Dict[str, Any]] = None
+    correlation_id: Optional[str] = None
+
+
 def _finalize_and_write_artifacts(
     now: datetime,
     config: StrategyConfig,
     state: StrategyState,
     decisions: List[ReconciledDecision],
     candidate_outcomes: Dict[str, Dict[str, Any]],
-    order_reviews_attempted: int,
-    errors_count: int,
-    notifications_sent: Optional[int],
-    cost_control_notes: Optional[Sequence[str]],
-    top_up_outcomes: Optional[Dict[str, TopUpGuardOutcome]],
-    scheduled: bool,
-    artifacts_dir: Optional[str | Path],
-    classification_state_root: Optional[str | Path],
-    raw_persistence_state: Optional[Dict[str, object]] = None,
-    classification_overrides: Optional[Dict[str, Any]] = None,
-    correlation_id: Optional[str] = None,
+    context: ArtifactWriteContext,
 ) -> None:
-    if artifacts_dir is None:
+    if context.artifacts_dir is None:
         return
 
     artifacts = build_run_artifacts(
@@ -5391,24 +5408,24 @@ def _finalize_and_write_artifacts(
         state,
         decisions,
         candidate_outcomes,
-        order_reviews_attempted=order_reviews_attempted,
-        errors_count=errors_count,
-        notifications_sent=notifications_sent,
-        cost_control_notes=cost_control_notes,
-        top_up_outcomes=top_up_outcomes,
-        manual=not scheduled,
-        raw_persistence_state=raw_persistence_state,
-        classification_overrides=classification_overrides,
-        correlation_id=correlation_id,
+        order_reviews_attempted=context.order_reviews_attempted,
+        errors_count=context.errors_count,
+        notifications_sent=context.notifications_sent,
+        cost_control_notes=context.cost_control_notes,
+        top_up_outcomes=context.top_up_outcomes,
+        manual=not context.scheduled,
+        raw_persistence_state=context.raw_persistence_state,
+        classification_overrides=context.classification_overrides,
+        correlation_id=context.correlation_id,
     )
-    paths = write_run_artifacts(artifacts, artifacts_dir)
+    paths = write_run_artifacts(artifacts, context.artifacts_dir)
     logger.info("Wrote run artifacts: %s", paths["run_state"])
 
     contract_ok = True
-    if scheduled:
-        contract_ok = bool(_write_and_validate_scheduled_contract(artifacts, artifacts_dir))
+    if context.scheduled:
+        contract_ok = bool(_write_and_validate_scheduled_contract(artifacts, context.artifacts_dir))
 
-    if scheduled and classification_state_root is not None:
+    if context.scheduled and context.classification_state_root is not None:
         try:
             from scripts.run_classification import (
                 update_latest_scheduled_run_pointer,
@@ -5423,7 +5440,7 @@ def _finalize_and_write_artifacts(
         result = validate_classification(rc if isinstance(rc, dict) else {})
         if result and contract_ok:
             update_latest_scheduled_run_pointer(
-                artifacts, paths["run_state"], classification_state_root
+                artifacts, paths["run_state"], context.classification_state_root
             )
         elif not contract_ok:
             # A run that breached the artifact contract (e.g. the compute-only
@@ -6745,17 +6762,19 @@ def _run_once_impl(ctx: RunContext) -> List[ReconciledDecision]:
         state=state,
         decisions=decisions,
         candidate_outcomes=candidate_outcomes,
-        order_reviews_attempted=order_reviews_attempted,
-        errors_count=errors_count,
-        notifications_sent=notifications_sent,
-        cost_control_notes=cost_control_notes,
-        top_up_outcomes=top_up_outcomes if guard_active else None,
-        scheduled=scheduled,
-        artifacts_dir=artifacts_dir,
-        classification_state_root=classification_state_root,
-        raw_persistence_state=raw_persistence_state,
-        classification_overrides=classification_overrides,
-        correlation_id=correlation_id,
+        context=ArtifactWriteContext(
+            order_reviews_attempted=order_reviews_attempted,
+            errors_count=errors_count,
+            notifications_sent=notifications_sent,
+            cost_control_notes=cost_control_notes,
+            top_up_outcomes=top_up_outcomes if guard_active else None,
+            scheduled=scheduled,
+            artifacts_dir=artifacts_dir,
+            classification_state_root=classification_state_root,
+            raw_persistence_state=raw_persistence_state,
+            classification_overrides=classification_overrides,
+            correlation_id=correlation_id,
+        ),
     )
 
     return decisions
