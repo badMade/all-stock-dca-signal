@@ -11,14 +11,19 @@ Fixture scenarios:
 """
 
 import csv
+import ipaddress
 import json
 import sys
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import drift_detection  # noqa: E402
 from drift_detection import (  # noqa: E402
     CAUSE_ORDERS_EMPTY,
     CAUSE_RAW_MISSING,
@@ -331,6 +336,56 @@ class SlackTests(unittest.TestCase):
         report = detect_drift(self.run_dir)
         with self.assertRaises(urllib.error.URLError):
             send_slack_alert(report, webhook="file:///etc/passwd")
+
+    def test_send_slack_blocks_private_destination(self):
+        report = detect_drift(self.run_dir)
+        with patch.object(
+            drift_detection, "_resolve_ips", lambda hostname: {ipaddress.ip_address("127.0.0.1")}
+        ):
+            with self.assertRaises(urllib.error.URLError):
+                send_slack_alert(report, webhook="https://hooks.example/alert")
+
+    def test_send_slack_blocks_cloud_metadata_destination(self):
+        report = detect_drift(self.run_dir)
+        with patch.object(
+            drift_detection,
+            "_resolve_ips",
+            lambda hostname: {ipaddress.ip_address("169.254.169.254")},
+        ):
+            with self.assertRaises(urllib.error.URLError):
+                send_slack_alert(report, webhook="https://hooks.example/alert")
+
+    def test_send_slack_allows_public_destination(self):
+        report = detect_drift(self.run_dir)
+        calls = []
+
+        class _FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(request, timeout=None):
+            calls.append(request)
+            return _FakeResponse()
+
+        with patch.object(
+            drift_detection, "_resolve_ips", lambda hostname: {ipaddress.ip_address("93.184.216.34")}
+        ), patch.object(urllib.request, "urlopen", fake_urlopen):
+            self.assertTrue(send_slack_alert(report, webhook="https://hooks.example/alert"))
+        self.assertEqual(len(calls), 1)
+
+    def test_safe_redirect_handler_blocks_private_redirect_target(self):
+        handler = drift_detection._SafeRedirectHandler()
+        req = urllib.request.Request("https://hooks.example/start")
+        with patch.object(
+            drift_detection, "_resolve_ips", lambda hostname: {ipaddress.ip_address("127.0.0.1")}
+        ):
+            with self.assertRaises(urllib.error.HTTPError):
+                handler.redirect_request(req, None, 302, "Found", {}, "https://internal.example/secret")
 
     def test_slack_payload_shape(self):
         report = detect_drift(self.run_dir)

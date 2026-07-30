@@ -1,7 +1,9 @@
 """Tests for dca_alerts: failure alerting, heartbeats, and the guarded_run wrapper."""
 
 import io
+import ipaddress
 import json
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +12,8 @@ import pytest
 
 import dca_alerts
 from dca_alerts import alert_failure, guarded_run, heartbeat_url, send_heartbeat
+
+_PUBLIC_IP = ipaddress.ip_address("93.184.216.34")
 
 
 class _FakeResponse(io.BytesIO):
@@ -33,6 +37,17 @@ def captured_requests(monkeypatch):
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     return calls
+
+
+@pytest.fixture(autouse=True)
+def _fake_public_dns(monkeypatch):
+    """dca_alerts now validates that a URL's host resolves to a public address
+    before treating it as safe to use (SSRF guard). Test hostnames like
+    ``hc.example`` are a reserved TLD that never resolves in real DNS, so fake a
+    public address for every hostname here; tests exercising the SSRF-blocking
+    path itself override this per-test.
+    """
+    monkeypatch.setattr(dca_alerts, "_resolve_ips", lambda hostname: {_PUBLIC_IP})
 
 
 def _clear_alert_env(monkeypatch):
@@ -89,6 +104,75 @@ def test_send_heartbeat_never_raises_on_network_error(monkeypatch):
     assert send_heartbeat("morning") is False
 
 
+def test_send_heartbeat_redacts_url_on_delivery_failure(monkeypatch, caplog):
+    _clear_alert_env(monkeypatch)
+    monkeypatch.setenv("DCA_HEARTBEAT_URL", "https://hc.example/super-secret-token")
+
+    def boom(url, timeout=None):
+        raise OSError("network down")
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    with caplog.at_level("WARNING"):
+        assert send_heartbeat("morning") is False
+    assert "super-secret-token" not in caplog.text
+    assert "https://hc.example" in caplog.text
+
+
+@pytest.mark.parametrize("private_ip", ["127.0.0.1", "10.0.0.5", "169.254.169.254", "::1"])
+def test_send_heartbeat_blocks_private_destination(monkeypatch, captured_requests, private_ip):
+    _clear_alert_env(monkeypatch)
+    monkeypatch.setenv("DCA_HEARTBEAT_URL", "https://hc.example/check")
+    monkeypatch.setattr(
+        dca_alerts, "_resolve_ips", lambda hostname: {ipaddress.ip_address(private_ip)}
+    )
+    assert send_heartbeat("morning") is False
+    assert captured_requests == []
+
+
+def test_send_heartbeat_blocks_destination_with_any_disallowed_resolved_ip(monkeypatch, captured_requests):
+    _clear_alert_env(monkeypatch)
+    monkeypatch.setenv("DCA_HEARTBEAT_URL", "https://hc.example/check")
+    monkeypatch.setattr(
+        dca_alerts,
+        "_resolve_ips",
+        lambda hostname: {_PUBLIC_IP, ipaddress.ip_address("127.0.0.1")},
+    )
+    assert send_heartbeat("morning") is False
+    assert captured_requests == []
+
+
+def test_send_heartbeat_blocks_unresolvable_host(monkeypatch, captured_requests):
+    _clear_alert_env(monkeypatch)
+    monkeypatch.setenv("DCA_HEARTBEAT_URL", "https://hc.example/check")
+
+    def boom(hostname):
+        raise OSError("name resolution failed")
+
+    monkeypatch.setattr(dca_alerts, "_resolve_ips", boom)
+    assert send_heartbeat("morning") is False
+    assert captured_requests == []
+
+
+# -- SSRF redirect guard ------------------------------------------------------------
+
+
+def test_safe_redirect_handler_blocks_private_redirect_target(monkeypatch):
+    monkeypatch.setattr(
+        dca_alerts, "_resolve_ips", lambda hostname: {ipaddress.ip_address("127.0.0.1")}
+    )
+    handler = dca_alerts._SafeRedirectHandler()
+    req = urllib.request.Request("https://hc.example/start")
+    with pytest.raises(urllib.error.HTTPError):
+        handler.redirect_request(req, None, 302, "Found", {}, "https://internal.example/secret")
+
+
+def test_safe_redirect_handler_allows_public_redirect_target(monkeypatch):
+    handler = dca_alerts._SafeRedirectHandler()
+    req = urllib.request.Request("https://hc.example/start")
+    new_req = handler.redirect_request(req, None, 302, "Found", {}, "https://hc.example/elsewhere")
+    assert new_req.full_url == "https://hc.example/elsewhere"
+
+
 # -- failure alerts ---------------------------------------------------------------
 
 
@@ -109,6 +193,16 @@ def test_alert_failure_posts_stream_and_exception(monkeypatch, captured_requests
     assert "RuntimeError" in text
     assert "boom" in text
     assert "ctx-info" in text
+
+
+def test_alert_failure_blocks_private_destination(monkeypatch, captured_requests):
+    _clear_alert_env(monkeypatch)
+    monkeypatch.setenv("DCA_ALERT_SLACK_WEBHOOK", "https://hooks.example/alert")
+    monkeypatch.setattr(
+        dca_alerts, "_resolve_ips", lambda hostname: {ipaddress.ip_address("169.254.169.254")}
+    )
+    assert alert_failure("morning", RuntimeError("boom")) is False
+    assert captured_requests == []
 
 
 def test_alert_failure_falls_back_to_drift_webhook(monkeypatch, captured_requests):

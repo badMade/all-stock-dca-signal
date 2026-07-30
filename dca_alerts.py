@@ -28,10 +28,13 @@ mask the original run failure (it is logged instead).
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
+import socket
 import traceback
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -113,15 +116,99 @@ def ensure_log_handler(level: int = logging.INFO) -> None:
     )
 
 
+class _UnsafeDestinationError(Exception):
+    """URL scheme is not http(s), or its host resolves to a disallowed address."""
+
+
+def _resolve_ips(hostname: str) -> "set[ipaddress._BaseAddress]":
+    """Resolve ``hostname``'s IP addresses. A seam so tests can fake DNS."""
+    return {ipaddress.ip_address(info[4][0]) for info in socket.getaddrinfo(hostname, None)}
+
+
+def _is_disallowed_ip(ip: "ipaddress._BaseAddress") -> bool:
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def _assert_safe_destination(url: str) -> None:
+    """Raise :class:`_UnsafeDestinationError` unless ``url`` is http(s) and every
+    address its host resolves to is a public, routable address.
+
+    Restricting only the scheme (the pre-fix state) still lets an
+    attacker-influenced webhook/heartbeat value point at ``http://127.0.0.1:8080/``
+    or the ``http://169.254.169.254/latest/meta-data/`` cloud-metadata endpoint.
+    Every resolved address is checked, not just the first, since a hostname can
+    resolve to a mix of public and private IPs.
+    """
+    parsed = urlsplit(url)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise _UnsafeDestinationError(f"unsupported scheme {parsed.scheme!r}")
+    hostname = parsed.hostname
+    if not hostname:
+        raise _UnsafeDestinationError("missing host")
+    try:
+        ips = _resolve_ips(hostname)
+    except OSError as exc:
+        raise _UnsafeDestinationError("host does not resolve") from exc
+    if not ips or any(_is_disallowed_ip(ip) for ip in ips):
+        raise _UnsafeDestinationError("host resolves to a disallowed address")
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-validate every redirect target the same way as the initial request.
+
+    ``urlopen``'s default redirect handling blindly follows ``Location``
+    headers, so an initially-allowed public URL could 302 to
+    ``http://169.254.169.254/...`` and defeat :func:`_assert_safe_destination`
+    entirely. Each hop through this handler re-runs the same scheme and
+    resolved-address check before it is followed.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        try:
+            _assert_safe_destination(newurl)
+        except _UnsafeDestinationError as exc:
+            raise urllib.error.HTTPError(
+                newurl, code, f"blocked unsafe redirect destination: {exc}", headers, fp
+            ) from exc
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+# Installed once at import time so every urllib.request.urlopen() call in this
+# process -- not just the ones in this module -- gets redirect validation.
+urllib.request.install_opener(urllib.request.build_opener(_SafeRedirectHandler))
+
+
+def _redact_url(url: str) -> str:
+    """Reduce ``url`` to ``scheme://host[:port]``, dropping path/query/fragment.
+
+    Healthcheck-style heartbeat URLs commonly carry their auth token in the
+    path (e.g. ``https://hc.example/<token>``), so anything logged about a
+    delivery failure must not include it.
+    """
+    parsed = urlsplit(url)
+    netloc = parsed.hostname or ""
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+    return f"{parsed.scheme}://{netloc}" if netloc else "(unknown)"
+
+
 def _validated_url(url: Optional[str], purpose: str) -> Optional[str]:
     if not url:
         return None
     url = url.strip()
     if not url:
         return None
-    scheme = urlsplit(url).scheme.lower()
-    if scheme not in {"http", "https"}:
-        logger.warning("ignoring %s URL with unsupported scheme %r", purpose, scheme)
+    try:
+        _assert_safe_destination(url)
+    except _UnsafeDestinationError:
+        logger.warning("ignoring %s URL: not a safe http(s) destination", purpose)
         return None
     return url
 
@@ -150,7 +237,7 @@ def send_heartbeat(
         with urllib.request.urlopen(url, timeout=timeout) as response:  # noqa: S310 - operator-supplied URL
             return 200 <= response.status < 300
     except Exception as exc:  # noqa: BLE001 - delivery failure must not raise
-        logger.warning("heartbeat ping for %s failed (%s): %s", stream, url, exc)
+        logger.warning("heartbeat ping for %s failed (%s): %s", stream, _redact_url(url), exc)
         return False
 
 

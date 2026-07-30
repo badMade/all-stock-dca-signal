@@ -36,14 +36,17 @@ from __future__ import annotations
 
 import argparse
 import csv
+import ipaddress
 import json
 import os
+import socket
 import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
+from urllib.parse import urlsplit
 
 # This module is a documented standalone CLI (``python scripts/drift_detection.py``),
 # and direct invocation puts only ``scripts/`` on sys.path -- so the repo root is
@@ -711,6 +714,80 @@ def resolve_webhook(webhook: Optional[str], env_var: str) -> Optional[str]:
     return os.environ.get(env_var) or None
 
 
+class _UnsafeWebhookDestinationError(Exception):
+    """Webhook URL scheme is not http(s), or its host resolves to a disallowed address."""
+
+
+def _resolve_ips(hostname: str) -> "set[ipaddress._BaseAddress]":
+    """Resolve ``hostname``'s IP addresses. A seam so tests can fake DNS."""
+    return {ipaddress.ip_address(info[4][0]) for info in socket.getaddrinfo(hostname, None)}
+
+
+def _is_disallowed_ip(ip: "ipaddress._BaseAddress") -> bool:
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def _assert_safe_webhook_destination(url: str) -> None:
+    """Raise :class:`_UnsafeWebhookDestinationError` unless ``url`` is http(s) and
+    every address its host resolves to is a public, routable address.
+
+    Restricting only the scheme (the pre-fix state) still lets an
+    attacker-influenced webhook value point at ``http://127.0.0.1:8080/`` or the
+    ``http://169.254.169.254/latest/meta-data/`` cloud-metadata endpoint. Every
+    resolved address is checked, not just the first, since a hostname can
+    resolve to a mix of public and private IPs. Mirrors
+    ``dca_alerts._assert_safe_destination`` -- duplicated rather than imported to
+    keep this module free of a dependency on the repo-root package (see the
+    ``atomic_write_text`` import note above for why that's already an exception,
+    not the rule).
+    """
+    parsed = urlsplit(url)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise _UnsafeWebhookDestinationError(f"unsupported scheme {parsed.scheme!r}")
+    hostname = parsed.hostname
+    if not hostname:
+        raise _UnsafeWebhookDestinationError("missing host")
+    try:
+        ips = _resolve_ips(hostname)
+    except OSError as exc:
+        raise _UnsafeWebhookDestinationError("host does not resolve") from exc
+    if not ips or any(_is_disallowed_ip(ip) for ip in ips):
+        raise _UnsafeWebhookDestinationError("host resolves to a disallowed address")
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-validate every redirect target the same way as the initial request.
+
+    ``urlopen``'s default redirect handling blindly follows ``Location``
+    headers, so an initially-allowed public webhook URL could 302 to
+    ``http://169.254.169.254/...`` and defeat
+    :func:`_assert_safe_webhook_destination` entirely. Each hop through this
+    handler re-runs the same scheme and resolved-address check before it is
+    followed.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        try:
+            _assert_safe_webhook_destination(newurl)
+        except _UnsafeWebhookDestinationError as exc:
+            raise urllib.error.HTTPError(
+                newurl, code, f"blocked unsafe redirect destination: {exc}", headers, fp
+            ) from exc
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+# Installed once at import time so every urllib.request.urlopen() call in this
+# process -- not just the one in this module -- gets redirect validation.
+urllib.request.install_opener(urllib.request.build_opener(_SafeRedirectHandler))
+
+
 def send_slack_alert(
     report: DriftReport,
     *,
@@ -732,13 +809,10 @@ def send_slack_alert(
     if not url:
         return False
 
-    from urllib.parse import urlsplit
-
-    scheme = urlsplit(url).scheme.lower()
-    if scheme not in {"http", "https"}:
-        raise urllib.error.URLError(
-            f"Invalid webhook URL scheme {scheme!r}. Expected 'http' or 'https'."
-        )
+    try:
+        _assert_safe_webhook_destination(url)
+    except _UnsafeWebhookDestinationError as exc:
+        raise urllib.error.URLError(f"Invalid or unsafe webhook destination: {exc}") from exc
 
     payload = json.dumps(build_slack_payload(report)).encode("utf-8")
     request = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
