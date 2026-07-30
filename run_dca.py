@@ -2161,7 +2161,7 @@ def _run_pipeline_impl(
                     # bounded-reload fix should make on its own; escalate
                     # loudly instead so an operator can decide whether the
                     # affected artifacts warrant a manual hold.
-                    logger.warning(
+                    logger.error(
                         "same-day context scan for %s still had unreadable/unparseable "
                         "artifacts after the bounded reload; a ticker whose ONLY "
                         "same-day artifact was affected would not appear in "

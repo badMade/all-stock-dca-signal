@@ -1475,6 +1475,34 @@ def test_compute_auto_derived_prior_allocations_reports_scan_had_failures(tmp_pa
     assert scan_had_failures is True
 
 
+def test_run_pipeline_logs_error_when_bounded_reload_scan_still_fails(tmp_path, monkeypatch, caplog):
+    import run_dca
+
+    calls = 0
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+        nonlocal calls
+        calls += 1
+        return {}, True
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    with caplog.at_level("ERROR", logger=run_dca.logger.name):
+        run_dca.run_pipeline(
+            _now(), config, StrategyState(),
+            DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+            build_broker(config), artifacts_dir=tmp_path,
+        )
+
+    assert calls == 2
+    assert any(
+        record.levelname == "ERROR"
+        and "still had unreadable/unparseable artifacts after the bounded reload" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def test_run_pipeline_bounded_reload_preserves_already_resolved_ticker(tmp_path, monkeypatch):
     # Codex review ("Preserve resolved ticker context across the reload"): the
     # bounded reload exists to give an UNRESOLVED ticker a second chance, not
