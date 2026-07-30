@@ -4207,4 +4207,4 @@ def test_state_root_and_cron_tracking_root_resolve_at_call_time():
     # import-time constant used elsewhere (e.g. its own module docstring
     # references) -- which is exactly why state_root() naming it directly
     # was wrong.
-    assert lines[2] == "/home/user/workspace/cron_tracking/ce16ba6b", out.stdout
+    assert lines[2] == str(Path(__file__).resolve().parents[2] / "cron_tracking" / "ce16ba6b"), out.stdout

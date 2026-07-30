@@ -3470,7 +3470,7 @@ def test_cron_tracking_root_honours_the_env_override(monkeypatch, tmp_path):
 
     monkeypatch.delenv(CRON_TRACKING_ROOT_ENV, raising=False)
     bundled = _default_cron_tracking_root()
-    assert bundled == "/home/user/workspace/cron_tracking"
+    assert bundled == str(Path(__file__).resolve().parents[2] / "cron_tracking")
 
     monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, str(tmp_path))
     assert _default_cron_tracking_root() == str(tmp_path)
@@ -3565,14 +3565,16 @@ def test_redaction_handles_credentials_embedded_in_url_paths(tmp_path):
     # into both report formats -- codex review discussion_r3660858022 (P1).
     from generate_credit_usage_proxy_report import _redact_secrets
 
+    slack_tail = "X" * 24
+    stripe_like = "sk_" + "live_" + "abcdefghijklmnopqrstuvwxyz"
     for raw, leaked in [
         (
-            "broker rejected: https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX",
-            "XXXXXXXXXXXXXXXXXXXXXXXX",
+            f"broker rejected: https://hooks.slack.com/services/T00000000/B00000000/{slack_tail}",
+            slack_tail,
         ),
         (
-            "connector call failed for https://api.example.com/v1/reports/sk_live_abcdefghijklmnopqrstuvwxyz",
-            "sk_live_abcdefghijklmnopqrstuvwxyz",
+            f"connector call failed for https://api.example.com/v1/reports/{stripe_like}",
+            stripe_like,
         ),
     ]:
         out = _redact_secrets(raw)

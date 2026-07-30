@@ -10,6 +10,7 @@ import json
 import os
 import pathlib
 import tempfile
+from dataclasses import replace
 from datetime import date, datetime, time, timedelta
 
 import pytest
@@ -1122,7 +1123,13 @@ def test_guarded_top_up_retry_records_recovered_buy_despite_seeded_prior_context
     # restart looks like -- seeded with the morning allocation the same way
     # _run_once_impl seeds it before ever reaching _process_buy_candidate.
     fresh_state = StrategyState()
-    _seed_prior_allocations(fresh_state, trading_day, True, {"AAPL": prior})
+    _seed_prior_allocations(
+        fresh_state,
+        trading_day,
+        True,
+        {"AAPL": prior},
+        one_order_per_ticker_per_day=False,
+    )
     assert fresh_state.buys_today("AAPL", trading_day) == 1, "seeding must land the morning allocation"
     assert fresh_state.day_notional(trading_day) == pytest.approx(1.0)
 
@@ -6939,3 +6946,204 @@ def test_a_properly_pinned_injected_broker_still_passes():
 def test_a_dry_run_is_unaffected_by_the_pinning_gate():
     config = StrategyConfig(dry_run=True, target_account_number="")
     assert _check_execution_gates(_an_approved_day(config), config, _InjectedBroker(""), None)
+
+
+# --- one_order_per_ticker_per_day: closing the ticker_guarded bypass ---------
+#
+# config/budgets.json order_rules asserts one_order_per_ticker_per_day: true.
+# Nothing read it. _process_buy_candidate gates duplicates twice --
+# state.buys_today (:5296) and broker.same_day_strategy_order_exists (:5315) --
+# and both are skipped when `ticker_guarded` is set, i.e. whenever a prior
+# same-day allocation was loaded. That bypass is deliberate for the legacy
+# manual-morning -> scheduled-afternoon top-up, and is kept by default.
+#
+# On the seven-slot roster it is the hazard: with the guard's state root absent
+# (see test_dca_paths) or a slot missing from the prior-allocation chain, the
+# same ticker can be bought at successive slots at RISING prices. The new flag
+# lets a roster slot demand "first slot wins" without changing the legacy path.
+
+
+def test_one_order_per_ticker_per_day_defaults_off_to_preserve_the_top_up_path():
+    """Default False so test_run_daily_compact_manual_run_does_not_block_scheduled
+    and the documented manual->afternoon top-up keep working unchanged."""
+    assert StrategyConfig().one_order_per_ticker_per_day is False
+
+
+def test_flag_makes_the_broker_same_day_gate_beat_a_loaded_prior_allocation(tmp_path):
+    """With the flag on, a prior allocation no longer buys a second time."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-perday")
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = replace(config, one_order_per_ticker_per_day=True)
+
+    class _BlockingBroker(DryRunBroker):
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return True
+
+    blocking = _BlockingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    prior = {
+        "AAPL": PriorSameDayAllocation(
+            "AAPL", amount_usd=2.0, reference_price=99.0, run_id="slot_1030", source="scheduled",
+            selected_base_amount_usd=2.0,
+        ),
+    }
+
+    run_daily_compact(
+        now, config, state, fin, rh, blocking,
+        artifacts_dir=artifacts_dir, prior_same_day_allocations=prior,
+    )
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # Same setup as test_run_daily_compact_manual_run_does_not_block_scheduled,
+    # which asserts AAPL is topped up for $2. The flag inverts exactly that.
+    assert by_ticker["AAPL"]["status"] == "skipped"
+    assert by_ticker["AAPL"]["skip_reason"] == "same-day broker order exists"
+    assert by_ticker["AAPL"].get("incremental_order_amount", 0.0) == 0.0
+
+
+def test_flag_checks_the_hard_ceiling_before_its_own_broker_duplicate_lookup(tmp_path):
+    """Codex review discussion_r3679633773: 'Check the hard ceiling before the
+    broker duplicate lookup'. one_order_per_ticker_per_day's own broad
+    same_day_strategy_order_exists() check must not run for a candidate that
+    is already over the hard per-order ceiling -- that candidate should never
+    need a broker round-trip, matching the existing cap-before-duplicate
+    contract for the legacy (flag-off) path.
+    """
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-perday-cap-before-dup")
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = replace(
+        config,
+        one_order_per_ticker_per_day=True,
+        tickers=("AAPL",),
+        base_buy_amount_usd=10.0,
+        max_per_order_usd=15.0,
+    )
+
+    class _TrackingBroker(DryRunBroker):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.duplicate_lookup_calls = []
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            self.duplicate_lookup_calls.append(ticker)
+            return super().same_day_strategy_order_exists(ticker, trading_day)
+
+    tracking_broker = _TrackingBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+
+    run_daily_compact(now, config, state, fin, rh, tracking_broker, artifacts_dir=artifacts_dir)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    candidate = run_state["buy_candidates"][0]
+    assert candidate["status"] == "blocked"
+    assert candidate["skip_reason"] == "max per-order ceiling exceeded"
+    assert tracking_broker.duplicate_lookup_calls == []
+
+
+def test_flag_makes_local_buys_today_gate_beat_a_loaded_prior_allocation(tmp_path):
+    """The :5296 gate is bypassed by ticker_guarded too; the flag closes both."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-perday-local")
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = replace(config, one_order_per_ticker_per_day=True)
+
+    trading_day = now.astimezone(EASTERN).date()
+    state.record_buy("AAPL", trading_day, 2.0)
+    prior = {
+        "AAPL": PriorSameDayAllocation(
+            "AAPL", amount_usd=2.0, reference_price=99.0, run_id="slot_1030", source="scheduled",
+            selected_base_amount_usd=2.0,
+        ),
+    }
+
+    run_daily_compact(
+        now, config, state, fin, rh, broker,
+        artifacts_dir=artifacts_dir, prior_same_day_allocations=prior,
+    )
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    assert by_ticker["AAPL"]["status"] == "skipped"
+    assert by_ticker["AAPL"]["skip_reason"] == "already bought today"
+
+
+def test_flag_off_leaves_the_documented_top_up_bypass_intact(tmp_path):
+    """Anti-entropy pin: the legacy path must be untouched when the flag is off."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-legacy")
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    assert config.one_order_per_ticker_per_day is False
+
+    class _BlockingBroker(DryRunBroker):
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return True
+
+    blocking = _BlockingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    prior = {
+        "AAPL": PriorSameDayAllocation(
+            "AAPL", amount_usd=2.0, reference_price=99.0, run_id="manual_am", source="manual",
+            selected_base_amount_usd=2.0,
+        ),
+    }
+
+    run_daily_compact(
+        now, config, state, fin, rh, blocking,
+        artifacts_dir=artifacts_dir, prior_same_day_allocations=prior,
+    )
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    assert by_ticker["AAPL"]["status"] == "dry_run"
+    assert by_ticker["AAPL"]["incremental_order_amount"] == 2.0
+
+
+def test_seed_prior_allocations_still_seeds_notional_when_the_flag_is_on():
+    """Codex review discussion_r3679391265: 'Preserve prior allocations in cap
+    bookkeeping'. Before this fix, one_order_per_ticker_per_day=True made
+    _seed_prior_allocations an early-return no-op, so an earlier roster slot's
+    spend never counted against day_notional()/week_notional() -- a later
+    slot's OTHER (different-ticker) candidates would then see the full daily/
+    weekly cap as if nothing had been spent yet, letting the roster's
+    successive slots exceed the configured absolute $ caps even though the
+    broker-level duplicate check still blocked re-buying the SAME ticker.
+    """
+    state = StrategyState()
+    trading_day = date(2026, 6, 29)
+    prior = {
+        "AAPL": PriorSameDayAllocation(
+            ticker="AAPL", amount_usd=2.0, reference_price=99.0, run_id="slot_1030", source="scheduled",
+            selected_base_amount_usd=2.0,
+        ),
+    }
+
+    _seed_prior_allocations(
+        state,
+        trading_day,
+        True,
+        prior,
+        one_order_per_ticker_per_day=True,
+    )
+
+    assert state.buys_today("AAPL", trading_day) == 1
+    assert state.day_notional(trading_day) == pytest.approx(2.0)
+    assert state.week_notional(trading_day) == pytest.approx(2.0)
+
+
+def test_seed_prior_allocations_is_a_noop_when_guard_inactive_regardless_of_the_flag():
+    """guard_active still gates seeding either way: an unscheduled/manual run
+    (or a scheduled run with no prior_same_day_allocations loaded at all) must
+    not seed bookkeeping from a stale caller-supplied dict."""
+    state = StrategyState()
+    trading_day = date(2026, 6, 29)
+    prior = {
+        "AAPL": PriorSameDayAllocation(
+            ticker="AAPL", amount_usd=2.0, reference_price=99.0, run_id="slot_1030", source="scheduled",
+            selected_base_amount_usd=2.0,
+        ),
+    }
+
+    _seed_prior_allocations(state, trading_day, False, prior, one_order_per_ticker_per_day=True)
+
+    assert state.buys_today("AAPL", trading_day) == 0
+    assert state.day_notional(trading_day) == pytest.approx(0.0)

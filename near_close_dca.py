@@ -589,6 +589,7 @@ class StrategyConfig:
     high_multiplier_threshold: float = 3.0
     minimum_drop_vs_previous_close: float = 0.001
     max_buys_per_ticker_per_day: int = 1
+    one_order_per_ticker_per_day: bool = False
     max_bid_ask_spread_pct: float = 1.0
     target_account_number: str = ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
     broker: BrokerName = BrokerName.ROBINHOOD
@@ -929,6 +930,9 @@ class DryRunBroker:
 
     def get_order_fill(self, order_id: str) -> Optional[OrderFill]:
         return self._fills.get(order_id)
+
+    def get_raw_placement_responses(self) -> List[Dict[str, Any]]:
+        return []
 
 
 def format_notional(amount_usd: float) -> str:
@@ -2052,7 +2056,19 @@ def _build_buy_candidates(
                     "prior_same_day_reference_price": guard.prior_same_day_reference_price,
                     "prior_same_day_run_id": guard.prior_same_day_run_id,
                     "prior_same_day_source": guard.prior_same_day_source,
-                    "incremental_order_amount": round(guard.incremental_order_amount, 2),
+                    # outcome.get(..., default) only falls back on a MISSING key --
+                    # an outcome that explicitly carries None (a skip path that
+                    # doesn't set incremental_order_amount) would otherwise pass
+                    # None straight to float() and raise TypeError (Antigravity
+                    # review: "Defensive None check for dictionary lookup").
+                    "incremental_order_amount": round(
+                        float(
+                            outcome["incremental_order_amount"]
+                            if outcome.get("incremental_order_amount") is not None
+                            else guard.incremental_order_amount
+                        ),
+                        2,
+                    ),
                     "top_up_guard_result": guard.top_up_guard_result,
                     "top_up_skipped": guard.skipped,
                     "top_up_manual_review": guard.manual_review,
@@ -2115,6 +2131,8 @@ def build_run_artifacts(
     top_up_outcomes: Optional[Dict[str, "TopUpGuardOutcome"]] = None,
     manual: bool = False,
     raw_persistence_state: Optional[Dict[str, object]] = None,
+    classification_overrides: Optional[Dict[str, Any]] = None,
+    correlation_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build the structured run-state dict written by the daily live-run path.
 
@@ -2130,7 +2148,18 @@ def build_run_artifacts(
     ``dca_risk``'s scheduled-stream deployment accounting -- can tell a scheduled
     live run from a manual one from the artifact content alone. ``manual``
     selects which block is stamped: False (default) is the scheduled 3:30 PM ET
-    live task, True is a manual/ad hoc invocation.
+    live task, True is a manual/ad hoc invocation. ``classification_overrides``
+    lets a non-afternoon scheduled caller (the roster's ``run_slot`` for 1030ET/
+    1230ET) stamp its OWN stream/cron_id/scheduled_for_et/run_id instead of the
+    afternoon defaults (Codex review, discussion_r3679391261: "Stamp each slot
+    with its own scheduled classification") -- ignored when ``manual`` is True.
+
+    ``correlation_id``, when given, is stamped onto the top-level artifact (next
+    to ``run_id``) so the deterministic (day, stream, window) id a scheduler used
+    to fire this run is recoverable from the durable run_state.json itself, not
+    only from an in-process return value that is lost if the process exits or
+    crashes before the caller reads it (Codex review, discussion_r3679633768:
+    "Persist the slot correlation ID in run artifacts").
     """
     now_et = now.astimezone(EASTERN)
     trading_day = now_et.date()
@@ -2143,7 +2172,11 @@ def build_run_artifacts(
     run_classification = (
         build_manual_classification(triggered_at_utc=triggered_at_utc)
         if manual
-        else build_scheduled_classification(trading_day.isoformat(), triggered_at_utc=triggered_at_utc)
+        else build_scheduled_classification(
+            trading_day.isoformat(),
+            triggered_at_utc=triggered_at_utc,
+            **(classification_overrides or {}),
+        )
     )
     if not manual:
         # The scheduled afternoon (3:30 PM ET) artifact contract requires the
@@ -2239,6 +2272,7 @@ def build_run_artifacts(
     artifacts = {
         "run_id": run_id,
         "run_classification": run_classification,
+        **({"correlation_id": correlation_id} if correlation_id is not None else {}),
         "order_submit_status": _derive_order_submit_status(config, buy_candidates, errors_count),
         "generated_at": now_et.isoformat(),
         "trading_day": trading_day.isoformat(),
@@ -5283,6 +5317,8 @@ def _finalize_and_write_artifacts(
     artifacts_dir: Optional[str | Path],
     classification_state_root: Optional[str | Path],
     raw_persistence_state: Optional[Dict[str, object]] = None,
+    classification_overrides: Optional[Dict[str, Any]] = None,
+    correlation_id: Optional[str] = None,
 ) -> None:
     if artifacts_dir is None:
         return
@@ -5300,6 +5336,8 @@ def _finalize_and_write_artifacts(
         top_up_outcomes=top_up_outcomes,
         manual=not scheduled,
         raw_persistence_state=raw_persistence_state,
+        classification_overrides=classification_overrides,
+        correlation_id=correlation_id,
     )
     paths = write_run_artifacts(artifacts, artifacts_dir)
     logger.info("Wrote run artifacts: %s", paths["run_state"])
@@ -5653,13 +5691,15 @@ def _process_buy_candidate(
             )
             return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
 
-    if not ticker_guarded and state.buys_today(ticker, trading_day) >= config.max_buys_per_ticker_per_day:
-        candidate_outcome = {"status": "skipped", "skip_reason": "already bought today", "budget_blocked": True}
-        _block(MISSING_FILL_BUDGET_CAPPED, f"{ticker}: already bought today; skipping")
-        return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
-    # Hard per-order ceiling is checked before any broker round-trip: an
-    # over-cap candidate should never need a same-day-duplicate lookup or a
-    # spread quote.
+    # Hard per-order ceiling is checked before any broker round-trip -- including
+    # the one_order_per_ticker_per_day duplicate check just below -- so that an
+    # over-cap candidate never needs a same-day-duplicate lookup or a spread
+    # quote. Moving this ahead of the roster's broad broker check keeps the
+    # existing cap-before-duplicate contract (see
+    # test_run_daily_compact_checks_per_order_cap_before_broker_duplicate_lookup)
+    # intact now that one_order_per_ticker_per_day also triggers a broker
+    # round-trip on this path (Codex review, discussion_r3679633773: "Check the
+    # hard ceiling before the broker duplicate lookup").
     if order_amount > config.max_per_order_usd:
         candidate_outcome = {"status": "blocked", "skip_reason": "max per-order ceiling exceeded", "deliberate_skip": True, "budget_blocked": True}
         _block(
@@ -5668,14 +5708,40 @@ def _process_buy_candidate(
             f"${config.max_per_order_usd:.2f}; skipping",
         )
         return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+    if config.one_order_per_ticker_per_day and broker.same_day_strategy_order_exists(ticker, trading_day):
+        if top_up_outcome is not None:
+            top_up_outcome = replace(top_up_outcome, incremental_order_amount=0.0)
+        candidate_outcome = {"status": "skipped", "skip_reason": "same-day broker order exists"}
+        _block(MISSING_FILL_BUDGET_CAPPED, f"{ticker}: same-day broker order already exists; skipping")
+        return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+    if (config.one_order_per_ticker_per_day or not ticker_guarded) and (
+        state.buys_today(ticker, trading_day) >= config.max_buys_per_ticker_per_day
+    ):
+        # Zero the top-up guard's incremental amount the same way the broker
+        # duplicate check above does: this candidate is being skipped, so a
+        # downstream reader of top_up_outcome (_build_buy_candidates) must not
+        # still see a nonzero incremental_order_amount for a row whose status is
+        # "skipped" (Antigravity review: "Inconsistent top_up_outcome zeroing
+        # when one_order_per_ticker_per_day triggers").
+        if top_up_outcome is not None:
+            top_up_outcome = replace(top_up_outcome, incremental_order_amount=0.0)
+        candidate_outcome = {"status": "skipped", "skip_reason": "already bought today", "budget_blocked": True}
+        _block(MISSING_FILL_BUDGET_CAPPED, f"{ticker}: already bought today; skipping")
+        return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
     # A morning/manual run must NOT block the scheduled afternoon run: when the
     # top-up guard has a loaded prior allocation for this ticker, the earlier
     # same-day allocation is handled above (and any same-stream retry of THIS
     # ticker was already caught by the duplicate check at the top of this
     # function), so the broker's broad same-day-order block is intentionally
     # bypassed here for guarded tickers -- a legitimate cross-stream top-up
-    # must not be blocked by the morning stream's own earlier order.
-    if not ticker_guarded and broker.same_day_strategy_order_exists(ticker, trading_day):
+    # must not be blocked by the morning stream's own earlier order. When the
+    # roster's one-order-per-day policy is enabled, the unconditional broker
+    # check above already enforced the broader rule, so do not query it twice.
+    if (
+        not config.one_order_per_ticker_per_day
+        and not ticker_guarded
+        and broker.same_day_strategy_order_exists(ticker, trading_day)
+    ):
         candidate_outcome = {"status": "skipped", "skip_reason": "same-day broker order exists"}
         _block(MISSING_FILL_BUDGET_CAPPED, f"{ticker}: same-day broker order already exists; skipping")
         return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
@@ -5930,7 +5996,23 @@ def _seed_prior_allocations(
     trading_day: date,
     guard_active: bool,
     prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]],
+    *,
+    one_order_per_ticker_per_day: bool,
 ) -> None:
+    # ``one_order_per_ticker_per_day`` no longer skips seeding: this call is
+    # what folds an earlier roster slot's spend into day_notional()/
+    # week_notional() for the ABSOLUTE $ cap accounting. Early-returning here
+    # left duplicate-buy prevention to the broker's same_day_strategy_order_exists
+    # check alone, but that check says nothing about the previously-spent
+    # dollar amount -- so a later slot's own (different-ticker) candidates
+    # still saw the full daily/weekly cap as if nothing had been spent yet,
+    # letting successive roster slots exceed the configured absolute caps
+    # (Codex review, discussion_r3679391265: "Preserve prior allocations in
+    # cap bookkeeping"). Seeding also bumps buys_today() for the ticker,
+    # which is a harmless belt-and-suspenders duplicate for the one-order
+    # gates below since same_day_strategy_order_exists already blocks a
+    # second buy for that ticker first. The bool parameter is kept for
+    # call-site clarity/back-compat rather than removed.
     if guard_active and prior_same_day_allocations:
         for _ticker, _alloc in prior_same_day_allocations.items():
             if _alloc.amount_usd > 0 and state.buys_today(_ticker, trading_day) == 0:
@@ -6391,6 +6473,8 @@ def _run_once_impl(
     scheduled: bool = True,
     classification_state_root: Optional[str | Path] = None,
     raw_persistence_state: Optional[Dict[str, object]] = None,
+    classification_overrides: Optional[Dict[str, Any]] = None,
+    correlation_id: Optional[str] = None,
 ) -> List[ReconciledDecision]:
     now_et = now.astimezone(EASTERN)
     trading_day = now_et.date()
@@ -6456,7 +6540,13 @@ def _run_once_impl(
     # call sites), or a manual run could unintentionally double-buy.
     guard_active = scheduled and prior_same_day_allocations is not None
 
-    _seed_prior_allocations(state, trading_day, guard_active, prior_same_day_allocations)
+    _seed_prior_allocations(
+        state,
+        trading_day,
+        guard_active,
+        prior_same_day_allocations,
+        one_order_per_ticker_per_day=config.one_order_per_ticker_per_day,
+    )
 
     candidate_outcomes, top_up_outcomes, running_deployed_7d, err_inc, rev_inc = _process_buy_candidates_batch(
         buy_candidates=buy_candidates,
@@ -6514,6 +6604,8 @@ def _run_once_impl(
         artifacts_dir=artifacts_dir,
         classification_state_root=classification_state_root,
         raw_persistence_state=raw_persistence_state,
+        classification_overrides=classification_overrides,
+        correlation_id=correlation_id,
     )
 
     return decisions
@@ -6595,6 +6687,8 @@ def run_daily_compact(
     deployment_history_root: Optional[str | Path] = None,
     classification_state_root: Optional[str | Path] = None,
     raw_persistence_state: Optional[Dict[str, object]] = None,
+    classification_overrides: Optional[Dict[str, Any]] = None,
+    correlation_id: Optional[str] = None,
 ) -> Dict[str, object]:
     """Run one DCA scan and write only compact, structured daily artifacts.
 
@@ -6633,6 +6727,8 @@ def run_daily_compact(
         scheduled=scheduled,
         classification_state_root=classification_state_root,
         raw_persistence_state=raw_persistence_state,
+        classification_overrides=classification_overrides,
+        correlation_id=correlation_id,
     )
 
     out = Path(artifacts_dir)

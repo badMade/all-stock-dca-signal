@@ -30,11 +30,16 @@ module (including ``scripts/*``) can use it without creating a cycle. Mirrors
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any
 
-# The bundled production tree. Kept as the default so an unconfigured checkout
-# and the live deployment resolve identically.
-DEFAULT_CRON_TRACKING_ROOT = "/home/user/workspace/cron_tracking"
+# The bundled production tree serialized in config/*.json. This must remain
+# stable so rebase_bundled_root() can detect and rewrite those paths.
+BUNDLED_CRON_TRACKING_ROOT = "/home/user/workspace/cron_tracking"
+
+# Local default for an unconfigured checkout: keep run artifacts inside this
+# repository so the root exists on any machine and remains gitignored.
+DEFAULT_CRON_TRACKING_ROOT = str((Path(__file__).resolve().parent / "cron_tracking").resolve())
 
 # Deployment override, following the DCA_* convention already used by
 # DCA_CONFIG_DIR, DCA_ATTEMPT_LOG_ROOT, and DCA_INTRADAY_LIVE_STATE_ROOT.
@@ -85,7 +90,7 @@ def rebase_bundled_root(value: Any) -> Any:
     """Re-root a bundled config path onto the configured artifact tree.
 
     ``config/*.json`` records artifact locations as absolute paths under
-    :data:`DEFAULT_CRON_TRACKING_ROOT` (``artifact_paths.live_run_state_root``,
+    :data:`BUNDLED_CRON_TRACKING_ROOT` (``artifact_paths.live_run_state_root``,
     ``prior_allocation_roots``, the preflight resolution roots, …). Those values
     are loaded straight into the executors, so they *override* the roots derived
     from :func:`stream_root` -- meaning a deployment that set
@@ -124,14 +129,15 @@ def rebase_bundled_root(value: Any) -> Any:
     if not isinstance(value, str):
         return value
     boundaries = {"/", os.sep}
-    if value != DEFAULT_CRON_TRACKING_ROOT and not any(
-        value.startswith(DEFAULT_CRON_TRACKING_ROOT + sep) for sep in boundaries
+    if value != BUNDLED_CRON_TRACKING_ROOT and not any(
+        value.startswith(BUNDLED_CRON_TRACKING_ROOT + sep) for sep in boundaries
     ):
         return value
+    matched_root = BUNDLED_CRON_TRACKING_ROOT
     configured = cron_tracking_root()
-    if configured == DEFAULT_CRON_TRACKING_ROOT:
+    if configured == matched_root:
         return value
-    suffix = value[len(DEFAULT_CRON_TRACKING_ROOT) :]
+    suffix = value[len(matched_root) :]
     # Rebuild with the PLATFORM separator instead of concatenating. The bundled
     # values are serialized with forward slashes, so concatenation produced
     # "C:\dca/morning_dca" on Windows while stream_root() -- which joins through
@@ -165,6 +171,7 @@ def rebase_bundled_roots_in(node):
 
 
 __all__ = [
+    "BUNDLED_CRON_TRACKING_ROOT",
     "CRON_TRACKING_ROOT_ENV",
     "DEFAULT_CRON_TRACKING_ROOT",
     "cron_tracking_root",

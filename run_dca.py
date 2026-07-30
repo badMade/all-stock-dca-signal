@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import shutil
+from dataclasses import replace
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -38,8 +39,13 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from dca_alerts import artifact_freshness_probe, attempt_log_root_sibling_to, guarded_run
 from dca_config import DEFAULT_CONFIG_DIR, load_strategy_config
 from dca_fileio import atomic_write_text
-from midday_dca import DEFAULT_MIDDAY_LIVE_STATE_ROOT, load_midday_config
-from morning_dca import DEFAULT_MORNING_LIVE_STATE_ROOT, MORNING_LIVE_MODE, load_morning_config
+from midday_dca import DEFAULT_MIDDAY_LIVE_STATE_ROOT, MIDDAY_LIVE_CRON_ID, load_midday_config
+from morning_dca import (
+    DEFAULT_MORNING_LIVE_STATE_ROOT,
+    MORNING_LIVE_CRON_ID,
+    MORNING_LIVE_MODE,
+    load_morning_config,
+)
 from near_close_dca import (
     _TS_FLOOR,
     EASTERN,
@@ -58,6 +64,7 @@ from near_close_dca import (
     merge_manual_top_up_context,
     run_daily_compact,
 )
+from scripts.correlation import build_correlation_id
 from scripts.model_usage_log import log_model_usage
 from scripts.run_classification import (
     CANONICAL_RETIME_DATE_YYYYMMDD,
@@ -135,6 +142,70 @@ DEFAULT_MARKET_OPEN_LIVE_STATE_ROOT = "market_open_dca"
 # failure-alert / heartbeat identity (DCA_HEARTBEAT_URL_AFTERNOON). Matches the
 # "afternoon" stream name recorded by scripts/run_classification.py pointers.
 AFTERNOON_STREAM = "afternoon"
+
+SLOT_MAP: Dict[str, tuple[str, str]] = {
+    "1030ET": ("morning", "1030ET"),
+    "1230ET": ("midday", "1230ET"),
+    "1530ET": ("afternoon", "1530ET"),
+}
+DISABLED_SLOTS: tuple[str, ...] = ("0935ET", "1130ET", "1330ET", "1430ET")
+
+# The live task id for each canonical slot's stream, so log_model_usage's
+# telemetry attributes a 1030ET/1230ET run to its own task instead of always
+# recording the afternoon task id (Antigravity review: "run_slot() does not
+# pass cron_id to run_pipeline()", discussion on run_dca.py's run_slot).
+_SLOT_CRON_ID: Dict[str, str] = {
+    "morning": MORNING_LIVE_CRON_ID,
+    "midday": MIDDAY_LIVE_CRON_ID,
+    "afternoon": AFTERNOON_LIVE_CRON_ID,
+}
+
+
+class UnsupportedSlotError(ValueError):
+    """Raised when a requested slot is unsupported or intentionally disabled."""
+
+
+def _slot_time_et(window: str) -> time:
+    """'1030ET' -> time(10, 30). ``window`` is always a SLOT_MAP value."""
+    digits = window[:-2] if window.endswith("ET") else window
+    return time(int(digits[:2]), int(digits[2:]))
+
+
+def _slot_classification_overrides(
+    stream_name: str, window: str, trading_day: str
+) -> Optional[Dict[str, Any]]:
+    """Per-slot ``run_classification`` identity for a non-afternoon roster slot.
+
+    ``near_close_dca.build_run_artifacts`` stamps every scheduled run through
+    ``scripts.run_classification.build_scheduled_classification``, which
+    defaults to the afternoon (15:30 ET, cron_id ``10ce362c``) identity. Left
+    unoverridden, a 1030ET/1230ET slot routed through that same afternoon
+    pipeline stamped itself ``stream="afternoon"``, ``scheduled_for_et="15:30"``,
+    and the afternoon cron_id -- misattributing telemetry, hiding the slot's own
+    fills from a later slot's prior-allocation scan (which keys off
+    ``run_classification.stream``, see ``_prior_run_is_scheduled``), and risking
+    an early update of the afternoon ``latest_scheduled_run.json`` pointer
+    (Codex review, discussion_r3679391261: "Stamp each slot with its own
+    scheduled classification"). Returns ``None`` for the afternoon slot itself,
+    leaving the existing default (and every other, non-roster caller of
+    ``build_run_artifacts``) byte-for-byte unchanged.
+    """
+    if stream_name == AFTERNOON_STREAM:
+        return None
+    slot_time = _slot_time_et(window)
+    anchor = datetime(2000, 1, 1, slot_time.hour, slot_time.minute)
+    window_start = (anchor - timedelta(minutes=5)).strftime("%H:%M")
+    window_end = (anchor + timedelta(minutes=5)).strftime("%H:%M")
+    compact_day = trading_day.replace("-", "")
+    return {
+        "stream": stream_name,
+        "cron_id": _SLOT_CRON_ID[stream_name],
+        "supersedes_cron_id": None,
+        "scheduled_for_et": slot_time.strftime("%H:%M"),
+        "scheduled_window_start_et": window_start,
+        "scheduled_window_end_et": window_end,
+        "run_id": f"scheduled_{compact_day}_{window}",
+    }
 
 # Sibling stream roots the scheduled afternoon top-up guard folds in as prior
 # same-day allocation context (in addition to its own task root): the market-open,
@@ -1112,6 +1183,10 @@ def run_pipeline(
     model_usage_model_actual: Optional[str] = None,
     model_usage_model_routing_mode: Optional[str] = None,
     model_usage_reason_for_premium_model: Optional[str] = None,
+    stream_name: str = AFTERNOON_STREAM,
+    cron_id: str = AFTERNOON_LIVE_CRON_ID,
+    classification_overrides: Optional[Dict[str, Any]] = None,
+    correlation_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Thin wrapper around ``_run_pipeline_impl``: same signature plus the
     opt-in ``model_usage_log_root`` (see scripts/model_usage_log.py,
@@ -1164,6 +1239,8 @@ def run_pipeline(
             config_dir=config_dir,
             raw_connector_inputs=raw_connector_inputs,
             required_raw_filenames=required_raw_filenames,
+            classification_overrides=classification_overrides,
+            correlation_id=correlation_id,
         )
         run_state_path = result.get("run_state_path")
         run_id = None
@@ -1181,7 +1258,7 @@ def run_pipeline(
         log_model_usage(
             root=model_usage_log_root,
             run_id=run_id,
-            cron_id=AFTERNOON_LIVE_CRON_ID,
+            cron_id=cron_id,
             run_origin="scheduled" if scheduled else "manual",
             artifact_path=run_state_path,
             triggered_at_utc=now.astimezone(timezone.utc),
@@ -1190,7 +1267,7 @@ def run_pipeline(
         return result
 
     return guarded_run(
-        AFTERNOON_STREAM,
+        stream_name,
         _invoke,
         enabled=scheduled and not config.dry_run,
         context=f"artifacts_dir={artifacts_dir}",
@@ -1218,6 +1295,101 @@ def run_pipeline(
             isinstance(result, dict) and result.get("raw_persistence_error")
         ),
     )
+
+
+def prior_slots(slot: str) -> tuple[str, ...]:
+    """Canonical slots that occur before ``slot`` in the live roster."""
+    normalized = str(slot).strip().upper()
+    ordered = tuple(SLOT_MAP)
+    try:
+        index = ordered.index(normalized)
+    except ValueError as exc:
+        raise UnsupportedSlotError(f"unsupported slot label: {slot!r}") from exc
+    return ordered[:index]
+
+
+def run_slot(
+    slot: str,
+    *,
+    now: datetime,
+    config: StrategyConfig,
+    state: StrategyState,
+    finance_data: MarketDataProvider,
+    robinhood_data: MarketDataProvider,
+    broker: BrokerAdapter,
+    artifacts_dir: str | Path,
+    generate_full_reports: bool = False,
+    ignore_trend_filter: bool = False,
+    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]] = None,
+    prior_allocation_state_root: Optional[str | Path] = None,
+    deployment_history_root: Optional[str | Path] = None,
+    classification_state_root: Optional[str | Path] = None,
+    config_dir: Optional[str | Path] = None,
+    raw_connector_inputs: Optional[Mapping[str, Any]] = None,
+    required_raw_filenames: Optional[frozenset] = None,
+    model_usage_log_root: Optional[str | Path] = None,
+    model_usage_model_requested: Optional[str] = None,
+    model_usage_model_actual: Optional[str] = None,
+    model_usage_model_routing_mode: Optional[str] = None,
+    model_usage_reason_for_premium_model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Run one canonical roster slot with slot-scoped identity and guardrails."""
+    normalized_slot = str(slot).strip().upper()
+    if normalized_slot in DISABLED_SLOTS:
+        raise UnsupportedSlotError(
+            f"slot {normalized_slot} is disabled: prior-allocation chain is not modeled for it"
+        )
+    if normalized_slot not in SLOT_MAP:
+        raise UnsupportedSlotError(f"unsupported slot label: {slot!r}")
+    stream_name, window = SLOT_MAP[normalized_slot]
+    trading_day = now.astimezone(EASTERN).date().isoformat()
+    correlation_id = build_correlation_id(trading_day, stream_name, window)
+    slot_config = replace(
+        config,
+        one_order_per_ticker_per_day=True,
+        # Anchor signal evaluation to THIS slot's own decision time. Left at the
+        # bundled config's 15:30 default, a 10:30/12:30 invocation would query
+        # and anchor its lookback/downtrend window against afternoon bars,
+        # potentially against a future timestamp the provider rejects, or
+        # against the same latest bar for both ends (making the 60-minute
+        # downtrend check trivially false and silently suppressing buys) --
+        # Codex review, discussion_r3679391268: "Anchor signal evaluation to
+        # the requested slot".
+        decision_time_et=_slot_time_et(window),
+    )
+    result = run_pipeline(
+        now,
+        slot_config,
+        state,
+        finance_data,
+        robinhood_data,
+        broker,
+        artifacts_dir=artifacts_dir,
+        run_label=normalized_slot.lower(),
+        scheduled=True,
+        generate_full_reports=generate_full_reports,
+        ignore_trend_filter=ignore_trend_filter,
+        prior_same_day_allocations=prior_same_day_allocations,
+        prior_allocation_state_root=prior_allocation_state_root,
+        deployment_history_root=deployment_history_root,
+        classification_state_root=classification_state_root,
+        config_dir=config_dir,
+        raw_connector_inputs=raw_connector_inputs,
+        required_raw_filenames=required_raw_filenames,
+        model_usage_log_root=model_usage_log_root,
+        model_usage_model_requested=model_usage_model_requested,
+        model_usage_model_actual=model_usage_model_actual,
+        model_usage_model_routing_mode=model_usage_model_routing_mode,
+        model_usage_reason_for_premium_model=model_usage_reason_for_premium_model,
+        stream_name=stream_name,
+        # Antigravity review: "run_slot() does not pass cron_id to
+        # run_pipeline()" -- left at the default, log_model_usage() recorded
+        # every 1030ET/1230ET slot under the afternoon task id.
+        cron_id=_SLOT_CRON_ID[stream_name],
+        classification_overrides=_slot_classification_overrides(stream_name, window, trading_day),
+        correlation_id=correlation_id,
+    )
+    return {**result, "correlation_id": correlation_id}
 
 
 def _final_buy_trend_override_window_start(now: datetime) -> time:
@@ -1261,6 +1433,8 @@ def _run_pipeline_impl(
     config_dir: Optional[str | Path] = None,
     raw_connector_inputs: Optional[Mapping[str, Any]] = None,
     required_raw_filenames: Optional[frozenset] = None,
+    classification_overrides: Optional[Dict[str, Any]] = None,
+    correlation_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run one compact DCA cycle and (optionally) the full post-trade report set.
 
@@ -1305,6 +1479,13 @@ def _run_pipeline_impl(
     ``_resolve_cross_stream_prior_allocation_roots``); ``None`` uses their own
     default resolution (``DCA_CONFIG_DIR`` env var, then the bundled config/
     directory), matching how ``config`` itself is normally loaded.
+
+    ``classification_overrides`` and ``correlation_id`` are forwarded to
+    ``near_close_dca.run_daily_compact`` so a non-afternoon roster slot (see
+    ``run_slot``) stamps its OWN ``run_classification`` identity and a
+    deterministic ``correlation_id`` into ``run_state.json``, instead of the
+    afternoon-only defaults ``build_run_artifacts`` otherwise falls back to.
+    ``None`` (the default for both) reproduces the unmodified afternoon path.
     """
     # Drain any leftover raw placement responses from a prior run on this broker
     # instance (e.g. a manual run_pipeline() call that preceded this scheduled one).
@@ -1987,6 +2168,8 @@ def _run_pipeline_impl(
         deployment_history_root=deployment_history_root,
         classification_state_root=classification_state_root,
         raw_persistence_state=raw_persistence_state,
+        classification_overrides=classification_overrides,
+        correlation_id=correlation_id,
     )
     if result.get("blocked"):
         logger.warning("run blocked by date gate for %s; skipping reports", result.get("run_state_path"))
@@ -2157,16 +2340,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--artifacts-dir", default=None, help="Output directory (default: artifacts/<trading-day>).")
     parser.add_argument("--now", default=None, help="Override decision time (ISO 8601, e.g. 2026-07-06T15:45). For testing.")
     parser.add_argument("--run-label", default="daily", help="Run label recorded in artifacts.")
+    parser.add_argument(
+        "--slot",
+        default=None,
+        help="Canonical live roster slot label (for scheduler/in-process use only; CLI refuses it).",
+    )
     parser.add_argument("--report", action="store_true", help="Also render the full slippage/coverage reports and Notion sync.")
     parser.add_argument("--demo", action="store_true", help="Use the deterministic in-memory demo provider (no broker/network).")
     parser.add_argument("--log-level", default="INFO", help="Logging level (DEBUG/INFO/WARNING/ERROR).")
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return int(exc.code)
 
     configure_logging(args.log_level)
 
     config = load_strategy_config(args.config_dir)
     if not config.dry_run:
         logger.error("Refusing to run: config.dry_run is False. The CLI is dry-run only; drive live runs via run_pipeline().")
+        return 2
+    if args.slot is not None:
+        logger.error(
+            "Refusing to run: --slot is not supported from the CLI. "
+            "Scheduler/in-process runners must call run_dca.run_slot()."
+        )
         return 2
 
     now = _resolve_now(args.now, config)

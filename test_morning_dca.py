@@ -7382,7 +7382,7 @@ def test_cap_seeding_default_scan_roots_are_resolved_at_call_time():
     # DEFAULT_AFTERNOON_TASK_ROOT is untouched by the override -- it is still
     # used elsewhere (e.g. test_dca_paths.py's byte-identical-defaults pin),
     # which is exactly why _compute_top_up naming it directly was wrong.
-    assert stale_import_time_constant == "/home/user/workspace/cron_tracking/ce16ba6b", out.stdout
+    assert stale_import_time_constant == str(REPO_ROOT / "cron_tracking" / "ce16ba6b"), out.stdout
 
 
 def test_the_config_missing_fallback_resolves_the_live_account_at_call_time():

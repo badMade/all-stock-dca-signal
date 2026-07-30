@@ -218,6 +218,15 @@ def load_budgets(config_dir: Path) -> Dict[str, Any]:
         if not (math.isfinite(max_per_order) and max_per_order > 0):
             raise ValueError(f"max_per_order_usd must be a finite positive number, got {max_per_order}")
         out["max_per_order_usd"] = max_per_order
+    order_rules = data.get("order_rules")
+    if isinstance(order_rules, dict) and "one_order_per_ticker_per_day" in order_rules:
+        value = order_rules["one_order_per_ticker_per_day"]
+        if not isinstance(value, bool):
+            raise ValueError(
+                "order_rules.one_order_per_ticker_per_day must be a boolean "
+                f"(got {type(value).__name__})"
+            )
+        out["one_order_per_ticker_per_day"] = value
     return out
 
 

@@ -3801,3 +3801,387 @@ def test_fallback_discovery_roots_keep_nested_configured_roots(tmp_path, monkeyp
     assert nested not in core
     # ...but preserved for fallback discovery.
     assert nested in fallback
+
+
+# --- Seven-slot roster: the live Gate 5 entry point --------------------------
+#
+# Gate 5 in claude/dca-executor-prompts/*.txt says "Run the repo's own signal
+# generation for this slot ... Use the repo entry point, never a
+# reimplementation." Until now no such entry point existed: main() is dry-run
+# only (run_dca.py:2169, :2178) and the live path was an in-process
+# run_pipeline() call the retired Perplexity scheduler supplied with MCP
+# provider objects. See claude/GATE5-PROPOSAL.md.
+#
+# Scope decision (2026-07-29): only the three canonical slots ship. They map 1:1
+# onto the morning/midday/afternoon streams that same_day_top_up_policy already
+# understands. The other four slots stay disabled because their fills are folded
+# into no prior-allocation chain, so enabling them would let one ticker be
+# bought repeatedly at rising prices.
+
+
+def test_slot_map_exposes_only_the_three_canonical_slots():
+    """A slot is enabled only if the top-up guard already models its stream."""
+    from run_dca import SLOT_MAP
+
+    assert SLOT_MAP == {
+        "1030ET": ("morning", "1030ET"),
+        "1230ET": ("midday", "1230ET"),
+        "1530ET": ("afternoon", "1530ET"),
+    }
+
+
+def test_disabled_slots_are_the_four_unmodelled_ones():
+    from run_dca import DISABLED_SLOTS
+
+    assert set(DISABLED_SLOTS) == {"0935ET", "1130ET", "1330ET", "1430ET"}
+
+
+@pytest.mark.parametrize("slot", ["0935ET", "1130ET", "1330ET", "1430ET"])
+def test_run_slot_refuses_a_disabled_slot_and_places_nothing(slot, tmp_path):
+    """The four unmodelled slots must abort, not silently run as some stream.
+
+    An abort is the whole point: these slots have no prior-allocation chain, so
+    a "successful" run here is what buys the same ticker twice in a day.
+    """
+    from run_dca import UnsupportedSlotError, run_slot
+
+    config = _demo_config()
+    broker = DryRunBroker(account=config.target_account_number)
+    with pytest.raises(UnsupportedSlotError) as excinfo:
+        run_slot(
+            slot,
+            now=_now(),
+            config=config,
+            state=StrategyState(),
+            finance_data=DemoDataProvider(SourceName.FINANCE),
+            robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+            broker=broker,
+            artifacts_dir=tmp_path,
+        )
+    # The error has to say WHY, so the executor's alert is actionable rather
+    # than looking like a crash.
+    message = str(excinfo.value)
+    assert slot in message
+    assert "prior" in message.lower()
+    assert broker.get_raw_placement_responses() == []
+    # An aborted slot writes no run artifact at all.
+    assert not (tmp_path / "run_state.json").exists()
+
+
+def test_run_slot_rejects_an_unknown_slot_label(tmp_path):
+    from run_dca import UnsupportedSlotError, run_slot
+
+    config = _demo_config()
+    with pytest.raises(UnsupportedSlotError):
+        run_slot(
+            "0900ET",
+            now=_now(),
+            config=config,
+            state=StrategyState(),
+            finance_data=DemoDataProvider(SourceName.FINANCE),
+            robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+            broker=DryRunBroker(account=config.target_account_number),
+            artifacts_dir=tmp_path,
+        )
+
+
+@pytest.mark.parametrize(
+    "slot,stream",
+    [("1030ET", "morning"), ("1230ET", "midday"), ("1530ET", "afternoon")],
+)
+def test_run_slot_runs_the_pipeline_under_the_slots_own_stream(slot, stream, tmp_path, monkeypatch):
+    """run_pipeline() hardcoded AFTERNOON_STREAM (run_dca.py:1193).
+
+    Every slot ran under the afternoon stream's guarded_run identity, heartbeat,
+    and attempt log. A morning slot must not report itself as the afternoon run.
+    """
+    import run_dca as run_dca_module
+    from run_dca import run_slot
+
+    seen = {}
+
+    def _capture(stream_name, invoke, **kwargs):
+        seen["stream"] = stream_name
+        return invoke()
+
+    monkeypatch.setattr(run_dca_module, "guarded_run", _capture)
+
+    config = _demo_config()
+    result = run_slot(
+        slot,
+        now=_now(),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path,
+    )
+
+    assert seen["stream"] == stream
+    assert result["run_state_path"]
+
+
+@pytest.mark.parametrize(
+    "slot,expected",
+    [
+        ("1030ET", "dca-2026-07-06-morning-1030et"),
+        ("1230ET", "dca-2026-07-06-midday-1230et"),
+        ("1530ET", "dca-2026-07-06-afternoon-1530et"),
+    ],
+)
+def test_run_slot_records_the_deterministic_correlation_id(slot, expected, tmp_path):
+    """scripts/correlation.py already models a run as (day, stream, window).
+
+    The id must be derivable independently by the scheduler and the runner, so
+    it is asserted literally rather than round-tripped.
+    """
+    from run_dca import run_slot
+
+    config = _demo_config()
+    result = run_slot(
+        slot,
+        now=_now(),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path,
+    )
+    assert result["correlation_id"] == expected
+
+
+def test_prior_slots_returns_earlier_canonical_slots_in_order():
+    from run_dca import prior_slots
+
+    assert prior_slots("1030ET") == ()
+    assert prior_slots("1230ET") == ("1030ET",)
+    assert prior_slots("1530ET") == ("1030ET", "1230ET")
+
+
+@pytest.mark.parametrize(
+    "slot,expected_cron_id",
+    [("1030ET", "42173154"), ("1230ET", "a6239dae"), ("1530ET", "10ce362c")],
+)
+def test_run_slot_logs_model_usage_under_the_slots_own_cron_id(slot, expected_cron_id, tmp_path, monkeypatch):
+    """Codex/Antigravity review: run_slot() omitted cron_id, so log_model_usage
+    always recorded the afternoon task id (10ce362c) for every slot."""
+    import run_dca as run_dca_module
+    from run_dca import run_slot
+
+    captured = {}
+
+    def _fake_log_model_usage(**kwargs):
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr(run_dca_module, "log_model_usage", _fake_log_model_usage)
+
+    config = _demo_config()
+    run_slot(
+        slot,
+        now=_now(),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path,
+        model_usage_log_root=str(tmp_path / "model_usage"),
+    )
+
+    assert captured.get("cron_id") == expected_cron_id
+
+
+@pytest.mark.parametrize("slot,expected_time", [("1030ET", time(10, 30)), ("1230ET", time(12, 30)), ("1530ET", time(15, 30))])
+def test_run_slot_anchors_decision_time_to_the_slot(slot, expected_time, tmp_path, monkeypatch):
+    """Codex review discussion_r3679391268: a 1030/1230 slot must not evaluate
+    signals against the bundled config's 15:30 decision anchor."""
+    import run_dca as run_dca_module
+    from run_dca import run_slot
+
+    captured = {}
+    real_run_pipeline = run_dca_module.run_pipeline
+
+    def _capture(now, config, *args, **kwargs):
+        captured["decision_time_et"] = config.decision_time_et
+        return real_run_pipeline(now, config, *args, **kwargs)
+
+    monkeypatch.setattr(run_dca_module, "run_pipeline", _capture)
+
+    config = _demo_config()
+    run_slot(
+        slot,
+        now=_now(),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path,
+    )
+
+    assert captured["decision_time_et"] == expected_time
+
+
+@pytest.mark.parametrize(
+    "slot,stream,scheduled_for_et,cron_id",
+    [
+        ("1030ET", "morning", "10:30", "42173154"),
+        ("1230ET", "midday", "12:30", "a6239dae"),
+    ],
+)
+def test_run_slot_stamps_its_own_scheduled_classification(slot, stream, scheduled_for_et, cron_id, tmp_path):
+    """Codex review discussion_r3679391261: a 1030/1230 slot must not stamp
+    itself as the afternoon (15:30, cron_id 10ce362c) scheduled run -- that
+    misattributes telemetry and hides the slot's fills from a later slot's
+    prior-allocation scan (which keys off run_classification.stream)."""
+    import json
+
+    from run_dca import run_slot
+
+    config = _demo_config()
+    result = run_slot(
+        slot,
+        now=_now(),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path,
+    )
+    run_state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
+    rc = run_state["run_classification"]
+    assert rc["stream"] == stream
+    assert rc["cron_id"] == cron_id
+    assert rc["scheduled_for_et"] == scheduled_for_et
+    assert rc["run_id"] == f"scheduled_20260706_{slot}"
+    # The afternoon-only lineage marker must not be carried onto another stream.
+    assert "supersedes_cron_id" not in rc
+
+
+def test_run_slot_leaves_the_afternoon_classification_unchanged(tmp_path):
+    """Anti-entropy pin: the 1530ET slot -- and every other, non-roster caller
+    of build_run_artifacts -- must reproduce the original afternoon identity
+    byte-for-byte."""
+    import json
+
+    from run_dca import run_slot
+
+    config = _demo_config()
+    result = run_slot(
+        "1530ET",
+        now=_now(),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path,
+    )
+    run_state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
+    rc = run_state["run_classification"]
+    assert rc["stream"] == "afternoon"
+    assert rc["cron_id"] == "10ce362c"
+    assert rc["scheduled_for_et"] == "15:30"
+    assert rc["supersedes_cron_id"] == "ce16ba6b"
+    assert rc["run_id"] == "scheduled_20260706_1530ET"
+
+
+def test_run_slot_persists_the_correlation_id_into_run_state(tmp_path):
+    """Codex review discussion_r3679633768: the deterministic correlation_id
+    must survive in the durable run artifact, not only the in-process return
+    value -- a process that exits or crashes after writing run_state.json must
+    still let an operator recover the id that fired this run."""
+    import json
+
+    from run_dca import run_slot
+
+    config = _demo_config()
+    result = run_slot(
+        "1030ET",
+        now=_now(),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path,
+    )
+    run_state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
+    assert run_state["correlation_id"] == result["correlation_id"]
+    assert run_state["correlation_id"] == "dca-2026-07-06-morning-1030et"
+
+
+def test_run_slot_enforces_one_order_per_ticker_per_day(tmp_path):
+    """Roster rule: first slot to buy a ticker wins; later slots skip it.
+
+    near_close_dca._process_buy_candidate bypasses both same-day gates when a
+    prior allocation is loaded (`not ticker_guarded and ...`, :5296 and :5315).
+    That bypass is the top-up path, and across seven slots it is what permits
+    repeated full-size buys. run_slot must close it.
+    """
+    import json
+
+    from run_dca import run_slot
+
+    config = _demo_config()
+    captured = {}
+
+    class _RecordingBroker(DryRunBroker):
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            captured.setdefault("asked", []).append(ticker)
+            return True
+
+    result = run_slot(
+        "1530ET",
+        now=_now(),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=_RecordingBroker(account=config.target_account_number),
+        artifacts_dir=tmp_path,
+    )
+
+    # The broker, not local bookkeeping, is the authority (Gate 6).
+    assert captured.get("asked")
+    run_state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
+    placed = [c for c in run_state["buy_candidates"] if c["status"] not in {"skipped", "blocked"}]
+    assert placed == []
+    reasons = {c.get("skip_reason") for c in run_state["buy_candidates"]}
+    assert "same-day broker order exists" in reasons
+
+
+def test_run_slot_does_not_construct_its_own_broker(tmp_path):
+    """The caller wires the live broker. run_slot must never build one itself.
+
+    If run_slot could construct a broker it would be one refactor away from
+    being able to place real orders from the dry-run-only CLI.
+    """
+    from run_dca import run_slot
+
+    config = _demo_config()
+    with pytest.raises(TypeError):
+        run_slot(
+            "1530ET",
+            now=_now(),
+            config=config,
+            state=StrategyState(),
+            finance_data=DemoDataProvider(SourceName.FINANCE),
+            robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+            artifacts_dir=tmp_path,
+        )
+
+
+def test_cli_still_refuses_to_run_a_slot_live(tmp_path, capsys):
+    """--slot must not become a live path on the CLI. Gate 5 calls run_slot()
+    in-process with wired MCP callables; the CLI stays dry-run only."""
+    exit_code = main([
+        "--slot", "1530ET",
+        "--artifacts-dir", str(tmp_path),
+        "--now", "2026-07-06T15:45:00",
+    ])
+    assert exit_code == 2

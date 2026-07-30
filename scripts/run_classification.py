@@ -634,7 +634,16 @@ def manual_run_id(triggered_at_utc: Optional[str] = None) -> str:
 
 
 def build_scheduled_classification(
-    trading_day: str, triggered_at_utc: Optional[str] = None
+    trading_day: str,
+    triggered_at_utc: Optional[str] = None,
+    *,
+    stream: str = "afternoon",
+    cron_id: str = CRON_ID,
+    supersedes_cron_id: Optional[str] = SUPERSEDES_CRON_ID,
+    scheduled_for_et: str = SCHEDULED_FOR_ET,
+    scheduled_window_start_et: str = SCHEDULED_WINDOW_START_ET,
+    scheduled_window_end_et: str = SCHEDULED_WINDOW_END_ET,
+    run_id: Optional[str] = None,
 ) -> Dict[str, object]:
     """Return a fully-populated scheduled run_classification block.
 
@@ -644,21 +653,44 @@ def build_scheduled_classification(
     ``run_classification.stream`` is absent -- accepts a real scheduled
     afternoon run_state instead of rejecting it for a missing field (Codex
     review: "Accept the valid afternoon dated state").
+
+    The keyword-only ``stream``/``cron_id``/``scheduled_for_et``/window/``run_id``
+    parameters default to the afternoon identity above, reproducing the original
+    unconditional return byte-for-byte for every existing caller. They exist so
+    ``near_close_dca.build_run_artifacts`` can stamp a DIFFERENT roster slot's own
+    identity (e.g. the 10:30/12:30 morning/midday live tasks, when routed through
+    this same afternoon-shaped artifact writer via ``run_dca.run_slot``) instead
+    of always claiming to be the 15:30 afternoon run -- which would misattribute
+    ``cron_id``/``scheduled_for_et`` for telemetry, hide the slot's own fills from
+    a later slot's prior-allocation scan (keyed off ``run_classification.stream``),
+    and risk an early update of the afternoon ``latest_scheduled_run.json`` pointer
+    (Codex review, discussion_r3679391261: "Stamp each slot with its own scheduled
+    classification"). ``supersedes_cron_id`` is omitted entirely (rather than set
+    to the afternoon-specific ``SUPERSEDES_CRON_ID``) when explicitly passed as
+    ``None``, since it names a task lineage that is meaningless for another
+    stream. Note ``scripts.run_classification.validate_classification`` (the
+    strict validator gating ``update_latest_scheduled_run_pointer``) still only
+    accepts the canonical afternoon identity -- a non-afternoon block from this
+    function is valid scheduled evidence for ITS OWN stream but is correctly
+    rejected as afternoon evidence, so it never updates that pointer.
     """
-    return {
+    block: Dict[str, object] = {
         "run_origin": "scheduled",
         "run_type": SCHEDULED_RUN_TYPE,
-        "cron_id": CRON_ID,
-        "supersedes_cron_id": SUPERSEDES_CRON_ID,
-        "scheduled_for_et": SCHEDULED_FOR_ET,
-        "scheduled_window_start_et": SCHEDULED_WINDOW_START_ET,
-        "scheduled_window_end_et": SCHEDULED_WINDOW_END_ET,
+        "cron_id": cron_id,
+        "supersedes_cron_id": supersedes_cron_id,
+        "scheduled_for_et": scheduled_for_et,
+        "scheduled_window_start_et": scheduled_window_start_et,
+        "scheduled_window_end_et": scheduled_window_end_et,
         "manual_run": False,
-        "run_id": scheduled_run_id(trading_day),
-        "stream": "afternoon",
+        "run_id": run_id or scheduled_run_id(trading_day),
+        "stream": stream,
         "triggered_at_utc": triggered_at_utc or _utc_now_iso(),
         "state_schema_version": STATE_SCHEMA_VERSION,
     }
+    if supersedes_cron_id is None:
+        del block["supersedes_cron_id"]
+    return block
 
 
 def build_manual_classification(
