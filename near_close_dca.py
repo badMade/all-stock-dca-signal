@@ -660,6 +660,17 @@ class StrategyState:
     # order in which days are finalized vs. queried (a quiet week with no BUY
     # candidates must still roll the reserve before that day is finalized).
     reserve_week_key: Optional[tuple[int, int]] = None
+    # (ticker, trading_day) pairs THIS state instance has booked its own order
+    # for -- via a fresh placement or a same-stream duplicate-preserved retry.
+    # Deliberately separate from buys_by_ticker_by_day: _seed_prior_allocations
+    # also calls record_buy (to seed CROSS-stream morning/midday context into
+    # this ticker's day/week spend), which bumps buys_today to a nonzero value
+    # with no order of THIS stream's own ever booked. A same-stream duplicate
+    # check keyed off buys_today alone would then wrongly treat a freshly
+    # restarted process's never-recorded afternoon order as already booked
+    # (Codex review, PR #231: "Record the recovered buy separately from seeded
+    # prior context").
+    own_orders_recorded: Set[Tuple[str, date]] = field(default_factory=set)
 
     def buys_today(self, ticker: str, trading_day: date) -> int:
         return self.buys_by_ticker_by_day.get(ticker, {}).get(trading_day, 0)
@@ -818,6 +829,17 @@ class BrokerAdapter(Protocol):
     def same_day_strategy_order_exists(self, ticker: str, trading_day: date) -> bool:
         """Return True if this strategy already submitted an order for ticker today."""
 
+    def same_day_strategy_order_exists_with_ref_id_prefix(
+        self, ticker: str, trading_day: date, ref_id_prefixes: Tuple[str, ...]
+    ) -> Optional[Dict[str, Any]]:
+        """Return the live same-day order whose ref id matches one of ``ref_id_prefixes``.
+
+        Used to narrow the broad same-day-order check to only this stream's own
+        idempotency ids, so a guarded top-up candidate (whose broad check is
+        intentionally bypassed to allow topping up a cross-stream allocation)
+        can still detect a retry of ITS OWN earlier same-day order.
+        """
+
     def is_tradable_for_fractional_buy(self, ticker: str) -> bool:
         """Return True only if the instrument can receive this notional buy."""
 
@@ -879,6 +901,11 @@ class DryRunBroker:
 
     def same_day_strategy_order_exists(self, ticker: str, trading_day: date) -> bool:
         return False
+
+    def same_day_strategy_order_exists_with_ref_id_prefix(
+        self, ticker: str, trading_day: date, ref_id_prefixes: Tuple[str, ...]
+    ) -> Optional[Dict[str, Any]]:
+        return None
 
     def is_tradable_for_fractional_buy(self, ticker: str) -> bool:
         return True
@@ -1037,6 +1064,30 @@ class AlpacaBroker:
             until=f"{day_iso}T23:59:59Z",
         )
         return bool(self._list_orders_fn(payload))
+
+    def same_day_strategy_order_exists_with_ref_id_prefix(
+        self, ticker: str, trading_day: date, ref_id_prefixes: Tuple[str, ...]
+    ) -> Optional[Dict[str, Any]]:
+        # build_alpaca_market_buy_payload carries no client-order-id field, so
+        # place_market_buy below never sends this strategy's ref_id to the
+        # live connector -- no listed Alpaca order could ever be matched by
+        # ref_id here even with list_orders_fn wired. Returning None ("no
+        # known duplicate") would silently disable retry protection for a
+        # guarded top-up: an explicitly enabled live AlpacaBroker could then
+        # place a second real order on every retry. Fail closed instead --
+        # this raises, which _same_stream_order_exists's caller already
+        # converts into a blocked candidate (Codex review, PR #231: "Fail
+        # closed for Alpaca until client IDs are wired") -- the same posture
+        # as an adapter that doesn't implement this method at all. Real
+        # conflict protection for this adapter requires plumbing a
+        # client-order-id through the connector payload and inspecting
+        # listed orders here -- out of scope while ALPACA is not a selected
+        # backend in any config.
+        raise RuntimeError(
+            "AlpacaBroker cannot verify same-stream order duplicates: "
+            "place_market_buy does not send a client order id the live "
+            "connector could match against"
+        )
 
     def is_tradable_for_fractional_buy(self, ticker: str) -> bool:
         return True
@@ -1930,7 +1981,19 @@ def _build_buy_candidates(
         # reflects any mid-batch kill-switch cap) or fall back to suggested_amount.
         guard = top_up_outcomes.get(decision.ticker) if top_up_outcomes else None
         submitted_amount = outcome.get("submitted_amount_usd")
-        if guard is not None:
+        if guard is not None and outcome.get("duplicate_preserved"):
+            # A same-stream duplicate-preserved retry (near_close_dca.py's
+            # _process_buy_candidate) carries the REAL broker order's amount
+            # from an earlier attempt this run, not a fresh placement -- this
+            # retry's own freshly recomputed guard.incremental_order_amount
+            # can differ (e.g. new prior-allocation context shrinks it) and
+            # must not clamp away the real submitted amount here (Codex
+            # review, PR #231: "Keep the broker notional when rebuilding
+            # duplicate artifacts").
+            planned_amount_usd = (
+                submitted_amount if submitted_amount is not None else guard.incremental_order_amount
+            )
+        elif guard is not None:
             # When the kill-switch capped order_amount before the guard ran,
             # submitted_amount_usd already reflects the actual capped spend.
             # Use that when available so planned_amount_usd is never higher than
@@ -4984,15 +5047,17 @@ def _check_execution_gates(
     return True
 
 
-def _apply_deployment_history(
-    config: StrategyConfig, trading_day: date, deployment_history_root: str | Path
-) -> StrategyConfig:
-    from dca_risk import (
-        KILL_SWITCH_WINDOW_DAYS,
-        apply_risk_guard,
-        deployed_by_day,
-        find_run_state_files,
-    )
+def _load_deployment_history_states(
+    trading_day: date, deployment_history_root: str | Path
+) -> List[Dict[str, Any]]:
+    """Every readable, non-blocked run_state in the trailing kill-switch window.
+
+    Shared scan behind :func:`_apply_deployment_history` (the pre-run
+    kill-switch injection) and :func:`_same_day_ticker_deployment_already_recorded`
+    (same-stream duplicate-preserved accounting), so both agree on exactly
+    which artifacts count as deployment evidence.
+    """
+    from dca_risk import KILL_SWITCH_WINDOW_DAYS, find_run_state_files
 
     # ⚡ Bolt Optimization: the injected figure only sums the trailing
     # KILL_SWITCH_WINDOW_DAYS calendar days ending on ``trading_day`` (see
@@ -5039,7 +5104,60 @@ def _apply_deployment_history(
             or data.get("artifact_contract_failure") is not None
         ):
             prior_states.append(data)
+    return prior_states
+
+
+def _apply_deployment_history(
+    config: StrategyConfig, trading_day: date, deployment_history_root: str | Path
+) -> StrategyConfig:
+    from dca_risk import apply_risk_guard, deployed_by_day
+
+    prior_states = _load_deployment_history_states(trading_day, deployment_history_root)
     return apply_risk_guard(config, deployed_by_day(prior_states), trading_day)
+
+
+def _same_day_ticker_deployment_already_recorded(
+    ticker: str, trading_day: date, deployment_history_root: str | Path
+) -> bool:
+    """True when a scheduled-afternoon artifact for exactly ``trading_day``
+    already recorded a submitted order for ``ticker`` on disk (and therefore
+    already summed that order's notional into ``config.deployed_last_7d_usd``
+    via ``_apply_deployment_history`` above).
+
+    A same-stream retry's preserved-duplicate broker order must add its
+    notional to ``running_deployed_7d`` only when this is False: the prior
+    attempt that placed the order was interrupted before it could write its
+    own run_state.json, so nothing on disk has counted that capital yet.
+
+    Checked per TICKER, not merely "does any artifact exist for today": a
+    zero-order (or different-ticker) afternoon artifact can already be on
+    disk for today from an earlier invocation, while a LATER invocation's
+    real placement for THIS ticker is still unwritten because it was
+    interrupted before overwriting that artifact. Treating any same-day
+    artifact as proof this ticker's capital was counted would then silently
+    under-count deployment and let later candidates evade the kill-switch
+    (Codex review, PR #231: "Verify the recovered order is actually in
+    deployment history").
+    """
+    from dca_risk import is_afternoon_scheduled_evidence
+
+    trading_day_iso = trading_day.isoformat()
+    for state in _load_deployment_history_states(trading_day, deployment_history_root):
+        if state.get("trading_day") != trading_day_iso:
+            continue
+        if not is_afternoon_scheduled_evidence(state):
+            continue
+        candidates = state.get("buy_candidates")
+        if not isinstance(candidates, list):
+            continue
+        for candidate in candidates:
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("ticker") == ticker
+                and candidate.get("status") == "submitted"
+            ):
+                return True
+    return False
 
 
 def _write_and_validate_scheduled_contract(
@@ -5225,6 +5343,44 @@ def _finalize_and_write_artifacts(
             )
 
 
+def _same_stream_order_exists(
+    broker: BrokerAdapter, ticker: str, trading_day: date
+) -> Optional[Dict[str, Any]]:
+    """Return the broker order dict when this stream's own idempotency ref id
+    already exists for ``ticker`` today, else ``None``.
+
+    A guarded top-up candidate (``ticker_guarded`` in ``_process_buy_candidate``)
+    intentionally bypasses the broad ``same_day_strategy_order_exists`` check so
+    that an earlier CROSS-stream (morning/midday) allocation is not mistaken for
+    a duplicate. But that bypass must not also blind a retry of THIS SAME
+    scheduled afternoon run to an order it already placed for the ticker on an
+    earlier attempt today -- with no narrower check, such a retry would
+    recompute the top-up guard from the cross-stream prior allocation alone
+    (which does not know about this stream's own already-placed top-up) and
+    submit a second, duplicate order (mirrors morning_dca.py's
+    ``_same_stream_order_exists``).
+
+    Both the plain and topup scheduled ref-id prefixes are checked, matching
+    the two ref_id shapes ``_process_buy_candidate`` can have used depending on
+    whether the ticker was already guarded on the attempt that placed the order.
+    """
+    checker = getattr(broker, "same_day_strategy_order_exists_with_ref_id_prefix", None)
+    if checker is None:
+        raise RuntimeError(
+            "broker does not support same-stream ref-id duplicate checks for guarded top-ups"
+        )
+    prefixes = (
+        f"graded-dca-topup-{trading_day.isoformat()}-{ticker}",
+        f"graded-dca-{trading_day.isoformat()}-{ticker}",
+    )
+    result = checker(ticker, trading_day, prefixes)
+    if not isinstance(result, dict):
+        # Normalize legacy boolean adapters: False/None -> None (no duplicate),
+        # True -> treat as found but without order details.
+        return None if not result else {}
+    return result
+
+
 def _process_buy_candidate(
     decision: ReconciledDecision,
     config: StrategyConfig,
@@ -5238,6 +5394,7 @@ def _process_buy_candidate(
     running_deployed_7d: float,
     scheduled: bool,
     run_result: Optional[RunResult],
+    deployment_history_root: Optional[str | Path] = None,
 ) -> tuple[Dict[str, Any], Optional[TopUpGuardOutcome], float, int, int]:
     ticker = decision.ticker
     order_amount = decision.suggested_amount_usd
@@ -5253,7 +5410,204 @@ def _process_buy_candidate(
             run_result.loop_block_reasons[ticker] = reason
         logger.info(message)
 
+    # Computed here (before any early-return gate below) purely for context --
+    # its incremental_order_amount still caps order_amount further down, but
+    # its own skipped/manual_review verdict must not be honored until AFTER
+    # the same-stream duplicate check just below has a chance to find and
+    # preserve an order this stream already placed earlier the same run.
+    if guard_active:
+        top_up_outcome = evaluate_top_up_guard(decision, prior, config)
 
+    # A morning/manual run must NOT block the scheduled afternoon run: when the
+    # top-up guard has a loaded prior allocation for this ticker, the earlier
+    # same-day allocation is handled via the top-up guard below, so the
+    # broker's broad same-day-order block further down is intentionally
+    # bypassed here for guarded tickers. That bypass must not also blind a RETRY of
+    # this same scheduled afternoon run to an order it already placed for this
+    # ticker on an earlier attempt today -- prior_same_day_allocations
+    # deliberately excludes this stream's own earlier same-day runs (see
+    # load_prior_same_day_allocations), so nothing else would catch that case.
+    # A narrower same-stream ref-id check closes that gap without reopening the
+    # broad block for a legitimate cross-stream top-up.
+    #
+    # This runs BEFORE the top-up guard's own skip-return, the kill-switch
+    # cap, and the per-order ceiling below: a retry's freshly recomputed
+    # top-up math (or a freshly recomputed order_amount that happens to sit
+    # above max_per_order_usd) must never suppress or overwrite evidence of an
+    # order this same stream already placed earlier the same run (Codex
+    # review, PR #231: "Check for an existing order before returning from the
+    # top-up guard").
+    #
+    # Skipped entirely under config.dry_run: this whole check exists only to
+    # prevent a REAL duplicate broker order, and a dry run never submits one
+    # (the placement branch further down short-circuits into a simulated
+    # order instead of calling the broker at all -- see "if config.dry_run"
+    # below). Querying the broker's narrow duplicate lookup here anyway would
+    # let a fail-closed adapter (e.g. AlpacaBroker, which now raises when it
+    # cannot verify a real duplicate) block a harmless simulated candidate
+    # for a risk that cannot occur in dry-run mode (Codex review, PR #231:
+    # "Allow guarded Alpaca simulations through the duplicate hook").
+    if ticker_guarded and not config.dry_run:
+        try:
+            dup_order = _same_stream_order_exists(broker, ticker, trading_day)
+        except Exception as exc:  # noqa: BLE001
+            errors_count_inc += 1
+            candidate_outcome = {"status": "blocked", "skip_reason": f"duplicate-check failed: {exc}"}
+            _block(MISSING_FILL_DATA_ERROR, f"{ticker}: same-stream duplicate check failed: {exc}; skipping")
+            return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+        if dup_order is not None:
+            order_id = dup_order.get("id") or dup_order.get("order_id")
+            if not order_id:
+                # A legacy boolean-style adapter (True, normalized to {} by
+                # _same_stream_order_exists) or a matched order dict missing
+                # both id fields carries no traceable identity: recording
+                # status="submitted" with a null order_id would land an
+                # unidentifiable row in submitted_orders.csv that
+                # reconciliation can never match to a broker fill, while
+                # _log_execution can't query a fill for it either. Classify
+                # it as incomplete and let a human/recovery pass resolve the
+                # real order id rather than publish an untraceable
+                # submission (Codex review, PR #231: "Require an order ID
+                # before marking legacy duplicates submitted").
+                errors_count_inc += 1
+                candidate_outcome = {
+                    "status": "blocked",
+                    "skip_reason": "same-stream broker order exists but adapter returned no order id",
+                }
+                _block(
+                    MISSING_FILL_DATA_ERROR,
+                    f"{ticker}: same-stream duplicate found but broker returned no order id; skipping",
+                )
+                return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+            try:
+                dup_amount = float(dup_order.get("dollar_amount") or dup_order.get("notional") or 0)
+            except (TypeError, ValueError):
+                dup_amount = 0.0
+            # A matched order missing both amount fields carries no real
+            # dollar figure -- fall back to this run's own freshly
+            # recomputed order_amount (pre-kill-switch, pre-top-up-cap at
+            # this point) rather than record a nonsensical $0 buy against
+            # the ticker's daily cap. The real production broker adapter
+            # always reports dollar_amount for a matched order, so this
+            # fallback is not reachable there.
+            if not math.isfinite(dup_amount) or dup_amount <= 0:
+                dup_amount = order_amount
+            order_key = (ticker, trading_day)
+            if order_key not in state.own_orders_recorded:
+                state.record_buy(ticker, trading_day, dup_amount)
+                state.own_orders_recorded.add(order_key)
+            # else: this exact StrategyState instance already booked THIS
+            # STREAM's own order for this ticker/day earlier in the SAME run
+            # (e.g. an in-process retry that reuses its StrategyState rather
+            # than starting a fresh one) -- recording it again here would
+            # inflate today's/this week's spend and buy count, incorrectly
+            # capping later candidates and overstating the persisted budget
+            # audit (Codex review, PR #231: "Avoid rebooking duplicates in
+            # reused strategy state"). Checked via own_orders_recorded, NOT
+            # buys_today: _seed_prior_allocations also calls record_buy to
+            # seed CROSS-stream (morning/midday) prior context into this
+            # ticker's day/week spend, which bumps buys_today to a nonzero
+            # value even on a freshly restarted process whose OWN afternoon
+            # order was never booked into this state instance -- checking
+            # buys_today alone would then wrongly skip recording a genuinely
+            # new-to-this-state recovered order, omitting it from day/week
+            # spend and letting later candidates exceed the corrected cap
+            # (Codex review, PR #231: "Record the recovered buy separately
+            # from seeded prior context").
+            #
+            # Whether this order is already counted toward the trailing-7-day
+            # kill-switch figure depends on whether THIS ticker's submitted
+            # order is recorded in an on-disk scheduled-afternoon artifact for
+            # today: _apply_deployment_history sums deployment from disk once
+            # before this batch starts, so a written artifact already reflects
+            # it (adding it again here would double-count against the
+            # kill-switch threshold -- Codex review, PR #231: "Do not add a
+            # preserved duplicate to deployment again"). But when the prior
+            # attempt was interrupted after the broker accepted the order yet
+            # before it could write ITS OWN artifact for this ticker, nothing
+            # on disk has ever counted this capital, and the recovered order
+            # must be added so later candidates in this retry's batch (and the
+            # kill-switch audit) see the real deployed total. Checked per
+            # ticker, not merely "does any artifact exist for today's date":
+            # a same-day artifact that doesn't itself contain THIS ticker's
+            # submitted order (e.g. a zero-order artifact from an earlier,
+            # unrelated invocation) must not be mistaken for proof that this
+            # order was already counted (Codex review, PR #231: "Verify the
+            # recovered order is actually in deployment history").
+            if deployment_history_root is not None and not _same_day_ticker_deployment_already_recorded(
+                ticker, trading_day, deployment_history_root
+            ):
+                running_deployed_7d += dup_amount
+            # This row's real order was authorized by the spread gate on the
+            # EARLIER attempt that actually placed it, and that original
+            # evidence isn't available here without threading the prior
+            # artifact's path through this call (out of scope for this
+            # change). Taking a fresh retry-time quote_spread_pct and
+            # recording it as an ordinary spread_ok/spread_not_ok/
+            # spread_unavailable verdict would be worse than recording
+            # nothing: the spread can move between the original placement and
+            # this retry, and a fresh unfavorable reading would relabel an
+            # already-authorized, genuinely submitted order as having failed
+            # or never reached the safety gate, corrupting the historical
+            # evidence config/scheduled_tasks.json's audit consumers rely on
+            # (Codex review, PR #231: "Retain the original spread verdict for
+            # recovered orders"). A prior attempt at this used a bespoke
+            # "duplicate_recovered" status, but config/scheduled_tasks.json's
+            # row_level_statuses contract enumerates exactly spread_ok,
+            # spread_unavailable, spread_not_ok, and not_evaluated -- emitting
+            # anything outside that declared enum breaks contract consumers
+            # (Codex review, PR #231: "Keep recovered spread evidence within
+            # the declared contract"). SPREAD_STATUS_NOT_EVALUATED is the
+            # nearest compliant value: like this row, it commits to no
+            # pass/fail verdict and per the contract's own note is "never
+            # recorded as spread_ok=true" -- spread_ok/spread_pct stay None
+            # rather than a fabricated True/False. duplicate_preserved=True
+            # on the outcome remains the signal that this status reflects
+            # missing RETRY evidence, not a row that skipped the gate outright.
+            spread_fields = {
+                "spread_ok": None,
+                "spread_pct": None,
+                "spread_status": SPREAD_STATUS_NOT_EVALUATED,
+            }
+            candidate_outcome = {
+                "status": "submitted",
+                "order_id": order_id,
+                "skip_reason": "same-stream broker order exists",
+                "submitted_amount_usd": dup_amount,
+                # Carried on the outcome so a failure handler synthesizing a
+                # buy_candidates row from this outcome alone (see
+                # _publish_in_flight_outcome / _failure_candidate_row) can
+                # still record the real multiplier, matching the fresh-
+                # placement branch below.
+                "buy_multiplier": decision.buy_multiplier,
+                # Preserves the real broker order rather than a fresh placement,
+                # so a caller booking this candidate into a persistent ledger
+                # must not double-count it against an earlier attempt's record,
+                # and so _build_buy_candidates keeps this amount instead of
+                # clamping it against THIS retry's freshly recomputed
+                # incremental_order_amount (Codex review, PR #231: "Keep the
+                # broker notional when rebuilding duplicate artifacts").
+                "duplicate_preserved": True,
+                **spread_fields,
+            }
+            _publish_in_flight_outcome(ticker, candidate_outcome)
+            logger.info(
+                "%s: same-stream broker order already exists; not re-submitting (order_id=%s)",
+                ticker,
+                candidate_outcome.get("order_id"),
+            )
+            if run_result is not None:
+                # Log this the same way as a fresh placement (not via _block):
+                # this ticker's order was actually submitted, so it must appear
+                # in execution_records for the slippage/coverage report, and
+                # any missing-fill classification must come from the real fill
+                # status (_log_execution only classifies MISSING_FILL_EXECUTION_GAP
+                # when the order truly has no fill) rather than a hardcoded
+                # "budget capped" reason that would misreport a submitted order.
+                _log_execution(
+                    run_result, decision, candidate_outcome.get("order_id"), broker, notional_usd=dup_amount
+                )
+            return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
 
     if kill_switch_engaged(replace(config, deployed_last_7d_usd=running_deployed_7d)):
         # Cap at THIS candidate's own selected base ($1 or $2), not the fixed
@@ -5279,25 +5633,23 @@ def _process_buy_candidate(
         order_amount = min(order_amount, kill_switch_base)
 
     if guard_active:
-        outcome = evaluate_top_up_guard(decision, prior, config)
-        top_up_outcome = outcome
-        order_amount = min(outcome.incremental_order_amount, order_amount)
-        if outcome.skipped:
+        order_amount = min(top_up_outcome.incremental_order_amount, order_amount)
+        if top_up_outcome.skipped:
             candidate_outcome = {
                 "status": "skipped",
                 "order_id": None,
-                "skip_reason": outcome.top_up_guard_result,
+                "skip_reason": top_up_outcome.top_up_guard_result,
             }
-            if outcome.manual_review:
+            if top_up_outcome.manual_review:
                 logger.warning(
                     "%s: prior same-day amount $%.2f but no comparable price; "
                     "conservative $0 top-up, manual review required",
                     ticker,
-                    outcome.prior_same_day_amount,
+                    top_up_outcome.prior_same_day_amount,
                 )
             _block(
                 MISSING_FILL_TOP_UP_OFFSET,
-                f"{ticker}: top-up guard offset ({outcome.top_up_guard_result}); no incremental buy",
+                f"{ticker}: top-up guard offset ({top_up_outcome.top_up_guard_result}); no incremental buy",
             )
             return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
 
@@ -5318,8 +5670,11 @@ def _process_buy_candidate(
         return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
     # A morning/manual run must NOT block the scheduled afternoon run: when the
     # top-up guard has a loaded prior allocation for this ticker, the earlier
-    # same-day allocation is handled above, so the broker's same-day-order
-    # block is intentionally bypassed here.
+    # same-day allocation is handled above (and any same-stream retry of THIS
+    # ticker was already caught by the duplicate check at the top of this
+    # function), so the broker's broad same-day-order block is intentionally
+    # bypassed here for guarded tickers -- a legitimate cross-stream top-up
+    # must not be blocked by the morning stream's own earlier order.
     if not ticker_guarded and broker.same_day_strategy_order_exists(ticker, trading_day):
         candidate_outcome = {"status": "skipped", "skip_reason": "same-day broker order exists"}
         _block(MISSING_FILL_BUDGET_CAPPED, f"{ticker}: same-day broker order already exists; skipping")
@@ -5420,10 +5775,24 @@ def _process_buy_candidate(
             "review_passed": True,
         }
 
+    # A manual (non-scheduled) placement gets its own "-manual-" ref-id
+    # segment, distinct from a plain scheduled order's ref_id. guard_active
+    # (and so ticker_guarded) is only ever True for scheduled runs, so a
+    # manual placement always falls to this branch. Without a distinct
+    # segment a manual fill's ref_id would be indistinguishable from a plain
+    # scheduled order's, so a LATER scheduled run that finds this manual fill
+    # as cross-stream prior context and computes a guarded top-up would have
+    # its same-stream duplicate check match the manual fill's ordinary ref_id
+    # and wrongly treat the fresh incremental top-up as an already-submitted
+    # retry -- recording it as "submitted" without ever calling
+    # place_market_buy (Codex review, PR #231: "Separate manual ref IDs from
+    # scheduled retry IDs"; mirrors morning_dca.py's identical fix, PR #42).
     ref_id = (
         f"graded-dca-topup-{trading_day.isoformat()}-{ticker}"
         if ticker_guarded
         else f"graded-dca-{trading_day.isoformat()}-{ticker}"
+        if scheduled
+        else f"graded-dca-manual-{trading_day.isoformat()}-{ticker}"
     )
     if config.dry_run:
         logger.info(
@@ -5474,6 +5843,7 @@ def _process_buy_candidate(
             logger.error("Placement failed for %s: %s", ticker, exc)
             return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
         state.record_buy(ticker, trading_day, order_amount)
+        state.own_orders_recorded.add((ticker, trading_day))
         if scheduled:
             running_deployed_7d += order_amount
         logger.info(
@@ -5579,6 +5949,7 @@ def _process_buy_candidates_batch(
     prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]],
     scheduled: bool,
     run_result: Optional[RunResult],
+    deployment_history_root: Optional[str | Path] = None,
 ) -> tuple[Dict[str, Dict[str, Any]], Dict[str, TopUpGuardOutcome], float, int, int]:
     candidate_outcomes: Dict[str, Dict[str, Any]] = {}
     # Published by reference BEFORE any placement so a failure part-way through
@@ -5605,6 +5976,7 @@ def _process_buy_candidates_batch(
             running_deployed_7d=running_deployed_7d,
             scheduled=scheduled,
             run_result=run_result,
+            deployment_history_root=deployment_history_root,
         )
         candidate_outcomes[decision.ticker] = c_outcome
         if t_outcome is not None:
@@ -6036,6 +6408,10 @@ def _run_once_impl(
     # Inject the trailing-7-day scheduled-live deployment from history so the
     # kill-switch in graded_buy_multiplier reflects real cash burn. Imported
     # lazily to avoid a circular import (dca_risk imports from this module).
+    # deployment_history_root is threaded through to _process_buy_candidates_batch
+    # (and from there to _process_buy_candidate) so a duplicate-preserved retry
+    # can check per-ticker, at the moment it needs to, whether ITS OWN order is
+    # already reflected on disk -- see _same_day_ticker_deployment_already_recorded.
     if deployment_history_root is not None:
         config = _apply_deployment_history(config, trading_day, deployment_history_root)
 
@@ -6094,6 +6470,7 @@ def _run_once_impl(
         prior_same_day_allocations=prior_same_day_allocations,
         scheduled=scheduled,
         run_result=run_result,
+        deployment_history_root=deployment_history_root,
     )
     errors_count += err_inc
     order_reviews_attempted += rev_inc

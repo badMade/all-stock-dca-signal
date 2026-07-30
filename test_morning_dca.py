@@ -4851,6 +4851,79 @@ def test_morning_live_full_buy_when_no_prior_allocation(tmp_path):
     assert rows["NVDA"]["top_up_guard_result"] == "no_prior_run"
 
 
+def test_morning_live_insufficient_buying_power_blocks_order(tmp_path):
+    # available_buying_power() below the candidate's notional must block the
+    # order before any placement, distinctly from a cap or spread block.
+    class _PoorBroker(_TopUpBroker):
+        def available_buying_power(self):
+            return 0.50
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
+    cfg = MorningConfig(
+        tickers=("NVDA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        prior_allocation_roots=(str(tmp_path / "empty_prior"),),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    broker = _PoorBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=broker)
+    assert "NVDA" not in broker.placed
+    outcome = res["artifacts"].get("broker_outcomes", {}).get("NVDA", {})
+    assert outcome.get("status") == "blocked"
+    assert outcome.get("skip_reason") == "insufficient buying power"
+
+
+def test_morning_live_not_tradable_blocks_order(tmp_path):
+    class _UntradableBroker(_TopUpBroker):
+        def is_tradable_for_fractional_buy(self, ticker):
+            return False
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
+    cfg = MorningConfig(
+        tickers=("NVDA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        prior_allocation_roots=(str(tmp_path / "empty_prior"),),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    broker = _UntradableBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=broker)
+    assert "NVDA" not in broker.placed
+    outcome = res["artifacts"].get("broker_outcomes", {}).get("NVDA", {})
+    assert outcome.get("status") == "blocked"
+    assert outcome.get("skip_reason") == "not tradable for fractional buy"
+
+
+def test_morning_manual_review_block_prevents_placement(tmp_path):
+    # Scheduled runs are pre-authorized to skip review_market_buy (config/
+    # budgets.json execution_authorization_policy: calls_review_equity_order=
+    # false); a MANUAL run still calls it as a human-reviewed safety net, and a
+    # broker-side rejection there must block the order.
+    class _ReviewBlockedBroker(_TopUpBroker):
+        def review_market_buy(self, ticker, notional_usd):
+            return False, "flagged for manual review"
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
+    cfg = MorningConfig(
+        tickers=("NVDA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        prior_allocation_roots=(str(tmp_path / "empty_prior"),),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    broker = _ReviewBlockedBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=broker, manual=True)
+    assert "NVDA" not in broker.placed
+    outcome = res["artifacts"].get("broker_outcomes", {}).get("NVDA", {})
+    assert outcome.get("status") == "blocked"
+    assert outcome.get("skip_reason") == "review blocked: flagged for manual review"
+
+
 def test_morning_live_missing_price_triggers_manual_review(tmp_path):
     # Prior: NVDA "submitted" with unknown reference price → missing_prior_price → $0 + manual review.
     prior_root = _seed_prior(tmp_path / "prior", "NVDA", 9.0, status="submitted", reference_price=None)

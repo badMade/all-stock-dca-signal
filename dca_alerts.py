@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, TypeVar
 from urllib.parse import urlsplit
 
+from dca_fileio import atomic_write_text
 from dca_paths import stream_root
 
 logger = logging.getLogger("near_close_dca.alerts")
@@ -278,7 +279,7 @@ def write_failed_start_marker(
         except OSError:
             logger.exception("failed-start attempt-history append failed for %s", stream)
         path = day_dir / f"{stream}.json"
-        path.write_text(serialized, encoding="utf-8")
+        atomic_write_text(path, serialized, encoding="utf-8")
         return path
     except Exception:  # noqa: BLE001 - see alert_failure/send_heartbeat above
         logger.exception("failed-start marker write raised for %s", stream)

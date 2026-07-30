@@ -39,6 +39,7 @@ from near_close_dca import (
     Bar,
     BrokerName,
     DryRunBroker,
+    OrderFill,
     PriorSameDayAllocation,
     ReconciledDecision,
     RunResult,
@@ -50,6 +51,8 @@ from near_close_dca import (
     _earlier_selected_base,
     _iso_or_none,
     _process_buy_candidate,
+    _same_stream_order_exists,
+    _seed_prior_allocations,
     account_pinning_failure,
     allocation_sort_key,
     build_broker,
@@ -771,6 +774,821 @@ def test_kill_switch_caps_guarded_top_up_at_preserved_base():
     assert candidate_outcome["submitted_amount_usd"] == 1.0
 
 
+class _RefIdTrackingBroker:
+    """Broker double that remembers placed ref_ids, so the same-stream duplicate
+    check (same_day_strategy_order_exists_with_ref_id_prefix) reflects real prior
+    placements instead of a fixture that always returns nothing.
+    """
+
+    def __init__(self, cash: float = 1000.0):
+        self._cash = cash
+        self.placed: dict = {}  # ticker -> notional (last placement)
+        self._orders: list = []  # (ticker, ref_id, notional, order_id)
+        self._fills: dict = {}  # order_id -> OrderFill
+
+    def get_order_fill(self, order_id):
+        return self._fills.get(order_id)
+
+    def account_number(self):
+        return FIXTURE_ACCOUNT_NUMBER
+
+    def available_buying_power(self):
+        return self._cash
+
+    def same_day_strategy_order_exists(self, ticker, trading_day):
+        return any(t == ticker for t, _rid, _amt, _oid in self._orders)
+
+    def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+        for t, rid, amt, order_id in self._orders:
+            if t == ticker and rid in ref_id_prefixes:
+                return {"id": order_id, "dollar_amount": amt}
+        return None
+
+    def is_tradable_for_fractional_buy(self, ticker):
+        return True
+
+    def review_market_buy(self, ticker, notional_usd):
+        return True, "ok"
+
+    def place_market_buy(self, ticker, notional_usd, ref_id):
+        order_id = f"ORDER-{ticker}-{len(self._orders) + 1}"
+        self.placed[ticker] = notional_usd
+        self._orders.append((ticker, ref_id, notional_usd, order_id))
+        return order_id
+
+
+def _graded_decision(ticker="AAPL", buy_multiplier=5.0, suggested_amount_usd=10.0, selected_base_amount_usd=2.0, target_price=98.0):
+    return ReconciledDecision(
+        ticker=ticker,
+        action=Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=buy_multiplier,
+        suggested_amount_usd=suggested_amount_usd,
+        selected_base_amount_usd=selected_base_amount_usd,
+        target_price=target_price,
+    )
+
+
+def test_guarded_top_up_retry_does_not_place_a_duplicate_order():
+    # A retry of the SCHEDULED afternoon run for a ticker with an earlier
+    # same-day (morning/midday) allocation must detect ITS OWN already-placed
+    # top-up order rather than recompute and place a second one. Before the
+    # fix, ticker_guarded candidates skipped the broker's same-day-order check
+    # entirely (with no narrower same-stream check to replace it), so a retry
+    # would double-buy.
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision()
+    prior = PriorSameDayAllocation(
+        ticker="AAPL", amount_usd=1.0, reference_price=99.0, selected_base_amount_usd=1.0
+    )
+    broker = _RefIdTrackingBroker()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    # Attempt 1: places the guarded top-up for real.
+    state1 = StrategyState()
+    outcome1, _, _, _, _ = _process_buy_candidate(
+        decision, config, state1, broker, robinhood_data=robinhood_data, now=now,
+        trading_day=trading_day, guard_active=True,
+        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
+        scheduled=True, run_result=None,
+    )
+    assert outcome1["status"] == "submitted"
+    assert broker.placed["AAPL"] > 0
+    placed_amount = broker.placed["AAPL"]
+    assert len(broker._orders) == 1
+
+    # Give the broker a real fill for the already-placed order, as a live
+    # broker would report on a retry that queries it fresh.
+    placed_order_id = broker._orders[0][3]
+    broker._fills[placed_order_id] = OrderFill(
+        avg_fill_price=98.0,
+        quantity_filled=placed_amount / 98.0,
+        order_submitted_at=now,
+        order_filled_at=now,
+    )
+
+    # Attempt 2 (a retry with a fresh, unseeded StrategyState -- exactly what a
+    # fresh process restart looks like -- and the SAME prior_same_day_allocations,
+    # since load_prior_same_day_allocations deliberately excludes this stream's
+    # own earlier same-day runs): must find the same-stream order already on the
+    # broker and must NOT place a second one.
+    state2 = StrategyState()
+    run_result = RunResult(trading_day=trading_day, decisions=[decision], active_universe=["AAPL"])
+    outcome2, _, _, _, _ = _process_buy_candidate(
+        decision, config, state2, broker, robinhood_data=robinhood_data, now=now,
+        trading_day=trading_day, guard_active=True,
+        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
+        scheduled=True, run_result=run_result,
+    )
+    assert len(broker._orders) == 1, "retry must not place a second broker order"
+    assert outcome2["status"] == "submitted"
+    assert outcome2["duplicate_preserved"] is True
+    assert outcome2["order_id"] == broker._orders[0][3]
+    assert outcome2["submitted_amount_usd"] == pytest.approx(placed_amount)
+    # Codex/Copilot review: a preserved duplicate order must still be logged
+    # into execution_records (so it appears in the slippage/coverage report)
+    # and must NOT be misclassified as a budget-capped missing fill -- the
+    # order was genuinely submitted (and here, filled).
+    assert len(run_result.execution_records) == 1
+    record = run_result.execution_records[0]
+    assert record.ticker == "AAPL"
+    assert record.order_id == placed_order_id
+    assert record.status == "filled"
+    assert "AAPL" not in run_result.loop_block_reasons
+
+
+def _write_scheduled_afternoon_artifact(history_root, trading_day, buy_candidates):
+    """Write a minimal valid scheduled-afternoon run_state.json for
+    ``trading_day`` under ``history_root``, for tests exercising
+    deployment-history scans keyed off exact ticker/day/stream matches."""
+    from scripts.run_classification import (
+        CRON_ID,
+        SCHEDULED_FOR_ET,
+        SCHEDULED_RUN_TYPE,
+        SCHEDULED_WINDOW_END_ET,
+        SCHEDULED_WINDOW_START_ET,
+    )
+
+    run_dir = os.path.join(str(history_root), trading_day.isoformat())
+    os.makedirs(run_dir, exist_ok=True)
+    state = {
+        "trading_day": trading_day.isoformat(),
+        "status": "ok",
+        "generated_at": f"{trading_day.isoformat()}T15:45:00",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "run_type": SCHEDULED_RUN_TYPE,
+            "cron_id": CRON_ID,
+            "scheduled_for_et": SCHEDULED_FOR_ET,
+            "scheduled_window_start_et": SCHEDULED_WINDOW_START_ET,
+            "scheduled_window_end_et": SCHEDULED_WINDOW_END_ET,
+            "manual_run": False,
+            "run_id": f"scheduled_{trading_day.strftime('%Y%m%d')}_1530ET",
+            "triggered_at_utc": f"{trading_day.isoformat()}T19:45:00Z",
+            "state_schema_version": "run-classification-v1",
+        },
+        "buy_candidates": buy_candidates,
+    }
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(state, handle, indent=2)
+
+
+def test_guarded_top_up_retry_does_not_double_count_deployed_7d():
+    # Codex review on PR #231 ("Do not add a preserved duplicate to
+    # deployment again"): on the production path, _apply_deployment_history
+    # has already summed a duplicate-preserved order into
+    # config.deployed_last_7d_usd (and so into running_deployed_7d's starting
+    # value) from THIS trading day's own already-written artifact before this
+    # retry's batch even started. _process_buy_candidate must not add the
+    # preserved amount to running_deployed_7d a second time.
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision()
+    prior = PriorSameDayAllocation(
+        ticker="AAPL", amount_usd=1.0, reference_price=99.0, selected_base_amount_usd=1.0
+    )
+    broker = _RefIdTrackingBroker()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+    _process_buy_candidate(
+        decision, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
+        trading_day=trading_day, guard_active=True,
+        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
+        scheduled=True, run_result=None,
+    )
+    starting_deployed_7d = 50.0
+    _, _, returned_deployed_7d, _, _ = _process_buy_candidate(
+        decision, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
+        trading_day=trading_day, guard_active=True,
+        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=starting_deployed_7d,
+        scheduled=True, run_result=None,
+    )
+    assert returned_deployed_7d == starting_deployed_7d, (
+        "a duplicate-preserved outcome places no new capital and must not "
+        "increment running_deployed_7d"
+    )
+
+
+def test_guarded_top_up_retry_counts_recovered_order_when_not_yet_on_disk(tmp_path):
+    # Codex review on PR #231 ("Count broker-only preserved orders in rolling
+    # deployment"): when the prior attempt was interrupted after the broker
+    # accepted the order but before it could write its own run_state.json,
+    # _apply_deployment_history has nothing on disk to sum -- the recovered
+    # order must be added to running_deployed_7d so later candidates in this
+    # retry's batch (and the kill-switch audit) see the real deployed total.
+    # An empty deployment_history_root (no run_state.json for this ticker/day
+    # anywhere on disk) is exactly that "nothing counted this yet" state.
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision()
+    prior = PriorSameDayAllocation(
+        ticker="AAPL", amount_usd=1.0, reference_price=99.0, selected_base_amount_usd=1.0
+    )
+    broker = _RefIdTrackingBroker()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+    history_root = os.path.join(str(tmp_path), "history")
+    _process_buy_candidate(
+        decision, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
+        trading_day=trading_day, guard_active=True,
+        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
+        scheduled=True, run_result=None, deployment_history_root=history_root,
+    )
+    placed_amount = broker.placed["AAPL"]
+    starting_deployed_7d = 50.0
+    _, _, returned_deployed_7d, _, _ = _process_buy_candidate(
+        decision, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
+        trading_day=trading_day, guard_active=True,
+        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=starting_deployed_7d,
+        scheduled=True, run_result=None, deployment_history_root=history_root,
+    )
+    assert returned_deployed_7d == pytest.approx(starting_deployed_7d + placed_amount), (
+        "a preserved duplicate not yet reflected in any written artifact must "
+        "still be added to running_deployed_7d"
+    )
+
+
+def test_guarded_top_up_retry_does_not_recount_when_ticker_already_on_disk(tmp_path):
+    # Codex review on PR #231 ("Verify the recovered order is actually in
+    # deployment history"): date membership alone is not enough -- a
+    # scheduled-afternoon artifact for today that DOES contain this exact
+    # ticker's submitted order must still suppress the running_deployed_7d
+    # increment (it's already summed into config.deployed_last_7d_usd via
+    # _apply_deployment_history), even though this call also passes a
+    # non-zero starting running_deployed_7d.
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision()
+    prior = PriorSameDayAllocation(
+        ticker="AAPL", amount_usd=1.0, reference_price=99.0, selected_base_amount_usd=1.0
+    )
+    broker = _RefIdTrackingBroker()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+    history_root = os.path.join(str(tmp_path), "history")
+    _write_scheduled_afternoon_artifact(
+        history_root, trading_day, [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 1.0}]
+    )
+    _process_buy_candidate(
+        decision, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
+        trading_day=trading_day, guard_active=True,
+        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
+        scheduled=True, run_result=None, deployment_history_root=history_root,
+    )
+    starting_deployed_7d = 50.0
+    _, _, returned_deployed_7d, _, _ = _process_buy_candidate(
+        decision, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
+        trading_day=trading_day, guard_active=True,
+        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=starting_deployed_7d,
+        scheduled=True, run_result=None, deployment_history_root=history_root,
+    )
+    assert returned_deployed_7d == starting_deployed_7d
+
+
+def test_guarded_top_up_retry_counts_ticker_when_only_a_different_ticker_is_on_disk(tmp_path):
+    # Codex review on PR #231 ("Verify the recovered order is actually in
+    # deployment history"): a same-day scheduled-afternoon artifact that
+    # exists on disk but records a DIFFERENT ticker (e.g. an earlier
+    # invocation that placed one ticker then crashed before a later
+    # invocation's placement for THIS ticker was ever written) must not be
+    # mistaken for proof that THIS ticker's order was already counted --
+    # checking "any artifact for today" instead of this ticker specifically
+    # would silently under-count deployment.
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision()
+    prior = PriorSameDayAllocation(
+        ticker="AAPL", amount_usd=1.0, reference_price=99.0, selected_base_amount_usd=1.0
+    )
+    broker = _RefIdTrackingBroker()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+    history_root = os.path.join(str(tmp_path), "history")
+    _write_scheduled_afternoon_artifact(
+        history_root, trading_day, [{"ticker": "MSFT", "status": "submitted", "planned_amount_usd": 4.0}]
+    )
+    _process_buy_candidate(
+        decision, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
+        trading_day=trading_day, guard_active=True,
+        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
+        scheduled=True, run_result=None, deployment_history_root=history_root,
+    )
+    placed_amount = broker.placed["AAPL"]
+    starting_deployed_7d = 50.0
+    _, _, returned_deployed_7d, _, _ = _process_buy_candidate(
+        decision, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
+        trading_day=trading_day, guard_active=True,
+        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=starting_deployed_7d,
+        scheduled=True, run_result=None, deployment_history_root=history_root,
+    )
+    assert returned_deployed_7d == pytest.approx(starting_deployed_7d + placed_amount)
+
+
+def test_guarded_top_up_retry_records_recovered_buy_despite_seeded_prior_context():
+    # Codex review on PR #231 ("Record the recovered buy separately from
+    # seeded prior context"): on every real guarded run, _seed_prior_allocations
+    # calls state.record_buy() for this ticker's morning/midday allocation
+    # BEFORE _process_buy_candidate runs, so buys_today(...) is already
+    # nonzero even in a freshly restarted process whose OWN afternoon order
+    # was never booked into this StrategyState. Gating the duplicate-preserved
+    # branch's state.record_buy on buys_today()==0 (as a prior fix did) would
+    # then wrongly skip recording a genuinely new-to-this-state recovered
+    # order, omitting it from day/week spend.
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision()
+    trading_day = date(2026, 6, 29)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    prior = PriorSameDayAllocation(
+        ticker="AAPL", amount_usd=1.0, reference_price=99.0, selected_base_amount_usd=1.0
+    )
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+    # A fresh, never-before-used StrategyState -- exactly what a process
+    # restart looks like -- seeded with the morning allocation the same way
+    # _run_once_impl seeds it before ever reaching _process_buy_candidate.
+    fresh_state = StrategyState()
+    _seed_prior_allocations(fresh_state, trading_day, True, {"AAPL": prior})
+    assert fresh_state.buys_today("AAPL", trading_day) == 1, "seeding must land the morning allocation"
+    assert fresh_state.day_notional(trading_day) == pytest.approx(1.0)
+
+    # The broker already has this stream's own afternoon order from an
+    # earlier (now-dead) process instance -- simulated directly, since this
+    # fresh process never placed it itself.
+    broker = _RefIdTrackingBroker()
+    broker._orders.append(("AAPL", f"graded-dca-topup-{trading_day.isoformat()}-AAPL", 3.0, "ORDER-AAPL-recovered"))
+
+    outcome, _, _, _, _ = _process_buy_candidate(
+        decision, config, fresh_state, broker, robinhood_data=robinhood_data, now=now,
+        trading_day=trading_day, guard_active=True,
+        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
+        scheduled=True, run_result=None,
+    )
+    assert outcome["duplicate_preserved"] is True
+    assert outcome["submitted_amount_usd"] == pytest.approx(3.0)
+    # The recovered order must be booked ON TOP of the seeded morning
+    # allocation, not skipped because buys_today was already nonzero.
+    assert fresh_state.buys_today("AAPL", trading_day) == 2
+    assert fresh_state.day_notional(trading_day) == pytest.approx(1.0 + 3.0)
+
+
+def test_guarded_top_up_retry_does_not_rebook_when_state_already_recorded_it():
+    # Codex review on PR #231 ("Avoid rebooking duplicates in reused strategy
+    # state"): when a retry reuses the SAME StrategyState instance the first
+    # attempt already booked this order through (rather than a fresh
+    # process-restart StrategyState), the duplicate-preserved branch must not
+    # call state.record_buy a second time -- that would inflate today's/this
+    # week's spend and buy count for this ticker.
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision()
+    prior = PriorSameDayAllocation(
+        ticker="AAPL", amount_usd=1.0, reference_price=99.0, selected_base_amount_usd=1.0
+    )
+    broker = _RefIdTrackingBroker()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+    shared_state = StrategyState()
+    _process_buy_candidate(
+        decision, config, shared_state, broker, robinhood_data=robinhood_data, now=now,
+        trading_day=trading_day, guard_active=True,
+        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
+        scheduled=True, run_result=None,
+    )
+    placed_amount = broker.placed["AAPL"]
+    assert shared_state.buys_today("AAPL", trading_day) == 1
+    assert shared_state.day_notional(trading_day) == pytest.approx(placed_amount)
+
+    _process_buy_candidate(
+        decision, config, shared_state, broker, robinhood_data=robinhood_data, now=now,
+        trading_day=trading_day, guard_active=True,
+        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
+        scheduled=True, run_result=None,
+    )
+    assert shared_state.buys_today("AAPL", trading_day) == 1, (
+        "a duplicate-preserved outcome must not rebook a buy already recorded "
+        "in this same StrategyState instance"
+    )
+    assert shared_state.day_notional(trading_day) == pytest.approx(placed_amount), (
+        "rebooking would double-count this order's notional in the same "
+        "StrategyState instance's day spend"
+    )
+
+
+def test_guarded_top_up_retry_records_recovered_spread_status_without_a_verdict():
+    # Codex review on PR #231 ("Retain the original spread verdict for
+    # recovered orders"): a duplicate-preserved outcome must not carry a
+    # fresh retry-time spread_ok/spread_not_ok/spread_unavailable verdict --
+    # the spread can move between the original placement and this retry, and
+    # an unfavorable fresh reading would relabel an already-authorized,
+    # genuinely submitted order as having failed or never reached the safety
+    # gate. It must record spread_status="not_evaluated" with no spread_ok
+    # verdict instead -- the nearest value inside config/scheduled_tasks.json's
+    # declared row_level_statuses enum that commits to no pass/fail claim
+    # (Codex review, PR #231: "Keep recovered spread evidence within the
+    # declared contract" -- a bespoke "duplicate_recovered" status was tried
+    # first and rejected for falling outside that enum).
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision()
+    prior = PriorSameDayAllocation(
+        ticker="AAPL", amount_usd=1.0, reference_price=99.0, selected_base_amount_usd=1.0
+    )
+    broker = _RefIdTrackingBroker()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    # Attempt 1: a narrow spread that actually authorizes the placement.
+    narrow_spread_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+    _process_buy_candidate(
+        decision, config, StrategyState(), broker, robinhood_data=narrow_spread_data, now=now,
+        trading_day=trading_day, guard_active=True,
+        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
+        scheduled=True, run_result=None,
+    )
+    # Attempt 2 (retry): the spread has since widened past the gate's limit.
+    # A wide/failing spread on the RETRY must not surface as this row's
+    # verdict -- the original placement is what was actually authorized.
+    wide_spread_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(90.0, 110.0)
+    )
+    outcome2, _, _, _, _ = _process_buy_candidate(
+        decision, config, StrategyState(), broker, robinhood_data=wide_spread_data, now=now,
+        trading_day=trading_day, guard_active=True,
+        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
+        scheduled=True, run_result=None,
+    )
+    assert outcome2["duplicate_preserved"] is True
+    assert outcome2["spread_status"] == "not_evaluated"
+    assert outcome2["spread_ok"] is None
+    assert outcome2["spread_pct"] is None
+
+
+def test_guarded_top_up_retry_blocks_when_broker_returns_no_order_id():
+    # Codex review on PR #231 ("Require an order ID before marking legacy
+    # duplicates submitted"): a matched duplicate with no id/order_id field
+    # (a legacy boolean-style adapter, or a matched order dict missing both)
+    # must not be published as status="submitted" with a null order_id --
+    # that row would be untraceable in submitted_orders.csv and
+    # reconciliation could never match it to a broker fill.
+    class _NoIdDupBroker:
+        def account_number(self):
+            return FIXTURE_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 1000.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return True
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return {"dollar_amount": 5.0}  # no id / order_id
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise AssertionError("must not place a fresh order when a same-stream duplicate is found")
+
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision()
+    prior = PriorSameDayAllocation(
+        ticker="AAPL", amount_usd=1.0, reference_price=99.0, selected_base_amount_usd=1.0
+    )
+    broker = _NoIdDupBroker()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+    outcome, _, _, errors_count_inc, _ = _process_buy_candidate(
+        decision, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
+        trading_day=trading_day, guard_active=True,
+        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
+        scheduled=True, run_result=None,
+    )
+    assert outcome["status"] == "blocked"
+    assert outcome.get("order_id") is None
+    assert errors_count_inc == 1
+
+
+def test_guarded_top_up_retry_finds_duplicate_even_when_fresh_guard_would_skip():
+    # Codex review on PR #231, P1 ("Check for an existing order before
+    # returning from the top-up guard"): a retry whose freshly recomputed
+    # top-up guard evaluates to a zero increment (e.g. the price rose above
+    # the prior reference) must still detect and preserve an order this
+    # stream already placed on an earlier attempt -- not overwrite the
+    # scheduled artifact with a "skipped" row that erases the real order's
+    # evidence.
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    prior = PriorSameDayAllocation(
+        ticker="AAPL", amount_usd=1.0, reference_price=99.0, selected_base_amount_usd=1.0
+    )
+    broker = _RefIdTrackingBroker()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    # Attempt 1: target_price (98.0) below prior.reference_price (99.0) -> a
+    # real incremental top-up is computed and placed.
+    decision_attempt1 = _graded_decision(target_price=98.0)
+    outcome1, _, _, _, _ = _process_buy_candidate(
+        decision_attempt1, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
+        trading_day=trading_day, guard_active=True,
+        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
+        scheduled=True, run_result=None,
+    )
+    assert outcome1["status"] == "submitted"
+    assert len(broker._orders) == 1
+
+    # Attempt 2 (retry): a fresh decision whose target_price (100.0) is now
+    # ABOVE the prior reference price -- evaluate_top_up_guard would compute
+    # a $0/skipped incremental on its own. The retry must still find and
+    # preserve the real order from attempt 1 instead of reporting "skipped".
+    decision_attempt2 = _graded_decision(target_price=100.0)
+    outcome2, top_up_outcome2, _, _, _ = _process_buy_candidate(
+        decision_attempt2, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
+        trading_day=trading_day, guard_active=True,
+        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
+        scheduled=True, run_result=None,
+    )
+    assert len(broker._orders) == 1, "retry must not place a second broker order"
+    assert outcome2["status"] == "submitted", outcome2
+    assert outcome2["duplicate_preserved"] is True
+    # The fresh top-up guard context is still computed/available for the row
+    # (e.g. for reporting), even though its own skip verdict was overridden.
+    assert top_up_outcome2 is not None
+
+
+def test_manual_placement_uses_distinct_ref_id_namespace():
+    # Codex review on PR #231, P1 ("Separate manual ref IDs from scheduled
+    # retry IDs"): a manual (scheduled=False) placement's ref_id must not
+    # collide with a plain scheduled order's ref_id -- otherwise a LATER
+    # scheduled run that treats this manual fill as cross-stream prior
+    # context would have its same-stream duplicate check match the manual
+    # order and wrongly skip a legitimate fresh incremental top-up.
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision()
+    broker = _RefIdTrackingBroker()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    outcome, _, _, _, _ = _process_buy_candidate(
+        decision, config, StrategyState(), broker, robinhood_data=None, now=now,
+        trading_day=date(2026, 6, 29), guard_active=False, prior_same_day_allocations={},
+        running_deployed_7d=0.0, scheduled=False, run_result=None,
+    )
+    assert outcome["status"] == "submitted"
+    ref_id = broker._orders[0][1]
+    assert "manual" in ref_id, f"manual placement must use a distinct ref_id namespace, got {ref_id!r}"
+
+
+def test_scheduled_top_up_not_blocked_by_manual_fills_ordinary_ref_id():
+    # End-to-end regression for the ref_id-collision bug above: a manual
+    # near-close run buys AAPL earlier in the day; a later SCHEDULED run
+    # treats that fill as prior context (ticker_guarded=True) and must place
+    # its own real incremental top-up, not mistake the manual order's ref_id
+    # for its own earlier attempt and skip as a phantom duplicate.
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    broker = _RefIdTrackingBroker()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    # Manual run: no prior allocation, so ticker_guarded=False and the ref_id
+    # is the manual-namespaced one.
+    manual_decision = _graded_decision(suggested_amount_usd=3.0, selected_base_amount_usd=1.0, buy_multiplier=3.0)
+    manual_outcome, _, _, _, _ = _process_buy_candidate(
+        manual_decision, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
+        trading_day=trading_day, guard_active=False, prior_same_day_allocations={},
+        running_deployed_7d=0.0, scheduled=False, run_result=None,
+    )
+    assert manual_outcome["status"] == "submitted"
+    assert len(broker._orders) == 1
+
+    # Scheduled run: the manual fill above is now visible as prior context.
+    prior = PriorSameDayAllocation(
+        ticker="AAPL", amount_usd=3.0, reference_price=99.0, selected_base_amount_usd=1.0
+    )
+    scheduled_decision = _graded_decision(target_price=98.0)
+    scheduled_outcome, _, _, _, _ = _process_buy_candidate(
+        scheduled_decision, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
+        trading_day=trading_day, guard_active=True, prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=0.0, scheduled=True, run_result=None,
+    )
+    assert scheduled_outcome.get("duplicate_preserved") is not True, (
+        "the manual fill's ref_id must not be mistaken for this scheduled "
+        "run's own earlier attempt"
+    )
+    assert scheduled_outcome["status"] == "submitted"
+    assert len(broker._orders) == 2, "the scheduled run must place its own real incremental order"
+
+
+def test_alpaca_broker_same_stream_check_fails_closed():
+    # Codex review on PR #231 ("Fail closed for Alpaca until client IDs are
+    # wired"): build_broker() can return AlpacaBroker for a guarded top-up
+    # candidate, but place_market_buy never sends a client order id the live
+    # connector could match against, so this narrow check can never actually
+    # detect a same-stream duplicate. Degrading to "no known duplicate" would
+    # silently disable retry protection for a live-enabled AlpacaBroker and
+    # let a retry place a second real order. It must raise instead, matching
+    # the posture of an adapter that doesn't implement this method at all.
+    broker = AlpacaBroker()
+    with pytest.raises(RuntimeError):
+        broker.same_day_strategy_order_exists_with_ref_id_prefix(
+            "AAPL", date(2026, 6, 29), ("graded-dca-topup-2026-06-29-AAPL",)
+        )
+    # And _same_stream_order_exists (the real call site) must also raise, so a
+    # guarded top-up on Alpaca is blocked rather than silently unprotected.
+    with pytest.raises(RuntimeError):
+        _same_stream_order_exists(broker, "AAPL", date(2026, 6, 29))
+
+
+def test_guarded_top_up_dry_run_skips_duplicate_check_entirely():
+    # Codex review on PR #231 ("Allow guarded Alpaca simulations through the
+    # duplicate hook"): the same-stream duplicate check exists only to guard
+    # against a REAL duplicate broker order, but it ran unconditionally
+    # whenever ticker_guarded was true -- even under config.dry_run, where no
+    # real order (duplicate or otherwise) is ever submitted. Combined with
+    # AlpacaBroker's now fail-closed narrow check, a scheduled Alpaca DRY RUN
+    # with prior same-day context would raise and get blocked instead of
+    # producing the expected simulated order. The check must be skipped
+    # entirely under dry_run, regardless of which broker is selected.
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=True)
+    decision = _graded_decision()
+    prior = PriorSameDayAllocation(
+        ticker="AAPL", amount_usd=1.0, reference_price=99.0, selected_base_amount_usd=1.0
+    )
+    # AlpacaBroker's narrow duplicate lookup always raises (fail-closed) --
+    # if the dry-run candidate reaches it at all, this test would fail with
+    # that RuntimeError instead of exercising the intended simulated path.
+    broker = AlpacaBroker()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+    outcome, _, _, errors_count_inc, _ = _process_buy_candidate(
+        decision, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
+        trading_day=trading_day, guard_active=True,
+        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
+        scheduled=True, run_result=None,
+    )
+    assert errors_count_inc == 0
+    assert outcome["status"] == "dry_run"
+    assert "duplicate_preserved" not in outcome
+
+
+def test_guarded_top_up_first_attempt_bypasses_broad_same_day_check():
+    # The broad same_day_strategy_order_exists check must stay bypassed for a
+    # guarded ticker's FIRST attempt this run, even when the broker reports an
+    # (unrelated, cross-stream) same-day order for the ticker -- otherwise a
+    # legitimate top-up on top of a morning allocation could never place.
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision()
+    prior = PriorSameDayAllocation(
+        ticker="AAPL", amount_usd=1.0, reference_price=99.0, selected_base_amount_usd=1.0
+    )
+
+    class _CrossStreamBroker(_RefIdTrackingBroker):
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return True  # e.g. the morning stream's own order, unrelated to this stream
+
+    broker = _CrossStreamBroker()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+    outcome, _, _, _, _ = _process_buy_candidate(
+        decision, config, StrategyState(), broker, robinhood_data=robinhood_data,
+        now=now, trading_day=date(2026, 6, 29),
+        guard_active=True, prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=0.0, scheduled=True, run_result=None,
+    )
+    assert outcome["status"] == "submitted"
+    assert outcome.get("duplicate_preserved") is not True
+    assert "AAPL" in broker.placed
+
+
+def test_non_guarded_candidate_still_blocked_by_broad_same_day_check():
+    # A ticker with no prior same-day allocation is not "guarded", so the
+    # existing broad broker-level same-day check must still gate it.
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0)
+    decision = _graded_decision()
+    broker = _RefIdTrackingBroker()
+    broker._orders.append(("AAPL", "other-stream-ref", 5.0, "ORDER-OTHER"))
+    outcome, _, _, _, _ = _process_buy_candidate(
+        decision, config, StrategyState(), broker, robinhood_data=None,
+        now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN), trading_day=date(2026, 6, 29),
+        guard_active=False, prior_same_day_allocations={},
+        running_deployed_7d=0.0, scheduled=True, run_result=None,
+    )
+    assert outcome["status"] == "skipped"
+    assert outcome["skip_reason"] == "same-day broker order exists"
+    assert "AAPL" not in broker.placed
+
+
+def test_same_stream_order_exists_fails_closed_when_broker_unsupported():
+    # An adapter that doesn't implement the narrower ref-id check must raise
+    # rather than silently behave as "no duplicate" -- a guarded top-up retry
+    # would otherwise double-buy on exactly the broker this check exists for.
+    class _LegacyBroker:
+        pass
+
+    with pytest.raises(RuntimeError):
+        _same_stream_order_exists(_LegacyBroker(), "AAPL", date(2026, 6, 29))
+
+
+def test_insufficient_buying_power_blocks_before_placement():
+    # available_buying_power() < order_amount must block the candidate before
+    # any broker order is placed, and be distinguishable from a cap/spread block.
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision()
+    broker = DryRunBroker(cash=0.50)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+    outcome, _, _, _, _ = _process_buy_candidate(
+        decision, config, StrategyState(), broker, robinhood_data=robinhood_data,
+        now=now, trading_day=date(2026, 6, 29), guard_active=False,
+        prior_same_day_allocations={}, running_deployed_7d=0.0, scheduled=True,
+        run_result=None,
+    )
+    assert outcome["status"] == "blocked"
+    assert outcome["skip_reason"] == "insufficient buying power"
+    assert outcome["budget_blocked"] is True
+
+
+def test_not_tradable_for_fractional_buy_blocks_before_placement():
+    class _UntradableBroker(DryRunBroker):
+        def is_tradable_for_fractional_buy(self, ticker):
+            return False
+
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision()
+    broker = _UntradableBroker(cash=1000.0)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+    outcome, _, _, _, _ = _process_buy_candidate(
+        decision, config, StrategyState(), broker, robinhood_data=robinhood_data,
+        now=now, trading_day=date(2026, 6, 29), guard_active=False,
+        prior_same_day_allocations={}, running_deployed_7d=0.0, scheduled=True,
+        run_result=None,
+    )
+    assert outcome["status"] == "blocked"
+    assert outcome["skip_reason"] == "not tradable for fractional buy"
+    assert "AAPL" not in broker._fills
+
+
+def test_broker_review_block_prevents_manual_order_placement():
+    # A manual (non-scheduled) run routes through review_market_buy as its
+    # human-reviewed safety net; a broker-side rejection must block the order.
+    class _ReviewBlockedBroker(DryRunBroker):
+        def review_market_buy(self, ticker, notional_usd):
+            return False, "flagged for manual review"
+
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision()
+    broker = _ReviewBlockedBroker(cash=1000.0)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+    outcome, _, _, _, reviews_attempted = _process_buy_candidate(
+        decision, config, StrategyState(), broker, robinhood_data=robinhood_data,
+        now=now, trading_day=date(2026, 6, 29), guard_active=False,
+        prior_same_day_allocations={}, running_deployed_7d=0.0, scheduled=False,
+        run_result=None,
+    )
+    assert outcome["status"] == "blocked"
+    assert outcome["skip_reason"] == "review blocked: flagged for manual review"
+    assert reviews_attempted == 1
+
+
 def test_approved_dates_cover_window_and_exclude_holidays():
     from near_close_dca import APPROVED_TEST_DATES
 
@@ -1327,6 +2145,40 @@ def test_apply_deployment_history_only_counts_trailing_7d(tmp_path):
     # day-40 artifacts are correctly excluded even though they are valid,
     # capital-deploying scheduled runs.
     assert guarded.deployed_last_7d_usd == 42.0
+
+
+def test_same_day_ticker_deployment_already_recorded(tmp_path):
+    # Underpins the deployment_history_root check in _process_buy_candidate's
+    # duplicate-preserved branch (Codex review, PR #231: "Count broker-only
+    # preserved orders in rolling deployment" and "Verify the recovered order
+    # is actually in deployment history"): False exactly when THIS ticker's
+    # submitted order hasn't been written to disk for today yet, so a
+    # same-stream duplicate found via the broker is real, not-yet-counted
+    # capital.
+    from near_close_dca import _same_day_ticker_deployment_already_recorded
+
+    history_root = os.path.join(str(tmp_path), "runs")
+    trading_day = date(2026, 7, 21)
+
+    # No artifact for trading_day anywhere on disk yet -> not recorded.
+    assert _same_day_ticker_deployment_already_recorded("AAPL", trading_day, history_root) is False
+
+    # A same-day artifact exists but records a DIFFERENT ticker (e.g. an
+    # earlier invocation placed MSFT then crashed before a later invocation's
+    # AAPL placement was ever written) -> date membership alone must not be
+    # mistaken for proof AAPL's order was counted.
+    _write_scheduled_afternoon_artifact(
+        history_root, trading_day, [{"ticker": "MSFT", "status": "submitted", "planned_amount_usd": 5.0}]
+    )
+    assert _same_day_ticker_deployment_already_recorded("AAPL", trading_day, history_root) is False
+    # MSFT itself, however, is recorded.
+    assert _same_day_ticker_deployment_already_recorded("MSFT", trading_day, history_root) is True
+
+    # Now AAPL's own submitted order is on disk for today -> recorded.
+    _write_scheduled_afternoon_artifact(
+        history_root, trading_day, [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 5.0}]
+    )
+    assert _same_day_ticker_deployment_already_recorded("AAPL", trading_day, history_root) is True
 
 
 def test_kill_switch_caps_later_candidates_within_the_same_batch(tmp_path):
@@ -4839,6 +5691,58 @@ def test_build_run_artifacts_uses_guarded_amount_as_planned_notional(tmp_path):
     )
     assert candidates["AAPL"]["afternoon_desired_amount_usd"] == 6.0, (
         "original desired amount must be preserved in afternoon_desired_amount_usd"
+    )
+
+
+def test_build_run_artifacts_keeps_preserved_amount_for_duplicate(tmp_path):
+    # Codex review on PR #231 ("Keep the broker notional when rebuilding
+    # duplicate artifacts"): a same-stream duplicate-preserved outcome carries
+    # the REAL broker order's amount from an earlier attempt this run. If this
+    # retry's freshly recomputed guard.incremental_order_amount is smaller
+    # (e.g. new prior-allocation context shrank it), planned_amount_usd must
+    # still be the real preserved amount, not clamped down to the stale guard
+    # figure -- the order actually deployed the larger amount.
+    from near_close_dca import TOP_UP_INCREMENTAL, TopUpGuardOutcome, build_run_artifacts
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
+    )
+    state = StrategyState()
+    decision = _buy_decision("AAPL", suggested_amount_usd=6.0, target_price=98.0)
+    # This retry's own freshly recomputed guard says only $2 incremental --
+    # smaller than the $4 that was actually preserved/submitted.
+    guard = TopUpGuardOutcome(
+        ticker="AAPL",
+        top_up_guard_result=TOP_UP_INCREMENTAL,
+        incremental_order_amount=2.0,
+        afternoon_desired_amount=6.0,
+        afternoon_decision_price=98.0,
+        prior_same_day_amount=4.0,
+        prior_same_day_reference_price=99.0,
+        prior_same_day_run_id="manual_am",
+        prior_same_day_source="manual",
+        skipped=False,
+        manual_review=False,
+    )
+    artifacts = build_run_artifacts(
+        now, config, state, [decision],
+        candidate_outcomes={
+            "AAPL": {
+                "order_id": "ORDER-1",
+                "status": "submitted",
+                "submitted_amount_usd": 4.0,
+                "duplicate_preserved": True,
+            }
+        },
+        top_up_outcomes={"AAPL": guard},
+    )
+    candidates = {c["ticker"]: c for c in artifacts["buy_candidates"]}
+    assert candidates["AAPL"]["planned_amount_usd"] == 4.0, (
+        "planned_amount_usd must retain the preserved broker amount, not be "
+        "clamped to this retry's freshly recomputed incremental_order_amount"
     )
 
 
