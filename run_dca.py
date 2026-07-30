@@ -586,8 +586,12 @@ def _build_frozen_providers_from_raw(
     if raw_dir.is_dir():
         for path in sorted(raw_dir.iterdir()):
             name = path.name
+            if not name.endswith(".json"):
+                continue
             try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
+                # Performance optimization: json.loads accepts bytes directly.
+                # read_bytes() avoids explicit python-side utf-8 string decoding overhead.
+                payload = json.loads(path.read_bytes())
             except (OSError, json.JSONDecodeError):
                 continue
             # Unwrap the data envelope so both save paths read the same way:
