@@ -1781,7 +1781,7 @@ def test_run_pipeline_bounded_reload_preserves_uncertainty_on_equal_swapped_tota
     # amount, price newly resolved" here would silently understate the
     # true $10 prior spend as a falsely-confident $5. Both scans report
     # scan_had_failures=True (each genuinely skipped one artifact), which
-    # is the signal the fix uses to refuse this equal-amount "resolution."
+    # is the signal the logic uses to refuse this equal-amount "resolution."
     import run_dca
     from near_close_dca import PriorSameDayAllocation
 
@@ -1837,7 +1837,7 @@ def test_run_pipeline_bounded_reload_preserves_uncertainty_on_unequal_swapped_to
     # parse THIS pass instead). $6 > $5 looks like a strictly more complete
     # answer by amount alone, but it silently discards the other real
     # contributor and its unresolved status. Both scans report
-    # scan_had_failures=True, which is the signal the fix uses to refuse
+    # scan_had_failures=True, which is the signal the logic uses to refuse
     # trusting either total as more complete than the other for this ticker.
     import run_dca
     from near_close_dca import PriorSameDayAllocation
