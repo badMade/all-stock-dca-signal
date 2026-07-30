@@ -6291,16 +6291,17 @@ def run_once(
     _IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
     scheduled = kwargs.get("scheduled", True)
     try:
-        return _run_once_impl(
-            now,
-            config,
-            state,
-            finance_data,
-            robinhood_data,
-            broker,
-            artifacts_dir,
+        ctx = RunContext(
+            now=now,
+            config=config,
+            state=state,
+            finance_data=finance_data,
+            robinhood_data=robinhood_data,
+            broker=broker,
+            artifacts_dir=artifacts_dir,
             **kwargs,
         )
+        return _run_once_impl(ctx)
     except Exception as exc:  # noqa: BLE001 - always re-raised below
         if scheduled and artifacts_dir:
             try:
@@ -6593,26 +6594,49 @@ def config_broker_name() -> str:
     return "robinhood"
 
 
-def _run_once_impl(
-    now: datetime,
-    config: StrategyConfig,
-    state: StrategyState,
-    finance_data: MarketDataProvider,
-    robinhood_data: MarketDataProvider,
-    broker: BrokerAdapter,
-    artifacts_dir: Optional[str | Path] = None,
-    run_result: Optional[RunResult] = None,
-    notifications_sent: Optional[int] = None,
-    cost_control_notes: Optional[Sequence[str]] = None,
-    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]] = None,
-    deployment_history_root: Optional[str | Path] = None,
-    scheduled: bool = True,
-    classification_state_root: Optional[str | Path] = None,
-    raw_persistence_state: Optional[Dict[str, object]] = None,
-    classification_overrides: Optional[Dict[str, Any]] = None,
-    correlation_id: Optional[str] = None,
-    stream: str = "afternoon",
-) -> List[ReconciledDecision]:
+@dataclass(frozen=True)
+class RunContext:
+    """Immutable execution context for a single afternoon DCA run."""
+
+    now: datetime
+    config: StrategyConfig
+    state: StrategyState
+    finance_data: MarketDataProvider
+    robinhood_data: MarketDataProvider
+    broker: BrokerAdapter
+    artifacts_dir: Optional[str | Path] = None
+    run_result: Optional[RunResult] = None
+    notifications_sent: Optional[int] = None
+    cost_control_notes: Optional[Sequence[str]] = None
+    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]] = None
+    deployment_history_root: Optional[str | Path] = None
+    scheduled: bool = True
+    classification_state_root: Optional[str | Path] = None
+    raw_persistence_state: Optional[Dict[str, object]] = None
+    classification_overrides: Optional[Dict[str, Any]] = None
+    correlation_id: Optional[str] = None
+    stream: str = "afternoon"
+
+
+def _run_once_impl(ctx: RunContext) -> List[ReconciledDecision]:
+    now = ctx.now
+    config = ctx.config
+    state = ctx.state
+    finance_data = ctx.finance_data
+    robinhood_data = ctx.robinhood_data
+    broker = ctx.broker
+    artifacts_dir = ctx.artifacts_dir
+    run_result = ctx.run_result
+    notifications_sent = ctx.notifications_sent
+    cost_control_notes = ctx.cost_control_notes
+    prior_same_day_allocations = ctx.prior_same_day_allocations
+    deployment_history_root = ctx.deployment_history_root
+    scheduled = ctx.scheduled
+    classification_state_root = ctx.classification_state_root
+    raw_persistence_state = ctx.raw_persistence_state
+    classification_overrides = ctx.classification_overrides
+    correlation_id = ctx.correlation_id
+    stream = ctx.stream
     now_et = now.astimezone(EASTERN)
     trading_day = now_et.date()
     if run_result is not None:
