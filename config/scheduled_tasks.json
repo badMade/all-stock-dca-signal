@@ -209,7 +209,7 @@
         "MUST NOT write any required file only under an artifacts/ (or out/, output/) subfolder. Nesting is a contract failure, not a partial pass.",
         "MUST NOT omit run_summary.json on a live run. Before 2026-07-27 only the read-only 9:45 pre-flight wrote one, so every live morning/midday run directory failed require_summary.",
         "MUST NOT write a headerless signals.csv or submitted_orders.csv on a no-candidate run.",
-        "MUST NOT skip artifact creation because the run is escalating; see connector_native_execution_policy.escalation_still_writes_artifacts."
+        "MUST NOT skip artifact creation because the run is escalating; the complete artifact set is written before any escalation report."
       ],
       "enforced_by": "scripts/scheduled_artifacts.py: write_scheduled_run_artifacts writes the complete set at the run root, and validate_run_artifacts reports a nested-only required file by name rather than as an unexplained missing file.",
       "enforcement_by_stream": {
@@ -258,52 +258,12 @@
   },
   "connector_native_execution_policy": {
     "added_on_et": "2026-07-27",
-    "status": "disabled_for_seven_slot_claude_roster",
-    "disabled_on_et": "2026-07-30",
-    "disabled_reason": "This policy's rule ('missing entry point is the TRIGGER for connector-native execution') was being read as authorizing a seven-slot-roster Claude executor to hand-build a buy list from live connector quotes and call place_equity_order directly whenever run_dca.py's CLI refuses (it is demo-only by design). That directly contradicts Gate 5 in every claude/dca-executor-prompts/*.txt ('Use the repo entry point, never a reimplementation... never build a buy list from broker data, watchlists, quotes, scanners, or your own judgment') and its STANDING GATE 5 OVERRIDE, and it contradicts Gate 9's instruction that a missing-entry-point Gate 5 fire is the silent, non-alerting GATE5_DISABLED verdict, not an abort. Repeated 2026-07-29 abort/alert reports across all seven slots cited this policy as an 'unresolved conflict needing a human decision' -- it is resolved here: for the seven-slot Claude roster, this policy does NOT apply and does NOT authorize placing an order or constructing a buy list outside run_dca.py/run_pipeline(). Superseded, not deleted -- the incident record below and the applies_to_cron_ids list stay as the historical reason this was added, and this may still be read as describing the separate, non-Claude, external ('Perplexity-era') scheduler docs/safeguards.md documents as the account's actually-functioning live execution today, which this change does not touch. Re-enabling any connector-native path for the seven-slot Claude roster requires a human decision on claude/GATE5-PROPOSAL.md sec 4 (the morning/midday boundary and the per-ticker-per-day rule across seven slots) and a reviewed, tested signal-generation entry point to call -- not a config edit alone.",
-    "see_also": "claude/GATE5-PROPOSAL.md; claude/dca-executor-prompts/*.txt (STANDING GATE 5 OVERRIDE, Gate 5, Gate 9); docs/safeguards.md#live-execution-roster",
+    "removed_on_et": "2026-07-30",
     "incident": "Two scheduled slots the same day failed the same way. The 12:30 PM ET midday live task a6239dae failed at startup before writing any scheduled artifact, and the 2:30 PM ET intraday slot on 7be82b97 escalated before order placement reporting no existing run script and no internal implementation for order submission. Both left no artifact root at all. In both cases a connector-native pass minutes later did the work successfully, which proves the work was doable inside the scheduled run.",
     "applies_to_cron_ids": ["2ba19526", "42173154", "a6239dae", "7be82b97", "10ce362c"],
-    "scope_note": "Every LIVE scheduled stream, not just the intraday task. Missing local tooling is a property of the environment, not of a slot, so a policy scoped to one cron id leaves every other slot able to fail the identical way.",
-    "rule": "A missing repo runner script, a missing entry point, or a missing internal order-submission implementation is NOT a blocking condition and NOT a reason to escalate. It is the TRIGGER for connector-native execution.",
-    "in_place_requirement": "Connector-native execution runs IN PLACE: inside the scheduled run, under the scheduled slot's OWN artifact root, with run_origin='scheduled' and manual_run=false. It is not a separate later pass, not a recovery root, and not an escalation.",
-    "must_not_escalate_before_artifact_creation": true,
-    "required_inputs": [
-      "Robinhood live quotes including bid and ask.",
-      "Finance quotes where available.",
-      "Prior completed regular-session close and OHLC where available.",
-      "Same-day order context from ALL prior streams of the trading day, not just the immediately preceding one.",
-      "Tradability for each candidate ticker.",
-      "Account-specific same-day Robinhood orders."
-    ],
-    "required_steps": [
-      "Gather every entry in required_inputs.",
-      "Persist the raw connector responses BEFORE computing, and compute only from the persisted files, per the existing raw input persistence contract.",
-      "Evaluate the first-allocation and ticker-scoped same-day top-up rules per ticker.",
-      "Place only qualifying orders with place_equity_order, and only after spread_ok and every other internal safety check passes.",
-      "Write the complete root-level artifact set defined in scheduled_run_artifact_contract.root_level_artifact_set_2026_07_27."
-    ],
-    "order_placement_tool": "place_equity_order",
-    "if_orders_cannot_be_placed": {
-      "condition": "Connector-native execution ran but could not place orders it had otherwise qualified.",
-      "required_behavior": "Record run_classification_outcome='failed_after_connector_native_recovery_attempt' with error_class set to the same code, and STILL write the complete artifact set.",
-      "note": "This is for a genuine placement failure after the connector-native path was attempted. It MUST NOT be used for a run that simply had no qualifying candidates; that is completed_no_orders with a completion_reason. See spread_gate_outcome_contract_2026_07_27."
-    },
-    "escalate_only_when": [
-      "A safety, account, or order rejection occurs.",
-      "Connector data is still unavailable after the allowed bounded recovery attempt.",
-      "The workspace itself is unavailable."
-    ],
-    "escalation_still_writes_artifacts": "Even in the escalate_only_when cases the complete artifact set is written FIRST. Escalation reports an outcome; it never replaces the artifact.",
-    "must_not": [
-      "MUST NOT escalate with the sole reason 'no run script found' or 'no internal implementation for order submission'.",
-      "MUST NOT escalate before creating the artifact root and writing the complete artifact set.",
-      "MUST NOT place any order that has not passed spread_ok and every other safety check.",
-      "MUST NOT reclassify itself as manual; run_origin stays scheduled and manual_run stays false."
-    ],
-    "safety_note": "This changes only what a run does when its local tooling is missing. It does not relax any budget cap, circuit breaker, whitelist, ordering, spread, confidence, or top-up rule; a connector-native run passes exactly the same gates as a runner-driven one.",
-    "supersedes_note": "Generalizes the intraday-only connector-native requirement to every live stream. Where both apply, the stricter reading governs.",
-    "doc": "docs/schedule_manifest.md"
+    "scope_note": "Kept for historical context: this policy's applies_to_cron_ids were always the five legacy/Perplexity-era cron tasks, never the seven-slot Claude roster (which has no cron ids of its own yet, since Gate 5 isn't wired for it).",
+    "removal_reason": "This block instructed a scheduled run to treat a missing repo entry point or order-submission implementation as a trigger to independently reimplement signal generation from raw connector data and place live orders directly, bypassing the repo's own vetted logic. That directly contradicts the standing prohibition against building a buy list without the repo, and contradicts claude/GATE5-PROPOSAL.md's own safety analysis (section 1.4): four of the seven roster slots (9:35, 11:30, 1:30, 2:30) are not folded into the same-day top-up guard's prior-allocation chain at all, so a ticker bought at one of those slots is invisible to the guard at the next slot, and the connector-native path would have repeatedly bought the same ticker at successively higher prices on the same day -- precisely the outcome the guard exists to prevent -- while GATE5-PROPOSAL.md recommended keeping live execution disabled until that gap (plus stale per-stream budget caps and a sole-executor race) is fixed. This removal applies to EVERY executor of the applies_to_cron_ids above, not only a Claude-run session: docs/README.md and docs/safeguards.md#live-execution-roster document that these five cron ids are actually run today by a separate, non-Claude, external ('Perplexity-era') agent with its own live Robinhood order-placement tool access, and the same-day top-up-guard gap this policy's fallback would trigger applies to that agent exactly as it would to any other. An earlier revision of this removal (see PR #241/#242 on main) tried to scope the disablement to 'the seven-slot Claude roster' only, leaving the literal rule/required_steps/order_placement_tool text live for the five legacy cron ids on the theory that the Perplexity-era agent's use of them was untouched by design; that was reconsidered and superseded here at the account owner's explicit direction (2026-07-30), because a scoped label next to unmodified bypass instructions does not stop a tool-using agent -- Claude, Perplexity, or otherwise -- from reading and following the literal text for a cron id the label doesn't clearly cover. No executor should reconstruct trading logic ad hoc and place real orders from config text alone, for any of these five cron ids. A missing repo entry point remains a no-trade condition: the current claude/dca-executor-prompts/*.txt Gate 5 text ends the run with a silent, non-alerting GATE5_DISABLED verdict until a human implements a real signal-generation entry point, at which point it reverts to a normal abort-and-alert check on failure, the same as every other gate; whatever executes the five legacy cron ids should now fail closed (place nothing) on a missing entry point the same way, until a reviewed entry point exists for them too.",
+    "supersedes_note": "This key is intentionally kept (rather than deleted outright) as a tombstone so historical references to connector_native_execution_policy resolve to an explicit removal notice instead of a dangling pointer."
   },
   "spread_gate_outcome_contract_2026_07_27": {
     "added_on_et": "2026-07-27",
@@ -1539,7 +1499,7 @@
     "patched_at_et": "14:55",
     "applies_to_cron_id": "7be82b97",
     "applies_to_slots_et": ["11:30", "13:30", "14:30"],
-    "summary": "The live recurring intraday task 7be82b97 was patched on 2026-07-27 at about 2:55 PM ET to fix the 1:30 and 2:30 behavior observed earlier the same day. The patch tightens the artifact contract, separates a ladder no-candidate outcome from a spread-data outcome, and requires connector-native execution in place of escalation when local tooling is missing.",
+    "summary": "The live recurring intraday task 7be82b97 was patched on 2026-07-27 at about 2:55 PM ET to fix the 1:30 and 2:30 behavior observed earlier the same day. The patch tightens the artifact contract and separates a ladder no-candidate outcome from a spread-data outcome. It also originally required connector-native execution in place of escalation when local tooling was missing; that requirement was removed 2026-07-30, see intraday_connector_native_recovery_policy.removal_reason.",
     "motivating_observations": {
       "slot_1330": "The 1:30 PM ET run produced a safe no-order artifact, but the artifact contract was too loose. Observed gaps: run_state.json, run_summary.json, signals.csv, and submitted_orders.csv were written only under an artifacts/ subfolder, with NO files at the artifact root 20260727_1330ET/; the top-level run classification fields were incomplete (run_classification was a bare string 'completed_no_orders' rather than an object, and run_origin, manual_run, scheduled_for_et, state_schema_version, valid_recovery_context, and orders_submitted_count were all absent at the top level); and submitted_orders.csv carried a non-canonical 6-column CRLF header (ticker,order_usd,ref_id,order_id,status,reason) rather than the canonical submitted_orders schema used by every other stream, so it was not usable by a downstream reader.",
       "slot_1430": "The 2:30 PM ET run escalated for missing local tooling BEFORE creating any artifact, leaving no artifact root at all."
@@ -1591,54 +1551,11 @@
   },
   "intraday_connector_native_recovery_policy": {
     "added": "2026-07-27",
-    "status": "disabled_for_seven_slot_claude_roster",
-    "disabled_on_et": "2026-07-30",
-    "disabled_reason": "Same disposition and reason as connector_native_execution_policy.disabled_reason above, which this policy duplicates for the 11:30/1:30/2:30 intraday slots specifically: it does NOT authorize a seven-slot-roster Claude executor to hand-build a buy list or place an order outside run_dca.py/run_pipeline(). Gate 5 in claude/dca-executor-prompts/3-executor-1130-cron_30_15.txt, 5-executor-1330-cron_30_17.txt, and 6-executor-1430-cron_30_18.txt governs those three slots and requires the silent GATE5_DISABLED verdict, never a connector-native reimplementation.",
-    "superseded_by": "connector_native_execution_policy.disabled_reason (2026-07-30)",
+    "removed_on_et": "2026-07-30",
     "applies_to_cron_id": "7be82b97",
     "applies_to_slots_et": ["11:30", "13:30", "14:30"],
-    "rule": "If the intraday background run cannot find an existing repo runner script or an internal order-submission implementation, it MUST NOT escalate. Missing local tooling or a missing repo runner script is not a blocking condition; it is the trigger for connector-native execution.",
-    "in_place_requirement": "Connector-native execution runs IN PLACE, inside the scheduled run and under the scheduled slot's own artifact root. It is not a separate later pass and it is not an escalation. Escalating before artifact creation is a contract violation: the run MUST create its artifact root and write the complete artifact set regardless of outcome.",
-    "must_not_escalate_before_artifact_creation": true,
-    "required_path": "Run the connector-native execution path inside the scheduled run.",
-    "required_inputs": [
-      "Robinhood live quotes including bid and ask.",
-      "Finance quotes where available.",
-      "Prior completed regular-session close.",
-      "Same-day order context from ALL prior streams of the trading day, not just the immediately preceding one.",
-      "Tradability for each candidate ticker.",
-      "Account-specific same-day Robinhood orders."
-    ],
-    "required_steps": [
-      "Gather every entry in required_inputs.",
-      "Persist the raw responses before computing.",
-      "Evaluate the first-allocation and ticker-scoped same-day top-up rules per ticker.",
-      "Place qualifying orders with place_equity_order, and only after spread_ok and every other internal safety check passes.",
-      "Write the complete root-level artifact set defined in intraday_task_patch_2026_07_27.artifact_contract."
-    ],
-    "order_placement_tool": "place_equity_order",
-    "persist_first": "Persist all raw connector responses before computing, and compute only from the persisted files, per the existing raw input persistence contract.",
-    "if_orders_cannot_be_placed": {
-      "condition": "Connector-native execution ran but could not place orders that it had otherwise qualified.",
-      "required_behavior": "Record run_classification='failed_after_connector_native_recovery_attempt' and still write the COMPLETE artifact set.",
-      "run_classification": "failed_after_connector_native_recovery_attempt",
-      "artifacts_complete": true,
-      "note": "This classification is for a genuine placement failure after the connector-native path was attempted. It MUST NOT be used for a run that simply had no qualifying candidates; that is completed_no_orders with a completion_reason. See spread_data_availability_policy.evaluation_order."
-    },
-    "escalate_only_when": [
-      "A safety, account, or order rejection occurs.",
-      "Connector data is unavailable after the allowed bounded recovery attempt.",
-      "The workspace itself is unavailable."
-    ],
-    "escalation_still_writes_artifacts": "Even in the escalate_only_when cases, the complete artifact set is written first. Escalation reports an outcome; it never replaces the artifact.",
-    "must_not": [
-      "MUST NOT escalate with the sole reason 'no run script found' or 'no internal implementation for order submission'.",
-      "MUST NOT escalate before creating the artifact root and writing the complete artifact set.",
-      "MUST NOT place any order that has not passed spread_ok and all other safety checks.",
-      "MUST NOT reclassify itself as manual; run_origin stays scheduled or scheduled_recovery and manual_run stays false."
-    ],
-    "origin": "Added after the 2026-07-27 2:30 PM ET intraday scheduled run escalated for exactly this reason and a connector-native pass at 2:32 PM ET completed the work successfully.",
-    "doc": "docs/schedule_manifest.md"
+    "removal_reason": "This was the original intraday-only version of the same mandate generalized (2026-07-27) into connector_native_execution_policy: treat a missing repo entry point as a trigger to reimplement signal generation from raw connector data and place live orders directly, bypassing the repo's own vetted logic. Removed for the same reason and at the same time as connector_native_execution_policy; see that key's removal_reason for the full rationale, including the specific same-day top-up guard gap (slots 9:35, 11:30, 1:30, 2:30 not folded into the guard's prior-allocation chain) and the correction that this removal covers EVERY executor of cron 7be82b97 -- including the separate, non-Claude, external ('Perplexity-era') agent that docs/safeguards.md#live-execution-roster documents as actually running it today -- not only a Claude-run session. A missing repo runner script remains a no-trade condition for this cron, per the current claude/dca-executor-prompts/*.txt Gate 5 text, until a reviewed entry point exists.",
+    "supersedes_note": "Kept as a tombstone, not deleted outright, so historical references to intraday_connector_native_recovery_policy resolve to an explicit removal notice."
   },
   "spread_data_availability_policy": {
     "added": "2026-07-27",
@@ -2660,11 +2577,6 @@
   "tasks": [
     {
       "id": "2ba19526",
-      "connector_native_fallback": {
-        "policy": "connector_native_execution_policy",
-        "enabled": true,
-        "summary": "If this scheduled run cannot find a repo runner script, an entry point, or an internal order-submission implementation, it MUST NOT escalate for that reason. It runs the connector-native path IN PLACE under this slot's own artifact root with run_origin='scheduled' and manual_run=false, gathers Robinhood quotes with bid/ask plus Finance data, prior close, same-day order context from all prior streams, tradability and account context, persists the raw responses first, and places only qualifying orders after spread_ok and every other safety check passes. It writes the complete root-level artifact set on every outcome, and escalation never happens before the artifacts exist."
-      },
       "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
       "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
       "name": "Weekday 9:35 AM market-open DCA live Robinhood execution",
@@ -2773,11 +2685,6 @@
     },
     {
       "id": "7be82b97",
-      "connector_native_fallback": {
-        "policy": "connector_native_execution_policy",
-        "enabled": true,
-        "summary": "If this scheduled run cannot find a repo runner script, an entry point, or an internal order-submission implementation, it MUST NOT escalate for that reason. It runs the connector-native path IN PLACE under this slot's own artifact root with run_origin='scheduled' and manual_run=false, gathers Robinhood quotes with bid/ask plus Finance data, prior close, same-day order context from all prior streams, tradability and account context, persists the raw responses first, and places only qualifying orders after spread_ok and every other safety check passes. It writes the complete root-level artifact set on every outcome, and escalation never happens before the artifacts exist."
-      },
       "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
       "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
       "name": "Weekday intraday DCA live Robinhood execution (11:30 AM, 1:30 PM, 2:30 PM ET)",
@@ -2909,11 +2816,6 @@
     },
     {
       "id": "42173154",
-      "connector_native_fallback": {
-        "policy": "connector_native_execution_policy",
-        "enabled": true,
-        "summary": "If this scheduled run cannot find a repo runner script, an entry point, or an internal order-submission implementation, it MUST NOT escalate for that reason. It runs the connector-native path IN PLACE under this slot's own artifact root with run_origin='scheduled' and manual_run=false, gathers Robinhood quotes with bid/ask plus Finance data, prior close, same-day order context from all prior streams, tradability and account context, persists the raw responses first, and places only qualifying orders after spread_ok and every other safety check passes. It writes the complete root-level artifact set on every outcome, and escalation never happens before the artifacts exist."
-      },
       "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
       "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
       "name": "Weekday 10:30 AM morning DCA live Robinhood execution",
@@ -3108,11 +3010,6 @@
     },
     {
       "id": "a6239dae",
-      "connector_native_fallback": {
-        "policy": "connector_native_execution_policy",
-        "enabled": true,
-        "summary": "If this scheduled run cannot find a repo runner script, an entry point, or an internal order-submission implementation, it MUST NOT escalate for that reason. It runs the connector-native path IN PLACE under this slot's own artifact root with run_origin='scheduled' and manual_run=false, gathers Robinhood quotes with bid/ask plus Finance data, prior close, same-day order context from all prior streams, tradability and account context, persists the raw responses first, and places only qualifying orders after spread_ok and every other safety check passes. It writes the complete root-level artifact set on every outcome, and escalation never happens before the artifacts exist."
-      },
       "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
       "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
       "name": "Weekday 12:30 PM midday DCA live Robinhood execution",
@@ -3247,11 +3144,6 @@
     },
     {
       "id": "10ce362c",
-      "connector_native_fallback": {
-        "policy": "connector_native_execution_policy",
-        "enabled": true,
-        "summary": "If this scheduled run cannot find a repo runner script, an entry point, or an internal order-submission implementation, it MUST NOT escalate for that reason. It runs the connector-native path IN PLACE under this slot's own artifact root with run_origin='scheduled' and manual_run=false, gathers Robinhood quotes with bid/ask plus Finance data, prior close, same-day order context from all prior streams, tradability and account context, persists the raw responses first, and places only qualifying orders after spread_ok and every other safety check passes. It writes the complete root-level artifact set on every outcome, and escalation never happens before the artifacts exist."
-      },
       "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
       "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
       "supersedes_cron_id": "ce16ba6b",

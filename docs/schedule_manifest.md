@@ -750,53 +750,54 @@ midday task and the 2:30 intraday slot failed the identical way minutes apart, s
 a contract scoped to one cron id would have left the other able to fail again.
 Machine-readable source:
 [`config/scheduled_tasks.json`](../config/scheduled_tasks.json) →
-`connector_native_execution_policy`,
-`scheduled_run_artifact_contract.root_level_artifact_set_2026_07_27`, and
+`scheduled_run_artifact_contract.root_level_artifact_set_2026_07_27` and
 `spread_gate_outcome_contract_2026_07_27`.
 
-### Connector-native execution runs in place, never as an escalation
+### A missing repo entry point is a no-trade condition, not a trigger for a workaround
 
-A missing repo runner script, a missing entry point, or a missing internal
-order-submission implementation is **not** a blocking condition and **not** a
-reason to escalate. It is the **trigger** for connector-native execution, which
-runs **in place**: inside the scheduled run, under the slot's own artifact root,
-with `run_origin='scheduled'` and `manual_run=false`.
+**Removed 2026-07-30.** This section formerly instructed a scheduled run to
+treat a missing repo runner script, entry point, or order-submission
+implementation as a trigger to reimplement signal generation directly from
+Robinhood/Finance connector data and place live orders via
+`place_equity_order`, bypassing the repo's own vetted logic entirely. That
+directly contradicted the standing prohibition against building a buy list
+without the repo, and contradicted `claude/GATE5-PROPOSAL.md`'s own safety
+analysis, which found real unresolved gaps in the seven-slot roster (the
+same-day top-up guard doesn't cover four of the seven slots, stale
+per-stream budget caps, a sole-executor race) and recommended keeping live
+execution disabled until those are fixed. Removed at the account owner's
+explicit request. The corresponding `config/scheduled_tasks.json` keys
+(`connector_native_execution_policy`, `intraday_connector_native_recovery_policy`)
+are kept as tombstones recording the same removal, not deleted outright, so
+no reference is left dangling. **A missing repo entry point remains a
+no-trade condition today: the current `claude/dca-executor-prompts/*.txt`
+Gate 5 text ends the run with a silent, non-alerting `GATE5_DISABLED`
+verdict until a human implements a real signal-generation entry point, at
+which point it reverts to a normal abort-and-alert check on failure like
+every other gate. No executor should reimplement trading logic ad hoc and
+place real orders from config text alone.**
 
-The run gathers Robinhood quotes **including bid and ask**, Finance quotes where
-available, the prior completed regular-session close, same-day order context from
-**all** prior streams of the day, tradability, and account-specific same-day
-Robinhood orders. It persists the raw responses **before** computing, computes
-only from the persisted files, evaluates the first-allocation and ticker-scoped
-same-day top-up rules, and places only qualifying orders with
-`place_equity_order` after `spread_ok` and every other safety check passes.
-
-**Escalating before artifact creation is a contract violation.** Escalation stays
-correct for a safety/account/order rejection, connector data still unavailable
-after the bounded retry, or an unavailable workspace, and even then the complete
-artifact set is written **first**. Escalation reports an outcome; it never
-replaces the artifact.
-
-This changes only what a run does when its local tooling is missing. Every
-budget cap, circuit breaker, whitelist, ordering, spread, confidence, and top-up
-rule is unchanged: a connector-native run passes exactly the same gates.
-
-**Disabled for the seven-slot Claude roster (2026-07-30).** `config/scheduled_tasks.json`'s
-`connector_native_execution_policy` and `intraday_connector_native_recovery_policy`
-are both marked `status: disabled_for_seven_slot_claude_roster`. Repeated
-2026-07-29 abort reports across all seven Claude executor slots cited this
-policy against Gate 5 (`claude/dca-executor-prompts/*.txt`, "Use the repo
-entry point, never a reimplementation") as an unresolved conflict. It is
-resolved: for the seven-slot Claude roster this policy does **not** authorize
-hand-building a buy list or calling `place_equity_order` outside
-`run_dca.py`/`run_pipeline()`. A missing entry point for that roster is Gate
-5's known, silent `GATE5_DISABLED` verdict (see
-[safeguards.md](safeguards.md#live-execution-roster), which documents the
-verdict itself; the underlying gap it exists for is analyzed in
-`claude/GATE5-PROPOSAL.md`), not a trigger for connector-native execution. The
-policy above may still describe the separate, non-Claude, external
-("Perplexity-era") scheduler this repo's config also tracks (see
-[safeguards.md](safeguards.md#live-execution-roster)); this change does not
-touch that system.
+**This removal covers every executor of these cron ids, not only the
+seven-slot Claude roster.** An earlier revision of this fix (main branch PRs
+#241/#242, since superseded) tried to scope the disablement to "the
+seven-slot Claude roster" by adding a `status: disabled_for_seven_slot_claude_roster`
+label next to the policy's literal `rule`/`required_steps`/`order_placement_tool`
+text, while leaving that text otherwise unmodified on the theory that the
+separate, non-Claude, external ("Perplexity-era") scheduler documented in
+[safeguards.md](safeguards.md#live-execution-roster) — which
+`docs/README.md` confirms is the account's actual live executor for all
+five cron ids this policy names, including `10ce362c` — was untouched by
+design. That was reconsidered at the account owner's explicit direction
+(2026-07-30): a scoped label next to unmodified bypass instructions doesn't
+stop a tool-using agent, Claude or Perplexity, from reading and following
+the literal text for a cron id the label doesn't clearly cover, and the
+same-day top-up-guard gap this fallback would trigger applies to that agent
+exactly as it would to any other. The tombstones above now remove the
+literal instructions outright, for every one of the five cron ids
+(`2ba19526`, `42173154`, `a6239dae`, `7be82b97`, `10ce362c`), accepting that
+whatever executes them should fail closed (place nothing) on a missing
+entry point until a reviewed one exists, the same as the seven-slot roster's
+`GATE5_DISABLED`.
 
 ### Root-level artifacts, every run, every outcome
 
@@ -1055,26 +1056,18 @@ never estimated, inferred, or defaulted.
   `intraday_dca_scheduled_recovery_2026_07_27` and `scheduled_run_outcomes`, and
   `config/run_classification.json` -> `intraday_no_order_skip_2026_07_27_1330` and
   `intraday_scheduled_recovery_2026_07_27`.
-- **Connector-native execution is required in place, missing local tooling is not an
-  escalation reason (added 2026-07-27, tightened 2:55 PM ET):** if the 11:30, 1:30, or 2:30
-  intraday background run cannot find an existing repo runner script or an internal
-  order-submission implementation, that is **not** a blocking condition. It is the trigger
-  for connector-native execution, which runs **in place, inside the scheduled run and under
-  the scheduled slot's own artifact root**. Escalating **before artifact creation** is a
-  contract violation: the run must create its artifact root and write the complete artifact
-  set regardless of outcome. Required inputs: **Robinhood live quotes including bid and
-  ask**, **Finance quotes where available**, the **prior completed regular-session close**,
-  **same-day order context from all prior streams** of the trading day, **tradability**, and
-  **account-specific same-day Robinhood orders**. Raw responses are persisted before compute.
-  The run then evaluates the first-allocation and **ticker-scoped same-day top-up** rules and
-  places qualifying orders with **`place_equity_order`**, and only after `spread_ok` and every
-  other internal safety check passes. If connector-native execution ran but could not place
-  orders it had otherwise qualified, record
-  `run_classification='failed_after_connector_native_recovery_attempt'` and **still write the
-  complete artifact set**. Escalation remains correct for a safety/account/order rejection,
-  for connector data still unavailable after the allowed bounded recovery attempt, or for an
-  unavailable workspace, and even then the artifacts are written first. See
-  `config/scheduled_tasks.json` -> `intraday_connector_native_recovery_policy`.
+- **Connector-native execution requirement removed (added 2026-07-27, removed 2026-07-30):**
+  this task formerly required that if the 11:30, 1:30, or 2:30 intraday background run
+  could not find an existing repo runner script or an internal order-submission
+  implementation, it must reimplement signal generation from raw Robinhood/Finance
+  connector data and place live orders with `place_equity_order` in place of escalating.
+  That was removed: it bypassed the repo's own vetted logic, and four of the seven roster
+  slots (9:35, 11:30, 1:30, 2:30) are not folded into the same-day top-up guard's
+  prior-allocation chain, so the connector-native path could have bought the same ticker
+  repeatedly at rising prices on the same day. See
+  `config/scheduled_tasks.json` -> `intraday_connector_native_recovery_policy` for the
+  full removal rationale. A missing repo runner script or entry point remains a no-trade
+  condition today.
 - **Missing spread inputs are never a startup failure (added 2026-07-27, revised 2:55 PM
   ET):** the run always fires, always evaluates, and always writes the complete artifact set.
   **Evaluate the ladder first, then the spread gate**, because the correct recorded outcome
@@ -1094,9 +1087,10 @@ never estimated, inferred, or defaulted.
   See `config/scheduled_tasks.json` -> `spread_data_availability_policy`.
 - **2026-07-27 about 2:55 PM ET: live task patch (`intraday_task_patch_2026_07_27`).** The
   live recurring intraday task `7be82b97` was patched to fix the 1:30 and 2:30 behavior seen
-  earlier the same day. The patch tightens the artifact contract, separates a ladder
-  no-candidate outcome from a spread-data outcome, and requires connector-native execution in
-  place of escalation when local tooling is missing. The **artifact contract** for the 1:30
+  earlier the same day. The patch tightens the artifact contract and separates a ladder
+  no-candidate outcome from a spread-data outcome. It also originally required
+  connector-native execution in place of escalation when local tooling was missing; that
+  requirement was removed 2026-07-30 (see above). The **artifact contract** for the 1:30
   and 2:30 slots: write complete **root-level** artifacts under
   `/home/user/workspace/cron_tracking/intraday_dca/YYYYMMDD_HHMMET/` **every time**, namely
   `run_state.json`, `run_summary.json`, `signals.csv`, and `submitted_orders.csv` **with its
