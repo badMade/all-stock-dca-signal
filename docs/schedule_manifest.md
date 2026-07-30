@@ -1,5 +1,17 @@
 # Scheduled Tasks Manifest
 
+> **Stale as of 2026-07-28:** this manifest and its machine-readable source
+> (`config/scheduled_tasks.json`) still describe the pre-2026-07-28
+> three-stream Perplexity-era live roster (morning `42173154`, midday
+> `a6239dae`, afternoon `10ce362c`) using the OLD three-stream naming, but
+> those five tasks are still the account's ONLY currently-functioning live
+> execution -- do not retire them. A seven-slot Claude roster is the
+> intended eventual replacement; every one of those seven prompts hard-aborts
+> at Gate 5 until a signal-generation entry point is wired (see
+> `claude/GATE5-PROPOSAL.md`), so it runs alongside the five tasks below, not
+> instead of them. [`safeguards.md`](safeguards.md#live-execution-roster) is
+> authoritative for the current roster until this file is reconciled.
+
 Backup of the current scheduled tasks. Machine-readable source:
 [`config/scheduled_tasks.json`](../config/scheduled_tasks.json).
 

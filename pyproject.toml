@@ -73,6 +73,11 @@ py-modules = [
     "dca_notion_sync",
     "dca_weekly_dashboard",
     "run_dca",
+    # The seven-slot live-runner entrypoint (docs/live_wiring.md); omitting it
+    # here means `import dca_runner` only works from a source checkout, not an
+    # installed wheel (Codex review: "Ship the new runner in the installed
+    # package").
+    "dca_runner",
 ]
 # scripts/run_classification.py is the run-classification contract used by both
 # the live artifact writer (near_close_dca.build_run_artifacts) and readers
@@ -94,6 +99,11 @@ packages = ["scripts"]
     "config/notifications.json",
     "config/reporting.json",
     "config/morning_dca.json",
+    # Read by dca_runner's Gate 0; without it an installed wheel's
+    # get_config_dir() resolution finds every other config file except this
+    # one (Codex review: "Resolve runner configuration through the shared
+    # loader").
+    "config/market_calendar.json",
     "config/midday_dca.json",
 ]
 

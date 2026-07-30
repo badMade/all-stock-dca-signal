@@ -6836,7 +6836,14 @@ def test_a_synthesized_morning_failure_state_carries_the_schema_required_fields(
         assert field in run_state, field
     # Real values from the executor's configuration, not placeholders.
     assert run_state["broker"] == "robinhood"
-    for field in schema["properties"]["budget"]["required"]:
+    # budget_tier/daily_cap_usd/weekly_cap_usd moved from an unconditional
+    # `required` on the budget object into the schema's `else` branch (Codex
+    # review, PR #232: "Define a schema-valid budget for pre-budget exits"),
+    # so the seven-slot roster can write budget: {"budget_evaluated": false}
+    # on a fire that exits before Gate 6 ever selects a tier. morning_dca.py
+    # does not use that marker at all -- it always falls into the `else`
+    # branch, which is exactly what these fields being present here proves.
+    for field in schema["properties"]["budget"]["else"]["required"]:
         assert field in run_state["budget"], field
     assert run_state["counts"]["submitted"] == 0
     # Not run through jsonschema: run_state.schema.json $refs

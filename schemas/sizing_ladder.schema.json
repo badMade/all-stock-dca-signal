@@ -3,26 +3,34 @@
   "$id": "sizing_ladder.schema.json",
   "title": "Graded sizing ladder",
   "type": "object",
-  "required": ["tiers", "base_amount_usd"],
+  "required": ["tiers", "base_amount_usd", "status"],
   "additionalProperties": true,
   "properties": {
     "version": { "type": "string" },
     "status": { "type": "string", "enum": ["active", "historical", "backtest_analytics"] },
-    "base_amount_usd": { "type": "number", "minimum": 0 },
-    "base_amount_below_close_usd": { "type": "number", "minimum": 0 },
+    "base_amount_usd": { "type": "number", "exclusiveMinimum": 0 },
+    "base_amount_below_close_usd": { "type": "number", "exclusiveMinimum": 0 },
     "no_buy_below_pct": { "type": "number" },
     "tiers": {
       "type": "array",
+      "minItems": 1,
       "items": {
         "type": "object",
-        "required": ["min_drop_pct", "multiplier"],
+        "required": ["min_drop_pct", "max_drop_pct", "multiplier"],
         "additionalProperties": true,
         "properties": {
-          "min_drop_pct": { "type": "number" },
-          "max_drop_pct": { "type": ["number", "null"] },
-          "multiplier": { "type": "number", "minimum": 0 }
+          "min_drop_pct": { "type": "number", "exclusiveMinimum": 0 },
+          "max_drop_pct": { "type": ["number", "null"], "exclusiveMinimum": 0 },
+          "multiplier": { "type": "number", "exclusiveMinimum": 0 }
         }
       }
     }
+  },
+  "if": {
+    "properties": { "status": { "const": "active" } },
+    "required": ["status"]
+  },
+  "then": {
+    "required": ["base_amount_below_close_usd"]
   }
 }

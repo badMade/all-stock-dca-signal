@@ -45,6 +45,7 @@ from near_close_dca import (
 
 REPO_ROOT = Path(__file__).resolve().parent
 CONFIG_DIR = REPO_ROOT / "config"
+SCHEMAS_DIR = REPO_ROOT / "schemas"
 
 
 def _load(name: str) -> dict:
@@ -59,6 +60,99 @@ def test_every_config_file_parses_as_a_json_object():
     for path in files:
         data = json.loads(path.read_text(encoding="utf-8"))
         assert isinstance(data, dict), f"{path.name} must contain a JSON object"
+
+
+def test_every_config_file_validates_against_its_referenced_schema():
+    """A schema requirement tightened for the active ladder silently broke a
+    DIFFERENT config file that shares the same schema via its own ``$schema``
+    pointer: ``schemas/sizing_ladder.schema.json`` unconditionally required
+    ``base_amount_below_close_usd``, which ``config/backtest_sizing_ladder.json``
+    (an analytics-only ladder, ``status: "backtest_analytics"``, never loaded
+    by the live runner) does not define at all. Any editor, packaging check,
+    or consumer that validates a config file against its own declared schema
+    would reject it (Codex review: "Preserve validity of the backtest sizing
+    ladder"). Every config file naming a local schemas/*.json via ``$schema``
+    must actually validate against it, not just the one file a given change
+    happened to have in mind.
+    """
+    jsonschema = pytest.importorskip("jsonschema")
+    for path in sorted(CONFIG_DIR.glob("*.json")):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        schema_ref = data.get("$schema")
+        if not schema_ref or not schema_ref.endswith(".json") or "://" in schema_ref:
+            continue  # no local schema reference to check
+        schema_path = (path.parent / schema_ref).resolve()
+        if SCHEMAS_DIR not in schema_path.parents:
+            continue
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        jsonschema.validate(data, schema)
+
+
+def test_sizing_ladder_schema_requires_status_before_making_the_reduced_base_conditional():
+    """The conditional added to fix the prior finding had its own gap: the
+    ``if`` block itself required ``status`` (``required: ["status"]``), so a
+    document omitting BOTH ``status`` and ``base_amount_below_close_usd``
+    made the ``if`` evaluate false (its own required-property check failed),
+    skipping the ``then`` requirement entirely and validating successfully --
+    even though ``dca_runner._validated_sizing_ladder()`` unconditionally
+    reads ``ladder["base_amount_below_close_usd"]`` and would crash at import
+    on exactly this schema-valid document (Codex review: "Require status
+    before making the live base conditional"). ``status`` is now required at
+    the top level, so this document fails validation outright instead of
+    silently passing.
+    """
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "sizing_ladder.schema.json").read_text(encoding="utf-8"))
+    document = {
+        "base_amount_usd": 2.0,
+        "tiers": [{"min_drop_pct": 0.1, "max_drop_pct": None, "multiplier": 1.0}],
+        # deliberately omits both "status" and "base_amount_below_close_usd"
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(document, schema)
+
+
+def _run_state_document(budget):
+    return {
+        "run_id": "test-run-2026-07-28",
+        "generated_at": "2026-07-28T09:35:00-04:00",
+        "trading_day": "2026-07-28",
+        "broker": "robinhood",
+        "counts": {},
+        "budget": budget,
+    }
+
+
+def test_run_state_schema_allows_an_unevaluated_budget_for_pre_budget_exits():
+    """The seven-slot roster's END_SILENTLY (weekend/holiday, exits at Gate
+    0), GATE5_DISABLED (exits at Gate 5, before Gate 6), GATE4_EXPECTED_OVERLAP,
+    and an ABORT at Gate 1/2/3/4 all exit before Gate 6 ever selects a tier,
+    but schemas/run_state.schema.json unconditionally required budget_tier/
+    daily_cap_usd/weekly_cap_usd -- forcing the executor to either fabricate
+    a tier that was never selected or write a schema-invalid artifact (Codex
+    review: "Define a schema-valid budget for pre-budget exits").
+    budget.budget_evaluated=false with no tier/caps at all must now validate,
+    while a legacy-style artifact with a full, real budget (and no
+    budget_evaluated marker at all) must keep validating exactly as before,
+    and one missing budget_tier with no marker must still fail -- the
+    conditional must not weaken validation for the currently-live
+    three-stream engine's own artifacts."""
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "run_state.schema.json").read_text(encoding="utf-8"))
+
+    pre_budget_exit = _run_state_document({"budget_evaluated": False})
+    jsonschema.validate(pre_budget_exit, schema)
+
+    legacy_full_budget = _run_state_document(
+        {"budget_tier": "normal", "daily_cap_usd": 180.0, "weekly_cap_usd": 900.0}
+    )
+    jsonschema.validate(legacy_full_budget, schema)
+
+    legacy_incomplete_budget = _run_state_document(
+        {"daily_cap_usd": 180.0, "weekly_cap_usd": 900.0}
+    )
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(legacy_incomplete_budget, schema)
 
 
 # --- Two documented dev-install paths install the same tooling ---------------

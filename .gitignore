@@ -7,6 +7,7 @@ venv/
 .env.*
 *.log
 cron_tracking/
+_to_delete/
 
 # Python build / tooling
 *.egg-info/
@@ -34,3 +35,6 @@ artifacts/
 
 # Claude Code agent directory
 .claude/
+
+# Cowork folder-mount write probe artifact
+.__probe_write_test

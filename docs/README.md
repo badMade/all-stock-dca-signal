@@ -41,16 +41,39 @@ environment (see the repository README).
 - **Budgets:** $2 base · tiered caps selected per run by planned spend and 3x+
   signal count — Normal $180/$900 · Elevated $240/$1,200 · High-vol $300/$1,500 ·
   Stress $360/$1,800 (daily/weekly); weekly rollover reserve capped at $900.
-- **Only trading task:** `10ce362c` ("Graded DCA automatic live test - $2
-  allocation"; the repaired task that supersedes the deleted `ce16ba6b`, with
-  artifact root kept under `.../ce16ba6b` for continuity), **3:30 PM ET**
-  weekdays, Robinhood account `<ROBINHOOD_ACCOUNT_NUMBER>` only;
-  Alpaca read-only. The **3:35 PM ET** task is analytics (slippage + Notion sync).
-- **Run classification:** scheduled runs write under
-  `scheduled_runs/YYYYMMDD_1530ET/` and update `latest_scheduled_run.json`;
-  manual runs write under `manual_runs/<timestamp>/` and never do. Reporting
-  excludes manual runs/order IDs from scheduled-live metrics. See
-  [run_classification.md](run_classification.md).
+- **Live execution:** the prior Perplexity-run three-stream model
+  (`2ba19526`/`42173154`/`7be82b97`/`a6239dae`/`10ce362c`) is still the
+  account's ONLY currently-functioning live execution. A seven-slot
+  Claude-executed roster (weekdays 9:35 AM through 3:30 PM ET) is the
+  intended eventual replacement, but every one of those seven prompts
+  hard-aborts at Gate 5 (no signal-generation entry point exists yet; see
+  `claude/GATE5-PROPOSAL.md`), so it runs alongside the five Perplexity-era
+  tasks, not instead of them, until Gate 5 is wired. See
+  [safeguards.md](safeguards.md#live-execution-roster) for the current
+  roster. Robinhood account `<ROBINHOOD_ACCOUNT_NUMBER>` only; Alpaca read-only.
+  The **3:35 PM ET** task is analytics (slippage + Notion sync).
+- **Run classification:** each currently-functioning stream writes under its OWN
+  artifact root and pointer, not a shared `scheduled_runs/` path: market-open
+  (`2ba19526`) under `market_open_dca/` + `latest_market_open_run.json`, morning
+  (`42173154`) under `morning_dca/` + `latest_morning_run.json`, midday
+  (`a6239dae`) under `midday_dca/` + `latest_midday_run.json`, intraday
+  (`7be82b97`) under `intraday_dca/` + `latest_intraday_run.json`; only the final
+  afternoon stream (`10ce362c`) uses `scheduled_runs/YYYYMMDD_1530ET/` and
+  `latest_scheduled_run.json` (under the legacy `ce16ba6b` root). The proposed
+  seven-slot Claude roster mirrors this for its own six non-final slots
+  (`scheduled_runs/YYYYMMDD_<slot HHMM>ET/`, under a plain, un-prefixed root --
+  audit-only today, no reader wired). Those six slots share that one
+  `scheduled_runs/` namespace, so each updates its OWN slot-specific pointer
+  filename, `latest_scheduled_run_<slot HHMM>ET.json` (e.g.
+  `latest_scheduled_run_0935ET.json`), never the bare, unqualified
+  `latest_scheduled_run.json` a later slot would otherwise silently overwrite
+  (Codex review: "Give each slot an unambiguous latest-run pointer"; "Name
+  slot-specific pointers in the overview"). Its 3:30 PM slot writes to its own
+  separate `claude_roster_1530/` root
+  (never the legacy `ce16ba6b` one, to avoid colliding with `10ce362c`'s real
+  evidence). Manual runs write under each stream's own `manual_runs/<timestamp>/`
+  and never update that stream's pointer. Reporting excludes manual runs/order
+  IDs from scheduled-live metrics. See [run_classification.md](run_classification.md).
 - **Afternoon completion:** all afternoon trading/artifact-writing tasks finish
   by **3:40 PM ET**, when the read-only watchdog starts its final verification;
   the watchdog's own check and the Friday weekly Notion refresh at **5:00 PM ET**

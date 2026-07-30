@@ -27,19 +27,25 @@
       "name": "normal",
       "daily_cap_usd": 180.0,
       "weekly_cap_usd": 900.0,
-      "select_when": "planned spend <= $129 and 3x-or-greater signals <= 5"
+      "select_when": "planned spend <= $129 and 3x-or-greater signals <= 5",
+      "escalate_above_planned_spend_usd": 129.0,
+      "escalate_above_high_multiplier_signals": 5
     },
     {
       "name": "elevated",
       "daily_cap_usd": 240.0,
       "weekly_cap_usd": 1200.0,
-      "select_when": "planned spend > $129 or 3x-or-greater signals 6-10"
+      "select_when": "planned spend > $129 or 3x-or-greater signals 6-10",
+      "escalate_above_planned_spend_usd": 213.0,
+      "escalate_above_high_multiplier_signals": 10
     },
     {
       "name": "high_volatility",
       "daily_cap_usd": 300.0,
       "weekly_cap_usd": 1500.0,
-      "select_when": "planned spend > $213 or 3x-or-greater signals 11-17"
+      "select_when": "planned spend > $213 or 3x-or-greater signals 11-17",
+      "escalate_above_planned_spend_usd": 272.0,
+      "escalate_above_high_multiplier_signals": 17
     },
     {
       "name": "stress",

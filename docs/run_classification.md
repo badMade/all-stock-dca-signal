@@ -1,5 +1,18 @@
 # Run Classification Contract
 
+> **Stale as of 2026-07-28:** the scheduled-vs-manual **contract mechanics**
+> below (paths, required fields, exclusion rules) still apply, but examples
+> and stream names referencing the pre-2026-07-28 three-stream Perplexity-era
+> roster (morning `42173154`, midday `a6239dae`, afternoon `10ce362c`) use
+> the OLD three-stream naming -- those five tasks are still the account's
+> ONLY currently-functioning live execution, not a stream that has been
+> replaced. A seven-slot Claude roster is the intended eventual replacement;
+> every one of those seven prompts hard-aborts at Gate 5 until a
+> signal-generation entry point is wired (see `claude/GATE5-PROPOSAL.md`),
+> so it runs alongside the five tasks referenced below, not instead of them.
+> See [`safeguards.md`](safeguards.md#live-execution-roster) for the current
+> roster.
+
 Prevents **manual runs** of the graded DCA task from being confused with
 **scheduled live runs**. This is a binding contract: every run_state artifact
 must declare its origin, and every downstream reporting task must honor it.

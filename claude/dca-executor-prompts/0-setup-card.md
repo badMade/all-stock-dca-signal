@@ -1,0 +1,134 @@
+# Seven DCA executor tasks — corrected setup card
+
+Create each one in the Claude desktop app: new Cowork task -> "Run this task"
+picker, top right -> **On your computer** -> schedule it with the cron below
+-> paste the matching `.txt` file as the prompt. Each `.txt` holds nothing but
+prompt text. Select all, copy, paste. No trimming.
+
+| # | Slot ET | Cron (UTC) | Prompt file |
+| --- | --- | --- | --- |
+| 1 | 9:35 AM market-open | `35 13 * * 1-5` | `1-executor-0935-cron_35_13.txt` |
+| 2 | 10:30 AM morning | `30 14 * * 1-5` | `2-executor-1030-cron_30_14.txt` |
+| 3 | 11:30 AM intraday | `30 15 * * 1-5` | `3-executor-1130-cron_30_15.txt` |
+| 4 | 12:30 PM midday | `30 16 * * 1-5` | `4-executor-1230-cron_30_16.txt` |
+| 5 | 1:30 PM intraday | `30 17 * * 1-5` | `5-executor-1330-cron_30_17.txt` |
+| 6 | 2:30 PM intraday | `30 18 * * 1-5` | `6-executor-1430-cron_30_18.txt` |
+| 7 | 3:30 PM final | `30 19 * * 1-5` | `7-executor-1530-cron_30_19.txt` |
+
+**Do NOT retire the old schedule yet.** `config/scheduled_tasks.json` still lists five
+live-execution tasks from the prior three(ish)-stream scheduler (`2ba19526` 9:35
+market-open, `42173154` 10:30 morning, `7be82b97` 11:30/1:30/2:30 intraday, `a6239dae`
+12:30 midday, `10ce362c` 3:30 final) -- these are the account's ONLY currently-functioning
+scheduled DCA execution. Every one of the seven new prompt files below ends silently at
+Gate 5 with the non-alerting `GATE5_DISABLED` verdict (no callable signal-generation entry
+point exists yet; see `claude/GATE5-PROPOSAL.md`), so none of them can place a single
+order today. Retiring the five old tasks before Gate 5 is resolved leaves the account
+with zero functioning scheduled execution for however long that takes (Codex review:
+"Keep the old executors until replacements can pass Gate 5") -- create and schedule all
+seven new tasks below ALONGSIDE the five old ones, not instead of them.
+
+It is safe to run both schedules at once for now precisely because the new prompts
+cannot place orders: each fires, checks Gate 4, and then ends at Gate 5 without ever
+reaching placement. Gate 4 is not harmless noise, though -- every one of the seven new
+slots shares its exact window with a real Perplexity-era task (9:35, 10:30, 11:30,
+12:30, 1:30, 2:30, and 3:30 are the OLD roster's own five tasks' windows too), so Gate 4
+is *expected* to see that task's real same-window order on every fire once it places
+one. Rather than treating that as evidence of a rogue second executor and alerting (as
+Gate 4 does everywhere else), the 10:30, 12:30, and 3:30 prompts inspect the found
+order's ref_id against their own slot's known legacy prefix -- `morning-dca-` (`42173154`,
+`morning_dca.py`), `midday-dca-` (`a6239dae`, `midday_dca.py`), and `graded-dca-`
+(`10ce362c`, `near_close_dca.py`) respectively -- distinct from this roster's own
+`dca-runner-<slot_id>-<trading_day>-<ticker>` (per `dca_runner.py`, once Gate 5 is
+wired). Only when EVERY order in the window carries that slot's specific legacy prefix does the prompt
+classify it `GATE4_EXPECTED_OVERLAP` and stay silent -- the same non-alerting treatment
+as `GATE5_DISABLED` below. An order with no recognizable ref_id, or one carrying this
+roster's OWN prefix, stays on the real abort-and-alert path: that's either an untrusted
+collision or, worse, a genuine duplicate execution of this roster, and blanket-silencing
+"any order in the window" (or trusting a single, roster-wide prefix that doesn't match
+every slot's real legacy task) would have hidden exactly that (Codex review: "Recognize
+the real legacy stream ref-id prefixes"; "Distinguish legacy orders before suppressing
+Gate 4 alerts"; "Avoid expected Gate 4 alerts during roster overlap"). The 9:35, 11:30,
+1:30, and 2:30 prompts have NO such exception at all: their real legacy counterparts
+(`2ba19526` and `7be82b97`) carry `no_python_entry_point=true` in
+`config/scheduled_tasks.json` -- an external scheduler/agent runs them directly, with no
+committed, documented ref_id convention to verify against -- so those four prompts
+cannot safely attribute a same-window order to them and their Gate 4 alerts on every
+collision exactly as it always has, with no silent classification attempted. Both
+`GATE5_DISABLED` and, where applicable, `GATE4_EXPECTED_OVERLAP` are deliberately silent
+-- no message-center post, no alert file, no email draft -- because they are known,
+expected outcomes on every fire of the prompts that can reach them, not a failure to
+escalate; scheduling all seven alongside the old roster without at least the
+`GATE5_DISABLED` exception would mean up to seven expected abort alerts a day from Gate 5
+alone (35/week), burying any real safety failure under routine noise (Codex review: "Do
+not schedule tasks that are guaranteed to alert"). The Gate 4 sole-executor-interlock
+double-order risk this section used to warn about only becomes real once a human
+finishes `claude/GATE5-PROPOSAL.md` and wires a real signal-generation entry point into
+these prompts -- **that** is the point to retire the five old tasks, and it must happen
+before (not after) the new prompts can place real orders, or the two schedules really
+could both submit in the same window. It is also the point where Gate 4 (in the three
+prompts where it has an exception) and Gate 5 (in all seven) must revert from their
+disabled/silent classifications back to real abort-and-alert checks on failure, the same
+as every other gate.
+
+**Truncation risk:** `config/scheduled_tasks.json`'s `live_task_text_compactness_policy`
+documents that the scheduling service can silently truncate long task text --
+the documented working precedent for a live task is ~5,850 characters. These
+seven prompts are far longer than that (roughly 16,000-19,000 characters
+each), and before this fix each prompt's own `GATE5_DISABLED` instruction did
+not begin until roughly character 7,900-9,300, with Gate 9's evidence-writing
+rules starting after character 12,700 -- both well past a boundary that has
+already truncated task text once before. A truncated fire could therefore
+lose the very instruction that keeps it from placing a real order, or the
+evidence-writing requirement, or both. Each prompt now opens with a short,
+self-contained "STANDING GATE 5 OVERRIDE" paragraph -- before anything else,
+including the `LIVE EXECUTOR` line -- stating unconditionally that no real
+order may be placed today and, if the fuller gate sequence below is missing
+or incomplete, to treat that as this task's own `GATE5_DISABLED` verdict and
+write whatever evidence is possible (Codex review: "Move the disabled gate
+ahead of the truncation boundary"). This closes the immediate safety risk
+(an accidental live placement surviving truncation) regardless of prompt
+length. It does NOT address the underlying length problem: shrinking each
+prompt down toward the ~5,850-character precedent -- replacing inlined
+long-form explanations with compact references to `docs/safeguards.md`,
+`claude/GATE5-PROPOSAL.md`, and the other repo sources already cited
+throughout -- is a larger rewrite left as a deliberate follow-up, not
+attempted here, since a rushed compaction pass risks introducing new errors
+into carefully-reviewed safety text. Until that follow-up lands, paste each
+prompt in full as instructed above; do not trim it yourself.
+
+**If you only create one tonight, create #1.**
+
+**Crons are UTC and assume EDT.** On 2026-11-01 every one fires an hour early
+in ET; each needs +1 hour then, and the live-test window in
+`config/trading_window.json` already ends 2026-10-30 specifically to avoid
+that DST edge before it's handled.
+
+## What changed from the version you pasted earlier
+
+- **Budget caps:** these use `config/budgets.json`'s existing tiered daily/weekly
+  caps (Normal $180/$900 up to Stress $360/$1,800, selected per day by planned
+  spend and signal count), not a flat $200/day or $1,200/week. They're shared
+  across all seven slots, same effective "earlier slots have priority" behavior
+  you described, just with the real numbers.
+- **Ladder:** $2.00/$1.00 base times a 1.0x-5.0x multiplier from
+  `config/sizing_ladder.json`, topping out at exactly $10/order — not the
+  $1.50-based ladder that ran past its own stated $10 cap.
+- **Notifications:** in-app message center + email to you, not Slack.
+  `config/notifications.json` has Slack explicitly disabled for routine
+  notifications; the only Slack paths in this repo are env-gated, off-by-default
+  drift/failure webhooks.
+- **Gate 3** no longer references the old "2026-08-28 vs 2026-10-30 unresolved
+  dispute" framing — `config/trading_window.json` already resolved that,
+  dated and reasoned, on 2026-07-26.
+- Each prompt points at `docs/safeguards.md#live-execution-roster`, the section
+  I added to the repo (branch `claude/dca-seven-slot-roster-docs`, commit
+  `21b272d`, not yet pushed) documenting this seven-slot roster as the
+  authoritative reference, since `docs/schedule_manifest.md` and
+  `config/scheduled_tasks.json` still describe the old three-stream Perplexity
+  model and haven't been reconciled yet.
+
+## Before the first run
+
+Confirm the Mac won't be asleep at 9:35 AM ET — `caffeinate` or a launchd
+keep-awake job is worth setting up now that Perplexity's cloud scheduler isn't
+a fallback.

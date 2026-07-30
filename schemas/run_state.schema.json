@@ -128,9 +128,12 @@
     },
     "budget": {
       "type": "object",
-      "required": ["budget_tier", "daily_cap_usd", "weekly_cap_usd"],
       "additionalProperties": true,
       "properties": {
+        "budget_evaluated": {
+          "type": "boolean",
+          "description": "False when Gate 6 (budget/tier selection) never ran on this fire -- e.g. the seven-slot roster's END_SILENTLY (weekend/holiday, exits at Gate 0), GATE5_DISABLED (exits at Gate 5, before Gate 6), GATE4_EXPECTED_OVERLAP, or an ABORT at Gate 1/2/3/4 (all before Gate 6). budget_tier/daily_cap_usd/weekly_cap_usd are not required in that case, since fabricating a tier that was never actually selected would be worse evidence than omitting it (Codex review: \"Define a schema-valid budget for pre-budget exits\"). Omitted (or true) for every run that actually reached Gate 6 and selected a tier, matching every artifact written before this field existed -- omission is NOT itself treated as 'unevaluated'; only an explicit false is."
+        },
         "base_amount_usd": { "type": "number" },
         "base_buy_amount_usd": { "type": "number", "description": "Legacy alias of base_amount_usd; both are written for backward compatibility." },
         "budget_tier": { "type": "string", "enum": ["normal", "elevated", "high_volatility", "stress"] },
@@ -144,6 +147,14 @@
         "remaining_spend_today_usd": { "type": "number" },
         "day_notional_usd": { "type": "number" },
         "week_notional_usd": { "type": "number" }
+      },
+      "if": {
+        "properties": { "budget_evaluated": { "const": false } },
+        "required": ["budget_evaluated"]
+      },
+      "then": {},
+      "else": {
+        "required": ["budget_tier", "daily_cap_usd", "weekly_cap_usd"]
       }
     },
     "counts": {
