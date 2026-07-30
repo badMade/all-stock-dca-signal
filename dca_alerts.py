@@ -37,6 +37,7 @@ import socket
 import traceback
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional, TypeVar
@@ -624,7 +625,7 @@ def artifact_freshness_probe(path: "str | Path") -> Callable[[], bool]:
 
     Call this BEFORE invoking the guarded function (so the snapshot predates
     any write it could make) and pass the returned callable as
-    ``guarded_run(..., run_artifact_written=...)``.
+    ``config=GuardedRunConfig(run_artifact_written=...)``.
     """
     p = Path(path)
     try:
@@ -642,16 +643,26 @@ def artifact_freshness_probe(path: "str | Path") -> Callable[[], bool]:
     return _probe
 
 
+@dataclass(frozen=True)
+class GuardedRunConfig:
+    """Configuration for :func:`guarded_run`.
+
+    ``enabled`` toggles alerting/heartbeats (see :func:`guarded_run` for the
+    full behavioral contract); the remaining fields correspond 1:1 to
+    ``guarded_run``'s former keyword arguments of the same name.
+    """
+
+    enabled: bool = True
+    context: Optional[str] = None
+    result_ok: Optional[Callable[[Any], bool]] = None
+    attempt_log_root: Optional[str] = None
+    run_artifact_written: Optional[Callable[[], bool]] = None
+
+
 def guarded_run(
     stream: str,
-    fn: Callable[..., T],
-    *args: Any,
-    enabled: bool = True,
-    context: Optional[str] = None,
-    result_ok: Optional[Callable[[T], bool]] = None,
-    attempt_log_root: Optional[str] = None,
-    run_artifact_written: Optional[Callable[[], bool]] = None,
-    **kwargs: Any,
+    fn: Callable[[], T],
+    config: Optional[GuardedRunConfig] = None,
 ) -> T:
     """Run ``fn`` with guaranteed logging, failure alerting, and heartbeats.
 
@@ -698,15 +709,16 @@ def guarded_run(
     being attempted, since the marker especially is the only durable evidence
     this failure ever happened -- codex review discussion_r3658373974.
     """
+    config = config or GuardedRunConfig()
     ensure_log_handler()
-    if not enabled:
-        return fn(*args, **kwargs)
+    if not config.enabled:
+        return fn()
     try:
-        result = fn(*args, **kwargs)
+        result = fn()
     except Exception as exc:
         logger.exception("live %s run failed", stream)
         try:
-            alert_failure(stream, exc, context=context)
+            alert_failure(stream, exc, context=config.context)
         except Exception:  # noqa: BLE001 - alerting bugs must not mask the run failure
             logger.exception("alert_failure raised while handling a %s run failure", stream)
         try:
@@ -722,21 +734,21 @@ def guarded_run(
             # start) if the probe itself raises: that is the pre-existing
             # behavior and never loses the failure record.
             artifact_written = False
-            if run_artifact_written is not None:
+            if config.run_artifact_written is not None:
                 try:
-                    artifact_written = bool(run_artifact_written())
+                    artifact_written = bool(config.run_artifact_written())
                 except Exception:  # noqa: BLE001 - a broken probe must not lose the marker
                     logger.exception("run_artifact_written probe raised for %s; recording a failed start", stream)
             write_failed_start_marker(
-                stream, exc, root=attempt_log_root, run_artifact_written=artifact_written
+                stream, exc, root=config.attempt_log_root, run_artifact_written=artifact_written
             )
         except Exception:  # noqa: BLE001 - alerting bugs must not mask the run failure
             logger.exception("write_failed_start_marker raised while handling a %s run failure", stream)
         raise
     ok = True
-    if result_ok is not None:
+    if config.result_ok is not None:
         try:
-            ok = bool(result_ok(result))
+            ok = bool(config.result_ok(result))
         except Exception:  # noqa: BLE001 - fail closed: a broken predicate must not report healthy
             logger.exception("result_ok predicate raised for %s; pinging failed heartbeat", stream)
             ok = False

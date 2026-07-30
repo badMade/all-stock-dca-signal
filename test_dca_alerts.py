@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 import dca_alerts
-from dca_alerts import alert_failure, guarded_run, heartbeat_url, send_heartbeat
+from dca_alerts import GuardedRunConfig, alert_failure, guarded_run, heartbeat_url, send_heartbeat
 
 _PUBLIC_IP = ipaddress.ip_address("93.184.216.34")
 
@@ -575,7 +575,7 @@ def test_guarded_run_disabled_never_pings(monkeypatch):
     monkeypatch.setattr(dca_alerts, "alert_failure", lambda *a, **kw: alerts.append(a))
 
     with pytest.raises(RuntimeError):
-        guarded_run("morning", lambda: (_ for _ in ()).throw(RuntimeError("boom")), enabled=False)
+        guarded_run("morning", lambda: (_ for _ in ()).throw(RuntimeError("boom")), config=GuardedRunConfig(enabled=False))
     assert pings == []
     assert alerts == []
 
@@ -589,7 +589,7 @@ def test_guarded_run_result_ok_false_pings_fail_without_alert(monkeypatch):
     result = guarded_run(
         "afternoon",
         lambda: {"raw_persistence_error": "disk full"},
-        result_ok=lambda r: not r.get("raw_persistence_error"),
+        config=GuardedRunConfig(result_ok=lambda r: not r.get("raw_persistence_error")),
     )
     assert result == {"raw_persistence_error": "disk full"}
     assert pings == [("afternoon", False)]
@@ -604,7 +604,7 @@ def test_guarded_run_result_ok_predicate_error_fails_closed(monkeypatch):
     result = guarded_run(
         "morning",
         lambda: {"fine": True},
-        result_ok=lambda r: r["missing-key"],
+        config=GuardedRunConfig(result_ok=lambda r: r["missing-key"]),
     )
     assert result == {"fine": True}
     assert pings == [("morning", False)]
@@ -674,7 +674,7 @@ def test_guarded_run_passes_attempt_log_root_to_marker(monkeypatch, tmp_path):
         guarded_run(
             "morning",
             lambda: (_ for _ in ()).throw(RuntimeError("boom")),
-            attempt_log_root=str(tmp_path),
+            config=GuardedRunConfig(attempt_log_root=str(tmp_path)),
         )
     assert roots == [str(tmp_path)]
 
@@ -753,7 +753,7 @@ def test_guarded_run_probes_whether_the_run_artifact_was_written(monkeypatch):
             guarded_run(
                 "morning",
                 lambda: (_ for _ in ()).throw(RuntimeError("boom")),
-                run_artifact_written=probe,
+                config=GuardedRunConfig(run_artifact_written=probe),
             )
         assert phases == [expected], probe
 
@@ -777,7 +777,7 @@ def test_guarded_run_artifact_probe_failure_falls_back_to_failed_start(monkeypat
         guarded_run(
             "morning",
             lambda: (_ for _ in ()).throw(RuntimeError("boom")),
-            run_artifact_written=_broken_probe,
+            config=GuardedRunConfig(run_artifact_written=_broken_probe),
         )
     assert phases == [False]
 

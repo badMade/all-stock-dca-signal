@@ -60,7 +60,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from dca_alerts import artifact_freshness_probe, attempt_log_root_sibling_to, guarded_run
+from dca_alerts import GuardedRunConfig, artifact_freshness_probe, attempt_log_root_sibling_to, guarded_run
 from dca_config import (
     ACCOUNT_NUMBER_SHAPE,
     READ_ONLY_ACCOUNT,
@@ -3769,28 +3769,30 @@ class MorningDCAExecutor(DCAExecutor):
             return guarded_run(
                 self.stream,
                 _invoke,
-                enabled=is_scheduled_live,
-                context=f"cron_id={self.profile.get('cron_id')}",
-                # Keep the failed-start marker under the same custom base as a
-                # configured model_usage_log_root, so a non-default artifacts
-                # root doesn't split the writer and the report's reader across
-                # two different attempt_log locations -- codex review
-                # discussion_r3658373966.
-                attempt_log_root=attempt_log_root_sibling_to(self.config.model_usage_log_root),
-                # A scheduled morning/midday run that persists run_state.json and
-                # only then fails writing morning_signals.csv/submitted_orders.csv/
-                # a same-day pointer left the marker unconditionally recording
-                # failure_phase='before_run_artifact', fabricating an earlier
-                # failed start plus a successful retry -- codex review
-                # discussion_r3660858010 (the afternoon call already had this
-                # probe; this call never did).
-                run_artifact_written=run_artifact_written,
-                # A run whose raw-persistence recorder failed is surfaced as data on
-                # the artifacts (raw_persistence_error) rather than raised; it must
-                # ping a FAILED heartbeat, not clear the dead-man's switch.
-                result_ok=lambda result: not (
-                    isinstance(result, dict)
-                    and (result.get("artifacts") or {}).get("raw_persistence_error")
+                config=GuardedRunConfig(
+                    enabled=is_scheduled_live,
+                    context=f"cron_id={self.profile.get('cron_id')}",
+                    # Keep the failed-start marker under the same custom base as a
+                    # configured model_usage_log_root, so a non-default artifacts
+                    # root doesn't split the writer and the report's reader across
+                    # two different attempt_log locations -- codex review
+                    # discussion_r3658373966.
+                    attempt_log_root=attempt_log_root_sibling_to(self.config.model_usage_log_root),
+                    # A scheduled morning/midday run that persists run_state.json and
+                    # only then fails writing morning_signals.csv/submitted_orders.csv/
+                    # a same-day pointer left the marker unconditionally recording
+                    # failure_phase='before_run_artifact', fabricating an earlier
+                    # failed start plus a successful retry -- codex review
+                    # discussion_r3660858010 (the afternoon call already had this
+                    # probe; this call never did).
+                    run_artifact_written=run_artifact_written,
+                    # A run whose raw-persistence recorder failed is surfaced as data on
+                    # the artifacts (raw_persistence_error) rather than raised; it must
+                    # ping a FAILED heartbeat, not clear the dead-man's switch.
+                    result_ok=lambda result: not (
+                        isinstance(result, dict)
+                        and (result.get("artifacts") or {}).get("raw_persistence_error")
+                    ),
                 ),
             )
         except Exception as exc:  # noqa: BLE001 - see below; always re-raised

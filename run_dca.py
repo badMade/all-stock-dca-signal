@@ -36,7 +36,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from dca_alerts import artifact_freshness_probe, attempt_log_root_sibling_to, guarded_run
+from dca_alerts import GuardedRunConfig, artifact_freshness_probe, attempt_log_root_sibling_to, guarded_run
 from dca_config import DEFAULT_CONFIG_DIR, load_strategy_config
 from dca_fileio import atomic_write_text
 from midday_dca import DEFAULT_MIDDAY_LIVE_STATE_ROOT, MIDDAY_LIVE_CRON_ID, load_midday_config
@@ -1278,30 +1278,32 @@ def run_pipeline(
     return guarded_run(
         stream_name,
         _invoke,
-        enabled=scheduled and not config.dry_run,
-        context=f"artifacts_dir={artifacts_dir}",
-        # Keep the failed-start marker under the same custom base as a
-        # configured model_usage_log_root, so a non-default artifacts root
-        # doesn't split the writer and the report's reader across two
-        # different attempt_log locations -- codex review
-        # discussion_r3658373966.
-        attempt_log_root=attempt_log_root_sibling_to(model_usage_log_root),
-        # _run_pipeline_impl persists run_state.json directly under
-        # artifacts_dir (see the `out = Path(artifacts_dir)` writers above)
-        # before generate_full_reports=True's later report-generation phase
-        # runs; probing that path lets guarded_run tell a crash AFTER the run
-        # completed its work from a genuine failed start, instead of always
-        # recording the latter -- codex review discussion_r3660464501. The
-        # probe is mtime-snapshotted (not existence-only) so a retry reusing
-        # this slot's directory after an earlier invocation already wrote it
-        # is not credited with a write it never made itself -- codex review
-        # discussion_r3660858013.
-        run_artifact_written=run_artifact_written,
-        # The raw-persistence failure path reports its failure as a returned
-        # result (with its own targeted Slack alert) instead of raising; it must
-        # ping a FAILED heartbeat, not clear the dead-man's switch.
-        result_ok=lambda result: not (
-            isinstance(result, dict) and result.get("raw_persistence_error")
+        config=GuardedRunConfig(
+            enabled=scheduled and not config.dry_run,
+            context=f"artifacts_dir={artifacts_dir}",
+            # Keep the failed-start marker under the same custom base as a
+            # configured model_usage_log_root, so a non-default artifacts root
+            # doesn't split the writer and the report's reader across two
+            # different attempt_log locations -- codex review
+            # discussion_r3658373966.
+            attempt_log_root=attempt_log_root_sibling_to(model_usage_log_root),
+            # _run_pipeline_impl persists run_state.json directly under
+            # artifacts_dir (see the `out = Path(artifacts_dir)` writers above)
+            # before generate_full_reports=True's later report-generation phase
+            # runs; probing that path lets guarded_run tell a crash AFTER the run
+            # completed its work from a genuine failed start, instead of always
+            # recording the latter -- codex review discussion_r3660464501. The
+            # probe is mtime-snapshotted (not existence-only) so a retry reusing
+            # this slot's directory after an earlier invocation already wrote it
+            # is not credited with a write it never made itself -- codex review
+            # discussion_r3660858013.
+            run_artifact_written=run_artifact_written,
+            # The raw-persistence failure path reports its failure as a returned
+            # result (with its own targeted Slack alert) instead of raising; it must
+            # ping a FAILED heartbeat, not clear the dead-man's switch.
+            result_ok=lambda result: not (
+                isinstance(result, dict) and result.get("raw_persistence_error")
+            ),
         ),
     )
 
