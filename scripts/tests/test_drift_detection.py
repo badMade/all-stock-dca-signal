@@ -11,8 +11,10 @@ Fixture scenarios:
 """
 
 import csv
+import http.client
 import ipaddress
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -29,6 +31,7 @@ from drift_detection import (  # noqa: E402
     CAUSE_RAW_MISSING,
     CAUSE_ROW_BLOCK,
     DEFAULT_SLACK_WEBHOOK_ENV,
+    _sanitize_exception,
     build_slack_payload,
     detect_drift,
     load_run_artifacts,
@@ -313,6 +316,16 @@ class SlackTests(unittest.TestCase):
         (self.run_dir / "raw").mkdir()
         _write_csv(self.run_dir / "signals.csv", SIGNAL_FIELDS, [_signal("AAPL", incremental=3.0)])
         _write_csv(self.run_dir / "submitted_orders.csv", ORDER_FIELDS, [])
+        # drift_detection now special-cases webhook destinations routed
+        # through a configured forward proxy (see _proxy_configured_for) so
+        # proxy-only deployments don't need local DNS resolution to
+        # succeed. These tests must exercise the direct (non-proxied) path
+        # regardless of whatever proxy happens to be configured in the
+        # environment the suite itself runs in.
+        for name in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "no_proxy", "NO_PROXY"):
+            old_value = os.environ.pop(name, None)
+            if old_value is not None:
+                self.addCleanup(os.environ.__setitem__, name, old_value)
 
     def test_resolve_webhook_prefers_arg_then_env(self):
         self.assertEqual(resolve_webhook("https://arg", "SOME_ENV"), "https://arg")
@@ -386,6 +399,160 @@ class SlackTests(unittest.TestCase):
         ):
             with self.assertRaises(urllib.error.HTTPError):
                 handler.redirect_request(req, None, 302, "Found", {}, "https://internal.example/secret")
+
+    def test_send_slack_blocks_shared_address_space_destination(self):
+        """100.64.0.0/10 (carrier-grade NAT) is neither private nor reserved
+        but is not publicly routable either -- is_private/is_reserved alone
+        let it through.
+        """
+        report = detect_drift(self.run_dir)
+        with patch.object(
+            drift_detection, "_resolve_ips", lambda hostname: {ipaddress.ip_address("100.64.0.1")}
+        ):
+            with self.assertRaises(urllib.error.URLError):
+                send_slack_alert(report, webhook="https://hooks.example/alert")
+
+    def test_send_slack_blocks_deprecated_site_local_destination(self):
+        report = detect_drift(self.run_dir)
+        with patch.object(
+            drift_detection, "_resolve_ips", lambda hostname: {ipaddress.ip_address("fec0::1")}
+        ):
+            with self.assertRaises(urllib.error.URLError):
+                send_slack_alert(report, webhook="https://hooks.example/alert")
+
+    def test_send_slack_rejects_malformed_port(self):
+        report = detect_drift(self.run_dir)
+        with self.assertRaises(urllib.error.URLError):
+            send_slack_alert(report, webhook="https://hooks.example:notaport/alert")
+
+    def test_send_slack_skips_local_resolution_behind_a_proxy(self):
+        """A proxy-only deployment's webhook host may intentionally not
+        resolve on this host (the proxy resolves it); a genuine local
+        resolution FAILURE for that hostname must not block the request
+        when a proxy is configured (codex review discussion_r3679190507).
+        """
+        report = detect_drift(self.run_dir)
+        calls = []
+
+        class _FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(request, timeout=None):
+            calls.append(request)
+            return _FakeResponse()
+
+        def boom(hostname):
+            raise OSError("name resolution failed")
+
+        os.environ["https_proxy"] = "http://proxy.internal:3128"
+        self.addCleanup(os.environ.pop, "https_proxy", None)
+        with patch.object(drift_detection, "_resolve_ips", boom), patch.object(
+            urllib.request, "urlopen", fake_urlopen
+        ):
+            self.assertTrue(send_slack_alert(report, webhook="https://internal-only.example/alert"))
+        self.assertEqual(len(calls), 1)
+
+    def test_send_slack_still_blocks_literal_disallowed_ip_behind_a_proxy(self):
+        """A literal IP host (e.g. the cloud-metadata address) needs no DNS
+        resolution at all, so the proxy-bypass branch above must not skip
+        validating it -- an attacker-influenced webhook naming
+        169.254.169.254 directly must still be rejected even when a proxy is
+        configured (codex review on this PR).
+        """
+        report = detect_drift(self.run_dir)
+        os.environ["https_proxy"] = "http://proxy.internal:3128"
+        self.addCleanup(os.environ.pop, "https_proxy", None)
+        with self.assertRaises(urllib.error.URLError):
+            send_slack_alert(report, webhook="https://169.254.169.254/latest/meta-data/")
+
+    def test_send_slack_still_blocks_resolvable_disallowed_hostname_behind_a_proxy(self):
+        """A hostname (not a literal IP) that DOES resolve locally to a
+        disallowed address must still be rejected even when a proxy is
+        configured for the scheme -- unconditionally skipping validation
+        whenever any proxy exists would let an attacker-controlled hostname
+        resolve via the proxy to a private/link-local address completely
+        unchecked (codex review on this PR).
+        """
+        report = detect_drift(self.run_dir)
+        os.environ["https_proxy"] = "http://proxy.internal:3128"
+        self.addCleanup(os.environ.pop, "https_proxy", None)
+        with patch.object(
+            drift_detection, "_resolve_ips", lambda hostname: {ipaddress.ip_address("169.254.169.254")}
+        ):
+            with self.assertRaises(urllib.error.URLError):
+                send_slack_alert(report, webhook="https://attacker.example/alert")
+
+    def test_connect_pinned_connects_to_the_validated_address(self):
+        """The address _connect_pinned validates must be the exact address
+        it connects to -- not a hostname handed to a second, independent
+        lookup that could answer differently (DNS rebinding).
+        """
+        validated_ip = ipaddress.ip_address("93.184.216.34")
+        calls = []
+
+        def fake_create_connection(address, timeout, source_address):
+            calls.append(address)
+            return object()
+
+        class _FakeConn:
+            host = "hooks.example"
+            port = 443
+            timeout = 10.0
+            source_address = None
+
+        conn = _FakeConn()
+        with patch.object(
+            drift_detection, "_resolve_ips", lambda hostname: {validated_ip}
+        ), patch.object(drift_detection.socket, "create_connection", fake_create_connection):
+            drift_detection._connect_pinned(conn)
+        self.assertEqual(calls, [(str(validated_ip), 443)])
+        self.assertIsNotNone(conn.sock)
+
+    def test_pinned_https_handler_constructs_connection_without_crashing(self):
+        """https_open() must be able to construct its connection object
+        without raising. Every other test here mocks urllib.request.urlopen
+        directly, which bypasses this handler entirely and let a Python-
+        version-specific bug ship undetected: on 3.12+, HTTPSHandler no
+        longer sets self._check_hostname at all, and
+        http.client.HTTPSConnection.__init__ no longer accepts a
+        check_hostname argument either, so forwarding it here raised
+        AttributeError/TypeError on every real HTTPS request (Codex review
+        on this PR).
+        """
+
+        class _ReachedConnection(Exception):
+            pass
+
+        def fake_request(self, *a, **kw):
+            raise _ReachedConnection("construction succeeded")
+
+        handler = drift_detection._PinnedHTTPSHandler()
+        req = urllib.request.Request("https://hooks.example/alert")
+        req.timeout = 10.0  # normally set by OpenerDirector.open() before dispatch
+        with patch.object(drift_detection._PinnedHTTPSConnection, "request", fake_request):
+            with self.assertRaises(_ReachedConnection):
+                handler.https_open(req)
+
+    def test_pinned_https_handler_proxied_branch_constructs_connection_without_crashing(self):
+        class _ReachedConnection(Exception):
+            pass
+
+        def fake_request(self, *a, **kw):
+            raise _ReachedConnection("construction succeeded")
+
+        handler = drift_detection._PinnedHTTPSHandler()
+        req = urllib.request.Request("https://hooks.example/alert")
+        req.timeout = 10.0  # normally set by OpenerDirector.open() before dispatch
+        req._tunnel_host = "hooks.example"
+        with patch.object(http.client.HTTPSConnection, "request", fake_request):
+            with self.assertRaises(_ReachedConnection):
+                handler.https_open(req)
 
     def test_slack_payload_shape(self):
         report = detect_drift(self.run_dir)
@@ -476,6 +643,44 @@ class LoadRunArtifactsSignalSelectionTest(unittest.TestCase):
 
             self.assertEqual(artifacts.signals_path.name, "signals.csv")
             self.assertEqual(artifacts.signal_rows, [])
+
+
+class SanitizeExceptionTests(unittest.TestCase):
+    """_sanitize_exception never exposes webhook tokens or URL-derived content."""
+
+    def test_plain_string_reason_hides_content(self):
+        exc = urllib.error.URLError("connection to https://hooks.example/secret-token failed")
+        rendered = _sanitize_exception(exc)
+        assert "secret-token" not in rendered
+        assert "URLError" in rendered
+
+    def test_oserror_reason_reports_errno_only(self):
+        exc = urllib.error.URLError(OSError(111, "connection refused"))
+        rendered = _sanitize_exception(exc)
+        assert "URLError" in rendered
+        assert "111" in rendered
+        assert "connection refused" not in rendered
+
+    def test_base_exception_reason_without_errno_reports_type_only(self):
+        exc = urllib.error.URLError(ValueError("unexpected scheme https://hooks.example/secret-token"))
+        rendered = _sanitize_exception(exc)
+        assert "secret-token" not in rendered
+        assert "URLError" in rendered
+        assert "ValueError" in rendered
+
+    def test_http_error_reports_status_only(self):
+        exc = urllib.error.HTTPError(
+            "https://hooks.example/secret-token", 503, "blocked", {}, None
+        )
+        rendered = _sanitize_exception(exc)
+        assert "secret-token" not in rendered
+        assert "503" in rendered
+
+    def test_generic_exception_reports_type_only(self):
+        exc = RuntimeError("contains https://hooks.example/secret-token in message")
+        rendered = _sanitize_exception(exc)
+        assert "secret-token" not in rendered
+        assert "RuntimeError" in rendered
 
 
 if __name__ == "__main__":

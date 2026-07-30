@@ -1,5 +1,6 @@
 """Tests for dca_alerts: failure alerting, heartbeats, and the guarded_run wrapper."""
 
+import http.client
 import io
 import ipaddress
 import json
@@ -48,6 +49,20 @@ def _fake_public_dns(monkeypatch):
     path itself override this per-test.
     """
     monkeypatch.setattr(dca_alerts, "_resolve_ips", lambda hostname: {_PUBLIC_IP})
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_proxy(monkeypatch):
+    """dca_alerts now special-cases destinations routed through a
+    configured forward proxy (see _proxy_configured_for) so proxy-only
+    deployments don't need local DNS resolution to succeed. That must not
+    depend on whatever proxy happens to be configured in the environment
+    the test suite itself runs in -- clear it so every test here exercises
+    the direct (non-proxied) path unless it opts into proxy behavior
+    explicitly.
+    """
+    for name in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "no_proxy", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
 
 
 def _clear_alert_env(monkeypatch):
@@ -171,6 +186,310 @@ def test_safe_redirect_handler_allows_public_redirect_target(monkeypatch):
     req = urllib.request.Request("https://hc.example/start")
     new_req = handler.redirect_request(req, None, 302, "Found", {}, "https://hc.example/elsewhere")
     assert new_req.full_url == "https://hc.example/elsewhere"
+
+
+# -- disallowed-address coverage (carrier-grade NAT / deprecated site-local) -------
+
+
+@pytest.mark.parametrize(
+    "disallowed_ip",
+    ["100.64.0.1", "100.100.100.1", "fec0::1"],
+)
+def test_send_heartbeat_blocks_shared_and_site_local_destination(
+    monkeypatch, captured_requests, disallowed_ip
+):
+    """100.64.0.0/10 (carrier-grade NAT) and fec0::/10 (deprecated IPv6
+    site-local) are neither private nor reserved but are not publicly
+    routable either -- is_private/is_reserved alone let them through.
+    """
+    _clear_alert_env(monkeypatch)
+    monkeypatch.setenv("DCA_HEARTBEAT_URL", "https://hc.example/check")
+    monkeypatch.setattr(
+        dca_alerts, "_resolve_ips", lambda hostname: {ipaddress.ip_address(disallowed_ip)}
+    )
+    assert send_heartbeat("morning") is False
+    assert captured_requests == []
+
+
+# -- malformed port ----------------------------------------------------------------
+
+
+def test_heartbeat_url_rejects_malformed_port(monkeypatch):
+    monkeypatch.setenv("DCA_HEARTBEAT_URL", "https://hc.example:notaport/super-secret-token")
+    assert heartbeat_url("morning") is None
+
+
+def test_send_heartbeat_never_raises_on_malformed_port(monkeypatch, captured_requests):
+    _clear_alert_env(monkeypatch)
+    monkeypatch.setenv("DCA_HEARTBEAT_URL", "https://hc.example:notaport/super-secret-token")
+    assert send_heartbeat("morning") is False
+    assert captured_requests == []
+
+
+def test_redact_url_never_raises_on_malformed_port():
+    assert dca_alerts._redact_url("https://hc.example:notaport/super-secret-token") == "https://hc.example"
+
+
+# -- sanitized exception logging ----------------------------------------------------
+
+
+def test_send_heartbeat_does_not_log_raw_exception_text_with_token(monkeypatch, caplog):
+    """http.client.InvalidURL (raised for a URL path containing a control
+    character) embeds the complete offending path -- including a token --
+    in its message; the failure log must not reproduce it.
+    """
+    _clear_alert_env(monkeypatch)
+    monkeypatch.setenv("DCA_HEARTBEAT_URL", "https://hc.example/check")
+
+    def boom(url, timeout=None):
+        import http.client
+
+        raise http.client.InvalidURL("URL can't contain control characters. '/super-secret-token\\x00'")
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    with caplog.at_level("WARNING"):
+        assert send_heartbeat("morning") is False
+    assert "super-secret-token" not in caplog.text
+    assert "InvalidURL" in caplog.text
+
+
+def test_alert_failure_does_not_log_raw_exception_text_with_token(monkeypatch, caplog):
+    _clear_alert_env(monkeypatch)
+    monkeypatch.setenv("DCA_ALERT_SLACK_WEBHOOK", "https://hooks.example/super-secret-token")
+
+    def boom(request, timeout=None):
+        import http.client
+
+        raise http.client.InvalidURL("URL can't contain control characters. '/super-secret-token\\x00'")
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    with caplog.at_level("WARNING"):
+        assert alert_failure("morning", RuntimeError("boom")) is False
+    assert "super-secret-token" not in caplog.text
+    assert "InvalidURL" in caplog.text
+
+
+def test_sanitize_exception_never_stringifies_urlerror_reason():
+    """URLError.reason can be a plain string OR an arbitrary exception object;
+    stringifying it directly (rather than reporting only its type) could
+    reintroduce a URL/token leak (Copilot review on this PR).
+    """
+    token_leaking_reason = "connection to https://hooks.example/super-secret-token failed"
+    rendered = dca_alerts._sanitize_exception(urllib.error.URLError(token_leaking_reason))
+    assert "super-secret-token" not in rendered
+    assert "URLError" in rendered
+
+    oserror_reason = OSError(111, "connection refused")
+    rendered = dca_alerts._sanitize_exception(urllib.error.URLError(oserror_reason))
+    assert "URLError" in rendered
+    assert "111" in rendered
+
+    # BaseException-typed reason without errno -- only the type names are safe
+    # to report; the exception message itself may contain URL/token data.
+    value_error_reason = ValueError("unexpected scheme https://hooks.example/secret-token")
+    rendered = dca_alerts._sanitize_exception(urllib.error.URLError(value_error_reason))
+    assert "secret-token" not in rendered
+    assert "URLError" in rendered
+    assert "ValueError" in rendered
+
+
+def test_sanitize_exception_reports_http_error_status_only():
+    exc = urllib.error.HTTPError(
+        "https://hooks.example/super-secret-token", 503, "blocked", {}, None
+    )
+    rendered = dca_alerts._sanitize_exception(exc)
+    assert "super-secret-token" not in rendered
+    assert "503" in rendered
+
+
+# -- proxy-only deployments ----------------------------------------------------------
+
+
+def test_proxy_configured_for_true_when_scheme_proxy_set(monkeypatch):
+    monkeypatch.setenv("https_proxy", "http://proxy.internal:3128")
+    assert dca_alerts._proxy_configured_for("https://hc.example/check") is True
+
+
+def test_proxy_configured_for_false_when_only_other_scheme_proxied(monkeypatch):
+    monkeypatch.setenv("http_proxy", "http://proxy.internal:3128")
+    assert dca_alerts._proxy_configured_for("https://hc.example/check") is False
+
+
+def test_proxy_configured_for_respects_no_proxy(monkeypatch):
+    monkeypatch.setenv("https_proxy", "http://proxy.internal:3128")
+    monkeypatch.setenv("no_proxy", "hc.example")
+    assert dca_alerts._proxy_configured_for("https://hc.example/check") is False
+
+
+def test_send_heartbeat_skips_local_resolution_behind_a_proxy(monkeypatch, captured_requests):
+    """A proxy-only deployment's heartbeat host may intentionally not
+    resolve on this host (the proxy resolves it); a genuine local
+    resolution FAILURE for that hostname must not block the request when a
+    proxy is configured (codex review discussion_r3679190507).
+    """
+    _clear_alert_env(monkeypatch)
+    monkeypatch.setenv("DCA_HEARTBEAT_URL", "https://internal-only.example/check")
+    monkeypatch.setenv("https_proxy", "http://proxy.internal:3128")
+
+    def boom(hostname):
+        raise OSError("name resolution failed")
+
+    monkeypatch.setattr(dca_alerts, "_resolve_ips", boom)
+    assert send_heartbeat("morning") is True
+    assert captured_requests == ["https://internal-only.example/check"]
+
+
+def test_heartbeat_url_still_blocks_literal_disallowed_ip_behind_a_proxy(monkeypatch):
+    """A literal IP host (e.g. the cloud-metadata address) needs no DNS
+    resolution at all, so the proxy-bypass branch above must not skip
+    validating it -- an attacker-influenced URL naming
+    169.254.169.254 directly must still be rejected even when a proxy is
+    configured (codex review on this PR).
+    """
+    monkeypatch.setenv("DCA_HEARTBEAT_URL", "https://169.254.169.254/latest/meta-data/")
+    monkeypatch.setenv("https_proxy", "http://proxy.internal:3128")
+    assert heartbeat_url("morning") is None
+
+
+def test_heartbeat_url_allows_literal_public_ip_behind_a_proxy(monkeypatch):
+    monkeypatch.setenv("DCA_HEARTBEAT_URL", "https://93.184.216.34/check")
+    monkeypatch.setenv("https_proxy", "http://proxy.internal:3128")
+    assert heartbeat_url("morning") == "https://93.184.216.34/check"
+
+
+def test_heartbeat_url_still_blocks_resolvable_disallowed_hostname_behind_a_proxy(monkeypatch):
+    """A hostname (not a literal IP) that DOES resolve locally to a
+    disallowed address must still be rejected even when a proxy is
+    configured for the scheme -- unconditionally skipping validation
+    whenever any proxy exists (regardless of whether this particular
+    hostname needed it) would let an attacker-controlled hostname resolve
+    via the proxy to a private/link-local address completely unchecked
+    (codex review on this PR).
+    """
+    monkeypatch.setenv("DCA_HEARTBEAT_URL", "https://attacker.example/check")
+    monkeypatch.setenv("https_proxy", "http://proxy.internal:3128")
+    monkeypatch.setattr(
+        dca_alerts, "_resolve_ips", lambda hostname: {ipaddress.ip_address("169.254.169.254")}
+    )
+    assert heartbeat_url("morning") is None
+
+
+# -- pinned connection (DNS-rebinding guard) -----------------------------------------
+
+
+def test_connect_pinned_connects_to_the_validated_address(monkeypatch):
+    """The address _connect_pinned validates must be the exact address it
+    connects to -- not a hostname handed to a second, independent lookup
+    that could answer differently (DNS rebinding).
+    """
+    validated_ip = ipaddress.ip_address("93.184.216.34")
+    monkeypatch.setattr(dca_alerts, "_resolve_ips", lambda hostname: {validated_ip})
+    calls = []
+
+    def fake_create_connection(address, timeout, source_address):
+        calls.append(address)
+        return object()
+
+    monkeypatch.setattr(dca_alerts.socket, "create_connection", fake_create_connection)
+
+    class _FakeConn:
+        host = "hc.example"
+        port = 443
+        timeout = 10.0
+        source_address = None
+
+    conn = _FakeConn()
+    dca_alerts._connect_pinned(conn)
+    assert calls == [(str(validated_ip), 443)]
+    assert conn.sock is not None
+
+
+def test_connect_pinned_rejects_disallowed_resolved_address(monkeypatch):
+    monkeypatch.setattr(
+        dca_alerts, "_resolve_ips", lambda hostname: {ipaddress.ip_address("127.0.0.1")}
+    )
+
+    class _FakeConn:
+        host = "hc.example"
+        port = 443
+        timeout = 10.0
+        source_address = None
+
+    with pytest.raises(dca_alerts._UnsafeDestinationError):
+        dca_alerts._connect_pinned(_FakeConn())
+
+
+def test_request_is_proxied_detects_tunnel_and_plain_proxy_forms():
+    tunneled = urllib.request.Request("https://hc.example/check")
+    tunneled._tunnel_host = "hc.example"
+    assert dca_alerts._request_is_proxied(tunneled) is True
+
+    plain_proxied = urllib.request.Request("http://hc.example/check")
+    plain_proxied.selector = "http://hc.example/check"
+    assert dca_alerts._request_is_proxied(plain_proxied) is True
+
+    direct = urllib.request.Request("https://hc.example/check")
+    direct.selector = "/check"
+    assert dca_alerts._request_is_proxied(direct) is False
+
+
+# -- handler construction (not exercised by tests that mock urlopen directly) -----
+
+
+def test_pinned_https_handler_constructs_connection_without_crashing(monkeypatch):
+    """https_open() must be able to construct its connection object without
+    raising. Every other test in this module mocks urllib.request.urlopen
+    directly, which bypasses this handler entirely and let a Python-version-
+    specific bug ship undetected: on 3.12+, HTTPSHandler no longer sets
+    self._check_hostname at all, and http.client.HTTPSConnection.__init__ no
+    longer accepts a check_hostname argument either, so forwarding it here
+    raised AttributeError/TypeError on every real HTTPS request (Codex
+    review on this PR).
+    """
+
+    class _ReachedConnection(Exception):
+        pass
+
+    def fake_request(self, *a, **kw):
+        raise _ReachedConnection("construction succeeded")
+
+    monkeypatch.setattr(dca_alerts._PinnedHTTPSConnection, "request", fake_request)
+    handler = dca_alerts._PinnedHTTPSHandler()
+    req = urllib.request.Request("https://hc.example/check")
+    req.timeout = 10.0  # normally set by OpenerDirector.open() before dispatch
+    with pytest.raises(_ReachedConnection):
+        handler.https_open(req)
+
+
+def test_pinned_https_handler_proxied_branch_constructs_connection_without_crashing(monkeypatch):
+    class _ReachedConnection(Exception):
+        pass
+
+    def fake_request(self, *a, **kw):
+        raise _ReachedConnection("construction succeeded")
+
+    monkeypatch.setattr(http.client.HTTPSConnection, "request", fake_request)
+    handler = dca_alerts._PinnedHTTPSHandler()
+    req = urllib.request.Request("https://hc.example/check")
+    req.timeout = 10.0  # normally set by OpenerDirector.open() before dispatch
+    req._tunnel_host = "hc.example"
+    with pytest.raises(_ReachedConnection):
+        handler.https_open(req)
+
+
+def test_pinned_http_handler_constructs_connection_without_crashing(monkeypatch):
+    class _ReachedConnection(Exception):
+        pass
+
+    def fake_request(self, *a, **kw):
+        raise _ReachedConnection("construction succeeded")
+
+    monkeypatch.setattr(dca_alerts._PinnedHTTPConnection, "request", fake_request)
+    handler = dca_alerts._PinnedHTTPHandler()
+    req = urllib.request.Request("http://hc.example/check")
+    req.timeout = 10.0  # normally set by OpenerDirector.open() before dispatch
+    with pytest.raises(_ReachedConnection):
+        handler.http_open(req)
 
 
 # -- failure alerts ---------------------------------------------------------------
