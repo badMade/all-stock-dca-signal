@@ -986,7 +986,7 @@ def test_resolve_cross_stream_prior_allocation_roots_intraday_override_nested_un
     # DCA_INTRADAY_LIVE_STATE_ROOT is set to a path NESTED under the
     # conventional cron_base/intraday_dca fallback (e.g. a "relocated"
     # subdirectory), the override must be scanned INSTEAD of the broader
-    # fallback, not merely alongside/covered-by it. An earlier fix kept the
+    # fallback, not merely alongside/covered-by it. An earlier iteration kept the
     # broader fallback in this case (to avoid losing coverage entirely), but
     # that scans every legacy artifact elsewhere under cron_base/intraday_dca
     # too -- not just the relocated tree the operator configured -- which can
