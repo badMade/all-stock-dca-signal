@@ -218,15 +218,22 @@ def load_budgets(config_dir: Path) -> Dict[str, Any]:
         if not (math.isfinite(max_per_order) and max_per_order > 0):
             raise ValueError(f"max_per_order_usd must be a finite positive number, got {max_per_order}")
         out["max_per_order_usd"] = max_per_order
-    order_rules = data.get("order_rules")
-    if isinstance(order_rules, dict) and "one_order_per_ticker_per_day" in order_rules:
-        value = order_rules["one_order_per_ticker_per_day"]
-        if not isinstance(value, bool):
-            raise ValueError(
-                "order_rules.one_order_per_ticker_per_day must be a boolean "
-                f"(got {type(value).__name__})"
-            )
-        out["one_order_per_ticker_per_day"] = value
+    # order_rules.one_order_per_ticker_per_day is intentionally NOT overlaid here.
+    # StrategyConfig.one_order_per_ticker_per_day defaults to False specifically to
+    # preserve the legacy manual-morning -> scheduled-afternoon lower-price top-up
+    # path (see near_close_dca.py's _process_buy_candidate and
+    # test_one_order_per_ticker_per_day_defaults_off_to_preserve_the_top_up_path).
+    # budgets.json asserts this field true for the seven-slot roster's own
+    # bookkeeping/documentation; run_dca.run_slot() is the ONE caller that turns the
+    # flag on, via an explicit `replace(config, one_order_per_ticker_per_day=True)`
+    # roster-only override -- the same way dry_run/broker are excluded from JSON and
+    # only ever set by an explicit caller override (see this module's docstring: "so
+    # loading config can never by itself enable live trading"). Reading the flag from
+    # JSON here would overlay it onto EVERY load_strategy_config() call, including the
+    # legacy afternoon live path (docs/live_wiring.md), which would then block that
+    # stream's legitimate same-day top-up before it could run (Codex review,
+    # discussion on dca_config.py: "Keep first-wins policy out of legacy config
+    # loads").
     return out
 
 

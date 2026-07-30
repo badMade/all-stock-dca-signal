@@ -143,6 +143,25 @@ def test_budgets_maps_surviving_fields_only(tmp_path):
     }
 
 
+def test_budgets_does_not_overlay_one_order_per_ticker_per_day(tmp_path):
+    """The bundled config/budgets.json asserts order_rules.one_order_per_ticker_per_day:
+    true for the seven-slot roster's own bookkeeping, but StrategyConfig defaults it to
+    False specifically to preserve the legacy manual-morning -> scheduled-afternoon
+    lower-price top-up path. run_dca.run_slot() is the one caller allowed to turn it on,
+    via an explicit config override -- load_strategy_config() must never pick it up from
+    JSON, or every legacy load_strategy_config() caller (including the afternoon live
+    stream, see docs/live_wiring.md) would have its top-up path silently blocked by the
+    roster-only policy (Codex review: "Keep first-wins policy out of legacy config
+    loads")."""
+    _write(tmp_path, "budgets.json", {
+        "order_rules": {"one_order_per_ticker_per_day": True},
+    })
+    out = load_budgets(tmp_path)
+    assert "one_order_per_ticker_per_day" not in out
+    config = load_strategy_config(tmp_path)
+    assert config.one_order_per_ticker_per_day is False
+
+
 def test_tickers_loaded(tmp_path):
     _write(tmp_path, "tickers.json", {"active": ["AAA", "BBB"], "excluded": ["CCC"]})
     out = load_tickers(tmp_path)
