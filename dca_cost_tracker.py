@@ -20,8 +20,11 @@ the caller/scheduler.
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
+import os
+from itertools import repeat
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -89,6 +92,38 @@ def _month_prefix(year: int, month: int) -> str:
     return f"{year:04d}-{month:02d}"
 
 
+# Below this many artifacts, process-pool startup/IPC overhead outweighs any
+# parallel speedup (the common case is one file per trading day, ~20-23/month).
+_PARALLEL_FILE_THRESHOLD = 64
+
+
+def _process_run_state_file(args: tuple[Path, str]) -> Optional[Dict[str, Any]]:
+    path, prefix = args
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        logger.warning("skipping unreadable run-state artifact %s: %s", path, exc)
+        return None
+
+    # ⚡ Bolt Optimization: Fast JSON filtering via substring check.
+    # Skip the expensive JSON parse if the file doesn't match the month prefix.
+    if prefix not in raw_text:
+        return None
+
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        logger.warning("skipping unparseable run-state artifact %s: %s", path, exc)
+        return None
+
+    if data.get("status") == "blocked":
+        return None
+    trading_day = data.get("trading_day")
+    if isinstance(trading_day, str) and trading_day.startswith(prefix):
+        return data
+    return None
+
+
 def collect_month_run_states(
     root: str | Path,
     year: int,
@@ -102,31 +137,40 @@ def collect_month_run_states(
     they carry no usage data and are not analyzed runs.
     """
     prefix = _month_prefix(year, month)
-    run_states: List[Dict[str, Any]] = []
-    for path in find_run_state_files(root):
-        try:
-            raw_text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            logger.warning("skipping unreadable run-state artifact %s: %s", path, exc)
-            continue
+    paths = find_run_state_files(root)
+    if not paths:
+        return []
 
-        # ⚡ Bolt Optimization: Fast JSON filtering via substring check.
-        # Skip the expensive JSON parse if the file doesn't match the month prefix.
-        if prefix not in raw_text:
-            continue
+    if len(paths) < _PARALLEL_FILE_THRESHOLD:
+        return [
+            result
+            for result in (_process_run_state_file((path, prefix)) for path in paths)
+            if result is not None
+        ]
 
-        try:
-            data = json.loads(raw_text)
-        except json.JSONDecodeError as exc:
-            logger.warning("skipping unparseable run-state artifact %s: %s", path, exc)
-            continue
-
-        if data.get("status") == "blocked":
-            continue
-        trading_day = data.get("trading_day")
-        if isinstance(trading_day, str) and trading_day.startswith(prefix):
-            run_states.append(data)
-    return run_states
+    # ⚡ Bolt Optimization: Use ProcessPoolExecutor to parallelize file I/O and
+    # JSON parsing for large artifact trees, eliminating the N+1 sequential
+    # read bottleneck. Falls back to sequential parsing if the process pool
+    # can't be started — e.g. spawn-based platforms invoking this at module
+    # scope without an `if __name__ == "__main__"` guard (RuntimeError), or
+    # this helper running inside a daemonic pool worker, which raises
+    # AssertionError because daemon processes can't spawn children.
+    chunksize = max(1, len(paths) // ((os.cpu_count() or 1) * 4))
+    try:
+        with concurrent.futures.ProcessPoolExecutor() as executor:
+            results = executor.map(
+                _process_run_state_file, zip(paths, repeat(prefix)), chunksize=chunksize
+            )
+            return [result for result in results if result is not None]
+    except (OSError, RuntimeError, AssertionError) as exc:
+        logger.warning(
+            "process pool unavailable (%s); falling back to sequential run-state parsing", exc
+        )
+        return [
+            result
+            for result in (_process_run_state_file((path, prefix)) for path in paths)
+            if result is not None
+        ]
 
 
 def aggregate_usage(
