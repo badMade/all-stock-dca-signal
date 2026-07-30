@@ -1876,12 +1876,37 @@ def _iso_or_none(value: Optional[datetime]) -> Optional[str]:
     return value.isoformat() if value is not None else None
 
 
+
+@dataclass(frozen=True)
+class UsageProxyContext:
+    """Inputs for :func:`build_usage_proxy`, bundling one run's activity counters.
+
+    ``decisions``, ``signal_rows``, ``buy_candidates``, and ``candidate_outcomes``
+    describe what the run actually evaluated/produced. The remaining fields are
+    optional overrides/annotations (provider call counts, error/notification
+    counts, cost-control notes) that fall back to sensible defaults inside
+    ``build_usage_proxy`` when left as ``None``.
+    """
+
+    decisions: Sequence[ReconciledDecision]
+    signal_rows: Sequence[Dict[str, Any]]
+    buy_candidates: Sequence[Dict[str, Any]]
+    candidate_outcomes: Dict[str, Dict[str, Any]]
+    order_reviews_attempted: Optional[int] = None
+    finance_calls_attempted: Optional[int] = None
+    robinhood_calls_attempted: Optional[int] = None
+    errors_count: int = 0
+    notifications_sent: Optional[int] = None
+    cost_control_notes: Optional[Sequence[str]] = None
+
+
 def build_usage_proxy(
+    context: Optional[UsageProxyContext] = None,
     *,
-    decisions: Sequence[ReconciledDecision],
-    signal_rows: Sequence[Dict[str, Any]],
-    buy_candidates: Sequence[Dict[str, Any]],
-    candidate_outcomes: Dict[str, Dict[str, Any]],
+    decisions: Optional[Sequence[ReconciledDecision]] = None,
+    signal_rows: Optional[Sequence[Dict[str, Any]]] = None,
+    buy_candidates: Optional[Sequence[Dict[str, Any]]] = None,
+    candidate_outcomes: Optional[Dict[str, Dict[str, Any]]] = None,
     order_reviews_attempted: Optional[int] = None,
     finance_calls_attempted: Optional[int] = None,
     robinhood_calls_attempted: Optional[int] = None,
@@ -1897,38 +1922,60 @@ def build_usage_proxy(
     signal per ticker; pass explicit values when the provider count is known. The
     byte/count-of-file fields are left ``None`` here and filled by
     ``write_run_artifacts`` once the files exist on disk.
+
+    Accepts either a single ``UsageProxyContext`` (preferred) or the previous
+    per-field keyword arguments, kept for backward compatibility with callers
+    of the installable module that predate ``UsageProxyContext``.
     """
-    tickers_scanned = len(decisions)
-    manual_review_count = sum(1 for d in decisions if d.action == Action.MANUAL_REVIEW)
-    top_up_manual_review_count = sum(1 for c in buy_candidates if c.get("top_up_manual_review"))
+    if context is None:
+        if decisions is None or signal_rows is None or buy_candidates is None or candidate_outcomes is None:
+            raise TypeError(
+                "build_usage_proxy requires either a UsageProxyContext or the "
+                "decisions/signal_rows/buy_candidates/candidate_outcomes keyword arguments"
+            )
+        context = UsageProxyContext(
+            decisions=decisions,
+            signal_rows=signal_rows,
+            buy_candidates=buy_candidates,
+            candidate_outcomes=candidate_outcomes,
+            order_reviews_attempted=order_reviews_attempted,
+            finance_calls_attempted=finance_calls_attempted,
+            robinhood_calls_attempted=robinhood_calls_attempted,
+            errors_count=errors_count,
+            notifications_sent=notifications_sent,
+            cost_control_notes=cost_control_notes,
+        )
+    tickers_scanned = len(context.decisions)
+    manual_review_count = sum(1 for d in context.decisions if d.action == Action.MANUAL_REVIEW)
+    top_up_manual_review_count = sum(1 for c in context.buy_candidates if c.get("top_up_manual_review"))
     orders_placed_count = sum(
         1
-        for outcome in candidate_outcomes.values()
+        for outcome in context.candidate_outcomes.values()
         if outcome.get("order_id") and outcome.get("status") in {"submitted", "dry_run"}
     )
     return {
         "tickers_scanned": tickers_scanned,
         "finance_calls_attempted": (
-            finance_calls_attempted if finance_calls_attempted is not None else tickers_scanned
+            context.finance_calls_attempted if context.finance_calls_attempted is not None else tickers_scanned
         ),
         "robinhood_calls_attempted": (
-            robinhood_calls_attempted if robinhood_calls_attempted is not None else tickers_scanned
+            context.robinhood_calls_attempted if context.robinhood_calls_attempted is not None else tickers_scanned
         ),
-        "signal_rows_written": len(signal_rows),
-        "buy_candidates_written": len(buy_candidates),
+        "signal_rows_written": len(context.signal_rows),
+        "buy_candidates_written": len(context.buy_candidates),
         "order_reviews_attempted": (
-            order_reviews_attempted if order_reviews_attempted is not None else len(buy_candidates)
+            context.order_reviews_attempted if context.order_reviews_attempted is not None else len(context.buy_candidates)
         ),
         "orders_placed_count": orders_placed_count,
         # Filled in write_run_artifacts once files are written (approximate proxy).
         "state_file_bytes": None,
         "csv_artifact_count": None,
         "total_artifact_bytes": None,
-        "notifications_sent": notifications_sent,
-        "errors_count": errors_count,
-        "manual_recovery_required": manual_review_count > 0 or top_up_manual_review_count > 0 or errors_count > 0,
-        "cost_control_notes": list(cost_control_notes)
-        if cost_control_notes is not None
+        "notifications_sent": context.notifications_sent,
+        "errors_count": context.errors_count,
+        "manual_recovery_required": manual_review_count > 0 or top_up_manual_review_count > 0 or context.errors_count > 0,
+        "cost_control_notes": list(context.cost_control_notes)
+        if context.cost_control_notes is not None
         else list(DAILY_COST_CONTROL_NOTES),
     }
 
@@ -2318,16 +2365,18 @@ def build_run_artifacts(
         "buy_candidates": buy_candidates,
         "manual_review_tickers": manual_review_tickers,
         "usage_proxy": build_usage_proxy(
-            decisions=decisions,
-            signal_rows=signal_rows,
-            buy_candidates=buy_candidates,
-            candidate_outcomes=candidate_outcomes,
-            order_reviews_attempted=order_reviews_attempted,
-            finance_calls_attempted=finance_calls_attempted,
-            robinhood_calls_attempted=robinhood_calls_attempted,
-            errors_count=errors_count,
-            notifications_sent=notifications_sent,
-            cost_control_notes=cost_control_notes,
+            UsageProxyContext(
+                decisions=decisions,
+                signal_rows=signal_rows,
+                buy_candidates=buy_candidates,
+                candidate_outcomes=candidate_outcomes,
+                order_reviews_attempted=order_reviews_attempted,
+                finance_calls_attempted=finance_calls_attempted,
+                robinhood_calls_attempted=robinhood_calls_attempted,
+                errors_count=errors_count,
+                notifications_sent=notifications_sent,
+                cost_control_notes=cost_control_notes,
+            )
         ),
     }
     _apply_no_order_classification(artifacts, candidate_outcomes, scheduled=not manual)

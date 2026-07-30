@@ -48,6 +48,7 @@ from near_close_dca import (
     SourceSignal,
     StrategyConfig,
     StrategyState,
+    UsageProxyContext,
     _check_execution_gates,
     _earlier_selected_base,
     _graded_dca_ref_id_prefix,
@@ -3689,10 +3690,12 @@ def test_build_usage_proxy_defaults_and_overrides():
     outcomes = {"A": {"status": "dry_run", "order_id": "X"}}
 
     usage = build_usage_proxy(
-        decisions=decisions,
-        signal_rows=signal_rows,
-        buy_candidates=buy_candidates,
-        candidate_outcomes=outcomes,
+        UsageProxyContext(
+            decisions=decisions,
+            signal_rows=signal_rows,
+            buy_candidates=buy_candidates,
+            candidate_outcomes=outcomes,
+        )
     )
     # calls default to tickers scanned; reviews default to candidate count.
     assert usage["tickers_scanned"] == 2
@@ -3701,6 +3704,34 @@ def test_build_usage_proxy_defaults_and_overrides():
     assert usage["orders_placed_count"] == 1
     # a MANUAL_REVIEW decision flags manual recovery even with zero errors.
     assert usage["manual_recovery_required"] is True
+
+
+def test_build_usage_proxy_legacy_keyword_call():
+    """The pre-UsageProxyContext keyword-only call signature still works."""
+    decisions = [
+        _decision("A", Action.BUY),
+        _decision("B", Action.MANUAL_REVIEW),
+    ]
+    signal_rows = [{}, {}, {}, {}]
+    buy_candidates = [{"ticker": "A"}]
+    outcomes = {"A": {"status": "dry_run", "order_id": "X"}}
+
+    usage = build_usage_proxy(
+        decisions=decisions,
+        signal_rows=signal_rows,
+        buy_candidates=buy_candidates,
+        candidate_outcomes=outcomes,
+    )
+    assert usage["tickers_scanned"] == 2
+    assert usage["finance_calls_attempted"] == 2
+    assert usage["order_reviews_attempted"] == 1
+    assert usage["orders_placed_count"] == 1
+    assert usage["manual_recovery_required"] is True
+
+
+def test_build_usage_proxy_requires_context_or_legacy_fields():
+    with pytest.raises(TypeError):
+        build_usage_proxy()
 
 
 # --- Same-day prior-run offset / top-up guard --------------------------------
