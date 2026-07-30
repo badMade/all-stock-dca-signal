@@ -22,6 +22,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -606,6 +607,27 @@ def _model_usage_log_helper():
     return log_model_usage
 
 
+
+@dataclass(frozen=True)
+class ModelUsageConfig:
+    """Model-usage-tracking overrides for :func:`generate_scheduled_reports`.
+
+    Bundles the audit-log root and the ``log_model_usage`` cost-conscious
+    defaults' overrides (see ``scripts/model_usage_log.py``) into a single
+    opt-in object: ``log_root=None`` (the default) skips the audit-log
+    append entirely, and the remaining fields stay unset unless the caller
+    explicitly knows it used a permitted premium escalation. See
+    ``docs/cost_tracking.md`` ("What Python cannot know") for the full
+    contract these fields satisfy.
+    """
+
+    log_root: Optional[str | Path] = None
+    model_requested: Optional[str] = None
+    model_actual: Optional[str] = None
+    model_routing_mode: Optional[str] = None
+    reason_for_premium_model: Optional[str] = None
+
+
 def generate_scheduled_reports(
     trading_day: str,
     fills: Sequence[Dict[str, Any]],
@@ -616,6 +638,8 @@ def generate_scheduled_reports(
     model_usage_model_actual: Optional[str] = None,
     model_usage_model_routing_mode: Optional[str] = None,
     model_usage_reason_for_premium_model: Optional[str] = None,
+    *,
+    model_usage_config: Optional[ModelUsageConfig] = None,
 ) -> Dict[str, str]:
     """Task 67aa802b entry point: post-trade reports for the SCHEDULED run only.
 
@@ -627,16 +651,63 @@ def generate_scheduled_reports(
 
     ``fills`` is the same broker fill list ``generate_reports`` takes; ``base``
     overrides the artifact root (defaults to the contract's STATE_ROOT).
-    ``model_usage_log_root`` is opt-in (see scripts/model_usage_log.py,
+    ``model_usage_config.log_root`` is opt-in (see scripts/model_usage_log.py,
     config/scheduled_tasks.json -> model_usage_log): None (the default) skips
     the audit-log append entirely (appended even when report generation
-    raises, so a failed run is still recorded). The ``model_usage_model_*``/
-    ``model_usage_reason_for_premium_model`` kwargs override
+    raises, so a failed run is still recorded). The other ``model_usage_config`` fields override
     ``log_model_usage``'s cost-conscious defaults -- this function has no
     visibility into which model/agent actually drove the run, so they stay
     unset unless the scheduler invoking this call explicitly knows it used a
     permitted premium escalation and passes them.
+
+    The ``model_usage_log_root``/``model_usage_model_*``/
+    ``model_usage_reason_for_premium_model`` parameters are the pre-existing
+    interface documented at ``docs/cost_tracking.md:206-220`` and are kept
+    in their original positional-or-keyword slots (unchanged) for the
+    externally managed 67aa802b scheduler, which still calls this entry
+    point with them -- including positionally. ``model_usage_config`` is
+    the new keyword-only alternative; any of the legacy parameters that is
+    passed (non-``None``) overrides the corresponding ``model_usage_config``
+    field, so old and new call sites can both be satisfied.
     """
+    if any(
+        v is not None
+        for v in (
+            model_usage_log_root,
+            model_usage_model_requested,
+            model_usage_model_actual,
+            model_usage_model_routing_mode,
+            model_usage_reason_for_premium_model,
+        )
+    ):
+        base_config = model_usage_config or ModelUsageConfig()
+        model_usage_config = ModelUsageConfig(
+            log_root=(
+                model_usage_log_root
+                if model_usage_log_root is not None
+                else base_config.log_root
+            ),
+            model_requested=(
+                model_usage_model_requested
+                if model_usage_model_requested is not None
+                else base_config.model_requested
+            ),
+            model_actual=(
+                model_usage_model_actual
+                if model_usage_model_actual is not None
+                else base_config.model_actual
+            ),
+            model_routing_mode=(
+                model_usage_model_routing_mode
+                if model_usage_model_routing_mode is not None
+                else base_config.model_routing_mode
+            ),
+            reason_for_premium_model=(
+                model_usage_reason_for_premium_model
+                if model_usage_reason_for_premium_model is not None
+                else base_config.reason_for_premium_model
+            ),
+        )
     collect_manual_order_ids, select_scheduled = _run_classification_helpers()
     base_path = Path(base) if base is not None else None
     selection = select_scheduled(trading_day, base=base_path)
@@ -734,12 +805,14 @@ def generate_scheduled_reports(
     report_run_id = f"reporting_{trading_day}_1535ET"
     source_run_id = (selection.state or {}).get("run_id")
     log_model_usage = _model_usage_log_helper()
-    routing_overrides = {
-        "model_requested": model_usage_model_requested,
-        "model_actual": model_usage_model_actual,
-        "model_routing_mode": model_usage_model_routing_mode,
-        "reason_for_premium_model": model_usage_reason_for_premium_model,
-    }
+    routing_overrides = {}
+    if model_usage_config:
+        routing_overrides = {
+            "model_requested": model_usage_config.model_requested,
+            "model_actual": model_usage_config.model_actual,
+            "model_routing_mode": model_usage_config.model_routing_mode,
+            "reason_for_premium_model": model_usage_config.reason_for_premium_model,
+        }
     try:
         report_paths = generate_reports(
             selection.state,
@@ -751,7 +824,7 @@ def generate_scheduled_reports(
         # Best-effort append even when generate_reports raises, so a failed
         # report run is still recorded per the one-entry-per-task-run contract.
         log_model_usage(
-            root=model_usage_log_root,
+            root=model_usage_config.log_root if model_usage_config else None,
             run_id=report_run_id,
             cron_id="67aa802b",
             run_origin="scheduled",

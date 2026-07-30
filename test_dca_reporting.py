@@ -549,7 +549,7 @@ def test_generate_scheduled_reports_appends_model_usage_log_entry_when_root_conf
     import tempfile
     from pathlib import Path
 
-    from dca_reporting import generate_scheduled_reports
+    from dca_reporting import ModelUsageConfig, generate_scheduled_reports
     from scripts.model_usage_log import resolve_log_path
 
     build_sched, _build_manual, write_run_artifacts = _classification_helpers()
@@ -561,7 +561,7 @@ def test_generate_scheduled_reports_appends_model_usage_log_entry_when_root_conf
     fills = [{"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 0.03, "order_id": "O1"}]
     log_root = base / "model_usage"
     report_paths = generate_scheduled_reports(
-        day, fills, base / "reports", base=base, model_usage_log_root=log_root
+        day, fills, base / "reports", base=base, model_usage_config=ModelUsageConfig(log_root=log_root)
     )
 
     from datetime import datetime, timezone
@@ -580,7 +580,12 @@ def test_generate_scheduled_reports_appends_model_usage_log_entry_when_root_conf
     assert Path(report_paths["latest_run_summary"]).exists()
 
 
-def test_generate_scheduled_reports_records_premium_routing_metadata_when_supplied(tmp_path=None):
+def test_generate_scheduled_reports_accepts_legacy_model_usage_keywords(tmp_path=None):
+    # The externally managed 67aa802b scheduler calls this entry point with
+    # the pre-existing model_usage_log_root/model_usage_model_*/
+    # model_usage_reason_for_premium_model keywords (docs/cost_tracking.md:
+    # 206-220); those must keep working even though the in-repo call sites
+    # now prefer the bundled ModelUsageConfig object.
     import tempfile
     from datetime import datetime, timezone
     from pathlib import Path
@@ -596,11 +601,91 @@ def test_generate_scheduled_reports_records_premium_routing_metadata_when_suppli
     )
     fills = [{"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 0.03, "order_id": "O1"}]
     log_root = base / "model_usage"
-    generate_scheduled_reports(
-        day, fills, base / "reports", base=base,
+    report_paths = generate_scheduled_reports(
+        day,
+        fills,
+        base / "reports",
+        base=base,
         model_usage_log_root=log_root,
         model_usage_model_routing_mode="premium",
         model_usage_reason_for_premium_model="explicit_user_request",
+    )
+
+    log_path = resolve_log_path(datetime.now(timezone.utc), root=log_root)
+    assert log_path.exists()
+    entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+    assert entry["cron_id"] == "67aa802b"
+    assert entry["model_routing_mode"] == "premium"
+    assert entry["reason_for_premium_model"] == "explicit_user_request"
+    assert Path(report_paths["latest_run_summary"]).exists()
+
+
+def test_generate_scheduled_reports_accepts_legacy_positional_model_usage_args(tmp_path=None):
+    # Before the ModelUsageConfig extraction, model_usage_log_root/
+    # model_usage_model_*/model_usage_reason_for_premium_model were plain
+    # positional-or-keyword parameters (not keyword-only), so an external
+    # caller could -- and per the scheduler contract, may -- pass them
+    # positionally after `base`. model_usage_config must stay keyword-only
+    # so it never shifts into one of those legacy positional slots.
+    import tempfile
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    from dca_reporting import generate_scheduled_reports
+    from scripts.model_usage_log import resolve_log_path
+
+    build_sched, _build_manual, write_run_artifacts = _classification_helpers()
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-06"
+    write_run_artifacts(
+        _sched_state(day, [("AAPL", "O1")], build_sched(day, f"{day}T19:20:01Z")), base=base,
+    )
+    fills = [{"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 0.03, "order_id": "O1"}]
+    log_root = base / "model_usage"
+    report_paths = generate_scheduled_reports(
+        day,
+        fills,
+        base / "reports",
+        base,
+        log_root,
+        None,
+        None,
+        "premium",
+        "explicit_user_request",
+    )
+
+    log_path = resolve_log_path(datetime.now(timezone.utc), root=log_root)
+    assert log_path.exists()
+    entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+    assert entry["cron_id"] == "67aa802b"
+    assert entry["model_routing_mode"] == "premium"
+    assert entry["reason_for_premium_model"] == "explicit_user_request"
+    assert Path(report_paths["latest_run_summary"]).exists()
+
+
+def test_generate_scheduled_reports_records_premium_routing_metadata_when_supplied(tmp_path=None):
+    import tempfile
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    from dca_reporting import ModelUsageConfig, generate_scheduled_reports
+    from scripts.model_usage_log import resolve_log_path
+
+    build_sched, _build_manual, write_run_artifacts = _classification_helpers()
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-06"
+    write_run_artifacts(
+        _sched_state(day, [("AAPL", "O1")], build_sched(day, f"{day}T19:20:01Z")), base=base,
+    )
+    fills = [{"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 0.03, "order_id": "O1"}]
+    log_root = base / "model_usage"
+    generate_scheduled_reports(
+        day, fills, base / "reports", base=base,
+        model_usage_config=ModelUsageConfig(
+            log_root=log_root,
+            model_routing_mode="premium",
+            reason_for_premium_model="explicit_user_request",
+        )
     )
     log_path = resolve_log_path(datetime.now(timezone.utc), root=log_root)
     entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
@@ -615,6 +700,7 @@ def test_generate_scheduled_reports_logs_even_when_report_generation_fails(tmp_p
     from datetime import datetime, timezone
 
     import dca_reporting
+    from dca_reporting import ModelUsageConfig
     from scripts.model_usage_log import resolve_log_path
 
     build_sched, _build_manual, write_run_artifacts = _classification_helpers()
@@ -633,7 +719,7 @@ def test_generate_scheduled_reports_logs_even_when_report_generation_fails(tmp_p
     log_root = base / "model_usage"
     try:
         dca_reporting.generate_scheduled_reports(
-            day, fills, base / "reports", base=base, model_usage_log_root=log_root
+            day, fills, base / "reports", base=base, model_usage_config=ModelUsageConfig(log_root=log_root)
         )
         raise AssertionError("expected RuntimeError to propagate")
     except RuntimeError as exc:
