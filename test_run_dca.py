@@ -2010,7 +2010,7 @@ def test_run_pipeline_bounded_reload_poisons_conflict_after_clean_first_scan(
     # artifact for MSFT in the window between the two scans, so the reload
     # now sees MSFT at $6/unknown -- a genuine disagreement, not a scan
     # artifact. Gating the poison on the FIRST pass's scan_had_failures flag
-    # (as the prior fix did) would miss this: that flag says nothing about
+    # (as the prior implementation did) would miss this: that flag says nothing about
     # whether pass one's snapshot of MSFT specifically is still current.
     # Any disagreement observed while the reload is unverified must poison
     # to uncertain, regardless of whether the earlier scan reported a
