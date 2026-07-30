@@ -3,6 +3,14 @@
 Status: **PROPOSAL ONLY. Not applied.** This document is committed for review; no live prompt was changed
 by it. Written 2026-07-28.
 
+See also `claude/GATE5-ALERT-INCIDENT-2026-07-29.md`: a 2026-07-29 alert
+initially looked like a live session not following the disabled-Gate-5
+contract this proposal's own recommendation put in place. On review that
+conclusion didn't hold up — the prompt text being compared against was
+committed *after* the alert fired, so there's no way to confirm what was
+actually deployed at the time. That document now reads as inconclusive
+rather than a confirmed deviation.
+
 Gate 5 currently says: *"Run the repo's own signal generation for this slot ...
 Use the repo entry point, never a reimplementation."* There is no such entry
 point. This document says exactly why, proposes one, and flags the two things

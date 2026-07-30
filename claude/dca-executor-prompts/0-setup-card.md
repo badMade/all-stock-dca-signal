@@ -98,6 +98,15 @@ prompt in full as instructed above; do not trim it yourself.
 
 **If you only create one tonight, create #1.**
 
+**2026-07-29 alert review:** an ABORT alert (Slack + repo file + Gmail) fired
+from what looks like the 10:30 slot the same day. A same-day review draft
+concluded this contradicted this card and `2-executor-1030-cron_30_14.txt`,
+but that draft compared the alert against prompt text first committed by the
+PR #232 merge over ten hours *after* the alert fired, so it couldn't actually
+confirm what was deployed at 10:30 AM. See
+`claude/GATE5-ALERT-INCIDENT-2026-07-29.md` (now revised) for the corrected,
+more hedged version — no prompt or config change resulted either way.
+
 **Crons are UTC and assume EDT.** On 2026-11-01 every one fires an hour early
 in ET; each needs +1 hour then, and the live-test window in
 `config/trading_window.json` already ends 2026-10-30 specifically to avoid

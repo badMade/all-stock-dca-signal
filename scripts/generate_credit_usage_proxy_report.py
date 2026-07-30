@@ -2496,7 +2496,7 @@ def _usage_counts(
     error_count = failed_start_escalation_count + late_error_escalation_count + recorded_error_count
 
     return {
-        "run_count_scheduled": run_count_scheduled,
+        "run_count_scheduled": sum(1 for r in scheduled_rows if r.get("classification") == "valid_scheduled_evidence"),
         "run_count_recovery": len(run_rows),
         "no_op_count": no_op_count,
         # Only rows that actually ran (valid_scheduled_evidence, or a manual
