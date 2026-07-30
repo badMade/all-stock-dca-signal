@@ -1111,7 +1111,7 @@ def test_guarded_top_up_retry_records_recovered_buy_despite_seeded_prior_context
     # BEFORE _process_buy_candidate runs, so buys_today(...) is already
     # nonzero even in a freshly restarted process whose OWN afternoon order
     # was never booked into this StrategyState. Gating the duplicate-preserved
-    # branch's state.record_buy on buys_today()==0 (as a prior fix did) would
+    # branch's state.record_buy on buys_today()==0 (as a prior implementation did) would
     # then wrongly skip recording a genuinely new-to-this-state recovered
     # order, omitting it from day/week spend.
     config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
