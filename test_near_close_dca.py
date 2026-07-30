@@ -50,6 +50,7 @@ from near_close_dca import (
     StrategyState,
     _check_execution_gates,
     _earlier_selected_base,
+    _graded_dca_ref_id_prefix,
     _iso_or_none,
     _process_buy_candidate,
     _same_stream_order_exists,
@@ -805,6 +806,9 @@ class _RefIdTrackingBroker:
                 return {"id": order_id, "dollar_amount": amt}
         return None
 
+    def same_day_ticker_notional_usd(self, ticker, trading_day):
+        return sum(amt for t, _rid, amt, _oid in self._orders if t == ticker)
+
     def is_tradable_for_fractional_buy(self, ticker):
         return True
 
@@ -1514,6 +1518,155 @@ def test_non_guarded_candidate_still_blocked_by_broad_same_day_check():
     assert outcome["status"] == "skipped"
     assert outcome["skip_reason"] == "same-day broker order exists"
     assert "AAPL" not in broker.placed
+
+
+def test_graded_dca_ref_id_prefix_scopes_non_afternoon_streams_only():
+    # "afternoon" (this module's historical, single-stream default) must keep
+    # the exact legacy, unprefixed convention byte-for-byte -- docs/safeguards.md's
+    # Gate 4 sole-executor check and the real legacy 10ce362c task's own order
+    # history depend on this literal string. Only morning/midday (the
+    # seven-slot roster's other two canonical run_slot() streams) get a
+    # distinguishing token.
+    assert _graded_dca_ref_id_prefix("afternoon") == "graded-dca"
+    assert _graded_dca_ref_id_prefix("afternoon", "topup") == "graded-dca-topup"
+    assert _graded_dca_ref_id_prefix("afternoon", "manual") == "graded-dca-manual"
+    assert _graded_dca_ref_id_prefix("morning") == "graded-dca-morning"
+    assert _graded_dca_ref_id_prefix("morning", "topup") == "graded-dca-morning-topup"
+    assert _graded_dca_ref_id_prefix("midday") == "graded-dca-midday"
+    assert _graded_dca_ref_id_prefix("midday", "topup") == "graded-dca-midday-topup"
+
+
+def test_same_stream_order_exists_does_not_cross_canonical_slots(monkeypatch):
+    # Codex review (P1): "Namespace idempotency keys before enabling cross-slot
+    # top-ups". Before the stream parameter existed, a real order the morning
+    # slot placed for AAPL (ref_id "graded-dca-2026-06-29-AAPL") would ALSO
+    # match the midday slot's own same-stream duplicate lookup, since both
+    # canonical slots share this exact near_close_dca.py engine and used the
+    # identical unprefixed prefix. That misread a genuine cross-slot top-up as
+    # "this run's own retry" and silently skipped placing it.
+    broker = _RefIdTrackingBroker()
+    trading_day = date(2026, 6, 29)
+    morning_ref_id = f"{_graded_dca_ref_id_prefix('morning')}-{trading_day.isoformat()}-AAPL"
+    broker._orders.append(("AAPL", morning_ref_id, 1.0, "ORDER-MORNING-AAPL"))
+
+    # The midday slot's own same-stream check must NOT find the morning
+    # slot's order -- it belongs to a different stream.
+    assert _same_stream_order_exists(broker, "AAPL", trading_day, "midday") is None
+    # The morning slot's own retry check DOES find its own earlier order.
+    found = _same_stream_order_exists(broker, "AAPL", trading_day, "morning")
+    assert found is not None
+    assert found["id"] == "ORDER-MORNING-AAPL"
+
+
+def test_guarded_top_up_across_canonical_slots_places_a_new_order_not_a_duplicate():
+    # End-to-end version of the above through _process_buy_candidate: the
+    # midday slot guard-topping-up a ticker the morning slot already bought
+    # must actually SUBMIT the incremental order, not silently re-confirm the
+    # morning slot's order as though it were its own retry.
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision()  # target_price=98.0, below the $99 prior reference.
+    trading_day = date(2026, 6, 29)
+    morning_ref_id = f"{_graded_dca_ref_id_prefix('morning')}-{trading_day.isoformat()}-AAPL"
+    broker = _RefIdTrackingBroker()
+    broker._orders.append(("AAPL", morning_ref_id, 1.0, "ORDER-MORNING-AAPL"))
+    prior = PriorSameDayAllocation(
+        ticker="AAPL", amount_usd=1.0, reference_price=99.0, run_id="slot_1030",
+        source="scheduled", selected_base_amount_usd=2.0,
+    )
+    now = datetime(2026, 6, 29, 12, 30, tzinfo=EASTERN)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    outcome, top_up_outcome, _, _, _ = _process_buy_candidate(
+        decision, config, StrategyState(), broker, robinhood_data=robinhood_data,
+        now=now, trading_day=trading_day,
+        guard_active=True, prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=0.0, scheduled=True, run_result=None,
+        stream="midday",
+    )
+
+    assert outcome["status"] == "submitted"
+    assert outcome.get("duplicate_preserved") is not True
+    assert top_up_outcome.top_up_guard_result == "incremental_top_up"
+    # $10 desired (2.0 base * 5.0 multiplier) - $1.0 already bought = $9.0 incremental.
+    assert broker.placed["AAPL"] == 9.0
+    midday_ref_id = f"{_graded_dca_ref_id_prefix('midday', 'topup')}-{trading_day.isoformat()}-AAPL"
+    assert broker._orders[-1][1] == midday_ref_id
+
+
+def test_guarded_top_up_corrects_an_understated_artifact_prior_against_the_broker():
+    # Codex review (P1): "Include broker orders in the delta before disabling
+    # the duplicate gate". The artifact-derived prior says only $1.00 was
+    # bought (e.g. the artifact write for a second fill failed, or a
+    # different-ref-id order isn't reflected in the scanned prior-allocation
+    # roots), but the broker's own ground-truth same-day total for this
+    # ticker is $9.00. Trusting the artifact figure would compute a $9.00
+    # incremental top-up on top of capital already spent; the corrected
+    # delta must instead be the true remaining $1.00.
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision()  # desired = 2.0 base * 5.0 multiplier = $10.00.
+    trading_day = date(2026, 6, 29)
+    broker = _RefIdTrackingBroker()
+    # A real $9.00 same-day order the artifact trail failed to capture, under
+    # a ref id our own same-stream check does not recognize as a duplicate.
+    broker._orders.append(("AAPL", "some-other-untracked-ref-id", 9.0, "ORDER-UNTRACKED"))
+    prior = PriorSameDayAllocation(
+        ticker="AAPL", amount_usd=1.0, reference_price=99.0, run_id="slot_1030",
+        source="scheduled", selected_base_amount_usd=2.0,
+    )
+    now = datetime(2026, 6, 29, 12, 30, tzinfo=EASTERN)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    outcome, top_up_outcome, _, _, _ = _process_buy_candidate(
+        decision, config, StrategyState(), broker, robinhood_data=robinhood_data,
+        now=now, trading_day=trading_day,
+        guard_active=True, prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=0.0, scheduled=True, run_result=None,
+        stream="midday",
+    )
+
+    assert top_up_outcome.top_up_guard_result == "incremental_top_up"
+    assert top_up_outcome.incremental_order_amount == 1.0
+    assert outcome["status"] == "submitted"
+    assert broker.placed["AAPL"] == 1.0
+
+
+def test_guarded_top_up_fails_closed_when_broker_cannot_verify_same_day_notional():
+    # A broker adapter that doesn't implement same_day_ticker_notional_usd at
+    # all (e.g. AlpacaBroker) must not silently fall back to trusting the
+    # artifact-only prior -- that's exactly the gap this fix closes.
+    class _NoNotionalCheckBroker(_RefIdTrackingBroker):
+        def same_day_ticker_notional_usd(self, ticker, trading_day):
+            raise RuntimeError("notional lookup not implemented")
+
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision()
+    trading_day = date(2026, 6, 29)
+    broker = _NoNotionalCheckBroker()
+    prior = PriorSameDayAllocation(
+        ticker="AAPL", amount_usd=1.0, reference_price=99.0, run_id="slot_1030",
+        source="scheduled", selected_base_amount_usd=2.0,
+    )
+    now = datetime(2026, 6, 29, 12, 30, tzinfo=EASTERN)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    outcome, _, _, errors_count_inc, _ = _process_buy_candidate(
+        decision, config, StrategyState(), broker, robinhood_data=robinhood_data,
+        now=now, trading_day=trading_day,
+        guard_active=True, prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=0.0, scheduled=True, run_result=None,
+        stream="midday",
+    )
+
+    assert outcome["status"] == "blocked"
+    assert "same-day notional check failed" in outcome["skip_reason"]
+    assert "AAPL" not in broker.placed
+    assert errors_count_inc == 1
 
 
 def test_same_stream_order_exists_fails_closed_when_broker_unsupported():

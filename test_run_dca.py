@@ -4115,13 +4115,12 @@ def test_run_slot_persists_the_correlation_id_into_run_state(tmp_path):
     assert run_state["correlation_id"] == "dca-2026-07-06-morning-1030et"
 
 
-def test_run_slot_enforces_one_order_per_ticker_per_day(tmp_path):
-    """Roster rule: first slot to buy a ticker wins; later slots skip it.
-
-    near_close_dca._process_buy_candidate bypasses both same-day gates when a
-    prior allocation is loaded (`not ticker_guarded and ...`, :5296 and :5315).
-    That bypass is the top-up path, and across seven slots it is what permits
-    repeated full-size buys. run_slot must close it.
+def test_run_slot_without_a_guarded_prior_allocation_still_blocks_a_same_day_repeat(tmp_path):
+    """Safe default, unaffected by the guarded-top-up decision below: a ticker
+    with NO loaded prior same-day allocation is not "guarded"
+    (near_close_dca._process_buy_candidate's `ticker_guarded`), so the broad
+    broker-level same-day check still gates it regardless of
+    one_order_per_ticker_per_day.
     """
     import json
 
@@ -4153,6 +4152,101 @@ def test_run_slot_enforces_one_order_per_ticker_per_day(tmp_path):
     assert placed == []
     reasons = {c.get("skip_reason") for c in run_state["buy_candidates"]}
     assert "same-day broker order exists" in reasons
+
+
+@pytest.mark.parametrize("slot", ["1030ET", "1230ET", "1530ET"])
+def test_run_slot_no_longer_forces_one_order_per_ticker_per_day(slot, tmp_path):
+    """Human decision, GATE5-PROPOSAL.md #4 item 2 (2026-07-30): guarded top-up,
+    not "first slot wins". run_slot must stop forcing
+    one_order_per_ticker_per_day=True so near_close_dca's existing
+    strictly-lower-price top-up guard (already exercised by
+    test_flag_off_leaves_the_documented_top_up_bypass_intact and friends in
+    test_near_close_dca.py) can run for these three canonical slots.
+    """
+    import run_dca as run_dca_module
+    from run_dca import run_slot
+
+    captured = {}
+    real_run_pipeline = run_dca_module.run_pipeline
+
+    def _capture(now, config, *args, **kwargs):
+        captured["one_order_per_ticker_per_day"] = config.one_order_per_ticker_per_day
+        return real_run_pipeline(now, config, *args, **kwargs)
+
+    monkeypatch_target = run_dca_module
+    original = monkeypatch_target.run_pipeline
+    monkeypatch_target.run_pipeline = _capture
+    try:
+        config = _demo_config()
+        run_slot(
+            slot,
+            now=_now(),
+            config=config,
+            state=StrategyState(),
+            finance_data=DemoDataProvider(SourceName.FINANCE),
+            robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+            broker=build_broker(config),
+            artifacts_dir=tmp_path,
+        )
+    finally:
+        monkeypatch_target.run_pipeline = original
+
+    assert captured["one_order_per_ticker_per_day"] is False
+
+
+def test_run_slot_allows_a_guarded_top_up_the_old_forced_flag_used_to_block(tmp_path):
+    """End-to-end proof the flip above actually changes behavior: a ticker
+    with a loaded prior same-day allocation at a strictly higher reference
+    price (e.g. the morning slot buying it earlier the same day, at $105,
+    while this slot's own decision price is ~$99.05 under DemoDataProvider)
+    is no longer unconditionally blocked by the broker's broad same-day
+    check the way it was when run_slot forced
+    one_order_per_ticker_per_day=True -- it now reaches
+    near_close_dca.evaluate_top_up_guard, which computes the real strictly-
+    lower-price incremental top-up ($2.00 desired - $1.00 already bought =
+    $1.00 incremental) instead of a flat block.
+
+    DemoDataProvider has no get_bid_ask, so a *scheduled* run (spread_ok
+    required) always blocks at the spread gate afterward regardless of this
+    fix -- that gate is downstream of and irrelevant to the same-day guard
+    this test targets, so the status itself is not asserted here.
+    """
+    import json
+
+    from near_close_dca import PriorSameDayAllocation
+    from run_dca import run_slot
+
+    config = _demo_config()
+
+    class _RecordingBroker(DryRunBroker):
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return True  # e.g. the morning slot's own earlier order for AAPL.
+
+    prior = {
+        "AAPL": PriorSameDayAllocation(
+            ticker="AAPL", amount_usd=1.0, reference_price=105.0, selected_base_amount_usd=2.0,
+        ),
+    }
+
+    result = run_slot(
+        "1530ET",
+        now=_now(),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=_RecordingBroker(account=config.target_account_number),
+        artifacts_dir=tmp_path,
+        prior_same_day_allocations=prior,
+    )
+
+    run_state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    aapl = by_ticker["AAPL"]
+    assert aapl.get("skip_reason") != "same-day broker order exists"
+    assert aapl.get("top_up_guard_result") == "incremental_top_up"
+    assert aapl.get("top_up_skipped") is False
+    assert aapl.get("incremental_order_amount") == 1.0
 
 
 def test_run_slot_does_not_construct_its_own_broker(tmp_path):

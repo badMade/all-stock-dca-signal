@@ -647,6 +647,28 @@ class RobinhoodBroker:
                 return order
         return None
 
+    def same_day_ticker_notional_usd(self, ticker: str, trading_day: date) -> float:
+        """Sum the dollar notional of every live same-day order for ``ticker``.
+
+        Unlike the two methods above, this is NOT scoped to any particular
+        ref-id convention -- it sums every live-state order the broker itself
+        reports for this ticker/day, regardless of which stream or executor
+        (this roster, a legacy morning_dca.py/midday_dca.py run, or a manual
+        fill) placed it. Ground truth for a guarded top-up's incremental
+        delta, which must never trust an artifact-derived prior allocation
+        that is lower than what the broker actually shows (see
+        near_close_dca.evaluate_top_up_guard's KNOWN GAP note).
+        """
+        total = 0.0
+        for order in self._same_day_orders(ticker, trading_day):
+            if str(order.get("state", "")).lower() not in _LIVE_ORDER_STATES:
+                continue
+            try:
+                total += float(order.get("dollar_amount") or order.get("notional") or 0)
+            except (TypeError, ValueError):
+                continue
+        return total
+
     def is_tradable_for_fractional_buy(self, ticker: str) -> bool:
         if self._tradability_fn is None:
             return True

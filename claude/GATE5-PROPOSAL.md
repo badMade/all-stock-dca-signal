@@ -547,6 +547,50 @@ top-ups across later slots").
    which requires 1.4 and 1.5 to be fixed first. **Until one of these is chosen
    and enforced, running seven live slots against this engine can buy the same
    ticker up to seven times a day.**
+
+   **Decided 2026-07-30: option (b), guarded top-up.** Applied by no longer
+   forcing `one_order_per_ticker_per_day=True` in `run_dca.run_slot()`
+   (`run_dca.py`), letting `near_close_dca._process_buy_candidate`'s existing,
+   already-tested strictly-lower-price guard run for the three canonical slots
+   -- their prior allocation is auto-discovered from the other two slots' own
+   state roots, which the guard already understands (see item 3, resolved).
+   This decision does NOT extend to the four `DISABLED_SLOTS` (9:35, 11:30,
+   1:30, 2:30): §1.4's cross-slot prior-allocation gap for those slots is
+   unresolved, so they remain hard-disabled in `run_dca.py` regardless of this
+   choice. §3.13's `dca_runner.py`-local analysis is superseded by this: that
+   module is not wired into any live path (no production caller ever
+   constructs a `dca_runner.Candidate`), so the real fix belongs in
+   `run_dca.run_slot()`/`near_close_dca.py`, not there.
+
+   **Two P1 gaps found by review (2026-07-30) after the above landed, both now
+   fixed:**
+   - **Idempotency keys collided across canonical slots.** `near_close_dca.py`'s
+     ref-id scheme (`graded-dca[-topup]-<day>-<ticker>`) carried no stream
+     component, so a guarded top-up at 12:30/3:30 could match an earlier
+     canonical slot's own real order via `_same_stream_order_exists` and get
+     silently recorded as `duplicate_preserved` instead of actually placing the
+     incremental order -- the feature would have no-op'd for live (non-dry-run)
+     cross-slot top-ups. Fixed by adding a `stream` parameter threaded from
+     `run_dca.run_slot()` through `near_close_dca.run_daily_compact` ->
+     `run_once` -> `_process_buy_candidates_batch` -> `_process_buy_candidate`,
+     used to scope both the ref-id written on placement and the prefixes
+     `_same_stream_order_exists` checks (`_graded_dca_ref_id_prefix()`). The
+     `"afternoon"` stream (this module's historical default) keeps the exact
+     legacy, unprefixed convention byte-for-byte -- `docs/safeguards.md`'s Gate
+     4 check and the real legacy `10ce362c` task's own order history depend on
+     that literal string -- only `"morning"`/`"midday"` get a stream token.
+   - **`evaluate_top_up_guard`'s KNOWN GAP (artifact-only prior) was newly
+     live-reachable.** Previously the forced `one_order_per_ticker_per_day=True`
+     blanket-blocked any same-day repeat regardless of what the artifact trail
+     knew, masking this. Fixed by cross-checking the artifact-derived
+     `prior.amount_usd` against a new `BrokerAdapter.same_day_ticker_notional_usd()`
+     method (ground-truth sum of every live-state same-day order for the
+     ticker, regardless of ref id/stream) before computing the incremental
+     delta, and never trusting a figure lower than what the broker reports.
+     Implemented for `RobinhoodBroker` (the real, selected backend);
+     `AlpacaBroker` fails closed, matching its existing posture for the
+     sibling ref-id check (`AlpacaBroker` is not a selected backend in any
+     config).
 3. **Where does run state live on the Mac?** Resolved (see §1.5): the roots
    now derive from `dca_paths.stream_root()`, which honors
    `$DCA_CRON_TRACKING_ROOT`. Setting that variable to the Mac's real artifact

@@ -1241,6 +1241,7 @@ def run_pipeline(
             required_raw_filenames=required_raw_filenames,
             classification_overrides=classification_overrides,
             correlation_id=correlation_id,
+            stream=stream_name,
         )
         run_state_path = result.get("run_state_path")
         run_id = None
@@ -1346,7 +1347,22 @@ def run_slot(
     correlation_id = build_correlation_id(trading_day, stream_name, window)
     slot_config = replace(
         config,
-        one_order_per_ticker_per_day=True,
+        # Human decision (GATE5-PROPOSAL.md #4 item 2, 2026-07-30): guarded
+        # top-up, not "first slot wins". False (rather than omitting the
+        # override, which would leave whatever config/budgets.json's own
+        # order_rules.one_order_per_ticker_per_day says) lets
+        # near_close_dca._process_buy_candidate's existing, already-tested
+        # strictly-lower-price top-up guard run for these slots specifically,
+        # without changing the flag's default for any other caller of
+        # StrategyConfig. This was previously forced True here -- see the
+        # (now superseded) rationale on the old
+        # test_run_slot_enforces_one_order_per_ticker_per_day -- because the
+        # prior-allocation chain isn't modeled for the four DISABLED_SLOTS;
+        # it stays correct for the three canonical slots because each one's
+        # prior allocation is auto-discovered from the other two's own state
+        # roots (run_pipeline's scheduled-run discovery), which the guard
+        # already understands.
+        one_order_per_ticker_per_day=False,
         # Anchor signal evaluation to THIS slot's own decision time. Left at the
         # bundled config's 15:30 default, a 10:30/12:30 invocation would query
         # and anchor its lookback/downtrend window against afternoon bars,
@@ -1435,6 +1451,7 @@ def _run_pipeline_impl(
     required_raw_filenames: Optional[frozenset] = None,
     classification_overrides: Optional[Dict[str, Any]] = None,
     correlation_id: Optional[str] = None,
+    stream: str = "afternoon",
 ) -> Dict[str, Any]:
     """Run one compact DCA cycle and (optionally) the full post-trade report set.
 
@@ -2170,6 +2187,7 @@ def _run_pipeline_impl(
         raw_persistence_state=raw_persistence_state,
         classification_overrides=classification_overrides,
         correlation_id=correlation_id,
+        stream=stream,
     )
     if result.get("blocked"):
         logger.warning("run blocked by date gate for %s; skipping reports", result.get("run_state_path"))

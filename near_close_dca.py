@@ -841,6 +841,17 @@ class BrokerAdapter(Protocol):
         can still detect a retry of ITS OWN earlier same-day order.
         """
 
+    def same_day_ticker_notional_usd(self, ticker: str, trading_day: date) -> float:
+        """Return the total dollar notional of every live same-day order for ticker.
+
+        Unlike the two methods above (existence checks scoped to this
+        strategy's own ref-id conventions), this sums EVERY live-state broker
+        order for the ticker/day regardless of ref id or which stream/executor
+        placed it -- the real, ground-truth figure a guarded top-up's
+        incremental delta must never under-count relative to (see
+        ``evaluate_top_up_guard``'s KNOWN GAP note).
+        """
+
     def is_tradable_for_fractional_buy(self, ticker: str) -> bool:
         """Return True only if the instrument can receive this notional buy."""
 
@@ -907,6 +918,9 @@ class DryRunBroker:
         self, ticker: str, trading_day: date, ref_id_prefixes: Tuple[str, ...]
     ) -> Optional[Dict[str, Any]]:
         return None
+
+    def same_day_ticker_notional_usd(self, ticker: str, trading_day: date) -> float:
+        return 0.0
 
     def is_tradable_for_fractional_buy(self, ticker: str) -> bool:
         return True
@@ -1091,6 +1105,17 @@ class AlpacaBroker:
             "AlpacaBroker cannot verify same-stream order duplicates: "
             "place_market_buy does not send a client order id the live "
             "connector could match against"
+        )
+
+    def same_day_ticker_notional_usd(self, ticker: str, trading_day: date) -> float:
+        # Same posture as same_day_strategy_order_exists_with_ref_id_prefix
+        # above: real order-history verification for this adapter is out of
+        # scope while ALPACA is not a selected backend in any config. Fail
+        # closed rather than silently returning 0.0 and letting a guarded
+        # top-up trust an artifact-only figure this adapter cannot verify.
+        raise RuntimeError(
+            "AlpacaBroker cannot verify same-day order notional: "
+            "list_orders_fn wiring for this adapter is not implemented"
         )
 
     def is_tradable_for_fractional_buy(self, ticker: str) -> bool:
@@ -5381,8 +5406,35 @@ def _finalize_and_write_artifacts(
             )
 
 
+def _graded_dca_ref_id_prefix(stream: str, kind: str = "") -> str:
+    """Build the ``graded-dca[-<stream>][-<kind>]`` prefix for ref ids and
+    same-stream duplicate checks.
+
+    The ``"afternoon"`` stream (this module's own historical, single-stream
+    default) keeps the exact legacy, unprefixed ``"graded-dca[-kind]"``
+    convention byte-for-byte -- ``docs/safeguards.md``'s Gate 4 sole-executor
+    check and the real legacy ``10ce362c`` task's own order history depend on
+    that literal string. Only a non-``"afternoon"`` stream (``"morning"``/
+    ``"midday"``, from the seven-slot roster's ``run_dca.run_slot()``) gets a
+    stream token inserted: ``near_close_dca.py`` is now the SAME engine
+    shared across all three canonical slots, so without a per-stream token,
+    ``_same_stream_order_exists`` cannot tell "this exact run's own retry"
+    apart from "a different, earlier canonical slot's genuine cross-stream
+    order" -- an earlier slot's real fill would be misread as this slot's own
+    duplicate, and the guarded top-up it should have placed would silently
+    become a no-op instead (Codex review: "Namespace idempotency keys before
+    enabling cross-slot top-ups").
+    """
+    parts = ["graded-dca"]
+    if stream and stream != "afternoon":
+        parts.append(stream)
+    if kind:
+        parts.append(kind)
+    return "-".join(parts)
+
+
 def _same_stream_order_exists(
-    broker: BrokerAdapter, ticker: str, trading_day: date
+    broker: BrokerAdapter, ticker: str, trading_day: date, stream: str = "afternoon"
 ) -> Optional[Dict[str, Any]]:
     """Return the broker order dict when this stream's own idempotency ref id
     already exists for ``ticker`` today, else ``None``.
@@ -5391,8 +5443,8 @@ def _same_stream_order_exists(
     intentionally bypasses the broad ``same_day_strategy_order_exists`` check so
     that an earlier CROSS-stream (morning/midday) allocation is not mistaken for
     a duplicate. But that bypass must not also blind a retry of THIS SAME
-    scheduled afternoon run to an order it already placed for the ticker on an
-    earlier attempt today -- with no narrower check, such a retry would
+    scheduled run (same stream) to an order it already placed for the ticker on
+    an earlier attempt today -- with no narrower check, such a retry would
     recompute the top-up guard from the cross-stream prior allocation alone
     (which does not know about this stream's own already-placed top-up) and
     submit a second, duplicate order (mirrors morning_dca.py's
@@ -5401,6 +5453,9 @@ def _same_stream_order_exists(
     Both the plain and topup scheduled ref-id prefixes are checked, matching
     the two ref_id shapes ``_process_buy_candidate`` can have used depending on
     whether the ticker was already guarded on the attempt that placed the order.
+    ``stream`` (default ``"afternoon"``, this module's historical sole caller)
+    scopes both prefixes to the calling slot -- see
+    :func:`_graded_dca_ref_id_prefix`.
     """
     checker = getattr(broker, "same_day_strategy_order_exists_with_ref_id_prefix", None)
     if checker is None:
@@ -5408,8 +5463,8 @@ def _same_stream_order_exists(
             "broker does not support same-stream ref-id duplicate checks for guarded top-ups"
         )
     prefixes = (
-        f"graded-dca-topup-{trading_day.isoformat()}-{ticker}",
-        f"graded-dca-{trading_day.isoformat()}-{ticker}",
+        f"{_graded_dca_ref_id_prefix(stream, 'topup')}-{trading_day.isoformat()}-{ticker}",
+        f"{_graded_dca_ref_id_prefix(stream)}-{trading_day.isoformat()}-{ticker}",
     )
     result = checker(ticker, trading_day, prefixes)
     if not isinstance(result, dict):
@@ -5433,6 +5488,7 @@ def _process_buy_candidate(
     scheduled: bool,
     run_result: Optional[RunResult],
     deployment_history_root: Optional[str | Path] = None,
+    stream: str = "afternoon",
 ) -> tuple[Dict[str, Any], Optional[TopUpGuardOutcome], float, int, int]:
     ticker = decision.ticker
     order_amount = decision.suggested_amount_usd
@@ -5454,7 +5510,36 @@ def _process_buy_candidate(
     # the same-stream duplicate check just below has a chance to find and
     # preserve an order this stream already placed earlier the same run.
     if guard_active:
-        top_up_outcome = evaluate_top_up_guard(decision, prior, config)
+        effective_prior = prior
+        if ticker_guarded and not config.dry_run:
+            # KNOWN GAP fix (Codex review: "Include broker orders in the delta
+            # before disabling the duplicate gate"): evaluate_top_up_guard's own
+            # docstring already documents that `prior.amount_usd` is
+            # artifact-derived only -- a same-day buy confirmed at the broker but
+            # missing or incomplete in the artifact trail (or placed by an
+            # entirely different ref-id convention, e.g. a legacy
+            # morning_dca.py/midday_dca.py order for this same ticker) would
+            # otherwise be invisible here, letting the guard compute a delta
+            # larger than what is actually still unallocated. Cross-check
+            # against the broker's own ground-truth same-day total for this
+            # ticker (regardless of ref id/stream) and never trust an artifact
+            # figure lower than what the broker itself reports.
+            try:
+                broker_reported_usd = broker.same_day_ticker_notional_usd(ticker, trading_day)
+            except Exception as exc:  # noqa: BLE001
+                errors_count_inc += 1
+                candidate_outcome = {
+                    "status": "blocked",
+                    "skip_reason": f"same-day notional check failed: {exc}",
+                }
+                _block(
+                    MISSING_FILL_DATA_ERROR,
+                    f"{ticker}: same-day notional check failed: {exc}; skipping",
+                )
+                return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+            if broker_reported_usd > prior.amount_usd:
+                effective_prior = replace(prior, amount_usd=broker_reported_usd)
+        top_up_outcome = evaluate_top_up_guard(decision, effective_prior, config)
 
     # A morning/manual run must NOT block the scheduled afternoon run: when the
     # top-up guard has a loaded prior allocation for this ticker, the earlier
@@ -5487,7 +5572,7 @@ def _process_buy_candidate(
     # "Allow guarded Alpaca simulations through the duplicate hook").
     if ticker_guarded and not config.dry_run:
         try:
-            dup_order = _same_stream_order_exists(broker, ticker, trading_day)
+            dup_order = _same_stream_order_exists(broker, ticker, trading_day, stream)
         except Exception as exc:  # noqa: BLE001
             errors_count_inc += 1
             candidate_outcome = {"status": "blocked", "skip_reason": f"duplicate-check failed: {exc}"}
@@ -5854,11 +5939,11 @@ def _process_buy_candidate(
     # place_market_buy (Codex review, PR #231: "Separate manual ref IDs from
     # scheduled retry IDs"; mirrors morning_dca.py's identical fix, PR #42).
     ref_id = (
-        f"graded-dca-topup-{trading_day.isoformat()}-{ticker}"
+        f"{_graded_dca_ref_id_prefix(stream, 'topup')}-{trading_day.isoformat()}-{ticker}"
         if ticker_guarded
-        else f"graded-dca-{trading_day.isoformat()}-{ticker}"
+        else f"{_graded_dca_ref_id_prefix(stream)}-{trading_day.isoformat()}-{ticker}"
         if scheduled
-        else f"graded-dca-manual-{trading_day.isoformat()}-{ticker}"
+        else f"{_graded_dca_ref_id_prefix(stream, 'manual')}-{trading_day.isoformat()}-{ticker}"
     )
     if config.dry_run:
         logger.info(
@@ -6032,6 +6117,7 @@ def _process_buy_candidates_batch(
     scheduled: bool,
     run_result: Optional[RunResult],
     deployment_history_root: Optional[str | Path] = None,
+    stream: str = "afternoon",
 ) -> tuple[Dict[str, Dict[str, Any]], Dict[str, TopUpGuardOutcome], float, int, int]:
     candidate_outcomes: Dict[str, Dict[str, Any]] = {}
     # Published by reference BEFORE any placement so a failure part-way through
@@ -6059,6 +6145,7 @@ def _process_buy_candidates_batch(
             scheduled=scheduled,
             run_result=run_result,
             deployment_history_root=deployment_history_root,
+            stream=stream,
         )
         candidate_outcomes[decision.ticker] = c_outcome
         if t_outcome is not None:
@@ -6475,6 +6562,7 @@ def _run_once_impl(
     raw_persistence_state: Optional[Dict[str, object]] = None,
     classification_overrides: Optional[Dict[str, Any]] = None,
     correlation_id: Optional[str] = None,
+    stream: str = "afternoon",
 ) -> List[ReconciledDecision]:
     now_et = now.astimezone(EASTERN)
     trading_day = now_et.date()
@@ -6561,6 +6649,7 @@ def _run_once_impl(
         scheduled=scheduled,
         run_result=run_result,
         deployment_history_root=deployment_history_root,
+        stream=stream,
     )
     errors_count += err_inc
     order_reviews_attempted += rev_inc
@@ -6689,6 +6778,7 @@ def run_daily_compact(
     raw_persistence_state: Optional[Dict[str, object]] = None,
     classification_overrides: Optional[Dict[str, Any]] = None,
     correlation_id: Optional[str] = None,
+    stream: str = "afternoon",
 ) -> Dict[str, object]:
     """Run one DCA scan and write only compact, structured daily artifacts.
 
@@ -6729,6 +6819,7 @@ def run_daily_compact(
         raw_persistence_state=raw_persistence_state,
         classification_overrides=classification_overrides,
         correlation_id=correlation_id,
+        stream=stream,
     )
 
     out = Path(artifacts_dir)
