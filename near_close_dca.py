@@ -2150,28 +2150,33 @@ def _build_buy_candidates(
     return buy_candidates
 
 
-def _build_budget_block(
-    config: StrategyConfig,
-    state: StrategyState,
-    tier: BudgetTier,
-    planned_spend: float,
-    high_multiplier_signals: int,
-    trading_day: date,
-) -> Dict[str, Any]:
+@dataclass(frozen=True)
+class _BudgetBlockParams:
+    """Parameters bundled for the private ``_build_budget_block`` helper."""
+
+    config: StrategyConfig
+    state: StrategyState
+    tier: BudgetTier
+    planned_spend: float
+    high_multiplier_signals: int
+    trading_day: date
+
+
+def _build_budget_block(params: _BudgetBlockParams) -> Dict[str, Any]:
     return {
-        "base_amount_usd": config.base_buy_amount_usd,
-        "base_buy_amount_usd": config.base_buy_amount_usd,
-        "budget_tier": tier.name,
-        "planned_spend_usd": round(planned_spend, 2),
-        "high_multiplier_signal_count": high_multiplier_signals,
-        "daily_cap_usd": tier.daily_cap_usd,
-        "weekly_cap_usd": round(state.effective_weekly_cap(), 2),
-        "weekly_rollover_reserve_usd": round(state.weekly_rollover_reserve_usd, 2),
-        "weekly_rollover_reserve_cap_usd": config.weekly_rollover_reserve_cap_usd,
-        "allowed_spend_today_usd": round(state.allowed_spend_today(trading_day, config), 2),
-        "remaining_spend_today_usd": round(state.remaining_spend_today(trading_day, config), 2),
-        "day_notional_usd": round(state.day_notional(trading_day), 2),
-        "week_notional_usd": round(state.week_notional(trading_day), 2),
+        "base_amount_usd": params.config.base_buy_amount_usd,
+        "base_buy_amount_usd": params.config.base_buy_amount_usd,
+        "budget_tier": params.tier.name,
+        "planned_spend_usd": round(params.planned_spend, 2),
+        "high_multiplier_signal_count": params.high_multiplier_signals,
+        "daily_cap_usd": params.tier.daily_cap_usd,
+        "weekly_cap_usd": round(params.state.effective_weekly_cap(), 2),
+        "weekly_rollover_reserve_usd": round(params.state.weekly_rollover_reserve_usd, 2),
+        "weekly_rollover_reserve_cap_usd": params.config.weekly_rollover_reserve_cap_usd,
+        "allowed_spend_today_usd": round(params.state.allowed_spend_today(params.trading_day, params.config), 2),
+        "remaining_spend_today_usd": round(params.state.remaining_spend_today(params.trading_day, params.config), 2),
+        "day_notional_usd": round(params.state.day_notional(params.trading_day), 2),
+        "week_notional_usd": round(params.state.week_notional(params.trading_day), 2),
     }
 
 
@@ -2352,7 +2357,16 @@ def build_run_artifacts(
         "broker": config.broker.value,
         "dry_run": config.dry_run,
         "account_number": None,
-        "budget": _build_budget_block(config, state, tier, planned_spend, high_multiplier_signals, trading_day),
+        "budget": _build_budget_block(
+            _BudgetBlockParams(
+                config=config,
+                state=state,
+                tier=tier,
+                planned_spend=planned_spend,
+                high_multiplier_signals=high_multiplier_signals,
+                trading_day=trading_day,
+            )
+        ),
         "risk_guard": _build_risk_guard_block(config),
         "counts": {
             "evaluated": len(decisions),
