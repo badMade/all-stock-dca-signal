@@ -2436,17 +2436,32 @@ def _apply_no_order_classification(
     """
     outcomes = [oc for oc in (candidate_outcomes or {}).values() if isinstance(oc, dict)]
 
+    # ⚡ Bolt Optimization: Consolidate multiple list comprehensions/generators
+    # into a single pass over `outcomes` list, eliminating redundant O(N) passes.
     submitted = 0
     failed = 0
     connector_errors = 0
+    reaching_gate = 0
+    blocked_missing_spread = 0
+    failed_any = False
+
     for oc in outcomes:
         status = oc.get("status")
         if status == "submitted":
             submitted += 1
         elif status == "failed":
             failed += 1
+            failed_any = True
         elif status == "blocked" and not oc.get("deliberate_skip"):
             connector_errors += 1
+
+        if submitted:
+            continue
+        spread_status = oc.get("spread_status")
+        if spread_status and spread_status != SPREAD_STATUS_NOT_EVALUATED:
+            reaching_gate += 1
+        if oc.get("blocked_by") == BLOCKED_BY_SPREAD_GATE:
+            blocked_missing_spread += 1
 
     # A pre-placement broker check that RAISED is recorded as a non-deliberate
     # block, not as 'failed'. We count these as connector errors here too so a batch
@@ -2471,22 +2486,16 @@ def _apply_no_order_classification(
                 else ERROR_CLASS_DEGRADED_MARKET_DATA,
             )
         return
-    at_gate = [oc for oc in outcomes if oc.get("spread_status")]
-    reaching_gate = sum(
-        1 for oc in at_gate if oc.get("spread_status") != SPREAD_STATUS_NOT_EVALUATED
-    )
+
     # Only rows the SPREAD GATE itself stopped, recorded explicitly rather than
     # inferred from spread_status: a manual run does not fail closed on an
     # unproven spread, so a row can carry spread_status='spread_unavailable' and
     # still be stopped later by review or confirmation (Codex review).
-    blocked_missing_spread = sum(
-        1 for oc in outcomes if oc.get("blocked_by") == BLOCKED_BY_SPREAD_GATE
-    )
     outcome = classify_no_order_run(
         candidates_reaching_spread_gate=reaching_gate,
         candidates_blocked_missing_spread=blocked_missing_spread,
         candidates_evaluated=len(artifacts.get("buy_candidates") or []),
-        placement_attempted_and_failed=any(oc.get("status") == "failed" for oc in outcomes),
+        placement_attempted_and_failed=failed_any,
         # Providers that raised degrade tickers to NO_DATA/manual review rather
         # than genuinely evaluating them, so the zero-order result is not a clean
         # ladder no-op and must not be recorded with a null error_class.
