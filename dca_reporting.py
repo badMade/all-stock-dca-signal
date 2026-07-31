@@ -25,7 +25,7 @@ import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from dca_fileio import atomic_open_w, atomic_write_text
 
@@ -597,6 +597,22 @@ def _run_classification_helpers():
     return collect_manual_order_ids, select_scheduled_state_for_reporting
 
 
+def _foreground_primary_helpers():
+    """Import the Jul 30 2026 foreground-primary gate, tolerating either import
+    layout (repo-root namespace package ``scripts`` or ``scripts/`` on sys.path)."""
+    try:
+        from scripts.foreground_primary import (  # type: ignore
+            detect_foreground_primary_context,
+            evaluate_scheduled_evidence_alert,
+        )
+    except ImportError:  # scripts/ directly on sys.path
+        from foreground_primary import (  # type: ignore
+            detect_foreground_primary_context,
+            evaluate_scheduled_evidence_alert,
+        )
+    return detect_foreground_primary_context, evaluate_scheduled_evidence_alert
+
+
 def _model_usage_log_helper():
     """Import the model usage log writer, tolerating either import layout
     (repo-root namespace package ``scripts`` or ``scripts/`` on sys.path)."""
@@ -606,6 +622,45 @@ def _model_usage_log_helper():
         from model_usage_log import log_model_usage  # type: ignore
     return log_model_usage
 
+
+def write_foreground_primary_report(
+    trading_day: str,
+    output_dir: str | Path,
+    *,
+    foreground_primary_artifacts: Optional[Iterable[str | Path | Mapping[str, Any]]],
+    scheduled_evidence_reasons: Sequence[str] = (),
+    blocking_findings: Sequence[str] = (),
+    close_window_summary: Optional[Dict[str, Any]] = None,
+) -> Optional[Path]:
+    """Write ``foreground_primary_context.json`` when the day ran foreground primary.
+
+    Returns the report path when foreground primary mode is active and nothing
+    else is escalating, and ``None`` otherwise, in which case the caller must
+    escalate as it always did. See scripts/foreground_primary.py for the rule.
+    """
+    detect, evaluate = _foreground_primary_helpers()
+    foreground = detect(foreground_primary_artifacts, trading_day=trading_day)
+    alert = evaluate(
+        scheduled_evidence_ok=False,
+        scheduled_evidence_reasons=scheduled_evidence_reasons,
+        foreground=foreground,
+        blocking_findings=blocking_findings,
+    )
+    if alert.escalate or not alert.foreground_primary_mode_active:
+        return None
+
+    payload: Dict[str, Any] = {
+        "trading_day": trading_day,
+        "patch": "foreground_primary_surrogate_context_2026_07_30",
+        "foreground_primary_context": foreground.to_report(),
+        "scheduled_evidence_alert": alert.to_report(),
+    }
+    if close_window_summary is not None:
+        payload["what_would_have_fired"] = close_window_summary
+    path = Path(output_dir) / "foreground_primary_context.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return path
 
 
 @dataclass(frozen=True)
@@ -639,6 +694,8 @@ def generate_scheduled_reports(
     model_usage_model_routing_mode: Optional[str] = None,
     model_usage_reason_for_premium_model: Optional[str] = None,
     *,
+    foreground_primary_artifacts: Optional[Iterable[str | Path | Mapping[str, Any]]] = None,
+    close_window_summary: Optional[Dict[str, Any]] = None,
     model_usage_config: Optional[ModelUsageConfig] = None,
 ) -> Dict[str, str]:
     """Task 67aa802b entry point: post-trade reports for the SCHEDULED run only.
@@ -651,14 +708,15 @@ def generate_scheduled_reports(
 
     ``fills`` is the same broker fill list ``generate_reports`` takes; ``base``
     overrides the artifact root (defaults to the contract's STATE_ROOT).
-    ``model_usage_config.log_root`` is opt-in (see scripts/model_usage_log.py,
+
+    ``model_usage_log_root`` is opt-in (see scripts/model_usage_log.py,
     config/scheduled_tasks.json -> model_usage_log): None (the default) skips
     the audit-log append entirely (appended even when report generation
-    raises, so a failed run is still recorded). The other ``model_usage_config`` fields override
-    ``log_model_usage``'s cost-conscious defaults -- this function has no
-    visibility into which model/agent actually drove the run, so they stay
-    unset unless the scheduler invoking this call explicitly knows it used a
-    permitted premium escalation and passes them.
+    raises, so a failed run is still recorded). ``model_usage_config.log_root``
+    is the new keyword-only alternative; any of the legacy
+    ``model_usage_model_*``/``model_usage_reason_for_premium_model`` kwargs
+    override the corresponding ``model_usage_config`` field, so old and new
+    call sites can both be satisfied.
 
     The ``model_usage_log_root``/``model_usage_model_*``/
     ``model_usage_reason_for_premium_model`` parameters are the pre-existing
@@ -669,6 +727,16 @@ def generate_scheduled_reports(
     the new keyword-only alternative; any of the legacy parameters that is
     passed (non-``None``) overrides the corresponding ``model_usage_config``
     field, so old and new call sites can both be satisfied.
+
+    ``foreground_primary_artifacts`` opts into the Jul 30 2026 foreground primary
+    surrogate context patch: same-day foreground ``run_state.json`` /
+    ``run_summary.json`` / pointer paths (or already-loaded manifest entries) to
+    check for a foreground primary marker when no valid scheduled state exists.
+    When one is found this function writes ``foreground_primary_context.json``
+    and returns its path instead of raising. Left as None (the default) the
+    missing-scheduled-state case raises exactly as it always has.
+    ``close_window_summary`` is the optional read-only what-would-have-fired
+    analytics block (see scripts/close_window_signal.py) embedded in that report.
     """
     if any(
         v is not None
@@ -712,6 +780,23 @@ def generate_scheduled_reports(
     base_path = Path(base) if base is not None else None
     selection = select_scheduled(trading_day, base=base_path)
     if not selection.ok:
+        # JUL 30 2026 FOREGROUND PRIMARY SURROGATE CONTEXT PATCH. A day the
+        # operator drove in the foreground legitimately has no background
+        # scheduled run_state, so raising here reported an outage that did not
+        # happen. Only a same-day, marker-carrying foreground artifact reaches
+        # the non-raising path, and it is recorded as CONTEXT: the report it
+        # writes states valid_scheduled_evidence=false. Callers that pass no
+        # foreground artifacts (every existing one) still raise exactly as
+        # before.
+        report_path = write_foreground_primary_report(
+            trading_day,
+            output_dir,
+            foreground_primary_artifacts=foreground_primary_artifacts,
+            scheduled_evidence_reasons=selection.errors,
+            close_window_summary=close_window_summary,
+        )
+        if report_path is not None:
+            return {"foreground_primary_context": str(report_path)}
         raise ValueError(
             f"no valid scheduled run_state for {trading_day}: "
             + "; ".join(selection.errors)
