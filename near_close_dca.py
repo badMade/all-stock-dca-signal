@@ -1801,7 +1801,7 @@ def evaluate_top_up_guard(
     # be resolved (legacy artifact predating the field, or an unresolved bare
     # manual CSV entry) -- resolve_top_up_desired_amount_usd's fallback above
     # silently recomputed `desired` from THIS run's own freshly selected base,
-    # which is exactly the base-upgrade/downgrade bug the preserved-base rule
+    # which is exactly the base-upgrade/downgrade edge case the preserved-base rule
     # exists to prevent. Fail closed like a missing reference price instead of
     # trusting that silently-recomputed target (Codex review: "Fail closed
     # when the first allocation base is unknown").
