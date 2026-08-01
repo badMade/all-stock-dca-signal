@@ -6734,14 +6734,7 @@ def _publish_in_flight_outcome(ticker: str, outcome: Dict[str, Any]) -> None:
 
 
 def run_once(
-    now: datetime,
-    config: StrategyConfig,
-    state: StrategyState,
-    finance_data: MarketDataProvider,
-    robinhood_data: MarketDataProvider,
-    broker: BrokerAdapter,
-    artifacts_dir: Optional[str | Path] = None,
-    **kwargs: Any,
+    ctx: RunContext,
 ) -> List[ReconciledDecision]:
     """Run the afternoon scan, guaranteeing an artifact set even when it raises.
 
@@ -6755,8 +6748,11 @@ def run_once(
     # Clear any in-flight state from a PREVIOUS call before anything can fail, or
     # a startup failure here would record the prior run's orders as this one's.
     _IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
-    scheduled = kwargs.get("scheduled", True)
+    scheduled = ctx.scheduled
     try:
+<<<<<<< HEAD
+        return _run_once_impl(ctx)
+=======
         return _run_once_impl(
             now,
             config,
@@ -6767,20 +6763,21 @@ def run_once(
             artifacts_dir,
             **kwargs,
         )
+>>>>>>> origin/main
     except Exception as exc:  # noqa: BLE001 - always re-raised below
-        if scheduled and artifacts_dir:
+        if scheduled and ctx.artifacts_dir:
             try:
                 _write_afternoon_failure_artifacts(
-                    artifacts_dir,
-                    now,
+                    ctx.artifacts_dir,
+                    ctx.now,
                     exc,
-                    classification_state_root=kwargs.get("classification_state_root"),
+                    classification_state_root=ctx.classification_state_root,
                 )
             except Exception:  # noqa: BLE001 - never mask the original failure
                 logger.exception(
                     "failed to write afternoon failure artifacts to %s; re-raising "
                     "the original run failure",
-                    artifacts_dir,
+                    ctx.artifacts_dir,
                 )
         raise
 
@@ -7290,6 +7287,16 @@ def run_and_report(
     """
     if deployment_history_root is None:
         deployment_history_root = Path(output_dir).parent
+<<<<<<< HEAD
+    run_result = RunResult(trading_day=now.astimezone(EASTERN).date(), decisions=[])
+    ctx = RunContext(
+        now=now,
+        config=config,
+        state=state,
+        finance_data=finance_data,
+        robinhood_data=robinhood_data,
+        broker=broker,
+=======
     run_result = RunResult(
         trading_day=now.astimezone(EASTERN).date(),
         decisions=[],
@@ -7303,10 +7310,12 @@ def run_and_report(
         finance_data,
         robinhood_data,
         broker,
+>>>>>>> origin/main
         run_result=run_result,
         deployment_history_root=deployment_history_root,
         scheduled=scheduled,
     )
+    run_once(ctx)
     report = generate_slippage_report(
         run_result, output_dir=output_dir, now=now
     )
@@ -7422,6 +7431,17 @@ def run_daily_compact(
             "'options' or the legacy keyword arguments, not both"
         )
     trading_day = now.astimezone(EASTERN).date()
+<<<<<<< HEAD
+    run_result = RunResult(trading_day=trading_day, decisions=[])
+    ctx = RunContext(
+        now=now,
+        config=config,
+        state=state,
+        finance_data=finance_data,
+        robinhood_data=robinhood_data,
+        broker=broker,
+        artifacts_dir=artifacts_dir,
+=======
     run_result = RunResult(
         trading_day=trading_day,
         decisions=[],
@@ -7436,6 +7456,7 @@ def run_daily_compact(
         robinhood_data,
         broker,
         artifacts_dir=options.artifacts_dir,
+>>>>>>> origin/main
         run_result=run_result,
         notifications_sent=options.notifications_sent,
         prior_same_day_allocations=options.prior_same_day_allocations,
@@ -7447,6 +7468,7 @@ def run_daily_compact(
         correlation_id=options.correlation_id,
         stream=options.stream,
     )
+    run_once(ctx)
 
     out = Path(options.artifacts_dir)
     out.mkdir(parents=True, exist_ok=True)
