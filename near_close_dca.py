@@ -5193,7 +5193,38 @@ def _load_deployment_history_states(
     }
 
     prior_states = []
+
+    # ⚡ Bolt Optimization: If the run_state is nested under a date folder
+    # (e.g., .../2023-01-01/run_state.json or .../scheduled_runs/20260731_1530ET/...),
+    # extract date-like strings from the path parts. We only inspect the relative
+    # path component (under the root) to prevent an old ancestor directory from causing
+    # a false out-of-window rejection, and we also handle the compact YYYYMMDD format
+    # used by production scheduled_runs.
+    iso_date_pattern = re.compile(r"\d{4}-\d{2}-\d{2}")
+    compact_date_pattern = re.compile(r"\d{8}")
+
     for path in find_run_state_files(deployment_history_root):
+        dates_in_path = []
+        try:
+            rel_path = str(path.relative_to(deployment_history_root))
+        except ValueError:
+            rel_path = str(path)
+
+        iso_dates = iso_date_pattern.findall(rel_path)
+        dates_in_path.extend(iso_dates)
+
+        # Look for compact YYYYMMDD dates and format them to ISO strings for matching
+        compact_dates = compact_date_pattern.findall(rel_path)
+        for cd in compact_dates:
+            try:
+                dt = datetime.strptime(cd, "%Y%m%d").date()
+                dates_in_path.append(dt.isoformat())
+            except ValueError:
+                pass
+
+        if dates_in_path and not any(d in window_days for d in dates_in_path):
+            continue
+
         try:
             raw_text = path.read_text(encoding="utf-8")
         except (ValueError, OSError):
