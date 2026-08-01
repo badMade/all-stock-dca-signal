@@ -318,7 +318,7 @@ EMAIL_TEMPLATE = """
         <div class="headline-item">
           <span class="headline-sentiment sent-{{ h.label_short }}">{{ h.label }}</span>
           <span>
-            {{ h.title }}
+            {% if h.url %}<a href="{{ h.url }}" style="color:inherit;text-decoration:underline;" target="_blank" rel="noopener noreferrer">{{ h.title }}</a>{% else %}{{ h.title }}{% endif %}
             <br><span class="headline-source">{{ h.source }}</span>
           </span>
         </div>
@@ -554,12 +554,15 @@ class NewsCollector:
                 description = art.get("description") or ""
                 # Use title + description for richer NLP signal
                 combined = f"{title}. {description}".strip(". ")
+                url = art.get("url", "")
+                if url and not url.lower().startswith(("http://", "https://")):
+                    url = ""
                 results.append({
                     "title": title or description,
                     "text": combined,
                     "source": art.get("source", {}).get("name", "Unknown"),
                     "published_at": art.get("publishedAt", ""),
-                    "url": art.get("url", ""),
+                    "url": url,
                 })
             logger.info("NewsAPI: %d articles for %s", len(results), ticker)
             return results
@@ -808,6 +811,7 @@ class EmailBriefing:
                     "source": h.get("source", ""),
                     "label": label,
                     "label_short": label[:3],  # pos/neg/neu for CSS class
+                    "url": h.get("url", ""),
                 })
             top_movers_ctx.append({
                 "ticker": r["ticker"],
@@ -1101,6 +1105,7 @@ def run_pipeline(
                     "source": h.get("source", ""),
                     "label": h.get("label", "neutral"),
                     "score": h.get("score", 0.0),
+                    "url": h.get("url", ""),
                 }
                 for h in top_headlines
             ],

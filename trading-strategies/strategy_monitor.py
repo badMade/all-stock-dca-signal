@@ -1321,7 +1321,10 @@ class MonitorOrchestrator:
 
         # ── Step 4b: Build & send email ──────────────────────────────────
         logger.info("Step 4/4b — Preparing email …")
-        sheet_url = self.cfg.get("GOOGLE_SHEET_URL", "")
+sheet_url = (self.cfg.get("GOOGLE_SHEET_URL", "") or "").strip()
+if sheet_url and not sheet_url.lower().startswith(("http://", "https://")):
+    logger.warning("Invalid GOOGLE_SHEET_URL scheme; omitting dashboard link.")
+    sheet_url = ""
 
         # Decide whether to send
         should_send = (
