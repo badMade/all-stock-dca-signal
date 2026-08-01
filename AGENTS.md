@@ -14,6 +14,10 @@ These instructions apply to the entire repository.
 
 ## Agent workflow
 
+For a bug fix specifically, read [`docs/code_fix_guidelines.md`](docs/code_fix_guidelines.md)
+first — it specializes the workflow below (confidence statements, test-first
+process, PR format) for fixes; the steps here still apply in full.
+
 1. Inspect `git status --short` before editing and preserve any existing user changes.
 2. Prefer small, reviewable patches. Avoid unrelated refactors.
 3. Add or update tests when behavior changes. If a bug is fixed, add a regression test when practical.
