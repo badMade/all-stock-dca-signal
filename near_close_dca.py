@@ -176,11 +176,51 @@ DAILY_COST_CONTROL_NOTES = (
 )
 
 ACTIVE_TICKERS = [
-    "DFTX", "TRIN", "AAAU", "SPCX", "EVR", "LUNR", "IRDM",
-    "DXYZ", "LITE", "ASML", "DRAM", "STX", "MSFT", "AAPL", "AMAT", "AMD", "CBRS",
-    "MRVL", "BTX", "STM", "SNDK", "WDC", "TSM", "AVGO", "NVDA", "QBTS", "FLKR",
-    "INTC", "GOOGL", "GOOG", "AMZN", "GLW", "MA", "GS", "MU", "NFLX", "XLG",
-    "TOPT", "QTOP", "SATA", "RGTI", "IBM", "GFUZ", "TXN", "RKLB",
+    "DFTX",
+    "TRIN",
+    "AAAU",
+    "SPCX",
+    "EVR",
+    "LUNR",
+    "IRDM",
+    "DXYZ",
+    "LITE",
+    "ASML",
+    "DRAM",
+    "STX",
+    "MSFT",
+    "AAPL",
+    "AMAT",
+    "AMD",
+    "CBRS",
+    "MRVL",
+    "BTX",
+    "STM",
+    "SNDK",
+    "WDC",
+    "TSM",
+    "AVGO",
+    "NVDA",
+    "QBTS",
+    "FLKR",
+    "INTC",
+    "GOOGL",
+    "GOOG",
+    "AMZN",
+    "GLW",
+    "MA",
+    "GS",
+    "MU",
+    "NFLX",
+    "XLG",
+    "TOPT",
+    "QTOP",
+    "SATA",
+    "RGTI",
+    "IBM",
+    "GFUZ",
+    "TXN",
+    "RKLB",
 ]
 
 # BYDDY (ADR wind-down), VCX, TRLV, and RVI are excluded from the active universe.
@@ -299,7 +339,9 @@ def nyse_holidays(year: int) -> frozenset[date]:
     """
     holidays = {
         _nth_weekday_of_month(year, 1, 0, 3),  # MLK Day: 3rd Monday of January
-        _nth_weekday_of_month(year, 2, 0, 3),  # Washington's Birthday: 3rd Monday of February
+        _nth_weekday_of_month(
+            year, 2, 0, 3
+        ),  # Washington's Birthday: 3rd Monday of February
         _easter_sunday(year) - timedelta(days=2),  # Good Friday
         _last_weekday_of_month(year, 5, 0),  # Memorial Day: last Monday of May
         _observed(date(year, 6, 19)),  # Juneteenth
@@ -430,15 +472,23 @@ TOP_UP_INCREMENTAL = "incremental_top_up"  # buy only the incremental dollar dif
 # and morning_dca.py's own guard still emit these for their own sessions). The scheduled
 # afternoon guard (evaluate_top_up_guard below) uses the unified canonical code instead --
 # see TOP_UP_NOT_LOWER_OR_NO_DELTA.
-TOP_UP_PRICE_NOT_BELOW = "price_not_below_prior_run"  # afternoon price >= prior ref -> $0
-TOP_UP_NO_INCREMENTAL = "no_incremental_difference"  # afternoon desired <= prior amount -> $0
+TOP_UP_PRICE_NOT_BELOW = (
+    "price_not_below_prior_run"  # afternoon price >= prior ref -> $0
+)
+TOP_UP_NO_INCREMENTAL = (
+    "no_incremental_difference"  # afternoon desired <= prior amount -> $0
+)
 # Canonical rule item 12 (config/scheduled_tasks.json canonical_first_buy_and_topup_rule):
 # the scheduled afternoon guard (evaluate_top_up_guard) emits this single unified code
 # whenever a same-day top-up is skipped because the price is not strictly lower than the
 # ticker's same-day reference, OR the recomputed corrected_delta_usd is 0 -- replacing the
 # two legacy codes above for that guard specifically.
-TOP_UP_NOT_LOWER_OR_NO_DELTA = "same_day_topup_not_lower_or_no_delta"  # afternoon price not lower or delta 0 -> $0
-TOP_UP_MISSING_PRIOR_PRICE = "missing_prior_price"  # prior amount known but no ref price -> $0 (manual review)
+TOP_UP_NOT_LOWER_OR_NO_DELTA = (
+    "same_day_topup_not_lower_or_no_delta"  # afternoon price not lower or delta 0 -> $0
+)
+TOP_UP_MISSING_PRIOR_PRICE = (
+    "missing_prior_price"  # prior amount known but no ref price -> $0 (manual review)
+)
 TOP_UP_MISSING_PRIOR_BASE = "missing_prior_base"  # prior amount known but no resolved base -> $0 (manual review)
 
 
@@ -548,7 +598,9 @@ def _escalation_index(value: float, thresholds: Sequence[float]) -> int:
     return sum(1 for threshold in thresholds if value > threshold)
 
 
-def select_budget_tier(planned_spend_usd: float, high_multiplier_signal_count: int) -> BudgetTier:
+def select_budget_tier(
+    planned_spend_usd: float, high_multiplier_signal_count: int
+) -> BudgetTier:
     """Select the budget tier for a run from planned spend and 3x+ signal count.
 
     Each dimension independently maps to a tier index and the HIGHER of the two
@@ -573,7 +625,9 @@ class StrategyConfig:
     tickers: Sequence[str] = tuple(ACTIVE_TICKERS)
     excluded_tickers: frozenset[str] = frozenset(EXCLUDED_TICKERS)
     approved_test_dates: frozenset[date] = frozenset(APPROVED_TEST_DATES)
-    decision_time_et: time = time(15, 30)  # matches the 3:30 PM ET canonical live schedule
+    decision_time_et: time = time(
+        15, 30
+    )  # matches the 3:30 PM ET canonical live schedule
     trend_lookback_minutes: int = 60
     # First-allocation base amount selected before the ladder multiplier. When the
     # decision price is below the prior regular-session close AND the prior
@@ -652,7 +706,9 @@ class StrategyConfig:
 class StrategyState:
     buys_by_ticker_by_day: Dict[str, Dict[date, int]] = field(default_factory=dict)
     submitted_notional_by_day: Dict[date, float] = field(default_factory=dict)
-    submitted_notional_by_week: Dict[tuple[int, int], float] = field(default_factory=dict)
+    submitted_notional_by_week: Dict[tuple[int, int], float] = field(
+        default_factory=dict
+    )
     weekly_rollover_reserve_usd: float = 0.0
     selected_tier: Optional[BudgetTier] = None
     finalized_budget_days: Set[date] = field(default_factory=set)
@@ -678,8 +734,12 @@ class StrategyState:
 
     def record_buy(self, ticker: str, trading_day: date, notional_usd: float) -> None:
         self.buys_by_ticker_by_day.setdefault(ticker, {})
-        self.buys_by_ticker_by_day[ticker][trading_day] = self.buys_today(ticker, trading_day) + 1
-        self.submitted_notional_by_day[trading_day] = self.day_notional(trading_day) + notional_usd
+        self.buys_by_ticker_by_day[ticker][trading_day] = (
+            self.buys_today(ticker, trading_day) + 1
+        )
+        self.submitted_notional_by_day[trading_day] = (
+            self.day_notional(trading_day) + notional_usd
+        )
         self.submitted_notional_by_week[iso_week_key(trading_day)] = (
             self.week_notional(trading_day) + notional_usd
         )
@@ -695,7 +755,10 @@ class StrategyState:
         return self.selected_tier or BUDGET_TIERS[0]
 
     def select_daily_budget(
-        self, planned_spend_usd: float, high_multiplier_signal_count: int, config: StrategyConfig
+        self,
+        planned_spend_usd: float,
+        high_multiplier_signal_count: int,
+        config: StrategyConfig,
     ) -> BudgetTier:
         """Choose and store the budget tier for the run from the day's plan."""
         tier = select_budget_tier(planned_spend_usd, high_multiplier_signal_count)
@@ -746,7 +809,8 @@ class StrategyState:
         tier = self.current_tier()
         if tier.uses_rollover_reserve:
             return min(
-                tier.weekly_cap_usd, NORMAL_WEEKLY_CAP_USD + self.weekly_rollover_reserve_usd
+                tier.weekly_cap_usd,
+                NORMAL_WEEKLY_CAP_USD + self.weekly_rollover_reserve_usd,
             )
         return tier.weekly_cap_usd
 
@@ -765,7 +829,11 @@ class StrategyState:
 
     def remaining_spend_today(self, trading_day: date, config: StrategyConfig) -> float:
         """Return remaining strategy spend after same-day submitted notional."""
-        return max(0.0, self.allowed_spend_today(trading_day, config) - self.day_notional(trading_day))
+        return max(
+            0.0,
+            self.allowed_spend_today(trading_day, config)
+            - self.day_notional(trading_day),
+        )
 
     def finalize_daily_budget(self, trading_day: date, config: StrategyConfig) -> None:
         """Mark the current trading day as finalized.
@@ -1052,7 +1120,9 @@ class AlpacaBroker:
         account: str = ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
         place_order_fn: Optional[Callable[[Dict[str, Any]], str]] = None,
         account_info_fn: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
-        list_orders_fn: Optional[Callable[[Dict[str, Any]], List[Dict[str, Any]]]] = None,
+        list_orders_fn: Optional[
+            Callable[[Dict[str, Any]], List[Dict[str, Any]]]
+        ] = None,
     ) -> None:
         self.config = config or AlpacaConfig()
         self._account = account
@@ -1065,7 +1135,9 @@ class AlpacaBroker:
 
     def available_buying_power(self) -> float:
         if self._account_info_fn is not None:
-            info = self._account_info_fn(build_alpaca_account_info_payload(self.config.is_paper_api))
+            info = self._account_info_fn(
+                build_alpaca_account_info_payload(self.config.is_paper_api)
+            )
             return float(info.get("buying_power", info.get("cash", 0.0)))
         return self.config.simulated_buying_power_usd
 
@@ -1124,7 +1196,9 @@ class AlpacaBroker:
     def review_market_buy(self, ticker: str, notional_usd: float) -> tuple[bool, str]:
         return True, "alpaca dry-run review approved"
 
-    def build_market_buy_payload(self, ticker: str, notional_usd: float) -> Dict[str, Any]:
+    def build_market_buy_payload(
+        self, ticker: str, notional_usd: float
+    ) -> Dict[str, Any]:
         return build_alpaca_market_buy_payload(
             symbol=ticker,
             notional_usd=notional_usd,
@@ -1219,7 +1293,9 @@ def build_broker(
     callables are wired) here instead, before any live adapter is constructed.
     """
     if not config.dry_run:
-        pinning_failure = account_pinning_failure(config.target_account_number, config.broker)
+        pinning_failure = account_pinning_failure(
+            config.target_account_number, config.broker
+        )
         if pinning_failure:
             raise RuntimeError(
                 f"build_broker: config.dry_run is False but {pinning_failure}. Set the "
@@ -1255,7 +1331,9 @@ def iso_week_key(day: date) -> tuple[int, int]:
     return iso.year, iso.week
 
 
-def completed_bar_anchor(decision_dt: datetime, interval_minutes: int, config: StrategyConfig) -> datetime:
+def completed_bar_anchor(
+    decision_dt: datetime, interval_minutes: int, config: StrategyConfig
+) -> datetime:
     if config.assume_bar_timestamps_are_start_times:
         return decision_dt - timedelta(minutes=interval_minutes)
     return decision_dt
@@ -1290,7 +1368,9 @@ def kill_switch_engaged(config: StrategyConfig) -> bool:
     return config.deployed_last_7d_usd > threshold
 
 
-def graded_buy_multiplier(drop_vs_previous_close: float, config: StrategyConfig) -> float:
+def graded_buy_multiplier(
+    drop_vs_previous_close: float, config: StrategyConfig
+) -> float:
     """Map a drop from prior close to a buy multiplier via the graded ladder.
 
     ``drop_vs_previous_close`` is a fraction (0.02 == 2.0% down). The largest tier
@@ -1387,8 +1467,8 @@ def evaluate_source_signal(
     data: MarketDataProvider,
     interval_minutes: int,
 ) -> SourceSignal:
-    trading_day, decision_dt, decision_anchor, lookback_anchor = _compute_signal_timestamps(
-        now, config, interval_minutes
+    trading_day, decision_dt, decision_anchor, lookback_anchor = (
+        _compute_signal_timestamps(now, config, interval_minutes)
     )
 
     bars = data.get_intraday_bars(
@@ -1450,14 +1530,19 @@ def evaluate_source_signal(
     intraday_trend_up = decision_price > lookback_price
 
     trend_required = not getattr(config, "ignore_trend_filter", False)
-    if below_previous_close and minimum_drop_met and buy_multiplier > 0 and (
-        intraday_trend_down or not trend_required
+    if (
+        below_previous_close
+        and minimum_drop_met
+        and buy_multiplier > 0
+        and (intraday_trend_down or not trend_required)
     ):
         action = Action.BUY
         if trend_required:
             reason = "below prior close, minimum drop met, 60-minute trend down"
         else:
-            reason = "below prior close, minimum drop met, trend filter bypassed (final-buy)"
+            reason = (
+                "below prior close, minimum drop met, trend filter bypassed (final-buy)"
+            )
     elif above_previous_close and intraday_trend_up:
         action = Action.SKIP
         reason = "above prior close and 60-minute trend up"
@@ -1485,7 +1570,9 @@ def evaluate_source_signal(
         buy_multiplier=buy_multiplier if action == Action.BUY else 0.0,
         suggested_amount_usd=suggested_amount_usd if action == Action.BUY else 0.0,
         previous_low=previous_low,
-        selected_base_amount_usd=selected_base_amount_usd if action == Action.BUY else 0.0,
+        selected_base_amount_usd=(
+            selected_base_amount_usd if action == Action.BUY else 0.0
+        ),
         base_selection_reason=base_selection_reason,
         decision_bar_timestamp=decision_bar.timestamp,
         previous_close_timestamp=previous_close_bar.timestamp,
@@ -1521,7 +1608,10 @@ def reconcile_signals(
     if Action.BUY in {finance_action, robinhood_action}:
         errored = [
             name
-            for name, signal in (("finance", finance_signal), ("robinhood", robinhood_signal))
+            for name, signal in (
+                ("finance", finance_signal),
+                ("robinhood", robinhood_signal),
+            )
             if signal is not None and signal.provider_error
         ]
         if errored:
@@ -1546,7 +1636,8 @@ def reconcile_signals(
         # be used together, not finance's mismatched 2.5x.
         winning_signal = (
             finance_signal
-            if finance_signal.suggested_amount_usd <= robinhood_signal.suggested_amount_usd
+            if finance_signal.suggested_amount_usd
+            <= robinhood_signal.suggested_amount_usd
             else robinhood_signal
         )
         return ReconciledDecision(
@@ -1594,14 +1685,20 @@ def reconcile_signals(
 
     return ReconciledDecision(
         ticker=ticker,
-        action=Action.NO_ACTION if Action.NO_DATA not in {finance_action, robinhood_action} else Action.NO_DATA,
+        action=(
+            Action.NO_ACTION
+            if Action.NO_DATA not in {finance_action, robinhood_action}
+            else Action.NO_DATA
+        ),
         reason=f"no reconciled BUY; finance={finance_action.value}, robinhood={robinhood_action.value}",
         finance_signal=finance_signal,
         robinhood_signal=robinhood_signal,
     )
 
 
-def within_caps(amount: float, state: StrategyState, trading_day: date, config: StrategyConfig) -> bool:
+def within_caps(
+    amount: float, state: StrategyState, trading_day: date, config: StrategyConfig
+) -> bool:
     """True if ``amount`` (the amount actually about to be ordered) fits the remaining cap.
 
     Takes the amount explicitly rather than reading it off a decision so a
@@ -1616,7 +1713,9 @@ def within_caps(amount: float, state: StrategyState, trading_day: date, config: 
     return True
 
 
-def _quote_bid_ask(data: MarketDataProvider, ticker: str, as_of: datetime) -> Optional[tuple[float, float]]:
+def _quote_bid_ask(
+    data: MarketDataProvider, ticker: str, as_of: datetime
+) -> Optional[tuple[float, float]]:
     """Return a live bid/ask quote when the provider exposes one.
 
     The scheduled live path uses this as a final pre-placement spread circuit
@@ -1641,7 +1740,9 @@ def _quote_bid_ask(data: MarketDataProvider, ticker: str, as_of: datetime) -> Op
     return bid, ask
 
 
-def quote_spread_pct(data: MarketDataProvider, ticker: str, as_of: datetime) -> Optional[float]:
+def quote_spread_pct(
+    data: MarketDataProvider, ticker: str, as_of: datetime
+) -> Optional[float]:
     """Return bid/ask spread as a percent of quote midpoint, if available."""
     bid_ask = _quote_bid_ask(data, ticker, as_of)
     if bid_ask is None:
@@ -1662,8 +1763,16 @@ def allocation_sort_key(decision: ReconciledDecision) -> Tuple[float, float, str
     sorting with ``reverse=True``) so ticker still sorts ascending.
     """
     drop = max(
-        decision.finance_signal.drop_vs_previous_close_pct if decision.finance_signal else 0.0,
-        decision.robinhood_signal.drop_vs_previous_close_pct if decision.robinhood_signal else 0.0,
+        (
+            decision.finance_signal.drop_vs_previous_close_pct
+            if decision.finance_signal
+            else 0.0
+        ),
+        (
+            decision.robinhood_signal.drop_vs_previous_close_pct
+            if decision.robinhood_signal
+            else 0.0
+        ),
     )
     return (-decision.buy_multiplier, -drop, decision.ticker)
 
@@ -1726,8 +1835,15 @@ def resolve_top_up_desired_amount_usd(
     used (Codex review: "Persist the preserved base on top-up candidates")
     instead of always the current run's own freshly recomputed base.
     """
-    if prior is not None and prior.selected_base_amount_usd and prior.selected_base_amount_usd > 0:
-        return round(prior.selected_base_amount_usd * current_multiplier, 2), prior.selected_base_amount_usd
+    if (
+        prior is not None
+        and prior.selected_base_amount_usd
+        and prior.selected_base_amount_usd > 0
+    ):
+        return (
+            round(prior.selected_base_amount_usd * current_multiplier, 2),
+            prior.selected_base_amount_usd,
+        )
     return round(current_suggested_amount_usd, 2), current_base_amount_usd
 
 
@@ -1767,7 +1883,10 @@ def evaluate_top_up_guard(
     into ``corrected_delta_usd`` here.
     """
     desired, effective_base = resolve_top_up_desired_amount_usd(
-        prior, decision.buy_multiplier, decision.suggested_amount_usd, decision.selected_base_amount_usd
+        prior,
+        decision.buy_multiplier,
+        decision.suggested_amount_usd,
+        decision.selected_base_amount_usd,
     )
     afternoon_price = _afternoon_decision_price(decision)
 
@@ -1801,17 +1920,21 @@ def evaluate_top_up_guard(
     # be resolved (legacy artifact predating the field, or an unresolved bare
     # manual CSV entry) -- resolve_top_up_desired_amount_usd's fallback above
     # silently recomputed `desired` from THIS run's own freshly selected base,
-    # which is exactly the base-upgrade/downgrade edge case the preserved-base rule
+    # which is exactly the base-upgrade/downgrade bug the preserved-base rule
     # exists to prevent. Fail closed like a missing reference price instead of
     # trusting that silently-recomputed target (Codex review: "Fail closed
     # when the first allocation base is unknown").
     if prior.selected_base_amount_usd is None or prior.selected_base_amount_usd <= 0:
-        return _outcome(0.0, TOP_UP_MISSING_PRIOR_BASE, skipped=True, manual_review=True)
+        return _outcome(
+            0.0, TOP_UP_MISSING_PRIOR_BASE, skipped=True, manual_review=True
+        )
 
     # Prior amount is known but we cannot establish a comparable price on either side.
     # Prefer the conservative no-top-up path and flag the ticker for manual review.
     if prior.reference_price is None or afternoon_price is None:
-        return _outcome(0.0, TOP_UP_MISSING_PRIOR_PRICE, skipped=True, manual_review=True)
+        return _outcome(
+            0.0, TOP_UP_MISSING_PRIOR_PRICE, skipped=True, manual_review=True
+        )
 
     # Only top up when buying into a lower price than the earlier same-day run.
     # Canonical rule item 12: not-strictly-lower and zero-delta both use the
@@ -1825,7 +1948,9 @@ def evaluate_top_up_guard(
     return _outcome(incremental, TOP_UP_INCREMENTAL, skipped=False)
 
 
-def _signal_row(ticker: str, source: str, signal: Optional[SourceSignal]) -> Dict[str, Any]:
+def _signal_row(
+    ticker: str, source: str, signal: Optional[SourceSignal]
+) -> Dict[str, Any]:
     if signal is None:
         return {
             "ticker": ticker,
@@ -1876,37 +2001,12 @@ def _iso_or_none(value: Optional[datetime]) -> Optional[str]:
     return value.isoformat() if value is not None else None
 
 
-
-@dataclass(frozen=True)
-class UsageProxyContext:
-    """Inputs for :func:`build_usage_proxy`, bundling one run's activity counters.
-
-    ``decisions``, ``signal_rows``, ``buy_candidates``, and ``candidate_outcomes``
-    describe what the run actually evaluated/produced. The remaining fields are
-    optional overrides/annotations (provider call counts, error/notification
-    counts, cost-control notes) that fall back to sensible defaults inside
-    ``build_usage_proxy`` when left as ``None``.
-    """
-
-    decisions: Sequence[ReconciledDecision]
-    signal_rows: Sequence[Dict[str, Any]]
-    buy_candidates: Sequence[Dict[str, Any]]
-    candidate_outcomes: Dict[str, Dict[str, Any]]
-    order_reviews_attempted: Optional[int] = None
-    finance_calls_attempted: Optional[int] = None
-    robinhood_calls_attempted: Optional[int] = None
-    errors_count: int = 0
-    notifications_sent: Optional[int] = None
-    cost_control_notes: Optional[Sequence[str]] = None
-
-
 def build_usage_proxy(
-    context: Optional[UsageProxyContext] = None,
     *,
-    decisions: Optional[Sequence[ReconciledDecision]] = None,
-    signal_rows: Optional[Sequence[Dict[str, Any]]] = None,
-    buy_candidates: Optional[Sequence[Dict[str, Any]]] = None,
-    candidate_outcomes: Optional[Dict[str, Dict[str, Any]]] = None,
+    decisions: Sequence[ReconciledDecision],
+    signal_rows: Sequence[Dict[str, Any]],
+    buy_candidates: Sequence[Dict[str, Any]],
+    candidate_outcomes: Dict[str, Dict[str, Any]],
     order_reviews_attempted: Optional[int] = None,
     finance_calls_attempted: Optional[int] = None,
     robinhood_calls_attempted: Optional[int] = None,
@@ -1922,66 +2022,58 @@ def build_usage_proxy(
     signal per ticker; pass explicit values when the provider count is known. The
     byte/count-of-file fields are left ``None`` here and filled by
     ``write_run_artifacts`` once the files exist on disk.
-
-    Accepts either a single ``UsageProxyContext`` (preferred) or the previous
-    per-field keyword arguments, kept for backward compatibility with callers
-    of the installable module that predate ``UsageProxyContext``.
     """
-    if context is None:
-        if decisions is None or signal_rows is None or buy_candidates is None or candidate_outcomes is None:
-            raise TypeError(
-                "build_usage_proxy requires either a UsageProxyContext or the "
-                "decisions/signal_rows/buy_candidates/candidate_outcomes keyword arguments"
-            )
-        context = UsageProxyContext(
-            decisions=decisions,
-            signal_rows=signal_rows,
-            buy_candidates=buy_candidates,
-            candidate_outcomes=candidate_outcomes,
-            order_reviews_attempted=order_reviews_attempted,
-            finance_calls_attempted=finance_calls_attempted,
-            robinhood_calls_attempted=robinhood_calls_attempted,
-            errors_count=errors_count,
-            notifications_sent=notifications_sent,
-            cost_control_notes=cost_control_notes,
-        )
-    tickers_scanned = len(context.decisions)
-    manual_review_count = sum(1 for d in context.decisions if d.action == Action.MANUAL_REVIEW)
-    top_up_manual_review_count = sum(1 for c in context.buy_candidates if c.get("top_up_manual_review"))
+    tickers_scanned = len(decisions)
+    manual_review_count = sum(1 for d in decisions if d.action == Action.MANUAL_REVIEW)
+    top_up_manual_review_count = sum(
+        1 for c in buy_candidates if c.get("top_up_manual_review")
+    )
     orders_placed_count = sum(
         1
-        for outcome in context.candidate_outcomes.values()
+        for outcome in candidate_outcomes.values()
         if outcome.get("order_id") and outcome.get("status") in {"submitted", "dry_run"}
     )
     return {
         "tickers_scanned": tickers_scanned,
         "finance_calls_attempted": (
-            context.finance_calls_attempted if context.finance_calls_attempted is not None else tickers_scanned
+            finance_calls_attempted
+            if finance_calls_attempted is not None
+            else tickers_scanned
         ),
         "robinhood_calls_attempted": (
-            context.robinhood_calls_attempted if context.robinhood_calls_attempted is not None else tickers_scanned
+            robinhood_calls_attempted
+            if robinhood_calls_attempted is not None
+            else tickers_scanned
         ),
-        "signal_rows_written": len(context.signal_rows),
-        "buy_candidates_written": len(context.buy_candidates),
+        "signal_rows_written": len(signal_rows),
+        "buy_candidates_written": len(buy_candidates),
         "order_reviews_attempted": (
-            context.order_reviews_attempted if context.order_reviews_attempted is not None else len(context.buy_candidates)
+            order_reviews_attempted
+            if order_reviews_attempted is not None
+            else len(buy_candidates)
         ),
         "orders_placed_count": orders_placed_count,
         # Filled in write_run_artifacts once files are written (approximate proxy).
         "state_file_bytes": None,
         "csv_artifact_count": None,
         "total_artifact_bytes": None,
-        "notifications_sent": context.notifications_sent,
-        "errors_count": context.errors_count,
-        "manual_recovery_required": manual_review_count > 0 or top_up_manual_review_count > 0 or context.errors_count > 0,
-        "cost_control_notes": list(context.cost_control_notes)
-        if context.cost_control_notes is not None
-        else list(DAILY_COST_CONTROL_NOTES),
+        "notifications_sent": notifications_sent,
+        "errors_count": errors_count,
+        "manual_recovery_required": manual_review_count > 0
+        or top_up_manual_review_count > 0
+        or errors_count > 0,
+        "cost_control_notes": (
+            list(cost_control_notes)
+            if cost_control_notes is not None
+            else list(DAILY_COST_CONTROL_NOTES)
+        ),
     }
 
 
 def _derive_order_submit_status(
-    config: "StrategyConfig", buy_candidates: Sequence[Dict[str, Any]], errors_count: int
+    config: "StrategyConfig",
+    buy_candidates: Sequence[Dict[str, Any]],
+    errors_count: int,
 ) -> str:
     """Classify the run's overall order-submission outcome for run_classification/reporting.
 
@@ -2034,7 +2126,9 @@ def _derive_order_submit_status(
     # classifier's failure status in place) as soon as any row failed.
     if any(c.get("status") == "failed" for c in buy_candidates):
         return ORDER_SUBMIT_STATUS_ERROR
-    if any(c.get("status") == "not_submitted_confirmation_required" for c in buy_candidates):
+    if any(
+        c.get("status") == "not_submitted_confirmation_required" for c in buy_candidates
+    ):
         return ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED
     if errors_count > 0:
         return ORDER_SUBMIT_STATUS_ERROR
@@ -2067,7 +2161,9 @@ def _build_buy_candidates(
             # review, PR #231: "Keep the broker notional when rebuilding
             # duplicate artifacts").
             planned_amount_usd = (
-                submitted_amount if submitted_amount is not None else guard.incremental_order_amount
+                submitted_amount
+                if submitted_amount is not None
+                else guard.incremental_order_amount
             )
         elif guard is not None:
             # When the kill-switch capped order_amount before the guard ran,
@@ -2082,7 +2178,9 @@ def _build_buy_candidates(
             )
         else:
             planned_amount_usd = (
-                submitted_amount if submitted_amount is not None else decision.suggested_amount_usd
+                submitted_amount
+                if submitted_amount is not None
+                else decision.suggested_amount_usd
             )
         candidate_row = {
             "ticker": decision.ticker,
@@ -2097,7 +2195,9 @@ def _build_buy_candidates(
             # own freshly recomputed decision.selected_base_amount_usd (Codex
             # review: "Persist the preserved base on top-up candidates").
             "selected_base_amount_usd": (
-                guard.effective_base_amount_usd if guard is not None else decision.selected_base_amount_usd
+                guard.effective_base_amount_usd
+                if guard is not None
+                else decision.selected_base_amount_usd
             ),
             "planned_amount_usd": round(planned_amount_usd, 2),
             "target_price": target_price,
@@ -2106,7 +2206,11 @@ def _build_buy_candidates(
             "previous_close": (
                 decision.finance_signal.previous_close
                 if decision.finance_signal is not None
-                else (decision.robinhood_signal.previous_close if decision.robinhood_signal else None)
+                else (
+                    decision.robinhood_signal.previous_close
+                    if decision.robinhood_signal
+                    else None
+                )
             ),
             "order_id": outcome.get("order_id"),
             "status": outcome.get("status", "not_submitted"),
@@ -2121,8 +2225,12 @@ def _build_buy_candidates(
         if guard is not None:
             candidate_row.update(
                 {
-                    "afternoon_desired_amount_usd": round(decision.suggested_amount_usd, 2),
-                    "afternoon_desired_amount": round(guard.afternoon_desired_amount, 2),
+                    "afternoon_desired_amount_usd": round(
+                        decision.suggested_amount_usd, 2
+                    ),
+                    "afternoon_desired_amount": round(
+                        guard.afternoon_desired_amount, 2
+                    ),
                     "afternoon_decision_price": guard.afternoon_decision_price,
                     "prior_same_day_amount": round(guard.prior_same_day_amount, 2),
                     "prior_same_day_reference_price": guard.prior_same_day_reference_price,
@@ -2150,33 +2258,32 @@ def _build_buy_candidates(
     return buy_candidates
 
 
-@dataclass(frozen=True)
-class _BudgetBlockParams:
-    """Parameters bundled for the private ``_build_budget_block`` helper."""
-
-    config: StrategyConfig
-    state: StrategyState
-    tier: BudgetTier
-    planned_spend: float
-    high_multiplier_signals: int
-    trading_day: date
-
-
-def _build_budget_block(params: _BudgetBlockParams) -> Dict[str, Any]:
+def _build_budget_block(
+    config: StrategyConfig,
+    state: StrategyState,
+    tier: BudgetTier,
+    planned_spend: float,
+    high_multiplier_signals: int,
+    trading_day: date,
+) -> Dict[str, Any]:
     return {
-        "base_amount_usd": params.config.base_buy_amount_usd,
-        "base_buy_amount_usd": params.config.base_buy_amount_usd,
-        "budget_tier": params.tier.name,
-        "planned_spend_usd": round(params.planned_spend, 2),
-        "high_multiplier_signal_count": params.high_multiplier_signals,
-        "daily_cap_usd": params.tier.daily_cap_usd,
-        "weekly_cap_usd": round(params.state.effective_weekly_cap(), 2),
-        "weekly_rollover_reserve_usd": round(params.state.weekly_rollover_reserve_usd, 2),
-        "weekly_rollover_reserve_cap_usd": params.config.weekly_rollover_reserve_cap_usd,
-        "allowed_spend_today_usd": round(params.state.allowed_spend_today(params.trading_day, params.config), 2),
-        "remaining_spend_today_usd": round(params.state.remaining_spend_today(params.trading_day, params.config), 2),
-        "day_notional_usd": round(params.state.day_notional(params.trading_day), 2),
-        "week_notional_usd": round(params.state.week_notional(params.trading_day), 2),
+        "base_amount_usd": config.base_buy_amount_usd,
+        "base_buy_amount_usd": config.base_buy_amount_usd,
+        "budget_tier": tier.name,
+        "planned_spend_usd": round(planned_spend, 2),
+        "high_multiplier_signal_count": high_multiplier_signals,
+        "daily_cap_usd": tier.daily_cap_usd,
+        "weekly_cap_usd": round(state.effective_weekly_cap(), 2),
+        "weekly_rollover_reserve_usd": round(state.weekly_rollover_reserve_usd, 2),
+        "weekly_rollover_reserve_cap_usd": config.weekly_rollover_reserve_cap_usd,
+        "allowed_spend_today_usd": round(
+            state.allowed_spend_today(trading_day, config), 2
+        ),
+        "remaining_spend_today_usd": round(
+            state.remaining_spend_today(trading_day, config), 2
+        ),
+        "day_notional_usd": round(state.day_notional(trading_day), 2),
+        "week_notional_usd": round(state.week_notional(trading_day), 2),
     }
 
 
@@ -2185,7 +2292,8 @@ def _build_risk_guard_block(config: StrategyConfig) -> Dict[str, Any]:
         "monthly_cash_allocation_usd": config.monthly_cash_allocation_usd,
         "kill_switch_7d_deploy_fraction": config.kill_switch_7d_deploy_fraction,
         "kill_switch_7d_threshold_usd": round(
-            config.kill_switch_7d_deploy_fraction * config.monthly_cash_allocation_usd, 2
+            config.kill_switch_7d_deploy_fraction * config.monthly_cash_allocation_usd,
+            2,
         ),
         "deployed_last_7d_usd": round(config.deployed_last_7d_usd, 2),
         "kill_switch_engaged": kill_switch_engaged(config),
@@ -2243,9 +2351,15 @@ def build_run_artifacts(
     run_id = f"{trading_day.isoformat()}-{now_et.strftime('%H%M%S')}"
     triggered_at_utc = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
-        from scripts.run_classification import build_manual_classification, build_scheduled_classification
+        from scripts.run_classification import (
+            build_manual_classification,
+            build_scheduled_classification,
+        )
     except ImportError:
-        from run_classification import build_manual_classification, build_scheduled_classification
+        from run_classification import (
+            build_manual_classification,
+            build_scheduled_classification,
+        )
     run_classification = (
         build_manual_classification(triggered_at_utc=triggered_at_utc)
         if manual
@@ -2269,8 +2383,12 @@ def build_run_artifacts(
     signal_rows: List[Dict[str, Any]] = []
     for decision in decisions:
         is_reconciled_buy = decision.action == Action.BUY
-        finance_row = _signal_row(decision.ticker, SourceName.FINANCE.value, decision.finance_signal)
-        robinhood_row = _signal_row(decision.ticker, SourceName.ROBINHOOD.value, decision.robinhood_signal)
+        finance_row = _signal_row(
+            decision.ticker, SourceName.FINANCE.value, decision.finance_signal
+        )
+        robinhood_row = _signal_row(
+            decision.ticker, SourceName.ROBINHOOD.value, decision.robinhood_signal
+        )
         # Override auto_buy_signal with the RECONCILED decision. When providers
         # disagree (one BUY, one SKIP/NO_ACTION) reconcile_signals() produces
         # MANUAL_REVIEW and no order is placed; using the per-provider action would
@@ -2287,20 +2405,31 @@ def build_run_artifacts(
     # Keep it True for genuine errors (spread-quote error, placement failure) so
     # those do trigger alerts.
     _afternoon_deliberate_skips = {
-        t for t, oc in candidate_outcomes.items()
+        t
+        for t, oc in candidate_outcomes.items()
         if oc.get("status") == "skipped"
         or (oc.get("status") == "blocked" and oc.get("deliberate_skip"))
     }
     if _afternoon_deliberate_skips:
         for _row in signal_rows:
-            if _row.get("auto_buy_signal") and _row.get("ticker") in _afternoon_deliberate_skips:
+            if (
+                _row.get("auto_buy_signal")
+                and _row.get("ticker") in _afternoon_deliberate_skips
+            ):
                 _row["auto_buy_signal"] = False
 
-    buy_candidates = _build_buy_candidates(decisions, candidate_outcomes, top_up_outcomes)
+    buy_candidates = _build_buy_candidates(
+        decisions, candidate_outcomes, top_up_outcomes
+    )
 
-    manual_review_tickers = [d.ticker for d in decisions if d.action == Action.MANUAL_REVIEW]
+    manual_review_tickers = [
+        d.ticker for d in decisions if d.action == Action.MANUAL_REVIEW
+    ]
     for candidate in buy_candidates:
-        if candidate.get("top_up_manual_review") and candidate["ticker"] not in manual_review_tickers:
+        if (
+            candidate.get("top_up_manual_review")
+            and candidate["ticker"] not in manual_review_tickers
+        ):
             manual_review_tickers.append(candidate["ticker"])
 
     # Backfill signal rows with the reconciled planned_amount_usd from buy candidates
@@ -2350,7 +2479,9 @@ def build_run_artifacts(
         "run_id": run_id,
         "run_classification": run_classification,
         **({"correlation_id": correlation_id} if correlation_id is not None else {}),
-        "order_submit_status": _derive_order_submit_status(config, buy_candidates, errors_count),
+        "order_submit_status": _derive_order_submit_status(
+            config, buy_candidates, errors_count
+        ),
         "generated_at": now_et.isoformat(),
         "trading_day": trading_day.isoformat(),
         "iso_week": list(iso_week_key(trading_day)),
@@ -2358,14 +2489,7 @@ def build_run_artifacts(
         "dry_run": config.dry_run,
         "account_number": None,
         "budget": _build_budget_block(
-            _BudgetBlockParams(
-                config=config,
-                state=state,
-                tier=tier,
-                planned_spend=planned_spend,
-                high_multiplier_signals=high_multiplier_signals,
-                trading_day=trading_day,
-            )
+            config, state, tier, planned_spend, high_multiplier_signals, trading_day
         ),
         "risk_guard": _build_risk_guard_block(config),
         "counts": {
@@ -2379,18 +2503,16 @@ def build_run_artifacts(
         "buy_candidates": buy_candidates,
         "manual_review_tickers": manual_review_tickers,
         "usage_proxy": build_usage_proxy(
-            UsageProxyContext(
-                decisions=decisions,
-                signal_rows=signal_rows,
-                buy_candidates=buy_candidates,
-                candidate_outcomes=candidate_outcomes,
-                order_reviews_attempted=order_reviews_attempted,
-                finance_calls_attempted=finance_calls_attempted,
-                robinhood_calls_attempted=robinhood_calls_attempted,
-                errors_count=errors_count,
-                notifications_sent=notifications_sent,
-                cost_control_notes=cost_control_notes,
-            )
+            decisions=decisions,
+            signal_rows=signal_rows,
+            buy_candidates=buy_candidates,
+            candidate_outcomes=candidate_outcomes,
+            order_reviews_attempted=order_reviews_attempted,
+            finance_calls_attempted=finance_calls_attempted,
+            robinhood_calls_attempted=robinhood_calls_attempted,
+            errors_count=errors_count,
+            notifications_sent=notifications_sent,
+            cost_control_notes=cost_control_notes,
         ),
     }
     _apply_no_order_classification(artifacts, candidate_outcomes, scheduled=not manual)
@@ -2404,7 +2526,9 @@ def build_run_artifacts(
             from scripts.same_day_pointer import derive_valid_scheduled_evidence
         except ImportError:
             from same_day_pointer import derive_valid_scheduled_evidence
-        run_classification["valid_scheduled_evidence"] = derive_valid_scheduled_evidence(artifacts)
+        run_classification["valid_scheduled_evidence"] = (
+            derive_valid_scheduled_evidence(artifacts)
+        )
     return artifacts
 
 
@@ -2434,34 +2558,21 @@ def _apply_no_order_classification(
     A run that submitted an order is not a no-order run; it keeps the
     ``order_submit_status`` the placement path derived.
     """
-    outcomes = [oc for oc in (candidate_outcomes or {}).values() if isinstance(oc, dict)]
+    outcomes = [
+        oc for oc in (candidate_outcomes or {}).values() if isinstance(oc, dict)
+    ]
 
-    # ⚡ Bolt Optimization: Consolidate multiple list comprehensions/generators
-    # into a single pass over `outcomes` list, eliminating redundant O(N) passes.
     submitted = 0
     failed = 0
     connector_errors = 0
-    reaching_gate = 0
-    blocked_missing_spread = 0
-    failed_any = False
-
     for oc in outcomes:
         status = oc.get("status")
         if status == "submitted":
             submitted += 1
         elif status == "failed":
             failed += 1
-            failed_any = True
         elif status == "blocked" and not oc.get("deliberate_skip"):
             connector_errors += 1
-
-        if submitted:
-            continue
-        spread_status = oc.get("spread_status")
-        if spread_status and spread_status != SPREAD_STATUS_NOT_EVALUATED:
-            reaching_gate += 1
-        if oc.get("blocked_by") == BLOCKED_BY_SPREAD_GATE:
-            blocked_missing_spread += 1
 
     # A pre-placement broker check that RAISED is recorded as a non-deliberate
     # block, not as 'failed'. We count these as connector errors here too so a batch
@@ -2476,26 +2587,38 @@ def _apply_no_order_classification(
             # check did. Returning as an ordinary success would leave the run
             # with no is_trading_failure and no failure outcome even though an
             # intended order never happened (Codex review).
-            artifacts["run_classification_outcome"] = RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
+            artifacts["run_classification_outcome"] = (
+                RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
+            )
             artifacts["is_trading_failure"] = True
             artifacts["orders_failed_count"] = failed
             artifacts.setdefault(
                 "error_class",
-                ERROR_CLASS_PARTIAL_PLACEMENT_FAILURE
-                if failed
-                else ERROR_CLASS_DEGRADED_MARKET_DATA,
+                (
+                    ERROR_CLASS_PARTIAL_PLACEMENT_FAILURE
+                    if failed
+                    else ERROR_CLASS_DEGRADED_MARKET_DATA
+                ),
             )
         return
-
+    at_gate = [oc for oc in outcomes if oc.get("spread_status")]
+    reaching_gate = sum(
+        1 for oc in at_gate if oc.get("spread_status") != SPREAD_STATUS_NOT_EVALUATED
+    )
     # Only rows the SPREAD GATE itself stopped, recorded explicitly rather than
     # inferred from spread_status: a manual run does not fail closed on an
     # unproven spread, so a row can carry spread_status='spread_unavailable' and
     # still be stopped later by review or confirmation (Codex review).
+    blocked_missing_spread = sum(
+        1 for oc in outcomes if oc.get("blocked_by") == BLOCKED_BY_SPREAD_GATE
+    )
     outcome = classify_no_order_run(
         candidates_reaching_spread_gate=reaching_gate,
         candidates_blocked_missing_spread=blocked_missing_spread,
         candidates_evaluated=len(artifacts.get("buy_candidates") or []),
-        placement_attempted_and_failed=failed_any,
+        placement_attempted_and_failed=any(
+            oc.get("status") == "failed" for oc in outcomes
+        ),
         # Providers that raised degrade tickers to NO_DATA/manual review rather
         # than genuinely evaluating them, so the zero-order result is not a clean
         # ladder no-op and must not be recorded with a null error_class.
@@ -2526,7 +2649,9 @@ def _apply_no_order_classification(
         ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED,
         ORDER_SUBMIT_STATUS_NO_CANDIDATES,
     )
-    if not replaceable or (current == ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED and budget_blocked):
+    if not replaceable or (
+        current == ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED and budget_blocked
+    ):
         fields.pop("order_submit_status", None)
     artifacts.update(fields)
 
@@ -2545,7 +2670,9 @@ def _serialize_run_state(run_state: Dict[str, Any]) -> str:
     return json.dumps(run_state, indent=2, sort_keys=True)
 
 
-def _settle_usage_bytes(run_state: Dict[str, Any], usage: Dict[str, Any], csv_bytes: int) -> str:
+def _settle_usage_bytes(
+    run_state: Dict[str, Any], usage: Dict[str, Any], csv_bytes: int
+) -> str:
     """Set state_file_bytes/total_artifact_bytes to match the payload written to disk.
 
     The serialized size only shifts when a counter changes digit count, so this
@@ -2566,7 +2693,9 @@ def _settle_usage_bytes(run_state: Dict[str, Any], usage: Dict[str, Any], csv_by
     return serialized
 
 
-def write_run_artifacts(artifacts: Dict[str, Any], output_dir: str | Path) -> Dict[str, str]:
+def write_run_artifacts(
+    artifacts: Dict[str, Any], output_dir: str | Path
+) -> Dict[str, str]:
     """Write the run-state JSON plus signal and candidate CSVs; return their paths."""
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -2824,9 +2953,8 @@ def _prior_run_is_scheduled(run_state: Dict[str, Any]) -> bool:
         # recursively scanned root had its fills loaded without ever reaching
         # the canonical recovery validator (Codex review: "Gate every
         # scheduled-recovery origin before loading fills").
-        if (
-            classification.get("run_origin") == "scheduled_recovery"
-            or (isinstance(stream, str) and stream.endswith("_recovery"))
+        if classification.get("run_origin") == "scheduled_recovery" or (
+            isinstance(stream, str) and stream.endswith("_recovery")
         ):
             # A recovery stream is eligible prior context ONLY when it is one of
             # the earlier-slot recovery streams AND the artifact satisfies the
@@ -2880,7 +3008,10 @@ def _prior_run_is_scheduled(run_state: Dict[str, Any]) -> bool:
             return False
         if classification.get("run_origin") == "scheduled":
             return True
-        if classification.get("manual_run") is False and classification.get("run_origin") is None:
+        if (
+            classification.get("manual_run") is False
+            and classification.get("run_origin") is None
+        ):
             return True
     return False
 
@@ -2974,8 +3105,16 @@ def _earlier_selected_base(
     existing_dt = _prior_run_timestamp(existing_at)
     alloc_dt = _prior_run_timestamp(alloc_at)
     if existing_dt is not None and alloc_dt is not None:
-        return (alloc_base, alloc_at) if alloc_dt < existing_dt else (existing_base, existing_at)
-    return (existing_base, existing_at) if existing_base is not None else (alloc_base, alloc_at)
+        return (
+            (alloc_base, alloc_at)
+            if alloc_dt < existing_dt
+            else (existing_base, existing_at)
+        )
+    return (
+        (existing_base, existing_at)
+        if existing_base is not None
+        else (alloc_base, alloc_at)
+    )
 
 
 # Confirmed-fill column aliases. The codebase-standard writers (_CSV_FIELDS,
@@ -3094,6 +3233,7 @@ def _has_executed_quantity(row: Mapping[str, object]) -> bool:
     except (TypeError, ValueError):
         return False
     return math.isfinite(qty) and qty > 0
+
 
 def _executed_quantity_is_explicit_zero(row: Mapping[str, object]) -> bool:
     """True only when an executed column states a definitive numeric ZERO.
@@ -3269,7 +3409,9 @@ def _orders_csv_fills(
             if not _has_executed_quantity(row):
                 continue
             partial_execution = True
-        is_manual_filled_orders = (orders_csv.name == "filled_orders.csv" or "amount_usd" in row) and not status
+        is_manual_filled_orders = (
+            orders_csv.name == "filled_orders.csv" or "amount_usd" in row
+        ) and not status
         # partial_execution passes too. Last round taught this gate about
         # state='filled' but not about a row still carrying status='submitted'
         # while the broker reports partially_filled (or canceled after executing
@@ -3375,6 +3517,7 @@ def _combined_fill(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     is left None and the guard routes to its conservative manual-review path
     rather than comparing against a price that was never paid.
     """
+
     def _num(value):
         try:
             out = float(value)
@@ -3405,7 +3548,9 @@ def _combined_fill(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _merge_fill(fills: Dict[str, Dict[str, Any]], ticker: str, fill: Dict[str, Any]) -> None:
+def _merge_fill(
+    fills: Dict[str, Dict[str, Any]], ticker: str, fill: Dict[str, Any]
+) -> None:
     """Reconcile a fill into ``fills``, keyed by ORDER, not merely by ticker.
 
     Three cases, and conflating them is what went wrong before:
@@ -3569,7 +3714,9 @@ def _orders_csv_submitted_notionals(
         if not ticker:
             continue
         row_status = (row.get("status") or "").strip().lower()
-        row_state_raw = (row.get("state") or "").strip().lower() if "state" in row else None
+        row_state_raw = (
+            (row.get("state") or "").strip().lower() if "state" in row else None
+        )
         # A broker-native recovery CSV may omit `status` entirely and report the
         # outcome only in `state` -- a shape _orders_csv_fills already treats as
         # authoritative. Requiring status=='submitted' dropped such a row even
@@ -3618,8 +3765,9 @@ def _orders_csv_submitted_notionals(
         # notionals"). My earlier note claiming this reader RETAINED such a row
         # was wrong: this gate drops it.
         if (
-            (row.get("state") or "").strip().lower() in _TERMINAL_NON_FILL_STATES
-            and _executed_quantity_is_explicit_zero(row)
+            row.get("state") or ""
+        ).strip().lower() in _TERMINAL_NON_FILL_STATES and _executed_quantity_is_explicit_zero(
+            row
         ):
             continue
         # The broker-native recovery shape records the amount as `amount_usd`,
@@ -3818,7 +3966,12 @@ def load_prior_same_day_allocations(
     aggregated: Dict[str, Dict[str, Any]] = {}
     trading_day_iso = trading_day.isoformat()
     all_run_state_paths = sorted(
-        set(p for root in all_roots if root.exists() for p in root.rglob("run_state*.json"))
+        set(
+            p
+            for root in all_roots
+            if root.exists()
+            for p in root.rglob("run_state*.json")
+        )
     )
 
     # Parse every candidate artifact once, then process them in CHRONOLOGICAL
@@ -3841,7 +3994,9 @@ def load_prior_same_day_allocations(
             # Scoped to plausibly same-day artifacts (by mtime) so a permanently
             # corrupted HISTORICAL file elsewhere in the recursively scanned
             # root doesn't poison every future scan's completeness signal forever.
-            if skip_sink is not None and _mtime_matches_trading_day(run_state_path, trading_day):
+            if skip_sink is not None and _mtime_matches_trading_day(
+                run_state_path, trading_day
+            ):
                 skip_sink.append(run_state_path)
             continue
 
@@ -3869,7 +4024,11 @@ def load_prior_same_day_allocations(
         # escape, which would not literal-match trading_day_iso even though
         # the parsed value is identical.
         same_day_mtime = _mtime_matches_trading_day(run_state_path, trading_day)
-        if not same_day_mtime and trading_day_iso not in raw_text and "\\u" not in raw_text:
+        if (
+            not same_day_mtime
+            and trading_day_iso not in raw_text
+            and "\\u" not in raw_text
+        ):
             continue
 
         try:
@@ -3975,7 +4134,9 @@ def load_prior_same_day_allocations(
             # worked is untouched.
             if recorded_csv is not None and recorded_csv.exists():
                 for _t, _f in _orders_csv_fills(
-                    recorded_csv.parent, orders_csv_file=recorded_csv, skip_sink=skip_sink
+                    recorded_csv.parent,
+                    orders_csv_file=recorded_csv,
+                    skip_sink=skip_sink,
                 ).items():
                     _merge_fill(fills, _t, _f)
             recovery_root = _recovery_root_for(run_state_path.parent)
@@ -4010,7 +4171,9 @@ def load_prior_same_day_allocations(
                     # Pass the exact recorded file rather than run_dir/"orders.csv"
                     # because run_and_report writes custom-named CSVs.
                     report_fills = _orders_csv_fills(
-                        orders_csv_file.parent, orders_csv_file=orders_csv_file, skip_sink=skip_sink
+                        orders_csv_file.parent,
+                        orders_csv_file=orders_csv_file,
+                        skip_sink=skip_sink,
                     )
                     submitted_notionals = _orders_csv_submitted_notionals(
                         orders_csv_file, skip_sink=skip_sink
@@ -4062,7 +4225,10 @@ def load_prior_same_day_allocations(
                             _entry["reference_ts"] = None
                             _entry["reference_price_unknown"] = True
                         else:
-                            if _entry["reference_price"] is None or run_ts >= _entry["reference_ts"]:
+                            if (
+                                _entry["reference_price"] is None
+                                or run_ts >= _entry["reference_ts"]
+                            ):
                                 _entry["reference_price"] = _ref
                                 _entry["reference_ts"] = run_ts
                         # This CSV-reconstructed shape carries no base info -- if
@@ -4071,7 +4237,9 @@ def load_prior_same_day_allocations(
                         # first-allocation base from a later run") rather than
                         # leaving it open for a later run's own base to fill in.
                         if not _entry["selected_base_amount_usd_seen"]:
-                            _entry["selected_base_amount_usd_at"] = run_state.get("generated_at")
+                            _entry["selected_base_amount_usd_at"] = run_state.get(
+                                "generated_at"
+                            )
                             _entry["selected_base_amount_usd_seen"] = True
                         _entry["run_id"] = run_id
                         _entry["source"] = source
@@ -4110,7 +4278,9 @@ def load_prior_same_day_allocations(
                     # basename-only check missed the glob fallback).
                     # Only flag the failure when NEITHER supported
                     # fallback has anything to find.
-                    _has_basename_sibling = (run_state_path.parent / orders_csv_file.name).exists()
+                    _has_basename_sibling = (
+                        run_state_path.parent / orders_csv_file.name
+                    ).exists()
                     _has_glob_sibling = any(run_state_path.parent.glob("*orders.csv"))
                     if not _has_basename_sibling and not _has_glob_sibling:
                         skip_sink.append(run_state_path)
@@ -4165,7 +4335,11 @@ def load_prior_same_day_allocations(
                 # Prefer the actual filled notional over the planned amount so a
                 # manual override or partial fill doesn't overstate prior allocation.
                 amount = fill["amount_usd"]
-            elif fill is not None and fill["quantity_filled"] and fill.get("avg_fill_price") is not None:
+            elif (
+                fill is not None
+                and fill["quantity_filled"]
+                and fill.get("avg_fill_price") is not None
+            ):
                 # Prefer the actual filled notional over the planned amount so a
                 # partial fill doesn't overstate prior allocation. Requires a
                 # confirmed price -- a quantity-only fill with no usable price
@@ -4435,7 +4609,11 @@ def merge_manual_top_up_context(
                 else None
             )
             alloc_seconds = alloc.reference_ts
-            if existing_seconds is not None and alloc_seconds is not None and existing_seconds > alloc_seconds:
+            if (
+                existing_seconds is not None
+                and alloc_seconds is not None
+                and existing_seconds > alloc_seconds
+            ):
                 ref = existing.reference_price
                 ref_ts = existing.reference_ts
                 ref_run_id = existing.run_id
@@ -4470,11 +4648,18 @@ def merge_manual_top_up_context(
         # reference_price's own poison-on-uncertainty policy above.
         base = None
         base_at = None
-        if existing.selected_base_amount_usd is not None and alloc.reference_ts is not None:
-            existing_base_dt = _prior_run_timestamp(existing.selected_base_amount_usd_at)
+        if (
+            existing.selected_base_amount_usd is not None
+            and alloc.reference_ts is not None
+        ):
+            existing_base_dt = _prior_run_timestamp(
+                existing.selected_base_amount_usd_at
+            )
             if existing_base_dt is not None:
                 existing_base_seconds = (
-                    existing_base_dt.hour * 3600 + existing_base_dt.minute * 60 + existing_base_dt.second
+                    existing_base_dt.hour * 3600
+                    + existing_base_dt.minute * 60
+                    + existing_base_dt.second
                 )
                 if alloc.reference_ts > existing_base_seconds:
                     base = existing.selected_base_amount_usd
@@ -4550,11 +4735,19 @@ def classify_execution_quality(slippage_pct: Optional[float]) -> str:
 
 
 def build_execution_record(
-    decision: ReconciledDecision,
-    notional_usd: float,
     *,
+    ticker: str,
+    target_price: float,
+    target_price_source: str,
+    decision_bar_close: float,
+    notional_usd: float,
+    action_reason: str = "",
     order_id: Optional[str] = None,
-    fill: Optional[OrderFill] = None,
+    target_quote_time: Optional[datetime] = None,
+    order_submitted_at: Optional[datetime] = None,
+    order_filled_at: Optional[datetime] = None,
+    avg_fill_price: Optional[float] = None,
+    quantity_filled: Optional[float] = None,
 ) -> OrderExecutionRecord:
     """Compute slippage and latency for a submitted order against its target price.
 
@@ -4562,38 +4755,34 @@ def build_execution_record(
     (unfavorable). slippage_cost is the extra dollars paid versus target across the
     filled quantity. Records without a fill are marked ``unfilled``.
     """
-    filled = (
-        fill is not None
-        and fill.avg_fill_price is not None
-        and fill.quantity_filled is not None
-    )
+    filled = avg_fill_price is not None and quantity_filled is not None
     slippage_abs: Optional[float] = None
     slippage_pct: Optional[float] = None
     slippage_cost: Optional[float] = None
     latency_seconds: Optional[float] = None
 
     if filled:
-        slippage_abs = fill.avg_fill_price - decision.target_price
-        if decision.target_price:
-            slippage_pct = slippage_abs / decision.target_price * 100.0
-        slippage_cost = slippage_abs * fill.quantity_filled
-    if fill and fill.order_submitted_at is not None and fill.order_filled_at is not None:
-        latency_seconds = (fill.order_filled_at - fill.order_submitted_at).total_seconds()
+        slippage_abs = avg_fill_price - target_price
+        if target_price:
+            slippage_pct = slippage_abs / target_price * 100.0
+        slippage_cost = slippage_abs * quantity_filled
+    if order_submitted_at is not None and order_filled_at is not None:
+        latency_seconds = (order_filled_at - order_submitted_at).total_seconds()
 
     return OrderExecutionRecord(
-        ticker=decision.ticker,
-        status="filled" if filled else "unfilled",
+        ticker=ticker,
+        status="filled" if filled else "submitted",
         order_id=order_id,
         notional_usd=notional_usd,
-        action_reason=decision.reason,
-        target_price=decision.target_price,
-        target_price_source=decision.target_price_source,
-        target_quote_time=decision.target_quote_time,
-        decision_bar_close=decision.decision_bar_close,
-        order_submitted_at=fill.order_submitted_at if fill else None,
-        order_filled_at=fill.order_filled_at if fill else None,
-        avg_fill_price=fill.avg_fill_price if fill else None,
-        quantity_filled=fill.quantity_filled if fill else None,
+        action_reason=action_reason,
+        target_price=target_price,
+        target_price_source=target_price_source,
+        target_quote_time=target_quote_time,
+        decision_bar_close=decision_bar_close,
+        order_submitted_at=order_submitted_at,
+        order_filled_at=order_filled_at,
+        avg_fill_price=avg_fill_price,
+        quantity_filled=quantity_filled,
         slippage_abs=slippage_abs,
         slippage_pct=slippage_pct,
         slippage_cost=slippage_cost,
@@ -4624,10 +4813,20 @@ def _log_execution(
         if isinstance(res, OrderFill):
             fill = res
     record = build_execution_record(
-        decision,
-        notional_usd=notional_usd if notional_usd is not None else decision.suggested_amount_usd,
+        ticker=decision.ticker,
+        target_price=decision.target_price,
+        target_price_source=decision.target_price_source,
+        target_quote_time=decision.target_quote_time,
+        decision_bar_close=decision.decision_bar_close,
+        notional_usd=(
+            notional_usd if notional_usd is not None else decision.suggested_amount_usd
+        ),
+        action_reason=decision.reason,
         order_id=order_id,
-        fill=fill,
+        order_submitted_at=fill.order_submitted_at if fill else None,
+        order_filled_at=fill.order_filled_at if fill else None,
+        avg_fill_price=fill.avg_fill_price if fill else None,
+        quantity_filled=fill.quantity_filled if fill else None,
     )
     run_result.execution_records.append(record)
     # A submitted order that never returned a fill is an execution gap, not a
@@ -4636,7 +4835,9 @@ def _log_execution(
         run_result.loop_block_reasons[decision.ticker] = MISSING_FILL_EXECUTION_GAP
 
 
-def classify_missing_fill(decision: Optional[ReconciledDecision], loop_reason: Optional[str]) -> str:
+def classify_missing_fill(
+    decision: Optional[ReconciledDecision], loop_reason: Optional[str]
+) -> str:
     """Classify why an active-universe ticker produced no filled order.
 
     ``loop_reason`` is the outcome recorded during the order loop (cap, broker, gap),
@@ -4645,7 +4846,9 @@ def classify_missing_fill(decision: Optional[ReconciledDecision], loop_reason: O
     if loop_reason:
         return loop_reason
     action = decision.action if decision else Action.NO_DATA
-    if action == Action.NO_DATA or (decision is not None and _decision_had_provider_error(decision)):
+    if action == Action.NO_DATA or (
+        decision is not None and _decision_had_provider_error(decision)
+    ):
         # A provider exception is a data problem even when reconciliation degraded
         # it to MANUAL_REVIEW instead of NO_DATA; report it as such so outages
         # surface in the "data error" bucket rather than "failed DCA trigger".
@@ -4701,7 +4904,9 @@ def _percentile(sorted_values: Sequence[float], pct: float) -> float:
     return sorted_values[low] * (1.0 - frac) + sorted_values[high] * frac
 
 
-def build_report(run_result: RunResult, generated_at: datetime) -> ReportResult:
+def build_report(
+    run_result: RunResult, run_label: str, generated_at: datetime
+) -> ReportResult:
     """Assemble the slippage/coverage report data (no file I/O)."""
     filled = [r for r in run_result.execution_records if r.status == "filled"]
     ranked = sorted(filled, key=lambda r: abs(r.slippage_pct or 0.0), reverse=True)
@@ -4738,8 +4943,12 @@ def build_report(run_result: RunResult, generated_at: datetime) -> ReportResult:
         "filled_order_count": len(filled),
         "total_filled_notional": round(total_filled_notional, 6),
         "net_slippage_cost": round(net_slippage_cost, 6),
-        "mean_abs_slippage_pct": round(statistics.fmean(abs_pcts), 6) if abs_pcts else 0.0,
-        "median_abs_slippage_pct": round(statistics.median(abs_pcts), 6) if abs_pcts else 0.0,
+        "mean_abs_slippage_pct": (
+            round(statistics.fmean(abs_pcts), 6) if abs_pcts else 0.0
+        ),
+        "median_abs_slippage_pct": (
+            round(statistics.median(abs_pcts), 6) if abs_pcts else 0.0
+        ),
         "p90_abs_slippage_pct": round(_percentile(abs_pcts, 90.0), 6),
         "top_slippage_tickers": top_tickers,
         "missing_fill_count": len(missing),
@@ -4757,10 +4966,24 @@ def build_report(run_result: RunResult, generated_at: datetime) -> ReportResult:
 
 
 _CSV_FIELDS = [
-    "ticker", "status", "order_id", "notional_usd", "action_reason",
-    "target_price", "target_price_source", "target_quote_time", "decision_bar_close",
-    "order_submitted_at", "order_filled_at", "avg_fill_price", "quantity_filled",
-    "slippage_abs", "slippage_pct", "slippage_cost", "latency_seconds", "execution_quality",
+    "ticker",
+    "status",
+    "order_id",
+    "notional_usd",
+    "action_reason",
+    "target_price",
+    "target_price_source",
+    "target_quote_time",
+    "decision_bar_close",
+    "order_submitted_at",
+    "order_filled_at",
+    "avg_fill_price",
+    "quantity_filled",
+    "slippage_abs",
+    "slippage_pct",
+    "slippage_cost",
+    "latency_seconds",
+    "execution_quality",
 ]
 
 
@@ -4775,7 +4998,10 @@ def write_execution_csv(records: Sequence[OrderExecutionRecord], path: str) -> s
         writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
         writer.writeheader()
         for record in records:
-            row = {field_name: _iso(getattr(record, field_name)) for field_name in _CSV_FIELDS}
+            row = {
+                field_name: _iso(getattr(record, field_name))
+                for field_name in _CSV_FIELDS
+            }
             writer.writerow(row)
     return path
 
@@ -4812,7 +5038,9 @@ def render_report_markdown(report: ReportResult, run_result: RunResult) -> str:
     lines.append("")
     lines.append("## Ranked Slippage (by absolute slippage %)")
     lines.append("")
-    lines.append("| Rank | Ticker | Target | Avg Fill | Slippage % | Slippage $ | Latency s | Quality |")
+    lines.append(
+        "| Rank | Ticker | Target | Avg Fill | Slippage % | Slippage $ | Latency s | Quality |"
+    )
     lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
     for rank, r in enumerate(report.ranked_slippage, start=1):
         lines.append(
@@ -4848,7 +5076,7 @@ def generate_slippage_report(
     Reusable after manual or scheduled execution. Performs no interactive prompting.
     """
     generated_at = (now or datetime.now(tz=EASTERN)).astimezone(EASTERN)
-    report = build_report(run_result, generated_at)
+    report = build_report(run_result, run_result.run_label, generated_at)
     stamp = generated_at.strftime("%Y%m%d-%H%M%S")
     base = f"dca_{run_result.run_label}_{run_result.trading_day.isoformat()}_{stamp}"
     os.makedirs(output_dir, exist_ok=True)
@@ -4894,7 +5122,6 @@ def write_run_state(
     return state_path
 
 
-
 # Warn this many approved trading days before the configured window's end, so the
 # hard stop built into APPROVED_TEST_DATES / trading_window.json is never a
 # surprise: past the last approved date every scheduled run is silently blocked.
@@ -4934,7 +5161,9 @@ def warn_if_window_expiring(
     every run carries a countdown warning so the operator extends
     ``config/trading_window.json`` before trading stops.
     """
-    in_window, window_end, remaining = approved_window_status(approved_dates, trading_day)
+    in_window, window_end, remaining = approved_window_status(
+        approved_dates, trading_day
+    )
     if window_end is None:
         return
     if trading_day > window_end:
@@ -5135,13 +5364,17 @@ def _check_execution_gates(
     warn_if_window_expiring(config.approved_test_dates, trading_day)
     if _date_or_holiday_blocked(trading_day, config):
         if trading_day not in config.approved_test_dates:
-            logger.warning("Date gate blocked execution for %s. No trades.", trading_day)
+            logger.warning(
+                "Date gate blocked execution for %s. No trades.", trading_day
+            )
         else:
             # Independent of config.approved_test_dates (which config/trading_window.json
             # can widen to any weekday range with no holiday subtraction of its own): a
             # full NYSE closure is never a trading day, so extending the approved window
             # can never silently reopen a holiday for live orders.
-            logger.warning("NYSE holiday gate blocked execution for %s. No trades.", trading_day)
+            logger.warning(
+                "NYSE holiday gate blocked execution for %s. No trades.", trading_day
+            )
         _write_blocked_run_stub(trading_day, artifacts_dir, classification_state_root)
         return False
 
@@ -5154,7 +5387,9 @@ def _check_execution_gates(
     # bypass the factory entirely, so the same condition has to hold here at the
     # execution gate, which every path crosses (Codex review, PR #219).
     if not config.dry_run:
-        pinning_failure = account_pinning_failure(config.target_account_number, config.broker)
+        pinning_failure = account_pinning_failure(
+            config.target_account_number, config.broker
+        )
         if pinning_failure:
             raise RuntimeError(
                 f"Refusing to trade live: {pinning_failure}. Configure a real account "
@@ -5195,38 +5430,7 @@ def _load_deployment_history_states(
     }
 
     prior_states = []
-
-    # ⚡ Bolt Optimization: If the run_state is nested under a date folder
-    # (e.g., .../2023-01-01/run_state.json or .../scheduled_runs/20260731_1530ET/...),
-    # extract date-like strings from the path parts. We only inspect the relative
-    # path component (under the root) to prevent an old ancestor directory from causing
-    # a false out-of-window rejection, and we also handle the compact YYYYMMDD format
-    # used by production scheduled_runs.
-    iso_date_pattern = re.compile(r"\d{4}-\d{2}-\d{2}")
-    compact_date_pattern = re.compile(r"\d{8}")
-
     for path in find_run_state_files(deployment_history_root):
-        dates_in_path = []
-        try:
-            rel_path = str(path.relative_to(deployment_history_root))
-        except ValueError:
-            rel_path = str(path)
-
-        iso_dates = iso_date_pattern.findall(rel_path)
-        dates_in_path.extend(iso_dates)
-
-        # Look for compact YYYYMMDD dates and format them to ISO strings for matching
-        compact_dates = compact_date_pattern.findall(rel_path)
-        for cd in compact_dates:
-            try:
-                dt = datetime.strptime(cd, "%Y%m%d").date()
-                dates_in_path.append(dt.isoformat())
-            except ValueError:
-                pass
-
-        if dates_in_path and not any(d in window_days for d in dates_in_path):
-            continue
-
         try:
             raw_text = path.read_text(encoding="utf-8")
         except (ValueError, OSError):
@@ -5313,7 +5517,10 @@ def _same_day_ticker_deployment_already_recorded(
 
 
 def _write_and_validate_scheduled_contract(
-    artifacts: Dict[str, Any], artifacts_dir: str | Path, *, require_signals: bool = True
+    artifacts: Dict[str, Any],
+    artifacts_dir: str | Path,
+    *,
+    require_signals: bool = True,
 ) -> Any:
     """Write the remaining scheduled-live contract files, then validate them.
 
@@ -5383,7 +5590,10 @@ def _write_and_validate_scheduled_contract(
     )
 
     result = validate_run_artifacts(
-        out, require_signals=require_signals, require_submitted_orders=True, require_summary=True
+        out,
+        require_signals=require_signals,
+        require_submitted_orders=True,
+        require_summary=True,
     )
     if not result:
         logger.error(
@@ -5416,35 +5626,10 @@ def _write_and_validate_scheduled_contract(
             rc = data.get("run_classification")
             if isinstance(rc, dict):
                 rc["valid_scheduled_evidence"] = False
-            fpath.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+            fpath.write_text(
+                json.dumps(data, indent=2, sort_keys=True), encoding="utf-8"
+            )
     return result
-
-
-
-@dataclass(frozen=True)
-class ArtifactWriteContext:
-    """Bundles :func:`_finalize_and_write_artifacts`'s tracking counters, run
-    directories, and persistence overrides into one object.
-
-    ``artifacts_dir`` gates the whole write (``None`` skips it entirely);
-    ``scheduled`` selects the manual-vs-scheduled artifact contract and, when
-    true, whether the scheduled-run pointer at ``classification_state_root``
-    gets updated. The remaining fields are optional annotations/overrides
-    forwarded to :func:`build_run_artifacts` -- see that function for what
-    each defaults to when left unset.
-    """
-
-    order_reviews_attempted: int
-    errors_count: int
-    scheduled: bool
-    artifacts_dir: Optional[str | Path]
-    classification_state_root: Optional[str | Path]
-    notifications_sent: Optional[int] = None
-    cost_control_notes: Optional[Sequence[str]] = None
-    top_up_outcomes: Optional[Dict[str, TopUpGuardOutcome]] = None
-    raw_persistence_state: Optional[Dict[str, object]] = None
-    classification_overrides: Optional[Dict[str, Any]] = None
-    correlation_id: Optional[str] = None
 
 
 def _finalize_and_write_artifacts(
@@ -5453,9 +5638,19 @@ def _finalize_and_write_artifacts(
     state: StrategyState,
     decisions: List[ReconciledDecision],
     candidate_outcomes: Dict[str, Dict[str, Any]],
-    context: ArtifactWriteContext,
+    order_reviews_attempted: int,
+    errors_count: int,
+    notifications_sent: Optional[int],
+    cost_control_notes: Optional[Sequence[str]],
+    top_up_outcomes: Optional[Dict[str, TopUpGuardOutcome]],
+    scheduled: bool,
+    artifacts_dir: Optional[str | Path],
+    classification_state_root: Optional[str | Path],
+    raw_persistence_state: Optional[Dict[str, object]] = None,
+    classification_overrides: Optional[Dict[str, Any]] = None,
+    correlation_id: Optional[str] = None,
 ) -> None:
-    if context.artifacts_dir is None:
+    if artifacts_dir is None:
         return
 
     artifacts = build_run_artifacts(
@@ -5464,24 +5659,26 @@ def _finalize_and_write_artifacts(
         state,
         decisions,
         candidate_outcomes,
-        order_reviews_attempted=context.order_reviews_attempted,
-        errors_count=context.errors_count,
-        notifications_sent=context.notifications_sent,
-        cost_control_notes=context.cost_control_notes,
-        top_up_outcomes=context.top_up_outcomes,
-        manual=not context.scheduled,
-        raw_persistence_state=context.raw_persistence_state,
-        classification_overrides=context.classification_overrides,
-        correlation_id=context.correlation_id,
+        order_reviews_attempted=order_reviews_attempted,
+        errors_count=errors_count,
+        notifications_sent=notifications_sent,
+        cost_control_notes=cost_control_notes,
+        top_up_outcomes=top_up_outcomes,
+        manual=not scheduled,
+        raw_persistence_state=raw_persistence_state,
+        classification_overrides=classification_overrides,
+        correlation_id=correlation_id,
     )
-    paths = write_run_artifacts(artifacts, context.artifacts_dir)
+    paths = write_run_artifacts(artifacts, artifacts_dir)
     logger.info("Wrote run artifacts: %s", paths["run_state"])
 
     contract_ok = True
-    if context.scheduled:
-        contract_ok = bool(_write_and_validate_scheduled_contract(artifacts, context.artifacts_dir))
+    if scheduled:
+        contract_ok = bool(
+            _write_and_validate_scheduled_contract(artifacts, artifacts_dir)
+        )
 
-    if context.scheduled and context.classification_state_root is not None:
+    if scheduled and classification_state_root is not None:
         try:
             from scripts.run_classification import (
                 update_latest_scheduled_run_pointer,
@@ -5496,7 +5693,7 @@ def _finalize_and_write_artifacts(
         result = validate_classification(rc if isinstance(rc, dict) else {})
         if result and contract_ok:
             update_latest_scheduled_run_pointer(
-                artifacts, paths["run_state"], context.classification_state_root
+                artifacts, paths["run_state"], classification_state_root
             )
         elif not contract_ok:
             # A run that breached the artifact contract (e.g. the compute-only
@@ -5635,7 +5832,9 @@ def _process_buy_candidate(
             # ticker (regardless of ref id/stream) and never trust an artifact
             # figure lower than what the broker itself reports.
             try:
-                broker_reported_usd = broker.same_day_ticker_notional_usd(ticker, trading_day)
+                broker_reported_usd = broker.same_day_ticker_notional_usd(
+                    ticker, trading_day
+                )
             except Exception as exc:  # noqa: BLE001
                 errors_count_inc += 1
                 candidate_outcome = {
@@ -5646,7 +5845,13 @@ def _process_buy_candidate(
                     MISSING_FILL_DATA_ERROR,
                     f"{ticker}: same-day notional check failed: {exc}; skipping",
                 )
-                return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+                return (
+                    candidate_outcome,
+                    top_up_outcome,
+                    running_deployed_7d,
+                    errors_count_inc,
+                    order_reviews_attempted_inc,
+                )
             if broker_reported_usd > prior.amount_usd:
                 effective_prior = replace(prior, amount_usd=broker_reported_usd)
         top_up_outcome = evaluate_top_up_guard(decision, effective_prior, config)
@@ -5685,9 +5890,21 @@ def _process_buy_candidate(
             dup_order = _same_stream_order_exists(broker, ticker, trading_day, stream)
         except Exception as exc:  # noqa: BLE001
             errors_count_inc += 1
-            candidate_outcome = {"status": "blocked", "skip_reason": f"duplicate-check failed: {exc}"}
-            _block(MISSING_FILL_DATA_ERROR, f"{ticker}: same-stream duplicate check failed: {exc}; skipping")
-            return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+            candidate_outcome = {
+                "status": "blocked",
+                "skip_reason": f"duplicate-check failed: {exc}",
+            }
+            _block(
+                MISSING_FILL_DATA_ERROR,
+                f"{ticker}: same-stream duplicate check failed: {exc}; skipping",
+            )
+            return (
+                candidate_outcome,
+                top_up_outcome,
+                running_deployed_7d,
+                errors_count_inc,
+                order_reviews_attempted_inc,
+            )
         if dup_order is not None:
             order_id = dup_order.get("id") or dup_order.get("order_id")
             if not order_id:
@@ -5711,9 +5928,17 @@ def _process_buy_candidate(
                     MISSING_FILL_DATA_ERROR,
                     f"{ticker}: same-stream duplicate found but broker returned no order id; skipping",
                 )
-                return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+                return (
+                    candidate_outcome,
+                    top_up_outcome,
+                    running_deployed_7d,
+                    errors_count_inc,
+                    order_reviews_attempted_inc,
+                )
             try:
-                dup_amount = float(dup_order.get("dollar_amount") or dup_order.get("notional") or 0)
+                dup_amount = float(
+                    dup_order.get("dollar_amount") or dup_order.get("notional") or 0
+                )
             except (TypeError, ValueError):
                 dup_amount = 0.0
             # A matched order missing both amount fields carries no real
@@ -5767,8 +5992,11 @@ def _process_buy_candidate(
             # unrelated invocation) must not be mistaken for proof that this
             # order was already counted (Codex review, PR #231: "Verify the
             # recovered order is actually in deployment history").
-            if deployment_history_root is not None and not _same_day_ticker_deployment_already_recorded(
-                ticker, trading_day, deployment_history_root
+            if (
+                deployment_history_root is not None
+                and not _same_day_ticker_deployment_already_recorded(
+                    ticker, trading_day, deployment_history_root
+                )
             ):
                 running_deployed_7d += dup_amount
             # This row's real order was authorized by the spread gate on the
@@ -5838,9 +6066,19 @@ def _process_buy_candidate(
                 # when the order truly has no fill) rather than a hardcoded
                 # "budget capped" reason that would misreport a submitted order.
                 _log_execution(
-                    run_result, decision, candidate_outcome.get("order_id"), broker, notional_usd=dup_amount
+                    run_result,
+                    decision,
+                    candidate_outcome.get("order_id"),
+                    broker,
+                    notional_usd=dup_amount,
                 )
-            return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+            return (
+                candidate_outcome,
+                top_up_outcome,
+                running_deployed_7d,
+                errors_count_inc,
+                order_reviews_attempted_inc,
+            )
 
     if kill_switch_engaged(replace(config, deployed_last_7d_usd=running_deployed_7d)):
         # Cap at THIS candidate's own selected base ($1 or $2), not the fixed
@@ -5860,7 +6098,9 @@ def _process_buy_candidate(
         # preserved base").
         kill_switch_base = (
             prior.selected_base_amount_usd
-            if prior is not None and prior.selected_base_amount_usd and prior.selected_base_amount_usd > 0
+            if prior is not None
+            and prior.selected_base_amount_usd
+            and prior.selected_base_amount_usd > 0
             else decision.selected_base_amount_usd
         )
         order_amount = min(order_amount, kill_switch_base)
@@ -5884,7 +6124,13 @@ def _process_buy_candidate(
                 MISSING_FILL_TOP_UP_OFFSET,
                 f"{ticker}: top-up guard offset ({top_up_outcome.top_up_guard_result}); no incremental buy",
             )
-            return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+            return (
+                candidate_outcome,
+                top_up_outcome,
+                running_deployed_7d,
+                errors_count_inc,
+                order_reviews_attempted_inc,
+            )
 
     # Hard per-order ceiling is checked before any broker round-trip -- including
     # the one_order_per_ticker_per_day duplicate check just below -- so that an
@@ -5896,19 +6142,44 @@ def _process_buy_candidate(
     # round-trip on this path (Codex review, discussion_r3679633773: "Check the
     # hard ceiling before the broker duplicate lookup").
     if order_amount > config.max_per_order_usd:
-        candidate_outcome = {"status": "blocked", "skip_reason": "max per-order ceiling exceeded", "deliberate_skip": True, "budget_blocked": True}
+        candidate_outcome = {
+            "status": "blocked",
+            "skip_reason": "max per-order ceiling exceeded",
+            "deliberate_skip": True,
+            "budget_blocked": True,
+        }
         _block(
             MISSING_FILL_BUDGET_CAPPED,
             f"{ticker}: order amount ${order_amount:.2f} exceeds max per-order "
             f"${config.max_per_order_usd:.2f}; skipping",
         )
-        return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
-    if config.one_order_per_ticker_per_day and broker.same_day_strategy_order_exists(ticker, trading_day):
+        return (
+            candidate_outcome,
+            top_up_outcome,
+            running_deployed_7d,
+            errors_count_inc,
+            order_reviews_attempted_inc,
+        )
+    if config.one_order_per_ticker_per_day and broker.same_day_strategy_order_exists(
+        ticker, trading_day
+    ):
         if top_up_outcome is not None:
             top_up_outcome = replace(top_up_outcome, incremental_order_amount=0.0)
-        candidate_outcome = {"status": "skipped", "skip_reason": "same-day broker order exists"}
-        _block(MISSING_FILL_BUDGET_CAPPED, f"{ticker}: same-day broker order already exists; skipping")
-        return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+        candidate_outcome = {
+            "status": "skipped",
+            "skip_reason": "same-day broker order exists",
+        }
+        _block(
+            MISSING_FILL_BUDGET_CAPPED,
+            f"{ticker}: same-day broker order already exists; skipping",
+        )
+        return (
+            candidate_outcome,
+            top_up_outcome,
+            running_deployed_7d,
+            errors_count_inc,
+            order_reviews_attempted_inc,
+        )
     if (config.one_order_per_ticker_per_day or not ticker_guarded) and (
         state.buys_today(ticker, trading_day) >= config.max_buys_per_ticker_per_day
     ):
@@ -5920,9 +6191,19 @@ def _process_buy_candidate(
         # when one_order_per_ticker_per_day triggers").
         if top_up_outcome is not None:
             top_up_outcome = replace(top_up_outcome, incremental_order_amount=0.0)
-        candidate_outcome = {"status": "skipped", "skip_reason": "already bought today", "budget_blocked": True}
+        candidate_outcome = {
+            "status": "skipped",
+            "skip_reason": "already bought today",
+            "budget_blocked": True,
+        }
         _block(MISSING_FILL_BUDGET_CAPPED, f"{ticker}: already bought today; skipping")
-        return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+        return (
+            candidate_outcome,
+            top_up_outcome,
+            running_deployed_7d,
+            errors_count_inc,
+            order_reviews_attempted_inc,
+        )
     # A morning/manual run must NOT block the scheduled afternoon run: when the
     # top-up guard has a loaded prior allocation for this ticker, the earlier
     # same-day allocation is handled above (and any same-stream retry of THIS
@@ -5937,9 +6218,21 @@ def _process_buy_candidate(
         and not ticker_guarded
         and broker.same_day_strategy_order_exists(ticker, trading_day)
     ):
-        candidate_outcome = {"status": "skipped", "skip_reason": "same-day broker order exists"}
-        _block(MISSING_FILL_BUDGET_CAPPED, f"{ticker}: same-day broker order already exists; skipping")
-        return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+        candidate_outcome = {
+            "status": "skipped",
+            "skip_reason": "same-day broker order exists",
+        }
+        _block(
+            MISSING_FILL_BUDGET_CAPPED,
+            f"{ticker}: same-day broker order already exists; skipping",
+        )
+        return (
+            candidate_outcome,
+            top_up_outcome,
+            running_deployed_7d,
+            errors_count_inc,
+            order_reviews_attempted_inc,
+        )
     # Budget/cap checks run BEFORE the spread lookup, matching the per-order
     # ceiling above ("an over-cap candidate should never need a same-day-duplicate
     # lookup or a spread quote") and the blocked_before_spread_gate contract: a
@@ -5953,7 +6246,13 @@ def _process_buy_candidate(
             "budget_blocked": True,
         }
         _block(MISSING_FILL_BUDGET_CAPPED, f"{ticker}: cap would be exceeded; skipping")
-        return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+        return (
+            candidate_outcome,
+            top_up_outcome,
+            running_deployed_7d,
+            errors_count_inc,
+            order_reviews_attempted_inc,
+        )
 
     # This candidate qualified on the ladder and top-up rules, so it reaches the
     # spread gate. Only rows that get this far carry a spread verdict, and only
@@ -5966,10 +6265,20 @@ def _process_buy_candidate(
         candidate_outcome = {
             "status": "blocked",
             "skip_reason": f"spread quote error: {exc}",
-            **spread_gate_fields(spread_pct=None, max_spread_pct=config.max_bid_ask_spread_pct),
+            **spread_gate_fields(
+                spread_pct=None, max_spread_pct=config.max_bid_ask_spread_pct
+            ),
         }
-        _block(MISSING_FILL_DATA_ERROR, f"{ticker}: spread quote failed: {exc}; skipping")
-        return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+        _block(
+            MISSING_FILL_DATA_ERROR, f"{ticker}: spread quote failed: {exc}; skipping"
+        )
+        return (
+            candidate_outcome,
+            top_up_outcome,
+            running_deployed_7d,
+            errors_count_inc,
+            order_reviews_attempted_inc,
+        )
     spread_fields = spread_gate_fields(
         spread_pct=spread_pct, max_spread_pct=config.max_bid_ask_spread_pct
     )
@@ -5993,7 +6302,13 @@ def _process_buy_candidate(
             MISSING_FILL_BROKER_BLOCKED,
             f"{ticker}: bid/ask spread unavailable for scheduled run; skipping",
         )
-        return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+        return (
+            candidate_outcome,
+            top_up_outcome,
+            running_deployed_7d,
+            errors_count_inc,
+            order_reviews_attempted_inc,
+        )
     if spread_pct is not None and spread_pct > config.max_bid_ask_spread_pct:
         candidate_outcome = {
             "status": "blocked",
@@ -6009,24 +6324,72 @@ def _process_buy_candidate(
             f"{ticker}: bid/ask spread {spread_pct:.2f}% exceeds "
             f"{config.max_bid_ask_spread_pct:.2f}% limit; skipping",
         )
-        return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+        return (
+            candidate_outcome,
+            top_up_outcome,
+            running_deployed_7d,
+            errors_count_inc,
+            order_reviews_attempted_inc,
+        )
     if broker.available_buying_power() < order_amount:
-        candidate_outcome = {"status": "blocked", "skip_reason": "insufficient buying power", "deliberate_skip": True, "budget_blocked": True, **spread_fields}
-        _block(MISSING_FILL_BUDGET_CAPPED, f"{ticker}: insufficient buying power; skipping")
-        return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+        candidate_outcome = {
+            "status": "blocked",
+            "skip_reason": "insufficient buying power",
+            "deliberate_skip": True,
+            "budget_blocked": True,
+            **spread_fields,
+        }
+        _block(
+            MISSING_FILL_BUDGET_CAPPED, f"{ticker}: insufficient buying power; skipping"
+        )
+        return (
+            candidate_outcome,
+            top_up_outcome,
+            running_deployed_7d,
+            errors_count_inc,
+            order_reviews_attempted_inc,
+        )
     if not broker.is_tradable_for_fractional_buy(ticker):
-        candidate_outcome = {"status": "blocked", "skip_reason": "not tradable for fractional buy", "deliberate_skip": True, **spread_fields}
-        _block(MISSING_FILL_BROKER_BLOCKED, f"{ticker}: not tradable for fractional/notional buy; skipping")
-        return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+        candidate_outcome = {
+            "status": "blocked",
+            "skip_reason": "not tradable for fractional buy",
+            "deliberate_skip": True,
+            **spread_fields,
+        }
+        _block(
+            MISSING_FILL_BROKER_BLOCKED,
+            f"{ticker}: not tradable for fractional/notional buy; skipping",
+        )
+        return (
+            candidate_outcome,
+            top_up_outcome,
+            running_deployed_7d,
+            errors_count_inc,
+            order_reviews_attempted_inc,
+        )
 
     reviewed_order = None
     if not scheduled:
         order_reviews_attempted_inc += 1
         review_ok, review_reason = broker.review_market_buy(ticker, order_amount)
         if not review_ok:
-            candidate_outcome = {"status": "blocked", "skip_reason": f"review blocked: {review_reason}", "deliberate_skip": True, **spread_fields}
-            _block(MISSING_FILL_BROKER_BLOCKED, f"{ticker}: review blocked order: {review_reason}")
-            return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+            candidate_outcome = {
+                "status": "blocked",
+                "skip_reason": f"review blocked: {review_reason}",
+                "deliberate_skip": True,
+                **spread_fields,
+            }
+            _block(
+                MISSING_FILL_BROKER_BLOCKED,
+                f"{ticker}: review blocked order: {review_reason}",
+            )
+            return (
+                candidate_outcome,
+                top_up_outcome,
+                running_deployed_7d,
+                errors_count_inc,
+                order_reviews_attempted_inc,
+            )
         reviewed_order = {
             "notional_usd": round(order_amount, 2),
             "side": "buy",
@@ -6051,9 +6414,11 @@ def _process_buy_candidate(
     ref_id = (
         f"{_graded_dca_ref_id_prefix(stream, 'topup')}-{trading_day.isoformat()}-{ticker}"
         if ticker_guarded
-        else f"{_graded_dca_ref_id_prefix(stream)}-{trading_day.isoformat()}-{ticker}"
-        if scheduled
-        else f"{_graded_dca_ref_id_prefix(stream, 'manual')}-{trading_day.isoformat()}-{ticker}"
+        else (
+            f"{_graded_dca_ref_id_prefix(stream)}-{trading_day.isoformat()}-{ticker}"
+            if scheduled
+            else f"{_graded_dca_ref_id_prefix(stream, 'manual')}-{trading_day.isoformat()}-{ticker}"
+        )
     )
     if config.dry_run:
         logger.info(
@@ -6090,7 +6455,13 @@ def _process_buy_candidate(
                 MISSING_FILL_BROKER_BLOCKED,
                 f"{ticker}: broker requires confirmation before submission; skipping",
             )
-            return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+            return (
+                candidate_outcome,
+                top_up_outcome,
+                running_deployed_7d,
+                errors_count_inc,
+                order_reviews_attempted_inc,
+            )
         except Exception as exc:  # noqa: BLE001
             errors_count_inc += 1
             candidate_outcome = {
@@ -6102,7 +6473,13 @@ def _process_buy_candidate(
                 **spread_fields,
             }
             logger.error("Placement failed for %s: %s", ticker, exc)
-            return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+            return (
+                candidate_outcome,
+                top_up_outcome,
+                running_deployed_7d,
+                errors_count_inc,
+                order_reviews_attempted_inc,
+            )
         state.record_buy(ticker, trading_day, order_amount)
         state.own_orders_recorded.add((ticker, trading_day))
         if scheduled:
@@ -6135,9 +6512,21 @@ def _process_buy_candidate(
         _publish_in_flight_outcome(ticker, candidate_outcome)
 
     if run_result is not None:
-        _log_execution(run_result, decision, candidate_outcome.get("order_id"), broker, notional_usd=order_amount)
+        _log_execution(
+            run_result,
+            decision,
+            candidate_outcome.get("order_id"),
+            broker,
+            notional_usd=order_amount,
+        )
 
-    return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+    return (
+        candidate_outcome,
+        top_up_outcome,
+        running_deployed_7d,
+        errors_count_inc,
+        order_reviews_attempted_inc,
+    )
 
 
 def _evaluate_all_signals(
@@ -6149,7 +6538,9 @@ def _evaluate_all_signals(
 ) -> tuple[List[ReconciledDecision], int]:
     errors_count = 0
 
-    def _safe_signal(ticker: str, data: MarketDataProvider, interval_minutes: int) -> SourceSignal:
+    def _safe_signal(
+        ticker: str, data: MarketDataProvider, interval_minutes: int
+    ) -> SourceSignal:
         nonlocal errors_count
         try:
             return evaluate_source_signal(
@@ -6179,8 +6570,12 @@ def _evaluate_all_signals(
 
     decisions = []
     for ticker in tradable_tickers:
-        finance_signal = _safe_signal(ticker, finance_data, config.finance_interval_minutes)
-        robinhood_signal = _safe_signal(ticker, robinhood_data, config.robinhood_interval_minutes)
+        finance_signal = _safe_signal(
+            ticker, finance_data, config.finance_interval_minutes
+        )
+        robinhood_signal = _safe_signal(
+            ticker, robinhood_data, config.robinhood_interval_minutes
+        )
         decisions.append(reconcile_signals(ticker, finance_signal, robinhood_signal))
 
     return decisions, errors_count
@@ -6241,21 +6636,23 @@ def _process_buy_candidates_batch(
     order_reviews_attempted_inc = 0
 
     for decision in buy_candidates:
-        c_outcome, t_outcome, running_deployed_7d, err_inc, rev_inc = _process_buy_candidate(
-            decision=decision,
-            config=config,
-            state=state,
-            broker=broker,
-            robinhood_data=robinhood_data,
-            now=now,
-            trading_day=trading_day,
-            guard_active=guard_active,
-            prior_same_day_allocations=prior_same_day_allocations or {},
-            running_deployed_7d=running_deployed_7d,
-            scheduled=scheduled,
-            run_result=run_result,
-            deployment_history_root=deployment_history_root,
-            stream=stream,
+        c_outcome, t_outcome, running_deployed_7d, err_inc, rev_inc = (
+            _process_buy_candidate(
+                decision=decision,
+                config=config,
+                state=state,
+                broker=broker,
+                robinhood_data=robinhood_data,
+                now=now,
+                trading_day=trading_day,
+                guard_active=guard_active,
+                prior_same_day_allocations=prior_same_day_allocations or {},
+                running_deployed_7d=running_deployed_7d,
+                scheduled=scheduled,
+                run_result=run_result,
+                deployment_history_root=deployment_history_root,
+                stream=stream,
+            )
         )
         candidate_outcomes[decision.ticker] = c_outcome
         if t_outcome is not None:
@@ -6263,7 +6660,14 @@ def _process_buy_candidates_batch(
         errors_count_inc += err_inc
         order_reviews_attempted_inc += rev_inc
 
-    return candidate_outcomes, top_up_outcomes, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+    return (
+        candidate_outcomes,
+        top_up_outcomes,
+        running_deployed_7d,
+        errors_count_inc,
+        order_reviews_attempted_inc,
+    )
+
 
 # Placement outcomes for the run currently in flight, keyed so the failure
 # handler can read whatever the batch had produced when it raised.
@@ -6277,7 +6681,8 @@ def _order_csv_covers(path: Path, expected_rows: Sequence[Dict[str, Any]]) -> bo
     earlier attempt passes it while omitting orders the state records.
     """
     expected = {
-        str(row.get("order_id") or f"ticker:{row.get('ticker')}") for row in expected_rows
+        str(row.get("order_id") or f"ticker:{row.get('ticker')}")
+        for row in expected_rows
     }
     if not expected:
         return True
@@ -6352,17 +6757,16 @@ def run_once(
     _IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
     scheduled = kwargs.get("scheduled", True)
     try:
-        ctx = RunContext(
-            now=now,
-            config=config,
-            state=state,
-            finance_data=finance_data,
-            robinhood_data=robinhood_data,
-            broker=broker,
-            artifacts_dir=artifacts_dir,
+        return _run_once_impl(
+            now,
+            config,
+            state,
+            finance_data,
+            robinhood_data,
+            broker,
+            artifacts_dir,
             **kwargs,
         )
-        return _run_once_impl(ctx)
     except Exception as exc:  # noqa: BLE001 - always re-raised below
         if scheduled and artifacts_dir:
             try:
@@ -6425,7 +6829,9 @@ def _write_afternoon_failure_artifacts(
 
     placed = {
         ticker: outcome
-        for ticker, outcome in (_IN_FLIGHT_CANDIDATE_OUTCOMES.get("outcomes") or {}).items()
+        for ticker, outcome in (
+            _IN_FLIGHT_CANDIDATE_OUTCOMES.get("outcomes") or {}
+        ).items()
         if isinstance(outcome, dict)
     }
     submitted = sum(1 for oc in placed.values() if oc.get("status") == "submitted")
@@ -6467,10 +6873,14 @@ def _write_afternoon_failure_artifacts(
                 else RUN_CLASSIFICATION_STARTUP_FAILED
             ),
             "order_submit_status": (
-                ORDER_SUBMIT_STATUS_SUBMITTED if submitted else ORDER_SUBMIT_STATUS_ERROR
+                ORDER_SUBMIT_STATUS_SUBMITTED
+                if submitted
+                else ORDER_SUBMIT_STATUS_ERROR
             ),
             "error_class": (
-                ERROR_CLASS_POST_SUBMISSION_FAILURE if submitted else ERROR_CLASS_STARTUP_FAILURE
+                ERROR_CLASS_POST_SUBMISSION_FAILURE
+                if submitted
+                else ERROR_CLASS_STARTUP_FAILURE
             ),
             "error_detail": f"{type(exc).__name__}: {exc}",
             "is_trading_failure": True,
@@ -6478,11 +6888,20 @@ def _write_afternoon_failure_artifacts(
             "orders_submitted_count": submitted,
             "candidates_reaching_spread_gate": 0,
             "candidates_blocked_missing_spread": 0,
-            "budget": {"budget_tier": "normal", "daily_cap_usd": 0, "weekly_cap_usd": 0},
-            "counts": {"evaluated": 0, "buy_candidates": len(placed), "submitted": submitted},
+            "budget": {
+                "budget_tier": "normal",
+                "daily_cap_usd": 0,
+                "weekly_cap_usd": 0,
+            },
+            "counts": {
+                "evaluated": 0,
+                "buy_candidates": len(placed),
+                "submitted": submitted,
+            },
             "signal_rows": [],
             "buy_candidates": [
-                _failure_candidate_row(ticker, outcome) for ticker, outcome in placed.items()
+                _failure_candidate_row(ticker, outcome)
+                for ticker, outcome in placed.items()
             ],
             "broker_outcomes": placed,
         }
@@ -6502,7 +6921,11 @@ def _write_afternoon_failure_artifacts(
         if placed:
             merged = dict(run_state)
             existing_outcomes = dict(merged.get("broker_outcomes") or {})
-            rows = [row for row in (merged.get("buy_candidates") or []) if isinstance(row, dict)]
+            rows = [
+                row
+                for row in (merged.get("buy_candidates") or [])
+                if isinstance(row, dict)
+            ]
             # Keyed by ORDER ID, not ticker. A retry can place a distinct
             # incremental order for a ticker the earlier attempt already bought,
             # and a ticker-keyed setdefault would silently keep only the old one
@@ -6513,7 +6936,9 @@ def _write_afternoon_failure_artifacts(
                 for oc in existing_outcomes.values()
                 if isinstance(oc, dict) and oc.get("order_id")
             }
-            seen_orders.update(row.get("order_id") for row in rows if row.get("order_id"))
+            seen_orders.update(
+                row.get("order_id") for row in rows if row.get("order_id")
+            )
             added = False
             for ticker, outcome in placed.items():
                 order_id = outcome.get("order_id")
@@ -6528,7 +6953,11 @@ def _write_afternoon_failure_artifacts(
                 # carried INSIDE the outcome, because submitted_order_rows()
                 # would otherwise write the synthetic key into the canonical
                 # order row as the symbol (Codex review).
-                key = ticker if ticker not in existing_outcomes else f"{ticker}:{order_id}"
+                key = (
+                    ticker
+                    if ticker not in existing_outcomes
+                    else f"{ticker}:{order_id}"
+                )
                 if key != ticker:
                     outcome = {**outcome, "ticker": ticker}
                 existing_outcomes[key] = outcome
@@ -6600,8 +7029,14 @@ def _write_afternoon_failure_artifacts(
     # Regenerate whenever the state changed: validate_run_artifacts compares only
     # the nested classification, so a pre-merge summary would pass while reporting
     # the previous attempt's order count and outcome (Codex review).
-    if state_is_synthesized or state_was_mutated or not (out / "run_summary.json").exists():
-        atomic_write_text(out / "run_summary.json", _serialize_run_state(build_run_summary(run_state)))
+    if (
+        state_is_synthesized
+        or state_was_mutated
+        or not (out / "run_summary.json").exists()
+    ):
+        atomic_write_text(
+            out / "run_summary.json", _serialize_run_state(build_run_summary(run_state))
+        )
     # Refresh latest_scheduled_run.json so a pointer-based watchdog sees today's
     # slot as fired-and-failed rather than still targeting the previous trading
     # day (Codex review). The state it points at carries
@@ -6627,7 +7062,8 @@ def _write_afternoon_failure_artifacts(
         if not contract or not _order_csv_covers(orders_csv, expected_orders):
             run_state["artifact_contract_failure"] = artifact_contract_failure(
                 "scheduled-run artifact contract failed",
-                detail="; ".join(contract.errors) or "order CSV does not cover the state",
+                detail="; ".join(contract.errors)
+                or "order CSV does not cover the state",
             )
             run_state["scheduled_evidence_denied"] = True
             rc = run_state.get("run_classification")
@@ -6655,49 +7091,26 @@ def config_broker_name() -> str:
     return "robinhood"
 
 
-@dataclass(frozen=True)
-class RunContext:
-    """Immutable execution context for a single afternoon DCA run."""
-
-    now: datetime
-    config: StrategyConfig
-    state: StrategyState
-    finance_data: MarketDataProvider
-    robinhood_data: MarketDataProvider
-    broker: BrokerAdapter
-    artifacts_dir: Optional[str | Path] = None
-    run_result: Optional[RunResult] = None
-    notifications_sent: Optional[int] = None
-    cost_control_notes: Optional[Sequence[str]] = None
-    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]] = None
-    deployment_history_root: Optional[str | Path] = None
-    scheduled: bool = True
-    classification_state_root: Optional[str | Path] = None
-    raw_persistence_state: Optional[Dict[str, object]] = None
-    classification_overrides: Optional[Dict[str, Any]] = None
-    correlation_id: Optional[str] = None
-    stream: str = "afternoon"
-
-
-def _run_once_impl(ctx: RunContext) -> List[ReconciledDecision]:
-    now = ctx.now
-    config = ctx.config
-    state = ctx.state
-    finance_data = ctx.finance_data
-    robinhood_data = ctx.robinhood_data
-    broker = ctx.broker
-    artifacts_dir = ctx.artifacts_dir
-    run_result = ctx.run_result
-    notifications_sent = ctx.notifications_sent
-    cost_control_notes = ctx.cost_control_notes
-    prior_same_day_allocations = ctx.prior_same_day_allocations
-    deployment_history_root = ctx.deployment_history_root
-    scheduled = ctx.scheduled
-    classification_state_root = ctx.classification_state_root
-    raw_persistence_state = ctx.raw_persistence_state
-    classification_overrides = ctx.classification_overrides
-    correlation_id = ctx.correlation_id
-    stream = ctx.stream
+def _run_once_impl(
+    now: datetime,
+    config: StrategyConfig,
+    state: StrategyState,
+    finance_data: MarketDataProvider,
+    robinhood_data: MarketDataProvider,
+    broker: BrokerAdapter,
+    artifacts_dir: Optional[str | Path] = None,
+    run_result: Optional[RunResult] = None,
+    notifications_sent: Optional[int] = None,
+    cost_control_notes: Optional[Sequence[str]] = None,
+    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]] = None,
+    deployment_history_root: Optional[str | Path] = None,
+    scheduled: bool = True,
+    classification_state_root: Optional[str | Path] = None,
+    raw_persistence_state: Optional[Dict[str, object]] = None,
+    classification_overrides: Optional[Dict[str, Any]] = None,
+    correlation_id: Optional[str] = None,
+    stream: str = "afternoon",
+) -> List[ReconciledDecision]:
     now_et = now.astimezone(EASTERN)
     trading_day = now_et.date()
     if run_result is not None:
@@ -6727,7 +7140,9 @@ def _run_once_impl(ctx: RunContext) -> List[ReconciledDecision]:
         config = _apply_deployment_history(config, trading_day, deployment_history_root)
 
     decisions: List[ReconciledDecision] = []
-    tradable_tickers = [ticker for ticker in config.tickers if ticker not in config.excluded_tickers]
+    tradable_tickers = [
+        ticker for ticker in config.tickers if ticker not in config.excluded_tickers
+    ]
     if run_result is not None:
         run_result.active_universe = list(tradable_tickers)
 
@@ -6739,9 +7154,9 @@ def _run_once_impl(ctx: RunContext) -> List[ReconciledDecision]:
     if run_result is not None:
         run_result.decisions = decisions
 
-
-
-    buy_candidates = [decision for decision in decisions if decision.action == Action.BUY]
+    buy_candidates = [
+        decision for decision in decisions if decision.action == Action.BUY
+    ]
     # Higher multiplier -> larger drop -> ticker alphabetical (see allocation_sort_key).
     buy_candidates.sort(key=allocation_sort_key)
 
@@ -6775,20 +7190,22 @@ def _run_once_impl(ctx: RunContext) -> List[ReconciledDecision]:
         one_order_per_ticker_per_day=config.one_order_per_ticker_per_day,
     )
 
-    candidate_outcomes, top_up_outcomes, running_deployed_7d, err_inc, rev_inc = _process_buy_candidates_batch(
-        buy_candidates=buy_candidates,
-        config=config,
-        state=state,
-        broker=broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=trading_day,
-        guard_active=guard_active,
-        prior_same_day_allocations=prior_same_day_allocations,
-        scheduled=scheduled,
-        run_result=run_result,
-        deployment_history_root=deployment_history_root,
-        stream=stream,
+    candidate_outcomes, top_up_outcomes, running_deployed_7d, err_inc, rev_inc = (
+        _process_buy_candidates_batch(
+            buy_candidates=buy_candidates,
+            config=config,
+            state=state,
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=guard_active,
+            prior_same_day_allocations=prior_same_day_allocations,
+            scheduled=scheduled,
+            run_result=run_result,
+            deployment_history_root=deployment_history_root,
+            stream=stream,
+        )
     )
     errors_count += err_inc
     order_reviews_attempted += rev_inc
@@ -6802,7 +7219,9 @@ def _run_once_impl(ctx: RunContext) -> List[ReconciledDecision]:
 
     manual_review = [d for d in decisions if d.action == Action.MANUAL_REVIEW]
     if manual_review:
-        logger.info("Manual review tickers: %s", ", ".join(d.ticker for d in manual_review))
+        logger.info(
+            "Manual review tickers: %s", ", ".join(d.ticker for d in manual_review)
+        )
 
     tier = state.current_tier()
     state.finalize_daily_budget(trading_day, config)
@@ -6823,19 +7242,17 @@ def _run_once_impl(ctx: RunContext) -> List[ReconciledDecision]:
         state=state,
         decisions=decisions,
         candidate_outcomes=candidate_outcomes,
-        context=ArtifactWriteContext(
-            order_reviews_attempted=order_reviews_attempted,
-            errors_count=errors_count,
-            notifications_sent=notifications_sent,
-            cost_control_notes=cost_control_notes,
-            top_up_outcomes=top_up_outcomes if guard_active else None,
-            scheduled=scheduled,
-            artifacts_dir=artifacts_dir,
-            classification_state_root=classification_state_root,
-            raw_persistence_state=raw_persistence_state,
-            classification_overrides=classification_overrides,
-            correlation_id=correlation_id,
-        ),
+        order_reviews_attempted=order_reviews_attempted,
+        errors_count=errors_count,
+        notifications_sent=notifications_sent,
+        cost_control_notes=cost_control_notes,
+        top_up_outcomes=top_up_outcomes if guard_active else None,
+        scheduled=scheduled,
+        artifacts_dir=artifacts_dir,
+        classification_state_root=classification_state_root,
+        raw_persistence_state=raw_persistence_state,
+        classification_overrides=classification_overrides,
+        correlation_id=correlation_id,
     )
 
     return decisions
@@ -6880,8 +7297,14 @@ def run_and_report(
         scheduled=scheduled,
     )
     run_once(
-        now, config, state, finance_data, robinhood_data, broker,
-        run_result=run_result, deployment_history_root=deployment_history_root,
+        now,
+        config,
+        state,
+        finance_data,
+        robinhood_data,
+        broker,
+        run_result=run_result,
+        deployment_history_root=deployment_history_root,
         scheduled=scheduled,
     )
     report = generate_slippage_report(
@@ -6904,6 +7327,55 @@ def run_and_report(
     }
 
 
+@dataclass(frozen=True)
+class CompactRunOptions:
+    """Grouped configuration for :func:`run_daily_compact`.
+
+    Bundles the daily compact run's tunables -- output location, run
+    labeling/scheduling flags, cross-run state carried between same-day
+    passes, and identifiers threaded through to the underlying
+    :func:`run_once` call -- into a single immutable options object instead
+    of a long keyword-argument list.
+
+    Attributes:
+        artifacts_dir: Directory the run's structured JSON/CSV artifacts are
+            written to.
+        run_label: Label recorded on the run result and artifacts (e.g.
+            ``"daily"``, ``"morning"``).
+        scheduled: Whether this run was triggered by the scheduler (as
+            opposed to a manual invocation).
+        notifications_sent: Count of notifications already sent for this
+            trading day, if any, used to keep the usage-proxy counter
+            accurate across passes.
+        prior_same_day_allocations: Per-ticker allocations from an earlier
+            same-day pass, used to top up rather than double-allocate.
+        deployment_history_root: Root directory for deployment-history
+            lookups; defaults to the parent of ``artifacts_dir`` when unset.
+        classification_state_root: Root directory for persisted signal
+            classification state.
+        raw_persistence_state: Raw persistence state carried in from a
+            prior pass/process, if the caller is resuming one.
+        classification_overrides: Manual overrides applied on top of the
+            computed signal classification.
+        correlation_id: Identifier used to correlate this run's artifacts
+            and logs with related runs/processes.
+        stream: Which scheduled stream this run belongs to (e.g.
+            ``"morning"``, ``"afternoon"``).
+    """
+
+    artifacts_dir: str | Path
+    run_label: str = "daily"
+    scheduled: bool = True
+    notifications_sent: Optional[int] = None
+    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]] = None
+    deployment_history_root: Optional[str | Path] = None
+    classification_state_root: Optional[str | Path] = None
+    raw_persistence_state: Optional[Dict[str, object]] = None
+    classification_overrides: Optional[Dict[str, Any]] = None
+    correlation_id: Optional[str] = None
+    stream: str = "afternoon"
+
+
 def run_daily_compact(
     now: datetime,
     config: StrategyConfig,
@@ -6911,18 +7383,8 @@ def run_daily_compact(
     finance_data: MarketDataProvider,
     robinhood_data: MarketDataProvider,
     broker: BrokerAdapter,
-    *,
-    artifacts_dir: str | Path,
-    run_label: str = "daily",
-    scheduled: bool = True,
-    notifications_sent: Optional[int] = None,
-    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]] = None,
-    deployment_history_root: Optional[str | Path] = None,
-    classification_state_root: Optional[str | Path] = None,
-    raw_persistence_state: Optional[Dict[str, object]] = None,
-    classification_overrides: Optional[Dict[str, Any]] = None,
-    correlation_id: Optional[str] = None,
-    stream: str = "afternoon",
+    options: Optional[CompactRunOptions] = None,
+    **legacy_options: object,
 ) -> Dict[str, object]:
     """Run one DCA scan and write only compact, structured daily artifacts.
 
@@ -6943,13 +7405,28 @@ def run_daily_compact(
     ``latest_run_summary.json`` (see ``dca_reporting``/``dca_notion_sync``); this
     function only writes local artifacts and does not contact Notion directly.
     It may interact with the passed-in broker adapter (dry-run by default).
+
+    Prefer passing ``options`` (a :class:`CompactRunOptions`). The former
+    keyword-only parameters (``artifacts_dir``, ``run_label``, ``scheduled``,
+    etc. -- documented in ``README_REPORTING.md``) are still accepted via
+    ``**legacy_options`` and used to build a ``CompactRunOptions`` for
+    backwards compatibility; do not pass both ``options`` and legacy keyword
+    arguments in the same call.
     """
+    if options is None:
+        options = CompactRunOptions(**legacy_options)
+    elif legacy_options:
+        raise TypeError(
+            "run_daily_compact() got legacy keyword arguments "
+            f"{sorted(legacy_options)} in addition to 'options'; pass either "
+            "'options' or the legacy keyword arguments, not both"
+        )
     trading_day = now.astimezone(EASTERN).date()
     run_result = RunResult(
         trading_day=trading_day,
         decisions=[],
-        run_label=run_label,
-        scheduled=scheduled,
+        run_label=options.run_label,
+        scheduled=options.scheduled,
     )
     run_once(
         now,
@@ -6958,24 +7435,24 @@ def run_daily_compact(
         finance_data,
         robinhood_data,
         broker,
-        artifacts_dir=artifacts_dir,
+        artifacts_dir=options.artifacts_dir,
         run_result=run_result,
-        notifications_sent=notifications_sent,
-        prior_same_day_allocations=prior_same_day_allocations,
-        deployment_history_root=deployment_history_root,
-        scheduled=scheduled,
-        classification_state_root=classification_state_root,
-        raw_persistence_state=raw_persistence_state,
-        classification_overrides=classification_overrides,
-        correlation_id=correlation_id,
-        stream=stream,
+        notifications_sent=options.notifications_sent,
+        prior_same_day_allocations=options.prior_same_day_allocations,
+        deployment_history_root=options.deployment_history_root,
+        scheduled=options.scheduled,
+        classification_state_root=options.classification_state_root,
+        raw_persistence_state=options.raw_persistence_state,
+        classification_overrides=options.classification_overrides,
+        correlation_id=options.correlation_id,
+        stream=options.stream,
     )
 
-    out = Path(artifacts_dir)
+    out = Path(options.artifacts_dir)
     out.mkdir(parents=True, exist_ok=True)
     result: Dict[str, object] = {
-        "run_label": run_label,
-        "scheduled": scheduled,
+        "run_label": options.run_label,
+        "scheduled": options.scheduled,
         "compact": True,
         "blocked": _date_or_holiday_blocked(trading_day, config),
         "artifacts_dir": str(out),

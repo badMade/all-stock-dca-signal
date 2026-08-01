@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -10,15 +9,19 @@ from unittest.mock import patch
 import pytest
 
 from dca_config import load_strategy_config
-from near_close_dca import EASTERN, DryRunBroker, SourceName, StrategyConfig, StrategyState, build_broker
+from near_close_dca import (
+    EASTERN,
+    DryRunBroker,
+    SourceName,
+    StrategyConfig,
+    StrategyState,
+    build_broker,
+)
 from run_dca import (
     DemoDataProvider,
-    _demo_runtime,
     _fills_from_orders_csv,
-    _final_buy_trend_override_window_start,
     _is_within,
     _resolve_now,
-    configure_logging,
     main,
     run_pipeline,
 )
@@ -31,19 +34,6 @@ def _now(day=(2026, 7, 6)):
 def _demo_config():
     # Approve the demo trading day regardless of the bundled window.
     return load_strategy_config(approved_test_dates=frozenset({_now().date()}))
-
-
-def test_demo_runtime():
-    config = StrategyConfig(decision_time_et=time(15, 45))
-    finance, robinhood, broker = _demo_runtime(config)
-
-    assert isinstance(finance, DemoDataProvider)
-    assert finance.source == SourceName.FINANCE
-
-    assert isinstance(robinhood, DemoDataProvider)
-    assert robinhood.source == SourceName.ROBINHOOD
-
-    assert isinstance(broker, DryRunBroker)
 
 
 def test_resolve_now_with_naive_string():
@@ -160,11 +150,22 @@ def test_run_pipeline_writes_artifacts_and_reports(tmp_path):
     robinhood = DemoDataProvider(SourceName.ROBINHOOD)
     broker = build_broker(config)
     result = run_pipeline(
-        _now(), config, StrategyState(), finance, robinhood, broker,
-        artifacts_dir=tmp_path, generate_full_reports=True,
+        _now(),
+        config,
+        StrategyState(),
+        finance,
+        robinhood,
+        broker,
+        artifacts_dir=tmp_path,
+        generate_full_reports=True,
     )
     assert result["blocked"] is False
-    for key in ("run_state_path", "signals_path", "buy_candidates_path", "orders_csv_path"):
+    for key in (
+        "run_state_path",
+        "signals_path",
+        "buy_candidates_path",
+        "orders_csv_path",
+    ):
         assert (tmp_path / result[key].split("/")[-1]).exists()
     assert "reports" in result and "notion_sync" in result
     assert (tmp_path / "latest_run_summary.json").exists()
@@ -175,9 +176,14 @@ def test_run_pipeline_blocked_day_skips_reports(tmp_path):
     # A day outside the approved set trips the date gate and writes only the stub.
     config = load_strategy_config(approved_test_dates=frozenset())
     result = run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=tmp_path, generate_full_reports=True,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=tmp_path,
+        generate_full_reports=True,
     )
     assert result["blocked"] is True
     assert "reports" not in result
@@ -188,9 +194,13 @@ def test_run_pipeline_does_not_write_model_usage_log_by_default(tmp_path):
     # any model-usage path unless a caller opts in explicitly.
     config = _demo_config()
     run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=tmp_path,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=tmp_path,
     )
     assert not (tmp_path / "model_usage").exists()
 
@@ -204,9 +214,13 @@ def test_run_pipeline_appends_model_usage_log_entry_when_root_configured(tmp_pat
     log_root = tmp_path / "model_usage"
     now = _now()
     result = run_pipeline(
-        now, config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=tmp_path / "artifacts",
+        now,
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=tmp_path / "artifacts",
         model_usage_log_root=log_root,
     )
 
@@ -229,9 +243,13 @@ def test_run_pipeline_records_premium_routing_metadata_when_supplied(tmp_path):
     log_root = tmp_path / "model_usage"
     now = _now()
     run_pipeline(
-        now, config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=tmp_path / "artifacts",
+        now,
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=tmp_path / "artifacts",
         model_usage_log_root=log_root,
         model_usage_model_requested="claude-opus-4-8",
         model_usage_model_actual="claude-opus-4-8",
@@ -256,9 +274,13 @@ def test_run_pipeline_date_gate_blocked_run_has_no_run_id_to_log(tmp_path):
     log_root = tmp_path / "model_usage"
     now = _now()
     result = run_pipeline(
-        now, config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=tmp_path / "artifacts",
+        now,
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=tmp_path / "artifacts",
         model_usage_log_root=log_root,
     )
     assert result["blocked"] is True
@@ -280,27 +302,38 @@ def test_run_pipeline_scheduled_run_auto_loads_prior_allocations(tmp_path):
     manual_dir = task_root / "manual_runs" / "0900"
     manual_dir.mkdir(parents=True)
     (manual_dir / "run_state.json").write_text(
-        json.dumps({
-            "trading_day": _now().date().isoformat(),
-            "generated_at": f"{_now().date().isoformat()}T09:00:00-04:00",
-            "run_classification": {"run_origin": "manual", "run_id": "manual_am"},
-            # A very low reference price guarantees the afternoon price is never
-            # below it, so this ticker's guard result proves the allocation was
-            # loaded (top_up_guard_result != "no_prior_run") without depending
-            # on the demo provider's exact drop-derived price.
-            "buy_candidates": [
-                {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0, "target_price": 0.01},
-            ],
-        }),
+        json.dumps(
+            {
+                "trading_day": _now().date().isoformat(),
+                "generated_at": f"{_now().date().isoformat()}T09:00:00-04:00",
+                "run_classification": {"run_origin": "manual", "run_id": "manual_am"},
+                # A very low reference price guarantees the afternoon price is never
+                # below it, so this ticker's guard result proves the allocation was
+                # loaded (top_up_guard_result != "no_prior_run") without depending
+                # on the demo provider's exact drop-derived price.
+                "buy_candidates": [
+                    {
+                        "ticker": "AAPL",
+                        "status": "submitted",
+                        "planned_amount_usd": 3.0,
+                        "target_price": 0.01,
+                    },
+                ],
+            }
+        ),
         encoding="utf-8",
     )
 
     config = _demo_config()
     scheduled_dir = task_root / "scheduled_runs" / "20260706_1530ET"
     result = run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=scheduled_dir,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=scheduled_dir,
     )
     assert result["blocked"] is False
     with open(result["run_state_path"], encoding="utf-8") as handle:
@@ -325,32 +358,43 @@ def test_run_pipeline_scheduled_run_loads_intraday_recovery_top_up_context(tmp_p
     intraday_dir = tmp_path / "cron_tracking" / "intraday_dca" / "20260706_1430ET"
     intraday_dir.mkdir(parents=True)
     (intraday_dir / "run_state.json").write_text(
-        json.dumps({
-            "trading_day": _now().date().isoformat(),
-            "generated_at": f"{_now().date().isoformat()}T14:30:00-04:00",
-            "run_classification": {
-                "run_origin": "scheduled",
-                "manual_run": False,
-                "stream": "intraday_1430",
-                "run_id": "intraday_live_20260706_1430ET",
-            },
-            # A very low reference price guarantees the afternoon price is
-            # never below it, so this ticker's guard result proves the
-            # recovery allocation was loaded without depending on the demo
-            # provider's exact drop-derived price.
-            "buy_candidates": [
-                {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0, "target_price": 0.01},
-            ],
-        }),
+        json.dumps(
+            {
+                "trading_day": _now().date().isoformat(),
+                "generated_at": f"{_now().date().isoformat()}T14:30:00-04:00",
+                "run_classification": {
+                    "run_origin": "scheduled",
+                    "manual_run": False,
+                    "stream": "intraday_1430",
+                    "run_id": "intraday_live_20260706_1430ET",
+                },
+                # A very low reference price guarantees the afternoon price is
+                # never below it, so this ticker's guard result proves the
+                # recovery allocation was loaded without depending on the demo
+                # provider's exact drop-derived price.
+                "buy_candidates": [
+                    {
+                        "ticker": "AAPL",
+                        "status": "filled",
+                        "planned_amount_usd": 3.0,
+                        "target_price": 0.01,
+                    },
+                ],
+            }
+        ),
         encoding="utf-8",
     )
 
     config = _demo_config()
     scheduled_dir = task_root / "scheduled_runs" / "20260706_1530ET"
     result = run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=scheduled_dir,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=scheduled_dir,
     )
     assert result["blocked"] is False
     with open(result["run_state_path"], encoding="utf-8") as handle:
@@ -375,32 +419,43 @@ def test_run_pipeline_scheduled_run_loads_market_open_top_up_context(tmp_path):
     market_open_dir = tmp_path / "cron_tracking" / "market_open_dca" / "20260706_0935ET"
     market_open_dir.mkdir(parents=True)
     (market_open_dir / "run_state.json").write_text(
-        json.dumps({
-            "trading_day": _now().date().isoformat(),
-            "generated_at": f"{_now().date().isoformat()}T09:35:00-04:00",
-            "run_classification": {
-                "run_origin": "scheduled",
-                "manual_run": False,
-                "stream": "market_open",
-                "run_id": "market_open_live_20260706_0935ET",
-            },
-            # A very low reference price guarantees the afternoon price is
-            # never below it, so this ticker's guard result proves the
-            # market-open allocation was loaded without depending on the demo
-            # provider's exact drop-derived price.
-            "buy_candidates": [
-                {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0, "target_price": 0.01},
-            ],
-        }),
+        json.dumps(
+            {
+                "trading_day": _now().date().isoformat(),
+                "generated_at": f"{_now().date().isoformat()}T09:35:00-04:00",
+                "run_classification": {
+                    "run_origin": "scheduled",
+                    "manual_run": False,
+                    "stream": "market_open",
+                    "run_id": "market_open_live_20260706_0935ET",
+                },
+                # A very low reference price guarantees the afternoon price is
+                # never below it, so this ticker's guard result proves the
+                # market-open allocation was loaded without depending on the demo
+                # provider's exact drop-derived price.
+                "buy_candidates": [
+                    {
+                        "ticker": "AAPL",
+                        "status": "filled",
+                        "planned_amount_usd": 3.0,
+                        "target_price": 0.01,
+                    },
+                ],
+            }
+        ),
         encoding="utf-8",
     )
 
     config = _demo_config()
     scheduled_dir = task_root / "scheduled_runs" / "20260706_1530ET"
     result = run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=scheduled_dir,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=scheduled_dir,
     )
     assert result["blocked"] is False
     with open(result["run_state_path"], encoding="utf-8") as handle:
@@ -426,20 +481,22 @@ def test_run_pipeline_scheduled_run_loads_manual_midday_top_up_context(tmp_path)
     )
     manual_midday_dir.mkdir(parents=True)
     (manual_midday_dir / "run_state.json").write_text(
-        json.dumps({
-            "trading_day": _now().date().isoformat(),
-            "generated_at": f"{_now().date().isoformat()}T13:45:00-04:00",
-            "run_classification": {
-                "run_origin": "manual",
-                "manual_run": True,
-                "run_id": "manual_midday_20260706_1345ET",
-                "stream": "midday_manual",
+        json.dumps(
+            {
                 "trading_day": _now().date().isoformat(),
-                "same_day_top_up_context_only": True,
-                "valid_scheduled_evidence": False,
-                "valid_afternoon_scheduled_evidence": False,
-            },
-        }),
+                "generated_at": f"{_now().date().isoformat()}T13:45:00-04:00",
+                "run_classification": {
+                    "run_origin": "manual",
+                    "manual_run": True,
+                    "run_id": "manual_midday_20260706_1345ET",
+                    "stream": "midday_manual",
+                    "trading_day": _now().date().isoformat(),
+                    "same_day_top_up_context_only": True,
+                    "valid_scheduled_evidence": False,
+                    "valid_afternoon_scheduled_evidence": False,
+                },
+            }
+        ),
         encoding="utf-8",
     )
     # A very low reference price guarantees the afternoon price is never below
@@ -455,9 +512,13 @@ def test_run_pipeline_scheduled_run_loads_manual_midday_top_up_context(tmp_path)
     config = _demo_config()
     scheduled_dir = task_root / "scheduled_runs" / "20260706_1530ET"
     result = run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=scheduled_dir,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=scheduled_dir,
     )
     assert result["blocked"] is False
     with open(result["run_state_path"], encoding="utf-8") as handle:
@@ -481,21 +542,34 @@ def test_run_pipeline_honors_configured_morning_artifact_root(tmp_path):
     morning_run_dir = relocated_morning_root / "20260706_1030ET"
     morning_run_dir.mkdir(parents=True)
     (morning_run_dir / "run_state.json").write_text(
-        json.dumps({
-            "trading_day": _now().date().isoformat(),
-            "generated_at": f"{_now().date().isoformat()}T10:30:00-04:00",
-            "run_classification": {"run_origin": "scheduled", "run_id": "morning_am", "stream": "morning"},
-            "buy_candidates": [
-                {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0, "target_price": 0.01},
-            ],
-        }),
+        json.dumps(
+            {
+                "trading_day": _now().date().isoformat(),
+                "generated_at": f"{_now().date().isoformat()}T10:30:00-04:00",
+                "run_classification": {
+                    "run_origin": "scheduled",
+                    "run_id": "morning_am",
+                    "stream": "morning",
+                },
+                "buy_candidates": [
+                    {
+                        "ticker": "AAPL",
+                        "status": "submitted",
+                        "planned_amount_usd": 3.0,
+                        "target_price": 0.01,
+                    },
+                ],
+            }
+        ),
         encoding="utf-8",
     )
 
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     (config_dir / "morning_dca.json").write_text(
-        json.dumps({"artifact_paths": {"live_run_state_root": str(relocated_morning_root)}}),
+        json.dumps(
+            {"artifact_paths": {"live_run_state_root": str(relocated_morning_root)}}
+        ),
         encoding="utf-8",
     )
 
@@ -503,9 +577,14 @@ def test_run_pipeline_honors_configured_morning_artifact_root(tmp_path):
     task_root = tmp_path / "cron_tracking" / "ce16ba6b"
     scheduled_dir = task_root / "scheduled_runs" / "20260706_1530ET"
     result = run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=scheduled_dir, config_dir=str(config_dir),
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=scheduled_dir,
+        config_dir=str(config_dir),
     )
     assert result["blocked"] is False
     with open(result["run_state_path"], encoding="utf-8") as handle:
@@ -535,22 +614,37 @@ def test_run_pipeline_preserves_sibling_root_fallback_when_tree_is_relocated(tmp
     morning_run_dir = sibling_morning_root / "20260706_1030ET"
     morning_run_dir.mkdir(parents=True)
     (morning_run_dir / "run_state.json").write_text(
-        json.dumps({
-            "trading_day": _now().date().isoformat(),
-            "generated_at": f"{_now().date().isoformat()}T10:30:00-04:00",
-            "run_classification": {"run_origin": "scheduled", "run_id": "morning_am", "stream": "morning"},
-            "buy_candidates": [
-                {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0, "target_price": 0.01},
-            ],
-        }),
+        json.dumps(
+            {
+                "trading_day": _now().date().isoformat(),
+                "generated_at": f"{_now().date().isoformat()}T10:30:00-04:00",
+                "run_classification": {
+                    "run_origin": "scheduled",
+                    "run_id": "morning_am",
+                    "stream": "morning",
+                },
+                "buy_candidates": [
+                    {
+                        "ticker": "AAPL",
+                        "status": "submitted",
+                        "planned_amount_usd": 3.0,
+                        "target_price": 0.01,
+                    },
+                ],
+            }
+        ),
         encoding="utf-8",
     )
 
     config = _demo_config()
     result = run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=scheduled_dir,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=scheduled_dir,
     )
     assert result["blocked"] is False
     with open(result["run_state_path"], encoding="utf-8") as handle:
@@ -559,7 +653,9 @@ def test_run_pipeline_preserves_sibling_root_fallback_when_tree_is_relocated(tmp
     assert by_ticker["AAPL"]["top_up_guard_result"] != "no_prior_run"
 
 
-def test_resolve_cross_stream_prior_allocation_roots_excludes_mismatched_default(tmp_path):
+def test_resolve_cross_stream_prior_allocation_roots_excludes_mismatched_default(
+    tmp_path,
+):
     # Codex follow-up review ("Keep relocated runs from scanning production
     # roots"): when config_dir is left unset (None) and this run's
     # cron-tracking tree is relocated (tests/demo/staging), load_morning_config/
@@ -634,7 +730,9 @@ def test_resolve_cross_stream_prior_allocation_roots_env_dir_with_override_is_tr
     env_config_dir.mkdir()
     custom_morning_root = tmp_path / "elsewhere" / "morning_live"
     (env_config_dir / "morning_dca.json").write_text(
-        json.dumps({"artifact_paths": {"live_run_state_root": str(custom_morning_root)}}),
+        json.dumps(
+            {"artifact_paths": {"live_run_state_root": str(custom_morning_root)}}
+        ),
         encoding="utf-8",
     )
     monkeypatch.setenv("DCA_CONFIG_DIR", str(env_config_dir))
@@ -677,7 +775,9 @@ def test_resolve_cross_stream_prior_allocation_roots_env_dir_empty_override_stay
     assert (afternoon_root.parent / "morning_dca").resolve() in resolved
 
 
-def test_resolve_cross_stream_prior_allocation_roots_prunes_nested_configured_root(tmp_path):
+def test_resolve_cross_stream_prior_allocation_roots_prunes_nested_configured_root(
+    tmp_path,
+):
     # Codex review ("Avoid double-counting nested stream roots"): a configured
     # live_run_state_root that is a CHILD of the sibling-of-afternoon-root
     # convention path (e.g. <cron_base>/morning_dca/live) used to be kept
@@ -700,11 +800,15 @@ def test_resolve_cross_stream_prior_allocation_roots_prunes_nested_configured_ro
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     (config_dir / "morning_dca.json").write_text(
-        json.dumps({"artifact_paths": {"live_run_state_root": str(nested_morning_root)}}),
+        json.dumps(
+            {"artifact_paths": {"live_run_state_root": str(nested_morning_root)}}
+        ),
         encoding="utf-8",
     )
 
-    roots = _resolve_cross_stream_prior_allocation_roots(str(config_dir), afternoon_root)
+    roots = _resolve_cross_stream_prior_allocation_roots(
+        str(config_dir), afternoon_root
+    )
     resolved = {r.resolve() for r in roots}
     assert nested_morning_root.resolve() not in resolved
     assert (cron_base / "morning_dca").resolve() in resolved
@@ -731,7 +835,9 @@ def test_resolve_cross_stream_prior_allocation_roots_excludes_afternoon_tree(tmp
         encoding="utf-8",
     )
 
-    roots = _resolve_cross_stream_prior_allocation_roots(str(config_dir), afternoon_root)
+    roots = _resolve_cross_stream_prior_allocation_roots(
+        str(config_dir), afternoon_root
+    )
     resolved = {r.resolve() for r in roots}
     assert cron_base.resolve() not in resolved
 
@@ -740,7 +846,7 @@ def test_resolve_cross_stream_prior_allocation_roots_afternoon_containing_root_k
     tmp_path,
 ):
     # Codex follow-up review ("Filter afternoon-containing roots before
-    # descendant pruning"): a residual case after the previous adjustment. When a
+    # descendant pruning"): a residual case after the fix above. When a
     # stream is configured to the shared cron_base itself, the sibling
     # cron_base/morning_dca root is a genuine DESCENDANT of cron_base, so the
     # descendant-pruning pass would discard it as "redundant" with cron_base
@@ -764,13 +870,17 @@ def test_resolve_cross_stream_prior_allocation_roots_afternoon_containing_root_k
         encoding="utf-8",
     )
 
-    roots = _resolve_cross_stream_prior_allocation_roots(str(config_dir), afternoon_root)
+    roots = _resolve_cross_stream_prior_allocation_roots(
+        str(config_dir), afternoon_root
+    )
     resolved = {r.resolve() for r in roots}
     assert cron_base.resolve() not in resolved
     assert (cron_base / "morning_dca").resolve() in resolved
 
 
-def test_resolve_cross_stream_prior_allocation_roots_intraday_sibling_fallback(tmp_path):
+def test_resolve_cross_stream_prior_allocation_roots_intraday_sibling_fallback(
+    tmp_path,
+):
     # With no DCA_INTRADAY_LIVE_STATE_ROOT override, the intraday recovery
     # root still falls back to the sibling-of-afternoon-root convention, same
     # as morning/midday, so the bundled production layout keeps working.
@@ -951,12 +1061,18 @@ def test_resolve_cross_stream_prior_allocation_roots_intraday_override_covered_b
         json.dumps({"artifact_paths": {"live_run_state_root": str(relocated_root)}}),
         encoding="utf-8",
     )
-    monkeypatch.setenv("DCA_INTRADAY_LIVE_STATE_ROOT", str(relocated_root / "intraday_dca"))
+    monkeypatch.setenv(
+        "DCA_INTRADAY_LIVE_STATE_ROOT", str(relocated_root / "intraday_dca")
+    )
 
-    roots = _resolve_cross_stream_prior_allocation_roots(str(config_dir), afternoon_root)
+    roots = _resolve_cross_stream_prior_allocation_roots(
+        str(config_dir), afternoon_root
+    )
     resolved = {r.resolve() for r in roots}
     assert relocated_root.resolve() in resolved  # the ancestor covering the override
-    assert (cron_base / "intraday_dca").resolve() not in resolved  # stale fallback dropped
+    assert (
+        cron_base / "intraday_dca"
+    ).resolve() not in resolved  # stale fallback dropped
 
 
 def test_resolve_cross_stream_prior_allocation_roots_intraday_override_equals_fallback_survives(
@@ -986,7 +1102,7 @@ def test_resolve_cross_stream_prior_allocation_roots_intraday_override_nested_un
     # DCA_INTRADAY_LIVE_STATE_ROOT is set to a path NESTED under the
     # conventional cron_base/intraday_dca fallback (e.g. a "relocated"
     # subdirectory), the override must be scanned INSTEAD of the broader
-    # fallback, not merely alongside/covered-by it. An earlier iteration kept the
+    # fallback, not merely alongside/covered-by it. An earlier fix kept the
     # broader fallback in this case (to avoid losing coverage entirely), but
     # that scans every legacy artifact elsewhere under cron_base/intraday_dca
     # too -- not just the relocated tree the operator configured -- which can
@@ -1007,7 +1123,9 @@ def test_resolve_cross_stream_prior_allocation_roots_intraday_override_nested_un
     assert (cron_base / "intraday_dca").resolve() not in resolved
 
 
-def test_resolve_cross_stream_prior_allocation_roots_market_open_sibling_fallback(tmp_path):
+def test_resolve_cross_stream_prior_allocation_roots_market_open_sibling_fallback(
+    tmp_path,
+):
     # With no DCA_MARKET_OPEN_LIVE_STATE_ROOT override, the market-open root
     # still falls back to the sibling-of-afternoon-root convention, same as
     # morning/midday/intraday, so the bundled production layout keeps
@@ -1152,12 +1270,18 @@ def test_resolve_cross_stream_prior_allocation_roots_market_open_override_covere
         json.dumps({"artifact_paths": {"live_run_state_root": str(relocated_root)}}),
         encoding="utf-8",
     )
-    monkeypatch.setenv("DCA_MARKET_OPEN_LIVE_STATE_ROOT", str(relocated_root / "market_open_dca"))
+    monkeypatch.setenv(
+        "DCA_MARKET_OPEN_LIVE_STATE_ROOT", str(relocated_root / "market_open_dca")
+    )
 
-    roots = _resolve_cross_stream_prior_allocation_roots(str(config_dir), afternoon_root)
+    roots = _resolve_cross_stream_prior_allocation_roots(
+        str(config_dir), afternoon_root
+    )
     resolved = {r.resolve() for r in roots}
     assert relocated_root.resolve() in resolved  # the ancestor covering the override
-    assert (cron_base / "market_open_dca").resolve() not in resolved  # stale fallback dropped
+    assert (
+        cron_base / "market_open_dca"
+    ).resolve() not in resolved  # stale fallback dropped
 
 
 def test_resolve_cross_stream_prior_allocation_roots_market_open_override_equals_fallback_survives(
@@ -1170,7 +1294,9 @@ def test_resolve_cross_stream_prior_allocation_roots_market_open_override_equals
 
     afternoon_root = tmp_path / "cron_tracking" / "ce16ba6b"
     cron_base = afternoon_root.parent
-    monkeypatch.setenv("DCA_MARKET_OPEN_LIVE_STATE_ROOT", str(cron_base / "market_open_dca"))
+    monkeypatch.setenv(
+        "DCA_MARKET_OPEN_LIVE_STATE_ROOT", str(cron_base / "market_open_dca")
+    )
 
     roots = _resolve_cross_stream_prior_allocation_roots(None, afternoon_root)
     resolved = {r.resolve() for r in roots}
@@ -1204,22 +1330,35 @@ def test_run_pipeline_explicit_prior_root_uses_run_time_boundary(tmp_path):
     manual_dir.mkdir(parents=True)
     now = _now()
     (manual_dir / "run_state.json").write_text(
-        json.dumps({
-            "trading_day": now.date().isoformat(),
-            "generated_at": datetime.combine(now.date(), time(15, 5), tzinfo=EASTERN).isoformat(),
-            "run_classification": {"run_origin": "manual", "run_id": "manual_1505"},
-            "buy_candidates": [
-                {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0, "target_price": 0.01},
-            ],
-        }),
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "generated_at": datetime.combine(
+                    now.date(), time(15, 5), tzinfo=EASTERN
+                ).isoformat(),
+                "run_classification": {"run_origin": "manual", "run_id": "manual_1505"},
+                "buy_candidates": [
+                    {
+                        "ticker": "AAPL",
+                        "status": "submitted",
+                        "planned_amount_usd": 3.0,
+                        "target_price": 0.01,
+                    },
+                ],
+            }
+        ),
         encoding="utf-8",
     )
 
     config = _demo_config()
     result = run_pipeline(
-        now, config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=tmp_path / "scheduled",
+        now,
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=tmp_path / "scheduled",
         prior_allocation_state_root=prior_root,
     )
 
@@ -1230,7 +1369,9 @@ def test_run_pipeline_explicit_prior_root_uses_run_time_boundary(tmp_path):
     assert by_ticker["AAPL"]["top_up_guard_result"] != "no_prior_run"
 
 
-def test_run_pipeline_explicit_prior_root_does_not_leak_sibling_manual_context(tmp_path):
+def test_run_pipeline_explicit_prior_root_does_not_leak_sibling_manual_context(
+    tmp_path,
+):
     import json
 
     # Codex review r3626083298 ("Respect explicit prior-allocation root
@@ -1247,19 +1388,21 @@ def test_run_pipeline_explicit_prior_root_does_not_leak_sibling_manual_context(t
     sibling_manual_dir.mkdir(parents=True)
     now = _now()
     (sibling_manual_dir / "run_state.json").write_text(
-        json.dumps({
-            "trading_day": now.date().isoformat(),
-            "generated_at": f"{now.date().isoformat()}T13:45:00-04:00",
-            "run_classification": {
-                "run_origin": "manual",
-                "manual_run": True,
-                "run_id": "manual_midday_20260706_1345ET",
+        json.dumps(
+            {
                 "trading_day": now.date().isoformat(),
-                "same_day_top_up_context_only": True,
-                "valid_scheduled_evidence": False,
-                "valid_afternoon_scheduled_evidence": False,
-            },
-        }),
+                "generated_at": f"{now.date().isoformat()}T13:45:00-04:00",
+                "run_classification": {
+                    "run_origin": "manual",
+                    "manual_run": True,
+                    "run_id": "manual_midday_20260706_1345ET",
+                    "trading_day": now.date().isoformat(),
+                    "same_day_top_up_context_only": True,
+                    "valid_scheduled_evidence": False,
+                    "valid_afternoon_scheduled_evidence": False,
+                },
+            }
+        ),
         encoding="utf-8",
     )
     (sibling_manual_dir / "submitted_orders.csv").write_text(
@@ -1270,9 +1413,13 @@ def test_run_pipeline_explicit_prior_root_does_not_leak_sibling_manual_context(t
 
     config = _demo_config()
     result = run_pipeline(
-        now, config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=tmp_path / "scheduled",
+        now,
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=tmp_path / "scheduled",
         prior_allocation_state_root=explicit_root,
     )
 
@@ -1296,23 +1443,37 @@ def test_run_pipeline_scheduled_run_loads_sibling_stream_roots_to_run_time(tmp_p
     prior_dir = midday_root / "manual_reruns" / "1505"
     prior_dir.mkdir(parents=True)
     (prior_dir / "run_state.json").write_text(
-        json.dumps({
-            "trading_day": _now().date().isoformat(),
-            "generated_at": f"{_now().date().isoformat()}T15:05:00-04:00",
-            "run_classification": {"run_origin": "manual", "run_id": "midday_manual_1505"},
-            "buy_candidates": [
-                {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0, "target_price": 0.01},
-            ],
-        }),
+        json.dumps(
+            {
+                "trading_day": _now().date().isoformat(),
+                "generated_at": f"{_now().date().isoformat()}T15:05:00-04:00",
+                "run_classification": {
+                    "run_origin": "manual",
+                    "run_id": "midday_manual_1505",
+                },
+                "buy_candidates": [
+                    {
+                        "ticker": "AAPL",
+                        "status": "submitted",
+                        "planned_amount_usd": 3.0,
+                        "target_price": 0.01,
+                    },
+                ],
+            }
+        ),
         encoding="utf-8",
     )
 
     config = _demo_config()
     scheduled_dir = afternoon_root / "scheduled_runs" / "20260706_1530ET"
     result = run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=scheduled_dir,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=scheduled_dir,
     )
 
     assert result["blocked"] is False
@@ -1376,7 +1537,9 @@ def test_tickers_with_unresolved_same_day_context():
     assert _tickers_with_unresolved_same_day_context(allocations) == ["AAPL", "TSLA"]
 
 
-def test_run_pipeline_bounded_reload_resolves_unresolved_same_day_context(tmp_path, monkeypatch):
+def test_run_pipeline_bounded_reload_resolves_unresolved_same_day_context(
+    tmp_path, monkeypatch
+):
     # Canonical rule item 13: "if same-day context cannot be resolved for one
     # ticker, perform one bounded same-day context reload, then fail only
     # that ticker closed." Simulate an artifact that only becomes resolvable
@@ -1397,7 +1560,10 @@ def test_run_pipeline_bounded_reload_resolves_unresolved_same_day_context(tmp_pa
             return (
                 {
                     "AAPL": PriorSameDayAllocation(
-                        "AAPL", amount_usd=3.0, reference_price=None, selected_base_amount_usd=2.0
+                        "AAPL",
+                        amount_usd=3.0,
+                        reference_price=None,
+                        selected_base_amount_usd=2.0,
                     )
                 },
                 False,
@@ -1408,20 +1574,30 @@ def test_run_pipeline_bounded_reload_resolves_unresolved_same_day_context(tmp_pa
         return (
             {
                 "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=3.0, reference_price=0.01, run_id="am", source="manual",
+                    "AAPL",
+                    amount_usd=3.0,
+                    reference_price=0.01,
+                    run_id="am",
+                    source="manual",
                     selected_base_amount_usd=2.0,
                 )
             },
             False,
         )
 
-    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    monkeypatch.setattr(
+        run_dca, "_compute_auto_derived_prior_allocations", _fake_compute
+    )
 
     config = _demo_config()
     result = run_dca.run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=tmp_path,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=tmp_path,
     )
 
     assert len(calls) == 2  # exactly one bounded reload, not an unbounded retry loop
@@ -1433,7 +1609,10 @@ def test_run_pipeline_bounded_reload_resolves_unresolved_same_day_context(tmp_pa
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
     # If the stale (unresolved) first-call result had been used instead of the
     # reload, this would be "missing_prior_price" with top_up_manual_review=True.
-    assert by_ticker["AAPL"]["top_up_guard_result"] == "same_day_topup_not_lower_or_no_delta"
+    assert (
+        by_ticker["AAPL"]["top_up_guard_result"]
+        == "same_day_topup_not_lower_or_no_delta"
+    )
     assert by_ticker["AAPL"]["top_up_manual_review"] is False
 
 
@@ -1475,35 +1654,9 @@ def test_compute_auto_derived_prior_allocations_reports_scan_had_failures(tmp_pa
     assert scan_had_failures is True
 
 
-def test_run_pipeline_logs_error_when_bounded_reload_scan_still_fails(tmp_path, monkeypatch, caplog):
-    import run_dca
-
-    calls = 0
-
-    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
-        nonlocal calls
-        calls += 1
-        return {}, True
-
-    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
-
-    config = _demo_config()
-    with caplog.at_level("ERROR", logger=run_dca.logger.name):
-        run_dca.run_pipeline(
-            _now(), config, StrategyState(),
-            DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-            build_broker(config), artifacts_dir=tmp_path,
-        )
-
-    assert calls == 2
-    assert any(
-        record.levelname == "ERROR"
-        and "still had unreadable/unparseable artifacts after the bounded reload" in record.getMessage()
-        for record in caplog.records
-    )
-
-
-def test_run_pipeline_bounded_reload_preserves_already_resolved_ticker(tmp_path, monkeypatch):
+def test_run_pipeline_bounded_reload_preserves_already_resolved_ticker(
+    tmp_path, monkeypatch
+):
     # Codex review ("Preserve resolved ticker context across the reload"): the
     # bounded reload exists to give an UNRESOLVED ticker a second chance, not
     # to let a transient scan hiccup on the SECOND pass silently discard a
@@ -1522,28 +1675,56 @@ def test_run_pipeline_bounded_reload_preserves_already_resolved_ticker(tmp_path,
         if len(calls) == 1:
             return (
                 {
-                    "AAPL": PriorSameDayAllocation("AAPL", amount_usd=3.0, reference_price=None, selected_base_amount_usd=2.0),
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL",
+                        amount_usd=3.0,
+                        reference_price=None,
+                        selected_base_amount_usd=2.0,
+                    ),
                     "MSFT": PriorSameDayAllocation(
-                        "MSFT", amount_usd=2.0, reference_price=0.01, run_id="am", source="manual", selected_base_amount_usd=2.0),
+                        "MSFT",
+                        amount_usd=2.0,
+                        reference_price=0.01,
+                        run_id="am",
+                        source="manual",
+                        selected_base_amount_usd=2.0,
+                    ),
                 },
                 False,
             )
         return (
             {
                 "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=3.0, reference_price=0.01, run_id="am", source="manual", selected_base_amount_usd=2.0),
-                "MSFT": PriorSameDayAllocation("MSFT", amount_usd=2.0, reference_price=None, selected_base_amount_usd=2.0),
+                    "AAPL",
+                    amount_usd=3.0,
+                    reference_price=0.01,
+                    run_id="am",
+                    source="manual",
+                    selected_base_amount_usd=2.0,
+                ),
+                "MSFT": PriorSameDayAllocation(
+                    "MSFT",
+                    amount_usd=2.0,
+                    reference_price=None,
+                    selected_base_amount_usd=2.0,
+                ),
             },
             False,
         )
 
-    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    monkeypatch.setattr(
+        run_dca, "_compute_auto_derived_prior_allocations", _fake_compute
+    )
 
     config = _demo_config()
     result = run_dca.run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=tmp_path,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=tmp_path,
     )
 
     assert len(calls) == 2  # exactly one bounded reload, not an unbounded retry loop
@@ -1554,11 +1735,17 @@ def test_run_pipeline_bounded_reload_preserves_already_resolved_ticker(tmp_path,
         run_state = json.load(handle)
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
     # AAPL used the reloaded (resolved) data.
-    assert by_ticker["AAPL"]["top_up_guard_result"] == "same_day_topup_not_lower_or_no_delta"
+    assert (
+        by_ticker["AAPL"]["top_up_guard_result"]
+        == "same_day_topup_not_lower_or_no_delta"
+    )
     # MSFT kept its first-pass (resolved) data. If the whole mapping had been
     # replaced with pass two's result, MSFT would fall back to the
     # missing_prior_price / manual_review $0 path instead.
-    assert by_ticker["MSFT"]["top_up_guard_result"] == "same_day_topup_not_lower_or_no_delta"
+    assert (
+        by_ticker["MSFT"]["top_up_guard_result"]
+        == "same_day_topup_not_lower_or_no_delta"
+    )
     assert by_ticker["MSFT"]["top_up_manual_review"] is False
 
 
@@ -1583,9 +1770,15 @@ def test_run_pipeline_bounded_reload_uses_recovered_larger_amount_for_resolved_t
         if len(calls) == 1:
             return (
                 {
-                    "AAPL": PriorSameDayAllocation("AAPL", amount_usd=3.0, reference_price=None),
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", amount_usd=3.0, reference_price=None
+                    ),
                     "MSFT": PriorSameDayAllocation(
-                        "MSFT", amount_usd=2.0, reference_price=0.01, run_id="am", source="manual"
+                        "MSFT",
+                        amount_usd=2.0,
+                        reference_price=0.01,
+                        run_id="am",
+                        source="manual",
                     ),
                 },
                 False,
@@ -1593,24 +1786,38 @@ def test_run_pipeline_bounded_reload_uses_recovered_larger_amount_for_resolved_t
         return (
             {
                 "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=3.0, reference_price=0.01, run_id="am", source="manual"
+                    "AAPL",
+                    amount_usd=3.0,
+                    reference_price=0.01,
+                    run_id="am",
+                    source="manual",
                 ),
                 # Recovered a second, previously-unreadable artifact for
                 # MSFT: the amount grew from $2 to $6, still resolved.
                 "MSFT": PriorSameDayAllocation(
-                    "MSFT", amount_usd=6.0, reference_price=0.01, run_id="am2", source="manual"
+                    "MSFT",
+                    amount_usd=6.0,
+                    reference_price=0.01,
+                    run_id="am2",
+                    source="manual",
                 ),
             },
             False,
         )
 
-    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    monkeypatch.setattr(
+        run_dca, "_compute_auto_derived_prior_allocations", _fake_compute
+    )
 
     config = _demo_config()
     result = run_dca.run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=tmp_path,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=tmp_path,
     )
 
     assert len(calls) == 2
@@ -1649,22 +1856,41 @@ def test_run_pipeline_bounded_reload_trusts_clean_reload_after_dirty_first_pass(
             return (
                 {
                     "AAPL": PriorSameDayAllocation(
-                        "AAPL", amount_usd=2.0, reference_price=98.0, run_id="am", source="manual", selected_base_amount_usd=2.0)
+                        "AAPL",
+                        amount_usd=2.0,
+                        reference_price=98.0,
+                        run_id="am",
+                        source="manual",
+                        selected_base_amount_usd=2.0,
+                    )
                 },
                 True,
             )
         return (
-            {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=5.0, reference_price=None, selected_base_amount_usd=2.0)},
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL",
+                    amount_usd=5.0,
+                    reference_price=None,
+                    selected_base_amount_usd=2.0,
+                )
+            },
             False,
         )
 
-    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    monkeypatch.setattr(
+        run_dca, "_compute_auto_derived_prior_allocations", _fake_compute
+    )
 
     config = _demo_config()
     result = run_dca.run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=tmp_path,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=tmp_path,
     )
 
     assert len(calls) == 2
@@ -1681,7 +1907,9 @@ def test_run_pipeline_bounded_reload_trusts_clean_reload_after_dirty_first_pass(
     assert by_ticker["AAPL"]["prior_same_day_amount"] == 5.0
 
 
-def test_run_pipeline_bounded_reload_accepts_corrected_reference_price(tmp_path, monkeypatch):
+def test_run_pipeline_bounded_reload_accepts_corrected_reference_price(
+    tmp_path, monkeypatch
+):
     # Codex review ("Accept updated references from a clean reload"): AAPL's
     # first pass reads a full-report CSV-only allocation at a preliminary
     # fill price ($2 at $100). By the clean reload, the same $2 notional has
@@ -1701,7 +1929,11 @@ def test_run_pipeline_bounded_reload_accepts_corrected_reference_price(tmp_path,
             return (
                 {
                     "AAPL": PriorSameDayAllocation(
-                        "AAPL", amount_usd=2.0, reference_price=100.0, run_id="am", source="manual"
+                        "AAPL",
+                        amount_usd=2.0,
+                        reference_price=100.0,
+                        run_id="am",
+                        source="manual",
                     )
                 },
                 True,
@@ -1709,19 +1941,29 @@ def test_run_pipeline_bounded_reload_accepts_corrected_reference_price(tmp_path,
         return (
             {
                 "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=2.0, reference_price=90.0, run_id="am2", source="manual"
+                    "AAPL",
+                    amount_usd=2.0,
+                    reference_price=90.0,
+                    run_id="am2",
+                    source="manual",
                 )
             },
             False,
         )
 
-    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    monkeypatch.setattr(
+        run_dca, "_compute_auto_derived_prior_allocations", _fake_compute
+    )
 
     config = _demo_config()
     result = run_dca.run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=tmp_path,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=tmp_path,
     )
 
     assert len(calls) == 2
@@ -1759,7 +2001,14 @@ def test_run_pipeline_bounded_reload_keeps_unresolved_when_reload_is_incomplete(
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return (
-                {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=5.0, reference_price=None, selected_base_amount_usd=2.0)},
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL",
+                        amount_usd=5.0,
+                        reference_price=None,
+                        selected_base_amount_usd=2.0,
+                    )
+                },
                 False,
             )
         # Reload lost the $3 unconfirmed-submission artifact: smaller
@@ -1768,18 +2017,30 @@ def test_run_pipeline_bounded_reload_keeps_unresolved_when_reload_is_incomplete(
         return (
             {
                 "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=2.0, reference_price=98.0, run_id="am", source="manual", selected_base_amount_usd=2.0)
+                    "AAPL",
+                    amount_usd=2.0,
+                    reference_price=98.0,
+                    run_id="am",
+                    source="manual",
+                    selected_base_amount_usd=2.0,
+                )
             },
             False,
         )
 
-    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    monkeypatch.setattr(
+        run_dca, "_compute_auto_derived_prior_allocations", _fake_compute
+    )
 
     config = _demo_config()
     result = run_dca.run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=tmp_path,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=tmp_path,
     )
 
     assert len(calls) == 2
@@ -1809,7 +2070,7 @@ def test_run_pipeline_bounded_reload_preserves_uncertainty_on_equal_swapped_tota
     # amount, price newly resolved" here would silently understate the
     # true $10 prior spend as a falsely-confident $5. Both scans report
     # scan_had_failures=True (each genuinely skipped one artifact), which
-    # is the signal the logic uses to refuse this equal-amount "resolution."
+    # is the signal the fix uses to refuse this equal-amount "resolution."
     import run_dca
     from near_close_dca import PriorSameDayAllocation
 
@@ -1819,24 +2080,43 @@ def test_run_pipeline_bounded_reload_preserves_uncertainty_on_equal_swapped_tota
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return (
-                {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=5.0, reference_price=None, selected_base_amount_usd=2.0)},
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL",
+                        amount_usd=5.0,
+                        reference_price=None,
+                        selected_base_amount_usd=2.0,
+                    )
+                },
                 True,
             )
         return (
             {
                 "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=5.0, reference_price=98.0, run_id="am", source="manual", selected_base_amount_usd=2.0)
+                    "AAPL",
+                    amount_usd=5.0,
+                    reference_price=98.0,
+                    run_id="am",
+                    source="manual",
+                    selected_base_amount_usd=2.0,
+                )
             },
             True,
         )
 
-    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    monkeypatch.setattr(
+        run_dca, "_compute_auto_derived_prior_allocations", _fake_compute
+    )
 
     config = _demo_config()
     result = run_dca.run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=tmp_path,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=tmp_path,
     )
 
     assert len(calls) == 2
@@ -1865,7 +2145,7 @@ def test_run_pipeline_bounded_reload_preserves_uncertainty_on_unequal_swapped_to
     # parse THIS pass instead). $6 > $5 looks like a strictly more complete
     # answer by amount alone, but it silently discards the other real
     # contributor and its unresolved status. Both scans report
-    # scan_had_failures=True, which is the signal the logic uses to refuse
+    # scan_had_failures=True, which is the signal the fix uses to refuse
     # trusting either total as more complete than the other for this ticker.
     import run_dca
     from near_close_dca import PriorSameDayAllocation
@@ -1876,24 +2156,43 @@ def test_run_pipeline_bounded_reload_preserves_uncertainty_on_unequal_swapped_to
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return (
-                {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=5.0, reference_price=None, selected_base_amount_usd=2.0)},
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL",
+                        amount_usd=5.0,
+                        reference_price=None,
+                        selected_base_amount_usd=2.0,
+                    )
+                },
                 True,
             )
         return (
             {
                 "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=6.0, reference_price=98.0, run_id="am", source="manual", selected_base_amount_usd=2.0)
+                    "AAPL",
+                    amount_usd=6.0,
+                    reference_price=98.0,
+                    run_id="am",
+                    source="manual",
+                    selected_base_amount_usd=2.0,
+                )
             },
             True,
         )
 
-    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    monkeypatch.setattr(
+        run_dca, "_compute_auto_derived_prior_allocations", _fake_compute
+    )
 
     config = _demo_config()
     result = run_dca.run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=tmp_path,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=tmp_path,
     )
 
     assert len(calls) == 2
@@ -1937,18 +2236,30 @@ def test_run_pipeline_bounded_reload_keeps_newly_recovered_ticker_uncertain(
         return (
             {
                 "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=6.0, reference_price=98.0, run_id="am", source="manual", selected_base_amount_usd=2.0)
+                    "AAPL",
+                    amount_usd=6.0,
+                    reference_price=98.0,
+                    run_id="am",
+                    source="manual",
+                    selected_base_amount_usd=2.0,
+                )
             },
             True,
         )
 
-    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    monkeypatch.setattr(
+        run_dca, "_compute_auto_derived_prior_allocations", _fake_compute
+    )
 
     config = _demo_config()
     result = run_dca.run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=tmp_path,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=tmp_path,
     )
 
     assert len(calls) == 2
@@ -1973,13 +2284,13 @@ def test_run_pipeline_bounded_reload_poisons_resolved_ticker_on_reverse_swap(
     # above. The first pass reads a known-price $5 artifact for AAPL (a $6
     # unknown-price sibling artifact fails to parse that pass); the reload
     # then reads that $6 unknown-price artifact but misses the $5 one this
-    # time. Both passes report scan_had_failures=True. Before this correction,
+    # time. Both passes report scan_had_failures=True. Before this fix,
     # `elif not _reload_verified_complete: pass` blindly kept the first
     # pass's resolved $5/known-price allocation -- presenting FALSE
     # CONFIDENCE (a fully resolved, comparable amount) even though the true
     # same-day context is $11/unknown. The top-up guard could then submit
     # excess capital on top of an incomplete picture instead of failing this
-    # ticker closed. The merged result must be poisoned to unresolved,
+    # ticker closed. The fix must poison the merged result to unresolved,
     # using the larger ($6) of the two observed amounts as a conservative
     # floor.
     import run_dca
@@ -1991,24 +2302,43 @@ def test_run_pipeline_bounded_reload_poisons_resolved_ticker_on_reverse_swap(
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return (
-                {"AAPL": PriorSameDayAllocation("AAPL", amount_usd=5.0, reference_price=50.0, selected_base_amount_usd=2.0)},
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL",
+                        amount_usd=5.0,
+                        reference_price=50.0,
+                        selected_base_amount_usd=2.0,
+                    )
+                },
                 True,
             )
         return (
             {
                 "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=6.0, reference_price=None, run_id="am", source="manual", selected_base_amount_usd=2.0)
+                    "AAPL",
+                    amount_usd=6.0,
+                    reference_price=None,
+                    run_id="am",
+                    source="manual",
+                    selected_base_amount_usd=2.0,
+                )
             },
             True,
         )
 
-    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    monkeypatch.setattr(
+        run_dca, "_compute_auto_derived_prior_allocations", _fake_compute
+    )
 
     config = _demo_config()
     result = run_dca.run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=tmp_path,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=tmp_path,
     )
 
     assert len(calls) == 2
@@ -2038,7 +2368,7 @@ def test_run_pipeline_bounded_reload_poisons_conflict_after_clean_first_scan(
     # artifact for MSFT in the window between the two scans, so the reload
     # now sees MSFT at $6/unknown -- a genuine disagreement, not a scan
     # artifact. Gating the poison on the FIRST pass's scan_had_failures flag
-    # (as the prior implementation did) would miss this: that flag says nothing about
+    # (as the prior fix did) would miss this: that flag says nothing about
     # whether pass one's snapshot of MSFT specifically is still current.
     # Any disagreement observed while the reload is unverified must poison
     # to uncertain, regardless of whether the earlier scan reported a
@@ -2053,30 +2383,58 @@ def test_run_pipeline_bounded_reload_poisons_conflict_after_clean_first_scan(
         if len(calls) == 1:
             return (
                 {
-                    "AAPL": PriorSameDayAllocation("AAPL", amount_usd=5.0, reference_price=None, selected_base_amount_usd=2.0),
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL",
+                        amount_usd=5.0,
+                        reference_price=None,
+                        selected_base_amount_usd=2.0,
+                    ),
                     "MSFT": PriorSameDayAllocation(
-                        "MSFT", amount_usd=2.0, reference_price=50.0, run_id="am", source="manual", selected_base_amount_usd=2.0),
+                        "MSFT",
+                        amount_usd=2.0,
+                        reference_price=50.0,
+                        run_id="am",
+                        source="manual",
+                        selected_base_amount_usd=2.0,
+                    ),
                 },
                 False,
             )
         return (
             {
                 "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=5.0, reference_price=99.0, run_id="am", source="manual", selected_base_amount_usd=2.0),
+                    "AAPL",
+                    amount_usd=5.0,
+                    reference_price=99.0,
+                    run_id="am",
+                    source="manual",
+                    selected_base_amount_usd=2.0,
+                ),
                 # A sibling writer added a new MSFT artifact between the two
                 # scans -- a real change, not a parse race.
-                "MSFT": PriorSameDayAllocation("MSFT", amount_usd=6.0, reference_price=None, selected_base_amount_usd=2.0),
+                "MSFT": PriorSameDayAllocation(
+                    "MSFT",
+                    amount_usd=6.0,
+                    reference_price=None,
+                    selected_base_amount_usd=2.0,
+                ),
             },
             True,
         )
 
-    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    monkeypatch.setattr(
+        run_dca, "_compute_auto_derived_prior_allocations", _fake_compute
+    )
 
     config = _demo_config()
     result = run_dca.run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=tmp_path,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=tmp_path,
     )
 
     assert len(calls) == 2
@@ -2120,25 +2478,43 @@ def test_run_pipeline_bounded_reload_poisons_equal_metadata_swap(tmp_path, monke
             return (
                 {
                     "AAPL": PriorSameDayAllocation(
-                        "AAPL", amount_usd=5.0, reference_price=90.0, run_id="am", source="manual", selected_base_amount_usd=2.0)
+                        "AAPL",
+                        amount_usd=5.0,
+                        reference_price=90.0,
+                        run_id="am",
+                        source="manual",
+                        selected_base_amount_usd=2.0,
+                    )
                 },
                 True,
             )
         return (
             {
                 "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=5.0, reference_price=90.0, run_id="am2", source="manual", selected_base_amount_usd=2.0)
+                    "AAPL",
+                    amount_usd=5.0,
+                    reference_price=90.0,
+                    run_id="am2",
+                    source="manual",
+                    selected_base_amount_usd=2.0,
+                )
             },
             True,
         )
 
-    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    monkeypatch.setattr(
+        run_dca, "_compute_auto_derived_prior_allocations", _fake_compute
+    )
 
     config = _demo_config()
     result = run_dca.run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=tmp_path,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=tmp_path,
     )
 
     assert len(calls) == 2
@@ -2193,13 +2569,19 @@ def test_run_pipeline_bounded_reload_poisons_despite_matching_run_id_when_reload
         # full contributor set was read.
         return ({"AAPL": allocation}, True)
 
-    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    monkeypatch.setattr(
+        run_dca, "_compute_auto_derived_prior_allocations", _fake_compute
+    )
 
     config = _demo_config()
     result = run_dca.run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=tmp_path,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=tmp_path,
     )
 
     assert len(calls) == 2
@@ -2240,7 +2622,13 @@ def test_run_pipeline_bounded_reload_poisons_first_only_entry_after_incomplete_r
             return (
                 {
                     "AAPL": PriorSameDayAllocation(
-                        "AAPL", amount_usd=5.0, reference_price=50.0, run_id="am", source="manual", selected_base_amount_usd=2.0),
+                        "AAPL",
+                        amount_usd=5.0,
+                        reference_price=50.0,
+                        run_id="am",
+                        source="manual",
+                        selected_base_amount_usd=2.0,
+                    ),
                 },
                 True,
             )
@@ -2248,13 +2636,19 @@ def test_run_pipeline_bounded_reload_poisons_first_only_entry_after_incomplete_r
         # artifacts this pass.
         return ({}, True)
 
-    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    monkeypatch.setattr(
+        run_dca, "_compute_auto_derived_prior_allocations", _fake_compute
+    )
 
     config = _demo_config()
     result = run_dca.run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=tmp_path,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=tmp_path,
     )
 
     assert len(calls) == 2
@@ -2272,7 +2666,9 @@ def test_run_pipeline_bounded_reload_poisons_first_only_entry_after_incomplete_r
     assert by_ticker["AAPL"]["prior_same_day_amount"] == 5.0
 
 
-def test_run_pipeline_bounded_reload_accepts_corrected_base_from_clean_reload(tmp_path, monkeypatch):
+def test_run_pipeline_bounded_reload_accepts_corrected_base_from_clean_reload(
+    tmp_path, monkeypatch
+):
     # Codex review ("Accept corrected allocation bases from a clean reload"):
     # AAPL's amount and reference price are unchanged between passes, but its
     # selected_base_amount_usd is corrected from $2 (a preliminary/estimated
@@ -2292,8 +2688,13 @@ def test_run_pipeline_bounded_reload_accepts_corrected_base_from_clean_reload(tm
             return (
                 {
                     "AAPL": PriorSameDayAllocation(
-                        "AAPL", amount_usd=2.0, reference_price=50.0, run_id="am", source="manual",
-                        selected_base_amount_usd=2.0, selected_base_amount_usd_at="2026-06-29T09:00:00-04:00",
+                        "AAPL",
+                        amount_usd=2.0,
+                        reference_price=50.0,
+                        run_id="am",
+                        source="manual",
+                        selected_base_amount_usd=2.0,
+                        selected_base_amount_usd_at="2026-06-29T09:00:00-04:00",
                     )
                 },
                 True,
@@ -2301,20 +2702,31 @@ def test_run_pipeline_bounded_reload_accepts_corrected_base_from_clean_reload(tm
         return (
             {
                 "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=2.0, reference_price=50.0, run_id="am2", source="manual",
-                    selected_base_amount_usd=1.0, selected_base_amount_usd_at="2026-06-29T09:00:00-04:00",
+                    "AAPL",
+                    amount_usd=2.0,
+                    reference_price=50.0,
+                    run_id="am2",
+                    source="manual",
+                    selected_base_amount_usd=1.0,
+                    selected_base_amount_usd_at="2026-06-29T09:00:00-04:00",
                 )
             },
             False,
         )
 
-    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    monkeypatch.setattr(
+        run_dca, "_compute_auto_derived_prior_allocations", _fake_compute
+    )
 
     config = _demo_config()
     result = run_dca.run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=tmp_path,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=tmp_path,
     )
 
     assert len(calls) == 2
@@ -2356,8 +2768,13 @@ def test_run_pipeline_bounded_reload_poisons_reference_when_accepting_corrected_
             return (
                 {
                     "AAPL": PriorSameDayAllocation(
-                        "AAPL", amount_usd=2.0, reference_price=100.0, run_id="am", source="manual",
-                        selected_base_amount_usd=1.0, selected_base_amount_usd_at="2026-06-29T09:00:00-04:00",
+                        "AAPL",
+                        amount_usd=2.0,
+                        reference_price=100.0,
+                        run_id="am",
+                        source="manual",
+                        selected_base_amount_usd=1.0,
+                        selected_base_amount_usd_at="2026-06-29T09:00:00-04:00",
                     )
                 },
                 True,
@@ -2365,20 +2782,31 @@ def test_run_pipeline_bounded_reload_poisons_reference_when_accepting_corrected_
         return (
             {
                 "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=2.0, reference_price=None, run_id="am2", source="manual",
-                    selected_base_amount_usd=2.0, selected_base_amount_usd_at="2026-06-29T09:00:00-04:00",
+                    "AAPL",
+                    amount_usd=2.0,
+                    reference_price=None,
+                    run_id="am2",
+                    source="manual",
+                    selected_base_amount_usd=2.0,
+                    selected_base_amount_usd_at="2026-06-29T09:00:00-04:00",
                 )
             },
             False,
         )
 
-    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    monkeypatch.setattr(
+        run_dca, "_compute_auto_derived_prior_allocations", _fake_compute
+    )
 
     config = _demo_config()
     result = run_dca.run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=tmp_path,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=tmp_path,
     )
 
     assert len(calls) == 2
@@ -2395,7 +2823,9 @@ def test_run_pipeline_bounded_reload_poisons_reference_when_accepting_corrected_
     assert by_ticker["AAPL"]["selected_base_amount_usd"] == 2.0
 
 
-def test_run_pipeline_bounded_reload_treats_base_only_change_as_conflict(tmp_path, monkeypatch):
+def test_run_pipeline_bounded_reload_treats_base_only_change_as_conflict(
+    tmp_path, monkeypatch
+):
     # Codex review ("Include base metadata in incomplete-reload conflicts"):
     # MSFT is unresolved on pass one, triggering the bounded reload. AAPL's
     # pass-one read is clean (amount $2, reference $100, base $2). The
@@ -2418,33 +2848,55 @@ def test_run_pipeline_bounded_reload_treats_base_only_change_as_conflict(tmp_pat
             return (
                 {
                     "AAPL": PriorSameDayAllocation(
-                        "AAPL", amount_usd=2.0, reference_price=100.0, run_id="am", source="manual",
-                        selected_base_amount_usd=2.0, selected_base_amount_usd_at="2026-06-29T09:00:00-04:00",
+                        "AAPL",
+                        amount_usd=2.0,
+                        reference_price=100.0,
+                        run_id="am",
+                        source="manual",
+                        selected_base_amount_usd=2.0,
+                        selected_base_amount_usd_at="2026-06-29T09:00:00-04:00",
                     ),
-                    "MSFT": PriorSameDayAllocation("MSFT", amount_usd=3.0, reference_price=None),
+                    "MSFT": PriorSameDayAllocation(
+                        "MSFT", amount_usd=3.0, reference_price=None
+                    ),
                 },
                 False,
             )
         return (
             {
                 "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=2.0, reference_price=100.0, run_id="am2", source="manual",
-                    selected_base_amount_usd=1.0, selected_base_amount_usd_at="2026-06-29T09:00:00-04:00",
+                    "AAPL",
+                    amount_usd=2.0,
+                    reference_price=100.0,
+                    run_id="am2",
+                    source="manual",
+                    selected_base_amount_usd=1.0,
+                    selected_base_amount_usd_at="2026-06-29T09:00:00-04:00",
                 ),
                 "MSFT": PriorSameDayAllocation(
-                    "MSFT", amount_usd=3.0, reference_price=40.0, run_id="am", source="manual"
+                    "MSFT",
+                    amount_usd=3.0,
+                    reference_price=40.0,
+                    run_id="am",
+                    source="manual",
                 ),
             },
             True,
         )
 
-    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    monkeypatch.setattr(
+        run_dca, "_compute_auto_derived_prior_allocations", _fake_compute
+    )
 
     config = _demo_config()
     result = run_dca.run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=tmp_path,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=tmp_path,
     )
 
     assert len(calls) == 2
@@ -2490,28 +2942,57 @@ def test_run_pipeline_bounded_reload_poisons_stale_reference_on_smaller_clean_re
             return (
                 {
                     "AAPL": PriorSameDayAllocation(
-                        "AAPL", amount_usd=5.0, reference_price=100.0, run_id="am", source="manual", selected_base_amount_usd=2.0),
-                    "MSFT": PriorSameDayAllocation("MSFT", amount_usd=3.0, reference_price=None, selected_base_amount_usd=2.0),
+                        "AAPL",
+                        amount_usd=5.0,
+                        reference_price=100.0,
+                        run_id="am",
+                        source="manual",
+                        selected_base_amount_usd=2.0,
+                    ),
+                    "MSFT": PriorSameDayAllocation(
+                        "MSFT",
+                        amount_usd=3.0,
+                        reference_price=None,
+                        selected_base_amount_usd=2.0,
+                    ),
                 },
                 False,
             )
         return (
             {
                 "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=4.0, reference_price=90.0, run_id="am2", source="manual", selected_base_amount_usd=2.0),
+                    "AAPL",
+                    amount_usd=4.0,
+                    reference_price=90.0,
+                    run_id="am2",
+                    source="manual",
+                    selected_base_amount_usd=2.0,
+                ),
                 "MSFT": PriorSameDayAllocation(
-                    "MSFT", amount_usd=3.0, reference_price=40.0, run_id="am", source="manual", selected_base_amount_usd=2.0),
+                    "MSFT",
+                    amount_usd=3.0,
+                    reference_price=40.0,
+                    run_id="am",
+                    source="manual",
+                    selected_base_amount_usd=2.0,
+                ),
             },
             False,
         )
 
-    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    monkeypatch.setattr(
+        run_dca, "_compute_auto_derived_prior_allocations", _fake_compute
+    )
 
     config = _demo_config()
     result = run_dca.run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=tmp_path,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=tmp_path,
     )
 
     assert len(calls) == 2
@@ -2552,33 +3033,55 @@ def test_run_pipeline_bounded_reload_poisons_base_change_on_smaller_clean_reload
             return (
                 {
                     "AAPL": PriorSameDayAllocation(
-                        "AAPL", amount_usd=5.0, reference_price=100.0, run_id="am", source="manual",
-                        selected_base_amount_usd=2.0, selected_base_amount_usd_at="2026-06-29T09:00:00-04:00",
+                        "AAPL",
+                        amount_usd=5.0,
+                        reference_price=100.0,
+                        run_id="am",
+                        source="manual",
+                        selected_base_amount_usd=2.0,
+                        selected_base_amount_usd_at="2026-06-29T09:00:00-04:00",
                     ),
-                    "MSFT": PriorSameDayAllocation("MSFT", amount_usd=3.0, reference_price=None),
+                    "MSFT": PriorSameDayAllocation(
+                        "MSFT", amount_usd=3.0, reference_price=None
+                    ),
                 },
                 False,
             )
         return (
             {
                 "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=4.0, reference_price=100.0, run_id="am2", source="manual",
-                    selected_base_amount_usd=1.0, selected_base_amount_usd_at="2026-06-29T09:00:00-04:00",
+                    "AAPL",
+                    amount_usd=4.0,
+                    reference_price=100.0,
+                    run_id="am2",
+                    source="manual",
+                    selected_base_amount_usd=1.0,
+                    selected_base_amount_usd_at="2026-06-29T09:00:00-04:00",
                 ),
                 "MSFT": PriorSameDayAllocation(
-                    "MSFT", amount_usd=3.0, reference_price=40.0, run_id="am", source="manual"
+                    "MSFT",
+                    amount_usd=3.0,
+                    reference_price=40.0,
+                    run_id="am",
+                    source="manual",
                 ),
             },
             False,
         )
 
-    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    monkeypatch.setattr(
+        run_dca, "_compute_auto_derived_prior_allocations", _fake_compute
+    )
 
     config = _demo_config()
     result = run_dca.run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=tmp_path,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=tmp_path,
     )
 
     assert len(calls) == 2
@@ -2609,37 +3112,6 @@ def test_fills_from_orders_csv(tmp_path):
     assert fills[0]["order_id"] == "O1"
 
 
-def test_fills_from_orders_csv_malformed(tmp_path):
-    csv_path = tmp_path / "malformed_orders.csv"
-    csv_path.write_text(
-        "ticker,status,order_id,avg_fill_price,quantity_filled\n"
-        "AAPL,,O1,100.0,0.5\n"
-        "MSFT,filled,O2,,\n"
-        "TSLA,FiLleD,O3,200.0,0.1\n"
-        "GOOG\n"
-        "AMZN,filled,O4,150.0,\n"
-        "NFLX,filled,O5,,0.2\n",
-        encoding="utf-8",
-    )
-    fills = _fills_from_orders_csv(csv_path)
-
-    assert len(fills) == 1
-
-    assert fills[0]["ticker"] == "TSLA"
-    assert fills[0]["fill_price"] == "200.0"
-    assert fills[0]["filled_qty"] == "0.1"
-    assert fills[0]["order_id"] == "O3"
-
-    csv_path2 = tmp_path / "missing_cols_orders.csv"
-    csv_path2.write_text(
-        "ticker,order_id,avg_fill_price,quantity_filled\n"
-        "AAPL,O1,100.0,0.5\n",
-        encoding="utf-8",
-    )
-    fills2 = _fills_from_orders_csv(csv_path2)
-    assert len(fills2) == 0
-
-
 def test_execution_targets_from_orders_csv(tmp_path):
     from run_dca import _execution_targets_from_orders_csv
 
@@ -2663,9 +3135,7 @@ def test_refresh_fills_from_broker(tmp_path):
 
     csv_path = tmp_path / "orders.csv"
     csv_path.write_text(
-        "ticker,status,order_id\n"
-        "AAPL,submitted,O1\n"
-        "NVDA,filled,O2\n",
+        "ticker,status,order_id\n" "AAPL,submitted,O1\n" "NVDA,filled,O2\n",
         encoding="utf-8",
     )
 
@@ -2782,7 +3252,9 @@ def test_cli_refuses_without_demo(tmp_path):
 def test_cli_refuses_when_dry_run_false(tmp_path, monkeypatch):
     import run_dca
 
-    monkeypatch.setattr(run_dca, "load_strategy_config", lambda *a, **k: StrategyConfig(dry_run=False))
+    monkeypatch.setattr(
+        run_dca, "load_strategy_config", lambda *a, **k: StrategyConfig(dry_run=False)
+    )
     rc = run_dca.main(["--demo", "--artifacts-dir", str(tmp_path)])
     assert rc == 2
 
@@ -2796,9 +3268,13 @@ def test_run_pipeline_persists_raw_inputs_before_compute(tmp_path):
     quotes_file = tmp_path / "quotes.json"
     quotes_file.write_text('{"symbol": "AAPL", "price": 150.0}', encoding="utf-8")
     result = run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=scheduled_dir,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=scheduled_dir,
         raw_connector_inputs={"quotes_batch1.json": {"output_path": str(quotes_file)}},
     )
     assert result["blocked"] is False
@@ -2810,12 +3286,13 @@ def test_run_pipeline_persists_raw_inputs_before_compute(tmp_path):
     assert run_state["raw_inputs_saved"] == ["quotes_batch1.json"]
 
 
-def test_run_pipeline_raw_persistence_failure_preserves_prior_successful_raw_files(tmp_path):
+def test_run_pipeline_raw_persistence_failure_preserves_prior_successful_raw_files(
+    tmp_path,
+):
     # Codex review on PR #49: a same-day retry that fails to persist its own
     # raw connector responses must not destroy a PRIOR successful attempt's
     # durable raw/ files -- those are the audit/replay record for any live
     # orders that attempt already placed.
-
 
     class ExplodingPayload:
         pass
@@ -2826,9 +3303,13 @@ def test_run_pipeline_raw_persistence_failure_preserves_prior_successful_raw_fil
     quotes_file.write_text('{"symbol": "AAPL", "price": 150.0}', encoding="utf-8")
 
     first = run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=scheduled_dir,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=scheduled_dir,
         raw_connector_inputs={"quotes_batch1.json": {"output_path": str(quotes_file)}},
     )
     assert first["blocked"] is False
@@ -2837,13 +3318,19 @@ def test_run_pipeline_raw_persistence_failure_preserves_prior_successful_raw_fil
     prior_contents = raw_file.read_text(encoding="utf-8")
 
     second = run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=scheduled_dir,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=scheduled_dir,
         raw_connector_inputs={"quotes_batch1.json": ExplodingPayload()},
     )
     assert "raw_persistence_error" in second
-    assert raw_file.exists(), "prior successful run's raw file was destroyed by the failed retry"
+    assert (
+        raw_file.exists()
+    ), "prior successful run's raw file was destroyed by the failed retry"
     assert raw_file.read_text(encoding="utf-8") == prior_contents
 
 
@@ -2857,9 +3344,13 @@ def test_run_pipeline_raw_persistence_failure_writes_error_state(tmp_path):
     task_root = tmp_path / "cron_tracking" / "ce16ba6b"
     scheduled_dir = task_root / "scheduled_runs" / "20260706_1530ET"
     result = run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=scheduled_dir,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=scheduled_dir,
         raw_connector_inputs={"quotes_batch1.json": ExplodingPayload()},
     )
     assert "raw_persistence_error" in result
@@ -2880,7 +3371,10 @@ def test_run_pipeline_raw_persistence_failure_writes_contract_artifacts(tmp_path
     import csv as _csv
     import json
 
-    from scripts.scheduled_artifacts import SUBMITTED_ORDERS_FIELDS, validate_run_artifacts
+    from scripts.scheduled_artifacts import (
+        SUBMITTED_ORDERS_FIELDS,
+        validate_run_artifacts,
+    )
 
     class ExplodingPayload:
         pass
@@ -2893,9 +3387,13 @@ def test_run_pipeline_raw_persistence_failure_writes_contract_artifacts(tmp_path
     (scheduled_dir / "run_summary.json").write_text('{"stale": true}', encoding="utf-8")
 
     result = run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=scheduled_dir,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=scheduled_dir,
         raw_connector_inputs={"quotes_batch1.json": ExplodingPayload()},
     )
     assert "raw_persistence_error" in result
@@ -2912,7 +3410,10 @@ def test_run_pipeline_raw_persistence_failure_writes_contract_artifacts(tmp_path
 
     # the fail-closed state satisfies the contract (signals not required)
     assert validate_run_artifacts(
-        scheduled_dir, require_signals=False, require_submitted_orders=True, require_summary=True
+        scheduled_dir,
+        require_signals=False,
+        require_submitted_orders=True,
+        require_summary=True,
     )
 
 
@@ -2930,9 +3431,12 @@ def test_run_pipeline_raw_persistence_failure_clears_stale_compact_artifacts(tmp
     # preserved across retry failures so a successful prior run's fill records survive
     # (see test_run_pipeline_raw_persistence_failure_preserves_prior_order_artifacts).
     cleared_files = (
-        "latest_run_summary.json", "slippage_and_coverage_report.md",
-        "slippage_ranked.csv", "missing_fills_report.csv",
-        "notion_latest_run_compact.md", "notion_latest_run_payload.json",
+        "latest_run_summary.json",
+        "slippage_and_coverage_report.md",
+        "slippage_ranked.csv",
+        "missing_fills_report.csv",
+        "notion_latest_run_compact.md",
+        "notion_latest_run_payload.json",
     )
     for name in cleared_files:
         (scheduled_dir / name).write_text("stale", encoding="utf-8")
@@ -2942,9 +3446,13 @@ def test_run_pipeline_raw_persistence_failure_clears_stale_compact_artifacts(tmp
     (scheduled_dir / "signals.csv").write_text("stale", encoding="utf-8")
 
     result = run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=scheduled_dir,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=scheduled_dir,
         raw_connector_inputs={"quotes_batch1.json": ExplodingPayload()},
     )
     assert "raw_persistence_error" in result
@@ -3024,9 +3532,13 @@ def test_the_raw_failure_state_on_disk_carries_the_prior_orders(tmp_path):
     config = _demo_config()
 
     result = run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=scheduled_dir,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=scheduled_dir,
         raw_connector_inputs={"quotes_batch1.json": ExplodingPayload()},
     )
 
@@ -3074,9 +3586,13 @@ def test_a_carried_confirmation_required_row_leaves_the_denial_in_place(tmp_path
     config = _demo_config()
 
     result = run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=scheduled_dir,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=scheduled_dir,
         raw_connector_inputs={"quotes_batch1.json": ExplodingPayload()},
     )
 
@@ -3155,7 +3671,11 @@ def test_a_confirmation_required_row_is_carried_but_never_counted():
     from run_dca import _accepted_order_rows
 
     rows = [
-        {"ticker": "AAPL", "status": "not_submitted_confirmation_required", "order_id": ""},
+        {
+            "ticker": "AAPL",
+            "status": "not_submitted_confirmation_required",
+            "order_id": "",
+        },
         {"ticker": "MSFT", "status": "pending", "order_id": "ord-1"},
     ]
 
@@ -3165,7 +3685,13 @@ def test_a_confirmation_required_row_is_carried_but_never_counted():
     # An id can only come from the broker, so a row carrying one is kept
     # whatever its status.
     assert _accepted_order_rows(
-        [{"ticker": "AAPL", "status": "not_submitted_confirmation_required", "order_id": "ord-9"}]
+        [
+            {
+                "ticker": "AAPL",
+                "status": "not_submitted_confirmation_required",
+                "order_id": "ord-9",
+            }
+        ]
     )
 
 
@@ -3176,6 +3702,7 @@ def test_run_pipeline_raw_persistence_failure_preserves_prior_order_artifacts(tm
     a subsequent retry that fails at the raw-persistence step must preserve
     those fill records so reporting and cap accounting are not lost.
     """
+
     class ExplodingPayload:
         pass
 
@@ -3189,16 +3716,25 @@ def test_run_pipeline_raw_persistence_failure_preserves_prior_order_artifacts(tm
     prior_candidates_csv.write_text("ticker,amount\nAAPL,7.50\n", encoding="utf-8")
 
     result = run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=scheduled_dir,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=scheduled_dir,
         raw_connector_inputs={"quotes_batch1.json": ExplodingPayload()},
     )
     assert "raw_persistence_error" in result
     # Order artifacts from the prior successful run must survive.
     assert prior_orders_csv.exists(), "orders.csv was deleted by a retry failure"
-    assert prior_orders_csv.read_text(encoding="utf-8") == "ticker,order_id\nAAPL,ord-123\n"
-    assert prior_candidates_csv.exists(), "buy_candidates.csv was deleted by a retry failure"
+    assert (
+        prior_orders_csv.read_text(encoding="utf-8")
+        == "ticker,order_id\nAAPL,ord-123\n"
+    )
+    assert (
+        prior_candidates_csv.exists()
+    ), "buy_candidates.csv was deleted by a retry failure"
 
 
 def test_run_pipeline_live_run_missing_raw_inputs_writes_error_state(tmp_path):
@@ -3211,9 +3747,13 @@ def test_run_pipeline_live_run_missing_raw_inputs_writes_error_state(tmp_path):
     # The raw persistence error fires before any broker call, so a DryRunBroker is fine here.
     broker = DryRunBroker(account=config.target_account_number)
     result = run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        broker, artifacts_dir=scheduled_dir,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        broker,
+        artifacts_dir=scheduled_dir,
         raw_connector_inputs=None,
     )
     assert "raw_persistence_error" in result
@@ -3232,9 +3772,13 @@ def test_run_pipeline_live_run_empty_raw_inputs_writes_error_state(tmp_path):
     scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
     broker = DryRunBroker(account=config.target_account_number)
     result = run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        broker, artifacts_dir=scheduled_dir,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        broker,
+        artifacts_dir=scheduled_dir,
         raw_connector_inputs={},
     )
     assert "raw_persistence_error" in result
@@ -3255,11 +3799,17 @@ def test_run_pipeline_live_run_partial_raw_inputs_writes_error_state(tmp_path):
     quotes_file.write_text('{"symbol": "AAPL", "price": 150.0}', encoding="utf-8")
     broker = DryRunBroker(account=config.target_account_number)
     result = run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        broker, artifacts_dir=scheduled_dir,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        broker,
+        artifacts_dir=scheduled_dir,
         raw_connector_inputs={"quotes_batch1.json": {"output_path": str(quotes_file)}},
-        required_raw_filenames=frozenset({"quotes_batch1.json", "historicals_batch1.json"}),
+        required_raw_filenames=frozenset(
+            {"quotes_batch1.json", "historicals_batch1.json"}
+        ),
     )
     assert "raw_persistence_error" in result
     assert "historicals_batch1.json" in result["raw_persistence_error"]
@@ -3269,7 +3819,9 @@ def test_run_pipeline_live_run_partial_raw_inputs_writes_error_state(tmp_path):
     assert run_state["raw_inputs_saved"] == []
 
 
-def test_run_pipeline_late_failure_after_run_artifact_written_is_not_a_failed_start(tmp_path, monkeypatch):
+def test_run_pipeline_late_failure_after_run_artifact_written_is_not_a_failed_start(
+    tmp_path, monkeypatch
+):
     # guarded_run's run_artifact_written probe distinguishes a crash BEFORE any
     # artifact exists from an ordinary late error AFTER run_state.json was
     # already persisted (the generate_full_reports=True path can fail during
@@ -3298,9 +3850,14 @@ def test_run_pipeline_late_failure_after_run_artifact_written_is_not_a_failed_st
 
     with pytest.raises(RuntimeError, match="report generation exploded"):
         run_pipeline(
-            _now(), config, StrategyState(),
-            DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-            broker, artifacts_dir=artifacts_dir, generate_full_reports=True,
+            _now(),
+            config,
+            StrategyState(),
+            DemoDataProvider(SourceName.FINANCE),
+            DemoDataProvider(SourceName.ROBINHOOD),
+            broker,
+            artifacts_dir=artifacts_dir,
+            generate_full_reports=True,
             model_usage_log_root=model_usage_log_root,
         )
 
@@ -3311,7 +3868,9 @@ def test_run_pipeline_late_failure_after_run_artifact_written_is_not_a_failed_st
     assert marker["failure_phase"] == "after_run_artifact"
 
 
-def test_run_pipeline_stale_run_artifact_is_not_credited_to_a_later_failed_invocation(tmp_path, monkeypatch):
+def test_run_pipeline_stale_run_artifact_is_not_credited_to_a_later_failed_invocation(
+    tmp_path, monkeypatch
+):
     # A retry can reuse the SAME artifacts_dir as the attempt before it. An
     # existence-only probe would see the earlier invocation's run_state.json
     # and wrongly report after_run_artifact for a crash that THIS invocation
@@ -3345,14 +3904,22 @@ def test_run_pipeline_stale_run_artifact_is_not_credited_to_a_later_failed_invoc
 
     with pytest.raises(RuntimeError, match="crashed before writing anything"):
         run_pipeline(
-            _now(), config, StrategyState(),
-            DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-            broker, artifacts_dir=artifacts_dir, generate_full_reports=True,
+            _now(),
+            config,
+            StrategyState(),
+            DemoDataProvider(SourceName.FINANCE),
+            DemoDataProvider(SourceName.ROBINHOOD),
+            broker,
+            artifacts_dir=artifacts_dir,
+            generate_full_reports=True,
             model_usage_log_root=model_usage_log_root,
         )
 
     # The stale file is untouched -- still exactly the earlier attempt's content.
-    assert stale_run_state.read_text(encoding="utf-8") == '{"run_id": "stale_earlier_attempt"}'
+    assert (
+        stale_run_state.read_text(encoding="utf-8")
+        == '{"run_id": "stale_earlier_attempt"}'
+    )
     attempt_log_root = model_usage_log_root.parent / "attempt_log"
     marker_path = next(attempt_log_root.glob("*/afternoon.json"))
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
@@ -3375,20 +3942,26 @@ def test_build_frozen_providers_strict_finance_raises_on_live_run(tmp_path):
     broker = DryRunBroker(account=config.target_account_number)
     rh_only_inputs = {
         "quotes_batch1.json": {"results": [{"quote": {"symbol": "AAPL"}}]},
-        "historicals_batch1.json": {"results": [{"symbol": "AAPL", "interval": 5, "items": []}]},
+        "historicals_batch1.json": {
+            "results": [{"symbol": "AAPL", "interval": 5, "items": []}]
+        },
     }
     result = run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        broker, artifacts_dir=scheduled_dir,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        broker,
+        artifacts_dir=scheduled_dir,
         raw_connector_inputs=rh_only_inputs,
     )
-    assert "raw_persistence_error" in result, (
-        "Expected raw_persistence_error when finance raw files absent on a live run"
-    )
-    assert "finance" in result["raw_persistence_error"].lower(), (
-        f"Expected 'finance' in error message, got: {result['raw_persistence_error']!r}"
-    )
+    assert (
+        "raw_persistence_error" in result
+    ), "Expected raw_persistence_error when finance raw files absent on a live run"
+    assert (
+        "finance" in result["raw_persistence_error"].lower()
+    ), f"Expected 'finance' in error message, got: {result['raw_persistence_error']!r}"
     with open(result["run_state_path"], encoding="utf-8") as handle:
         run_state = _json.load(handle)
     assert run_state["order_submit_status"] == "not_submitted_error"
@@ -3413,17 +3986,21 @@ def test_build_frozen_providers_strict_robinhood_raises_on_live_run(tmp_path):
         "finance_close_batch1.json": {"results": []},
     }
     result = run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        broker, artifacts_dir=scheduled_dir,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        broker,
+        artifacts_dir=scheduled_dir,
         raw_connector_inputs=finance_only_inputs,
     )
-    assert "raw_persistence_error" in result, (
-        "Expected raw_persistence_error when Robinhood raw files absent on a live run"
-    )
-    assert "robinhood" in result["raw_persistence_error"].lower(), (
-        f"Expected 'robinhood' in error message, got: {result['raw_persistence_error']!r}"
-    )
+    assert (
+        "raw_persistence_error" in result
+    ), "Expected raw_persistence_error when Robinhood raw files absent on a live run"
+    assert (
+        "robinhood" in result["raw_persistence_error"].lower()
+    ), f"Expected 'robinhood' in error message, got: {result['raw_persistence_error']!r}"
     with open(result["run_state_path"], encoding="utf-8") as handle:
         run_state = _json.load(handle)
     assert run_state["order_submit_status"] == "not_submitted_error"
@@ -3448,7 +4025,9 @@ def test_build_frozen_providers_keeps_bid_ask_live(tmp_path):
     # A stale persisted quote with its own (deliberately different) price,
     # standing in for what a scheduler fetched well before placement time.
     (raw_dir / "quotes_batch1.json").write_text(
-        _json.dumps({"results": [{"quote": {"symbol": "AAPL", "last_trade_price": "1.0"}}]}),
+        _json.dumps(
+            {"results": [{"quote": {"symbol": "AAPL", "last_trade_price": "1.0"}}]}
+        ),
         encoding="utf-8",
     )
 
@@ -3457,12 +4036,16 @@ def test_build_frozen_providers_keeps_bid_ask_live(tmp_path):
             return (50.0, 51.0)
 
     _finance, robinhood = _build_frozen_providers_from_raw(
-        DemoDataProvider(SourceName.FINANCE), LiveStub(SourceName.ROBINHOOD), raw_dir,
+        DemoDataProvider(SourceName.FINANCE),
+        LiveStub(SourceName.ROBINHOOD),
+        raw_dir,
     )
     assert robinhood.get_bid_ask("AAPL", _now()) == (50.0, 51.0)
 
     _finance_no_live, robinhood_no_live = _build_frozen_providers_from_raw(
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD), raw_dir,
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        raw_dir,
     )
     assert robinhood_no_live.get_bid_ask("AAPL", _now()) is None
 
@@ -3484,22 +4067,37 @@ def test_build_frozen_providers_unwraps_doubly_nested_pointer_data(tmp_path):
     raw_dir = tmp_path / "raw"
     raw_dir.mkdir()
     raw_dir.joinpath("historicals_batch1.json").write_text(
-        _json.dumps({
-            "data": {"data": {
-                "results": [{
-                    "symbol": "AAPL",
-                    "interval": "5minute",
-                    "bars": [{"begins_at": "2026-07-06T14:00:00-04:00", "close_price": "100.0"}],
-                }],
-            }},
-        }),
+        _json.dumps(
+            {
+                "data": {
+                    "data": {
+                        "results": [
+                            {
+                                "symbol": "AAPL",
+                                "interval": "5minute",
+                                "bars": [
+                                    {
+                                        "begins_at": "2026-07-06T14:00:00-04:00",
+                                        "close_price": "100.0",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                },
+            }
+        ),
         encoding="utf-8",
     )
-    raw_dir.joinpath("quotes_batch1.json").write_text(_json.dumps({"results": []}), encoding="utf-8")
+    raw_dir.joinpath("quotes_batch1.json").write_text(
+        _json.dumps({"results": []}), encoding="utf-8"
+    )
 
     robinhood_live = DemoDataProvider(SourceName.ROBINHOOD)
     _finance, robinhood = _build_frozen_providers_from_raw(
-        DemoDataProvider(SourceName.FINANCE), robinhood_live, raw_dir,
+        DemoDataProvider(SourceName.FINANCE),
+        robinhood_live,
+        raw_dir,
     )
     bars = robinhood.get_intraday_bars(
         "AAPL",
@@ -3527,16 +4125,22 @@ def test_run_pipeline_retry_preserves_orders_after_place(tmp_path):
     prior_raw = scheduled_dir / "raw"
     prior_raw.mkdir()
     prior_oap_content = '{"orders": [{"ticker": "AAPL", "order_id": "prior-X1"}]}'
-    (prior_raw / "orders_after_place.json").write_text(prior_oap_content, encoding="utf-8")
+    (prior_raw / "orders_after_place.json").write_text(
+        prior_oap_content, encoding="utf-8"
+    )
 
     # Second run with new raw connector inputs. The dry-run broker never calls
     # get_raw_placement_responses, so no new orders_after_place.json is written.
     quotes_file = tmp_path / "quotes.json"
     quotes_file.write_text('{"symbol": "AAPL", "price": 150.0}', encoding="utf-8")
     result = run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        build_broker(config), artifacts_dir=scheduled_dir,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=scheduled_dir,
         raw_connector_inputs={"quotes_batch1.json": {"output_path": str(quotes_file)}},
     )
     assert result["blocked"] is False
@@ -3589,9 +4193,13 @@ def test_run_pipeline_partial_retry_merges_orders_after_place(tmp_path):
 
     broker = _BrokerWithResponses(account=config.target_account_number)
     run_pipeline(
-        _now(), config, StrategyState(),
-        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        broker, artifacts_dir=scheduled_dir,
+        _now(),
+        config,
+        StrategyState(),
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        broker,
+        artifacts_dir=scheduled_dir,
         raw_connector_inputs={
             "quotes_batch1.json": {"output_path": str(quotes_file)},
             "finance_bars_batch1.json": {"output_path": str(finance_bars_file)},
@@ -3600,9 +4208,12 @@ def test_run_pipeline_partial_retry_merges_orders_after_place(tmp_path):
     )
     oap = scheduled_dir / "raw" / "orders_after_place.json"
     assert oap.exists(), "orders_after_place.json missing after partial retry"
-    order_ids = {o["order_id"] for o in _json.loads(oap.read_text(encoding="utf-8"))["orders"]}
+    order_ids = {
+        o["order_id"] for o in _json.loads(oap.read_text(encoding="utf-8"))["orders"]
+    }
     assert "retry-Y2" in order_ids, "New MSFT order missing from merged file"
     assert "prior-X1" in order_ids, "Prior AAPL fill lost during partial retry"
+
 
 # --- New live-stream schema contracts (market_open, intraday) ---------------
 #
@@ -3656,9 +4267,16 @@ def test_market_open_run_classification_validates_against_json_schema():
     jsonschema = pytest.importorskip("jsonschema")
     import json
 
-    schema_path = Path(__file__).resolve().parent / "schemas" / "market_open_run_classification.schema.json"
+    schema_path = (
+        Path(__file__).resolve().parent
+        / "schemas"
+        / "market_open_run_classification.schema.json"
+    )
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
-    for rc in (_market_open_run_classification(manual=False), _market_open_run_classification(manual=True)):
+    for rc in (
+        _market_open_run_classification(manual=False),
+        _market_open_run_classification(manual=True),
+    ):
         jsonschema.validate(rc, schema)
 
 
@@ -3666,7 +4284,11 @@ def test_market_open_run_classification_rejects_wrong_cron_id():
     jsonschema = pytest.importorskip("jsonschema")
     import json
 
-    schema_path = Path(__file__).resolve().parent / "schemas" / "market_open_run_classification.schema.json"
+    schema_path = (
+        Path(__file__).resolve().parent
+        / "schemas"
+        / "market_open_run_classification.schema.json"
+    )
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
     bad = _market_open_run_classification(manual=False)
     bad["cron_id"] = "42173154"  # the morning task's cron_id, not market-open's
@@ -3723,9 +4345,16 @@ def test_intraday_run_classification_validates_against_json_schema():
     jsonschema = pytest.importorskip("jsonschema")
     import json
 
-    schema_path = Path(__file__).resolve().parent / "schemas" / "intraday_run_classification.schema.json"
+    schema_path = (
+        Path(__file__).resolve().parent
+        / "schemas"
+        / "intraday_run_classification.schema.json"
+    )
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
-    docs = [_intraday_run_classification(slot, manual=False) for slot in _INTRADAY_SLOT_WINDOWS]
+    docs = [
+        _intraday_run_classification(slot, manual=False)
+        for slot in _INTRADAY_SLOT_WINDOWS
+    ]
     docs.append(_intraday_run_classification("11:30", manual=True))
     for rc in docs:
         jsonschema.validate(rc, schema)
@@ -3738,7 +4367,11 @@ def test_intraday_run_classification_rejects_mismatched_slot_window():
     jsonschema = pytest.importorskip("jsonschema")
     import json
 
-    schema_path = Path(__file__).resolve().parent / "schemas" / "intraday_run_classification.schema.json"
+    schema_path = (
+        Path(__file__).resolve().parent
+        / "schemas"
+        / "intraday_run_classification.schema.json"
+    )
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
     bad = _intraday_run_classification("11:30", manual=False)
     bad["scheduled_window_start_et"] = "13:25"  # the 13:30 slot's window, not 11:30's
@@ -3755,7 +4388,11 @@ def test_intraday_run_classification_rejects_ad_hoc_recovery_stream_suffix():
     jsonschema = pytest.importorskip("jsonschema")
     import json
 
-    schema_path = Path(__file__).resolve().parent / "schemas" / "intraday_run_classification.schema.json"
+    schema_path = (
+        Path(__file__).resolve().parent
+        / "schemas"
+        / "intraday_run_classification.schema.json"
+    )
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
     bad = _intraday_run_classification("14:30", manual=False)
     bad["stream"] = "intraday_1430"
@@ -3785,9 +4422,9 @@ def test_carried_prior_order_rows_are_schema_valid_candidates(tmp_path):
     rows = _r._prior_submitted_order_rows(run_dir)
 
     schema = _json.loads(
-        (Path(__file__).resolve().parent / "schemas" / "run_state.schema.json").read_text(
-            encoding="utf-8"
-        )
+        (
+            Path(__file__).resolve().parent / "schemas" / "run_state.schema.json"
+        ).read_text(encoding="utf-8")
     )
     item_schema = schema["properties"]["buy_candidates"]["items"]
     for row in rows:
@@ -3972,7 +4609,9 @@ def test_run_slot_rejects_an_unknown_slot_label(tmp_path):
     "slot,stream",
     [("1030ET", "morning"), ("1230ET", "midday"), ("1530ET", "afternoon")],
 )
-def test_run_slot_runs_the_pipeline_under_the_slots_own_stream(slot, stream, tmp_path, monkeypatch):
+def test_run_slot_runs_the_pipeline_under_the_slots_own_stream(
+    slot, stream, tmp_path, monkeypatch
+):
     """run_pipeline() hardcoded AFTERNOON_STREAM (run_dca.py:1193).
 
     Every slot ran under the afternoon stream's guarded_run identity, heartbeat,
@@ -3983,7 +4622,7 @@ def test_run_slot_runs_the_pipeline_under_the_slots_own_stream(slot, stream, tmp
 
     seen = {}
 
-    def _capture(stream_name, invoke, **kwargs):
+    def _capture(stream_name, invoke, config=None, **kwargs):
         seen["stream"] = stream_name
         return invoke()
 
@@ -4047,7 +4686,9 @@ def test_prior_slots_returns_earlier_canonical_slots_in_order():
     "slot,expected_cron_id",
     [("1030ET", "42173154"), ("1230ET", "a6239dae"), ("1530ET", "10ce362c")],
 )
-def test_run_slot_logs_model_usage_under_the_slots_own_cron_id(slot, expected_cron_id, tmp_path, monkeypatch):
+def test_run_slot_logs_model_usage_under_the_slots_own_cron_id(
+    slot, expected_cron_id, tmp_path, monkeypatch
+):
     """Codex/Antigravity review: run_slot() omitted cron_id, so log_model_usage
     always recorded the afternoon task id (10ce362c) for every slot."""
     import run_dca as run_dca_module
@@ -4077,8 +4718,13 @@ def test_run_slot_logs_model_usage_under_the_slots_own_cron_id(slot, expected_cr
     assert captured.get("cron_id") == expected_cron_id
 
 
-@pytest.mark.parametrize("slot,expected_time", [("1030ET", time(10, 30)), ("1230ET", time(12, 30)), ("1530ET", time(15, 30))])
-def test_run_slot_anchors_decision_time_to_the_slot(slot, expected_time, tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "slot,expected_time",
+    [("1030ET", time(10, 30)), ("1230ET", time(12, 30)), ("1530ET", time(15, 30))],
+)
+def test_run_slot_anchors_decision_time_to_the_slot(
+    slot, expected_time, tmp_path, monkeypatch
+):
     """Codex review discussion_r3679391268: a 1030/1230 slot must not evaluate
     signals against the bundled config's 15:30 decision anchor."""
     import run_dca as run_dca_module
@@ -4115,7 +4761,9 @@ def test_run_slot_anchors_decision_time_to_the_slot(slot, expected_time, tmp_pat
         ("1230ET", "midday", "12:30", "a6239dae"),
     ],
 )
-def test_run_slot_stamps_its_own_scheduled_classification(slot, stream, scheduled_for_et, cron_id, tmp_path):
+def test_run_slot_stamps_its_own_scheduled_classification(
+    slot, stream, scheduled_for_et, cron_id, tmp_path
+):
     """Codex review discussion_r3679391261: a 1030/1230 slot must not stamp
     itself as the afternoon (15:30, cron_id 10ce362c) scheduled run -- that
     misattributes telemetry and hides the slot's fills from a later slot's
@@ -4198,7 +4846,9 @@ def test_run_slot_persists_the_correlation_id_into_run_state(tmp_path):
     assert run_state["correlation_id"] == "dca-2026-07-06-morning-1030et"
 
 
-def test_run_slot_without_a_guarded_prior_allocation_still_blocks_a_same_day_repeat(tmp_path):
+def test_run_slot_without_a_guarded_prior_allocation_still_blocks_a_same_day_repeat(
+    tmp_path,
+):
     """Safe default, unaffected by the guarded-top-up decision below: a ticker
     with NO loaded prior same-day allocation is not "guarded"
     (near_close_dca._process_buy_candidate's `ticker_guarded`), so the broad
@@ -4231,7 +4881,11 @@ def test_run_slot_without_a_guarded_prior_allocation_still_blocks_a_same_day_rep
     # The broker, not local bookkeeping, is the authority (Gate 6).
     assert captured.get("asked")
     run_state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
-    placed = [c for c in run_state["buy_candidates"] if c["status"] not in {"skipped", "blocked"}]
+    placed = [
+        c
+        for c in run_state["buy_candidates"]
+        if c["status"] not in {"skipped", "blocked"}
+    ]
     assert placed == []
     reasons = {c.get("skip_reason") for c in run_state["buy_candidates"]}
     assert "same-day broker order exists" in reasons
@@ -4307,7 +4961,10 @@ def test_run_slot_allows_a_guarded_top_up_the_old_forced_flag_used_to_block(tmp_
 
     prior = {
         "AAPL": PriorSameDayAllocation(
-            ticker="AAPL", amount_usd=1.0, reference_price=105.0, selected_base_amount_usd=2.0,
+            ticker="AAPL",
+            amount_usd=1.0,
+            reference_price=105.0,
+            selected_base_amount_usd=2.0,
         ),
     }
 
@@ -4356,138 +5013,14 @@ def test_run_slot_does_not_construct_its_own_broker(tmp_path):
 def test_cli_still_refuses_to_run_a_slot_live(tmp_path, capsys):
     """--slot must not become a live path on the CLI. Gate 5 calls run_slot()
     in-process with wired MCP callables; the CLI stays dry-run only."""
-    exit_code = main([
-        "--slot", "1530ET",
-        "--artifacts-dir", str(tmp_path),
-        "--now", "2026-07-06T15:45:00",
-    ])
-    assert exit_code == 2
-
-@patch("run_dca.atomic_write_text")
-@patch("scripts.drift_detection.send_slack_alert")
-@patch("scripts.drift_detection.detect_drift")
-def test_run_drift_check(mock_detect_drift, mock_send_slack_alert, mock_atomic_write_text, tmp_path):
-    """Test _run_drift_check handles drift reporting without invoking slack."""
-    from run_dca import _run_drift_check
-
-    report = mock_detect_drift.return_value
-    report.drift_detected = False
-    report.to_dict.return_value = {"status": "ok"}
-    report.to_json.return_value = "{\"status\": \"ok\"}\n"
-    report.to_markdown.return_value = "status: ok\n"
-
-    assert _run_drift_check(tmp_path) == {"status": "ok"}
-    mock_detect_drift.assert_called_once_with(tmp_path)
-    mock_atomic_write_text.assert_any_call(tmp_path / "drift_report.json", "{\"status\": \"ok\"}\n")
-    mock_atomic_write_text.assert_any_call(tmp_path / "drift_report.md", "status: ok\n")
-    assert mock_atomic_write_text.call_count == 2
-    mock_send_slack_alert.assert_not_called()
-
-
-
-@patch("run_dca.atomic_write_text")
-@patch("scripts.drift_detection.send_slack_alert")
-@patch("scripts.drift_detection.detect_drift")
-def test_run_drift_check_detected(mock_detect_drift, mock_send_slack_alert, mock_atomic_write_text, tmp_path):
-    """Test _run_drift_check handles drift reporting and invokes slack."""
-    from run_dca import _run_drift_check
-
-    report = mock_detect_drift.return_value
-    report.drift_detected = True
-
-    class MockSymbol:
-        def __init__(self, sym):
-            self.symbol = sym
-    report.affected_symbols = [MockSymbol("AAPL"), MockSymbol("MSFT")]
-
-    report.to_dict.return_value = {"status": "drift"}
-    report.to_json.return_value = '{"status": "drift"}\n'
-    report.to_markdown.return_value = "status: drift\n"
-
-    from scripts.drift_detection import DEFAULT_SLACK_WEBHOOK_ENV
-
-    assert _run_drift_check(tmp_path) == {"status": "drift"}
-    mock_detect_drift.assert_called_once_with(tmp_path)
-    mock_atomic_write_text.assert_any_call(tmp_path / "drift_report.json", '{"status": "drift"}\n')
-    mock_atomic_write_text.assert_any_call(tmp_path / "drift_report.md", "status: drift\n")
-    assert mock_atomic_write_text.call_count == 2
-    mock_send_slack_alert.assert_called_once_with(report, env_var=DEFAULT_SLACK_WEBHOOK_ENV)
-
-
-
-@patch("run_dca.atomic_write_text")
-@patch("scripts.drift_detection.send_slack_alert")
-@patch("scripts.drift_detection.detect_drift")
-def test_run_drift_check_failed(mock_detect_drift, mock_send_slack_alert, mock_atomic_write_text, tmp_path):
-    """Test _run_drift_check returns None when detect_drift raises."""
-    from run_dca import _run_drift_check
-
-    mock_detect_drift.side_effect = Exception("test error")
-
-    assert _run_drift_check(tmp_path) is None
-    mock_atomic_write_text.assert_not_called()
-    mock_send_slack_alert.assert_not_called()
-
-
-@patch("run_dca.atomic_write_text")
-def test_run_drift_check_import_unavailable(mock_atomic_write_text, tmp_path):
-    """Test _run_drift_check returns None when scripts.drift_detection cannot be imported."""
-    import builtins
-
-    from run_dca import _run_drift_check
-
-    real_import = builtins.__import__
-
-    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
-        if name == "scripts.drift_detection":
-            raise ImportError("test import error")
-        return real_import(name, globals, locals, fromlist, level)
-
-    with patch("builtins.__import__", side_effect=fake_import):
-        assert _run_drift_check(tmp_path) is None
-
-    mock_atomic_write_text.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    "dt, expected_time",
-    [
-        # Pre-retime: Keep legacy 15:15 window
-        (datetime(2026, 7, 26, 12, 0, tzinfo=EASTERN), time(15, 15)),
-        # Exact retime date: Canonical 15:25 window
-        (datetime(2026, 7, 27, 12, 0, tzinfo=EASTERN), time(15, 25)),
-        # Post-retime date: Canonical 15:25 window
-        (datetime(2026, 7, 28, 12, 0, tzinfo=EASTERN), time(15, 25)),
-        # Pre-retime but provided in UTC (16:00 UTC -> 12:00 EDT)
-        (datetime(2026, 7, 26, 16, 0, tzinfo=timezone.utc), time(15, 15)),
-        # UTC retime-date timestamp that is still pre-retime in ET (00:30 UTC -> 20:30 EDT previous day)
-        (datetime(2026, 7, 27, 0, 30, tzinfo=timezone.utc), time(15, 15)),
-        # Post-retime but provided in UTC (16:00 UTC -> 12:00 EDT)
-        (datetime(2026, 7, 28, 16, 0, tzinfo=timezone.utc), time(15, 25)),
-        # UTC post-retime timestamp that is still on retime date in ET (00:30 UTC -> 20:30 EDT)
-        (datetime(2026, 7, 28, 0, 30, tzinfo=timezone.utc), time(15, 25))
-    ]
-)
-def test_final_buy_trend_override_window_start(dt, expected_time):
-    assert _final_buy_trend_override_window_start(dt) == expected_time
-
-
-@pytest.mark.parametrize(
-    "args, expected_level",
-    [
-        ((), logging.INFO),
-        (("DEBUG",), logging.DEBUG),
-        (("WARNING",), logging.WARNING),
-        (("debug",), logging.DEBUG),
-        (("invalid",), logging.INFO),
-        (("",), logging.INFO),
-    ]
-)
-@patch("run_dca.logging.basicConfig")
-def test_configure_logging(mock_basic_config, args, expected_level):
-    configure_logging(*args)
-
-    mock_basic_config.assert_called_once_with(
-        level=expected_level,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    exit_code = main(
+        [
+            "--slot",
+            "1530ET",
+            "--artifacts-dir",
+            str(tmp_path),
+            "--now",
+            "2026-07-06T15:45:00",
+        ]
     )
+    assert exit_code == 2

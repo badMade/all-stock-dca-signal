@@ -39,6 +39,7 @@ from near_close_dca import (
     AlpacaBroker,
     Bar,
     BrokerName,
+    CompactRunOptions,
     DryRunBroker,
     OrderFill,
     PriorSameDayAllocation,
@@ -48,7 +49,6 @@ from near_close_dca import (
     SourceSignal,
     StrategyConfig,
     StrategyState,
-    UsageProxyContext,
     _check_execution_gates,
     _earlier_selected_base,
     _graded_dca_ref_id_prefix,
@@ -81,25 +81,25 @@ from scripts.run_classification import PriorAllocation
 
 # (drop percent from prior close, expected multiplier).
 LADDER_BOUNDARY_CASES = [
-    (0.09, 0.0),   # below the 0.1% minimum -> no buy
-    (0.1, 1.0),    # 1x tier begins
+    (0.09, 0.0),  # below the 0.1% minimum -> no buy
+    (0.1, 1.0),  # 1x tier begins
     (0.999, 1.0),  # still 1x just under 1.0%
-    (1.0, 1.5),    # 1.5x tier begins
+    (1.0, 1.5),  # 1.5x tier begins
     (1.999, 1.5),  # still 1.5x just under 2.0%
-    (2.0, 2.0),    # 2x tier begins
+    (2.0, 2.0),  # 2x tier begins
     (2.999, 2.0),  # still 2x just under 3.0%
-    (3.0, 2.5),    # 2.5x tier begins
+    (3.0, 2.5),  # 2.5x tier begins
     (3.999, 2.5),  # still 2.5x just under 4.0%
-    (4.0, 3.0),    # 3x tier begins
+    (4.0, 3.0),  # 3x tier begins
     (4.999, 3.0),  # still 3x just under 5.0%
-    (5.0, 3.5),    # 3.5x tier begins
+    (5.0, 3.5),  # 3.5x tier begins
     (5.999, 3.5),  # still 3.5x just under 6.0%
-    (6.0, 4.0),    # 4x tier begins
+    (6.0, 4.0),  # 4x tier begins
     (6.999, 4.0),  # still 4x just under 7.0%
-    (7.0, 4.5),    # 4.5x tier begins
+    (7.0, 4.5),  # 4.5x tier begins
     (7.999, 4.5),  # still 4.5x just under 8.0%
-    (8.0, 5.0),    # 5x tier begins
-    (12.0, 5.0),   # no upper cutoff, still 5x
+    (8.0, 5.0),  # 5x tier begins
+    (12.0, 5.0),  # no upper cutoff, still 5x
 ]
 
 
@@ -122,7 +122,11 @@ def test_weekly_rollover_reserve_cap():
 def test_budget_tier_selection():
     # Normal when both planned spend and 3x+ signal count are low.
     normal = select_budget_tier(0.0, 0)
-    assert (normal.name, normal.daily_cap_usd, normal.weekly_cap_usd) == ("normal", 180.0, 900.0)
+    assert (normal.name, normal.daily_cap_usd, normal.weekly_cap_usd) == (
+        "normal",
+        180.0,
+        900.0,
+    )
     assert select_budget_tier(129.0, 5).name == "normal"
 
     # Either dimension can escalate the tier; the higher wins.
@@ -189,6 +193,7 @@ def test_ticker_universe():
 
 # --- Target price selection --------------------------------------------------
 
+
 class _FakeData:
     """Minimal provider producing a controlled drop and an optional signal quote."""
 
@@ -199,7 +204,9 @@ class _FakeData:
         self._quote = quote
 
     def get_previous_close_bar(self, ticker, as_of):
-        ts = datetime.combine(as_of.date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN)
+        ts = datetime.combine(
+            as_of.date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN
+        )
         return Bar(ts, self._prev, self._prev, self._prev, self._prev, 1000)
 
     def get_intraday_bars(self, ticker, start, end, interval_minutes):
@@ -219,7 +226,9 @@ class _FakeData:
 
 
 class _FakeDataWithBidAsk(_FakeData):
-    def __init__(self, source, close_price, prev_close, quote=None, bid_ask=(97.0, 99.0)):
+    def __init__(
+        self, source, close_price, prev_close, quote=None, bid_ask=(97.0, 99.0)
+    ):
         super().__init__(source, close_price, prev_close, quote=quote)
         self._bid_ask = bid_ask
 
@@ -237,8 +246,12 @@ class _FakeDataWithRaisingBidAsk(_FakeData):
 def test_target_price_defaults_to_signal_quote():
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     quote_time = datetime(2026, 6, 29, 15, 44, tzinfo=EASTERN)
-    data = _FakeData(SourceName.FINANCE, close_price=98.0, prev_close=100.0, quote=(97.5, quote_time))
-    signal = evaluate_source_signal("AAPL", now, StrategyConfig(), data, interval_minutes=15)
+    data = _FakeData(
+        SourceName.FINANCE, close_price=98.0, prev_close=100.0, quote=(97.5, quote_time)
+    )
+    signal = evaluate_source_signal(
+        "AAPL", now, StrategyConfig(), data, interval_minutes=15
+    )
     # target (quote) is distinct from the completed decision-bar close.
     assert signal.quote_price == 97.5
     assert signal.decision_bar_close == 98.0
@@ -248,7 +261,9 @@ def test_target_price_defaults_to_signal_quote():
 def test_target_price_falls_back_to_bar_close_without_quote():
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     data = _FakeData(SourceName.FINANCE, close_price=98.0, prev_close=100.0, quote=None)
-    signal = evaluate_source_signal("AAPL", now, StrategyConfig(), data, interval_minutes=15)
+    signal = evaluate_source_signal(
+        "AAPL", now, StrategyConfig(), data, interval_minutes=15
+    )
     assert signal.quote_price == 98.0
     assert signal.decision_bar_close == 98.0
 
@@ -266,7 +281,9 @@ class _FakeDataWithLow(_FakeData):
         self._prev_low = prev_low
 
     def get_previous_close_bar(self, ticker, as_of):
-        ts = datetime.combine(as_of.date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN)
+        ts = datetime.combine(
+            as_of.date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN
+        )
         # open/high sit at/above the close; low is the distinct prior-session low.
         return Bar(ts, self._prev, self._prev, self._prev_low, self._prev, 1000)
 
@@ -275,8 +292,12 @@ def test_first_allocation_below_close_only_uses_one_dollar_base():
     # Decision price below the prior close (100) but not below the prior low (95)
     # -> $1 base scale. Drop is 2% -> 2x multiplier -> $1 * 2 = $2 suggested.
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
-    data = _FakeDataWithLow(SourceName.FINANCE, close_price=98.0, prev_close=100.0, prev_low=95.0)
-    signal = evaluate_source_signal("AAPL", now, StrategyConfig(), data, interval_minutes=15)
+    data = _FakeDataWithLow(
+        SourceName.FINANCE, close_price=98.0, prev_close=100.0, prev_low=95.0
+    )
+    signal = evaluate_source_signal(
+        "AAPL", now, StrategyConfig(), data, interval_minutes=15
+    )
     assert signal.action == Action.BUY
     assert signal.previous_low == 95.0
     assert signal.base_selection_reason == BASE_BELOW_CLOSE_ONLY
@@ -289,8 +310,12 @@ def test_first_allocation_below_close_and_low_uses_two_dollar_base():
     # Decision price below both the prior close (100) and the prior low (95)
     # -> $2 base scale. Drop is 6% -> 4x multiplier -> $2 * 4 = $8 suggested.
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
-    data = _FakeDataWithLow(SourceName.FINANCE, close_price=94.0, prev_close=100.0, prev_low=95.0)
-    signal = evaluate_source_signal("AAPL", now, StrategyConfig(), data, interval_minutes=15)
+    data = _FakeDataWithLow(
+        SourceName.FINANCE, close_price=94.0, prev_close=100.0, prev_low=95.0
+    )
+    signal = evaluate_source_signal(
+        "AAPL", now, StrategyConfig(), data, interval_minutes=15
+    )
     assert signal.action == Action.BUY
     assert signal.previous_low == 95.0
     assert signal.base_selection_reason == BASE_BELOW_CLOSE_AND_LOW
@@ -302,8 +327,12 @@ def test_first_allocation_below_close_and_low_uses_two_dollar_base():
 def test_first_allocation_above_close_is_no_buy():
     # Decision price above the prior close -> no buy, $0 base, zeroed amount.
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
-    data = _FakeDataWithLow(SourceName.FINANCE, close_price=101.0, prev_close=100.0, prev_low=95.0)
-    signal = evaluate_source_signal("AAPL", now, StrategyConfig(), data, interval_minutes=15)
+    data = _FakeDataWithLow(
+        SourceName.FINANCE, close_price=101.0, prev_close=100.0, prev_low=95.0
+    )
+    signal = evaluate_source_signal(
+        "AAPL", now, StrategyConfig(), data, interval_minutes=15
+    )
     assert signal.action != Action.BUY
     assert signal.selected_base_amount_usd == 0.0
     assert signal.suggested_amount_usd == 0.0
@@ -313,8 +342,12 @@ def test_first_allocation_missing_prior_low_treated_as_below_close_only():
     # A non-positive/missing prior low is treated conservatively as not-below-low,
     # so the $1 (below-close-only) scale is selected even on a deep drop.
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
-    data = _FakeDataWithLow(SourceName.FINANCE, close_price=94.0, prev_close=100.0, prev_low=0.0)
-    signal = evaluate_source_signal("AAPL", now, StrategyConfig(), data, interval_minutes=15)
+    data = _FakeDataWithLow(
+        SourceName.FINANCE, close_price=94.0, prev_close=100.0, prev_low=0.0
+    )
+    signal = evaluate_source_signal(
+        "AAPL", now, StrategyConfig(), data, interval_minutes=15
+    )
     assert signal.action == Action.BUY
     assert signal.base_selection_reason == BASE_BELOW_CLOSE_ONLY
     assert signal.selected_base_amount_usd == 1.0
@@ -329,8 +362,12 @@ def test_first_allocation_zero_multiplier_normalizes_reason_to_no_buy():
     # ticker must not carry a first-buy sizing reason for what the rule says was a
     # no-buy.
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
-    data = _FakeDataWithLow(SourceName.FINANCE, close_price=99.95, prev_close=100.0, prev_low=95.0)
-    signal = evaluate_source_signal("AAPL", now, StrategyConfig(), data, interval_minutes=15)
+    data = _FakeDataWithLow(
+        SourceName.FINANCE, close_price=99.95, prev_close=100.0, prev_low=95.0
+    )
+    signal = evaluate_source_signal(
+        "AAPL", now, StrategyConfig(), data, interval_minutes=15
+    )
     assert signal.action != Action.BUY
     assert signal.buy_multiplier == 0.0
     assert signal.base_selection_reason == BASE_NOT_BELOW_CLOSE
@@ -340,12 +377,27 @@ def test_first_allocation_zero_multiplier_normalizes_reason_to_no_buy():
 
 def test_select_first_allocation_base_helper_branches():
     config = StrategyConfig()
-    assert select_first_allocation_base_usd(94.0, 100.0, 95.0, config) == (2.0, BASE_BELOW_CLOSE_AND_LOW)
-    assert select_first_allocation_base_usd(98.0, 100.0, 95.0, config) == (1.0, BASE_BELOW_CLOSE_ONLY)
-    assert select_first_allocation_base_usd(101.0, 100.0, 95.0, config) == (0.0, BASE_NOT_BELOW_CLOSE)
-    assert select_first_allocation_base_usd(100.0, 100.0, 95.0, config) == (0.0, BASE_NOT_BELOW_CLOSE)
+    assert select_first_allocation_base_usd(94.0, 100.0, 95.0, config) == (
+        2.0,
+        BASE_BELOW_CLOSE_AND_LOW,
+    )
+    assert select_first_allocation_base_usd(98.0, 100.0, 95.0, config) == (
+        1.0,
+        BASE_BELOW_CLOSE_ONLY,
+    )
+    assert select_first_allocation_base_usd(101.0, 100.0, 95.0, config) == (
+        0.0,
+        BASE_NOT_BELOW_CLOSE,
+    )
+    assert select_first_allocation_base_usd(100.0, 100.0, 95.0, config) == (
+        0.0,
+        BASE_NOT_BELOW_CLOSE,
+    )
     # Missing prior low -> conservative below-close-only ($1).
-    assert select_first_allocation_base_usd(94.0, 100.0, None, config) == (1.0, BASE_BELOW_CLOSE_ONLY)
+    assert select_first_allocation_base_usd(94.0, 100.0, None, config) == (
+        1.0,
+        BASE_BELOW_CLOSE_ONLY,
+    )
     # Per-order ceiling holds: deepest drop (5x) on the $2 scale tops out at $10.
     assert 2.0 * 5.0 == config.max_per_order_usd
 
@@ -358,8 +410,12 @@ def test_first_buy_ticker_uses_close_and_low_even_when_other_tickers_have_prior_
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig()
 
-    aaa_data = _FakeDataWithLow(SourceName.FINANCE, close_price=94.0, prev_close=100.0, prev_low=95.0)
-    aaa_signal = evaluate_source_signal("AAA", now, config, aaa_data, interval_minutes=15)
+    aaa_data = _FakeDataWithLow(
+        SourceName.FINANCE, close_price=94.0, prev_close=100.0, prev_low=95.0
+    )
+    aaa_signal = evaluate_source_signal(
+        "AAA", now, config, aaa_data, interval_minutes=15
+    )
     assert aaa_signal.action == Action.BUY
     assert aaa_signal.base_selection_reason == BASE_BELOW_CLOSE_AND_LOW
     assert aaa_signal.selected_base_amount_usd == 2.0
@@ -376,14 +432,25 @@ def test_run_daily_compact_prior_allocation_scoped_to_its_own_ticker(tmp_path):
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
     prior = {
         "AAPL": PriorSameDayAllocation(
-            "AAPL", amount_usd=3.0, reference_price=99.0, run_id="am", source="manual",
+            "AAPL",
+            amount_usd=3.0,
+            reference_price=99.0,
+            run_id="am",
+            source="manual",
             selected_base_amount_usd=2.0,
         ),
     }
 
     result = run_daily_compact(
-        now, config, state, fin, rh, broker,
-        artifacts_dir=artifacts_dir, prior_same_day_allocations=prior,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(
+            artifacts_dir=artifacts_dir, prior_same_day_allocations=prior
+        ),
     )
 
     assert result["blocked"] is False
@@ -438,7 +505,9 @@ def test_merge_manual_top_up_context_poisons_base_to_unknown():
         ),
     }
     manual_context = {
-        "AAPL": PriorAllocation(ticker="AAPL", prior_usd=1.0, reference_price=99.0, sources=["manual_csv"]),
+        "AAPL": PriorAllocation(
+            ticker="AAPL", prior_usd=1.0, reference_price=99.0, sources=["manual_csv"]
+        ),
     }
     merge_manual_top_up_context(prior_same_day_allocations, manual_context)
     merged = prior_same_day_allocations["AAPL"]
@@ -454,7 +523,7 @@ def test_merge_manual_top_up_context_retains_base_when_manual_fill_is_later():
     # fill, whose PriorAllocation.reference_ts now identifies its own time,
     # must not erase that known base -- it cannot itself be the true first
     # allocation since it happened after the base was already established.
-    # Previously, this unconditionally poisoned the base to None, so a
+    # Before the fix this unconditionally poisoned the base to None, so a
     # subsequent lower-price run would recompute its own (possibly $2) base,
     # doubling the full-day target before subtracting prior spend.
     prior_same_day_allocations = {
@@ -537,7 +606,11 @@ def test_merge_manual_top_up_context_uses_most_recent_reference_not_merge_order(
     }
     manual_context = {
         "AAPL": PriorAllocation(
-            ticker="AAPL", prior_usd=1.0, reference_price=100.0, sources=["manual_csv"], reference_ts=9 * 3600
+            ticker="AAPL",
+            prior_usd=1.0,
+            reference_price=100.0,
+            sources=["manual_csv"],
+            reference_ts=9 * 3600,
         ),
     }
     merge_manual_top_up_context(prior_same_day_allocations, manual_context)
@@ -636,7 +709,9 @@ def test_reconcile_signals_agree_preserves_base_from_winning_signal():
     )
     decision = reconcile_signals("AAPL", finance, robinhood)
     assert decision.suggested_amount_usd == 2.0  # finance's smaller amount wins
-    assert decision.selected_base_amount_usd == 2.0  # finance's base, not Robinhood's $1
+    assert (
+        decision.selected_base_amount_usd == 2.0
+    )  # finance's base, not Robinhood's $1
 
 
 def test_reconcile_signals_agree_pairs_multiplier_with_winning_signal():
@@ -667,7 +742,10 @@ def test_reconcile_signals_agree_pairs_multiplier_with_winning_signal():
     assert decision.suggested_amount_usd == 3.5
     assert decision.selected_base_amount_usd == 1.0
     assert decision.buy_multiplier == 3.5  # Robinhood's, paired with its own $1 base
-    assert decision.selected_base_amount_usd * decision.buy_multiplier == decision.suggested_amount_usd
+    assert (
+        decision.selected_base_amount_usd * decision.buy_multiplier
+        == decision.suggested_amount_usd
+    )
 
 
 def test_earlier_selected_base_picks_by_timestamp_not_argument_order():
@@ -675,20 +753,30 @@ def test_earlier_selected_base_picks_by_timestamp_not_argument_order():
     # the later (15:05) allocation is passed as `existing` (the position that
     # previously always won); the earlier (09:45) allocation must still win.
     later_as_existing = _earlier_selected_base(
-        2.0, "2026-06-29T15:05:00-04:00",  # existing: later, would previously win
-        1.0, "2026-06-29T09:45:00-04:00",  # alloc: earlier
+        2.0,
+        "2026-06-29T15:05:00-04:00",  # existing: later, would previously win
+        1.0,
+        "2026-06-29T09:45:00-04:00",  # alloc: earlier
     )
     assert later_as_existing == (1.0, "2026-06-29T09:45:00-04:00")
     # Same two allocations, swapped argument positions -> same (earlier) answer.
     earlier_as_existing = _earlier_selected_base(
-        1.0, "2026-06-29T09:45:00-04:00",
-        2.0, "2026-06-29T15:05:00-04:00",
+        1.0,
+        "2026-06-29T09:45:00-04:00",
+        2.0,
+        "2026-06-29T15:05:00-04:00",
     )
     assert earlier_as_existing == (1.0, "2026-06-29T09:45:00-04:00")
     # Missing/unparseable timestamps fall back to preferring `existing` (the
     # pre-chronological-comparison default) rather than guessing at ordering.
-    assert _earlier_selected_base(2.0, None, 1.0, "2026-06-29T09:45:00-04:00") == (2.0, None)
-    assert _earlier_selected_base(None, None, 1.0, "2026-06-29T09:45:00-04:00") == (1.0, "2026-06-29T09:45:00-04:00")
+    assert _earlier_selected_base(2.0, None, 1.0, "2026-06-29T09:45:00-04:00") == (
+        2.0,
+        None,
+    )
+    assert _earlier_selected_base(None, None, 1.0, "2026-06-29T09:45:00-04:00") == (
+        1.0,
+        "2026-06-29T09:45:00-04:00",
+    )
 
 
 def test_kill_switch_caps_order_at_candidates_own_selected_base():
@@ -752,7 +840,10 @@ def test_kill_switch_caps_guarded_top_up_at_preserved_base():
         target_price=98.0,
     )
     prior = PriorSameDayAllocation(
-        ticker="AAPL", amount_usd=1.0, reference_price=99.0, selected_base_amount_usd=1.0
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
     )
     state = StrategyState()
     broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
@@ -801,7 +892,9 @@ class _RefIdTrackingBroker:
     def same_day_strategy_order_exists(self, ticker, trading_day):
         return any(t == ticker for t, _rid, _amt, _oid in self._orders)
 
-    def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+    def same_day_strategy_order_exists_with_ref_id_prefix(
+        self, ticker, trading_day, ref_id_prefixes
+    ):
         for t, rid, amt, order_id in self._orders:
             if t == ticker and rid in ref_id_prefixes:
                 return {"id": order_id, "dollar_amount": amt}
@@ -823,7 +916,13 @@ class _RefIdTrackingBroker:
         return order_id
 
 
-def _graded_decision(ticker="AAPL", buy_multiplier=5.0, suggested_amount_usd=10.0, selected_base_amount_usd=2.0, target_price=98.0):
+def _graded_decision(
+    ticker="AAPL",
+    buy_multiplier=5.0,
+    suggested_amount_usd=10.0,
+    selected_base_amount_usd=2.0,
+    target_price=98.0,
+):
     return ReconciledDecision(
         ticker=ticker,
         action=Action.BUY,
@@ -847,7 +946,10 @@ def test_guarded_top_up_retry_does_not_place_a_duplicate_order():
     config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
     decision = _graded_decision()
     prior = PriorSameDayAllocation(
-        ticker="AAPL", amount_usd=1.0, reference_price=99.0, selected_base_amount_usd=1.0
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
     )
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
@@ -859,10 +961,18 @@ def test_guarded_top_up_retry_does_not_place_a_duplicate_order():
     # Attempt 1: places the guarded top-up for real.
     state1 = StrategyState()
     outcome1, _, _, _, _ = _process_buy_candidate(
-        decision, config, state1, broker, robinhood_data=robinhood_data, now=now,
-        trading_day=trading_day, guard_active=True,
-        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
-        scheduled=True, run_result=None,
+        decision,
+        config,
+        state1,
+        broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=True,
+        prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=0.0,
+        scheduled=True,
+        run_result=None,
     )
     assert outcome1["status"] == "submitted"
     assert broker.placed["AAPL"] > 0
@@ -885,12 +995,22 @@ def test_guarded_top_up_retry_does_not_place_a_duplicate_order():
     # own earlier same-day runs): must find the same-stream order already on the
     # broker and must NOT place a second one.
     state2 = StrategyState()
-    run_result = RunResult(trading_day=trading_day, decisions=[decision], active_universe=["AAPL"])
+    run_result = RunResult(
+        trading_day=trading_day, decisions=[decision], active_universe=["AAPL"]
+    )
     outcome2, _, _, _, _ = _process_buy_candidate(
-        decision, config, state2, broker, robinhood_data=robinhood_data, now=now,
-        trading_day=trading_day, guard_active=True,
-        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
-        scheduled=True, run_result=run_result,
+        decision,
+        config,
+        state2,
+        broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=True,
+        prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=0.0,
+        scheduled=True,
+        run_result=run_result,
     )
     assert len(broker._orders) == 1, "retry must not place a second broker order"
     assert outcome2["status"] == "submitted"
@@ -956,7 +1076,10 @@ def test_guarded_top_up_retry_does_not_double_count_deployed_7d():
     config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
     decision = _graded_decision()
     prior = PriorSameDayAllocation(
-        ticker="AAPL", amount_usd=1.0, reference_price=99.0, selected_base_amount_usd=1.0
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
     )
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
@@ -965,17 +1088,33 @@ def test_guarded_top_up_retry_does_not_double_count_deployed_7d():
         SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
     )
     _process_buy_candidate(
-        decision, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
-        trading_day=trading_day, guard_active=True,
-        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
-        scheduled=True, run_result=None,
+        decision,
+        config,
+        StrategyState(),
+        broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=True,
+        prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=0.0,
+        scheduled=True,
+        run_result=None,
     )
     starting_deployed_7d = 50.0
     _, _, returned_deployed_7d, _, _ = _process_buy_candidate(
-        decision, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
-        trading_day=trading_day, guard_active=True,
-        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=starting_deployed_7d,
-        scheduled=True, run_result=None,
+        decision,
+        config,
+        StrategyState(),
+        broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=True,
+        prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=starting_deployed_7d,
+        scheduled=True,
+        run_result=None,
     )
     assert returned_deployed_7d == starting_deployed_7d, (
         "a duplicate-preserved outcome places no new capital and must not "
@@ -995,7 +1134,10 @@ def test_guarded_top_up_retry_counts_recovered_order_when_not_yet_on_disk(tmp_pa
     config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
     decision = _graded_decision()
     prior = PriorSameDayAllocation(
-        ticker="AAPL", amount_usd=1.0, reference_price=99.0, selected_base_amount_usd=1.0
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
     )
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
@@ -1005,20 +1147,40 @@ def test_guarded_top_up_retry_counts_recovered_order_when_not_yet_on_disk(tmp_pa
     )
     history_root = os.path.join(str(tmp_path), "history")
     _process_buy_candidate(
-        decision, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
-        trading_day=trading_day, guard_active=True,
-        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
-        scheduled=True, run_result=None, deployment_history_root=history_root,
+        decision,
+        config,
+        StrategyState(),
+        broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=True,
+        prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=0.0,
+        scheduled=True,
+        run_result=None,
+        deployment_history_root=history_root,
     )
     placed_amount = broker.placed["AAPL"]
     starting_deployed_7d = 50.0
     _, _, returned_deployed_7d, _, _ = _process_buy_candidate(
-        decision, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
-        trading_day=trading_day, guard_active=True,
-        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=starting_deployed_7d,
-        scheduled=True, run_result=None, deployment_history_root=history_root,
+        decision,
+        config,
+        StrategyState(),
+        broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=True,
+        prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=starting_deployed_7d,
+        scheduled=True,
+        run_result=None,
+        deployment_history_root=history_root,
     )
-    assert returned_deployed_7d == pytest.approx(starting_deployed_7d + placed_amount), (
+    assert returned_deployed_7d == pytest.approx(
+        starting_deployed_7d + placed_amount
+    ), (
         "a preserved duplicate not yet reflected in any written artifact must "
         "still be added to running_deployed_7d"
     )
@@ -1035,7 +1197,10 @@ def test_guarded_top_up_retry_does_not_recount_when_ticker_already_on_disk(tmp_p
     config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
     decision = _graded_decision()
     prior = PriorSameDayAllocation(
-        ticker="AAPL", amount_usd=1.0, reference_price=99.0, selected_base_amount_usd=1.0
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
     )
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
@@ -1045,25 +1210,47 @@ def test_guarded_top_up_retry_does_not_recount_when_ticker_already_on_disk(tmp_p
     )
     history_root = os.path.join(str(tmp_path), "history")
     _write_scheduled_afternoon_artifact(
-        history_root, trading_day, [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 1.0}]
+        history_root,
+        trading_day,
+        [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 1.0}],
     )
     _process_buy_candidate(
-        decision, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
-        trading_day=trading_day, guard_active=True,
-        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
-        scheduled=True, run_result=None, deployment_history_root=history_root,
+        decision,
+        config,
+        StrategyState(),
+        broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=True,
+        prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=0.0,
+        scheduled=True,
+        run_result=None,
+        deployment_history_root=history_root,
     )
     starting_deployed_7d = 50.0
     _, _, returned_deployed_7d, _, _ = _process_buy_candidate(
-        decision, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
-        trading_day=trading_day, guard_active=True,
-        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=starting_deployed_7d,
-        scheduled=True, run_result=None, deployment_history_root=history_root,
+        decision,
+        config,
+        StrategyState(),
+        broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=True,
+        prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=starting_deployed_7d,
+        scheduled=True,
+        run_result=None,
+        deployment_history_root=history_root,
     )
     assert returned_deployed_7d == starting_deployed_7d
 
 
-def test_guarded_top_up_retry_counts_ticker_when_only_a_different_ticker_is_on_disk(tmp_path):
+def test_guarded_top_up_retry_counts_ticker_when_only_a_different_ticker_is_on_disk(
+    tmp_path,
+):
     # Codex review on PR #231 ("Verify the recovered order is actually in
     # deployment history"): a same-day scheduled-afternoon artifact that
     # exists on disk but records a DIFFERENT ticker (e.g. an earlier
@@ -1075,7 +1262,10 @@ def test_guarded_top_up_retry_counts_ticker_when_only_a_different_ticker_is_on_d
     config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
     decision = _graded_decision()
     prior = PriorSameDayAllocation(
-        ticker="AAPL", amount_usd=1.0, reference_price=99.0, selected_base_amount_usd=1.0
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
     )
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
@@ -1085,21 +1275,41 @@ def test_guarded_top_up_retry_counts_ticker_when_only_a_different_ticker_is_on_d
     )
     history_root = os.path.join(str(tmp_path), "history")
     _write_scheduled_afternoon_artifact(
-        history_root, trading_day, [{"ticker": "MSFT", "status": "submitted", "planned_amount_usd": 4.0}]
+        history_root,
+        trading_day,
+        [{"ticker": "MSFT", "status": "submitted", "planned_amount_usd": 4.0}],
     )
     _process_buy_candidate(
-        decision, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
-        trading_day=trading_day, guard_active=True,
-        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
-        scheduled=True, run_result=None, deployment_history_root=history_root,
+        decision,
+        config,
+        StrategyState(),
+        broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=True,
+        prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=0.0,
+        scheduled=True,
+        run_result=None,
+        deployment_history_root=history_root,
     )
     placed_amount = broker.placed["AAPL"]
     starting_deployed_7d = 50.0
     _, _, returned_deployed_7d, _, _ = _process_buy_candidate(
-        decision, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
-        trading_day=trading_day, guard_active=True,
-        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=starting_deployed_7d,
-        scheduled=True, run_result=None, deployment_history_root=history_root,
+        decision,
+        config,
+        StrategyState(),
+        broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=True,
+        prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=starting_deployed_7d,
+        scheduled=True,
+        run_result=None,
+        deployment_history_root=history_root,
     )
     assert returned_deployed_7d == pytest.approx(starting_deployed_7d + placed_amount)
 
@@ -1111,7 +1321,7 @@ def test_guarded_top_up_retry_records_recovered_buy_despite_seeded_prior_context
     # BEFORE _process_buy_candidate runs, so buys_today(...) is already
     # nonzero even in a freshly restarted process whose OWN afternoon order
     # was never booked into this StrategyState. Gating the duplicate-preserved
-    # branch's state.record_buy on buys_today()==0 (as a prior implementation did) would
+    # branch's state.record_buy on buys_today()==0 (as a prior fix did) would
     # then wrongly skip recording a genuinely new-to-this-state recovered
     # order, omitting it from day/week spend.
     config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
@@ -1119,7 +1329,10 @@ def test_guarded_top_up_retry_records_recovered_buy_despite_seeded_prior_context
     trading_day = date(2026, 6, 29)
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     prior = PriorSameDayAllocation(
-        ticker="AAPL", amount_usd=1.0, reference_price=99.0, selected_base_amount_usd=1.0
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
     )
     robinhood_data = _FakeDataWithBidAsk(
         SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
@@ -1135,20 +1348,37 @@ def test_guarded_top_up_retry_records_recovered_buy_despite_seeded_prior_context
         {"AAPL": prior},
         one_order_per_ticker_per_day=False,
     )
-    assert fresh_state.buys_today("AAPL", trading_day) == 1, "seeding must land the morning allocation"
+    assert (
+        fresh_state.buys_today("AAPL", trading_day) == 1
+    ), "seeding must land the morning allocation"
     assert fresh_state.day_notional(trading_day) == pytest.approx(1.0)
 
     # The broker already has this stream's own afternoon order from an
     # earlier (now-dead) process instance -- simulated directly, since this
     # fresh process never placed it itself.
     broker = _RefIdTrackingBroker()
-    broker._orders.append(("AAPL", f"graded-dca-topup-{trading_day.isoformat()}-AAPL", 3.0, "ORDER-AAPL-recovered"))
+    broker._orders.append(
+        (
+            "AAPL",
+            f"graded-dca-topup-{trading_day.isoformat()}-AAPL",
+            3.0,
+            "ORDER-AAPL-recovered",
+        )
+    )
 
     outcome, _, _, _, _ = _process_buy_candidate(
-        decision, config, fresh_state, broker, robinhood_data=robinhood_data, now=now,
-        trading_day=trading_day, guard_active=True,
-        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
-        scheduled=True, run_result=None,
+        decision,
+        config,
+        fresh_state,
+        broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=True,
+        prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=0.0,
+        scheduled=True,
+        run_result=None,
     )
     assert outcome["duplicate_preserved"] is True
     assert outcome["submitted_amount_usd"] == pytest.approx(3.0)
@@ -1168,7 +1398,10 @@ def test_guarded_top_up_retry_does_not_rebook_when_state_already_recorded_it():
     config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
     decision = _graded_decision()
     prior = PriorSameDayAllocation(
-        ticker="AAPL", amount_usd=1.0, reference_price=99.0, selected_base_amount_usd=1.0
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
     )
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
@@ -1178,20 +1411,36 @@ def test_guarded_top_up_retry_does_not_rebook_when_state_already_recorded_it():
     )
     shared_state = StrategyState()
     _process_buy_candidate(
-        decision, config, shared_state, broker, robinhood_data=robinhood_data, now=now,
-        trading_day=trading_day, guard_active=True,
-        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
-        scheduled=True, run_result=None,
+        decision,
+        config,
+        shared_state,
+        broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=True,
+        prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=0.0,
+        scheduled=True,
+        run_result=None,
     )
     placed_amount = broker.placed["AAPL"]
     assert shared_state.buys_today("AAPL", trading_day) == 1
     assert shared_state.day_notional(trading_day) == pytest.approx(placed_amount)
 
     _process_buy_candidate(
-        decision, config, shared_state, broker, robinhood_data=robinhood_data, now=now,
-        trading_day=trading_day, guard_active=True,
-        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
-        scheduled=True, run_result=None,
+        decision,
+        config,
+        shared_state,
+        broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=True,
+        prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=0.0,
+        scheduled=True,
+        run_result=None,
     )
     assert shared_state.buys_today("AAPL", trading_day) == 1, (
         "a duplicate-preserved outcome must not rebook a buy already recorded "
@@ -1219,7 +1468,10 @@ def test_guarded_top_up_retry_records_recovered_spread_status_without_a_verdict(
     config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
     decision = _graded_decision()
     prior = PriorSameDayAllocation(
-        ticker="AAPL", amount_usd=1.0, reference_price=99.0, selected_base_amount_usd=1.0
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
     )
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
@@ -1229,10 +1481,18 @@ def test_guarded_top_up_retry_records_recovered_spread_status_without_a_verdict(
         SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
     )
     _process_buy_candidate(
-        decision, config, StrategyState(), broker, robinhood_data=narrow_spread_data, now=now,
-        trading_day=trading_day, guard_active=True,
-        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
-        scheduled=True, run_result=None,
+        decision,
+        config,
+        StrategyState(),
+        broker,
+        robinhood_data=narrow_spread_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=True,
+        prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=0.0,
+        scheduled=True,
+        run_result=None,
     )
     # Attempt 2 (retry): the spread has since widened past the gate's limit.
     # A wide/failing spread on the RETRY must not surface as this row's
@@ -1241,10 +1501,18 @@ def test_guarded_top_up_retry_records_recovered_spread_status_without_a_verdict(
         SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(90.0, 110.0)
     )
     outcome2, _, _, _, _ = _process_buy_candidate(
-        decision, config, StrategyState(), broker, robinhood_data=wide_spread_data, now=now,
-        trading_day=trading_day, guard_active=True,
-        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
-        scheduled=True, run_result=None,
+        decision,
+        config,
+        StrategyState(),
+        broker,
+        robinhood_data=wide_spread_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=True,
+        prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=0.0,
+        scheduled=True,
+        run_result=None,
     )
     assert outcome2["duplicate_preserved"] is True
     assert outcome2["spread_status"] == "not_evaluated"
@@ -1269,7 +1537,9 @@ def test_guarded_top_up_retry_blocks_when_broker_returns_no_order_id():
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return True
 
-        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
             return {"dollar_amount": 5.0}  # no id / order_id
 
         def is_tradable_for_fractional_buy(self, ticker):
@@ -1279,12 +1549,17 @@ def test_guarded_top_up_retry_blocks_when_broker_returns_no_order_id():
             return True, "ok"
 
         def place_market_buy(self, ticker, notional_usd, ref_id):
-            raise AssertionError("must not place a fresh order when a same-stream duplicate is found")
+            raise AssertionError(
+                "must not place a fresh order when a same-stream duplicate is found"
+            )
 
     config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
     decision = _graded_decision()
     prior = PriorSameDayAllocation(
-        ticker="AAPL", amount_usd=1.0, reference_price=99.0, selected_base_amount_usd=1.0
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
     )
     broker = _NoIdDupBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
@@ -1293,10 +1568,18 @@ def test_guarded_top_up_retry_blocks_when_broker_returns_no_order_id():
         SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
     )
     outcome, _, _, errors_count_inc, _ = _process_buy_candidate(
-        decision, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
-        trading_day=trading_day, guard_active=True,
-        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
-        scheduled=True, run_result=None,
+        decision,
+        config,
+        StrategyState(),
+        broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=True,
+        prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=0.0,
+        scheduled=True,
+        run_result=None,
     )
     assert outcome["status"] == "blocked"
     assert outcome.get("order_id") is None
@@ -1313,7 +1596,10 @@ def test_guarded_top_up_retry_finds_duplicate_even_when_fresh_guard_would_skip()
     # evidence.
     config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
     prior = PriorSameDayAllocation(
-        ticker="AAPL", amount_usd=1.0, reference_price=99.0, selected_base_amount_usd=1.0
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
     )
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
@@ -1326,10 +1612,18 @@ def test_guarded_top_up_retry_finds_duplicate_even_when_fresh_guard_would_skip()
     # real incremental top-up is computed and placed.
     decision_attempt1 = _graded_decision(target_price=98.0)
     outcome1, _, _, _, _ = _process_buy_candidate(
-        decision_attempt1, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
-        trading_day=trading_day, guard_active=True,
-        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
-        scheduled=True, run_result=None,
+        decision_attempt1,
+        config,
+        StrategyState(),
+        broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=True,
+        prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=0.0,
+        scheduled=True,
+        run_result=None,
     )
     assert outcome1["status"] == "submitted"
     assert len(broker._orders) == 1
@@ -1340,10 +1634,18 @@ def test_guarded_top_up_retry_finds_duplicate_even_when_fresh_guard_would_skip()
     # preserve the real order from attempt 1 instead of reporting "skipped".
     decision_attempt2 = _graded_decision(target_price=100.0)
     outcome2, top_up_outcome2, _, _, _ = _process_buy_candidate(
-        decision_attempt2, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
-        trading_day=trading_day, guard_active=True,
-        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
-        scheduled=True, run_result=None,
+        decision_attempt2,
+        config,
+        StrategyState(),
+        broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=True,
+        prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=0.0,
+        scheduled=True,
+        run_result=None,
     )
     assert len(broker._orders) == 1, "retry must not place a second broker order"
     assert outcome2["status"] == "submitted", outcome2
@@ -1365,13 +1667,24 @@ def test_manual_placement_uses_distinct_ref_id_namespace():
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     outcome, _, _, _, _ = _process_buy_candidate(
-        decision, config, StrategyState(), broker, robinhood_data=None, now=now,
-        trading_day=date(2026, 6, 29), guard_active=False, prior_same_day_allocations={},
-        running_deployed_7d=0.0, scheduled=False, run_result=None,
+        decision,
+        config,
+        StrategyState(),
+        broker,
+        robinhood_data=None,
+        now=now,
+        trading_day=date(2026, 6, 29),
+        guard_active=False,
+        prior_same_day_allocations={},
+        running_deployed_7d=0.0,
+        scheduled=False,
+        run_result=None,
     )
     assert outcome["status"] == "submitted"
     ref_id = broker._orders[0][1]
-    assert "manual" in ref_id, f"manual placement must use a distinct ref_id namespace, got {ref_id!r}"
+    assert (
+        "manual" in ref_id
+    ), f"manual placement must use a distinct ref_id namespace, got {ref_id!r}"
 
 
 def test_scheduled_top_up_not_blocked_by_manual_fills_ordinary_ref_id():
@@ -1390,31 +1703,56 @@ def test_scheduled_top_up_not_blocked_by_manual_fills_ordinary_ref_id():
 
     # Manual run: no prior allocation, so ticker_guarded=False and the ref_id
     # is the manual-namespaced one.
-    manual_decision = _graded_decision(suggested_amount_usd=3.0, selected_base_amount_usd=1.0, buy_multiplier=3.0)
+    manual_decision = _graded_decision(
+        suggested_amount_usd=3.0, selected_base_amount_usd=1.0, buy_multiplier=3.0
+    )
     manual_outcome, _, _, _, _ = _process_buy_candidate(
-        manual_decision, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
-        trading_day=trading_day, guard_active=False, prior_same_day_allocations={},
-        running_deployed_7d=0.0, scheduled=False, run_result=None,
+        manual_decision,
+        config,
+        StrategyState(),
+        broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=False,
+        prior_same_day_allocations={},
+        running_deployed_7d=0.0,
+        scheduled=False,
+        run_result=None,
     )
     assert manual_outcome["status"] == "submitted"
     assert len(broker._orders) == 1
 
     # Scheduled run: the manual fill above is now visible as prior context.
     prior = PriorSameDayAllocation(
-        ticker="AAPL", amount_usd=3.0, reference_price=99.0, selected_base_amount_usd=1.0
+        ticker="AAPL",
+        amount_usd=3.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
     )
     scheduled_decision = _graded_decision(target_price=98.0)
     scheduled_outcome, _, _, _, _ = _process_buy_candidate(
-        scheduled_decision, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
-        trading_day=trading_day, guard_active=True, prior_same_day_allocations={"AAPL": prior},
-        running_deployed_7d=0.0, scheduled=True, run_result=None,
+        scheduled_decision,
+        config,
+        StrategyState(),
+        broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=True,
+        prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=0.0,
+        scheduled=True,
+        run_result=None,
     )
     assert scheduled_outcome.get("duplicate_preserved") is not True, (
         "the manual fill's ref_id must not be mistaken for this scheduled "
         "run's own earlier attempt"
     )
     assert scheduled_outcome["status"] == "submitted"
-    assert len(broker._orders) == 2, "the scheduled run must place its own real incremental order"
+    assert (
+        len(broker._orders) == 2
+    ), "the scheduled run must place its own real incremental order"
 
 
 def test_alpaca_broker_same_stream_check_fails_closed():
@@ -1450,7 +1788,10 @@ def test_guarded_top_up_dry_run_skips_duplicate_check_entirely():
     config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=True)
     decision = _graded_decision()
     prior = PriorSameDayAllocation(
-        ticker="AAPL", amount_usd=1.0, reference_price=99.0, selected_base_amount_usd=1.0
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
     )
     # AlpacaBroker's narrow duplicate lookup always raises (fail-closed) --
     # if the dry-run candidate reaches it at all, this test would fail with
@@ -1462,10 +1803,18 @@ def test_guarded_top_up_dry_run_skips_duplicate_check_entirely():
         SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
     )
     outcome, _, _, errors_count_inc, _ = _process_buy_candidate(
-        decision, config, StrategyState(), broker, robinhood_data=robinhood_data, now=now,
-        trading_day=trading_day, guard_active=True,
-        prior_same_day_allocations={"AAPL": prior}, running_deployed_7d=0.0,
-        scheduled=True, run_result=None,
+        decision,
+        config,
+        StrategyState(),
+        broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=True,
+        prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=0.0,
+        scheduled=True,
+        run_result=None,
     )
     assert errors_count_inc == 0
     assert outcome["status"] == "dry_run"
@@ -1480,7 +1829,10 @@ def test_guarded_top_up_first_attempt_bypasses_broad_same_day_check():
     config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
     decision = _graded_decision()
     prior = PriorSameDayAllocation(
-        ticker="AAPL", amount_usd=1.0, reference_price=99.0, selected_base_amount_usd=1.0
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
     )
 
     class _CrossStreamBroker(_RefIdTrackingBroker):
@@ -1493,10 +1845,18 @@ def test_guarded_top_up_first_attempt_bypasses_broad_same_day_check():
         SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
     )
     outcome, _, _, _, _ = _process_buy_candidate(
-        decision, config, StrategyState(), broker, robinhood_data=robinhood_data,
-        now=now, trading_day=date(2026, 6, 29),
-        guard_active=True, prior_same_day_allocations={"AAPL": prior},
-        running_deployed_7d=0.0, scheduled=True, run_result=None,
+        decision,
+        config,
+        StrategyState(),
+        broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=date(2026, 6, 29),
+        guard_active=True,
+        prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=0.0,
+        scheduled=True,
+        run_result=None,
     )
     assert outcome["status"] == "submitted"
     assert outcome.get("duplicate_preserved") is not True
@@ -1511,10 +1871,18 @@ def test_non_guarded_candidate_still_blocked_by_broad_same_day_check():
     broker = _RefIdTrackingBroker()
     broker._orders.append(("AAPL", "other-stream-ref", 5.0, "ORDER-OTHER"))
     outcome, _, _, _, _ = _process_buy_candidate(
-        decision, config, StrategyState(), broker, robinhood_data=None,
-        now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN), trading_day=date(2026, 6, 29),
-        guard_active=False, prior_same_day_allocations={},
-        running_deployed_7d=0.0, scheduled=True, run_result=None,
+        decision,
+        config,
+        StrategyState(),
+        broker,
+        robinhood_data=None,
+        now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
+        trading_day=date(2026, 6, 29),
+        guard_active=False,
+        prior_same_day_allocations={},
+        running_deployed_7d=0.0,
+        scheduled=True,
+        run_result=None,
     )
     assert outcome["status"] == "skipped"
     assert outcome["skip_reason"] == "same-day broker order exists"
@@ -1547,7 +1915,9 @@ def test_same_stream_order_exists_does_not_cross_canonical_slots(monkeypatch):
     # "this run's own retry" and silently skipped placing it.
     broker = _RefIdTrackingBroker()
     trading_day = date(2026, 6, 29)
-    morning_ref_id = f"{_graded_dca_ref_id_prefix('morning')}-{trading_day.isoformat()}-AAPL"
+    morning_ref_id = (
+        f"{_graded_dca_ref_id_prefix('morning')}-{trading_day.isoformat()}-AAPL"
+    )
     broker._orders.append(("AAPL", morning_ref_id, 1.0, "ORDER-MORNING-AAPL"))
 
     # The midday slot's own same-stream check must NOT find the morning
@@ -1567,12 +1937,18 @@ def test_guarded_top_up_across_canonical_slots_places_a_new_order_not_a_duplicat
     config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
     decision = _graded_decision()  # target_price=98.0, below the $99 prior reference.
     trading_day = date(2026, 6, 29)
-    morning_ref_id = f"{_graded_dca_ref_id_prefix('morning')}-{trading_day.isoformat()}-AAPL"
+    morning_ref_id = (
+        f"{_graded_dca_ref_id_prefix('morning')}-{trading_day.isoformat()}-AAPL"
+    )
     broker = _RefIdTrackingBroker()
     broker._orders.append(("AAPL", morning_ref_id, 1.0, "ORDER-MORNING-AAPL"))
     prior = PriorSameDayAllocation(
-        ticker="AAPL", amount_usd=1.0, reference_price=99.0, run_id="slot_1030",
-        source="scheduled", selected_base_amount_usd=2.0,
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        run_id="slot_1030",
+        source="scheduled",
+        selected_base_amount_usd=2.0,
     )
     now = datetime(2026, 6, 29, 12, 30, tzinfo=EASTERN)
     robinhood_data = _FakeDataWithBidAsk(
@@ -1580,10 +1956,18 @@ def test_guarded_top_up_across_canonical_slots_places_a_new_order_not_a_duplicat
     )
 
     outcome, top_up_outcome, _, _, _ = _process_buy_candidate(
-        decision, config, StrategyState(), broker, robinhood_data=robinhood_data,
-        now=now, trading_day=trading_day,
-        guard_active=True, prior_same_day_allocations={"AAPL": prior},
-        running_deployed_7d=0.0, scheduled=True, run_result=None,
+        decision,
+        config,
+        StrategyState(),
+        broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=True,
+        prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=0.0,
+        scheduled=True,
+        run_result=None,
         stream="midday",
     )
 
@@ -1592,7 +1976,9 @@ def test_guarded_top_up_across_canonical_slots_places_a_new_order_not_a_duplicat
     assert top_up_outcome.top_up_guard_result == "incremental_top_up"
     # $10 desired (2.0 base * 5.0 multiplier) - $1.0 already bought = $9.0 incremental.
     assert broker.placed["AAPL"] == 9.0
-    midday_ref_id = f"{_graded_dca_ref_id_prefix('midday', 'topup')}-{trading_day.isoformat()}-AAPL"
+    midday_ref_id = (
+        f"{_graded_dca_ref_id_prefix('midday', 'topup')}-{trading_day.isoformat()}-AAPL"
+    )
     assert broker._orders[-1][1] == midday_ref_id
 
 
@@ -1611,10 +1997,16 @@ def test_guarded_top_up_corrects_an_understated_artifact_prior_against_the_broke
     broker = _RefIdTrackingBroker()
     # A real $9.00 same-day order the artifact trail failed to capture, under
     # a ref id our own same-stream check does not recognize as a duplicate.
-    broker._orders.append(("AAPL", "some-other-untracked-ref-id", 9.0, "ORDER-UNTRACKED"))
+    broker._orders.append(
+        ("AAPL", "some-other-untracked-ref-id", 9.0, "ORDER-UNTRACKED")
+    )
     prior = PriorSameDayAllocation(
-        ticker="AAPL", amount_usd=1.0, reference_price=99.0, run_id="slot_1030",
-        source="scheduled", selected_base_amount_usd=2.0,
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        run_id="slot_1030",
+        source="scheduled",
+        selected_base_amount_usd=2.0,
     )
     now = datetime(2026, 6, 29, 12, 30, tzinfo=EASTERN)
     robinhood_data = _FakeDataWithBidAsk(
@@ -1622,10 +2014,18 @@ def test_guarded_top_up_corrects_an_understated_artifact_prior_against_the_broke
     )
 
     outcome, top_up_outcome, _, _, _ = _process_buy_candidate(
-        decision, config, StrategyState(), broker, robinhood_data=robinhood_data,
-        now=now, trading_day=trading_day,
-        guard_active=True, prior_same_day_allocations={"AAPL": prior},
-        running_deployed_7d=0.0, scheduled=True, run_result=None,
+        decision,
+        config,
+        StrategyState(),
+        broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=True,
+        prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=0.0,
+        scheduled=True,
+        run_result=None,
         stream="midday",
     )
 
@@ -1648,8 +2048,12 @@ def test_guarded_top_up_fails_closed_when_broker_cannot_verify_same_day_notional
     trading_day = date(2026, 6, 29)
     broker = _NoNotionalCheckBroker()
     prior = PriorSameDayAllocation(
-        ticker="AAPL", amount_usd=1.0, reference_price=99.0, run_id="slot_1030",
-        source="scheduled", selected_base_amount_usd=2.0,
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        run_id="slot_1030",
+        source="scheduled",
+        selected_base_amount_usd=2.0,
     )
     now = datetime(2026, 6, 29, 12, 30, tzinfo=EASTERN)
     robinhood_data = _FakeDataWithBidAsk(
@@ -1657,10 +2061,18 @@ def test_guarded_top_up_fails_closed_when_broker_cannot_verify_same_day_notional
     )
 
     outcome, _, _, errors_count_inc, _ = _process_buy_candidate(
-        decision, config, StrategyState(), broker, robinhood_data=robinhood_data,
-        now=now, trading_day=trading_day,
-        guard_active=True, prior_same_day_allocations={"AAPL": prior},
-        running_deployed_7d=0.0, scheduled=True, run_result=None,
+        decision,
+        config,
+        StrategyState(),
+        broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=True,
+        prior_same_day_allocations={"AAPL": prior},
+        running_deployed_7d=0.0,
+        scheduled=True,
+        run_result=None,
         stream="midday",
     )
 
@@ -1692,9 +2104,17 @@ def test_insufficient_buying_power_blocks_before_placement():
         SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
     )
     outcome, _, _, _, _ = _process_buy_candidate(
-        decision, config, StrategyState(), broker, robinhood_data=robinhood_data,
-        now=now, trading_day=date(2026, 6, 29), guard_active=False,
-        prior_same_day_allocations={}, running_deployed_7d=0.0, scheduled=True,
+        decision,
+        config,
+        StrategyState(),
+        broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=date(2026, 6, 29),
+        guard_active=False,
+        prior_same_day_allocations={},
+        running_deployed_7d=0.0,
+        scheduled=True,
         run_result=None,
     )
     assert outcome["status"] == "blocked"
@@ -1715,9 +2135,17 @@ def test_not_tradable_for_fractional_buy_blocks_before_placement():
         SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
     )
     outcome, _, _, _, _ = _process_buy_candidate(
-        decision, config, StrategyState(), broker, robinhood_data=robinhood_data,
-        now=now, trading_day=date(2026, 6, 29), guard_active=False,
-        prior_same_day_allocations={}, running_deployed_7d=0.0, scheduled=True,
+        decision,
+        config,
+        StrategyState(),
+        broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=date(2026, 6, 29),
+        guard_active=False,
+        prior_same_day_allocations={},
+        running_deployed_7d=0.0,
+        scheduled=True,
         run_result=None,
     )
     assert outcome["status"] == "blocked"
@@ -1740,9 +2168,17 @@ def test_broker_review_block_prevents_manual_order_placement():
         SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
     )
     outcome, _, _, _, reviews_attempted = _process_buy_candidate(
-        decision, config, StrategyState(), broker, robinhood_data=robinhood_data,
-        now=now, trading_day=date(2026, 6, 29), guard_active=False,
-        prior_same_day_allocations={}, running_deployed_7d=0.0, scheduled=False,
+        decision,
+        config,
+        StrategyState(),
+        broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=date(2026, 6, 29),
+        guard_active=False,
+        prior_same_day_allocations={},
+        running_deployed_7d=0.0,
+        scheduled=False,
         run_result=None,
     )
     assert outcome["status"] == "blocked"
@@ -1771,7 +2207,8 @@ def test_allocation_sort_key_tie_break_is_alphabetical():
             buy_multiplier=mult,
             finance_signal=SimpleNamespace(drop_vs_previous_close_pct=drop),
             robinhood_signal=(
-                None if rh_drop is None
+                None
+                if rh_drop is None
                 else SimpleNamespace(drop_vs_previous_close_pct=rh_drop)
             ),
         )
@@ -1781,22 +2218,37 @@ def test_allocation_sort_key_tie_break_is_alphabetical():
 
     # Equal multiplier and drop -> ticker alphabetical breaks the tie (A->Z),
     # not the input/universe order.
-    assert order([cand("MSFT", 2.0, 3.0), cand("AAPL", 2.0, 3.0), cand("GOOG", 2.0, 3.0)]) == [
-        "AAPL", "GOOG", "MSFT",
+    assert order(
+        [cand("MSFT", 2.0, 3.0), cand("AAPL", 2.0, 3.0), cand("GOOG", 2.0, 3.0)]
+    ) == [
+        "AAPL",
+        "GOOG",
+        "MSFT",
     ]
 
     # Higher multiplier dominates both drop and alphabetical.
-    assert order([cand("AAPL", 1.0, 9.0), cand("ZZZ", 3.0, 0.5), cand("MSFT", 2.0, 5.0)]) == [
-        "ZZZ", "MSFT", "AAPL",
+    assert order(
+        [cand("AAPL", 1.0, 9.0), cand("ZZZ", 3.0, 0.5), cand("MSFT", 2.0, 5.0)]
+    ) == [
+        "ZZZ",
+        "MSFT",
+        "AAPL",
     ]
 
     # Same multiplier -> larger drop first, then ticker.
-    assert order([cand("BBB", 2.0, 1.0), cand("AAA", 2.0, 4.0), cand("CCC", 2.0, 4.0)]) == [
-        "AAA", "CCC", "BBB",
+    assert order(
+        [cand("BBB", 2.0, 1.0), cand("AAA", 2.0, 4.0), cand("CCC", 2.0, 4.0)]
+    ) == [
+        "AAA",
+        "CCC",
+        "BBB",
     ]
 
     # Drop is the max across sources: a bigger Robinhood drop outranks finance-only.
-    assert order([cand("FN", 2.0, 3.0), cand("RH", 2.0, 1.0, rh_drop=6.0)]) == ["RH", "FN"]
+    assert order([cand("FN", 2.0, 3.0), cand("RH", 2.0, 1.0, rh_drop=6.0)]) == [
+        "RH",
+        "FN",
+    ]
 
 
 def _no_data_signal(source, provider_error):
@@ -1804,7 +2256,11 @@ def _no_data_signal(source, provider_error):
         ticker="AAPL",
         source=source,
         action=Action.NO_DATA,
-        reason="provider error: boom" if provider_error else "missing completed bar or previous close",
+        reason=(
+            "provider error: boom"
+            if provider_error
+            else "missing completed bar or previous close"
+        ),
         provider_error=provider_error,
     )
 
@@ -1836,57 +2292,38 @@ def test_plain_no_data_still_allows_robinhood_only_buy():
 
 # --- Slippage calculations ---------------------------------------------------
 
+
 def test_slippage_calculations_unfavorable_buy():
     submitted = datetime(2026, 6, 29, 15, 45, 0, tzinfo=EASTERN)
     filled = submitted + timedelta(seconds=3)
-    decision = ReconciledDecision(
+    record = build_execution_record(
         ticker="AAPL",
-        action=Action.BUY,
-        reason="",
-        finance_signal=None,
-        robinhood_signal=None,
         target_price=100.0,
         target_price_source="finance:signal_quote",
         decision_bar_close=100.5,
-    )
-    fill = OrderFill(
-        avg_fill_price=101.0,
-        quantity_filled=2.0,
+        notional_usd=10.0,
         order_submitted_at=submitted,
         order_filled_at=filled,
-    )
-    record = build_execution_record(
-        decision,
-        notional_usd=10.0,
-        fill=fill,
+        avg_fill_price=101.0,
+        quantity_filled=2.0,
     )
     assert record.status == "filled"
     assert abs(record.slippage_abs - 1.0) < 1e-9
-    assert abs(record.slippage_pct - 1.0) < 1e-9   # 1 / 100 * 100
+    assert abs(record.slippage_pct - 1.0) < 1e-9  # 1 / 100 * 100
     assert abs(record.slippage_cost - 2.0) < 1e-9  # 1.0 * 2 shares
     assert record.latency_seconds == 3.0
     assert record.execution_quality == "poor"
 
 
 def test_slippage_favorable_and_quality_buckets():
-    decision = ReconciledDecision(
+    record = build_execution_record(
         ticker="MSFT",
-        action=Action.BUY,
-        reason="",
-        finance_signal=None,
-        robinhood_signal=None,
         target_price=200.0,
         target_price_source="finance:signal_quote",
         decision_bar_close=200.0,
-    )
-    fill = OrderFill(
+        notional_usd=10.0,
         avg_fill_price=199.9,  # filled below target -> favorable (negative)
         quantity_filled=1.0,
-    )
-    record = build_execution_record(
-        decision,
-        notional_usd=10.0,
-        fill=fill,
     )
     assert record.slippage_abs < 0
     assert abs(record.slippage_pct - (-0.05)) < 1e-9
@@ -1903,74 +2340,95 @@ def test_execution_quality_buckets():
 
 
 def test_unfilled_record_has_no_slippage():
-    decision = ReconciledDecision(
+    record = build_execution_record(
         ticker="NVDA",
-        action=Action.BUY,
-        reason="",
-        finance_signal=None,
-        robinhood_signal=None,
         target_price=50.0,
         target_price_source="finance:signal_quote",
         decision_bar_close=50.0,
-    )
-    record = build_execution_record(
-        decision,
         notional_usd=5.0,
-        fill=None,
+        avg_fill_price=None,
+        quantity_filled=None,
     )
-    assert record.status == "unfilled"
+    assert record.status == "submitted"
     assert record.slippage_pct is None
     assert record.execution_quality == "unfilled"
 
 
 # --- Missing-fill classification ---------------------------------------------
 
-def _decision(ticker, action):
-    return ReconciledDecision(ticker=ticker, action=action, reason="x", finance_signal=None, robinhood_signal=None)
 
+def _decision(ticker, action):
+    return ReconciledDecision(
+        ticker=ticker,
+        action=action,
+        reason="x",
+        finance_signal=None,
+        robinhood_signal=None,
+    )
 
 
 def test_missing_fill_loop_reason_none_decision():
-    assert classify_missing_fill(None, MISSING_FILL_BUDGET_CAPPED) == MISSING_FILL_BUDGET_CAPPED
-
+    assert (
+        classify_missing_fill(None, MISSING_FILL_BUDGET_CAPPED)
+        == MISSING_FILL_BUDGET_CAPPED
+    )
 
 
 def test_missing_fill_none_decision_no_loop_reason():
     assert classify_missing_fill(None, None) == MISSING_FILL_DATA_ERROR
 
 
-
 def test_missing_fill_classification():
-    assert classify_missing_fill(_decision("A", Action.NO_DATA), None) == MISSING_FILL_DATA_ERROR
-    assert classify_missing_fill(_decision("A", Action.SKIP), None) == MISSING_FILL_FAILED_TRIGGER
-    assert classify_missing_fill(_decision("A", Action.NO_ACTION), None) == MISSING_FILL_FAILED_TRIGGER
-    assert classify_missing_fill(_decision("A", Action.MANUAL_REVIEW), None) == MISSING_FILL_FAILED_TRIGGER
+    assert (
+        classify_missing_fill(_decision("A", Action.NO_DATA), None)
+        == MISSING_FILL_DATA_ERROR
+    )
+    assert (
+        classify_missing_fill(_decision("A", Action.SKIP), None)
+        == MISSING_FILL_FAILED_TRIGGER
+    )
+    assert (
+        classify_missing_fill(_decision("A", Action.NO_ACTION), None)
+        == MISSING_FILL_FAILED_TRIGGER
+    )
+    assert (
+        classify_missing_fill(_decision("A", Action.MANUAL_REVIEW), None)
+        == MISSING_FILL_FAILED_TRIGGER
+    )
     # loop reason takes precedence over the reconciled action.
-    assert classify_missing_fill(_decision("A", Action.BUY), MISSING_FILL_BUDGET_CAPPED) == MISSING_FILL_BUDGET_CAPPED
-    assert classify_missing_fill(_decision("A", Action.BUY), MISSING_FILL_BROKER_BLOCKED) == MISSING_FILL_BROKER_BLOCKED
-    assert classify_missing_fill(_decision("A", Action.BUY), MISSING_FILL_EXECUTION_GAP) == MISSING_FILL_EXECUTION_GAP
+    assert (
+        classify_missing_fill(_decision("A", Action.BUY), MISSING_FILL_BUDGET_CAPPED)
+        == MISSING_FILL_BUDGET_CAPPED
+    )
+    assert (
+        classify_missing_fill(_decision("A", Action.BUY), MISSING_FILL_BROKER_BLOCKED)
+        == MISSING_FILL_BROKER_BLOCKED
+    )
+    assert (
+        classify_missing_fill(_decision("A", Action.BUY), MISSING_FILL_EXECUTION_GAP)
+        == MISSING_FILL_EXECUTION_GAP
+    )
 
 
 def test_build_report_metrics_and_ranking():
     records = [
         build_execution_record(
-            ReconciledDecision(
-                ticker="A",
-                action=Action.BUY,
-                reason="",
-                finance_signal=None,
-                robinhood_signal=None,
-                target_price=100.0,
-                target_price_source="finance:signal_quote",
-                decision_bar_close=100.0,
-            ),
+            ticker="A",
+            target_price=100.0,
+            target_price_source="finance:signal_quote",
+            decision_bar_close=100.0,
             notional_usd=10.0,
-            fill=OrderFill(avg_fill_price=101.0, quantity_filled=1.0),
+            avg_fill_price=101.0,
+            quantity_filled=1.0,
         ),
         build_execution_record(
-            ReconciledDecision(ticker="B", action=Action.BUY, reason="", finance_signal=None, robinhood_signal=None, target_price=100.0, target_price_source="finance:signal_quote", decision_bar_close=100.0),
+            ticker="B",
+            target_price=100.0,
+            target_price_source="finance:signal_quote",
+            decision_bar_close=100.0,
             notional_usd=10.0,
-            fill=OrderFill(avg_fill_price=100.2, quantity_filled=1.0)
+            avg_fill_price=100.2,
+            quantity_filled=1.0,
         ),
     ]
     run_result = RunResult(
@@ -1980,7 +2438,9 @@ def test_build_report_metrics_and_ranking():
         loop_block_reasons={},
         active_universe=["A", "B", "C", "D"],
     )
-    report = build_report(run_result, datetime(2026, 6, 29, 16, 0, tzinfo=EASTERN))
+    report = build_report(
+        run_result, "manual", datetime(2026, 6, 29, 16, 0, tzinfo=EASTERN)
+    )
     # A has larger abs slippage (1.0%) than B (0.2%), so A ranks first.
     assert [r.ticker for r in report.ranked_slippage] == ["A", "B"]
     assert report.top_slippage_tickers == ["A", "B"]
@@ -1989,11 +2449,17 @@ def test_build_report_metrics_and_ranking():
     assert report.missing_fills["C"] == MISSING_FILL_DATA_ERROR
     assert report.missing_fills["D"] == MISSING_FILL_FAILED_TRIGGER
     assert report.metrics["missing_fill_reasons"][MISSING_FILL_DATA_ERROR] == 1
-    for key in ["mean_abs_slippage_pct", "median_abs_slippage_pct", "p90_abs_slippage_pct", "net_slippage_cost"]:
+    for key in [
+        "mean_abs_slippage_pct",
+        "median_abs_slippage_pct",
+        "p90_abs_slippage_pct",
+        "net_slippage_cost",
+    ]:
         assert key in report.metrics
 
 
 # --- Artifact / state-file fields --------------------------------------------
+
 
 def test_generate_report_and_state_artifacts(tmp_path=None):
     tmpdir_obj = tempfile.TemporaryDirectory()
@@ -2002,13 +2468,21 @@ def test_generate_report_and_state_artifacts(tmp_path=None):
     config = StrategyConfig(dry_run=True)
     state = StrategyState()
     # reference prices near the decision close so the dry-run broker simulates fills.
-    broker = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers},
-                          simulated_slippage_pct=0.2)
+    broker = DryRunBroker(
+        cash=500.0,
+        reference_prices={t: 98.0 for t in config.tickers},
+        simulated_slippage_pct=0.2,
+    )
     fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
     rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
 
     result = run_and_report(
-        now, config, state, fin, rh, broker,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
         output_dir=os.path.join(workdir, "reports"),
         state_path=os.path.join(workdir, "state.json"),
         run_label="manual",
@@ -2024,13 +2498,21 @@ def test_generate_report_and_state_artifacts(tmp_path=None):
 
     with open(result["state_path"], encoding="utf-8") as handle:
         payload = json.load(handle)
-    assert payload["artifacts"]["slippage_report_path"] == result["slippage_report_path"]
+    assert (
+        payload["artifacts"]["slippage_report_path"] == result["slippage_report_path"]
+    )
     assert payload["artifacts"]["orders_csv_path"] == result["orders_csv_path"]
     metrics = payload["summary_metrics"]
     for key in [
-        "filled_order_count", "total_filled_notional", "net_slippage_cost",
-        "mean_abs_slippage_pct", "median_abs_slippage_pct", "p90_abs_slippage_pct",
-        "top_slippage_tickers", "missing_fill_count", "missing_fill_reasons",
+        "filled_order_count",
+        "total_filled_notional",
+        "net_slippage_cost",
+        "mean_abs_slippage_pct",
+        "median_abs_slippage_pct",
+        "p90_abs_slippage_pct",
+        "top_slippage_tickers",
+        "missing_fill_count",
+        "missing_fill_reasons",
     ]:
         assert key in metrics, f"missing metric {key}"
     # dry-run simulated fills should have produced at least one filled order.
@@ -2039,11 +2521,18 @@ def test_generate_report_and_state_artifacts(tmp_path=None):
     # CSV carries the durable per-order slippage fields.
     csv_text = open(result["orders_csv_path"], encoding="utf-8").read()
     header = csv_text.splitlines()[0]
-    for column in ["target_price", "slippage_pct", "slippage_cost", "latency_seconds", "execution_quality"]:
+    for column in [
+        "target_price",
+        "slippage_pct",
+        "slippage_cost",
+        "latency_seconds",
+        "execution_quality",
+    ]:
         assert column in header
 
 
 # --- Usage-proxy logging & compact daily mode --------------------------------
+
 
 class _RaisingData:
     """Provider whose intraday fetch always raises, to exercise error counting."""
@@ -2083,14 +2572,18 @@ def _compact_setup(workdir):
         approved_test_dates=frozenset({date(2026, 6, 29)}),
     )
     state = StrategyState()
-    broker = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    broker = DryRunBroker(
+        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
+    )
     fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
     # Tight bid/ask (0.2% spread, well under the default 1% breaker) so these
     # compact-mode tests -- which exercise usage-proxy logging, kill-switch
     # accounting, confirmation-required handling, and top-up recording, not
     # spread behavior itself -- still reach a submitted/dry_run outcome under
     # the scheduled-run fail-closed-on-missing-spread breaker.
-    rh = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
+    rh = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
     return now, config, state, broker, fin, rh
 
 
@@ -2098,10 +2591,19 @@ def test_usage_proxy_logged_in_run_state(tmp_path):
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
 
-    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir,
-                      notifications_sent=1)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, notifications_sent=1),
+    )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
 
     usage = run_state["usage_proxy"]
@@ -2119,7 +2621,9 @@ def test_usage_proxy_logged_in_run_state(tmp_path):
     assert usage["csv_artifact_count"] == 3
     # The backfill re-serializes until the recorded size matches what is on disk,
     # and the total must cover the state file plus every counted CSV exactly.
-    assert usage["state_file_bytes"] == os.path.getsize(os.path.join(artifacts_dir, "run_state.json"))
+    assert usage["state_file_bytes"] == os.path.getsize(
+        os.path.join(artifacts_dir, "run_state.json")
+    )
     csv_bytes = sum(
         os.path.getsize(os.path.join(artifacts_dir, name))
         for name in ("signals.csv", "buy_candidates.csv", "orders.csv")
@@ -2136,9 +2640,19 @@ def test_usage_proxy_counts_provider_errors(tmp_path):
     now, config, state, broker, _fin, rh = _compact_setup(tmp_path)
     raising = _RaisingData(SourceName.FINANCE)
 
-    run_daily_compact(now, config, state, raising, rh, broker, artifacts_dir=artifacts_dir)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        raising,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
     usage = run_state["usage_proxy"]
 
@@ -2151,7 +2665,9 @@ def test_usage_proxy_counts_provider_errors(tmp_path):
     assert run_state["counts"]["manual_review"] == 3
     assert sorted(run_state["manual_review_tickers"]) == ["AAPL", "MSFT", "NVDA"]
     # The artifact rows carry the provider_error flag, not just the reason text.
-    finance_rows = [row for row in run_state["signal_rows"] if row["source"] == "finance"]
+    finance_rows = [
+        row for row in run_state["signal_rows"] if row["source"] == "finance"
+    ]
     assert finance_rows and all(row["provider_error"] is True for row in finance_rows)
 
 
@@ -2160,9 +2676,19 @@ def test_finance_ticker_not_found_degrades_to_robinhood_only_buy(tmp_path):
     now, config, state, broker, _fin, rh = _compact_setup(tmp_path)
     not_found = _NotFoundData(SourceName.FINANCE)
 
-    run_daily_compact(now, config, state, not_found, rh, broker, artifacts_dir=artifacts_dir)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        not_found,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
     usage = run_state["usage_proxy"]
 
@@ -2173,7 +2699,9 @@ def test_finance_ticker_not_found_degrades_to_robinhood_only_buy(tmp_path):
     assert usage["errors_count"] == 0
     assert usage["manual_recovery_required"] is False
     assert usage["orders_placed_count"] == 3
-    finance_rows = [row for row in run_state["signal_rows"] if row["source"] == "finance"]
+    finance_rows = [
+        row for row in run_state["signal_rows"] if row["source"] == "finance"
+    ]
     assert finance_rows and all(row["provider_error"] is False for row in finance_rows)
     assert all("not found" in row["reason"] for row in finance_rows)
 
@@ -2182,10 +2710,23 @@ def test_run_daily_compact_writes_structured_only(tmp_path):
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
 
-    result = run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir)
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
 
     assert result["compact"] is True
-    for key in ["run_state_path", "signals_path", "buy_candidates_path", "orders_csv_path"]:
+    for key in [
+        "run_state_path",
+        "signals_path",
+        "buy_candidates_path",
+        "orders_csv_path",
+    ]:
         assert os.path.exists(result[key]), f"missing structured artifact: {key}"
 
     # The compact daily path must not emit the narrative markdown report or any
@@ -2203,9 +2744,19 @@ def test_run_daily_compact_stamps_scheduled_run_classification(tmp_path):
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
 
-    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
     rc = run_state["run_classification"]
     assert rc["run_origin"] == "scheduled"
@@ -2219,9 +2770,19 @@ def test_run_daily_compact_manual_stamps_manual_run_classification(tmp_path):
     artifacts_dir = os.path.join(tmp_path, "runs", "manual_2026-06-29")
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
 
-    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=False)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=False),
+    )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
     rc = run_state["run_classification"]
     assert rc["run_origin"] == "manual"
@@ -2248,31 +2809,58 @@ def test_deployment_history_root_engages_kill_switch_on_later_run(tmp_path):
         monthly_cash_allocation_usd=10.0,  # tiny allocation -> trivial to exceed 40%
     )
     state1 = StrategyState()
-    broker1 = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    broker1 = DryRunBroker(
+        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
+    )
     fin1 = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now1))
     # Tight bid/ask so the scheduled-run fail-closed-on-missing-spread breaker
     # doesn't block this kill-switch scenario (spread behavior is not under test).
-    rh1 = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now1), bid_ask=(97.9, 98.1))
-    run_daily_compact(now1, config, state1, fin1, rh1, broker1, artifacts_dir=day1_dir)
+    rh1 = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now1), bid_ask=(97.9, 98.1)
+    )
+    run_daily_compact(
+        now1,
+        config,
+        state1,
+        fin1,
+        rh1,
+        broker1,
+        options=CompactRunOptions(artifacts_dir=day1_dir),
+    )
 
     with open(os.path.join(day1_dir, "run_state.json"), encoding="utf-8") as handle:
         day1_state = json.load(handle)
     day1_deployed = sum(
-        c["planned_amount_usd"] for c in day1_state["buy_candidates"] if c["status"] == "submitted"
+        c["planned_amount_usd"]
+        for c in day1_state["buy_candidates"]
+        if c["status"] == "submitted"
     )
-    assert day1_deployed > 0.4 * config.monthly_cash_allocation_usd  # sanity: threshold is crossed
+    assert (
+        day1_deployed > 0.4 * config.monthly_cash_allocation_usd
+    )  # sanity: threshold is crossed
 
     # Day 2 (within the trailing 7 days): the kill-switch must engage from day 1's
     # history alone, capping every buy multiplier to 1x.
     day2_dir = os.path.join(history_root, "2026-07-02")
     now2 = datetime(2026, 7, 2, 15, 45, tzinfo=EASTERN)
     state2 = StrategyState()
-    broker2 = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    broker2 = DryRunBroker(
+        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
+    )
     fin2 = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now2))
-    rh2 = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now2), bid_ask=(97.9, 98.1))
+    rh2 = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now2), bid_ask=(97.9, 98.1)
+    )
     run_daily_compact(
-        now2, config, state2, fin2, rh2, broker2,
-        artifacts_dir=day2_dir, deployment_history_root=history_root,
+        now2,
+        config,
+        state2,
+        fin2,
+        rh2,
+        broker2,
+        options=CompactRunOptions(
+            artifacts_dir=day2_dir, deployment_history_root=history_root
+        ),
     )
 
     with open(os.path.join(day2_dir, "run_state.json"), encoding="utf-8") as handle:
@@ -2286,7 +2874,9 @@ def test_deployment_history_root_engages_kill_switch_on_later_run(tmp_path):
     # own submissions as they were made (see
     # test_kill_switch_caps_later_candidates_within_the_same_batch for the
     # narrower in-batch behavior) -- not just the pre-run historical figure.
-    assert day2_state["risk_guard"]["deployed_last_7d_usd"] == round(day1_deployed + day2_deployed, 2)
+    assert day2_state["risk_guard"]["deployed_last_7d_usd"] == round(
+        day1_deployed + day2_deployed, 2
+    )
 
 
 def test_apply_deployment_history_only_counts_trailing_7d(tmp_path):
@@ -2327,18 +2917,24 @@ def test_apply_deployment_history_only_counts_trailing_7d(tmp_path):
                 "state_schema_version": "run-classification-v1",
             },
             "buy_candidates": [
-                {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": deployed_usd}
+                {
+                    "ticker": "AAPL",
+                    "status": "submitted",
+                    "planned_amount_usd": deployed_usd,
+                }
             ],
         }
-        with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        with open(
+            os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8"
+        ) as handle:
             json.dump(state, handle, indent=2)
 
     history_root = os.path.join(str(tmp_path), "runs")
     as_of = date(2026, 7, 21)
-    _write_scheduled_state(as_of - timedelta(days=3), 30.0)     # in window -> counts
-    _write_scheduled_state(as_of - timedelta(days=6), 12.0)     # window edge -> counts
-    _write_scheduled_state(as_of - timedelta(days=7), 999.0)    # first day past window
-    _write_scheduled_state(as_of - timedelta(days=40), 999.0)   # long-stale history
+    _write_scheduled_state(as_of - timedelta(days=3), 30.0)  # in window -> counts
+    _write_scheduled_state(as_of - timedelta(days=6), 12.0)  # window edge -> counts
+    _write_scheduled_state(as_of - timedelta(days=7), 999.0)  # first day past window
+    _write_scheduled_state(as_of - timedelta(days=40), 999.0)  # long-stale history
 
     config = StrategyConfig(monthly_cash_allocation_usd=3600.0)
     guarded = _apply_deployment_history(config, as_of, history_root)
@@ -2363,24 +2959,40 @@ def test_same_day_ticker_deployment_already_recorded(tmp_path):
     trading_day = date(2026, 7, 21)
 
     # No artifact for trading_day anywhere on disk yet -> not recorded.
-    assert _same_day_ticker_deployment_already_recorded("AAPL", trading_day, history_root) is False
+    assert (
+        _same_day_ticker_deployment_already_recorded("AAPL", trading_day, history_root)
+        is False
+    )
 
     # A same-day artifact exists but records a DIFFERENT ticker (e.g. an
     # earlier invocation placed MSFT then crashed before a later invocation's
     # AAPL placement was ever written) -> date membership alone must not be
     # mistaken for proof AAPL's order was counted.
     _write_scheduled_afternoon_artifact(
-        history_root, trading_day, [{"ticker": "MSFT", "status": "submitted", "planned_amount_usd": 5.0}]
+        history_root,
+        trading_day,
+        [{"ticker": "MSFT", "status": "submitted", "planned_amount_usd": 5.0}],
     )
-    assert _same_day_ticker_deployment_already_recorded("AAPL", trading_day, history_root) is False
+    assert (
+        _same_day_ticker_deployment_already_recorded("AAPL", trading_day, history_root)
+        is False
+    )
     # MSFT itself, however, is recorded.
-    assert _same_day_ticker_deployment_already_recorded("MSFT", trading_day, history_root) is True
+    assert (
+        _same_day_ticker_deployment_already_recorded("MSFT", trading_day, history_root)
+        is True
+    )
 
     # Now AAPL's own submitted order is on disk for today -> recorded.
     _write_scheduled_afternoon_artifact(
-        history_root, trading_day, [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 5.0}]
+        history_root,
+        trading_day,
+        [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 5.0}],
     )
-    assert _same_day_ticker_deployment_already_recorded("AAPL", trading_day, history_root) is True
+    assert (
+        _same_day_ticker_deployment_already_recorded("AAPL", trading_day, history_root)
+        is True
+    )
 
 
 def test_kill_switch_caps_later_candidates_within_the_same_batch(tmp_path):
@@ -2400,13 +3012,27 @@ def test_kill_switch_caps_later_candidates_within_the_same_batch(tmp_path):
         monthly_cash_allocation_usd=7.5,
     )
     state = StrategyState()
-    broker = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    broker = DryRunBroker(
+        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
+    )
     fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
-    rh = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
+    rh = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
 
-    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
     submitted = [c for c in run_state["buy_candidates"] if c["status"] == "submitted"]
@@ -2438,15 +3064,25 @@ def test_manual_run_submissions_do_not_advance_in_batch_burn(tmp_path):
         monthly_cash_allocation_usd=7.5,
     )
     state = StrategyState()
-    broker = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    broker = DryRunBroker(
+        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
+    )
     fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
     rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
 
     run_daily_compact(
-        now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=False,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=False),
     )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
     assert by_ticker["AAA"]["planned_amount_usd"] == 4.0
@@ -2466,7 +3102,15 @@ def test_run_daily_compact_date_gated_short_circuits(tmp_path):
     _now, config, state, broker, fin, rh = _compact_setup(tmp_path)
     gated_now = datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN)  # not an approved date
 
-    result = run_daily_compact(gated_now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir)
+    result = run_daily_compact(
+        gated_now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
 
     assert result["blocked"] is True
     assert os.path.exists(result["run_state_path"])
@@ -2502,7 +3146,15 @@ def test_run_daily_compact_holiday_gated_short_circuits(tmp_path):
         approved_test_dates=frozenset({labor_day}),
     )
 
-    result = run_daily_compact(holiday_now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir)
+    result = run_daily_compact(
+        holiday_now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
 
     assert result["blocked"] is True
     with open(result["run_state_path"], encoding="utf-8") as handle:
@@ -2528,9 +3180,19 @@ def test_blocked_stub_is_contract_valid_but_never_scheduled_evidence(tmp_path):
     _now, config, state, broker, fin, rh = _compact_setup(tmp_path)
     gated_now = datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN)  # not an approved date
 
-    run_daily_compact(gated_now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir)
+    run_daily_compact(
+        gated_now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
 
     # Well-formed and attributable...
@@ -2548,16 +3210,36 @@ def test_blocked_stub_is_contract_valid_but_never_scheduled_evidence(tmp_path):
 def test_run_daily_compact_date_gate_does_not_clobber_prior_artifacts(tmp_path):
     artifacts_dir = os.path.join(tmp_path, "runs", "reused")
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
-    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir)
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         original = json.load(handle)
     assert "usage_proxy" in original
 
     gated_now = datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN)  # not an approved date
-    result = run_daily_compact(gated_now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir)
+    result = run_daily_compact(
+        gated_now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
 
     assert result["blocked"] is True
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         preserved = json.load(handle)
     # The blocked stub must never overwrite a previously recorded run.
     assert preserved == original
@@ -2571,9 +3253,19 @@ def test_build_run_artifacts_stamps_scheduled_classification(tmp_path):
 
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
-    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
+    )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
 
     rc = run_state["run_classification"]
@@ -2590,9 +3282,19 @@ def test_build_run_artifacts_stamps_manual_classification(tmp_path):
 
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
     artifacts_dir = os.path.join(tmp_path, "runs", "manual-am")
-    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=False)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=False),
+    )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
 
     rc = run_state["run_classification"]
@@ -2612,7 +3314,15 @@ def test_scheduled_compact_writes_and_validates_artifact_contract(tmp_path):
 
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
-    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
+    )
 
     d = Path(artifacts_dir)
     assert (d / "run_state.json").exists()
@@ -2630,7 +3340,9 @@ def test_scheduled_compact_writes_and_validates_artifact_contract(tmp_path):
     assert rc["same_day_required"] is True
     assert rc["valid_scheduled_evidence"] is True
     # the production contract validator passes on the written dir
-    assert validate_run_artifacts(d, require_submitted_orders=True, require_summary=True)
+    assert validate_run_artifacts(
+        d, require_submitted_orders=True, require_summary=True
+    )
 
 
 def test_manual_compact_does_not_write_scheduled_contract_files(tmp_path):
@@ -2640,7 +3352,15 @@ def test_manual_compact_does_not_write_scheduled_contract_files(tmp_path):
 
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
     artifacts_dir = os.path.join(tmp_path, "runs", "manual-am")
-    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=False)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=False),
+    )
 
     run_state = json.loads(Path(artifacts_dir, "run_state.json").read_text())
     rc = run_state["run_classification"]
@@ -2668,10 +3388,18 @@ def test_scheduled_contract_excludes_dry_run_orders_from_submitted_orders(tmp_pa
         "order_submit_status": "dry_run",
         "run_classification": {"run_origin": "scheduled", "manual_run": False},
         "buy_candidates": [
-            {"ticker": "A", "planned_amount_usd": 2.0, "status": "dry_run",
-             "order_id": "DRY-RUN-SIM-A-2.00-x"},
-            {"ticker": "B", "planned_amount_usd": 3.0, "status": "dry_run",
-             "order_id": "DRY-RUN-SIM-B-3.00-x"},
+            {
+                "ticker": "A",
+                "planned_amount_usd": 2.0,
+                "status": "dry_run",
+                "order_id": "DRY-RUN-SIM-A-2.00-x",
+            },
+            {
+                "ticker": "B",
+                "planned_amount_usd": 3.0,
+                "status": "dry_run",
+                "order_id": "DRY-RUN-SIM-B-3.00-x",
+            },
         ],
     }
     d = Path(tmp_path)
@@ -2703,11 +3431,18 @@ def test_contract_failure_persists_invalid_evidence_marker(tmp_path):
         "dry_run": False,
         "order_submit_status": "submitted",
         "run_classification": {
-            "run_origin": "scheduled", "manual_run": False, "stream": "afternoon",
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
             "valid_scheduled_evidence": True,
         },
         "buy_candidates": [
-            {"ticker": "A", "planned_amount_usd": 2.0, "order_id": "o1", "status": "submitted"},
+            {
+                "ticker": "A",
+                "planned_amount_usd": 2.0,
+                "order_id": "o1",
+                "status": "submitted",
+            },
             # positive planned row left unplaced -> compute-only terminal failure
             {"ticker": "B", "planned_amount_usd": 3.0, "status": "not_submitted"},
         ],
@@ -2721,7 +3456,9 @@ def test_contract_failure_persists_invalid_evidence_marker(tmp_path):
 
     persisted = json.loads((d / "run_state.json").read_text())
     assert persisted["status"] == "blocked"
-    assert persisted["artifact_contract_failure"]["failure"] == "artifact_contract_failure"
+    assert (
+        persisted["artifact_contract_failure"]["failure"] == "artifact_contract_failure"
+    )
     assert persisted["run_classification"]["valid_scheduled_evidence"] is False
     # both direct-discovery consumers now refuse the rejected run
     assert derive_valid_scheduled_evidence(persisted) is False
@@ -2741,16 +3478,26 @@ def test_contract_failure_blocks_scheduled_pointer_update(tmp_path, monkeypatch)
     monkeypatch.setattr(
         near_close_dca,
         "_write_and_validate_scheduled_contract",
-        lambda artifacts, artifacts_dir: ArtifactContractResult(False, ["forced contract failure"]),
+        lambda artifacts, artifacts_dir: ArtifactContractResult(
+            False, ["forced contract failure"]
+        ),
     )
 
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
     classification_root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
     run_daily_compact(
-        now, config, state, fin, rh, broker,
-        artifacts_dir=artifacts_dir, scheduled=True,
-        classification_state_root=classification_root,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(
+            artifacts_dir=artifacts_dir,
+            scheduled=True,
+            classification_state_root=classification_root,
+        ),
     )
     # run_state.json is still written, but the invalid run is not pointed at.
     assert Path(artifacts_dir, "run_state.json").exists()
@@ -2766,9 +3513,17 @@ def test_scheduled_run_updates_latest_scheduled_run_pointer(tmp_path):
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
     classification_root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
     run_daily_compact(
-        now, config, state, fin, rh, broker,
-        artifacts_dir=artifacts_dir, scheduled=True,
-        classification_state_root=classification_root,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(
+            artifacts_dir=artifacts_dir,
+            scheduled=True,
+            classification_state_root=classification_root,
+        ),
     )
 
     pointer = latest_scheduled_run_path(classification_root)
@@ -2787,9 +3542,17 @@ def test_manual_run_does_not_touch_latest_scheduled_run_pointer(tmp_path):
     artifacts_dir = os.path.join(tmp_path, "runs", "manual-am")
     classification_root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
     run_daily_compact(
-        now, config, state, fin, rh, broker,
-        artifacts_dir=artifacts_dir, scheduled=False,
-        classification_state_root=classification_root,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(
+            artifacts_dir=artifacts_dir,
+            scheduled=False,
+            classification_state_root=classification_root,
+        ),
     )
 
     assert not latest_scheduled_run_path(classification_root).exists()
@@ -2808,12 +3571,24 @@ def test_confirmation_required_broker_response_recorded_distinctly(tmp_path):
         tickers=config.tickers,
         approved_test_dates=config.approved_test_dates,
     )
-    broker = _ConfirmationRequiredBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    broker = _ConfirmationRequiredBroker(
+        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
+    )
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
 
-    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
 
     assert run_state["order_submit_status"] == "not_submitted_confirmation_required"
@@ -2844,9 +3619,19 @@ def test_scheduled_no_order_run_records_completed_no_orders_not_a_failure(tmp_pa
     rh = _FakeData(SourceName.ROBINHOOD, 100.0, 100.0, quote=(100.0, now))
     artifacts_dir = os.path.join(tmp_path, "runs", "no-candidates")
 
-    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
+    )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
 
     assert run_state["run_classification_outcome"] == "completed_no_orders"
@@ -2862,7 +3647,9 @@ def test_scheduled_no_order_run_records_completed_no_orders_not_a_failure(tmp_pa
     assert run_state["orders_submitted_count"] == 0
 
 
-def test_scheduled_run_blocked_only_by_missing_spread_records_missing_spread_data(tmp_path):
+def test_scheduled_run_blocked_only_by_missing_spread_records_missing_spread_data(
+    tmp_path,
+):
     """Candidates DID reach the gate and every one was failed closed there, so the
     run legitimately carries error_class='missing_spread_data' -- still a safe
     no-order skip, not a trading failure."""
@@ -2879,9 +3666,19 @@ def test_scheduled_run_blocked_only_by_missing_spread_records_missing_spread_dat
     rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
     artifacts_dir = os.path.join(tmp_path, "runs", "spread-blocked")
 
-    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
+    )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
 
     [candidate] = run_state["buy_candidates"]
@@ -2906,16 +3703,28 @@ def test_confirmation_required_status_survives_the_no_order_classification(tmp_p
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     config = StrategyConfig(
-        dry_run=False, tickers=config.tickers, approved_test_dates=config.approved_test_dates
+        dry_run=False,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
     )
     broker = _ConfirmationRequiredBroker(
         cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
     )
     artifacts_dir = os.path.join(tmp_path, "runs", "confirmation")
 
-    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
+    )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
 
     assert run_state["order_submit_status"] == "not_submitted_confirmation_required"
@@ -2934,17 +3743,34 @@ def test_afternoon_placement_failures_are_recorded_as_a_trading_failure(tmp_path
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     config = StrategyConfig(
-        dry_run=False, tickers=config.tickers, approved_test_dates=config.approved_test_dates
+        dry_run=False,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
     )
-    broker = _FailingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    broker = _FailingBroker(
+        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
+    )
     artifacts_dir = os.path.join(tmp_path, "runs", "placement-failed")
 
-    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
+    )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
 
-    assert run_state["run_classification_outcome"] == "failed_after_connector_native_recovery_attempt"
+    assert (
+        run_state["run_classification_outcome"]
+        == "failed_after_connector_native_recovery_attempt"
+    )
     assert run_state["error_class"] == "failed_after_connector_native_recovery_attempt"
     assert run_state["is_trading_failure"] is True
     assert run_state["order_submit_status"] == "not_submitted_error"
@@ -2955,7 +3781,9 @@ def test_afternoon_run_summary_carries_the_no_order_outcome_fields(tmp_path):
     a failure (Codex review)."""
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
-        dry_run=False, tickers=("AAPL",), approved_test_dates=frozenset({date(2026, 6, 29)})
+        dry_run=False,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
     )
     state = StrategyState()
     broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 100.0})
@@ -2963,11 +3791,23 @@ def test_afternoon_run_summary_carries_the_no_order_outcome_fields(tmp_path):
     rh = _FakeData(SourceName.ROBINHOOD, 100.0, 100.0, quote=(100.0, now))
     artifacts_dir = os.path.join(tmp_path, "runs", "summary-fields")
 
-    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
+    )
 
-    with open(os.path.join(artifacts_dir, "run_summary.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_summary.json"), encoding="utf-8"
+    ) as handle:
         summary = json.load(handle)
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
 
     assert summary["run_classification_outcome"] == "completed_no_orders"
@@ -2990,7 +3830,15 @@ def test_blocked_stub_completes_a_partial_legacy_directory(tmp_path):
     _now, config, state, broker, fin, rh = _compact_setup(tmp_path)
     gated_now = datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN)  # not an approved date
 
-    run_daily_compact(gated_now, config, state, fin, rh, broker, artifacts_dir=str(artifacts_dir))
+    run_daily_compact(
+        gated_now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=str(artifacts_dir)),
+    )
 
     # The pre-existing run_state is preserved byte for byte...
     assert (artifacts_dir / "run_state.json").read_text(encoding="utf-8") == legacy
@@ -2999,7 +3847,9 @@ def test_blocked_stub_completes_a_partial_legacy_directory(tmp_path):
         assert (artifacts_dir / name).exists(), f"{name} still missing"
     _assert_csv_header(str(artifacts_dir / "signals.csv"))
     _assert_csv_header(str(artifacts_dir / "submitted_orders.csv"))
-    summary = json.loads((artifacts_dir / "run_summary.json").read_text(encoding="utf-8"))
+    summary = json.loads(
+        (artifacts_dir / "run_summary.json").read_text(encoding="utf-8")
+    )
     # The summary mirrors what is actually on disk, not the fresh stub.
     assert summary["trading_day"] == "2026-07-01"
 
@@ -3010,7 +3860,9 @@ def test_provider_errors_are_not_recorded_as_a_healthy_no_order_run(tmp_path):
     no-op (Codex review)."""
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
-        dry_run=False, tickers=("AAPL",), approved_test_dates=frozenset({date(2026, 6, 29)})
+        dry_run=False,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
     )
     state = StrategyState()
     broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
@@ -3023,9 +3875,19 @@ def test_provider_errors_are_not_recorded_as_a_healthy_no_order_run(tmp_path):
     rh = _RaisingProvider(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
     artifacts_dir = os.path.join(tmp_path, "runs", "provider-errors")
 
-    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
+    )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
 
     assert run_state["usage_proxy"]["errors_count"] > 0
@@ -3048,7 +3910,15 @@ def test_empty_universe_still_writes_a_signals_header(tmp_path):
     rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
     artifacts_dir = os.path.join(tmp_path, "runs", "empty-universe")
 
-    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
+    )
 
     _assert_csv_header(os.path.join(artifacts_dir, "signals.csv"))
     _assert_csv_header(os.path.join(artifacts_dir, "buy_candidates.csv"))
@@ -3058,7 +3928,9 @@ def test_empty_universe_still_writes_a_signals_header(tmp_path):
     assert validate_run_artifacts(artifacts_dir, require_summary=True)
 
 
-def test_a_manual_afternoon_placement_failure_is_not_a_scheduled_recovery_failure(tmp_path):
+def test_a_manual_afternoon_placement_failure_is_not_a_scheduled_recovery_failure(
+    tmp_path,
+):
     """run_once(scheduled=False) never runs the connector-native recovery policy,
     so its broker failures must not be attributed to it (Codex review)."""
 
@@ -3068,16 +3940,28 @@ def test_a_manual_afternoon_placement_failure_is_not_a_scheduled_recovery_failur
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     config = StrategyConfig(
-        dry_run=False, tickers=config.tickers, approved_test_dates=config.approved_test_dates
+        dry_run=False,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
     )
-    broker = _FailingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    broker = _FailingBroker(
+        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
+    )
     artifacts_dir = os.path.join(tmp_path, "runs", "manual-placement-failed")
 
     run_daily_compact(
-        now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=False
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=False),
     )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
 
     assert run_state["run_classification_outcome"] == "failed_placement"
@@ -3097,16 +3981,28 @@ def test_afternoon_partially_submitted_batch_records_the_failed_placement(tmp_pa
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     config = StrategyConfig(
-        dry_run=False, tickers=config.tickers, approved_test_dates=config.approved_test_dates
+        dry_run=False,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
     )
     broker = _PartlyFailingBroker(
         cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
     )
     artifacts_dir = os.path.join(tmp_path, "runs", "partial-batch")
 
-    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
+    )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
 
     assert run_state["orders_submitted_count"] >= 1
@@ -3114,7 +4010,9 @@ def test_afternoon_partially_submitted_batch_records_the_failed_placement(tmp_pa
     assert run_state["run_classification_outcome"] == "failed_after_partial_submission"
     assert run_state["is_trading_failure"] is True
     # The summary carries it too, so a summary-only consumer sees the failure.
-    with open(os.path.join(artifacts_dir, "run_summary.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_summary.json"), encoding="utf-8"
+    ) as handle:
         summary = json.load(handle)
     assert summary["is_trading_failure"] is True
 
@@ -3128,8 +4026,12 @@ def test_a_retry_keeps_an_earlier_attempts_orders_in_the_aggregate(tmp_path):
     outcomes = {"AAA": {"status": "submitted", "order_id": "o-new"}}
     carried = [
         {"ticker": "AAA", "status": "submitted", "order_id": "o-new"},
-        {"ticker": "BBB", "status": "submitted", "order_id": "o-earlier",
-         "planned_amount_usd": 2.0},
+        {
+            "ticker": "BBB",
+            "status": "submitted",
+            "order_id": "o-earlier",
+            "planned_amount_usd": 2.0,
+        },
     ]
 
     # Counted once for AAA (present in both) plus once for the carried-forward BBB.
@@ -3151,19 +4053,34 @@ def test_afternoon_startup_failure_still_writes_the_complete_artifact_set(tmp_pa
             raise RuntimeError("account lookup exploded")
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    broker = _ExplodingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    broker = _ExplodingBroker(
+        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
+    )
     artifacts_dir = os.path.join(tmp_path, "runs", "afternoon-startup-failure")
 
     with pytest.raises(RuntimeError):
         run_daily_compact(
-            now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True
+            now,
+            config,
+            state,
+            fin,
+            rh,
+            broker,
+            options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
         )
 
-    for name in ("run_state.json", "run_summary.json", "signals.csv", "submitted_orders.csv"):
+    for name in (
+        "run_state.json",
+        "run_summary.json",
+        "signals.csv",
+        "submitted_orders.csv",
+    ):
         assert os.path.exists(os.path.join(artifacts_dir, name)), f"{name} missing"
     assert validate_run_artifacts(artifacts_dir, require_summary=True)
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
     assert run_state["status"] == "failed"
     assert run_state["error_class"] == "scheduled_run_startup_failure"
@@ -3190,7 +4107,9 @@ def test_an_afternoon_failure_after_placement_preserves_the_order(tmp_path):
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     config = StrategyConfig(
-        dry_run=False, tickers=config.tickers, approved_test_dates=config.approved_test_dates
+        dry_run=False,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
     )
     broker = _FailAfterFirstBroker(
         cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
@@ -3201,22 +4120,35 @@ def test_an_afternoon_failure_after_placement_preserves_the_order(tmp_path):
     # than raising; either way the accepted order must survive in the artifact.
     try:
         run_daily_compact(
-            now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True
+            now,
+            config,
+            state,
+            fin,
+            rh,
+            broker,
+            options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
         )
     except RuntimeError:
         pass
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
     assert run_state["orders_submitted_count"] >= 1
-    submitted = [c for c in run_state["buy_candidates"] if c.get("status") == "submitted"]
+    submitted = [
+        c for c in run_state["buy_candidates"] if c.get("status") == "submitted"
+    ]
     assert submitted and submitted[0].get("order_id")
 
 
 def test_an_evidence_denied_stub_is_not_selected_for_scheduled_reporting(tmp_path):
     """is_scheduled_state must honor the denial marker too, or the reporting
     selector returns a blocked stub as a valid scheduled run (Codex review)."""
-    from scripts.run_classification import build_scheduled_classification, is_scheduled_state
+    from scripts.run_classification import (
+        build_scheduled_classification,
+        is_scheduled_state,
+    )
 
     denied = {
         "trading_day": "2026-07-01",
@@ -3249,12 +4181,20 @@ def test_an_accepted_order_survives_a_raise_in_post_placement_work(tmp_path):
 
     try:
         run_daily_compact(
-            now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True
+            now,
+            config,
+            state,
+            fin,
+            rh,
+            broker,
+            options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
         )
     except RuntimeError:
         pass
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
 
     # The accepted order is in the artifact no matter which path wrote it.
@@ -3275,15 +4215,25 @@ def test_an_afternoon_failure_refreshes_the_latest_scheduled_pointer(tmp_path):
             raise RuntimeError("account lookup exploded")
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    broker = _ExplodingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    broker = _ExplodingBroker(
+        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
+    )
     artifacts_dir = os.path.join(tmp_path, "runs", "pointer-on-failure")
     classification_root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
 
     with pytest.raises(RuntimeError):
         run_daily_compact(
-            now, config, state, fin, rh, broker,
-            artifacts_dir=artifacts_dir, scheduled=True,
-            classification_state_root=classification_root,
+            now,
+            config,
+            state,
+            fin,
+            rh,
+            broker,
+            options=CompactRunOptions(
+                artifacts_dir=artifacts_dir,
+                scheduled=True,
+                classification_state_root=classification_root,
+            ),
         )
 
     pointer = latest_scheduled_run_path(pathlib.Path(classification_root))
@@ -3304,18 +4254,30 @@ def test_an_afternoon_failure_state_carries_the_scheduled_run_id(tmp_path):
             raise RuntimeError("boom")
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    broker = _ExplodingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    broker = _ExplodingBroker(
+        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
+    )
     artifacts_dir = os.path.join(tmp_path, "runs", "failure-run-id")
 
     with pytest.raises(RuntimeError):
         run_daily_compact(
-            now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True
+            now,
+            config,
+            state,
+            fin,
+            rh,
+            broker,
+            options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
         )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
     assert run_state["run_id"], "failure state has no top-level run_id"
-    with open(os.path.join(artifacts_dir, "run_summary.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_summary.json"), encoding="utf-8"
+    ) as handle:
         summary = json.load(handle)
     assert summary["run_id"] == run_state["run_id"]
 
@@ -3330,9 +4292,19 @@ def test_an_unreadable_blocked_state_is_replaced_not_wrapped(tmp_path):
     _now, config, state, broker, fin, rh = _compact_setup(tmp_path)
     gated_now = datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN)  # not an approved date
 
-    run_daily_compact(gated_now, config, state, fin, rh, broker, artifacts_dir=str(artifacts_dir))
+    run_daily_compact(
+        gated_now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=str(artifacts_dir)),
+    )
 
-    run_state = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    run_state = json.loads(
+        (artifacts_dir / "run_state.json").read_text(encoding="utf-8")
+    )
     assert run_state["status"] == "blocked"
     assert run_state["completion_reason"] == "date_or_holiday_gate_blocked"
 
@@ -3341,7 +4313,9 @@ def test_an_unreadable_blocked_state_is_replaced_not_wrapped(tmp_path):
     assert validate_run_artifacts(str(artifacts_dir), require_summary=True)
 
 
-def test_a_failing_afternoon_run_with_broken_companions_denies_its_own_evidence(tmp_path):
+def test_a_failing_afternoon_run_with_broken_companions_denies_its_own_evidence(
+    tmp_path,
+):
     """The failure handler must not publish a valid pointer for a state whose
     four-file set is incomplete or corrupt (Codex review)."""
     from scripts.run_classification import latest_scheduled_run_path
@@ -3351,36 +4325,67 @@ def test_a_failing_afternoon_run_with_broken_companions_denies_its_own_evidence(
             raise RuntimeError("boom")
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    broker = _ExplodingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    broker = _ExplodingBroker(
+        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
+    )
     artifacts_dir = pathlib.Path(tmp_path) / "runs" / "broken-companions"
     artifacts_dir.mkdir(parents=True)
     classification_root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
     # A state from an earlier attempt, with a summary that does not mirror it.
     (artifacts_dir / "run_state.json").write_text(
-        json.dumps({"run_id": "earlier", "trading_day": "2026-06-29",
-                    "run_classification": {"run_origin": "scheduled", "manual_run": False,
-                                           "stream": "afternoon"}}),
+        json.dumps(
+            {
+                "run_id": "earlier",
+                "trading_day": "2026-06-29",
+                "run_classification": {
+                    "run_origin": "scheduled",
+                    "manual_run": False,
+                    "stream": "afternoon",
+                },
+            }
+        ),
         encoding="utf-8",
     )
     (artifacts_dir / "run_summary.json").write_text(
-        json.dumps({"run_id": "stale", "run_classification": {"run_origin": "scheduled",
-                                                              "manual_run": False,
-                                                              "stream": "morning"}}),
+        json.dumps(
+            {
+                "run_id": "stale",
+                "run_classification": {
+                    "run_origin": "scheduled",
+                    "manual_run": False,
+                    "stream": "morning",
+                },
+            }
+        ),
         encoding="utf-8",
     )
 
     with pytest.raises(RuntimeError):
         run_daily_compact(
-            now, config, state, fin, rh, broker,
-            artifacts_dir=str(artifacts_dir), scheduled=True,
-            classification_state_root=classification_root,
+            now,
+            config,
+            state,
+            fin,
+            rh,
+            broker,
+            options=CompactRunOptions(
+                artifacts_dir=str(artifacts_dir),
+                scheduled=True,
+                classification_state_root=classification_root,
+            ),
         )
 
-    run_state = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
-    assert run_state["artifact_contract_failure"]["failure"] == "artifact_contract_failure"
+    run_state = json.loads(
+        (artifacts_dir / "run_state.json").read_text(encoding="utf-8")
+    )
+    assert (
+        run_state["artifact_contract_failure"]["failure"] == "artifact_contract_failure"
+    )
     assert run_state["scheduled_evidence_denied"] is True
     payload = json.loads(
-        latest_scheduled_run_path(pathlib.Path(classification_root)).read_text(encoding="utf-8")
+        latest_scheduled_run_path(pathlib.Path(classification_root)).read_text(
+            encoding="utf-8"
+        )
     )
     assert payload["valid_scheduled_evidence"] is False
 
@@ -3406,9 +4411,19 @@ def test_a_cap_blocked_candidate_never_reaches_the_spread_gate(tmp_path):
     rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
     artifacts_dir = os.path.join(tmp_path, "runs", "cap-before-spread")
 
-    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
+    )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
 
     [candidate] = run_state["buy_candidates"]
@@ -3447,14 +4462,24 @@ def _preserved_state():
         "run_id": "earlier",
         "trading_day": "2026-06-29",
         "status": "completed",
-        "run_classification": {"run_origin": "scheduled", "manual_run": False,
-                               "stream": "afternoon"},
+        "run_classification": {
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+        },
         "run_classification_outcome": "completed_no_orders",
         "order_submit_status": "submitted",
         "is_trading_failure": False,
-        "broker_outcomes": {"AAA": {"status": "submitted", "order_id": "o-earlier",
-                                    "submitted_amount_usd": 2.0}},
-        "buy_candidates": [{"ticker": "AAA", "status": "submitted", "order_id": "o-earlier"}],
+        "broker_outcomes": {
+            "AAA": {
+                "status": "submitted",
+                "order_id": "o-earlier",
+                "submitted_amount_usd": 2.0,
+            }
+        },
+        "buy_candidates": [
+            {"ticker": "AAA", "status": "submitted", "order_id": "o-earlier"}
+        ],
         "orders_submitted_count": 1,
     }
 
@@ -3462,8 +4487,13 @@ def _preserved_state():
 def test_a_retrys_second_order_for_the_same_ticker_is_not_dropped(tmp_path):
     """A ticker-keyed merge kept only the earlier order while the count and CSV
     are derived from those outcomes (Codex review)."""
-    placed = {"AAA": {"status": "submitted", "order_id": "o-retry",
-                      "submitted_amount_usd": 1.0}}
+    placed = {
+        "AAA": {
+            "status": "submitted",
+            "order_id": "o-retry",
+            "submitted_amount_usd": 1.0,
+        }
+    }
 
     out, run_state = _afternoon_merge(_preserved_state(), placed, tmp_path=tmp_path)
 
@@ -3478,8 +4508,13 @@ def test_a_retrys_second_order_for_the_same_ticker_is_not_dropped(tmp_path):
 def test_a_merged_retry_is_recorded_as_a_post_submission_failure(tmp_path):
     """Retaining the earlier attempt's successful classification would let the
     canonical state claim the retry succeeded (Codex review)."""
-    placed = {"BBB": {"status": "submitted", "order_id": "o-retry",
-                      "submitted_amount_usd": 1.0}}
+    placed = {
+        "BBB": {
+            "status": "submitted",
+            "order_id": "o-retry",
+            "submitted_amount_usd": 1.0,
+        }
+    }
 
     _out, run_state = _afternoon_merge(_preserved_state(), placed, tmp_path=tmp_path)
 
@@ -3497,12 +4532,22 @@ def test_the_summary_is_regenerated_after_a_merge(tmp_path):
     out = pathlib.Path(tmp_path) / "slot"
     out.mkdir(parents=True)
     (out / "run_summary.json").write_text(
-        json.dumps({"run_id": "earlier", "orders_submitted_count": 1,
-                    "run_classification_outcome": "completed_no_orders"}),
+        json.dumps(
+            {
+                "run_id": "earlier",
+                "orders_submitted_count": 1,
+                "run_classification_outcome": "completed_no_orders",
+            }
+        ),
         encoding="utf-8",
     )
-    placed = {"BBB": {"status": "submitted", "order_id": "o-retry",
-                      "submitted_amount_usd": 1.0}}
+    placed = {
+        "BBB": {
+            "status": "submitted",
+            "order_id": "o-retry",
+            "submitted_amount_usd": 1.0,
+        }
+    }
 
     _out, run_state = _afternoon_merge(_preserved_state(), placed, tmp_path=tmp_path)
 
@@ -3523,12 +4568,24 @@ def test_scheduled_afternoon_blocks_wide_spread_before_ordering(tmp_path):
     broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
     fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
     # 97 x 99 is a ~2.04% midpoint spread, above the configured 1% hard breaker.
-    rh = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.0, 99.0))
+    rh = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.0, 99.0)
+    )
     artifacts_dir = os.path.join(tmp_path, "runs", "wide-spread")
 
-    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
+    )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
 
     [candidate] = run_state["buy_candidates"]
@@ -3556,9 +4613,19 @@ def test_scheduled_afternoon_blocks_when_spread_unavailable(tmp_path):
     rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
     artifacts_dir = os.path.join(tmp_path, "runs", "missing-spread")
 
-    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
+    )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
 
     [candidate] = run_state["buy_candidates"]
@@ -3586,13 +4653,27 @@ def test_scheduled_afternoon_blocks_non_finite_bid_ask_quote(tmp_path):
     broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
     fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
     rh = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(float("nan"), 99.0)
+        SourceName.ROBINHOOD,
+        98.0,
+        100.0,
+        quote=(98.0, now),
+        bid_ask=(float("nan"), 99.0),
     )
     artifacts_dir = os.path.join(tmp_path, "runs", "nan-spread")
 
-    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
+    )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
 
     [candidate] = run_state["buy_candidates"]
@@ -3618,9 +4699,19 @@ def test_manual_run_not_blocked_when_spread_unavailable(tmp_path):
     rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
     artifacts_dir = os.path.join(tmp_path, "runs", "manual-missing-spread")
 
-    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=False)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=False),
+    )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
 
     [candidate] = run_state["buy_candidates"]
@@ -3639,12 +4730,24 @@ def test_scheduled_afternoon_spread_error_is_caught_and_recorded(tmp_path):
     broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
     fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
     # Provider raises on get_bid_ask (e.g. halted or missing bid/ask fields).
-    rh = _FakeDataWithRaisingBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+    rh = _FakeDataWithRaisingBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now)
+    )
     artifacts_dir = os.path.join(tmp_path, "runs", "spread-error")
 
-    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir, scheduled=True)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
+    )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
 
     [candidate] = run_state["buy_candidates"]
@@ -3667,9 +4770,19 @@ def test_run_daily_compact_blocks_orders_above_per_order_ceiling(tmp_path):
     )
     broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
 
-    run_daily_compact(now, config, state, fin, rh, broker, artifacts_dir=artifacts_dir)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
 
     candidate = run_state["buy_candidates"][0]
@@ -3703,9 +4816,9 @@ def test_write_run_artifacts_ignores_stale_orders_csv(tmp_path):
     assert usage["csv_artifact_count"] == 2
     state_size = os.path.getsize(os.path.join(out, "run_state.json"))
     assert usage["state_file_bytes"] == state_size
-    written_csv_bytes = os.path.getsize(os.path.join(out, "signals.csv")) + os.path.getsize(
-        os.path.join(out, "buy_candidates.csv")
-    )
+    written_csv_bytes = os.path.getsize(
+        os.path.join(out, "signals.csv")
+    ) + os.path.getsize(os.path.join(out, "buy_candidates.csv"))
     assert usage["total_artifact_bytes"] == state_size + written_csv_bytes
 
 
@@ -3731,12 +4844,10 @@ def test_build_usage_proxy_defaults_and_overrides():
     outcomes = {"A": {"status": "dry_run", "order_id": "X"}}
 
     usage = build_usage_proxy(
-        UsageProxyContext(
-            decisions=decisions,
-            signal_rows=signal_rows,
-            buy_candidates=buy_candidates,
-            candidate_outcomes=outcomes,
-        )
+        decisions=decisions,
+        signal_rows=signal_rows,
+        buy_candidates=buy_candidates,
+        candidate_outcomes=outcomes,
     )
     # calls default to tickers scanned; reviews default to candidate count.
     assert usage["tickers_scanned"] == 2
@@ -3745,34 +4856,6 @@ def test_build_usage_proxy_defaults_and_overrides():
     assert usage["orders_placed_count"] == 1
     # a MANUAL_REVIEW decision flags manual recovery even with zero errors.
     assert usage["manual_recovery_required"] is True
-
-
-def test_build_usage_proxy_legacy_keyword_call():
-    """The pre-UsageProxyContext keyword-only call signature still works."""
-    decisions = [
-        _decision("A", Action.BUY),
-        _decision("B", Action.MANUAL_REVIEW),
-    ]
-    signal_rows = [{}, {}, {}, {}]
-    buy_candidates = [{"ticker": "A"}]
-    outcomes = {"A": {"status": "dry_run", "order_id": "X"}}
-
-    usage = build_usage_proxy(
-        decisions=decisions,
-        signal_rows=signal_rows,
-        buy_candidates=buy_candidates,
-        candidate_outcomes=outcomes,
-    )
-    assert usage["tickers_scanned"] == 2
-    assert usage["finance_calls_attempted"] == 2
-    assert usage["order_reviews_attempted"] == 1
-    assert usage["orders_placed_count"] == 1
-    assert usage["manual_recovery_required"] is True
-
-
-def test_build_usage_proxy_requires_context_or_legacy_fields():
-    with pytest.raises(TypeError):
-        build_usage_proxy()
 
 
 # --- Same-day prior-run offset / top-up guard --------------------------------
@@ -3804,7 +4887,11 @@ def test_top_up_guard_no_prior_run_allocates_full_amount():
 def test_top_up_guard_lower_price_buys_incremental_difference():
     # Morning bought $3 at 99.0; afternoon wants $6 and the price is below 99.0.
     prior = PriorSameDayAllocation(
-        "AAPL", amount_usd=3.0, reference_price=99.0, run_id="manual_am", source="manual",
+        "AAPL",
+        amount_usd=3.0,
+        reference_price=99.0,
+        run_id="manual_am",
+        source="manual",
         selected_base_amount_usd=3.0,
     )
     decision = _buy_decision("AAPL", 6.0, target_price=98.0)
@@ -3821,16 +4908,24 @@ def test_top_up_guard_price_not_below_prior_buys_zero():
     # Canonical rule item 12: not-strictly-lower and zero-delta both carry the
     # single unified same_day_topup_not_lower_or_no_delta reason.
     prior = PriorSameDayAllocation(
-        "AAPL", amount_usd=3.0, reference_price=98.0, run_id="manual_am", source="manual",
+        "AAPL",
+        amount_usd=3.0,
+        reference_price=98.0,
+        run_id="manual_am",
+        source="manual",
         selected_base_amount_usd=3.0,
     )
     # Equal price -> not strictly below -> $0.
-    equal = evaluate_top_up_guard(_buy_decision("AAPL", 6.0, target_price=98.0), prior, StrategyConfig())
+    equal = evaluate_top_up_guard(
+        _buy_decision("AAPL", 6.0, target_price=98.0), prior, StrategyConfig()
+    )
     assert equal.top_up_guard_result == TOP_UP_NOT_LOWER_OR_NO_DELTA
     assert equal.incremental_order_amount == 0.0
     assert equal.skipped is True
     # Higher price -> also $0.
-    higher = evaluate_top_up_guard(_buy_decision("AAPL", 6.0, target_price=98.5), prior, StrategyConfig())
+    higher = evaluate_top_up_guard(
+        _buy_decision("AAPL", 6.0, target_price=98.5), prior, StrategyConfig()
+    )
     assert higher.top_up_guard_result == TOP_UP_NOT_LOWER_OR_NO_DELTA
     assert higher.incremental_order_amount == 0.0
     assert higher.skipped is True
@@ -3840,10 +4935,16 @@ def test_top_up_guard_prior_exceeds_afternoon_desired_buys_zero():
     # Morning bought $6; afternoon only wants $3, even into a lower price -> $0.
     # Canonical rule item 12: zero-delta also carries the unified reason.
     prior = PriorSameDayAllocation(
-        "AAPL", amount_usd=6.0, reference_price=99.0, run_id="manual_am", source="manual",
+        "AAPL",
+        amount_usd=6.0,
+        reference_price=99.0,
+        run_id="manual_am",
+        source="manual",
         selected_base_amount_usd=1.5,
     )
-    outcome = evaluate_top_up_guard(_buy_decision("AAPL", 3.0, target_price=98.0), prior, StrategyConfig())
+    outcome = evaluate_top_up_guard(
+        _buy_decision("AAPL", 3.0, target_price=98.0), prior, StrategyConfig()
+    )
     assert outcome.top_up_guard_result == TOP_UP_NOT_LOWER_OR_NO_DELTA
     assert outcome.incremental_order_amount == 0.0
     assert outcome.skipped is True
@@ -3852,10 +4953,16 @@ def test_top_up_guard_prior_exceeds_afternoon_desired_buys_zero():
 def test_top_up_guard_missing_prior_price_is_conservative_manual_review():
     # Prior amount known but no comparable reference price -> conservative $0 + manual review.
     prior = PriorSameDayAllocation(
-        "AAPL", amount_usd=3.0, reference_price=None, run_id="manual_am", source="manual",
+        "AAPL",
+        amount_usd=3.0,
+        reference_price=None,
+        run_id="manual_am",
+        source="manual",
         selected_base_amount_usd=3.0,
     )
-    outcome = evaluate_top_up_guard(_buy_decision("AAPL", 6.0, target_price=98.0), prior, StrategyConfig())
+    outcome = evaluate_top_up_guard(
+        _buy_decision("AAPL", 6.0, target_price=98.0), prior, StrategyConfig()
+    )
     assert outcome.top_up_guard_result == TOP_UP_MISSING_PRIOR_PRICE
     assert outcome.incremental_order_amount == 0.0
     assert outcome.skipped is True
@@ -3865,10 +4972,16 @@ def test_top_up_guard_missing_prior_price_is_conservative_manual_review():
 def test_top_up_guard_missing_afternoon_price_is_conservative():
     # Known prior price but no afternoon price (no target, no signals) -> conservative $0.
     prior = PriorSameDayAllocation(
-        "AAPL", amount_usd=3.0, reference_price=99.0, run_id="manual_am", source="manual",
+        "AAPL",
+        amount_usd=3.0,
+        reference_price=99.0,
+        run_id="manual_am",
+        source="manual",
         selected_base_amount_usd=3.0,
     )
-    outcome = evaluate_top_up_guard(_buy_decision("AAPL", 6.0, target_price=0.0), prior, StrategyConfig())
+    outcome = evaluate_top_up_guard(
+        _buy_decision("AAPL", 6.0, target_price=0.0), prior, StrategyConfig()
+    )
     assert outcome.top_up_guard_result == TOP_UP_MISSING_PRIOR_PRICE
     assert outcome.incremental_order_amount == 0.0
     assert outcome.manual_review is True
@@ -3903,7 +5016,9 @@ def test_top_up_guard_reuses_first_allocation_base_for_later_top_up():
         target_price=94.0,
     )
     outcome = evaluate_top_up_guard(decision, prior, StrategyConfig())
-    assert outcome.afternoon_desired_amount == 4.0  # 1.0 (preserved base) * 4x, not 2.0 * 4x
+    assert (
+        outcome.afternoon_desired_amount == 4.0
+    )  # 1.0 (preserved base) * 4x, not 2.0 * 4x
     assert outcome.top_up_guard_result == TOP_UP_INCREMENTAL
     assert outcome.incremental_order_amount == 2.0  # 4.0 - 2.0, not 8.0 - 2.0 == 6.0
     # Codex review ("Persist the preserved base on top-up candidates"): the
@@ -3920,7 +5035,13 @@ def test_top_up_guard_fails_closed_when_prior_base_unknown():
     # closed when the first allocation base is unknown"), so the guard must
     # conservatively buy $0 and flag manual review instead, exactly like a
     # missing reference price.
-    prior = PriorSameDayAllocation("AAPL", amount_usd=2.0, reference_price=98.0, run_id="manual_am", source="manual")
+    prior = PriorSameDayAllocation(
+        "AAPL",
+        amount_usd=2.0,
+        reference_price=98.0,
+        run_id="manual_am",
+        source="manual",
+    )
     decision = ReconciledDecision(
         ticker="AAPL",
         action=Action.BUY,
@@ -3951,7 +5072,9 @@ def _write_prior_run(root, subdir, run_state, orders_rows=None):
         with open(os.path.join(run_dir, "orders.csv"), "w", encoding="utf-8") as handle:
             handle.write("ticker,status,avg_fill_price\n")
             for row in orders_rows:
-                handle.write(f"{row['ticker']},{row['status']},{row['avg_fill_price']}\n")
+                handle.write(
+                    f"{row['ticker']},{row['status']},{row['avg_fill_price']}\n"
+                )
     return run_dir
 
 
@@ -3961,7 +5084,9 @@ def _stamp_mtime_on_trading_day(path, trading_day):
     os.utime(path, (stamp, stamp))
 
 
-def _manual_run_state(candidates, generated_at="2026-06-29T10:00:00-04:00", run_origin="manual"):
+def _manual_run_state(
+    candidates, generated_at="2026-06-29T10:00:00-04:00", run_origin="manual"
+):
     return {
         "trading_day": "2026-06-29",
         "generated_at": generated_at,
@@ -4005,7 +5130,11 @@ def test_load_prior_same_day_survives_malformed_buy_candidates(tmp_path):
     # orders-CSV fallback, so the run's real fills went unseen and its ticker
     # could be bought again at 3:30. Both now route into the CSV fallback.
     for malformed in (1, 1.5, "candidates", {"AAPL": 3.0}, True):
-        root = os.path.join(tmp_path, f"cron_tracking_{type(malformed).__name__}_{malformed}", "morning_dca")
+        root = os.path.join(
+            tmp_path,
+            f"cron_tracking_{type(malformed).__name__}_{malformed}",
+            "morning_dca",
+        )
         _write_prior_run(
             root,
             "20260629_0945ET",
@@ -4022,8 +5151,12 @@ def test_load_prior_same_day_survives_malformed_buy_candidates(tmp_path):
                 "artifacts": {"orders_csv_path": "orders.csv"},
             },
         )
-        with open(os.path.join(root, "20260629_0945ET", "orders.csv"), "w", encoding="utf-8") as handle:
-            handle.write("ticker,status,amount_usd,avg_fill_price\nAAPL,filled,3.00,98.25\n")
+        with open(
+            os.path.join(root, "20260629_0945ET", "orders.csv"), "w", encoding="utf-8"
+        ) as handle:
+            handle.write(
+                "ticker,status,amount_usd,avg_fill_price\nAAPL,filled,3.00,98.25\n"
+            )
 
         # No TypeError, and the sibling CSV's fill is still counted.
         allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
@@ -4040,9 +5173,16 @@ def test_load_prior_same_day_reads_morning_manual_allocation(tmp_path):
     _write_prior_run(
         root,
         "manual_runs/0900",
-        _manual_run_state([
-            {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0, "target_price": 99.0},
-        ]),
+        _manual_run_state(
+            [
+                {
+                    "ticker": "AAPL",
+                    "status": "submitted",
+                    "planned_amount_usd": 3.0,
+                    "target_price": 99.0,
+                },
+            ]
+        ),
     )
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
     assert set(allocations) == {"AAPL"}
@@ -4069,7 +5209,12 @@ def test_load_prior_same_day_allocation_preserves_selected_base_amount(tmp_path)
                 "run_id": "morning_live_20260629_0945ET",
             },
             "buy_candidates": [
-                {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 2.0, "selected_base_amount_usd": 1.0},
+                {
+                    "ticker": "AAPL",
+                    "status": "filled",
+                    "planned_amount_usd": 2.0,
+                    "selected_base_amount_usd": 1.0,
+                },
             ],
         },
         orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "98.25"}],
@@ -4093,9 +5238,17 @@ def test_load_prior_same_day_first_run_locks_base_even_when_unknown(tmp_path):
         {
             "trading_day": "2026-06-29",
             "generated_at": "2026-06-29T09:45:00-04:00",
-            "run_classification": {"run_origin": "scheduled", "stream": "morning", "run_id": "morning_0945"},
+            "run_classification": {
+                "run_origin": "scheduled",
+                "stream": "morning",
+                "run_id": "morning_0945",
+            },
             "buy_candidates": [
-                {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 1.0},  # no base field at all
+                {
+                    "ticker": "AAPL",
+                    "status": "filled",
+                    "planned_amount_usd": 1.0,
+                },  # no base field at all
             ],
         },
         orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "99.0"}],
@@ -4106,9 +5259,18 @@ def test_load_prior_same_day_first_run_locks_base_even_when_unknown(tmp_path):
         {
             "trading_day": "2026-06-29",
             "generated_at": "2026-06-29T10:30:00-04:00",
-            "run_classification": {"run_origin": "scheduled", "stream": "morning", "run_id": "morning_1030"},
+            "run_classification": {
+                "run_origin": "scheduled",
+                "stream": "morning",
+                "run_id": "morning_1030",
+            },
             "buy_candidates": [
-                {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 2.0, "selected_base_amount_usd": 2.0},
+                {
+                    "ticker": "AAPL",
+                    "status": "filled",
+                    "planned_amount_usd": 2.0,
+                    "selected_base_amount_usd": 2.0,
+                },
             ],
         },
         orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "97.0"}],
@@ -4140,7 +5302,12 @@ def test_load_prior_same_day_processes_runs_by_timestamp_not_path_order(tmp_path
                 "run_id": "recovery_1100",
             },
             "buy_candidates": [
-                {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 2.0, "selected_base_amount_usd": 2.0},
+                {
+                    "ticker": "AAPL",
+                    "status": "filled",
+                    "planned_amount_usd": 2.0,
+                    "selected_base_amount_usd": 2.0,
+                },
             ],
         },
         orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "97.0"}],
@@ -4150,7 +5317,12 @@ def test_load_prior_same_day_processes_runs_by_timestamp_not_path_order(tmp_path
         "manual_runs/0900",
         _manual_run_state(
             [
-                {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 1.0, "selected_base_amount_usd": 1.0},
+                {
+                    "ticker": "AAPL",
+                    "status": "filled",
+                    "planned_amount_usd": 1.0,
+                    "selected_base_amount_usd": 1.0,
+                },
             ],
             generated_at="2026-06-29T09:00:00-04:00",
         ),
@@ -4160,7 +5332,9 @@ def test_load_prior_same_day_processes_runs_by_timestamp_not_path_order(tmp_path
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
 
     assert allocations["AAPL"].amount_usd == 3.0
-    assert allocations["AAPL"].selected_base_amount_usd == 1.0  # 09:00's base, not 11:00's
+    assert (
+        allocations["AAPL"].selected_base_amount_usd == 1.0
+    )  # 09:00's base, not 11:00's
 
 
 def test_load_prior_same_day_allocation_unconfirmed_base_not_trusted(tmp_path):
@@ -4170,36 +5344,42 @@ def test_load_prior_same_day_allocation_unconfirmed_base_not_trusted(tmp_path):
     _write_prior_run(
         root,
         "manual_runs/0900",
-        _manual_run_state([
-            {
-                "ticker": "AAPL",
-                "status": "submitted",
-                "planned_amount_usd": 3.0,
-                "target_price": 99.0,
-                "selected_base_amount_usd": 1.0,
-            },
-        ]),
+        _manual_run_state(
+            [
+                {
+                    "ticker": "AAPL",
+                    "status": "submitted",
+                    "planned_amount_usd": 3.0,
+                    "target_price": 99.0,
+                    "selected_base_amount_usd": 1.0,
+                },
+            ]
+        ),
     )
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
     assert allocations["AAPL"].selected_base_amount_usd is None
 
 
-def test_load_prior_same_day_submitted_with_logged_price_and_no_fill_has_unknown_reference(tmp_path):
+def test_load_prior_same_day_submitted_with_logged_price_and_no_fill_has_unknown_reference(
+    tmp_path,
+):
     # A still-submitted order with no confirmed fill row may later be rejected or
     # canceled; do not use its logged target/decision price as a known reference.
     root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
     _write_prior_run(
         root,
         "manual_runs/0900",
-        _manual_run_state([
-            {
-                "ticker": "AAPL",
-                "status": "submitted",
-                "planned_amount_usd": 3.0,
-                "target_price": 99.0,
-                "decision_bar_close": 99.2,
-            },
-        ]),
+        _manual_run_state(
+            [
+                {
+                    "ticker": "AAPL",
+                    "status": "submitted",
+                    "planned_amount_usd": 3.0,
+                    "target_price": 99.0,
+                    "decision_bar_close": 99.2,
+                },
+            ]
+        ),
         orders_rows=[{"ticker": "AAPL", "status": "submitted", "avg_fill_price": ""}],
     )
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
@@ -4214,9 +5394,11 @@ def test_load_prior_same_day_no_logged_price_has_no_reference(tmp_path):
     _write_prior_run(
         root,
         "manual_runs/0900",
-        _manual_run_state([
-            {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0},
-        ]),
+        _manual_run_state(
+            [
+                {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0},
+            ]
+        ),
     )
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
     assert allocations["AAPL"].amount_usd == 3.0
@@ -4295,9 +5477,16 @@ def test_load_prior_same_day_prefers_logged_target_over_fill_price(tmp_path):
     _write_prior_run(
         root,
         "manual_runs/0900",
-        _manual_run_state([
-            {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0, "target_price": 99.0},
-        ]),
+        _manual_run_state(
+            [
+                {
+                    "ticker": "AAPL",
+                    "status": "filled",
+                    "planned_amount_usd": 3.0,
+                    "target_price": 99.0,
+                },
+            ]
+        ),
         orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "97.5"}],
     )
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
@@ -4310,9 +5499,11 @@ def test_load_prior_same_day_falls_back_to_fill_price_without_logged_price(tmp_p
     _write_prior_run(
         root,
         "manual_runs/0900",
-        _manual_run_state([
-            {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0},
-        ]),
+        _manual_run_state(
+            [
+                {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0},
+            ]
+        ),
         orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "97.5"}],
     )
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
@@ -4328,12 +5519,16 @@ def test_load_prior_same_day_reads_manual_override_filled_orders_csv(tmp_path):
     os.makedirs(run_dir, exist_ok=True)
     with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(
-            _manual_run_state([
-                {"ticker": "AMZN", "status": "filled", "planned_amount_usd": 3.0},
-            ]),
+            _manual_run_state(
+                [
+                    {"ticker": "AMZN", "status": "filled", "planned_amount_usd": 3.0},
+                ]
+            ),
             handle,
         )
-    with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+    with open(
+        os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8"
+    ) as handle:
         handle.write("ticker,amount_usd,avg_fill_price\nAMZN,2.5,242.1099\n")
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
     assert allocations["AMZN"].amount_usd == 2.5
@@ -4349,12 +5544,16 @@ def test_load_prior_same_day_reads_documented_manual_filled_orders_shape(tmp_pat
     os.makedirs(run_dir, exist_ok=True)
     with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(
-            _manual_run_state([
-                {"ticker": "AMZN", "status": "filled", "planned_amount_usd": 6.0},
-            ]),
+            _manual_run_state(
+                [
+                    {"ticker": "AMZN", "status": "filled", "planned_amount_usd": 6.0},
+                ]
+            ),
             handle,
         )
-    with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+    with open(
+        os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8"
+    ) as handle:
         handle.write("ticker,amount_usd,avg_fill_price\nAMZN,4.25,242.1099\n")
 
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
@@ -4671,12 +5870,16 @@ def test_load_prior_same_day_reads_midday_recovery_artifact(tmp_path):
     os.makedirs(run_dir, exist_ok=True)
     with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(
-            _recovery_run_state([
-                {"ticker": "SPCX", "status": "filled", "planned_amount_usd": 3.5},
-            ]),
+            _recovery_run_state(
+                [
+                    {"ticker": "SPCX", "status": "filled", "planned_amount_usd": 3.5},
+                ]
+            ),
             handle,
         )
-    with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+    with open(
+        os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8"
+    ) as handle:
         handle.write(
             "ticker,amount_usd,state,average_fill_price,quantity\n"
             "SPCX,3.50,filled,109.989900,0.031821\n"
@@ -4688,7 +5891,9 @@ def test_load_prior_same_day_reads_midday_recovery_artifact(tmp_path):
     assert allocations["SPCX"].reference_price == 109.9899
 
 
-def test_load_prior_same_day_follows_recorded_csv_for_candidate_backed_recovery(tmp_path):
+def test_load_prior_same_day_follows_recorded_csv_for_candidate_backed_recovery(
+    tmp_path,
+):
     # Codex review: "Follow the recorded CSV for candidate-backed recoveries".
     # A recovery can write artifacts/run_state.json beside a ROOT-level CSV
     # under a CUSTOM name and record it as ../executions.csv, while ALSO
@@ -4706,11 +5911,15 @@ def test_load_prior_same_day_follows_recorded_csv_for_candidate_backed_recovery(
     run_dir = os.path.join(root, "20260629_1230ET_recovery_1305ET")
     state_dir = os.path.join(run_dir, "artifacts")
     os.makedirs(state_dir, exist_ok=True)
-    state = _recovery_run_state([
-        {"ticker": "SPCX", "status": "submitted", "planned_amount_usd": 3.5},
-    ])
+    state = _recovery_run_state(
+        [
+            {"ticker": "SPCX", "status": "submitted", "planned_amount_usd": 3.5},
+        ]
+    )
     state["artifacts"] = {"orders_csv_path": "../executions.csv"}
-    with open(os.path.join(state_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+    with open(
+        os.path.join(state_dir, "run_state.json"), "w", encoding="utf-8"
+    ) as handle:
         json.dump(state, handle)
     with open(os.path.join(run_dir, "executions.csv"), "w", encoding="utf-8") as handle:
         handle.write(
@@ -4740,23 +5949,31 @@ def test_load_prior_same_day_survives_malformed_recorded_csv_path(tmp_path):
     root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
     bad_dir = os.path.join(root, "20260629_1230ET_recovery_1305ET")
     os.makedirs(bad_dir, exist_ok=True)
-    bad_state = _recovery_run_state([
-        {"ticker": "SPCX", "status": "filled", "planned_amount_usd": 3.5},
-    ])
+    bad_state = _recovery_run_state(
+        [
+            {"ticker": "SPCX", "status": "filled", "planned_amount_usd": 3.5},
+        ]
+    )
     bad_state["artifacts"] = {"orders_csv_path": []}
     with open(os.path.join(bad_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(bad_state, handle)
 
     good_dir = os.path.join(root, "manual_reruns", "1505")
     os.makedirs(good_dir, exist_ok=True)
-    with open(os.path.join(good_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+    with open(
+        os.path.join(good_dir, "run_state.json"), "w", encoding="utf-8"
+    ) as handle:
         json.dump(
-            _manual_run_state([
-                {"ticker": "AMZN", "status": "filled", "planned_amount_usd": 3.0},
-            ]),
+            _manual_run_state(
+                [
+                    {"ticker": "AMZN", "status": "filled", "planned_amount_usd": 3.0},
+                ]
+            ),
             handle,
         )
-    with open(os.path.join(good_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+    with open(
+        os.path.join(good_dir, "filled_orders.csv"), "w", encoding="utf-8"
+    ) as handle:
         handle.write("ticker,amount_usd,avg_fill_price\nAMZN,2.5,242.1099\n")
 
     skipped = []
@@ -4781,24 +5998,28 @@ def test_load_prior_same_day_honors_terminal_rejection_for_candidate_recovery(tm
     root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
     run_dir = os.path.join(root, "20260629_1230ET_recovery_1305ET")
     os.makedirs(run_dir, exist_ok=True)
-    state = _recovery_run_state([
-        {
-            "ticker": "EVR",
-            "status": "submitted",
-            "order_id": "ORD-REJECTED",
-            "planned_amount_usd": 5.0,
-        },
-        {
-            "ticker": "SPCX",
-            "status": "submitted",
-            "order_id": "ORD-FILLED",
-            "planned_amount_usd": 3.5,
-        },
-    ])
+    state = _recovery_run_state(
+        [
+            {
+                "ticker": "EVR",
+                "status": "submitted",
+                "order_id": "ORD-REJECTED",
+                "planned_amount_usd": 5.0,
+            },
+            {
+                "ticker": "SPCX",
+                "status": "submitted",
+                "order_id": "ORD-FILLED",
+                "planned_amount_usd": 3.5,
+            },
+        ]
+    )
     state["artifacts"] = {"orders_csv_path": "filled_orders.csv"}
     with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(state, handle)
-    with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+    with open(
+        os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8"
+    ) as handle:
         handle.write(
             "ticker,order_id,amount_usd,state,average_fill_price,quantity\n"
             "EVR,ORD-REJECTED,5.00,rejected,,0\n"
@@ -4872,15 +6093,21 @@ def test_load_prior_same_day_merges_recorded_fills_with_sibling_fills(tmp_path):
     run_dir = os.path.join(root, "20260629_1230ET_recovery_1305ET")
     state_dir = os.path.join(run_dir, "artifacts")
     os.makedirs(state_dir, exist_ok=True)
-    state = _recovery_run_state([
-        {"ticker": "AMZN", "status": "filled", "planned_amount_usd": 1.0},
-        {"ticker": "GFUZ", "status": "submitted", "planned_amount_usd": 10.0},
-    ])
+    state = _recovery_run_state(
+        [
+            {"ticker": "AMZN", "status": "filled", "planned_amount_usd": 1.0},
+            {"ticker": "GFUZ", "status": "submitted", "planned_amount_usd": 10.0},
+        ]
+    )
     state["artifacts"] = {"orders_csv_path": "../executions.csv"}
-    with open(os.path.join(state_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+    with open(
+        os.path.join(state_dir, "run_state.json"), "w", encoding="utf-8"
+    ) as handle:
         json.dump(state, handle)
     # A fill sits BESIDE run_state.json, so `fills` is already truthy.
-    with open(os.path.join(state_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+    with open(
+        os.path.join(state_dir, "filled_orders.csv"), "w", encoding="utf-8"
+    ) as handle:
         handle.write(
             "ticker,amount_usd,state,average_fill_price,quantity\n"
             "AMZN,1.00,filled,231.429900,0.004320\n"
@@ -4937,19 +6164,25 @@ def test_load_prior_same_day_prefers_a_final_fill_over_a_stale_partial(tmp_path)
     run_dir = os.path.join(root, "20260629_1230ET_recovery_1305ET")
     state_dir = os.path.join(run_dir, "artifacts")
     os.makedirs(state_dir, exist_ok=True)
-    state = _recovery_run_state([
-        {
-            "ticker": "GFUZ",
-            "status": "submitted",
-            "order_id": "ORD-GFUZ",
-            "planned_amount_usd": 10.0,
-        },
-    ])
+    state = _recovery_run_state(
+        [
+            {
+                "ticker": "GFUZ",
+                "status": "submitted",
+                "order_id": "ORD-GFUZ",
+                "planned_amount_usd": 10.0,
+            },
+        ]
+    )
     state["artifacts"] = {"orders_csv_path": "../executions.csv"}
-    with open(os.path.join(state_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+    with open(
+        os.path.join(state_dir, "run_state.json"), "w", encoding="utf-8"
+    ) as handle:
         json.dump(state, handle)
     # Stale snapshot beside the state: only part of the order had executed.
-    with open(os.path.join(state_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+    with open(
+        os.path.join(state_dir, "filled_orders.csv"), "w", encoding="utf-8"
+    ) as handle:
         handle.write(
             "ticker,order_id,amount_usd,state,average_fill_price,quantity\n"
             "GFUZ,ORD-GFUZ,10.00,partially_filled,6.249900,0.480000\n"
@@ -5026,9 +6259,7 @@ def test_submitted_notionals_read_the_recovery_amount_column(tmp_path):
 
     csv_path = tmp_path / "submitted_orders.csv"
     csv_path.write_text(
-        "ticker,state,amount_usd\n"
-        "AMZN,pending,1.00\n"
-        "GFUZ,queued,10.00\n",
+        "ticker,state,amount_usd\n" "AMZN,pending,1.00\n" "GFUZ,queued,10.00\n",
         encoding="utf-8",
     )
     notionals = _orders_csv_submitted_notionals(csv_path)
@@ -5055,13 +6286,24 @@ def test_load_prior_same_day_sums_two_distinct_orders_for_one_ticker(tmp_path):
     run_dir = os.path.join(root, "20260629_1230ET_recovery_1305ET")
     state_dir = os.path.join(run_dir, "artifacts")
     os.makedirs(state_dir, exist_ok=True)
-    state = _recovery_run_state([
-        {"ticker": "GFUZ", "status": "filled", "order_id": "ORD-A", "planned_amount_usd": 4.0},
-    ])
+    state = _recovery_run_state(
+        [
+            {
+                "ticker": "GFUZ",
+                "status": "filled",
+                "order_id": "ORD-A",
+                "planned_amount_usd": 4.0,
+            },
+        ]
+    )
     state["artifacts"] = {"orders_csv_path": "../executions.csv"}
-    with open(os.path.join(state_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+    with open(
+        os.path.join(state_dir, "run_state.json"), "w", encoding="utf-8"
+    ) as handle:
         json.dump(state, handle)
-    with open(os.path.join(state_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+    with open(
+        os.path.join(state_dir, "filled_orders.csv"), "w", encoding="utf-8"
+    ) as handle:
         handle.write(
             "ticker,order_id,amount_usd,state,average_fill_price,quantity\n"
             "GFUZ,ORD-A,4.00,filled,4.000000,1.000000\n"
@@ -5088,13 +6330,24 @@ def test_load_prior_same_day_does_not_sum_the_same_order_twice(tmp_path):
     run_dir = os.path.join(root, "20260629_1230ET_recovery_1305ET")
     state_dir = os.path.join(run_dir, "artifacts")
     os.makedirs(state_dir, exist_ok=True)
-    state = _recovery_run_state([
-        {"ticker": "GFUZ", "status": "filled", "order_id": "ORD-A", "planned_amount_usd": 4.0},
-    ])
+    state = _recovery_run_state(
+        [
+            {
+                "ticker": "GFUZ",
+                "status": "filled",
+                "order_id": "ORD-A",
+                "planned_amount_usd": 4.0,
+            },
+        ]
+    )
     state["artifacts"] = {"orders_csv_path": "../executions.csv"}
-    with open(os.path.join(state_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+    with open(
+        os.path.join(state_dir, "run_state.json"), "w", encoding="utf-8"
+    ) as handle:
         json.dump(state, handle)
-    with open(os.path.join(state_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+    with open(
+        os.path.join(state_dir, "filled_orders.csv"), "w", encoding="utf-8"
+    ) as handle:
         handle.write(
             "ticker,order_id,amount_usd,state,average_fill_price,quantity\n"
             "GFUZ,ORD-A,4.00,partially_filled,4.000000,1.000000\n"
@@ -5140,11 +6393,16 @@ def test_prior_run_is_scheduled_treats_recovery_streams_as_prior_context():
         assert _prior_run_is_scheduled(state) is False, stream
         # Without it the artifact is ignored (True = treated as scheduled), the
         # safe direction and the one the allocation loader already takes.
-        assert _prior_run_is_scheduled(
-            {"run_classification": _recovery_classification(stream)}
-        ) is True, stream
+        assert (
+            _prior_run_is_scheduled(
+                {"run_classification": _recovery_classification(stream)}
+            )
+            is True
+        ), stream
 
-    afternoon = {"run_classification": {"stream": "afternoon", "run_origin": "scheduled"}}
+    afternoon = {
+        "run_classification": {"stream": "afternoon", "run_origin": "scheduled"}
+    }
     assert _prior_run_is_scheduled(afternoon) is True
 
 
@@ -5157,9 +6415,17 @@ def test_prior_run_is_scheduled_gates_recovery_streams_on_the_contract():
     from near_close_dca import _prior_run_is_scheduled
 
     # The bare shape: a recovery stream name and nothing else.
-    assert _prior_run_is_scheduled(
-        {"run_classification": {"stream": "midday_recovery", "run_origin": "scheduled"}}
-    ) is True
+    assert (
+        _prior_run_is_scheduled(
+            {
+                "run_classification": {
+                    "stream": "midday_recovery",
+                    "run_origin": "scheduled",
+                }
+            }
+        )
+        is True
+    )
 
     for override in (
         {"valid_recovery_context": None},
@@ -5181,7 +6447,6 @@ def test_prior_run_is_scheduled_excludes_afternoon_recovery():
     state = {"run_classification": _recovery_classification("afternoon_recovery")}
 
     assert _prior_run_is_scheduled(state) is True
-
 
 
 def test_recovery_orders_csv_path_outside_run_dir_is_ignored(tmp_path):
@@ -5258,7 +6523,9 @@ def test_recovery_external_csv_path_falls_back_to_the_local_sibling(tmp_path):
             "AAPL,99.00,filled,100.0,0.99\n"
         )
     # The SAME basename, locally, with this run's real fills.
-    with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+    with open(
+        os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8"
+    ) as handle:
         handle.write(
             "ticker,amount_usd,state,average_fill_price,quantity\n"
             "SPCX,3.50,filled,109.9899,0.031821\n"
@@ -5287,18 +6554,23 @@ def test_prior_run_is_scheduled_gates_on_recovery_origin_not_stream_name():
     from near_close_dca import _prior_run_is_scheduled
 
     for stream in ("intraday_bogus", None, 123, "", "midday", [], {}):
-        state = {"run_classification": {"run_origin": "scheduled_recovery", "stream": stream}}
+        state = {
+            "run_classification": {"run_origin": "scheduled_recovery", "stream": stream}
+        }
         assert _prior_run_is_scheduled(state) is True, stream
 
     # A conforming recovery artifact is still eligible prior context. It needs
     # its top-level trading_day, which the contract now requires (Codex review:
     # "Require a top-level trading day on recovery states").
-    assert _prior_run_is_scheduled(
-        {
-            "trading_day": "2026-06-29",
-            "run_classification": _recovery_classification("midday_recovery"),
-        }
-    ) is False
+    assert (
+        _prior_run_is_scheduled(
+            {
+                "trading_day": "2026-06-29",
+                "run_classification": _recovery_classification("midday_recovery"),
+            }
+        )
+        is False
+    )
 
 
 def test_orders_csv_fills_rejects_non_finite_amount_and_price(tmp_path):
@@ -5327,7 +6599,9 @@ def test_orders_csv_fills_rejects_non_finite_amount_and_price(tmp_path):
     assert fills["MU"]["quantity_filled"] is None
 
 
-def test_load_prior_same_day_multi_merges_roots_sums_amounts_most_recent_reference(tmp_path):
+def test_load_prior_same_day_multi_merges_roots_sums_amounts_most_recent_reference(
+    tmp_path,
+):
     # The afternoon guard scans multiple roots (its own + morning + midday). When
     # a ticker appears in more than one root, amounts sum and the ticker's MOST
     # RECENT known reference price wins (by generated_at) -- NOT the lowest. Here
@@ -5338,7 +6612,14 @@ def test_load_prior_same_day_multi_merges_roots_sums_amounts_most_recent_referen
         morning_root,
         "20260629_1030ET",
         _manual_run_state(
-            [{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0, "target_price": 97.0}],
+            [
+                {
+                    "ticker": "AAPL",
+                    "status": "filled",
+                    "planned_amount_usd": 3.0,
+                    "target_price": 97.0,
+                }
+            ],
             generated_at="2026-06-29T10:30:00-04:00",
         ),
     )
@@ -5347,7 +6628,14 @@ def test_load_prior_same_day_multi_merges_roots_sums_amounts_most_recent_referen
         midday_root,
         "20260629_1230ET",
         _manual_run_state(
-            [{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 4.5, "target_price": 99.0}],
+            [
+                {
+                    "ticker": "AAPL",
+                    "status": "filled",
+                    "planned_amount_usd": 4.5,
+                    "target_price": 99.0,
+                }
+            ],
             generated_at="2026-06-29T12:30:00-04:00",
         ),
     )
@@ -5366,17 +6654,26 @@ def test_load_prior_same_day_multi_missing_reference_poisons_to_none(tmp_path):
     _write_prior_run(
         morning_root,
         "20260629_1030ET",
-        _manual_run_state([
-            {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0, "target_price": 99.0},
-        ]),
+        _manual_run_state(
+            [
+                {
+                    "ticker": "AAPL",
+                    "status": "filled",
+                    "planned_amount_usd": 3.0,
+                    "target_price": 99.0,
+                },
+            ]
+        ),
     )
     midday_root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
     _write_prior_run(
         midday_root,
         "20260629_1230ET",
-        _manual_run_state([
-            {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 4.5},
-        ]),
+        _manual_run_state(
+            [
+                {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 4.5},
+            ]
+        ),
         orders_rows=[{"ticker": "AAPL", "status": "submitted", "avg_fill_price": ""}],
     )
     allocations = load_prior_same_day_allocations_multi(
@@ -5387,7 +6684,9 @@ def test_load_prior_same_day_multi_missing_reference_poisons_to_none(tmp_path):
     assert allocations["AAPL"].reference_ts is None
 
 
-def test_load_prior_same_day_multi_picks_chronologically_first_base_regardless_of_root_order(tmp_path):
+def test_load_prior_same_day_multi_picks_chronologically_first_base_regardless_of_root_order(
+    tmp_path,
+):
     # Codex review ("Select the base from the chronologically first allocation"):
     # a 09:45 morning $1-base buy is the true first same-day allocation; a 15:05
     # manual $2-base buy under the afternoon root came later. The afternoon root
@@ -5417,9 +6716,18 @@ def test_load_prior_same_day_multi_picks_chronologically_first_base_regardless_o
         {
             "trading_day": "2026-06-29",
             "generated_at": "2026-06-29T09:45:00-04:00",
-            "run_classification": {"run_origin": "scheduled", "stream": "morning", "run_id": "morning_0945"},
+            "run_classification": {
+                "run_origin": "scheduled",
+                "stream": "morning",
+                "run_id": "morning_0945",
+            },
             "buy_candidates": [
-                {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 1.0, "selected_base_amount_usd": 1.0},
+                {
+                    "ticker": "AAPL",
+                    "status": "filled",
+                    "planned_amount_usd": 1.0,
+                    "selected_base_amount_usd": 1.0,
+                },
             ],
         },
         orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "99.0"}],
@@ -5433,7 +6741,9 @@ def test_load_prior_same_day_multi_picks_chronologically_first_base_regardless_o
     assert allocations["AAPL"].selected_base_amount_usd == 1.0
 
 
-def test_load_prior_same_day_unconfirmed_submitted_order_has_no_reference_price(tmp_path):
+def test_load_prior_same_day_unconfirmed_submitted_order_has_no_reference_price(
+    tmp_path,
+):
     # status="submitted" in run_state.json only means an order_id was obtained,
     # not that it filled; when orders.csv doesn't confirm a fill (still
     # "submitted"), we can't tell whether real capital moved. Dropping the
@@ -5447,9 +6757,11 @@ def test_load_prior_same_day_unconfirmed_submitted_order_has_no_reference_price(
     _write_prior_run(
         root,
         "manual_runs/0900",
-        _manual_run_state([
-            {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0},
-        ]),
+        _manual_run_state(
+            [
+                {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0},
+            ]
+        ),
         orders_rows=[{"ticker": "AAPL", "status": "submitted", "avg_fill_price": ""}],
     )
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
@@ -5464,9 +6776,16 @@ def test_load_prior_same_day_excludes_dry_run_candidates(tmp_path):
     _write_prior_run(
         root,
         "manual_runs/0900",
-        _manual_run_state([
-            {"ticker": "AAPL", "status": "dry_run", "planned_amount_usd": 3.0, "target_price": 99.0},
-        ]),
+        _manual_run_state(
+            [
+                {
+                    "ticker": "AAPL",
+                    "status": "dry_run",
+                    "planned_amount_usd": 3.0,
+                    "target_price": 99.0,
+                },
+            ]
+        ),
     )
     assert load_prior_same_day_allocations(root, date(2026, 6, 29)) == {}
 
@@ -5478,7 +6797,14 @@ def test_load_prior_same_day_excludes_scheduled_and_after_boundary(tmp_path):
         root,
         "scheduled_runs/20260629_1520ET",
         _manual_run_state(
-            [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0, "target_price": 99.0}],
+            [
+                {
+                    "ticker": "AAPL",
+                    "status": "submitted",
+                    "planned_amount_usd": 3.0,
+                    "target_price": 99.0,
+                }
+            ],
             run_origin="scheduled",
         ),
     )
@@ -5487,7 +6813,14 @@ def test_load_prior_same_day_excludes_scheduled_and_after_boundary(tmp_path):
         root,
         "manual_runs/1500",
         _manual_run_state(
-            [{"ticker": "NVDA", "status": "submitted", "planned_amount_usd": 3.0, "target_price": 99.0}],
+            [
+                {
+                    "ticker": "NVDA",
+                    "status": "submitted",
+                    "planned_amount_usd": 3.0,
+                    "target_price": 99.0,
+                }
+            ],
             generated_at="2026-06-29T15:00:00-04:00",
         ),
     )
@@ -5523,7 +6856,9 @@ def test_load_prior_same_day_includes_morning_scheduled_run(tmp_path):
     allocations = load_prior_same_day_allocations(
         root, date(2026, 6, 29), additional_state_roots=[morning_root]
     )
-    assert "AAPL" in allocations, "morning scheduled run must appear as prior allocation context"
+    assert (
+        "AAPL" in allocations
+    ), "morning scheduled run must appear as prior allocation context"
     assert allocations["AAPL"].amount_usd == 3.0
 
 
@@ -5538,7 +6873,14 @@ def test_load_prior_same_day_aggregates_amount_and_takes_most_recent_price(tmp_p
         root,
         "manual_runs/0900",
         _manual_run_state(
-            [{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0, "target_price": 98.0}],
+            [
+                {
+                    "ticker": "AAPL",
+                    "status": "filled",
+                    "planned_amount_usd": 3.0,
+                    "target_price": 98.0,
+                }
+            ],
             generated_at="2026-06-29T09:00:00-04:00",
         ),
         orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "98.0"}],
@@ -5547,7 +6889,14 @@ def test_load_prior_same_day_aggregates_amount_and_takes_most_recent_price(tmp_p
         root,
         "manual_runs/1000",
         _manual_run_state(
-            [{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 4.5, "target_price": 99.0}],
+            [
+                {
+                    "ticker": "AAPL",
+                    "status": "filled",
+                    "planned_amount_usd": 4.5,
+                    "target_price": 99.0,
+                }
+            ],
             generated_at="2026-06-29T10:00:00-04:00",
         ),
         orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "99.0"}],
@@ -5589,7 +6938,14 @@ def test_load_prior_same_day_unknown_reference_clears_reference_timestamp(tmp_pa
 def test_load_prior_same_day_ignores_other_trading_days(tmp_path):
     root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
     state = _manual_run_state(
-        [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0, "target_price": 99.0}]
+        [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": 3.0,
+                "target_price": 99.0,
+            }
+        ]
     )
     state["trading_day"] = "2026-06-26"
     _write_prior_run(root, "manual_runs/0900", state)
@@ -5609,10 +6965,14 @@ def test_load_prior_same_day_preserves_amount_only_fill_as_unknown_price(tmp_pat
     os.makedirs(run_dir, exist_ok=True)
     with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(
-            _manual_run_state([{"ticker": "AMZN", "status": "filled", "planned_amount_usd": 3.0}]),
+            _manual_run_state(
+                [{"ticker": "AMZN", "status": "filled", "planned_amount_usd": 3.0}]
+            ),
             handle,
         )
-    with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+    with open(
+        os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8"
+    ) as handle:
         handle.write("ticker,amount_usd,avg_fill_price\nAMZN,2.5,\n")
 
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
@@ -5630,11 +6990,15 @@ def test_load_prior_same_day_quantity_only_fill_without_price_does_not_crash(tmp
     _write_prior_run(
         root,
         "manual_runs/0900",
-        _manual_run_state([{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0}]),
+        _manual_run_state(
+            [{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0}]
+        ),
     )
     orders_csv = os.path.join(root, "manual_runs", "0900", "orders.csv")
     with open(orders_csv, "w", encoding="utf-8") as handle:
-        handle.write("ticker,status,avg_fill_price,quantity_filled\nAAPL,filled,,0.05\n")
+        handle.write(
+            "ticker,status,avg_fill_price,quantity_filled\nAAPL,filled,,0.05\n"
+        )
 
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
 
@@ -5642,7 +7006,9 @@ def test_load_prior_same_day_quantity_only_fill_without_price_does_not_crash(tmp
     assert allocations["AAPL"].reference_price is None
 
 
-def test_run_daily_compact_checks_per_order_cap_before_broker_duplicate_lookup(tmp_path):
+def test_run_daily_compact_checks_per_order_cap_before_broker_duplicate_lookup(
+    tmp_path,
+):
     # Codex review #83: the hard per-order cap must be checked before the
     # broker's same-day-duplicate lookup, not after -- an over-cap candidate
     # should never need a same_day_strategy_order_exists() broker round-trip.
@@ -5667,9 +7033,19 @@ def test_run_daily_compact_checks_per_order_cap_before_broker_duplicate_lookup(t
 
     tracking_broker = _TrackingBroker(cash=500.0, reference_prices={"AAPL": 98.0})
 
-    run_daily_compact(now, config, state, fin, rh, tracking_broker, artifacts_dir=artifacts_dir)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        tracking_broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
     candidate = run_state["buy_candidates"][0]
     assert candidate["status"] == "blocked"
@@ -5756,9 +7132,16 @@ def test_load_prior_same_day_skips_non_utf8_artifact_without_crashing(tmp_path):
     _write_prior_run(
         root,
         "manual_runs/0900",
-        _manual_run_state([
-            {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0, "target_price": 99.0},
-        ]),
+        _manual_run_state(
+            [
+                {
+                    "ticker": "AAPL",
+                    "status": "submitted",
+                    "planned_amount_usd": 3.0,
+                    "target_price": 99.0,
+                },
+            ]
+        ),
     )
 
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
@@ -5775,17 +7158,30 @@ def test_run_daily_compact_top_up_records_incremental(tmp_path):
     # afternoon quote is 98.0 (< 99.0) so only the $2 difference is bought.
     prior = {
         "AAPL": PriorSameDayAllocation(
-            "AAPL", amount_usd=2.0, reference_price=99.0, run_id="manual_am", source="manual",
+            "AAPL",
+            amount_usd=2.0,
+            reference_price=99.0,
+            run_id="manual_am",
+            source="manual",
             selected_base_amount_usd=2.0,
         ),
     }
 
     run_daily_compact(
-        now, config, state, fin, rh, broker,
-        artifacts_dir=artifacts_dir, prior_same_day_allocations=prior,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(
+            artifacts_dir=artifacts_dir, prior_same_day_allocations=prior
+        ),
     )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
     aapl = by_ticker["AAPL"]
@@ -5818,22 +7214,33 @@ def test_run_daily_compact_fully_offset_still_writes_valid_state(tmp_path):
     # run_state must still be written.
     prior = {
         t: PriorSameDayAllocation(
-            t, amount_usd=2.0, reference_price=97.0, run_id="manual_am", source="manual",
+            t,
+            amount_usd=2.0,
+            reference_price=97.0,
+            run_id="manual_am",
+            source="manual",
             selected_base_amount_usd=2.0,
         )
         for t in config.tickers
     }
 
     result = run_daily_compact(
-        now, config, state, fin, rh, broker,
-        artifacts_dir=artifacts_dir, prior_same_day_allocations=prior,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(
+            artifacts_dir=artifacts_dir, prior_same_day_allocations=prior
+        ),
     )
 
     assert result["blocked"] is False
     assert os.path.exists(result["run_state_path"])
     with open(result["run_state_path"], encoding="utf-8") as handle:
         run_state = json.load(handle)
-    # Patch 2: prior amounts are seeded into the ledger before the cap check,
+    # Fix 2: prior amounts are seeded into the ledger before the cap check,
     # so day_notional reflects the 3 tickers x $2 prior spend even though the
     # afternoon incremental is $0 for all (price not below prior).
     assert run_state["budget"]["day_notional_usd"] == 6.0
@@ -5853,20 +7260,35 @@ def test_run_daily_compact_manual_run_does_not_block_scheduled(tmp_path):
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return True
 
-    blocking = _BlockingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    blocking = _BlockingBroker(
+        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
+    )
     prior = {
         "AAPL": PriorSameDayAllocation(
-            "AAPL", amount_usd=2.0, reference_price=99.0, run_id="manual_am", source="manual",
+            "AAPL",
+            amount_usd=2.0,
+            reference_price=99.0,
+            run_id="manual_am",
+            source="manual",
             selected_base_amount_usd=2.0,
         ),
     }
 
     run_daily_compact(
-        now, config, state, fin, rh, blocking,
-        artifacts_dir=artifacts_dir, prior_same_day_allocations=prior,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        blocking,
+        options=CompactRunOptions(
+            artifacts_dir=artifacts_dir, prior_same_day_allocations=prior
+        ),
     )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
     # Guard bypassed the same-day broker block and still topped up AAPL, which
@@ -5879,16 +7301,18 @@ def test_run_daily_compact_manual_run_does_not_block_scheduled(tmp_path):
     assert by_ticker["NVDA"]["skip_reason"] == "same-day broker order exists"
 
 
-
-
-# --- Patch 1: planned_amount_usd reflects the guarded incremental amount --------
+# --- Fix 1: planned_amount_usd reflects the guarded incremental amount --------
 
 
 def test_build_run_artifacts_uses_guarded_amount_as_planned_notional(tmp_path):
     """build_run_artifacts must set planned_amount_usd = incremental_order_amount
     (not the full afternoon desired amount) when a top-up guard outcome is present.
     The original desired amount must be preserved in afternoon_desired_amount_usd."""
-    from near_close_dca import TOP_UP_INCREMENTAL, TopUpGuardOutcome, build_run_artifacts
+    from near_close_dca import (
+        TOP_UP_INCREMENTAL,
+        TopUpGuardOutcome,
+        build_run_artifacts,
+    )
 
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
@@ -5913,17 +7337,20 @@ def test_build_run_artifacts_uses_guarded_amount_as_planned_notional(tmp_path):
         manual_review=False,
     )
     artifacts = build_run_artifacts(
-        now, config, state, [decision],
+        now,
+        config,
+        state,
+        [decision],
         candidate_outcomes={"AAPL": {"order_id": "x", "status": "dry_run"}},
         top_up_outcomes={"AAPL": guard},
     )
     candidates = {c["ticker"]: c for c in artifacts["buy_candidates"]}
-    assert candidates["AAPL"]["planned_amount_usd"] == 3.0, (
-        "planned_amount_usd must equal incremental_order_amount, not the full desired amount"
-    )
-    assert candidates["AAPL"]["afternoon_desired_amount_usd"] == 6.0, (
-        "original desired amount must be preserved in afternoon_desired_amount_usd"
-    )
+    assert (
+        candidates["AAPL"]["planned_amount_usd"] == 3.0
+    ), "planned_amount_usd must equal incremental_order_amount, not the full desired amount"
+    assert (
+        candidates["AAPL"]["afternoon_desired_amount_usd"] == 6.0
+    ), "original desired amount must be preserved in afternoon_desired_amount_usd"
 
 
 def test_build_run_artifacts_keeps_preserved_amount_for_duplicate(tmp_path):
@@ -5934,7 +7361,11 @@ def test_build_run_artifacts_keeps_preserved_amount_for_duplicate(tmp_path):
     # (e.g. new prior-allocation context shrank it), planned_amount_usd must
     # still be the real preserved amount, not clamped down to the stale guard
     # figure -- the order actually deployed the larger amount.
-    from near_close_dca import TOP_UP_INCREMENTAL, TopUpGuardOutcome, build_run_artifacts
+    from near_close_dca import (
+        TOP_UP_INCREMENTAL,
+        TopUpGuardOutcome,
+        build_run_artifacts,
+    )
 
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
@@ -5960,7 +7391,10 @@ def test_build_run_artifacts_keeps_preserved_amount_for_duplicate(tmp_path):
         manual_review=False,
     )
     artifacts = build_run_artifacts(
-        now, config, state, [decision],
+        now,
+        config,
+        state,
+        [decision],
         candidate_outcomes={
             "AAPL": {
                 "order_id": "ORDER-1",
@@ -5978,12 +7412,18 @@ def test_build_run_artifacts_keeps_preserved_amount_for_duplicate(tmp_path):
     )
 
 
-def test_build_run_artifacts_records_guards_effective_base_not_current_run_base(tmp_path):
+def test_build_run_artifacts_records_guards_effective_base_not_current_run_base(
+    tmp_path,
+):
     # Codex review ("Persist the preserved base on top-up candidates"): when the
     # guard reused a preserved prior-allocation base, the candidate row must
     # record THAT base, not this run's own freshly recomputed
     # decision.selected_base_amount_usd.
-    from near_close_dca import TOP_UP_INCREMENTAL, TopUpGuardOutcome, build_run_artifacts
+    from near_close_dca import (
+        TOP_UP_INCREMENTAL,
+        TopUpGuardOutcome,
+        build_run_artifacts,
+    )
 
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
@@ -6019,7 +7459,10 @@ def test_build_run_artifacts_records_guards_effective_base_not_current_run_base(
         effective_base_amount_usd=1.0,  # the PRESERVED base actually used
     )
     artifacts = build_run_artifacts(
-        now, config, state, [decision],
+        now,
+        config,
+        state,
+        [decision],
         candidate_outcomes={"AAPL": {"order_id": "x", "status": "dry_run"}},
         top_up_outcomes={"AAPL": guard},
     )
@@ -6028,7 +7471,7 @@ def test_build_run_artifacts_records_guards_effective_base_not_current_run_base(
     assert candidates["AAPL"]["decision_bar_close"] == 93.0
 
 
-# --- Patch 2: prior same-day allocations count against the daily/weekly cap ----
+# --- Fix 2: prior same-day allocations count against the daily/weekly cap ----
 
 
 def test_prior_allocations_count_against_cap(tmp_path):
@@ -6039,8 +7482,8 @@ def test_prior_allocations_count_against_cap(tmp_path):
     which triggers stress tier ($360/day). Prior=$200 at $99; afternoon=$98 (below
     prior -> incremental = $380 - $200 = $180).
 
-    Without Patch 2: remaining = $360 (no seeding). $180 < $360 -> cap passes (BUG).
-    With    Patch 2: remaining = $360 - $200 = $160. $180 > $160 -> cap blocks (correct).
+    Without Fix 2: remaining = $360 (no seeding). $180 < $360 -> cap passes (BUG).
+    With    Fix 2: remaining = $360 - $200 = $160. $180 > $160 -> cap blocks (correct).
     """
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
@@ -6052,7 +7495,11 @@ def test_prior_allocations_count_against_cap(tmp_path):
     state = StrategyState()
     prior = {
         "AAPL": PriorSameDayAllocation(
-            "AAPL", amount_usd=200.0, reference_price=99.0, run_id="manual_am", source="manual"
+            "AAPL",
+            amount_usd=200.0,
+            reference_price=99.0,
+            run_id="manual_am",
+            source="manual",
         )
     }
     broker = DryRunBroker(cash=5000.0, reference_prices={"AAPL": 98.0})
@@ -6061,10 +7508,17 @@ def test_prior_allocations_count_against_cap(tmp_path):
     artifacts_dir = str(tmp_path / "runs" / "2026-06-29-cap")
 
     import json as _json
+
     result = run_daily_compact(
-        now, config, state, fin, rh, broker,
-        artifacts_dir=artifacts_dir,
-        prior_same_day_allocations=prior,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(
+            artifacts_dir=artifacts_dir, prior_same_day_allocations=prior
+        ),
     )
 
     with open(result["run_state_path"], encoding="utf-8") as handle:
@@ -6074,7 +7528,7 @@ def test_prior_allocations_count_against_cap(tmp_path):
     # $200 prior seeded -> remaining = $360 - $200 = $160.
     # Guard: $380 desired - $200 prior = $180 incremental.
     # $180 > $160 remaining -> must be blocked.
-    # (Without Patch 2, remaining = $360 and $180 < $360 -> would slip through.)
+    # (Without Fix 2, remaining = $360 and $180 < $360 -> would slip through.)
     aapl = candidates["AAPL"]
     assert aapl["status"] in ("blocked", "skipped"), (
         f"AAPL should be blocked by cap (prior + incremental > cap); "
@@ -6082,7 +7536,7 @@ def test_prior_allocations_count_against_cap(tmp_path):
     )
 
 
-# --- Patch 3: load_prior_same_day_allocations reads full-report run_state ------
+# --- Fix 3: load_prior_same_day_allocations reads full-report run_state ------
 
 
 def test_load_prior_same_day_ignores_unreadable_or_invalid_json(tmp_path):
@@ -6130,11 +7584,15 @@ def test_load_prior_same_day_skip_sink_records_scan_failures(tmp_path):
     # out before ever reaching json.loads) but is truncated mid-flush, like a
     # sibling stream's writer caught mid-write.
     partial_json = root / "run_state_partial.json"
-    partial_json.write_text('{"trading_day": "2026-06-29", "buy_candidates": [', encoding="utf-8")
+    partial_json.write_text(
+        '{"trading_day": "2026-06-29", "buy_candidates": [', encoding="utf-8"
+    )
     _stamp_mtime_on_trading_day(partial_json, date(2026, 6, 29))
 
     skip_sink: list = []
-    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
+    allocations = load_prior_same_day_allocations(
+        root, date(2026, 6, 29), skip_sink=skip_sink
+    )
 
     assert allocations == {}
     assert set(skip_sink) == {unreadable_json, partial_json}
@@ -6160,7 +7618,9 @@ def test_load_prior_same_day_skip_sink_records_truncated_prefix_missing_day(tmp_
     _stamp_mtime_on_trading_day(truncated_prefix_json, date(2026, 6, 29))
 
     skip_sink: list = []
-    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
+    allocations = load_prior_same_day_allocations(
+        root, date(2026, 6, 29), skip_sink=skip_sink
+    )
 
     assert allocations == {}
     assert set(skip_sink) == {empty_json, truncated_prefix_json}
@@ -6184,7 +7644,9 @@ def test_load_prior_same_day_skip_sink_records_nested_brace_truncation(tmp_path)
     _stamp_mtime_on_trading_day(nested_brace_prefix, date(2026, 6, 29))
 
     skip_sink: list = []
-    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
+    allocations = load_prior_same_day_allocations(
+        root, date(2026, 6, 29), skip_sink=skip_sink
+    )
 
     assert allocations == {}
     assert skip_sink == [nested_brace_prefix]
@@ -6207,7 +7669,9 @@ def test_load_prior_same_day_skip_sink_excludes_old_historical_parse_failure(tmp
     _stamp_mtime_on_trading_day(old_corrupt_json, date(2025, 1, 15))  # long-past day
 
     skip_sink: list = []
-    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
+    allocations = load_prior_same_day_allocations(
+        root, date(2026, 6, 29), skip_sink=skip_sink
+    )
 
     assert allocations == {}
     assert skip_sink == []
@@ -6229,13 +7693,25 @@ def test_load_prior_same_day_reads_full_report_run_state_via_orders_csv(tmp_path
     orders_csv_path = os.path.join(run_dir, "orders.csv")
     with open(orders_csv_path, "w", newline="", encoding="utf-8") as fh:
         writer = _csv.DictWriter(
-            fh, fieldnames=["ticker", "status", "avg_fill_price", "quantity_filled", "order_id"]
+            fh,
+            fieldnames=[
+                "ticker",
+                "status",
+                "avg_fill_price",
+                "quantity_filled",
+                "order_id",
+            ],
         )
         writer.writeheader()
-        writer.writerow({
-            "ticker": "AAPL", "status": "filled",
-            "avg_fill_price": "99.0", "quantity_filled": "0.0303", "order_id": "ord1",
-        })
+        writer.writerow(
+            {
+                "ticker": "AAPL",
+                "status": "filled",
+                "avg_fill_price": "99.0",
+                "quantity_filled": "0.0303",
+                "order_id": "ord1",
+            }
+        )
 
     # Write a full-report run_state without buy_candidates but with artifacts block.
     # Use run_origin="manual" and a morning time so it passes the boundary/schedule filters.
@@ -6252,15 +7728,17 @@ def test_load_prior_same_day_reads_full_report_run_state_via_orders_csv(tmp_path
         _json.dump(run_state, fh)
 
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
-    assert "AAPL" in allocations, (
-        "full-report run_state without buy_candidates must produce an AAPL allocation via orders_csv_path"
-    )
+    assert (
+        "AAPL" in allocations
+    ), "full-report run_state without buy_candidates must produce an AAPL allocation via orders_csv_path"
     alloc = allocations["AAPL"]
     assert abs(alloc.reference_price - 99.0) < 0.001
     assert abs(alloc.amount_usd - 99.0 * 0.0303) < 0.001
 
 
-def test_load_prior_same_day_orders_csv_unknown_reference_clears_reference_timestamp(tmp_path):
+def test_load_prior_same_day_orders_csv_unknown_reference_clears_reference_timestamp(
+    tmp_path,
+):
     import csv as _csv
     import json as _json
 
@@ -6272,32 +7750,53 @@ def test_load_prior_same_day_orders_csv_unknown_reference_clears_reference_times
 
     known_orders_csv_path = os.path.join(known_run_dir, "orders.csv")
     with open(known_orders_csv_path, "w", newline="", encoding="utf-8") as fh:
-        writer = _csv.DictWriter(fh, fieldnames=["ticker", "status", "avg_fill_price", "quantity_filled"])
+        writer = _csv.DictWriter(
+            fh, fieldnames=["ticker", "status", "avg_fill_price", "quantity_filled"]
+        )
         writer.writeheader()
-        writer.writerow({"ticker": "AAPL", "status": "filled", "avg_fill_price": "99.0", "quantity_filled": "0.0303"})
+        writer.writerow(
+            {
+                "ticker": "AAPL",
+                "status": "filled",
+                "avg_fill_price": "99.0",
+                "quantity_filled": "0.0303",
+            }
+        )
 
     unknown_orders_csv_path = os.path.join(unknown_run_dir, "orders.csv")
     with open(unknown_orders_csv_path, "w", newline="", encoding="utf-8") as fh:
         writer = _csv.DictWriter(fh, fieldnames=["ticker", "status", "notional_usd"])
         writer.writeheader()
-        writer.writerow({"ticker": "AAPL", "status": "submitted", "notional_usd": "4.5"})
+        writer.writerow(
+            {"ticker": "AAPL", "status": "submitted", "notional_usd": "4.5"}
+        )
 
-    with open(os.path.join(known_run_dir, "run_state.json"), "w", encoding="utf-8") as fh:
+    with open(
+        os.path.join(known_run_dir, "run_state.json"), "w", encoding="utf-8"
+    ) as fh:
         _json.dump(
             {
                 "trading_day": "2026-06-29",
                 "generated_at": "2026-06-29T10:00:00-04:00",
-                "run_classification": {"run_origin": "manual", "run_id": "manual_known"},
+                "run_classification": {
+                    "run_origin": "manual",
+                    "run_id": "manual_known",
+                },
                 "artifacts": {"orders_csv_path": known_orders_csv_path},
             },
             fh,
         )
-    with open(os.path.join(unknown_run_dir, "run_state.json"), "w", encoding="utf-8") as fh:
+    with open(
+        os.path.join(unknown_run_dir, "run_state.json"), "w", encoding="utf-8"
+    ) as fh:
         _json.dump(
             {
                 "trading_day": "2026-06-29",
                 "generated_at": "2026-06-29T10:30:00-04:00",
-                "run_classification": {"run_origin": "manual", "run_id": "manual_unknown"},
+                "run_classification": {
+                    "run_origin": "manual",
+                    "run_id": "manual_unknown",
+                },
                 "artifacts": {"orders_csv_path": unknown_orders_csv_path},
             },
             fh,
@@ -6342,7 +7841,9 @@ def test_load_prior_same_day_skip_sink_records_missing_referenced_orders_csv(tmp
         _json.dump(run_state, fh)
 
     skip_sink: list = []
-    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
+    allocations = load_prior_same_day_allocations(
+        root, date(2026, 6, 29), skip_sink=skip_sink
+    )
     assert "AAPL" not in allocations
     assert skip_sink, (
         "a full-report run_state referencing a missing orders CSV must be "
@@ -6350,7 +7851,9 @@ def test_load_prior_same_day_skip_sink_records_missing_referenced_orders_csv(tmp
     )
 
 
-def test_load_prior_same_day_skip_sink_ignores_stale_path_with_basename_sibling(tmp_path):
+def test_load_prior_same_day_skip_sink_ignores_stale_path_with_basename_sibling(
+    tmp_path,
+):
     # Codex review ("Do not flag stale CSV paths after fallback recovery"):
     # the run_state records a STALE ABSOLUTE artifacts.orders_csv_path (as
     # if from a relocated deployment) that no longer exists, but a
@@ -6463,7 +7966,9 @@ def test_load_prior_same_day_skip_sink_records_truncated_orders_csv_row(tmp_path
     orders_csv_path = os.path.join(run_dir, "orders.csv")
     with open(orders_csv_path, "w", newline="", encoding="utf-8") as fh:
         fh.write("ticker,status,order_id,avg_fill_price,quantity_filled\n")
-        fh.write("AAPL,filled")  # truncated mid-write -- no trailing columns, no newline
+        fh.write(
+            "AAPL,filled"
+        )  # truncated mid-write -- no trailing columns, no newline
 
     run_state = {
         "trading_day": "2026-06-29",
@@ -6477,7 +7982,9 @@ def test_load_prior_same_day_skip_sink_records_truncated_orders_csv_row(tmp_path
         _json.dump(run_state, fh)
 
     skip_sink: list = []
-    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
+    allocations = load_prior_same_day_allocations(
+        root, date(2026, 6, 29), skip_sink=skip_sink
+    )
     assert "AAPL" not in allocations
     assert skip_sink, (
         "a truncated final row in a referenced orders CSV must be recorded "
@@ -6519,7 +8026,9 @@ def test_load_prior_same_day_skip_sink_records_empty_orders_csv_snapshot(tmp_pat
         _json.dump(run_state, fh)
 
     skip_sink: list = []
-    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
+    allocations = load_prior_same_day_allocations(
+        root, date(2026, 6, 29), skip_sink=skip_sink
+    )
     assert "AAPL" not in allocations
     assert skip_sink, (
         "a completely empty referenced orders CSV (no header at all) must be "
@@ -6545,6 +8054,7 @@ def _run_all():
 
 def test_prior_run_before_boundary_malformed_iso_format():
     from near_close_dca import _prior_run_before_boundary
+
     run_state = {"generated_at": "invalid-date-format"}
     boundary_et = time(14, 30)
     assert _prior_run_before_boundary(run_state, boundary_et) is True
@@ -6552,6 +8062,7 @@ def test_prior_run_before_boundary_malformed_iso_format():
 
 def test_iso_or_none_handles_datetime_and_none():
     from datetime import timezone
+
     # Verify None is passed through
     assert _iso_or_none(None) is None
 
@@ -6584,34 +8095,44 @@ def test_iso_week_key():
     assert iso_week_key(date(2023, 10, 18)) == (2023, 42)  # Wednesday
 
     # Year boundaries
-    assert iso_week_key(date(2023, 12, 31)) == (2023, 52)  # Sunday, last day of 2023 ISO week 52
-    assert iso_week_key(date(2024, 1, 1)) == (2024, 1)    # Monday, first day of 2024 ISO week 1
+    assert iso_week_key(date(2023, 12, 31)) == (
+        2023,
+        52,
+    )  # Sunday, last day of 2023 ISO week 52
+    assert iso_week_key(date(2024, 1, 1)) == (
+        2024,
+        1,
+    )  # Monday, first day of 2024 ISO week 1
 
     # Leap year (2024)
-    assert iso_week_key(date(2024, 2, 29)) == (2024, 9)   # Thursday, Leap day
+    assert iso_week_key(date(2024, 2, 29)) == (2024, 9)  # Thursday, Leap day
 
     # A year where Jan 1st is in the previous year's week 52/53
     # Jan 1, 2023 was a Sunday. ISO weeks start on Monday.
     # Therefore, Jan 1 2023 belongs to the last ISO week of 2022.
     assert iso_week_key(date(2023, 1, 1)) == (2022, 52)
-    assert iso_week_key(date(2023, 1, 2)) == (2023, 1)    # Monday, starts week 1 of 2023
+    assert iso_week_key(date(2023, 1, 2)) == (2023, 1)  # Monday, starts week 1 of 2023
 
     # 53-week year boundary (e.g., 2020)
-    assert iso_week_key(date(2020, 12, 31)) == (2020, 53) # Thursday, week 53
-    assert iso_week_key(date(2021, 1, 3)) == (2020, 53)   # Sunday, last day of week 53
-    assert iso_week_key(date(2021, 1, 4)) == (2021, 1)    # Monday, starts week 1 of 2021
+    assert iso_week_key(date(2020, 12, 31)) == (2020, 53)  # Thursday, week 53
+    assert iso_week_key(date(2021, 1, 3)) == (2020, 53)  # Sunday, last day of week 53
+    assert iso_week_key(date(2021, 1, 4)) == (2021, 1)  # Monday, starts week 1 of 2021
 
 
 def test_approved_window_status_counts_remaining_days():
     from near_close_dca import approved_window_status
 
     approved = frozenset({date(2026, 8, 24), date(2026, 8, 25), date(2026, 8, 26)})
-    in_window, window_end, remaining = approved_window_status(approved, date(2026, 8, 25))
+    in_window, window_end, remaining = approved_window_status(
+        approved, date(2026, 8, 25)
+    )
     assert in_window is True
     assert window_end == date(2026, 8, 26)
     assert remaining == 2  # the 25th and 26th
 
-    in_window, window_end, remaining = approved_window_status(approved, date(2026, 9, 1))
+    in_window, window_end, remaining = approved_window_status(
+        approved, date(2026, 9, 1)
+    )
     assert in_window is False
     assert remaining == 0
 
@@ -6656,14 +8177,18 @@ def test_execution_gate_blocked_after_window_end_logs_error(tmp_path, caplog):
 
     config = StrategyConfig(approved_test_dates=frozenset({date(2026, 8, 28)}))
     with caplog.at_level("ERROR", logger="near_close_dca"):
-        allowed = _check_execution_gates(date(2026, 8, 31), config, DryRunBroker(), str(tmp_path))
+        allowed = _check_execution_gates(
+            date(2026, 8, 31), config, DryRunBroker(), str(tmp_path)
+        )
     assert allowed is False
     assert any("hard-stopped" in record.getMessage() for record in caplog.records)
     # The blocked stub artifact is still written as before.
     assert (tmp_path / "run_state.json").exists()
 
 
-def test_execution_gate_blocks_nyse_holiday_even_if_config_approves_it(tmp_path, caplog):
+def test_execution_gate_blocks_nyse_holiday_even_if_config_approves_it(
+    tmp_path, caplog
+):
     """A config-driven window (e.g. an extended trading_window.json) can widen
     approved_test_dates to any weekday range with no holiday subtraction of its
     own; the gate must still block full NYSE closures like Labor Day and
@@ -6673,10 +8198,13 @@ def test_execution_gate_blocks_nyse_holiday_even_if_config_approves_it(tmp_path,
     for holiday in (date(2026, 9, 7), date(2026, 11, 26)):  # Labor Day, Thanksgiving
         config = StrategyConfig(approved_test_dates=frozenset({holiday}))
         with caplog.at_level("WARNING", logger="near_close_dca"):
-            allowed = _check_execution_gates(holiday, config, DryRunBroker(), str(tmp_path / str(holiday)))
+            allowed = _check_execution_gates(
+                holiday, config, DryRunBroker(), str(tmp_path / str(holiday))
+            )
         assert allowed is False
         assert any(
-            "NYSE holiday gate blocked execution" in record.getMessage() for record in caplog.records
+            "NYSE holiday gate blocked execution" in record.getMessage()
+            for record in caplog.records
         )
         caplog.clear()
 
@@ -6702,7 +8230,9 @@ def test_orders_csv_fills_logs_and_keeps_partial_rows_on_corrupt_csv(tmp_path, c
     # An oversized field raises csv.Error (field larger than field limit) on the
     # row AFTER the valid AAPL row, so parsing fails mid-iteration.
     oversized = "x" * (csv.field_size_limit() + 1)
-    orders_csv.write_text(good + f"MSFT,filled,{oversized},0.01,oid-2\n", encoding="utf-8")
+    orders_csv.write_text(
+        good + f"MSFT,filled,{oversized},0.01,oid-2\n", encoding="utf-8"
+    )
 
     with caplog.at_level("ERROR", logger="near_close_dca"):
         fills = _orders_csv_fills(tmp_path)
@@ -6751,7 +8281,9 @@ def test_blocked_stub_refreshes_the_latest_scheduled_pointer(tmp_path):
 
     _write_blocked_run_stub(date(2026, 7, 1), artifacts_dir, state_root)
 
-    pointer = json.loads(latest_scheduled_run_path(state_root).read_text(encoding="utf-8"))
+    pointer = json.loads(
+        latest_scheduled_run_path(state_root).read_text(encoding="utf-8")
+    )
     assert pointer["trading_day"] == "2026-07-01"
     assert pointer["run_state_path"] == str(artifacts_dir / "run_state.json")
     # A market-closed day proves the slot fired but is never scheduled evidence.
@@ -6778,14 +8310,20 @@ def test_blocked_stub_withholds_the_pointer_when_the_contract_fails(tmp_path, ca
     # No run_classification on the preserved legacy state, so the contract fails.
     assert not latest_scheduled_run_path(state_root).exists()
     assert (artifacts_dir / "run_state.json").read_text(encoding="utf-8") == legacy
-    assert any("not refreshing the latest scheduled pointer" in r.message for r in caplog.records)
+    assert any(
+        "not refreshing the latest scheduled pointer" in r.message
+        for r in caplog.records
+    )
 
 
 def test_placement_failure_outranks_a_confirmation_hold(tmp_path):
     """A zero-submission batch where one order awaits confirmation and another
     placement RAISED is a placement failure, not an ordinary confirmation block:
     is_confirmation_blocked() must not claim the run (Codex review)."""
-    from near_close_dca import _apply_no_order_classification, _derive_order_submit_status
+    from near_close_dca import (
+        _apply_no_order_classification,
+        _derive_order_submit_status,
+    )
     from scripts.run_classification import is_confirmation_blocked
 
     config = StrategyConfig(dry_run=False, tickers=("AAPL", "MSFT"))
@@ -6794,7 +8332,9 @@ def test_placement_failure_outranks_a_confirmation_hold(tmp_path):
         {"ticker": "MSFT", "status": "failed"},
     ]
 
-    assert _derive_order_submit_status(config, buy_candidates, 0) == "not_submitted_error"
+    assert (
+        _derive_order_submit_status(config, buy_candidates, 0) == "not_submitted_error"
+    )
 
     artifacts = {
         "buy_candidates": buy_candidates,
@@ -6813,10 +8353,15 @@ def test_placement_failure_outranks_a_confirmation_hold(tmp_path):
 
 def test_confirmation_hold_survives_when_no_placement_failed(tmp_path):
     """The failure precedence must not swallow a genuine confirmation block."""
-    from near_close_dca import _apply_no_order_classification, _derive_order_submit_status
+    from near_close_dca import (
+        _apply_no_order_classification,
+        _derive_order_submit_status,
+    )
 
     config = StrategyConfig(dry_run=False, tickers=("AAPL",))
-    buy_candidates = [{"ticker": "AAPL", "status": "not_submitted_confirmation_required"}]
+    buy_candidates = [
+        {"ticker": "AAPL", "status": "not_submitted_confirmation_required"}
+    ]
 
     assert (
         _derive_order_submit_status(config, buy_candidates, 0)
@@ -6863,7 +8408,9 @@ def test_a_failure_synthesized_candidate_row_satisfies_the_schema():
 
     assert row["buy_multiplier"] == 1.5
     schema = _json.loads(
-        (_Path(__file__).parent / "schemas" / "run_state.schema.json").read_text(encoding="utf-8")
+        (_Path(__file__).parent / "schemas" / "run_state.schema.json").read_text(
+            encoding="utf-8"
+        )
     )
     item_schema = schema["properties"]["buy_candidates"]["items"]
     # The required-field check is the defect this test was written for, so it
@@ -6985,7 +8532,11 @@ def test_an_afternoon_deliberate_skip_beside_a_submission_stays_clean():
     artifacts = {"signal_rows": []}
     outcomes = {
         "AAA": {"status": "submitted", "order_id": "o-1"},
-        "BBB": {"status": "blocked", "skip_reason": "cap exceeded", "deliberate_skip": True},
+        "BBB": {
+            "status": "blocked",
+            "skip_reason": "cap exceeded",
+            "deliberate_skip": True,
+        },
     }
 
     _apply_no_order_classification(artifacts, outcomes, scheduled=True)
@@ -7043,8 +8594,10 @@ def test_a_synthesized_state_with_no_rows_still_gets_a_ticker_header(tmp_path):
 # MorningConfig/StrategyConfig construction bypass it. This shared gate is on
 # every live path, so the shape check belongs here too (Codex review, PR #219).
 
+
 @pytest.mark.parametrize(
-    "bad", ["acct-123", "12345", "1234567890123", " 123456789 ", "read_only", "12a456789"]
+    "bad",
+    ["acct-123", "12345", "1234567890123", " 123456789 ", "read_only", "12a456789"],
 )
 def test_account_pinning_rejects_malformed_accounts(bad):
     from near_close_dca import account_pinning_failure
@@ -7101,10 +8654,12 @@ def test_a_malformed_account_from_the_fallback_path_cannot_go_live(tmp_path):
         check=True,
     )
     configured, blocked = out.stdout.strip().splitlines()[-2:]
-    assert configured == "None", (
-        f"malformed account should be caught at load time, not passed through: {out.stdout}"
-    )
-    assert blocked == "True", f"malformed account was accepted for live execution: {out.stdout}"
+    assert (
+        configured == "None"
+    ), f"malformed account should be caught at load time, not passed through: {out.stdout}"
+    assert (
+        blocked == "True"
+    ), f"malformed account was accepted for live execution: {out.stdout}"
 
 
 # --- The digit shape is Robinhood's, not every broker's ----------------------
@@ -7112,6 +8667,7 @@ def test_a_malformed_account_from_the_fallback_path_cannot_go_live(tmp_path):
 # Alpaca identifier before execution reached the ALPACA branch, so the
 # documented broker-agnostic live adapter could not be built at all
 # (Codex review, PR #219).
+
 
 def test_an_alpaca_account_is_not_held_to_the_robinhood_digit_shape():
     config = StrategyConfig(
@@ -7122,7 +8678,9 @@ def test_an_alpaca_account_is_not_held_to_the_robinhood_digit_shape():
 
 
 @pytest.mark.parametrize("broker", [BrokerName.ALPACA, BrokerName.ROBINHOOD, None])
-@pytest.mark.parametrize("unusable", [None, "", "UNSET_ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"])
+@pytest.mark.parametrize(
+    "unusable", [None, "", "UNSET_ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"]
+)
 def test_no_backend_may_trade_an_account_nobody_named(broker, unusable):
     """The nonempty/placeholder half of the gate stays broker-agnostic."""
     assert account_pinning_failure(unusable, broker)
@@ -7130,7 +8688,9 @@ def test_no_backend_may_trade_an_account_nobody_named(broker, unusable):
 
 def test_robinhood_still_requires_the_digit_shape():
     assert account_pinning_failure("PA3ABCDEF123", BrokerName.ROBINHOOD)
-    assert account_pinning_failure("PA3ABCDEF123") is not None, "default must stay Robinhood"
+    assert (
+        account_pinning_failure("PA3ABCDEF123") is not None
+    ), "default must stay Robinhood"
 
 
 # --- The execution gate fails closed on an injected broker -------------------
@@ -7139,6 +8699,7 @@ def test_robinhood_still_requires_the_digit_shape():
 # only compared broker.account_number() to the configured value, and two empty
 # strings compare equal -- so an unpinned live run reached placement
 # (Codex review, PR #219).
+
 
 class _InjectedBroker:
     def __init__(self, account: str) -> None:
@@ -7149,7 +8710,11 @@ class _InjectedBroker:
 
 
 def _an_approved_day(config):
-    return sorted(config.approved_test_dates)[0] if config.approved_test_dates else date(2026, 7, 6)
+    return (
+        sorted(config.approved_test_dates)[0]
+        if config.approved_test_dates
+        else date(2026, 7, 6)
+    )
 
 
 @pytest.mark.parametrize(
@@ -7158,7 +8723,9 @@ def _an_approved_day(config):
 def test_an_injected_broker_cannot_trade_an_unpinned_live_account(account):
     config = StrategyConfig(dry_run=False, target_account_number=account)
     with pytest.raises(RuntimeError, match="Refusing to trade live"):
-        _check_execution_gates(_an_approved_day(config), config, _InjectedBroker(account), None)
+        _check_execution_gates(
+            _an_approved_day(config), config, _InjectedBroker(account), None
+        )
 
 
 def test_a_properly_pinned_injected_broker_still_passes():
@@ -7170,7 +8737,9 @@ def test_a_properly_pinned_injected_broker_still_passes():
 
 def test_a_dry_run_is_unaffected_by_the_pinning_gate():
     config = StrategyConfig(dry_run=True, target_account_number="")
-    assert _check_execution_gates(_an_approved_day(config), config, _InjectedBroker(""), None)
+    assert _check_execution_gates(
+        _an_approved_day(config), config, _InjectedBroker(""), None
+    )
 
 
 # --- one_order_per_ticker_per_day: closing the ticker_guarded bypass ---------
@@ -7204,20 +8773,35 @@ def test_flag_makes_the_broker_same_day_gate_beat_a_loaded_prior_allocation(tmp_
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return True
 
-    blocking = _BlockingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    blocking = _BlockingBroker(
+        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
+    )
     prior = {
         "AAPL": PriorSameDayAllocation(
-            "AAPL", amount_usd=2.0, reference_price=99.0, run_id="slot_1030", source="scheduled",
+            "AAPL",
+            amount_usd=2.0,
+            reference_price=99.0,
+            run_id="slot_1030",
+            source="scheduled",
             selected_base_amount_usd=2.0,
         ),
     }
 
     run_daily_compact(
-        now, config, state, fin, rh, blocking,
-        artifacts_dir=artifacts_dir, prior_same_day_allocations=prior,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        blocking,
+        options=CompactRunOptions(
+            artifacts_dir=artifacts_dir, prior_same_day_allocations=prior
+        ),
     )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
     # Same setup as test_run_daily_compact_manual_run_does_not_block_scheduled,
@@ -7256,9 +8840,19 @@ def test_flag_checks_the_hard_ceiling_before_its_own_broker_duplicate_lookup(tmp
 
     tracking_broker = _TrackingBroker(cash=500.0, reference_prices={"AAPL": 98.0})
 
-    run_daily_compact(now, config, state, fin, rh, tracking_broker, artifacts_dir=artifacts_dir)
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        tracking_broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
     candidate = run_state["buy_candidates"][0]
     assert candidate["status"] == "blocked"
@@ -7276,17 +8870,30 @@ def test_flag_makes_local_buys_today_gate_beat_a_loaded_prior_allocation(tmp_pat
     state.record_buy("AAPL", trading_day, 2.0)
     prior = {
         "AAPL": PriorSameDayAllocation(
-            "AAPL", amount_usd=2.0, reference_price=99.0, run_id="slot_1030", source="scheduled",
+            "AAPL",
+            amount_usd=2.0,
+            reference_price=99.0,
+            run_id="slot_1030",
+            source="scheduled",
             selected_base_amount_usd=2.0,
         ),
     }
 
     run_daily_compact(
-        now, config, state, fin, rh, broker,
-        artifacts_dir=artifacts_dir, prior_same_day_allocations=prior,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(
+            artifacts_dir=artifacts_dir, prior_same_day_allocations=prior
+        ),
     )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
     assert by_ticker["AAPL"]["status"] == "skipped"
@@ -7303,20 +8910,35 @@ def test_flag_off_leaves_the_documented_top_up_bypass_intact(tmp_path):
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return True
 
-    blocking = _BlockingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    blocking = _BlockingBroker(
+        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
+    )
     prior = {
         "AAPL": PriorSameDayAllocation(
-            "AAPL", amount_usd=2.0, reference_price=99.0, run_id="manual_am", source="manual",
+            "AAPL",
+            amount_usd=2.0,
+            reference_price=99.0,
+            run_id="manual_am",
+            source="manual",
             selected_base_amount_usd=2.0,
         ),
     }
 
     run_daily_compact(
-        now, config, state, fin, rh, blocking,
-        artifacts_dir=artifacts_dir, prior_same_day_allocations=prior,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        blocking,
+        options=CompactRunOptions(
+            artifacts_dir=artifacts_dir, prior_same_day_allocations=prior
+        ),
     )
 
-    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
         run_state = json.load(handle)
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
     assert by_ticker["AAPL"]["status"] == "dry_run"
@@ -7337,7 +8959,11 @@ def test_seed_prior_allocations_still_seeds_notional_when_the_flag_is_on():
     trading_day = date(2026, 6, 29)
     prior = {
         "AAPL": PriorSameDayAllocation(
-            ticker="AAPL", amount_usd=2.0, reference_price=99.0, run_id="slot_1030", source="scheduled",
+            ticker="AAPL",
+            amount_usd=2.0,
+            reference_price=99.0,
+            run_id="slot_1030",
+            source="scheduled",
             selected_base_amount_usd=2.0,
         ),
     }
@@ -7363,12 +8989,18 @@ def test_seed_prior_allocations_is_a_noop_when_guard_inactive_regardless_of_the_
     trading_day = date(2026, 6, 29)
     prior = {
         "AAPL": PriorSameDayAllocation(
-            ticker="AAPL", amount_usd=2.0, reference_price=99.0, run_id="slot_1030", source="scheduled",
+            ticker="AAPL",
+            amount_usd=2.0,
+            reference_price=99.0,
+            run_id="slot_1030",
+            source="scheduled",
             selected_base_amount_usd=2.0,
         ),
     }
 
-    _seed_prior_allocations(state, trading_day, False, prior, one_order_per_ticker_per_day=True)
+    _seed_prior_allocations(
+        state, trading_day, False, prior, one_order_per_ticker_per_day=True
+    )
 
     assert state.buys_today("AAPL", trading_day) == 0
     assert state.day_notional(trading_day) == pytest.approx(0.0)
