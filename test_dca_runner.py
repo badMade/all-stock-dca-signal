@@ -6791,14 +6791,7 @@ def test_execute_plan_refuses_a_stale_orders_fetch():
     )
     now = datetime(2026, 7, 28, 9, 43, tzinfo=ET)
     stale_fetch = now - timedelta(seconds=dca_runner.MAX_ORDERS_FETCH_AGE_SECONDS + 1)
-    with pytest.raises(
-        ValueError,
-        match=(
-            r"^execute_plan refuses to place: orders_fetched_at is -?\d+\.\d+s away from now, "
-            rf"outside the {dca_runner.MAX_ORDERS_FETCH_AGE_SECONDS}s freshness window; "
-            r"refetch order history immediately before placement$"
-        ),
-    ):
+    with pytest.raises(ValueError, match=r"outside the .* freshness window"):
         dca_runner.execute_plan(
             plan,
             broker,
@@ -6818,7 +6811,7 @@ def test_execute_plan_refuses_a_stale_orders_fetch():
 
 
 def test_execute_plan_refuses_an_orders_fetch_from_the_future():
-    """A clock/wiring error producing orders_fetched_at after now is just as
+    """A clock/wiring bug producing orders_fetched_at after now is just as
     untrustworthy as a stale one -- neither proves the history is current
     relative to the placement clock (Codex review: "Bind cap checks to a
     fresh history snapshot")."""

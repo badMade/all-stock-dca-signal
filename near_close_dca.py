@@ -4764,7 +4764,7 @@ def build_execution_record(
 
     For a buy, positive slippage means the average fill was above the target price
     (unfavorable). slippage_cost is the extra dollars paid versus target across the
-    filled quantity. Records without a fill are marked ``unfilled``.
+    filled quantity. Records without a fill are marked ``submitted``.
     """
     filled = avg_fill_price is not None and quantity_filled is not None
     slippage_abs: Optional[float] = None

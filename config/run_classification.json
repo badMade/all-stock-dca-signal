@@ -644,56 +644,6 @@
     "pointer_note": "latest_intraday_1430_recovery_run.json was written. No scheduled same-day pointer was overwritten.",
     "see": "config/scheduled_tasks.json:intraday_dca_scheduled_recovery_2026_07_27 and intraday_connector_native_recovery_policy"
   },
-  "foreground_primary_surrogate_context_2026_07_30": {
-    "added": "2026-07-30",
-    "applies_to_tasks": ["67aa802b", "a46bf007"],
-    "applies_to_tasks_note": "67aa802b is the 3:35 PM ET post-trade validator. a46bf007 is the 3:40 PM ET live-run watchdog. Those are the repo's only close-of-day validator schedule entries. This patch creates no new scheduled task.",
-    "trades": false,
-    "problem": "On a trading day the operator drives in the foreground, the background scheduled stream legitimately writes no artifact. Both close-of-day validators escalated a missing-scheduled-evidence alert for that day, reporting an outage that did not occur. A recurring false alert erodes trust in the alert that matters.",
-    "recognised_markers": [
-      "foreground_primary_surrogate_context=true (boolean field)",
-      "foreground_primary_surrogate_context (bare marker string, as a field value or a list entry)",
-      "run_origin='foreground_primary_surrogate'",
-      "run_origin='manual_foreground_primary'",
-      "valid_primary_executor_evidence=true"
-    ],
-    "marker_sources": "Same-day run_state.json, run_summary.json, latest pointers, and manifest entries. Searched at the top level and in the run_classification, classification, foreground_primary, foreground_primary_context, run_summary, and summary blocks.",
-    "same_day_requirement": "A marker counts only when the artifact carrying it declares trading_day equal to the current ET trading day. Prior-day markers, and markers on artifacts that declare no trading_day, are rejected. Without this, a single foreground day would silence the missing-scheduled-evidence alert permanently, the same failure mode same_day_pointer_validation_policy exists to prevent.",
-    "marker_matching": "Exact equality only, never substring. A marker named inside a prose note is documentation, not a declaration, and substring matching would let a note that says the run was NOT foreground primary switch the mode on. The boolean spellings require literal true, so the string \"false\" and the integer 0 are not declarations.",
-    "effect_when_active": "Report foreground_primary_mode_active=true, list the foreground artifact paths used, and classify those fills/orders as foreground_primary_surrogate_context. Do not escalate a missing or invalid background scheduled evidence alert solely because the scheduled run artifact is absent, incomplete, or valid_scheduled_evidence=false.",
-    "evidence_separation": {
-      "valid_scheduled_evidence": false,
-      "valid_afternoon_scheduled_evidence": false,
-      "top_up_context_only": true,
-      "rule": "Foreground and manual fills are execution CONTEXT for user-approved foreground primary operation. They are never scheduled evidence for the background stream, and never scheduled slippage, scheduled fill-count, scheduled reliability, or scheduled cost-basis evidence. There is no code path in scripts/foreground_primary.py that flips these three flags.",
-      "relationship_to_same_day_top_up_policy": "Unchanged. Foreground primary mode explains why the background stream produced nothing. It does not promote a top-up context artifact to scheduled evidence, and the existing recovery-context contract (run_classification.validate_recovery_classification) is untouched."
-    },
-    "still_escalate": [
-      "safety failures",
-      "broker/order mismatches",
-      "missing required foreground artifacts",
-      "stale same-day pointers",
-      "invalid schema",
-      "drift where a foreground signal says an order was placed but no broker or artifact record exists",
-      "invalid background scheduled artifacts when foreground primary mode is NOT active"
-    ],
-    "suppression_is_narrow": "Only the missing/invalid background scheduled evidence finding is suppressible. Every finding in still_escalate escalates regardless of foreground primary mode: the mode explains an absent background run, it does not excuse a failure.",
-    "relationship_to_watchdog_all_orders_fix_2026_07_21": "No conflict. That fix widened what the watchdog must LOOK AT (all same-day orders, no placed_agent filter) and is unchanged here. This patch changes only whether an ABSENT background scheduled artifact escalates.",
-    "relationship_to_watchdog_reconciliation_scope_patch_2026_07_27": "No conflict. That patch narrowed what may be COUNTED as a final-run submission and is unchanged here. A foreground artifact is never final-run evidence under either policy.",
-    "close_window_signal_comparison": {
-      "summary": "JUL 30 2026 CLOSE-WINDOW SIGNAL COMPARISON PATCH. The close-of-day validator pass computes a read-only what_would_have_fired summary for the active watchlist: current market-close decision price versus the prior completed regular-session close, graded through the sizing ladder, reporting which tickers would have fired in background scheduled mode and in foreground primary mode.",
-      "analytics_only": true,
-      "must_not": "place, review, cancel, sell, or modify any order.",
-      "fields": ["ticker", "decision_price", "prior_close", "drop_pct", "ladder_multiplier_capped_at_3x", "background_mode_status", "foreground_mode_status", "reason_if_not_fired", "data_source"],
-      "ladder_reporting_cap": "0x through 3x buckets. A drop the source ladder grades above 3x is reported as 3.0 with ladder_multiplier_label='3x_plus'. Reporting only: execution sizing still uses the full 0x-to-5x config/sizing_ladder.json ladder via near_close_dca.graded_buy_multiplier.",
-      "when_foreground_primary_is_active": "State that foreground primary mode is active and compare the foreground execution context against this watchlist signal summary, rather than treating missing scheduled evidence as a failure.",
-      "implementation": "scripts/close_window_signal.py"
-    },
-    "implementation": "scripts/foreground_primary.py, consumed by dca_reporting.generate_scheduled_reports via its foreground_primary_artifacts argument",
-    "backward_compatibility": "generate_scheduled_reports raises on a missing scheduled state exactly as before unless a caller explicitly passes foreground_primary_artifacts. Loading config alone can never activate foreground primary mode.",
-    "tests": ["scripts/tests/test_foreground_primary.py", "test_dca_reporting.py"],
-    "see": "config/scheduled_tasks.json:foreground_primary_and_close_window_patch_2026_07_30 and docs/schedule_manifest.md"
-  },
   "watchdog_reconciliation_scope_patch_2026_07_27": {
     "added": "2026-07-27",
     "applies_to_tasks": ["a46bf007", "67aa802b"],

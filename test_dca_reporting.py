@@ -549,7 +549,7 @@ def test_generate_scheduled_reports_appends_model_usage_log_entry_when_root_conf
     import tempfile
     from pathlib import Path
 
-    from dca_reporting import ModelUsageConfig, generate_scheduled_reports
+    from dca_reporting import generate_scheduled_reports
     from scripts.model_usage_log import resolve_log_path
 
     build_sched, _build_manual, write_run_artifacts = _classification_helpers()
@@ -561,7 +561,7 @@ def test_generate_scheduled_reports_appends_model_usage_log_entry_when_root_conf
     fills = [{"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 0.03, "order_id": "O1"}]
     log_root = base / "model_usage"
     report_paths = generate_scheduled_reports(
-        day, fills, base / "reports", base=base, model_usage_config=ModelUsageConfig(log_root=log_root)
+        day, fills, base / "reports", base=base, model_usage_log_root=log_root
     )
 
     from datetime import datetime, timezone
@@ -580,95 +580,12 @@ def test_generate_scheduled_reports_appends_model_usage_log_entry_when_root_conf
     assert Path(report_paths["latest_run_summary"]).exists()
 
 
-def test_generate_scheduled_reports_accepts_legacy_model_usage_keywords(tmp_path=None):
-    # The externally managed 67aa802b scheduler calls this entry point with
-    # the pre-existing model_usage_log_root/model_usage_model_*/
-    # model_usage_reason_for_premium_model keywords (docs/cost_tracking.md:
-    # 206-220); those must keep working even though the in-repo call sites
-    # now prefer the bundled ModelUsageConfig object.
-    import tempfile
-    from datetime import datetime, timezone
-    from pathlib import Path
-
-    from dca_reporting import generate_scheduled_reports
-    from scripts.model_usage_log import resolve_log_path
-
-    build_sched, _build_manual, write_run_artifacts = _classification_helpers()
-    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
-    day = "2026-07-06"
-    write_run_artifacts(
-        _sched_state(day, [("AAPL", "O1")], build_sched(day, f"{day}T19:20:01Z")), base=base,
-    )
-    fills = [{"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 0.03, "order_id": "O1"}]
-    log_root = base / "model_usage"
-    report_paths = generate_scheduled_reports(
-        day,
-        fills,
-        base / "reports",
-        base=base,
-        model_usage_log_root=log_root,
-        model_usage_model_routing_mode="premium",
-        model_usage_reason_for_premium_model="explicit_user_request",
-    )
-
-    log_path = resolve_log_path(datetime.now(timezone.utc), root=log_root)
-    assert log_path.exists()
-    entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
-    assert entry["cron_id"] == "67aa802b"
-    assert entry["model_routing_mode"] == "premium"
-    assert entry["reason_for_premium_model"] == "explicit_user_request"
-    assert Path(report_paths["latest_run_summary"]).exists()
-
-
-def test_generate_scheduled_reports_accepts_legacy_positional_model_usage_args(tmp_path=None):
-    # Before the ModelUsageConfig extraction, model_usage_log_root/
-    # model_usage_model_*/model_usage_reason_for_premium_model were plain
-    # positional-or-keyword parameters (not keyword-only), so an external
-    # caller could -- and per the scheduler contract, may -- pass them
-    # positionally after `base`. model_usage_config must stay keyword-only
-    # so it never shifts into one of those legacy positional slots.
-    import tempfile
-    from datetime import datetime, timezone
-    from pathlib import Path
-
-    from dca_reporting import generate_scheduled_reports
-    from scripts.model_usage_log import resolve_log_path
-
-    build_sched, _build_manual, write_run_artifacts = _classification_helpers()
-    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
-    day = "2026-07-06"
-    write_run_artifacts(
-        _sched_state(day, [("AAPL", "O1")], build_sched(day, f"{day}T19:20:01Z")), base=base,
-    )
-    fills = [{"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 0.03, "order_id": "O1"}]
-    log_root = base / "model_usage"
-    report_paths = generate_scheduled_reports(
-        day,
-        fills,
-        base / "reports",
-        base,
-        log_root,
-        None,
-        None,
-        "premium",
-        "explicit_user_request",
-    )
-
-    log_path = resolve_log_path(datetime.now(timezone.utc), root=log_root)
-    assert log_path.exists()
-    entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
-    assert entry["cron_id"] == "67aa802b"
-    assert entry["model_routing_mode"] == "premium"
-    assert entry["reason_for_premium_model"] == "explicit_user_request"
-    assert Path(report_paths["latest_run_summary"]).exists()
-
-
 def test_generate_scheduled_reports_records_premium_routing_metadata_when_supplied(tmp_path=None):
     import tempfile
     from datetime import datetime, timezone
     from pathlib import Path
 
-    from dca_reporting import ModelUsageConfig, generate_scheduled_reports
+    from dca_reporting import generate_scheduled_reports
     from scripts.model_usage_log import resolve_log_path
 
     build_sched, _build_manual, write_run_artifacts = _classification_helpers()
@@ -681,11 +598,9 @@ def test_generate_scheduled_reports_records_premium_routing_metadata_when_suppli
     log_root = base / "model_usage"
     generate_scheduled_reports(
         day, fills, base / "reports", base=base,
-        model_usage_config=ModelUsageConfig(
-            log_root=log_root,
-            model_routing_mode="premium",
-            reason_for_premium_model="explicit_user_request",
-        )
+        model_usage_log_root=log_root,
+        model_usage_model_routing_mode="premium",
+        model_usage_reason_for_premium_model="explicit_user_request",
     )
     log_path = resolve_log_path(datetime.now(timezone.utc), root=log_root)
     entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
@@ -700,7 +615,6 @@ def test_generate_scheduled_reports_logs_even_when_report_generation_fails(tmp_p
     from datetime import datetime, timezone
 
     import dca_reporting
-    from dca_reporting import ModelUsageConfig
     from scripts.model_usage_log import resolve_log_path
 
     build_sched, _build_manual, write_run_artifacts = _classification_helpers()
@@ -719,7 +633,7 @@ def test_generate_scheduled_reports_logs_even_when_report_generation_fails(tmp_p
     log_root = base / "model_usage"
     try:
         dca_reporting.generate_scheduled_reports(
-            day, fills, base / "reports", base=base, model_usage_config=ModelUsageConfig(log_root=log_root)
+            day, fills, base / "reports", base=base, model_usage_log_root=log_root
         )
         raise AssertionError("expected RuntimeError to propagate")
     except RuntimeError as exc:
@@ -1331,98 +1245,6 @@ def test_load_run_state(tmp_path):
 
     loaded_data = load_run_state(state_file)
     assert loaded_data == expected_data
-
-def test_generate_scheduled_reports_escalates_missing_scheduled_evidence_by_default(tmp_path=None):
-    """No foreground artifacts passed: the missing-state case raises as it always has."""
-    import tempfile
-    from pathlib import Path
-
-    import pytest
-
-    from dca_reporting import generate_scheduled_reports
-
-    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
-    day = "2026-07-30"
-    with pytest.raises(ValueError, match="no valid scheduled run_state"):
-        generate_scheduled_reports(day, [], base / "reports", base=base)
-
-
-def test_generate_scheduled_reports_escalates_when_foreground_primary_is_not_active(tmp_path=None):
-    """A same-day foreground artifact with NO marker does not suppress the alert."""
-    import tempfile
-    from pathlib import Path
-
-    import pytest
-
-    from dca_reporting import generate_scheduled_reports
-
-    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
-    day = "2026-07-30"
-    unmarked = {"trading_day": day, "run_classification": {"run_origin": "manual"}}
-    with pytest.raises(ValueError, match="no valid scheduled run_state"):
-        generate_scheduled_reports(
-            day,
-            [],
-            base / "reports",
-            base=base,
-            foreground_primary_artifacts=[unmarked],
-        )
-
-
-def test_generate_scheduled_reports_reports_foreground_primary_mode_instead_of_escalating(tmp_path=None):
-    """Jul 30 2026 patch: a marked same-day foreground artifact is reported, not alerted."""
-    import tempfile
-    from pathlib import Path
-
-    from dca_reporting import generate_scheduled_reports
-    from scripts.close_window_signal import build_close_window_summary
-
-    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
-    day = "2026-07-30"
-    foreground = base / "foreground" / "run_state.json"
-    foreground.parent.mkdir(parents=True, exist_ok=True)
-    foreground.write_text(
-        json.dumps(
-            {
-                "trading_day": day,
-                "run_classification": {"run_origin": "manual_foreground_primary"},
-            }
-        )
-    )
-
-    summary = build_close_window_summary(
-        {"NVDA": {"decision_price": 98.0, "prior_close": 100.0, "data_source": "finance"}},
-        tiers=((0.001, 1.0), (0.02, 2.0)),
-        trading_day=day,
-        background_mode_active=False,
-        foreground_primary_mode_active=True,
-    )
-
-    paths = generate_scheduled_reports(
-        day,
-        [],
-        base / "reports",
-        base=base,
-        foreground_primary_artifacts=[foreground],
-        close_window_summary=summary,
-    )
-    report = json.loads(Path(paths["foreground_primary_context"]).read_text())
-
-    context = report["foreground_primary_context"]
-    assert context["foreground_primary_mode_active"] is True
-    assert context["foreground_artifact_paths"] == [str(foreground)]
-    # Evidence separation survives the round trip into the artifact.
-    assert context["valid_scheduled_evidence"] is False
-    assert context["valid_afternoon_scheduled_evidence"] is False
-    assert context["top_up_context_only"] is True
-
-    alert = report["scheduled_evidence_alert"]
-    assert alert["escalate"] is False
-    assert alert["suppressed_reasons"]
-
-    assert report["what_would_have_fired"]["analytics_only"] is True
-    assert report["what_would_have_fired"]["would_have_fired_tickers"] == ["NVDA"]
-
 
 def _run_all():
     import inspect

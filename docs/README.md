@@ -26,7 +26,6 @@ environment (see the repository README).
 | [backtest_curve.md](backtest_curve.md) | Analytics-only weekly-rollover intraday cap curve backtest (35 / 65 / 100 candidate) |
 | [pr_review_workflow.md](pr_review_workflow.md) | The two-workflow PR review split, its trust boundary, and the CI-enforced workflow policy checks |
 | [scheduled_session_repo_access.md](scheduled_session_repo_access.md) | Dated probe log for whether a Routine-fired scheduled session actually has working repo (clone/fetch/push) and environment (account number) access |
-| [code_fix_guidelines.md](code_fix_guidelines.md) | Condensed, fix-focused workflow for bug fixes: non-negotiables, test-first process, PR requirements |
 
 ## Machine-readable backup
 

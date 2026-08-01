@@ -69,14 +69,14 @@ _LIVE_ORDER_STATES = frozenset(
 def _unwrap(payload: Any) -> Dict[str, Any]:
     """Extract the inner data dict from an MCP resource/tool payload.
 
-    Fails closed (returns empty dict) if the payload is not a dict, lacks
-    the expected 'data' key, or has a non-dict 'data' value.
+    Returns ``payload['data']`` when present and a dict; otherwise returns the
+    original payload dict. Non-dict payloads return an empty dict.
     """
     if not isinstance(payload, dict):
         return {}
     data = payload.get("data")
     if not isinstance(data, dict):
-        return {}
+        return payload
     return data
 
 
@@ -359,10 +359,6 @@ class RobinhoodDataProvider:
 
     def _parse_bars(self, response: Any, ticker: str) -> List[Bar]:
         data = _unwrap(response)
-        if not data and isinstance(response, dict) and "results" in response and "data" not in response:
-            # Compatibility fallback for callers/tests that provide the *inner* payload dict
-            # directly (i.e. already unwrapped), so "results" is at the top level.
-            data = response
         results = data.get("results") or []
         bars: List[Bar] = []
         for result in results:
@@ -863,16 +859,42 @@ def _interpret_review(response: Any) -> Tuple[bool, str]:
     informational and never block on their own (they carry no severity). An empty
     response approves — it is genuinely empty, not a reported failure.
     """
-    outer_failure = _response_failure(response)
-    if outer_failure is not None:
-        return False, outer_failure
     data = _unwrap(response)
     if not data:
-        if isinstance(response, dict) and response and "data" not in response:
-            return False, "review response missing data envelope"
         return True, "empty review response; no blocking alerts reported"
+
+    # Shape sanity-check: a well-formed review payload must contain at least one recognised
+    # review field.  A plain quote response (e.g. {"quote": {...}}) with no review/alert keys
+    # does not constitute approval — fail closed so unexpected broker shapes don't silently
+    # green-light a live order.
+    _REVIEW_FIELDS = frozenset(
+        {
+            "approved",
+            "state",
+            "tradeable",
+            "alerts",
+            "warnings",
+            "pre_trade_alerts",
+            "messages",
+            "checks",
+            "errors",
+            "error_messages",
+            "rejections",
+            "success",
+            "ok",
+            "error",
+        }
+    )
+    if not (data.keys() & _REVIEW_FIELDS):
+        return False, f"unexpected review response shape; no recognised review fields (keys: {sorted(data.keys())})"
+
     blocking: List[str] = []
 
+    # Explicit failure signals, at the outer envelope or inside data: fail closed when the
+    # wrapper reports failure as data (e.g. {"success": false, "data": {...}}).
+    outer_failure = _response_failure(response)
+    if outer_failure is not None:
+        blocking.append(outer_failure)
     if data.get("approved") is False:
         blocking.append("approved=false")
     if str(data.get("state", "")).lower() in {"rejected", "failed"}:

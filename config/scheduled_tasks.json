@@ -2270,65 +2270,6 @@
     "see": "config/run_classification.json:watchdog_reconciliation_scope_patch_2026_07_27",
     "doc": "docs/schedule_manifest.md"
   },
-  "foreground_primary_and_close_window_patch_2026_07_30": {
-    "added": "2026-07-30",
-    "applies_to_tasks": ["67aa802b", "a46bf007"],
-    "applies_to_tasks_note": "67aa802b is the 3:35 PM ET post-trade slippage and Notion sync. a46bf007 is the 3:40 PM ET live-run watchdog. These are the repo's only close-of-day validator schedule entries; no 3:45 PM ET validator task exists and none is created here.",
-    "creates_new_scheduled_task": false,
-    "trades": false,
-    "foreground_primary_surrogate_context": {
-      "problem": "On a day the operator drives execution in the foreground, the background scheduled stream legitimately produces no artifact. Both close-of-day validators escalated a missing-scheduled-evidence alert for that day, reporting an outage that did not happen. A recurring false alert trains an operator to ignore the alert that matters.",
-      "markers": [
-        "foreground_primary_surrogate_context=true (boolean field)",
-        "foreground_primary_surrogate_context (bare marker string, as a field value or a list entry)",
-        "run_origin='foreground_primary_surrogate'",
-        "run_origin='manual_foreground_primary'",
-        "valid_primary_executor_evidence=true"
-      ],
-      "marker_sources": "Same-day run_state.json, run_summary.json, latest pointers, and manifest entries. The top level plus the run_classification, classification, foreground_primary, foreground_primary_context, run_summary, and summary blocks are searched. Not a full recursive walk: an unbounded search would pick a marker out of a deep provenance blob that never meant to declare the day's mode.",
-      "marker_matching": "Exact equality only. A marker mentioned inside a prose note is documentation, not a declaration. The boolean spellings require literal true, so the string \"false\" and the integer 0 are not declarations.",
-      "effect": "Report foreground_primary_mode_active=true, list the foreground artifact paths used, and classify the fills/orders as foreground_primary_surrogate_context. Do not escalate a missing or invalid background scheduled evidence alert solely on the absence, incompleteness, or valid_scheduled_evidence=false state of the background scheduled artifact.",
-      "evidence_separation_is_absolute": "Foreground and manual fills remain valid_scheduled_evidence=false, valid_afternoon_scheduled_evidence=false, and top_up_context_only=true. There is no code path that flips them. Foreground primary mode explains why the background stream produced nothing; it never claims the background stream ran.",
-      "same_day_requirement": "A marker counts only on an artifact whose declared trading_day equals the current ET trading day. Prior-day markers and markers on artifacts declaring no trading_day are rejected, for the same reason the same-day pointer contract rejects a stale pointer.",
-      "still_escalate": [
-        "safety failures",
-        "broker/order mismatches",
-        "missing required foreground artifacts",
-        "stale same-day pointers",
-        "invalid schema",
-        "drift where a foreground signal says an order was placed but no broker or artifact record exists",
-        "invalid background scheduled artifacts when foreground primary mode is NOT active"
-      ],
-      "implementation": "scripts/foreground_primary.py",
-      "tests": "scripts/tests/test_foreground_primary.py, test_dca_reporting.py"
-    },
-    "close_window_signal_comparison": {
-      "summary": "JUL 30 2026 CLOSE-WINDOW SIGNAL COMPARISON PATCH. During the close-of-day validator pass, compute a read-only what_would_have_fired summary for the active watchlist. Use the current market-close decision price versus the prior completed regular-session close, apply the graded sizing ladder for summary purposes, and report which tickers would have fired in background scheduled mode and in foreground primary mode. When foreground_primary_surrogate_context is active, state that foreground primary mode is active and compare the foreground execution context against this watchlist signal summary rather than treating missing scheduled evidence as a failure.",
-      "analytics_only": true,
-      "must_not": "place, review, cancel, sell, or modify any order.",
-      "decision_price": "The current market-close decision price for the active watchlist ticker.",
-      "prior_close": "The prior COMPLETED regular-session close, never an in-progress session.",
-      "fields": [
-        "ticker",
-        "decision_price",
-        "prior_close",
-        "drop_pct",
-        "ladder_multiplier_capped_at_3x",
-        "background_mode_status",
-        "foreground_mode_status",
-        "reason_if_not_fired",
-        "data_source"
-      ],
-      "mode_status_values": ["would_have_fired", "no_signal", "would_have_fired_mode_not_active", "unknown_missing_data"],
-      "reason_if_not_fired_values": ["missing_or_invalid_decision_price", "missing_or_invalid_prior_close", "decision_price_not_below_prior_close", "drop_below_first_ladder_tier"],
-      "ladder_reporting_cap": "0x through 3x buckets. Anything the source ladder grades above 3x is reported as 3.0 with ladder_multiplier_label='3x_plus'. Reporting only; execution sizing is unchanged and still uses the full 0x-to-5x config/sizing_ladder.json ladder.",
-      "missing_quote_rule": "A watchlist ticker whose quote failed is still reported, as an unknown_missing_data row. A ticker silently dropped because its provider failed is indistinguishable from one that had no signal, and removing that ambiguity is the point of the summary.",
-      "purity": "scripts/close_window_signal.py performs no network I/O and writes nothing. The caller fetches quotes under market_data_source_policy and passes decision_price, prior_close, and data_source in, so the summary cannot become a second, drifting copy of the provider policy.",
-      "implementation": "scripts/close_window_signal.py",
-      "tests": "scripts/tests/test_foreground_primary.py"
-    },
-    "doc": "docs/schedule_manifest.md"
-  },
   "canonical_schedule_reconciliation_2026_07_27": {
     "verified_on_et": "2026-07-27",
     "purpose": "Reconcile this manifest against the user's canonical DCA schedule. The canonical_schedule_et table below is the single source of truth for which RECURRING tasks are active, at what ET time, and in what state. A task is an active schedule entry only if it appears in canonical_schedule_et OR in one_time_additions_after_canonical_verification (for one-time tasks added after the 2026-07-27 verification); a task in neither list is NOT an active schedule entry.",
@@ -3410,48 +3351,6 @@
           "zero_order_rule": "A zero-order final run contributes zero scheduled slippage fills. Earlier same-day orders in raw context MUST NOT be attributed to it.",
           "evr_recovery_containment": "The 2:33 PM ET EVR recovery order remains same-day top-up context only and is never scheduled slippage evidence.",
           "see": "final_run_reconciliation_scope_2026_07_27"
-        },
-        "foreground_primary_surrogate_context": {
-          "added": "2026-07-30",
-          "policy": "foreground_primary_and_close_window_patch_2026_07_30",
-          "summary": "JUL 30 2026 FOREGROUND PRIMARY SURROGATE CONTEXT PATCH. If any same-day foreground/manual recovery artifact, run_state.json, run_summary.json, latest pointer, or manifest entry carries one of the recognised markers (foreground_primary_surrogate_context=true, the bare marker string foreground_primary_surrogate_context, run_origin='foreground_primary_surrogate', run_origin='manual_foreground_primary', or valid_primary_executor_evidence=true), treat that as intentional foreground primary mode for the current trading day. In foreground primary mode the 3:35 PM ET post-trade validator MUST NOT escalate a missing or invalid background scheduled evidence alert solely because the scheduled run artifact is absent, incomplete, or valid_scheduled_evidence=false. Report foreground_primary_mode_active=true, list the foreground artifact paths used, and classify those fills/orders as foreground_primary_surrogate_context.",
-          "evidence_separation": "Foreground and manual fills stay valid_scheduled_evidence=false, valid_afternoon_scheduled_evidence=false, and top_up_context_only=true. They are execution context for user-approved foreground primary operation. They never prove that background scheduled execution ran, and they are never scheduled slippage, scheduled reliability, or scheduled cost-basis evidence.",
-          "still_escalate": [
-            "safety failures",
-            "broker/order mismatches",
-            "missing required foreground artifacts",
-            "stale same-day pointers",
-            "invalid schema",
-            "drift where a foreground signal says an order was placed but no broker or artifact record exists",
-            "invalid background scheduled artifacts when foreground primary mode is NOT active"
-          ],
-          "same_day_requirement": "A marker only counts when the artifact carrying it declares trading_day equal to the current ET trading day. A prior-day marker, or a marker on an artifact that declares no trading day, is rejected: otherwise one foreground day would silence the missing-scheduled-evidence alert permanently.",
-          "interaction_with_final_run_reconciliation_scope": "Unchanged. A foreground artifact is never final-run evidence and never scheduled slippage evidence; the 19:30Z-to-19:35Z EDT window is untouched.",
-          "reporting_behavior": "dca_reporting.generate_scheduled_reports writes foreground_primary_context.json instead of raising when a marked same-day foreground artifact is supplied and nothing else is escalating.",
-          "implementation": "scripts/foreground_primary.py (detect_foreground_primary_context, evaluate_scheduled_evidence_alert)",
-          "see": "foreground_primary_and_close_window_patch_2026_07_30 and config/run_classification.json:foreground_primary_surrogate_context_2026_07_30"
-        },
-        "close_window_signal_comparison": {
-          "added": "2026-07-30",
-          "policy": "foreground_primary_and_close_window_patch_2026_07_30",
-          "summary": "JUL 30 2026 CLOSE-WINDOW SIGNAL COMPARISON PATCH. During the close-of-day validator pass, compute a read-only what_would_have_fired summary for the active watchlist. Use the current market-close decision price versus the prior completed regular-session close, apply the graded sizing ladder for summary purposes, and report which tickers would have fired in background scheduled mode and in foreground primary mode. When foreground_primary_surrogate_context is active, state that foreground primary mode is active and compare the foreground execution context against this watchlist signal summary rather than treating missing scheduled evidence as a failure.",
-          "analytics_only": true,
-          "must_not": "place, review, cancel, sell, or modify any order. No budget is consumed and no order path is exercised.",
-          "data_sources": "Finance connector primary market data, Alpaca and Robinhood validation/context, yfinance fallback only when needed. Unchanged from market_data_source_policy; this summary consumes the same reads, it does not add a provider.",
-          "fields": [
-            "ticker",
-            "decision_price",
-            "prior_close",
-            "drop_pct",
-            "ladder_multiplier_capped_at_3x",
-            "background_mode_status",
-            "foreground_mode_status",
-            "reason_if_not_fired",
-            "data_source"
-          ],
-          "ladder_reporting_cap": "Report 0x through 3x buckets. The live ladder in config/sizing_ladder.json runs to 5x; a drop the ladder grades above 3x is reported as 3.0 with ladder_multiplier_label='3x_plus' so the cap is visible. REPORTING ONLY: execution sizing continues to use the full ladder via near_close_dca.graded_buy_multiplier.",
-          "implementation": "scripts/close_window_signal.py (build_close_window_summary)",
-          "see": "foreground_primary_and_close_window_patch_2026_07_30"
         }
       },
       "notes": "Analytics only, no trading. Reads the scheduled live-run state and Robinhood order history, writes slippage/coverage artifacts, and updates the compact Notion Latest Run section only. Honors the run-classification policy (config/run_classification.json): scheduled-live metrics use only validated scheduled runs with manual order IDs excluded. Final manual buy overrides (final_manual_review/** and ce16ba6b/manual_runs/final_manual_override_* and midday_dca/manual_reruns/final_manual_override_*) are excluded from scheduled slippage/fills and shown only in the Manual Final Buy Override / Same-Day Top-Up Context section."
@@ -3502,48 +3401,6 @@
           "zero_order_rule": "If submitted_orders.csv is empty and run_state says completed_no_orders, earlier same-day orders in raw broker context MUST NOT fail the watchdog. Classify as same_day_prior_context_present and PASS, unless matching final-run order evidence contradicts the artifact.",
           "does_not_weaken_all_orders_fix": "The all-orders query and per-order classification required by all_orders_reconciliation are unchanged. This scope rule governs only which classified orders may count as FINAL-RUN submissions.",
           "see": "final_run_reconciliation_scope_2026_07_27 and config/run_classification.json:watchdog_reconciliation_scope_patch_2026_07_27"
-        },
-        "foreground_primary_surrogate_context": {
-          "added": "2026-07-30",
-          "policy": "foreground_primary_and_close_window_patch_2026_07_30",
-          "summary": "JUL 30 2026 FOREGROUND PRIMARY SURROGATE CONTEXT PATCH. If any same-day foreground/manual recovery artifact, run_state.json, run_summary.json, latest pointer, or manifest entry carries one of the recognised markers (foreground_primary_surrogate_context=true, the bare marker string foreground_primary_surrogate_context, run_origin='foreground_primary_surrogate', run_origin='manual_foreground_primary', or valid_primary_executor_evidence=true), treat that as intentional foreground primary mode for the current trading day. In foreground primary mode the 3:40 PM ET watchdog MUST NOT escalate a missing or invalid background scheduled evidence alert solely because the scheduled run artifact is absent, incomplete, or valid_scheduled_evidence=false. Report foreground_primary_mode_active=true, list the foreground artifact paths used, and classify those fills/orders as foreground_primary_surrogate_context.",
-          "evidence_separation": "Foreground and manual fills stay valid_scheduled_evidence=false, valid_afternoon_scheduled_evidence=false, and top_up_context_only=true. They are execution context for user-approved foreground primary operation. They never prove that background scheduled execution ran, and they are never scheduled slippage, scheduled reliability, or scheduled cost-basis evidence.",
-          "still_escalate": [
-            "safety failures",
-            "broker/order mismatches",
-            "missing required foreground artifacts",
-            "stale same-day pointers",
-            "invalid schema",
-            "drift where a foreground signal says an order was placed but no broker or artifact record exists",
-            "invalid background scheduled artifacts when foreground primary mode is NOT active"
-          ],
-          "same_day_requirement": "A marker only counts when the artifact carrying it declares trading_day equal to the current ET trading day. A prior-day marker, or a marker on an artifact that declares no trading day, is rejected: otherwise one foreground day would silence the missing-scheduled-evidence alert permanently.",
-          "interaction_with_all_orders_reconciliation": "Unchanged. The watchdog still queries ALL same-day orders with no placed_agent filter and still classifies every returned order. This patch changes only whether an ABSENT background scheduled artifact escalates.",
-          "interaction_with_final_run_reconciliation_scope": "Unchanged. A foreground artifact is never final-run evidence, and the 19:30Z-to-19:35Z EDT window is untouched.",
-          "implementation": "scripts/foreground_primary.py (detect_foreground_primary_context, evaluate_scheduled_evidence_alert)",
-          "see": "foreground_primary_and_close_window_patch_2026_07_30 and config/run_classification.json:foreground_primary_surrogate_context_2026_07_30"
-        },
-        "close_window_signal_comparison": {
-          "added": "2026-07-30",
-          "policy": "foreground_primary_and_close_window_patch_2026_07_30",
-          "summary": "JUL 30 2026 CLOSE-WINDOW SIGNAL COMPARISON PATCH. During the close-of-day validator pass, compute a read-only what_would_have_fired summary for the active watchlist. Use the current market-close decision price versus the prior completed regular-session close, apply the graded sizing ladder for summary purposes, and report which tickers would have fired in background scheduled mode and in foreground primary mode. When foreground_primary_surrogate_context is active, state that foreground primary mode is active and compare the foreground execution context against this watchlist signal summary rather than treating missing scheduled evidence as a failure.",
-          "analytics_only": true,
-          "must_not": "place, review, cancel, sell, or modify any order. No budget is consumed and no order path is exercised.",
-          "data_sources": "Finance connector primary market data, Alpaca and Robinhood validation/context, yfinance fallback only when needed. Unchanged from market_data_source_policy; this summary consumes the same reads, it does not add a provider.",
-          "fields": [
-            "ticker",
-            "decision_price",
-            "prior_close",
-            "drop_pct",
-            "ladder_multiplier_capped_at_3x",
-            "background_mode_status",
-            "foreground_mode_status",
-            "reason_if_not_fired",
-            "data_source"
-          ],
-          "ladder_reporting_cap": "Report 0x through 3x buckets. The live ladder in config/sizing_ladder.json runs to 5x; a drop the ladder grades above 3x is reported as 3.0 with ladder_multiplier_label='3x_plus' so the cap is visible. REPORTING ONLY: execution sizing continues to use the full ladder via near_close_dca.graded_buy_multiplier.",
-          "implementation": "scripts/close_window_signal.py (build_close_window_summary)",
-          "see": "foreground_primary_and_close_window_patch_2026_07_30"
         }
       },
       "notes": "Read-only, no trading. Final scheduled afternoon event. Alerts only on missed, incomplete, error, or discrepancy conditions. Validates the run-classification contract: a missing/invalid scheduled run_state is a discrepancy even if manual runs or broker orders exist that day. A confirmation-blocked scheduled run (order_submit_status='not_submitted_confirmation_required') is a valid run that fired: alert on no order placed, but do not treat the lineage as invalid when the required fields are present. WATCHDOG SCAN FIX (2026-07-13): the 3:40 watchdog alerted because broker history had orders after 3:15 PM ET but no manual-run artifacts were present under the paths it scanned; it must scan final_manual_review/** and ce16ba6b/manual_runs/final_manual_override_* (and midday_dca/manual_reruns/final_manual_override_*) as manual exclusions so backfilled final manual buy overrides reconcile those orders as manual, not scheduled. WATCHDOG ALL-ORDERS FIX (2026-07-21, see watchdog_all_orders_fix_2026_07_21): the watchdog MUST query ALL same-day Robinhood equity orders for account <ROBINHOOD_ACCOUNT_NUMBER> WITHOUT a placed_agent filter first and classify every order by scheduled evidence, manual artifacts, same-day top-up roots, placed_agent, and order IDs; it MAY additionally report the agentic-only (placed_agent='agent') subset. Orders with placed_agent='user' or any non-agentic value are surfaced in a Manual/User Orders section and NEVER count as scheduled fills unless their order IDs appear in a valid scheduled submitted_orders.csv from the same-day scheduled run. Manual fills remain excluded from scheduled slippage, scheduled fill counts, scheduled reliability, scheduled cost-basis evidence, watchdog proof, and scheduled afternoon evidence."

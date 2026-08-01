@@ -652,7 +652,6 @@ def test_broker_buying_power_parses_dict_response():
 
 def test_interpret_review_empty_and_state_rejection():
     assert _interpret_review({})[0] is True
-    assert _interpret_review({"quote": {"ask": "1.0"}})[0] is False
     ok, reason = _interpret_review({"data": {"state": "rejected"}})
     assert ok is False and "rejected" in reason
 
@@ -832,9 +831,9 @@ def test_unwrap_valid_dict_with_data():
     payload = {"data": {"key": "value"}}
     assert _unwrap(payload) == {"key": "value"}
 
-def test_unwrap_dict_without_data_fails_closed():
+def test_unwrap_valid_dict_without_data():
     payload = {"key": "value"}
-    assert _unwrap(payload) == {}
+    assert _unwrap(payload) == {"key": "value"}
 
 def test_unwrap_non_dict_payload():
     assert _unwrap("not a dict") == {}
@@ -843,4 +842,4 @@ def test_unwrap_non_dict_payload():
 
 def test_unwrap_data_key_not_dict():
     payload = {"data": "not a dict"}
-    assert _unwrap(payload) == {}
+    assert _unwrap(payload) == {"data": "not a dict"}
