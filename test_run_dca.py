@@ -4407,29 +4407,22 @@ def test_final_buy_trend_override_window_start(dt, expected_time):
     assert _final_buy_trend_override_window_start(dt) == expected_time
 
 
+@pytest.mark.parametrize(
+    "args, expected_level",
+    [
+        ((), logging.INFO),
+        (("DEBUG",), logging.DEBUG),
+        (("WARNING",), logging.WARNING),
+        (("debug",), logging.DEBUG),
+        (("invalid",), logging.INFO),
+        (("",), logging.INFO),
+    ]
+)
 @patch("run_dca.logging.basicConfig")
-def test_configure_logging_default(mock_basic_config):
-    configure_logging()
+def test_configure_logging(mock_basic_config, args, expected_level):
+    configure_logging(*args)
+
     mock_basic_config.assert_called_once_with(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-    )
-
-
-@patch("run_dca.logging.basicConfig")
-def test_configure_logging_custom_level(mock_basic_config):
-    configure_logging("DEBUG")
-    mock_basic_config.assert_called_once_with(
-        level=logging.DEBUG,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-    )
-
-
-@patch("run_dca.logging.basicConfig")
-def test_configure_logging_invalid_level(mock_basic_config):
-    # If the level doesn't exist, getattr returns the default, which is INFO
-    configure_logging("INVALID")
-    mock_basic_config.assert_called_once_with(
-        level=logging.INFO,
+        level=expected_level,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
