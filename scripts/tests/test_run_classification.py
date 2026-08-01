@@ -406,6 +406,64 @@ def test_update_latest_scheduled_run_pointer_uses_given_path():
         assert list(base.rglob("run_state.json")) == [external_path]
 
 
+def test_update_latest_scheduled_run_pointer_uses_the_classifications_own_stream():
+    # Codex review discussion_r3694494924 ("Write the blocked pointer with the
+    # morning stream identity"): the pointer's "stream" field was hardcoded to
+    # "afternoon" regardless of what run_classification.stream actually said,
+    # so scripts.same_day_pointer.validate_pointer(..., expected_stream="morning")
+    # rejected a freshly written pointer for a 10:30/12:30 roster run as
+    # wrong_stream -- the pointer-based watchdog could never observe those
+    # slots, including one blocked before placement.
+    from run_classification import update_latest_scheduled_run_pointer
+
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        state = _scheduled_state()
+        state["run_classification"]["stream"] = "morning"
+        state_path = base / "run_state.json"
+        state_path.write_text(json.dumps(state))
+
+        pointer = update_latest_scheduled_run_pointer(state, state_path, base)
+
+        ptr = json.loads(pointer.read_text())
+        assert ptr["stream"] == "morning"
+
+    # Omitting stream entirely (an older/afternoon-only classification) still
+    # falls back to "afternoon", matching build_scheduled_classification's own
+    # default and preserving every existing caller's behavior.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        state = _scheduled_state()
+        state["run_classification"].pop("stream", None)
+        state_path = base / "run_state.json"
+        state_path.write_text(json.dumps(state))
+
+        pointer = update_latest_scheduled_run_pointer(state, state_path, base)
+
+        ptr = json.loads(pointer.read_text())
+        assert ptr["stream"] == "afternoon"
+
+    # Codex review discussion_r3694664... ("Default null legacy streams before
+    # writing the pointer"): an EXPLICIT null (present, not merely omitted)
+    # must ALSO fall back to "afternoon". rc.get("stream", "afternoon")'s
+    # default only applies when the key is ABSENT -- validate_classification()
+    # treats an explicit null the same as absent, so a classification with
+    # "stream": null present passed validation but wrote a null stream into
+    # the pointer, which scripts.same_day_pointer.validate_pointer normalizes
+    # to "" and rejects as wrong_stream.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        state = _scheduled_state()
+        state["run_classification"]["stream"] = None
+        state_path = base / "run_state.json"
+        state_path.write_text(json.dumps(state))
+
+        pointer = update_latest_scheduled_run_pointer(state, state_path, base)
+
+        ptr = json.loads(pointer.read_text())
+        assert ptr["stream"] == "afternoon"
+
+
 def test_update_latest_scheduled_run_pointer_rejects_incomplete_classification():
     # An incomplete run_classification that says run_origin=scheduled but omits
     # manual_run entirely must not be treated as valid scheduled evidence --
@@ -1363,6 +1421,243 @@ def test_schema_rejects_hybrid_canonical_legacy_identity():
         pass
     else:
         raise AssertionError("expected ValidationError: recovery is required when recovery_rerun=true")
+
+
+def test_schema_accepts_the_seven_slot_rosters_morning_and_midday_identities():
+    # Codex review discussion_r3694371454/r3694407934 ("Emit classifications
+    # that satisfy the declared stream schema"): run_dca.run_slot("1030ET")/
+    # ("1230ET") stamp their own morning/midday identity via
+    # _slot_classification_overrides + build_scheduled_classification, e.g.
+    # stream="morning", cron_id="42173154", scheduled_for_et="10:30",
+    # scheduled_window_start_et="10:25", scheduled_window_end_et="10:35",
+    # run_id="scheduled_YYYYMMDD_1030ET" -- but this generic schema only
+    # recognized the afternoon 15:30/legacy 15:20 identities, so every
+    # non-afternoon roster artifact was schema-invalid and rejectable by a
+    # schema-aware watchdog or consumer.
+    jsonschema = pytest.importorskip("jsonschema")
+    referencing = pytest.importorskip("referencing")
+    Registry, Resource = referencing.Registry, referencing.Resource
+
+    repo_root = Path(__file__).resolve().parents[2]
+    schemas_dir = repo_root / "schemas"
+    rc_schema = json.loads((schemas_dir / "run_classification.schema.json").read_text(encoding="utf-8"))
+    resources = [
+        (name, Resource.from_contents(json.loads((schemas_dir / name).read_text(encoding="utf-8"))))
+        for name in ("run_classification.schema.json",)
+    ]
+    registry = Registry().with_resources(resources)
+    validator = jsonschema.Draft7Validator(rc_schema, registry=registry)
+
+    morning = build_scheduled_classification(
+        TRADING_DAY,
+        "2026-07-06T14:30:01Z",
+        stream="morning",
+        cron_id="42173154",
+        supersedes_cron_id=None,
+        scheduled_for_et="10:30",
+        scheduled_window_start_et="10:25",
+        scheduled_window_end_et="10:35",
+        run_id="scheduled_20260706_1030ET",
+        valid_afternoon_scheduled_evidence=False,
+    )
+    validator.validate(morning)
+
+    midday = dict(morning)
+    midday.update(
+        stream="midday",
+        cron_id="a6239dae",
+        scheduled_for_et="12:30",
+        scheduled_window_start_et="12:25",
+        scheduled_window_end_et="12:35",
+        run_id="scheduled_20260706_1230ET",
+    )
+    validator.validate(midday)
+
+    # A morning cron_id claiming the afternoon stream is not a real identity
+    # and must still be rejected.
+    mislabeled = dict(morning)
+    mislabeled["stream"] = "afternoon"
+    assert not validator.is_valid(mislabeled)
+
+    # A 10:30 time paired with a 1230ET run_id has no coherent slot either.
+    hybrid_slot = dict(morning)
+    hybrid_slot["run_id"] = "scheduled_20260706_1230ET"
+    assert not validator.is_valid(hybrid_slot)
+
+    # Codex review discussion_r3694494920 ("Bind the window end to each slot
+    # identity"): a morning time/run_id paired with the afternoon or midday
+    # window end has no coherent slot and must be rejected, not accepted via
+    # the shared enum alone.
+    wrong_window_end = dict(morning)
+    wrong_window_end["scheduled_window_end_et"] = "15:35"
+    assert not validator.is_valid(wrong_window_end)
+
+    # Codex review discussion_r3694494922 ("Validate the cron ID with the
+    # complete slot identity"): the morning cron_id must not validate
+    # alongside the canonical afternoon time/run_id (or vice versa) just
+    # because each was independently acceptable somewhere.
+    afternoon_time_morning_cron = build_scheduled_classification(
+        TRADING_DAY,
+        "2026-07-06T19:30:01Z",
+        cron_id="42173154",
+        supersedes_cron_id=None,
+        stream="afternoon",
+    )
+    assert not validator.is_valid(afternoon_time_morning_cron)
+
+    # Codex review discussion_r3694494927 ("Deny afternoon evidence in
+    # non-afternoon schema branches"): a morning-shaped record must not be
+    # able to also claim valid_afternoon_scheduled_evidence=true.
+    claims_afternoon_evidence = dict(morning)
+    claims_afternoon_evidence["valid_afternoon_scheduled_evidence"] = True
+    assert not validator.is_valid(claims_afternoon_evidence)
+
+    # Codex review discussion_r3694494926 ("Exclude the new scheduled IDs
+    # from manual classifications"): a manual run must not be able to claim
+    # one of the new scheduled-slot run_ids either.
+    manual_claiming_slot_id = build_manual_classification("2026-07-06T14:30:01Z")
+    manual_claiming_slot_id["run_id"] = "scheduled_20260706_1030ET"
+    assert not validator.is_valid(manual_claiming_slot_id)
+
+    # Codex review discussion_r3694539232 ("Require the afternoon stream in
+    # afternoon identity branches"): the canonical/legacy afternoon time+cron
+    # identity must not validate alongside a morning/midday stream claim.
+    afternoon_shape_morning_stream = build_scheduled_classification(
+        TRADING_DAY, "2026-07-06T19:30:01Z", stream="morning"
+    )
+    assert not validator.is_valid(afternoon_shape_morning_stream)
+
+    # Codex review discussion_r3694585153 ("Reject afternoon supersession
+    # lineage on roster slots"): a morning classification must not be able to
+    # also claim the afternoon task's own supersedes_cron_id lineage marker.
+    claims_afternoon_lineage = dict(morning)
+    claims_afternoon_lineage["supersedes_cron_id"] = "ce16ba6b"
+    assert not validator.is_valid(claims_afternoon_lineage)
+
+    # Codex review discussion_r3694664... ("Allow null supersession markers in
+    # roster branches"): an EXPLICIT null (present in the object, not merely
+    # omitted) must still validate. build_scheduled_classification always
+    # deletes the key when None, so this constructs the present-but-null case
+    # by hand -- the global property and validate_classification() both
+    # already treat null the same as absent, and a 'not: required' constraint
+    # (which rejects the key whenever PRESENT, regardless of value) wrongly
+    # rejected this same case in an earlier revision.
+    explicit_null_supersedes = dict(morning)
+    explicit_null_supersedes["supersedes_cron_id"] = None
+    validator.validate(explicit_null_supersedes)
+
+    # Codex review discussion_r3694682778 ("Accept null legacy streams in the
+    # schema"): the afternoon branches' own 'stream, when present, must be
+    # afternoon' constraint has the SAME null-vs-absent gap the roster
+    # branches had above. An explicit stream=null on an afternoon-shaped
+    # record must still validate -- validate_classification() treats it the
+    # same as absent, and update_latest_scheduled_run_pointer normalizes both
+    # to "afternoon" when writing the pointer, so a bare 'const': 'afternoon'
+    # rejected a present-but-null case those two already accept and publish.
+    afternoon = build_scheduled_classification(TRADING_DAY, "2026-07-06T19:30:01Z")
+    afternoon_explicit_null_stream = dict(afternoon)
+    afternoon_explicit_null_stream["stream"] = None
+    validator.validate(afternoon_explicit_null_stream)
+    # A non-null, non-"afternoon" stream must still be rejected.
+    afternoon_garbage_stream = dict(afternoon)
+    afternoon_garbage_stream["stream"] = "midday_recovery"
+    assert not validator.is_valid(afternoon_garbage_stream)
+
+
+def test_validate_classification_accepts_the_seven_slot_rosters_morning_and_midday_identities():
+    # Codex review discussion_r3694864526 ("Mirror roster identities in the
+    # runtime validator"): validate_classification() -- not the JSON schema --
+    # is what is_scheduled_state(), dca_risk.classify_stream(), and
+    # near_close_dca's scheduled-pointer-update gate actually call at
+    # runtime. Widening only the JSON schema in the two Codex rounds above
+    # left this function still afternoon-only, so every 10:30/12:30 roster
+    # classification failed here regardless of the schema fix -- and the
+    # pointer-update gate SKIPS its update when this fails.
+    morning = build_scheduled_classification(
+        TRADING_DAY,
+        "2026-07-06T14:30:01Z",
+        stream="morning",
+        cron_id="42173154",
+        supersedes_cron_id=None,
+        scheduled_for_et="10:30",
+        scheduled_window_start_et="10:25",
+        scheduled_window_end_et="10:35",
+        run_id="scheduled_20260706_1030ET",
+        valid_afternoon_scheduled_evidence=False,
+    )
+    res = validate_classification(morning)
+    assert res.ok, res.errors
+
+    midday = dict(morning)
+    midday.update(
+        stream="midday",
+        cron_id="a6239dae",
+        scheduled_for_et="12:30",
+        scheduled_window_start_et="12:25",
+        scheduled_window_end_et="12:35",
+        run_id="scheduled_20260706_1230ET",
+    )
+    res = validate_classification(midday)
+    assert res.ok, res.errors
+
+    # Every adversarial case the schema rejects must also fail the runtime
+    # validator -- the whole point of this fix is that the two agree.
+    mislabeled = dict(morning)
+    mislabeled["stream"] = "afternoon"
+    assert not validate_classification(mislabeled).ok
+
+    hybrid_slot = dict(morning)
+    hybrid_slot["run_id"] = "scheduled_20260706_1230ET"
+    assert not validate_classification(hybrid_slot).ok
+
+    wrong_window_end = dict(morning)
+    wrong_window_end["scheduled_window_end_et"] = "15:35"
+    assert not validate_classification(wrong_window_end).ok
+
+    afternoon_cron_morning_time = dict(morning)
+    afternoon_cron_morning_time["cron_id"] = "10ce362c"
+    assert not validate_classification(afternoon_cron_morning_time).ok
+
+    claims_afternoon_evidence = dict(morning)
+    claims_afternoon_evidence["valid_afternoon_scheduled_evidence"] = True
+    assert not validate_classification(claims_afternoon_evidence).ok
+
+    # Codex review discussion_r3694864524 ("Reject afternoon supersession
+    # lineage on roster slots"): a morning classification must not also carry
+    # the afternoon task's own supersedes_cron_id lineage marker.
+    claims_afternoon_lineage = dict(morning)
+    claims_afternoon_lineage["supersedes_cron_id"] = "ce16ba6b"
+    assert not validate_classification(claims_afternoon_lineage).ok
+
+    manual_claiming_slot_id = build_manual_classification("2026-07-06T14:30:01Z")
+    manual_claiming_slot_id["run_id"] = "scheduled_20260706_1030ET"
+    assert not validate_classification(manual_claiming_slot_id).ok
+
+    # The existing afternoon/legacy path must be completely unaffected.
+    afternoon = build_scheduled_classification(TRADING_DAY, "2026-07-06T19:30:01Z")
+    assert validate_classification(afternoon).ok
+
+    # Codex review discussion_r3694864531 ("Reject unknown streams before
+    # using the afternoon validator"): an afternoon-shaped identity paired
+    # with an unrecognized stream (a typo, or an unrelated value like
+    # "midday_recovery") must not fall through to the afternoon branch just
+    # because it is neither "morning" nor "midday" -- mirroring the schema's
+    # own 'stream, when present, must be afternoon' constraint on the
+    # canonical/legacy branches.
+    garbage_stream = dict(afternoon)
+    garbage_stream["stream"] = "midday_recovery"
+    assert not validate_classification(garbage_stream).ok
+
+    # stream absent entirely (legacy artifacts predating the field) must
+    # still validate under the afternoon branch.
+    no_stream = dict(afternoon)
+    no_stream.pop("stream", None)
+    assert validate_classification(no_stream).ok
+
+    # And an explicit stream="afternoon" must still validate too.
+    explicit_afternoon = dict(afternoon)
+    explicit_afternoon["stream"] = "afternoon"
+    assert validate_classification(explicit_afternoon).ok
 
 
 # --- Final manual buy override (2026-07-13 final-buy behavior) ---------------

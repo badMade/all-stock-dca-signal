@@ -341,6 +341,22 @@ SCHEDULED_WINDOW_END_ET = "15:35"
 # and existing artifacts stay valid. Writers only ever emit the canonical values.
 LEGACY_SCHEDULED_FOR_ET = "15:20"
 LEGACY_SCHEDULED_WINDOW_START_ET = "15:15"
+# The seven-slot roster's own morning/midday identities (run_dca.run_slot()'s
+# 1030ET/1230ET via scripts.run_classification.build_scheduled_classification's
+# stream override -- see run_dca._SLOT_CRON_ID). validate_classification below
+# accepts these as their OWN coherent identity, scoped to stream="morning"/
+# "midday" so they are never accepted as afternoon lineage.
+AFTERNOON_STREAM = "afternoon"
+MORNING_SLOT_STREAM = "morning"
+MORNING_SLOT_CRON_ID = "42173154"
+MORNING_SLOT_SCHEDULED_FOR_ET = "10:30"
+MORNING_SLOT_SCHEDULED_WINDOW_START_ET = "10:25"
+MORNING_SLOT_SCHEDULED_WINDOW_END_ET = "10:35"
+MIDDAY_SLOT_STREAM = "midday"
+MIDDAY_SLOT_CRON_ID = "a6239dae"
+MIDDAY_SLOT_SCHEDULED_FOR_ET = "12:30"
+MIDDAY_SLOT_SCHEDULED_WINDOW_START_ET = "12:25"
+MIDDAY_SLOT_SCHEDULED_WINDOW_END_ET = "12:35"
 # Date the retime took effect, as the same zero-padded YYYYMMDD string used in
 # run_id (so it can be compared lexicographically without a date parse). The
 # legacy identity tuple is accepted ONLY for a run_id dated strictly before
@@ -390,8 +406,14 @@ SCHEDULED_RUN_ID_RE = re.compile(r"^scheduled_[0-9]{8}_1530ET$")
 # combined identity check. Captures the YYYYMMDD group so that check can also
 # enforce CANONICAL_RETIME_DATE_YYYYMMDD.
 LEGACY_SCHEDULED_RUN_ID_RE = re.compile(r"^scheduled_([0-9]{8})_1520ET$")
-# Accepts the canonical 1530ET id and the legacy 1520ET id (pre-2026-07-27 runs).
-SCHEDULED_RUN_ID_ANY_RE = re.compile(r"^scheduled_[0-9]{8}_15(?:3|2)0ET$")
+MORNING_SLOT_RUN_ID_RE = re.compile(r"^scheduled_[0-9]{8}_1030ET$")
+MIDDAY_SLOT_RUN_ID_RE = re.compile(r"^scheduled_[0-9]{8}_1230ET$")
+# Accepts the canonical 1530ET id, the legacy 1520ET id (pre-2026-07-27 runs),
+# and the seven-slot roster's own 1030ET/1230ET ids -- every official
+# scheduled-slot run_id shape, so a manual run can never claim one of these
+# (Codex review: "Exclude the new scheduled IDs from manual classifications",
+# mirrored from the same fix in schemas/run_classification.schema.json).
+SCHEDULED_RUN_ID_ANY_RE = re.compile(r"^scheduled_[0-9]{8}_(?:15(?:3|2)0|1030|1230)ET$")
 
 # order_submit_status values (mirror schemas/run_state.schema.json). The scheduled
 # 3:30 task always writes a run_state (and updates the pointer) even when nothing is
@@ -654,6 +676,7 @@ def build_scheduled_classification(
     scheduled_window_start_et: str = SCHEDULED_WINDOW_START_ET,
     scheduled_window_end_et: str = SCHEDULED_WINDOW_END_ET,
     run_id: Optional[str] = None,
+    valid_afternoon_scheduled_evidence: Optional[bool] = None,
 ) -> Dict[str, object]:
     """Return a fully-populated scheduled run_classification block.
 
@@ -683,6 +706,16 @@ def build_scheduled_classification(
     accepts the canonical afternoon identity -- a non-afternoon block from this
     function is valid scheduled evidence for ITS OWN stream but is correctly
     rejected as afternoon evidence, so it never updates that pointer.
+
+    ``valid_afternoon_scheduled_evidence`` defaults to ``None`` (omitted from
+    the block entirely), reproducing the unmodified afternoon path byte for
+    byte -- omitted/true there means "counts as afternoon evidence" per this
+    field's own documented default. A non-afternoon roster caller
+    (``run_dca._slot_classification_overrides``) passes ``False`` explicitly,
+    since a morning/midday-shaped block must never be mistaken for afternoon
+    evidence by a flag-based slippage/reliability consumer that does not also
+    cross-check ``stream`` (Codex review: "Deny afternoon evidence in
+    non-afternoon schema branches").
     """
     block: Dict[str, object] = {
         "run_origin": "scheduled",
@@ -700,6 +733,8 @@ def build_scheduled_classification(
     }
     if supersedes_cron_id is None:
         del block["supersedes_cron_id"]
+    if valid_afternoon_scheduled_evidence is not None:
+        block["valid_afternoon_scheduled_evidence"] = valid_afternoon_scheduled_evidence
     return block
 
 
@@ -1089,6 +1124,66 @@ def raw_persistence_failure_run_state(
     return deny_scheduled_evidence(state)
 
 
+def morning_preflight_blocked_run_state(
+    trading_day: str,
+    block_reason: str,
+    *,
+    triggered_at_utc: Optional[str] = None,
+    generated_at: Optional[str] = None,
+    broker: str = "robinhood",
+    budget: Optional[Dict[str, object]] = None,
+    classification_overrides: Optional[Dict[str, Any]] = None,
+    correlation_id: Optional[str] = None,
+) -> Dict[str, object]:
+    """Build a valid scheduled run_state for a missing/invalid morning preflight.
+
+    Mirrors :func:`raw_persistence_failure_run_state`'s blocked-before-placement
+    shape (``run_classification_outcome=RUN_CLASSIFICATION_STARTUP_FAILED``,
+    ``is_trading_failure=True``, ``completion_reason=None``, evidence denied) --
+    the same outcome ``morning_dca._apply_blocked_before_placement_fields``
+    stamps for its own preflight-block path -- rather than the calendar gate's
+    completed-no-orders shape: a missing safety prerequisite is a failure, not
+    a clean no-op, and reporting it as one hides it from failure/watchdog
+    consumers entirely (Codex review: "Classify missing preflight as a startup
+    failure"). Deliberately its own function rather than reusing
+    ``raw_persistence_failure_run_state`` directly: that function's
+    ``raw_persistence_error`` field is a type discriminator several consumers
+    (``dca_alerts``, ``generate_credit_usage_proxy_report``) key off of
+    specifically for raw-persistence failures, and stamping it here would
+    misreport an unrelated failure mode to those consumers.
+
+    ``classification_overrides``/``correlation_id`` let a non-afternoon roster
+    slot (``run_dca.run_slot``'s 1030ET) stamp its own stream/cron_id/
+    scheduled_for_et/run_id and deterministic correlation id onto this failure
+    artifact, the same way ``raw_persistence_failure_run_state`` does.
+    """
+    ts = triggered_at_utc or _utc_now_iso()
+    _generated_at = generated_at or datetime.now(_EASTERN).strftime("%Y-%m-%dT%H:%M:%S")
+    run_classification = build_scheduled_classification(trading_day, ts, **(classification_overrides or {}))
+    state = {
+        "run_id": run_classification["run_id"],
+        "generated_at": _generated_at,
+        "trading_day": trading_day,
+        "broker": broker,
+        "order_submit_status": ORDER_SUBMIT_STATUS_ERROR,
+        "run_classification_outcome": RUN_CLASSIFICATION_STARTUP_FAILED,
+        "completion_reason": None,
+        "error_class": ERROR_CLASS_BLOCKED_BEFORE_PLACEMENT,
+        "is_trading_failure": True,
+        "candidates_reaching_spread_gate": 0,
+        "candidates_blocked_missing_spread": 0,
+        "budget": budget or {"budget_tier": "normal", "daily_cap_usd": 0, "weekly_cap_usd": 0},
+        "counts": {"evaluated": 0, "buy_candidates": 0, "submitted": 0},
+        "buy_candidates": [],
+        "run_classification": run_classification,
+        "orders_submitted_count": 0,
+        "block_reason": block_reason,
+    }
+    if correlation_id is not None:
+        state["correlation_id"] = correlation_id
+    return deny_scheduled_evidence(state)
+
+
 # --- Automatic failure recovery for scheduled live tasks (2026-07-15) --------
 #
 # The three scheduled LIVE Robinhood execution tasks (morning 42173154, midday
@@ -1253,7 +1348,14 @@ def validate_classification(rc: Dict[str, object]) -> ValidationResult:
     """Validate a run_classification block against the contract.
 
     Mirrors run_classification.schema.json but usable at runtime with no
-    third-party dependency.
+    third-party dependency, including the seven-slot roster's own morning/
+    midday identities (run_dca.run_slot()'s 1030ET/1230ET) alongside the
+    afternoon/legacy identity. This function -- not the JSON schema -- is
+    what is_scheduled_state(), dca_risk.classify_stream(), and
+    near_close_dca's scheduled-pointer-update gate actually call at runtime,
+    so widening only the JSON schema left every one of those still rejecting
+    every roster classification, scheduled or blocked (Codex review: "Mirror
+    roster identities in the runtime validator").
     """
     errors: List[str] = []
     if not isinstance(rc, dict):
@@ -1297,55 +1399,146 @@ def validate_classification(rc: Dict[str, object]) -> ValidationResult:
             errors.append("scheduled run must have manual_run=false")
         if rc.get("run_type") != SCHEDULED_RUN_TYPE:
             errors.append(f"scheduled run_type must be {SCHEDULED_RUN_TYPE!r}")
-        # Lineage of the repaired live task: accept the current task id OR the
-        # superseded-task marker so continuity artifacts stay valid.
-        if rc.get("cron_id") != CRON_ID and rc.get("supersedes_cron_id") != SUPERSEDES_CRON_ID:
-            errors.append(
-                f"scheduled run must have cron_id={CRON_ID!r} "
-                f"OR supersedes_cron_id={SUPERSEDES_CRON_ID!r}"
-            )
-        if rc.get("scheduled_window_end_et") != SCHEDULED_WINDOW_END_ET:
-            errors.append(f"scheduled_window_end_et must be {SCHEDULED_WINDOW_END_ET!r}")
         run_id = rc.get("run_id")
         run_id_is_str = isinstance(run_id, str)
         if not run_id_is_str:
             errors.append(f"scheduled run_id must be a string, got {run_id!r}")
-        # scheduled_for_et, scheduled_window_start_et, and run_id must form ONE
-        # coherent identity -- either fully canonical or fully legacy -- rather
-        # than being accepted independently (Codex review discussion_r3653976747:
-        # "Validate canonical and legacy identity fields as a unit"). Checking
-        # each field against (canonical OR legacy) separately let a hybrid
-        # classification such as scheduled_for_et='15:30' paired with a legacy
-        # '..._1520ET' run_id pass as valid scheduled evidence even though no
-        # real scheduled slot ever produces that combination.
         scheduled_for_et = rc.get("scheduled_for_et")
         window_start_et = rc.get("scheduled_window_start_et")
-        run_id_ok_canonical = run_id_is_str and bool(SCHEDULED_RUN_ID_RE.match(run_id))
-        legacy_match = LEGACY_SCHEDULED_RUN_ID_RE.match(run_id) if run_id_is_str else None
-        # The legacy tuple is valid ONLY for a run dated strictly before the
-        # 2026-07-27 retime (Codex review r3654117261); a legacy-shaped run_id
-        # dated on/after that date is NOT run_id_ok_legacy, so it falls through
-        # to the "neither identity" error below rather than passing as valid
-        # scheduled evidence.
-        run_id_ok_legacy = bool(legacy_match) and legacy_match.group(1) < CANONICAL_RETIME_DATE_YYYYMMDD
-        is_canonical_identity = (
-            scheduled_for_et == SCHEDULED_FOR_ET
-            and window_start_et == SCHEDULED_WINDOW_START_ET
-            and run_id_ok_canonical
-        )
-        is_legacy_identity = (
-            scheduled_for_et == LEGACY_SCHEDULED_FOR_ET
-            and window_start_et == LEGACY_SCHEDULED_WINDOW_START_ET
-            and run_id_ok_legacy
-        )
-        if run_id_is_str and not (is_canonical_identity or is_legacy_identity):
+        stream = rc.get("stream")
+        # Dispatch by stream FIRST, mirroring schemas/run_classification.schema.json's
+        # unified per-slot anyOf branches (Codex review: "Mirror roster identities
+        # in the runtime validator"). This function previously only ever accepted
+        # the afternoon identity, so every 10:30/12:30 seven-slot-roster
+        # classification (run_dca.run_slot()) failed here -- and is_scheduled_state(),
+        # dca_risk.classify_stream(), and the pointer-update gate in
+        # near_close_dca (which SKIPS its pointer update when this fails) all
+        # rejected every roster classification, scheduled or blocked, as a
+        # result. Dispatching by stream also means an afternoon-shaped record
+        # that also claims stream="morning"/"midday" is validated against the
+        # MORNING/MIDDAY branch instead of falling through to the afternoon
+        # checks below, so it is correctly rejected there rather than accepted
+        # as afternoon evidence.
+        if stream == MORNING_SLOT_STREAM:
+            if rc.get("cron_id") != MORNING_SLOT_CRON_ID:
+                errors.append(f"morning scheduled run must have cron_id={MORNING_SLOT_CRON_ID!r}")
+            if supersedes is not None:
+                errors.append(
+                    "morning scheduled run must not carry supersedes_cron_id "
+                    "(that names the afternoon task's lineage)"
+                )
+            if rc.get("scheduled_window_end_et") != MORNING_SLOT_SCHEDULED_WINDOW_END_ET:
+                errors.append(
+                    f"morning scheduled_window_end_et must be {MORNING_SLOT_SCHEDULED_WINDOW_END_ET!r}"
+                )
+            if rc.get("valid_afternoon_scheduled_evidence") is not False:
+                errors.append(
+                    "morning scheduled run must have valid_afternoon_scheduled_evidence=false"
+                )
+            is_morning_identity = (
+                scheduled_for_et == MORNING_SLOT_SCHEDULED_FOR_ET
+                and window_start_et == MORNING_SLOT_SCHEDULED_WINDOW_START_ET
+                and run_id_is_str
+                and bool(MORNING_SLOT_RUN_ID_RE.match(run_id))
+            )
+            if run_id_is_str and not is_morning_identity:
+                errors.append(
+                    "morning scheduled_for_et, scheduled_window_start_et, and run_id must "
+                    f"form the coherent morning tuple ({MORNING_SLOT_SCHEDULED_FOR_ET!r}, "
+                    f"{MORNING_SLOT_SCHEDULED_WINDOW_START_ET!r}, 'scheduled_YYYYMMDD_1030ET'); "
+                    f"got scheduled_for_et={scheduled_for_et!r}, "
+                    f"scheduled_window_start_et={window_start_et!r}, run_id={run_id!r}"
+                )
+        elif stream == MIDDAY_SLOT_STREAM:
+            if rc.get("cron_id") != MIDDAY_SLOT_CRON_ID:
+                errors.append(f"midday scheduled run must have cron_id={MIDDAY_SLOT_CRON_ID!r}")
+            if supersedes is not None:
+                errors.append(
+                    "midday scheduled run must not carry supersedes_cron_id "
+                    "(that names the afternoon task's lineage)"
+                )
+            if rc.get("scheduled_window_end_et") != MIDDAY_SLOT_SCHEDULED_WINDOW_END_ET:
+                errors.append(
+                    f"midday scheduled_window_end_et must be {MIDDAY_SLOT_SCHEDULED_WINDOW_END_ET!r}"
+                )
+            if rc.get("valid_afternoon_scheduled_evidence") is not False:
+                errors.append(
+                    "midday scheduled run must have valid_afternoon_scheduled_evidence=false"
+                )
+            is_midday_identity = (
+                scheduled_for_et == MIDDAY_SLOT_SCHEDULED_FOR_ET
+                and window_start_et == MIDDAY_SLOT_SCHEDULED_WINDOW_START_ET
+                and run_id_is_str
+                and bool(MIDDAY_SLOT_RUN_ID_RE.match(run_id))
+            )
+            if run_id_is_str and not is_midday_identity:
+                errors.append(
+                    "midday scheduled_for_et, scheduled_window_start_et, and run_id must "
+                    f"form the coherent midday tuple ({MIDDAY_SLOT_SCHEDULED_FOR_ET!r}, "
+                    f"{MIDDAY_SLOT_SCHEDULED_WINDOW_START_ET!r}, 'scheduled_YYYYMMDD_1230ET'); "
+                    f"got scheduled_for_et={scheduled_for_et!r}, "
+                    f"scheduled_window_start_et={window_start_et!r}, run_id={run_id!r}"
+                )
+        elif stream in (None, AFTERNOON_STREAM):
+            # stream, when present, must be exactly 'afternoon' here -- not added
+            # to a hard requirement, since historical artifacts predating the
+            # stream field must stay valid. Without this elif/else split, ANY
+            # other value (a typo, or an unrelated string like
+            # 'midday_recovery') fell through to this branch and validated
+            # anyway whenever the rest of the identity was afternoon-shaped,
+            # even though the JSON schema already rejects exactly this
+            # (Codex review: "Reject unknown streams before using the
+            # afternoon validator", mirroring schemas/run_classification.
+            # schema.json's own 'stream, when present, must be afternoon'
+            # constraint on these two branches).
+            # Lineage of the repaired live task: accept the current task id OR the
+            # superseded-task marker so continuity artifacts stay valid.
+            if rc.get("cron_id") != CRON_ID and rc.get("supersedes_cron_id") != SUPERSEDES_CRON_ID:
+                errors.append(
+                    f"scheduled run must have cron_id={CRON_ID!r} "
+                    f"OR supersedes_cron_id={SUPERSEDES_CRON_ID!r}"
+                )
+            if rc.get("scheduled_window_end_et") != SCHEDULED_WINDOW_END_ET:
+                errors.append(f"scheduled_window_end_et must be {SCHEDULED_WINDOW_END_ET!r}")
+            # scheduled_for_et, scheduled_window_start_et, and run_id must form ONE
+            # coherent identity -- either fully canonical or fully legacy -- rather
+            # than being accepted independently (Codex review discussion_r3653976747:
+            # "Validate canonical and legacy identity fields as a unit"). Checking
+            # each field against (canonical OR legacy) separately let a hybrid
+            # classification such as scheduled_for_et='15:30' paired with a legacy
+            # '..._1520ET' run_id pass as valid scheduled evidence even though no
+            # real scheduled slot ever produces that combination.
+            run_id_ok_canonical = run_id_is_str and bool(SCHEDULED_RUN_ID_RE.match(run_id))
+            legacy_match = LEGACY_SCHEDULED_RUN_ID_RE.match(run_id) if run_id_is_str else None
+            # The legacy tuple is valid ONLY for a run dated strictly before the
+            # 2026-07-27 retime (Codex review r3654117261); a legacy-shaped run_id
+            # dated on/after that date is NOT run_id_ok_legacy, so it falls through
+            # to the "neither identity" error below rather than passing as valid
+            # scheduled evidence.
+            run_id_ok_legacy = bool(legacy_match) and legacy_match.group(1) < CANONICAL_RETIME_DATE_YYYYMMDD
+            is_canonical_identity = (
+                scheduled_for_et == SCHEDULED_FOR_ET
+                and window_start_et == SCHEDULED_WINDOW_START_ET
+                and run_id_ok_canonical
+            )
+            is_legacy_identity = (
+                scheduled_for_et == LEGACY_SCHEDULED_FOR_ET
+                and window_start_et == LEGACY_SCHEDULED_WINDOW_START_ET
+                and run_id_ok_legacy
+            )
+            if run_id_is_str and not (is_canonical_identity or is_legacy_identity):
+                errors.append(
+                    "scheduled_for_et, scheduled_window_start_et, and run_id must form a single "
+                    f"coherent identity: either the canonical tuple ({SCHEDULED_FOR_ET!r}, "
+                    f"{SCHEDULED_WINDOW_START_ET!r}, 'scheduled_YYYYMMDD_1530ET') or the legacy "
+                    f"tuple ({LEGACY_SCHEDULED_FOR_ET!r}, {LEGACY_SCHEDULED_WINDOW_START_ET!r}, "
+                    f"'scheduled_YYYYMMDD_1520ET'); got scheduled_for_et={scheduled_for_et!r}, "
+                    f"scheduled_window_start_et={window_start_et!r}, run_id={run_id!r}"
+                )
+        else:
             errors.append(
-                "scheduled_for_et, scheduled_window_start_et, and run_id must form a single "
-                f"coherent identity: either the canonical tuple ({SCHEDULED_FOR_ET!r}, "
-                f"{SCHEDULED_WINDOW_START_ET!r}, 'scheduled_YYYYMMDD_1530ET') or the legacy "
-                f"tuple ({LEGACY_SCHEDULED_FOR_ET!r}, {LEGACY_SCHEDULED_WINDOW_START_ET!r}, "
-                f"'scheduled_YYYYMMDD_1520ET'); got scheduled_for_et={scheduled_for_et!r}, "
-                f"scheduled_window_start_et={window_start_et!r}, run_id={run_id!r}"
+                f"scheduled run must have stream in (None, {AFTERNOON_STREAM!r}, "
+                f"{MORNING_SLOT_STREAM!r}, {MIDDAY_SLOT_STREAM!r}), got {stream!r}"
             )
     elif origin == "manual":
         if manual_flag is not True:
@@ -1712,6 +1905,38 @@ def update_latest_scheduled_run_pointer(
     config/scheduled_tasks.json) can update the pointer without a second,
     potentially differently-located copy of run_state.json being written.
     Callers must validate ``run_state["run_classification"]`` themselves first.
+
+    The pointer's own ``stream`` is read from ``run_state["run_classification"]``
+    (falling back to ``"afternoon"`` when absent, matching
+    ``build_scheduled_classification``'s own default), not hardcoded: a
+    non-afternoon roster slot (``run_dca.run_slot``'s 1030ET/1230ET) stamps its
+    own stream via ``classification_overrides``, and a pointer that always
+    claimed ``"afternoon"`` regardless made
+    ``scripts.same_day_pointer.validate_pointer(..., expected_stream="morning")``
+    reject that freshly written pointer as ``wrong_stream`` -- the pointer-based
+    watchdog could never observe a morning/midday run this way, including one
+    blocked before placement (Codex review: "Write the blocked pointer with the
+    morning stream identity").
+
+    This always writes to ``latest_scheduled_run.json`` (via
+    :func:`latest_scheduled_run_path`), never to ``morning_dca.py``/
+    ``midday_dca.py``'s own ``latest_morning_run.json``/``latest_midday_run.json``
+    (Codex review: "Write blocked slots through their stream-specific
+    pointer"). That is a deliberate scope limit, not an oversight: those two
+    files and their dedicated schemas (morning_run_classification.schema.json,
+    midday_run_classification.schema.json) are written and read only by
+    MorningDCAExecutor/MiddayDCAExecutor themselves (and their own tests) --
+    no other code in this repository reads either pointer file or validates
+    against either dedicated schema outside tests. The seven-slot roster's
+    10:30/12:30 LIVE trading decision (this function's actual caller) has
+    already superseded those executors' own live-mode code path entirely;
+    MorningDCAExecutor's only confirmed remaining live caller is the 9:45 AM
+    preflight scan (read-only, no trading -- see docs/morning_dca.md), and
+    MiddayDCAExecutor has no live caller left at all. Writing a second,
+    stream-specific pointer/schema pair here would be exercising a consumer
+    that does not exist today. If an out-of-repo consumer (e.g. the external
+    watchdog task documented in config/scheduled_tasks.json) is later found to
+    depend on either file, that is the point to revisit this.
     """
     try:  # pragma: no cover - import shim for flat sys.path
         from scripts.same_day_pointer import derive_valid_scheduled_evidence
@@ -1743,7 +1968,20 @@ def update_latest_scheduled_run_pointer(
                 "run_id": rc.get("run_id"),
                 "trading_day": day,
                 "run_state_path": str(run_state_path),
-                "stream": "afternoon",
+                # rc.get("stream", "afternoon") looked equivalent but is not:
+                # that default only applies when the KEY IS ABSENT, whereas
+                # validate_classification() treats an explicit stream=null the
+                # SAME as absent (both mean legacy/afternoon evidence). A
+                # classification with "stream": null present therefore passed
+                # validate_classification() and write_run_artifacts() but
+                # wrote a null stream into the pointer instead of "afternoon",
+                # which scripts.same_day_pointer.validate_pointer normalizes
+                # to "" and rejects as wrong_stream -- publishing an unusable
+                # pointer from a classification its own runtime validator just
+                # accepted (Codex review: "Default null legacy streams before
+                # writing the pointer"). `or` treats both absent and null the
+                # same, matching validate_classification()'s own check.
+                "stream": rc.get("stream") or "afternoon",
                 "pointer_status": pointer_status,
                 "same_day_required": True,
                 "valid_scheduled_evidence": bool(valid_scheduled_evidence),
@@ -3682,6 +3920,7 @@ __all__ = [
     "list_raw_inputs_saved",
     "build_raw_persistence_state",
     "raw_persistence_failure_run_state",
+    "morning_preflight_blocked_run_state",
     "RECOVERY_TRIGGER_REASONS",
     "build_recovery_state",
     "recovery_escalation_run_state",

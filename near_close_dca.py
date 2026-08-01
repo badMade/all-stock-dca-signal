@@ -5379,6 +5379,42 @@ def _date_or_holiday_blocked(trading_day: date, config: StrategyConfig) -> bool:
     return trading_day in nyse_holidays(trading_day.year)
 
 
+def _check_account_pinning(config: StrategyConfig, broker: BrokerAdapter) -> None:
+    """Raise RuntimeError if the live account isn't safely pinned to ``broker``.
+
+    Extracted from :func:`_check_execution_gates` so any OTHER path that might
+    persist a result for what could be a live, non-dry-run invocation --
+    e.g. run_dca.py's preflight-blocked early return, which runs before
+    run_daily_compact ever reaches this gate -- can enforce the same refusal
+    instead of silently completing with a misconfigured/mismatched account
+    undetected (Codex review: "Run account checks before returning the
+    preflight failure").
+
+    Validate the CONFIGURED account before comparing it to the broker's. The
+    equality check below is satisfied by any two values that happen to match,
+    including two empty ones -- so a live StrategyConfig(target_account_number="")
+    paired with an injected adapter whose account_number() is also "" sailed
+    through and reached placement. build_broker refuses to construct such an
+    adapter, but callers may inject a BrokerAdapter into run_once directly and
+    bypass the factory entirely, so the same condition has to hold here at the
+    execution gate, which every path crosses (Codex review, PR #219).
+    """
+    if not config.dry_run:
+        pinning_failure = account_pinning_failure(
+            config.target_account_number, config.broker
+        )
+        if pinning_failure:
+            raise RuntimeError(
+                f"Refusing to trade live: {pinning_failure}. Configure a real account "
+                "number (ROBINHOOD_AGENTIC_ACCOUNT_NUMBER) before running live, or set "
+                "dry_run=True."
+            )
+    if broker.account_number() != config.target_account_number:
+        raise RuntimeError(
+            f"Refusing to trade account {broker.account_number()}; expected {config.target_account_number}"
+        )
+
+
 def _check_execution_gates(
     trading_day: date,
     config: StrategyConfig,
@@ -5411,28 +5447,7 @@ def _check_execution_gates(
         )
         return False
 
-    # Validate the CONFIGURED account before comparing it to the broker's. The
-    # equality check below is satisfied by any two values that happen to match,
-    # including two empty ones -- so a live StrategyConfig(target_account_number="")
-    # paired with an injected adapter whose account_number() is also "" sailed
-    # through and reached placement. build_broker refuses to construct such an
-    # adapter, but callers may inject a BrokerAdapter into run_once directly and
-    # bypass the factory entirely, so the same condition has to hold here at the
-    # execution gate, which every path crosses (Codex review, PR #219).
-    if not config.dry_run:
-        pinning_failure = account_pinning_failure(
-            config.target_account_number, config.broker
-        )
-        if pinning_failure:
-            raise RuntimeError(
-                f"Refusing to trade live: {pinning_failure}. Configure a real account "
-                "number (ROBINHOOD_AGENTIC_ACCOUNT_NUMBER) before running live, or set "
-                "dry_run=True."
-            )
-    if broker.account_number() != config.target_account_number:
-        raise RuntimeError(
-            f"Refusing to trade account {broker.account_number()}; expected {config.target_account_number}"
-        )
+    _check_account_pinning(config, broker)
     return True
 
 

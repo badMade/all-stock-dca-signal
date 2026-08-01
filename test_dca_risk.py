@@ -11,6 +11,8 @@ import pytest
 
 from dca_risk import (
     STREAM_MANUAL,
+    STREAM_MIDDAY,
+    STREAM_MORNING,
     STREAM_OTHER,
     STREAM_SCHEDULED,
     _trading_day,
@@ -223,6 +225,80 @@ def test_streams_not_conflated():
     assert report["scheduled_live"]["kill_switch_engaged"] is False
 
 
+def _slot_state(trading_day: str, deployed: float, *, stream: str) -> dict:
+    """A seven-slot-roster run_state (morning/midday) depositing ``deployed``."""
+    slot = {
+        "morning": dict(
+            cron_id="42173154",
+            scheduled_for_et="10:30",
+            scheduled_window_start_et="10:25",
+            scheduled_window_end_et="10:35",
+            run_id=f"scheduled_{trading_day.replace('-', '')}_1030ET",
+        ),
+        "midday": dict(
+            cron_id="a6239dae",
+            scheduled_for_et="12:30",
+            scheduled_window_start_et="12:25",
+            scheduled_window_end_et="12:35",
+            run_id=f"scheduled_{trading_day.replace('-', '')}_1230ET",
+        ),
+    }[stream]
+    et_time = {"morning": "10:30:01", "midday": "12:30:01"}[stream]
+    rc = build_scheduled_classification(
+        trading_day,
+        f"{trading_day}T{et_time}-04:00",
+        stream=stream,
+        supersedes_cron_id=None,
+        valid_afternoon_scheduled_evidence=False,
+        **slot,
+    )
+    return {
+        "trading_day": trading_day,
+        "generated_at": f"{trading_day}T{et_time}-04:00",
+        "run_classification": rc,
+        "buy_candidates": [
+            {"ticker": "AAA", "planned_amount_usd": deployed, "status": "submitted"},
+        ],
+    }
+
+
+def test_morning_midday_roster_deployment_has_its_own_bucket():
+    # Codex review discussion_r3694627885 ("Keep non-afternoon runs out of the
+    # afternoon risk stream"): a valid 10:30/12:30 roster run classifies as
+    # STREAM_SCHEDULED (Codex review: "Mirror roster identities in the runtime
+    # validator"), but its timestamp is always before the 2:30 PM afternoon
+    # floor, so it must not count toward the afternoon kill-switch stream --
+    # and it must not silently vanish either, now that it is no longer
+    # STREAM_OTHER. It needs a bucket of its own.
+    as_of = date(2026, 7, 8)
+    states = [
+        _scheduled_state("2026-07-07", 500.0),          # afternoon
+        _slot_state("2026-07-07", 200.0, stream="morning"),
+        _slot_state("2026-07-07", 300.0, stream="midday"),
+    ]
+
+    # All three are valid scheduled evidence...
+    assert all(classify_stream(s) == STREAM_SCHEDULED for s in states)
+    # ...but only the afternoon one counts as afternoon evidence, and only it
+    # feeds the kill-switch-relevant scheduled bucket.
+    scheduled_by_day = deployed_by_day(states, stream=STREAM_SCHEDULED)
+    assert scheduled_by_day == {date(2026, 7, 7): 500.0}
+
+    other_by_day = deployed_by_day(states, stream=STREAM_OTHER, require_afternoon_evidence=False)
+    assert other_by_day == {}
+
+    report = build_risk_report(states, as_of, _config())
+    by_stream = report["deployed_last_7d_usd_by_stream"]
+    assert by_stream[STREAM_SCHEDULED] == 500.0
+    assert by_stream[STREAM_MORNING] == 200.0
+    assert by_stream[STREAM_MIDDAY] == 300.0
+    assert by_stream[STREAM_OTHER] == 0.0
+    # The 1,000 total across all three slots must never wedge the afternoon
+    # kill-switch: only the $500 afternoon slice counts toward it.
+    assert report["scheduled_live"]["deployed_last_7d_usd"] == 500.0
+    assert report["scheduled_live"]["kill_switch_engaged"] is False
+
+
 def test_manual_flag_wins_over_scheduled_origin():
     """A state marked scheduled but flagged manual is treated as manual, not scheduled."""
     state = _scheduled_state("2026-07-07", 500.0)
@@ -242,6 +318,43 @@ def test_afternoon_evidence_before_230pm_rejected():
     by_day = deployed_by_day([early, late], stream=STREAM_SCHEDULED)
     # Only the afternoon artifact contributes; the pre-2:30 PM one is dropped.
     assert by_day == {date(2026, 7, 8): 900.0}
+
+
+def test_afternoon_evidence_excludes_only_morning_midday_not_every_other_stream(monkeypatch):
+    """Codex review discussion_r3694703749 ("Preserve the documented 14:30
+    risk-stream eligibility"): docs/risk_management.md documents a 2:30 PM
+    intraday slot -- not yet wired into validate_classification() -- that is
+    INTENDED to jointly fund the afternoon kill-switch alongside the 3:30 PM
+    slot. is_afternoon_scheduled_evidence() must exclude ONLY the morning/
+    midday streams this session actually wired in, not every stream other
+    than exactly "afternoon" -- otherwise a future 2:30 PM identity (whatever
+    non-"afternoon" stream value it turns out to use) would stay wrongly
+    excluded even after validate_classification() is updated to accept it,
+    perpetuating the documented undercount rather than only guarding against
+    the two streams known today to be non-afternoon.
+
+    validate_classification() doesn't recognize a hypothetical future
+    "intraday" stream yet, so classify_stream() is patched to isolate the
+    stream-exclusion check itself from that unrelated, not-yet-implemented
+    gap."""
+    import dca_risk
+
+    monkeypatch.setattr(dca_risk, "classify_stream", lambda state: STREAM_SCHEDULED)
+
+    future_intraday_state = {
+        "trading_day": "2026-07-07",
+        "generated_at": "2026-07-07T18:30:00Z",  # 14:30 ET
+        "run_classification": {"stream": "intraday"},
+    }
+    assert dca_risk.is_afternoon_scheduled_evidence(future_intraday_state) is True
+
+    morning_state = dict(future_intraday_state)
+    morning_state["run_classification"] = {"stream": STREAM_MORNING}
+    assert dca_risk.is_afternoon_scheduled_evidence(morning_state) is False
+
+    midday_state = dict(future_intraday_state)
+    midday_state["run_classification"] = {"stream": STREAM_MIDDAY}
+    assert dca_risk.is_afternoon_scheduled_evidence(midday_state) is False
 
 
 def test_utc_timestamp_converted_to_et_for_floor():
@@ -282,6 +395,30 @@ def test_rolling_30day_burn_rate_window_and_average():
 def test_classify_stream_non_dict_state():
     assert classify_stream(None) == STREAM_OTHER
     assert classify_stream([]) == STREAM_OTHER
+
+
+def test_classify_stream_accepts_the_seven_slot_rosters_morning_identity():
+    # Codex review discussion_r3694864526 ("Mirror roster identities in the
+    # runtime validator"): classify_stream() calls
+    # scripts.run_classification.validate_classification() directly, which
+    # previously only ever accepted the afternoon identity -- so every
+    # 10:30/12:30 seven-slot-roster run_state (run_dca.run_slot()) classified
+    # as STREAM_OTHER instead of STREAM_SCHEDULED, regardless of how correct
+    # and complete its own identity fields were.
+    rc = build_scheduled_classification(
+        "2026-07-06",
+        "2026-07-06T14:30:01Z",
+        stream="morning",
+        cron_id="42173154",
+        supersedes_cron_id=None,
+        scheduled_for_et="10:30",
+        scheduled_window_start_et="10:25",
+        scheduled_window_end_et="10:35",
+        run_id="scheduled_20260706_1030ET",
+        valid_afternoon_scheduled_evidence=False,
+    )
+    state = {"trading_day": "2026-07-06", "run_classification": rc, "buy_candidates": []}
+    assert classify_stream(state) == STREAM_SCHEDULED
 
 def test_classify_stream_scheduled_but_invalid_classification():
     state = _scheduled_state("2026-07-07", 500.0)

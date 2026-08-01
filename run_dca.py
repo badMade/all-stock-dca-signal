@@ -68,6 +68,8 @@ from near_close_dca import (
     SourceName,
     StrategyConfig,
     StrategyState,
+    _check_account_pinning,
+    _date_or_holiday_blocked,
     _earlier_selected_base,
     _write_and_validate_scheduled_contract,
     build_broker,
@@ -75,11 +77,13 @@ from near_close_dca import (
     load_prior_same_day_allocations_multi,
     merge_manual_top_up_context,
     run_daily_compact,
+    warn_if_window_expiring,
 )
 from scripts.correlation import build_correlation_id
 from scripts.model_usage_log import log_model_usage
 from scripts.run_classification import (
     CANONICAL_RETIME_DATE_YYYYMMDD,
+    ERROR_CLASS_BLOCKED_BEFORE_PLACEMENT,
     LEGACY_SCHEDULED_WINDOW_START_ET,
     ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED,
     ORDER_SUBMIT_STATUS_SUBMITTED,
@@ -87,6 +91,7 @@ from scripts.run_classification import (
     SCHEDULED_WINDOW_START_ET,
     build_raw_persistence_state,
     load_same_day_top_up_context,
+    morning_preflight_blocked_run_state,
     raw_persistence_failure_run_state,
     save_raw_input,
     update_latest_scheduled_run_pointer,
@@ -250,6 +255,12 @@ def _slot_classification_overrides(
     scheduled classification"). Returns ``None`` for the afternoon slot itself,
     leaving the existing default (and every other, non-roster caller of
     ``build_run_artifacts``) byte-for-byte unchanged.
+
+    Also stamps ``valid_afternoon_scheduled_evidence=False``: a morning/midday
+    classification must never be mistaken for afternoon evidence by a
+    flag-based slippage/reliability consumer that reads this field without
+    also cross-checking ``stream`` (Codex review: "Deny afternoon evidence in
+    non-afternoon schema branches").
     """
     if stream_name == AFTERNOON_STREAM:
         return None
@@ -266,6 +277,7 @@ def _slot_classification_overrides(
         "scheduled_window_start_et": window_start,
         "scheduled_window_end_et": window_end,
         "run_id": f"scheduled_{compact_day}_{window}",
+        "valid_afternoon_scheduled_evidence": False,
     }
 
 
@@ -1293,6 +1305,7 @@ def run_pipeline(
     cron_id: str = AFTERNOON_LIVE_CRON_ID,
     classification_overrides: Optional[Dict[str, Any]] = None,
     correlation_id: Optional[str] = None,
+    preflight_gate: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Thin wrapper around ``_run_pipeline_impl``: same signature plus the
     opt-in ``model_usage_log_root`` (see scripts/model_usage_log.py,
@@ -1317,6 +1330,17 @@ def run_pipeline(
     re-raising, and a completed run pings the afternoon success heartbeat
     (dead-man's switch for the missed-fire failure class). Demo/dry-run and
     unscheduled calls only get a log handler ensured.
+
+    ``preflight_gate`` (``run_slot``'s morning-preflight diagnostic dict, see
+    ``morning_preflight_eligible_tickers``) is forwarded to
+    ``_run_pipeline_impl``, which checks it from INSIDE this guarded scope --
+    after its own calendar gate, so a weekend/holiday absence of the same-day
+    09:45 artifact is never misdiagnosed as a failed prerequisite -- rather
+    than ``run_slot`` short-circuiting before ``run_pipeline`` is even
+    called. That earlier short-circuit bypassed this function's heartbeat
+    and model-usage-log append entirely, letting the dead-man's switch read
+    a blocked-but-written slot as one that never fired at all (Codex
+    review: "Route the preflight-blocked result through guarded_run").
     """
 
     # Snapshotted BEFORE _invoke() runs, so the probe passed to guarded_run
@@ -1350,6 +1374,7 @@ def run_pipeline(
             classification_overrides=classification_overrides,
             correlation_id=correlation_id,
             stream=stream_name,
+            preflight_gate=preflight_gate,
         )
         run_state_path = result.get("run_state_path")
         run_id = None
@@ -1400,11 +1425,17 @@ def run_pipeline(
             # is not credited with a write it never made itself -- codex review
             # discussion_r3660858013.
             run_artifact_written=run_artifact_written,
-            # The raw-persistence failure path reports its failure as a returned
-            # result (with its own targeted Slack alert) instead of raising; it must
-            # ping a FAILED heartbeat, not clear the dead-man's switch.
+            # The raw-persistence failure path and the preflight-blocked path
+            # both report their failure as a returned result (each with its own
+            # targeted alert) instead of raising; either must ping a FAILED
+            # heartbeat, not clear the dead-man's switch (Codex review: "Route
+            # the preflight-blocked result through guarded_run").
             result_ok=lambda result: not (
-                isinstance(result, dict) and result.get("raw_persistence_error")
+                isinstance(result, dict)
+                and (
+                    result.get("raw_persistence_error")
+                    or result.get("error_class") == ERROR_CLASS_BLOCKED_BEFORE_PLACEMENT
+                )
             ),
         ),
     )
@@ -1459,6 +1490,7 @@ def run_slot(
     trading_day = now.astimezone(EASTERN).date().isoformat()
     correlation_id = build_correlation_id(trading_day, stream_name, window)
     slot_tickers = config.tickers
+    preflight_gate: Optional[Dict[str, Any]] = None
     if stream_name == MORNING_STREAM:
         # The 10:30 slot must not scan the configured universe unconditionally:
         # config/morning_dca.json's live_task.preflight_artifact_resolution
@@ -1486,8 +1518,25 @@ def run_slot(
             manual=False,
         )
         if preflight_gate.get("preflight_missing_block"):
-            logger.warning(
-                "1030ET preflight gate blocked the morning universe: %s",
+            # A missing/invalid 09:45 preflight artifact must not read as an
+            # ordinary evaluated-to-zero-candidates run: letting slot_tickers
+            # (now empty) fall through unremarked would record a normal
+            # completed_no_orders state indistinguishable from a legitimately
+            # quiet market. ``preflight_gate`` is forwarded to run_pipeline()
+            # below, which -- from INSIDE its own guarded_run/heartbeat scope,
+            # and only after its own calendar gate has had a chance to run --
+            # short-circuits into a startup-failure-shaped blocked state
+            # instead (Codex review: "Persist a blocked state when morning
+            # preflight is missing", "Route the preflight-blocked result
+            # through guarded_run", "Apply the calendar gate before the
+            # preflight early return"). info, not warning: the later
+            # short-circuit's own warning (tied to the actual persisted
+            # blocked artifact and alert) is the authoritative one --
+            # warning here too logged two near-identical messages for a
+            # single event whenever the calendar gate did not suppress the
+            # later one (Copilot review).
+            logger.info(
+                "1030ET preflight gate found the morning universe blocked: %s",
                 preflight_gate.get("block_reason"),
             )
         elif preflight_gate.get("gated_out_tickers"):
@@ -1557,6 +1606,7 @@ def run_slot(
             stream_name, window, trading_day
         ),
         correlation_id=correlation_id,
+        preflight_gate=preflight_gate,
     )
     return {**result, "correlation_id": correlation_id}
 
@@ -1605,6 +1655,7 @@ def _run_pipeline_impl(
     classification_overrides: Optional[Dict[str, Any]] = None,
     correlation_id: Optional[str] = None,
     stream: str = "afternoon",
+    preflight_gate: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run one compact DCA cycle and (optionally) the full post-trade report set.
 
@@ -1656,6 +1707,21 @@ def _run_pipeline_impl(
     deterministic ``correlation_id`` into ``run_state.json``, instead of the
     afternoon-only defaults ``build_run_artifacts`` otherwise falls back to.
     ``None`` (the default for both) reproduces the unmodified afternoon path.
+
+    ``preflight_gate`` is ``run_slot``'s morning-preflight diagnostic dict
+    (see ``morning_preflight_eligible_tickers``). When it reports
+    ``preflight_missing_block`` -- a missing/invalid same-day 09:45 artifact
+    -- AND the date/holiday gate does not ALSO block ``trading_day_et`` (a
+    weekend, holiday, or out-of-window date legitimately has no same-day
+    preflight artifact and must resolve as that ordinary calendar block, not
+    a failed safety prerequisite -- Codex review: "Apply the calendar gate
+    before the preflight early return"), this writes a startup-failure-shaped
+    blocked run_state (see ``morning_preflight_blocked_run_state``) and
+    returns early, before any signal evaluation. Checked here (inside
+    ``run_pipeline``'s ``guarded_run``/heartbeat scope) rather than by
+    ``run_slot`` short-circuiting before this function is ever called, so the
+    heartbeat and model-usage-log append still fire for the blocked slot
+    (Codex review: "Route the preflight-blocked result through guarded_run").
     """
     # Drain any leftover raw placement responses from a prior run on this broker
     # instance (e.g. a manual run_pipeline() call that preceded this scheduled one).
@@ -1691,6 +1757,206 @@ def _run_pipeline_impl(
     if scheduled:
         trading_day_et = now.astimezone(EASTERN).date()
         trading_day_raw = trading_day_et.isoformat()
+        if (
+            preflight_gate is not None
+            and preflight_gate.get("preflight_missing_block")
+            and not _date_or_holiday_blocked(trading_day_et, config)
+        ):
+            # _check_execution_gates's own first action, unconditional of the
+            # calendar gate: without it, an approved live run whose window is
+            # about to expire gets no countdown on a day its preflight also
+            # happens to be missing, silently losing the warning meant to
+            # stop live trading from lapsing without notice (Codex review:
+            # "Emit the approved-window expiry warning before returning").
+            warn_if_window_expiring(config.approved_test_dates, trading_day_et)
+            # This branch's own condition already excludes calendar-blocked
+            # dates (the `not _date_or_holiday_blocked(...)` check above), so
+            # reaching here means the date is approved. Account pinning and
+            # broker-account matching are the other execution gate that every
+            # live path must cross, and this early return happens before
+            # run_daily_compact ever reaches _check_execution_gates. Without
+            # this, an approved live run with BOTH a missing preflight AND a
+            # misconfigured/mismatched account would persist and alert only
+            # the preflight failure, hiding the account-safety refusal until a
+            # later run happened to have valid preflight data (Codex review:
+            # "Run account checks before returning the preflight failure").
+            _check_account_pinning(config, broker)
+            block_reason = (
+                preflight_gate.get("block_reason")
+                or "morning preflight artifact missing or invalid"
+            )
+            logger.warning(
+                "%s preflight gate blocked the universe: %s", stream, block_reason
+            )
+            failure_state = morning_preflight_blocked_run_state(
+                trading_day_raw,
+                block_reason,
+                triggered_at_utc=now.astimezone(timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                generated_at=now.astimezone(EASTERN).strftime("%Y-%m-%dT%H:%M:%S"),
+                broker=config.broker.value,
+                budget={
+                    "budget_tier": state.current_tier().name,
+                    "daily_cap_usd": state.current_tier().daily_cap_usd,
+                    "weekly_cap_usd": state.effective_weekly_cap(),
+                },
+                classification_overrides=classification_overrides,
+                correlation_id=correlation_id,
+            )
+            out = Path(artifacts_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            # Remove stale derived/report artifacts from any prior attempt in
+            # this same directory, the same list the raw-persistence failure
+            # path deletes: a same-slot retry that earlier ran with
+            # generate_full_reports=True left these report-only files on disk,
+            # and this write only overwrites the canonical state/summary/CSVs,
+            # so without this a consumer could display the earlier successful
+            # attempt's reports beside this new preflight-failure state (Codex
+            # review: "Clear stale reports before returning the blocked
+            # result"). signals.csv and drift_report.{json,md} are recreated
+            # fresh below/in the alert block; deleting them first is harmless.
+            for _stale in (
+                "signals.csv",
+                "latest_run_summary.json",
+                "slippage_and_coverage_report.md",
+                "slippage_ranked.csv",
+                "missing_fills_report.csv",
+                "notion_latest_run_compact.md",
+                "notion_latest_run_payload.json",
+                "drift_report.json",
+                "drift_report.md",
+            ):
+                (out / _stale).unlink(missing_ok=True)
+            # Carry forward the SLOT's prior order evidence BEFORE the state is
+            # serialized, the same way the raw-persistence failure path does: a
+            # same-slot retry whose EARLIER attempt already submitted orders
+            # must not have this unconditional write erase them from the
+            # canonical record -- morning_dca.py itself returns the existing
+            # submitted state for this exact preflight-retry scenario (Codex
+            # review: "Preserve prior orders on preflight-blocked retries").
+            _prior_orders_csv = out / "orders.csv"
+            if _prior_orders_csv.exists():
+                failure_state["artifacts"] = {
+                    "orders_csv_path": str(_prior_orders_csv)
+                }
+            _prior_rows = _prior_submitted_order_rows(out)
+            _accepted = _accepted_order_rows(_prior_rows)
+            if _prior_rows:
+                failure_state["buy_candidates"] = _prior_rows
+                failure_state["placement_evidence_incomplete"] = True
+                failure_state["orders_submitted_count"] = len(_accepted)
+                failure_state["counts"] = {
+                    **(failure_state.get("counts") or {}),
+                    "submitted": len(_accepted),
+                    "buy_candidates": len(_prior_rows),
+                }
+            if _accepted:
+                failure_state["order_submit_status"] = ORDER_SUBMIT_STATUS_SUBMITTED
+                failure_state["run_classification_outcome"] = (
+                    RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
+                )
+            run_state_path = out / "run_state.json"
+            atomic_write_text(
+                run_state_path, json.dumps(failure_state, indent=2) + "\n"
+            )
+            write_signals_csv(out, [], fieldnames=("ticker",))
+            contract_ok = bool(
+                _write_and_validate_scheduled_contract(failure_state, out)
+            )
+            if classification_state_root is not None and contract_ok:
+                update_latest_scheduled_run_pointer(
+                    failure_state, run_state_path, base=Path(classification_state_root)
+                )
+            elif classification_state_root is not None:
+                logger.error(
+                    "Not updating latest_scheduled_run.json: preflight-blocked "
+                    "failure-state artifact contract failed."
+                )
+            # guarded_run's result_ok predicate (below) pings a FAILED heartbeat
+            # for this result, but guarded_run deliberately sends no Slack alert
+            # itself when result_ok is false: structured-failure callers are
+            # expected to emit their OWN targeted alert, the same way the
+            # raw-persistence failure path does below (Codex review: "Alert on
+            # returned preflight failures").
+            failure_result: Dict[str, Any] = {
+                "run_label": run_label,
+                "scheduled": scheduled,
+                "blocked": True,
+                "artifacts_dir": str(out),
+                "run_state_path": str(run_state_path),
+                "run_summary_path": str(out / "run_summary.json"),
+                "signals_path": str(out / "signals.csv"),
+                "submitted_orders_path": str(out / "submitted_orders.csv"),
+                "error_class": failure_state["error_class"],
+            }
+            try:
+                from scripts.drift_detection import (
+                    CAUSE_PREFLIGHT_MISSING,
+                    DEFAULT_SLACK_WEBHOOK_ENV,
+                    DriftReport,
+                    send_slack_alert,
+                )
+
+                # On a retry that preserved an earlier attempt's submitted
+                # orders, the prominent operator-facing action must say so --
+                # not claim no orders were placed, or a partially submitted
+                # slot reads as a zero-order slot (Codex review: "Report
+                # preserved orders accurately in the failure alert").
+                if _accepted:
+                    _action = (
+                        "The same-day 09:45 morning preflight artifact was missing or "
+                        "invalid; the 10:30 slot's eligible universe was reduced to zero "
+                        f"and no NEW orders were placed this attempt ({len(_accepted)} "
+                        "order(s) from an earlier attempt this slot/day are preserved). "
+                        "Confirm the 09:45 preflight task ran and wrote a valid artifact "
+                        "before re-running."
+                    )
+                else:
+                    _action = (
+                        "The same-day 09:45 morning preflight artifact was missing or "
+                        "invalid; the 10:30 slot's eligible universe was reduced to "
+                        "zero and no orders were placed. Confirm the 09:45 preflight "
+                        "task ran and wrote a valid artifact before re-running."
+                    )
+                # These three describe physical artifact presence on disk --
+                # the same semantic detect_drift() itself uses (signals_path/
+                # orders_path is not None, raw_dir.is_dir()) -- not whether
+                # this attempt freshly computed/submitted anything. By this
+                # point signals.csv and submitted_orders.csv have both just
+                # been written (header-only when empty) by the code above/
+                # _write_and_validate_scheduled_contract, and a retry may
+                # still have an earlier attempt's raw/ directory on disk, so
+                # hardcoding all three to False misdiagnosed every one of
+                # them as missing (Codex review: "Report the artifacts that
+                # the blocked path actually writes").
+                _signals_path = out / "signals.csv"
+                _orders_path = out / "submitted_orders.csv"
+                _raw_dir_path = out / "raw"
+                _fail_report = DriftReport(
+                    run_dir=str(out),
+                    drift_detected=True,
+                    affected_symbols=[],
+                    run_suspected_cause=CAUSE_PREFLIGHT_MISSING,
+                    recommended_action=_action,
+                    signals_present=_signals_path.exists(),
+                    orders_present=_orders_path.exists(),
+                    submitted_orders_empty=not _accepted,
+                    raw_dir_present=_raw_dir_path.is_dir(),
+                    expected_symbol_count=0,
+                    submitted_symbol_count=len(_accepted),
+                    notes=[f"block_reason: {block_reason}"],
+                )
+                atomic_write_text(
+                    out / "drift_report.json", _fail_report.to_json(compact=False)
+                )
+                atomic_write_text(out / "drift_report.md", _fail_report.to_markdown())
+                if scheduled and not config.dry_run:
+                    send_slack_alert(_fail_report, env_var=DEFAULT_SLACK_WEBHOOK_ENV)
+                failure_result["drift_report"] = _fail_report.to_dict()
+            except Exception as _alert_exc:  # pragma: no cover
+                logger.warning("preflight-blocked failure alert failed: %s", _alert_exc)
+            return failure_result
         # Only persist raw inputs on approved trading days; unapproved days let
         # run_daily_compact write the normal blocked stub without side effects.
         if trading_day_et in config.approved_test_dates:

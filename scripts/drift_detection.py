@@ -445,6 +445,7 @@ CAUSE_ORDER_ERRORS = "order_errors_or_rejections"
 CAUSE_RUN_STATE_ERROR = "run_state_error_or_missing_classification"
 CAUSE_ROW_BLOCK = "per_row_guard_or_block"
 CAUSE_UNKNOWN = "unknown_no_order_record"
+CAUSE_PREFLIGHT_MISSING = "morning_preflight_missing_or_invalid"
 
 
 def _row_block_evidence(row: Mapping[str, Any]) -> List[str]:

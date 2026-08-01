@@ -46,6 +46,26 @@ time -- so this module recomputes just that one field per ticker before
 handing it to the decision function (Codex review: "Compare against the most
 recent valid reference price").
 
+KNOWN LIMITATION: reference price is broker average_price only. That same
+``reference_price_preference`` config also documents a fuller preference --
+logged ``target_price``, then ``decision_price``, and only then
+``average_fill_price`` -- read from a prior run's own artifacts (see
+``scripts.run_classification._PRICE_COLS``). This module cannot honor that
+fuller chain: it is deliberately stateless and broker-only (see WHAT THIS IS
+FOR above), and a raw broker order carries no logged target/decision price,
+only what was actually filled at (``normalize_order``'s ``average_price``).
+Recovering target/decision price would mean reading the same per-run
+artifacts whose absence this module exists to tolerate, reintroducing the
+exact fragility (a missing/unreachable state root read as "nothing to
+recover") this replacement was built to remove. Using the confirmed fill
+price is therefore a real, deliberate trade-off, not an oversight: it can be
+either more or less permissive than the full chain depending on whether a
+given fill happened to slip above or below its original target (Codex
+review: "Preserve the configured reference-price preference" -- flagged and
+accepted as a known gap rather than silently resolved either direction,
+since reintroducing artifact reads or making this gate permanently unable to
+authorize an automatic top-up both carry their own risk to a live strategy).
+
 It also does not decide share-class equivalence. ``GOOG`` and ``GOOGL`` are
 scored as independent tickers here, exactly as ``config/tickers.json`` lists
 them. Changing that is a portfolio-construction decision for a human.

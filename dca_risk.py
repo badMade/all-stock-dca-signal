@@ -37,7 +37,7 @@ import json
 import logging
 from datetime import date, datetime, time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 from near_close_dca import StrategyConfig, kill_switch_engaged
@@ -61,6 +61,20 @@ KILL_SWITCH_WINDOW_DAYS = 7
 STREAM_SCHEDULED = "scheduled"
 STREAM_MANUAL = "manual"
 STREAM_OTHER = "other"
+# Report-only sub-buckets of STREAM_SCHEDULED for build_risk_report's
+# deployed_last_7d_usd_by_stream, NOT values classify_stream() ever returns.
+# The seven-slot roster's 10:30/12:30 identities (run_dca.run_slot()) validate
+# as STREAM_SCHEDULED (Codex review: "Mirror roster identities in the runtime
+# validator"), but their timestamp is always before the 2:30 PM afternoon-
+# evidence floor, so deployed_by_day(stream=STREAM_SCHEDULED) -- which also
+# requires is_afternoon_scheduled_evidence -- never counts them, and they no
+# longer classify as STREAM_OTHER either now that they are valid scheduled
+# evidence. Without a bucket of their own that capital vanished entirely from
+# every per-stream total instead of remaining visible outside the afternoon
+# kill-switch stream (Codex review: "Keep non-afternoon runs out of the
+# afternoon risk stream").
+STREAM_MORNING = "morning"
+STREAM_MIDDAY = "midday"
 
 
 # --- run_state parsing -------------------------------------------------------
@@ -136,19 +150,57 @@ def classify_stream(state: Dict[str, Any]) -> str:
     return STREAM_OTHER
 
 
+def _classification_stream(state: Dict[str, Any]) -> Optional[str]:
+    """The run_classification block's own ``stream`` field, or None if absent/missing."""
+    rc = state.get("run_classification") if isinstance(state, dict) else None
+    return rc.get("stream") if isinstance(rc, dict) else None
+
+
 def is_afternoon_scheduled_evidence(state: Dict[str, Any]) -> bool:
     """True only if this is a scheduled run whose timestamp is at/after 2:30 PM ET.
 
     Rejects (returns False) a scheduled run whose timestamp lands before the
     afternoon floor, so a stray morning or pre-2:30 PM artifact can never be
-    counted as afternoon scheduled-live deployment.
+    counted as afternoon scheduled-live deployment. Also rejects a run whose
+    own classification claims the morning/midday stream: the seven-slot
+    roster's 10:30/12:30 identities are valid STREAM_SCHEDULED evidence (see
+    STREAM_MORNING/STREAM_MIDDAY above) but must never be double-counted here
+    just because a future slot happened to land at/after the time floor.
+
+    Excludes ONLY the morning/midday streams, not every non-"afternoon" value:
+    docs/risk_management.md documents a 2:30 PM intraday slot -- not yet
+    wired into validate_classification() -- that is INTENDED to jointly fund
+    this same afternoon kill-switch alongside the 3:30 PM slot. Rejecting
+    every stream other than exactly "afternoon" would keep excluding that
+    2:30 PM slot's evidence even after its identity is eventually accepted,
+    perpetuating the documented undercount instead of only guarding against
+    the two streams this function actually knows are non-afternoon (Codex
+    review: "Preserve the documented 14:30 risk-stream eligibility").
     """
     if classify_stream(state) != STREAM_SCHEDULED:
+        return False
+    if _classification_stream(state) in (STREAM_MORNING, STREAM_MIDDAY):
         return False
     dt = run_timestamp_et(state)
     if dt is None:
         return False
     return dt.timetz().replace(tzinfo=None) >= AFTERNOON_EVIDENCE_FLOOR_ET
+
+
+def is_morning_scheduled_evidence(state: Dict[str, Any]) -> bool:
+    """True only if this is a valid STREAM_SCHEDULED run claiming the morning stream."""
+    return (
+        classify_stream(state) == STREAM_SCHEDULED
+        and _classification_stream(state) == STREAM_MORNING
+    )
+
+
+def is_midday_scheduled_evidence(state: Dict[str, Any]) -> bool:
+    """True only if this is a valid STREAM_SCHEDULED run claiming the midday stream."""
+    return (
+        classify_stream(state) == STREAM_SCHEDULED
+        and _classification_stream(state) == STREAM_MIDDAY
+    )
 
 
 def deployed_usd(state: Dict[str, Any]) -> float:
@@ -207,6 +259,7 @@ def deployed_by_day(
     *,
     stream: str = STREAM_SCHEDULED,
     require_afternoon_evidence: bool = True,
+    evidence_predicate: Optional[Callable[[Dict[str, Any]], bool]] = None,
 ) -> Dict[date, float]:
     """Sum deployed capital per trading day for a single stream.
 
@@ -215,6 +268,13 @@ def deployed_by_day(
     scheduled stream and ``require_afternoon_evidence`` is True, a scheduled run
     is only counted if it passes :func:`is_afternoon_scheduled_evidence` (at/after
     2:30 PM ET) — a pre-2:30 PM scheduled artifact is dropped, not counted.
+
+    ``evidence_predicate``, when given, REPLACES that afternoon-evidence check
+    (regardless of ``stream``/``require_afternoon_evidence``) with an arbitrary
+    per-state predicate -- e.g. :func:`is_morning_scheduled_evidence` to bucket
+    the seven-slot roster's own morning deployment separately from afternoon
+    scheduled-live evidence, both of which classify as the same STREAM_SCHEDULED
+    (Codex review: "Keep non-afternoon runs out of the afternoon risk stream").
     """
     per_day: Dict[date, float] = {}
     for state in states:
@@ -222,7 +282,10 @@ def deployed_by_day(
             continue
         if classify_stream(state) != stream:
             continue
-        if (
+        if evidence_predicate is not None:
+            if not evidence_predicate(state):
+                continue
+        elif (
             stream == STREAM_SCHEDULED
             and require_afternoon_evidence
             and not is_afternoon_scheduled_evidence(state)
@@ -318,7 +381,13 @@ def build_risk_report(
 
     Reports the 30-day burn and 7-day deployment for the scheduled-live stream
     (the trading stream), plus per-stream 7-day deployment so an operator can see
-    that manual/other streams are tracked but excluded from the guard.
+    that manual/other streams are tracked but excluded from the guard. The
+    seven-slot roster's own morning/midday deployment (STREAM_MORNING/
+    STREAM_MIDDAY) is reported separately from both: it validates as
+    STREAM_SCHEDULED (so it is not "other") but is not afternoon evidence (so
+    it does not fund the kill-switch) -- without its own bucket that capital
+    would be counted in neither total and vanish from this report (Codex
+    review: "Keep non-afternoon runs out of the afternoon risk stream").
     """
     config = config or StrategyConfig()
     scheduled = deployed_by_day(states, stream=STREAM_SCHEDULED)
@@ -329,6 +398,18 @@ def build_risk_report(
         STREAM_SCHEDULED: deployed_7d,
         STREAM_MANUAL: seven_day_deployed(
             deployed_by_day(states, stream=STREAM_MANUAL), as_of
+        ),
+        STREAM_MORNING: seven_day_deployed(
+            deployed_by_day(
+                states, stream=STREAM_SCHEDULED, evidence_predicate=is_morning_scheduled_evidence
+            ),
+            as_of,
+        ),
+        STREAM_MIDDAY: seven_day_deployed(
+            deployed_by_day(
+                states, stream=STREAM_SCHEDULED, evidence_predicate=is_midday_scheduled_evidence
+            ),
+            as_of,
         ),
         STREAM_OTHER: seven_day_deployed(
             deployed_by_day(states, stream=STREAM_OTHER, require_afternoon_evidence=False),
@@ -350,8 +431,8 @@ def build_risk_report(
         "deployed_last_7d_usd_by_stream": per_stream_7d,
         "streams_note": (
             "Only the scheduled-live afternoon stream funds the kill-switch; "
-            "manual and other streams are reported for visibility but never "
-            "counted toward scheduled-live deployment."
+            "manual, morning, midday, and other streams are reported for "
+            "visibility but never counted toward scheduled-live deployment."
         ),
     }
 

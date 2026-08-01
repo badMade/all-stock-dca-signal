@@ -2879,7 +2879,7 @@ def test_run_pipeline_raw_persistence_failure_writes_error_state(tmp_path):
     assert run_state["buy_candidates"] == []
 
 
-def test_run_slot_raw_persistence_failure_preserves_the_slots_own_identity(tmp_path):
+def test_run_slot_raw_persistence_failure_preserves_the_slots_own_identity(tmp_path, monkeypatch):
     """A 10:30/12:30 run whose raw persistence fails must not stamp itself as
     the afternoon (15:30, cron_id 10ce362c) scheduled run either --
     raw_persistence_failure_run_state is the OTHER early-exit builder that
@@ -2887,7 +2887,16 @@ def test_run_slot_raw_persistence_failure_preserves_the_slots_own_identity(tmp_p
     "Preserve slot identity on early failure artifacts")."""
     import json
 
+    import run_dca as run_dca_module
     from run_dca import run_slot
+
+    # This test exercises raw-persistence failure, not the morning preflight
+    # gate -- admit the full universe so the run reaches run_pipeline().
+    monkeypatch.setattr(
+        run_dca_module,
+        "morning_preflight_eligible_tickers",
+        lambda now, tickers, **kw: (list(tickers), {}),
+    )
 
     class ExplodingPayload:
         pass
@@ -4031,6 +4040,12 @@ def test_run_slot_runs_the_pipeline_under_the_slots_own_stream(slot, stream, tmp
         return invoke()
 
     monkeypatch.setattr(run_dca_module, "guarded_run", _capture)
+    # This test exercises stream attribution, not the morning preflight gate.
+    monkeypatch.setattr(
+        run_dca_module,
+        "morning_preflight_eligible_tickers",
+        lambda now, tickers, **kw: (list(tickers), {}),
+    )
 
     config = _demo_config()
     result = run_slot(
@@ -4103,6 +4118,13 @@ def test_run_slot_logs_model_usage_under_the_slots_own_cron_id(slot, expected_cr
         return None
 
     monkeypatch.setattr(run_dca_module, "log_model_usage", _fake_log_model_usage)
+    # This test exercises model-usage cron_id attribution, not the morning
+    # preflight gate.
+    monkeypatch.setattr(
+        run_dca_module,
+        "morning_preflight_eligible_tickers",
+        lambda now, tickers, **kw: (list(tickers), {}),
+    )
 
     config = _demo_config()
     run_slot(
@@ -4135,6 +4157,13 @@ def test_run_slot_anchors_decision_time_to_the_slot(slot, expected_time, tmp_pat
         return real_run_pipeline(now, config, *args, **kwargs)
 
     monkeypatch.setattr(run_dca_module, "run_pipeline", _capture)
+    # This test exercises decision-time anchoring, not the morning preflight
+    # gate.
+    monkeypatch.setattr(
+        run_dca_module,
+        "morning_preflight_eligible_tickers",
+        lambda now, tickers, **kw: (list(tickers), {}),
+    )
 
     config = _demo_config()
     run_slot(
@@ -4277,6 +4306,39 @@ def test_run_slot_date_gate_block_preserves_the_slots_own_identity(tmp_path):
     assert run_state["correlation_id"] == "dca-2026-07-07-morning-1030et"
 
 
+def test_run_slot_calendar_gate_takes_priority_over_a_missing_preflight(tmp_path, monkeypatch):
+    """On a weekend/holiday/out-of-window date, the same-day 09:45 preflight
+    artifact is legitimately absent too -- this must resolve as the ordinary
+    date/holiday block (Codex review: "Apply the calendar gate before the
+    preflight early return"), not be misdiagnosed as a failed safety
+    prerequisite. Uses an out-of-approved-window date (like
+    test_run_slot_date_gate_block_preserves_the_slots_own_identity) with no
+    preflight artifact written either, so both gates would fire if checked
+    independently -- the calendar gate's shape must win."""
+    import json
+
+    from run_dca import run_slot
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _demo_config()  # only approves 2026-07-06
+    off_approved_day_now = _now_for_slot("1030ET", day=(2026, 7, 7))
+    result = run_slot(
+        "1030ET",
+        now=off_approved_day_now,
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path / "artifacts",
+    )
+    run_state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
+    assert run_state["status"] == "blocked"
+    assert run_state["completion_reason"] == "date_or_holiday_gate_blocked"
+    assert "error_class" not in run_state or run_state["error_class"] is None
+    assert run_state["is_trading_failure"] is False
+
+
 def test_run_slot_1030et_blocks_the_universe_when_no_preflight_artifact_exists(tmp_path, monkeypatch):
     """config/morning_dca.json's live_task.preflight_artifact_resolution: a
     missing/invalid same-day 9:45 pre-flight artifact must reduce the eligible
@@ -4306,8 +4368,179 @@ def test_run_slot_1030et_blocks_the_universe_when_no_preflight_artifact_exists(t
     )
     run_state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
     assert run_state["counts"]["evaluated"] == 0
-    assert run_state["signal_rows"] == []
     assert run_state["buy_candidates"] == []
+    # A missing preflight artifact must read as a STARTUP FAILURE -- the same
+    # blocked-before-placement shape morning_dca._apply_blocked_before_placement_fields
+    # stamps for its own preflight-block path -- not an ordinary evaluated-to-
+    # zero run or the calendar gate's completed-no-orders shape: both would
+    # hide a failed safety prerequisite from failure/watchdog reporting
+    # entirely (Codex review: "Persist a blocked state when morning preflight
+    # is missing", "Classify missing preflight as a startup failure").
+    assert result["blocked"] is True
+    assert result["error_class"] == "scheduled_run_blocked_before_placement"
+    assert run_state["run_classification_outcome"] == "failed_scheduled_run_startup"
+    assert run_state["error_class"] == "scheduled_run_blocked_before_placement"
+    assert run_state["is_trading_failure"] is True
+    assert run_state["completion_reason"] is None
+    assert run_state["block_reason"]
+    assert run_state["scheduled_evidence_denied"] is True
+    assert run_state["run_classification"]["stream"] == "morning"
+    assert run_state["run_classification"]["valid_afternoon_scheduled_evidence"] is False
+    assert run_state["correlation_id"] == result["correlation_id"]
+
+
+def test_run_slot_1030et_preflight_block_still_runs_account_pinning_first(tmp_path, monkeypatch):
+    """Even with the calendar gate passed and the preflight artifact missing,
+    a mismatched broker/account must still raise instead of being masked by
+    the preflight-blocked result. This early return runs before
+    run_daily_compact ever reaches _check_execution_gates's account checks,
+    so without its own check an approved live run with BOTH a missing
+    preflight AND a misconfigured/mismatched account would persist and alert
+    only the preflight failure, hiding the account-safety refusal until a
+    later run happened to have valid preflight data (Codex review: "Run
+    account checks before returning the preflight failure")."""
+    from run_dca import run_slot
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _demo_config()
+    mismatched_broker = DryRunBroker(account=f"not-{config.target_account_number}")
+
+    with pytest.raises(RuntimeError, match="Refusing to trade account"):
+        run_slot(
+            "1030ET",
+            now=_now_for_slot("1030ET"),
+            config=config,
+            state=StrategyState(),
+            finance_data=DemoDataProvider(SourceName.FINANCE),
+            robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+            broker=mismatched_broker,
+            artifacts_dir=tmp_path / "artifacts",
+        )
+    # No preflight-failure artifact must have been persisted -- the refusal
+    # must win outright, not race with or follow a written blocked state.
+    assert not (tmp_path / "artifacts" / "run_state.json").exists()
+
+
+def test_run_slot_1030et_preflight_block_still_warns_on_window_expiry(tmp_path, monkeypatch):
+    """_check_execution_gates's own first, unconditional action --
+    warn_if_window_expiring -- must still fire on the preflight-blocked early
+    return, which runs before run_daily_compact ever reaches that gate.
+    Without this, an approved live run whose window is about to expire gets
+    no countdown on a day its preflight also happens to be missing, silently
+    losing the warning meant to stop live trading from lapsing without notice
+    (Codex review: "Emit the approved-window expiry warning before
+    returning")."""
+    import run_dca
+    from run_dca import run_slot
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _demo_config()
+    captured = {}
+
+    def _spy(approved_dates, trading_day, **kwargs):
+        captured["approved_dates"] = approved_dates
+        captured["trading_day"] = trading_day
+
+    monkeypatch.setattr(run_dca, "warn_if_window_expiring", _spy)
+
+    run_slot(
+        "1030ET",
+        now=_now_for_slot("1030ET"),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path / "artifacts",
+    )
+
+    assert captured.get("trading_day") is not None
+    assert captured["trading_day"].isoformat() == "2026-07-06"
+    assert captured.get("approved_dates") == config.approved_test_dates
+
+
+@patch("scripts.drift_detection.send_slack_alert")
+def test_run_slot_1030et_preflight_block_sends_its_own_slack_alert(
+    mock_send_slack_alert, tmp_path, monkeypatch
+):
+    """guarded_run pings a failed heartbeat for this result but deliberately
+    sends no Slack alert itself when result_ok is false: structured-failure
+    callers are expected to emit their own targeted alert. Without one, this
+    newly classified startup failure would lack the immediate operator
+    notification that escaping exceptions and raw-persistence failures
+    receive (Codex review: "Alert on returned preflight failures")."""
+    from run_dca import run_slot
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = load_strategy_config(
+        approved_test_dates=frozenset({_now().date()}), dry_run=False
+    )
+    broker = DryRunBroker(account=config.target_account_number)
+    result = run_slot(
+        "1030ET",
+        now=_now_for_slot("1030ET"),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=broker,
+        artifacts_dir=tmp_path / "artifacts",
+    )
+
+    assert result["blocked"] is True
+    mock_send_slack_alert.assert_called_once()
+    report = mock_send_slack_alert.call_args[0][0]
+    assert report.run_suspected_cause == "morning_preflight_missing_or_invalid"
+    assert "drift_report" in result
+    assert (tmp_path / "artifacts" / "drift_report.json").exists()
+
+
+def test_run_slot_1030et_preflight_block_preserves_a_prior_attempts_submitted_orders(
+    tmp_path, monkeypatch
+):
+    """A same-slot retry whose EARLIER attempt already submitted orders must
+    not have this write erase them: the failure state overwrites the slot's
+    canonical run_state.json, and the contract writer regenerates
+    submitted_orders.csv from buy_candidates, so an unconditional zero here
+    would erase real placement evidence from reporting and reconciliation --
+    the same loss the raw-persistence failure path already guards against
+    (Codex review: "Preserve prior orders on preflight-blocked retries")."""
+    import json
+
+    from run_dca import run_slot
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _demo_config()
+    artifacts_dir = tmp_path / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+    (artifacts_dir / "submitted_orders.csv").write_text(
+        "ticker,order_id,submitted_amount_usd,status\n"
+        "AAA,o-earlier,2.0,submitted\n",
+        encoding="utf-8",
+    )
+
+    result = run_slot(
+        "1030ET",
+        now=_now_for_slot("1030ET"),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=artifacts_dir,
+    )
+
+    run_state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
+    assert run_state["orders_submitted_count"] == 1
+    assert [c["order_id"] for c in run_state["buy_candidates"]] == ["o-earlier"]
+    # The aggregate fields agree with the carried count, the same as the
+    # raw-persistence path: the state must not simultaneously claim orders
+    # were and were not submitted.
+    assert run_state["order_submit_status"] == "submitted"
+    assert run_state["run_classification_outcome"] == "failed_after_partial_submission"
+    assert run_state["counts"]["submitted"] == 1
+    assert run_state["is_trading_failure"] is True
+    assert run_state["placement_evidence_incomplete"] is True
 
 
 def test_run_slot_1230et_and_1530et_are_unaffected_by_a_missing_preflight_artifact(tmp_path, monkeypatch):
@@ -4395,7 +4628,13 @@ def test_run_slot_no_longer_forces_one_order_per_ticker_per_day(slot, tmp_path):
 
     monkeypatch_target = run_dca_module
     original = monkeypatch_target.run_pipeline
+    original_preflight = monkeypatch_target.morning_preflight_eligible_tickers
     monkeypatch_target.run_pipeline = _capture
+    # This test exercises the one_order_per_ticker_per_day flag, not the
+    # morning preflight gate.
+    monkeypatch_target.morning_preflight_eligible_tickers = (
+        lambda now, tickers, **kw: (list(tickers), {})
+    )
     try:
         config = _demo_config()
         run_slot(
@@ -4410,6 +4649,7 @@ def test_run_slot_no_longer_forces_one_order_per_ticker_per_day(slot, tmp_path):
         )
     finally:
         monkeypatch_target.run_pipeline = original
+        monkeypatch_target.morning_preflight_eligible_tickers = original_preflight
 
     assert captured["one_order_per_ticker_per_day"] is False
 
