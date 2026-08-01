@@ -4669,6 +4669,11 @@ class RunResult:
     # ticker -> missing-fill reason captured during the order loop (cap/broker/gap).
     loop_block_reasons: Dict[str, str] = field(default_factory=dict)
     active_universe: List[str] = field(default_factory=list)
+    # Kept last so existing positional callers (e.g. RunResult(day, decisions,
+    # execution_records)) keep binding to the same fields -- codex review
+    # discussion_r3692009447.
+    run_label: str = "manual"
+    scheduled: bool = False
 
 
 @dataclass
@@ -4696,7 +4701,7 @@ def _percentile(sorted_values: Sequence[float], pct: float) -> float:
     return sorted_values[low] * (1.0 - frac) + sorted_values[high] * frac
 
 
-def build_report(run_result: RunResult, run_label: str, generated_at: datetime) -> ReportResult:
+def build_report(run_result: RunResult, generated_at: datetime) -> ReportResult:
     """Assemble the slippage/coverage report data (no file I/O)."""
     filled = [r for r in run_result.execution_records if r.status == "filled"]
     ranked = sorted(filled, key=lambda r: abs(r.slippage_pct or 0.0), reverse=True)
@@ -4743,7 +4748,7 @@ def build_report(run_result: RunResult, run_label: str, generated_at: datetime) 
 
     return ReportResult(
         generated_at=generated_at,
-        run_label=run_label,
+        run_label=run_result.run_label,
         ranked_slippage=ranked,
         top_slippage_tickers=top_tickers,
         missing_fills=missing,
@@ -4835,7 +4840,6 @@ def render_report_markdown(report: ReportResult, run_result: RunResult) -> str:
 def generate_slippage_report(
     run_result: RunResult,
     *,
-    run_label: str,
     output_dir: str,
     now: Optional[datetime] = None,
 ) -> ReportResult:
@@ -4844,9 +4848,9 @@ def generate_slippage_report(
     Reusable after manual or scheduled execution. Performs no interactive prompting.
     """
     generated_at = (now or datetime.now(tz=EASTERN)).astimezone(EASTERN)
-    report = build_report(run_result, run_label, generated_at)
+    report = build_report(run_result, generated_at)
     stamp = generated_at.strftime("%Y%m%d-%H%M%S")
-    base = f"dca_{run_label}_{run_result.trading_day.isoformat()}_{stamp}"
+    base = f"dca_{run_result.run_label}_{run_result.trading_day.isoformat()}_{stamp}"
     os.makedirs(output_dir, exist_ok=True)
     csv_path = os.path.join(output_dir, f"{base}_orders.csv")
     report_path = os.path.join(output_dir, f"{base}_slippage_coverage.md")
@@ -4860,8 +4864,6 @@ def generate_slippage_report(
 def write_run_state(
     state_path: str,
     *,
-    run_label: str,
-    scheduled: bool,
     run_result: RunResult,
     report: ReportResult,
     config: StrategyConfig,
@@ -4870,8 +4872,8 @@ def write_run_state(
     """Write the manual/scheduled run-state JSON including artifact paths + metrics."""
     trading_day = run_result.trading_day
     payload = {
-        "run_label": run_label,
-        "scheduled": scheduled,
+        "run_label": run_result.run_label,
+        "scheduled": run_result.scheduled,
         "trading_day": trading_day.isoformat(),
         "generated_at": report.generated_at.isoformat(),
         "dry_run": config.dry_run,
@@ -6700,6 +6702,11 @@ def _run_once_impl(ctx: RunContext) -> List[ReconciledDecision]:
     trading_day = now_et.date()
     if run_result is not None:
         run_result.trading_day = trading_day
+        # Sync the resolved scheduled flag onto the result so write_run_state
+        # reflects how this run actually executed, not whatever default the
+        # caller's RunResult happened to be constructed with -- codex review
+        # discussion_r3692009453.
+        run_result.scheduled = scheduled
 
     errors_count = 0
     order_reviews_attempted = 0
@@ -6866,19 +6873,22 @@ def run_and_report(
     """
     if deployment_history_root is None:
         deployment_history_root = Path(output_dir).parent
-    run_result = RunResult(trading_day=now.astimezone(EASTERN).date(), decisions=[])
+    run_result = RunResult(
+        trading_day=now.astimezone(EASTERN).date(),
+        decisions=[],
+        run_label=run_label,
+        scheduled=scheduled,
+    )
     run_once(
         now, config, state, finance_data, robinhood_data, broker,
         run_result=run_result, deployment_history_root=deployment_history_root,
         scheduled=scheduled,
     )
     report = generate_slippage_report(
-        run_result, run_label=run_label, output_dir=output_dir, now=now
+        run_result, output_dir=output_dir, now=now
     )
     written_state = write_run_state(
         state_path,
-        run_label=run_label,
-        scheduled=scheduled,
         run_result=run_result,
         report=report,
         config=config,
@@ -6935,7 +6945,12 @@ def run_daily_compact(
     It may interact with the passed-in broker adapter (dry-run by default).
     """
     trading_day = now.astimezone(EASTERN).date()
-    run_result = RunResult(trading_day=trading_day, decisions=[])
+    run_result = RunResult(
+        trading_day=trading_day,
+        decisions=[],
+        run_label=run_label,
+        scheduled=scheduled,
+    )
     run_once(
         now,
         config,

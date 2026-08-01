@@ -1980,7 +1980,7 @@ def test_build_report_metrics_and_ranking():
         loop_block_reasons={},
         active_universe=["A", "B", "C", "D"],
     )
-    report = build_report(run_result, "manual", datetime(2026, 6, 29, 16, 0, tzinfo=EASTERN))
+    report = build_report(run_result, datetime(2026, 6, 29, 16, 0, tzinfo=EASTERN))
     # A has larger abs slippage (1.0%) than B (0.2%), so A ranks first.
     assert [r.ticker for r in report.ranked_slippage] == ["A", "B"]
     assert report.top_slippage_tickers == ["A", "B"]
