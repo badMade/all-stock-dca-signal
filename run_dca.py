@@ -53,7 +53,9 @@ from morning_dca import (
     DEFAULT_MORNING_LIVE_STATE_ROOT,
     MORNING_LIVE_CRON_ID,
     MORNING_LIVE_MODE,
+    MORNING_STREAM,
     load_morning_config,
+    morning_preflight_eligible_tickers,
 )
 from near_close_dca import (
     _TS_FLOOR,
@@ -175,10 +177,59 @@ class UnsupportedSlotError(ValueError):
     """Raised when a requested slot is unsupported or intentionally disabled."""
 
 
+class OffScheduleSlotError(ValueError):
+    """Raised when a slot fires outside its scheduled +/-5-minute window."""
+
+
 def _slot_time_et(window: str) -> time:
     """'1030ET' -> time(10, 30). ``window`` is always a SLOT_MAP value."""
     digits = window[:-2] if window.endswith("ET") else window
     return time(int(digits[:2]), int(digits[2:]))
+
+
+# Matches the +/-5-minute scheduled_window_start_et/scheduled_window_end_et
+# _slot_classification_overrides already stamps onto the run artifact.
+_SLOT_SCHEDULE_TOLERANCE = timedelta(minutes=5)
+
+# 1530ET's own approved trigger_window (config/scheduled_tasks.json's "10ce362c"
+# entry) narrows the START bound to 15:30-15:32 ET specifically, because the
+# 15:35 post-trade sync task (67aa802b) neither waits nor retries for an
+# in-progress run: a late-but-permitted start under the shared +/-5-minute
+# tolerance (as late as 15:35) could still race that sync and make it report a
+# missing or partial final-run (Codex review: "Enforce the final slot's 15:32
+# start cutoff"). Every other slot keeps the shared symmetric tolerance.
+_SLOT_SCHEDULE_BOUNDS: Dict[str, tuple[timedelta, timedelta]] = {
+    "1530ET": (timedelta(0), timedelta(minutes=2)),
+}
+
+
+def _validate_slot_schedule(now: datetime, window: str) -> None:
+    """Abort a roster slot invocation whose wall-clock time misses its window.
+
+    ``run_pipeline``'s generic execution gates only ever receive the trading
+    DATE, so without this, ``run_slot("1030ET", now=<14:00 ET>)`` would merely
+    anchor signal history to 10:30 (via ``decision_time_et``) and still place
+    a live market order hours off-schedule. Every live executor contract
+    (``claude/dca-executor-prompts/live-mirror/*``) treats an off-schedule
+    firing as a scheduler fault that must abort, not a normal business
+    condition to size around (Codex review: "Reject slot invocations outside
+    their scheduled window").
+    """
+    slot_time = _slot_time_et(window)
+    anchor = datetime(2000, 1, 1, slot_time.hour, slot_time.minute)
+    now_et = now.astimezone(EASTERN)
+    now_anchor = now_et.replace(year=2000, month=1, day=1, tzinfo=None)
+    delta = now_anchor - anchor
+    before_tolerance, after_tolerance = _SLOT_SCHEDULE_BOUNDS.get(
+        window, (_SLOT_SCHEDULE_TOLERANCE, _SLOT_SCHEDULE_TOLERANCE)
+    )
+    if delta < -before_tolerance or delta > after_tolerance:
+        raise OffScheduleSlotError(
+            f"slot {window} fired at {now_et.time().isoformat()} ET, outside its "
+            f"scheduled -{before_tolerance}/+{after_tolerance} window around "
+            f"{slot_time.isoformat()} ET; aborting as a scheduler fault rather "
+            "than placing an off-schedule order"
+        )
 
 
 def _slot_classification_overrides(
@@ -829,11 +880,15 @@ def _fills_from_orders_csv(orders_csv: Path) -> List[Dict[str, Any]]:
         for row in csv.DictReader(handle):
             if (row.get("status") or "").lower() != "filled":
                 continue
+            fill_price = (row.get("avg_fill_price") or "").strip()
+            filled_qty = (row.get("quantity_filled") or "").strip()
+            if fill_price in ("", "-") or filled_qty in ("", "-"):
+                continue
             fills.append(
                 {
                     "ticker": row.get("ticker"),
-                    "fill_price": row.get("avg_fill_price"),
-                    "filled_qty": row.get("quantity_filled"),
+                    "fill_price": fill_price,
+                    "filled_qty": filled_qty,
                     "order_id": row.get("order_id"),
                 }
             )
@@ -1400,10 +1455,49 @@ def run_slot(
     if normalized_slot not in SLOT_MAP:
         raise UnsupportedSlotError(f"unsupported slot label: {slot!r}")
     stream_name, window = SLOT_MAP[normalized_slot]
+    _validate_slot_schedule(now, window)
     trading_day = now.astimezone(EASTERN).date().isoformat()
     correlation_id = build_correlation_id(trading_day, stream_name, window)
+    slot_tickers = config.tickers
+    if stream_name == MORNING_STREAM:
+        # The 10:30 slot must not scan the configured universe unconditionally:
+        # config/morning_dca.json's live_task.preflight_artifact_resolution
+        # requires a missing or invalid same-day 9:45 pre-flight artifact to
+        # reduce the eligible universe to ZERO, the same fail-closed contract
+        # MorningDCAExecutor._apply_preflight_gate() enforces for its own,
+        # separate morning-live entry point. Routed only through the generic
+        # pipeline, run_slot("1030ET") never called that gate at all, so a
+        # missing/invalid preflight artifact silently let it scan every
+        # configured ticker and place live orders without the required morning
+        # eligibility evidence (Codex review: "Route the morning slot through
+        # its required preflight gate"). allow_unpinned_account=True: this
+        # call only needs the preflight root/forbidden-roots/bounded-recovery
+        # fields, not an account -- the broker/account this slot actually
+        # trades through is the caller-supplied ``broker`` above.
+        morning_config = load_morning_config(
+            config_dir=config_dir, mode=MORNING_LIVE_MODE, allow_unpinned_account=True
+        )
+        slot_tickers, preflight_gate = morning_preflight_eligible_tickers(
+            now,
+            config.tickers,
+            preflight_run_state_root=morning_config.preflight_run_state_root,
+            preflight_forbidden_roots=morning_config.preflight_forbidden_roots,
+            preflight_bounded_recovery=morning_config.preflight_bounded_recovery,
+            manual=False,
+        )
+        if preflight_gate.get("preflight_missing_block"):
+            logger.warning(
+                "1030ET preflight gate blocked the morning universe: %s",
+                preflight_gate.get("block_reason"),
+            )
+        elif preflight_gate.get("gated_out_tickers"):
+            logger.info(
+                "1030ET preflight gate excluded tickers not admitted by the 9:45 pre-flight: %s",
+                preflight_gate["gated_out_tickers"],
+            )
     slot_config = replace(
         config,
+        tickers=slot_tickers,
         # Human decision (GATE5-PROPOSAL.md #4 item 2, 2026-07-30): guarded
         # top-up, not "first slot wins". False (rather than omitting the
         # override, which would leave whatever config/budgets.json's own
@@ -1748,6 +1842,8 @@ def _run_pipeline_impl(
                             "daily_cap_usd": state.current_tier().daily_cap_usd,
                             "weekly_cap_usd": state.effective_weekly_cap(),
                         },
+                        classification_overrides=classification_overrides,
+                        correlation_id=correlation_id,
                     )
                     # Preserve orders.csv from a prior successful run so that
                     # load_prior_same_day_allocations() can still find the fills
@@ -2264,7 +2360,7 @@ def _run_pipeline_impl(
                     # bounded-reload fix should make on its own; escalate
                     # loudly instead so an operator can decide whether the
                     # affected artifacts warrant a manual hold.
-                    logger.warning(
+                    logger.error(
                         "same-day context scan for %s still had unreadable/unparseable "
                         "artifacts after the bounded reload; a ticker whose ONLY "
                         "same-day artifact was affected would not appear in "

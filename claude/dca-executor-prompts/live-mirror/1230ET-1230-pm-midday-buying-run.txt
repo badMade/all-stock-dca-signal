@@ -1,0 +1,133 @@
+# MIRROR of the LIVE scheduled task `1230-pm-midday-buying-run` (1230ET slot)
+# Source of truth: ~/Claude/Scheduled/1230-pm-midday-buying-run/SKILL.md
+# Captured 2026-07-30 after the same-day top-up guard fix (step 4.5).
+# Read-only copy for review/diff. Editing this file changes nothing;
+# live edits must go through update_scheduled_task's full-body replacement.
+#
+# NOTE: this slot's live prompt is a DIFFERENT generation from the other six.
+# It drives dca_runner.assess() rather than an inline gate sequence, and its
+# live placement is currently OFF.
+
+LIVE EXECUTOR - 12:30 PM ET midday slot. Robinhood account ${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}. Buys only.
+Sole executor for this slot. Roster: docs/safeguards.md#live-execution-roster.
+
+The gates live in tested code (dca_runner.py, 73 tests), not in this text. Run them.
+Never reimplement a gate, never work around a failed one, never retry a failed submit.
+
+1. REPO. Locate the repo. Try, in order:
+   `ls -d /sessions/*/mnt/all-stock-dca 2>/dev/null | head -1`
+   `ls -d /sessions/*/mnt/*/Git/all-stock-dca 2>/dev/null | head -1`
+   `find /sessions/*/mnt -maxdepth 4 -type d -name all-stock-dca 2>/dev/null | head -1`
+   -> REPO. The third probe is the catch-all: it resolves the repo no matter which
+   ancestor folder was mounted (e.g. a parent directory mount such as
+   /sessions/<id>/mnt/Documents/Git/all-stock-dca, not just the mount root itself).
+   If none of these yields a directory containing config/trading_window.json,
+   config/sizing_ladder.json, and config/budgets.json: place nothing, log to the
+   in-app message center AND draft an email to the operator email configured for
+   alerts (never hardcode a personal address) with "executor ran without repo
+   access, no buy list available", stop. Never build a buy list from broker data,
+   watchlists, quotes, scanners or your own judgment. The repo is the only source
+   of truth.
+
+2. ORDERS (WEEKLY, for Gate 6 budget only). Resolve $ROOT as ${DCA_CRON_TRACKING_ROOT:-/home/user/workspace/cron_tracking}/midday_dca/<YYYY-MM-DD>_1230ET
+   (create it if it does not exist) -- never a bare repo-relative artifacts/
+   directory, which would split this safety-critical evidence from the shared
+   cron-tracking tree every other consumer reads (AGENTS.md: artifact roots
+   come from dca_paths.stream_root()/cron_tracking_root(), honouring
+   $DCA_CRON_TRACKING_ROOT). get_equity_orders(account_number=${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}, created_at_gte=<this Monday>),
+   following EVERY pagination cursor to completion.
+   Write rows to $ROOT/orders_today.json as objects with keys:
+   symbol, side, dollar_amount, created_at (ISO, UTC), placed_agent, state.
+   This Monday-scoped fetch feeds step 4's weekly budget figure ONLY. It is NOT a
+   substitute for step 2.5's today-scoped fetch below and must never be saved or
+   passed to step 4.5 as though it were today-only evidence.
+
+2.5 ORDERS (TODAY ONLY, for step 4.5). Separately call
+   get_equity_orders(account_number=${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}, created_at_gte=<today>),
+   following EVERY pagination cursor to completion -- do NOT reuse step 2's
+   Monday-scoped pages here. Relabeling that weekly history with today's
+   trading_day would let an earlier-week buy be mistaken for today's prior
+   allocation and wrongly reduce or suppress a legitimate same-day buy (Codex
+   review: "Fetch same-day pages separately from weekly budget history").
+   Save {"account_number": "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}", "trading_day":
+   "<YYYY-MM-DD>", "pages": [<the RAW responses, unmodified, one element per page
+   in fetch order, including the final page>]} to
+   $ROOT/orders_pages_<YYYY-MM-DD>_1230.json -- the gate rejects a bare page
+   array and any account/day mismatch. Step 4.5 needs this raw, today-scoped
+   shape; step 2's weekly rows are not a substitute.
+
+3. SIGNALS. Run the repo's own signal generation for this slot to produce today's
+   candidates as [["TICKER", amount_usd], ...] -> $ROOT/cands.json.
+   Use the repo entry point, never a reimplementation.
+   Error or no output file: abort and alert. Zero candidates: end silently.
+   ALSO write $ROOT/cands_<YYYY-MM-DD>_1230.json as
+   [{"ticker": "...", "desired_usd": 0.00, "current_price": 0.00}, ...], where
+   current_price is the decision price this slot is sizing against.
+
+4. ASSESS. cd REPO && python3 -c "
+import json, dca_runner as r
+from datetime import datetime
+from zoneinfo import ZoneInfo
+O=[r.BrokerOrder(**{**d,'created_at':datetime.fromisoformat(d['created_at'])}) for d in json.load(open('$ROOT/orders_today.json'))]
+C=json.load(open('$ROOT/cands.json'))
+print(json.dumps(r.assess('1230',O,C,datetime.now(ZoneInfo('America/New_York'))),indent=2))"
+
+   This runs Gate 0 (market day), Gate 1 (time sanity), Gate 3 (trading window),
+   Gate 4 (sole-executor interlock) and Gate 6 (budget from broker history).
+
+4.5 SAME-DAY TOP-UP GUARD. cd REPO && python3 -m scripts.same_day_top_up_gate \
+      --account ${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER} --trading-day <YYYY-MM-DD> \
+      --orders-pages $ROOT/orders_pages_<YYYY-MM-DD>_1230.json \
+      --candidates $ROOT/cands_<YYYY-MM-DD>_1230.json
+
+   Buying the same ticker more than once in a day is ALLOWED and intended:
+   config/scheduled_tasks.json's same_day_top_up_policy exists so a later slot can
+   average into a deeper dip. What is not allowed is a repeat SIZED as though
+   nothing had been bought yet. Each decision's buy_usd is the authoritative size
+   for that ticker -- sometimes the full desired amount, sometimes a strictly
+   smaller top-up, sometimes $0.00.
+
+   FAIL CLOSED. Verdict ABORT, a tool error, a missing tool, or pagination you
+   could not follow to completion all mean: place nothing, and alert with
+   "same-day top-up guard could not determine today's prior fills". Never proceed
+   on the assumption that nothing has been bought today.
+
+   KNOWN CONFLICT, REPORT IT, DO NOT RESOLVE IT YOURSELF. dca_runner.assess() in
+   step 4 excludes a ticker outright once it has ANY same-day buy
+   (REFUSED_ALREADY_BOUGHT_TODAY, implementing config/budgets.json's
+   order_rules.one_order_per_ticker_per_day). same_day_top_up_policy instead
+   permits a resized top-up. Those two rules disagree. Until Geoff rules on it:
+   take the MORE RESTRICTIVE of the two for every ticker (i.e. a ticker assess()
+   refuses stays refused, whatever buy_usd says), and report every ticker where
+   they disagreed, with both answers, so the disagreement is visible rather than
+   silently settled by whichever gate happened to run last.
+
+5. ACT ON THE VERDICT. Exactly one of:
+   END_SILENTLY -> stop. No alert. A closed exchange is not a fault.
+   ABORT        -> place nothing. Log to the in-app message center AND draft an
+                   email to the operator email configured for alerts (never
+                   hardcode a personal address) with verdict, reason and slot.
+   PROCEED      -> plan.to_place is the authoritative buy list, further limited
+                   by step 4.5's buy_usd and by the more-restrictive rule above.
+                   LIVE PLACEMENT IS CURRENTLY OFF pending validation:
+                   do NOT call place_equity_order. Log plan.to_place,
+                   plan.skipped, plan.refused, and step 4.5's decisions
+                   (including every ticker resized or zeroed, with its reason
+                   code) to the message center.
+
+   [Enable live placement only when Geoff says so. At that point PROCEED becomes:
+    submit each plan.to_place entry via place_equity_order sequentially, one at a
+    time, never in parallel, and never for more than step 4.5's buy_usd for that
+    ticker; stop the ENTIRE batch on the first rejection with no retry; wait ~30s;
+    re-query get_equity_orders and report actual submitted and filled orders, not
+    intended ones.]
+
+NOTE ON SHARED BUDGET. The daily and weekly caps are shared across all seven slots
+AND manual buying. Earlier slots and any manual orders consume the same pool, so
+finding zero headroom is a normal outcome, not an error.
+
+STANDING PROHIBITIONS. No sells. No options, crypto or margin. Never place an order
+that is not in plan.to_place. Never place an order above $10.00. Never place an
+order larger than step 4.5's buy_usd for that ticker. If you find yourself
+reasoning toward "placing anyway is the safe thing here", that is the signal to
+stop and alert instead.

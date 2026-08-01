@@ -1490,6 +1490,79 @@ def _forbidden_preflight_root_reason(
     return None
 
 
+def morning_preflight_eligible_tickers(
+    now: datetime,
+    tickers: Sequence[str],
+    *,
+    preflight_run_state_root: Optional[str] = None,
+    preflight_forbidden_roots: Sequence[str] = (),
+    preflight_bounded_recovery: bool = True,
+    manual: bool = False,
+) -> tuple[List[str], Dict[str, Any]]:
+    """Restrict ``tickers`` to the same-day 9:45 pre-flight verdict.
+
+    Shared by :meth:`MorningDCAExecutor._apply_preflight_gate` (which
+    additionally no-ops outside morning-live-mode) and the seven-slot roster's
+    ``run_dca.run_slot("1030ET", ...)``, so config/morning_dca.json's
+    fail-closed contract -- a missing or invalid pre-flight artifact reduces
+    the eligible universe to ZERO, not to the full configured universe -- is
+    enforced exactly once no matter which caller reaches the 10:30 slot
+    (Codex review: "Route the morning slot through its required preflight
+    gate").
+
+    Returns ``(admitted_tickers, gate_diagnostic)``: the same
+    ``preflight_gate``-shaped dict :class:`MorningDCAExecutor` stores on
+    itself, so a caller that wants to surface it (e.g. in artifacts) can.
+    """
+    trading_day = now.astimezone(EASTERN).date()
+    # stream_root() at CALL time, not an import-time constant -- same
+    # staleness reasoning as elsewhere in this module (Codex review, PR #219).
+    root = preflight_run_state_root or stream_root("morning_dca_preflight")
+    forbidden_roots = preflight_forbidden_roots or default_preflight_forbidden_roots()
+    forbidden_reason = _forbidden_preflight_root_reason(root, forbidden_roots)
+    if forbidden_reason is not None:
+        # must_not_look_under: treat a misconfigured root the same as
+        # "artifact not found" -- fail closed for scheduled runs -- rather
+        # than silently reading from (or failing to find data in) the
+        # 10:30 live output directory or a bare cron-id path.
+        if not manual:
+            return [], {
+                "preflight_found": False,
+                "preflight_missing_block": True,
+                "block_reason": forbidden_reason,
+            }
+        return list(tickers), {"preflight_found": False, "warning": forbidden_reason}
+    loaded = load_same_day_preflight(root, trading_day, bounded_recovery=preflight_bounded_recovery)
+    if loaded is None:
+        if not manual:
+            # Fail closed but return a durable-shaped diagnostic so watchdog and
+            # reporting can distinguish a missing-preflight block from a crash.
+            return [], {
+                "preflight_found": False,
+                "preflight_missing_block": True,
+                "block_reason": (
+                    "no same-day 9:45 pre-flight artifact found; "
+                    "scheduled live run blocked (fail-closed)"
+                ),
+            }
+        return list(tickers), {
+            "preflight_found": False,
+            "warning": "no same-day 9:45 pre-flight artifact found; evaluating full universe",
+        }
+    eligible = loaded["eligible_tickers"]
+    admitted = [t for t in tickers if t in eligible]
+    gated_out = [t for t in tickers if t not in eligible]
+    gate = {
+        "preflight_found": True,
+        "preflight_run_id": loaded["run_id"],
+        "eligible_to_execute_tickers": sorted(eligible),
+        "admitted_tickers": admitted,
+        "gated_out_tickers": gated_out,
+        "recovered_via_bounded_lookup": loaded.get("recovered_via_bounded_lookup", False),
+    }
+    return admitted, gate
+
+
 class DCAExecutor:
     """Base class for class-based DCA executors over the strategy library.
 
@@ -2358,63 +2431,15 @@ class MorningDCAExecutor(DCAExecutor):
         self.preflight_gate = None
         if not (self.mode == MORNING_LIVE_MODE and self.stream == MORNING_STREAM):
             return tickers
-        trading_day = now.astimezone(EASTERN).date()
-        # stream_root() at CALL time, not the import-time
-        # DEFAULT_MORNING_PREFLIGHT_STATE_ROOT constant -- same staleness
-        # reasoning as self.state_root above (Codex review, PR #219).
-        root = self.config.preflight_run_state_root or stream_root("morning_dca_preflight")
-        # default_preflight_forbidden_roots() at CALL time, not the
-        # import-time DEFAULT_PREFLIGHT_FORBIDDEN_ROOTS constant -- same
-        # staleness reasoning as root above (Codex review, PR #219: "Resolve
-        # forbidden preflight roots at call time").
-        forbidden_roots = self.config.preflight_forbidden_roots or default_preflight_forbidden_roots()
-        forbidden_reason = _forbidden_preflight_root_reason(root, forbidden_roots)
-        if forbidden_reason is not None:
-            # must_not_look_under: treat a misconfigured root the same as
-            # "artifact not found" -- fail closed for scheduled runs -- rather
-            # than silently reading from (or failing to find data in) the
-            # 10:30 live output directory or a bare cron-id path.
-            if not manual:
-                self.preflight_gate = {
-                    "preflight_found": False,
-                    "preflight_missing_block": True,
-                    "block_reason": forbidden_reason,
-                }
-                return []
-            self.preflight_gate = {"preflight_found": False, "warning": forbidden_reason}
-            return tickers
-        loaded = load_same_day_preflight(
-            root, trading_day, bounded_recovery=self.config.preflight_bounded_recovery
+        admitted, gate = morning_preflight_eligible_tickers(
+            now,
+            tickers,
+            preflight_run_state_root=self.config.preflight_run_state_root,
+            preflight_forbidden_roots=self.config.preflight_forbidden_roots,
+            preflight_bounded_recovery=self.config.preflight_bounded_recovery,
+            manual=manual,
         )
-        if loaded is None:
-            if not manual:
-                # Fail closed but write a durable blocked artifact so watchdog and
-                # reporting can distinguish a missing-preflight block from a crash.
-                self.preflight_gate = {
-                    "preflight_found": False,
-                    "preflight_missing_block": True,
-                    "block_reason": (
-                        "no same-day 9:45 pre-flight artifact found; "
-                        "scheduled live run blocked (fail-closed)"
-                    ),
-                }
-                return []
-            self.preflight_gate = {
-                "preflight_found": False,
-                "warning": "no same-day 9:45 pre-flight artifact found; evaluating full universe",
-            }
-            return tickers
-        eligible = loaded["eligible_tickers"]
-        admitted = [t for t in tickers if t in eligible]
-        gated_out = [t for t in tickers if t not in eligible]
-        self.preflight_gate = {
-            "preflight_found": True,
-            "preflight_run_id": loaded["run_id"],
-            "eligible_to_execute_tickers": sorted(eligible),
-            "admitted_tickers": admitted,
-            "gated_out_tickers": gated_out,
-            "recovered_via_bounded_lookup": loaded.get("recovered_via_bounded_lookup", False),
-        }
+        self.preflight_gate = gate
         return admitted
 
     @staticmethod

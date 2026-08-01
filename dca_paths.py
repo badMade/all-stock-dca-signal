@@ -30,16 +30,24 @@ module (including ``scripts/*``) can use it without creating a cycle. Mirrors
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import Any
 
 # The bundled production tree serialized in config/*.json. This must remain
 # stable so rebase_bundled_root() can detect and rewrite those paths.
 BUNDLED_CRON_TRACKING_ROOT = "/home/user/workspace/cron_tracking"
 
-# Local default for an unconfigured checkout: keep run artifacts inside this
-# repository so the root exists on any machine and remains gitignored.
-DEFAULT_CRON_TRACKING_ROOT = str((Path(__file__).resolve().parent / "cron_tracking").resolve())
+# Unset-env-var default. Deliberately identical to BUNDLED_CRON_TRACKING_ROOT
+# (rather than a checkout-relative path) so a deployment that does not export
+# $DCA_CRON_TRACKING_ROOT keeps reading/writing the exact tree its watchdogs
+# and prior-allocation consumers already monitor -- config/scheduled_tasks.json
+# itself falls back to this same literal path (see its
+# "${DCA_CRON_TRACKING_ROOT:-/home/user/workspace/cron_tracking}" shell
+# expansions), so this module's fallback must match it byte-for-byte or the
+# two would silently split onto different trees. A checkout without access to
+# that production path (Mac/local dev) must export the env var explicitly
+# rather than relying on this default to change out from under it (Codex
+# review: "Keep the established production artifact default stable").
+DEFAULT_CRON_TRACKING_ROOT = BUNDLED_CRON_TRACKING_ROOT
 
 # Deployment override, following the DCA_* convention already used by
 # DCA_CONFIG_DIR, DCA_ATTEMPT_LOG_ROOT, and DCA_INTRADAY_LIVE_STATE_ROOT.

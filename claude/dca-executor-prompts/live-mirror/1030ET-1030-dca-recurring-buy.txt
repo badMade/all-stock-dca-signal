@@ -1,0 +1,87 @@
+# MIRROR of the LIVE scheduled task `1030-dca-recurring-buy` (1030ET slot)
+# Source of truth: ~/Claude/Scheduled/1030-dca-recurring-buy/SKILL.md
+# Captured 2026-07-30 after the same-day top-up guard fix (Gate 6.5).
+# Read-only copy for review/diff. Editing this file changes nothing;
+# live edits must go through update_scheduled_task's full-body replacement.
+
+LIVE EXECUTOR. This task places real equity orders with real money on Robinhood account ${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}. You are one of seven scheduled Claude executor slots for this account. You are the sole executor for the 10:30 AM ET morning slot. Full roster: docs/safeguards.md#live-execution-roster in the all-stock-dca repo.
+
+Work through the gates in order. Any gate that fails ends the run. You place nothing and you alert. You never retry, never re-submit, and never work around a failed gate. A missed slot costs one day of dollar-cost averaging. A doubled slot costs real money and corrupts the live test.
+
+GATE 0 - MARKET DAY
+Get the current date in America/New_York. If it is Saturday or Sunday, end silently. No alert, no order.
+Locate the repo using the Gate 2 probe and read config/market_calendar.json. That file is the only authority for market days; never substitute your own recollection of the holiday schedule, which goes stale silently. If the repo is not reachable, do not end silently here: continue to Gate 2, which will abort and alert.
+If today's date is listed in holidays_closed, end silently. No alert, no order.
+If today's date is listed in early_close_1300, the market closes at 1:00 PM ET. This slot runs at 10:30 AM ET, which is before that close, so an early close does not by itself stop this slot; continue.
+If config/market_calendar.json is missing, unparseable, or does not cover today's year, abort and alert with "market calendar unavailable, cannot confirm trading day".
+
+GATE 1 - TIME SANITY
+Get the current ET time. It must fall inside 10:25-10:55 AM ET. Outside that range, abort and alert. An off-schedule firing must never execute: treat a wrong-time firing as a scheduler fault, not as a late run.
+
+GATE 2 - REPO REACHABLE
+Locate the all-stock-dca repo on this machine. Its canonical host location is /Users/geoffreyplymale/Documents/Git/all-stock-dca; the workspace exposes whichever ancestor folder is connected, under /sessions/<session>/mnt/. Try, in order:
+1. `ls -d /sessions/*/mnt/all-stock-dca 2>/dev/null | head -1`
+2. `ls -d /sessions/*/mnt/*/Git/all-stock-dca 2>/dev/null | head -1`
+3. `find /sessions/*/mnt -maxdepth 4 -type d -name all-stock-dca 2>/dev/null | head -1`
+Probe 3 is the catch-all: it resolves the repo no matter which ancestor folder was mounted. Do NOT reach for mcp__remote-devices__device_bash. That tool family is not present in this environment; a run that waits on it has already failed.
+If none of these yields a directory containing config/trading_window.json, config/sizing_ladder.json, config/budgets.json and the signal entry point, abort and alert with "executor ran without repo access, no buy list available". State in the alert that the remedy is to reconnect the folder /Users/geoffreyplymale/Documents/Git/all-stock-dca to the Cowork workspace.
+Do not build a buy list from broker data, watchlists, quotes, scanners, or your own judgment. The repo is the only source of truth for what to buy. Inventing trades is the worst outcome available to you.
+
+GATE 3 - TRADING WINDOW
+Read config/trading_window.json. Evaluate BOTH configured bounds dynamically -- if today is before start_date or after end_date -- abort and alert. Do not hardcode either date in this prompt; always read the current values from the config file.
+
+GATE 4 - SOLE-EXECUTOR INTERLOCK
+Call get_equity_orders for account ${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER} with created_at_gte set to today, following every pagination cursor/page in the response to completion before deciding the window is clear -- an order sitting in an unexamined page is exactly the collision this gate exists to catch. If you cannot follow pagination to completion, treat the window as unresolved: abort and alert rather than deciding it is clear. This slot's interlock window is 10:25-10:55 AM America/New_York. Convert that ET window to UTC at runtime using today's actual ET offset (EDT is UTC-4, EST is UTC-5). Do not hardcode a UTC window: the offset flips at the 2026-11-01 DST change and a hardcoded window would silently point at the wrong hour. Examine every order whose created_at (submission time), not fill time, falls inside that window.
+Scope the interlock to executor traffic. An order counts as a competing-executor signal when its placed_agent is 'agentic', or when placed_agent is missing or unrecognized (fail safe: unknown provenance counts). Orders whose placed_agent is explicitly 'user', 'recurring', or 'drip' are Geoff's own activity, not a second executor. Those must NOT abort the run. Note any of them you find in the final report so the manual and automated streams stay legible, then continue.
+If ANY qualifying order already exists in that window, abort and alert with "executor-placed orders already present in the 10:30 AM ET window, a second executor may be live". Place nothing.
+This gate runs on every single execution. No exception, no override. It is what makes single-executor ownership real.
+
+GATE 5 - BUY LIST
+Run the repo's own signal generation for this slot to produce today's candidates (below the prior regular-session close, 60-minute intraday trend down, ladder multiplier > 0 -- see config/sizing_ladder.json). Use the repo entry point, never a reimplementation.
+Error or no output file: abort and alert.
+Zero candidates: end silently. A quiet tape is a legitimate outcome, not a failure.
+Carry each candidate's decision price forward with it as a PROVISIONAL value only. Gate 6.5 refreshes it immediately before use -- the market can move while Gates 6 and 6.5's paginated broker-history work runs, and a ticker that has since risen above its prior close/reference must never receive a real buy authorized on this stale, earlier price (Codex review: "Recompute the decision price immediately before placement").
+
+GATE 6 - BUDGET
+Compute all limits from broker history via get_equity_orders, not from a local counter and not from the repo's own bookkeeping. Every get_equity_orders call in this gate must follow every pagination cursor/page to completion; if complete coverage cannot be established, fail closed -- abort and alert rather than sizing off a partial history.
+- Per order: $10.00 maximum (5x times the $2.00 base). Refuse anything above it outright. Never clamp a larger order down to $10. Refusing surfaces a sizing bug; clamping hides it.
+- Per day and per week: select today's tier from config/budgets.json's budget_tiers by today's planned spend and count of 3x-or-greater signals -- Normal $180/$900, Elevated $240/$1,200, High-volatility $300/$1,500, Stress $360/$1,800 (daily/weekly). Stress-tier capacity is usable only against the weekly rollover reserve, capped at $900.
+- These daily and weekly caps are SHARED across all seven slots combined, not a per-slot allowance. Sum today's (and this ISO week's, Monday start) orders across all seven slots from get_equity_orders before deciding what headroom this slot has. Count every order regardless of placed_agent: unlike Gate 4, the budget gate deliberately over-counts, because spending less than the cap is the safe direction to err. Earlier slots in the day effectively have priority since they can exhaust the shared cap first.
+- Also fetch the account's current buying power (config/budgets.json's circuit_breakers.enforce_available_buying_power) and treat it as an additional ceiling on top of the daily/weekly caps: never plan a batch that spends more than the account can actually pay for, even when cap headroom remains. If buying power cannot be confirmed, fail closed -- abort and alert rather than assuming it is sufficient.
+If a cap would be breached mid-batch, stop at the boundary. Place the orders that fit, skip the rest, and report exactly which were skipped and why. Never shrink an order to squeeze under a cap.
+
+GATE 6.5 - SAME-DAY TOP-UP GUARD
+Buying the same ticker more than once in a day is ALLOWED and intended. config/scheduled_tasks.json's same_day_top_up_policy exists so a later slot can average into a deeper dip. What is not allowed is a repeat SIZED as though nothing had been bought yet. Enforce the policy; never bypass it and never substitute your own judgment for it.
+Fetch today's order history: call get_equity_orders for account ${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER} with created_at_gte set to today, and follow EVERY pagination cursor to completion. Resolve $ROOT as ${DCA_CRON_TRACKING_ROOT:-/home/user/workspace/cron_tracking}/morning_dca/<YYYY-MM-DD>_1030ET (create it if it does not exist) -- never a bare repo-relative artifacts/ directory, which would split this safety-critical evidence from the shared cron-tracking tree every other consumer reads (AGENTS.md: artifact roots come from dca_paths.stream_root()/cron_tracking_root(), honouring $DCA_CRON_TRACKING_ROOT). Save {"account_number": "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}", "trading_day": "<YYYY-MM-DD>", "pages": [<one element per page in fetch order, including the final page>]} to $ROOT/orders_pages_<YYYY-MM-DD>_1030.json -- the gate rejects a bare page array and any account/day mismatch.
+Immediately before writing your candidates file, re-fetch each surviving candidate's current quote and re-check it still qualifies under Gate 5's signal rule (below the prior regular-session close, and below the prior low for the $2.00 tier) using this FRESH price -- drop any candidate that no longer qualifies. Save the survivors to $ROOT/cands_<YYYY-MM-DD>_1030.json as [{"ticker": "...", "desired_usd": 0.00, "current_price": 0.00}, ...], where current_price is this REFRESHED price, not Gate 5's original quote (Codex review: "Recompute the decision price immediately before placement").
+Then run, from the repo root:
+  python3 -m scripts.same_day_top_up_gate --account ${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER} --trading-day <YYYY-MM-DD> --orders-pages $ROOT/orders_pages_<YYYY-MM-DD>_1030.json --candidates $ROOT/cands_<YYYY-MM-DD>_1030.json
+The JSON it prints is authoritative. For each ticker, buy_usd is the amount you may place: sometimes the full desired amount (first buy of the day for that ticker), sometimes a strictly smaller top-up, sometimes $0.00. Never place more than buy_usd. Never restore a $0.00 back to the desired amount. Never recompute the number yourself.
+FAIL CLOSED. If the verdict is ABORT, or the tool errors, or the tool is missing, or you could not follow pagination to completion, place NOTHING and alert per Gate 9 with "same-day top-up guard could not determine today's prior fills". Do not proceed on the assumption that nothing has been bought today. An unreadable prior-fill picture is exactly what produced repeated full-size buys on 2026-07-30, and it must stop the run rather than pass it.
+Report every ticker whose buy_usd came back below its desired amount, with its reason code, in Gate 9.
+
+GATE 6.7 - SPREAD
+For every candidate still surviving Gate 6.5 with buy_usd > 0.00, fetch a current bid/ask quote and compute the spread as a percentage of the mid price. This is a hard circuit breaker (config/budgets.json's circuit_breakers.enforce_spread_threshold; config/scheduled_tasks.json's spread_gate_outcome_contract), not optional: a candidate whose spread cannot be captured, or whose spread exceeds 1.0% (max_bid_ask_spread_pct), fails closed -- zero it out (spread_status 'spread_unavailable' or 'spread_not_ok') and report it in Gate 9. Fail ONLY the affected ticker, not the whole batch: continue evaluating and submitting every other qualifying candidate whose own spread was proven within tolerance. Never place an order for a ticker whose spread was not proven within tolerance.
+
+GATE 7 - PLACE THE ORDERS
+Load the schema with ToolSearch for place_equity_order, then submit one order at a time, sequentially, never in parallel.
+- Buys only. Zero sells. This is an accumulate-only strategy.
+- Dollar amount = selected base ($2.00 if today's decision price is below both the prior close and the prior low, $1.00 if below the prior close only, no buy otherwise) times the ladder multiplier for the drop (1.0x-5.0x per config/sizing_ladder.json), capped by Gate 6, and then replaced by Gate 6.5's buy_usd for that ticker. Gate 6.5 is the last word on size.
+- Only place an order for a ticker Gate 6.7 did not zero out for spread.
+- No ticker twice in one batch. Across the day a ticker may be bought more than once, but only ever at Gate 6.5's buy_usd, never at full size a second time.
+- Never call place_option_order, exercise_option, cancel_option_order, or any crypto or margin tool.
+If any single order is rejected or errors, stop the entire batch. Do not place the remaining orders and do not retry the failed one. Report what was placed before the stop.
+
+GATE 8 - CONFIRM
+Wait about 30 seconds, then call get_equity_orders again, following every pagination cursor/page to completion, and report actual submitted and filled orders, not what you intended to place. A just-submitted order sitting beyond the first page must not be reported as absent. Intent logs are how you end up believing in fills that never settled.
+
+GATE 9 - REPORT
+Clean run: log a compact summary to the in-app message center with order count, total notional, and ticker list. Include the Gate 6.5 line: every ticker resized or zeroed, with its reason code.
+Any abort, skip, or cap breach: alert on ALL THREE channels below, in order, and do not stop after the first one succeeds. State the slot, the failing gate, and the reason in each.
+1. IN-APP MESSAGE CENTER, primary (config/notifications.json alert routing).
+2. REPO ALERT FILE, durable fallback. If the repo is reachable, write the same text to ${DCA_CRON_TRACKING_ROOT:-/home/user/workspace/cron_tracking}/morning_dca/alerts/<YYYY-MM-DD>-<slot>-<gate>.txt (dca_paths.stream_root('morning_dca', 'alerts', ...) -- never a bare repo-relative artifacts/ directory) so the alert survives the session. If the repo is unreachable, skip this step and say so in the primary alert: a Gate 2 failure is exactly the case where this fallback cannot work.
+3. EMAIL DRAFT, belt-and-braces. Create a draft to the operator email configured for alerts (never hardcode a personal address) with the same text. The email connector has no send capability, so a draft is NOT delivery and must never be the only channel used.
+Zero candidates: stay silent.
+
+STANDING PROHIBITIONS
+Never place a sell. Never touch options, crypto, or margin. Never retry a failed submit. Never build a buy list without the repo. Never place an order larger than Gate 6.5's buy_usd for that ticker. Never override a gate because the situation looks like an exception. If you find yourself reasoning toward "the safe thing here is to place the order anyway," that is the signal to stop and alert instead.

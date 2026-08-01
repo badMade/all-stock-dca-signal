@@ -8494,6 +8494,46 @@ def test_replacing_an_unreadable_afternoon_state_regenerates_its_companions(tmp_
     assert "artifact_contract_failure" not in run_state
 
 
+def test_afternoon_failure_artifacts_carry_a_non_afternoon_slots_own_identity(tmp_path):
+    """A 10:30/12:30 run's runtime failure must stamp ITS OWN classification and
+    correlation id, not the afternoon default -- the raw-persistence and
+    calendar-gate failure paths already do this; the generic exception handler
+    in run_once() must too (Codex review: "Forward slot identity into
+    exception artifacts")."""
+    import near_close_dca as _n
+
+    out = pathlib.Path(tmp_path) / "slot"
+    out.mkdir(parents=True, exist_ok=True)
+
+    overrides = {
+        "stream": "morning",
+        "cron_id": "42173154",
+        "supersedes_cron_id": None,
+        "scheduled_for_et": "10:30",
+        "scheduled_window_start_et": "10:25",
+        "scheduled_window_end_et": "10:35",
+        "run_id": "scheduled_20260629_1030ET",
+    }
+
+    _n._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    try:
+        _n._write_afternoon_failure_artifacts(
+            out,
+            _now_et(),
+            RuntimeError("boom"),
+            classification_overrides=overrides,
+            correlation_id="dca-2026-06-29-morning-1030et",
+        )
+    finally:
+        _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    run_state = json.loads((out / "run_state.json").read_text(encoding="utf-8"))
+    assert run_state["run_id"] == "scheduled_20260629_1030ET"
+    assert run_state["run_classification"]["stream"] == "morning"
+    assert run_state["run_classification"]["cron_id"] == "42173154"
+    assert run_state["correlation_id"] == "dca-2026-06-29-morning-1030et"
+
+
 def test_the_afternoon_failure_set_is_validated_without_a_pointer_root(tmp_path):
     """The contract failure is stamped INTO the state, which needs no pointer
     root, so gating validation on classification_state_root left a broken

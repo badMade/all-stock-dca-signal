@@ -33,7 +33,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, time, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Set
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set
 from zoneinfo import ZoneInfo
 
 from dca_fileio import atomic_write_text
@@ -626,6 +626,16 @@ def scheduled_run_id(trading_day: str) -> str:
     return f"scheduled_{compact}_1530ET"
 
 
+def _scheduled_run_id_for_time(trading_day: str, scheduled_for_et: str) -> str:
+    compact = trading_day.replace("-", "")
+    if not re.fullmatch(r"[0-9]{8}", compact):
+        raise ValueError(f"trading_day must be YYYY-MM-DD, got {trading_day!r}")
+    hhmm = re.sub(r"[^0-9]", "", scheduled_for_et)
+    if not re.fullmatch(r"[0-9]{4}", hhmm):
+        return scheduled_run_id(trading_day)
+    return f"scheduled_{compact}_{hhmm}ET"
+
+
 def manual_run_id(triggered_at_utc: Optional[str] = None) -> str:
     """Distinct id that can never match the scheduled pattern."""
     ts = triggered_at_utc or _utc_now_iso()
@@ -683,7 +693,7 @@ def build_scheduled_classification(
         "scheduled_window_start_et": scheduled_window_start_et,
         "scheduled_window_end_et": scheduled_window_end_et,
         "manual_run": False,
-        "run_id": run_id or scheduled_run_id(trading_day),
+        "run_id": run_id or _scheduled_run_id_for_time(trading_day, scheduled_for_et),
         "stream": stream,
         "triggered_at_utc": triggered_at_utc or _utc_now_iso(),
         "state_schema_version": STATE_SCHEMA_VERSION,
@@ -987,6 +997,8 @@ def raw_persistence_failure_run_state(
     broker: str = "robinhood",
     budget: Optional[Dict[str, object]] = None,
     recovery_from_escalation: bool = False,
+    classification_overrides: Optional[Dict[str, Any]] = None,
+    correlation_id: Optional[str] = None,
 ) -> Dict[str, object]:
     """Build a valid scheduled run_state for a raw-persistence/normalization failure.
 
@@ -1005,12 +1017,28 @@ def raw_persistence_failure_run_state(
     ``dca_risk.run_timestamp_et()`` reads ``generated_at`` before the
     classification timestamp, so passing the scheduled ``now`` here prevents
     a failure state from being attributed to the wrong time window.
+
+    ``classification_overrides``/``correlation_id`` let a non-afternoon roster
+    slot (``run_dca.run_slot``'s 1030ET/1230ET) stamp its OWN
+    stream/cron_id/scheduled_for_et/run_id and deterministic correlation id
+    onto this failure artifact, the same way ``near_close_dca.build_run_artifacts``
+    does for the normal compact path. Without this, a 10:30/12:30 run whose raw
+    persistence failed always stamped the afternoon cron/stream/time/run_id --
+    misattributing watchdog/telemetry diagnosis for the slot that actually
+    failed and losing its deterministic correlation id (Codex review: "Preserve
+    slot identity on early failure artifacts").
     """
     out_dir = raw_dir if raw_dir is not None else raw_input_dir(trading_day, base)
     ts = triggered_at_utc or _utc_now_iso()
     _generated_at = generated_at or datetime.now(_EASTERN).strftime("%Y-%m-%dT%H:%M:%S")
+    run_classification = build_scheduled_classification(trading_day, ts, **(classification_overrides or {}))
     state = {
-        "run_id": scheduled_run_id(trading_day),
+        # Derived from run_classification's OWN run_id (identical to
+        # scheduled_run_id(trading_day) for the unoverridden afternoon
+        # default) rather than computed separately, so the top-level run_id
+        # can never drift from the nested run_classification.run_id a
+        # classification_overrides caller stamped.
+        "run_id": run_classification["run_id"],
         "generated_at": _generated_at,
         "trading_day": trading_day,
         "broker": broker,
@@ -1041,12 +1069,14 @@ def raw_persistence_failure_run_state(
         "budget": budget or {"budget_tier": "normal", "daily_cap_usd": 0, "weekly_cap_usd": 0},
         "counts": {"evaluated": 0, "buy_candidates": 0, "submitted": 0},
         "buy_candidates": [],
-        "run_classification": build_scheduled_classification(trading_day, ts),
+        "run_classification": run_classification,
         "raw_input_dir": str(out_dir),
         "raw_inputs_saved": [],
         "recovery_from_escalation": bool(recovery_from_escalation),
         "raw_persistence_error": str(error),
     }
+    if correlation_id is not None:
+        state["correlation_id"] = correlation_id
     # The pointer writer publishes whatever this state derives, and the
     # derivation reads only run_origin/manual_run -- both of which say
     # "scheduled", because the slot really did fire. Denying evidence is what

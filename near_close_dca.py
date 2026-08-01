@@ -5196,6 +5196,8 @@ def _write_blocked_run_stub(
     trading_day: date,
     artifacts_dir: Optional[str | Path],
     classification_state_root: Optional[str | Path] = None,
+    classification_overrides: Optional[Dict[str, Any]] = None,
+    correlation_id: Optional[str] = None,
 ) -> None:
     """Record a date/holiday-gate block as a complete root-level artifact set.
 
@@ -5224,6 +5226,16 @@ def _write_blocked_run_stub(
     still targeting the previous trading day (Codex review). The state carries
     ``scheduled_evidence_denied``, so the pointer publishes as ``pending`` and no
     consumer counts a market-closed day as scheduled evidence.
+
+    ``classification_overrides``/``correlation_id`` let a non-afternoon roster
+    slot (``run_dca.run_slot``'s 1030ET/1230ET) stamp its OWN stream/cron_id/
+    scheduled_for_et/run_id and deterministic correlation id onto this stub,
+    the same way the normal compact path does via ``build_run_artifacts``.
+    Without this, a 10:30/12:30 run blocked by the date/holiday gate always
+    stamped the afternoon cron/stream/time/run_id -- misattributing watchdog
+    diagnosis for the slot that actually fired and losing its deterministic
+    correlation id (Codex review: "Preserve slot identity on early failure
+    artifacts").
     """
     if not artifacts_dir:
         return
@@ -5249,7 +5261,7 @@ def _write_blocked_run_stub(
         from run_classification import build_scheduled_classification  # type: ignore
 
     day_iso = trading_day.isoformat()
-    classification = dict(build_scheduled_classification(day_iso))
+    classification = dict(build_scheduled_classification(day_iso, **(classification_overrides or {})))
     classification["valid_scheduled_evidence"] = False
     # Deliberately NO top-level run_id / generated_at. The calendar gate fired
     # before any run existed, and downstream model-usage logging keys off the
@@ -5274,6 +5286,8 @@ def _write_blocked_run_stub(
         "buy_candidates": [],
         "signal_rows": [],
     }
+    if correlation_id is not None:
+        run_state["correlation_id"] = correlation_id
     # Never clobber a previously recorded run when a directory is reused: an
     # existing run_state.json is left exactly as it is. Each remaining file is
     # guarded on its own, so a directory left partial by an interrupted or legacy
@@ -5371,6 +5385,8 @@ def _check_execution_gates(
     broker: BrokerAdapter,
     artifacts_dir: Optional[str | Path],
     classification_state_root: Optional[str | Path] = None,
+    classification_overrides: Optional[Dict[str, Any]] = None,
+    correlation_id: Optional[str] = None,
 ) -> bool:
     warn_if_window_expiring(config.approved_test_dates, trading_day)
     if _date_or_holiday_blocked(trading_day, config):
@@ -5386,7 +5402,13 @@ def _check_execution_gates(
             logger.warning(
                 "NYSE holiday gate blocked execution for %s. No trades.", trading_day
             )
-        _write_blocked_run_stub(trading_day, artifacts_dir, classification_state_root)
+        _write_blocked_run_stub(
+            trading_day,
+            artifacts_dir,
+            classification_state_root,
+            classification_overrides=classification_overrides,
+            correlation_id=correlation_id,
+        )
         return False
 
     # Validate the CONFIGURED account before comparing it to the broker's. The
@@ -6751,9 +6773,11 @@ def _publish_in_flight_outcome(ticker: str, outcome: Dict[str, Any]) -> None:
 class RunContext:
     """Immutable execution context for a single afternoon DCA run.
 
-    Passed to :func:`run_once` to bundle the per-run execution parameters
-    (broker, data providers, artifact directory, etc.) into a single object
-    rather than a long keyword-argument list.
+    Bundles ``run_once``'s inputs and options -- broker, data providers,
+    artifact directory, etc. -- into a single object rather than a long
+    keyword-argument list. Mirrors the individual parameters
+    :func:`_run_once_impl` still accepts; ``run_once`` unpacks this back
+    into that call.
     """
 
     now: datetime
@@ -6800,7 +6824,7 @@ def run_once(
             ctx.finance_data,
             ctx.robinhood_data,
             ctx.broker,
-            ctx.artifacts_dir,
+            artifacts_dir=ctx.artifacts_dir,
             run_result=ctx.run_result,
             notifications_sent=ctx.notifications_sent,
             cost_control_notes=ctx.cost_control_notes,
@@ -6821,6 +6845,8 @@ def run_once(
                     ctx.now,
                     exc,
                     classification_state_root=ctx.classification_state_root,
+                    classification_overrides=ctx.classification_overrides,
+                    correlation_id=ctx.correlation_id,
                 )
             except Exception:  # noqa: BLE001 - never mask the original failure
                 logger.exception(
@@ -6836,17 +6862,29 @@ def _write_afternoon_failure_artifacts(
     now: datetime,
     exc: BaseException,
     classification_state_root: Optional[str | Path] = None,
+    classification_overrides: Optional[Dict[str, Any]] = None,
+    correlation_id: Optional[str] = None,
 ) -> None:
     """Write the complete root-level set for an afternoon run that raised.
 
     Preserves any order already placed, never overwrites a run_state the run had
     already written, and completes a partial directory. The artifact proves the
     slot fired; it is never scheduled evidence.
+
+    ``classification_overrides``/``correlation_id`` let a non-afternoon roster
+    slot (``run_dca.run_slot``'s 1030ET/1230ET) stamp its OWN stream/cron_id/
+    scheduled_for_et/run_id and deterministic correlation id onto this failure
+    artifact, the same way ``_write_blocked_run_stub``/``raw_persistence_failure_run_state``
+    already do. Without this, an ordinary runtime failure (account lookup,
+    signal evaluation, or a per-candidate broker check raising before
+    ``_finalize_and_write_artifacts`` ran) still stamped the default afternoon
+    identity for a 10:30/12:30 run, even though the raw-persistence and
+    calendar-gate failure paths were already fixed to carry the slot's own
+    identity (Codex review: "Forward slot identity into exception artifacts").
     """
     try:  # pragma: no cover - import shim for flat sys.path
         from scripts.run_classification import (
             build_scheduled_classification,
-            scheduled_run_id,
             update_latest_scheduled_run_pointer,
         )
         from scripts.scheduled_artifacts import (
@@ -6858,7 +6896,6 @@ def _write_afternoon_failure_artifacts(
     except ImportError:  # pragma: no cover
         from run_classification import (  # type: ignore
             build_scheduled_classification,
-            scheduled_run_id,
             update_latest_scheduled_run_pointer,
         )
         from scheduled_artifacts import (  # type: ignore
@@ -6901,13 +6938,17 @@ def _write_afternoon_failure_artifacts(
             )
 
     if not existing_is_usable:
-        classification = dict(build_scheduled_classification(trading_day))
+        classification = dict(build_scheduled_classification(trading_day, **(classification_overrides or {})))
         classification["valid_scheduled_evidence"] = False
         run_state: Dict[str, Any] = {
             # Unlike the deliberately runless calendar-gate stub, a failure state
             # IS a run: it carries the scheduled run id the schema requires and
-            # build_run_summary reads (Codex review).
-            "run_id": scheduled_run_id(trading_day),
+            # build_run_summary reads (Codex review). Derived from the (possibly
+            # slot-overridden) classification rather than always the afternoon
+            # scheduled_run_id, so a 10:30/12:30 run's failure artifact carries
+            # its own run_id instead of the afternoon one (Codex review: "Forward
+            # slot identity into exception artifacts").
+            "run_id": classification["run_id"],
             "trading_day": trading_day,
             "generated_at": now.astimezone(EASTERN).isoformat(),
             "broker": config_broker_name(),
@@ -6953,6 +6994,8 @@ def _write_afternoon_failure_artifacts(
         }
         if placed:
             run_state["placement_evidence_incomplete"] = True
+        if correlation_id is not None:
+            run_state["correlation_id"] = correlation_id
         atomic_write_text(state_path, _serialize_run_state(run_state))
     else:
         logger.warning(
@@ -7171,7 +7214,13 @@ def _run_once_impl(
     order_reviews_attempted = 0
 
     if not _check_execution_gates(
-        trading_day, config, broker, artifacts_dir, classification_state_root
+        trading_day,
+        config,
+        broker,
+        artifacts_dir,
+        classification_state_root,
+        classification_overrides=classification_overrides,
+        correlation_id=correlation_id,
     ):
         return []
 
