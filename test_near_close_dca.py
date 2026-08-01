@@ -43,6 +43,7 @@ from near_close_dca import (
     DryRunBroker,
     OrderFill,
     PriorSameDayAllocation,
+    ProcessCandidateContext,
     ReconciledDecision,
     RunResult,
     SourceName,
@@ -801,18 +802,19 @@ def test_kill_switch_caps_order_at_candidates_own_selected_base():
     broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
     candidate_outcome, _, _, _, _ = _process_buy_candidate(
         decision,
-        config,
-        state,
-        broker,
-        robinhood_data=None,
-        now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
-        trading_day=date(2026, 6, 29),
-        guard_active=False,
-        prior_same_day_allocations={},
-        # Trivially over the kill-switch threshold (fraction * $10 allocation).
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=broker,
+            robinhood_data=None,
+            now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
+            trading_day=date(2026, 6, 29),
+            guard_active=False,
+            prior_same_day_allocations={},
+            scheduled=False,
+            run_result=None,
+        ),
         running_deployed_7d=100.0,
-        scheduled=False,
-        run_result=None,
     )
     assert candidate_outcome["submitted_amount_usd"] == 1.0  # capped at $1, not $2
 
@@ -849,18 +851,19 @@ def test_kill_switch_caps_guarded_top_up_at_preserved_base():
     broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
     candidate_outcome, top_up_outcome, _, _, _ = _process_buy_candidate(
         decision,
-        config,
-        state,
-        broker,
-        robinhood_data=None,
-        now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
-        trading_day=date(2026, 6, 29),
-        guard_active=True,
-        prior_same_day_allocations={"AAPL": prior},
-        # Trivially over the kill-switch threshold (fraction * $10 allocation).
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=broker,
+            robinhood_data=None,
+            now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
+            trading_day=date(2026, 6, 29),
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=False,
+            run_result=None,
+        ),
         running_deployed_7d=100.0,
-        scheduled=False,
-        run_result=None,
     )
     # The guard's own $4 delta (($1 * 5x) - $1 already bought) must be capped
     # at the preserved $1 base, not this run's fresh $2 base.
@@ -962,17 +965,19 @@ def test_guarded_top_up_retry_does_not_place_a_duplicate_order():
     state1 = StrategyState()
     outcome1, _, _, _, _ = _process_buy_candidate(
         decision,
-        config,
-        state1,
-        broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=trading_day,
-        guard_active=True,
-        prior_same_day_allocations={"AAPL": prior},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state1,
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
         running_deployed_7d=0.0,
-        scheduled=True,
-        run_result=None,
     )
     assert outcome1["status"] == "submitted"
     assert broker.placed["AAPL"] > 0
@@ -1000,17 +1005,19 @@ def test_guarded_top_up_retry_does_not_place_a_duplicate_order():
     )
     outcome2, _, _, _, _ = _process_buy_candidate(
         decision,
-        config,
-        state2,
-        broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=trading_day,
-        guard_active=True,
-        prior_same_day_allocations={"AAPL": prior},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state2,
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=run_result,
+        ),
         running_deployed_7d=0.0,
-        scheduled=True,
-        run_result=run_result,
     )
     assert len(broker._orders) == 1, "retry must not place a second broker order"
     assert outcome2["status"] == "submitted"
@@ -1089,32 +1096,36 @@ def test_guarded_top_up_retry_does_not_double_count_deployed_7d():
     )
     _process_buy_candidate(
         decision,
-        config,
-        StrategyState(),
-        broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=trading_day,
-        guard_active=True,
-        prior_same_day_allocations={"AAPL": prior},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
         running_deployed_7d=0.0,
-        scheduled=True,
-        run_result=None,
     )
     starting_deployed_7d = 50.0
     _, _, returned_deployed_7d, _, _ = _process_buy_candidate(
         decision,
-        config,
-        StrategyState(),
-        broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=trading_day,
-        guard_active=True,
-        prior_same_day_allocations={"AAPL": prior},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
         running_deployed_7d=starting_deployed_7d,
-        scheduled=True,
-        run_result=None,
     )
     assert returned_deployed_7d == starting_deployed_7d, (
         "a duplicate-preserved outcome places no new capital and must not "
@@ -1148,35 +1159,39 @@ def test_guarded_top_up_retry_counts_recovered_order_when_not_yet_on_disk(tmp_pa
     history_root = os.path.join(str(tmp_path), "history")
     _process_buy_candidate(
         decision,
-        config,
-        StrategyState(),
-        broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=trading_day,
-        guard_active=True,
-        prior_same_day_allocations={"AAPL": prior},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+            deployment_history_root=history_root,
+        ),
         running_deployed_7d=0.0,
-        scheduled=True,
-        run_result=None,
-        deployment_history_root=history_root,
     )
     placed_amount = broker.placed["AAPL"]
     starting_deployed_7d = 50.0
     _, _, returned_deployed_7d, _, _ = _process_buy_candidate(
         decision,
-        config,
-        StrategyState(),
-        broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=trading_day,
-        guard_active=True,
-        prior_same_day_allocations={"AAPL": prior},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+            deployment_history_root=history_root,
+        ),
         running_deployed_7d=starting_deployed_7d,
-        scheduled=True,
-        run_result=None,
-        deployment_history_root=history_root,
     )
     assert returned_deployed_7d == pytest.approx(
         starting_deployed_7d + placed_amount
@@ -1216,34 +1231,38 @@ def test_guarded_top_up_retry_does_not_recount_when_ticker_already_on_disk(tmp_p
     )
     _process_buy_candidate(
         decision,
-        config,
-        StrategyState(),
-        broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=trading_day,
-        guard_active=True,
-        prior_same_day_allocations={"AAPL": prior},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+            deployment_history_root=history_root,
+        ),
         running_deployed_7d=0.0,
-        scheduled=True,
-        run_result=None,
-        deployment_history_root=history_root,
     )
     starting_deployed_7d = 50.0
     _, _, returned_deployed_7d, _, _ = _process_buy_candidate(
         decision,
-        config,
-        StrategyState(),
-        broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=trading_day,
-        guard_active=True,
-        prior_same_day_allocations={"AAPL": prior},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+            deployment_history_root=history_root,
+        ),
         running_deployed_7d=starting_deployed_7d,
-        scheduled=True,
-        run_result=None,
-        deployment_history_root=history_root,
     )
     assert returned_deployed_7d == starting_deployed_7d
 
@@ -1281,35 +1300,39 @@ def test_guarded_top_up_retry_counts_ticker_when_only_a_different_ticker_is_on_d
     )
     _process_buy_candidate(
         decision,
-        config,
-        StrategyState(),
-        broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=trading_day,
-        guard_active=True,
-        prior_same_day_allocations={"AAPL": prior},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+            deployment_history_root=history_root,
+        ),
         running_deployed_7d=0.0,
-        scheduled=True,
-        run_result=None,
-        deployment_history_root=history_root,
     )
     placed_amount = broker.placed["AAPL"]
     starting_deployed_7d = 50.0
     _, _, returned_deployed_7d, _, _ = _process_buy_candidate(
         decision,
-        config,
-        StrategyState(),
-        broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=trading_day,
-        guard_active=True,
-        prior_same_day_allocations={"AAPL": prior},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+            deployment_history_root=history_root,
+        ),
         running_deployed_7d=starting_deployed_7d,
-        scheduled=True,
-        run_result=None,
-        deployment_history_root=history_root,
     )
     assert returned_deployed_7d == pytest.approx(starting_deployed_7d + placed_amount)
 
@@ -1368,17 +1391,19 @@ def test_guarded_top_up_retry_records_recovered_buy_despite_seeded_prior_context
 
     outcome, _, _, _, _ = _process_buy_candidate(
         decision,
-        config,
-        fresh_state,
-        broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=trading_day,
-        guard_active=True,
-        prior_same_day_allocations={"AAPL": prior},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=fresh_state,
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
         running_deployed_7d=0.0,
-        scheduled=True,
-        run_result=None,
     )
     assert outcome["duplicate_preserved"] is True
     assert outcome["submitted_amount_usd"] == pytest.approx(3.0)
@@ -1412,17 +1437,19 @@ def test_guarded_top_up_retry_does_not_rebook_when_state_already_recorded_it():
     shared_state = StrategyState()
     _process_buy_candidate(
         decision,
-        config,
-        shared_state,
-        broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=trading_day,
-        guard_active=True,
-        prior_same_day_allocations={"AAPL": prior},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=shared_state,
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
         running_deployed_7d=0.0,
-        scheduled=True,
-        run_result=None,
     )
     placed_amount = broker.placed["AAPL"]
     assert shared_state.buys_today("AAPL", trading_day) == 1
@@ -1430,17 +1457,19 @@ def test_guarded_top_up_retry_does_not_rebook_when_state_already_recorded_it():
 
     _process_buy_candidate(
         decision,
-        config,
-        shared_state,
-        broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=trading_day,
-        guard_active=True,
-        prior_same_day_allocations={"AAPL": prior},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=shared_state,
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
         running_deployed_7d=0.0,
-        scheduled=True,
-        run_result=None,
     )
     assert shared_state.buys_today("AAPL", trading_day) == 1, (
         "a duplicate-preserved outcome must not rebook a buy already recorded "
@@ -1482,17 +1511,19 @@ def test_guarded_top_up_retry_records_recovered_spread_status_without_a_verdict(
     )
     _process_buy_candidate(
         decision,
-        config,
-        StrategyState(),
-        broker,
-        robinhood_data=narrow_spread_data,
-        now=now,
-        trading_day=trading_day,
-        guard_active=True,
-        prior_same_day_allocations={"AAPL": prior},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=narrow_spread_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
         running_deployed_7d=0.0,
-        scheduled=True,
-        run_result=None,
     )
     # Attempt 2 (retry): the spread has since widened past the gate's limit.
     # A wide/failing spread on the RETRY must not surface as this row's
@@ -1502,17 +1533,19 @@ def test_guarded_top_up_retry_records_recovered_spread_status_without_a_verdict(
     )
     outcome2, _, _, _, _ = _process_buy_candidate(
         decision,
-        config,
-        StrategyState(),
-        broker,
-        robinhood_data=wide_spread_data,
-        now=now,
-        trading_day=trading_day,
-        guard_active=True,
-        prior_same_day_allocations={"AAPL": prior},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=wide_spread_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
         running_deployed_7d=0.0,
-        scheduled=True,
-        run_result=None,
     )
     assert outcome2["duplicate_preserved"] is True
     assert outcome2["spread_status"] == "not_evaluated"
@@ -1569,17 +1602,19 @@ def test_guarded_top_up_retry_blocks_when_broker_returns_no_order_id():
     )
     outcome, _, _, errors_count_inc, _ = _process_buy_candidate(
         decision,
-        config,
-        StrategyState(),
-        broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=trading_day,
-        guard_active=True,
-        prior_same_day_allocations={"AAPL": prior},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
         running_deployed_7d=0.0,
-        scheduled=True,
-        run_result=None,
     )
     assert outcome["status"] == "blocked"
     assert outcome.get("order_id") is None
@@ -1613,17 +1648,19 @@ def test_guarded_top_up_retry_finds_duplicate_even_when_fresh_guard_would_skip()
     decision_attempt1 = _graded_decision(target_price=98.0)
     outcome1, _, _, _, _ = _process_buy_candidate(
         decision_attempt1,
-        config,
-        StrategyState(),
-        broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=trading_day,
-        guard_active=True,
-        prior_same_day_allocations={"AAPL": prior},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
         running_deployed_7d=0.0,
-        scheduled=True,
-        run_result=None,
     )
     assert outcome1["status"] == "submitted"
     assert len(broker._orders) == 1
@@ -1635,17 +1672,19 @@ def test_guarded_top_up_retry_finds_duplicate_even_when_fresh_guard_would_skip()
     decision_attempt2 = _graded_decision(target_price=100.0)
     outcome2, top_up_outcome2, _, _, _ = _process_buy_candidate(
         decision_attempt2,
-        config,
-        StrategyState(),
-        broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=trading_day,
-        guard_active=True,
-        prior_same_day_allocations={"AAPL": prior},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
         running_deployed_7d=0.0,
-        scheduled=True,
-        run_result=None,
     )
     assert len(broker._orders) == 1, "retry must not place a second broker order"
     assert outcome2["status"] == "submitted", outcome2
@@ -1668,17 +1707,19 @@ def test_manual_placement_uses_distinct_ref_id_namespace():
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     outcome, _, _, _, _ = _process_buy_candidate(
         decision,
-        config,
-        StrategyState(),
-        broker,
-        robinhood_data=None,
-        now=now,
-        trading_day=date(2026, 6, 29),
-        guard_active=False,
-        prior_same_day_allocations={},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=None,
+            now=now,
+            trading_day=date(2026, 6, 29),
+            guard_active=False,
+            prior_same_day_allocations={},
+            scheduled=False,
+            run_result=None,
+        ),
         running_deployed_7d=0.0,
-        scheduled=False,
-        run_result=None,
     )
     assert outcome["status"] == "submitted"
     ref_id = broker._orders[0][1]
@@ -1708,17 +1749,19 @@ def test_scheduled_top_up_not_blocked_by_manual_fills_ordinary_ref_id():
     )
     manual_outcome, _, _, _, _ = _process_buy_candidate(
         manual_decision,
-        config,
-        StrategyState(),
-        broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=trading_day,
-        guard_active=False,
-        prior_same_day_allocations={},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=False,
+            prior_same_day_allocations={},
+            scheduled=False,
+            run_result=None,
+        ),
         running_deployed_7d=0.0,
-        scheduled=False,
-        run_result=None,
     )
     assert manual_outcome["status"] == "submitted"
     assert len(broker._orders) == 1
@@ -1733,17 +1776,19 @@ def test_scheduled_top_up_not_blocked_by_manual_fills_ordinary_ref_id():
     scheduled_decision = _graded_decision(target_price=98.0)
     scheduled_outcome, _, _, _, _ = _process_buy_candidate(
         scheduled_decision,
-        config,
-        StrategyState(),
-        broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=trading_day,
-        guard_active=True,
-        prior_same_day_allocations={"AAPL": prior},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
         running_deployed_7d=0.0,
-        scheduled=True,
-        run_result=None,
     )
     assert scheduled_outcome.get("duplicate_preserved") is not True, (
         "the manual fill's ref_id must not be mistaken for this scheduled "
@@ -1804,17 +1849,19 @@ def test_guarded_top_up_dry_run_skips_duplicate_check_entirely():
     )
     outcome, _, _, errors_count_inc, _ = _process_buy_candidate(
         decision,
-        config,
-        StrategyState(),
-        broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=trading_day,
-        guard_active=True,
-        prior_same_day_allocations={"AAPL": prior},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
         running_deployed_7d=0.0,
-        scheduled=True,
-        run_result=None,
     )
     assert errors_count_inc == 0
     assert outcome["status"] == "dry_run"
@@ -1846,17 +1893,19 @@ def test_guarded_top_up_first_attempt_bypasses_broad_same_day_check():
     )
     outcome, _, _, _, _ = _process_buy_candidate(
         decision,
-        config,
-        StrategyState(),
-        broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=date(2026, 6, 29),
-        guard_active=True,
-        prior_same_day_allocations={"AAPL": prior},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=date(2026, 6, 29),
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
         running_deployed_7d=0.0,
-        scheduled=True,
-        run_result=None,
     )
     assert outcome["status"] == "submitted"
     assert outcome.get("duplicate_preserved") is not True
@@ -1872,17 +1921,19 @@ def test_non_guarded_candidate_still_blocked_by_broad_same_day_check():
     broker._orders.append(("AAPL", "other-stream-ref", 5.0, "ORDER-OTHER"))
     outcome, _, _, _, _ = _process_buy_candidate(
         decision,
-        config,
-        StrategyState(),
-        broker,
-        robinhood_data=None,
-        now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
-        trading_day=date(2026, 6, 29),
-        guard_active=False,
-        prior_same_day_allocations={},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=None,
+            now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
+            trading_day=date(2026, 6, 29),
+            guard_active=False,
+            prior_same_day_allocations={},
+            scheduled=True,
+            run_result=None,
+        ),
         running_deployed_7d=0.0,
-        scheduled=True,
-        run_result=None,
     )
     assert outcome["status"] == "skipped"
     assert outcome["skip_reason"] == "same-day broker order exists"
@@ -1957,18 +2008,20 @@ def test_guarded_top_up_across_canonical_slots_places_a_new_order_not_a_duplicat
 
     outcome, top_up_outcome, _, _, _ = _process_buy_candidate(
         decision,
-        config,
-        StrategyState(),
-        broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=trading_day,
-        guard_active=True,
-        prior_same_day_allocations={"AAPL": prior},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+            stream="midday",
+        ),
         running_deployed_7d=0.0,
-        scheduled=True,
-        run_result=None,
-        stream="midday",
     )
 
     assert outcome["status"] == "submitted"
@@ -2015,18 +2068,20 @@ def test_guarded_top_up_corrects_an_understated_artifact_prior_against_the_broke
 
     outcome, top_up_outcome, _, _, _ = _process_buy_candidate(
         decision,
-        config,
-        StrategyState(),
-        broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=trading_day,
-        guard_active=True,
-        prior_same_day_allocations={"AAPL": prior},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+            stream="midday",
+        ),
         running_deployed_7d=0.0,
-        scheduled=True,
-        run_result=None,
-        stream="midday",
     )
 
     assert top_up_outcome.top_up_guard_result == "incremental_top_up"
@@ -2062,18 +2117,20 @@ def test_guarded_top_up_fails_closed_when_broker_cannot_verify_same_day_notional
 
     outcome, _, _, errors_count_inc, _ = _process_buy_candidate(
         decision,
-        config,
-        StrategyState(),
-        broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=trading_day,
-        guard_active=True,
-        prior_same_day_allocations={"AAPL": prior},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+            stream="midday",
+        ),
         running_deployed_7d=0.0,
-        scheduled=True,
-        run_result=None,
-        stream="midday",
     )
 
     assert outcome["status"] == "blocked"
@@ -2105,17 +2162,19 @@ def test_insufficient_buying_power_blocks_before_placement():
     )
     outcome, _, _, _, _ = _process_buy_candidate(
         decision,
-        config,
-        StrategyState(),
-        broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=date(2026, 6, 29),
-        guard_active=False,
-        prior_same_day_allocations={},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=date(2026, 6, 29),
+            guard_active=False,
+            prior_same_day_allocations={},
+            scheduled=True,
+            run_result=None,
+        ),
         running_deployed_7d=0.0,
-        scheduled=True,
-        run_result=None,
     )
     assert outcome["status"] == "blocked"
     assert outcome["skip_reason"] == "insufficient buying power"
@@ -2136,17 +2195,19 @@ def test_not_tradable_for_fractional_buy_blocks_before_placement():
     )
     outcome, _, _, _, _ = _process_buy_candidate(
         decision,
-        config,
-        StrategyState(),
-        broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=date(2026, 6, 29),
-        guard_active=False,
-        prior_same_day_allocations={},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=date(2026, 6, 29),
+            guard_active=False,
+            prior_same_day_allocations={},
+            scheduled=True,
+            run_result=None,
+        ),
         running_deployed_7d=0.0,
-        scheduled=True,
-        run_result=None,
     )
     assert outcome["status"] == "blocked"
     assert outcome["skip_reason"] == "not tradable for fractional buy"
@@ -2169,17 +2230,19 @@ def test_broker_review_block_prevents_manual_order_placement():
     )
     outcome, _, _, _, reviews_attempted = _process_buy_candidate(
         decision,
-        config,
-        StrategyState(),
-        broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=date(2026, 6, 29),
-        guard_active=False,
-        prior_same_day_allocations={},
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=date(2026, 6, 29),
+            guard_active=False,
+            prior_same_day_allocations={},
+            scheduled=False,
+            run_result=None,
+        ),
         running_deployed_7d=0.0,
-        scheduled=False,
-        run_result=None,
     )
     assert outcome["status"] == "blocked"
     assert outcome["skip_reason"] == "review blocked: flagged for manual review"

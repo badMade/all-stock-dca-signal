@@ -5817,34 +5817,48 @@ def _same_stream_order_exists(
     return result
 
 
+@dataclass(frozen=True)
+class ProcessCandidateContext:
+    """Shared, per-run context for :func:`_process_buy_candidate` and
+    :func:`_process_buy_candidates_batch`.
+
+    Groups the config/state/broker/market-data/timing/guard fields that are
+    identical across every candidate in a single batch into one immutable
+    object, instead of threading each of them through as its own positional
+    or keyword argument.
+    """
+
+    config: StrategyConfig
+    state: StrategyState
+    broker: BrokerAdapter
+    robinhood_data: Optional[MarketDataProvider]
+    now: datetime
+    trading_day: date
+    guard_active: bool
+    prior_same_day_allocations: Dict[str, PriorSameDayAllocation]
+    scheduled: bool
+    run_result: Optional[RunResult]
+    deployment_history_root: Optional[str | Path] = None
+    stream: str = "afternoon"
+
+
 def _process_buy_candidate(
     decision: ReconciledDecision,
-    config: StrategyConfig,
-    state: StrategyState,
-    broker: BrokerAdapter,
-    robinhood_data: MarketDataProvider,
-    now: datetime,
-    trading_day: date,
-    guard_active: bool,
-    prior_same_day_allocations: Dict[str, PriorSameDayAllocation],
+    ctx: ProcessCandidateContext,
     running_deployed_7d: float,
-    scheduled: bool,
-    run_result: Optional[RunResult],
-    deployment_history_root: Optional[str | Path] = None,
-    stream: str = "afternoon",
 ) -> tuple[Dict[str, Any], Optional[TopUpGuardOutcome], float, int, int]:
     ticker = decision.ticker
     order_amount = decision.suggested_amount_usd
-    prior = prior_same_day_allocations.get(ticker) if guard_active else None
-    ticker_guarded = guard_active and prior is not None
+    prior = ctx.prior_same_day_allocations.get(ticker) if ctx.guard_active else None
+    ticker_guarded = ctx.guard_active and prior is not None
     top_up_outcome = None
     errors_count_inc = 0
     order_reviews_attempted_inc = 0
     candidate_outcome: Dict[str, Any] = {}
 
     def _block(reason: str, message: str) -> None:
-        if run_result is not None:
-            run_result.loop_block_reasons[ticker] = reason
+        if ctx.run_result is not None:
+            ctx.run_result.loop_block_reasons[ticker] = reason
         logger.info(message)
 
     # Computed here (before any early-return gate below) purely for context --
@@ -5852,9 +5866,9 @@ def _process_buy_candidate(
     # its own skipped/manual_review verdict must not be honored until AFTER
     # the same-stream duplicate check just below has a chance to find and
     # preserve an order this stream already placed earlier the same run.
-    if guard_active:
+    if ctx.guard_active:
         effective_prior = prior
-        if ticker_guarded and not config.dry_run:
+        if ticker_guarded and not ctx.config.dry_run:
             # KNOWN GAP fix (Codex review: "Include broker orders in the delta
             # before disabling the duplicate gate"): evaluate_top_up_guard's own
             # docstring already documents that `prior.amount_usd` is
@@ -5868,8 +5882,8 @@ def _process_buy_candidate(
             # ticker (regardless of ref id/stream) and never trust an artifact
             # figure lower than what the broker itself reports.
             try:
-                broker_reported_usd = broker.same_day_ticker_notional_usd(
-                    ticker, trading_day
+                broker_reported_usd = ctx.broker.same_day_ticker_notional_usd(
+                    ticker, ctx.trading_day
                 )
             except Exception as exc:  # noqa: BLE001
                 errors_count_inc += 1
@@ -5890,7 +5904,7 @@ def _process_buy_candidate(
                 )
             if broker_reported_usd > prior.amount_usd:
                 effective_prior = replace(prior, amount_usd=broker_reported_usd)
-        top_up_outcome = evaluate_top_up_guard(decision, effective_prior, config)
+        top_up_outcome = evaluate_top_up_guard(decision, effective_prior, ctx.config)
 
     # A morning/manual run must NOT block the scheduled afternoon run: when the
     # top-up guard has a loaded prior allocation for this ticker, the earlier
@@ -5921,9 +5935,9 @@ def _process_buy_candidate(
     # cannot verify a real duplicate) block a harmless simulated candidate
     # for a risk that cannot occur in dry-run mode (Codex review, PR #231:
     # "Allow guarded Alpaca simulations through the duplicate hook").
-    if ticker_guarded and not config.dry_run:
+    if ticker_guarded and not ctx.config.dry_run:
         try:
-            dup_order = _same_stream_order_exists(broker, ticker, trading_day, stream)
+            dup_order = _same_stream_order_exists(ctx.broker, ticker, ctx.trading_day, ctx.stream)
         except Exception as exc:  # noqa: BLE001
             errors_count_inc += 1
             candidate_outcome = {
@@ -5986,10 +6000,10 @@ def _process_buy_candidate(
             # fallback is not reachable there.
             if not math.isfinite(dup_amount) or dup_amount <= 0:
                 dup_amount = order_amount
-            order_key = (ticker, trading_day)
-            if order_key not in state.own_orders_recorded:
-                state.record_buy(ticker, trading_day, dup_amount)
-                state.own_orders_recorded.add(order_key)
+            order_key = (ticker, ctx.trading_day)
+            if order_key not in ctx.state.own_orders_recorded:
+                ctx.state.record_buy(ticker, ctx.trading_day, dup_amount)
+                ctx.state.own_orders_recorded.add(order_key)
             # else: this exact StrategyState instance already booked THIS
             # STREAM's own order for this ticker/day earlier in the SAME run
             # (e.g. an in-process retry that reuses its StrategyState rather
@@ -6029,9 +6043,9 @@ def _process_buy_candidate(
             # order was already counted (Codex review, PR #231: "Verify the
             # recovered order is actually in deployment history").
             if (
-                deployment_history_root is not None
+                ctx.deployment_history_root is not None
                 and not _same_day_ticker_deployment_already_recorded(
-                    ticker, trading_day, deployment_history_root
+                    ticker, ctx.trading_day, ctx.deployment_history_root
                 )
             ):
                 running_deployed_7d += dup_amount
@@ -6093,7 +6107,7 @@ def _process_buy_candidate(
                 ticker,
                 candidate_outcome.get("order_id"),
             )
-            if run_result is not None:
+            if ctx.run_result is not None:
                 # Log this the same way as a fresh placement (not via _block):
                 # this ticker's order was actually submitted, so it must appear
                 # in execution_records for the slippage/coverage report, and
@@ -6102,10 +6116,10 @@ def _process_buy_candidate(
                 # when the order truly has no fill) rather than a hardcoded
                 # "budget capped" reason that would misreport a submitted order.
                 _log_execution(
-                    run_result,
+                    ctx.run_result,
                     decision,
                     candidate_outcome.get("order_id"),
-                    broker,
+                    ctx.broker,
                     notional_usd=dup_amount,
                 )
             return (
@@ -6116,7 +6130,7 @@ def _process_buy_candidate(
                 order_reviews_attempted_inc,
             )
 
-    if kill_switch_engaged(replace(config, deployed_last_7d_usd=running_deployed_7d)):
+    if kill_switch_engaged(replace(ctx.config, deployed_last_7d_usd=running_deployed_7d)):
         # Cap at THIS candidate's own selected base ($1 or $2), not the fixed
         # config.base_buy_amount_usd ($2) -- a below-close-only candidate's 1x
         # kill-switch amount is $1, and capping it at $2 would let it submit
@@ -6141,7 +6155,7 @@ def _process_buy_candidate(
         )
         order_amount = min(order_amount, kill_switch_base)
 
-    if guard_active:
+    if ctx.guard_active:
         order_amount = min(top_up_outcome.incremental_order_amount, order_amount)
         if top_up_outcome.skipped:
             candidate_outcome = {
@@ -6177,7 +6191,7 @@ def _process_buy_candidate(
     # intact now that one_order_per_ticker_per_day also triggers a broker
     # round-trip on this path (Codex review, discussion_r3679633773: "Check the
     # hard ceiling before the broker duplicate lookup").
-    if order_amount > config.max_per_order_usd:
+    if order_amount > ctx.config.max_per_order_usd:
         candidate_outcome = {
             "status": "blocked",
             "skip_reason": "max per-order ceiling exceeded",
@@ -6187,7 +6201,7 @@ def _process_buy_candidate(
         _block(
             MISSING_FILL_BUDGET_CAPPED,
             f"{ticker}: order amount ${order_amount:.2f} exceeds max per-order "
-            f"${config.max_per_order_usd:.2f}; skipping",
+            f"${ctx.config.max_per_order_usd:.2f}; skipping",
         )
         return (
             candidate_outcome,
@@ -6196,8 +6210,8 @@ def _process_buy_candidate(
             errors_count_inc,
             order_reviews_attempted_inc,
         )
-    if config.one_order_per_ticker_per_day and broker.same_day_strategy_order_exists(
-        ticker, trading_day
+    if ctx.config.one_order_per_ticker_per_day and ctx.broker.same_day_strategy_order_exists(
+        ticker, ctx.trading_day
     ):
         if top_up_outcome is not None:
             top_up_outcome = replace(top_up_outcome, incremental_order_amount=0.0)
@@ -6216,8 +6230,8 @@ def _process_buy_candidate(
             errors_count_inc,
             order_reviews_attempted_inc,
         )
-    if (config.one_order_per_ticker_per_day or not ticker_guarded) and (
-        state.buys_today(ticker, trading_day) >= config.max_buys_per_ticker_per_day
+    if (ctx.config.one_order_per_ticker_per_day or not ticker_guarded) and (
+        ctx.state.buys_today(ticker, ctx.trading_day) >= ctx.config.max_buys_per_ticker_per_day
     ):
         # Zero the top-up guard's incremental amount the same way the broker
         # duplicate check above does: this candidate is being skipped, so a
@@ -6250,9 +6264,9 @@ def _process_buy_candidate(
     # roster's one-order-per-day policy is enabled, the unconditional broker
     # check above already enforced the broader rule, so do not query it twice.
     if (
-        not config.one_order_per_ticker_per_day
+        not ctx.config.one_order_per_ticker_per_day
         and not ticker_guarded
-        and broker.same_day_strategy_order_exists(ticker, trading_day)
+        and ctx.broker.same_day_strategy_order_exists(ticker, ctx.trading_day)
     ):
         candidate_outcome = {
             "status": "skipped",
@@ -6274,7 +6288,7 @@ def _process_buy_candidate(
     # lookup or a spread quote") and the blocked_before_spread_gate contract: a
     # cap-blocked candidate carries NO spread verdict, so a run stopped only by
     # caps is never misreported as missing_spread_data (Codex review).
-    if not within_caps(order_amount, state, trading_day, config):
+    if not within_caps(order_amount, ctx.state, ctx.trading_day, ctx.config):
         candidate_outcome = {
             "status": "blocked",
             "skip_reason": "cap would be exceeded",
@@ -6295,14 +6309,14 @@ def _process_buy_candidate(
     # they can be counted as blocked for want of a proven spread
     # (config/scheduled_tasks.json:spread_data_availability_policy.evaluation_order).
     try:
-        spread_pct = quote_spread_pct(robinhood_data, ticker, now)
+        spread_pct = quote_spread_pct(ctx.robinhood_data, ticker, ctx.now)
     except Exception as exc:  # noqa: BLE001
         errors_count_inc += 1
         candidate_outcome = {
             "status": "blocked",
             "skip_reason": f"spread quote error: {exc}",
             **spread_gate_fields(
-                spread_pct=None, max_spread_pct=config.max_bid_ask_spread_pct
+                spread_pct=None, max_spread_pct=ctx.config.max_bid_ask_spread_pct
             ),
         }
         _block(
@@ -6316,9 +6330,9 @@ def _process_buy_candidate(
             order_reviews_attempted_inc,
         )
     spread_fields = spread_gate_fields(
-        spread_pct=spread_pct, max_spread_pct=config.max_bid_ask_spread_pct
+        spread_pct=spread_pct, max_spread_pct=ctx.config.max_bid_ask_spread_pct
     )
-    if spread_pct is None and scheduled:
+    if spread_pct is None and ctx.scheduled:
         # config/scheduled_tasks.json requires spread_ok=true before any
         # scheduled live order: a provider without bid/ask support, or a
         # quote lookup that returned nothing, must fail closed here
@@ -6345,12 +6359,12 @@ def _process_buy_candidate(
             errors_count_inc,
             order_reviews_attempted_inc,
         )
-    if spread_pct is not None and spread_pct > config.max_bid_ask_spread_pct:
+    if spread_pct is not None and spread_pct > ctx.config.max_bid_ask_spread_pct:
         candidate_outcome = {
             "status": "blocked",
             "skip_reason": (
                 f"bid/ask spread {spread_pct:.2f}% exceeds "
-                f"{config.max_bid_ask_spread_pct:.2f}% limit"
+                f"{ctx.config.max_bid_ask_spread_pct:.2f}% limit"
             ),
             "deliberate_skip": True,
             **spread_fields,
@@ -6358,7 +6372,7 @@ def _process_buy_candidate(
         _block(
             MISSING_FILL_BROKER_BLOCKED,
             f"{ticker}: bid/ask spread {spread_pct:.2f}% exceeds "
-            f"{config.max_bid_ask_spread_pct:.2f}% limit; skipping",
+            f"{ctx.config.max_bid_ask_spread_pct:.2f}% limit; skipping",
         )
         return (
             candidate_outcome,
@@ -6367,7 +6381,7 @@ def _process_buy_candidate(
             errors_count_inc,
             order_reviews_attempted_inc,
         )
-    if broker.available_buying_power() < order_amount:
+    if ctx.broker.available_buying_power() < order_amount:
         candidate_outcome = {
             "status": "blocked",
             "skip_reason": "insufficient buying power",
@@ -6385,7 +6399,7 @@ def _process_buy_candidate(
             errors_count_inc,
             order_reviews_attempted_inc,
         )
-    if not broker.is_tradable_for_fractional_buy(ticker):
+    if not ctx.broker.is_tradable_for_fractional_buy(ticker):
         candidate_outcome = {
             "status": "blocked",
             "skip_reason": "not tradable for fractional buy",
@@ -6405,9 +6419,9 @@ def _process_buy_candidate(
         )
 
     reviewed_order = None
-    if not scheduled:
+    if not ctx.scheduled:
         order_reviews_attempted_inc += 1
-        review_ok, review_reason = broker.review_market_buy(ticker, order_amount)
+        review_ok, review_reason = ctx.broker.review_market_buy(ticker, order_amount)
         if not review_ok:
             candidate_outcome = {
                 "status": "blocked",
@@ -6448,23 +6462,23 @@ def _process_buy_candidate(
     # place_market_buy (Codex review, PR #231: "Separate manual ref IDs from
     # scheduled retry IDs"; mirrors morning_dca.py's identical fix, PR #42).
     ref_id = (
-        f"{_graded_dca_ref_id_prefix(stream, 'topup')}-{trading_day.isoformat()}-{ticker}"
+        f"{_graded_dca_ref_id_prefix(ctx.stream, 'topup')}-{ctx.trading_day.isoformat()}-{ticker}"
         if ticker_guarded
         else (
-            f"{_graded_dca_ref_id_prefix(stream)}-{trading_day.isoformat()}-{ticker}"
-            if scheduled
-            else f"{_graded_dca_ref_id_prefix(stream, 'manual')}-{trading_day.isoformat()}-{ticker}"
+            f"{_graded_dca_ref_id_prefix(ctx.stream)}-{ctx.trading_day.isoformat()}-{ticker}"
+            if ctx.scheduled
+            else f"{_graded_dca_ref_id_prefix(ctx.stream, 'manual')}-{ctx.trading_day.isoformat()}-{ticker}"
         )
     )
-    if config.dry_run:
+    if ctx.config.dry_run:
         logger.info(
             "[DRY RUN] Would buy %s: $%.2f (%s)",
             ticker,
             order_amount,
             decision.reason,
         )
-        if isinstance(broker, DryRunBroker):
-            order_id = broker.place_market_buy(ticker, order_amount, ref_id=ref_id)
+        if isinstance(ctx.broker, DryRunBroker):
+            order_id = ctx.broker.place_market_buy(ticker, order_amount, ref_id=ref_id)
         else:
             order_id = f"DRY-RUN-SIM-{ticker}-{order_amount:.2f}-{ref_id}"
         candidate_outcome = {
@@ -6477,7 +6491,7 @@ def _process_buy_candidate(
         }
     else:
         try:
-            order_id = broker.place_market_buy(ticker, order_amount, ref_id=ref_id)
+            order_id = ctx.broker.place_market_buy(ticker, order_amount, ref_id=ref_id)
         except OrderConfirmationRequiredError:
             candidate_outcome = {
                 "status": "not_submitted_confirmation_required",
@@ -6516,9 +6530,9 @@ def _process_buy_candidate(
                 errors_count_inc,
                 order_reviews_attempted_inc,
             )
-        state.record_buy(ticker, trading_day, order_amount)
-        state.own_orders_recorded.add((ticker, trading_day))
-        if scheduled:
+        ctx.state.record_buy(ticker, ctx.trading_day, order_amount)
+        ctx.state.own_orders_recorded.add((ticker, ctx.trading_day))
+        if ctx.scheduled:
             running_deployed_7d += order_amount
         logger.info(
             "Placed buy for %s: $%.2f, order_id=%s",
@@ -6547,12 +6561,12 @@ def _process_buy_candidate(
         # later same-day run re-allocate it (Codex review).
         _publish_in_flight_outcome(ticker, candidate_outcome)
 
-    if run_result is not None:
+    if ctx.run_result is not None:
         _log_execution(
-            run_result,
+            ctx.run_result,
             decision,
             candidate_outcome.get("order_id"),
-            broker,
+            ctx.broker,
             notional_usd=order_amount,
         )
 
@@ -6647,18 +6661,7 @@ def _seed_prior_allocations(
 
 def _process_buy_candidates_batch(
     buy_candidates: List[ReconciledDecision],
-    config: StrategyConfig,
-    state: StrategyState,
-    broker: BrokerAdapter,
-    robinhood_data: MarketDataProvider,
-    now: datetime,
-    trading_day: date,
-    guard_active: bool,
-    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]],
-    scheduled: bool,
-    run_result: Optional[RunResult],
-    deployment_history_root: Optional[str | Path] = None,
-    stream: str = "afternoon",
+    ctx: ProcessCandidateContext,
 ) -> tuple[Dict[str, Dict[str, Any]], Dict[str, TopUpGuardOutcome], float, int, int]:
     candidate_outcomes: Dict[str, Dict[str, Any]] = {}
     # Published by reference BEFORE any placement so a failure part-way through
@@ -6667,7 +6670,7 @@ def _process_buy_candidates_batch(
     # for a slot that had already placed some (Codex review).
     _IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = candidate_outcomes
     top_up_outcomes: Dict[str, TopUpGuardOutcome] = {}
-    running_deployed_7d = config.deployed_last_7d_usd
+    running_deployed_7d = ctx.config.deployed_last_7d_usd
     errors_count_inc = 0
     order_reviews_attempted_inc = 0
 
@@ -6675,19 +6678,8 @@ def _process_buy_candidates_batch(
         c_outcome, t_outcome, running_deployed_7d, err_inc, rev_inc = (
             _process_buy_candidate(
                 decision=decision,
-                config=config,
-                state=state,
-                broker=broker,
-                robinhood_data=robinhood_data,
-                now=now,
-                trading_day=trading_day,
-                guard_active=guard_active,
-                prior_same_day_allocations=prior_same_day_allocations or {},
+                ctx=ctx,
                 running_deployed_7d=running_deployed_7d,
-                scheduled=scheduled,
-                run_result=run_result,
-                deployment_history_root=deployment_history_root,
-                stream=stream,
             )
         )
         candidate_outcomes[decision.ticker] = c_outcome
@@ -7285,21 +7277,24 @@ def _run_once_impl(
         one_order_per_ticker_per_day=config.one_order_per_ticker_per_day,
     )
 
+    ctx = ProcessCandidateContext(
+        config=config,
+        state=state,
+        broker=broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=guard_active,
+        prior_same_day_allocations=prior_same_day_allocations or {},
+        scheduled=scheduled,
+        run_result=run_result,
+        deployment_history_root=deployment_history_root,
+        stream=stream,
+    )
     candidate_outcomes, top_up_outcomes, running_deployed_7d, err_inc, rev_inc = (
         _process_buy_candidates_batch(
             buy_candidates=buy_candidates,
-            config=config,
-            state=state,
-            broker=broker,
-            robinhood_data=robinhood_data,
-            now=now,
-            trading_day=trading_day,
-            guard_active=guard_active,
-            prior_same_day_allocations=prior_same_day_allocations,
-            scheduled=scheduled,
-            run_result=run_result,
-            deployment_history_root=deployment_history_root,
-            stream=stream,
+            ctx=ctx,
         )
     )
     errors_count += err_inc
