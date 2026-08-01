@@ -357,8 +357,14 @@ def build_latest_run_summary(
     # same-day run) are excluded from the coverage universe; otherwise a fully
     # offset scheduled run would report every offset ticker as a missing fill.
     coverage_candidates = [c for c in buy_candidates if not c.get("top_up_skipped")]
-    priced = [r for r in slippage_rows if not r["target_price_missing"] and r["slippage_pct"] is not None]
-    missing_target = [r for r in slippage_rows if r["target_price_missing"]]
+
+    priced = []
+    missing_target = []
+    for r in slippage_rows:
+        if r["target_price_missing"]:
+            missing_target.append(r)
+        elif r["slippage_pct"] is not None:
+            priced.append(r)
 
     slippage_values = [r["slippage_pct"] for r in priced]
     avg_slippage = round(sum(slippage_values) / len(slippage_values), 4) if slippage_values else None
