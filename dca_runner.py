@@ -1498,6 +1498,8 @@ def _tier_selection_inputs(fresh_cands: list[Candidate]) -> tuple[list[Candidate
     """
     seen_tickers: set[str] = set()
     valid_cands = []
+    planned_spend = 0.0
+    high_mult = 0
     for c in sorted(fresh_cands, key=_allocation_priority_key):
         if c.ticker in seen_tickers:
             continue
@@ -1526,8 +1528,11 @@ def _tier_selection_inputs(fresh_cands: list[Candidate]) -> tuple[list[Candidate
         # validation").
         seen_tickers.add(c.ticker)
         valid_cands.append(c)
-    planned_spend = sum(c.amount_usd for c in valid_cands)
-    high_mult = sum(1 for c in valid_cands if _estimated_multiplier(c) >= HIGH_MULTIPLIER_THRESHOLD)
+
+        # Accumulate spend and high-multiplier counts in the same pass.
+        planned_spend += c.amount_usd
+        if _estimated_multiplier(c) >= HIGH_MULTIPLIER_THRESHOLD:
+            high_mult += 1
     return valid_cands, planned_spend, high_mult
 
 
