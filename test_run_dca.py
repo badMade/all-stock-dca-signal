@@ -4384,6 +4384,71 @@ def test_run_drift_check(mock_detect_drift, mock_send_slack_alert, mock_atomic_w
     mock_send_slack_alert.assert_not_called()
 
 
+
+@patch("run_dca.atomic_write_text")
+@patch("scripts.drift_detection.send_slack_alert")
+@patch("scripts.drift_detection.detect_drift")
+def test_run_drift_check_detected(mock_detect_drift, mock_send_slack_alert, mock_atomic_write_text, tmp_path):
+    """Test _run_drift_check handles drift reporting and invokes slack."""
+    from run_dca import _run_drift_check
+
+    report = mock_detect_drift.return_value
+    report.drift_detected = True
+
+    class MockSymbol:
+        def __init__(self, sym):
+            self.symbol = sym
+    report.affected_symbols = [MockSymbol("AAPL"), MockSymbol("MSFT")]
+
+    report.to_dict.return_value = {"status": "drift"}
+    report.to_json.return_value = '{"status": "drift"}\n'
+    report.to_markdown.return_value = "status: drift\n"
+
+    from scripts.drift_detection import DEFAULT_SLACK_WEBHOOK_ENV
+
+    assert _run_drift_check(tmp_path) == {"status": "drift"}
+    mock_detect_drift.assert_called_once_with(tmp_path)
+    mock_atomic_write_text.assert_any_call(tmp_path / "drift_report.json", '{"status": "drift"}\n')
+    mock_atomic_write_text.assert_any_call(tmp_path / "drift_report.md", "status: drift\n")
+    assert mock_atomic_write_text.call_count == 2
+    mock_send_slack_alert.assert_called_once_with(report, env_var=DEFAULT_SLACK_WEBHOOK_ENV)
+
+
+
+@patch("run_dca.atomic_write_text")
+@patch("scripts.drift_detection.send_slack_alert")
+@patch("scripts.drift_detection.detect_drift")
+def test_run_drift_check_failed(mock_detect_drift, mock_send_slack_alert, mock_atomic_write_text, tmp_path):
+    """Test _run_drift_check returns None when detect_drift raises."""
+    from run_dca import _run_drift_check
+
+    mock_detect_drift.side_effect = Exception("test error")
+
+    assert _run_drift_check(tmp_path) is None
+    mock_atomic_write_text.assert_not_called()
+    mock_send_slack_alert.assert_not_called()
+
+
+@patch("run_dca.atomic_write_text")
+def test_run_drift_check_import_unavailable(mock_atomic_write_text, tmp_path):
+    """Test _run_drift_check returns None when scripts.drift_detection cannot be imported."""
+    import builtins
+
+    from run_dca import _run_drift_check
+
+    real_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "scripts.drift_detection":
+            raise ImportError("test import error")
+        return real_import(name, globals, locals, fromlist, level)
+
+    with patch("builtins.__import__", side_effect=fake_import):
+        assert _run_drift_check(tmp_path) is None
+
+    mock_atomic_write_text.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "dt, expected_time",
     [
