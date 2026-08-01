@@ -703,6 +703,29 @@ class StrategyConfig:
 
 
 @dataclass
+class ArtifactRunContext:
+    """Execution parameters for :func:`build_run_artifacts` and :func:`build_usage_proxy`.
+
+    Groups the 11 keyword arguments that control what is stamped into run
+    artifacts (error counts, notification counters, top-up guard outcomes,
+    manual/scheduled flag, etc.) into a single cohesive object instead of a
+    long keyword-argument list.
+    """
+
+    order_reviews_attempted: Optional[int] = None
+    finance_calls_attempted: Optional[int] = None
+    robinhood_calls_attempted: Optional[int] = None
+    errors_count: int = 0
+    notifications_sent: Optional[int] = None
+    cost_control_notes: Optional[Sequence[str]] = None
+    top_up_outcomes: Optional[Dict[str, "TopUpGuardOutcome"]] = None
+    manual: bool = False
+    raw_persistence_state: Optional[Dict[str, object]] = None
+    classification_overrides: Optional[Dict[str, Any]] = None
+    correlation_id: Optional[str] = None
+
+
+@dataclass
 class StrategyState:
     buys_by_ticker_by_day: Dict[str, Dict[date, int]] = field(default_factory=dict)
     submitted_notional_by_day: Dict[date, float] = field(default_factory=dict)
@@ -2307,45 +2330,37 @@ def build_run_artifacts(
     decisions: Sequence[ReconciledDecision],
     candidate_outcomes: Dict[str, Dict[str, Any]],
     *,
-    order_reviews_attempted: Optional[int] = None,
-    finance_calls_attempted: Optional[int] = None,
-    robinhood_calls_attempted: Optional[int] = None,
-    errors_count: int = 0,
-    notifications_sent: Optional[int] = None,
-    cost_control_notes: Optional[Sequence[str]] = None,
-    top_up_outcomes: Optional[Dict[str, "TopUpGuardOutcome"]] = None,
-    manual: bool = False,
-    raw_persistence_state: Optional[Dict[str, object]] = None,
-    classification_overrides: Optional[Dict[str, Any]] = None,
-    correlation_id: Optional[str] = None,
+    run_context: Optional[ArtifactRunContext] = None,
 ) -> Dict[str, Any]:
     """Build the structured run-state dict written by the daily live-run path.
 
     The artifact captures everything downstream reporting needs: per-source signal
     rows, buy candidates with the target price at signal time and the per-symbol
     planned dollar amount, order ids, skip/block reasons, and budget/reserve fields.
-    When ``top_up_outcomes`` is supplied (the scheduled afternoon run applied the
+    When ``run_context.top_up_outcomes`` is supplied (the scheduled afternoon run applied the
     same-day prior-run offset/top-up guard), each candidate also records the guard's
     prior-allocation context and the resulting incremental order amount.
 
     Also stamps a ``run_classification`` block (via ``scripts/run_classification``)
     so downstream consumers -- ``dca_reporting``'s manual-order exclusion and
     ``dca_risk``'s scheduled-stream deployment accounting -- can tell a scheduled
-    live run from a manual one from the artifact content alone. ``manual``
+    live run from a manual one from the artifact content alone. ``run_context.manual``
     selects which block is stamped: False (default) is the scheduled 3:30 PM ET
-    live task, True is a manual/ad hoc invocation. ``classification_overrides``
+    live task, True is a manual/ad hoc invocation. ``run_context.classification_overrides``
     lets a non-afternoon scheduled caller (the roster's ``run_slot`` for 1030ET/
     1230ET) stamp its OWN stream/cron_id/scheduled_for_et/run_id instead of the
     afternoon defaults (Codex review, discussion_r3679391261: "Stamp each slot
-    with its own scheduled classification") -- ignored when ``manual`` is True.
+    with its own scheduled classification") -- ignored when ``run_context.manual`` is True.
 
-    ``correlation_id``, when given, is stamped onto the top-level artifact (next
+    ``run_context.correlation_id``, when given, is stamped onto the top-level artifact (next
     to ``run_id``) so the deterministic (day, stream, window) id a scheduler used
     to fire this run is recoverable from the durable run_state.json itself, not
     only from an in-process return value that is lost if the process exits or
     crashes before the caller reads it (Codex review, discussion_r3679633768:
     "Persist the slot correlation ID in run artifacts").
     """
+    run_context = run_context or ArtifactRunContext()
+
     now_et = now.astimezone(EASTERN)
     trading_day = now_et.date()
     run_id = f"{trading_day.isoformat()}-{now_et.strftime('%H%M%S')}"
@@ -2362,14 +2377,14 @@ def build_run_artifacts(
         )
     run_classification = (
         build_manual_classification(triggered_at_utc=triggered_at_utc)
-        if manual
+        if run_context.manual
         else build_scheduled_classification(
             trading_day.isoformat(),
             triggered_at_utc=triggered_at_utc,
-            **(classification_overrides or {}),
+            **(run_context.classification_overrides or {}),
         )
     )
-    if not manual:
+    if not run_context.manual:
         # The scheduled afternoon (3:30 PM ET) artifact contract requires the
         # run_classification to additionally carry trading_day, same_day_required,
         # and valid_scheduled_evidence (see
@@ -2418,9 +2433,7 @@ def build_run_artifacts(
             ):
                 _row["auto_buy_signal"] = False
 
-    buy_candidates = _build_buy_candidates(
-        decisions, candidate_outcomes, top_up_outcomes
-    )
+    buy_candidates = _build_buy_candidates(decisions, candidate_outcomes, run_context.top_up_outcomes)
 
     manual_review_tickers = [
         d.ticker for d in decisions if d.action == Action.MANUAL_REVIEW
@@ -2478,10 +2491,8 @@ def build_run_artifacts(
     artifacts = {
         "run_id": run_id,
         "run_classification": run_classification,
-        **({"correlation_id": correlation_id} if correlation_id is not None else {}),
-        "order_submit_status": _derive_order_submit_status(
-            config, buy_candidates, errors_count
-        ),
+        **({"correlation_id": run_context.correlation_id} if run_context.correlation_id is not None else {}),
+        "order_submit_status": _derive_order_submit_status(config, buy_candidates, run_context.errors_count),
         "generated_at": now_et.isoformat(),
         "trading_day": trading_day.isoformat(),
         "iso_week": list(iso_week_key(trading_day)),
@@ -2507,18 +2518,18 @@ def build_run_artifacts(
             signal_rows=signal_rows,
             buy_candidates=buy_candidates,
             candidate_outcomes=candidate_outcomes,
-            order_reviews_attempted=order_reviews_attempted,
-            finance_calls_attempted=finance_calls_attempted,
-            robinhood_calls_attempted=robinhood_calls_attempted,
-            errors_count=errors_count,
-            notifications_sent=notifications_sent,
-            cost_control_notes=cost_control_notes,
+            order_reviews_attempted=run_context.order_reviews_attempted,
+            finance_calls_attempted=run_context.finance_calls_attempted,
+            robinhood_calls_attempted=run_context.robinhood_calls_attempted,
+            errors_count=run_context.errors_count,
+            notifications_sent=run_context.notifications_sent,
+            cost_control_notes=run_context.cost_control_notes,
         ),
     }
-    _apply_no_order_classification(artifacts, candidate_outcomes, scheduled=not manual)
-    if raw_persistence_state is not None:
-        artifacts.update(raw_persistence_state)
-    if not manual:
+    _apply_no_order_classification(artifacts, candidate_outcomes, scheduled=not run_context.manual)
+    if run_context.raw_persistence_state is not None:
+        artifacts.update(run_context.raw_persistence_state)
+    if not run_context.manual:
         # Derive valid_scheduled_evidence from the completed state rather than
         # asserting it: a scheduled (non-manual) run is same-day scheduled
         # evidence, a manual run never is. Mirrors morning_dca.py's finalization.
@@ -5653,12 +5664,7 @@ def _finalize_and_write_artifacts(
     if artifacts_dir is None:
         return
 
-    artifacts = build_run_artifacts(
-        now,
-        config,
-        state,
-        decisions,
-        candidate_outcomes,
+    run_context = ArtifactRunContext(
         order_reviews_attempted=order_reviews_attempted,
         errors_count=errors_count,
         notifications_sent=notifications_sent,
@@ -5668,6 +5674,14 @@ def _finalize_and_write_artifacts(
         raw_persistence_state=raw_persistence_state,
         classification_overrides=classification_overrides,
         correlation_id=correlation_id,
+    )
+    artifacts = build_run_artifacts(
+        now,
+        config,
+        state,
+        decisions,
+        candidate_outcomes,
+        run_context=run_context,
     )
     paths = write_run_artifacts(artifacts, artifacts_dir)
     logger.info("Wrote run artifacts: %s", paths["run_state"])
@@ -6733,6 +6747,35 @@ def _publish_in_flight_outcome(ticker: str, outcome: Dict[str, Any]) -> None:
         outcomes[ticker] = outcome
 
 
+@dataclass(frozen=True)
+class RunContext:
+    """Immutable execution context for a single afternoon DCA run.
+
+    Passed to :func:`run_once` to bundle the per-run execution parameters
+    (broker, data providers, artifact directory, etc.) into a single object
+    rather than a long keyword-argument list.
+    """
+
+    now: datetime
+    config: StrategyConfig
+    state: StrategyState
+    finance_data: MarketDataProvider
+    robinhood_data: MarketDataProvider
+    broker: BrokerAdapter
+    artifacts_dir: Optional[str | Path] = None
+    run_result: Optional[RunResult] = None
+    notifications_sent: Optional[int] = None
+    cost_control_notes: Optional[Sequence[str]] = None
+    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]] = None
+    deployment_history_root: Optional[str | Path] = None
+    scheduled: bool = True
+    classification_state_root: Optional[str | Path] = None
+    raw_persistence_state: Optional[Dict[str, object]] = None
+    classification_overrides: Optional[Dict[str, Any]] = None
+    correlation_id: Optional[str] = None
+    stream: str = "afternoon"
+
+
 def run_once(
     ctx: RunContext,
 ) -> List[ReconciledDecision]:
@@ -6750,20 +6793,26 @@ def run_once(
     _IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
     scheduled = ctx.scheduled
     try:
-<<<<<<< HEAD
-        return _run_once_impl(ctx)
-=======
         return _run_once_impl(
-            now,
-            config,
-            state,
-            finance_data,
-            robinhood_data,
-            broker,
-            artifacts_dir,
-            **kwargs,
+            ctx.now,
+            ctx.config,
+            ctx.state,
+            ctx.finance_data,
+            ctx.robinhood_data,
+            ctx.broker,
+            ctx.artifacts_dir,
+            run_result=ctx.run_result,
+            notifications_sent=ctx.notifications_sent,
+            cost_control_notes=ctx.cost_control_notes,
+            prior_same_day_allocations=ctx.prior_same_day_allocations,
+            deployment_history_root=ctx.deployment_history_root,
+            scheduled=ctx.scheduled,
+            classification_state_root=ctx.classification_state_root,
+            raw_persistence_state=ctx.raw_persistence_state,
+            classification_overrides=ctx.classification_overrides,
+            correlation_id=ctx.correlation_id,
+            stream=ctx.stream,
         )
->>>>>>> origin/main
     except Exception as exc:  # noqa: BLE001 - always re-raised below
         if scheduled and ctx.artifacts_dir:
             try:
@@ -7287,8 +7336,12 @@ def run_and_report(
     """
     if deployment_history_root is None:
         deployment_history_root = Path(output_dir).parent
-<<<<<<< HEAD
-    run_result = RunResult(trading_day=now.astimezone(EASTERN).date(), decisions=[])
+    run_result = RunResult(
+        trading_day=now.astimezone(EASTERN).date(),
+        decisions=[],
+        run_label=run_label,
+        scheduled=scheduled,
+    )
     ctx = RunContext(
         now=now,
         config=config,
@@ -7296,21 +7349,6 @@ def run_and_report(
         finance_data=finance_data,
         robinhood_data=robinhood_data,
         broker=broker,
-=======
-    run_result = RunResult(
-        trading_day=now.astimezone(EASTERN).date(),
-        decisions=[],
-        run_label=run_label,
-        scheduled=scheduled,
-    )
-    run_once(
-        now,
-        config,
-        state,
-        finance_data,
-        robinhood_data,
-        broker,
->>>>>>> origin/main
         run_result=run_result,
         deployment_history_root=deployment_history_root,
         scheduled=scheduled,
@@ -7431,8 +7469,12 @@ def run_daily_compact(
             "'options' or the legacy keyword arguments, not both"
         )
     trading_day = now.astimezone(EASTERN).date()
-<<<<<<< HEAD
-    run_result = RunResult(trading_day=trading_day, decisions=[])
+    run_result = RunResult(
+        trading_day=trading_day,
+        decisions=[],
+        run_label=options.run_label,
+        scheduled=options.scheduled,
+    )
     ctx = RunContext(
         now=now,
         config=config,
@@ -7440,23 +7482,7 @@ def run_daily_compact(
         finance_data=finance_data,
         robinhood_data=robinhood_data,
         broker=broker,
-        artifacts_dir=artifacts_dir,
-=======
-    run_result = RunResult(
-        trading_day=trading_day,
-        decisions=[],
-        run_label=options.run_label,
-        scheduled=options.scheduled,
-    )
-    run_once(
-        now,
-        config,
-        state,
-        finance_data,
-        robinhood_data,
-        broker,
         artifacts_dir=options.artifacts_dir,
->>>>>>> origin/main
         run_result=run_result,
         notifications_sent=options.notifications_sent,
         prior_same_day_allocations=options.prior_same_day_allocations,

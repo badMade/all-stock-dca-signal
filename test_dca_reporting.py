@@ -934,13 +934,13 @@ def test_build_run_artifacts_manual_classification():
     from datetime import date, datetime, time
     from zoneinfo import ZoneInfo
 
-    from near_close_dca import StrategyConfig, StrategyState, build_run_artifacts
+    from near_close_dca import ArtifactRunContext, StrategyConfig, StrategyState, build_run_artifacts
     from scripts.run_classification import validate_classification
 
     eastern = ZoneInfo("America/New_York")
     now = datetime.combine(date(2026, 6, 29), time(15, 45), tzinfo=eastern)
 
-    artifacts = build_run_artifacts(now, StrategyConfig(), StrategyState(), [], {}, manual=True)
+    artifacts = build_run_artifacts(now, StrategyConfig(), StrategyState(), [], {}, run_context=ArtifactRunContext(manual=True))
     rc = artifacts["run_classification"]
     assert rc["run_origin"] == "manual"
     assert rc["manual_run"] is True
@@ -953,6 +953,7 @@ def test_build_run_artifacts_surfaces_top_up_manual_review():
 
     from near_close_dca import (
         Action,
+        ArtifactRunContext,
         ReconciledDecision,
         SourceName,
         SourceSignal,
@@ -986,7 +987,7 @@ def test_build_run_artifacts_surfaces_top_up_manual_review():
     artifacts = build_run_artifacts(
         now, StrategyConfig(), StrategyState(), [decision],
         {"AAPL": {"status": "not_submitted", "skip_reason": "missing_prior_price"}},
-        top_up_outcomes={"AAPL": guard_outcome},
+        run_context=ArtifactRunContext(top_up_outcomes={"AAPL": guard_outcome}),
     )
     assert artifacts["manual_review_tickers"] == ["AAPL"]
     assert artifacts["usage_proxy"]["manual_recovery_required"] is True

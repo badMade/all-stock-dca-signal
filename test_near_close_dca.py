@@ -4857,6 +4857,25 @@ def test_build_usage_proxy_defaults_and_overrides():
     # a MANUAL_REVIEW decision flags manual recovery even with zero errors.
     assert usage["manual_recovery_required"] is True
 
+    proxy = build_usage_proxy(
+        decisions=[_decision("A", Action.BUY), _decision("B", Action.BUY)],
+        signal_rows=[{}, {}, {}],
+        buy_candidates=[{"a": 1}],
+        candidate_outcomes={},
+        order_reviews_attempted=5,
+        finance_calls_attempted=4,
+        robinhood_calls_attempted=2,
+        errors_count=1,
+        notifications_sent=3,
+        cost_control_notes=["Note 1"],
+    )
+    assert proxy["finance_calls_attempted"] == 4
+    assert proxy["robinhood_calls_attempted"] == 2
+    assert proxy["order_reviews_attempted"] == 5
+    assert proxy["errors_count"] == 1
+    assert proxy["notifications_sent"] == 3
+    assert proxy["cost_control_notes"] == ["Note 1"]
+
 
 # --- Same-day prior-run offset / top-up guard --------------------------------
 
@@ -7310,6 +7329,7 @@ def test_build_run_artifacts_uses_guarded_amount_as_planned_notional(tmp_path):
     The original desired amount must be preserved in afternoon_desired_amount_usd."""
     from near_close_dca import (
         TOP_UP_INCREMENTAL,
+        ArtifactRunContext,
         TopUpGuardOutcome,
         build_run_artifacts,
     )
@@ -7342,7 +7362,7 @@ def test_build_run_artifacts_uses_guarded_amount_as_planned_notional(tmp_path):
         state,
         [decision],
         candidate_outcomes={"AAPL": {"order_id": "x", "status": "dry_run"}},
-        top_up_outcomes={"AAPL": guard},
+        run_context=ArtifactRunContext(top_up_outcomes={"AAPL": guard}),
     )
     candidates = {c["ticker"]: c for c in artifacts["buy_candidates"]}
     assert (
@@ -7363,6 +7383,7 @@ def test_build_run_artifacts_keeps_preserved_amount_for_duplicate(tmp_path):
     # figure -- the order actually deployed the larger amount.
     from near_close_dca import (
         TOP_UP_INCREMENTAL,
+        ArtifactRunContext,
         TopUpGuardOutcome,
         build_run_artifacts,
     )
@@ -7403,7 +7424,7 @@ def test_build_run_artifacts_keeps_preserved_amount_for_duplicate(tmp_path):
                 "duplicate_preserved": True,
             }
         },
-        top_up_outcomes={"AAPL": guard},
+        run_context=ArtifactRunContext(top_up_outcomes={"AAPL": guard}),
     )
     candidates = {c["ticker"]: c for c in artifacts["buy_candidates"]}
     assert candidates["AAPL"]["planned_amount_usd"] == 4.0, (
@@ -7421,6 +7442,7 @@ def test_build_run_artifacts_records_guards_effective_base_not_current_run_base(
     # decision.selected_base_amount_usd.
     from near_close_dca import (
         TOP_UP_INCREMENTAL,
+        ArtifactRunContext,
         TopUpGuardOutcome,
         build_run_artifacts,
     )
@@ -7464,7 +7486,7 @@ def test_build_run_artifacts_records_guards_effective_base_not_current_run_base(
         state,
         [decision],
         candidate_outcomes={"AAPL": {"order_id": "x", "status": "dry_run"}},
-        top_up_outcomes={"AAPL": guard},
+        run_context=ArtifactRunContext(top_up_outcomes={"AAPL": guard}),
     )
     candidates = {c["ticker"]: c for c in artifacts["buy_candidates"]}
     assert candidates["AAPL"]["selected_base_amount_usd"] == 1.0
