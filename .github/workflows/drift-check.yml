@@ -1,0 +1,128 @@
+# DCA drift detector — BACKUP self-test (NOT the production drift check).
+#
+# This workflow is a backup/heartbeat only. It does NOT reconcile real orders:
+#   * GitHub runners cannot see the production cron_tracking/ run directories —
+#     those live on the trading host and are gitignored, so they never reach CI.
+#   * The real drift check runs INSIDE each live trading task (morning/midday/
+#     afternoon) immediately after it writes artifacts, per
+#     config/scheduled_tasks.json (drift_detection_policy). That in-task check is
+#     the source of truth; this workflow does not replace it.
+#
+# What it actually does:
+#   1. Smoke-tests scripts/drift_detection.py against a synthetic fixture that is
+#      built to trigger drift, proving the detector still detects and exits 2.
+#   2. Passes --slack on that same invocation, so when DCA_DRIFT_SLACK_WEBHOOK is
+#      configured the real send_slack_alert() path -- env lookup, payload
+#      construction, URL validation, and the send itself -- actually runs, not
+#      just a hand-rolled connectivity POST that bypasses that code (codex
+#      review discussion_r3697106546: a regression in any of those would
+#      otherwise leave this self-test green while production alerts are
+#      broken). The fixture's run directory and ticker are named so an operator
+#      who sees the resulting Slack message immediately recognizes it as this
+#      CI self-test, not a real drift alert. Still skipped (not failed) when the
+#      secret is unset, matching the detector's own documented behavior.
+#
+# TRUST BOUNDARY -- there is deliberately no `workflow_dispatch` trigger here.
+# `schedule` always runs the workflow file AND checks out the code as they
+# exist on the default branch, never a PR/dispatch-selected ref.
+# `workflow_dispatch` does not have that property: GitHub runs the version of
+# THIS FILE that lives on whatever ref the dispatcher selects, so any
+# checkout-ref pin added inside a job body can simply be edited out in that
+# same dispatched copy -- it isn't a real defense. With
+# DCA_DRIFT_SLACK_WEBHOOK injected as a secret, adding workflow_dispatch back
+# would let anyone with dispatch permission (which can be broader than merge
+# access) run their own branch's scripts/drift_detection.py with that secret
+# in scope and exfiltrate it (codex review). This repo's other secret-bearing
+# workflow (antigravity-pr-review-post.yml) follows the same rule: no trigger
+# that lets a non-default ref supply the code that runs with a secret. There
+# is consequently no on-demand trigger for this workflow at all -- the
+# `workflow_dispatch` API/UI requires the target workflow to declare that
+# trigger, so removing it removes the on-demand path along with the risk. For
+# an ad hoc check, run the detector directly instead (see section C, "Local
+# shell / by hand", in docs/slack_webhook_injection.md) rather than
+# reintroducing workflow_dispatch here.
+#
+# See docs/slack_webhook_injection.md for the full caveats and the per-runtime
+# webhook setup.
+
+name: Drift detector backup self-test
+
+on:
+  schedule:
+    # 13:00 UTC on weekdays — a backup heartbeat, deliberately offset from the
+    # real in-task checks. Times drift with DST; exact timing is not critical for
+    # a self-test.
+    - cron: "0 13 * * 1-5"
+
+# A rapid series of triggers on the same ref should leave one running self-test,
+# not N -- this is a heartbeat, so a superseded run carries no audit value.
+concurrency:
+  group: drift-check-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  self-test:
+    name: Detector smoke test + Slack send-path check
+    runs-on: ubuntu-latest
+    # A trivial smoke test; a generous ceiling that still stops a hung job from
+    # burning the full 6-hour runner default.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build synthetic drift fixture
+        run: |
+          set -euo pipefail
+          # Named ci-self-test-* (run dir AND ticker) so the "Run:"/"Affected:"
+          # lines in any resulting Slack message are unmistakably this backup
+          # self-test, never mistaken for a real drift alert.
+          fixture="$RUNNER_TEMP/ci-self-test-drift-fixture"
+          mkdir -p "$fixture"
+          # signals.csv with two auto-buy rows carrying positive incremental
+          # amounts and NO submitted_orders.csv -> the detector must flag drift.
+          printf 'ticker,auto_buy_signal,incremental_order_amount\n' > "$fixture/signals.csv"
+          printf 'ZZ_CI_SELF_TEST_1,true,100\n' >> "$fixture/signals.csv"
+          printf 'ZZ_CI_SELF_TEST_2,true,50\n' >> "$fixture/signals.csv"
+          echo "FIXTURE=$fixture" >> "$GITHUB_ENV"
+
+      - name: Smoke-test the drift detector (expects drift, exit 2) and exercise the Slack send path
+        env:
+          DCA_DRIFT_SLACK_WEBHOOK: ${{ secrets.DCA_DRIFT_SLACK_WEBHOOK }}
+        run: |
+          # GitHub's default bash runs with -e; disable it so the expected
+          # non-zero (2 = drift) exit does not abort the step before we check it.
+          set +e
+          slack_log="$RUNNER_TEMP/slack_stderr.log"
+          python3 scripts/drift_detection.py \
+            --run-dir "$FIXTURE" \
+            --json-out "$FIXTURE/drift_report.json" \
+            --md-out "$FIXTURE/drift_report.md" \
+            --slack \
+            --fail-on-drift 2> "$slack_log"
+          code=$?
+          cat "$slack_log" >&2
+          echo "detector exit code: $code"
+          if [ "$code" -ne 2 ]; then
+            echo "::error::Expected exit code 2 (drift detected) but got $code — the detector did not flag the synthetic drift fixture."
+            exit 1
+          fi
+          echo "Detector correctly detected drift on the synthetic fixture."
+          if [ -z "${DCA_DRIFT_SLACK_WEBHOOK:-}" ]; then
+            echo "DCA_DRIFT_SLACK_WEBHOOK is not set; Slack send path was not exercised (this is not a failure)."
+          elif grep -q "warning: Slack alert failed" "$slack_log"; then
+            echo "::error::DCA_DRIFT_SLACK_WEBHOOK is configured but send_slack_alert failed -- see the warning above."
+            exit 1
+          else
+            echo "DCA_DRIFT_SLACK_WEBHOOK is configured and the real send_slack_alert path succeeded."
+          fi
+          cat "$FIXTURE/drift_report.json"

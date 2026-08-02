@@ -18,6 +18,7 @@ environment (see the repository README).
 | [schedule_manifest.md](schedule_manifest.md) | The canonical 17-row recurring schedule verified 2026-07-27, one-time tasks, and retired entries |
 | [run_classification.md](run_classification.md) | Scheduled-vs-manual run contract (paths, required fields, exclusion rules) |
 | [drift_detection.md](drift_detection.md) | Post-artifact signals-vs-submitted-orders drift detector + Slack alerting |
+| [slack_webhook_injection.md](slack_webhook_injection.md) | How to inject the `DCA_DRIFT_SLACK_WEBHOOK` webhook across cron/systemd, agent/MCP scheduler, local shell, and GitHub Actions |
 | [reporting_workflow.md](reporting_workflow.md) | Daily/periodic artifact + Notion flow |
 | [notion_dashboard_template.md](notion_dashboard_template.md) | Notion page template + conceptual API sync |
 | [cost_tracking.md](cost_tracking.md) | Cost-control policy and usage proxies |

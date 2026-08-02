@@ -1,0 +1,18 @@
+# Timer for dca-drift-market-open.service — weekdays at 09:35 America/New_York.
+# OnCalendar is DST-aware because it names a timezone, so it stays at 09:35 ET
+# across EDT/EST. Persistence is intentionally NOT enabled: a missed trigger
+# would derive its run directory from the CURRENT wall-clock date at whenever
+# systemd catches it up, not the date of the trading day that was actually
+# missed, so a downtime-triggered catch-up run would check the wrong (or a
+# nonexistent) directory instead of the missed day's artifacts (codex review
+# discussion_r3697106541). A missed check is simply skipped -- this is a
+# backup detector; the primary check runs inside the live task itself.
+
+[Unit]
+Description=Schedule DCA drift detector (market-open 09:35 ET)
+
+[Timer]
+OnCalendar=Mon..Fri 09:35 America/New_York
+
+[Install]
+WantedBy=timers.target

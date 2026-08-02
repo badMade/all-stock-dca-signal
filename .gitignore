@@ -7,6 +7,9 @@ venv/
 .env.*
 *.log
 cron_tracking/
+
+# Deploy secrets (e.g. deploy/drift-slack.env) — templates (*.env.example) stay tracked
+deploy/*.env
 _to_delete/
 
 # Python build / tooling

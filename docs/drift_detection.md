@@ -105,6 +105,10 @@ and continues; the exit code still reflects drift. When Slack is not configured,
 drift still routes to `in_app_message_center` per
 [`config/notifications.json`](../config/notifications.json).
 
+For per-runtime webhook setup (cron/systemd, external agent/MCP scheduler, local
+shell, and the GitHub Actions backup), see
+[slack_webhook_injection.md](slack_webhook_injection.md).
+
 ## How scheduled tasks trigger the immediate alert
 
 Each live trading task carries a `post_artifact_drift_check` block in
