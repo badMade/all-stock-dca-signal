@@ -37,6 +37,7 @@ import csv
 import json
 import logging
 import os
+import os as _os
 import smtplib
 import sys
 import traceback
@@ -50,23 +51,23 @@ from typing import Any
 # ---------------------------------------------------------------------------
 import numpy as np
 import pandas as pd
+
+# vectorbt – signal generation and portfolio simulation
+import vectorbt as vbt
 import yfinance as yf
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
-import os as _os
-_ALPACA_KEY    = _os.environ.get("ALPACA_API_KEY", "")
-_ALPACA_SECRET = _os.environ.get("ALPACA_SECRET_KEY", "")
-_USE_ALPACA    = bool(_ALPACA_KEY and _ALPACA_SECRET)
-
-# vectorbt – signal generation and portfolio simulation
-import vectorbt as vbt
 
 # Jinja2 – HTML email templating
-from jinja2 import Environment, BaseLoader
+from jinja2 import BaseLoader, Environment
 
 # scipy – beta/alpha linear regression
 from scipy import stats
+
+_ALPACA_KEY    = _os.environ.get("ALPACA_API_KEY", "")
+_ALPACA_SECRET = _os.environ.get("ALPACA_SECRET_KEY", "")
+_USE_ALPACA    = bool(_ALPACA_KEY and _ALPACA_SECRET)
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -1027,9 +1028,9 @@ class SheetsWriter:
         Append one row per strategy to the Google Sheet.
         Returns True on success, False on any failure.
         """
-        import urllib.request
         import urllib.error
         import urllib.parse
+        import urllib.request
 
         if not self.spreadsheet_id:
             logger.warning("SheetsWriter: no GOOGLE_SHEET_ID configured — skipping.")
@@ -1321,10 +1322,10 @@ class MonitorOrchestrator:
 
         # ── Step 4b: Build & send email ──────────────────────────────────
         logger.info("Step 4/4b — Preparing email …")
-sheet_url = (self.cfg.get("GOOGLE_SHEET_URL", "") or "").strip()
-if sheet_url and not sheet_url.lower().startswith(("http://", "https://")):
-    logger.warning("Invalid GOOGLE_SHEET_URL scheme; omitting dashboard link.")
-    sheet_url = ""
+        sheet_url = (self.cfg.get("GOOGLE_SHEET_URL", "") or "").strip()
+        if sheet_url and not sheet_url.lower().startswith(("http://", "https://")):
+            logger.warning("Invalid GOOGLE_SHEET_URL scheme; omitting dashboard link.")
+            sheet_url = ""
 
         # Decide whether to send
         should_send = (
