@@ -1,0 +1,1 @@
+Leftover generator scratch file from the 2026-07-30 mirror capture. Safe to delete; the sandbox lacked unlink permission at the time. Nothing reads it.

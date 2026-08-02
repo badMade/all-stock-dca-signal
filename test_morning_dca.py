@@ -2735,6 +2735,43 @@ def test_live_gate_restricts_to_preflight_eligible(tmp_path):
     assert evaluated == {"BIG"}
 
 
+def test_live_gate_falls_back_to_full_universe_when_preflight_admits_nothing(tmp_path):
+    """A VALID preflight (overall_ok=true) that legitimately found no ticker
+    below its prior close at 9:45 is advisory context, not a block -- unlike
+    a missing/invalid artifact, this must not narrow the 10:30 run to zero,
+    or a ticker that only declined AFTER 9:45 would never be evaluated
+    (Codex review: "Fall back when the valid preflight admits no tickers")."""
+    preflight_root = tmp_path / "preflight"
+    pf = MorningDCAExecutor(
+        MorningConfig(tickers=("BIG", "FLAT"), morning_run_state_root=str(preflight_root)),
+        mode=MORNING_PREFLIGHT_MODE,
+    )
+    # Neither ticker is down at all at 9:45, so preflight_eligibility() admits
+    # neither -- eligible_to_execute_tickers is genuinely empty, not missing.
+    pf_data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.0, "FLAT": 0.0})
+    pf.run(_now_preflight(), pf_data)
+
+    live = MorningDCAExecutor(
+        MorningConfig(
+            tickers=("BIG", "FLAT"),
+            morning_run_state_root=str(tmp_path / "live"),
+            preflight_run_state_root=str(preflight_root),
+        ),
+        mode=MORNING_LIVE_MODE,
+    )
+    # Both tickers have since declined by 10:30 -- the exact case the empty
+    # 9:45 preflight must not have blocked from evaluation.
+    live_data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10, "FLAT": 0.10})
+    res = live.run(_now_live(), live_data, broker=FakeLiveBroker())
+    art = res["artifacts"]
+    gate = art["preflight_gate"]
+    assert gate["preflight_found"] is True
+    assert gate["eligible_to_execute_tickers"] == []
+    assert "warning" in gate
+    evaluated = {r["ticker"] for r in art["signal_rows"]}
+    assert evaluated == {"BIG", "FLAT"}
+
+
 def test_live_gate_fails_closed_when_preflight_missing_scheduled(tmp_path):
     # Scheduled live runs must write a durable blocked run_state (fail-closed)
     # when no preflight artifact exists, rather than raising and leaving no

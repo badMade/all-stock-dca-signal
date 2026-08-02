@@ -527,6 +527,19 @@ class PriorSameDayAllocation:
     # chronologically FIRST allocation's base rather than whichever root happened
     # to be merged first. None when unresolved/unavailable.
     selected_base_amount_usd_at: Optional[str] = None
+    # Count of distinct same-day broker order ATTEMPTS this aggregate folds
+    # in for this ticker -- every contributing candidate/CSV row, including a
+    # repeated same-ticker buy across separate slot invocations and a
+    # terminally rejected/canceled order that contributed $0 to amount_usd.
+    # amount_usd alone cannot answer "how many orders were attempted today":
+    # StrategyState resets across separate cron/manual process invocations,
+    # so _seed_prior_allocations must reconstruct day_order_count from THIS
+    # count rather than from one bump per ticker with a positive allocation,
+    # or eight earlier attempts spread across three tickers (or any rejected/
+    # canceled attempt) would undercount the roster-wide daily order-count
+    # cap and let a later slot exceed it (Codex review: "Reconstruct the cap
+    # from every prior buy attempt").
+    order_attempts: int = 0
 
 
 @dataclass(frozen=True)
@@ -764,6 +777,15 @@ class StrategyState:
     # (Codex review, PR #231: "Record the recovered buy separately from seeded
     # prior context").
     own_orders_recorded: Set[Tuple[str, date]] = field(default_factory=set)
+    # (ticker, trading_day) pairs whose PriorSameDayAllocation.order_attempts
+    # has already been folded into submitted_order_count_by_day by
+    # _seed_prior_allocations. Separate from buys_today-based idempotency: a
+    # ticker whose every same-day attempt was terminally rejected/canceled
+    # never calls record_buy (amount_usd stays 0), so buys_today() alone
+    # cannot guard against re-seeding its attempt count if an in-process
+    # retry reuses this StrategyState instance (Codex review: "Reconstruct
+    # the cap from every prior buy attempt").
+    seeded_attempt_tickers: Set[Tuple[str, date]] = field(default_factory=set)
 
     def buys_today(self, ticker: str, trading_day: date) -> int:
         return self.buys_by_ticker_by_day.get(ticker, {}).get(trading_day, 0)
@@ -791,6 +813,24 @@ class StrategyState:
 
     def day_order_count(self, trading_day: date) -> int:
         return self.submitted_order_count_by_day.get(trading_day, 0)
+
+    def record_additional_order_attempts(self, trading_day: date, count: int) -> None:
+        """Bump the day's order-attempt count WITHOUT touching notional/buys_today.
+
+        ``record_buy`` bumps dollar totals and the order count together
+        because it always represents a real, priced allocation. Seeding prior
+        SAME-TICKER repeat attempts (or terminally rejected/canceled ones
+        that never moved capital) from ``PriorSameDayAllocation.order_attempts``
+        must NOT double-count the dollar amount ``record_buy`` already folded
+        in for that ticker's first seeded allocation -- only the count needs
+        the remaining attempts added (Codex review: "Reconstruct the cap from
+        every prior buy attempt").
+        """
+        if count <= 0:
+            return
+        self.submitted_order_count_by_day[trading_day] = (
+            self.day_order_count(trading_day) + count
+        )
 
     def current_tier(self) -> BudgetTier:
         """Return the tier selected for the current run, defaulting to Normal."""
@@ -3998,6 +4038,24 @@ def load_prior_same_day_allocations(
     context reload) should pass a list here and treat any entries in it as
     reason enough to reload, independent of what the returned mapping shows.
     """
+
+    def _default_entry(run_id: Optional[str], source: Optional[str]) -> Dict[str, Any]:
+        return {
+            "amount": 0.0,
+            "reference_price": None,
+            "reference_ts": None,
+            "run_id": run_id,
+            "source": source,
+            "selected_base_amount_usd": None,
+            "selected_base_amount_usd_at": None,
+            "selected_base_amount_usd_seen": False,
+            # See PriorSameDayAllocation.order_attempts: every contributing
+            # candidate/CSV row bumps this, including a terminally rejected/
+            # canceled order that contributes $0 to "amount" (Codex review:
+            # "Reconstruct the cap from every prior buy attempt").
+            "attempt_count": 0,
+        }
+
     # Deduplicate roots by resolved path so an additional_state_root that matches
     # state_root (or another additional root) doesn't cause double-counting.
     _seen_roots: set = set()
@@ -4250,19 +4308,10 @@ def load_prior_same_day_allocations(
                         if _amount <= 0:
                             continue
                         _entry = aggregated.setdefault(
-                            _ticker,
-                            {
-                                "amount": 0.0,
-                                "reference_price": None,
-                                "reference_ts": None,
-                                "run_id": run_id,
-                                "source": source,
-                                "selected_base_amount_usd": None,
-                                "selected_base_amount_usd_at": None,
-                                "selected_base_amount_usd_seen": False,
-                            },
+                            _ticker, _default_entry(run_id, source)
                         )
                         _entry["amount"] += _amount
+                        _entry["attempt_count"] += 1
                         if _entry.get("reference_price_unknown"):
                             pass
                         elif _ref is None:
@@ -4350,12 +4399,21 @@ def load_prior_same_day_allocations(
             # separate real fill.
             _cand_oid = (candidate.get("order_id") or "").strip()
             if _cand_oid and _cand_oid in terminal_order_ids:
+                # No capital moved, but a real broker attempt was made -- it
+                # still counts toward the roster-wide daily order-count cap
+                # even though it contributes $0 to amount_usd.
+                aggregated.setdefault(ticker, _default_entry(run_id, source))[
+                    "attempt_count"
+                ] += 1
                 continue
             if (
                 not _cand_oid
                 and ticker in terminal_tickers
                 and fills.get(ticker) is None
             ):
+                aggregated.setdefault(ticker, _default_entry(run_id, source))[
+                    "attempt_count"
+                ] += 1
                 continue
 
             # A "submitted" candidate in run_state.json only means an order_id was
@@ -4420,20 +4478,9 @@ def load_prior_same_day_allocations(
                 ):
                     base_amount_usd = None
 
-            entry = aggregated.setdefault(
-                ticker,
-                {
-                    "amount": 0.0,
-                    "reference_price": None,
-                    "reference_ts": None,
-                    "run_id": run_id,
-                    "source": source,
-                    "selected_base_amount_usd": None,
-                    "selected_base_amount_usd_at": None,
-                    "selected_base_amount_usd_seen": False,
-                },
-            )
+            entry = aggregated.setdefault(ticker, _default_entry(run_id, source))
             entry["amount"] += amount
+            entry["attempt_count"] += 1
             # If ANY contributing prior price is unknown, the whole aggregated
             # reference is treated as unknown so the guard takes the conservative
             # missing_prior_price path rather than comparing against only the
@@ -4478,6 +4525,7 @@ def load_prior_same_day_allocations(
             reference_ts=entry["reference_ts"],
             selected_base_amount_usd=entry.get("selected_base_amount_usd"),
             selected_base_amount_usd_at=entry.get("selected_base_amount_usd_at"),
+            order_attempts=entry.get("attempt_count", 0),
         )
         for ticker, entry in aggregated.items()
     }
@@ -4568,6 +4616,9 @@ def load_prior_same_day_allocations_multi(
                 reference_ts=ref_ts,
                 selected_base_amount_usd=base,
                 selected_base_amount_usd_at=base_at,
+                # Summed, not overwritten: each root's attempts are distinct
+                # broker order attempts, same as amount_usd above.
+                order_attempts=existing.order_attempts + alloc.order_attempts,
             )
     return merged
 
@@ -6704,8 +6755,29 @@ def _seed_prior_allocations(
     # call-site clarity/back-compat rather than removed.
     if guard_active and prior_same_day_allocations:
         for _ticker, _alloc in prior_same_day_allocations.items():
+            _key = (_ticker, trading_day)
+            if _key in state.seeded_attempt_tickers:
+                continue
             if _alloc.amount_usd > 0 and state.buys_today(_ticker, trading_day) == 0:
                 state.record_buy(_ticker, trading_day, _alloc.amount_usd)
+                # record_buy above already counted ONE attempt for this
+                # ticker; seed the REMAINING same-day attempts (repeat buys
+                # across earlier slots, and terminally rejected/canceled
+                # orders that never moved capital) so the roster-wide daily
+                # order-count cap reflects every real broker attempt today,
+                # not one bump per ticker with a positive allocation (Codex
+                # review: "Reconstruct the cap from every prior buy
+                # attempt").
+                state.record_additional_order_attempts(
+                    trading_day, max(_alloc.order_attempts - 1, 0)
+                )
+                state.seeded_attempt_tickers.add(_key)
+            elif _alloc.order_attempts > 0:
+                # No positive allocation contributed at all -- e.g. every
+                # same-day attempt for this ticker was terminally rejected or
+                # canceled -- but those attempts still count toward the cap.
+                state.record_additional_order_attempts(trading_day, _alloc.order_attempts)
+                state.seeded_attempt_tickers.add(_key)
 
 
 def _process_buy_candidates_batch(

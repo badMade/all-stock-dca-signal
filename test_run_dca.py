@@ -2948,11 +2948,10 @@ def test_run_slot_raw_persistence_failure_preserves_the_slots_own_identity(tmp_p
     the afternoon (15:30, cron_id 10ce362c) scheduled run either --
     raw_persistence_failure_run_state is the OTHER early-exit builder that
     must thread classification_overrides/correlation_id (Codex review:
-    "Preserve slot identity on early failure artifacts"). Exercises this on
-    the 10:30 slot specifically, so a same-day 9:45 preflight artifact must
-    be present -- otherwise run_slot's own preflight gate now blocks the run
-    before reaching raw persistence at all (Codex review: "Persist a missing
-    preflight as a blocked morning run")."""
+"Preserve slot identity on early failure artifacts"). Exercises this on
+    the 10:30 slot specifically; the morning preflight gate is monkeypatched
+    to admit the full universe so the run reaches raw persistence and this
+    test stays focused on the raw-persistence early-exit identity stamping."""
     import json
 
     import run_dca as run_dca_module

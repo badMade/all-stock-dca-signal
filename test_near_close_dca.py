@@ -6269,11 +6269,18 @@ def test_load_prior_same_day_honors_terminal_rejection_for_candidate_recovery(tm
 
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
 
-    # Rejected with zero execution: no capital moved, so no prior allocation.
-    assert "EVR" not in allocations
+    # Rejected with zero execution: no capital moved, so no DOLLAR prior
+    # allocation -- evaluate_top_up_guard treats amount_usd<=0 exactly like
+    # "no entry at all" (TOP_UP_NO_PRIOR_RUN). It still appears in the
+    # mapping, though, because the attempt itself must count toward the
+    # roster-wide daily order-count cap (Codex review: "Reconstruct the cap
+    # from every prior buy attempt").
+    assert allocations["EVR"].amount_usd == 0.0
+    assert allocations["EVR"].order_attempts == 1
     # The genuine fill in the same CSV is unaffected.
     assert allocations["SPCX"].amount_usd == 3.50
     assert allocations["SPCX"].reference_price == 109.9899
+    assert allocations["SPCX"].order_attempts == 1
 
 
 def test_terminal_non_fill_states_match_the_canonical_broker_set():
@@ -9288,3 +9295,73 @@ def test_seed_prior_allocations_is_a_noop_when_guard_inactive_regardless_of_the_
 
     assert state.buys_today("AAPL", trading_day) == 0
     assert state.day_notional(trading_day) == pytest.approx(0.0)
+
+
+def test_seed_prior_allocations_reconstructs_the_cap_from_every_attempt():
+    """Codex review: 'Reconstruct the cap from every prior buy attempt'.
+
+    Before this fix, _seed_prior_allocations bumped day_order_count by
+    exactly ONE per ticker with a positive allocation -- so eight earlier
+    attempts spread across three tickers (repeat buys plus a rejected order
+    that moved no capital) reconstructed as day_order_count=3, letting a
+    ninth attempt through a roster-wide cap of 8. order_attempts on each
+    PriorSameDayAllocation now carries the true per-ticker attempt count, and
+    seeding must sum ALL of them, not just one per ticker.
+    """
+    state = StrategyState()
+    trading_day = date(2026, 6, 29)
+    prior = {
+        # 4 attempts, 1 positive allocation ($ amount already dollar-summed
+        # by the loader; the count is the part this test is pinning).
+        "AAPL": PriorSameDayAllocation(
+            ticker="AAPL", amount_usd=6.0, order_attempts=4,
+        ),
+        # 3 attempts.
+        "MSFT": PriorSameDayAllocation(
+            ticker="MSFT", amount_usd=3.0, order_attempts=3,
+        ),
+        # Every attempt for this ticker was terminally rejected/canceled --
+        # $0 dollar allocation, but the attempt still happened.
+        "EVR": PriorSameDayAllocation(
+            ticker="EVR", amount_usd=0.0, order_attempts=1,
+        ),
+    }
+
+    _seed_prior_allocations(
+        state, trading_day, True, prior, one_order_per_ticker_per_day=False,
+    )
+
+    assert state.day_order_count(trading_day) == 8
+    config = StrategyConfig(max_orders_per_day=8)
+    # The roster-wide cap is already exhausted by the reconstructed count --
+    # a ninth attempt today, on any ticker, must be refused.
+    assert within_caps(2.0, state, trading_day, config) is False
+
+
+def test_seed_prior_allocations_is_idempotent_across_a_reused_state():
+    """An in-process retry that reuses the same StrategyState instance (see
+    own_orders_recorded) must not double-count seeded attempts on a second
+    _seed_prior_allocations call -- neither the dollar-seeded branch nor the
+    rejected-only (amount_usd<=0) branch, which buys_today() alone cannot
+    guard since it is never bumped for a ticker with no positive allocation.
+    """
+    state = StrategyState()
+    trading_day = date(2026, 6, 29)
+    prior = {
+        "AAPL": PriorSameDayAllocation(
+            ticker="AAPL", amount_usd=2.0, order_attempts=3,
+        ),
+        "EVR": PriorSameDayAllocation(
+            ticker="EVR", amount_usd=0.0, order_attempts=2,
+        ),
+    }
+
+    _seed_prior_allocations(
+        state, trading_day, True, prior, one_order_per_ticker_per_day=False,
+    )
+    _seed_prior_allocations(
+        state, trading_day, True, prior, one_order_per_ticker_per_day=False,
+    )
+
+    assert state.day_order_count(trading_day) == 5
+    assert state.day_notional(trading_day) == pytest.approx(2.0)

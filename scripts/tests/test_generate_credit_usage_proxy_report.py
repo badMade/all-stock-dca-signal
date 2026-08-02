@@ -3486,7 +3486,15 @@ def test_cron_tracking_root_honours_the_env_override(monkeypatch, tmp_path):
 
 
 def test_registered_command_expands_the_configurable_root():
-    # The manifest command must not hardcode the production tree.
+    # The manifest command must not hardcode a deployment-specific literal.
+    # Its unset ":-" fallback must be the SAME checkout-relative default
+    # dca_paths.DEFAULT_CRON_TRACKING_ROOT resolves to (this command's own
+    # note requires running from the repository root), not the retired
+    # bundled /home/user/workspace/cron_tracking literal -- otherwise this
+    # scheduler command and every other in-repo producer/consumer of
+    # cron_tracking_root() read/write two different trees whenever the
+    # variable is unset (Codex review: "Keep the unset artifact-root default
+    # consistent").
     import subprocess
 
     repo_root = Path(__file__).resolve().parents[2]
@@ -3503,7 +3511,8 @@ def test_registered_command_expands_the_configurable_root():
     default_out = subprocess.run(
         ["sh", "-c", echoed], capture_output=True, text=True, check=True
     ).stdout
-    assert default_out.count("/home/user/workspace/cron_tracking") == 3
+    assert default_out.count("cron_tracking") == 3
+    assert "/home/user/workspace/cron_tracking" not in default_out
 
     relocated = subprocess.run(
         ["sh", "-c", echoed],

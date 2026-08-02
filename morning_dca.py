@@ -21,14 +21,15 @@ scheduled live task (cron ``10ce362c``, which supersedes the deleted
 The morning stream has two modes (see :data:`MORNING_PROFILES`):
 
     - ``watchlist`` (9:45 AM ET, ``bb4f6ef1``): a READ-ONLY early-warning
-      watchlist scan. Analytics only, ``trades=false``. It may surface early
-      candidates but every dollar figure is HYPOTHETICAL / watchlist-only. It
-      writes under ``.../cron_tracking/morning_dca_watchlist/YYYYMMDD_0945ET/``
+      watchlist scan. Analytics only,
+      ``trades=false``. It may surface early candidates but every dollar
+      figure is HYPOTHETICAL / watchlist-only. It writes under
+      ``.../cron_tracking/morning_dca_watchlist/YYYYMMDD_0945ET/``
       with ``run_type='morning_dca_watchlist_scan'`` and
       ``state_schema_version='morning-watchlist-v1'``.
     - ``live`` (10:30 AM ET, ``42173154``): the approved live Robinhood morning
-      execution, moved from 9:45 to 10:30 so it evaluates a true 60-minute
-      trend window (9:30-10:30). ``trades=true``. It writes under
+      execution, evaluating a true 60-minute trend window (9:30-10:30).
+      ``trades=true``. It writes under
       ``.../cron_tracking/morning_dca/YYYYMMDD_1030ET/`` with
       ``run_type='morning_dca_live'``, ``scheduled_for_et='10:30'``,
       ``run_id='morning_live_YYYYMMDD_1030ET'`` and
@@ -1124,7 +1125,7 @@ def load_morning_config(
 def load_same_day_preflight(
     preflight_root: str, trading_day: date, *, bounded_recovery: bool = True
 ) -> Optional[Dict[str, Any]]:
-    """Load the same-day 9:45 pre-flight artifact for the 10:30 live gate.
+    """Load the same-day 9:45 AM ET pre-flight artifact for the 10:30 live task.
 
     Returns a dict ``{"run_id", "eligible_tickers": set[str], "run_state_path",
     "recovered_via_bounded_lookup"}`` when a same-day pre-flight
@@ -1499,7 +1500,7 @@ def morning_preflight_eligible_tickers(
     preflight_bounded_recovery: bool = True,
     manual: bool = False,
 ) -> tuple[List[str], Dict[str, Any]]:
-    """Restrict ``tickers`` to the same-day 9:45 pre-flight verdict.
+    """Narrow ``tickers`` using the same-day 9:45 pre-flight verdict, when available.
 
     Shared by :meth:`MorningDCAExecutor._apply_preflight_gate` (which
     additionally no-ops outside morning-live-mode) and the seven-slot roster's
@@ -1508,7 +1509,13 @@ def morning_preflight_eligible_tickers(
     the eligible universe to ZERO, not to the full configured universe -- is
     enforced exactly once no matter which caller reaches the 10:30 slot
     (Codex review: "Route the morning slot through its required preflight
-    gate").
+    gate"). That fail-closed rule is about the artifact itself being
+    missing/invalid/misconfigured, NOT about what it says: a VALID preflight
+    that legitimately admits no ticker is advisory context, not a block, and
+    degrades to the full universe with a warning the same way a missing
+    artifact does for a manual run (Codex review: "Fall back when the valid
+    preflight admits no tickers") -- see the empty-``eligible_tickers``
+    branch below.
 
     Returns ``(admitted_tickers, gate_diagnostic)``: the same
     ``preflight_gate``-shaped dict :class:`MorningDCAExecutor` stores on
@@ -1550,6 +1557,28 @@ def morning_preflight_eligible_tickers(
             "warning": "no same-day 9:45 pre-flight artifact found; evaluating full universe",
         }
     eligible = loaded["eligible_tickers"]
+    if not eligible:
+        # A VALID preflight (overall_ok=true) can legitimately admit no
+        # ticker -- e.g. nothing was below its prior close at 09:45 -- and
+        # that is a different claim than "block everything". Narrowing to
+        # admitted=[] here would let an advisory-only gate reduce a run to
+        # zero exactly the way a missing/invalid artifact is barred from
+        # doing, missing any ticker that declined AFTER the pre-flight ran
+        # (Codex review: "Fall back when the valid preflight admits no
+        # tickers"). Degrade to the full universe with a warning, the same
+        # shape as the missing-artifact fallback below, rather than trusting
+        # an empty eligible set as a real narrowing.
+        return list(tickers), {
+            "preflight_found": True,
+            "preflight_run_id": loaded["run_id"],
+            "eligible_to_execute_tickers": [],
+            "warning": (
+                "same-day 9:45 pre-flight admitted no tickers; evaluating "
+                "full universe rather than treating an empty advisory gate "
+                "as a block"
+            ),
+            "recovered_via_bounded_lookup": loaded.get("recovered_via_bounded_lookup", False),
+        }
     admitted = [t for t in tickers if t in eligible]
     gated_out = [t for t in tickers if t not in eligible]
     gate = {
@@ -2644,9 +2673,13 @@ class MorningDCAExecutor(DCAExecutor):
             artifacts["manual_review_tickers"] = [c.ticker for c in manual_review]
             if self.preflight_gate is not None:
                 artifacts["preflight_gate"] = self.preflight_gate
-                if not self.preflight_gate.get("preflight_found"):
+                if not self.preflight_gate.get("preflight_found") or self.preflight_gate.get("warning"):
                     # The manual degrade-to-full-universe path sets "warning"; the
-                    # scheduled fail-closed block sets "block_reason" instead.
+                    # scheduled fail-closed block sets "block_reason" instead. A
+                    # VALID preflight that admitted no ticker also sets "warning"
+                    # (with preflight_found still True), so this must not be
+                    # gated on preflight_found alone or that fallback's warning
+                    # would silently never reach the artifact.
                     warnings.append(
                         self.preflight_gate.get("warning") or self.preflight_gate.get("block_reason")
                     )
@@ -4184,15 +4217,16 @@ class MorningDCAExecutor(DCAExecutor):
                 broker = _PersistingBrokerAdapter(broker, raw_recorder)
         signals = self.evaluate(now, data, manual=manual)
         source = data_source or getattr(getattr(data, "source", None), "value", "unknown")
-        # Scheduled-run preflight block: _apply_preflight_gate found no same-day
-        # pre-flight artifact (or one that explicitly flagged itself invalid) and
-        # set preflight_missing_block instead of raising. Build the blocked result
-        # through the normal artifact pipeline (build_artifacts/write_artifacts)
-        # rather than a hand-written stub, so the persisted run_state carries the
-        # standard shape (run_id, generated_at, counts, run_classification) and
-        # the latest scheduled pointer is still updated -- watchdog/reporting can
-        # then validate this as a real (blocked) scheduled-run attempt instead of
-        # something that looks malformed or missing.
+        # VESTIGIAL AS OF 2026-07-31: morning_preflight_eligible_tickers() no
+        # longer sets preflight_missing_block for any caller -- per the user
+        # directive "the preflight is informative and shouldn't block any
+        # run", a missing/invalid/misconfigured pre-flight now always degrades
+        # to the full universe with a warning instead of failing closed. This
+        # branch is kept as a defensive no-op (it can never trigger from the
+        # current gate contract) rather than deleted outright, so a future
+        # regression that re-introduces a blocking gate diagnostic still has a
+        # tested, correctly-shaped path to write a "blocked" artifact through
+        # rather than silently doing nothing.
         pgate = getattr(self, "preflight_gate", None)
         if pgate and pgate.get("preflight_missing_block"):
             # Before overwriting the dated-slot artifact with a blocked stub,

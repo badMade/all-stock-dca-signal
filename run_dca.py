@@ -1505,17 +1505,13 @@ def run_slot(
     slot_tickers = config.tickers
     preflight_gate: Optional[Dict[str, Any]] = None
     if stream_name == MORNING_STREAM:
-        # The 10:30 slot must not scan the configured universe unconditionally:
-        # config/morning_dca.json's live_task.preflight_artifact_resolution
-        # requires a missing or invalid same-day 9:45 pre-flight artifact to
-        # reduce the eligible universe to ZERO, the same fail-closed contract
-        # MorningDCAExecutor._apply_preflight_gate() enforces for its own,
-        # separate morning-live entry point. Routed only through the generic
-        # pipeline, run_slot("1030ET") never called that gate at all, so a
-        # missing/invalid preflight artifact silently let it scan every
-        # configured ticker and place live orders without the required morning
-        # eligibility evidence (Codex review: "Route the morning slot through
-        # its required preflight gate"). allow_unpinned_account=True: this
+        # CHANGED 2026-07-31 (user directive: "the preflight is informative
+        # and shouldn't block any run"): the 9:15 pre-flight is advisory only.
+        # When it is present and valid it narrows the universe to its
+        # eligible_to_execute tickers; when it is missing, invalid, or its
+        # root is misconfigured, morning_preflight_eligible_tickers() now
+        # always degrades to the FULL configured universe with a warning
+        # instead of reducing it to zero. allow_unpinned_account=True: this
         # call only needs the preflight root/forbidden-roots/bounded-recovery
         # fields, not an account -- the broker/account this slot actually
         # trades through is the caller-supplied ``broker`` above.
@@ -1530,31 +1526,18 @@ def run_slot(
             preflight_bounded_recovery=morning_config.preflight_bounded_recovery,
             manual=False,
         )
-        if preflight_gate.get("preflight_missing_block"):
-            # A missing/invalid 09:45 preflight artifact must not read as an
-            # ordinary evaluated-to-zero-candidates run: letting slot_tickers
-            # (now empty) fall through unremarked would record a normal
-            # completed_no_orders state indistinguishable from a legitimately
-            # quiet market. ``preflight_gate`` is forwarded to run_pipeline()
-            # below, which -- from INSIDE its own guarded_run/heartbeat scope,
-            # and only after its own calendar gate has had a chance to run --
-            # short-circuits into a startup-failure-shaped blocked state
-            # instead (Codex review: "Persist a blocked state when morning
-            # preflight is missing", "Route the preflight-blocked result
-            # through guarded_run", "Apply the calendar gate before the
-            # preflight early return"). info, not warning: the later
-            # short-circuit's own warning (tied to the actual persisted
-            # blocked artifact and alert) is the authoritative one --
-            # warning here too logged two near-identical messages for a
-            # single event whenever the calendar gate did not suppress the
-            # later one (Copilot review).
-            logger.info(
-                "1030ET preflight gate found the morning universe blocked: %s",
-                preflight_gate.get("block_reason"),
+        if not preflight_gate.get("preflight_found") or preflight_gate.get("warning"):
+            # Covers both "no artifact found" (preflight_found=False) and a
+            # VALID preflight that legitimately admitted no ticker
+            # (preflight_found=True, warning set) -- both degrade to the full
+            # universe rather than narrowing to zero.
+            logger.warning(
+                "1030ET preflight not available or admitted no tickers, evaluating full universe: %s",
+                preflight_gate.get("warning"),
             )
         elif preflight_gate.get("gated_out_tickers"):
             logger.info(
-                "1030ET preflight gate excluded tickers not admitted by the 9:45 pre-flight: %s",
+                "1030ET preflight gate excluded tickers not admitted by the 9:15 pre-flight: %s",
                 preflight_gate["gated_out_tickers"],
             )
     slot_config = replace(

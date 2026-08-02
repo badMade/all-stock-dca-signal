@@ -10,10 +10,18 @@ into a module constant, which put 15 copies of one deployment detail across
 to relocate the tree short of editing source.
 
 They now derive from :func:`cron_tracking_root`, which honours
-``$DCA_CRON_TRACKING_ROOT`` and otherwise returns the same bundled default as
-before. With the variable unset, every path this module produces is byte-for-byte
-what the previous hardcoded constants produced, so this is a portability change
-and not a behavior change.
+``$DCA_CRON_TRACKING_ROOT`` and otherwise falls back to
+:data:`DEFAULT_CRON_TRACKING_ROOT` -- a checkout-relative ``cron_tracking``
+directory, NOT the old bundled ``/home/user/workspace/cron_tracking`` literal
+(see that constant's own docstring for why: AGENTS.md forbids hard-coding a
+deployment-specific absolute path in runtime code). Production sets
+``$DCA_CRON_TRACKING_ROOT`` explicitly, so this default is exercised only by
+an unconfigured checkout -- but every OTHER place that also needs to agree on
+"what root does an unset variable resolve to" (e.g. a scheduler command's own
+shell ``:-`` fallback in ``config/scheduled_tasks.json``) must use this same
+checkout-relative default, not the retired bundled literal, or a producer and
+a consumer can silently read/write two different trees (Codex review: "Keep
+the unset artifact-root default consistent").
 
 **Resolution timing.** The stream constants below are module-level and therefore
 resolved once, at import. That matches the deployment (a cron entry exports the
