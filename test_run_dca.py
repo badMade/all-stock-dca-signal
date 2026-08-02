@@ -2543,7 +2543,7 @@ def test_run_pipeline_bounded_reload_poisons_base_change_on_smaller_clean_reload
     # pass-one read is $5 fill / base $2 / reference $100. The CLEAN reload
     # reduces BOTH the amount ($5 -> $4) AND the base ($2 -> $1) while
     # leaving the reference UNCHANGED at $100 -- so the earlier
-    # "discard stale references" fix (which only checks reference_price)
+    # "discard stale references" patch (which only checks reference_price)
     # doesn't trigger, and the entire stale $5/$2/$100 snapshot survives
     # unmodified. Kept unpoisoned, the stale $2 base combined with the kept
     # $5 floor amount can still compute a target that permits a top-up the
