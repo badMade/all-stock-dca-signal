@@ -101,15 +101,16 @@ print(json.dumps(r.assess('1230',O,C,datetime.now(ZoneInfo('America/New_York')))
    "same-day top-up guard could not determine today's prior fills". Never proceed
    on the assumption that nothing has been bought today.
 
-   KNOWN CONFLICT, REPORT IT, DO NOT RESOLVE IT YOURSELF. dca_runner.assess() in
-   step 4 excludes a ticker outright once it has ANY same-day buy
-   (REFUSED_ALREADY_BOUGHT_TODAY, implementing config/budgets.json's
-   order_rules.one_order_per_ticker_per_day). same_day_top_up_policy instead
-   permits a resized top-up. Those two rules disagree. Until Geoff rules on it:
-   take the MORE RESTRICTIVE of the two for every ticker (i.e. a ticker assess()
-   refuses stays refused, whatever buy_usd says), and report every ticker where
-   they disagreed, with both answers, so the disagreement is visible rather than
-   silently settled by whichever gate happened to run last.
+   RESOLVED 2026-08-02 (was: KNOWN CONFLICT). Geoff ruled: buys on the same
+   ticker are allowed more than once a day, just never twice in the same
+   slot/session. config/budgets.json's order_rules.one_order_per_ticker_per_day
+   is permanently false, and dca_runner.assess() in step 4 reads that flag
+   directly -- it no longer excludes a same-day-bought ticker at all. There is
+   no disagreement left to reconcile: step 4.5's buy_usd is simply the
+   authoritative size for every ticker, full stop. (A ticker can still be
+   REFUSED_ALREADY_BOUGHT_TODAY if a human ever flips that config flag back to
+   true -- if you ever see that refusal reason, treat it as a live policy
+   change, report it, and do not silently override it.)
 
 5. ACT ON THE VERDICT. Exactly one of:
    END_SILENTLY -> stop. No alert. A closed exchange is not a fault.
@@ -117,7 +118,8 @@ print(json.dumps(r.assess('1230',O,C,datetime.now(ZoneInfo('America/New_York')))
                    email to the operator email configured for alerts (never
                    hardcode a personal address) with verdict, reason and slot.
    PROCEED      -> plan.to_place is the authoritative buy list, further limited
-                   by step 4.5's buy_usd and by the more-restrictive rule above.
+                   by step 4.5's buy_usd (the authoritative size for every
+                   ticker, including a same-day repeat -- see step 4.5).
                    LIVE PLACEMENT IS CURRENTLY OFF pending validation:
                    do NOT call place_equity_order. Log plan.to_place,
                    plan.skipped, plan.refused, and step 4.5's decisions

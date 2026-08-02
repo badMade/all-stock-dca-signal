@@ -55,6 +55,7 @@ from morning_dca import (
     MorningLedger,
     MorningSignal,
     TopUpOutcome,
+    _csv_qualifying_notional_total,
     _PersistingBrokerAdapter,
     _PersistingMarketDataProvider,
     _RawInputRecorder,
@@ -943,10 +944,13 @@ def test_watchlist_run_does_not_write_budget_ledger(tmp_path):
     assert "budget_ledger" not in res["paths"]
 
 
-def test_preflight_gate_blocks_when_root_under_forbidden_live_output_dir(tmp_path):
+def test_preflight_gate_forbidden_root_degrades_scheduled_run_not_a_block(tmp_path):
     """must_not_look_under: a preflight_run_state_root resolving under the
-    10:30 live output directory must fail closed for a scheduled run rather
-    than being read (the Jul 20 2026 incident)."""
+    10:30 live output directory must still be recognized as forbidden (the
+    Jul 20 2026 incident) -- but as of 2026-08-02 (Geoff: "should not block
+    any later runs") this degrades a SCHEDULED run to the full universe with
+    a warning, exactly like a manual run, rather than blocking it to zero
+    tickers."""
     forbidden_root = tmp_path / "morning_dca"
     forbidden_root.mkdir()
     cfg = MorningConfig(
@@ -957,11 +961,13 @@ def test_preflight_gate_blocks_when_root_under_forbidden_live_output_dir(tmp_pat
     )
     ex = MorningDCAExecutor(cfg, mode="live")
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
-    res = ex.run(_now_live(), data)
+    res = ex.run(_now_live(), data, broker=FakeLiveBroker())
 
-    assert res["artifacts"]["status"] == "blocked"
-    assert "forbidden" in res["artifacts"]["block_reason"]
-    assert res["artifacts"]["buy_candidates"] == []
+    assert res["artifacts"].get("status") != "blocked"
+    assert res["artifacts"]["preflight_gate"]["preflight_found"] is False
+    assert "forbidden" in res["artifacts"]["preflight_gate"]["warning"]
+    evaluated = {r["ticker"] for r in res["artifacts"]["signal_rows"]}
+    assert evaluated == {"SMALL"}
 
 
 def test_preflight_gate_forbidden_root_warns_on_manual_run():
@@ -1494,6 +1500,14 @@ def test_morning_live_ledger_seed_rejects_non_finite_csv_notional(tmp_path):
     # orders.csv/filled_orders.csv survives float() and would seed the ledger
     # with infinite cap spend via max(total, csv_total), cap-exceeding every
     # later order for the rest of the day/week.
+    #
+    # Monday's filled_orders.csv is THIS stream's own earlier-weekday
+    # artifact -- since "Fail closed on unreadable own-stream prior-week
+    # states", a rejected (non-finite) qualifying-row amount there is
+    # recorded via csv_qualifying_notional_total's own skip_sink just like
+    # any other malformed CSV, setting _cap_seed_scan_incomplete and forcing
+    # the shared weekly bucket to its ceiling -- BBB is correctly BLOCKED,
+    # not silently admitted against the JSON-only fallback total.
     monday_dir = tmp_path / "20260706_1030ET"
     monday_dir.mkdir(parents=True)
     (monday_dir / "run_state.json").write_text(
@@ -1520,21 +1534,27 @@ def test_morning_live_ledger_seed_rejects_non_finite_csv_notional(tmp_path):
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.03})
     broker = RecordingLiveBroker(account="999000111", reference_prices={"BBB": 97.0})
+    # Must not raise/crash on the non-finite value (the original infinite-seed
+    # bug this test was written against): the run completes and fails closed.
     res = ex.run(_now_live(), data, broker=broker, manual=True)
 
-    # $10 weekly cap: Monday's JSON total ($1, the inf notional rejected) plus
-    # BBB's $7.50 = $8.50 <= $10 -- must be admitted. The infinite-seed bug
-    # would leave -inf headroom and block BBB outright.
-    assert broker.placed_orders, f"BBB wrongly blocked; ledger={ex.ledger.planned_by_week}"
+    assert ex._cap_seed_scan_incomplete is True
+    assert not broker.placed_orders, "a rejected non-finite CSV amount must fail closed, not admit BBB"
     bbb = res["artifacts"]["buy_candidates"][0]
-    assert bbb["status"] == "submitted"
+    assert bbb["status"] == "cap_exceeded"
 
 
 def test_morning_live_ledger_seed_survives_corrupt_filled_orders_csv(tmp_path):
     # Codex review: a non-UTF-8 filled_orders.csv raised UnicodeDecodeError
     # while csv.DictReader iterated it, which the seeding loop's except OSError
     # did not catch, aborting the entire scheduled retry over one corrupt
-    # auxiliary fill file instead of falling back to the JSON-derived total.
+    # auxiliary fill file instead of failing closed gracefully.
+    #
+    # Monday's filled_orders.csv is THIS stream's own earlier-weekday
+    # artifact -- since "Fail closed on unreadable own-stream prior-week
+    # states", an unreadable file there sets _cap_seed_scan_incomplete and
+    # forces the shared weekly bucket to its ceiling -- BBB is correctly
+    # BLOCKED, not silently admitted against the JSON-only fallback total.
     monday_dir = tmp_path / "20260706_1030ET"
     monday_dir.mkdir(parents=True)
     (monday_dir / "run_state.json").write_text(
@@ -1558,11 +1578,13 @@ def test_morning_live_ledger_seed_survives_corrupt_filled_orders_csv(tmp_path):
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.03})
     broker = RecordingLiveBroker(account="999000111", reference_prices={"BBB": 97.0})
-    # Must not raise UnicodeDecodeError; falls back to the JSON total ($1).
+    # Must not raise UnicodeDecodeError; fails closed gracefully instead.
     res = ex.run(_now_live(), data, broker=broker, manual=True)
-    assert broker.placed_orders, f"BBB wrongly blocked; ledger={ex.ledger.planned_by_week}"
+
+    assert ex._cap_seed_scan_incomplete is True
+    assert not broker.placed_orders, "an unreadable CSV must fail closed, not admit BBB"
     bbb = res["artifacts"]["buy_candidates"][0]
-    assert bbb["status"] == "submitted"
+    assert bbb["status"] == "cap_exceeded"
 
 
 def test_morning_live_ledger_seed_falls_back_to_orders_csv_when_filled_orders_unusable(tmp_path):
@@ -2115,7 +2137,10 @@ def test_morning_executor_default_init_loads_config_file():
     """MorningDCAExecutor() with no args loads from the shipped config/morning_dca.json."""
     ex = MorningDCAExecutor()
     assert ex.config.base_buy_amount_usd == 2.0
-    assert ex.config.morning_daily_cap_usd == 90.0
+    # Shared Normal-tier ceiling (near_close_dca.BUDGET_TIERS[0]), not the old
+    # isolated 90.0 per-stream half-share -- see morning_dca.py's
+    # DEFAULT_MORNING_DAILY_CAP_USD comment (pooling fix, 2026-08-02).
+    assert ex.config.morning_daily_cap_usd == 180.0
     assert date(2026, 7, 2) in ex.config.approved_test_dates
     assert date(2026, 8, 28) in ex.config.approved_test_dates
 
@@ -2485,6 +2510,28 @@ def test_load_same_day_preflight_reads_eligible_set(tmp_path):
     assert load_same_day_preflight(str(tmp_path), date(2026, 7, 9)) is None
 
 
+def test_load_same_day_preflight_treats_non_object_json_as_unavailable(tmp_path):
+    """Codex review: "Treat non-object preflight JSON as unavailable". Valid
+    JSON whose root is a list, scalar, or null (e.g. after a partial
+    recovery) has no .get() method; the function used to call state.get(...)
+    immediately after decoding without checking this, so it raised instead
+    of returning None. A crash here means the 10:30 run never reaches its
+    own non-blocking fallback and the documented "None means no pre-flight
+    found, degrade to full universe with a warning" contract is broken."""
+    trading_day = date(2026, 7, 8)
+    run_dir = tmp_path / f"{trading_day.strftime('%Y%m%d')}_0945ET"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_state.json").write_text("[]", encoding="utf-8")
+
+    assert load_same_day_preflight(str(tmp_path), trading_day, bounded_recovery=False) is None
+
+    (run_dir / "run_state.json").write_text("null", encoding="utf-8")
+    assert load_same_day_preflight(str(tmp_path), trading_day, bounded_recovery=False) is None
+
+    (run_dir / "run_state.json").write_text('"a string"', encoding="utf-8")
+    assert load_same_day_preflight(str(tmp_path), trading_day, bounded_recovery=False) is None
+
+
 def test_load_same_day_preflight_reads_per_ticker_eligibility_v2(tmp_path):
     # Codex review #92: a strictly schema-compliant v2 preflight artifact is
     # only required to carry per_ticker_eligibility, not the legacy
@@ -2705,6 +2752,43 @@ def test_load_same_day_preflight_fails_closed_when_overall_ok_false(tmp_path):
     assert load_same_day_preflight(str(tmp_path), date(2026, 7, 8)) is None
 
 
+def test_live_gate_degrades_to_full_universe_when_preflight_found_but_empty(tmp_path):
+    """Codex review: "Keep valid empty preflights non-blocking". A VALID
+    preflight that found zero eligible tickers (e.g. nothing was below its
+    prior close at 9:45) must not be treated as authoritative -- it is
+    exactly as coarse/stale-by-10:30 as a missing artifact, and the 10:30
+    slot's own signal/budget/spread/trend/top-up checks are the real safety
+    gates. A quiet preflight must not be MORE restrictive than a missing
+    one, which already degrades to the full universe."""
+    preflight_root = tmp_path / "preflight"
+    pf = MorningDCAExecutor(
+        MorningConfig(tickers=("BIG", "FLAT"), morning_run_state_root=str(preflight_root)),
+        mode=MORNING_PREFLIGHT_MODE,
+    )
+    # Nothing down at 9:45: preflight legitimately finds zero eligible tickers.
+    pf_data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.0, "FLAT": 0.0})
+    pf.run(_now_preflight(), pf_data)
+
+    live = MorningDCAExecutor(
+        MorningConfig(
+            tickers=("BIG", "FLAT"),
+            morning_run_state_root=str(tmp_path / "live"),
+            preflight_run_state_root=str(preflight_root),
+        ),
+        mode=MORNING_LIVE_MODE,
+    )
+    # A dip has since appeared by 10:30 -- the full universe must still be
+    # evaluated, not silently zeroed out by the stale, empty preflight.
+    live_data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10, "FLAT": 0.10})
+    res = live.run(_now_live(), live_data, broker=FakeLiveBroker())
+    art = res["artifacts"]
+    gate = art["preflight_gate"]
+    assert gate["preflight_found"] is True
+    assert "zero eligible" in gate["warning"]
+    evaluated = {r["ticker"] for r in art["signal_rows"]}
+    assert evaluated == {"BIG", "FLAT"}
+
+
 def test_live_gate_restricts_to_preflight_eligible(tmp_path):
     preflight_root = tmp_path / "preflight"
     pf = MorningDCAExecutor(
@@ -2735,47 +2819,14 @@ def test_live_gate_restricts_to_preflight_eligible(tmp_path):
     assert evaluated == {"BIG"}
 
 
-def test_live_gate_falls_back_to_full_universe_when_preflight_admits_nothing(tmp_path):
-    """A VALID preflight (overall_ok=true) that legitimately found no ticker
-    below its prior close at 9:45 is advisory context, not a block -- unlike
-    a missing/invalid artifact, this must not narrow the 10:30 run to zero,
-    or a ticker that only declined AFTER 9:45 would never be evaluated
-    (Codex review: "Fall back when the valid preflight admits no tickers")."""
-    preflight_root = tmp_path / "preflight"
-    pf = MorningDCAExecutor(
-        MorningConfig(tickers=("BIG", "FLAT"), morning_run_state_root=str(preflight_root)),
-        mode=MORNING_PREFLIGHT_MODE,
-    )
-    # Neither ticker is down at all at 9:45, so preflight_eligibility() admits
-    # neither -- eligible_to_execute_tickers is genuinely empty, not missing.
-    pf_data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.0, "FLAT": 0.0})
-    pf.run(_now_preflight(), pf_data)
-
-    live = MorningDCAExecutor(
-        MorningConfig(
-            tickers=("BIG", "FLAT"),
-            morning_run_state_root=str(tmp_path / "live"),
-            preflight_run_state_root=str(preflight_root),
-        ),
-        mode=MORNING_LIVE_MODE,
-    )
-    # Both tickers have since declined by 10:30 -- the exact case the empty
-    # 9:45 preflight must not have blocked from evaluation.
-    live_data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10, "FLAT": 0.10})
-    res = live.run(_now_live(), live_data, broker=FakeLiveBroker())
-    art = res["artifacts"]
-    gate = art["preflight_gate"]
-    assert gate["preflight_found"] is True
-    assert gate["eligible_to_execute_tickers"] == []
-    assert "warning" in gate
-    evaluated = {r["ticker"] for r in art["signal_rows"]}
-    assert evaluated == {"BIG", "FLAT"}
-
-
-def test_live_gate_fails_closed_when_preflight_missing_scheduled(tmp_path):
-    # Scheduled live runs must write a durable blocked run_state (fail-closed)
-    # when no preflight artifact exists, rather than raising and leaving no
-    # artifact for watchdog/reporting to observe.
+def test_live_gate_degrades_to_full_universe_when_preflight_missing_scheduled(tmp_path):
+    # NON-BLOCKING as of 2026-08-02 (Geoff: "should not block any later
+    # runs"), superseding the old fail-closed contract (Codex review #77):
+    # a SCHEDULED live run with no same-day preflight artifact now degrades
+    # to the full configured universe with a warning, exactly like a manual
+    # run (see test_live_gate_degrades_to_full_universe_when_preflight_missing_manual
+    # below), and still writes a normal (not "blocked") durable run_state so
+    # watchdog/reporting see a real completed scheduled-run attempt.
     state_root = str(tmp_path / "live")
     live = MorningDCAExecutor(
         MorningConfig(
@@ -2786,10 +2837,13 @@ def test_live_gate_fails_closed_when_preflight_missing_scheduled(tmp_path):
         mode=MORNING_LIVE_MODE,
     )
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10, "FLAT": 0.10})
-    res = live.run(_now_live(), data)
+    res = live.run(_now_live(), data, broker=FakeLiveBroker())
     art = res["artifacts"]
-    assert art["status"] == "blocked"
-    assert "pre-flight" in art["block_reason"]
+    assert art.get("status") != "blocked"
+    assert art["preflight_gate"]["preflight_found"] is False
+    assert "pre-flight" in art["preflight_gate"]["warning"]
+    evaluated = {r["ticker"] for r in art["signal_rows"]}
+    assert evaluated == {"BIG", "FLAT"}
     assert "run_id" in art
     assert "generated_at" in art
     assert "counts" in art
@@ -2797,21 +2851,14 @@ def test_live_gate_fails_closed_when_preflight_missing_scheduled(tmp_path):
     state_path = Path(res["paths"]["run_state"])
     assert state_path.exists()
     persisted = json.loads(state_path.read_text(encoding="utf-8"))
-    assert persisted["status"] == "blocked"
-    assert persisted["trades"] is False
+    assert persisted["trades"] is True
     assert persisted["run_id"] == art["run_id"]
     # Latest pointer must be updated for scheduled runs.
     pointer_key = live.latest_pointer_name.replace(".json", "")
     assert pointer_key in res["paths"]
 
-    # Codex review #77: "write a valid blocked run_state for missing
-    # preflight" -- the persisted artifact must use the normal scheduled
-    # artifact shape (run_id, generated_at, counts, run_classification), and
-    # the latest scheduled pointer must still be updated, so watchdog and
-    # reporting can validate this as a real (blocked) scheduled-run attempt
-    # rather than a malformed/missing one.
     for key in ("run_id", "generated_at", "counts", "run_classification"):
-        assert key in persisted, f"blocked run_state is missing {key!r}"
+        assert key in persisted, f"run_state is missing {key!r}"
     assert persisted["run_classification"]["run_origin"] == "scheduled"
     assert persisted["run_classification"]["manual_run"] is False
     pointer_path = Path(state_root) / "latest_morning_run.json"
@@ -3576,16 +3623,20 @@ def test_blocked_live_retry_recovers_from_null_broker_outcomes_in_existing_state
     assert on_disk["block_reason"] == "missing broker adapter for scheduled live execution"
 
 
-def test_preflight_missing_block_retry_preserves_prior_submitted_evidence(tmp_path):
-    # Codex review (PR #88): "Preserve submitted state on a preflight-blocked
-    # retry". Unlike _blocked_live_result(), the preflight_missing_block
-    # branch in run() built its blocked stub directly and never called
-    # _existing_submitted_run_state() first. If an earlier attempt at the
-    # same scheduled slot already submitted a real order, and the same-day
-    # preflight artifact becomes unavailable by the time a later retry runs
-    # (e.g. deleted, or a transient read failure), this path would overwrite
-    # the dated-slot run_state.json with a blocked stub and erase that
-    # submitted-order evidence.
+def test_preflight_missing_on_retry_degrades_to_full_universe_not_a_block(tmp_path):
+    # NON-BLOCKING as of 2026-08-02 (Geoff: "should not block any later runs"),
+    # superseding the old "preflight_missing_block retry preserves prior
+    # submitted evidence" test (Codex review, PR #88), which pinned a
+    # belt-and-suspenders local-artifact preservation path that only existed
+    # because a missing preflight used to overwrite the dated-slot run_state
+    # with a blocked stub. That branch is gone: a missing preflight now always
+    # degrades to the full universe, so there is nothing to preserve against
+    # here -- the real, unconditional duplicate-order protection for a same-
+    # slot retry is broker.same_day_strategy_order_exists() in
+    # _place_broker_orders, checked before every placement regardless of
+    # preflight status. This test just confirms a retry whose same-day
+    # preflight artifact disappeared between attempts is not treated as a
+    # failure or a block.
     pf_dir = tmp_path / "pf"
     pf_root = _seed_preflight(pf_dir, ("SMALL",))
     cfg = MorningConfig(
@@ -3597,29 +3648,23 @@ def test_preflight_missing_block_retry_preserves_prior_submitted_evidence(tmp_pa
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
 
-    # First attempt: preflight available, order genuinely submitted.
     first = ex.run(_now_live(), data, broker=FakeLiveBroker())
     assert first["artifacts"]["buy_candidates"][0]["status"] == "submitted"
-    run_state_path = Path(first["paths"]["run_state"])
-    assert run_state_path.exists()
 
     # The same-day preflight artifact becomes unavailable before the retry
     # (e.g. deleted, transient read failure, disk issue).
     for f in pf_dir.glob("*/run_state.json"):
         f.unlink()
 
-    # Retry at the same slot: preflight load now fails -> preflight_missing_block.
-    # The prior submitted evidence must survive, not be overwritten by the
-    # blocked stub.
     retry_now = _now_live() + timedelta(minutes=1)
     second = ex.run(retry_now, data, broker=FakeLiveBroker())
 
     assert second["artifacts"].get("status") != "blocked", (
-        "a preflight-missing-block retry must not overwrite prior submitted evidence"
+        "a missing same-day preflight artifact must not block a retry"
     )
-    assert second["artifacts"]["buy_candidates"][0]["status"] == "submitted"
-    on_disk = json.loads(run_state_path.read_text(encoding="utf-8"))
-    assert on_disk["buy_candidates"][0]["status"] == "submitted"
+    assert second["artifacts"]["preflight_gate"]["preflight_found"] is False
+    evaluated = {r["ticker"] for r in second["artifacts"]["signal_rows"]}
+    assert evaluated == {"SMALL"}
 
 
 def test_auto_buy_candidates_prioritized_by_multiplier_when_cap_hit(tmp_path):
@@ -4073,6 +4118,271 @@ def test_morning_cap_seeding_is_idempotent_across_multiple_runs(tmp_path):
     ex.run(_now_live(), data, broker=broker3)
     assert ex.ledger.day_planned(date(2026, 7, 8)) == 89.0, (
         "ledger must pick up new fills written between runs ($85 + $4 = $89)"
+    )
+
+
+def test_cap_seed_scan_failure_poison_clears_on_a_recovered_rescan(tmp_path, monkeypatch):
+    """Codex review ("Clear fail-closed cap poisoning after a recovered
+    retry"): when a sibling stream's cap artifact is transiently unreadable,
+    _compute_top_up's fail-closed branch pins planned_by_day/planned_by_week
+    to the cap ceiling. A long-lived executor instance retrying against the
+    SAME self.ledger after the artifact becomes readable must see real
+    remaining headroom again -- not stay permanently pinned at the ceiling
+    just because an earlier scan on this instance failed."""
+    import morning_dca as _md
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+    class _Broker:
+        def __init__(self): self.placed = {}
+        def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+        def available_buying_power(self): return 500.0
+        def same_day_strategy_order_exists(self, ticker, trading_day): return False
+        def is_tradable_for_fractional_buy(self, ticker): return True
+        def review_market_buy(self, ticker, notional_usd): return True, "ok"
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.placed[ticker] = notional_usd
+            return f"ORDER-{ticker}"
+
+    cap_root = str(tmp_path / "cap_root")
+    pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
+    cfg = MorningConfig(
+        tickers=("TOPUP",),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        cap_seed_roots=(cap_root,),
+        morning_daily_cap_usd=90.0,
+        morning_weekly_cap_usd=450.0,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+
+    real_loader = _md.load_prior_same_day_allocations_multi
+    scan_state = {"n": 0}
+
+    def _fake_loader(roots, trading_day, **kwargs):
+        if roots and str(roots[0]) == cap_root:
+            scan_state["n"] += 1
+            skip_sink = kwargs.get("skip_sink")
+            if scan_state["n"] == 1:
+                # Simulate a sibling stream's cap artifact that is transiently
+                # unreadable (mid-write, malformed, etc.) on the FIRST scan.
+                if skip_sink is not None:
+                    skip_sink.append(Path(cap_root) / "run_state.json")
+                return {}
+            # Second scan: the artifact is now readable with a real, modest
+            # $10 fill -- far below the $90/$450 ceilings the first scan
+            # poisoned the ledger with.
+            return {
+                "OTHER": PriorSameDayAllocation(
+                    "OTHER",
+                    amount_usd=10.0,
+                    reference_price=50.0,
+                    run_id="cap_seed_recovered",
+                    source="manual",
+                )
+            }
+        return real_loader(roots, trading_day, **kwargs)
+
+    monkeypatch.setattr(_md, "load_prior_same_day_allocations_multi", _fake_loader)
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.03})
+
+    # First run: cap artifact unreadable -> fail closed, cap fully exhausted.
+    broker1 = _Broker()
+    ex.run(_now_live(), data, broker=broker1)
+    assert ex.ledger.day_planned(date(2026, 7, 8)) == 90.0
+    assert ex.ledger.week_planned(date(2026, 7, 8)) == 450.0
+    assert ex.ledger.remaining_daily(date(2026, 7, 8)) == 0.0
+    assert ex.ledger.remaining_weekly(date(2026, 7, 8)) == 0.0
+
+    # Second run, SAME executor instance: the artifact is now readable with a
+    # real $10 fill, restoring $80 of real headroom -- enough for TOPUP's
+    # $7.50 desired order to place. The ledger must reflect the real $10
+    # external fill plus this run's own $7.50 placed order (17.50 total), not
+    # stay pinned at the $90/$450 ceilings the first (failed) scan injected.
+    broker2 = _Broker()
+    ex.run(_now_live(), data, broker=broker2)
+    assert broker2.placed.get("TOPUP") == 7.5, (
+        "TOPUP should place once real remaining headroom is restored by the recovered scan"
+    )
+    assert ex.ledger.day_planned(date(2026, 7, 8)) == 17.5, (
+        "the earlier fail-closed poisoning must be cleared once the scan recovers"
+    )
+    assert ex.ledger.week_planned(date(2026, 7, 8)) == 17.5
+    assert ex.ledger.remaining_daily(date(2026, 7, 8)) == 72.5
+    assert ex.ledger.remaining_weekly(date(2026, 7, 8)) == 432.5
+
+
+def test_own_stream_earlier_weekday_run_state_failure_fails_closed(tmp_path):
+    """Codex review ("Fail closed on unreadable own-stream prior-week
+    states"): _seed_ledger_from_prior_runs's own day-loop scans THIS
+    stream's own root for the current ISO week's fixed scheduled paths,
+    which discovers EARLIER weekdays too (e.g. Monday's own run_state.json,
+    scanned again on a Tuesday run) -- but those paths were never added to
+    _earlier_weekday_sibling_paths, so an unreadable one silently skipped
+    without failing closed. Neither _compute_top_up (which only ever covers
+    TODAY) nor the cross-stream sibling scan (which deliberately never
+    scans the current stream's own bare root, since the day-loop already
+    covers it) catches this case either -- Monday's own spend could
+    silently vanish from the weekly ledger. cap_seed_roots is deliberately
+    None here to isolate this from the (separately tested) cross-stream
+    sibling scan."""
+    state_root = tmp_path / "live"
+    monday_dir = state_root / "20260629_1030ET"
+    monday_dir.mkdir(parents=True)
+    # Malformed JSON -- caught mid-write.
+    (monday_dir / "run_state.json").write_text("{not valid json", encoding="utf-8")
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAPL",), trading_date=date(2026, 6, 30))
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(state_root),
+        preflight_run_state_root=str(pf_root),
+        cap_seed_roots=None,
+        morning_daily_cap_usd=90.0,
+        morning_weekly_cap_usd=450.0,
+        approved_test_dates=frozenset({date(2026, 6, 30)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    now = datetime.combine(date(2026, 6, 30), time(10, 30), tzinfo=EASTERN)
+
+    ex._compute_top_up(now, ())
+    ex._seed_ledger_from_prior_runs(now)
+
+    assert ex._cap_seed_scan_incomplete is True
+    assert ex.ledger.week_planned(date(2026, 6, 30)) == 450.0
+
+
+def test_earlier_weekday_cap_seed_poison_clears_on_a_recovered_rescan(tmp_path):
+    """Codex review ("Clear prior-week cap poisoning after a recovered
+    scan"): _seed_ledger_from_prior_runs's earlier-weekday sibling scan fails
+    closed the same way _compute_top_up's cap_seed_roots scan does, pinning
+    planned_by_week to the cap ceiling when an earlier-weekday sibling
+    artifact is transiently unreadable. A long-lived executor instance
+    retrying against the SAME self.ledger after that artifact becomes
+    readable must see its real remaining weekly headroom again -- not stay
+    permanently pinned just because an earlier scan on this instance failed
+    to parse it."""
+    cap_root = tmp_path / "cap_root"
+    sibling_dir = cap_root / "20260629_manualET"
+    sibling_dir.mkdir(parents=True)
+    sibling_path = sibling_dir / "run_state.json"
+    # First pass: caught mid-write -- invalid JSON.
+    sibling_path.write_text("{not valid json", encoding="utf-8")
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAPL",), trading_date=date(2026, 6, 30))
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        cap_seed_roots=(str(cap_root),),
+        morning_daily_cap_usd=90.0,
+        morning_weekly_cap_usd=450.0,
+        approved_test_dates=frozenset({date(2026, 6, 30)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    now = datetime.combine(date(2026, 6, 30), time(10, 30), tzinfo=EASTERN)
+
+    # First pass: the malformed sibling artifact fails to parse -> fail closed.
+    ex._compute_top_up(now, ())
+    ex._seed_ledger_from_prior_runs(now)
+    assert ex._cap_seed_scan_incomplete is True
+    assert ex.ledger.week_planned(date(2026, 6, 30)) == 450.0
+    assert ex.ledger.remaining_weekly(date(2026, 6, 30)) == 0.0
+
+    # The artifact becomes readable with a real, modest $10 fill.
+    sibling_path.write_text(
+        json.dumps({
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T09:00:00-04:00",
+            "run_id": "earlier_week_recovered",
+            "buy_candidates": [
+                {"ticker": "OTHER", "status": "filled", "planned_amount_usd": 10.0},
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    # Second pass, SAME executor instance: the ledger must reflect the real
+    # $10, not stay pinned at the $450 weekly ceiling the first (failed)
+    # scan injected.
+    ex._compute_top_up(now, ())
+    ex._seed_ledger_from_prior_runs(now)
+    assert ex._cap_seed_scan_incomplete is False
+    assert ex.ledger.week_planned(date(2026, 6, 30)) == 10.0, (
+        "the earlier fail-closed poisoning must be cleared once the scan recovers"
+    )
+    assert ex.ledger.remaining_weekly(date(2026, 6, 30)) == 440.0
+
+
+def test_earlier_weekday_run_with_a_failed_csv_scan_is_rescanned_once_repaired(tmp_path):
+    """Codex review ("Do not cache prior runs whose CSV scan failed"): an
+    earlier-weekday sibling run_state.json can parse fine (no buy_candidates,
+    e.g. a market-open/intraday stream) while its canonical
+    submitted_orders.csv is transiently malformed/mid-write. The old code
+    unconditionally cached this run_id as seeded even when its CSV scan
+    failed this pass, so a later successful rescan (via the already_seeded
+    check) skipped it forever -- permanently losing whatever spend existed
+    only in that CSV, even after the overall week-level fail-closed
+    poisoning cleared."""
+    cap_root = tmp_path / "cap_root"
+    sibling_dir = cap_root / "20260629_manualET"
+    sibling_dir.mkdir(parents=True)
+    (sibling_dir / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T09:00:00-04:00",
+            "run_id": "earlier_week_csv_run",
+            "buy_candidates": [],
+        }),
+        encoding="utf-8",
+    )
+    csv_path = sibling_dir / "submitted_orders.csv"
+    # First pass: caught mid-write -- headerless (empty file).
+    csv_path.write_text("", encoding="utf-8")
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAPL",), trading_date=date(2026, 6, 30))
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        cap_seed_roots=(str(cap_root),),
+        morning_daily_cap_usd=90.0,
+        morning_weekly_cap_usd=450.0,
+        approved_test_dates=frozenset({date(2026, 6, 30)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    now = datetime.combine(date(2026, 6, 30), time(10, 30), tzinfo=EASTERN)
+
+    # First pass: the headerless CSV fails to parse -> fail closed, and this
+    # run_id must NOT be cached as seeded.
+    ex._compute_top_up(now, ())
+    ex._seed_ledger_from_prior_runs(now)
+    assert ex._cap_seed_scan_incomplete is True
+    assert "earlier_week_csv_run" not in ex._seeded_prior_run_ids
+    assert ex.ledger.week_planned(date(2026, 6, 30)) == 450.0  # fail-closed ceiling
+
+    # The CSV becomes readable with a real $25 fill.
+    csv_path.write_text(
+        "ticker,order_id,status,submitted_amount_usd,avg_fill_price,quantity_filled\n"
+        "AAPL,ORD-1,filled,25.00,50.00,0.5\n",
+        encoding="utf-8",
+    )
+
+    # Second pass, SAME executor instance: the run must be rescanned (not
+    # skipped as already-seeded) and its real $25 fill seeded, not stay
+    # pinned at the $450 ceiling the first (failed) scan injected.
+    ex._compute_top_up(now, ())
+    ex._seed_ledger_from_prior_runs(now)
+    assert ex._cap_seed_scan_incomplete is False
+    assert "earlier_week_csv_run" in ex._seeded_prior_run_ids
+    assert ex.ledger.week_planned(date(2026, 6, 30)) == pytest.approx(25.0), (
+        "the run's real $25 fill must be seeded once its CSV becomes readable, not "
+        "permanently skipped because an earlier failed pass cached it as seeded"
     )
 
 
@@ -6218,9 +6528,19 @@ def test_manual_review_block_is_not_recorded_as_a_missing_spread_block(tmp_path)
     assert artifacts["candidates_blocked_missing_spread"] == 0
 
 
-def test_preflight_blocked_run_carries_the_blocked_outcome_fields(tmp_path):
-    """This path writes and returns before the classifier, so it must stamp the
-    outcome itself (Codex review)."""
+def test_preflight_missing_no_longer_blocks_and_still_evaluates(tmp_path):
+    """Superseded 2026-08-02 (Geoff: "should not block any later runs"): a
+    missing same-day preflight artifact used to end the run here as a
+    blocked-before-placement outcome (Codex review, PR #77/#88), which this
+    test used to verify carried the right outcome fields
+    (run_classification_outcome/order_submit_status/is_trading_failure/etc via
+    _apply_blocked_before_placement_fields). That branch and its trigger are
+    both gone; the same field-stamping helper is still exercised by other
+    genuinely-blocking paths (e.g. a missing broker adapter, account pinning
+    failure -- see the many other run_classification_outcome ==
+    'failed_scheduled_run_startup' assertions elsewhere in this file). This
+    test now just confirms the missing-preflight case reaches a normal,
+    non-blocked evaluation instead."""
     cfg = MorningConfig(
         tickers=("NVDA",),
         morning_run_state_root=str(tmp_path / "live"),
@@ -6233,17 +6553,10 @@ def test_preflight_blocked_run_carries_the_blocked_outcome_fields(tmp_path):
     res = ex.run(_now_live(), data, broker=_TopUpBroker())
 
     artifacts = res["artifacts"]
-    assert artifacts["status"] == "blocked"
-    # Never reached placement, so NOT the placement-failure outcome.
-    assert artifacts["run_classification_outcome"] == "failed_scheduled_run_startup"
-    assert artifacts["order_submit_status"] == "not_submitted_error"
-    assert artifacts["is_trading_failure"] is True
-    assert artifacts["orders_submitted_count"] == 0
-    assert artifacts["error_class"] is not None
-
-    run_dir = Path(res["paths"]["run_state"]).parent
-    summary = json.loads((run_dir / "run_summary.json").read_text(encoding="utf-8"))
-    assert summary["run_classification_outcome"] == "failed_scheduled_run_startup"
+    assert artifacts.get("status") != "blocked"
+    assert artifacts["preflight_gate"]["preflight_found"] is False
+    evaluated = {r["ticker"] for r in artifacts["signal_rows"]}
+    assert evaluated == {"NVDA"}
 
 
 def test_confirmation_required_survives_the_morning_no_order_classification(tmp_path):
@@ -7357,7 +7670,12 @@ def test_unconfigured_preflight_forbidden_roots_resolve_at_call_time(tmp_path):
     forbidden path, silently passing the must_not_look_under check it exists
     to enforce (Codex review, PR #219: "Resolve forbidden preflight roots at
     call time"). Points preflight_run_state_root inside the freshly-resolved
-    live root and confirms the gate still blocks it."""
+    live root and confirms the gate still recognizes it as forbidden.
+
+    NON-BLOCKING as of 2026-08-02 (Geoff: "should not block any later runs"):
+    a forbidden root degrades a SCHEDULED run to the full universe with a
+    warning, exactly like a manual run, rather than blocking to zero tickers
+    -- this test now asserts that degrade, not a block."""
     probe = (
         "import os\n"
         "from datetime import date, datetime, time\n"
@@ -7370,7 +7688,8 @@ def test_unconfigured_preflight_forbidden_roots_resolve_at_call_time(tmp_path):
         "now = datetime.combine(date(2026, 7, 8), time(10, 30), tzinfo=morning_dca.EASTERN)\n"
         "admitted = ex._apply_preflight_gate(now, ['SMALL'], manual=False)\n"
         "print(admitted)\n"
-        "print(ex.preflight_gate['preflight_missing_block'])\n"
+        "print(ex.preflight_gate['preflight_found'])\n"
+        "print('forbidden' in ex.preflight_gate['warning'])\n"
     )
     env = {k: v for k, v in os.environ.items() if k != CRON_TRACKING_ROOT_ENV}
     env["PROBE_ROOT"] = str(tmp_path / "dca-preflight-forbidden-probe")
@@ -7383,7 +7702,157 @@ def test_unconfigured_preflight_forbidden_roots_resolve_at_call_time(tmp_path):
         check=True,
     )
     lines = out.stdout.splitlines()
-    assert lines == ["[]", "True"], out.stdout
+    assert lines == ["['SMALL']", "False", "True"], out.stdout
+
+
+def test_csv_qualifying_notional_total_reads_the_canonical_submitted_amount_column(tmp_path):
+    """Codex review: "Read the canonical submitted amount column". The
+    submitted_orders.csv fallback (added for market-open/intraday prior-
+    weekday cap seeding, which have no buy_candidates/filled_orders.csv/
+    orders.csv) opened the file but only ever checked notional_usd/
+    amount_usd -- the canonical column scripts.scheduled_artifacts.
+    SUBMITTED_ORDERS_FIELDS actually defines is submitted_amount_usd, so the
+    fallback always summed to $0.00 for a real submitted_orders.csv."""
+    csv_path = tmp_path / "submitted_orders.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["ticker", "order_id", "submitted_amount_usd", "status"])
+        writer.writerow(["AAAU", "ord-1", "7.50", "submitted"])
+        writer.writerow(["TRIN", "ord-2", "2.00", "filled"])
+        writer.writerow(["DRY", "DRY-RUN-1", "5.00", "submitted"])
+
+    total = _csv_qualifying_notional_total(csv_path, blank_status_means_filled=False)
+    assert total == pytest.approx(9.50)
+
+
+def test_csv_qualifying_notional_total_reserves_in_flight_order_statuses(tmp_path):
+    """Codex review: "Reserve in-flight canonical orders in weekly cap
+    seeding". scripts.scheduled_artifacts.ORDER_ATTEMPT_STATUSES includes
+    'pending' and 'unconfirmed' among the statuses the canonical
+    submitted_orders.csv writer uses for a placed-or-in-flight order, not
+    just 'submitted'/'filled'. A pending or unconfirmed row may still fill
+    later, so it must be reserved (counted) here rather than read as $0 --
+    treating it as $0 could let a later run re-spend headroom that order
+    goes on to actually consume.
+
+    'not_submitted_confirmation_required' is deliberately EXCLUDED even
+    though it is also in ORDER_ATTEMPT_STATUSES: scripts/drift_detection.py's
+    _NOT_ACTUALLY_SUBMITTED_STATUSES documents that this status means the
+    order was blocked pending a separate confirmation step and never reached
+    the broker, so it is not real capital and counting it would
+    unnecessarily suppress later slots' valid orders (Codex review: "Exclude
+    confirmation-blocked rows from pooled spend")."""
+    csv_path = tmp_path / "submitted_orders.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["ticker", "order_id", "submitted_amount_usd", "status"])
+        writer.writerow(["AAAU", "ord-1", "5.00", "pending"])
+        writer.writerow(["TRIN", "ord-2", "3.00", "unconfirmed"])
+        writer.writerow(["EVR", "ord-3", "2.50", "not_submitted_confirmation_required"])
+        writer.writerow(["FLAT", "ord-4", "1.00", "cap_exceeded"])
+        writer.writerow(["SKIP", "ord-5", "1.00", "skipped"])
+
+    total = _csv_qualifying_notional_total(csv_path, blank_status_means_filled=False)
+    assert total == pytest.approx(8.00)
+
+
+def test_csv_qualifying_notional_total_fails_closed_on_malformed_amount(tmp_path):
+    """Codex review: "Fail closed on malformed canonical order rows". A row
+    with a qualifying status (a real placed/in-flight order) but a blank or
+    non-numeric amount is a truncated or malformed write, not a genuine $0
+    order. csv.DictReader does not raise for this, so it must be explicitly
+    detected and pushed into skip_sink rather than silently read as no
+    spend."""
+    csv_path = tmp_path / "submitted_orders.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["ticker", "order_id", "submitted_amount_usd", "status"])
+        writer.writerow(["AAAU", "ord-1", "5.00", "submitted"])
+        writer.writerow(["TRIN", "ord-2", "", "submitted"])
+
+    skip_sink = []
+    total = _csv_qualifying_notional_total(csv_path, blank_status_means_filled=False, skip_sink=skip_sink)
+    assert total == pytest.approx(5.00)
+    assert skip_sink == [csv_path]
+
+
+def test_csv_qualifying_notional_total_fails_closed_on_nonpositive_amount(tmp_path):
+    """Codex review: "Reject nonpositive amounts in qualifying order rows".
+    A qualifying-status row (a real placed/in-flight order) can never
+    legitimately have a zero or negative submitted_amount_usd -- that is a
+    malformed/truncated write too, exactly like a blank or non-numeric
+    amount. The first malformed-amount fix only caught `notional is None`,
+    so a zero or negative value on a qualifying row silently read as
+    genuine $0 spend instead of failing closed."""
+    csv_path = tmp_path / "submitted_orders.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["ticker", "order_id", "submitted_amount_usd", "status"])
+        writer.writerow(["AAAU", "ord-1", "5.00", "submitted"])
+        writer.writerow(["TRIN", "ord-2", "0", "submitted"])
+        writer.writerow(["DXYZ", "ord-3", "-3.00", "submitted"])
+
+    skip_sink = []
+    total = _csv_qualifying_notional_total(csv_path, blank_status_means_filled=False, skip_sink=skip_sink)
+    assert total == pytest.approx(5.00)
+    assert skip_sink == [csv_path, csv_path]
+
+
+def test_csv_qualifying_notional_total_fails_closed_on_missing_status_header(tmp_path):
+    """Codex review: "Validate canonical CSV headers before filtering rows".
+    A missing/corrupted "status" header makes row.get("status") return None
+    for every row, which the qualifying-status filter silently treats as
+    "not qualifying" -- no exception, so the malformed-amount fail-closed
+    path added for the previous finding is never reached either. A file with
+    a real header row that is missing a required column must fail closed,
+    not read as zero orders."""
+    csv_path = tmp_path / "submitted_orders.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        # No "status" column at all -- corrupted/wrong header for a CSV type
+        # that is NOT filled_orders.csv (blank_status_means_filled=False).
+        writer.writerow(["ticker", "order_id", "submitted_amount_usd"])
+        writer.writerow(["AAAU", "ord-1", "5.00"])
+
+    skip_sink = []
+    total = _csv_qualifying_notional_total(csv_path, blank_status_means_filled=False, skip_sink=skip_sink)
+    assert total == 0.0
+    assert skip_sink == [csv_path]
+
+
+def test_csv_qualifying_notional_total_fails_closed_on_a_headerless_existing_file(tmp_path):
+    """Codex review: "Treat headerless existing order CSVs as incomplete".
+    An EXISTING file with no header line at all (zero-byte, or truncated
+    before writer.writeheader() flushed) makes csv.DictReader.fieldnames
+    None, not merely missing a required column. The previous fix collapsed
+    None into () via `reader.fieldnames or ()` and then only validated
+    `if fieldnames` (truthy), so this exact case slipped through that guard
+    and silently read as a genuine zero-orders file instead of failing
+    closed -- a caught-mid-write file must not be treated the same as a
+    legitimately empty/quiet day."""
+    csv_path = tmp_path / "submitted_orders.csv"
+    csv_path.write_text("", encoding="utf-8")
+
+    skip_sink = []
+    total = _csv_qualifying_notional_total(csv_path, blank_status_means_filled=False, skip_sink=skip_sink)
+    assert total == 0.0
+    assert skip_sink == [csv_path]
+
+
+def test_csv_qualifying_notional_total_missing_status_header_ok_for_filled_orders(tmp_path):
+    """Manual filled_orders.csv files legitimately omit "status" entirely
+    (blank_status_means_filled=True treats every row as a confirmed fill),
+    so a missing status header there is normal, not a fail-closed case."""
+    csv_path = tmp_path / "filled_orders.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["ticker", "order_id", "amount_usd"])
+        writer.writerow(["AAAU", "ord-1", "5.00"])
+
+    skip_sink = []
+    total = _csv_qualifying_notional_total(csv_path, blank_status_means_filled=True, skip_sink=skip_sink)
+    assert total == pytest.approx(5.00)
+    assert skip_sink == []
 
 
 def test_cap_seeding_default_scan_roots_are_resolved_at_call_time():

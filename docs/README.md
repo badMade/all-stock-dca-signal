@@ -15,7 +15,7 @@ environment (see the repository README).
 | [strategy.md](strategy.md) | Strategy overview, ticker universe, latest sizing ladder, budgets |
 | [live_wiring.md](live_wiring.md) | Live providers/broker adapters, orchestrator/CLI, and the two placement safety gates |
 | [safeguards.md](safeguards.md) | Broker/account, trading constraints, budget caps, test window |
-| [schedule_manifest.md](schedule_manifest.md) | The canonical 17-row recurring schedule verified 2026-07-27, one-time tasks, and retired entries |
+| [schedule_manifest.md](schedule_manifest.md) | The canonical 15-row recurring schedule (17 rows verified 2026-07-27; 2 removed 2026-08-02), one-time tasks, and retired entries |
 | [run_classification.md](run_classification.md) | Scheduled-vs-manual run contract (paths, required fields, exclusion rules) |
 | [drift_detection.md](drift_detection.md) | Post-artifact signals-vs-submitted-orders drift detector + Slack alerting |
 | [slack_webhook_injection.md](slack_webhook_injection.md) | How to inject the `DCA_DRIFT_SLACK_WEBHOOK` webhook across cron/systemd, agent/MCP scheduler, local shell, and GitHub Actions |
@@ -37,7 +37,10 @@ environment (see the repository README).
 
 ## Key facts (quick reference)
 
-- **Active universe:** 45 tickers (includes `GFUZ`, `TXN`, `RKLB`); `BYDDY`, `VCX`, `TRLV`, `RVI` excluded; `IRDMI→IRDM`, `GLWR→GLW`; `GFUZ` uses Robinhood primary data (finance `NOT_FOUND`).
+- **Active universe:** 52 tickers (includes `GFUZ`, `TXN`, `RKLB`, and the
+  2026-08-02 additions `GE`, `VRT`, `CAT`, `QQQ`, `QCOM`, `ABBV`, `JPM`);
+  `BYDDY`, `VCX`, `TRLV`, `RVI` excluded; `IRDMI→IRDM`, `GLWR→GLW`; `GFUZ` uses
+  Robinhood primary data (finance `NOT_FOUND`).
 - **Latest ladder:** 0.1%→8%+, base $2, max **5x** (no upper cutoff). Older
   0.1%–12% ladders are **superseded**.
 - **Budgets:** $2 base · tiered caps selected per run by planned spend and 3x+
@@ -53,7 +56,8 @@ environment (see the repository README).
   tasks, not instead of them, until Gate 5 is wired. See
   [safeguards.md](safeguards.md#live-execution-roster) for the current
   roster. Robinhood account `<ROBINHOOD_ACCOUNT_NUMBER>` only; Alpaca read-only.
-  The **3:35 PM ET** task is analytics (slippage + Notion sync).
+  The **5:00 PM ET** task is analytics (slippage + Notion sync; retimed
+  2026-08-02 from 3:35 PM ET).
 - **Run classification:** each currently-functioning stream writes under its OWN
   artifact root and pointer, not a shared `scheduled_runs/` path: market-open
   (`2ba19526`) under `market_open_dca/` + `latest_market_open_run.json`, morning
@@ -76,10 +80,18 @@ environment (see the repository README).
   evidence). Manual runs write under each stream's own `manual_runs/<timestamp>/`
   and never update that stream's pointer. Reporting excludes manual runs/order
   IDs from scheduled-live metrics. See [run_classification.md](run_classification.md).
-- **Afternoon completion:** all afternoon trading/artifact-writing tasks finish
-  by **3:40 PM ET**, when the read-only watchdog starts its final verification;
-  the watchdog's own check and the Friday weekly Notion refresh at **5:00 PM ET**
-  are the only exceptions.
+- **Afternoon completion (rewritten 2026-08-02):** the 3:05 PM monitor-only
+  signal check (`e3e6f09e`) and the 3:40 PM read-only watchdog (`a46bf007`)
+  were both **removed from the schedule entirely**. Afternoon **trading** now
+  completes **no later than 3:30 PM ET** (`10ce362c`). Same-day
+  artifact-writing moved later: the post-trade slippage + Notion sync
+  (`67aa802b`) moved from 3:35 PM ET to **5:00 PM ET daily**, and the Friday
+  weekly Notion refresh (`041d9d90`) moved from 5:00 PM ET to **5:30 PM ET**
+  the same day to clear the resulting Friday collision. The month-end
+  volatility risk refresh (`c9fb1fb8` / `17a3b2a9`) moved from its own prior
+  5:00 PM ET to **5:15 PM ET** the same day for the same reason -- it
+  collided with `67aa802b`'s new daily 5:00 PM slot too. These three tasks
+  are the only DCA-related tasks approved to run after 3:30 PM ET.
 - **Test window:** through **2026-10-30** inclusive per `config/trading_window.json`
   (extended 2026-07-26 from the original 2026-08-28 end date; stops the Friday
   before the 2026-11-01 DST change since the live tasks' cron schedules are

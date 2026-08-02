@@ -71,15 +71,15 @@ Then diff and review before committing. See [`scripts/README.md`](../scripts/REA
 
 ## Audit checklist
 
-- [ ] Active universe = 45 symbols (includes `GFUZ`, `TXN`, `RKLB`); `BYDDY`, `VCX`, `TRLV`, `RVI` excluded; `IRDMI→IRDM`, `GLWR→GLW` applied; `GFUZ` included (Robinhood primary data, finance `NOT_FOUND`).
+- [ ] Active universe = 52 symbols (includes `GFUZ`, `TXN`, `RKLB`, and the 2026-08-02 additions `GE`, `VRT`, `CAT`, `QQQ`, `QCOM`, `ABBV`, `JPM`); `BYDDY`, `VCX`, `TRLV`, `RVI` excluded; `IRDMI→IRDM`, `GLWR→GLW` applied; `GFUZ` included (Robinhood primary data, finance `NOT_FOUND`).
 - [ ] Ladder is the latest (0.1%–8%+, max 5x, no upper cutoff). No 12x-era tiers.
 - [ ] Base amount $2; tiered daily/weekly caps and $900 weekly rollover reserve cap intact.
 - [ ] Only the live trading tasks `2ba19526`, `42173154`, `7be82b97`, `a6239dae`, and `10ce362c` (supersedes deleted `ce16ba6b`) can trade; they use only Robinhood account `<ROBINHOOD_ACCOUNT_NUMBER>`; Alpaca read-only.
-- [ ] Final live task at 3:30 PM ET; slippage/Notion sync at 3:35 PM ET (not merged).
+- [ ] Final live task at 3:30 PM ET; slippage/Notion sync at 5:00 PM ET daily (retimed 2026-08-02 from 3:35 PM ET).
 - [ ] Run-classification contract wired: every run_state has a `run_classification` block; scheduled runs update `latest_scheduled_run.json`, manual runs don't; reporting excludes manual runs/order IDs (`python scripts/tests/test_run_classification.py`).
-- [ ] The 16 canonical active tasks plus the one-time `f7411889` are present and match `config/scheduled_tasks.json` -> `canonical_schedule_reconciliation_2026_07_27.canonical_schedule_et`: `2ba19526`, `bb4f6ef1`, `42173154`, `7be82b97`, `a6239dae`, `e3e6f09e` (paused), `10ce362c`, `67aa802b`, `a46bf007`, `041d9d90`, `0656657a`, `bec4a6ee`, `c9fb1fb8`, `17a3b2a9`, `f7411889`.
-- [ ] The retired entries `b7961407`, `cd45e95b`, `morning-dca-0945`, `d72aa525`, and `d1f7a2c0` are **absent from every active schedule table** and carry no `cron_utc`.
-- [ ] Afternoon tasks complete by 3:40 PM ET, except Fri 5:00 PM Notion refresh.
+- [ ] The 14 canonical active tasks plus the one-time `f7411889` are present and match `config/scheduled_tasks.json` -> `canonical_schedule_reconciliation_2026_07_27.canonical_schedule_et`: `2ba19526`, `bb4f6ef1`, `42173154`, `7be82b97`, `a6239dae`, `10ce362c`, `67aa802b`, `041d9d90`, `0656657a`, `bec4a6ee`, `c9fb1fb8`, `17a3b2a9`, `f7411889`. `e3e6f09e` (3:05 PM monitor-only check) and `a46bf007` (3:40 PM live-run watchdog) were REMOVED from the schedule entirely on 2026-08-02 -- they must NOT be restored; see `removed_on_2026_08_02` in `config/scheduled_tasks.json`.
+- [ ] The retired entries `b7961407`, `cd45e95b`, `morning-dca-0945`, `d72aa525`, and `d1f7a2c0` (kept as historical stubs in `retired_not_in_canonical_schedule`, each with a `former_et`) are **absent from every active schedule table** and carry no `cron_utc`. `e3e6f09e` and `a46bf007` are absent too, but differently: their task definitions were deleted entirely on 2026-08-02, not kept as retired stubs -- do not expect to find them in `retired_not_in_canonical_schedule`.
+- [ ] Afternoon trading completes by 3:30 PM ET (`10ce362c`'s final execution -- the 3:40 PM watchdog that used to anchor a separate completion boundary was removed 2026-08-02); the 5:00 PM ET slippage/Notion sync (`67aa802b`), Fri 5:30 PM ET weekly Notion refresh (`041d9d90`, retimed 2026-08-02 from 5:00 PM ET), and the month-end volatility risk refresh at 5:15 PM ET (`c9fb1fb8`/`17a3b2a9`, retimed 2026-08-02 from its own prior 5:00 PM ET to clear the collision with `67aa802b`'s new 5:00 PM slot) are the only approved post-3:30 PM DCA-related tasks.
 - [ ] Signal rules recorded: below prior close + 60-min trend down + multiplier > 0.
 - [ ] No secrets committed (`git grep` for tokens/keys before pushing).
 - [ ] Notifications: no *routine* Slack (in-app + email-where-specified only for normal runs); Slack is permitted, env-gated, and off-by-default for the drift (`DCA_DRIFT_SLACK_WEBHOOK`) and failure-alert/heartbeat (`DCA_ALERT_SLACK_WEBHOOK`) paths only — never for routine success notifications.

@@ -113,10 +113,24 @@ resolved machine-specific state-root decision").
 
 ### 1.6 Stale per-stream caps
 
-`DEFAULT_MORNING_DAILY_CAP_USD = 90.0 / weekly 450.0`, same for midday. These are
-the old per-stream halves of a $180/$900 day. The seven-slot model treats
-$180/$900 as a **shared** total. If `run_pipeline` enforces its own 90/450 the two
-budget models will disagree.
+**RESOLVED 2026-08-02** (Geoff: "caps aren't pooled the way the target design
+intends -- fix it"). `DEFAULT_MORNING_DAILY_CAP_USD`/`DEFAULT_MIDDAY_DAILY_CAP_USD`
+(and their weekly counterparts) are now `180.0`/`900.0` -- the same shared
+Normal-tier ceiling as `near_close_dca.BUDGET_TIERS[0]`, not an isolated
+per-stream half-share. `MorningConfig.cap_seed_roots`/`MiddayConfig.cap_seed_roots`
+(config/morning_dca.json, config/midday_dca.json) now span every sibling
+stream's artifact root, and the seeding block in `_compute_top_up` (previously
+gated to `self.stream == MORNING_STREAM` only) runs for any stream with
+`cap_seed_roots` configured, so morning and midday's cap ledgers now see real
+cross-stream same-day/week spend rather than just their own.
+This is a deliberately partial fix, not full parity with the seven-slot
+model's shared-total vision: morning and midday still don't dynamically
+escalate to Elevated/High-volatility/Stress on their own -- only the 3:30
+final run does that, from its fuller same-day view -- and market-open
+(`2ba19526`) / intraday (`7be82b97`) have no in-repo Python at all
+(`no_python_entry_point=true`), so their $180/$900 pooling exists only as
+documented policy an external scheduler/agent must implement itself, the same
+limitation as the same-day top-up guard's Perplexity restatement.
 
 ---
 
@@ -495,6 +509,25 @@ review: "Derive rollover reserve from the shared broker budget").
 
 ## 3.13 `assess()` hard-codes "first slot wins", not the guarded incremental top-up §4 item 2 leaves open
 
+**RESOLVED 2026-08-02.** This section originally flagged (2026-07-29) that
+`assess()`'s `bought_today` exclusion (`REFUSED_ALREADY_BOUGHT_TODAY`)
+hard-coded option (a) below regardless of what `config/budgets.json` said.
+That has since been fixed: the exclusion is now gated behind
+`ONE_ORDER_PER_TICKER_PER_DAY`, a module-level constant `assess()` loads
+directly from `config/budgets.json`'s `order_rules.one_order_per_ticker_per_day`
+at import time (`_load_one_order_per_ticker_per_day()`), with no hardcoded
+override anywhere in `dca_runner.py`. Geoff ruled explicitly on the open
+question below: option (b), guarded top-up, permanently -- the same ticker
+may be bought more than once a day, resized to the incremental delta at a
+strictly lower price, never blocked outright for having a prior same-day
+buy. `config/budgets.json`'s flag is `false` to match, so `assess()` no
+longer excludes a same-day-bought ticker at all; `scripts/same_day_top_up_gate.py`
+(step 4.5 in the 1230ET prompt, Gate 6.5 in the other six) is the sole,
+authoritative sizer for the repeat. The original finding is preserved below
+for history.
+
+---
+
 Flagged by review (2026-07-29): once a ticker has any same-day buy attempt,
 `assess()`'s `bought_today` exclusion (`REFUSED_ALREADY_BOUGHT_TODAY`) removes
 it from `cands` entirely before tier selection or `plan_orders()` ever sees
@@ -529,12 +562,13 @@ original tier's caps or a fresh one?) -- decisions with real, product-level
 consequences for a live-money strategy, not something to guess at
 opportunistically while fixing an unrelated review round.
 
-No code change is made for this finding. `assess()`'s current all-or-nothing
-exclusion is left in place as the documented, deliberately conservative
-default until a human makes the §4 item 2 decision explicitly; this section
-exists so that choice is not mistaken for having been made already just
-because the code enforces something (Codex review: "Preserve incremental
-top-ups across later slots").
+**Superseded 2026-08-02:** the fix taken was simpler than reimplementing that
+delta math a second time inside `dca_runner.py`. `assess()` no longer tries
+to compute the resized amount itself; it just stops excluding the ticker, and
+`scripts/same_day_top_up_gate.py` (already built, tested, and wired as a
+separate gate that runs immediately after `assess()` in every prompt that
+uses one) is the one place that owns the delta arithmetic. That avoids two
+independently-maintained top-up implementations disagreeing with each other.
 
 ## 4. What must be decided by a human before any of this ships
 
@@ -557,10 +591,15 @@ top-ups across later slots").
    This decision does NOT extend to the four `DISABLED_SLOTS` (9:35, 11:30,
    1:30, 2:30): §1.4's cross-slot prior-allocation gap for those slots is
    unresolved, so they remain hard-disabled in `run_dca.py` regardless of this
-   choice. §3.13's `dca_runner.py`-local analysis is superseded by this: that
-   module is not wired into any live path (no production caller ever
-   constructs a `dca_runner.Candidate`), so the real fix belongs in
-   `run_dca.run_slot()`/`near_close_dca.py`, not there.
+   choice. §3.13's `dca_runner.py`-local analysis is superseded by this: the
+   real per-ticker-per-day fix for the three canonical slots belongs in
+   `run_dca.run_slot()`/`near_close_dca.py`, not `dca_runner.py`. (Correction,
+   2026-08-02: the claim that used to be here -- that no production caller
+   constructs a `dca_runner.Candidate` -- was already stale when written; the
+   live 1230ET prompt's own "step 4" runs `dca_runner.assess()` against real
+   broker/candidate data every business day, live placement OFF pending
+   validation. §3.13 resolves that module's own copy of this same question
+   directly instead.)
 
    **Two P1 gaps found by review (2026-07-30) after the above landed, both now
    fixed:**
@@ -604,3 +643,13 @@ the one currently in force: Gate 2 aborts, nothing trades. If slots must run
 sooner, run **only the three canonical slots** (10:30, 12:30, 3:30), which map
 1:1 onto streams the top-up guard already understands, and leave the other four
 disabled until items 1-3 above are resolved.
+
+**This recommendation is unchanged as of 2026-08-02.** A separate, standing
+question -- how Claude and Perplexity coordinate ownership of a slot once
+Gate 5 IS eventually wired, and how to stop Gate 4 alerting on Perplexity's
+own routine activity in the meantime -- is addressed in
+`claude/PERPLEXITY-CLAUDE-COORDINATION.md`. That document does not wire Gate
+5 and does not change this section's recommendation; it only changes what
+happens once an order does land in a slot's window, and reframes the
+five-legacy-task relationship from a one-time cutover to standing
+coexistence.

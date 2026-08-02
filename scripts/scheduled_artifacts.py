@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -974,6 +975,153 @@ def validate_run_artifacts(
     return ArtifactContractResult(not errors, errors)
 
 
+def csv_qualifying_notional_total(
+    csv_path: Path, blank_status_means_filled: bool, *, skip_sink: Optional[List[Path]] = None
+) -> float:
+    """Sum notional_usd/amount_usd across submitted/filled, non-DRY-RUN rows.
+
+    Shared by morning_dca.py's ``_seed_ledger_from_prior_runs`` (as a
+    cross-check against the JSON-derived spend total) and near_close_dca.py's
+    ``load_prior_same_day_allocations`` (for the canonical ``submitted_orders.csv``
+    fallback market-open/intraday artifacts require -- those streams have no
+    in-repo executor writing ``buy_candidates``/``orders.csv``). Lives here,
+    not in either caller module, to avoid a circular import between them.
+    Returns ``0.0`` -- never raises -- for a missing, corrupt, unreadable, or
+    empty file, or one with no qualifying rows, so the caller can safely try a
+    fallback source (or fall back to the JSON total alone) without any
+    special-casing at the call site.
+
+    Pass ``skip_sink`` to distinguish "genuinely no file" (never appended --
+    a stream that simply didn't write this CSV is not evidence of anything)
+    from "the file EXISTS but could not be read/parsed" (appended -- real
+    evidence that could not be verified, e.g. a mid-write or corrupt CSV).
+    Without this, a caller cross-checking a prior-week artifact could treat a
+    corrupt submitted_orders.csv the same as a ticker with zero orders and
+    understate real prior-week spend (Codex review: "Fail closed when
+    prior-week order CSVs cannot be parsed").
+    """
+    total = 0.0
+    if not csv_path.exists():
+        return total
+    try:
+        with csv_path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            # reader.fieldnames is None specifically when the file has NO
+            # header line at all -- every real writer of this shape calls
+            # writer.writeheader() unconditionally on creation, so an
+            # EXISTING file with no header at all was caught mid-write
+            # (zero-byte or truncated before the header flushed), not a
+            # legitimate empty/quiet day. Collapsing that None into () and
+            # then only validating "if fieldnames" (truthy) silently
+            # bypassed this exact case -- an incomplete file read as
+            # genuinely zero orders instead of failing closed (Codex
+            # review: "Treat headerless existing order CSVs as
+            # incomplete"). Checked BEFORE the `or ()` fallback so it can't
+            # be conflated with a header row that simply lacks the columns
+            # this reader needs (handled separately below).
+            if reader.fieldnames is None:
+                if skip_sink is not None:
+                    skip_sink.append(csv_path)
+                return total
+            fieldnames = reader.fieldnames
+            # Codex review: "Validate canonical CSV headers before filtering
+            # rows". A missing/corrupted "status" header makes row.get
+            # ("status") return None for every row, which the qualifying-
+            # status filter below then silently treats as "not qualifying" --
+            # no exception, so the malformed-amount fail-closed path is never
+            # reached and a real order can read as zero spend. A missing
+            # amount column (none of notional_usd/amount_usd/
+            # submitted_amount_usd present) has the same silent-zero effect
+            # on every row's amount lookup. filled_orders.csv legitimately
+            # omits "status" entirely (manual fill files use the documented
+            # amount_usd/avg_fill_price shape without it, per this file's own
+            # docstring in near_close_dca._orders_csv_fills) -- that omission
+            # is normal there, not malformed, since blank_status_means_filled
+            # already treats a missing status as "filled".
+            _has_amount_column = any(
+                col in fieldnames for col in ("notional_usd", "amount_usd", "submitted_amount_usd")
+            )
+            _status_header_ok = blank_status_means_filled or "status" in fieldnames
+            if not _has_amount_column or not _status_header_ok:
+                if skip_sink is not None:
+                    skip_sink.append(csv_path)
+                return total
+            for row in reader:
+                status = (row.get("status") or "").lower()
+                # filled_orders.csv rows are always confirmed fills; a
+                # blank/missing status field still counts as "filled".
+                if blank_status_means_filled and not status:
+                    status = "filled"
+                order_id = row.get("order_id") or ""
+                # Codex review: "Reserve in-flight canonical orders in weekly
+                # cap seeding". ORDER_ATTEMPT_STATUSES ("submitted", "filled",
+                # "pending", "unconfirmed",
+                # "not_submitted_confirmation_required") are every status the
+                # canonical submitted_orders.csv writer uses for a placed-OR-
+                # ATTEMPTED order -- a "pending"/"unconfirmed" row may still
+                # fill later, so treating it as $0 here (rather than as
+                # reserved capital) could let a later run re-spend headroom
+                # that order goes on to actually consume. Reserving it is the
+                # conservative direction: it can only ever under-authorize a
+                # later run, never over-authorize one. EXCLUDE
+                # "not_submitted_confirmation_required" specifically, though:
+                # scripts/drift_detection.py's _NOT_ACTUALLY_SUBMITTED_STATUSES
+                # documents that this status means the order was BLOCKED
+                # pending a separate pre-authorization step and NEVER reached
+                # the broker -- it is not real capital consumed, and counting
+                # it would unnecessarily suppress every later slot's valid
+                # orders for the rest of the week (Codex review: "Exclude
+                # confirmation-blocked rows from pooled spend").
+                if (
+                    status not in ORDER_ATTEMPT_STATUSES
+                    or status == "not_submitted_confirmation_required"
+                    or order_id.startswith("DRY-RUN")
+                ):
+                    continue
+                # filled_orders.csv uses amount_usd; orders.csv uses notional_usd;
+                # submitted_orders.csv uses submitted_amount_usd (the canonical
+                # column defined by SUBMITTED_ORDERS_FIELDS) -- without this,
+                # the prior-weekday submitted_orders.csv fallback opened the
+                # file but never actually read its amount column, so it
+                # always contributed $0 (Codex review: "Read the canonical
+                # submitted amount column").
+                raw = row.get("notional_usd") or row.get("amount_usd") or row.get("submitted_amount_usd")
+                try:
+                    notional = float(raw) if raw not in (None, "", "-") else None
+                except (TypeError, ValueError):
+                    notional = None
+                # Reject inf/-inf/nan: an infinite notional would seed the
+                # ledger with infinite spend and cap-exceed every later order.
+                if notional is not None and not math.isfinite(notional):
+                    notional = None
+                if notional is None or notional <= 0:
+                    # A qualifying-status row (a real placed/in-flight order)
+                    # with a blank, non-numeric, zero, or negative amount is a
+                    # malformed or truncated write, not a genuine $0 order --
+                    # csv.DictReader does not raise for this, so without an
+                    # explicit check it silently reads as no spend. Fail
+                    # closed the same way an unreadable file does (Codex
+                    # review: "Fail closed on malformed canonical order rows",
+                    # "Reject nonpositive amounts in qualifying order rows" --
+                    # the first pass only caught notional is None, missing the
+                    # zero/negative case a placed order can never legitimately
+                    # have).
+                    if skip_sink is not None:
+                        skip_sink.append(csv_path)
+                    continue
+                total += notional
+    except (OSError, UnicodeDecodeError, csv.Error):
+        # A corrupt/unreadable CSV must not abort the scheduled retry; the
+        # caller falls back to another source (or the JSON total alone) --
+        # but a caller that passed skip_sink is told this file existed and
+        # could not be verified, so it can fail closed instead of silently
+        # treating it as zero.
+        if skip_sink is not None:
+            skip_sink.append(csv_path)
+        return 0.0
+    return total
+
+
 __all__ = [
     "RUN_STATE_FILENAME",
     "SIGNALS_CSV_FILENAME",
@@ -1022,4 +1170,5 @@ __all__ = [
     "ArtifactContractResult",
     "derive_valid_scheduled_evidence",
     "today_et",
+    "csv_qualifying_notional_total",
 ]

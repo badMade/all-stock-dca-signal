@@ -48,7 +48,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from dca_config import get_config_dir
@@ -4594,6 +4594,51 @@ def _positive_int(value: object, field: str) -> int:
     return value
 
 
+def _load_week_keyed_nonneg(raw: dict, field: str) -> dict[tuple[int, int], float]:
+    """Load a week-keyed (str -> number) mapping into a validated tuple-keyed dict.
+
+    Shared by the two ``reconcile_earlier_week_cross_stream_notional``
+    bookkeeping fields (``earlier_week_cross_stream_seeded_usd``/
+    ``..._poison_usd``): both are plain ISO-week-keyed dollar amounts with
+    the same validity requirements as every other persisted dollar field
+    (finite, non-negative), and the same aliased-key risk as
+    ``submitted_notional_by_week`` (e.g. ``"2026-1"``/``"2026-01"`` both
+    normalize to ``(2026, 1)``).
+    """
+    result: dict[tuple[int, int], float] = {}
+    spellings: dict[tuple[int, int], str] = {}
+    for k, v in raw.items():
+        week_key = _week_key_from_str(k)
+        if week_key in spellings:
+            raise ValueError(
+                f"{field} keys {spellings[week_key]!r} and {k!r} both normalize to ISO "
+                f"week {week_key!r}; a duplicate entry is corrupt, not additive"
+            )
+        spellings[week_key] = k
+        result[week_key] = _finite_nonneg(_json_number(v, field), field)
+    return result
+
+
+def _load_ticker_day_keyed_nonneg(raw: dict, field: str, *, parse_value) -> dict[str, dict[date, Any]]:
+    """Load a ``{ticker: {date_str: value}}`` mapping, validating each value.
+
+    Shared by ``reconcile_prior_allocation``'s two bookkeeping fields
+    (``seeded_prior_context_amount_by_ticker_day``/``..._attempts_by_ticker_day``),
+    which mirror ``buys_by_ticker_by_day``'s own nested shape. Ticker keys are
+    used verbatim (not normalized/alias-checked the way
+    ``buys_by_ticker_by_day`` is): these are pure idempotency bookkeeping, not
+    a ledger real duplicate-buy decisions are keyed against directly, so the
+    stricter handling that field needs would be more validation than this
+    one's failure mode warrants.
+    """
+    result: dict[str, dict[date, Any]] = {}
+    for ticker, per_day in raw.items():
+        result[ticker] = _dedup_date_keyed(
+            per_day.items(), lambda v: parse_value(v, field)
+        )
+    return result
+
+
 def _state_to_json(state: StrategyState) -> dict:
     return {
         "schema_version": STATE_SCHEMA_VERSION,
@@ -4606,6 +4651,52 @@ def _state_to_json(state: StrategyState) -> dict:
         },
         "submitted_notional_by_week": {
             _week_key_to_str(k): v for k, v in state.submitted_notional_by_week.items()
+        },
+        # Shared daily buy-ATTEMPT counter (config/budgets.json
+        # circuit_breakers.max_orders_per_day), bumped alongside
+        # buys_by_ticker_by_day/submitted_notional_by_day/_by_week in the same
+        # record_buy()/seed_prior_allocation() call. Omitting it here (as this
+        # field previously did) means every scheduled process reloading state
+        # via state_transaction() sees an EMPTY submitted_order_count_by_day,
+        # and _seed_prior_allocations() never repairs it for a ticker whose
+        # buys_today() is already nonzero (it deliberately skips reseeding
+        # that ticker) -- so prior accepted orders silently vanish from the
+        # shared max_orders_per_day count and a later slot can exceed the
+        # breaker (Codex review: "Persist the shared daily attempt counter").
+        "submitted_order_count_by_day": {
+            d.isoformat(): n for d, n in state.submitted_order_count_by_day.items()
+        },
+        # Idempotent-seeding bookkeeping for
+        # reconcile_earlier_week_cross_stream_notional (Codex review:
+        # "Reconcile earlier-week spend instead of adding it") -- must
+        # survive across invocations (state_transaction() reloads this
+        # persistent state fresh each time) the same way every other ledger
+        # here does, or a fresh reload would see "nothing seeded yet this
+        # week" and re-add the full earlier-week cross-stream total again.
+        "earlier_week_cross_stream_seeded_usd": {
+            _week_key_to_str(k): v
+            for k, v in state.earlier_week_cross_stream_seeded_usd.items()
+        },
+        "earlier_week_cross_stream_poison_usd": {
+            _week_key_to_str(k): v
+            for k, v in state.earlier_week_cross_stream_poison_usd.items()
+        },
+        # Idempotent-seeding bookkeeping for reconcile_prior_allocation
+        # (Codex review: "Reconcile increases to already-seeded ticker
+        # allocations"), mirroring buys_by_ticker_by_day's own nested
+        # ticker -> {day: value} shape. Must survive a process restart the
+        # same way every other ledger here does, or a fresh reload would
+        # forget how much of a ticker's aggregate has already been folded in
+        # and either re-add it (if buys_today() happened to be 0) or fall
+        # back to reconcile_prior_allocation's own conservative
+        # ambiguous-baseline handling.
+        "seeded_prior_context_amount_by_ticker_day": {
+            ticker: {d.isoformat(): v for d, v in per_day.items()}
+            for ticker, per_day in state.seeded_prior_context_amount_by_ticker_day.items()
+        },
+        "seeded_prior_context_attempts_by_ticker_day": {
+            ticker: {d.isoformat(): v for d, v in per_day.items()}
+            for ticker, per_day in state.seeded_prior_context_attempts_by_ticker_day.items()
         },
         "weekly_rollover_reserve_usd": state.weekly_rollover_reserve_usd,
         "finalized_budget_days": sorted(d.isoformat() for d in state.finalized_budget_days),
@@ -4706,14 +4797,22 @@ def _state_from_json(raw: dict) -> StrategyState:
     # record_buy() always updates the day and week ledgers together in the
     # same call, and neither is ever pruned independently of the other, so
     # under any legitimately-written state each week's persisted total must
-    # equal the sum of that week's daily entries. A document where the two
-    # disagree -- e.g. $900 recorded for a Monday but $0 for that ISO week --
-    # is corrupt: StrategyState.week_notional() would silently forget the
-    # real spend and authorize another week's worth of buys even though the
-    # same document proves the prior spend (Codex review: "Reject
+    # be AT LEAST the sum of that week's daily entries -- it can legitimately
+    # exceed that sum too, since bump_week_notional_only()/
+    # force_week_notional_to_worst_case_ceiling()/
+    # reconcile_earlier_week_cross_stream_notional() add EARLIER-weekday
+    # cross-stream spend (or a fail-closed ceiling) to the week bucket ONLY,
+    # deliberately without a corresponding submitted_notional_by_day entry in
+    # THIS state (that spend belongs to a sibling stream or an earlier day's
+    # own history, not a ticker/day this state tracks -- Codex review:
+    # "Include prior-week sibling spend in the afternoon ledger"). A week
+    # total UNDER its daily sum -- e.g. $900 recorded for a Monday but $0 for
+    # that ISO week -- is still corrupt: StrategyState.week_notional() would
+    # silently forget real spend and authorize another week's worth of buys
+    # even though the same document proves it (Codex review: "Reject
     # inconsistent persisted daily and weekly ledgers"). Compared in whole
     # cents, not with a flat 0.01 tolerance: a tolerance of exactly one cent
-    # also accepts a real, corrupt one-cent mismatch (e.g. daily entries
+    # also accepts a real, corrupt one-cent shortfall (e.g. daily entries
     # summing to $899.01 against a persisted $899.00) as if it were float
     # non-associativity noise, when floating-point subtraction of the two can
     # land just under that threshold even for a real discrepancy (Codex
@@ -4725,35 +4824,30 @@ def _state_from_json(raw: dict) -> StrategyState:
     for wk in set(expected_week_totals) | set(state.submitted_notional_by_week):
         expected = expected_week_totals.get(wk, 0.0)
         persisted = state.submitted_notional_by_week.get(wk, 0.0)
-        if _cents(expected) != _cents(persisted):
+        if _cents(persisted) < _cents(expected):
             raise ValueError(
                 f"submitted_notional_by_week for {wk!r} is {persisted!r} but its daily "
-                f"entries in submitted_notional_by_day sum to {expected!r}; the two "
-                "ledgers must agree"
+                f"entries in submitted_notional_by_day sum to {expected!r}; the week "
+                "total can never fall short of its own daily entries"
             )
-    # record_buy() also updates buys_by_ticker_by_day in the SAME call as the
-    # two notional ledgers above, so a buy-count entry for a given date can
-    # never legitimately exist without a positive corresponding entry in both
-    # submitted_notional_by_day and submitted_notional_by_week. A document
-    # with a buy count but empty notional maps is corrupt: subsequent budget
-    # checks would see zero prior spend for that day/week and could authorize
-    # purchases beyond the real caps even though the same document proves a
-    # buy happened (Codex review: "Cross-check persisted buy counts against
-    # notional ledgers").
-    for ticker, per_day in state.buys_by_ticker_by_day.items():
-        for d in per_day:
-            if state.submitted_notional_by_day.get(d, 0.0) <= 0:
-                raise ValueError(
-                    f"buys_by_ticker_by_day has a buy for {ticker!r} on {d.isoformat()!r} "
-                    "but submitted_notional_by_day has no positive entry for that date"
-                )
-            if state.submitted_notional_by_week.get(iso_week_key(d), 0.0) <= 0:
-                raise ValueError(
-                    f"buys_by_ticker_by_day has a buy for {ticker!r} on {d.isoformat()!r} "
-                    "but submitted_notional_by_week has no positive entry for that ISO week"
-                )
-    # The inverse direction is corrupt too: record_buy() is the only runtime
-    # writer of all three structures, always together, so a positive
+    # A buys_by_ticker_by_day entry no longer implies positive notional in
+    # THIS direction: record_buy() always pairs a buy count with positive
+    # notional, but seed_prior_allocation() also bumps buys_by_ticker_by_day
+    # by attempt_count for a RECONSTRUCTED zero-capital attempt (a candidate
+    # that obtained an order_id but was confirmed rejected/canceled, or a
+    # placement that raised) -- an all-rejected day for a ticker is a
+    # legitimate buy-count-with-zero-notional state, not corruption (Codex
+    # review: "Keep zero-notional attempts out of the buy ledger" -- the
+    # stricter check previously here made save_strategy_state() itself
+    # reject this state via its own pre-save validation, turning an
+    # otherwise-valid reconstruction into StateCorruptError on every day
+    # with an all-zero-notional prior attempt). The submitted_order_count_by_
+    # day cross-check above already verifies buys_by_ticker_by_day's counts
+    # are internally consistent, so this direction is deliberately NOT
+    # re-checked against notional.
+    #
+    # The inverse direction is still corrupt, and IS still checked: record_buy()
+    # is the only runtime writer of all three structures, always together, so a positive
     # submitted_notional_by_day entry can never legitimately exist with no
     # ticker's buy count on that date. Without this, a document with real
     # notional but an empty buys_by_ticker_by_day loads successfully, and
@@ -4768,6 +4862,113 @@ def _state_from_json(raw: dict) -> StrategyState:
                 f"submitted_notional_by_day has a positive entry for {d.isoformat()!r} but "
                 "no ticker in buys_by_ticker_by_day has a buy count for that date"
             )
+    # record_buy()/seed_prior_allocation() always bump submitted_order_count_by_day
+    # and buys_by_ticker_by_day together, by the exact same amount, in the same
+    # call -- so a genuinely current document's per-day attempt count must equal
+    # the sum of that day's per-ticker buy counts. A document written BEFORE this
+    # field existed never persisted it at all (raw.get(...) returning None, not
+    # {}, distinguishes "never had this key" from "had it and it was empty");
+    # reconstruct it losslessly from buys_by_ticker_by_day's per-day sum rather
+    # than loading an empty counter and letting _seed_prior_allocations() skip
+    # reseeding it for every ticker whose buys_today() is already nonzero,
+    # silently forgetting real prior attempts against max_orders_per_day (Codex
+    # review: "Persist the shared daily attempt counter").
+    day_buy_count_sums: dict[date, int] = {}
+    for per_day in state.buys_by_ticker_by_day.values():
+        for d, n in per_day.items():
+            day_buy_count_sums[d] = day_buy_count_sums.get(d, 0) + n
+    raw_order_counts = raw.get("submitted_order_count_by_day")
+    if raw_order_counts is None:
+        state.submitted_order_count_by_day = dict(day_buy_count_sums)
+    else:
+        state.submitted_order_count_by_day = _dedup_date_keyed(
+            raw_order_counts.items(),
+            lambda n: _positive_int(n, "submitted_order_count_by_day"),
+        )
+        for d in set(state.submitted_order_count_by_day) | set(day_buy_count_sums):
+            expected = day_buy_count_sums.get(d, 0)
+            persisted = state.submitted_order_count_by_day.get(d, 0)
+            if persisted != expected:
+                raise ValueError(
+                    f"submitted_order_count_by_day for {d.isoformat()!r} is {persisted!r} "
+                    "but buys_by_ticker_by_day's per-ticker counts for that date sum to "
+                    f"{expected!r}; the two must agree"
+                )
+    # Bookkeeping only (no equivalent field existed before, so an absent key
+    # loads as "nothing seeded/poisoned yet" -- correct for both a legacy
+    # document and a fresh state).
+    state.earlier_week_cross_stream_seeded_usd = _load_week_keyed_nonneg(
+        raw.get("earlier_week_cross_stream_seeded_usd", {}),
+        "earlier_week_cross_stream_seeded_usd",
+    )
+    state.earlier_week_cross_stream_poison_usd = _load_week_keyed_nonneg(
+        raw.get("earlier_week_cross_stream_poison_usd", {}),
+        "earlier_week_cross_stream_poison_usd",
+    )
+    # reconcile_earlier_week_cross_stream_notional() only ever writes a
+    # seeded-so-far value that is <= the weekly bucket it just folded it
+    # into (the incremental delta it adds can never be negative, so the
+    # bucket only grows to cover at least what's recorded as seeded). A
+    # persisted seeded value EXCEEDING the weekly bucket is impossible from
+    # any legitimate write path: reconcile computes
+    # incremental = total_usd - already_seeded and would silently compute a
+    # NEGATIVE increment against that inflated baseline on the next call,
+    # skip adding real earlier-week spend just discovered, and permanently
+    # forget it -- letting the shared weekly cap be exceeded (Codex review:
+    # "Reject seeded bookkeeping that exceeds the weekly ledger").
+    for wk, seeded in state.earlier_week_cross_stream_seeded_usd.items():
+        bucket = state.submitted_notional_by_week.get(wk, 0.0)
+        if _cents(seeded) > _cents(bucket):
+            raise ValueError(
+                f"earlier_week_cross_stream_seeded_usd for {wk!r} is {seeded!r} but "
+                f"submitted_notional_by_week has only {bucket!r} for that ISO week; the "
+                "seeded total can never exceed the weekly bucket it was folded into"
+            )
+    # Bookkeeping only, same absent-key handling as the week-keyed fields
+    # above (Codex review: "Reconcile increases to already-seeded ticker
+    # allocations").
+    state.seeded_prior_context_amount_by_ticker_day = _load_ticker_day_keyed_nonneg(
+        raw.get("seeded_prior_context_amount_by_ticker_day", {}),
+        "seeded_prior_context_amount_by_ticker_day",
+        parse_value=lambda v, field: _finite_nonneg(_json_number(v, field), field),
+    )
+    state.seeded_prior_context_attempts_by_ticker_day = _load_ticker_day_keyed_nonneg(
+        raw.get("seeded_prior_context_attempts_by_ticker_day", {}),
+        "seeded_prior_context_attempts_by_ticker_day",
+        parse_value=lambda v, field: _positive_int(v, field),
+    )
+    # reconcile_prior_allocation() only ever writes a seeded attempt count
+    # that is <= buys_by_ticker_by_day's own count for that exact
+    # (ticker, day) -- and a seeded dollar amount that is <= the DAY-level
+    # submitted_notional_by_day total (a looser bound, since that field
+    # aggregates every ticker, not just this one, but still a real ceiling
+    # no single ticker's seeded portion can exceed). A persisted seeded
+    # value beyond either bound is impossible from any legitimate write
+    # path and would let a later reconciliation compute a negative
+    # increment, permanently forgetting real evidence the same way an
+    # inflated earlier_week_cross_stream_seeded_usd would (Codex review:
+    # "Reject seeded bookkeeping that exceeds the weekly ledger" -- the same
+    # class of corruption, applied to this per-ticker bookkeeping).
+    for ticker, per_day in state.seeded_prior_context_attempts_by_ticker_day.items():
+        for d, seeded_attempts in per_day.items():
+            actual_attempts = state.buys_by_ticker_by_day.get(ticker, {}).get(d, 0)
+            if seeded_attempts > actual_attempts:
+                raise ValueError(
+                    f"seeded_prior_context_attempts_by_ticker_day for {ticker!r} on "
+                    f"{d.isoformat()!r} is {seeded_attempts!r} but buys_by_ticker_by_day "
+                    f"has only {actual_attempts!r} for that ticker/date; the seeded count "
+                    "can never exceed the buy ledger it was folded into"
+                )
+    for ticker, per_day in state.seeded_prior_context_amount_by_ticker_day.items():
+        for d, seeded_amount in per_day.items():
+            day_total = state.submitted_notional_by_day.get(d, 0.0)
+            if _cents(seeded_amount) > _cents(day_total):
+                raise ValueError(
+                    f"seeded_prior_context_amount_by_ticker_day for {ticker!r} on "
+                    f"{d.isoformat()!r} is {seeded_amount!r} but submitted_notional_by_day "
+                    f"has only {day_total!r} for that date; a single ticker's seeded amount "
+                    "can never exceed the day's total notional"
+                )
     state.weekly_rollover_reserve_usd = _finite_nonneg(
         _json_number(raw.get("weekly_rollover_reserve_usd", 0.0), "weekly_rollover_reserve_usd"),
         "weekly_rollover_reserve_usd",

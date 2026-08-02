@@ -69,6 +69,28 @@ def test_normalize_filled_order_uses_executed_dollars_and_reference_price():
     assert order.reference_price == pytest.approx(2.0)
 
 
+def test_normalize_prefers_authoritative_executed_notional_over_reconstruction():
+    # Codex review: "Do not round prior exposure down before sizing". Broker
+    # -reported executed_notional ($3.01) is authoritative and already
+    # cent-precise; cumulative_quantity * average_price reconstructs the SAME
+    # fill as exactly $3.004 (0.04 * 75.10) -- a value that can never be a
+    # genuine settled dollar amount. Preferring the reconstruction here would
+    # round down to $3.00 downstream in same_day_top_up_gate.py, understating
+    # real exposure by a cent.
+    raw = {
+        "id": "o3",
+        "symbol": "TXN",
+        "state": "filled",
+        "side": "buy",
+        "cumulative_quantity": "0.04",
+        "average_price": "75.10",
+        "executed_notional": "3.01",
+    }
+    order = normalize_order(raw)
+    assert order is not None
+    assert order.notional_usd == pytest.approx(3.01)
+
+
 def test_normalize_live_unfilled_order_counts_planned_notional_no_reference():
     order = normalize_order(_raw("o2", "TXN", "confirmed", notional="1.00"))
     assert order is not None

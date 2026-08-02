@@ -13,7 +13,7 @@
 ```
 9:45 AM          10:30 AM            10:35 AM
 Preflight        Claude Executor     Perplexity Runner
-(read-only)      (live trading)       
+(read-only)      (live trading)
                  ❌ GATE 5: No signals available
                  Aborts before 10:35 AM fires
                              ↑

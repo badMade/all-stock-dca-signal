@@ -221,6 +221,13 @@ ACTIVE_TICKERS = [
     "GFUZ",
     "TXN",
     "RKLB",
+    "GE",
+    "VRT",
+    "CAT",
+    "QQQ",
+    "QCOM",
+    "ABBV",
+    "JPM",
 ]
 
 # BYDDY (ADR wind-down), VCX, TRLV, and RVI are excluded from the active universe.
@@ -527,19 +534,45 @@ class PriorSameDayAllocation:
     # chronologically FIRST allocation's base rather than whichever root happened
     # to be merged first. None when unresolved/unavailable.
     selected_base_amount_usd_at: Optional[str] = None
-    # Count of distinct same-day broker order ATTEMPTS this aggregate folds
-    # in for this ticker -- every contributing candidate/CSV row, including a
-    # repeated same-ticker buy across separate slot invocations and a
-    # terminally rejected/canceled order that contributed $0 to amount_usd.
-    # amount_usd alone cannot answer "how many orders were attempted today":
-    # StrategyState resets across separate cron/manual process invocations,
-    # so _seed_prior_allocations must reconstruct day_order_count from THIS
-    # count rather than from one bump per ticker with a positive allocation,
-    # or eight earlier attempts spread across three tickers (or any rejected/
-    # canceled attempt) would undercount the roster-wide daily order-count
-    # cap and let a later slot exceed it (Codex review: "Reconstruct the cap
-    # from every prior buy attempt").
-    order_attempts: int = 0
+    # Count of genuine prior-run buy ATTEMPTS this allocation was built from,
+    # including zero-capital ones (a candidate that obtained an order_id but
+    # was later confirmed rejected/canceled, or a placement that raised) --
+    # NOT derived from amount_usd being positive. config/budgets.json's
+    # max_orders_per_day circuit breaker is defined as a count of attempts
+    # shared across all seven roster slots, and "a cancelled or rejected buy
+    # still consumes one -- the conservative direction"; collapsing multiple
+    # attempts into one dollar total (amount_usd) must not also collapse them
+    # into one attempt when this is used to reconstruct state after a process
+    # restart (Codex review: "Count every prior buy attempt toward the daily
+    # limit"). Defaults to 1 so any other/older construction site still
+    # represents "at least one contributing attempt" rather than zero.
+    attempt_count: int = 1
+    # Every run_id that contributed dollars to amount_usd within a SINGLE
+    # root's scan (load_prior_same_day_allocations), not just the latest one
+    # (unlike run_id above, which is overwritten to whichever run was
+    # scanned last for auditability). Lets load_prior_same_day_allocations_
+    # multi() recognize when a later root's contribution for this ticker is
+    # a COMPLETE duplicate of evidence an earlier root already counted --
+    # e.g. a manual override backfilled under both midday_dca/manual_reruns
+    # and ce16ba6b/manual_runs -- and skip re-summing it, rather than
+    # recording twice the real spend (Codex review: "Deduplicate mirrored
+    # artifacts before pooling spend"). Empty by default for any
+    # older/direct construction site, which correctly disables dedup for
+    # allocations with no known contributing run_id rather than falsely
+    # treating them as a match.
+    contributing_run_ids: frozenset = field(default_factory=frozenset)
+    # Every run_id that contributed an ATTEMPT (attempt_count), including a
+    # zero-dollar rejected/canceled/failed one -- a strict superset of
+    # contributing_run_ids, which only tracks DOLLAR contributors. Needed
+    # because the same mirrored zero-notional attempt (e.g. a rejected order
+    # backfilled under both midday_dca/manual_reruns and ce16ba6b/manual_runs)
+    # never enters contributing_run_ids at all (it contributed no dollars), so
+    # the dollar-dedup check in load_prior_same_day_allocations_multi never
+    # recognizes it as a duplicate and double-counts the same broker attempt
+    # against max_orders_per_day (Codex review: "Deduplicate mirrored
+    # zero-notional attempts"). Empty by default for any older/direct
+    # construction site, matching contributing_run_ids' same-reasoning default.
+    attempt_run_ids: frozenset = field(default_factory=frozenset)
 
 
 @dataclass(frozen=True)
@@ -758,6 +791,37 @@ class StrategyState:
     # by the same same-day seeding path that rebuilds submitted_notional_by_day
     # across separate slot invocations -- see _seed_prior_allocations.
     submitted_order_count_by_day: Dict[date, int] = field(default_factory=dict)
+    # How much EARLIER-weekday cross-stream notional (run_dca._compute_
+    # earlier_week_cross_stream_notional's total, re-derived from on-disk
+    # artifacts on every invocation) has already been folded into
+    # submitted_notional_by_week for a given ISO week via
+    # reconcile_earlier_week_cross_stream_notional. This persistent
+    # StrategyState survives across invocations (state_transaction()
+    # reloads it fresh each time), and record_buy() calls made on an
+    # EARLIER day already updated submitted_notional_by_week for that day's
+    # own ISO week -- so a later invocation re-scanning that same earlier
+    # day's artifacts and blindly ADDING its total again would double-count
+    # spend the persisted ledger already knows about, worse on every
+    # subsequent same-week invocation (Codex review: "Reconcile earlier-week
+    # spend instead of adding it"). Tracking the total already folded in
+    # lets each call add only the INCREMENTAL delta, the same idiom
+    # morning_dca.py's own _cap_seeded_amounts uses for its (ephemeral,
+    # in-memory) cross-stream cap seeding.
+    earlier_week_cross_stream_seeded_usd: Dict[tuple[int, int], float] = field(
+        default_factory=dict
+    )
+    # How much of submitted_notional_by_week's current total for a given ISO
+    # week is SYNTHETIC ceiling-topping injected by
+    # force_week_notional_to_worst_case_ceiling's fail-closed path (as
+    # opposed to real spend or a real reconciled cross-stream total).
+    # reconcile_earlier_week_cross_stream_notional subtracts this back out
+    # before reconciling, so a transient earlier-week scan failure doesn't
+    # leave the weekly bucket permanently pinned at the ceiling once a later
+    # invocation's scan succeeds (mirrors morning_dca.py's own
+    # _cap_seed_poison_week fix for the identical failure mode).
+    earlier_week_cross_stream_poison_usd: Dict[tuple[int, int], float] = field(
+        default_factory=dict
+    )
     weekly_rollover_reserve_usd: float = 0.0
     selected_tier: Optional[BudgetTier] = None
     finalized_budget_days: Set[date] = field(default_factory=set)
@@ -777,15 +841,22 @@ class StrategyState:
     # (Codex review, PR #231: "Record the recovered buy separately from seeded
     # prior context").
     own_orders_recorded: Set[Tuple[str, date]] = field(default_factory=set)
-    # (ticker, trading_day) pairs whose PriorSameDayAllocation.order_attempts
-    # has already been folded into submitted_order_count_by_day by
-    # _seed_prior_allocations. Separate from buys_today-based idempotency: a
-    # ticker whose every same-day attempt was terminally rejected/canceled
-    # never calls record_buy (amount_usd stays 0), so buys_today() alone
-    # cannot guard against re-seeding its attempt count if an in-process
-    # retry reuses this StrategyState instance (Codex review: "Reconstruct
-    # the cap from every prior buy attempt").
-    seeded_attempt_tickers: Set[Tuple[str, date]] = field(default_factory=set)
+    # How much prior-context has already been folded in via
+    # reconcile_prior_allocation, per (ticker, trading_day) -- so a LATER
+    # invocation's fresh scan discovering MORE evidence for a ticker already
+    # seeded (e.g. a manual fill written between the original run and its
+    # retry) tops up only the newly-discovered delta, instead of the old
+    # buys_today()==0 gate treating any prior count as proof the aggregate
+    # was already complete and skipping the ticker forever (Codex review:
+    # "Reconcile increases to already-seeded ticker allocations"). Mirrors
+    # buys_by_ticker_by_day's own nested ticker -> {day: value} shape so it
+    # round-trips through the same date-dedup/normalization machinery.
+    seeded_prior_context_amount_by_ticker_day: Dict[str, Dict[date, float]] = field(
+        default_factory=dict
+    )
+    seeded_prior_context_attempts_by_ticker_day: Dict[str, Dict[date, int]] = field(
+        default_factory=dict
+    )
 
     def buys_today(self, ticker: str, trading_day: date) -> int:
         return self.buys_by_ticker_by_day.get(ticker, {}).get(trading_day, 0)
@@ -805,6 +876,300 @@ class StrategyState:
             self.day_order_count(trading_day) + 1
         )
 
+    def seed_prior_allocation(
+        self,
+        ticker: str,
+        trading_day: date,
+        notional_usd: float,
+        attempt_count: int,
+    ) -> None:
+        """Restore CROSS-run/cross-slot allocation context reconstructed from
+        prior artifacts -- not a placement by this process. Unlike
+        ``record_buy`` (always exactly +1 attempt, for a single real
+        placement this process just made), this seeds the RECONSTRUCTED
+        attempt count: an earlier slot may have made several attempts for
+        the same ticker (including rejected/canceled ones that moved no
+        capital), and each one still consumed one of the shared
+        ``max_orders_per_day`` slots (config/budgets.json:
+        "Counted as buy ATTEMPTS ... a cancelled or rejected buy still
+        consumes one -- the conservative direction"). Collapsing several
+        attempts into ``notional_usd`` (already pre-summed by the caller)
+        while only bumping the attempt counters by 1 would let
+        ``day_order_count()`` undercount and permit more real orders than
+        the shared cap allows (Codex review: "Count every prior buy attempt
+        toward the daily limit").
+        """
+        self.buys_by_ticker_by_day.setdefault(ticker, {})
+        self.buys_by_ticker_by_day[ticker][trading_day] = (
+            self.buys_today(ticker, trading_day) + attempt_count
+        )
+        self.submitted_notional_by_day[trading_day] = (
+            self.day_notional(trading_day) + notional_usd
+        )
+        self.submitted_notional_by_week[iso_week_key(trading_day)] = (
+            self.week_notional(trading_day) + notional_usd
+        )
+        self.submitted_order_count_by_day[trading_day] = (
+            self.day_order_count(trading_day) + attempt_count
+        )
+
+    def reconcile_prior_allocation(
+        self, ticker: str, trading_day: date, amount_usd: float, attempt_count: int
+    ) -> None:
+        """Idempotently top up a ticker's seeded prior-context to match a
+        freshly re-scanned aggregate, adding only the newly-discovered delta.
+
+        ``_seed_prior_allocations`` used to gate seeding on
+        ``buys_today(ticker, trading_day) == 0``, treating ANY prior count as
+        proof the ticker's aggregate was already fully accounted for. But a
+        RETRY re-scans artifacts fresh each time, and can discover MORE
+        evidence for a ticker already seeded on an earlier pass -- e.g. a
+        manual fill for this ticker written between the original 15:30 run
+        and its retry raises the aggregate from $2/1 attempt to $4/2
+        attempts. The old gate skipped the ticker entirely once ANY prior
+        count existed, so neither the extra $2 nor the extra attempt were
+        ever folded in, letting the retry exceed the dollar or
+        ``max_orders_per_day`` cap (Codex review: "Reconcile increases to
+        already-seeded ticker allocations").
+
+        Tracks how much has already been seeded via THIS mechanism, per
+        (ticker, trading_day), in ``seeded_prior_context_amount_by_ticker_day``
+        /``..._attempts_by_ticker_day`` -- separate from ``buys_today()``,
+        which also reflects this stream's OWN real orders (via
+        ``record_buy``). Conflating the two would double-count: the caller
+        must gate this call on ``(ticker, trading_day) not in
+        own_orders_recorded`` so a ticker this stream has already bought for
+        real today is never topped up here (its own record_buy call already
+        accounts for it).
+
+        ``own_orders_recorded`` is deliberately NOT persisted across a full
+        process restart (it exists only to guard in-process retries reusing
+        the same ``StrategyState``), so a fresh reload of a state that
+        already has ``buys_today(ticker, trading_day) > 0`` -- from THIS
+        stream's own real order recorded before a crash, or from a
+        pre-this-fix ``seed_prior_allocation`` call -- looks identical to a
+        brand-new ticker to the caller's gate. When THIS specific
+        (ticker, trading_day) has never been tracked here before AND
+        ``buys_today()`` is already positive, that ambiguity is resolved
+        conservatively: the exact, ticker-specific ``buys_today()`` count
+        becomes the attempt baseline (so attempts are still counted
+        precisely), but the dollar baseline defaults to THIS call's own
+        ``amount_usd`` rather than 0 -- ``submitted_notional_by_day`` is a
+        DAY-level aggregate, not ticker-keyed, so there is no reliable way to
+        recover exactly how many of those dollars belong to this ticker
+        already; assuming none of the freshly-scanned total is new avoids
+        ever re-adding dollars that may already be recorded, at the cost of
+        not crediting a genuinely new cross-stream dollar contribution
+        discovered in that same ambiguous call -- the same conservative
+        trade-off ``buys_today() == 0`` already made for this exact
+        combination before this fix existed.
+        """
+        tracked_attempts = self.seeded_prior_context_attempts_by_ticker_day.get(
+            ticker, {}
+        ).get(trading_day)
+        if tracked_attempts is None:
+            already_attempts = self.buys_today(ticker, trading_day)
+            already_amount = amount_usd if already_attempts > 0 else 0.0
+        else:
+            already_attempts = tracked_attempts
+            already_amount = self.seeded_prior_context_amount_by_ticker_day.get(
+                ticker, {}
+            ).get(trading_day, 0.0)
+        # Reconciled INDEPENDENTLY, not gated on each other: a previously
+        # seeded order's executed notional can grow (e.g. a partial fill
+        # confirms more shares) across two scans with NO new attempt at all
+        # -- attempt_delta stays 0 while amount_delta is genuinely positive.
+        # Returning early whenever attempt_delta <= 0 (as a prior version of
+        # this method did) skipped that dollar delta entirely, leaving the
+        # daily/weekly ledgers understated even though the fresh allocation
+        # proves the extra exposure (Codex review: "Reconcile notional when
+        # the attempt count is unchanged").
+        attempt_delta = max(0, attempt_count - already_attempts)
+        amount_delta = max(0.0, amount_usd - already_amount)
+        if attempt_delta > 0 or amount_delta > 0:
+            self.seed_prior_allocation(ticker, trading_day, amount_delta, attempt_delta)
+        # Persisted UNCONDITIONALLY, even when both deltas are zero this
+        # call: when tracked_attempts was None above (the ambiguous-branch
+        # case, e.g. this ticker's first-ever reconcile call this process),
+        # a scan that happens to exactly match the existing buys_today()
+        # baseline computed BOTH deltas as zero and used to return before
+        # ever reaching these two lines. That left the tracked dicts empty,
+        # so the NEXT call re-entered the same ambiguous branch and
+        # recomputed already_amount from THAT call's own (now-larger)
+        # amount_usd -- silently assuming the entire new total was already
+        # accounted for and crediting only the attempt delta, permanently
+        # losing the dollar delta between the two scans (Codex review:
+        # "Record no-op prior-allocation baselines"). Recording the observed
+        # baseline here regardless of whether anything changed ensures the
+        # next call takes the tracked (non-ambiguous) branch instead.
+        #
+        # max()'d against the prior tracked value, not a blind overwrite: a
+        # transient rescan that happens to observe fewer dollars/attempts
+        # than a PREVIOUS call already recorded (e.g. an artifact briefly
+        # unreadable) must not lower this baseline -- doing so would let a
+        # later scan that recovers to the true (higher) total look like a
+        # fresh delta on top of the already-credited amount, double-counting
+        # it against the daily/weekly caps.
+        self.seeded_prior_context_amount_by_ticker_day.setdefault(ticker, {})[
+            trading_day
+        ] = max(already_amount, amount_usd)
+        self.seeded_prior_context_attempts_by_ticker_day.setdefault(ticker, {})[
+            trading_day
+        ] = max(already_attempts, attempt_count)
+
+    def bump_week_notional_only(self, trading_day: date, amount_usd: float) -> None:
+        """Add ``amount_usd`` to the shared weekly dollar bucket ONLY --
+        touches no per-ticker, per-day, or attempt-count bucket at all.
+
+        For reconstructing EARLIER-weekday cross-stream spend (a completed
+        prior day in the same ISO week), which must count against the
+        shared weekly cap but must NOT be attributed to any specific
+        ticker's same-day top-up reference price -- that reference is only
+        ever compared against TODAY's own price, and conflating an earlier
+        day's amount into a ticker's PriorSameDayAllocation would make the
+        same-day top-up guard require today's price to beat an unrelated
+        day's price instead of evaluating a fresh, independent DCA occasion
+        (Codex review: "Include prior-week sibling spend in the afternoon
+        ledger"). Mirrors morning_dca.py's own earlier-weekday ledger scan,
+        which bumps ``planned_by_week`` directly for exactly the same
+        reason.
+        """
+        self.submitted_notional_by_week[iso_week_key(trading_day)] = (
+            self.week_notional(trading_day) + amount_usd
+        )
+
+    def force_week_notional_to_worst_case_ceiling(self, trading_day: date) -> None:
+        """Fail closed: force the shared weekly bucket to the highest tier's
+        ceiling, so remaining weekly headroom is zero regardless of which
+        tier this run ultimately selects.
+
+        Used when an earlier-weekday cross-stream scan could not verify
+        every artifact it found (a transient read/parse race) -- real
+        week-to-date spend may be understated, and placing against an
+        unproven, possibly-too-low figure is the unsafe direction. Matches
+        morning_dca.py's own fail-closed policy for the same failure mode.
+        Injects only the INCREMENTAL delta needed to reach the ceiling (not
+        a flat overwrite) and records exactly how much was injected in
+        ``earlier_week_cross_stream_poison_usd``, so
+        ``reconcile_earlier_week_cross_stream_notional`` can subtract it
+        back out once a later invocation's scan succeeds -- otherwise this
+        persistent StrategyState (reloaded across invocations) would stay
+        pinned at the ceiling for the rest of the week even after the
+        transient failure clears (mirrors morning_dca.py's own
+        ``_cap_seed_poison_week`` fix for the identical failure mode). Net
+        effect on ``week_notional`` is unchanged from a flat ``max()``:
+        calling this repeatedly still never inflates past the ceiling, and
+        it never lowers an already-larger real total.
+        """
+        week_key = iso_week_key(trading_day)
+        worst_case_cap = max(tier.weekly_cap_usd for tier in BUDGET_TIERS)
+        poison_delta = max(0.0, worst_case_cap - self.week_notional(trading_day))
+        if poison_delta > 0:
+            self.submitted_notional_by_week[week_key] = (
+                self.week_notional(trading_day) + poison_delta
+            )
+            self.earlier_week_cross_stream_poison_usd[week_key] = (
+                self.earlier_week_cross_stream_poison_usd.get(week_key, 0.0) + poison_delta
+            )
+
+    def reconcile_earlier_week_cross_stream_notional(
+        self,
+        trading_day: date,
+        total_usd: float,
+        *,
+        pre_same_day_seed_week_notional: Optional[float] = None,
+    ) -> None:
+        """Fold a freshly re-derived earlier-weekday cross-stream total into
+        the shared weekly bucket, adding only what isn't ALREADY reflected.
+
+        ``total_usd`` (run_dca._compute_earlier_week_cross_stream_notional's
+        result) is re-derived from on-disk artifacts on EVERY invocation --
+        it does not shrink as the week progresses, and it includes THIS
+        stream's own earlier-day spend too (that function's ``all_roots``
+        includes the afternoon root alongside the cross-stream siblings).
+        This StrategyState is persistent (reloaded fresh by
+        ``state_transaction()`` on every invocation, not just within one
+        process), so an earlier day's own ``record_buy()`` calls already
+        updated ``submitted_notional_by_week`` for that week when they
+        happened. Unconditionally adding ``total_usd`` again -- as a bare
+        ``bump_week_notional_only`` call did -- double-counts that already-
+        persisted spend, and does so AGAIN on every later invocation this
+        same week (Codex review: "Reconcile earlier-week spend instead of
+        adding it").
+
+        Tracks how much of ``total_usd`` has already been folded in (keyed
+        by ISO week, in ``earlier_week_cross_stream_seeded_usd``) and adds
+        only the incremental delta -- the same idempotent-seeding idiom
+        morning_dca.py's own ``_cap_seeded_amounts`` uses. Also clears any
+        prior fail-closed poisoning from
+        ``force_week_notional_to_worst_case_ceiling`` before reconciling, so
+        a scan that previously failed and is now succeeding doesn't just
+        pile the real total on top of a still-poisoned ceiling value.
+
+        ``pre_same_day_seed_week_notional`` is the caller's own
+        ``week_notional(trading_day)`` snapshot taken BEFORE it called
+        ``_seed_prior_allocations`` for today's own same-day cross-stream
+        context. The FIRST reconciliation this ISO week needs this snapshot
+        as its baseline, not the CURRENT ``week_notional`` -- by the time
+        this method runs, ``_seed_prior_allocations`` has already folded
+        today's own same-day allocations into the very same weekly bucket,
+        and mistaking that for "already-accounted earlier-week spend" (the
+        bug before this parameter existed) silently drops the real
+        earlier-week delta whenever today also has same-day context to seed
+        (Codex review: "Exclude today's allocations from the prior-week
+        baseline"). Optional and defaults to the current ``week_notional``
+        only for a caller with no same-day seeding step of its own to
+        snapshot before.
+        """
+        week_key = iso_week_key(trading_day)
+        poisoned = self.earlier_week_cross_stream_poison_usd.pop(week_key, 0.0)
+        if poisoned > 0:
+            self.submitted_notional_by_week[week_key] = max(
+                0.0, self.week_notional(trading_day) - poisoned
+            )
+        if week_key in self.earlier_week_cross_stream_seeded_usd:
+            already_seeded = self.earlier_week_cross_stream_seeded_usd[week_key]
+        else:
+            # First reconciliation this ISO week: the correct baseline is
+            # whatever this stream's own earlier-day history already
+            # contributed BEFORE today's own same-day seeding ran -- total_usd's
+            # fresh rescan re-derives that same earlier-day history too, since
+            # its all_roots includes the afternoon root alongside the
+            # cross-stream siblings.
+            already_seeded = (
+                pre_same_day_seed_week_notional
+                if pre_same_day_seed_week_notional is not None
+                else self.week_notional(trading_day)
+            )
+        incremental = total_usd - already_seeded
+        if incremental > 0:
+            self.submitted_notional_by_week[week_key] = (
+                self.week_notional(trading_day) + incremental
+            )
+        # Recorded UNCONDITIONALLY, even when incremental is zero (an exact
+        # match against the just-computed baseline): a prior version of this
+        # method only recorded earlier_week_cross_stream_seeded_usd inside
+        # the `incremental > 0` branch, so a first-ever reconciliation this
+        # ISO week that happened to exactly equal already_seeded left the key
+        # unset. The NEXT call then fell back to the "first reconciliation
+        # this week" branch again, re-baselining against a snapshot that may
+        # have since grown from today's own same-day spend and silently
+        # under-crediting the real earlier-week delta discovered by a later
+        # rescan (Codex review: "Persist an unchanged earlier-week
+        # reconciliation baseline"). Recording it here regardless of sign
+        # ensures the next call takes the already-seeded (non-rebaselining)
+        # branch instead.
+        #
+        # max()'d against the (possibly just-computed) already_seeded, not a
+        # blind overwrite: a transient rescan reporting a SMALLER total than
+        # a previous call already recorded must not lower this baseline --
+        # doing so would let a later scan that recovers to the true (higher)
+        # total look like a fresh delta on top of spend already added to the
+        # weekly bucket, double-counting it against the shared cap.
+        self.earlier_week_cross_stream_seeded_usd[week_key] = max(
+            already_seeded, total_usd
+        )
+
     def day_notional(self, trading_day: date) -> float:
         return self.submitted_notional_by_day.get(trading_day, 0.0)
 
@@ -813,24 +1178,6 @@ class StrategyState:
 
     def day_order_count(self, trading_day: date) -> int:
         return self.submitted_order_count_by_day.get(trading_day, 0)
-
-    def record_additional_order_attempts(self, trading_day: date, count: int) -> None:
-        """Bump the day's order-attempt count WITHOUT touching notional/buys_today.
-
-        ``record_buy`` bumps dollar totals and the order count together
-        because it always represents a real, priced allocation. Seeding prior
-        SAME-TICKER repeat attempts (or terminally rejected/canceled ones
-        that never moved capital) from ``PriorSameDayAllocation.order_attempts``
-        must NOT double-count the dollar amount ``record_buy`` already folded
-        in for that ticker's first seeded allocation -- only the count needs
-        the remaining attempts added (Codex review: "Reconstruct the cap from
-        every prior buy attempt").
-        """
-        if count <= 0:
-            return
-        self.submitted_order_count_by_day[trading_day] = (
-            self.day_order_count(trading_day) + count
-        )
 
     def current_tier(self) -> BudgetTier:
         """Return the tier selected for the current run, defaulting to Normal."""
@@ -2863,6 +3210,18 @@ def _write_csv(
 # placed") means no real capital moved, so a manual dry-run test earlier the
 # same day must never reduce the scheduled run's real buy.
 _PRIOR_ALLOCATION_STATUSES = frozenset({"submitted", "filled"})
+# Broader than _PRIOR_ALLOCATION_STATUSES above: also admits "failed" rows
+# (near_close_dca's own placement-exception path, e.g. a broker API error --
+# _process_buy_candidate's "except Exception" branch) into the aggregation
+# loop for ATTEMPT-COUNTING only. config/budgets.json's max_orders_per_day is
+# defined as a count of buy ATTEMPTS, not successful placements -- "a
+# cancelled or rejected buy still consumes one" -- so a genuine broker-facing
+# attempt that failed must still be reconstructed as one attempt when
+# rebuilding state from prior artifacts (Codex review: "Count every prior buy
+# attempt toward the daily limit"). "skipped" is deliberately still excluded:
+# it means the candidate was blocked BEFORE any broker submission (budget cap,
+# duplicate guard, whitelist, etc.), so no attempt was ever made.
+_PRIOR_ALLOCATION_ATTEMPT_STATUSES = _PRIOR_ALLOCATION_STATUSES | {"failed"}
 
 
 def _candidate_logged_reference_price(candidate: Dict[str, Any]) -> Optional[float]:
@@ -3249,9 +3608,31 @@ def _load_terminal_order_states() -> frozenset:
 
 _TERMINAL_NON_FILL_STATES = _load_terminal_order_states()
 
+# Every placed/in-flight (non-terminal, non-fill) STATUS a canonical
+# submitted_orders.csv row can carry, per scripts.scheduled_artifacts.
+# ORDER_ATTEMPT_STATUSES, minus "filled" (owned by _orders_csv_fills) and
+# minus "not_submitted_confirmation_required" (means the order never reached
+# the broker at all -- scripts/drift_detection.py's
+# _NOT_ACTUALLY_SUBMITTED_STATUSES). A market-open/intraday canonical CSV can
+# legitimately record status="pending"/"unconfirmed", not just "submitted";
+# _orders_csv_submitted_notionals previously required status == "submitted"
+# exactly (falling back to the statusless-live path only when the status
+# column was entirely EMPTY), so a row with an explicit "pending"/
+# "unconfirmed" status was silently dropped, reconstructing that attempt as
+# $0 exposure and letting the same ticker be bought again while the real
+# order was still outstanding (Codex review: "Reserve pending orders loaded
+# from the canonical CSV").
+_UNRESOLVED_ORDER_ATTEMPT_STATUSES = frozenset({"submitted", "pending", "unconfirmed"})
+
 # Submitted-amount aliases, canonical first. `amount_usd` is the broker-native
-# recovery spelling; _orders_csv_fills already reads it.
-_SUBMITTED_NOTIONAL_COLS = ("notional_usd", "amount_usd")
+# recovery spelling; _orders_csv_fills already reads it. `submitted_amount_usd`
+# is scripts.scheduled_artifacts.SUBMITTED_ORDERS_FIELDS's canonical column --
+# the market-open/intraday streams' submitted_orders.csv (their only
+# same-day evidence; they have no in-repo executor writing buy_candidates)
+# uses this name, and without it here a valid submitted row from that file
+# contributed $0 (Codex review: "Read canonical CSVs during same-day cap
+# seeding").
+_SUBMITTED_NOTIONAL_COLS = ("notional_usd", "amount_usd", "submitted_amount_usd")
 _FILL_PRICE_COLS = ("avg_fill_price", "average_fill_price")
 # EXECUTED-quantity columns, in precedence order. `quantity` is deliberately
 # absent: in the broker-native shape it is the REQUESTED size and
@@ -3530,7 +3911,12 @@ def _orders_csv_fills(
         except (TypeError, ValueError):
             qty = None
         qty_valid = qty is not None and math.isfinite(qty) and qty > 0
-        raw_amount = row.get("amount_usd")
+        # Canonical alias list, not a bare "amount_usd" lookup: a filled row
+        # in the market-open/intraday streams' submitted_orders.csv records
+        # the dollar amount as submitted_amount_usd, not amount_usd, and a
+        # hardcoded lookup here silently read it as unknown (Codex review:
+        # "Read canonical CSVs during same-day cap seeding").
+        raw_amount = _first_present(row, _SUBMITTED_NOTIONAL_COLS)
         try:
             amount = float(raw_amount) if raw_amount not in (None, "", "-") else None
         except (TypeError, ValueError):
@@ -3818,7 +4204,7 @@ def _orders_csv_submitted_notionals(
             and row_state_raw != "filled"
             and row_state_raw not in _TERMINAL_NON_FILL_STATES
         )
-        if row_status != "submitted" and not statusless_live:
+        if row_status not in _UNRESOLVED_ORDER_ATTEMPT_STATUSES and not statusless_live:
             continue
         # The recovery shape's authoritative `state` column, applied with the
         # opposite polarity to _orders_csv_fills. A row can carry BOTH
@@ -3873,10 +4259,104 @@ def _orders_csv_submitted_notionals(
     return notionals
 
 
-def _mtime_matches_trading_day(path: Path, trading_day: date) -> bool:
-    """True if ``path``'s last-modified time falls on ``trading_day`` (Eastern).
+def _orders_csv_attempt_counts(
+    orders_csv: Path,
+    *,
+    skip_sink: Optional[List[Path]] = None,
+) -> Dict[str, int]:
+    """Map ticker -> count of qualifying broker-facing attempt rows in an orders CSV.
 
-    Used to scope ``skip_sink`` to PLAUSIBLY same-day artifacts: a
+    Used by the no-embedded-candidates CSV-only reconstruction path in
+    ``load_prior_same_day_allocations`` to count ONE attempt per CSV ROW,
+    not one per ticker after ``_orders_csv_fills``/
+    ``_orders_csv_submitted_notionals`` collapse multiple distinct orders
+    for the same ticker into a single aggregated fill/notional record (and
+    ``_orders_csv_fills`` itself already sums same-ticker distinct orders'
+    dollar amounts together -- see ``_merge_fill``). Counting attempts
+    AFTER that collapse under-counted whenever a ticker had more than one
+    real order this run, and a terminal rejected/canceled-only row (which
+    never enters either reader's returned dict at all, since neither
+    reader's job is to surface zero-capital rows) was never counted as an
+    attempt either (Codex review: "Count each CSV order attempt before
+    aggregating by ticker").
+
+    Counts every row with a ticker present, except:
+    - a dry-run order_id (no real capital/attempt at risk), and
+    - ``not_submitted_confirmation_required`` (status or state) -- this
+      status means the order was blocked pending a separate
+      pre-authorization step and never reached the broker at all (see
+      ``scripts/drift_detection.py``'s ``_NOT_ACTUALLY_SUBMITTED_STATUSES``),
+      the same exclusion ``ORDER_ATTEMPT_STATUSES``-based counting applies
+      elsewhere in this module.
+
+    A missing file returns an empty mapping (0 attempts for every ticker)
+    rather than raising. A headerless file or a truncated final row (short
+    on trailing columns -- csv.DictReader fills those with ``None`` via its
+    ``restval`` instead of raising) is recorded in ``skip_sink`` and the
+    untrustworthy tail row is dropped, mirroring ``_orders_csv_fills``'s
+    truncated-read detection so a mid-write CSV observed here doesn't
+    silently under-count attempts the same way it must not silently
+    under-count dollars (Codex review: "Detect silently truncated CSV
+    reads").
+    """
+    counts: Dict[str, int] = {}
+    if not orders_csv.exists():
+        return counts
+    rows: List[Dict[str, Any]] = []
+    fieldnames = None
+    had_csv_error = False
+    try:
+        with orders_csv.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames = reader.fieldnames
+            if fieldnames is not None:
+                try:
+                    for row in reader:
+                        rows.append(row)
+                except csv.Error:
+                    had_csv_error = True
+                    if skip_sink is not None:
+                        skip_sink.append(orders_csv)
+    except (OSError, UnicodeDecodeError):
+        if skip_sink is not None:
+            skip_sink.append(orders_csv)
+        return counts
+    except Exception:
+        if skip_sink is not None:
+            skip_sink.append(orders_csv)
+        return counts
+    if fieldnames is None:
+        if skip_sink is not None:
+            skip_sink.append(orders_csv)
+        return counts
+    if not had_csv_error and rows and any(value is None for value in rows[-1].values()):
+        if skip_sink is not None:
+            skip_sink.append(orders_csv)
+        rows = rows[:-1]
+    for row in rows:
+        ticker = row.get("ticker")
+        if not ticker:
+            continue
+        order_id = (row.get("order_id") or "").strip()
+        if order_id.startswith("DRY-RUN"):
+            continue
+        status = (row.get("status") or "").strip().lower()
+        row_state = (
+            (row.get("state") or "").strip().lower() if "state" in row else ""
+        )
+        if (
+            status == "not_submitted_confirmation_required"
+            or row_state == "not_submitted_confirmation_required"
+        ):
+            continue
+        counts[ticker] = counts.get(ticker, 0) + 1
+    return counts
+
+
+def _mtime_matches_trading_day(path: Path, trading_day: date) -> bool:
+    """True if ``path``'s last-modified time falls ON OR AFTER ``trading_day`` (Eastern).
+
+    Used to scope ``skip_sink`` to PLAUSIBLY relevant artifacts: a
     ``run_state*.json`` candidate that fails to read/parse can't have its own
     ``trading_day`` field inspected (that's exactly what failed), so a
     permanently corrupted historical artifact from months or years ago --
@@ -3886,14 +4366,27 @@ def _mtime_matches_trading_day(path: Path, trading_day: date) -> bool:
     review: "Exclude historical parse failures from reload completeness").
     mtime is an imperfect but universal, cheap proxy: a same-day artifact still
     being flushed necessarily has a same-day mtime, while old corrupted files
-    do not. If the path can't even be stat'd, err toward still treating it as
-    a possible same-day failure rather than silently dropping the signal.
+    do not.
+
+    NOT a strict equality check: an earlier-weekday artifact (``trading_day``
+    Monday) being backfilled or repaired on a LATER day (mtime Tuesday, when
+    ``run_dca._compute_earlier_week_cross_stream_notional`` scans Monday from
+    a Tuesday run) is exactly as unverifiable as a same-day race, but its
+    mtime can never equal Monday -- an exact-equality check silently dropped
+    that failure from skip_sink, understating real earlier-week spend against
+    the shared weekly cap (Codex review: "Fail closed on later-modified
+    prior-day artifacts"). A file can never legitimately be modified BEFORE
+    the trading day it claims to represent, so "on or after" still excludes
+    genuinely stale historical garbage (whose mtime predates trading_day)
+    while also covering a later-day rewrite of an earlier day's artifact. If
+    the path can't even be stat'd, err toward still treating it as a possible
+    failure rather than silently dropping the signal.
     """
     try:
         mtime = path.stat().st_mtime
     except OSError:
         return True
-    return datetime.fromtimestamp(mtime, tz=EASTERN).date() == trading_day
+    return datetime.fromtimestamp(mtime, tz=EASTERN).date() >= trading_day
 
 
 def _resolve_recorded_orders_csv(
@@ -4038,24 +4531,6 @@ def load_prior_same_day_allocations(
     context reload) should pass a list here and treat any entries in it as
     reason enough to reload, independent of what the returned mapping shows.
     """
-
-    def _default_entry(run_id: Optional[str], source: Optional[str]) -> Dict[str, Any]:
-        return {
-            "amount": 0.0,
-            "reference_price": None,
-            "reference_ts": None,
-            "run_id": run_id,
-            "source": source,
-            "selected_base_amount_usd": None,
-            "selected_base_amount_usd_at": None,
-            "selected_base_amount_usd_seen": False,
-            # See PriorSameDayAllocation.order_attempts: every contributing
-            # candidate/CSV row bumps this, including a terminally rejected/
-            # canceled order that contributes $0 to "amount" (Codex review:
-            # "Reconstruct the cap from every prior buy attempt").
-            "attempt_count": 0,
-        }
-
     # Deduplicate roots by resolved path so an additional_state_root that matches
     # state_root (or another additional root) doesn't cause double-counting.
     _seen_roots: set = set()
@@ -4269,6 +4744,21 @@ def load_prior_same_day_allocations(
             orders_csv_file = _resolve_recorded_orders_csv(
                 run_state, run_state_path, skip_sink=skip_sink
             )
+            if orders_csv_file is None:
+                # Nothing recorded in artifacts.orders_csv_path -- the shape
+                # every in-repo executor (morning/midday/afternoon) writes.
+                # The market-open/intraday streams have no in-repo Python
+                # entry point at all (their Claude-executor prompts write
+                # only run_state.json and a bare sibling submitted_orders.csv,
+                # never buy_candidates or an artifacts block), so a valid
+                # same-day run whose only evidence is that canonical file was
+                # previously invisible here entirely (Codex review: "Read
+                # canonical CSVs during same-day cap seeding"). Check for it
+                # as a last-resort sibling, exactly like filled_orders.csv/
+                # orders.csv are checked by name elsewhere in this module.
+                _bare_submitted_orders = run_state_path.parent / "submitted_orders.csv"
+                if _bare_submitted_orders.exists():
+                    orders_csv_file = _bare_submitted_orders
             if orders_csv_file is not None:
                 if orders_csv_file.exists():
                     # Pass the exact recorded file rather than run_dir/"orders.csv"
@@ -4304,14 +4794,57 @@ def load_prior_same_day_allocations(
                     for _ticker, _notional in submitted_notionals.items():
                         if _ticker not in _csv_tickers:
                             _csv_tickers[_ticker] = (_notional, None)
-                    for _ticker, (_amount, _ref) in _csv_tickers.items():
+                    # Attempt counts are read PER CSV ROW, independent of
+                    # _csv_tickers -- report_fills/submitted_notionals both
+                    # collapse multiple distinct orders for the same ticker
+                    # into a single aggregated record (report_fills sums
+                    # them via _merge_fill), so counting "one attempt per
+                    # _csv_tickers entry" undercounted whenever a ticker had
+                    # more than one real order this run. It also omits a
+                    # terminal rejected/canceled-only ticker entirely (never
+                    # enters _csv_tickers, since neither reader surfaces
+                    # zero-capital rows), which must still count as an
+                    # attempt (Codex review: "Count each CSV order attempt
+                    # before aggregating by ticker").
+                    _attempt_counts = _orders_csv_attempt_counts(
+                        orders_csv_file, skip_sink=skip_sink
+                    )
+                    for _ticker in set(_csv_tickers) | set(_attempt_counts):
+                        _entry = aggregated.setdefault(
+                            _ticker,
+                            {
+                                "amount": 0.0,
+                                "reference_price": None,
+                                "reference_ts": None,
+                                "run_id": run_id,
+                                "source": source,
+                                "selected_base_amount_usd": None,
+                                "selected_base_amount_usd_at": None,
+                                "selected_base_amount_usd_seen": False,
+                                "attempt_count": 0,
+                                "contributing_run_ids": set(),
+                                "attempt_run_ids": set(),
+                            },
+                        )
+                        # Without an explicit "attempt_count" key in the
+                        # setdefault dict above, aggregated.setdefault()
+                        # would silently return a PRE-EXISTING entry from an
+                        # earlier-scanned run's embedded-candidate branch
+                        # missing this key entirely, and that branch's own
+                        # entry["attempt_count"] += 1 on a later-scanned run
+                        # for the same ticker would then raise KeyError and
+                        # abort reconstruction outright (Codex review:
+                        # "Initialize attempt counts for CSV-reconstructed
+                        # orders").
+                        _entry["attempt_count"] += _attempt_counts.get(_ticker, 1)
+                        if run_id is not None:
+                            _entry["attempt_run_ids"].add(run_id)
+                        _amount, _ref = _csv_tickers.get(_ticker, (0.0, None))
                         if _amount <= 0:
                             continue
-                        _entry = aggregated.setdefault(
-                            _ticker, _default_entry(run_id, source)
-                        )
                         _entry["amount"] += _amount
-                        _entry["attempt_count"] += 1
+                        if run_id is not None:
+                            _entry["contributing_run_ids"].add(run_id)
                         if _entry.get("reference_price_unknown"):
                             pass
                         elif _ref is None:
@@ -4382,10 +4915,45 @@ def load_prior_same_day_allocations(
             if not isinstance(candidate, dict):
                 continue
             status = candidate.get("status") or ""
-            if status not in _PRIOR_ALLOCATION_STATUSES:
+            if status not in _PRIOR_ALLOCATION_ATTEMPT_STATUSES:
                 continue
             ticker = candidate.get("ticker")
             if not ticker:
+                continue
+
+            # Every row that reaches here obtained an order_id at submission
+            # time (status "submitted"/"filled") or genuinely attempted
+            # placement and raised (status "failed") -- a real broker-facing
+            # attempt that consumes one of the shared max_orders_per_day
+            # slots regardless of whether it ends up contributing any dollar
+            # amount below (Codex review: "Count every prior buy attempt
+            # toward the daily limit"). Counted BEFORE the terminal-
+            # rejection/zero-amount/malformed-amount continues further down,
+            # since those still represent an attempt that was made, just one
+            # confirmed to have moved no capital.
+            entry = aggregated.setdefault(
+                ticker,
+                {
+                    "amount": 0.0,
+                    "reference_price": None,
+                    "reference_ts": None,
+                    "run_id": run_id,
+                    "source": source,
+                    "selected_base_amount_usd": None,
+                    "selected_base_amount_usd_at": None,
+                    "selected_base_amount_usd_seen": False,
+                    "attempt_count": 0,
+                    "contributing_run_ids": set(),
+                    "attempt_run_ids": set(),
+                },
+            )
+            entry["attempt_count"] += 1
+            if run_id is not None:
+                entry["attempt_run_ids"].add(run_id)
+            if status == "failed":
+                # A placement that raised before any capital moved (no fill,
+                # no order_id necessarily) -- counted as an attempt above,
+                # contributes nothing to amount/reference/base.
                 continue
 
             # The recovery CSV said this order ended REJECTED/CANCELED having
@@ -4399,21 +4967,12 @@ def load_prior_same_day_allocations(
             # separate real fill.
             _cand_oid = (candidate.get("order_id") or "").strip()
             if _cand_oid and _cand_oid in terminal_order_ids:
-                # No capital moved, but a real broker attempt was made -- it
-                # still counts toward the roster-wide daily order-count cap
-                # even though it contributes $0 to amount_usd.
-                aggregated.setdefault(ticker, _default_entry(run_id, source))[
-                    "attempt_count"
-                ] += 1
                 continue
             if (
                 not _cand_oid
                 and ticker in terminal_tickers
                 and fills.get(ticker) is None
             ):
-                aggregated.setdefault(ticker, _default_entry(run_id, source))[
-                    "attempt_count"
-                ] += 1
                 continue
 
             # A "submitted" candidate in run_state.json only means an order_id was
@@ -4478,9 +5037,22 @@ def load_prior_same_day_allocations(
                 ):
                     base_amount_usd = None
 
-            entry = aggregated.setdefault(ticker, _default_entry(run_id, source))
+            # `entry` was already created (and this row's attempt already
+            # counted) above, before the terminal-rejection/zero-amount/
+            # malformed-amount continues -- fetch it, don't re-create it.
+            entry = aggregated[ticker]
             entry["amount"] += amount
-            entry["attempt_count"] += 1
+            if run_id is not None:
+                # Only recorded once a row actually contributes a positive
+                # dollar amount (this line), not at the earlier attempt-count
+                # increment -- contributing_run_ids exists to let
+                # load_prior_same_day_allocations_multi recognize a fully
+                # duplicated DOLLAR contribution across roots, so a $0
+                # attempt (already counted toward attempt_count above) must
+                # not be treated as if it needs deduplicating here too
+                # (Codex review: "Deduplicate mirrored artifacts before
+                # pooling spend").
+                entry["contributing_run_ids"].add(run_id)
             # If ANY contributing prior price is unknown, the whole aggregated
             # reference is treated as unknown so the guard takes the conservative
             # missing_prior_price path rather than comparing against only the
@@ -4525,7 +5097,9 @@ def load_prior_same_day_allocations(
             reference_ts=entry["reference_ts"],
             selected_base_amount_usd=entry.get("selected_base_amount_usd"),
             selected_base_amount_usd_at=entry.get("selected_base_amount_usd_at"),
-            order_attempts=entry.get("attempt_count", 0),
+            attempt_count=entry.get("attempt_count", 0),
+            contributing_run_ids=frozenset(entry.get("contributing_run_ids") or ()),
+            attempt_run_ids=frozenset(entry.get("attempt_run_ids") or ()),
         )
         for ticker, entry in aggregated.items()
     }
@@ -4607,18 +5181,76 @@ def load_prior_same_day_allocations_multi(
                 alloc.selected_base_amount_usd,
                 alloc.selected_base_amount_usd_at,
             )
+            # A manual override mirrored/backfilled under multiple pooled
+            # roots (documented for e.g. midday_dca/manual_reruns AND
+            # ce16ba6b/manual_runs) makes each root's OWN per-root scan
+            # independently find and count the SAME run's dollars, so
+            # summing every root's amount_usd unconditionally records twice
+            # the real spend. Only skip the addition when `alloc`'s
+            # contributing run_ids are ENTIRELY already present in
+            # `existing`'s (a non-empty subset) -- an unambiguous full
+            # duplicate of already-counted evidence -- not on any overlap:
+            # a PARTIAL overlap (this root has some run_ids already seen
+            # plus at least one genuinely new one) can't be cleanly split
+            # into "new dollars" vs "duplicate dollars" without a per-run_id
+            # amount breakdown this aggregation doesn't track, so it falls
+            # through to the existing additive merge -- summing there is
+            # the conservative direction (it can only over-restrict
+            # headroom, never under-restrict it), whereas silently
+            # dropping a possibly-genuine contribution would risk the
+            # opposite (Codex review: "Deduplicate mirrored artifacts
+            # before pooling spend"). An empty alloc.contributing_run_ids
+            # (no run_id resolved -- an older/legacy artifact) can never
+            # be recognized as a subset either, so it always falls through
+            # to the additive merge too, unchanged from today's behavior.
+            is_full_duplicate = bool(
+                alloc.contributing_run_ids
+            ) and alloc.contributing_run_ids <= existing.contributing_run_ids
+            if is_full_duplicate:
+                merged_amount = existing.amount_usd
+                merged_contributing_run_ids = existing.contributing_run_ids
+            else:
+                merged_amount = round(existing.amount_usd + alloc.amount_usd, 2)
+                merged_contributing_run_ids = (
+                    existing.contributing_run_ids | alloc.contributing_run_ids
+                )
+            # Attempt-count dedup is decided INDEPENDENTLY of the dollar dedup
+            # above, using attempt_run_ids (a strict superset of
+            # contributing_run_ids that also covers zero-dollar attempts). A
+            # mirrored zero-notional attempt (e.g. the same rejected order
+            # backfilled under both midday_dca/manual_reruns and
+            # ce16ba6b/manual_runs) never enters contributing_run_ids at all
+            # (it contributed no dollars), so is_full_duplicate above is
+            # always False for it and the additive branch double-counts the
+            # same broker attempt against max_orders_per_day (Codex review:
+            # "Deduplicate mirrored zero-notional attempts"). Same subset
+            # logic as the dollar check: a full subset is an unambiguous
+            # duplicate; a partial overlap falls through to the conservative
+            # additive sum, same as "Count every prior buy attempt toward the
+            # daily limit" already established.
+            is_full_attempt_duplicate = bool(
+                alloc.attempt_run_ids
+            ) and alloc.attempt_run_ids <= existing.attempt_run_ids
+            if is_full_attempt_duplicate:
+                merged_attempt_count = existing.attempt_count
+                merged_attempt_run_ids = existing.attempt_run_ids
+            else:
+                merged_attempt_count = existing.attempt_count + alloc.attempt_count
+                merged_attempt_run_ids = (
+                    existing.attempt_run_ids | alloc.attempt_run_ids
+                )
             merged[ticker] = PriorSameDayAllocation(
                 ticker=ticker,
-                amount_usd=round(existing.amount_usd + alloc.amount_usd, 2),
+                amount_usd=merged_amount,
                 reference_price=ref,
                 run_id=ref_run_id,
                 source=ref_source,
                 reference_ts=ref_ts,
                 selected_base_amount_usd=base,
                 selected_base_amount_usd_at=base_at,
-                # Summed, not overwritten: each root's attempts are distinct
-                # broker order attempts, same as amount_usd above.
-                order_attempts=existing.order_attempts + alloc.order_attempts,
+                attempt_count=merged_attempt_count,
+                contributing_run_ids=merged_contributing_run_ids,
+                attempt_run_ids=merged_attempt_run_ids,
             )
     return merged
 
@@ -4678,6 +5310,17 @@ def merge_manual_top_up_context(
                 reference_price=alloc.reference_price,
                 run_id=(alloc.sources[0] if alloc.sources else None),
                 source="manual_top_up_context",
+                # PriorAllocation.attempt_count is a genuine per-ROW count
+                # (one per qualifying CSV order, not one per contributing
+                # run) -- len(alloc.sources) undercounted whenever one bare
+                # manual/recovery CSV contained multiple distinct orders for
+                # the same ticker, reconstructing several real broker
+                # attempts as a single one against the shared
+                # max_orders_per_day breaker (Codex review: "Count each
+                # fallback CSV order as an attempt"). Falls back to 1 only
+                # for a PriorAllocation built by some other, older
+                # construction site that never populated attempt_count.
+                attempt_count=alloc.attempt_count or 1,
             )
             continue
         if existing.reference_price is None or alloc.reference_price is None:
@@ -4769,6 +5412,7 @@ def merge_manual_top_up_context(
             reference_ts=ref_ts,
             selected_base_amount_usd=base,
             selected_base_amount_usd_at=base_at,
+            attempt_count=existing.attempt_count + (alloc.attempt_count or 1),
         )
 
 
@@ -6755,29 +7399,33 @@ def _seed_prior_allocations(
     # call-site clarity/back-compat rather than removed.
     if guard_active and prior_same_day_allocations:
         for _ticker, _alloc in prior_same_day_allocations.items():
-            _key = (_ticker, trading_day)
-            if _key in state.seeded_attempt_tickers:
-                continue
-            if _alloc.amount_usd > 0 and state.buys_today(_ticker, trading_day) == 0:
-                state.record_buy(_ticker, trading_day, _alloc.amount_usd)
-                # record_buy above already counted ONE attempt for this
-                # ticker; seed the REMAINING same-day attempts (repeat buys
-                # across earlier slots, and terminally rejected/canceled
-                # orders that never moved capital) so the roster-wide daily
-                # order-count cap reflects every real broker attempt today,
-                # not one bump per ticker with a positive allocation (Codex
-                # review: "Reconstruct the cap from every prior buy
-                # attempt").
-                state.record_additional_order_attempts(
-                    trading_day, max(_alloc.order_attempts - 1, 0)
+            # Seed on attempt_count, not amount_usd > 0: a ticker whose only
+            # earlier-slot evidence is a rejected/canceled/failed attempt has
+            # amount_usd == 0 but still consumed one of the shared
+            # max_orders_per_day slots and must still be reconstructed here
+            # (Codex review: "Count every prior buy attempt toward the daily
+            # limit" -- record_buy's fixed +1 per call previously collapsed
+            # however many earlier attempts a ticker had, successful or not,
+            # into exactly one seeded attempt).
+            #
+            # Gated on own_orders_recorded, NOT buys_today() == 0: a retry's
+            # fresh scan can discover MORE evidence for a ticker already
+            # seeded on an earlier pass (e.g. a manual fill written between
+            # the original run and its retry), and reconcile_prior_allocation
+            # tops up only the newly-discovered delta rather than treating
+            # any prior count as proof the aggregate is already current
+            # (Codex review: "Reconcile increases to already-seeded ticker
+            # allocations"). A ticker THIS stream has already bought for real
+            # today is excluded here -- its own record_buy call already
+            # accounts for it, and topping it up again from this separate
+            # tracker would double-count it.
+            if (
+                _alloc.attempt_count > 0
+                and (_ticker, trading_day) not in state.own_orders_recorded
+            ):
+                state.reconcile_prior_allocation(
+                    _ticker, trading_day, _alloc.amount_usd, _alloc.attempt_count
                 )
-                state.seeded_attempt_tickers.add(_key)
-            elif _alloc.order_attempts > 0:
-                # No positive allocation contributed at all -- e.g. every
-                # same-day attempt for this ticker was terminally rejected or
-                # canceled -- but those attempts still count toward the cap.
-                state.record_additional_order_attempts(trading_day, _alloc.order_attempts)
-                state.seeded_attempt_tickers.add(_key)
 
 
 def _process_buy_candidates_batch(
@@ -6911,6 +7559,8 @@ class RunContext:
     classification_overrides: Optional[Dict[str, Any]] = None
     correlation_id: Optional[str] = None
     stream: str = "afternoon"
+    earlier_week_notional_usd: float = 0.0
+    earlier_week_scan_had_failures: bool = False
 
 
 def run_once(
@@ -6949,6 +7599,8 @@ def run_once(
             classification_overrides=ctx.classification_overrides,
             correlation_id=ctx.correlation_id,
             stream=ctx.stream,
+            earlier_week_notional_usd=ctx.earlier_week_notional_usd,
+            earlier_week_scan_had_failures=ctx.earlier_week_scan_had_failures,
         )
     except Exception as exc:  # noqa: BLE001 - always re-raised below
         if scheduled and ctx.artifacts_dir:
@@ -7312,6 +7964,8 @@ def _run_once_impl(
     classification_overrides: Optional[Dict[str, Any]] = None,
     correlation_id: Optional[str] = None,
     stream: str = "afternoon",
+    earlier_week_notional_usd: float = 0.0,
+    earlier_week_scan_had_failures: bool = False,
 ) -> List[ReconciledDecision]:
     now_et = now.astimezone(EASTERN)
     trading_day = now_et.date()
@@ -7412,6 +8066,14 @@ def _run_once_impl(
     # capacity into the stress tier's ceiling.
     state.roll_weekly_reserve(trading_day, config)
 
+    # Snapshotted BEFORE _seed_prior_allocations folds TODAY's own same-day
+    # cross-stream context into the same weekly bucket -- reconcile_earlier_
+    # week_cross_stream_notional's first-reconciliation-this-week baseline
+    # must reflect only what predates today's own seeding, or it mistakes
+    # today's spend for already-accounted earlier-week spend and silently
+    # drops the real earlier-week delta (Codex review: "Exclude today's
+    # allocations from the prior-week baseline").
+    pre_same_day_seed_week_notional = state.week_notional(trading_day)
     _seed_prior_allocations(
         state,
         trading_day,
@@ -7419,6 +8081,27 @@ def _run_once_impl(
         prior_same_day_allocations,
         one_order_per_ticker_per_day=config.one_order_per_ticker_per_day,
     )
+    if guard_active:
+        # Earlier-weekday cross-stream spend (Codex review: "Include
+        # prior-week sibling spend in the afternoon ledger") -- computed by
+        # the caller (run_dca._compute_earlier_week_cross_stream_notional)
+        # since it needs config_dir/artifacts_dir to resolve cross-stream
+        # roots, which this function does not receive. Reconciled into the
+        # shared weekly bucket ONLY (decoupled from any specific ticker's
+        # same-day top-up reference), adding only what isn't already
+        # reflected in this persistent state's own history (Codex review:
+        # "Reconcile earlier-week spend instead of adding it" -- a bare
+        # bump_week_notional_only call here re-added the same earlier-week
+        # total on every invocation this week, double-counting spend this
+        # state's own earlier record_buy() calls already persisted).
+        if earlier_week_scan_had_failures:
+            state.force_week_notional_to_worst_case_ceiling(trading_day)
+        else:
+            state.reconcile_earlier_week_cross_stream_notional(
+                trading_day,
+                earlier_week_notional_usd,
+                pre_same_day_seed_week_notional=pre_same_day_seed_week_notional,
+            )
 
     ctx = ProcessCandidateContext(
         config=config,
@@ -7595,6 +8278,18 @@ class CompactRunOptions:
             and logs with related runs/processes.
         stream: Which scheduled stream this run belongs to (e.g.
             ``"morning"``, ``"afternoon"``).
+        earlier_week_notional_usd: Pre-summed EARLIER-weekday cross-stream
+            spend (a completed prior day in the current ISO week), bumped
+            onto the shared weekly cap bucket only -- see
+            ``StrategyState.bump_week_notional_only``. Computed by the
+            caller (``run_dca._compute_earlier_week_cross_stream_notional``),
+            since resolving cross-stream roots needs ``config_dir``, which
+            this options object does not carry.
+        earlier_week_scan_had_failures: True when the earlier-weekday scan
+            above could not verify every artifact it found; forces the
+            weekly bucket to the worst-case tier ceiling instead of trusting
+            an unproven, possibly-too-low total (see
+            ``StrategyState.force_week_notional_to_worst_case_ceiling``).
     """
 
     artifacts_dir: str | Path
@@ -7608,6 +8303,8 @@ class CompactRunOptions:
     classification_overrides: Optional[Dict[str, Any]] = None
     correlation_id: Optional[str] = None
     stream: str = "afternoon"
+    earlier_week_notional_usd: float = 0.0
+    earlier_week_scan_had_failures: bool = False
 
 
 def run_daily_compact(
@@ -7680,6 +8377,8 @@ def run_daily_compact(
         classification_overrides=options.classification_overrides,
         correlation_id=options.correlation_id,
         stream=options.stream,
+        earlier_week_notional_usd=options.earlier_week_notional_usd,
+        earlier_week_scan_had_failures=options.earlier_week_scan_had_failures,
     )
     run_once(ctx)
 

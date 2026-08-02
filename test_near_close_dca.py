@@ -631,6 +631,52 @@ def test_merge_manual_top_up_context_poisons_base_to_unknown():
     assert merged.selected_base_amount_usd_at is None
 
 
+def test_merge_manual_top_up_context_new_allocation_uses_attempt_count_not_sources():
+    """Codex review: "Count each fallback CSV order as an attempt". A single
+    bare manual/recovery CSV can contain multiple distinct orders for the
+    same ticker -- PriorAllocation.sources records only ONE entry per
+    contributing RUN, not per order, so len(sources) undercounted whenever a
+    fallback-only run placed more than one real order for a ticker.
+    attempt_count is populated per-row by scripts.run_classification's
+    _prior_from_rows/_merge_prior and must be used directly instead."""
+    prior_same_day_allocations = {}
+    manual_context = {
+        "AAPL": PriorAllocation(
+            ticker="AAPL",
+            prior_usd=5.0,
+            reference_price=99.0,
+            sources=["manual_csv"],
+            attempt_count=3,
+        ),
+    }
+    merge_manual_top_up_context(prior_same_day_allocations, manual_context)
+    assert prior_same_day_allocations["AAPL"].attempt_count == 3
+
+
+def test_merge_manual_top_up_context_merge_path_sums_attempt_count_not_sources():
+    prior_same_day_allocations = {
+        "AAPL": PriorSameDayAllocation(
+            "AAPL",
+            amount_usd=2.0,
+            reference_price=97.0,
+            run_id="run1",
+            source="scheduled",
+            attempt_count=1,
+        ),
+    }
+    manual_context = {
+        "AAPL": PriorAllocation(
+            ticker="AAPL",
+            prior_usd=5.0,
+            reference_price=99.0,
+            sources=["manual_csv"],
+            attempt_count=3,
+        ),
+    }
+    merge_manual_top_up_context(prior_same_day_allocations, manual_context)
+    assert prior_same_day_allocations["AAPL"].attempt_count == 4
+
+
 def test_merge_manual_top_up_context_retains_base_when_manual_fill_is_later():
     # Codex review discussion_r3653976740 ("Preserve the known base when a
     # later manual fill is merged"): an earlier scheduled allocation resolved
@@ -5364,6 +5410,134 @@ def test_load_prior_same_day_includes_scheduled_morning_live_allocation(tmp_path
     assert allocations["AAPL"].source == "scheduled"
 
 
+def test_load_prior_same_day_counts_a_failed_attempt_with_zero_amount(tmp_path):
+    """Codex review: "Count every prior buy attempt toward the daily limit".
+    A candidate whose placement raised (status="failed", near_close_dca's own
+    _process_buy_candidate exception path) obtained no order_id and moved no
+    capital, but the attempt was genuinely made against the broker and still
+    consumes one of the shared max_orders_per_day slots. Previously "failed"
+    wasn't even in _PRIOR_ALLOCATION_STATUSES, so this row was invisible to
+    load_prior_same_day_allocations entirely."""
+    root = os.path.join(tmp_path, "cron_tracking", "morning_dca")
+    _write_prior_run(
+        root,
+        "20260629_1030ET",
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T10:30:00-04:00",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "run_type": "morning_dca_live",
+                "stream": "morning",
+                "run_id": "morning_live_20260629_1030ET",
+            },
+            "buy_candidates": [
+                {
+                    "ticker": "AAPL",
+                    "status": "failed",
+                    "planned_amount_usd": 3.0,
+                    "skip_reason": "placement failed: broker timeout",
+                },
+            ],
+        },
+    )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["AAPL"].amount_usd == 0.0
+    assert allocations["AAPL"].attempt_count == 1
+    assert allocations["AAPL"].reference_price is None
+
+
+def test_load_prior_same_day_counts_every_attempt_for_one_ticker(tmp_path):
+    """A ticker bought once and re-attempted-and-failed twice in the same
+    earlier run is 3 attempts, not 1 -- even though only one of them
+    contributed a dollar amount."""
+    root = os.path.join(tmp_path, "cron_tracking", "morning_dca")
+    _write_prior_run(
+        root,
+        "20260629_1030ET",
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T10:30:00-04:00",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "run_type": "morning_dca_live",
+                "stream": "morning",
+                "run_id": "morning_live_20260629_1030ET",
+            },
+            "buy_candidates": [
+                {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0},
+                {"ticker": "AAPL", "status": "failed", "planned_amount_usd": 2.0},
+                {"ticker": "AAPL", "status": "failed", "planned_amount_usd": 1.0},
+            ],
+        },
+        orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": "98.25"}],
+    )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["AAPL"].amount_usd == 3.0
+    assert allocations["AAPL"].attempt_count == 3
+
+
+def test_load_prior_same_day_csv_only_reconstruction_does_not_crash_when_merged_with_a_candidate_run(
+    tmp_path,
+):
+    """Codex review: "Initialize attempt counts for CSV-reconstructed
+    orders". The no-embedded-candidates branch (a recovery run reconstructed
+    solely from its recorded orders CSV) used to create its aggregated entry
+    without an "attempt_count" key. Since aggregated.setdefault() returns
+    whatever entry already exists for a ticker, a LATER-scanned run's
+    embedded-candidate branch reusing that same entry via
+    entry["attempt_count"] += 1 would raise KeyError and abort the whole
+    reconstruction -- not just undercount, but crash -- when the earlier
+    CSV-only run is scanned first (by generated_at) and both runs cover the
+    same ticker."""
+    root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+
+    # Run 1 (scanned first: earlier generated_at): CSV-only reconstruction,
+    # no embedded buy_candidates.
+    csv_only_dir = os.path.join(root, "20260629_1230ET_recovery_1230ET")
+    os.makedirs(csv_only_dir, exist_ok=True)
+    csv_only_state = _recovery_run_state([], generated_at="2026-06-29T12:30:00-04:00")
+    csv_only_state["artifacts"] = {"orders_csv_path": "filled_orders.csv"}
+    with open(
+        os.path.join(csv_only_dir, "run_state.json"), "w", encoding="utf-8"
+    ) as handle:
+        json.dump(csv_only_state, handle)
+    with open(
+        os.path.join(csv_only_dir, "filled_orders.csv"), "w", encoding="utf-8"
+    ) as handle:
+        handle.write(
+            "ticker,amount_usd,state,average_fill_price,quantity\n"
+            "SPCX,3.50,filled,109.989900,0.031821\n"
+        )
+
+    # Run 2 (scanned second: later generated_at): embedded candidate for the
+    # SAME ticker, reusing run 1's aggregated entry.
+    candidate_dir = os.path.join(root, "20260629_1230ET_recovery_1305ET")
+    os.makedirs(candidate_dir, exist_ok=True)
+    candidate_state = _recovery_run_state(
+        [{"ticker": "SPCX", "status": "filled", "planned_amount_usd": 2.0}],
+        generated_at="2026-06-29T13:05:00-04:00",
+    )
+    with open(
+        os.path.join(candidate_dir, "run_state.json"), "w", encoding="utf-8"
+    ) as handle:
+        json.dump(candidate_state, handle)
+    with open(
+        os.path.join(candidate_dir, "orders.csv"), "w", encoding="utf-8"
+    ) as handle:
+        handle.write("ticker,status,avg_fill_price\nSPCX,filled,110.00\n")
+
+    # Must not raise KeyError.
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["SPCX"].amount_usd == pytest.approx(5.50)
+    assert allocations["SPCX"].attempt_count == 2
+
+
 def test_load_prior_same_day_survives_malformed_buy_candidates(tmp_path):
     # Codex review: "Reject malformed candidate collections in recovery states".
     # A scalar buy_candidates raised TypeError out of the whole scan, and a
@@ -6235,7 +6409,11 @@ def test_load_prior_same_day_honors_terminal_rejection_for_candidate_recovery(tm
     # loop then kept the full planned amount with an unknown reference price --
     # routing a ticker whose order is KNOWN not to have filled into the $0
     # manual-review guard and suppressing a legitimate later top-up. No capital
-    # moved, so the ticker must carry no prior allocation at all.
+    # moved, so the ticker's amount_usd must stay $0 (updated for Codex review:
+    # "Count every prior buy attempt toward the daily limit" -- the ticker now
+    # DOES appear, with amount_usd=0.0, so its rejected attempt still counts
+    # toward the shared max_orders_per_day cap when seeded; only the DOLLAR
+    # contract from the original finding is unchanged).
     root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
     run_dir = os.path.join(root, "20260629_1230ET_recovery_1305ET")
     os.makedirs(run_dir, exist_ok=True)
@@ -6269,18 +6447,13 @@ def test_load_prior_same_day_honors_terminal_rejection_for_candidate_recovery(tm
 
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
 
-    # Rejected with zero execution: no capital moved, so no DOLLAR prior
-    # allocation -- evaluate_top_up_guard treats amount_usd<=0 exactly like
-    # "no entry at all" (TOP_UP_NO_PRIOR_RUN). It still appears in the
-    # mapping, though, because the attempt itself must count toward the
-    # roster-wide daily order-count cap (Codex review: "Reconstruct the cap
-    # from every prior buy attempt").
+    # Rejected with zero execution: no capital moved, so no dollar prior
+    # allocation, but the attempt itself is still tracked.
     assert allocations["EVR"].amount_usd == 0.0
-    assert allocations["EVR"].order_attempts == 1
+    assert allocations["EVR"].attempt_count == 1
     # The genuine fill in the same CSV is unaffected.
     assert allocations["SPCX"].amount_usd == 3.50
     assert allocations["SPCX"].reference_price == 109.9899
-    assert allocations["SPCX"].order_attempts == 1
 
 
 def test_terminal_non_fill_states_match_the_canonical_broker_set():
@@ -6752,6 +6925,135 @@ def test_recovery_orders_csv_path_inside_run_dir_is_loaded(tmp_path):
     assert allocations["SPCX"].reference_price == 109.9899
 
 
+def test_market_open_bare_submitted_orders_csv_is_read_with_no_candidates_or_recorded_path(
+    tmp_path,
+):
+    """Codex review: "Read canonical CSVs during same-day cap seeding". The
+    market-open/intraday streams have no in-repo Python entry point at all --
+    their Claude-executor prompts write only run_state.json (no embedded
+    buy_candidates, no artifacts.orders_csv_path) plus a bare sibling
+    submitted_orders.csv using the canonical submitted_amount_usd column.
+    Without a fallback to that bare sibling, a valid same-day fill recorded
+    only there contributed $0 to the shared same-day cap ledger."""
+    root = os.path.join(tmp_path, "cron_tracking", "market_open_dca")
+    run_dir = os.path.join(root, "20260629_0935ET")
+    os.makedirs(run_dir, exist_ok=True)
+
+    state = {
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T09:35:00-04:00",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "run_type": "market_open_dca_live",
+            "stream": "market_open",
+            "manual_run": False,
+            "trading_day": "2026-06-29",
+            "run_id": "market_open_live_20260629_0935ET",
+        },
+        "buy_candidates": [],
+    }
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(state, handle)
+    with open(
+        os.path.join(run_dir, "submitted_orders.csv"), "w", encoding="utf-8"
+    ) as handle:
+        handle.write(
+            "ticker,order_id,status,submitted_amount_usd,avg_fill_price,quantity_filled\n"
+            "AAAU,ORD-1,filled,2.00,50.00,0.04\n"
+        )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["AAAU"].amount_usd == pytest.approx(2.00)
+    assert allocations["AAAU"].reference_price == 50.00
+
+
+def test_market_open_bare_submitted_orders_csv_unresolved_submitted_row(tmp_path):
+    """The submitted-but-not-yet-filled case for the same bare-sibling
+    fallback: a still-live order contributes its amount as prior allocation
+    with an UNKNOWN reference price (the conservative path), same as the
+    recorded-CSV branch already does."""
+    root = os.path.join(tmp_path, "cron_tracking", "market_open_dca")
+    run_dir = os.path.join(root, "20260629_0935ET")
+    os.makedirs(run_dir, exist_ok=True)
+
+    state = {
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T09:35:00-04:00",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "run_type": "market_open_dca_live",
+            "stream": "market_open",
+            "manual_run": False,
+            "trading_day": "2026-06-29",
+            "run_id": "market_open_live_20260629_0935ET",
+        },
+        "buy_candidates": [],
+    }
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(state, handle)
+    with open(
+        os.path.join(run_dir, "submitted_orders.csv"), "w", encoding="utf-8"
+    ) as handle:
+        handle.write(
+            "ticker,order_id,status,submitted_amount_usd,avg_fill_price,quantity_filled\n"
+            "AAAU,ORD-1,submitted,2.00,,\n"
+        )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["AAAU"].amount_usd == pytest.approx(2.00)
+    assert allocations["AAAU"].reference_price is None
+
+
+def test_market_open_bare_submitted_orders_csv_reserves_pending_and_unconfirmed_rows(
+    tmp_path,
+):
+    """Codex review: "Reserve pending orders loaded from the canonical CSV".
+    A canonical submitted_orders.csv row can carry an explicit status of
+    "pending" or "unconfirmed" (scripts.scheduled_artifacts.
+    ORDER_ATTEMPT_STATUSES), not just "submitted". The old status check
+    accepted only status == "submitted" exactly, falling back to the
+    statusless-live path only when the status column was entirely empty --
+    so a row with an explicit "pending"/"unconfirmed" status was silently
+    dropped, reconstructing that attempt as $0 exposure and letting the same
+    ticker be bought again while the real order was still outstanding."""
+    root = os.path.join(tmp_path, "cron_tracking", "market_open_dca")
+    run_dir = os.path.join(root, "20260629_0935ET")
+    os.makedirs(run_dir, exist_ok=True)
+
+    state = {
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T09:35:00-04:00",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "run_type": "market_open_dca_live",
+            "stream": "market_open",
+            "manual_run": False,
+            "trading_day": "2026-06-29",
+            "run_id": "market_open_live_20260629_0935ET",
+        },
+        "buy_candidates": [],
+    }
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(state, handle)
+    with open(
+        os.path.join(run_dir, "submitted_orders.csv"), "w", encoding="utf-8"
+    ) as handle:
+        handle.write(
+            "ticker,order_id,status,submitted_amount_usd,avg_fill_price,quantity_filled\n"
+            "AAAU,ORD-1,pending,2.00,,\n"
+            "IEMG,ORD-2,unconfirmed,3.50,,\n"
+        )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["AAAU"].amount_usd == pytest.approx(2.00)
+    assert allocations["AAAU"].reference_price is None
+    assert allocations["IEMG"].amount_usd == pytest.approx(3.50)
+    assert allocations["IEMG"].reference_price is None
+
+
 def test_recovery_external_csv_path_falls_back_to_the_local_sibling(tmp_path):
     # Codex review: "Fall back to the recovery run's local CSV". Rejecting the
     # external path outright turned a wrong allocation into NO allocation --
@@ -6869,6 +7171,13 @@ def test_load_prior_same_day_multi_merges_roots_sums_amounts_most_recent_referen
                 }
             ],
             generated_at="2026-06-29T10:30:00-04:00",
+            # Distinct run_origin per root so each contributes a distinct
+            # run_id ("manual_morning_am" vs "manual_midday_am") -- these are
+            # two genuinely separate runs, and a shared default run_id here
+            # would be wrongly recognized as a mirrored duplicate by the
+            # dedup added for "Deduplicate mirrored artifacts before pooling
+            # spend".
+            run_origin="manual_morning",
         ),
     )
     midday_root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
@@ -6885,6 +7194,7 @@ def test_load_prior_same_day_multi_merges_roots_sums_amounts_most_recent_referen
                 }
             ],
             generated_at="2026-06-29T12:30:00-04:00",
+            run_origin="manual_midday",
         ),
     )
     allocations = load_prior_same_day_allocations_multi(
@@ -6892,6 +7202,165 @@ def test_load_prior_same_day_multi_merges_roots_sums_amounts_most_recent_referen
     )
     assert allocations["AAPL"].amount_usd == 7.5
     assert allocations["AAPL"].reference_price == 99.0
+
+
+def test_load_prior_same_day_multi_deduplicates_a_mirrored_manual_override(tmp_path):
+    """Codex review: "Deduplicate mirrored artifacts before pooling spend".
+    The exact documented scenario: a manual override backfilled under both
+    midday_dca/manual_reruns AND ce16ba6b/manual_runs is the SAME run,
+    mirrored -- not two independent contributions. Before the fix, each
+    root's own per-root scan found and summed the same run's dollars, so
+    load_prior_same_day_allocations_multi() recorded twice the real spend
+    (existing.amount_usd + alloc.amount_usd unconditionally)."""
+    same_run_id = "midday_manual_override_20260629_1345ET"
+    mirrored_state = {
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T13:45:00-04:00",
+        "run_classification": {"run_origin": "manual", "run_id": same_run_id},
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "filled",
+                "planned_amount_usd": 5.0,
+                "target_price": 98.0,
+            },
+        ],
+    }
+    root_a = os.path.join(tmp_path, "cron_tracking", "midday_dca", "manual_reruns")
+    _write_prior_run(root_a, "20260629_1345ET", mirrored_state)
+    root_b = os.path.join(tmp_path, "cron_tracking", "ce16ba6b", "manual_runs")
+    _write_prior_run(root_b, "20260629_1345ET", mirrored_state)
+
+    allocations = load_prior_same_day_allocations_multi(
+        (
+            os.path.join(tmp_path, "cron_tracking", "midday_dca"),
+            os.path.join(tmp_path, "cron_tracking", "ce16ba6b"),
+        ),
+        date(2026, 6, 29),
+        include_scheduled_afternoon=True,
+    )
+
+    # The SAME $5.00 order, mirrored under two roots, must count once.
+    assert allocations["AAPL"].amount_usd == pytest.approx(5.0)
+    assert allocations["AAPL"].attempt_count == 1
+
+
+def test_load_prior_same_day_multi_deduplicates_a_mirrored_zero_notional_attempt(tmp_path):
+    """Codex review: "Deduplicate mirrored zero-notional attempts". The same
+    documented mirrored-run scenario as the dollar-dedup test above, but for a
+    REJECTED order that contributed no dollars. contributing_run_ids is only
+    populated once a row contributes a positive dollar amount, so a mirrored
+    zero-notional attempt's run_id never lands in it and the dollar-dedup
+    check can never recognize the duplicate -- before this fix, the additive
+    branch counted the SAME broker attempt twice against attempt_count."""
+    same_run_id = "midday_manual_override_20260629_1345ET"
+    mirrored_state = {
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T13:45:00-04:00",
+        "run_classification": {"run_origin": "manual", "run_id": same_run_id},
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "failed",
+                "planned_amount_usd": 5.0,
+                "skip_reason": "placement failed: broker timeout",
+            },
+        ],
+    }
+    root_a = os.path.join(tmp_path, "cron_tracking", "midday_dca", "manual_reruns")
+    _write_prior_run(root_a, "20260629_1345ET", mirrored_state)
+    root_b = os.path.join(tmp_path, "cron_tracking", "ce16ba6b", "manual_runs")
+    _write_prior_run(root_b, "20260629_1345ET", mirrored_state)
+
+    allocations = load_prior_same_day_allocations_multi(
+        (
+            os.path.join(tmp_path, "cron_tracking", "midday_dca"),
+            os.path.join(tmp_path, "cron_tracking", "ce16ba6b"),
+        ),
+        date(2026, 6, 29),
+        include_scheduled_afternoon=True,
+    )
+
+    # The SAME rejected attempt, mirrored under two roots, must count once.
+    assert allocations["AAPL"].amount_usd == 0.0
+    assert allocations["AAPL"].attempt_count == 1
+
+
+def test_load_prior_same_day_multi_partial_overlap_falls_back_to_summing(tmp_path):
+    """A root whose contributing run_ids for a ticker are only PARTIALLY
+    already-seen (one shared/mirrored run plus one genuinely new one) can't
+    be cleanly split into "new dollars" vs "duplicate dollars" without a
+    per-run_id amount breakdown -- falls through to the existing additive
+    merge, the conservative direction (over-restricts headroom rather than
+    risking silently dropping a genuine contribution)."""
+    root_a = os.path.join(tmp_path, "cron_tracking", "morning_dca")
+    _write_prior_run(
+        root_a,
+        "20260629_1030ET",
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T10:30:00-04:00",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "run_type": "morning_dca_live",
+                "stream": "morning",
+                "run_id": "shared_run_A",
+            },
+            "buy_candidates": [
+                {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 2.0},
+            ],
+        },
+    )
+    root_b = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    # Root B's own directory mirrors root A's run (same run_id "shared_run_A",
+    # e.g. backfilled for audit) PLUS a genuinely separate, later midday run
+    # ("run_B") for the same ticker.
+    _write_prior_run(
+        root_b,
+        "20260629_1030ET_mirror",
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T10:30:00-04:00",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "run_type": "morning_dca_live",
+                "stream": "morning",
+                "run_id": "shared_run_A",
+            },
+            "buy_candidates": [
+                {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 2.0},
+            ],
+        },
+    )
+    _write_prior_run(
+        root_b,
+        "20260629_1230ET",
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T12:30:00-04:00",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "run_type": "midday_dca_live",
+                "stream": "midday",
+                "run_id": "run_B",
+            },
+            "buy_candidates": [
+                {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0},
+            ],
+        },
+    )
+
+    allocations = load_prior_same_day_allocations_multi(
+        (root_a, root_b), date(2026, 6, 29)
+    )
+
+    # root_b's own per-root total is already 2.0 (mirrored) + 3.0 (genuine) =
+    # 5.0; only a FULL subset match against root_a's {shared_run_A} would
+    # skip re-adding it, but root_b's set {shared_run_A, run_B} is not a
+    # subset of root_a's {shared_run_A} -- so this sums root_a's 2.0 with
+    # root_b's full 5.0, landing on 7.0, not the true 5.0. This is the
+    # documented conservative fallback, not a silent drop.
+    assert allocations["AAPL"].amount_usd == pytest.approx(7.0)
 
 
 def test_load_prior_same_day_multi_missing_reference_poisons_to_none(tmp_path):
@@ -6910,7 +7379,11 @@ def test_load_prior_same_day_multi_missing_reference_poisons_to_none(tmp_path):
                     "planned_amount_usd": 3.0,
                     "target_price": 99.0,
                 },
-            ]
+            ],
+            # Distinct run_origin per root -- these are two separate runs;
+            # see the matching note in
+            # test_load_prior_same_day_multi_merges_roots_sums_amounts_most_recent_reference.
+            run_origin="manual_morning",
         ),
     )
     midday_root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
@@ -6920,7 +7393,8 @@ def test_load_prior_same_day_multi_missing_reference_poisons_to_none(tmp_path):
         _manual_run_state(
             [
                 {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 4.5},
-            ]
+            ],
+            run_origin="manual_midday",
         ),
         orders_rows=[{"ticker": "AAPL", "status": "submitted", "avg_fill_price": ""}],
     )
@@ -7928,6 +8402,58 @@ def test_load_prior_same_day_skip_sink_excludes_old_historical_parse_failure(tmp
     assert skip_sink == []
 
 
+def test_mtime_matches_trading_day_is_on_or_after_not_strict_equality(tmp_path):
+    """Codex review: "Fail closed on later-modified prior-day artifacts".
+    An earlier-weekday artifact (trading_day Monday) being backfilled or
+    repaired on a LATER day (mtime Tuesday) is exactly as unverifiable as a
+    same-day race, but its mtime can never equal Monday -- a strict
+    equality check silently excluded that failure from skip_sink,
+    understating real earlier-week spend. A file genuinely older than
+    trading_day (real historical garbage) must still be excluded."""
+    from near_close_dca import _mtime_matches_trading_day
+
+    monday = date(2026, 6, 29)
+    path = tmp_path / "run_state.json"
+    path.write_text("{", encoding="utf-8")
+
+    _stamp_mtime_on_trading_day(path, monday)
+    assert _mtime_matches_trading_day(path, monday) is True
+
+    # Rewritten/backfilled the NEXT day -- still plausibly relevant to Monday.
+    _stamp_mtime_on_trading_day(path, date(2026, 6, 30))
+    assert _mtime_matches_trading_day(path, monday) is True
+
+    # Genuinely predates the trading day -- real historical garbage, excluded.
+    _stamp_mtime_on_trading_day(path, date(2026, 6, 28))
+    assert _mtime_matches_trading_day(path, monday) is False
+
+
+def test_load_prior_same_day_skip_sink_records_later_day_rewrite_of_earlier_artifact(
+    tmp_path,
+):
+    """End-to-end wiring for the >= fix: an earlier-weekday (Monday) corrupt
+    artifact that was rewritten/backfilled on a LATER day (mtime Tuesday)
+    must still be recorded in skip_sink when scanned as Monday's context --
+    a strict mtime-equality check would have silently dropped it, since a
+    file can never have an mtime equal to a day earlier than when it was
+    last touched."""
+    root = tmp_path / "state_root"
+    root.mkdir()
+
+    monday = date(2026, 6, 29)
+    tuesday = date(2026, 6, 30)
+
+    rewritten_json = root / "run_state_monday.json"
+    rewritten_json.write_text("{this is not valid json at all", encoding="utf-8")
+    _stamp_mtime_on_trading_day(rewritten_json, tuesday)
+
+    skip_sink: list = []
+    allocations = load_prior_same_day_allocations(root, monday, skip_sink=skip_sink)
+
+    assert allocations == {}
+    assert skip_sink == [rewritten_json]
+
+
 def test_load_prior_same_day_reads_full_report_run_state_via_orders_csv(tmp_path):
     """load_prior_same_day_allocations must handle full-report run_states that store
     'artifacts.orders_csv_path' instead of a top-level 'buy_candidates' list.
@@ -8241,6 +8767,87 @@ def test_load_prior_same_day_skip_sink_records_truncated_orders_csv_row(tmp_path
         "a truncated final row in a referenced orders CSV must be recorded "
         "in skip_sink so scan_had_failures reflects the incomplete scan"
     )
+
+
+def test_load_prior_same_day_csv_only_counts_every_order_row_for_one_ticker(tmp_path):
+    """Codex review ("Count each CSV order attempt before aggregating by
+    ticker"): the no-embedded-candidates CSV-only reconstruction path (e.g. a
+    market-open/intraday run with no in-repo executor) must count ONE
+    attempt per qualifying CSV row, not one per ticker after
+    _orders_csv_fills/_orders_csv_submitted_notionals collapse multiple
+    distinct orders for the same ticker into a single aggregated record.
+    Two real orders for AAAU this run -> 2 attempts, even though only the
+    filled one contributes a dollar amount."""
+    root = os.path.join(tmp_path, "cron_tracking", "market_open_dca")
+    run_dir = os.path.join(root, "20260629_0935ET")
+    os.makedirs(run_dir, exist_ok=True)
+
+    state = {
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T09:35:00-04:00",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "run_type": "market_open_dca_live",
+            "stream": "market_open",
+            "manual_run": False,
+            "trading_day": "2026-06-29",
+            "run_id": "market_open_live_20260629_0935ET",
+        },
+        "buy_candidates": [],
+    }
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(state, handle)
+    with open(
+        os.path.join(run_dir, "submitted_orders.csv"), "w", encoding="utf-8"
+    ) as handle:
+        handle.write(
+            "ticker,order_id,status,submitted_amount_usd,avg_fill_price,quantity_filled\n"
+            "AAAU,ORD-1,filled,2.00,50.00,0.04\n"
+            "AAAU,ORD-2,canceled,0,,\n"
+        )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["AAAU"].amount_usd == pytest.approx(2.00)
+    assert allocations["AAAU"].attempt_count == 2
+
+
+def test_load_prior_same_day_csv_only_counts_a_terminal_rejected_only_ticker(tmp_path):
+    """A ticker whose only CSV row this run is a terminal rejection (no fill,
+    no submitted notional -- never enters _csv_tickers at all) must still be
+    counted as an attempt with $0, so the shared max_orders_per_day slot it
+    consumed isn't invisible to the next run's guard."""
+    root = os.path.join(tmp_path, "cron_tracking", "market_open_dca")
+    run_dir = os.path.join(root, "20260629_0935ET")
+    os.makedirs(run_dir, exist_ok=True)
+
+    state = {
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T09:35:00-04:00",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "run_type": "market_open_dca_live",
+            "stream": "market_open",
+            "manual_run": False,
+            "trading_day": "2026-06-29",
+            "run_id": "market_open_live_20260629_0935ET",
+        },
+        "buy_candidates": [],
+    }
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(state, handle)
+    with open(
+        os.path.join(run_dir, "submitted_orders.csv"), "w", encoding="utf-8"
+    ) as handle:
+        handle.write(
+            "ticker,order_id,status,submitted_amount_usd,avg_fill_price,quantity_filled\n"
+            "MSFT,ORD-9,rejected,0,,\n"
+        )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["MSFT"].amount_usd == 0.0
+    assert allocations["MSFT"].attempt_count == 1
 
 
 def test_load_prior_same_day_skip_sink_records_empty_orders_csv_snapshot(tmp_path):
@@ -9272,6 +9879,148 @@ def test_seed_prior_allocations_still_seeds_notional_when_the_flag_is_on():
     assert state.week_notional(trading_day) == pytest.approx(2.0)
 
 
+def test_seed_prior_allocations_tops_up_a_retry_that_discovers_more_evidence():
+    """Codex review: "Reconcile increases to already-seeded ticker
+    allocations". The original 15:30 run seeds AAPL at $2/1 attempt. A
+    manual AAPL fill is then written elsewhere before a retry re-scans
+    artifacts, raising the aggregate to $4/2 attempts. The old
+    buys_today() == 0 gate treated the first seed as proof the ticker was
+    already fully accounted for and skipped it on the retry entirely,
+    losing both the extra $2 and the extra attempt."""
+    state = StrategyState()
+    trading_day = date(2026, 6, 29)
+
+    _seed_prior_allocations(
+        state,
+        trading_day,
+        True,
+        {
+            "AAPL": PriorSameDayAllocation(
+                ticker="AAPL", amount_usd=2.0, reference_price=99.0, attempt_count=1
+            ),
+        },
+        one_order_per_ticker_per_day=False,
+    )
+    assert state.buys_today("AAPL", trading_day) == 1
+    assert state.day_notional(trading_day) == pytest.approx(2.0)
+
+    # Retry: a fresh scan discovers a new manual fill for the same ticker.
+    _seed_prior_allocations(
+        state,
+        trading_day,
+        True,
+        {
+            "AAPL": PriorSameDayAllocation(
+                ticker="AAPL", amount_usd=4.0, reference_price=99.0, attempt_count=2
+            ),
+        },
+        one_order_per_ticker_per_day=False,
+    )
+    assert state.buys_today("AAPL", trading_day) == 2, (
+        "the retry's newly-discovered attempt must be topped up, not skipped"
+    )
+    assert state.day_notional(trading_day) == pytest.approx(4.0), (
+        "the retry's newly-discovered $2 must be topped up, not skipped"
+    )
+
+    # A third pass with no new evidence must be a no-op, not a re-add.
+    _seed_prior_allocations(
+        state,
+        trading_day,
+        True,
+        {
+            "AAPL": PriorSameDayAllocation(
+                ticker="AAPL", amount_usd=4.0, reference_price=99.0, attempt_count=2
+            ),
+        },
+        one_order_per_ticker_per_day=False,
+    )
+    assert state.buys_today("AAPL", trading_day) == 2
+    assert state.day_notional(trading_day) == pytest.approx(4.0)
+
+
+def test_reconcile_prior_allocation_tops_up_notional_when_attempt_count_is_unchanged():
+    """Codex review: "Reconcile notional when the attempt count is unchanged".
+    A previously seeded order's executed notional can grow (a partial fill
+    confirms more shares) across two scans with NO new attempt at all --
+    attempt_delta stays 0 while the dollar delta is genuinely positive. The
+    old early return (gated on attempt_delta alone) skipped that dollar
+    delta entirely, leaving the daily/weekly ledgers understated."""
+    state = StrategyState()
+    trading_day = date(2026, 6, 29)
+
+    state.reconcile_prior_allocation("AAPL", trading_day, amount_usd=1.0, attempt_count=1)
+    assert state.buys_today("AAPL", trading_day) == 1
+    assert state.day_notional(trading_day) == pytest.approx(1.0)
+
+    # Same attempt count, but the fill's confirmed notional grew from $1 to $2.
+    state.reconcile_prior_allocation("AAPL", trading_day, amount_usd=2.0, attempt_count=1)
+    assert state.buys_today("AAPL", trading_day) == 1, "no new attempt was discovered"
+    assert state.day_notional(trading_day) == pytest.approx(2.0), (
+        "the extra $1 of confirmed notional must be reconciled even with no new attempt"
+    )
+
+
+def test_reconcile_prior_allocation_persists_baseline_on_exact_match():
+    """Codex review: "Record no-op prior-allocation baselines". A ticker's
+    first-ever reconcile_prior_allocation call can exactly match an existing
+    buys_today() baseline (e.g. a real order recorded by this stream in a
+    prior process invocation) -- both deltas compute to zero on that first
+    call. The old early return skipped persisting the tracked dicts in that
+    case, so a LATER retry that discovers the aggregate has genuinely grown
+    recomputed its own baseline from that later call's own (larger)
+    amount_usd, silently assuming the whole total was already credited and
+    permanently losing the dollar delta between the two scans."""
+    state = StrategyState()
+    trading_day = date(2026, 6, 29)
+
+    # A real $2/1-attempt order already exists in durable state (as if
+    # recorded by this stream in an earlier process invocation).
+    state.record_buy("AAPL", trading_day, 2.0)
+    assert state.buys_today("AAPL", trading_day) == 1
+    assert state.day_notional(trading_day) == pytest.approx(2.0)
+
+    # First reconcile call exactly matches the existing baseline -- both
+    # deltas are zero, but the baseline must still be persisted.
+    state.reconcile_prior_allocation("AAPL", trading_day, amount_usd=2.0, attempt_count=1)
+    assert state.buys_today("AAPL", trading_day) == 1
+    assert state.day_notional(trading_day) == pytest.approx(2.0)
+
+    # A retry discovers the aggregate genuinely grew to $4/2 attempts.
+    state.reconcile_prior_allocation("AAPL", trading_day, amount_usd=4.0, attempt_count=2)
+    assert state.buys_today("AAPL", trading_day) == 2, "the new attempt must be counted"
+    assert state.day_notional(trading_day) == pytest.approx(4.0), (
+        "the full $2 delta since the last reconcile call must be credited, "
+        "not silently dropped because the first call's exact match was never persisted"
+    )
+
+
+def test_seed_prior_allocations_skips_a_ticker_this_stream_already_bought_for_real():
+    """A ticker THIS stream has already booked its own real order for
+    (own_orders_recorded) must never be topped up from the separate seeded-
+    prior-context tracker -- record_buy already accounts for it, and doing
+    so too would double-count it."""
+    state = StrategyState()
+    trading_day = date(2026, 6, 29)
+    state.record_buy("AAPL", trading_day, 5.0)
+    state.own_orders_recorded.add(("AAPL", trading_day))
+
+    _seed_prior_allocations(
+        state,
+        trading_day,
+        True,
+        {
+            "AAPL": PriorSameDayAllocation(
+                ticker="AAPL", amount_usd=8.0, reference_price=99.0, attempt_count=2
+            ),
+        },
+        one_order_per_ticker_per_day=False,
+    )
+
+    assert state.buys_today("AAPL", trading_day) == 1
+    assert state.day_notional(trading_day) == pytest.approx(5.0)
+
+
 def test_seed_prior_allocations_is_a_noop_when_guard_inactive_regardless_of_the_flag():
     """guard_active still gates seeding either way: an unscheduled/manual run
     (or a scheduled run with no prior_same_day_allocations loaded at all) must
@@ -9297,71 +10046,244 @@ def test_seed_prior_allocations_is_a_noop_when_guard_inactive_regardless_of_the_
     assert state.day_notional(trading_day) == pytest.approx(0.0)
 
 
-def test_seed_prior_allocations_reconstructs_the_cap_from_every_attempt():
-    """Codex review: 'Reconstruct the cap from every prior buy attempt'.
-
-    Before this fix, _seed_prior_allocations bumped day_order_count by
-    exactly ONE per ticker with a positive allocation -- so eight earlier
-    attempts spread across three tickers (repeat buys plus a rejected order
-    that moved no capital) reconstructed as day_order_count=3, letting a
-    ninth attempt through a roster-wide cap of 8. order_attempts on each
-    PriorSameDayAllocation now carries the true per-ticker attempt count, and
-    seeding must sum ALL of them, not just one per ticker.
-    """
+def test_seed_prior_allocations_preserves_the_real_attempt_count():
+    """Codex review: "Count every prior buy attempt toward the daily limit".
+    Earlier slots made 8 attempts total across 3 tickers, several of which
+    were rejected/canceled (amount_usd == 0 for that ticker's aggregate, or
+    partially offset by one filled attempt). record_buy's fixed +1-per-
+    ticker used to collapse this into 3 seeded attempts, letting within_caps
+    authorize up to 5 MORE real orders even though the shared
+    max_orders_per_day: 8 circuit breaker should already be exhausted."""
     state = StrategyState()
     trading_day = date(2026, 6, 29)
     prior = {
-        # 4 attempts, 1 positive allocation ($ amount already dollar-summed
-        # by the loader; the count is the part this test is pinning).
-        "AAPL": PriorSameDayAllocation(
-            ticker="AAPL", amount_usd=6.0, order_attempts=4,
+        # 5 attempts, all rejected -- zero capital moved, but still 5 of the
+        # shared cap's 8 slots.
+        "AAAU": PriorSameDayAllocation(
+            ticker="AAAU", amount_usd=0.0, attempt_count=5
         ),
-        # 3 attempts.
-        "MSFT": PriorSameDayAllocation(
-            ticker="MSFT", amount_usd=3.0, order_attempts=3,
+        # 2 attempts, only the second filled.
+        "TRIN": PriorSameDayAllocation(
+            ticker="TRIN", amount_usd=3.0, reference_price=50.0, attempt_count=2
         ),
-        # Every attempt for this ticker was terminally rejected/canceled --
-        # $0 dollar allocation, but the attempt still happened.
+        # 1 attempt, filled.
         "EVR": PriorSameDayAllocation(
-            ticker="EVR", amount_usd=0.0, order_attempts=1,
+            ticker="EVR", amount_usd=2.0, reference_price=25.0, attempt_count=1
         ),
     }
 
     _seed_prior_allocations(
-        state, trading_day, True, prior, one_order_per_ticker_per_day=False,
+        state,
+        trading_day,
+        True,
+        prior,
+        one_order_per_ticker_per_day=False,
     )
 
     assert state.day_order_count(trading_day) == 8
+    assert state.day_notional(trading_day) == pytest.approx(5.0)
     config = StrategyConfig(max_orders_per_day=8)
-    # The roster-wide cap is already exhausted by the reconstructed count --
-    # a ninth attempt today, on any ticker, must be refused.
-    assert within_caps(2.0, state, trading_day, config) is False
+    # The shared cap is already exhausted by the reconstructed attempts --
+    # even a trivially small, otherwise-affordable order must be refused.
+    assert within_caps(1.0, state, trading_day, config) is False
 
 
-def test_seed_prior_allocations_is_idempotent_across_a_reused_state():
-    """An in-process retry that reuses the same StrategyState instance (see
-    own_orders_recorded) must not double-count seeded attempts on a second
-    _seed_prior_allocations call -- neither the dollar-seeded branch nor the
-    rejected-only (amount_usd<=0) branch, which buys_today() alone cannot
-    guard since it is never bumped for a ticker with no positive allocation.
-    """
+def test_bump_week_notional_only_touches_only_the_weekly_bucket():
+    """Codex review: "Include prior-week sibling spend in the afternoon
+    ledger". Earlier-weekday cross-stream spend must count against the
+    shared weekly cap without being attributed to any specific ticker's
+    same-day top-up reference (day_notional, buys_today, and
+    day_order_count must all stay untouched)."""
     state = StrategyState()
-    trading_day = date(2026, 6, 29)
-    prior = {
-        "AAPL": PriorSameDayAllocation(
-            ticker="AAPL", amount_usd=2.0, order_attempts=3,
-        ),
-        "EVR": PriorSameDayAllocation(
-            ticker="EVR", amount_usd=0.0, order_attempts=2,
-        ),
-    }
+    trading_day = date(2026, 6, 30)  # Tuesday
 
-    _seed_prior_allocations(
-        state, trading_day, True, prior, one_order_per_ticker_per_day=False,
-    )
-    _seed_prior_allocations(
-        state, trading_day, True, prior, one_order_per_ticker_per_day=False,
-    )
+    state.bump_week_notional_only(trading_day, 150.0)
 
-    assert state.day_order_count(trading_day) == 5
-    assert state.day_notional(trading_day) == pytest.approx(2.0)
+    assert state.week_notional(trading_day) == pytest.approx(150.0)
+    assert state.day_notional(trading_day) == 0.0
+    assert state.day_order_count(trading_day) == 0
+    assert state.buys_today("AAPL", trading_day) == 0
+
+    # Additive across multiple calls (e.g. two earlier weekdays scanned
+    # separately), not a last-write-wins overwrite.
+    state.bump_week_notional_only(trading_day, 25.0)
+    assert state.week_notional(trading_day) == pytest.approx(175.0)
+
+
+def test_force_week_notional_to_worst_case_ceiling_fails_closed():
+    """Codex review: "Include prior-week sibling spend in the afternoon
+    ledger". An earlier-weekday scan that could not verify every artifact
+    it found must not let the run place against an unproven, possibly
+    understated weekly total -- force the bucket to the worst-case (Stress)
+    tier's ceiling, matching morning_dca.py's own fail-closed policy for
+    the same failure mode."""
+    state = StrategyState()
+    trading_day = date(2026, 6, 30)
+    worst_case_cap = max(tier.weekly_cap_usd for tier in BUDGET_TIERS)
+
+    state.force_week_notional_to_worst_case_ceiling(trading_day)
+
+    assert state.week_notional(trading_day) == worst_case_cap
+
+    # A direct max(), not additive: calling it again (e.g. a second failed
+    # scan) must not inflate the bucket past the ceiling.
+    state.force_week_notional_to_worst_case_ceiling(trading_day)
+    assert state.week_notional(trading_day) == worst_case_cap
+
+    # And it must never LOWER an already-larger real total.
+    state2 = StrategyState()
+    state2.bump_week_notional_only(trading_day, worst_case_cap + 500.0)
+    state2.force_week_notional_to_worst_case_ceiling(trading_day)
+    assert state2.week_notional(trading_day) == pytest.approx(worst_case_cap + 500.0)
+
+
+def test_reconcile_earlier_week_cross_stream_notional_does_not_double_count_own_history():
+    """Codex review: "Reconcile earlier-week spend instead of adding it".
+    This StrategyState is persistent across invocations -- an earlier day's
+    OWN record_buy() calls already updated submitted_notional_by_week for
+    that week. run_dca._compute_earlier_week_cross_stream_notional's total
+    is re-derived from on-disk artifacts on EVERY invocation (it includes
+    this stream's own earlier-day spend, since its all_roots includes the
+    afternoon root) and does not shrink, so reconciling it must not simply
+    add it on top of spend this state already knows about from when it
+    actually happened."""
+    state = StrategyState()
+    trading_day = date(2026, 6, 30)  # Tuesday
+    # Monday's own record_buy already put $100 into this week's bucket --
+    # exactly the kind of spend a fresh cross-stream scan would re-discover.
+    state.record_buy("AAPL", date(2026, 6, 29), 100.0)
+
+    # A scan re-derived from artifacts (Monday's own $100 -- already in the
+    # bucket above -- plus $50 of genuine cross-stream sibling spend) reports
+    # $150 total. Only the genuinely NEW $50 sibling portion must be added on
+    # top of the $100 already present, landing on $150, not $250.
+    state.reconcile_earlier_week_cross_stream_notional(trading_day, 150.0)
+    assert state.week_notional(trading_day) == pytest.approx(150.0)
+
+    # A later invocation this SAME week re-derives the SAME $150 total
+    # (nothing new happened) -- must be a no-op, not another +$150.
+    state.reconcile_earlier_week_cross_stream_notional(trading_day, 150.0)
+    assert state.week_notional(trading_day) == pytest.approx(150.0)
+
+    # A genuinely NEW cross-stream fill raises the re-derived total to
+    # $180 -- only the $30 delta should be added.
+    state.reconcile_earlier_week_cross_stream_notional(trading_day, 180.0)
+    assert state.week_notional(trading_day) == pytest.approx(180.0)
+
+
+def test_reconcile_earlier_week_cross_stream_notional_preserves_same_day_spend_layered_after_it():
+    """A same-day retry that already recorded some of TODAY's own spend (via
+    record_buy, layered on top of the last reconciliation) must keep that
+    spend when a later reconcile call folds in a newly-discovered earlier-
+    week sibling fill -- a bare max(current, total_usd) would silently drop
+    it, since total_usd only ever covers EARLIER days, never today."""
+    state = StrategyState()
+    trading_day = date(2026, 6, 30)  # Tuesday
+    state.record_buy("AAPL", date(2026, 6, 29), 100.0)  # Monday's own spend
+
+    # First reconciliation this week: Monday's own $100 plus $50 sibling.
+    state.reconcile_earlier_week_cross_stream_notional(trading_day, 150.0)
+    assert state.week_notional(trading_day) == pytest.approx(150.0)
+
+    # Today's own $20 buy lands on top (a normal part of today's run).
+    state.record_buy("MSFT", trading_day, 20.0)
+    assert state.week_notional(trading_day) == pytest.approx(170.0)
+
+    # A retry re-scans and discovers a NEW $30 Monday sibling fill that
+    # wasn't visible before -- total_usd rises to $180. Reconciling this
+    # must add only the new $30 on top of the current $170 (which includes
+    # today's own $20), landing on $200 -- not silently drop today's $20 by
+    # taking max($170, $180) == $180.
+    state.reconcile_earlier_week_cross_stream_notional(trading_day, 180.0)
+    assert state.week_notional(trading_day) == pytest.approx(200.0)
+
+
+def test_reconcile_earlier_week_cross_stream_notional_clears_prior_poisoning():
+    """A transient earlier-week scan failure poisons the bucket to the
+    worst-case ceiling; once a LATER invocation's scan succeeds, reconciling
+    the real total must replace the synthetic ceiling, not add on top of
+    it."""
+    state = StrategyState()
+    trading_day = date(2026, 6, 30)
+    worst_case_cap = max(tier.weekly_cap_usd for tier in BUDGET_TIERS)
+
+    state.force_week_notional_to_worst_case_ceiling(trading_day)
+    assert state.week_notional(trading_day) == worst_case_cap
+
+    # The scan recovers with a real, modest $75 total.
+    state.reconcile_earlier_week_cross_stream_notional(trading_day, 75.0)
+    assert state.week_notional(trading_day) == pytest.approx(75.0)
+
+
+def test_reconcile_earlier_week_cross_stream_notional_excludes_same_day_seed_from_baseline():
+    """Codex review: "Exclude today's allocations from the prior-week
+    baseline". _run_once_impl snapshots week_notional() BEFORE calling
+    _seed_prior_allocations (which folds TODAY's own same-day cross-stream
+    context into the very same weekly bucket) and passes that snapshot as
+    pre_same_day_seed_week_notional. Without it, the first reconciliation
+    this week would mistake today's own just-seeded same-day spend for
+    already-accounted earlier-week spend, silently dropping the real
+    earlier-week delta."""
+    state = StrategyState()
+    trading_day = date(2026, 6, 30)  # Tuesday
+
+    # Nothing earlier this week yet -- the snapshot taken before today's own
+    # same-day seeding runs is $0.
+    pre_same_day_seed_week_notional = state.week_notional(trading_day)
+    assert pre_same_day_seed_week_notional == pytest.approx(0.0)
+
+    # Today's own same-day cross-stream context gets seeded first (as
+    # _run_once_impl does), landing $40 in the shared weekly bucket.
+    state.reconcile_prior_allocation("AAPL", trading_day, amount_usd=40.0, attempt_count=1)
+    assert state.week_notional(trading_day) == pytest.approx(40.0)
+
+    # A fresh earlier-week cross-stream scan reports $30 of genuine Monday
+    # sibling spend. Reconciling against the correct pre-seed baseline ($0)
+    # must add the full $30 on top of today's $40, landing on $70 -- not
+    # mistake today's own $40 same-day seed for already-accounted earlier-
+    # week spend and silently drop the $30 delta.
+    state.reconcile_earlier_week_cross_stream_notional(
+        trading_day, 30.0, pre_same_day_seed_week_notional=pre_same_day_seed_week_notional
+    )
+    assert state.week_notional(trading_day) == pytest.approx(70.0)
+
+
+def test_reconcile_earlier_week_cross_stream_notional_persists_baseline_on_exact_match():
+    """Codex review: "Persist an unchanged earlier-week reconciliation
+    baseline". A first-ever reconciliation this ISO week can exactly match
+    its pre_same_day_seed_week_notional baseline -- incremental computes to
+    zero. The old code only recorded earlier_week_cross_stream_seeded_usd
+    inside the `incremental > 0` branch, so that exact match left the key
+    unset. A LATER retry then re-entered the "first reconciliation this
+    week" branch again and re-baselined against a snapshot that had since
+    grown from today's own same-day spend, silently under-crediting the
+    real earlier-week delta discovered by the retry."""
+    state = StrategyState()
+    monday = date(2026, 6, 29)
+    tuesday = date(2026, 6, 30)
+
+    # Monday's own spend, already in the durable weekly bucket.
+    state.record_buy("MSFT", monday, 100.0)
+    assert state.week_notional(tuesday) == pytest.approx(100.0)
+
+    # First reconciliation this week exactly matches the existing bucket --
+    # incremental is zero, but the baseline must still be persisted.
+    pre_same_day_seed_week_notional = state.week_notional(tuesday)
+    state.reconcile_earlier_week_cross_stream_notional(
+        tuesday, 100.0, pre_same_day_seed_week_notional=pre_same_day_seed_week_notional
+    )
+    assert state.week_notional(tuesday) == pytest.approx(100.0)
+
+    # Tuesday's own $10 order lands on top (a normal part of today's run).
+    state.record_buy("IBM", tuesday, 10.0)
+    assert state.week_notional(tuesday) == pytest.approx(110.0)
+
+    # A retry discovers $50 of genuine NEW Monday sibling spend the first
+    # scan missed (total_usd rises from $100 to $150). Reconciling against
+    # the correctly persisted $100 baseline must add the full $50 on top of
+    # the current $110, landing on $160 -- not re-baseline against the
+    # current (Tuesday-inflated) bucket and silently drop $10 of it.
+    state.reconcile_earlier_week_cross_stream_notional(
+        tuesday, 150.0, pre_same_day_seed_week_notional=state.week_notional(tuesday)
+    )
+    assert state.week_notional(tuesday) == pytest.approx(160.0)

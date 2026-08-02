@@ -21,15 +21,14 @@ scheduled live task (cron ``10ce362c``, which supersedes the deleted
 The morning stream has two modes (see :data:`MORNING_PROFILES`):
 
     - ``watchlist`` (9:45 AM ET, ``bb4f6ef1``): a READ-ONLY early-warning
-      watchlist scan. Analytics only,
-      ``trades=false``. It may surface early candidates but every dollar
-      figure is HYPOTHETICAL / watchlist-only. It writes under
-      ``.../cron_tracking/morning_dca_watchlist/YYYYMMDD_0945ET/``
+      watchlist scan. Analytics only, ``trades=false``. It may surface early
+      candidates but every dollar figure is HYPOTHETICAL / watchlist-only. It
+      writes under ``.../cron_tracking/morning_dca_watchlist/YYYYMMDD_0945ET/``
       with ``run_type='morning_dca_watchlist_scan'`` and
       ``state_schema_version='morning-watchlist-v1'``.
     - ``live`` (10:30 AM ET, ``42173154``): the approved live Robinhood morning
-      execution, evaluating a true 60-minute trend window (9:30-10:30).
-      ``trades=true``. It writes under
+      execution, moved from 9:45 to 10:30 so it evaluates a true 60-minute
+      trend window (9:30-10:30). ``trades=true``. It writes under
       ``.../cron_tracking/morning_dca/YYYYMMDD_1030ET/`` with
       ``run_type='morning_dca_live'``, ``scheduled_for_et='10:30'``,
       ``run_id='morning_live_YYYYMMDD_1030ET'`` and
@@ -146,6 +145,9 @@ from scripts.scheduled_artifacts import (
     build_run_summary,
     submitted_order_rows,
     write_submitted_orders_csv,
+)
+from scripts.scheduled_artifacts import (
+    csv_qualifying_notional_total as _csv_qualifying_notional_total,
 )
 
 _log = logging.getLogger(__name__)
@@ -386,10 +388,66 @@ def _model_usage_routing_overrides(config: Any) -> Dict[str, Any]:
     return {k: v for k, v in overrides.items() if v is not None}
 
 
-# Morning budget caps. The morning stream owns these; they are intentionally not
-# the afternoon BUDGET_TIERS caps so morning activity is budgeted independently.
-DEFAULT_MORNING_DAILY_CAP_USD = 90.0
-DEFAULT_MORNING_WEEKLY_CAP_USD = 450.0
+# Morning budget caps. These are the SAME shared Normal-tier ceiling every live
+# stream draws from (near_close_dca.BUDGET_TIERS[0] = 180.0/900.0, mirrored in
+# config/budgets.json and config/morning_dca.json's budget_ledger block) -- not
+# an isolated per-stream half-share. Raised from the old 90.0/450.0 halves
+# 2026-08-02 (Geoff: "caps aren't pooled the way the target design intends --
+# fix it"); see MorningConfig.cap_seed_roots and default_cap_seed_roots() for
+# how cross-stream spend is folded in so this shared ceiling is actually
+# checked against the whole day's/week's spend, not just this stream's own.
+# This does NOT add this stream's own dynamic Elevated/High-volatility/Stress
+# escalation -- only the 3:30 final run (near_close_dca.select_budget_tier)
+# escalates past Normal, from its fuller same-day view; every earlier stream
+# conservatively shares the flat Normal floor, which can only ever be MORE
+# restrictive than the true escalated-day ceiling, never less.
+DEFAULT_MORNING_DAILY_CAP_USD = 180.0
+DEFAULT_MORNING_WEEKLY_CAP_USD = 900.0
+
+
+def default_pooled_cap_seed_roots() -> tuple[str, ...]:
+    """Every known live stream's root, for the shared budget cap ledger.
+
+    Used as ``MorningConfig.cap_seed_roots``'s default_factory (2026-08-02
+    pooling fix). Before this, the field's bare default was ``None`` -- no
+    cap seeding at all -- while DEFAULT_MORNING_DAILY_CAP_USD/
+    DEFAULT_MIDDAY_DAILY_CAP_USD were raised from an isolated $90/$450
+    half-share to the full shared $180/$900 ceiling. A config that fails to
+    load (``load_morning_config``'s / ``load_midday_config``'s "file missing
+    or unparseable" fallback) or a caller that constructs ``MorningConfig``/
+    ``MiddayConfig`` directly without setting ``cap_seed_roots`` would
+    otherwise silently grant that run the FULL $180/$900 ceiling with zero
+    cross-stream visibility -- MORE exposure than the old isolated defaults
+    ever allowed, not less (Codex review: "Seed cross-stream roots for
+    default pooled-cap configs"). Distinct from :func:`default_cap_seed_roots`
+    below, which is a differently-scoped fallback for
+    ``prior_allocation_roots``, not this field.
+
+    Defined ahead of :class:`MorningConfig` (unlike the other default-root
+    helpers further down this module) specifically so it can be used as that
+    class's own field default_factory -- a dataclass field's default_factory
+    must already be a bound name when the class body executes.
+
+    Resolved at CALL time (not import time) via :func:`stream_root`, so a
+    ``$DCA_CRON_TRACKING_ROOT`` set between import and construction is
+    honored, matching every other default-root helper in this module.
+    """
+    return (
+        stream_root("market_open_dca"),
+        stream_root("morning_dca"),
+        stream_root("midday_dca"),
+        stream_root("intraday_dca"),
+        stream_root("ce16ba6b"),
+        # Out-of-tree manual final-buy override root (Codex review: "Include
+        # out-of-tree manual fills in pooled roots"): scripts/run_classification.py
+        # explicitly treats final_manual_review/** as same-day allocation context
+        # (see _ROOTS_NEVER_REACHED_BY_CORE_LOADER), and real budget-block-override
+        # fills live here (config/scheduled_tasks.json's jul17_manual_budget_block_
+        # overrides). Without it, a manual override that filled budget-blocked
+        # signals after a scheduled run is invisible to a later stream's shared
+        # weekly ledger.
+        stream_root("final_manual_review"),
+    )
 
 
 @dataclass(frozen=True)
@@ -486,12 +544,19 @@ class MorningConfig:
     # Override via artifact_paths.prior_allocation_roots in morning_dca.json;
     # an explicit [] is preserved as () to honour the opt-out intent.
     prior_allocation_roots: Optional[Tuple[str, ...]] = None
-    # Roots used ONLY for seeding the morning daily/weekly cap ledger with prior
-    # same-day spend. Must contain ONLY morning-stream roots (e.g.
-    # morning_dca/manual_runs); never afternoon roots like ce16ba6b, which would
-    # incorrectly exhaust the morning cap. When None, no cap seeding is performed
-    # (the full daily cap remains available). Set via artifact_paths.cap_seed_roots.
-    cap_seed_roots: Optional[Tuple[str, ...]] = None
+    # Roots seeded into the shared daily/weekly cap ledger with prior same-day/
+    # week spend (2026-08-02 pooling fix: every sibling live stream's root, not
+    # just this one -- see default_pooled_cap_seed_roots). OMITTING this kwarg
+    # gets the default_factory (every known stream root) so a config that
+    # fails to load, or a caller that constructs MorningConfig/MiddayConfig
+    # directly, still gets cross-stream cap visibility instead of an isolated
+    # full ceiling with zero seeding (Codex review: "Seed cross-stream roots
+    # for default pooled-cap configs"). Explicitly passing () or None fully
+    # disables cap seeding either way (both falsy to the `if cap_seed_roots:`
+    # checks that consume this) -- e.g. for an isolated replay/staging config.
+    # Override via artifact_paths.cap_seed_roots in morning_dca.json/
+    # midday_dca.json.
+    cap_seed_roots: Tuple[str, ...] = field(default_factory=default_pooled_cap_seed_roots)
     # Minimum number of completed intraday bars over the trend window required to
     # validate the intraday trend in live mode. When fewer are available a
     # qualifying candidate is flagged manual_review_candidate rather than bought.
@@ -1090,7 +1155,11 @@ def load_morning_config(
         # the guard (None = not set = use default afternoon root at runtime).
         kwargs["prior_allocation_roots"] = tuple(str(r) for r in prior_roots)
     cap_roots = artifact_paths.get("cap_seed_roots")
-    if isinstance(cap_roots, list) and cap_roots:
+    if isinstance(cap_roots, list):
+        # Preserve an explicit [] as () so it fully disables cap seeding
+        # rather than falling through to MorningConfig's default_factory
+        # (every sibling stream root) -- consistent with how
+        # prior_allocation_roots treats an explicit empty array above.
         kwargs["cap_seed_roots"] = tuple(str(r) for r in cap_roots)
     # model_usage_log_root (see scripts/model_usage_log.py, config/scheduled_tasks.json
     # -> model_usage_log): defaults to stream_root("model_usage"), resolved when
@@ -1125,7 +1194,7 @@ def load_morning_config(
 def load_same_day_preflight(
     preflight_root: str, trading_day: date, *, bounded_recovery: bool = True
 ) -> Optional[Dict[str, Any]]:
-    """Load the same-day 9:45 AM ET pre-flight artifact for the 10:30 live task.
+    """Load the same-day 9:45 pre-flight artifact for the 10:30 live gate.
 
     Returns a dict ``{"run_id", "eligible_tickers": set[str], "run_state_path",
     "recovered_via_bounded_lookup"}`` when a same-day pre-flight
@@ -1207,6 +1276,13 @@ def load_same_day_preflight(
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(state, dict):
+        # Valid JSON whose root is a list, scalar, or null (e.g. after a
+        # partial recovery) has no .get() method; treat it the same as "no
+        # pre-flight found" instead of raising, so the 10:30 live gate still
+        # degrades to the full universe with a warning rather than crashing
+        # (Codex review: "Treat non-object preflight JSON as unavailable").
         return None
     if state.get("overall_ok") is False:
         return None
@@ -1500,22 +1576,18 @@ def morning_preflight_eligible_tickers(
     preflight_bounded_recovery: bool = True,
     manual: bool = False,
 ) -> tuple[List[str], Dict[str, Any]]:
-    """Narrow ``tickers`` using the same-day 9:45 pre-flight verdict, when available.
+    """Restrict ``tickers`` to the same-day 9:45 pre-flight verdict.
 
     Shared by :meth:`MorningDCAExecutor._apply_preflight_gate` (which
     additionally no-ops outside morning-live-mode) and the seven-slot roster's
     ``run_dca.run_slot("1030ET", ...)``, so config/morning_dca.json's
-    fail-closed contract -- a missing or invalid pre-flight artifact reduces
-    the eligible universe to ZERO, not to the full configured universe -- is
-    enforced exactly once no matter which caller reaches the 10:30 slot
-    (Codex review: "Route the morning slot through its required preflight
-    gate"). That fail-closed rule is about the artifact itself being
-    missing/invalid/misconfigured, NOT about what it says: a VALID preflight
-    that legitimately admits no ticker is advisory context, not a block, and
-    degrades to the full universe with a warning the same way a missing
-    artifact does for a manual run (Codex review: "Fall back when the valid
-    preflight admits no tickers") -- see the empty-``eligible_tickers``
-    branch below.
+    NON-BLOCKING contract (2026-08-02) -- a missing, invalid, or valid-but-
+    empty pre-flight artifact degrades to the FULL configured universe with a
+    warning, never a hard block -- is enforced exactly once no matter which
+    caller reaches the 10:30 slot (Codex review: "Route the morning slot
+    through its required preflight gate", originally about a fail-closed
+    contract this function no longer implements; superseded 2026-08-02 by
+    Geoff's "should not block any later runs" direction).
 
     Returns ``(admitted_tickers, gate_diagnostic)``: the same
     ``preflight_gate``-shaped dict :class:`MorningDCAExecutor` stores on
@@ -1528,56 +1600,48 @@ def morning_preflight_eligible_tickers(
     forbidden_roots = preflight_forbidden_roots or default_preflight_forbidden_roots()
     forbidden_reason = _forbidden_preflight_root_reason(root, forbidden_roots)
     if forbidden_reason is not None:
-        # must_not_look_under: treat a misconfigured root the same as
-        # "artifact not found" -- fail closed for scheduled runs -- rather
-        # than silently reading from (or failing to find data in) the
-        # 10:30 live output directory or a bare cron-id path.
-        if not manual:
-            return [], {
-                "preflight_found": False,
-                "preflight_missing_block": True,
-                "block_reason": forbidden_reason,
-            }
+        # NON-BLOCKING (Geoff, 2026-08-02: "should not block any later runs"):
+        # a misconfigured root used to fail SCHEDULED runs closed to zero
+        # tickers (preflight_missing_block=True); it now degrades to the full
+        # configured universe with a warning for scheduled and manual runs
+        # alike, exactly like a missing artifact below. The 9:45 pre-flight
+        # remains a coarse pre-screen only, never a hard gate the 10:30 slot
+        # depends on to run at all -- see the 9:45 scan's own note in
+        # config/morning_dca.json for why this is an acceptable trade (a
+        # missing/misconfigured pre-flight just means the 10:30 slot
+        # re-evaluates the whole universe itself instead of a pre-screened
+        # subset; every other safeguard at 10:30 is unaffected).
         return list(tickers), {"preflight_found": False, "warning": forbidden_reason}
     loaded = load_same_day_preflight(root, trading_day, bounded_recovery=preflight_bounded_recovery)
     if loaded is None:
-        if not manual:
-            # Fail closed but return a durable-shaped diagnostic so watchdog and
-            # reporting can distinguish a missing-preflight block from a crash.
-            return [], {
-                "preflight_found": False,
-                "preflight_missing_block": True,
-                "block_reason": (
-                    "no same-day 9:45 pre-flight artifact found; "
-                    "scheduled live run blocked (fail-closed)"
-                ),
-            }
+        # NON-BLOCKING (see the note above): a missing or unparseable same-day
+        # pre-flight artifact degrades to the full configured universe with a
+        # warning for scheduled and manual runs alike. Previously a scheduled
+        # run failed closed to zero tickers here; the 10:30 slot's own signal/
+        # budget/spread/trend/top-up checks are the real safety gates and are
+        # unaffected by this -- only the coarse pre-screen is skipped.
         return list(tickers), {
             "preflight_found": False,
             "warning": "no same-day 9:45 pre-flight artifact found; evaluating full universe",
         }
     eligible = loaded["eligible_tickers"]
     if not eligible:
-        # A VALID preflight (overall_ok=true) can legitimately admit no
-        # ticker -- e.g. nothing was below its prior close at 09:45 -- and
-        # that is a different claim than "block everything". Narrowing to
-        # admitted=[] here would let an advisory-only gate reduce a run to
-        # zero exactly the way a missing/invalid artifact is barred from
-        # doing, missing any ticker that declined AFTER the pre-flight ran
-        # (Codex review: "Fall back when the valid preflight admits no
-        # tickers"). Degrade to the full universe with a warning, the same
-        # shape as the missing-artifact fallback below, rather than trusting
-        # an empty eligible set as a real narrowing.
+        # NON-BLOCKING (see the notes above): a VALID preflight that found
+        # zero eligible tickers is exactly as coarse/stale-by-10:30 as a
+        # missing one -- treating it as authoritative would make a quiet
+        # preflight MORE restrictive than a missing one (which already
+        # degrades to the full universe), contradicting the "coarse
+        # pre-screen only, never a hard gate" policy this function
+        # implements everywhere else (Codex review: "Keep valid empty
+        # preflights non-blocking"). Degrade the same way: full universe,
+        # with a warning, letting the 10:30 slot's own signal/budget/spread/
+        # trend/top-up checks be the real safety gates as usual.
         return list(tickers), {
             "preflight_found": True,
             "preflight_run_id": loaded["run_id"],
             "eligible_to_execute_tickers": [],
-            "warning": (
-                "same-day 9:45 pre-flight admitted no tickers; evaluating "
-                "full universe rather than treating an empty advisory gate "
-                "as a block"
-            ),
             "recovered_via_bounded_lookup": loaded.get("recovered_via_bounded_lookup", False),
+            "warning": "same-day 9:45 pre-flight found zero eligible tickers; evaluating full universe",
         }
     admitted = [t for t in tickers if t in eligible]
     gated_out = [t for t in tickers if t not in eligible]
@@ -1730,6 +1794,23 @@ class MorningDCAExecutor(DCAExecutor):
         # reflect it. Kept only so the reporting/budget fields below never
         # need a None-check.
         self._prior_daily_spend_seeded = 0.0
+        # True when a cross-stream cap artifact could not be read/parsed this
+        # run, in which case _compute_top_up forces remaining capacity to 0
+        # rather than place against understated headroom (Codex review:
+        # "Fail closed when cross-stream cap evidence is unreadable"). Reset
+        # at the top of every _compute_top_up call.
+        self._cap_seed_scan_incomplete = False
+        self._cap_seed_scan_incomplete_paths: List[str] = []
+        # Tracks the synthetic ceiling-topping amount the fail-closed branch of
+        # _compute_top_up's cap_seed_roots block injects directly into
+        # self.ledger.planned_by_day/planned_by_week, keyed by trading_day / iso
+        # week, so a LATER successful rescan on this same long-lived executor
+        # instance can subtract back out exactly what it injected -- rather than
+        # leaving the ledger permanently pinned at the cap ceiling once the
+        # transient read failure clears (Codex review: "Clear fail-closed cap
+        # poisoning after a recovered retry").
+        self._cap_seed_poison_day: Dict[date, float] = {}
+        self._cap_seed_poison_week: Dict[Tuple[int, int], float] = {}
 
     def _load_default_config(self, config_dir: Optional[str], mode: str) -> MorningConfig:
         """Load this executor's config when none is passed. Overridable per stream.
@@ -1774,6 +1855,8 @@ class MorningDCAExecutor(DCAExecutor):
         context) never erroneously reduce this stream's cap.
         """
         self._prior_daily_spend_seeded = 0.0
+        self._cap_seed_scan_incomplete = False
+        self._cap_seed_scan_incomplete_paths = []
         if self.mode != MORNING_LIVE_MODE:
             return {}
         raw_roots = getattr(self.config, "prior_allocation_roots", None)
@@ -1813,18 +1896,93 @@ class MorningDCAExecutor(DCAExecutor):
                 roots = list(dict.fromkeys(configured))
         trading_day = now.astimezone(EASTERN).date()
         boundary_et = now.astimezone(EASTERN).time()
-        # Seed the morning cap ledger for ALL live runs (scheduled and manual) so
-        # prior morning fills always reduce remaining_daily before _place_broker_orders.
-        # Use cap_seed_roots (morning-only roots) to avoid charging afternoon fills.
-        # Incremental seeding: repeated calls pick up new fills without double-counting.
-        # This runs even when prior_allocation_roots=[] disables the per-ticker guard.
-        if self.stream == MORNING_STREAM:
-            cap_roots = getattr(self.config, "cap_seed_roots", None)
-            if cap_roots:
-                seed_key = (frozenset(cap_roots), trading_day)
-                cap_allocations = load_prior_same_day_allocations_multi(
-                    cap_roots, trading_day, boundary_et=boundary_et
+        # Seed this stream's cap ledger for ALL live runs (scheduled and manual) so
+        # prior same-day/week fills always reduce remaining_daily/remaining_weekly
+        # before _place_broker_orders. Uses cap_seed_roots, which now (2026-08-02,
+        # see DEFAULT_MORNING_DAILY_CAP_USD's comment) spans every sibling stream's
+        # root so the shared $180/$900 ceiling reflects real cross-stream spend,
+        # not just this stream's own. Incremental seeding: repeated calls pick up
+        # new fills without double-counting. This runs even when
+        # prior_allocation_roots=[] disables the per-ticker guard.
+        # Previously gated to `self.stream == MORNING_STREAM` only -- the block
+        # below is entirely stream-agnostic (reads self.config/self.state_root/
+        # self.ledger generically) and midday's own MiddayConfig.cap_seed_roots
+        # (config/midday_dca.json, added 2026-08-02) was simply never reached
+        # because of that restriction, leaving midday's cap ledger with zero
+        # cross-stream visibility. Runs for any stream that has cap_seed_roots
+        # configured, not morning specifically.
+        cap_roots = getattr(self.config, "cap_seed_roots", None)
+        if cap_roots:
+            seed_key = (frozenset(cap_roots), trading_day)
+            cap_skip_sink: List[Path] = []
+            cap_allocations = load_prior_same_day_allocations_multi(
+                cap_roots,
+                trading_day,
+                boundary_et=boundary_et,
+                # Cap purposes want EVERY same-day contribution counted,
+                # including a same-day SCHEDULED afternoon run -- unlike the
+                # per-ticker top-up guard below (``roots``), which deliberately
+                # excludes it (the afternoon guard must never see another
+                # afternoon-scheduled run as prior context). Without this, a
+                # manual morning/midday invocation running after the 3:30
+                # final slot undercounts real same-day spend and could let
+                # the day exceed the shared $180 cap (Codex review: "Count
+                # scheduled afternoon fills in late manual runs").
+                include_scheduled_afternoon=True,
+                # FAIL CLOSED on unreadable cross-stream evidence rather than
+                # silently under-counting it (Codex review: "Fail closed when
+                # cross-stream cap evidence is unreadable").
+                skip_sink=cap_skip_sink,
+            )
+            this_week = iso_week_key(trading_day)
+            if cap_skip_sink:
+                # A sibling stream's cap artifact could not be read or parsed
+                # (partially written, malformed, a missing referenced CSV).
+                # new_total below would then understate real cross-stream
+                # spend, letting this run place against overstated headroom.
+                # Treat capacity as fully exhausted for this run instead --
+                # remaining_daily/remaining_weekly become 0 -- rather than
+                # place on an unproven, possibly-too-low figure.
+                self._cap_seed_scan_incomplete = True
+                self._cap_seed_scan_incomplete_paths = [str(p) for p in cap_skip_sink]
+                # Inject only the INCREMENTAL top-up needed to reach the
+                # ceiling (not a flat max() overwrite), and remember exactly
+                # how much was injected. A long-lived executor's next retry
+                # reuses this same self.ledger; once the transient failure
+                # clears, the success branch below subtracts this recorded
+                # delta back out before applying the real incremental spend,
+                # so the poisoning never outlives the scan that caused it.
+                day_poison_delta = max(
+                    0.0, self.ledger.daily_cap_usd - self.ledger.day_planned(trading_day)
                 )
+                if day_poison_delta > 0:
+                    self.ledger.planned_by_day[trading_day] = (
+                        self.ledger.day_planned(trading_day) + day_poison_delta
+                    )
+                    self._cap_seed_poison_day[trading_day] = (
+                        self._cap_seed_poison_day.get(trading_day, 0.0) + day_poison_delta
+                    )
+                week_poison_delta = max(
+                    0.0, self.ledger.weekly_cap_usd - self.ledger.week_planned(trading_day)
+                )
+                if week_poison_delta > 0:
+                    self.ledger.planned_by_week[this_week] = (
+                        self.ledger.week_planned(trading_day) + week_poison_delta
+                    )
+                    self._cap_seed_poison_week[this_week] = (
+                        self._cap_seed_poison_week.get(this_week, 0.0) + week_poison_delta
+                    )
+            else:
+                poisoned_day = self._cap_seed_poison_day.pop(trading_day, 0.0)
+                if poisoned_day > 0:
+                    self.ledger.planned_by_day[trading_day] = max(
+                        0.0, self.ledger.day_planned(trading_day) - poisoned_day
+                    )
+                poisoned_week = self._cap_seed_poison_week.pop(this_week, 0.0)
+                if poisoned_week > 0:
+                    self.ledger.planned_by_week[this_week] = max(
+                        0.0, self.ledger.week_planned(trading_day) - poisoned_week
+                    )
                 new_total = sum(
                     a.amount_usd
                     for a in cap_allocations.values()
@@ -2635,6 +2793,8 @@ class MorningDCAExecutor(DCAExecutor):
                 "remaining_weekly_usd": round(
                     max(0.0, self.ledger.remaining_weekly(trading_day) - self._prior_daily_spend_seeded), 2
                 ),
+                "cap_seed_scan_incomplete": self._cap_seed_scan_incomplete,
+                "cap_seed_scan_incomplete_paths": list(self._cap_seed_scan_incomplete_paths),
             },
             "counts": {
                 "evaluated": len(signals),
@@ -2673,13 +2833,9 @@ class MorningDCAExecutor(DCAExecutor):
             artifacts["manual_review_tickers"] = [c.ticker for c in manual_review]
             if self.preflight_gate is not None:
                 artifacts["preflight_gate"] = self.preflight_gate
-                if not self.preflight_gate.get("preflight_found") or self.preflight_gate.get("warning"):
+                if not self.preflight_gate.get("preflight_found"):
                     # The manual degrade-to-full-universe path sets "warning"; the
-                    # scheduled fail-closed block sets "block_reason" instead. A
-                    # VALID preflight that admitted no ticker also sets "warning"
-                    # (with preflight_found still True), so this must not be
-                    # gated on preflight_found alone or that fallback's warning
-                    # would silently never reach the artifact.
+                    # scheduled fail-closed block sets "block_reason" instead.
                     warnings.append(
                         self.preflight_gate.get("warning") or self.preflight_gate.get("block_reason")
                     )
@@ -3199,23 +3355,129 @@ class MorningDCAExecutor(DCAExecutor):
         # _compute_top_up's own_manual_in_scan/own_scheduled_in_scan split)
         # never sees the scheduled slot, so this method must remain the one
         # seeding it or a scheduled retry could re-spend the full cap.
-        _cap_seed_roots = (
-            getattr(self.config, "cap_seed_roots", None) if self.stream == MORNING_STREAM else None
-        )
+        # Not restricted to the morning stream (2026-08-02): _compute_top_up's
+        # cap_seed_roots block above is stream-agnostic and now runs for any
+        # stream with cap_seed_roots configured (midday included, since its
+        # own cap ledger became genuinely cross-stream-pooled too), so this
+        # double-count guard must recognize that for every such stream, not
+        # just morning.
+        _cap_seed_roots = getattr(self.config, "cap_seed_roots", None)
         _today_seeded_by_cap_roots = bool(_cap_seed_roots) and any(
             Path(self.state_root).is_relative_to(Path(r)) for r in _cap_seed_roots
         )
 
         scheduled_path = self.run_state_dir(now) / "run_state.json"
         candidate_paths: List[Tuple[Path, bool]] = []
+        # Paths whose read/parse failure must fail closed (Codex review:
+        # "Fail closed on unreadable prior-week cap artifacts"), tracked
+        # separately from same-day/own-stream candidate_paths so a read/parse
+        # failure on ONE of these specifically can fail closed without also
+        # tripping on TODAY's own-stream miss, which has its own, separate
+        # handling elsewhere (_compute_top_up's skip_sink). Despite the name,
+        # this covers every EARLIER-weekday candidate discovered below,
+        # including THIS stream's own fixed scheduled path for an earlier
+        # day -- not just the cross-stream sibling-root scan further down.
+        # An earlier fix only added cross-stream sibling paths here, missing
+        # that the day-loop immediately below ALSO discovers this stream's
+        # OWN earlier-weekday fixed paths (e.g. Monday's own run_state.json,
+        # scanned again on Tuesday); an unreadable one of those silently
+        # skipped without setting _cap_seed_scan_incomplete, since neither
+        # this set nor _compute_top_up (which only ever covers TODAY) caught
+        # it, letting Monday's own spend vanish from the weekly ledger
+        # (Codex review: "Fail closed on unreadable own-stream prior-week
+        # states").
+        _earlier_weekday_sibling_paths: set = set()
         week_start = trading_day - timedelta(days=trading_day.weekday())
         day = week_start
         while day <= trading_day:
             path = state_root / f"{day.strftime('%Y%m%d')}_{folder_suffix}" / "run_state.json"
             if path.exists():
-                candidate_paths.append((path, path == scheduled_path))
+                is_scheduled_today = path == scheduled_path
+                candidate_paths.append((path, is_scheduled_today))
+                if not is_scheduled_today:
+                    _earlier_weekday_sibling_paths.add(path)
             day += timedelta(days=1)
 
+        # Cross-stream EARLIER-WEEKDAY seeding (Codex review, 2026-08-02:
+        # "Include earlier weekdays in cross-stream cap seeding"). The loop
+        # above only scans THIS stream's own root. _compute_top_up's own
+        # cap_seed_roots block already covers every sibling stream for TODAY
+        # specifically, but never for earlier days in the ISO week -- so
+        # without this, a Tuesday midday run never saw Monday's market-open/
+        # morning spend against the shared weekly cap, understating real
+        # week-to-date spend. Glob each sibling root generically
+        # (YYYYMMDD_*ET) rather than assuming this stream's own
+        # folder_suffix, since every sibling stream uses its own slot-time
+        # suffix (per-slot state-file guarantee, docs/safeguards.md).
+        # Deliberately scoped to day < trading_day only: TODAY's cross-stream
+        # seeding stays exclusively _compute_top_up's job, which tracks it
+        # via a different dedup key (_cap_seeded_amounts) than this method's
+        # own _seeded_prior_run_ids -- scanning today here too would let the
+        # two independent dedup mechanisms double-count the same fill.
+        if _cap_seed_roots:
+            # Every known manual-subtree naming convention across EVERY
+            # cap_seed_roots entry, including the current stream's OWN root
+            # -- Codex review: "Scan nested manual runs when seeding prior
+            # weekdays" and, in a later pass, "Include the current stream's
+            # nested manual artifacts": the separate own-stream day-loop
+            # above only checks the fixed scheduled-slot path (plus, for
+            # morning specifically, manual_runs/ but only for TODAY via
+            # scan_manual_reruns_for_ledger) -- so an EARLIER-weekday manual
+            # recovery/rerun under the current stream's own root (e.g. a
+            # morning manual_recovery/ backfill, or any midday
+            # manual_reruns/manual_recovery from a prior weekday) was
+            # invisible to the weekly ledger. Each manual subdirectory nests
+            # its dated run folders the same way the scheduled root does
+            # (e.g. midday_dca/manual_runs/20260721_1345ET/run_state.json),
+            # so the same day_str + "_*ET" glob pattern applies one level
+            # deeper.
+            manual_subdirs = ("manual_runs", "manual_reruns", "manual_recovery")
+            # The afternoon stream (near_close_dca / ce16ba6b) nests its
+            # SCHEDULED artifacts one level deeper than every other stream --
+            # config/run_classification.json's scheduled_run_dir is
+            # ce16ba6b/scheduled_runs/YYYYMMDD_1530ET/run_state.json, not a
+            # bare ce16ba6b/YYYYMMDD_1530ET/ -- so the bare-root glob below
+            # never finds afternoon's own scheduled runs at all (Codex
+            # review: "Scan prior-week afternoon scheduled runs"). Harmless
+            # no-op for every other stream, whose roots have no
+            # scheduled_runs/ subdirectory.
+            all_cap_roots = [Path(r) for r in _cap_seed_roots]
+            earlier_day = week_start
+            while earlier_day < trading_day:
+                day_str = earlier_day.strftime("%Y%m%d")
+                for cap_root in all_cap_roots:
+                    if not cap_root.exists():
+                        continue
+                    is_own_root = cap_root.resolve() == state_root.resolve()
+                    # The bare root itself is only scanned for SIBLING roots:
+                    # the current stream's own fixed scheduled-slot path for
+                    # earlier weekdays is already covered by the day-loop
+                    # above this block, and re-scanning it here would just
+                    # rediscover (harmlessly deduped) the same path -- but
+                    # afternoon's scheduled_runs/ subdirectory below is a
+                    # genuinely different location even for the current
+                    # stream, so it is NOT skipped.
+                    search_dirs = list(manual_subdirs) + ["scheduled_runs"]
+                    if not is_own_root:
+                        search_dirs = [""] + search_dirs
+                    for subdir in search_dirs:
+                        search_dir = cap_root / subdir if subdir else cap_root
+                        if not search_dir.exists():
+                            continue
+                        # Wildcard-prefixed day match (not anchored to the
+                        # start of the directory name): final_manual_review's
+                        # own dated dirs are named
+                        # budget_block_override_YYYYMMDD_HHMMET, not a bare
+                        # YYYYMMDD_*ET (Codex review: "Include out-of-tree
+                        # manual fills in pooled roots"). Harmless superset
+                        # for every other root, whose dated dirs already
+                        # start with YYYYMMDD and match either way.
+                        for path in sorted(search_dir.glob(f"*{day_str}_*ET/run_state.json")):
+                            if path in _earlier_weekday_sibling_paths:
+                                continue
+                            candidate_paths.append((path, False))
+                            _earlier_weekday_sibling_paths.add(path)
+                earlier_day += timedelta(days=1)
         # Cache parsed manual-run states to avoid re-reading files in the main loop.
         _manual_state_cache: Dict[Path, Dict[str, Any]] = {}
         if self.scan_manual_reruns_for_ledger:
@@ -3238,12 +3500,27 @@ class MorningDCAExecutor(DCAExecutor):
                 try:
                     state = json.loads(path.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                    # An unreadable/mid-write artifact from the earlier-weekday
+                    # sibling scan is exactly as unverifiable as a same-day
+                    # skip_sink miss -- fail closed rather than silently
+                    # undercounting this week's shared spend (Codex review:
+                    # "Fail closed on unreadable prior-week cap artifacts").
+                    # A same-day/own-stream miss is NOT included here: that
+                    # case is already covered by _compute_top_up's own
+                    # skip_sink/fail-closed handling and flagging it again
+                    # here would be redundant, not more correct.
+                    if path in _earlier_weekday_sibling_paths:
+                        self._cap_seed_scan_incomplete = True
+                        self._cap_seed_scan_incomplete_paths.append(str(path))
                     continue
             # A valid JSON document whose root is a list, string, or other
             # non-object value (e.g. a partially recovered artifact) has no
             # .get() -- skip it rather than raising AttributeError and
             # crashing the retry before it can reach the fail-closed path.
             if not isinstance(state, dict):
+                if path in _earlier_weekday_sibling_paths:
+                    self._cap_seed_scan_incomplete = True
+                    self._cap_seed_scan_incomplete_paths.append(str(path))
                 continue
             file_trading_day_str = state.get("trading_day")
             try:
@@ -3252,7 +3529,21 @@ class MorningDCAExecutor(DCAExecutor):
                 )
             except (TypeError, ValueError):
                 file_trading_day = None
-            if file_trading_day is None or file_trading_day > trading_day:
+            if file_trading_day is None:
+                # Missing or unparseable trading_day on an otherwise-valid
+                # JSON object is invalid required metadata, not a legitimate
+                # out-of-scope artifact -- fail closed for an earlier-weekday
+                # sibling path the same way a non-object root already does
+                # (Codex review: "Fail closed when prior-week state metadata
+                # is invalid"). A future-dated or different-week artifact
+                # (checked below) is NOT this case: its metadata is valid, it
+                # is simply out of this scan's scope, so it stays an ordinary
+                # skip.
+                if path in _earlier_weekday_sibling_paths:
+                    self._cap_seed_scan_incomplete = True
+                    self._cap_seed_scan_incomplete_paths.append(str(path))
+                continue
+            if file_trading_day > trading_day:
                 continue
             if iso_week_key(file_trading_day) != this_week:
                 continue
@@ -3266,6 +3557,13 @@ class MorningDCAExecutor(DCAExecutor):
                 continue
             run_id = state.get("run_id")
             if run_id is None:
+                # Same reasoning as the missing-trading_day case above: a
+                # valid JSON object with no run_id has invalid required
+                # metadata, not merely nothing-to-seed-from (Codex review:
+                # "Fail closed when prior-week state metadata is invalid").
+                if path in _earlier_weekday_sibling_paths:
+                    self._cap_seed_scan_incomplete = True
+                    self._cap_seed_scan_incomplete_paths.append(str(path))
                 continue
             already_seeded = run_id in self._seeded_prior_run_ids
             if already_seeded:
@@ -3325,29 +3623,116 @@ class MorningDCAExecutor(DCAExecutor):
             # rather than treating the two files as mutually exclusive.
             filled_orders_csv = path.parent / "filled_orders.csv"
             orders_csv = path.parent / "orders.csv"
-            csv_total = _csv_qualifying_notional_total(filled_orders_csv, blank_status_means_filled=True)
+            # submitted_orders.csv is the CANONICAL evidence source for the
+            # market-open/intraday streams, which have no in-repo Python code
+            # writing buy_candidates/filled_orders.csv/orders.csv -- their
+            # Claude-executor prompts write only run_state.json (via Gate 9)
+            # and submitted_orders.csv (via Gate 6.5-style bookkeeping). Without
+            # this, a valid earlier-weekday market-open/intraday run whose
+            # evidence exists ONLY in submitted_orders.csv contributed $0 to
+            # this week's shared ledger (Codex review: "Read canonical
+            # submitted-order files for prior weekdays").
+            submitted_orders_csv = path.parent / "submitted_orders.csv"
+            # For an earlier-weekday sibling path, a CSV that EXISTS but
+            # cannot be read/parsed must fail closed rather than silently
+            # read as "no orders in this file" -- Codex review: "Fail closed
+            # when prior-week order CSVs cannot be parsed". Scoped to
+            # earlier-weekday sibling paths only, matching this method's
+            # other fail-closed handling; today's own-stream scan has its
+            # own separate skip_sink handling in _compute_top_up.
+            _csv_skip_sink: Optional[List[Path]] = (
+                [] if path in _earlier_weekday_sibling_paths else None
+            )
+            csv_total = _csv_qualifying_notional_total(
+                filled_orders_csv, blank_status_means_filled=True, skip_sink=_csv_skip_sink
+            )
             if orders_csv.exists() and orders_csv != filled_orders_csv:
                 csv_total = max(
                     csv_total,
-                    _csv_qualifying_notional_total(orders_csv, blank_status_means_filled=False),
+                    _csv_qualifying_notional_total(
+                        orders_csv, blank_status_means_filled=False, skip_sink=_csv_skip_sink
+                    ),
                 )
+            if submitted_orders_csv.exists() and submitted_orders_csv not in (
+                filled_orders_csv,
+                orders_csv,
+            ):
+                csv_total = max(
+                    csv_total,
+                    _csv_qualifying_notional_total(
+                        submitted_orders_csv, blank_status_means_filled=False, skip_sink=_csv_skip_sink
+                    ),
+                )
+            if _csv_skip_sink:
+                self._cap_seed_scan_incomplete = True
+                self._cap_seed_scan_incomplete_paths.extend(str(p) for p in _csv_skip_sink)
             total = max(total, csv_total)
-            self._seeded_prior_run_ids.add(run_id)
-            if total > 0:
-                if file_trading_day == trading_day:
-                    # Only seed today's own bucket here when cap_seed_roots isn't
-                    # already doing it (see _today_seeded_by_cap_roots above) --
-                    # otherwise the same on-disk artifact would be double-counted.
-                    if not _today_seeded_by_cap_roots:
-                        self.ledger.record_hypothetical(trading_day, total)
-                else:
-                    # Cross-day-in-week seeding only bumps the shared weekly
-                    # bucket; the daily bucket stays scoped to trading_day.
-                    self.ledger.planned_by_week[this_week] = (
-                        self.ledger.planned_by_week.get(this_week, 0.0) + total
-                    )
+            # Only cache this run_id as seeded -- and only credit its total to
+            # the ledger -- when its OWN CSV scan this pass didn't fail. A run
+            # whose CSV was transiently malformed/mid-write must be rescanned
+            # on a later pass once it becomes readable: caching it here would
+            # make the already_seeded check above skip it forever, even after
+            # the file is repaired, permanently losing whatever spend exists
+            # only in that CSV (Codex review: "Do not cache prior runs whose
+            # CSV scan failed"). The overall week-level fail-closed poisoning
+            # below already accounts conservatively for this run's possible
+            # shortfall this pass; adding its partial total to the ledger now
+            # would also risk double-counting it once a later successful
+            # rescan adds the correct, complete total.
+            if not _csv_skip_sink:
+                self._seeded_prior_run_ids.add(run_id)
+                if total > 0:
+                    if file_trading_day == trading_day:
+                        # Only seed today's own bucket here when cap_seed_roots isn't
+                        # already doing it (see _today_seeded_by_cap_roots above) --
+                        # otherwise the same on-disk artifact would be double-counted.
+                        if not _today_seeded_by_cap_roots:
+                            self.ledger.record_hypothetical(trading_day, total)
+                    else:
+                        # Cross-day-in-week seeding only bumps the shared weekly
+                        # bucket; the daily bucket stays scoped to trading_day.
+                        self.ledger.planned_by_week[this_week] = (
+                            self.ledger.planned_by_week.get(this_week, 0.0) + total
+                        )
             if is_scheduled_today and submitted_rows:
                 self._prior_same_day_candidate_rows.extend(submitted_rows)
+
+        if _earlier_weekday_sibling_paths:
+            if self._cap_seed_scan_incomplete:
+                # FAIL CLOSED: an earlier-weekday sibling artifact that could
+                # not be read/parsed (see the skip-and-flag handling above)
+                # means real week-to-date cross-stream spend is understated.
+                # Force the shared weekly bucket to the cap itself -- zero
+                # remaining headroom for the rest of this run -- rather than
+                # place against an unproven, possibly too-low figure (same
+                # fail-closed policy _compute_top_up already applies to a
+                # same-day skip_sink miss; Codex review: "Fail closed on
+                # unreadable prior-week cap artifacts"). Injects only the
+                # INCREMENTAL delta needed to reach the ceiling (shared
+                # tracking dict with _compute_top_up's cap_seed_roots block,
+                # since both represent the same "this week's shared bucket is
+                # untrustworthy" state) and records exactly how much was
+                # injected, so a later successful scan (the else branch
+                # below) can subtract it back out instead of leaving the
+                # ledger permanently pinned once the transient failure clears
+                # (Codex review: "Clear prior-week cap poisoning after a
+                # recovered scan").
+                week_poison_delta = max(
+                    0.0, self.ledger.weekly_cap_usd - self.ledger.week_planned(trading_day)
+                )
+                if week_poison_delta > 0:
+                    self.ledger.planned_by_week[this_week] = (
+                        self.ledger.week_planned(trading_day) + week_poison_delta
+                    )
+                    self._cap_seed_poison_week[this_week] = (
+                        self._cap_seed_poison_week.get(this_week, 0.0) + week_poison_delta
+                    )
+            else:
+                poisoned_week = self._cap_seed_poison_week.pop(this_week, 0.0)
+                if poisoned_week > 0:
+                    self.ledger.planned_by_week[this_week] = max(
+                        0.0, self.ledger.week_planned(trading_day) - poisoned_week
+                    )
 
     def _place_broker_orders(
         self,
@@ -4217,44 +4602,17 @@ class MorningDCAExecutor(DCAExecutor):
                 broker = _PersistingBrokerAdapter(broker, raw_recorder)
         signals = self.evaluate(now, data, manual=manual)
         source = data_source or getattr(getattr(data, "source", None), "value", "unknown")
-        # VESTIGIAL AS OF 2026-07-31: morning_preflight_eligible_tickers() no
-        # longer sets preflight_missing_block for any caller -- per the user
-        # directive "the preflight is informative and shouldn't block any
-        # run", a missing/invalid/misconfigured pre-flight now always degrades
-        # to the full universe with a warning instead of failing closed. This
-        # branch is kept as a defensive no-op (it can never trigger from the
-        # current gate contract) rather than deleted outright, so a future
-        # regression that re-introduces a blocking gate diagnostic still has a
-        # tested, correctly-shaped path to write a "blocked" artifact through
-        # rather than silently doing nothing.
-        pgate = getattr(self, "preflight_gate", None)
-        if pgate and pgate.get("preflight_missing_block"):
-            # Before overwriting the dated-slot artifact with a blocked stub,
-            # check whether an EARLIER attempt at this same slot already
-            # submitted real orders -- e.g. the preflight artifact was
-            # available on the first attempt but becomes unavailable/stale by
-            # the time a scheduled retry runs. Unlike _blocked_live_result(),
-            # this path built its own stub directly rather than going through
-            # that helper, so it skipped the same preservation check and could
-            # erase submitted-order evidence a same-day top-up guard depends
-            # on (Codex review, PR #88: "Preserve submitted state on a
-            # preflight-blocked retry").
-            existing = self._existing_submitted_run_state(now)
-            if existing is not None:
-                return existing
-            block_reason = pgate["block_reason"]
-            artifacts = self.build_artifacts(now, signals, source, manual=manual)
-            artifacts["status"] = "blocked"
-            artifacts["block_reason"] = block_reason
-            artifacts["trades"] = False
-            artifacts["broker_outcomes"] = {}
-            # Writes and returns before the classification call, so it stamps the
-            # blocked-before-placement outcome itself (Codex review).
-            _apply_blocked_before_placement_fields(artifacts)
-            paths = self.write_artifacts(artifacts, now)
-            if self.mode == MORNING_LIVE_MODE and self.trades:
-                _run_drift_check(Path(paths["run_state"]).parent)
-            return {"artifacts": artifacts, "paths": paths}
+        # NON-BLOCKING (Geoff, 2026-08-02: "should not block any later runs"):
+        # a missing/invalid/forbidden same-day pre-flight artifact used to end
+        # the run here with a blocked stub before any signal evaluation could
+        # even use the full universe. morning_preflight_eligible_tickers()
+        # (called from _apply_preflight_gate() inside evaluate() above) now
+        # always degrades to the full configured universe with a warning
+        # instead -- preflight_missing_block is never set anymore, so this
+        # branch is dead and has been removed. The pre-flight artifact stays
+        # a coarse pre-screen only, surfaced via self.preflight_gate /
+        # artifacts["preflight_gate"] for observability, never a hard gate the
+        # 10:30 slot depends on to run at all.
         if raw_recorder is not None and raw_recorder.error:
             # Raw-input persistence failed before any order could be placed --
             # evaluate() above only reads price data and never places an
@@ -4945,48 +5303,6 @@ def _run_state_after_boundary(state: Dict[str, Any], boundary: datetime) -> bool
         # generated_at is a local Eastern timestamp, not UTC.
         gen_at = gen_at.replace(tzinfo=EASTERN)
     return gen_at.astimezone(EASTERN) > boundary.astimezone(EASTERN)
-
-
-def _csv_qualifying_notional_total(csv_path: Path, blank_status_means_filled: bool) -> float:
-    """Sum notional_usd/amount_usd across submitted/filled, non-DRY-RUN rows.
-
-    Used by ``_seed_ledger_from_prior_runs`` as a cross-check against the
-    JSON-derived spend total. Returns ``0.0`` -- never raises -- for a missing,
-    corrupt, unreadable, or empty file, or one with no qualifying rows, so the
-    caller can safely try a fallback source (or fall back to the JSON total
-    alone) without any special-casing at the call site.
-    """
-    total = 0.0
-    if not csv_path.exists():
-        return total
-    try:
-        with csv_path.open(newline="", encoding="utf-8") as handle:
-            for row in csv.DictReader(handle):
-                status = (row.get("status") or "").lower()
-                # filled_orders.csv rows are always confirmed fills; a
-                # blank/missing status field still counts as "filled".
-                if blank_status_means_filled and not status:
-                    status = "filled"
-                order_id = row.get("order_id") or ""
-                if status not in ("submitted", "filled") or order_id.startswith("DRY-RUN"):
-                    continue
-                # filled_orders.csv uses amount_usd; orders.csv uses notional_usd.
-                raw = row.get("notional_usd") or row.get("amount_usd")
-                try:
-                    notional = float(raw) if raw not in (None, "", "-") else None
-                except (TypeError, ValueError):
-                    notional = None
-                # Reject inf/-inf/nan: an infinite notional would seed the
-                # ledger with infinite spend and cap-exceed every later order.
-                if notional is not None and not math.isfinite(notional):
-                    notional = None
-                if notional and notional > 0:
-                    total += notional
-    except (OSError, UnicodeDecodeError, csv.Error):
-        # A corrupt/unreadable CSV must not abort the scheduled retry; the
-        # caller falls back to another source (or the JSON total alone).
-        return 0.0
-    return total
 
 
 def _write_csv(

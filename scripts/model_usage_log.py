@@ -247,9 +247,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         prog="python -m scripts.model_usage_log",
         description=(
             "Append one entry to the model usage audit log. For the covered tasks "
-            "with no in-repo Python entry point (2ba19526, 7be82b97, "
-            "e3e6f09e, a46bf007), the scheduler/agent "
+            "with no in-repo Python entry point (2ba19526, 7be82b97), "
+            "the scheduler/agent "
             "invokes this directly as a shell command after the run completes. "
+            "(e3e6f09e and a46bf007 were removed from the schedule entirely on "
+            "2026-08-02 and are no longer covered tasks.) "
             "bb4f6ef1 is NOT in this list: both of its sub-invocations go through "
             "MorningDCAExecutor.run() (preflight mode, then watchlist mode), which "
             "already appends its own model-usage entry per call -- an additional "

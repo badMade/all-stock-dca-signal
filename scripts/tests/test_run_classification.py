@@ -56,6 +56,7 @@ from run_classification import (  # noqa: E402
     STATE_SCHEMA_VERSION_V2,
     _already_covered_by_prior_allocation_loader,
     _dedupe_rows_by_order_id,
+    _merge_prior,
     _order_ids_from_state,
     _prior_from_rows,
     _read_csv_rows,
@@ -1962,6 +1963,57 @@ def test_top_up_context_skip_sink_excludes_historical_unreadable_manual_run_stat
         )
 
 
+def test_mtime_matches_trading_day_is_on_or_after_not_strict_equality():
+    # Codex review ("Fail closed on later-modified prior-day artifacts"): an
+    # earlier-weekday artifact being backfilled or repaired on a LATER day
+    # (e.g. Monday's run_state.json rewritten while a Tuesday run's
+    # earlier-week scan reads it) is exactly as unverifiable as a same-day
+    # race, but its mtime can never equal Monday -- a strict equality check
+    # silently dropped that failure from skip_sink. A file genuinely older
+    # than trading_day (real historical garbage) must still be excluded.
+    from run_classification import _mtime_matches_trading_day
+
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "run_state.json"
+        path.write_text("{")
+
+        _stamp_mtime_on_trading_day(path, "2026-06-29")
+        assert _mtime_matches_trading_day(path, "2026-06-29") is True
+
+        # Rewritten/backfilled the NEXT day -- still plausibly relevant.
+        _stamp_mtime_on_trading_day(path, "2026-06-30")
+        assert _mtime_matches_trading_day(path, "2026-06-29") is True
+
+        # Genuinely predates the trading day -- real historical garbage.
+        _stamp_mtime_on_trading_day(path, "2026-06-28")
+        assert _mtime_matches_trading_day(path, "2026-06-29") is False
+
+
+def test_top_up_context_skip_sink_records_later_day_rewrite_of_earlier_artifact():
+    # End-to-end wiring for the >= fix: an earlier-weekday (Jul 21) corrupt
+    # run_state that was rewritten/backfilled on a LATER day (mtime Jul 22)
+    # must still be recorded in skip_sink when scanned as Jul 21's context --
+    # a strict mtime-equality check would have silently dropped it, since a
+    # file can never have an mtime equal to a day earlier than when it was
+    # last touched.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        run_dir = Path(d) / "final_manual_review" / "20260721_1345ET"
+        run_dir.mkdir(parents=True)
+        run_state_path = run_dir / "run_state.json"
+        run_state_path.write_text("{not valid json")
+        _stamp_mtime_on_trading_day(run_state_path, "2026-07-22")
+
+        skip_sink: list = []
+        ctx = load_same_day_top_up_context(JUL21, base=base, skip_sink=skip_sink)
+        assert ctx == {}
+        assert skip_sink, (
+            "a corrupted run_state rewritten a day AFTER trading_day must "
+            "still be recorded in skip_sink, not silently dropped"
+        )
+
+
 def test_top_up_context_skip_sink_records_truncated_bare_manual_csv():
     # Codex review ("Reject incomplete bare manual CSV snapshots"): a bare
     # manual CSV read immediately after a writer truncates it (or while its
@@ -3021,6 +3073,47 @@ def test_prior_from_rows_sizes_a_partial_by_executed_quantity():
 
         assert abs(prior["GFUZ"]["prior_usd"] - 2.00) < 1e-9
         assert abs(prior["SPCX"]["prior_usd"] - 3.50) < 1e-9
+
+
+def test_prior_from_rows_counts_each_row_as_an_attempt():
+    # Codex review: "Count each fallback CSV order as an attempt". Two
+    # distinct orders for the SAME ticker in one bare CSV must count as two
+    # attempts, not be collapsed into a single per-run count.
+    with tempfile.TemporaryDirectory() as d:
+        csv_path = Path(d) / "filled_orders.csv"
+        csv_path.write_text(
+            "ticker,order_id,amount_usd,state,average_fill_price,quantity\n"
+            "GFUZ,ORD-1,2.00,filled,10.0,0.2\n"
+            "GFUZ,ORD-2,3.00,filled,10.0,0.3\n"
+            "SPCX,ORD-3,3.50,filled,109.99,0.032\n",
+            encoding="utf-8",
+        )
+
+        prior = _prior_from_rows(_read_csv_rows(csv_path))
+
+        assert prior["GFUZ"]["attempt_count"] == 2
+        assert prior["SPCX"]["attempt_count"] == 1
+
+
+def test_merge_prior_sums_attempt_count_across_merged_sources():
+    # A second run contributing a distinct new order for the same ticker
+    # must ADD its own attempt count on top, not overwrite or ignore it.
+    dst = {}
+    _merge_prior(
+        dst,
+        {"GFUZ": {"prior_usd": 2.0, "reference_price": None, "order_ids": ["ORD-1"], "attempt_count": 1}},
+        "run1",
+        run_ts=100,
+    )
+    _merge_prior(
+        dst,
+        {"GFUZ": {"prior_usd": 3.0, "reference_price": None, "order_ids": ["ORD-2"], "attempt_count": 1}},
+        "run2",
+        run_ts=200,
+    )
+
+    assert dst["GFUZ"].attempt_count == 2
+    assert dst["GFUZ"].prior_usd == pytest.approx(5.0)
 
 
 def test_recovery_root_contains_a_root_level_sibling_csv():

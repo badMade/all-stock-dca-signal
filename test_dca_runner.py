@@ -125,6 +125,122 @@ def test_roundtrip_preserves_date_keyed_daily_notional(tmp_path):
     assert isinstance(next(iter(loaded.submitted_notional_by_day)), date)
 
 
+def test_roundtrip_preserves_earlier_week_cross_stream_bookkeeping(tmp_path):
+    """Codex review: "Reconcile earlier-week spend instead of adding it".
+    earlier_week_cross_stream_seeded_usd/_poison_usd must round-trip like
+    every other ledger, or a fresh process reload would see "nothing seeded
+    yet this week" and re-add the full earlier-week cross-stream total on
+    top of spend a prior invocation already reconciled in."""
+    state = StrategyState()
+    day = date(2026, 7, 28)
+    state.reconcile_earlier_week_cross_stream_notional(day, 150.0)
+
+    path = tmp_path / "state.json"
+    dca_runner.save_strategy_state(state, path)
+    loaded = dca_runner.load_strategy_state(path)
+
+    week_key = iso_week_key(day)
+    assert loaded.earlier_week_cross_stream_seeded_usd[week_key] == pytest.approx(150.0)
+    assert isinstance(next(iter(loaded.earlier_week_cross_stream_seeded_usd)), tuple)
+
+    # A later invocation reloading this persisted state must still treat the
+    # $150 as already-seeded, not re-add it.
+    loaded.reconcile_earlier_week_cross_stream_notional(day, 150.0)
+    assert loaded.week_notional(day) == pytest.approx(150.0)
+
+
+def test_state_with_seeded_bookkeeping_exceeding_the_weekly_ledger_fails_closed(tmp_path):
+    """Codex review: "Reject seeded bookkeeping that exceeds the weekly
+    ledger". reconcile_earlier_week_cross_stream_notional() only ever writes
+    a seeded-so-far value <= the weekly bucket it was just folded into. A
+    document with a seeded value of $900 against a $0 weekly bucket is
+    impossible from any legitimate write path: a later reconciliation would
+    compute a negative increment against that inflated baseline, silently
+    forgetting real earlier-week spend just discovered instead of adding it
+    (e.g. a $100 real scan lands on incremental = 100 - 900 = -800, guarded
+    to a no-op, leaving the weekly bucket at $0 forever)."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "buys_by_ticker_by_day": {},
+        "submitted_notional_by_day": {},
+        "submitted_notional_by_week": {"2026-31": 0.0},
+        "earlier_week_cross_stream_seeded_usd": {"2026-31": 900.0},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_roundtrip_preserves_seeded_prior_context_bookkeeping(tmp_path):
+    """Codex review: "Reconcile increases to already-seeded ticker
+    allocations". seeded_prior_context_amount_by_ticker_day/
+    _attempts_by_ticker_day must round-trip, or a fresh process reload would
+    forget how much of a ticker's aggregate has already been folded in via
+    reconcile_prior_allocation."""
+    state = StrategyState()
+    day = date(2026, 7, 28)
+    state.reconcile_prior_allocation("AAPL", day, amount_usd=2.0, attempt_count=1)
+
+    path = tmp_path / "state.json"
+    dca_runner.save_strategy_state(state, path)
+    loaded = dca_runner.load_strategy_state(path)
+
+    assert loaded.seeded_prior_context_amount_by_ticker_day["AAPL"][day] == pytest.approx(2.0)
+    assert loaded.seeded_prior_context_attempts_by_ticker_day["AAPL"][day] == 1
+
+    # A later invocation reloading this persisted state must top up only the
+    # newly-discovered delta, not re-add the $2/1 attempt already reconciled.
+    loaded.reconcile_prior_allocation("AAPL", day, amount_usd=4.0, attempt_count=2)
+    assert loaded.day_notional(day) == pytest.approx(4.0)
+    assert loaded.buys_today("AAPL", day) == 2
+
+
+def test_state_with_seeded_ticker_attempts_exceeding_the_buy_ledger_fails_closed(tmp_path):
+    """Codex review ("Reject seeded bookkeeping that exceeds the weekly
+    ledger" -- same class of corruption applied to the per-ticker
+    bookkeeping): reconcile_prior_allocation() only ever writes a seeded
+    attempt count <= buys_by_ticker_by_day's own count for that ticker/day.
+    A document with a seeded count of 5 against a buy ledger of 1 is
+    impossible from any legitimate write path."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 2.0},
+        "submitted_notional_by_week": {"2026-31": 2.0},
+        "seeded_prior_context_attempts_by_ticker_day": {"AAPL": {"2026-07-28": 5}},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_state_with_seeded_ticker_amount_exceeding_the_day_ledger_fails_closed(tmp_path):
+    """Same as above, for the dollar-amount bookkeeping against the day-level
+    submitted_notional_by_day total."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 2.0},
+        "submitted_notional_by_week": {"2026-31": 2.0},
+        "seeded_prior_context_amount_by_ticker_day": {"AAPL": {"2026-07-28": 900.0}},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
 def test_roundtrip_preserves_tuple_keyed_weekly_notional(tmp_path):
     """(iso_year, iso_week) tuple keys are the piece a naive dict dump destroys."""
     state = StrategyState()
@@ -154,6 +270,74 @@ def test_roundtrip_preserves_per_ticker_buy_counts(tmp_path):
 
     assert loaded.buys_today("NVDA", day) == 2
     assert loaded.buys_today("AMD", day) == 0
+
+
+def test_roundtrip_preserves_submitted_order_count_by_day(tmp_path):
+    """Codex review: "Persist the shared daily attempt counter".
+    submitted_order_count_by_day (config/budgets.json circuit_breakers.
+    max_orders_per_day) must round-trip like every other ledger, not reload
+    empty -- otherwise a reconstructed process undercounts real prior
+    attempts against the shared breaker. seed_prior_allocation's
+    attempt_count (2, distinct from record_buy's fixed +1) exercises the
+    field's real write path."""
+    state = StrategyState()
+    day = date(2026, 7, 28)
+    state.seed_prior_allocation("AAPL", day, 4.0, attempt_count=2)
+    state.record_buy("MSFT", day, 6.0)
+
+    path = tmp_path / "state.json"
+    dca_runner.save_strategy_state(state, path)
+    loaded = dca_runner.load_strategy_state(path)
+
+    assert loaded.day_order_count(day) == 3
+
+
+def test_legacy_state_without_order_count_backfills_from_buy_counts(tmp_path):
+    """A document written before submitted_order_count_by_day existed never
+    persisted it at all. Rather than loading an empty counter (and letting
+    _seed_prior_allocations() silently forget every already-booked ticker's
+    attempts, since it skips reseeding a ticker whose buys_today() is
+    already nonzero), it must be reconstructed losslessly from
+    buys_by_ticker_by_day's per-day sum -- exactly what that counter always
+    equalled before this field existed to track it separately."""
+    path = tmp_path / "state.json"
+    path.write_text(
+        json.dumps({
+            "schema_version": 1,
+            "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}, "MSFT": {"2026-07-28": 2}},
+            "submitted_notional_by_day": {"2026-07-28": 10.0},
+            "submitted_notional_by_week": {"2026-31": 10.0},
+            "weekly_rollover_reserve_usd": 0.0,
+            "finalized_budget_days": [],
+            "reserve_week_key": None,
+            "selected_tier": None,
+        })
+    )
+    loaded = dca_runner.load_strategy_state(path)
+    assert loaded.day_order_count(date(2026, 7, 28)) == 3
+
+
+def test_state_with_mismatched_order_count_fails_closed(tmp_path):
+    """A genuinely current document (the key IS present) whose per-day
+    attempt count disagrees with buys_by_ticker_by_day's per-ticker sum is
+    corrupt -- record_buy()/seed_prior_allocation() always bump both
+    together by the same amount, so they can never legitimately diverge."""
+    path = tmp_path / "state.json"
+    path.write_text(
+        json.dumps({
+            "schema_version": 1,
+            "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+            "submitted_notional_by_day": {"2026-07-28": 4.0},
+            "submitted_notional_by_week": {"2026-31": 4.0},
+            "submitted_order_count_by_day": {"2026-07-28": 5},
+            "weekly_rollover_reserve_usd": 0.0,
+            "finalized_budget_days": [],
+            "reserve_week_key": None,
+            "selected_tier": None,
+        })
+    )
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
 
 
 def test_roundtrip_preserves_reserve_fields_and_finalized_days(tmp_path):
@@ -316,12 +500,12 @@ def test_state_with_aliased_week_keys_fails_closed(tmp_path):
 def test_state_with_inconsistent_daily_and_weekly_ledgers_fails_closed(tmp_path):
     """record_buy() always updates the day and week ledgers together in the
     same call, and neither is ever pruned independently of the other, so a
-    legitimately-written state's weekly total must equal the sum of that
-    week's daily entries. A document with $900 recorded for a day but $0 for
-    that ISO week is corrupt: StrategyState.week_notional() would silently
-    forget the real spend and authorize another week's worth of buys even
-    though the same document proves the prior spend (Codex review: "Reject
-    inconsistent persisted daily and weekly ledgers")."""
+    legitimately-written state's weekly total can never fall SHORT of the
+    sum of that week's daily entries. A document with $900 recorded for a
+    day but $0 for that ISO week is corrupt: StrategyState.week_notional()
+    would silently forget the real spend and authorize another week's worth
+    of buys even though the same document proves the prior spend (Codex
+    review: "Reject inconsistent persisted daily and weekly ledgers")."""
     path = tmp_path / "state.json"
     path.write_text(json.dumps({
         "schema_version": 1,
@@ -335,6 +519,30 @@ def test_state_with_inconsistent_daily_and_weekly_ledgers_fails_closed(tmp_path)
     }))
     with pytest.raises(dca_runner.StateCorruptError):
         dca_runner.load_strategy_state(path)
+
+
+def test_weekly_ledger_may_legitimately_exceed_its_own_daily_sum(tmp_path):
+    """Codex review: "Reconcile earlier-week spend instead of adding it".
+    bump_week_notional_only() adds EARLIER-weekday cross-stream spend to the
+    week bucket ONLY, with no corresponding submitted_notional_by_day entry
+    in THIS state (that spend belongs to a sibling stream or an earlier
+    day's own history). A week total exceeding its own daily sum is
+    therefore a legitimate, expected state -- not the corruption the
+    equality check above catches -- and must round-trip through save/load
+    without raising."""
+    state = StrategyState()
+    day = date(2026, 7, 28)
+    state.record_buy("AAPL", day, 100.0)
+    state.bump_week_notional_only(day, 50.0)
+    assert state.week_notional(day) == pytest.approx(150.0)
+    assert state.day_notional(day) == pytest.approx(100.0)
+
+    path = tmp_path / "state.json"
+    dca_runner.save_strategy_state(state, path)
+    loaded = dca_runner.load_strategy_state(path)
+
+    assert loaded.week_notional(day) == pytest.approx(150.0)
+    assert loaded.day_notional(day) == pytest.approx(100.0)
 
 
 def test_state_with_a_cent_level_ledger_mismatch_fails_closed(tmp_path):
@@ -383,15 +591,16 @@ def test_state_with_a_sub_cent_persisted_notional_fails_closed(tmp_path):
         dca_runner.load_strategy_state(path)
 
 
-def test_state_with_a_buy_count_but_no_notional_fails_closed(tmp_path):
-    """record_buy() always updates buys_by_ticker_by_day and both notional
-    ledgers together in the same call, so a buy-count entry can never
-    legitimately exist without a positive corresponding entry in both
-    submitted_notional_by_day and submitted_notional_by_week. A document
-    with a buy count but empty notional maps is corrupt: subsequent budget
-    checks would see zero prior spend for that day/week and could authorize
-    purchases beyond the real caps (Codex review: "Cross-check persisted
-    buy counts against notional ledgers")."""
+def test_state_with_a_buy_count_but_no_notional_loads_successfully(tmp_path):
+    """Codex review: "Keep zero-notional attempts out of the buy ledger".
+    seed_prior_allocation() bumps buys_by_ticker_by_day by attempt_count for
+    a RECONSTRUCTED zero-capital attempt (a candidate that obtained an
+    order_id but was confirmed rejected/canceled, or a placement that
+    raised) -- an all-rejected day for a ticker is a legitimate buy-count-
+    with-zero-notional state, not corruption. A stricter equality check here
+    previously made save_strategy_state()'s own pre-save validation reject
+    this state, turning an otherwise-valid reconstruction into
+    StateCorruptError on every day with an all-zero-notional prior attempt."""
     path = tmp_path / "state.json"
     path.write_text(json.dumps({
         "schema_version": 1,
@@ -403,8 +612,27 @@ def test_state_with_a_buy_count_but_no_notional_fails_closed(tmp_path):
         "reserve_week_key": None,
         "selected_tier": None,
     }))
-    with pytest.raises(dca_runner.StateCorruptError):
-        dca_runner.load_strategy_state(path)
+    state = dca_runner.load_strategy_state(path)
+    assert state.buys_today("AAPL", date(2026, 7, 28)) == 1
+    assert state.day_notional(date(2026, 7, 28)) == 0.0
+
+
+def test_seed_prior_allocation_zero_notional_attempt_round_trips(tmp_path):
+    """End-to-end version of the fixture above, using the real writer
+    (StrategyState.seed_prior_allocation) instead of a hand-built document,
+    exercising the exact save/load path save_strategy_state's own pre-save
+    validation runs against."""
+    state = StrategyState()
+    day = date(2026, 7, 28)
+    state.seed_prior_allocation("AAPL", day, notional_usd=0.0, attempt_count=2)
+
+    path = tmp_path / "state.json"
+    dca_runner.save_strategy_state(state, path)
+    loaded = dca_runner.load_strategy_state(path)
+
+    assert loaded.buys_today("AAPL", day) == 2
+    assert loaded.day_notional(day) == 0.0
+    assert loaded.day_order_count(day) == 2
 
 
 def test_state_with_a_whitespace_only_ticker_key_fails_closed(tmp_path):

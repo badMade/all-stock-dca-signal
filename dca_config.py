@@ -235,17 +235,25 @@ def load_budgets(config_dir: Path) -> Dict[str, Any]:
     # preserve the legacy manual-morning -> scheduled-afternoon lower-price top-up
     # path (see near_close_dca.py's _process_buy_candidate and
     # test_one_order_per_ticker_per_day_defaults_off_to_preserve_the_top_up_path).
-    # budgets.json asserts this field true for the seven-slot roster's own
-    # bookkeeping/documentation; run_dca.run_slot() is the ONE caller that turns the
-    # flag on, via an explicit `replace(config, one_order_per_ticker_per_day=True)`
-    # roster-only override -- the same way dry_run/broker are excluded from JSON and
-    # only ever set by an explicit caller override (see this module's docstring: "so
-    # loading config can never by itself enable live trading"). Reading the flag from
-    # JSON here would overlay it onto EVERY load_strategy_config() call, including the
-    # legacy afternoon live path (docs/live_wiring.md), which would then block that
-    # stream's legitimate same-day top-up before it could run (Codex review,
-    # discussion on dca_config.py: "Keep first-wins policy out of legacy config
-    # loads").
+    # Permanent policy (Geoff, confirmed 2026-08-02): the same ticker may be bought
+    # more than once in a day, resized to the incremental delta at a strictly lower
+    # price via same_day_top_up_policy / scripts/same_day_top_up_gate.py; a repeat
+    # in the SAME slot/session is what stays blocked, via each stream's own
+    # sole-executor interlock and one-order-per-ticker-per-batch rule, not via this
+    # flag. budgets.json's own order_rules.one_order_per_ticker_per_day is false to
+    # match. run_dca.run_slot() is the ONE caller that pins the flag explicitly, via
+    # `replace(config, one_order_per_ticker_per_day=False)` -- reinforcing this
+    # module's own default rather than overriding it -- the same way dry_run/broker
+    # are excluded from JSON and only ever set by an explicit caller override (see
+    # this module's docstring: "so loading config can never by itself enable live
+    # trading"). Reading the flag from JSON here would overlay it onto EVERY
+    # load_strategy_config() call, including the legacy afternoon live path
+    # (docs/live_wiring.md), which is harmless while the JSON value agrees with this
+    # default, but would silently change behavior everywhere the moment someone
+    # edited budgets.json alone -- keeping the override caller-explicit (Codex
+    # review, discussion on dca_config.py: "Keep first-wins policy out of legacy
+    # config loads") means a future flip of the JSON value cannot reintroduce
+    # first-slot-wins by accident.
     return out
 
 

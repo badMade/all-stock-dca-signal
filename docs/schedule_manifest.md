@@ -19,12 +19,23 @@ Backup of the current scheduled tasks. Machine-readable source:
 America/New_York and vary with DST (EDT, UTC-4, in Mar-Oct; EST, UTC-5, in Jan,
 Feb, Nov, Dec). Re-verify around DST transitions.
 
-> **Afternoon completion rule:** all afternoon **trading and artifact-writing**
-> tasks complete **no later than 3:40 PM ET**, when the read-only watchdog
-> (`a46bf007`) begins its final verification. The watchdog's own post-3:40 PM
-> verification, the Friday weekly Notion performance refresh at **5:00 PM ET**,
-> and the month-end volatility risk refresh at **5:00 PM ET** (`c9fb1fb8` /
-> `17a3b2a9`) are the only approved post-3:40 PM DCA-related exceptions.
+> **Afternoon completion rule (rewritten 2026-08-02):** the 3:05 PM monitor-only
+> signal check (`e3e6f09e`) and the 3:40 PM read-only live-run watchdog
+> (`a46bf007`) were both **removed from the schedule entirely** on 2026-08-02.
+> Afternoon **trading** now completes **no later than 3:30 PM ET** (`10ce362c`).
+> Same-day **artifact-writing** moved later: the post-trade slippage + compact
+> Notion latest-run sync (`67aa802b`) moved from 3:35 PM ET to **5:00 PM ET
+> daily**, and the Friday weekly Notion performance dashboard refresh
+> (`041d9d90`) moved from 5:00 PM ET to **5:30 PM ET** the same day to clear the
+> resulting Friday collision. The month-end volatility risk refresh
+> (`c9fb1fb8` / `17a3b2a9`) moved from its own prior 5:00 PM ET to **5:15 PM
+> ET** the same day for the same reason -- it independently collided with
+> `67aa802b`'s new 5:00 PM slot. These three tasks are the
+> only DCA-related tasks approved to run after 3:30 PM ET. See
+> [`docs/safeguards.md`](safeguards.md#operational-rules), the authoritative
+> source, and `config/scheduled_tasks.json`'s `afternoon_completion_rule`. This
+> file's own detailed `e3e6f09e`/`a46bf007` sections below were not fully
+> rewritten for this change; treat them as historical.
 
 > **TICKER UNIVERSE UPDATE JUL 19 2026:** TXN is added to the active DCA
 > universe and GFUZ remains active, used by every universe-bearing scheduled
@@ -56,8 +67,9 @@ Feb, Nov, Dec). Re-verify around DST transitions.
 > recovery text.
 
 > **Schedule integrity note:** the live trading task runs at **3:30 PM ET**; the
-> post-trade slippage / Notion sync runs at **3:35 PM ET**. These are two
-> different tasks. Do not merge them or move the live trade off 3:30 PM ET.
+> post-trade slippage / Notion sync runs at **5:00 PM ET daily** (moved
+> 2026-08-02 from 3:35 PM ET). These are two different tasks. Do not merge them
+> or move the live trade off 3:30 PM ET.
 
 > **3:30 PM state-file guarantee:** the live task (`10ce362c`) **always** writes
 > a scheduled `run_state.json` under
@@ -697,15 +709,13 @@ active. Machine-readable source:
 | 12:30 PM | Midday DCA live Robinhood execution | `a6239dae` | Weekdays | `30 16 * * 1-5` | **yes** | active |
 | 1:30 PM | Intraday DCA live Robinhood execution | `7be82b97` | Weekdays | `30 15,17,18 * * 1-5` | **yes** | active |
 | 2:30 PM | Intraday DCA live Robinhood execution | `7be82b97` | Weekdays | `30 15,17,18 * * 1-5` | **yes** | active |
-| 3:05 PM | $2-base DCA monitor-only signal check | `e3e6f09e` | Weekdays | `5 19 * * 1-5` | no | **paused** |
 | 3:30 PM | Final DCA live Robinhood execution | `10ce362c` | Weekdays | `30 19 * * 1-5` | **yes** | active |
-| 3:35 PM | Post-trade slippage plus Notion latest-run sync | `67aa802b` | Weekdays | `35 19 * * 1-5` | no | active |
-| 3:40 PM | DCA live-run watchdog | `a46bf007` | Weekdays | `40 19 * * 1-5` | no | active |
-| 5:00 PM | Weekly DCA Notion performance dashboard refresh | `041d9d90` | Fridays | `0 21 * * 5` | no | active |
+| 5:00 PM | Post-trade slippage plus Notion latest-run sync | `67aa802b` | Weekdays | `0 21 * * 1-5` | no | active |
+| 5:30 PM | Weekly DCA Notion performance dashboard refresh | `041d9d90` | Fridays | `30 21 * * 5` | no | active |
 | 8:45 AM | Monthly graded DCA dashboard refresh | `0656657a` | First weekday gate | `45 12 1-7 * 1-5` | no | active |
 | 9:55 AM | Monthly DCA automation cost review | `bec4a6ee` | First weekday gate | `55 13 1-7 * 1-5` | no | active |
-| 5:00 PM | Month-end DCA volatility risk refresh, EDT | `c9fb1fb8` | Days 25-31, final eligible market-day gate | `0 21 25-31 3-10 *` | no | active |
-| 5:00 PM | Month-end DCA volatility risk refresh, EST | `17a3b2a9` | Seasonal EST months, final eligible market-day gate | `0 22 25-31 1,2,11,12 *` | no | active |
+| 5:15 PM | Month-end DCA volatility risk refresh, EDT | `c9fb1fb8` | Days 25-31, final eligible market-day gate | `15 21 25-31 3-10 *` | no | active |
+| 5:15 PM | Month-end DCA volatility risk refresh, EST | `17a3b2a9` | Seasonal EST months, final eligible market-day gate | `15 22 25-31 1,2,11,12 *` | no | active |
 | One-time future | Evaluate graded DCA live test continuation | `f7411889` | One-time | one-shot 2026-08-15 11:45 AM ET | no | active |
 
 **Note on `7be82b97`:** one task fires at three ET slots (11:30 AM, 1:30 PM, and
@@ -714,13 +724,18 @@ active. Machine-readable source:
 
 ### One-time tasks added after the 2026-07-27 canonical verification
 
-The canonical table above is the verified schedule and is held at exactly 17
-rows, byte-identical since verification; it already contains one pre-existing
-one-time entry (`f7411889`) from before this verification, which stays in
-place. Starting with this change, new one-time, non-recurring tasks are
-recorded here instead of being appended to the canonical table, so it stays
-intact and diffable. Both this table and the canonical table above are active
-schedule sources.
+The canonical table above was originally verified at exactly 17 rows,
+byte-identical since verification. On 2026-08-02 the user gave explicit,
+direct instructions to remove `e3e6f09e` (3:05 PM monitor-only signal check)
+and `a46bf007` (3:40 PM live-run watchdog) entirely, and to retime `67aa802b`
+(3:35 PM -> 5:00 PM ET daily) and `041d9d90` (Fridays 5:00 PM -> 5:30 PM ET);
+the table above reflects that change (17 -> 15 rows). See
+`config/scheduled_tasks.json`'s `canonical_schedule_reconciliation_2026_07_27.canonical_schedule_et_immutability_note`
+for the full reasoning. It already contains one pre-existing one-time entry
+(`f7411889`) from before the 2026-07-27 verification, which stays in place.
+New one-time, non-recurring tasks are recorded here instead of being appended
+to the canonical table, so it stays intact and diffable. Both this table and
+the canonical table above are active schedule sources.
 
 | Fires | Task | ID | Trades | Status | Scheduler-registered |
 |---|---|---|---|---|---|
@@ -1501,21 +1516,25 @@ never estimated, inferred, or defaulted.
 - **Paired EDT/EST schedules (final-eligible-market-day gate):** because
   programmatic month-end trigger checks are disabled, two cron schedules cover the
   two US Eastern DST states, and each run self-gates:
-  - `c9fb1fb8` — `0 21 25-31 3-10 *` for **EDT** months (Mar–Oct), intended as
-    **5:00 PM America/New_York on the final eligible market day of the month**.
-  - `17a3b2a9` — `0 22 25-31 1,2,11,12 *` for **EST** months (Jan, Feb, Nov, Dec),
-    intended as **5:00 PM America/New_York on the final eligible market day of the
-    month**.
+  - `c9fb1fb8` — `15 21 25-31 3-10 *` for **EDT** months (Mar–Oct), intended as
+    **5:15 PM America/New_York on the final eligible market day of the month**
+    (retimed 2026-08-02 from 5:00 PM ET to clear the collision with
+    `67aa802b`'s new daily 5:00 PM slot; see `docs/safeguards.md#operational-rules`).
+  - `17a3b2a9` — `15 22 25-31 1,2,11,12 *` for **EST** months (Jan, Feb, Nov, Dec),
+    intended as **5:15 PM America/New_York on the final eligible market day of the
+    month** (same 2026-08-02 retime as `c9fb1fb8`).
 - **Silent gate:** every run must **first** determine whether the current
   America/New_York date is the final eligible market day of the month. If it is
   **not**, the run ends **silently** — no notification, no market-data pulls, no
   Notion updates, and no reporting.
-- **Active universe (45 symbols):** DFTX, TRIN, AAAU, SPCX, EVR, LUNR, IRDM, DXYZ,
+- **Active universe (52 symbols):** DFTX, TRIN, AAAU, SPCX, EVR, LUNR, IRDM, DXYZ,
   LITE, ASML, DRAM, STX, MSFT, AAPL, AMAT, AMD, CBRS, MRVL, BTX, STM, SNDK, WDC,
   TSM, AVGO, NVDA, QBTS, FLKR, INTC, GOOGL, GOOG, AMZN, GLW, MA, GS, MU, NFLX, XLG,
-  TOPT, QTOP, SATA, RGTI, IBM, GFUZ, TXN, RKLB. **Excluded:** BYDDY, VCX, TRLV, RVI.
-  **Corrections:** IRDMI→IRDM, GLWR→GLW. IBM, GFUZ, TXN, and RKLB remain included
-  unless later removed. Source of truth: [`config/tickers.json`](../config/tickers.json).
+  TOPT, QTOP, SATA, RGTI, IBM, GFUZ, TXN, RKLB, GE, VRT, CAT, QQQ, QCOM, ABBV, JPM
+  (the last seven added 2026-08-02). **Excluded:** BYDDY, VCX, TRLV, RVI.
+  **Corrections:** IRDMI→IRDM, GLWR→GLW. IBM, GFUZ, TXN, RKLB, and the
+  2026-08-02 additions remain included unless later removed. Source of truth:
+  [`config/tickers.json`](../config/tickers.json).
 - **Data source policy:** Finance connector is **primary** for historical market
   data. **Alpaca and Robinhood are read-only** validation/context. **yfinance is a
   fallback only** when connector data is unavailable, stale, incomplete, or

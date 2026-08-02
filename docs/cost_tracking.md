@@ -15,7 +15,8 @@ shape: [`schemas/cost_tracker.schema.json`](../schemas/cost_tracker.schema.json)
 Machine-readable source of truth:
 [`config/scheduled_tasks.json`](../config/scheduled_tasks.json) → `operating_mode`
 (mode `cost_saving_daily_compact`). Weekday tasks stay **compact**; all heavy
-analysis is deferred to the **Friday 5:00 PM ET** weekly refresh. This mode
+analysis is deferred to the **Friday 5:30 PM ET** weekly refresh (retimed
+2026-08-02 from 5:00 PM ET). This mode
 changes **cost/reporting behavior only** — it does **not** relax any trading
 safety rule (see [safeguards.md](safeguards.md)).
 
@@ -31,8 +32,12 @@ safety rule (see [safeguards.md](safeguards.md)).
 | 1:30 PM | `7be82b97` | intraday live execution |
 | 2:30 PM | `7be82b97` | intraday live execution |
 | 3:30 PM | `10ce362c` | final live execution (final buy of the day) |
-| 3:35 PM | `67aa802b` | post-trade slippage + compact Notion **Latest Run** sync |
-| 3:40 PM | `a46bf007` | live-run watchdog |
+| 5:00 PM | `67aa802b` | post-trade slippage + compact Notion **Latest Run** sync |
+
+The 3:05 PM monitor-only signal check (`e3e6f09e`) and the 3:40 PM live-run
+watchdog (`a46bf007`) were removed from the schedule entirely on 2026-08-02;
+`67aa802b` moved the same day from 3:35 PM ET to 5:00 PM ET daily. See
+`config/scheduled_tasks.json`'s `afternoon_completion_rule`.
 
 ### Daily mode rules
 
@@ -64,12 +69,17 @@ safety rule (see [safeguards.md](safeguards.md)).
   normal notification/reporting. **Do not** use ChatGPT 5.5 or other premium
   models for these.
 
-### Friday heavy analysis (`041d9d90`, 5:00 PM ET)
+### Friday heavy analysis (`041d9d90`, 5:30 PM ET)
 
 Full Notion refresh, performance tables, slippage trend analysis, missing-fill
 analysis, cost-basis / control comparisons, cost tracker update, and the full
-weekly dashboard refresh. This is the only approved post-3:40 PM DCA-related
-exception.
+weekly dashboard refresh. Retimed 2026-08-02 from 5:00 PM ET to clear the
+collision with `67aa802b`'s new daily 5:00 PM ET slot on Fridays. Afternoon
+**trading** completes by 3:30 PM ET (`10ce362c`); this task, `67aa802b`
+(5:00 PM ET daily), and the month-end volatility risk refresh (`c9fb1fb8` /
+`17a3b2a9`, 5:15 PM ET, retimed 2026-08-02 from its own prior 5:00 PM ET to
+clear the collision with `67aa802b`'s new 5:00 PM slot) are the only
+DCA-related tasks approved to run after 3:30 PM ET.
 
 ### Recovery policy
 
@@ -111,14 +121,17 @@ behavior **only** — it does **not** relax any trading safety rule (see
 | 12:30 PM | `a6239dae` | midday live execution |
 | 1:30 PM | `7be82b97` | intraday live execution |
 | 2:30 PM | `7be82b97` | intraday live execution |
-| 3:05 PM | `e3e6f09e` | monitor-only signal check (read-only, **paused**) |
 | 3:30 PM | `10ce362c` | final live execution (final buy of the day) |
-| 3:35 PM | `67aa802b` | post-trade slippage + compact Notion **Latest Run** sync |
-| 3:40 PM | `a46bf007` | live-run watchdog |
+| 5:00 PM | `67aa802b` | post-trade slippage + compact Notion **Latest Run** sync |
 
-The 3:05 PM monitor-only signal check `e3e6f09e` is `paused` and is not in the
-live scheduler, so it is not listed above. The retired tasks `b7961407`,
-`cd45e95b`, `d72aa525`, and `d1f7a2c0` are not covered either.
+**REMOVED 2026-08-02:** the 3:05 PM monitor-only signal check (`e3e6f09e`,
+already paused) and the 3:40 PM live-run watchdog (`a46bf007`) were both
+removed from the schedule entirely at the user's request -- neither is a
+schedule entry anymore, so neither is listed above. `67aa802b` moved the same
+day from 3:35 PM ET to 5:00 PM ET daily. See
+`config/scheduled_tasks.json`'s `afternoon_completion_rule` and
+[`safeguards.md`](safeguards.md#operational-rules). The retired tasks
+`b7961407`, `cd45e95b`, `d72aa525`, and `d1f7a2c0` are not covered either.
 
 ### Keep daily runs compact
 
@@ -170,10 +183,14 @@ Covered daily tasks (same set as the routing policy):
 | 10:30 AM | `42173154` | morning |
 | 11:30 AM, 1:30 PM, 2:30 PM | `7be82b97` | intraday |
 | 12:30 PM | `a6239dae` | midday |
-| 3:05 PM | `e3e6f09e` | monitor |
 | 3:30 PM | `10ce362c` | afternoon |
-| 3:35 PM | `67aa802b` | slippage |
-| 3:40 PM | `a46bf007` | watchdog |
+| 5:00 PM | `67aa802b` | slippage |
+
+`e3e6f09e` (monitor) and `a46bf007` (watchdog) were removed from the
+schedule entirely on 2026-08-02; `build_entry()`/`log_model_usage()` in
+`scripts/model_usage_log.py` now raise `UnknownTaskError` for either
+`task_id`, since neither ever fires again. `67aa802b` moved the same day
+from 3:35 PM to 5:00 PM ET daily.
 
 `7be82b97` fires three times a day from one cron entry, so its manifest row
 carries the combined default `"11:30,13:30,14:30"`. Each run must pass its own
@@ -208,9 +225,9 @@ defaults to `None`, so ad-hoc/test construction never touches the real path.
   explicit roots, e.g. `classification_state_root`) so, matching that
   existing pattern, `model_usage_log_root` there stays caller-opt-in rather
   than defaulted.
-- **CLI for the rest:** `2ba19526`, `bb4f6ef1`, `7be82b97`, `e3e6f09e`, and
-  `a46bf007` have no in-repo executor to wire a call into, so the
-  scheduler/agent appends their entry directly:
+- **CLI for the rest:** `2ba19526`, `bb4f6ef1`, and `7be82b97` have no in-repo
+  executor to wire a call into, so the scheduler/agent appends their entry
+  directly:
   `python -m scripts.model_usage_log --run-id <id> --task-id <id> --artifact-path <path>`
   (see `--help` for the full option list).
 - **What Python cannot know:** this module has no visibility into which

@@ -390,6 +390,99 @@ def test_midday_refreshes_only_its_own_pointer_with_guard_fields(tmp_path):
     assert pdata["updated_at_utc"].endswith("Z")
 
 
+# --- Cross-stream shared budget pooling (added 2026-08-02) ------------------
+def test_midday_cap_ledger_seeded_from_cross_stream_morning_fill(tmp_path):
+    """The midday budget ledger's cap must be genuinely pooled with other
+    streams, not an isolated $90/day half-share.
+
+    Before the 2026-08-02 pooling fix, MiddayConfig.cap_seed_roots had no
+    default and midday_dca.json shipped none either, so this cap_seed_roots
+    scan (added to _compute_top_up alongside morning's own) never ran for
+    midday at all -- a $170 prior MORNING fill would have been invisible to
+    midday's cap ledger, which stayed isolated at its own (then-$90) cap.
+    Now the cap is the shared $180 Normal-tier ceiling and cap_seed_roots
+    covers the morning root, so a $170 prior morning fill leaves only $10 of
+    headroom for the midday run.
+    """
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+    class _Broker:
+        def __init__(self):
+            self.placed = {}
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return None
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.placed[ticker] = notional_usd
+            return f"ORDER-{ticker}"
+
+    morning_root = tmp_path / "morning_prior"
+    # $170 prior MORNING fill on a different ticker, well below TOPUP's own
+    # decision price so the per-ticker top-up guard isn't what blocks TOPUP --
+    # only the shared daily cap should be the binding constraint here.
+    _write_prior_morning_run(
+        morning_root, ticker="PRIOR_TICKER", planned_amount=170.0, generated_at="2026-07-08T10:30:00-04:00"
+    )
+    cfg = MiddayConfig(
+        tickers=("TOPUP",),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "live"),
+        cap_seed_roots=(str(morning_root),),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    assert cfg.morning_daily_cap_usd == 180.0  # the shared Normal-tier ceiling, not an isolated 90.0
+    ex = MiddayDCAExecutor(cfg, mode="live")
+    broker = _Broker()
+    # 3% drop: TOPUP desired = 2.5x * $3 = $7.50; remaining shared cap = $180 - $170 = $10.
+    # $7.50 fits under $10, proving the fill was seen (a stale isolated-$90 cap
+    # with no seeding at all would ALSO have allowed this by coincidence, so the
+    # cap-exceeded case below is the one that actually proves seeding occurred).
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.03})
+    res = ex.run(_now_midday(), data, broker=broker)
+    broker_outcomes = res["artifacts"].get("broker_outcomes", {})
+    assert broker_outcomes.get("TOPUP", {}).get("status") == "submitted"
+    assert broker.placed.get("TOPUP") == pytest.approx(7.50)
+
+    # Now push the prior morning fill up to $175: remaining shared cap = $5,
+    # which TOPUP's $7.50 desired amount exceeds.
+    morning_root2 = tmp_path / "morning_prior_2"
+    _write_prior_morning_run(
+        morning_root2, ticker="PRIOR_TICKER", planned_amount=175.0, generated_at="2026-07-08T10:30:00-04:00"
+    )
+    cfg2 = MiddayConfig(
+        tickers=("TOPUP",),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "live2"),
+        cap_seed_roots=(str(morning_root2),),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex2 = MiddayDCAExecutor(cfg2, mode="live")
+    broker2 = _Broker()
+    res2 = ex2.run(_now_midday(), data, broker=broker2)
+    broker_outcomes2 = res2["artifacts"].get("broker_outcomes", {})
+    assert broker_outcomes2.get("TOPUP", {}).get("status") == "cap_exceeded", (
+        "TOPUP ($7.50 desired) should be cap-gated once a $175 prior MORNING fill, "
+        "seeded cross-stream via cap_seed_roots, leaves only $5 of the shared $180 cap"
+    )
+    assert "TOPUP" not in broker2.placed
+
+
 def test_midday_manual_run_id_and_no_pointer(tmp_path):
     cfg = MiddayConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
     ex = MiddayDCAExecutor(cfg)
@@ -1058,7 +1151,10 @@ def test_load_midday_config_enables_model_usage_log_by_default(tmp_path):
 def test_midday_executor_default_init_loads_shipped_config():
     ex = MiddayDCAExecutor()
     assert ex.config.base_buy_amount_usd == 2.0
-    assert ex.config.morning_daily_cap_usd == 90.0
+    # Shared Normal-tier ceiling (near_close_dca.BUDGET_TIERS[0]), not the old
+    # isolated 90.0 per-stream half-share -- see midday_dca.py's
+    # DEFAULT_MIDDAY_DAILY_CAP_USD comment (pooling fix, 2026-08-02).
+    assert ex.config.morning_daily_cap_usd == 180.0
     assert date(2026, 7, 2) in ex.config.approved_test_dates
     assert date(2026, 8, 28) in ex.config.approved_test_dates
     assert ex.state_root == DEFAULT_MIDDAY_LIVE_STATE_ROOT

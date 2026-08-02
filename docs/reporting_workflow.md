@@ -20,9 +20,7 @@ private links are stored in this repo.**
    The 2026-07-24 2:30 PM ET scheduled recovery (18 fills, $72.00) belongs to this task.
 5. **12:30 PM ET: Midday live execution (`a6239dae`)**
    Places buys and writes `cron_tracking/midday_dca/YYYYMMDD_1230ET/`.
-6. **3:05 PM ET: $2-base monitor-only signal check (`e3e6f09e`, PAUSED)**
-   Analytics only. Currently **paused**, so it does not fire.
-7. **3:30 PM ET: Final live graded DCA task (`10ce362c`, supersedes deleted `ce16ba6b`)**
+6. **3:30 PM ET: Final live graded DCA task (`10ce362c`, supersedes deleted `ce16ba6b`)**
    Places buys (Robinhood `<ROBINHOOD_ACCOUNT_NUMBER>`) and writes the standardized same-day
    **run state** artifact ([`schemas/run_state.schema.json`](../schemas/run_state.schema.json)).
    A **scheduled** run writes under
@@ -30,20 +28,25 @@ private links are stored in this repo.**
    `run_classification.run_origin='scheduled'` and updates
    `latest_scheduled_run.json`. Manual runs write under `manual_runs/<timestamp>/`
    and never update that pointer. See
-   [run_classification.md](run_classification.md).
-8. **3:35 PM ET: Post-trade slippage + Notion sync (`67aa802b`)**
+   [run_classification.md](run_classification.md). Afternoon **trading**
+   completes here, no later than 3:30 PM ET.
+7. **5:00 PM ET: Post-trade slippage + Notion sync (`67aa802b`)**
    Reads the **scheduled** run-state artifact and Robinhood order history,
    computes slippage
    ([`schemas/slippage_report.schema.json`](../schemas/slippage_report.schema.json)),
    writes slippage/coverage artifacts, and updates the **compact Notion "Latest
    Run" section only**. Scheduled-live rows exclude all manual order IDs and any
    `run_origin='manual'` / `manual_run=true` state; manual fills go only in the
-   labeled **Manual Test Runs** section.
-9. **3:40 PM ET: Watchdog (`a46bf007`)**
-   Read-only, the final scheduled afternoon event. Confirms a valid **scheduled**
-   run_state exists and that `latest_scheduled_run.json` points at it; flags
-   missing/incomplete/error/discrepancy. Never infers a scheduled run from
-   same-day broker orders or manual runs alone.
+   labeled **Manual Test Runs** section. Retimed 2026-08-02 from 3:35 PM ET.
+
+**REMOVED 2026-08-02:** the 3:05 PM $2-base monitor-only signal check
+(`e3e6f09e`, already paused) and the 3:40 PM watchdog (`a46bf007`, which used
+to confirm a valid **scheduled** run_state existed and that
+`latest_scheduled_run.json` pointed at it) were both removed from the
+schedule entirely at the user's request; neither fires anymore, so neither
+is numbered above. See `config/scheduled_tasks.json`'s
+`afternoon_completion_rule` and
+[`safeguards.md`](safeguards.md#operational-rules).
 
 Every manual or scheduled run produces a **DCA Manual Run Slippage and Coverage
 Report** where fills exist, or a compact run artifact explaining no fills.
@@ -64,8 +67,10 @@ section and never affect scheduled-live metrics.
 
 ## Periodic flow
 
-- **Fridays 5:00 PM ET — Weekly dashboard (`041d9d90`)**: full Notion
-  performance dashboard refresh. No routine email.
+- **Fridays 5:30 PM ET — Weekly dashboard (`041d9d90`)**: full Notion
+  performance dashboard refresh. Retimed 2026-08-02 from 5:00 PM ET to clear
+  the collision with `67aa802b`'s new daily 5:00 PM ET slot on Fridays. No
+  routine email.
 - **First weekday of month 8:45 AM ET — Monthly dashboard (`0656657a`)**:
   refresh; no-op otherwise.
 - **First weekday of month — Cost review (`bec4a6ee`)**: usage proxies only

@@ -1195,6 +1195,61 @@ def test_main_creates_output_parent_directories(tmp_path):
     assert json.loads(json_out.read_text(encoding="utf-8"))["trading_day"] == TRADING_DAY
 
 
+def test_main_write_defaults_derives_root_and_paths_without_any_shell_hardcoding(
+    monkeypatch, tmp_path
+):
+    """Codex review: "Keep the report command on the shared artifact root".
+    The registered scheduler command used to hardcode a shell
+    ${DCA_CRON_TRACKING_ROOT:-/home/user/workspace/cron_tracking} fallback
+    for --cron-tracking-root/--json-out/--md-out, which diverges from
+    dca_paths.cron_tracking_root()'s own checkout-relative unset-default --
+    the same root every other in-repo producer/consumer uses. --write-defaults
+    removes the shell-side computation entirely: with no --cron-tracking-root/
+    --json-out/--md-out given at all, the script must derive the root via
+    cron_tracking_root() and write to default_report_paths()'s exact
+    locations, so a scheduler invocation using --write-defaults can never
+    drift from the shared root."""
+    from scripts.generate_credit_usage_proxy_report import (
+        CRON_TRACKING_ROOT_ENV,
+        default_report_paths,
+    )
+
+    monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, str(tmp_path))
+    exit_code = _main(
+        ["--trading-day", TRADING_DAY, "--write-defaults"]
+    )
+    assert exit_code == 0
+
+    expected = default_report_paths(TRADING_DAY, tmp_path)
+    assert expected["json"].is_file()
+    assert expected["md"].is_file()
+    assert json.loads(expected["json"].read_text(encoding="utf-8"))["trading_day"] == TRADING_DAY
+
+
+def test_main_write_defaults_is_ignored_when_explicit_paths_are_given(tmp_path):
+    """--write-defaults must not override an explicitly passed --json-out/
+    --md-out -- explicit flags stay authoritative."""
+    json_out = tmp_path / "explicit.json"
+    md_out = tmp_path / "explicit.md"
+    exit_code = _main(
+        [
+            "--trading-day",
+            TRADING_DAY,
+            "--cron-tracking-root",
+            str(tmp_path / "cron_tracking"),
+            "--json-out",
+            str(json_out),
+            "--md-out",
+            str(md_out),
+            "--write-defaults",
+        ]
+    )
+    assert exit_code == 0
+    assert json_out.is_file()
+    assert md_out.is_file()
+    assert not (tmp_path / "credit_usage_proxy_report").exists()
+
+
 def test_non_utf8_run_state_does_not_abort_the_report(tmp_path):
     # UnicodeDecodeError is a ValueError, not an OSError or JSONDecodeError,
     # so an invalid-UTF-8 run_state.json used to escape _load_json and prevent
@@ -3485,44 +3540,29 @@ def test_cron_tracking_root_honours_the_env_override(monkeypatch, tmp_path):
     assert _default_cron_tracking_root() == bundled
 
 
-def test_registered_command_expands_the_configurable_root():
-    # The manifest command must not hardcode a deployment-specific literal.
-    # Its unset ":-" fallback must be the SAME checkout-relative default
-    # dca_paths.DEFAULT_CRON_TRACKING_ROOT resolves to (this command's own
-    # note requires running from the repository root), not the retired
-    # bundled /home/user/workspace/cron_tracking literal -- otherwise this
-    # scheduler command and every other in-repo producer/consumer of
-    # cron_tracking_root() read/write two different trees whenever the
-    # variable is unset (Codex review: "Keep the unset artifact-root default
-    # consistent").
-    import subprocess
-
+def test_registered_command_derives_the_root_with_no_shell_hardcoding():
+    # Codex review: "Keep the report command on the shared artifact root".
+    # The command previously expanded a shell ${DCA_CRON_TRACKING_ROOT:-
+    # /home/user/workspace/cron_tracking} fallback for --cron-tracking-root/
+    # --json-out/--md-out, which diverges from dca_paths.cron_tracking_root()'s
+    # own checkout-relative unset-default -- the same root every other
+    # in-repo producer/consumer uses -- so an unconfigured checkout would
+    # read/write a different tree than every other task. The manifest
+    # command must not hardcode any root or path at all; --write-defaults
+    # lets the Python entry point derive both via cron_tracking_root()/
+    # default_report_paths() instead, which can never drift from the shared
+    # root the way a static shell fallback could.
     repo_root = Path(__file__).resolve().parents[2]
     manifest = json.loads((repo_root / "config" / "scheduled_tasks.json").read_text(encoding="utf-8"))
     command = next(
         t["command"] for t in manifest["tasks"] if t.get("id", "").startswith("onetime-1630-credit")
     )
-    assert "${DCA_CRON_TRACKING_ROOT" in command
-
-    # Resolve the argv under sh both ways, echoing instead of running.
-    echoed = command.replace(
-        "python -m scripts.generate_credit_usage_proxy_report", 'printf "%s\\n"'
-    )
-    default_out = subprocess.run(
-        ["sh", "-c", echoed], capture_output=True, text=True, check=True
-    ).stdout
-    assert default_out.count("cron_tracking") == 3
-    assert "/home/user/workspace/cron_tracking" not in default_out
-
-    relocated = subprocess.run(
-        ["sh", "-c", echoed],
-        capture_output=True,
-        text=True,
-        check=True,
-        env={"PATH": "/usr/bin:/bin", "DCA_CRON_TRACKING_ROOT": "/relocated/tree"},
-    ).stdout
-    assert relocated.count("/relocated/tree") == 3
-    assert "/home/user/workspace/cron_tracking" not in relocated
+    assert "--write-defaults" in command
+    assert "DCA_CRON_TRACKING_ROOT" not in command
+    assert "/home/user/workspace/cron_tracking" not in command
+    assert "--cron-tracking-root" not in command
+    assert "--json-out" not in command
+    assert "--md-out" not in command
 
 
 def test_redaction_handles_quoted_json_credential_keys(tmp_path):

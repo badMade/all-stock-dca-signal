@@ -76,12 +76,17 @@ alerts a day, every weekday, until a real entry point exists) as the cost of tha
 The Gate 4 sole-executor-interlock
 double-order risk this section used to warn about only becomes real once a human
 finishes `claude/GATE5-PROPOSAL.md` and wires a real signal-generation entry point into
-these prompts -- **that** is the point to retire the five old tasks, and it must happen
-before (not after) the new prompts can place real orders, or the two schedules really
-could both submit in the same window. It is also the point where Gate 4 (in the three
-prompts where it has an exception) and Gate 5 (in all seven) must revert from their
-disabled classifications (`GATE4_EXPECTED_OVERLAP` and `GATE5_DISABLED`, both alerting) back
-to real abort-and-alert checks on failure, the same as every other gate.
+these prompts, and Gate 5 in all seven must revert from its disabled `GATE5_DISABLED`
+classification to a real abort-and-alert check on failure, the same as every other gate.
+
+**Correction, 2026-08-02:** this section (and this whole file, which documents
+the SUPERSEDED prompt generation — see `claude/dca-executor-prompts/README.md`)
+used to say that wiring Gate 5 is also "the point to retire the five old
+[Perplexity] tasks." Geoff has since directed a standing dual-executor design
+instead: Perplexity and Claude coordinate first-come-first-serve per slot and
+keep running alongside each other indefinitely, not a one-time cutover the
+moment Gate 5 ships. See `claude/PERPLEXITY-CLAUDE-COORDINATION.md` and
+`docs/safeguards.md`'s "Live execution roster" section for the current design.
 
 **Truncation risk:** `config/scheduled_tasks.json`'s `live_task_text_compactness_policy`
 documents that the scheduling service can silently truncate long task text --

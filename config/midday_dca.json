@@ -90,9 +90,10 @@
   },
   "budget_ledger": {
     "namespace": "midday",
-    "midday_daily_cap_usd": 90.0,
-    "midday_weekly_cap_usd": 450.0,
-    "separation_note": "The midday ledger is a separate session from both the morning ledger and the afternoon StrategyState / BUDGET_TIERS ledger. Midday buys never consume or validate the morning or afternoon 3:20 daily/weekly budget."
+    "midday_daily_cap_usd": 180.0,
+    "midday_weekly_cap_usd": 900.0,
+    "shared_pool_note": "POOLING FIX (Geoff, confirmed 2026-08-02: 'caps aren't pooled the way the target design intends -- fix it'). Raised from the old isolated per-stream half-share (90.0/450.0) to the SAME shared Normal-tier ceiling every stream draws from (near_close_dca.BUDGET_TIERS[0], mirrored in config/budgets.json and config/morning_dca.json). artifact_paths.cap_seed_roots below (previously absent -- midday had NO cross-stream cap visibility at all) now spans every sibling stream so this ledger sees the whole day's/week's cross-stream spend. As with morning, this does not add dynamic Elevated/High-volatility/Stress escalation to the midday slot itself -- only the 3:30 final run escalates, from its fuller same-day view; midday shares the flat Normal $180/$900 floor and is therefore only ever more conservative than the true escalated-day ceiling, never less.",
+    "separation_note": "Superseded 2026-08-02 by shared_pool_note above: the midday ledger's CAP is now the same shared $180/day, $900/week ceiling every stream draws from, not an isolated 90/450 half-share. It remains a separate ledger OBJECT from the morning ledger and the afternoon StrategyState / BUDGET_TIERS ledger (different code path, different persisted file, own namespace) -- but the ceiling it is checked against is shared, not independent."
   },
   "top_up_rule": {
     "description": "Morning/manual prior same-day buys are prior-allocation context only; they never block the midday run. The midday run tops up only when it is buying into a lower price. The identical guard applies to the morning, midday, afternoon, and manual override same-day fills: every later run buys only max(0, desired_amount - prior_same_day_amount), and only when the current decision price is strictly below the prior same-day reference price.",
@@ -120,6 +121,15 @@
       "/home/user/workspace/cron_tracking/intraday_dca",
       "/home/user/workspace/cron_tracking/ce16ba6b"
     ],
+    "cap_seed_roots": [
+      "/home/user/workspace/cron_tracking/midday_dca",
+      "/home/user/workspace/cron_tracking/market_open_dca",
+      "/home/user/workspace/cron_tracking/morning_dca",
+      "/home/user/workspace/cron_tracking/intraday_dca",
+      "/home/user/workspace/cron_tracking/ce16ba6b",
+      "/home/user/workspace/cron_tracking/final_manual_review"
+    ],
+    "cap_seed_roots_note": "ADDED 2026-08-02 (see budget_ledger.shared_pool_note). Previously midday had NO cap_seed_roots at all, so its budget ledger was fully isolated with zero visibility into any other stream's same-day spend -- unlike prior_allocation_roots above, which only feeds the PER-TICKER top-up guard's reference price, never the daily/weekly cap. This list is every sibling stream, including midday's own root (so a restart/retry still seeds from its own prior fills) and final_manual_review (the out-of-tree manual final-buy override root), so the shared ceiling in budget_ledger above is genuinely pooled.",
     "manual_recovery_root": "/home/user/workspace/cron_tracking/morning_dca/manual_recovery",
     "manual_recovery_run_dir_glob": "/home/user/workspace/cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*",
     "manual_recovery_note": "The 12:30 midday run MUST scan /home/user/workspace/cron_tracking/morning_dca/manual_recovery/YYYYMMDD_* for same-day MANUAL missed-morning 10:30 recovery artifacts (run_origin='manual', manual_run=true, same_day_top_up_context_only=true, valid_scheduled_evidence=false). They are prior-allocation / same-day top-up context ONLY: the midday run buys max(0, desired - prior) and only when its decision price is strictly below the prior reference price. They are NEVER midday scheduled evidence, never proof the 10:30 scheduled task ran, and never counted in scheduled reliability, fill counts, slippage, cost basis, or watchdog confirmation. See config/morning_dca.json:manual_missed_run_recovery.",

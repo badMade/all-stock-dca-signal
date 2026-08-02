@@ -1482,6 +1482,422 @@ def test_compute_auto_derived_prior_allocations_reports_scan_had_failures(tmp_pa
     assert scan_had_failures is True
 
 
+def test_compute_auto_derived_prior_allocations_sums_attempt_count_across_the_afternoon_merge(
+    tmp_path,
+):
+    """Codex review: "Carry attempt counts through the final cross-stream
+    merge". _compute_auto_derived_prior_allocations's own afternoon-root vs
+    cross-stream merge (run_dca.py, not near_close_dca's
+    load_prior_same_day_allocations_multi) used to construct a bare
+    PriorSameDayAllocation(...) without attempt_count, silently resetting
+    the aggregate to the dataclass default of 1 -- even when both sides
+    genuinely contributed real, distinct attempts."""
+    import json
+
+    from run_dca import _compute_auto_derived_prior_allocations
+
+    trading_day = _now().date()
+    root = tmp_path / "cron_tracking"
+    afternoon_task_root = root / "ce16ba6b"
+    afternoon_dir = afternoon_task_root / "manual_runs" / "0900"
+    afternoon_dir.mkdir(parents=True)
+    (afternoon_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": trading_day.isoformat(),
+                "generated_at": f"{trading_day.isoformat()}T09:00:00-04:00",
+                "run_classification": {"run_origin": "manual", "run_id": "afternoon_manual_am"},
+                "buy_candidates": [
+                    {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 2.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    morning_dir = root / "morning_dca" / "20260706_1030ET"
+    morning_dir.mkdir(parents=True)
+    (morning_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": trading_day.isoformat(),
+                "generated_at": f"{trading_day.isoformat()}T10:30:00-04:00",
+                "run_classification": {
+                    "run_origin": "scheduled",
+                    "run_type": "morning_dca_live",
+                    "stream": "morning",
+                    "manual_run": False,
+                    "trading_day": trading_day.isoformat(),
+                    "run_id": "morning_live_20260706_1030ET",
+                },
+                "buy_candidates": [
+                    {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    scheduled_dir = afternoon_task_root / "scheduled_runs" / "20260706_1520ET"
+    allocations, scan_had_failures = _compute_auto_derived_prior_allocations(
+        _now(), trading_day, scheduled_dir, None
+    )
+
+    assert scan_had_failures is False
+    assert allocations["AAPL"].amount_usd == pytest.approx(5.0)
+    assert allocations["AAPL"].attempt_count == 2
+
+
+def test_compute_auto_derived_prior_allocations_deduplicates_a_mirrored_run_across_the_merge(
+    tmp_path,
+):
+    """Codex review: "Apply mirrored-run dedup across the afternoon merge
+    boundary". The SAME manual override mirrored under the afternoon root
+    (ce16ba6b/manual_runs) and a sibling root (morning_dca) is one run, not
+    two -- the final afternoon-vs-cross-stream merge must recognize the
+    duplicate the same way load_prior_same_day_allocations_multi's own
+    cross-root merge does, not silently sum it twice."""
+    import json
+
+    from run_dca import _compute_auto_derived_prior_allocations
+
+    trading_day = _now().date()
+    root = tmp_path / "cron_tracking"
+    mirrored_state = {
+        "trading_day": trading_day.isoformat(),
+        "generated_at": f"{trading_day.isoformat()}T09:00:00-04:00",
+        "run_classification": {"run_origin": "manual", "run_id": "mirrored_override_0900"},
+        "buy_candidates": [
+            {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 5.0},
+        ],
+    }
+
+    afternoon_task_root = root / "ce16ba6b"
+    afternoon_dir = afternoon_task_root / "manual_runs" / "0900"
+    afternoon_dir.mkdir(parents=True)
+    (afternoon_dir / "run_state.json").write_text(json.dumps(mirrored_state), encoding="utf-8")
+
+    morning_dir = root / "morning_dca" / "manual_runs" / "0900"
+    morning_dir.mkdir(parents=True)
+    (morning_dir / "run_state.json").write_text(json.dumps(mirrored_state), encoding="utf-8")
+
+    scheduled_dir = afternoon_task_root / "scheduled_runs" / "20260706_1520ET"
+    allocations, scan_had_failures = _compute_auto_derived_prior_allocations(
+        _now(), trading_day, scheduled_dir, None
+    )
+
+    assert scan_had_failures is False
+    # The SAME $5.00 order, mirrored under two roots, must count once.
+    assert allocations["AAPL"].amount_usd == pytest.approx(5.0)
+    assert allocations["AAPL"].attempt_count == 1
+
+
+def test_compute_auto_derived_prior_allocations_deduplicates_a_mirrored_zero_notional_attempt(
+    tmp_path,
+):
+    """Codex review: "Deduplicate mirrored zero-notional attempts". Same
+    mirrored-run scenario as the dollar-dedup test above, but for a REJECTED
+    order that contributed no dollars. contributing_run_ids is only
+    populated once a row contributes a positive dollar amount, so this
+    run's id never lands in it and the dollar-dedup check in this merge
+    could never recognize the duplicate -- the additive branch counted the
+    SAME broker attempt twice against attempt_count."""
+    import json
+
+    from run_dca import _compute_auto_derived_prior_allocations
+
+    trading_day = _now().date()
+    root = tmp_path / "cron_tracking"
+    mirrored_state = {
+        "trading_day": trading_day.isoformat(),
+        "generated_at": f"{trading_day.isoformat()}T09:00:00-04:00",
+        "run_classification": {"run_origin": "manual", "run_id": "mirrored_override_0900"},
+        "buy_candidates": [
+            {"ticker": "AAPL", "status": "failed", "planned_amount_usd": 5.0},
+        ],
+    }
+
+    afternoon_task_root = root / "ce16ba6b"
+    afternoon_dir = afternoon_task_root / "manual_runs" / "0900"
+    afternoon_dir.mkdir(parents=True)
+    (afternoon_dir / "run_state.json").write_text(json.dumps(mirrored_state), encoding="utf-8")
+
+    morning_dir = root / "morning_dca" / "manual_runs" / "0900"
+    morning_dir.mkdir(parents=True)
+    (morning_dir / "run_state.json").write_text(json.dumps(mirrored_state), encoding="utf-8")
+
+    scheduled_dir = afternoon_task_root / "scheduled_runs" / "20260706_1520ET"
+    allocations, scan_had_failures = _compute_auto_derived_prior_allocations(
+        _now(), trading_day, scheduled_dir, None
+    )
+
+    assert scan_had_failures is False
+    # The SAME rejected attempt, mirrored under two roots, must count once.
+    assert allocations["AAPL"].amount_usd == 0.0
+    assert allocations["AAPL"].attempt_count == 1
+
+
+def test_compute_earlier_week_cross_stream_notional_sums_monday_sibling_spend(tmp_path):
+    """Codex review: "Include prior-week sibling spend in the afternoon
+    ledger". _compute_auto_derived_prior_allocations only scans
+    trading_day itself, so a fresh Tuesday afternoon run never saw Monday's
+    morning/midday/market-open spend against the shared weekly cap.
+    _compute_earlier_week_cross_stream_notional must aggregate every
+    completed earlier day in the current ISO week across the afternoon
+    root and its cross-stream siblings."""
+    import json
+
+    from run_dca import _compute_earlier_week_cross_stream_notional
+
+    root = tmp_path / "cron_tracking"
+    afternoon_run_dir = root / "ce16ba6b" / "scheduled_runs" / "20260630_1530ET"
+    afternoon_run_dir.mkdir(parents=True)
+
+    # Monday's morning live run: real, confirmed spend.
+    morning_dir = root / "morning_dca" / "20260629_1030ET"
+    morning_dir.mkdir(parents=True)
+    (morning_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-29",
+                "generated_at": "2026-06-29T10:30:00-04:00",
+                "run_classification": {
+                    "run_origin": "scheduled",
+                    "run_type": "morning_dca_live",
+                    "stream": "morning",
+                    "manual_run": False,
+                    "trading_day": "2026-06-29",
+                    "run_id": "morning_live_20260629_1030ET",
+                },
+                "buy_candidates": [
+                    {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 2.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Monday's market-open live run: external stream, canonical CSV only.
+    market_open_dir = root / "market_open_dca" / "20260629_0935ET"
+    market_open_dir.mkdir(parents=True)
+    (market_open_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-29",
+                "generated_at": "2026-06-29T09:35:00-04:00",
+                "run_classification": {
+                    "run_origin": "scheduled",
+                    "run_type": "market_open_dca_live",
+                    "stream": "market_open",
+                    "manual_run": False,
+                    "trading_day": "2026-06-29",
+                    "run_id": "market_open_live_20260629_0935ET",
+                },
+                "buy_candidates": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (market_open_dir / "submitted_orders.csv").write_text(
+        "ticker,order_id,status,submitted_amount_usd,avg_fill_price,quantity_filled\n"
+        "TRIN,ORD-2,filled,1.50,25.00,0.06\n",
+        encoding="utf-8",
+    )
+
+    from datetime import date as _date
+
+    trading_day = _date(2026, 6, 30)
+    now = datetime.combine(trading_day, time(15, 30), tzinfo=EASTERN)
+    total, scan_had_failures = _compute_earlier_week_cross_stream_notional(
+        now, trading_day, afternoon_run_dir, None
+    )
+
+    assert scan_had_failures is False
+    assert total == pytest.approx(3.50)
+
+
+def test_compute_earlier_week_cross_stream_notional_no_earlier_spend_is_zero(tmp_path):
+    from datetime import date as _date
+
+    from run_dca import _compute_earlier_week_cross_stream_notional
+
+    root = tmp_path / "cron_tracking"
+    afternoon_run_dir = root / "ce16ba6b" / "scheduled_runs" / "20260630_1530ET"
+    afternoon_run_dir.mkdir(parents=True)
+
+    trading_day = _date(2026, 6, 30)
+    now = datetime.combine(trading_day, time(15, 30), tzinfo=EASTERN)
+    total, scan_had_failures = _compute_earlier_week_cross_stream_notional(
+        now, trading_day, afternoon_run_dir, None
+    )
+
+    assert total == 0.0
+    assert scan_had_failures is False
+
+
+def test_compute_earlier_week_cross_stream_notional_includes_final_manual_review(tmp_path):
+    """Codex review: "Include final-manual overrides in afternoon weekly
+    seeding". final_manual_review is an out-of-tree manual final-buy override
+    root (real budget-block-override fills, see
+    scripts/run_classification.py's _ROOTS_NEVER_REACHED_BY_CORE_LOADER) that
+    morning_dca.py's own default_cap_seed_roots() already scans. Before this
+    fix, _resolve_cross_stream_prior_allocation_roots (shared by both the
+    same-day and this earlier-week afternoon scan) never included it, so a
+    Monday final-manual override fill was invisible to a fresh Tuesday
+    afternoon run's shared weekly cap."""
+    import json
+    from datetime import date as _date
+
+    from run_dca import _compute_earlier_week_cross_stream_notional
+
+    root = tmp_path / "cron_tracking"
+    afternoon_run_dir = root / "ce16ba6b" / "scheduled_runs" / "20260630_1530ET"
+    afternoon_run_dir.mkdir(parents=True)
+
+    # Monday's out-of-tree manual final-buy override: a budget-blocked signal
+    # that a human approved and filled after the scheduled run completed.
+    override_dir = root / "final_manual_review" / "budget_block_override_20260629_1600ET"
+    override_dir.mkdir(parents=True)
+    (override_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-29",
+                "generated_at": "2026-06-29T16:00:00-04:00",
+                "run_classification": {"run_origin": "manual", "run_id": "final_override_0629"},
+                "buy_candidates": [
+                    {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 6.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    trading_day = _date(2026, 6, 30)
+    now = datetime.combine(trading_day, time(15, 30), tzinfo=EASTERN)
+    total, scan_had_failures = _compute_earlier_week_cross_stream_notional(
+        now, trading_day, afternoon_run_dir, None
+    )
+
+    assert scan_had_failures is False
+    assert total == pytest.approx(6.0)
+
+
+def test_compute_earlier_week_cross_stream_notional_includes_manual_bare_csv_fallback(tmp_path):
+    """Codex review: "Include unreferenced manual CSVs in prior-week
+    totals". _compute_earlier_week_cross_stream_notional's per-earlier-day
+    scan only used load_prior_same_day_allocations_multi (the core loader),
+    which cannot see a manual/recovery run whose fills live ONLY in a bare
+    sibling orders CSV the run_state never names (no embedded
+    buy_candidates, no artifacts.orders_csv_path -- the Jul 21 manual midday
+    shape). _compute_auto_derived_prior_allocations already merges
+    load_same_day_top_up_context for the SAME day; this earlier-week scan
+    must do the same for each EARLIER day, or that manual spend is invisible
+    to the shared weekly cap entirely."""
+    import json
+    from datetime import date as _date
+
+    from run_dca import _compute_earlier_week_cross_stream_notional
+
+    root = tmp_path / "cron_tracking"
+    afternoon_run_dir = root / "ce16ba6b" / "scheduled_runs" / "20260630_1530ET"
+    afternoon_run_dir.mkdir(parents=True)
+
+    # Monday's manual midday run: no embedded buy_candidates and no recorded
+    # artifacts.orders_csv_path, so the core loader can't see it -- its fills
+    # live only in the sibling submitted_orders.csv below.
+    manual_dir = root / "midday_dca" / "manual_runs" / "20260629_1345ET"
+    manual_dir.mkdir(parents=True)
+    (manual_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-29",
+                "generated_at": "2026-06-29T13:45:00-04:00",
+                "run_classification": {
+                    "run_origin": "manual",
+                    "manual_run": True,
+                    "run_id": "manual_midday_20260629_1345ET",
+                    "trading_day": "2026-06-29",
+                    "same_day_top_up_context_only": True,
+                    "valid_scheduled_evidence": False,
+                    "valid_afternoon_scheduled_evidence": False,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (manual_dir / "submitted_orders.csv").write_text(
+        "symbol,amount,order_id,status,average_price,quantity\n"
+        "IBM,4.0,MANUAL-IBM-1,filled,100.00,0.04\n",
+        encoding="utf-8",
+    )
+
+    trading_day = _date(2026, 6, 30)
+    now = datetime.combine(trading_day, time(15, 30), tzinfo=EASTERN)
+    total, scan_had_failures = _compute_earlier_week_cross_stream_notional(
+        now, trading_day, afternoon_run_dir, None
+    )
+
+    assert scan_had_failures is False
+    assert total == pytest.approx(4.0)
+
+
+def test_run_pipeline_afternoon_seeds_earlier_week_spend_into_state(tmp_path):
+    """End-to-end wiring check for "Include prior-week sibling spend in the
+    afternoon ledger": a Tuesday afternoon run_pipeline() call must fold
+    Monday's cross-stream spend into state.week_notional(), not just the
+    ephemeral return value -- StrategyState is mutated in place and the
+    caller's own reference reflects it after the call returns."""
+    import json
+
+    root = tmp_path / "cron_tracking"
+    afternoon_run_dir = root / "ce16ba6b" / "scheduled_runs" / "20260630_1530ET"
+
+    morning_dir = root / "morning_dca" / "20260629_1030ET"
+    morning_dir.mkdir(parents=True)
+    (morning_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-29",
+                "generated_at": "2026-06-29T10:30:00-04:00",
+                "run_classification": {
+                    "run_origin": "scheduled",
+                    "run_type": "morning_dca_live",
+                    "stream": "morning",
+                    "manual_run": False,
+                    "trading_day": "2026-06-29",
+                    "run_id": "morning_live_20260629_1030ET",
+                },
+                "buy_candidates": [
+                    {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 12.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    from datetime import date as _date
+
+    trading_day = _date(2026, 6, 30)
+    now = datetime.combine(trading_day, time(15, 30), tzinfo=EASTERN)
+    config = load_strategy_config(approved_test_dates=frozenset({trading_day}))
+    state = StrategyState()
+
+    run_pipeline(
+        now,
+        config,
+        state,
+        DemoDataProvider(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config),
+        artifacts_dir=afternoon_run_dir,
+    )
+
+    # Monday's morning spend now counts against Tuesday's shared weekly cap,
+    # even though _compute_auto_derived_prior_allocations only ever scans
+    # trading_day (Tuesday) itself for its own per-ticker top-up context.
+    assert state.week_notional(trading_day) >= 12.0
+
+
 def test_run_pipeline_logs_error_when_bounded_reload_scan_still_fails(tmp_path, monkeypatch, caplog):
     import run_dca
 
@@ -2543,7 +2959,7 @@ def test_run_pipeline_bounded_reload_poisons_base_change_on_smaller_clean_reload
     # pass-one read is $5 fill / base $2 / reference $100. The CLEAN reload
     # reduces BOTH the amount ($5 -> $4) AND the base ($2 -> $1) while
     # leaving the reference UNCHANGED at $100 -- so the earlier
-    # "discard stale references" patch (which only checks reference_price)
+    # "discard stale references" fix (which only checks reference_price)
     # doesn't trigger, and the entire stale $5/$2/$100 snapshot survives
     # unmodified. Kept unpoisoned, the stale $2 base combined with the kept
     # $5 floor amount can still compute a target that permits a top-up the
@@ -2948,10 +3364,11 @@ def test_run_slot_raw_persistence_failure_preserves_the_slots_own_identity(tmp_p
     the afternoon (15:30, cron_id 10ce362c) scheduled run either --
     raw_persistence_failure_run_state is the OTHER early-exit builder that
     must thread classification_overrides/correlation_id (Codex review:
-"Preserve slot identity on early failure artifacts"). Exercises this on
-    the 10:30 slot specifically; the morning preflight gate is monkeypatched
-    to admit the full universe so the run reaches raw persistence and this
-    test stays focused on the raw-persistence early-exit identity stamping."""
+    "Preserve slot identity on early failure artifacts"). Exercises this on
+    the 10:30 slot specifically, so a same-day 9:45 preflight artifact must
+    be present -- otherwise run_slot's own preflight gate now blocks the run
+    before reaching raw persistence at all (Codex review: "Persist a missing
+    preflight as a blocked morning run")."""
     import json
 
     import run_dca as run_dca_module
@@ -4428,23 +4845,20 @@ def test_run_slot_calendar_gate_takes_priority_over_a_missing_preflight(tmp_path
     assert run_state["is_trading_failure"] is False
 
 
-def test_run_slot_1030et_blocks_the_universe_when_no_preflight_artifact_exists(tmp_path, monkeypatch):
-    """config/morning_dca.json's live_task.preflight_artifact_resolution: a
-    missing/invalid same-day 9:45 pre-flight artifact must reduce the eligible
-    universe to ZERO for the 10:30 slot, not silently scan the configured
-    universe and place live orders without the required morning eligibility
-    evidence (Codex review: "Route the morning slot through its required
-    preflight gate"). Routed only through the generic afternoon-shaped
-    pipeline, run_slot("1030ET") never called MorningDCAExecutor's preflight
-    gate at all -- this is the regression test for that gap.
-
-    A reduced-to-zero universe is not enough on its own: a run that merely
-    evaluates zero candidates reports completion_reason='no_ladder_candidates'
-    -- a normal, healthy no-op -- which a watchdog cannot distinguish from a
-    missing prerequisite. This must instead route through the same
-    blocked-run-stub contract config/morning_dca.json requires of
-    MorningDCAExecutor._apply_preflight_gate() (Codex review: "Persist a
-    missing preflight as a blocked morning run")."""
+def test_run_slot_1030et_evaluates_full_universe_when_no_preflight_artifact_exists(
+    tmp_path, monkeypatch
+):
+    """NON-BLOCKING as of 2026-08-02 (Geoff: "should not block any later
+    runs"), superseding the old fail-closed contract (Codex review: "Route
+    the morning slot through its required preflight gate", "Persist a
+    missing preflight as a blocked morning run"). A missing/invalid same-day
+    pre-flight artifact used to reduce the 10:30 slot's eligible universe to
+    ZERO and short-circuit into a startup-failure-shaped blocked run_state.
+    It now degrades to the FULL configured universe with a warning instead
+    -- the same non-blocking contract morning_dca.py's own executor uses --
+    and the run proceeds and evaluates normally; the run_pipeline() branch
+    that used to build that blocked stub has been removed entirely, since
+    preflight_missing_block is never set anymore."""
     import json
 
     from run_dca import run_slot
@@ -4463,39 +4877,88 @@ def test_run_slot_1030et_blocks_the_universe_when_no_preflight_artifact_exists(t
         broker=build_broker(config),
         artifacts_dir=tmp_path / "artifacts",
     )
-    assert result["blocked"] is True
+    assert result.get("blocked") is not True
     run_state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
-    assert run_state["counts"]["evaluated"] == 0
-    assert run_state["buy_candidates"] == []
-    # A missing preflight artifact must read as a STARTUP FAILURE -- the same
-    # blocked-before-placement shape morning_dca._apply_blocked_before_placement_fields
-    # stamps for its own preflight-block path -- not an ordinary evaluated-to-
-    # zero run or the calendar gate's completed-no-orders shape: both would
-    # hide a failed safety prerequisite from failure/watchdog reporting
-    # entirely (Codex review: "Persist a blocked state when morning preflight
-    # is missing", "Classify missing preflight as a startup failure").
-    assert result["error_class"] == "scheduled_run_blocked_before_placement"
-    assert run_state["run_classification_outcome"] == "failed_scheduled_run_startup"
-    assert run_state["error_class"] == "scheduled_run_blocked_before_placement"
-    assert run_state["is_trading_failure"] is True
-    assert run_state["completion_reason"] is None
-    assert run_state["block_reason"]
-    assert run_state["scheduled_evidence_denied"] is True
+    assert run_state["counts"]["evaluated"] == len(config.tickers)
     assert run_state["run_classification"]["stream"] == "morning"
     assert run_state["run_classification"]["valid_afternoon_scheduled_evidence"] is False
     assert run_state["correlation_id"] == result["correlation_id"]
+    # Codex review: "Emit the advisory preflight warning from run_slot" --
+    # run_slot's preflight_gate check used to look for preflight_missing_block,
+    # a flag nothing sets anymore, so the advisory "warning" was silently
+    # dropped instead of being logged or persisted. It must now be stamped
+    # onto the returned result for durable observability.
+    assert result["preflight_gate"]["preflight_found"] is False
+    assert "warning" in result["preflight_gate"]
+    # Codex review: "Persist preflight diagnostics in the canonical
+    # artifact" -- build_run_artifacts/run_daily_compact already publish
+    # run_state.json to disk before _run_pipeline_impl can stamp
+    # preflight_gate onto its in-memory return value, so the on-disk
+    # artifact (not just the ephemeral Python dict) must carry it too --
+    # that's what reporting and operators actually read after the fact.
+    assert run_state["preflight_gate"] == result["preflight_gate"]
+    assert run_state["preflight_gate"]["preflight_found"] is False
+    assert "warning" in run_state["preflight_gate"]
+    # Codex review: "Recompute usage bytes after rewriting the run state" --
+    # run_daily_compact() already settled usage_proxy.state_file_bytes/
+    # total_artifact_bytes against the smaller pre-rewrite payload before
+    # preflight_gate was added, so those counters (which dca_cost_tracker.py
+    # consumes directly as its artifact-I/O proxy) must be re-settled against
+    # the actual on-disk size after this rewrite, not left stale.
+    from near_close_dca import _existing_csv_artifacts
+
+    usage = run_state["usage_proxy"]
+    run_dir = Path(result["run_state_path"]).parent
+    actual_state_bytes = Path(result["run_state_path"]).stat().st_size
+    actual_csv_bytes = sum(p.stat().st_size for p in _existing_csv_artifacts(run_dir))
+    assert usage["state_file_bytes"] == actual_state_bytes
+    assert usage["total_artifact_bytes"] == actual_state_bytes + actual_csv_bytes
 
 
-def test_run_slot_1030et_preflight_block_still_runs_account_pinning_first(tmp_path, monkeypatch):
-    """Even with the calendar gate passed and the preflight artifact missing,
-    a mismatched broker/account must still raise instead of being masked by
-    the preflight-blocked result. This early return runs before
-    run_daily_compact ever reaches _check_execution_gates's account checks,
-    so without its own check an approved live run with BOTH a missing
-    preflight AND a misconfigured/mismatched account would persist and alert
-    only the preflight failure, hiding the account-safety refusal until a
-    later run happened to have valid preflight data (Codex review: "Run
-    account checks before returning the preflight failure")."""
+def test_run_slot_1030et_survives_a_failed_preflight_gate_artifact_rewrite(
+    tmp_path, monkeypatch
+):
+    """Codex review: "Keep the diagnostic rewrite best-effort" -- the
+    run_state.json read-modify-write that persists preflight_gate onto the
+    canonical artifact is documented as best-effort (a full/unwritable
+    artifact volume must not turn an already-completed trading run into an
+    exception), but the original fix only guarded the read, not the
+    subsequent atomic_write_text call. An OSError from that write must be
+    swallowed (logged, not raised) so the rest of run_slot's return path --
+    including everything generate_full_reports/raw-response persistence do
+    afterward -- still completes."""
+    import run_dca
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _demo_config()
+
+    def _raise_oserror(*args, **kwargs):
+        raise OSError("simulated full/unwritable artifact volume")
+
+    monkeypatch.setattr(run_dca, "atomic_write_text", _raise_oserror)
+
+    result = run_dca.run_slot(
+        "1030ET",
+        now=_now_for_slot("1030ET"),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path / "artifacts",
+    )
+    assert result.get("blocked") is not True
+    # The in-memory return value is unaffected by the on-disk write failing.
+    assert result["preflight_gate"]["preflight_found"] is False
+
+
+def test_run_slot_1030et_still_runs_account_pinning_with_no_preflight_artifact(
+    tmp_path, monkeypatch
+):
+    """A mismatched broker/account must still raise regardless of preflight
+    artifact state -- account pinning is a standard execution gate every live
+    path crosses, not something the (now-removed) preflight-block early
+    return needed its own extra copy of."""
     from run_dca import run_slot
 
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
@@ -4513,131 +4976,6 @@ def test_run_slot_1030et_preflight_block_still_runs_account_pinning_first(tmp_pa
             broker=mismatched_broker,
             artifacts_dir=tmp_path / "artifacts",
         )
-    # No preflight-failure artifact must have been persisted -- the refusal
-    # must win outright, not race with or follow a written blocked state.
-    assert not (tmp_path / "artifacts" / "run_state.json").exists()
-
-
-def test_run_slot_1030et_preflight_block_still_warns_on_window_expiry(tmp_path, monkeypatch):
-    """_check_execution_gates's own first, unconditional action --
-    warn_if_window_expiring -- must still fire on the preflight-blocked early
-    return, which runs before run_daily_compact ever reaches that gate.
-    Without this, an approved live run whose window is about to expire gets
-    no countdown on a day its preflight also happens to be missing, silently
-    losing the warning meant to stop live trading from lapsing without notice
-    (Codex review: "Emit the approved-window expiry warning before
-    returning")."""
-    import run_dca
-    from run_dca import run_slot
-
-    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
-    config = _demo_config()
-    captured = {}
-
-    def _spy(approved_dates, trading_day, **kwargs):
-        captured["approved_dates"] = approved_dates
-        captured["trading_day"] = trading_day
-
-    monkeypatch.setattr(run_dca, "warn_if_window_expiring", _spy)
-
-    run_slot(
-        "1030ET",
-        now=_now_for_slot("1030ET"),
-        config=config,
-        state=StrategyState(),
-        finance_data=DemoDataProvider(SourceName.FINANCE),
-        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
-        broker=build_broker(config),
-        artifacts_dir=tmp_path / "artifacts",
-    )
-
-    assert captured.get("trading_day") is not None
-    assert captured["trading_day"].isoformat() == "2026-07-06"
-    assert captured.get("approved_dates") == config.approved_test_dates
-
-
-@patch("scripts.drift_detection.send_slack_alert")
-def test_run_slot_1030et_preflight_block_sends_its_own_slack_alert(
-    mock_send_slack_alert, tmp_path, monkeypatch
-):
-    """guarded_run pings a failed heartbeat for this result but deliberately
-    sends no Slack alert itself when result_ok is false: structured-failure
-    callers are expected to emit their own targeted alert. Without one, this
-    newly classified startup failure would lack the immediate operator
-    notification that escaping exceptions and raw-persistence failures
-    receive (Codex review: "Alert on returned preflight failures")."""
-    from run_dca import run_slot
-
-    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
-    config = load_strategy_config(
-        approved_test_dates=frozenset({_now().date()}), dry_run=False
-    )
-    broker = DryRunBroker(account=config.target_account_number)
-    result = run_slot(
-        "1030ET",
-        now=_now_for_slot("1030ET"),
-        config=config,
-        state=StrategyState(),
-        finance_data=DemoDataProvider(SourceName.FINANCE),
-        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
-        broker=broker,
-        artifacts_dir=tmp_path / "artifacts",
-    )
-
-    assert result["blocked"] is True
-    mock_send_slack_alert.assert_called_once()
-    report = mock_send_slack_alert.call_args[0][0]
-    assert report.run_suspected_cause == "morning_preflight_missing_or_invalid"
-    assert "drift_report" in result
-    assert (tmp_path / "artifacts" / "drift_report.json").exists()
-
-
-def test_run_slot_1030et_preflight_block_preserves_a_prior_attempts_submitted_orders(
-    tmp_path, monkeypatch
-):
-    """A same-slot retry whose EARLIER attempt already submitted orders must
-    not have this write erase them: the failure state overwrites the slot's
-    canonical run_state.json, and the contract writer regenerates
-    submitted_orders.csv from buy_candidates, so an unconditional zero here
-    would erase real placement evidence from reporting and reconciliation --
-    the same loss the raw-persistence failure path already guards against
-    (Codex review: "Preserve prior orders on preflight-blocked retries")."""
-    import json
-
-    from run_dca import run_slot
-
-    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
-    config = _demo_config()
-    artifacts_dir = tmp_path / "artifacts"
-    artifacts_dir.mkdir(parents=True)
-    (artifacts_dir / "submitted_orders.csv").write_text(
-        "ticker,order_id,submitted_amount_usd,status\n"
-        "AAA,o-earlier,2.0,submitted\n",
-        encoding="utf-8",
-    )
-
-    result = run_slot(
-        "1030ET",
-        now=_now_for_slot("1030ET"),
-        config=config,
-        state=StrategyState(),
-        finance_data=DemoDataProvider(SourceName.FINANCE),
-        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
-        broker=build_broker(config),
-        artifacts_dir=artifacts_dir,
-    )
-
-    run_state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
-    assert run_state["orders_submitted_count"] == 1
-    assert [c["order_id"] for c in run_state["buy_candidates"]] == ["o-earlier"]
-    # The aggregate fields agree with the carried count, the same as the
-    # raw-persistence path: the state must not simultaneously claim orders
-    # were and were not submitted.
-    assert run_state["order_submit_status"] == "submitted"
-    assert run_state["run_classification_outcome"] == "failed_after_partial_submission"
-    assert run_state["counts"]["submitted"] == 1
-    assert run_state["is_trading_failure"] is True
-    assert run_state["placement_evidence_incomplete"] is True
 
 
 def test_run_slot_1230et_and_1530et_are_unaffected_by_a_missing_preflight_artifact(tmp_path, monkeypatch):

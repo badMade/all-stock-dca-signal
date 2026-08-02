@@ -199,16 +199,31 @@ class BrokerOrder:
 def _executed_dollars(raw: Mapping[str, Any], *, filled_qty: Optional[float], avg_price: Optional[float]) -> float:
     """Dollars this order actually executed (settled), or 0 if nothing filled.
 
-    Prefers ``cumulative_quantity * average_price`` (the executed fill), falling
-    back to a broker-reported ``executed_notional``. ``average_price`` is the
-    *executed fill price*; the limit ``price`` field is deliberately NOT used here
-    because on a limit order it is the limit, not the achieved fill.
+    Prefers a broker-reported ``executed_notional`` -- an already cent-precise
+    settled dollar figure -- over reconstructing it as ``cumulative_quantity *
+    average_price``. Both factors of that multiplication are broker-reported at
+    share/price precision, so their product routinely lands a small fraction of
+    a cent off the real notional even for a genuine whole-cent fill (e.g. three
+    real $1.00 buys can reconstruct as $3.0000041175). Every real settled dollar
+    amount is cent-quantized by construction -- there is no such thing as a
+    genuine sub-cent fill -- so whenever ``executed_notional`` disagrees with
+    the reconstruction, the reconstruction is the noisy one; a caller rounding
+    the reconstructed value to cents (same_day_top_up_gate.py's top-up sizing)
+    could otherwise round DOWN through a real cent of exposure that
+    ``executed_notional`` already reports correctly -- e.g. an authoritative
+    $3.01 execution whose quantity*price reconstruction lands on $3.004 and
+    rounds down to $3.00, understating the top-up ceiling by a cent (Codex
+    review: "Do not round prior exposure down before sizing"). Falls back to
+    the reconstruction only when no broker-reported figure is available.
+    ``average_price`` is the *executed fill price*; the limit ``price`` field
+    is deliberately NOT used here because on a limit order it is the limit,
+    not the achieved fill.
     """
-    if filled_qty and avg_price and filled_qty > 0 and avg_price > 0:
-        return filled_qty * avg_price
     reported_executed = _money(raw.get("executed_notional"))
     if reported_executed and reported_executed > 0:
         return reported_executed
+    if filled_qty and avg_price and filled_qty > 0 and avg_price > 0:
+        return filled_qty * avg_price
     return 0.0
 
 

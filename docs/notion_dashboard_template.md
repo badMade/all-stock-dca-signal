@@ -18,7 +18,7 @@ Graded DCA Dashboard
 │   ├── Spent today / week, reserve balance
 │   └── Status + any errors
 ├── Strategy              (mirrors docs/strategy.md)
-│   ├── Active universe (45 tickers)
+│   ├── Active universe (52 tickers)
 │   ├── Sizing ladder (0.1%–8%+, max 5x)  ← older 0.1%–12% ladders are superseded
 │   └── Budget & reserve rules
 ├── Safeguards            (mirrors docs/safeguards.md)

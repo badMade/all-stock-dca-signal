@@ -573,7 +573,7 @@ def test_generate_scheduled_reports_appends_model_usage_log_entry_when_root_conf
     # A distinct run_id/artifact for THIS reporting task, not the 15:20 live
     # run's own run_id/run_state.json -- the live run's run_id is still
     # referenced in notes.
-    assert entry["run_id"] == f"reporting_{day}_1535ET"
+    assert entry["run_id"] == f"reporting_{day}_1700ET"
     assert entry["artifact_path"] == str(base / "reports")
     assert f"{day}-152001" in entry["notes"]
     assert entry["run_origin"] == "scheduled"
@@ -642,7 +642,7 @@ def test_generate_scheduled_reports_logs_even_when_report_generation_fails(tmp_p
     log_path = resolve_log_path(datetime.now(timezone.utc), root=log_root)
     assert log_path.exists()
     entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
-    assert entry["run_id"] == f"reporting_{day}_1535ET"
+    assert entry["run_id"] == f"reporting_{day}_1700ET"
 
 
 def test_generate_scheduled_reports_excludes_fills_for_confirmation_blocked_run(tmp_path=None):

@@ -1,13 +1,14 @@
 {
   "$schema": "../schemas/tickers.schema.json",
-  "version": "2026-07-27",
+  "version": "2026-08-02",
   "description": "Active graded DCA ticker universe. Backup of the latest thread state; no secrets.",
   "active": [
     "DFTX", "TRIN", "AAAU", "SPCX", "EVR", "LUNR", "IRDM",
     "DXYZ", "LITE", "ASML", "DRAM", "STX", "MSFT", "AAPL", "AMAT", "AMD", "CBRS",
     "MRVL", "BTX", "STM", "SNDK", "WDC", "TSM", "AVGO", "NVDA", "QBTS", "FLKR",
     "INTC", "GOOGL", "GOOG", "AMZN", "GLW", "MA", "GS", "MU", "NFLX", "XLG",
-    "TOPT", "QTOP", "SATA", "RGTI", "IBM", "GFUZ", "TXN", "RKLB"
+    "TOPT", "QTOP", "SATA", "RGTI", "IBM", "GFUZ", "TXN", "RKLB",
+    "GE", "VRT", "CAT", "QQQ", "QCOM", "ABBV", "JPM"
   ],
   "excluded": ["BYDDY", "VCX", "TRLV", "RVI"],
   "symbol_corrections": {
@@ -30,5 +31,5 @@
       }
     }
   },
-  "notes": "45 active symbols. BYDDY, VCX, TRLV, and RVI excluded. IRDMI->IRDM and GLWR->GLW corrected upstream; IBM and GFUZ included. GFUZ added 2026-07-15 (user-approved): Robinhood is primary (Finance connector returns NOT_FOUND). GFUZ has special handling (see special_handling): an unresolved GFUZ on Finance must not block the whole run, and if the 9:45 pre-flight lacks GFUZ the run intent is a supplemental GFUZ read-only validation persisted to gfuz_supplemental_preflight.json before decisioning — not yet implemented in code (see special_handling.GFUZ.supplemental_preflight.implementation_status); today a missing GFUZ preflight row just gates GFUZ out for that run. TICKER UNIVERSE UPDATE JUL 19 2026: TXN is added to the active DCA universe. Robinhood resolved TXN as Texas Instruments Incorporated Common Stock, state active, tradeable true, fractional tradability tradable, regular-hours dollar orders supported, and prior close available. Finance lookup resolved TXN as Texas Instruments Incorporated. Existing exclusions remain BYDDY, VCX, TRLV, and RVI; corrected symbols IRDM and GLW remain; IBM remains included. TICKER UNIVERSE UPDATE JUL 27 2026: RKLB (Rocket Lab Corporation) is added to the active DCA universe. Robinhood resolved RKLB as Rocket Lab Corporation Common Stock, state active, tradeable true, fractional tradability tradable, regular-hours dollar orders supported, and prior close available ($63.91 as of 2026-07-24)."
+  "notes": "52 active symbols (was 45 before the AUG 2 2026 update below). BYDDY, VCX, TRLV, and RVI excluded. IRDMI->IRDM and GLWR->GLW corrected upstream; IBM and GFUZ included. GFUZ added 2026-07-15 (user-approved): Robinhood is primary (Finance connector returns NOT_FOUND). GFUZ has special handling (see special_handling): an unresolved GFUZ on Finance must not block the whole run, and if the 9:45 pre-flight lacks GFUZ the run intent is a supplemental GFUZ read-only validation persisted to gfuz_supplemental_preflight.json before decisioning — not yet implemented in code (see special_handling.GFUZ.supplemental_preflight.implementation_status); today a missing GFUZ preflight row just gates GFUZ out for that run. TICKER UNIVERSE UPDATE JUL 19 2026: TXN is added to the active DCA universe. Robinhood resolved TXN as Texas Instruments Incorporated Common Stock, state active, tradeable true, fractional tradability tradable, regular-hours dollar orders supported, and prior close available. Finance lookup resolved TXN as Texas Instruments Incorporated. Existing exclusions remain BYDDY, VCX, TRLV, and RVI; corrected symbols IRDM and GLW remain; IBM remains included. TICKER UNIVERSE UPDATE JUL 27 2026: RKLB (Rocket Lab Corporation) is added to the active DCA universe. Robinhood resolved RKLB as Rocket Lab Corporation Common Stock, state active, tradeable true, fractional tradability tradable, regular-hours dollar orders supported, and prior close available ($63.91 as of 2026-07-24). TICKER UNIVERSE UPDATE AUG 2 2026 (user-requested): GE (GE Aerospace), VRT (Vertiv Holdings Co Class A), CAT (Caterpillar Inc.), QQQ (Invesco QQQ Trust), QCOM (Qualcomm Inc.), ABBV (AbbVie Inc.), and JPM (JPMorgan Chase & Co.) are added to the active DCA universe. Robinhood instrument search resolved all seven as real, distinct tradable instruments (no ambiguity). DJX was also requested but is NOT added: Robinhood instrument search returns no equity/ETF match for DJX — it resolves only as a market index (\"Dow Jones Industrial Average Mini Index\"), a cash-settled index-options underlying with no corresponding share to buy, so it cannot be a DCA buy target under this program's buy-only equity/ETF design. If a Dow-tracking ETF was intended instead (e.g. DIA), that would need to be requested explicitly."
 }

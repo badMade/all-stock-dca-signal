@@ -248,33 +248,27 @@ strategy on exactly the days it said stay out.
 2. Confirm which medium, if any, both executors can read and write, so §4 can be
    revisited — including running down who/what the `Computer` Slack sender is
    in the workspace.
-3. **Correction, 2026-08-01:** the claim that used to be here — that
-   `config/budgets.json`'s `order_rules.one_order_per_ticker_per_day` was set to
-   `false` on 2026-07-31 — does not hold. That flag is `true`, and has been
-   since it was introduced (2026-07-30); it was never toggled. What actually
-   preserves the top-up path is that `dca_config.py` deliberately does NOT
-   overlay this JSON flag into `StrategyConfig` (`StrategyConfig`'s own field
-   defaults to `False` in code, by design, per that module's comment). No
-   runtime call site anywhere in the repo currently sets the flag `True` at
-   all — only tests exercise that branch. `run_dca.run_slot()` is, if
-   anything, the opposite of a caller that turns it on: it explicitly sets
-   `one_order_per_ticker_per_day=False` for the seven-slot roster too (its own
-   2026-07-30 comment: "guarded top-up, not 'first slot wins'"), reinforcing
-   the code default rather than overriding it (Copilot review, PR #299 — the
-   prior wording here had this backwards). So at every layer that actually
-   runs live, the flag is off and top-ups are permitted; only
-   `config/budgets.json`'s own text still says `true`. The live 1230ET prompt
-   calls this exact tension a KNOWN
-   CONFLICT and does not resolve it unilaterally: `dca_runner.assess()` refuses
-   a ticker outright on ANY same-day buy, while `same_day_top_up_policy` permits
-   a resized repeat: until Geoff rules on which one governs, the instruction is
-   to take the MORE RESTRICTIVE answer for every ticker and report every
-   disagreement. §2 above has no way to reproduce that reconciliation — it
-   can't call `assess()` — so as written it only ever applies the top-up/resize
-   side (Step 3), never the all-or-nothing side. That is a real, currently-open
-   gap between what the Claude-side prompts do and what §2 can do, not
-   something silently fixed here. If Geoff rules on the KNOWN CONFLICT, §2
-   needs to be revisited alongside the seven live prompts, not in isolation.
+3. **Correction, 2026-08-02 (superseding the 2026-08-01 "correction" that used
+   to be here).** The 2026-08-01 text claimed `config/budgets.json`'s
+   `order_rules.one_order_per_ticker_per_day` was `true` and had never been
+   toggled. That claim does not hold: the field is `false` on disk right now,
+   with an explicit note recording it as permanent policy. More importantly,
+   **`dca_runner.py`'s own `assess()` reads this exact flag directly from
+   `config/budgets.json`** (`ONE_ORDER_PER_TICKER_PER_DAY =
+   _load_one_order_per_ticker_per_day()`, evaluated at import time, no
+   override) — so, unlike `near_close_dca.StrategyConfig` (which deliberately
+   does NOT overlay the JSON, for the separate reason described in
+   `dca_config.py`), `dca_runner.assess()`'s behavior tracks this file's
+   literal value directly. With the file at `false`, `assess()` does not
+   exclude a same-day-bought ticker at all.
+   **Geoff has now ruled on the KNOWN CONFLICT the 1230ET prompt used to flag:**
+   buys on the same ticker are allowed more than once a day, never twice in the
+   same slot/session. There is no more disagreement between `assess()` and
+   `same_day_top_up_policy` to reconcile — both permit the resized repeat, and
+   the 1230ET prompt's step 4.5 (`scripts/same_day_top_up_gate.py`) is simply
+   the authoritative sizer. §2 above already only ever implemented the
+   top-up/resize side, which is now correct rather than partial: it needed no
+   change for this ruling.
 4. **Added 2026-08-01 (Codex review, PR #299): reconcile
    `connector_native_execution_policy`'s blanket text with keeping Perplexity
    live.** That policy's `removal_reason` (`config/scheduled_tasks.json`) says,

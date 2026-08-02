@@ -174,17 +174,14 @@ def test_prior_exposure_accumulates_across_every_slot_not_just_the_last_one():
     ]
     r = _run(pages, [{"ticker": "TRIN", "desired_usd": 5.00, "current_price": 17.10}])
     d = _by_ticker(r)["TRIN"]
-    # effective_prior_usd is rounded to cents for DISPLAY only, so three
-    # genuine $1.00 fills present as exactly $3.00, not the raw
-    # cumulative_quantity * average_price reconstruction ($3.0000041175). The
-    # arithmetic itself uses the RAW, unrounded prior: rounding it down to
-    # $3.00 before subtracting would understate real exposure and let buy_usd
-    # exceed desired_usd - effective_prior_usd, a ceiling that must never be
-    # rounded up (Codex review: "Do not round prior exposure down before
-    # subtraction") -- so the top-up is the true $1.9999958825 rounded down
-    # to $1.99, not $2.00.
+    # Exact, not approximate: effective_prior_usd is normalized to cents before
+    # the subtraction below, so three genuine $1.00 fills must present as
+    # exactly $3.00 -- not $3.0000041175, the raw cumulative_quantity *
+    # average_price reconstruction -- and the top-up as exactly $2.00, not
+    # $1.99 (Codex review: "Preserve exact cents when rounding the top-up
+    # delta").
     assert d["effective_prior_usd"] == 3.00
-    assert d["buy_usd"] == 1.99
+    assert d["buy_usd"] == 2.00
 
 
 def test_the_reference_price_is_the_lowest_same_day_fill_not_the_most_recent():
@@ -239,8 +236,8 @@ def test_without_a_logged_reference_positive_slippage_wrongly_permits_a_topup():
 
 def test_a_logged_reference_price_blocks_a_topup_the_fill_price_would_permit():
     """The fix: when the caller supplies the ticker's actual logged
-    target_price/decision_price from the prior buy -- bound to that same
-    buy's broker order id -- this gate compares against THAT instead of the
+    target_price/decision_price from the prior buy, BOUND to that same
+    order's order_id, this gate compares against THAT instead of the
     inflated fill price, correctly blocking a new decision that is above the
     true reference even though it is below the fill price."""
     pages = [_page([_fill("o1", "TRIN", 1.00, 101.00, "2026-07-30T13:58:14Z")])]
@@ -264,7 +261,8 @@ def test_a_logged_reference_price_blocks_a_topup_the_fill_price_would_permit():
 
 def test_a_logged_reference_price_still_permits_a_genuine_topup():
     """The override is a straight substitution, not an extra restriction: a
-    decision genuinely below the logged reference is still authorized."""
+    decision genuinely below the logged reference is still authorized, when
+    bound to the order it describes."""
     pages = [_page([_fill("o1", "TRIN", 1.00, 101.00, "2026-07-30T13:58:14Z")])]
     r = _run(
         pages,
@@ -284,25 +282,43 @@ def test_a_logged_reference_price_still_permits_a_genuine_topup():
     assert d["reason"] == EFFECTIVE_TOP_UP
 
 
-def test_a_logged_reference_price_not_bound_to_the_latest_buy_is_ignored():
-    """A logged reference from an OLDER same-day buy must not override the
-    broker's own most-recent reference just because a candidate supplies it
-    -- an order id binding proves which buy the caller's reference actually
-    describes (Codex review: "Bind the reference override to the latest
-    buy"). Here the logged $100.00 belongs to the EARLIER order o1; the
-    ticker's most recent buy (o2) filled at $90.00. A $95.00 decision is
-    below the stale $100.00 override but NOT below the true $90.00 latest
-    reference, so honoring the unbound override would wrongly authorize a
-    top-up the real chronology forbids."""
+def test_a_logged_reference_price_unbound_to_the_latest_order_is_ignored():
+    """Codex review: 'Bind logged references to the latest broker order'.
+
+    A logged reference with NO order_id, or one that names an order OTHER
+    than the broker's own latest qualifying fill, must not override broker
+    history -- it could describe an older, stale buy (e.g. a $100 first
+    fill) while a more recent, lower fill ($90) is what the policy actually
+    requires comparing against. Falling back to the broker-observed
+    reference is the safe (harder-to-authorize) direction.
+    """
     pages = [
         _page(
             [
-                _fill("o1", "TRIN", 1.00, 100.00, "2026-07-30T13:58:14Z"),
-                _fill("o2", "TRIN", 1.00, 90.00, "2026-07-30T15:00:00Z"),
+                _fill("o1", "TRIN", 1.00, 100.00, "2026-07-30T13:00:00Z"),
+                _fill("o2", "TRIN", 1.00, 90.00, "2026-07-30T14:00:00Z"),
             ]
         )
     ]
-    r = _run(
+    # No order_id at all: falls back to the broker's own latest reference ($90).
+    r_no_id = _run(
+        pages,
+        [
+            {
+                "ticker": "TRIN",
+                "desired_usd": 4.00,
+                "current_price": 95.00,
+                "prior_logged_reference_price": 100.00,
+            }
+        ],
+    )
+    d_no_id = _by_ticker(r_no_id)["TRIN"]
+    assert d_no_id["reference_price"] == pytest.approx(90.00)
+    assert d_no_id["reason"] == NO_LOWER_PRICE
+    assert d_no_id["buy_usd"] == pytest.approx(0.0)
+
+    # order_id names the STALE $100 fill, not the latest $90 one: still ignored.
+    r_stale_id = _run(
         pages,
         [
             {
@@ -314,30 +330,10 @@ def test_a_logged_reference_price_not_bound_to_the_latest_buy_is_ignored():
             }
         ],
     )
-    d = _by_ticker(r)["TRIN"]
-    assert d["reference_price"] == pytest.approx(90.00)
-    assert d["buy_usd"] == pytest.approx(0.0)
-    assert d["reason"] == NO_LOWER_PRICE
-
-
-def test_a_logged_reference_price_with_no_order_id_falls_back_to_the_fill_price():
-    """An override with no order id to bind it to cannot be trusted as
-    describing the latest buy, so it is ignored just like a stale-bound one."""
-    pages = [_page([_fill("o1", "TRIN", 1.00, 101.00, "2026-07-30T13:58:14Z")])]
-    r = _run(
-        pages,
-        [
-            {
-                "ticker": "TRIN",
-                "desired_usd": 4.00,
-                "current_price": 100.50,
-                "prior_logged_reference_price": 100.00,
-            }
-        ],
-    )
-    d = _by_ticker(r)["TRIN"]
-    assert d["reference_price"] == pytest.approx(101.00)
-    assert d["buy_usd"] > 0
+    d_stale_id = _by_ticker(r_stale_id)["TRIN"]
+    assert d_stale_id["reference_price"] == pytest.approx(90.00)
+    assert d_stale_id["reason"] == NO_LOWER_PRICE
+    assert d_stale_id["buy_usd"] == pytest.approx(0.0)
 
 
 @pytest.mark.parametrize("bad_value", [0, -5.0, "not-a-number", None, float("nan")])
@@ -354,7 +350,6 @@ def test_an_invalid_logged_reference_price_falls_back_to_the_fill_price(bad_valu
                 "desired_usd": 4.00,
                 "current_price": 17.3199,
                 "prior_logged_reference_price": bad_value,
-                "prior_logged_reference_order_id": "o1",
             }
         ],
     )

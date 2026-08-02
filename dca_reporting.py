@@ -737,7 +737,13 @@ def generate_scheduled_reports(
     # an auditor at what THIS task produced (output_dir), not the afternoon
     # 15:30 live task's run_state.json. The live run's own run_id is kept in
     # `notes` as an explicit input reference.
-    report_run_id = f"reporting_{trading_day}_1535ET"
+    # Retimed 2026-08-02 from 3:35 PM ET to 5:00 PM ET daily (task 67aa802b,
+    # Geoff: "move the 3:35 slippage sync + compact Notion update to 5 pm
+    # daily") -- the audit run_id must match, or it claims the retired 3:35
+    # PM slot while build_entry() derives scheduled_for_et='17:00' from the
+    # manifest, producing internally contradictory audit data (Codex review:
+    # "Retag reporting runs with the new 17:00 slot").
+    report_run_id = f"reporting_{trading_day}_1700ET"
     source_run_id = (selection.state or {}).get("run_id")
     log_model_usage = _model_usage_log_helper()
     routing_overrides = {

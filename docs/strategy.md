@@ -64,12 +64,13 @@ spread, whitelist, or circuit-breaker requirements.
 
 ## Active ticker universe
 
-45 active symbols (see [`config/tickers.json`](../config/tickers.json)):
+52 active symbols (see [`config/tickers.json`](../config/tickers.json)):
 
 ```
 DFTX TRIN AAAU SPCX EVR LUNR IRDM DXYZ LITE ASML DRAM STX
 MSFT AAPL AMAT AMD CBRS MRVL BTX STM SNDK WDC TSM AVGO NVDA QBTS FLKR
 INTC GOOGL GOOG AMZN GLW MA GS MU NFLX XLG TOPT QTOP SATA RGTI IBM GFUZ TXN RKLB
+GE VRT CAT QQQ QCOM ABBV JPM
 ```
 
 - **Excluded:** `BYDDY`, `VCX`, `TRLV`, `RVI`
@@ -95,6 +96,17 @@ INTC GOOGL GOOG AMZN GLW MA GS MU NFLX XLG TOPT QTOP SATA RGTI IBM GFUZ TXN RKLB
 > available ($63.91 as of 2026-07-24). Existing exclusions remain BYDDY, VCX,
 > TRLV, and RVI; corrected symbols IRDM and GLW remain; IBM, GFUZ, and TXN
 > remain included.
+
+> **TICKER UNIVERSE UPDATE AUG 2 2026:** `GE`, `VRT`, `CAT`, `QQQ`, `QCOM`,
+> `ABBV`, and `JPM` are added to the active DCA universe. The active universe
+> is now **52 symbols**. `DJX` ("Dow Jones Industrial Average Mini Index") was
+> considered and excluded -- Robinhood instrument search returns no equity/ETF
+> match for it, only a market-index result, so it cannot be traded through the
+> account's equity-order path. Existing exclusions remain BYDDY, VCX, TRLV,
+> and RVI; corrected symbols IRDM and GLW remain; IBM, GFUZ, TXN, and RKLB
+> remain included. This adds whitelisted symbols only; it preserves all
+> existing trading safety, pre-authorization, top-up, run-classification,
+> budget, cost-conscious, manual-exclusion, and recovery text.
 
 ## Sizing ladder (latest, active)
 

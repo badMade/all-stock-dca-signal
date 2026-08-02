@@ -1,9 +1,9 @@
 # GATE 5 Failure Fix: Signal Generation Pipeline
 
 ## Problem Summary
-**Date:** 2026-07-31  
-**Executor:** 10:30 AM Morning DCA Live (Task 42173154)  
-**Failure:** GATE 5 - Buy List Generation  
+**Date:** 2026-07-31
+**Executor:** 10:30 AM Morning DCA Live (Task 42173154)
+**Failure:** GATE 5 - Buy List Generation
 **Root Cause:** No signal output file from 9:45 AM preflight task (bb4f6ef1)
 
 ## Architecture Issue
@@ -25,7 +25,7 @@ Preflight Watchlist          Morning Live Executor
 ## Real Fix Options
 
 ### Option A: Ensure Preflight Task Actually Executes ✅ (RECOMMENDED)
-**Why:** Preserves the intended separation of concerns  
+**Why:** Preserves the intended separation of concerns
 **Action:** Verify that the external scheduler/agent is:
 1. Running task `bb4f6ef1` at 9:45 AM ET
 2. Calling `MorningDCAExecutor` in **preflight mode** with config/morning_dca.json
@@ -45,18 +45,18 @@ output: morning_dca_preflight/YYYYMMDD_0945ET/signals.csv
 ```
 
 ### Option B: Make 10:30 AM Executor Self-Sufficient
-**Why:** Removes dependency on preflight task  
+**Why:** Removes dependency on preflight task
 **Action:** Modify `morning_dca.py` live mode to:
 1. Check for preflight signals first (existing behavior)
 2. If preflight missing/failed: generate own signals using fresh market data
 3. Requires market data provider access (same as preflight)
 4. Trades off latency: would run closer to 10:30 than 9:45
 
-**Code Change Location:** `morning_dca.py`, class `MorningDCAExecutor.run()` method  
+**Code Change Location:** `morning_dca.py`, class `MorningDCAExecutor.run()` method
 **Risk:** Adds latency; reduces time for signal validation before 10:30 open
 
 ### Option C: Add Earlier Preflight Signal Generation
-**Why:** Creates redundancy; multiple signal sources  
+**Why:** Creates redundancy; multiple signal sources
 **Action:** Add a pre-9:45 AM task that generates signals:
 - 9:35 AM market-open task (2ba19526) currently only places orders
 - Could be enhanced to also generate morning signals as a byproduct
@@ -65,13 +65,13 @@ output: morning_dca_preflight/YYYYMMDD_0945ET/signals.csv
 **Complexity:** High; touches 2ba19526 and signal persistence logic
 
 ### Option D: Use Perplexity Runner BEFORE 10:30 AM
-**Why:** Different execution engine might succeed where Claude fails  
+**Why:** Different execution engine might succeed where Claude fails
 **Action:** Schedule Perplexity runner at 10:20 AM (10 min before 10:30 executor)
 - Generates signals using Perplexity's market data access
 - Writes to `cron_tracking/morning_dca/YYYYMMDD_1030ET/signals.csv`
 - 10:30 executor reads Perplexity-generated signals instead of preflight
 
-**Timing:** ⚠️ Tight - only 10 minutes to generate and write signals  
+**Timing:** ⚠️ Tight - only 10 minutes to generate and write signals
 **Best Practice:** Run even earlier (9:50 AM or later 9:45)
 
 ---
@@ -128,7 +128,7 @@ Implement **Option B**: Make 10:30 AM executor self-sufficient.
 ---
 
 ## Success Criteria
-✅ Signals generated and available before 10:30 AM executor runs  
-✅ GATE 5 passes (output file exists)  
-✅ 10:30 AM executor can proceed through remaining gates  
+✅ Signals generated and available before 10:30 AM executor runs
+✅ GATE 5 passes (output file exists)
+✅ 10:30 AM executor can proceed through remaining gates
 ✅ Orders placed or appropriately skipped (zero candidates is OK)

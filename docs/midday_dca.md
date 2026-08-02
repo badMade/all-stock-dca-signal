@@ -98,8 +98,10 @@ The midday stream is **independent** of the afternoon 3:30 PM live task
 The midday stream never writes into the morning or `ce16ba6b` trees, never
 updates `latest_scheduled_run.json`, and its `run_classification` always carries
 `stream="midday"` and `valid_afternoon_evidence=false`. Afternoon consumers
-(`67aa802b`, `a46bf007`, `041d9d90`, `0656657a`) glob only
+(`67aa802b`, `041d9d90`, `0656657a`) glob only
 `.../ce16ba6b/scheduled_runs/**`, so they never traverse the midday root.
+(`a46bf007`, formerly also in this list, was removed from the schedule
+entirely on 2026-08-02.)
 
 **Prior-allocation context only:** midday fills are read by the afternoon
 **same-day top-up guard** as prior-allocation context, but never as afternoon

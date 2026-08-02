@@ -114,9 +114,9 @@
         "Any submitted/filled status implying an order was placed."
       ],
       "downstream_treatment": [
-        "Watchdog (a46bf007): treat as a valid scheduled run that fired. Alert that no order was placed, but do NOT mark the lineage/scheduled state invalid when the required fields are present.",
-        "Slippage (67aa802b): report no scheduled fills and no scheduled order IDs. Do NOT invalidate the run_state just because confirmation blocked order submission; the broker time-window fallback does NOT apply (there was no write failure).",
-        "Weekly/monthly: count the scheduled run as having occurred; contribute zero scheduled fills/orders."
+        "Slippage (67aa802b, retimed 2026-08-02 from 3:35 PM ET to 5:00 PM ET daily): report no scheduled fills and no scheduled order IDs. Do NOT invalidate the run_state just because confirmation blocked order submission; the broker time-window fallback does NOT apply (there was no write failure).",
+        "Weekly/monthly: count the scheduled run as having occurred; contribute zero scheduled fills/orders.",
+        "Historical: until 2026-08-02 the watchdog (a46bf007) also treated this as a valid scheduled run that fired, alerting that no order was placed without marking the lineage/scheduled state invalid. It was removed from the schedule entirely on 2026-08-02."
       ]
     }
   },
@@ -152,7 +152,8 @@
     },
     "pointer_output_normalization_2026_07_20": {
       "added": "2026-07-20",
-      "applies_to_tasks": ["42173154", "a6239dae", "e3e6f09e", "10ce362c"],
+      "applies_to_tasks": ["42173154", "a6239dae", "10ce362c"],
+      "applies_to_tasks_note_2026_08_02": "Historically also applied to e3e6f09e (3:05 PM monitor-only signal check), which was removed from the schedule entirely on 2026-08-02 and so is no longer in this list.",
       "trigger_incident": "On Jul 20 2026 the 3:20 scheduled run collected portfolio, quotes, tradability, same-day orders, and historicals, but large historicals (and possibly other connector responses) were only available as output_path / current_session_context tool-output pointers. The background run did not persist those pointer targets into the scheduled raw directory before compute, so it escalated after data collection.",
       "rules": [
         "Any connector response that returns an output_path or current_session_context pointer MUST be immediately copied or normalized into the run's raw directory BEFORE compute (follow the pointer, load the referenced payload, persist as parseable JSON with contents under 'data' and the original pointer under 'output_path').",
@@ -234,7 +235,8 @@
     ]
   },
   "downstream_reporting_rules": {
-    "applies_to_tasks": ["67aa802b", "a46bf007", "041d9d90", "0656657a"],
+    "applies_to_tasks": ["67aa802b", "041d9d90", "0656657a"],
+    "applies_to_tasks_note_2026_08_02": "a46bf007 (the 3:40 PM ET live-run watchdog) was ALSO in scope until it was removed from the schedule entirely on 2026-08-02; the watchdog-specific rule below is left as a historical record for that reason.",
     "rules": [
       "Validate scheduled state files against run_classification.schema.json before use.",
       "Accept BOTH run-classification-v1 and run-classification-v2-preauthorized scheduled run_state files: a v2 run_state is valid scheduled evidence when the required scheduled identity fields are correct and must not be excluded for its state_schema_version alone.",
@@ -246,7 +248,7 @@
       "Exclude final manual buy overrides (run_type='final_manual_buy_override', valid_afternoon_scheduled_evidence=false, same_day_top_up_context_only=true) from scheduled slippage, scheduled fills, scheduled reliability, scheduled cost basis, and watchdog confirmation. Show them only in a labeled Manual Final Buy Override / Same-Day Top-Up Context section (see manual_reporting).",
       "Exclude manual missed-morning recovery artifacts (under morning_dca/manual_recovery/**, run_origin='manual', manual_run=true, same_day_top_up_context_only=true, valid_scheduled_evidence=false) from scheduled slippage, scheduled fills, scheduled reliability, scheduled cost basis, and watchdog confirmation. They never prove the 10:30 scheduled task ran and are used only as same-day prior-allocation / top-up context (see manual_missed_morning_recovery).",
       "Exclude the 2026-07-21 manual midday run (under midday_dca/manual_runs/**, run_origin='manual', manual_run=true, stream='midday_manual', same_day_top_up_context_only=true, valid_scheduled_evidence=false, valid_afternoon_scheduled_evidence=false) from scheduled slippage, scheduled fill counts, scheduled reliability, scheduled cost-basis evidence, watchdog proof, and scheduled afternoon evidence. It never proves the 12:30 or 3:30 scheduled tasks ran and is used only as same-day prior-allocation / top-up context by the later 3:30 top-up logic (see midday_manual_run_2026_07_21).",
-      "The watchdog (a46bf007) queries ALL same-day Robinhood equity orders for account <ROBINHOOD_ACCOUNT_NUMBER> WITHOUT a placed_agent filter first, then classifies every order by scheduled evidence, manual artifacts, same-day top-up roots, placed_agent, and order IDs; orders with placed_agent='user' or any non-agentic value appear in a Manual/User Orders section and count as scheduled fills only when their order IDs are in a valid scheduled submitted_orders.csv from the same-day scheduled run (see watchdog_all_orders_fix_2026_07_21)."
+      "Historical (until 2026-08-02): the watchdog (a46bf007) queried ALL same-day Robinhood equity orders for account <ROBINHOOD_ACCOUNT_NUMBER> WITHOUT a placed_agent filter first, then classified every order by scheduled evidence, manual artifacts, same-day top-up roots, placed_agent, and order IDs; orders with placed_agent='user' or any non-agentic value appeared in a Manual/User Orders section and counted as scheduled fills only when their order IDs were in a valid scheduled submitted_orders.csv from the same-day scheduled run (see watchdog_all_orders_fix_2026_07_21). The watchdog was removed from the schedule entirely on 2026-08-02; no remaining downstream consumer performs this all-orders/no-filter query."
     ],
     "manual_exclusion_roots": {
       "reason": "The 2026-07-13 final manual buy override backfilled live artifacts under midday_dca/manual_reruns/final_manual_override_* and a final_manual_review/** tree, both OUTSIDE the ce16ba6b task root. Slippage/watchdog/reporting must scan these as manual exclusions so their order IDs never leak into scheduled-live metrics.",
@@ -646,7 +648,8 @@
   },
   "watchdog_reconciliation_scope_patch_2026_07_27": {
     "added": "2026-07-27",
-    "applies_to_tasks": ["a46bf007", "67aa802b"],
+    "applies_to_tasks": ["67aa802b"],
+    "applies_to_tasks_note_2026_08_02": "a46bf007 (the 3:40 PM ET live-run watchdog) was ALSO in scope until it was removed from the schedule entirely on 2026-08-02. The trigger_incident below is left as written because it documents a real 2026-07-27 incident involving the watchdog, but the reconciliation-scope rules now govern only 67aa802b (retimed the same day, 2026-08-02, from 3:35 PM ET to 5:00 PM ET daily).",
     "broker_account": "robinhood:<ROBINHOOD_ACCOUNT_NUMBER>",
     "trigger_incident": "The 3:40 PM ET watchdog FAILED the 2026-07-27 3:30 PM ET final run even though that run's artifact was internally consistent with zero orders. The cause was reconciliation SCOPE, not a trading defect and not an artifact defect.",
     "artifact_was_consistent": {
@@ -722,15 +725,15 @@
       "Never record a broker order as reconciled on the strength of a HUMAN attribution alone. If no validator can resolve the owning artifact, it stays a residual discrepancy until the artifact is repaired.",
       "Never count an order already claimed by an earlier stream artifact as final-run evidence.",
       "A zero-order final run with earlier same-day context present is same_day_prior_context_present and PASSES.",
-      "The 2:33 PM ET EVR recovery order stays same-day top-up context ONLY: never final-run evidence, never afternoon scheduled evidence, never slippage scheduled proof, never scheduled cost-basis evidence.",
-      "This does NOT weaken watchdog_all_orders_fix_2026_07_21. The all-orders query with no placed_agent filter and the per-order classification are unchanged; this patch governs only which classified orders count as FINAL-RUN submissions."
+      "The 2:33 PM ET EVR recovery order stays same-day top-up context ONLY: never final-run evidence, never afternoon scheduled evidence, never slippage scheduled proof, never scheduled cost-basis evidence."
     ],
-    "relationship_to_all_orders_fix": "Complementary, not contradictory. watchdog_all_orders_fix_2026_07_21 widened what the watchdog must LOOK AT. This patch narrows what may be COUNTED as final-run submissions. Both are required.",
+    "relationship_to_all_orders_fix": "Historical, watchdog removed 2026-08-02. watchdog_all_orders_fix_2026_07_21 widened what the watchdog had to LOOK AT (all same-day orders, no placed_agent filter); this patch narrowed what could be COUNTED as final-run submissions. The watchdog (a46bf007) was removed from the schedule entirely on 2026-08-02, so this patch now governs only which orders 67aa802b may count as final-run submissions for its own slippage reconciliation.",
     "see": "config/scheduled_tasks.json:final_run_reconciliation_scope_2026_07_27"
   },
   "watchdog_all_orders_fix_2026_07_21": {
     "added": "2026-07-21",
     "applies_to_tasks": ["a46bf007"],
+    "task_removed_2026_08_02": "a46bf007 (the live-run watchdog) was removed from the schedule entirely on 2026-08-02 at the user's request; it no longer exists as a scheduled task and nothing queries same-day orders with all-orders/no-placed_agent-filter semantics anymore. Kept as historical documentation mirroring config/scheduled_tasks.json:watchdog_all_orders_fix_2026_07_21, whose own note explains why: the underlying recovery-context-classification helpers remain implemented, tested, and used by near_close_dca.py independent of the watchdog.",
     "broker_account": "robinhood:${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}",
     "trigger_incident": "The 3:40 PM live-run watchdog queried the agentic (placed_agent='agent') order subset first, so same-day user/manual Robinhood orders could be missed by primary reconciliation.",
     "requirement": "The watchdog MUST query ALL same-day Robinhood equity orders for account <ROBINHOOD_ACCOUNT_NUMBER> WITHOUT any placed_agent filter FIRST, then classify every returned order. The agentic-only (placed_agent='agent') subset MAY be reported separately, but primary reconciliation runs over the full order set.",
@@ -807,7 +810,7 @@
     "added": "2026-07-10",
     "accepted_state_schema_versions": ["run-classification-v1", "run-classification-v2-preauthorized"],
     "order_history_persistence": {
-      "reason": "The 3:35 PM ET slippage task must persist the Robinhood order-history response before computing slippage, then compute average fill price and executions from the saved payload rather than re-querying the broker.",
+      "reason": "The slippage task (67aa802b, retimed 2026-08-02 from 3:35 PM ET to 5:00 PM ET daily) must persist the Robinhood order-history response before computing slippage, then compute average fill price and executions from the saved payload rather than re-querying the broker.",
       "persist_path": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/YYYYMMDD_1530ET/raw/orders_after_place.json",
       "computed_from": "saved payload",
       "helper": "dca_reporting.fills_from_order_history_payload",

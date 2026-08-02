@@ -62,7 +62,11 @@ own or an earlier slot's orders.csv/run_state.json), without this gate ever
 reading an artifact itself or treating one's absence as "no prior exists";
 see ``evaluate_slot``'s docstring. Omitted, the gate still falls back to the
 broker-observed fill price, matching the documented preference's own
-last-resort tier.
+last-resort tier. The override is honored ONLY when the candidate also
+supplies ``prior_logged_reference_order_id`` matching the broker's own latest
+qualifying order_id for that ticker -- an unbound override could describe a
+stale, older buy rather than the latest one, over-crediting prior exposure
+(Codex review: "Bind logged references to the latest broker order").
 
 It also does not decide share-class equivalence. ``GOOG`` and ``GOOGL`` are
 scored as independent tickers here, exactly as ``config/tickers.json`` lists
@@ -212,40 +216,14 @@ def _f(value: Any) -> Optional[float]:
     return result
 
 
-def _most_recent_reference(
-    orders: Sequence[BrokerOrder],
-) -> tuple[Optional[float], Optional[str]]:
-    """This policy's comparison reference: the most recent valid same-day buy.
+def _most_recent_reference(orders: Sequence[BrokerOrder]) -> "tuple[Optional[float], Optional[str]]":
+    """Like :func:`_most_recent_reference_price`, but also returns the specific
+    order_id the selected price came from.
 
-    Returns ``(reference_price, order_id)`` for that buy so a caller-supplied
-    ``prior_logged_reference_price`` override can be validated against the
-    SAME order before being trusted (see ``evaluate_slot``) rather than being
-    accepted on its own say-so -- an override sourced from an OLDER same-day
-    buy would silently replace the correct, more recent broker reference
-    (Codex review: "Bind the reference override to the latest buy").
-
-    ``reconcile_effective_prior`` computes ``min(known_prices)`` -- a more
-    conservative default tuned for its other (artifact-combining) callers, not
-    this gate's own documented contract. ``config/scheduled_tasks.json``'s
-    ``same_day_top_up_policy`` (``final_override_top_up``) defines the
-    comparison reference as "that ticker's most recent valid same-day buy
-    reference (ordered by generated_at)": for fills at $90 then $100, a later
-    $95 decision is below the most recent $100 reference and should top up,
-    even though $90 -- the minimum -- is also below $95 (Codex review:
-    "Compare against the most recent valid reference price").
-
-    Mirrors ``reconcile_effective_prior``'s own poisoning rule exactly (with
-    artifact_priors always ``{}`` for this stateless gate, every qualifying
-    order without a confirmed fill price poisons unconditionally): a buy-side
-    order that is live-and-unfilled, or a terminal order whose fill could not
-    be priced, means the true prior price is not yet knowable, so the
-    reference must be ``None`` rather than compared against. A contributing
-    fill with no usable ``created_at`` poisons the same way: substituting an
-    empty string would silently treat it as the OLDEST fill regardless of
-    when it actually happened, so a timestamped $100 fill plus an undated $90
-    fill that was in fact the most recent would compare a new $95 decision
-    against $100 and wrongly authorize a top-up (Codex review: "Fail closed
-    when fill chronology is unavailable").
+    Added so a caller-supplied ``prior_logged_reference_price`` can be bound to
+    the exact broker order it claims to describe (see ``evaluate_slot``'s
+    docstring and Codex review: "Bind logged references to the latest broker
+    order") rather than trusted purely on the caller's say-so.
     """
     from datetime import datetime, timezone
 
@@ -276,6 +254,41 @@ def _most_recent_reference(
     return latest_price, latest_order_id
 
 
+def _most_recent_reference_price(orders: Sequence[BrokerOrder]) -> Optional[float]:
+    """This policy's comparison reference: the most recent valid same-day buy.
+
+    ``reconcile_effective_prior`` computes ``min(known_prices)`` -- a more
+    conservative default tuned for its other (artifact-combining) callers, not
+    this gate's own documented contract. ``config/scheduled_tasks.json``'s
+    ``same_day_top_up_policy`` (``final_override_top_up``) defines the
+    comparison reference as "that ticker's most recent valid same-day buy
+    reference (ordered by generated_at)": for fills at $90 then $100, a later
+    $95 decision is below the most recent $100 reference and should top up,
+    even though $90 -- the minimum -- is also below $95 (Codex review:
+    "Compare against the most recent valid reference price").
+
+    Mirrors ``reconcile_effective_prior``'s own poisoning rule exactly (with
+    artifact_priors always ``{}`` for this stateless gate, every qualifying
+    order without a confirmed fill price poisons unconditionally): a buy-side
+    order that is live-and-unfilled, or a terminal order whose fill could not
+    be priced, means the true prior price is not yet knowable, so the
+    reference must be ``None`` rather than compared against. A contributing
+    fill with no usable ``created_at`` poisons the same way: substituting an
+    empty string would silently treat it as the OLDEST fill regardless of
+    when it actually happened, so a timestamped $100 fill plus an undated $90
+    fill that was in fact the most recent would compare a new $95 decision
+    against $100 and wrongly authorize a top-up (Codex review: "Fail closed
+    when fill chronology is unavailable").
+
+    Thin wrapper over :func:`_most_recent_reference`, which also returns the
+    order_id the price came from (needed to bind a caller-supplied
+    ``prior_logged_reference_price`` to a specific order -- see
+    ``evaluate_slot``).
+    """
+    price, _order_id = _most_recent_reference(orders)
+    return price
+
+
 def evaluate_slot(
     *,
     pages: Sequence[Mapping[str, Any]],
@@ -302,20 +315,16 @@ def evaluate_slot(
     authorizes a top-up (Codex review: "Compare top-ups against the
     configured reference price"). A caller that has the logged reference
     (e.g. from its own or an earlier slot's orders.csv/run_state.json) should
-    supply it; when omitted, this falls back to the broker-observed fill
-    price, matching the documented preference's own last-resort tier.
-
-    The override must also carry ``prior_logged_reference_order_id``: the
-    broker order id the logged reference price came from. It is honored ONLY
-    when that id matches this ticker's chronologically most recent qualifying
-    same-day buy as this gate itself resolves from the broker history --
-    otherwise it is ignored and the broker-observed fill price is used
-    instead. Without this binding, a ticker bought more than once today could
-    supply a stale reference from an EARLIER buy (e.g. an older logged $100
-    with a newer $90 fill) and override the correct, more recent broker
-    reference, wrongly authorizing a top-up a current decision price below
-    the true $90 reference should have blocked (Codex review: "Bind the
-    reference override to the latest buy").
+    supply it, ALONG WITH ``prior_logged_reference_order_id`` -- the specific
+    broker order_id that logged reference describes. The override is honored
+    only when that order_id matches the broker's own latest qualifying
+    order_id for the ticker, proving the logged reference describes the SAME
+    order the broker itself would otherwise use, not some older buy (Codex
+    review: "Bind logged references to the latest broker order" -- an
+    unbound override could belong to an earlier, stale fill and over-credit
+    prior exposure). When omitted, or unbound, this falls back to the
+    broker-observed fill price, matching the documented preference's own
+    last-resort tier.
 
     Raises ``ValueError`` if ``account_number`` is empty: an order snapshot that
     is not pinned to the account being traded proves nothing about it.
@@ -373,42 +382,65 @@ def evaluate_slot(
         # Prefer the caller-supplied logged target_price/decision_price (the
         # documented preference's first two tiers) over this stateless gate's
         # own broker-fill-price fallback -- see this function's docstring.
-        # The override is trusted only when it is bound to the SAME order
-        # this gate itself resolves as the ticker's most recent qualifying
-        # same-day buy; an unbound or stale-order override falls back to that
-        # broker-observed price instead of silently replacing it (Codex
-        # review: "Bind the reference override to the latest buy").
-        broker_latest_price, broker_latest_order_id = _most_recent_reference(
+        # ONLY when it is bound to the specific broker order it claims to
+        # describe: an unbound override could belong to an OLDER buy (e.g. a
+        # stale $100 logged reference from a ticker's first same-day fill,
+        # while the broker's own history shows a more recent $90 fill), which
+        # would authorize a top-up (e.g. at $95) the true latest-reference
+        # policy would refuse (Codex review: "Bind logged references to the
+        # latest broker order"). Compute the broker's own latest reference
+        # unconditionally so there is always a fallback and a value to bind
+        # against.
+        broker_reference_price, broker_reference_order_id = _most_recent_reference(
             orders_by_symbol.get(ticker, [])
         )
         logged_reference_price = _f(candidate.get("prior_logged_reference_price"))
         if logged_reference_price is not None and logged_reference_price <= 0:
             logged_reference_price = None
         logged_reference_order_id = candidate.get("prior_logged_reference_order_id")
+        reference_price = broker_reference_price
         if (
             logged_reference_price is not None
-            and logged_reference_order_id is not None
-            and broker_latest_order_id is not None
-            and str(logged_reference_order_id) == str(broker_latest_order_id)
+            and logged_reference_order_id
+            and broker_reference_order_id is not None
+            and str(logged_reference_order_id) == str(broker_reference_order_id)
         ):
+            # The caller's logged reference is proven to describe the SAME
+            # order the broker itself identifies as the latest qualifying
+            # buy -- safe to prefer it over the (possibly fill-price-inflated)
+            # broker reference for this order.
             reference_price = logged_reference_price
-        else:
-            reference_price = broker_latest_price
-        # effective_prior_usd feeds the desired - prior subtraction below at
-        # its full RAW precision -- not rounded to cents first. Reconstructing
-        # dollars from cumulative_quantity * average_price (both
-        # broker-reported at share/price precision) can land a small fraction
-        # of a cent off the requested notional in either direction; rounding
-        # that DOWN before the subtraction (e.g. a genuine $3.004 exposure
-        # reads as $3.00) understates prior exposure and lets buy_usd exceed
-        # desired_usd - effective_prior_usd, the ceiling the policy declares
-        # must never be rounded up (Codex review: "Do not round prior
-        # exposure down before subtraction"). buy_usd's own ROUND_DOWN below
-        # is the only rounding this arithmetic needs; cents-rounding is
-        # applied separately, only for the effective_prior_usd value reported
-        # below.
-        prior = replace(prior, reference_price=reference_price)
-        display_effective_prior_usd = round(prior.effective_prior_usd, 2)
+        # Normalize effective_prior_usd to cents BEFORE it feeds the desired -
+        # prior subtraction below. Reconstructing dollars from cumulative_quantity
+        # * average_price (both broker-reported at share/price precision) lands a
+        # small fraction of a cent off the requested notional even for whole-cent
+        # fills -- e.g. three genuine $1.00 buys can reconstruct as
+        # $3.0000041175. buy_usd's ROUND_DOWN below is a hard ceiling with no
+        # tolerance, so that noise previously survived all the way to the final
+        # answer and turned an intended $2.00 top-up into $1.99 (Codex review:
+        # "Preserve exact cents when rounding the top-up delta"). Rounding here
+        # -- not just at display time -- keeps the value used for arithmetic and
+        # the value reported in effective_prior_usd consistent.
+        #
+        # CONSIDERED AND REJECTED: rounding only the display value and keeping
+        # the raw value for arithmetic (Codex review, P2: "Keep raw prior
+        # exposure for top-up arithmetic" -- worried a raw $3.004 exposure
+        # rounding to $3.00 could over-credit headroom on a genuinely
+        # fractional-cent exposure). That does not apply to this domain: every
+        # real Robinhood notional amount is cent-quantized by construction --
+        # there is no such thing as a genuine $3.004 fill -- so any sub-cent
+        # residue in effective_prior_usd is PROVABLY float-reconstruction noise
+        # from the quantity * average_price multiplication, never real
+        # exposure. Rounding it away before arithmetic cannot lose genuine
+        # exposure in this domain, and skipping it reintroduces the original
+        # $1.99-instead-of-$2.00 bug this rounding was added to fix (see the
+        # test suite's ``test_prior_exposure_accumulates_across_every_slot_
+        # not_just_the_last_one``, which pins the $2.00 answer).
+        prior = replace(
+            prior,
+            reference_price=reference_price,
+            effective_prior_usd=round(prior.effective_prior_usd, 2),
+        )
         if current_price is None or current_price <= 0:
             # decide_effective_top_up (via incremental_top_up_amount) only
             # checks current_price AFTER finding a prior allocation --  a
@@ -427,7 +459,7 @@ def evaluate_slot(
                     "ticker": ticker,
                     "desired_usd": desired,
                     "current_price": None,
-                    "effective_prior_usd": display_effective_prior_usd,
+                    "effective_prior_usd": prior.effective_prior_usd,
                     "reference_price": prior.reference_price,
                     "buy_usd": 0.0,
                     "reason": MISSING_CURRENT_PRICE,
@@ -444,7 +476,7 @@ def evaluate_slot(
                 "ticker": ticker,
                 "desired_usd": desired,
                 "current_price": current_price,
-                "effective_prior_usd": display_effective_prior_usd,
+                "effective_prior_usd": prior.effective_prior_usd,
                 "reference_price": prior.reference_price,
                 "buy_usd": buy_usd,
                 "reason": decision.reason,
@@ -515,10 +547,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             'An entry may optionally carry "prior_logged_reference_price" -- '
             "this ticker's prior same-day buy's logged target_price/"
             "decision_price, when the caller has it -- to compare against "
-            "instead of this gate's own broker-fill-price fallback, plus "
-            '"prior_logged_reference_order_id" binding it to that buy\'s '
-            "broker order id (honored only when it matches this gate's own "
-            "most-recent-buy resolution; see evaluate_slot's docstring)."
+            "instead of this gate's own broker-fill-price fallback. It is used "
+            'ONLY when the entry ALSO carries a matching "prior_logged_reference_'
+            'order_id" -- the broker order_id that logged reference describes -- '
+            "proving it belongs to the broker's own latest qualifying buy for "
+            "that ticker; otherwise the broker-observed fill price is used "
+            "instead, ignoring the unbound override (see evaluate_slot's "
+            "docstring)."
         ),
     )
     args = parser.parse_args(argv)

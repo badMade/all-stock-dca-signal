@@ -111,11 +111,19 @@ MIDDAY_PROFILES: Dict[str, Dict[str, Any]] = {
 MIDDAY_SIZING_TIERS: Tuple[Tuple[float, float], ...] = StrategyConfig().sizing_tiers
 MIDDAY_MINIMUM_DROP = StrategyConfig().minimum_drop_vs_previous_close
 
-# Midday budget caps. The midday stream owns these; they mirror the morning
-# per-stream caps so midday activity is budgeted independently of both morning
-# and the afternoon BUDGET_TIERS ledger.
-DEFAULT_MIDDAY_DAILY_CAP_USD = 90.0
-DEFAULT_MIDDAY_WEEKLY_CAP_USD = 450.0
+# Midday budget caps. Same shared Normal-tier ceiling every live stream draws
+# from (near_close_dca.BUDGET_TIERS[0] = 180.0/900.0, mirrored in
+# config/budgets.json and config/midday_dca.json's budget_ledger block) -- not
+# an isolated per-stream half-share. Raised from the old 90.0/450.0 halves
+# 2026-08-02 (Geoff: "caps aren't pooled the way the target design intends --
+# fix it"); see morning_dca.DEFAULT_MORNING_DAILY_CAP_USD's comment and
+# MiddayConfig's cap_seed_roots (config/midday_dca.json, added 2026-08-02) for
+# how cross-stream spend is folded in. This does NOT add midday's own dynamic
+# Elevated/High-volatility/Stress escalation -- only the 3:30 final run
+# escalates past Normal, from its fuller same-day view; midday conservatively
+# shares the flat Normal floor.
+DEFAULT_MIDDAY_DAILY_CAP_USD = 180.0
+DEFAULT_MIDDAY_WEEKLY_CAP_USD = 900.0
 
 
 @dataclass(frozen=True)
@@ -279,6 +287,18 @@ def load_midday_config(config_dir=None, *, allow_unpinned_account: bool = False)
         # Preserve [] as () so an explicit empty array in JSON fully disables
         # the guard (consistent with load_morning_config).
         kwargs["prior_allocation_roots"] = tuple(str(r) for r in roots)
+    # cap_seed_roots (added 2026-08-02, mirrors load_morning_config): without
+    # this, config/midday_dca.json's artifact_paths.cap_seed_roots was silently
+    # never read, leaving MiddayConfig.cap_seed_roots at its inherited None
+    # default and the midday budget ledger fully isolated from every other
+    # stream's same-day spend (Geoff: "caps aren't pooled the way the target
+    # design intends -- fix it").
+    cap_roots = artifact_paths.get("cap_seed_roots")
+    if isinstance(cap_roots, list):
+        # Preserve an explicit [] as () so it fully disables cap seeding
+        # rather than falling through to MorningConfig's default_factory
+        # (every sibling stream root), consistent with prior_allocation_roots.
+        kwargs["cap_seed_roots"] = tuple(str(r) for r in cap_roots)
 
     # model_usage_log_root: defaults to stream_root("model_usage") resolved above
     # when this loader runs

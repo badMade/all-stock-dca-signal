@@ -1,6 +1,6 @@
 {
   "$schema": "../schemas/notifications.schema.json",
-  "version": "2026-07-16",
+  "version": "2026-08-02",
   "daily_compact_mode": {
     "requested_on_et": "2026-07-16",
     "summary": "Under the cost-saving daily-compact operating mode (config/scheduled_tasks.json -> operating_mode), weekday tasks suppress no-op / heartbeat notifications and notify ONLY for actionable events. Heavy narrative reporting is deferred to the Friday 5:00 PM ET weekly refresh.",
@@ -23,12 +23,19 @@
   "channels": {
     "slack": {
       "enabled": false,
-      "note": "No Slack for routine notifications. Explicitly disabled as a default channel.",
+      "note": "The in-app message center is the primary notification channel, not Slack. No routine run confirmations, dashboards, or heartbeats are ever posted to Slack. The ONLY two Slack paths anywhere in this project are the opt-in, off-by-default webhooks below (drift and failure alerts); both stay silent unless an operator explicitly sets their env var.",
       "optional_drift_alert": {
         "purpose": "Opt-in path for immediate drift alerts from scripts/drift_detection.py only.",
         "webhook_env": "DCA_DRIFT_SLACK_WEBHOOK",
         "secret_policy": "The webhook URL is read from the DCA_DRIFT_SLACK_WEBHOOK environment variable (or --slack-webhook) at runtime and is NEVER stored in git or this config. Leave the env var unset to keep Slack off; the detector then falls back to in_app_message_center routing.",
         "enable": "Set DCA_DRIFT_SLACK_WEBHOOK in the scheduler environment and pass --slack to the detector."
+      },
+      "optional_failure_alert": {
+        "purpose": "Opt-in path for uncaught-exception failure alerts from dca_alerts.py's shared entrypoint wrapper only (any live stream's run crashing with an unhandled exception), not for routine run outcomes.",
+        "webhook_env": "DCA_ALERT_SLACK_WEBHOOK",
+        "fallback_webhook_env": "DCA_DRIFT_SLACK_WEBHOOK",
+        "secret_policy": "The webhook URL is read from DCA_ALERT_SLACK_WEBHOOK (falling back to DCA_DRIFT_SLACK_WEBHOOK if unset) at runtime and is NEVER stored in git or this config. Leave both env vars unset to keep Slack off; a broken/unreachable webhook never masks or blocks the underlying failure handling (logging, heartbeat, failed-start marker) per dca_alerts.py.",
+        "enable": "Set DCA_ALERT_SLACK_WEBHOOK (or reuse DCA_DRIFT_SLACK_WEBHOOK) in the scheduler environment."
       }
     },
     "in_app_message_center": { "enabled": true, "note": "Primary notification channel." },

@@ -3288,6 +3288,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json-out", default=None, help="Write the report as JSON to this path.")
     parser.add_argument("--md-out", default=None, help="Write the report as Markdown to this path.")
     parser.add_argument(
+        "--write-defaults",
+        action="store_true",
+        help=(
+            "Write JSON/Markdown to default_report_paths(trading_day, cron_tracking_root) "
+            "instead of requiring --json-out/--md-out explicitly. Lets the scheduler "
+            "invoke this script without hardcoding any root or output path in the shell "
+            "command -- both are derived entirely from dca_paths.cron_tracking_root(), "
+            "the same function every other in-repo producer/consumer resolves its root "
+            "through, so this can never drift from them the way a shell ${VAR:-literal} "
+            "fallback could (Codex review: \"Keep the report command on the shared "
+            "artifact root\"). Ignored if --json-out/--md-out are also given explicitly."
+        ),
+    )
+    parser.add_argument(
         "--allow-execution-date-mismatch",
         action="store_true",
         help=(
@@ -3336,21 +3350,27 @@ def _main(argv: Optional[List[str]] = None) -> int:
             print(f"generate_credit_usage_proxy_report: {refusal}", file=sys.stderr)
             return 2
     report = generate_report(trading_day=args.trading_day, cron_tracking_root=cron_tracking_root)
-    if args.json_out:
-        json_out = Path(args.json_out)
+    json_out_path = args.json_out
+    md_out_path = args.md_out
+    if args.write_defaults and not json_out_path and not md_out_path:
+        defaults = default_report_paths(args.trading_day, cron_tracking_root)
+        json_out_path = str(defaults["json"])
+        md_out_path = str(defaults["md"])
+    if json_out_path:
+        json_out = Path(json_out_path)
         # On a fresh artifact tree (e.g. the first scheduled run) nothing has
         # pre-created credit_usage_proxy_report/20260727/, and Path.write_text
         # does not create parent directories -- codex review
         # discussion_r3658511841 (P1).
         json_out.parent.mkdir(parents=True, exist_ok=True)
         json_out.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
-        print(f"generate_credit_usage_proxy_report: wrote {args.json_out}")
-    if args.md_out:
-        md_out = Path(args.md_out)
+        print(f"generate_credit_usage_proxy_report: wrote {json_out_path}")
+    if md_out_path:
+        md_out = Path(md_out_path)
         md_out.parent.mkdir(parents=True, exist_ok=True)
         md_out.write_text(render_markdown(report), encoding="utf-8")
-        print(f"generate_credit_usage_proxy_report: wrote {args.md_out}")
-    if not args.json_out and not args.md_out:
+        print(f"generate_credit_usage_proxy_report: wrote {md_out_path}")
+    if not json_out_path and not md_out_path:
         print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 

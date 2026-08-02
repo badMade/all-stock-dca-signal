@@ -127,10 +127,14 @@ the detector **immediately after writing artifacts**:
 carry their own `post_artifact_drift_check` block too (Codex review: "Wire
 drift detection into the new live streams").
 
-The 3:30 PM check must complete before the 3:40 PM watchdog (`a46bf007`). When
-an auto-buy signal exists but no order record does, the task fires the Slack
-alert (webhook present) and/or the in-app drift alert immediately — it does not
-wait for the next-day review.
+When an auto-buy signal exists but no order record does, the task fires the
+Slack alert (webhook present) and/or the in-app drift alert immediately — it
+does not wait for the next-day review.
+
+**Historical, until 2026-08-02:** the 3:30 PM check used to need to complete
+before the 3:40 PM watchdog (`a46bf007`); the watchdog was removed from the
+schedule entirely on 2026-08-02, so this ordering requirement no longer
+applies. See `config/scheduled_tasks.json`'s `afternoon_completion_rule`.
 
 ## Running the tests
 

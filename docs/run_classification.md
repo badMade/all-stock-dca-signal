@@ -206,15 +206,17 @@ submitted/filled status.
 
 **Downstream treatment of a confirmation-blocked run:**
 
-- **Watchdog (`a46bf007`)** — treat it as a valid scheduled run that fired.
-  Alert that **no order was placed**, but do **not** mark the lineage/scheduled
-  state invalid when the required fields are present.
-- **Slippage (`67aa802b`)** — report **no scheduled fills and no scheduled
-  order IDs**. Do **not** invalidate the run_state because confirmation blocked
-  submission, and the broker time-window fallback does **not** apply (there was
-  no write failure).
+- **Slippage (`67aa802b`, retimed 2026-08-02 from 3:35 PM ET to 5:00 PM ET
+  daily)** — report **no scheduled fills and no scheduled order IDs**. Do
+  **not** invalidate the run_state because confirmation blocked submission, and
+  the broker time-window fallback does **not** apply (there was no write
+  failure).
 - **Weekly/monthly** — count the scheduled run as having occurred; it
   contributes **zero** scheduled fills/orders.
+- *(Historical, until 2026-08-02: the watchdog, `a46bf007`, also treated a
+  confirmation-blocked run as valid and alerted that no order was placed
+  without marking the lineage invalid. It was removed from the schedule
+  entirely on 2026-08-02.)*
 
 ## Nested run_classification requirement for watchdog confirmation (added 2026-07-17)
 
@@ -233,9 +235,11 @@ The Fri Jul 17 2026 3:20 PM ET scheduled `run_state` was repaired to include a
 2. **Nested object is authoritative.** In this repo, scheduled/manual identity fields live
    under `run_classification` (see [`../config/run_classification.json`](../config/run_classification.json));
    top-level mirror fields are not required by the artifact writers/consumers.
-3. **Watchdog confirmation.** The 3:40 PM watchdog (`a46bf007`) confirms a
-   scheduled run **only** when the nested `run_classification` object is present
-   and valid. A `run_state` missing it is a watchdog **discrepancy**.
+3. **Confirmation.** A scheduled run is confirmed **only** when the nested
+   `run_classification` object is present and valid. A `run_state` missing it
+   is a validation **discrepancy**. (Confirmed by the 3:40 PM watchdog,
+   `a46bf007`, until it was removed from the schedule entirely on 2026-08-02;
+   now confirmed by `67aa802b`'s post-trade validation.)
 
 See the
 `live_reliability_fix_2026_07_17.scheduled_run_state_classification_requirement`
@@ -295,9 +299,10 @@ exposes `ACCEPTED_STATE_SCHEMA_VERSIONS` and `is_preauthorized_v2(...)`, and
 
 ## Slippage order-history persistence (added 2026-07-10)
 
-The 3:35 PM ET slippage task (`67aa802b`) **persists the Robinhood order-history
-response before computing slippage** and computes average fill price / executions
-from the saved payload rather than re-querying the broker:
+The slippage task (`67aa802b`, retimed 2026-08-02 from 3:35 PM ET to 5:00 PM ET
+daily) **persists the Robinhood order-history response before computing
+slippage** and computes average fill price / executions from the saved payload
+rather than re-querying the broker:
 
 - The payload is saved to
   `scheduled_runs/YYYYMMDD_1530ET/raw/orders_after_place.json` and its path is
@@ -313,8 +318,9 @@ from the saved payload rather than re-querying the broker:
 
 ## Downstream reporting rules
 
-Applies to slippage (`67aa802b`), watchdog (`a46bf007`), weekly dashboard
-(`041d9d90`), and monthly dashboard (`0656657a`):
+Applies to slippage (`67aa802b`), weekly dashboard (`041d9d90`), and monthly
+dashboard (`0656657a`). (Also applied to the watchdog, `a46bf007`, until it was
+removed from the schedule entirely on 2026-08-02.)
 
 1. **Validate** scheduled state files against the run_classification schema
    before using them, accepting **both** `run-classification-v1` and
@@ -427,15 +433,19 @@ under `/home/user/workspace/cron_tracking/dry_runs/20260721_0905ET/`. See the
 `morning_manual_dry_run_2026_07_21` in
 [`../config/scheduled_tasks.json`](../config/scheduled_tasks.json).
 
-## Watchdog all-orders broker query (added 2026-07-21)
+## Watchdog all-orders broker query (added 2026-07-21, historical — watchdog removed 2026-08-02)
 
 The 3:40 PM live-run watchdog (`a46bf007`) previously queried the **agentic**
 (`placed_agent='agent'`) order subset first, so same-day **user/manual** Robinhood
 orders could be missed by primary reconciliation. From **2026-07-21** the watchdog
-**must query ALL same-day Robinhood equity orders for account <ROBINHOOD_ACCOUNT_NUMBER> without any
-`placed_agent` filter first**, then classify every returned order. It **may**
-report the agentic-only subset separately, but the primary reconciliation runs over
-the **full** order set.
+**had to query ALL same-day Robinhood equity orders for account <ROBINHOOD_ACCOUNT_NUMBER> without any
+`placed_agent` filter first**, then classify every returned order. It **could**
+report the agentic-only subset separately, but the primary reconciliation ran over
+the **full** order set. The watchdog was removed from the schedule entirely on
+2026-08-02 (see [`safeguards.md`](safeguards.md#operational-rules)); no
+remaining task performs this all-orders/no-filter query. Kept here as
+historical documentation, mirroring `config/run_classification.json`'s and
+`config/scheduled_tasks.json`'s own `watchdog_all_orders_fix_2026_07_21` blocks.
 
 Each order is classified by:
 
@@ -779,7 +789,8 @@ outcome, including a zero-order, blocked, or failed run:
   `MorningDCAExecutor`, and `10ce362c` through `near_close_dca`. The market-open
   `2ba19526` and intraday `7be82b97` tasks carry `no_python_entry_point=true`:
   an external scheduler/agent runs them directly from the manifest, the same
-  arrangement as the watchdog `a46bf007`. For those two the contract is the task
+  arrangement other manifest-only external scheduled tasks (e.g. `bb4f6ef1`) use.
+  For those two the contract is the task
   text the executor must follow, and the repo supplies the tested helpers
   (`write_scheduled_run_artifacts`, `validate_run_artifacts`,
   `classify_no_order_run`) rather than a producer. See

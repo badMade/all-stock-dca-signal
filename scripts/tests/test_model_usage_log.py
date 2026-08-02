@@ -39,7 +39,12 @@ COVERED_TASK_IDS = (
     "a6239dae",
     "10ce362c",
     "67aa802b",
-    "a46bf007",
+    # e3e6f09e (3:05 PM monitor, PAUSED) and a46bf007 (3:40 PM watchdog) were
+    # removed from the schedule entirely on 2026-08-02 and no longer appear in
+    # config/scheduled_tasks.json's model_usage_log.applies_to_daily_tasks_et,
+    # so build_entry() now raises UnknownTaskError for either -- see
+    # test_build_entry_unknown_task_raises and the CLI test below, which was
+    # switched from a46bf007 to bb4f6ef1 for the same reason.
 )
 
 
@@ -72,11 +77,11 @@ def test_build_entry_covers_every_manifest_task():
 
 def test_build_entry_accepts_cron_id_alone():
     entry = build_entry(
-        run_id="r1", cron_id="a46bf007", artifact_path="/tmp/a", triggered_at_utc=TRIGGERED
+        run_id="r1", cron_id="67aa802b", artifact_path="/tmp/a", triggered_at_utc=TRIGGERED
     )
-    assert entry["cron_id"] == "a46bf007"
+    assert entry["cron_id"] == "67aa802b"
     assert "task_id" not in entry
-    assert entry["stream"] == "watchdog"
+    assert entry["stream"] == "slippage"
 
 
 def test_build_entry_requires_an_identifier():
@@ -202,17 +207,21 @@ def test_entry_matches_json_schema():
 
 
 def test_cli_appends_entry_for_tasks_with_no_python_entry_point():
-    # bb4f6ef1/e3e6f09e/a46bf007 have no in-repo executor to wire a
+    # 2ba19526/7be82b97/bb4f6ef1 have no in-repo executor to wire a
     # log_model_usage() call into -- they're run directly by the external
-    # scheduler/agent, which shells out to this CLI instead.
+    # scheduler/agent, which shells out to this CLI instead. (This test used
+    # a46bf007, the 3:40 PM watchdog, until it was removed from the schedule
+    # entirely on 2026-08-02; switched to bb4f6ef1's watchlist sub-invocation,
+    # which is still a no-in-repo-entry-point CLI consumer for this purpose
+    # even though its two sub-invocations normally log via MorningDCAExecutor.)
     from model_usage_log import _main
 
     with tempfile.TemporaryDirectory() as td:
         rc = _main(
             [
-                "--run-id", "watchdog_20260721_1540ET",
-                "--task-id", "a46bf007",
-                "--artifact-path", "/tmp/watchdog_report.json",
+                "--run-id", "watchlist_20260721_0945ET",
+                "--task-id", "bb4f6ef1",
+                "--artifact-path", "/tmp/watchlist_report.json",
                 "--triggered-at-utc", TRIGGERED.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "--root", td,
             ]
@@ -221,8 +230,8 @@ def test_cli_appends_entry_for_tasks_with_no_python_entry_point():
         log_path = resolve_log_path(TRIGGERED, root=td)
         assert log_path.exists()
         entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
-        assert entry["task_id"] == "a46bf007"
-        assert entry["stream"] == "watchdog"
+        assert entry["task_id"] == "bb4f6ef1"
+        assert entry["stream"] == "watchlist"
 
 
 def test_cli_scheduled_for_et_override_beats_manifest_combined_default():

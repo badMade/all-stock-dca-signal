@@ -389,9 +389,10 @@ FINAL_MANUAL_OVERRIDE_DIR_PREFIX = "final_manual_override_"
 # Manual-exclusion roots beyond ce16ba6b/manual_runs. The 2026-07-13 final manual buy
 # override backfilled live artifacts under midday_dca/manual_reruns/final_manual_override_*
 # and a final_manual_review/** tree, both OUTSIDE the ce16ba6b task root. Slippage
-# (67aa802b), the watchdog (a46bf007), and weekly/monthly reporting must treat every
-# run_state/orders CSV under these roots as manual and exclude their order IDs from all
-# scheduled-live metrics. Paths are relative to CRON_TRACKING_ROOT.
+# (67aa802b) and weekly/monthly reporting must treat every run_state/orders CSV under
+# these roots as manual and exclude their order IDs from all scheduled-live metrics.
+# (The 3:40 PM watchdog, a46bf007, also did until it was removed from the schedule
+# entirely on 2026-08-02.) Paths are relative to CRON_TRACKING_ROOT.
 MANUAL_EXCLUSION_SUBROOTS = (
     "final_manual_review",
     "midday_dca/manual_reruns",
@@ -2898,6 +2899,20 @@ class PriorAllocation:
     # tie. None when reference_price is unknown or came from a run with no
     # parseable generated_at.
     reference_ts: Optional[int] = None
+    # Count of qualifying CSV rows (broker buy attempts) folded into this
+    # ticker, one per row regardless of order_id/amount -- NOT one per
+    # contributing run/source. A single bare manual/recovery CSV can contain
+    # multiple distinct orders for the same ticker; near_close_dca.py's
+    # merge_manual_top_up_context previously used len(sources) as its
+    # attempt-count proxy, which counts RUNS, not ORDERS, so several attempts
+    # from one fallback-only run were reconstructed as a single attempt
+    # against the shared max_orders_per_day breaker (Codex review: "Count
+    # each fallback CSV order as an attempt"). Rows with a duplicate order_id
+    # across merged sources are already excluded before _prior_from_rows ever
+    # sees them (see load_same_day_top_up_context's seen_order_ids/
+    # _exclude_seen_order_ids), so summing each source's own row count here
+    # does not double-count a mirrored order.
+    attempt_count: int = 0
 
 
 def _row_ticker(row: Mapping[str, object]) -> Optional[str]:
@@ -3229,8 +3244,13 @@ def _prior_from_rows(rows: Iterable[Dict[str, object]]) -> Dict[str, Dict[str, o
                 amount = fill_price * quantity
         first_row_for_ticker = ticker not in out
         entry = out.setdefault(
-            ticker, {"prior_usd": 0.0, "reference_price": None, "order_ids": []}
+            ticker,
+            {"prior_usd": 0.0, "reference_price": None, "order_ids": [], "attempt_count": 0},
         )
+        # Every qualifying row is a real broker buy attempt regardless of
+        # order_id/amount -- counted per ROW, not per contributing run (Codex
+        # review: "Count each fallback CSV order as an attempt").
+        entry["attempt_count"] = int(entry["attempt_count"]) + 1
         if amount is not None:
             entry["prior_usd"] = float(entry["prior_usd"]) + amount
         price = _row_number(row, _PRICE_COLS) if row.get("_confirmed_fill") else None
@@ -3423,15 +3443,23 @@ def _merge_prior(
         for oid in entry.get("order_ids", []) or []:
             if oid not in alloc.order_ids:
                 alloc.order_ids.append(oid)
+        # Summed, not deduplicated like order_ids: this is each contributing
+        # run's OWN qualifying-row count for this ticker, and a row whose
+        # order_id already appeared in an earlier-merged source was already
+        # excluded before _prior_from_rows ever built this run's entry (see
+        # load_same_day_top_up_context's seen_order_ids), so a genuinely
+        # distinct run's attempt_count here reflects only its own,
+        # not-yet-counted attempts.
+        alloc.attempt_count += int(entry.get("attempt_count") or 0)
         if source_label not in alloc.sources:
             alloc.sources.append(source_label)
 
 
 def _mtime_matches_trading_day(path: Path, trading_day: str) -> bool:
-    """True if ``path``'s last-modified time falls on ``trading_day`` (Eastern).
+    """True if ``path``'s last-modified time falls ON OR AFTER ``trading_day`` (Eastern).
 
     Mirrors ``near_close_dca._mtime_matches_trading_day``: scopes skip_sink to
-    PLAUSIBLY same-day artifacts. A ``run_state*.json`` that fails to
+    PLAUSIBLY relevant artifacts. A ``run_state*.json`` that fails to
     read/parse can't have its own ``trading_day`` field inspected (that's
     exactly what failed), so a permanently corrupted historical artifact
     accumulated anywhere under a recursively (``rglob``) scanned root would
@@ -3440,9 +3468,21 @@ def _mtime_matches_trading_day(path: Path, trading_day: str) -> bool:
     review: "Scope parse failures to plausible same-day states"). mtime is an
     imperfect but cheap, universal proxy: a same-day artifact still being
     flushed necessarily has a same-day mtime, while old corrupted files do
-    not. If the path can't even be stat'd, or ``trading_day`` doesn't parse,
-    err toward still treating it as a possible same-day failure rather than
-    silently dropping the signal.
+    not.
+
+    NOT a strict equality check: an earlier-weekday artifact being backfilled
+    or repaired on a LATER day (e.g. Monday's ``run_state.json`` rewritten
+    while a Tuesday run's earlier-week scan reads it) is exactly as
+    unverifiable as a same-day race, but its mtime can never equal Monday --
+    an exact-equality check silently dropped that failure from skip_sink,
+    understating real earlier-week spend against the shared weekly cap
+    (Codex review: "Fail closed on later-modified prior-day artifacts"). A
+    file can never legitimately be modified BEFORE the trading day it claims
+    to represent, so "on or after" still excludes genuinely stale historical
+    garbage (whose mtime predates trading_day) while also covering a
+    later-day rewrite of an earlier day's artifact. If the path can't even be
+    stat'd, or ``trading_day`` doesn't parse, err toward still treating it as
+    a possible failure rather than silently dropping the signal.
     """
     try:
         mtime = path.stat().st_mtime
@@ -3452,7 +3492,7 @@ def _mtime_matches_trading_day(path: Path, trading_day: str) -> bool:
         target = datetime.strptime(trading_day, "%Y-%m-%d").date()
     except (TypeError, ValueError):
         return True
-    return datetime.fromtimestamp(mtime, tz=_EASTERN).date() == target
+    return datetime.fromtimestamp(mtime, tz=_EASTERN).date() >= target
 
 
 def load_same_day_top_up_context(
