@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from conftest import FIXTURE_ACCOUNT_NUMBER
-from dca_paths import CRON_TRACKING_ROOT_ENV
+from dca_paths import CRON_TRACKING_ROOT_ENV, stream_root
 from midday_dca import (
     DEFAULT_MIDDAY_LIVE_STATE_ROOT,
     MIDDAY_LIVE_CRON_ID,
@@ -381,7 +381,7 @@ def test_midday_refreshes_only_its_own_pointer_with_guard_fields(tmp_path):
     assert not (Path(tmp_path) / "latest_morning_live.json").exists()
     assert "latest_morning_live" not in res["paths"]
 
-    pdata = json.loads((Path(tmp_path) / "latest_midday_run.json").read_text(encoding="utf-8"))
+    pdata = json.loads((Path(tmp_path) / "latest_midday_run.json").read_bytes())
     assert pdata["stream"] == "midday"
     assert pdata["trading_day"] == "2026-07-08"
     assert pdata["pointer_status"] == "valid"
@@ -1077,6 +1077,17 @@ def test_load_midday_config_reads_config_file(tmp_path):
     assert cfg.prior_allocation_roots == ("/custom/morning/root",)
 
 
+def test_load_midday_config_falls_back_on_invalid_utf8(tmp_path):
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "midday_dca.json").write_bytes(b"\xff")
+
+    cfg = load_midday_config(str(cfg_dir))
+
+    assert cfg.model_usage_log_root == stream_root("model_usage")
+    assert cfg.base_buy_amount_usd == MiddayConfig().base_buy_amount_usd
+
+
 # --- PR #22 bot-review regression coverage (batch: midday config loading) ----
 
 
@@ -1255,7 +1266,7 @@ def test_manual_midday_run_with_wrong_broker_account_raises_before_ordering(tmp_
 def test_midday_classification_validates_against_json_schema():
     jsonschema = pytest.importorskip("jsonschema")
     schema_path = Path(__file__).resolve().parent / "schemas" / "midday_run_classification.schema.json"
-    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    schema = json.loads(schema_path.read_bytes())
     cfg = MiddayConfig(tickers=("SMALL",))
     scheduled = MiddayDCAExecutor(cfg).run_classification(_now_midday(), manual=False)
     manual = MiddayDCAExecutor(cfg).run_classification(_now_midday(), manual=True)
@@ -1311,7 +1322,7 @@ if __name__ == "__main__":
 
 def _midday_schema():
     path = Path(__file__).resolve().parent / "schemas" / "midday_run_classification.schema.json"
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_bytes())
 
 
 def _a_valid_midday_live_classification():

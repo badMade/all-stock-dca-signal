@@ -374,7 +374,7 @@ def test_refresh_writes_same_day_metadata(tmp_path):
         trading_day=TODAY,
         run_state=_scheduled_state(),
     )
-    data = json.loads(pointer_path.read_text())
+    data = json.loads(pointer_path.read_bytes())
     assert data["same_day_required"] is True
     assert data["valid_scheduled_evidence"] is True
     assert data["pointer_status"] == STATUS_VALID
@@ -395,7 +395,7 @@ def test_refresh_derives_false_evidence_for_manual(tmp_path):
         trading_day=TODAY,
         run_state=_scheduled_state(manual=True),
     )
-    data = json.loads(pointer_path.read_text())
+    data = json.loads(pointer_path.read_bytes())
     assert data["valid_scheduled_evidence"] is False
 
 

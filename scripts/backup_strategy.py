@@ -389,7 +389,7 @@ def _merge_into_file(path: Path, updates: Dict[str, object]) -> None:
     existing: Dict[str, object] = {}
     if path.exists():
         try:
-            existing = json.loads(path.read_text())
+            existing = json.loads(path.read_bytes())
         except json.JSONDecodeError:
             existing = {}
     filtered_updates = {k: v for k, v in updates.items() if v not in (None, [], {})}

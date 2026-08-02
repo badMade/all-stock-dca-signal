@@ -138,7 +138,7 @@ def test_write_configs_refreshes_base_amount_from_dollar_dash_base_wording():
         out = Path(d)
         (out / "sizing_ladder.json").write_text(json.dumps({"base_amount_usd": 3.0}))
         write_configs(extract_all(transcript), out, only=["ladder"])
-        ladder = json.loads((out / "sizing_ladder.json").read_text())
+        ladder = json.loads((out / "sizing_ladder.json").read_bytes())
         assert ladder["base_amount_usd"] == 2.0
 
 
@@ -184,7 +184,7 @@ def test_write_configs_preserves_existing_tier_metadata():
             )
         )
         write_configs(extracted, out, only=["budgets"])
-        budgets = json.loads((out / "budgets.json").read_text())
+        budgets = json.loads((out / "budgets.json").read_bytes())
         assert budgets["version"] == "keep-me"  # top-level key preserved
         stress = {t["name"]: t for t in budgets["budget_tiers"]}["stress"]
         # Caps refreshed from the transcript...
@@ -234,11 +234,11 @@ def test_write_configs_merges_and_persists():
         assert "tickers.json" in written
         assert "sizing_ladder.json" in written
 
-        tickers = json.loads((out / "tickers.json").read_text())
+        tickers = json.loads((out / "tickers.json").read_bytes())
         assert tickers["version"] == "keep-me"  # preserved
         assert len(tickers["active"]) == 45      # merged in
 
-        ladder = json.loads((out / "sizing_ladder.json").read_text())
+        ladder = json.loads((out / "sizing_ladder.json").read_bytes())
         assert len(ladder["tiers"]) == 9
 
 

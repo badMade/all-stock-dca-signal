@@ -883,7 +883,7 @@ def validate_run_artifacts(
     else:
         state: Any = None
         try:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state = json.loads(state_path.read_bytes())
         except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
             errors.append(f"{RUN_STATE_FILENAME} is not readable JSON: {exc}")
         if isinstance(state, dict):
@@ -927,7 +927,7 @@ def validate_run_artifacts(
                     if not summary_path.exists():
                         continue
                     try:
-                        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                        summary = json.loads(summary_path.read_bytes())
                     except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
                         errors.append(f"{summary_name} is not readable JSON: {exc}")
                         continue

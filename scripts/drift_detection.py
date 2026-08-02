@@ -324,8 +324,8 @@ def load_run_artifacts(run_dir: Path) -> RunArtifacts:
     state_path = run_dir / RUN_STATE_NAME
     if state_path.exists():
         try:
-            run_state = json.loads(state_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+            run_state = json.loads(state_path.read_bytes())
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             run_state = None
 
     return RunArtifacts(

@@ -1192,7 +1192,7 @@ def test_main_creates_output_parent_directories(tmp_path):
     assert exit_code == 0
     assert json_out.is_file()
     assert md_out.is_file()
-    assert json.loads(json_out.read_text(encoding="utf-8"))["trading_day"] == TRADING_DAY
+    assert json.loads(json_out.read_bytes())["trading_day"] == TRADING_DAY
 
 
 def test_main_write_defaults_derives_root_and_paths_without_any_shell_hardcoding(
@@ -3553,7 +3553,7 @@ def test_registered_command_derives_the_root_with_no_shell_hardcoding():
     # default_report_paths() instead, which can never drift from the shared
     # root the way a static shell fallback could.
     repo_root = Path(__file__).resolve().parents[2]
-    manifest = json.loads((repo_root / "config" / "scheduled_tasks.json").read_text(encoding="utf-8"))
+    manifest = json.loads((repo_root / "config" / "scheduled_tasks.json").read_bytes())
     command = next(
         t["command"] for t in manifest["tasks"] if t.get("id", "").startswith("onetime-1630-credit")
     )

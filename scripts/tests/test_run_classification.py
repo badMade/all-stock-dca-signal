@@ -346,6 +346,37 @@ def test_collect_manual_ids_reads_referenced_orders_csv():
         assert kept == ["SCHED-1"]
 
 
+def test_collectors_skip_unreadable_run_state_files():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+
+        manual_written = write_run_artifacts(_manual_state(order_ids=("MAN-OK",)), base=base)
+        manual_dir = Path(manual_written["run_state"]).parent
+        (manual_dir / "run_state_corrupt.json").write_bytes(b"\xff")
+        assert collect_manual_order_ids(base) == {"MAN-OK"}
+
+        earlier_dir = cron_tracking_root(base) / "intraday_dca" / "20260706_1430ET"
+        earlier_dir.mkdir(parents=True)
+        (earlier_dir / "run_state.json").write_text(
+            json.dumps({
+                "run_id": "intraday_20260706_1430ET",
+                "trading_day": TRADING_DAY,
+                "run_classification": build_scheduled_classification(TRADING_DAY, "2026-07-06T18:30:00Z"),
+                "buy_candidates": [
+                    {"ticker": "EVR", "status": "submitted", "order_id": "EARLY-OK"}
+                ],
+            }),
+            encoding="utf-8",
+        )
+        (earlier_dir / "run_state_corrupt.json").write_bytes(b"\xff")
+        assert "EARLY-OK" in collect_earlier_scheduled_order_ids(base, TRADING_DAY)
+
+        recovery_dir = _write_recovery_run(base, "midday_dca/20260727_1230ET_recovery_1305ET", order_ids=("REC-OK",))
+        (recovery_dir / "run_state_corrupt.json").write_bytes(b"\xff")
+        assert collect_recovery_context_order_ids(base, "2026-07-27") == {"REC-OK"}
+
+
 def test_scheduled_write_updates_pointer():
     with tempfile.TemporaryDirectory() as d:
         base = Path(d)
@@ -355,7 +386,7 @@ def test_scheduled_write_updates_pointer():
         assert "scheduled_runs" in str(state_path)
         pointer = latest_scheduled_run_path(base)
         assert pointer.exists()
-        ptr = json.loads(pointer.read_text())
+        ptr = json.loads(pointer.read_bytes())
         assert ptr["run_id"] == "scheduled_20260706_1530ET"
         assert ptr["run_state_path"] == str(state_path)
 
@@ -398,7 +429,7 @@ def test_update_latest_scheduled_run_pointer_uses_given_path():
         pointer = update_latest_scheduled_run_pointer(state, external_path, base)
 
         assert pointer == latest_scheduled_run_path(base)
-        ptr = json.loads(pointer.read_text())
+        ptr = json.loads(pointer.read_bytes())
         assert ptr["run_state_path"] == str(external_path)
         assert ptr["run_id"] == "scheduled_20260706_1530ET"
         # No second copy of run_state.json was created anywhere under base.
@@ -424,7 +455,7 @@ def test_update_latest_scheduled_run_pointer_uses_the_classifications_own_stream
 
         pointer = update_latest_scheduled_run_pointer(state, state_path, base)
 
-        ptr = json.loads(pointer.read_text())
+        ptr = json.loads(pointer.read_bytes())
         assert ptr["stream"] == "morning"
 
     # Omitting stream entirely (an older/afternoon-only classification) still
@@ -439,7 +470,7 @@ def test_update_latest_scheduled_run_pointer_uses_the_classifications_own_stream
 
         pointer = update_latest_scheduled_run_pointer(state, state_path, base)
 
-        ptr = json.loads(pointer.read_text())
+        ptr = json.loads(pointer.read_bytes())
         assert ptr["stream"] == "afternoon"
 
     # Codex review discussion_r3694664... ("Default null legacy streams before
@@ -459,7 +490,7 @@ def test_update_latest_scheduled_run_pointer_uses_the_classifications_own_stream
 
         pointer = update_latest_scheduled_run_pointer(state, state_path, base)
 
-        ptr = json.loads(pointer.read_text())
+        ptr = json.loads(pointer.read_bytes())
         assert ptr["stream"] == "afternoon"
 
 
@@ -478,7 +509,7 @@ def test_update_latest_scheduled_run_pointer_rejects_incomplete_classification()
 
         pointer = update_latest_scheduled_run_pointer(state, state_path, base)
 
-        ptr = json.loads(pointer.read_text())
+        ptr = json.loads(pointer.read_bytes())
         assert ptr["valid_scheduled_evidence"] is False
         assert ptr["pointer_status"] == "pending"
 
@@ -739,7 +770,7 @@ def test_fallback_excludes_normal_earlier_stream_scheduled_orders():
             }),
             encoding="utf-8",
         )
-        assert not is_scheduled_state(json.loads((real_dir / "run_state.json").read_text()))
+        assert not is_scheduled_state(json.loads((real_dir / "run_state.json").read_bytes()))
 
         assert "INTRA-1527" in collect_earlier_scheduled_order_ids(base, TRADING_DAY)
         assert "REAL-1527" in collect_earlier_scheduled_order_ids(base, TRADING_DAY)
@@ -1021,7 +1052,7 @@ def test_confirmation_blocked_write_updates_pointer():
         assert "scheduled_runs" in str(state_path)
         pointer = latest_scheduled_run_path(base)
         assert pointer.exists()
-        ptr = json.loads(pointer.read_text())
+        ptr = json.loads(pointer.read_bytes())
         assert ptr["run_id"] == "scheduled_20260706_1530ET"
 
 
@@ -1155,7 +1186,7 @@ def test_save_raw_input_persists_before_compute():
         save_raw_input(TRADING_DAY, historicals_batch_filename(1), {"AAPL": [1, 2, 3]}, base=base)
         assert p1.exists()
         # Compute reads the persisted file, not an in-memory response.
-        assert json.loads(p1.read_text())["AAPL"] == 190.0
+        assert json.loads(p1.read_bytes())["AAPL"] == 190.0
         assert list_raw_inputs_saved(TRADING_DAY, base) == [
             "historicals_batch1.json",
             "quotes_batch1.json",
@@ -1227,7 +1258,7 @@ def test_save_raw_input_normalizes_pointer_payload():
             TRADING_DAY, historicals_batch_filename(1),
             {"output_path": str(pointer_file)}, base=base,
         )
-        saved = json.loads(path.read_text())
+        saved = json.loads(path.read_bytes())
         assert saved["normalized"] is True
         assert saved["data"]["AAPL"] == [1, 2, 3]
 
@@ -1342,9 +1373,9 @@ def test_recovery_triggers_match_config_and_schema():
     # schemas/run_state.schema.json recovery.trigger_reason.enum) so they can
     # never silently drift apart.
     repo_root = Path(__file__).resolve().parents[2]
-    config = json.loads((repo_root / "config" / "scheduled_tasks.json").read_text(encoding="utf-8"))
+    config = json.loads((repo_root / "config" / "scheduled_tasks.json").read_bytes())
     assert tuple(config["failure_recovery_policy"]["recovery_triggers"]) == RECOVERY_TRIGGER_REASONS
-    schema = json.loads((repo_root / "schemas" / "run_state.schema.json").read_text(encoding="utf-8"))
+    schema = json.loads((repo_root / "schemas" / "run_state.schema.json").read_bytes())
     assert tuple(schema["properties"]["recovery"]["properties"]["trigger_reason"]["enum"]) == RECOVERY_TRIGGER_REASONS
 
 
@@ -1355,9 +1386,9 @@ def test_recovery_state_validates_against_json_schema():
 
     repo_root = Path(__file__).resolve().parents[2]
     schemas_dir = repo_root / "schemas"
-    main = json.loads((schemas_dir / "run_state.schema.json").read_text(encoding="utf-8"))
+    main = json.loads((schemas_dir / "run_state.schema.json").read_bytes())
     resources = [
-        (name, Resource.from_contents(json.loads((schemas_dir / name).read_text(encoding="utf-8"))))
+        (name, Resource.from_contents(json.loads((schemas_dir / name).read_bytes())))
         for name in ("run_state.schema.json", "run_classification.schema.json")
     ]
     registry = Registry().with_resources(resources)
@@ -1390,9 +1421,9 @@ def test_schema_rejects_hybrid_canonical_legacy_identity():
 
     repo_root = Path(__file__).resolve().parents[2]
     schemas_dir = repo_root / "schemas"
-    rc_schema = json.loads((schemas_dir / "run_classification.schema.json").read_text(encoding="utf-8"))
+    rc_schema = json.loads((schemas_dir / "run_classification.schema.json").read_bytes())
     resources = [
-        (name, Resource.from_contents(json.loads((schemas_dir / name).read_text(encoding="utf-8"))))
+        (name, Resource.from_contents(json.loads((schemas_dir / name).read_bytes())))
         for name in ("run_classification.schema.json",)
     ]
     registry = Registry().with_resources(resources)
@@ -1439,9 +1470,9 @@ def test_schema_accepts_the_seven_slot_rosters_morning_and_midday_identities():
 
     repo_root = Path(__file__).resolve().parents[2]
     schemas_dir = repo_root / "schemas"
-    rc_schema = json.loads((schemas_dir / "run_classification.schema.json").read_text(encoding="utf-8"))
+    rc_schema = json.loads((schemas_dir / "run_classification.schema.json").read_bytes())
     resources = [
-        (name, Resource.from_contents(json.loads((schemas_dir / name).read_text(encoding="utf-8"))))
+        (name, Resource.from_contents(json.loads((schemas_dir / name).read_bytes())))
         for name in ("run_classification.schema.json",)
     ]
     registry = Registry().with_resources(resources)
@@ -3949,7 +3980,7 @@ def test_recorded_context_flags_agree_with_the_runtime_validator():
     repo_root = Path(__file__).resolve().parents[2]
     checked = 0
     for rel in ("config/run_classification.json", "config/scheduled_tasks.json"):
-        cfg = json.loads((repo_root / rel).read_text(encoding="utf-8"))
+        cfg = json.loads((repo_root / rel).read_bytes())
         for name, record, flags in _records_with_context_flags(cfg):
             origin = record.get("run_origin")
             claimed = flags.get("valid_recovery_context")
@@ -4045,7 +4076,7 @@ def test_recorded_recovery_records_satisfy_the_contract():
     # This walks the actual committed records rather than a fixture, so a future
     # recovery recorded with a stream the contract does not accept fails here.
     repo_root = Path(__file__).resolve().parents[2]
-    cfg = json.loads((repo_root / "config" / "run_classification.json").read_text(encoding="utf-8"))
+    cfg = json.loads((repo_root / "config" / "run_classification.json").read_bytes())
 
     checked = 0
     residual = 0
@@ -4243,7 +4274,7 @@ def test_recorded_recovery_records_still_satisfy_the_tightened_flags():
     # walk as test_recorded_recovery_records_satisfy_the_contract, re-asserted
     # here so a flag tightening that breaks real data fails loudly.
     repo_root = Path(__file__).resolve().parents[2]
-    cfg = json.loads((repo_root / "config" / "run_classification.json").read_text(encoding="utf-8"))
+    cfg = json.loads((repo_root / "config" / "run_classification.json").read_bytes())
     checked = 0
     residual = 0
     for name, rec in cfg.items():

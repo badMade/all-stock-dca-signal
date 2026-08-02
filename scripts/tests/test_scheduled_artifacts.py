@@ -62,7 +62,7 @@ def _morning_run_classification_schema():
     schema_path = (
         Path(__file__).resolve().parents[2] / "schemas" / "morning_run_classification.schema.json"
     )
-    return json.loads(schema_path.read_text(encoding="utf-8"))
+    return json.loads(schema_path.read_bytes())
 
 
 def test_preflight_classification_is_non_null_object_with_required_fields():
@@ -652,7 +652,7 @@ def test_run_summary_mirrors_run_classification_and_carries_the_no_order_outcome
     state = _live_run_state()
     write_scheduled_run_artifacts(tmp_path, state)
 
-    summary = json.loads((tmp_path / "run_summary.json").read_text(encoding="utf-8"))
+    summary = json.loads((tmp_path / "run_summary.json").read_bytes())
     assert summary["run_classification"] == state["run_classification"]
     assert summary["order_submit_status"] == "no_orders_submitted"
     assert summary["completion_reason"] == "no_ladder_candidates"

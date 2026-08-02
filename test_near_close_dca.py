@@ -3553,8 +3553,8 @@ def test_scheduled_compact_writes_and_validates_artifact_contract(tmp_path):
     assert (d / "submitted_orders.csv").exists()
     assert (d / "run_summary.json").exists()
 
-    run_state = json.loads((d / "run_state.json").read_text())
-    summary = json.loads((d / "run_summary.json").read_text())
+    run_state = json.loads((d / "run_state.json").read_bytes())
+    summary = json.loads((d / "run_summary.json").read_bytes())
     # run_summary.run_classification mirrors run_state's exactly
     assert summary["run_classification"] == run_state["run_classification"]
     # the scheduled classification now carries the afternoon-contract fields
@@ -3585,7 +3585,7 @@ def test_manual_compact_does_not_write_scheduled_contract_files(tmp_path):
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=False),
     )
 
-    run_state = json.loads(Path(artifacts_dir, "run_state.json").read_text())
+    run_state = json.loads(Path(artifacts_dir, "run_state.json").read_bytes())
     rc = run_state["run_classification"]
     assert rc["run_origin"] == "manual"
     assert "valid_scheduled_evidence" not in rc
@@ -3677,7 +3677,7 @@ def test_contract_failure_persists_invalid_evidence_marker(tmp_path):
     result = _write_and_validate_scheduled_contract(artifacts, d)
     assert not result  # partial unplaced planned order -> contract failure
 
-    persisted = json.loads((d / "run_state.json").read_text())
+    persisted = json.loads((d / "run_state.json").read_bytes())
     assert persisted["status"] == "blocked"
     assert (
         persisted["artifact_contract_failure"]["failure"] == "artifact_contract_failure"
@@ -3751,7 +3751,7 @@ def test_scheduled_run_updates_latest_scheduled_run_pointer(tmp_path):
 
     pointer = latest_scheduled_run_path(classification_root)
     assert pointer.exists()
-    ptr = json.loads(pointer.read_text())
+    ptr = json.loads(pointer.read_bytes())
     # Points at the run_state.json this run actually wrote to artifacts_dir, not
     # a second, separately-computed copy under classification_root.
     assert ptr["run_state_path"] == os.path.join(artifacts_dir, "run_state.json")
@@ -4461,7 +4461,7 @@ def test_an_afternoon_failure_refreshes_the_latest_scheduled_pointer(tmp_path):
 
     pointer = latest_scheduled_run_path(pathlib.Path(classification_root))
     assert pointer.exists(), "the scheduled pointer was never refreshed"
-    payload = json.loads(pointer.read_text(encoding="utf-8"))
+    payload = json.loads(pointer.read_bytes())
     assert payload["run_state_path"] == os.path.join(artifacts_dir, "run_state.json")
     # The state it points at denies its own evidence, so following the pointer
     # still refuses to count the run.
@@ -4718,7 +4718,7 @@ def _afternoon_merge(preserved, placed, exc=None, tmp_path=None):
         _n._write_afternoon_failure_artifacts(out, _now_et(), exc)
     finally:
         _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
-    return out, json.loads((out / "run_state.json").read_text(encoding="utf-8"))
+    return out, json.loads((out / "run_state.json").read_bytes())
 
 
 def _now_et():
@@ -4819,7 +4819,7 @@ def test_the_summary_is_regenerated_after_a_merge(tmp_path):
 
     _out, run_state = _afternoon_merge(_preserved_state(), placed, tmp_path=tmp_path)
 
-    summary = json.loads((out / "run_summary.json").read_text(encoding="utf-8"))
+    summary = json.loads((out / "run_summary.json").read_bytes())
     assert summary["orders_submitted_count"] == run_state["orders_submitted_count"] == 2
     assert summary["run_classification_outcome"] == "failed_after_partial_submission"
 
@@ -7839,7 +7839,7 @@ def test_load_prior_same_day_matches_json_escaped_trading_day(tmp_path):
 
 
 def test_load_prior_same_day_skips_non_utf8_artifact_without_crashing(tmp_path):
-    # Codex/Gemini review on PR #53: Path.read_text() can raise
+    # Codex/Gemini review on PR #53: Path.read_bytes() can raise
     # UnicodeDecodeError (a ValueError subclass) on a truncated/corrupt
     # historical artifact. The fast-path refactor narrowed the except clause
     # around the read itself to OSError only, so a single bad file would crash
@@ -8280,10 +8280,10 @@ def test_load_prior_same_day_ignores_unreadable_or_invalid_json(tmp_path):
     # review on PR #58: os.chmod(path, 0) does not reliably trigger an OSError --
     # it's a no-op for the root user (the sandbox/CI containers this suite runs in
     # commonly run as root) and Windows only supports a read-only attribute, not
-    # POSIX permission bits. Either environment would let read_text() succeed, so a
+    # POSIX permission bits. Either environment would let read_bytes() succeed, so a
     # regression that removed the OSError handler would still pass silently.
     # Creating a directory with the matching filename raises IsADirectoryError (an
-    # OSError subclass) from read_text() deterministically on every platform and
+    # OSError subclass) from read_bytes() deterministically on every platform and
     # user, including root.
     unreadable_json = root / "run_state_unreadable.json"
     unreadable_json.mkdir()
@@ -9320,7 +9320,7 @@ def test_replacing_an_unreadable_afternoon_state_regenerates_its_companions(tmp_
     finally:
         _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
-    summary = json.loads((out / "run_summary.json").read_text(encoding="utf-8"))
+    summary = json.loads((out / "run_summary.json").read_bytes())
     assert "stale" not in summary
     assert summary["run_classification"] is not None
     assert (out / "signals.csv").read_text(encoding="utf-8").strip() != ""
@@ -9328,7 +9328,7 @@ def test_replacing_an_unreadable_afternoon_state_regenerates_its_companions(tmp_
     # The repaired set validates, so the handler no longer denies an artifact set
     # it could have fixed.
     assert validate_run_artifacts(out, require_summary=True)
-    run_state = json.loads((out / "run_state.json").read_text(encoding="utf-8"))
+    run_state = json.loads((out / "run_state.json").read_bytes())
     assert "artifact_contract_failure" not in run_state
 
 
@@ -9365,7 +9365,7 @@ def test_afternoon_failure_artifacts_carry_a_non_afternoon_slots_own_identity(tm
     finally:
         _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
-    run_state = json.loads((out / "run_state.json").read_text(encoding="utf-8"))
+    run_state = json.loads((out / "run_state.json").read_bytes())
     assert run_state["run_id"] == "scheduled_20260629_1030ET"
     assert run_state["run_classification"]["stream"] == "morning"
     assert run_state["run_classification"]["cron_id"] == "42173154"
@@ -9389,7 +9389,7 @@ def test_the_afternoon_failure_set_is_validated_without_a_pointer_root(tmp_path)
         _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
     # Companions were regenerated, so the set is valid and nothing is stamped.
-    run_state = json.loads((out / "run_state.json").read_text(encoding="utf-8"))
+    run_state = json.loads((out / "run_state.json").read_bytes())
     assert "artifact_contract_failure" not in run_state
 
     # Break a companion after the fact and re-enter: validation still runs with

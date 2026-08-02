@@ -395,7 +395,7 @@ def _load_json(path: Path) -> Optional[Dict[str, Any]]:
     artifacts from being generated -- codex review discussion_r3658688909.
     """
     try:
-        parsed = json.loads(path.read_text(encoding="utf-8"))
+        parsed = json.loads(path.read_bytes())
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     return parsed if isinstance(parsed, dict) else None

@@ -188,7 +188,7 @@ def test_log_model_usage_writes_when_root_given():
 
 def test_entry_matches_json_schema():
     jsonschema = pytest.importorskip("jsonschema")
-    schema = json.loads((REPO_ROOT / "schemas" / "model_usage_log.schema.json").read_text(encoding="utf-8"))
+    schema = json.loads((REPO_ROOT / "schemas" / "model_usage_log.schema.json").read_bytes())
     validator = jsonschema.Draft7Validator(schema)
     for task_id in COVERED_TASK_IDS:
         entry = build_entry(
@@ -229,7 +229,7 @@ def test_cli_appends_entry_for_tasks_with_no_python_entry_point():
         assert rc == 0
         log_path = resolve_log_path(TRIGGERED, root=td)
         assert log_path.exists()
-        entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+        entry = json.loads(log_path.read_bytes().splitlines()[0])
         assert entry["task_id"] == "bb4f6ef1"
         assert entry["stream"] == "watchlist"
 
@@ -255,7 +255,7 @@ def test_cli_scheduled_for_et_override_beats_manifest_combined_default():
         )
         assert rc == 0
         log_path = resolve_log_path(TRIGGERED, root=td)
-        entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+        entry = json.loads(log_path.read_bytes().splitlines()[0])
         assert entry["task_id"] == "7be82b97"
         assert entry["scheduled_for_et"] == "13:30"
 

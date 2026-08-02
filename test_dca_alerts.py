@@ -712,7 +712,7 @@ def test_write_failed_start_marker_persists_readable_json(tmp_path):
         "market_open", RuntimeError("connector timed out"), triggered_at_utc=triggered, root=str(tmp_path)
     )
     assert path == tmp_path / "20260727" / "market_open.json"
-    marker = json.loads(path.read_text(encoding="utf-8"))
+    marker = json.loads(path.read_bytes())
     assert marker["stream"] == "market_open"
     assert marker["error_class"] == "RuntimeError"
     assert marker["error_message"] == "connector timed out"
@@ -732,7 +732,7 @@ def test_write_failed_start_marker_records_the_late_failure_phase(tmp_path):
         root=str(tmp_path),
         run_artifact_written=True,
     )
-    assert json.loads(path.read_text(encoding="utf-8"))["failure_phase"] == "after_run_artifact"
+    assert json.loads(path.read_bytes())["failure_phase"] == "after_run_artifact"
 
 
 def test_guarded_run_probes_whether_the_run_artifact_was_written(monkeypatch):
@@ -848,11 +848,11 @@ def test_repeated_failures_keep_every_attempt_in_the_history(tmp_path):
             root=str(tmp_path),
         )
     history = tmp_path / "20260727" / f"morning{dca_alerts.ATTEMPT_LOG_HISTORY_SUFFIX}"
-    entries = [json.loads(line) for line in history.read_text(encoding="utf-8").splitlines() if line.strip()]
+    entries = [json.loads(line) for line in history.read_bytes().splitlines() if line.strip()]
     assert [e["error_message"] for e in entries] == ["first failure", "second failure"]
     # The single marker still holds the LATEST attempt, so existing readers
     # keep working unchanged.
-    latest = json.loads((tmp_path / "20260727" / "morning.json").read_text(encoding="utf-8"))
+    latest = json.loads((tmp_path / "20260727" / "morning.json").read_bytes())
     assert latest["error_message"] == "second failure"
 
 
@@ -875,7 +875,7 @@ def test_attempt_history_append_failure_does_not_lose_the_marker(monkeypatch, tm
         root=str(tmp_path),
     )
     assert path is not None and path.is_file()
-    assert json.loads(path.read_text(encoding="utf-8"))["error_message"] == "boom"
+    assert json.loads(path.read_bytes())["error_message"] == "boom"
 
 
 def test_write_failed_start_marker_never_raises_on_unwritable_root(monkeypatch):

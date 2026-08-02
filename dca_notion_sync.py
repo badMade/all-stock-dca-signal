@@ -22,7 +22,7 @@ COMPACT_SYNC_TITLE = "Latest Run — Compact Sync"
 
 
 def load_latest_run_summary(path: str | Path) -> Dict[str, Any]:
-    return json.loads(Path(path).read_text())
+    return json.loads(Path(path).read_bytes())
 
 
 def _fmt(value: Any, suffix: str = "") -> str:

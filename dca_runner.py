@@ -5107,7 +5107,7 @@ def load_strategy_state(path=None) -> StrategyState:
     if not state_file_exists:
         return StrategyState()
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_keys)
+        raw = json.loads(path.read_bytes(), object_pairs_hook=_reject_duplicate_keys)
     except OSError as exc:
         # path.exists() above only proves the file was there a moment ago --
         # a permissions change, a filesystem I/O error, or the file being

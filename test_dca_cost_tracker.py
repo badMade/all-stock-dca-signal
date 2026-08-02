@@ -172,7 +172,7 @@ def test_generate_cost_tracker_writes_files(tmp_path):
 
     assert Path(paths["markdown"]).exists()
     assert Path(paths["payload"]).exists()
-    payload = json.loads(Path(paths["payload"]).read_text())
+    payload = json.loads(Path(paths["payload"]).read_bytes())
     assert payload["month_label"] == "2026-06"
     assert payload["aggregate"]["run_count"] == 2
 

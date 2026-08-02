@@ -145,8 +145,8 @@ def _read_json(path: Path) -> Optional[Dict[str, Any]]:
     if not path.exists():
         return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
+        data = json.loads(path.read_bytes())
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
         raise ValueError(f"could not parse config file {path}: {exc}") from exc
     if not isinstance(data, dict):
         raise ValueError(f"config file {path} must contain a JSON object, got {type(data).__name__}")

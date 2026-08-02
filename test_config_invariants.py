@@ -49,7 +49,7 @@ SCHEMAS_DIR = REPO_ROOT / "schemas"
 
 
 def _load(name: str) -> dict:
-    return json.loads((CONFIG_DIR / name).read_text(encoding="utf-8"))
+    return json.loads((CONFIG_DIR / name).read_bytes())
 
 
 # --- config/*.json is well-formed --------------------------------------------
@@ -58,7 +58,7 @@ def test_every_config_file_parses_as_a_json_object():
     files = sorted(CONFIG_DIR.glob("*.json"))
     assert files, "config/ must not be empty"
     for path in files:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_bytes())
         assert isinstance(data, dict), f"{path.name} must contain a JSON object"
 
 
@@ -77,14 +77,14 @@ def test_every_config_file_validates_against_its_referenced_schema():
     """
     jsonschema = pytest.importorskip("jsonschema")
     for path in sorted(CONFIG_DIR.glob("*.json")):
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_bytes())
         schema_ref = data.get("$schema")
         if not schema_ref or not schema_ref.endswith(".json") or "://" in schema_ref:
             continue  # no local schema reference to check
         schema_path = (path.parent / schema_ref).resolve()
         if SCHEMAS_DIR not in schema_path.parents:
             continue
-        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        schema = json.loads(schema_path.read_bytes())
         jsonschema.validate(data, schema)
 
 
@@ -102,7 +102,7 @@ def test_sizing_ladder_schema_requires_status_before_making_the_reduced_base_con
     silently passing.
     """
     jsonschema = pytest.importorskip("jsonschema")
-    schema = json.loads((SCHEMAS_DIR / "sizing_ladder.schema.json").read_text(encoding="utf-8"))
+    schema = json.loads((SCHEMAS_DIR / "sizing_ladder.schema.json").read_bytes())
     document = {
         "base_amount_usd": 2.0,
         "tiers": [{"min_drop_pct": 0.1, "max_drop_pct": None, "multiplier": 1.0}],
@@ -134,7 +134,7 @@ def test_budgets_schema_rejects_a_stress_tier_that_does_not_require_a_rollover_r
     (matched against this same document by test_budget_tiers_match_config_budgets_json)
     still trusts it, decoupling the two the same way the sizing-ladder gap did."""
     jsonschema = pytest.importorskip("jsonschema")
-    schema = json.loads((SCHEMAS_DIR / "budgets.schema.json").read_text(encoding="utf-8"))
+    schema = json.loads((SCHEMAS_DIR / "budgets.schema.json").read_bytes())
     document = json.loads(json.dumps(_load("budgets.json")))  # deep copy
     stress = next(t for t in document["budget_tiers"] if t["name"] == "stress")
     stress["requires_rollover_reserve"] = False
@@ -149,7 +149,7 @@ def test_scheduled_tasks_schema_rejects_an_unrecognized_task_type():
     value silently passing schema validation would only surface as a runtime
     KeyError/behavioral gap far from where the config was actually edited."""
     jsonschema = pytest.importorskip("jsonschema")
-    schema = json.loads((SCHEMAS_DIR / "scheduled_tasks.schema.json").read_text(encoding="utf-8"))
+    schema = json.loads((SCHEMAS_DIR / "scheduled_tasks.schema.json").read_bytes())
     document = json.loads(json.dumps(_load("scheduled_tasks.json")))  # deep copy
     document["tasks"][0]["type"] = "bogus-task-type"
     with pytest.raises(jsonschema.ValidationError):
@@ -164,7 +164,7 @@ def test_tickers_schema_rejects_a_malformed_ticker_symbol():
     test_active_tickers_have_no_duplicates/test_active_tickers_match_config_tickers_json
     only check membership and duplication, not shape."""
     jsonschema = pytest.importorskip("jsonschema")
-    schema = json.loads((SCHEMAS_DIR / "tickers.schema.json").read_text(encoding="utf-8"))
+    schema = json.loads((SCHEMAS_DIR / "tickers.schema.json").read_bytes())
     document = json.loads(json.dumps(_load("tickers.json")))  # deep copy
     document["active"].append("not-a-real-ticker")
     with pytest.raises(jsonschema.ValidationError):
@@ -179,7 +179,7 @@ def test_trading_window_schema_rejects_a_malformed_decision_time():
     invites -- must be rejected rather than silently pass through to
     whatever parses it downstream."""
     jsonschema = pytest.importorskip("jsonschema")
-    schema = json.loads((SCHEMAS_DIR / "trading_window.schema.json").read_text(encoding="utf-8"))
+    schema = json.loads((SCHEMAS_DIR / "trading_window.schema.json").read_bytes())
     document = json.loads(json.dumps(_load("trading_window.json")))  # deep copy
     document["decision_time_et"] = "9:35"
     with pytest.raises(jsonschema.ValidationError):
@@ -188,7 +188,7 @@ def test_trading_window_schema_rejects_a_malformed_decision_time():
 
 def test_trading_window_schema_rejects_a_document_missing_start_date():
     jsonschema = pytest.importorskip("jsonschema")
-    schema = json.loads((SCHEMAS_DIR / "trading_window.schema.json").read_text(encoding="utf-8"))
+    schema = json.loads((SCHEMAS_DIR / "trading_window.schema.json").read_bytes())
     document = json.loads(json.dumps(_load("trading_window.json")))  # deep copy
     del document["start_date"]
     with pytest.raises(jsonschema.ValidationError):
@@ -201,7 +201,7 @@ def test_notifications_schema_rejects_a_non_boolean_channel_enabled_flag():
     boolean contract, and a schema that accepted it would let a manual edit
     silently change what "enabled" means for that one channel."""
     jsonschema = pytest.importorskip("jsonschema")
-    schema = json.loads((SCHEMAS_DIR / "notifications.schema.json").read_text(encoding="utf-8"))
+    schema = json.loads((SCHEMAS_DIR / "notifications.schema.json").read_bytes())
     document = json.loads(json.dumps(_load("notifications.json")))  # deep copy
     first_channel = next(iter(document["channels"]))
     document["channels"][first_channel]["enabled"] = "yes"
@@ -214,7 +214,7 @@ def test_reporting_schema_rejects_a_non_object_notion_block():
     a scalar left over from a botched manual edit must be rejected rather
     than silently reach dca_notion_sync expecting a mapping."""
     jsonschema = pytest.importorskip("jsonschema")
-    schema = json.loads((SCHEMAS_DIR / "reporting.schema.json").read_text(encoding="utf-8"))
+    schema = json.loads((SCHEMAS_DIR / "reporting.schema.json").read_bytes())
     document = json.loads(json.dumps(_load("reporting.json")))  # deep copy
     document["notion"] = "not-an-object"
     with pytest.raises(jsonschema.ValidationError):
@@ -247,7 +247,7 @@ def test_run_state_schema_allows_an_unevaluated_budget_for_pre_budget_exits():
     conditional must not weaken validation for the currently-live
     three-stream engine's own artifacts."""
     jsonschema = pytest.importorskip("jsonschema")
-    schema = json.loads((SCHEMAS_DIR / "run_state.schema.json").read_text(encoding="utf-8"))
+    schema = json.loads((SCHEMAS_DIR / "run_state.schema.json").read_bytes())
 
     pre_budget_exit = _run_state_document({"budget_evaluated": False})
     jsonschema.validate(pre_budget_exit, schema)

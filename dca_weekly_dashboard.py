@@ -60,7 +60,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     counted into the weekly snapshot/table denominators — and skipping any
     manual run_states so manual candidates/notional never enter the
     scheduled-live weekly cost basis, reliability, or order-count metrics."""
-    loaded = [json.loads(Path(p).read_text(encoding="utf-8")) for p in paths]
+    loaded = [json.loads(Path(p).read_bytes()) for p in paths]
     return [
         data
         for data in loaded

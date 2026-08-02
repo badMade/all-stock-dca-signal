@@ -863,14 +863,14 @@ def test_state_read_failure_raises_state_corrupt_error(tmp_path, monkeypatch):
         "reserve_week_key": None,
         "selected_tier": None,
     }))
-    original_read_text = dca_runner.Path.read_text
+    original_read_bytes = dca_runner.Path.read_bytes
 
     def _boom(self, *args, **kwargs):
         if self == path:
             raise OSError("permission denied")
-        return original_read_text(self, *args, **kwargs)
+        return original_read_bytes(self, *args, **kwargs)
 
-    monkeypatch.setattr(dca_runner.Path, "read_text", _boom)
+    monkeypatch.setattr(dca_runner.Path, "read_bytes", _boom)
     with pytest.raises(dca_runner.StateCorruptError):
         dca_runner.load_strategy_state(path)
 
@@ -7563,7 +7563,7 @@ def test_every_slot_window_tolerates_observed_scheduler_jitter():
 
 def test_per_order_cap_is_base_times_max_ladder_multiplier():
     """$2.00 base x 5.0 max multiplier = $10.00. Pins the two configs together."""
-    ladder = json.loads((dca_runner.CONFIG_DIR / "sizing_ladder.json").read_text(encoding="utf-8"))
+    ladder = json.loads((dca_runner.CONFIG_DIR / "sizing_ladder.json").read_bytes())
     max_mult = max(t["multiplier"] for t in ladder["tiers"])
     assert dca_runner.MAX_PER_ORDER_USD == pytest.approx(ladder["base_amount_usd"] * max_mult)
     assert dca_runner.MAX_PER_ORDER_USD == pytest.approx(10.0)
@@ -7837,7 +7837,7 @@ def test_max_per_order_usd_matches_budgets_json_circuit_breaker():
     """Pins the real, shipped configuration: MAX_PER_ORDER_USD (derived from
     sizing_ladder.json) and budgets.json's own circuit_breakers.max_per_order_usd
     must already agree, not just tolerate each other."""
-    cfg = json.loads((dca_runner.CONFIG_DIR / "budgets.json").read_text(encoding="utf-8"))
+    cfg = json.loads((dca_runner.CONFIG_DIR / "budgets.json").read_bytes())
     assert dca_runner.MAX_PER_ORDER_USD == pytest.approx(
         cfg["circuit_breakers"]["max_per_order_usd"]
     )
@@ -7892,14 +7892,14 @@ def test_load_max_orders_per_day_accepts_a_valid_positive_integer(tmp_path, monk
 
 def test_budget_tiers_match_config_budgets_json():
     """Tier values are hardcoded in near_close_dca and documented in config."""
-    cfg = json.loads((dca_runner.CONFIG_DIR / "budgets.json").read_text(encoding="utf-8"))["budget_tiers"]
+    cfg = json.loads((dca_runner.CONFIG_DIR / "budgets.json").read_bytes())["budget_tiers"]
     runner_tiers = {t.name: (t.daily_cap_usd, t.weekly_cap_usd) for t in dca_runner.BUDGET_TIERS}
     for entry in cfg:
         assert runner_tiers[entry["name"]] == (entry["daily_cap_usd"], entry["weekly_cap_usd"])
 
 
 def _real_budget_tiers_config():
-    return json.loads((dca_runner.CONFIG_DIR / "budgets.json").read_text(encoding="utf-8"))["budget_tiers"]
+    return json.loads((dca_runner.CONFIG_DIR / "budgets.json").read_bytes())["budget_tiers"]
 
 
 def test_validate_budget_tiers_against_config_rejects_a_deployment_time_override(

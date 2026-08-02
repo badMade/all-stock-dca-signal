@@ -929,7 +929,7 @@ def normalize_connector_payload(
     if base_dir is not None and not path.is_absolute():
         path = Path(base_dir) / path
     try:
-        result["data"] = json.loads(path.read_text(encoding="utf-8"))
+        result["data"] = json.loads(path.read_bytes())
         result["normalized"] = True
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeError(
@@ -2177,8 +2177,8 @@ def collect_manual_order_ids(base: Optional[Path] = None) -> Set[str]:
     for manual_root in manual_exclusion_roots(base):
         for path in _iter_run_state_files(manual_root):
             try:
-                state = json.loads(path.read_text())
-            except (json.JSONDecodeError, OSError):
+                state = json.loads(path.read_bytes())
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
                 continue
             ids |= _order_ids_from_state(state)
             for csv_path in _referenced_orders_csvs(state, path.parent):
@@ -2230,8 +2230,8 @@ def collect_recovery_context_order_ids(
     for root in recovery_context_roots(base, stream_roots):
         for path in _iter_run_state_files(root):
             try:
-                state = json.loads(path.read_text())
-            except (json.JSONDecodeError, OSError):
+                state = json.loads(path.read_bytes())
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
                 continue
             if not is_top_up_context_state(state, trading_day):
                 continue
@@ -2379,8 +2379,8 @@ def collect_earlier_scheduled_order_ids(
             continue
         for path in _iter_run_state_files(root):
             try:
-                state = json.loads(path.read_text())
-            except (json.JSONDecodeError, OSError):
+                state = json.loads(path.read_bytes())
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
                 continue
             if not _is_earlier_stream_scheduled_state(state):
                 continue
@@ -3579,7 +3579,7 @@ def load_same_day_top_up_context(
     for root in top_up_context_roots(base, stream_roots):
         for path in _iter_run_state_files(root):
             try:
-                state = json.loads(path.read_text())
+                state = json.loads(path.read_bytes())
             except (json.JSONDecodeError, OSError):
                 # An unreadable or mid-write run_state under a manual
                 # top-up-context root is exactly as unverifiable as a
@@ -3765,7 +3765,7 @@ def select_scheduled_state_for_reporting(
         )
 
     try:
-        state = json.loads(state_path.read_text())
+        state = json.loads(state_path.read_bytes())
     except (json.JSONDecodeError, OSError) as exc:
         return ScheduledSelection(
             state=None,

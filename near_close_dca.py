@@ -3170,7 +3170,7 @@ def _backfill_orders_csv_usage(run_state_path: Path) -> None:
     """
     if not run_state_path.exists():
         return
-    run_state = json.loads(run_state_path.read_text(encoding="utf-8"))
+    run_state = json.loads(run_state_path.read_bytes())
     usage = run_state.get("usage_proxy")
     if not isinstance(usage, dict):
         return
@@ -6026,7 +6026,7 @@ def _write_blocked_run_stub(
         atomic_write_text(state_path, _serialize_run_state(run_state))
     else:
         try:
-            existing = json.loads(state_path.read_text(encoding="utf-8"))
+            existing = json.loads(state_path.read_bytes())
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             existing = None
         if isinstance(existing, dict):
@@ -6393,7 +6393,7 @@ def _write_and_validate_scheduled_contract(
             if not fpath.exists():
                 continue
             try:
-                data = json.loads(fpath.read_text(encoding="utf-8"))
+                data = json.loads(fpath.read_bytes())
             except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                 continue
             if not isinstance(data, dict):
@@ -7692,7 +7692,7 @@ def _write_afternoon_failure_artifacts(
     state_was_mutated = False
     if state_path.exists():
         try:
-            _loaded = json.loads(state_path.read_text(encoding="utf-8"))
+            _loaded = json.loads(state_path.read_bytes())
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             _loaded = None
         existing_is_usable = isinstance(_loaded, dict)

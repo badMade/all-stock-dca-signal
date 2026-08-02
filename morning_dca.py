@@ -786,7 +786,7 @@ def load_max_per_order_usd(config_dir_path: Path) -> Optional[float]:
     if not budgets_path.exists():
         return None
     try:
-        budgets_raw = json.loads(budgets_path.read_text(encoding="utf-8"))
+        budgets_raw = json.loads(budgets_path.read_bytes())
     except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
         raise RuntimeError(
             f"budgets.json exists but could not be read or parsed; "
@@ -1027,8 +1027,8 @@ def load_morning_config(
     }
 
     try:
-        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
+        raw = json.loads(cfg_path.read_bytes())
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
         logger.warning("could not parse %s (%s); using MorningConfig defaults", cfg_path, exc)
         return MorningConfig(**approved_date_overrides)
 
@@ -1274,7 +1274,7 @@ def load_same_day_preflight(
         else:
             return None
     try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state = json.loads(state_path.read_bytes())
     except (json.JSONDecodeError, OSError):
         return None
     if not isinstance(state, dict):
@@ -3143,7 +3143,7 @@ class MorningDCAExecutor(DCAExecutor):
         if not state_path.exists():
             return None
         try:
-            existing_artifacts = json.loads(state_path.read_text(encoding="utf-8"))
+            existing_artifacts = json.loads(state_path.read_bytes())
         except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
             _log.warning(
                 "existing run_state.json at %s is corrupted or unreadable (%s); "
@@ -3486,7 +3486,7 @@ class MorningDCAExecutor(DCAExecutor):
                 filtered_manual: List[Tuple[Path, bool]] = []
                 for p in sorted(manual_root.glob("*/run_state.json")):
                     try:
-                        raw_state = json.loads(p.read_text(encoding="utf-8"))
+                        raw_state = json.loads(p.read_bytes())
                     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                         continue
                     _manual_state_cache[p] = raw_state
@@ -3498,7 +3498,7 @@ class MorningDCAExecutor(DCAExecutor):
                 state = _manual_state_cache[path]
             else:
                 try:
-                    state = json.loads(path.read_text(encoding="utf-8"))
+                    state = json.loads(path.read_bytes())
                 except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                     # An unreadable/mid-write artifact from the earlier-weekday
                     # sibling scan is exactly as unverifiable as a same-day
@@ -4330,7 +4330,7 @@ class MorningDCAExecutor(DCAExecutor):
             # missing if write_artifacts raised part-way, so they are completed
             # from what is on disk.
             try:
-                loaded = json.loads(state_path.read_text(encoding="utf-8"))
+                loaded = json.loads(state_path.read_bytes())
             except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                 loaded = None
             if isinstance(loaded, dict):

@@ -211,8 +211,8 @@ def load_midday_config(config_dir=None, *, allow_unpinned_account: bool = False)
     }
 
     try:
-        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
+        raw = json.loads(cfg_path.read_bytes())
+    except (UnicodeDecodeError, json.JSONDecodeError, OSError) as exc:
         _log.warning("could not parse %s (%s); using MiddayConfig defaults", cfg_path, exc)
         return MiddayConfig(**approved_date_overrides)
 

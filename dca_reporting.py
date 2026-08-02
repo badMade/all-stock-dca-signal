@@ -31,7 +31,7 @@ from dca_fileio import atomic_open_w, atomic_write_text
 
 def load_run_state(path: str | Path) -> Dict[str, Any]:
     """Load a ``run_state.json`` artifact produced by the live-run path."""
-    return json.loads(Path(path).read_text())
+    return json.loads(Path(path).read_bytes())
 
 
 def _is_manual_run_state(run_state: Dict[str, Any]) -> bool:
@@ -684,7 +684,7 @@ def generate_scheduled_reports(
             raw_orders_path = Path(selection.state_path).parent / "raw" / "orders_after_place.json"
             if raw_orders_path.exists():
                 try:
-                    raw_payload = json.loads(raw_orders_path.read_text(encoding="utf-8"))
+                    raw_payload = json.loads(raw_orders_path.read_bytes())
                     # Map every tracked order ID (order_id or broker_order_id)
                     # to its ticker so fills_from_order_history_payload() can
                     # resolve symbols for order-ID-scoped payloads without a

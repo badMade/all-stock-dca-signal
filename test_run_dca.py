@@ -219,11 +219,11 @@ def test_run_pipeline_appends_model_usage_log_entry_when_root_configured(tmp_pat
 
     log_path = resolve_log_path(now, root=log_root)
     assert log_path.exists()
-    entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+    entry = json.loads(log_path.read_bytes().splitlines()[0])
     assert entry["cron_id"] == "10ce362c"
     assert entry["run_origin"] == "scheduled"
     assert entry["artifact_path"] == result["run_state_path"]
-    run_state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
+    run_state = json.loads(Path(result["run_state_path"]).read_bytes())
     assert entry["run_id"] == run_state["run_id"]
 
 
@@ -247,7 +247,7 @@ def test_run_pipeline_records_premium_routing_metadata_when_supplied(tmp_path):
     )
 
     log_path = resolve_log_path(now, root=log_root)
-    entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+    entry = json.loads(log_path.read_bytes().splitlines()[0])
     assert entry["model_routing_mode"] == "premium"
     assert entry["reason_for_premium_model"] == "safety_validation"
 
@@ -3420,7 +3420,7 @@ def test_run_slot_raw_persistence_failure_preserves_the_slots_own_identity(tmp_p
         raw_connector_inputs={"quotes_batch1.json": ExplodingPayload()},
     )
     assert "raw_persistence_error" in result
-    run_state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
+    run_state = json.loads(Path(result["run_state_path"]).read_bytes())
     rc = run_state["run_classification"]
     assert rc["stream"] == "morning"
     assert rc["cron_id"] == "42173154"
@@ -3464,8 +3464,8 @@ def test_run_pipeline_raw_persistence_failure_writes_contract_artifacts(tmp_path
     assert len(so_rows) == 1  # header only, no simulated orders
 
     # canonical run_summary.json mirrors run_state's run_classification
-    run_state = json.loads((scheduled_dir / "run_state.json").read_text())
-    summary = json.loads((scheduled_dir / "run_summary.json").read_text())
+    run_state = json.loads((scheduled_dir / "run_state.json").read_bytes())
+    summary = json.loads((scheduled_dir / "run_summary.json").read_bytes())
     assert summary["run_classification"] == run_state["run_classification"]
 
     # the fail-closed state satisfies the contract (signals not required)
@@ -3865,7 +3865,7 @@ def test_run_pipeline_late_failure_after_run_artifact_written_is_not_a_failed_st
     assert (artifacts_dir / "run_state.json").exists()
     attempt_log_root = model_usage_log_root.parent / "attempt_log"
     marker_path = next(attempt_log_root.glob("*/afternoon.json"))
-    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker = json.loads(marker_path.read_bytes())
     assert marker["failure_phase"] == "after_run_artifact"
 
 
@@ -3913,7 +3913,7 @@ def test_run_pipeline_stale_run_artifact_is_not_credited_to_a_later_failed_invoc
     assert stale_run_state.read_text(encoding="utf-8") == '{"run_id": "stale_earlier_attempt"}'
     attempt_log_root = model_usage_log_root.parent / "attempt_log"
     marker_path = next(attempt_log_root.glob("*/afternoon.json"))
-    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker = json.loads(marker_path.read_bytes())
     assert marker["failure_phase"] == "before_run_artifact"
 
 
@@ -4069,6 +4069,23 @@ def test_build_frozen_providers_unwraps_doubly_nested_pointer_data(tmp_path):
     assert bars[0].close == 100.0
 
 
+def test_build_frozen_providers_skips_unreadable_raw_files(tmp_path):
+    from run_dca import _build_frozen_providers_from_raw
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    raw_dir.joinpath("quotes_batch1.json").write_text(
+        '{"results": [{"quote": {"symbol": "AAPL"}}]}',
+        encoding="utf-8",
+    )
+    raw_dir.joinpath("aaa_corrupt.json").write_bytes(b"\xff\xfe\x00")
+
+    _finance, robinhood = _build_frozen_providers_from_raw(
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD), raw_dir,
+    )
+    assert robinhood.get_bid_ask("AAPL", _now()) is None
+
+
 def test_run_pipeline_retry_preserves_orders_after_place(tmp_path):
     """A successful retry must carry over orders_after_place.json from the prior raw/.
 
@@ -4158,7 +4175,7 @@ def test_run_pipeline_partial_retry_merges_orders_after_place(tmp_path):
     )
     oap = scheduled_dir / "raw" / "orders_after_place.json"
     assert oap.exists(), "orders_after_place.json missing after partial retry"
-    order_ids = {o["order_id"] for o in _json.loads(oap.read_text(encoding="utf-8"))["orders"]}
+    order_ids = {o["order_id"] for o in _json.loads(oap.read_bytes())["orders"]}
     assert "retry-Y2" in order_ids, "New MSFT order missing from merged file"
     assert "prior-X1" in order_ids, "Prior AAPL fill lost during partial retry"
 
@@ -4215,7 +4232,7 @@ def test_market_open_run_classification_validates_against_json_schema():
     import json
 
     schema_path = Path(__file__).resolve().parent / "schemas" / "market_open_run_classification.schema.json"
-    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    schema = json.loads(schema_path.read_bytes())
     for rc in (_market_open_run_classification(manual=False), _market_open_run_classification(manual=True)):
         jsonschema.validate(rc, schema)
 
@@ -4225,7 +4242,7 @@ def test_market_open_run_classification_rejects_wrong_cron_id():
     import json
 
     schema_path = Path(__file__).resolve().parent / "schemas" / "market_open_run_classification.schema.json"
-    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    schema = json.loads(schema_path.read_bytes())
     bad = _market_open_run_classification(manual=False)
     bad["cron_id"] = "42173154"  # the morning task's cron_id, not market-open's
     with pytest.raises(jsonschema.ValidationError):
@@ -4282,7 +4299,7 @@ def test_intraday_run_classification_validates_against_json_schema():
     import json
 
     schema_path = Path(__file__).resolve().parent / "schemas" / "intraday_run_classification.schema.json"
-    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    schema = json.loads(schema_path.read_bytes())
     docs = [_intraday_run_classification(slot, manual=False) for slot in _INTRADAY_SLOT_WINDOWS]
     docs.append(_intraday_run_classification("11:30", manual=True))
     for rc in docs:
@@ -4297,7 +4314,7 @@ def test_intraday_run_classification_rejects_mismatched_slot_window():
     import json
 
     schema_path = Path(__file__).resolve().parent / "schemas" / "intraday_run_classification.schema.json"
-    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    schema = json.loads(schema_path.read_bytes())
     bad = _intraday_run_classification("11:30", manual=False)
     bad["scheduled_window_start_et"] = "13:25"  # the 13:30 slot's window, not 11:30's
     with pytest.raises(jsonschema.ValidationError):
@@ -4314,7 +4331,7 @@ def test_intraday_run_classification_rejects_ad_hoc_recovery_stream_suffix():
     import json
 
     schema_path = Path(__file__).resolve().parent / "schemas" / "intraday_run_classification.schema.json"
-    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    schema = json.loads(schema_path.read_bytes())
     bad = _intraday_run_classification("14:30", manual=False)
     bad["stream"] = "intraday_1430"
     with pytest.raises(jsonschema.ValidationError):
@@ -4713,7 +4730,7 @@ def test_run_slot_stamps_its_own_scheduled_classification(slot, stream, schedule
         broker=build_broker(config),
         artifacts_dir=tmp_path,
     )
-    run_state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
+    run_state = json.loads(Path(result["run_state_path"]).read_bytes())
     rc = run_state["run_classification"]
     assert rc["stream"] == stream
     assert rc["cron_id"] == cron_id
@@ -4742,7 +4759,7 @@ def test_run_slot_leaves_the_afternoon_classification_unchanged(tmp_path):
         broker=build_broker(config),
         artifacts_dir=tmp_path,
     )
-    run_state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
+    run_state = json.loads(Path(result["run_state_path"]).read_bytes())
     rc = run_state["run_classification"]
     assert rc["stream"] == "afternoon"
     assert rc["cron_id"] == "10ce362c"
@@ -4771,7 +4788,7 @@ def test_run_slot_persists_the_correlation_id_into_run_state(tmp_path):
         broker=build_broker(config),
         artifacts_dir=tmp_path,
     )
-    run_state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
+    run_state = json.loads(Path(result["run_state_path"]).read_bytes())
     assert run_state["correlation_id"] == result["correlation_id"]
     assert run_state["correlation_id"] == "dca-2026-07-06-morning-1030et"
 
@@ -4800,7 +4817,7 @@ def test_run_slot_date_gate_block_preserves_the_slots_own_identity(tmp_path):
         broker=build_broker(config),
         artifacts_dir=tmp_path,
     )
-    run_state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
+    run_state = json.loads(Path(result["run_state_path"]).read_bytes())
     assert run_state["status"] == "blocked"
     rc = run_state["run_classification"]
     assert rc["stream"] == "morning"
@@ -4838,7 +4855,7 @@ def test_run_slot_calendar_gate_takes_priority_over_a_missing_preflight(tmp_path
         broker=build_broker(config),
         artifacts_dir=tmp_path / "artifacts",
     )
-    run_state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
+    run_state = json.loads(Path(result["run_state_path"]).read_bytes())
     assert run_state["status"] == "blocked"
     assert run_state["completion_reason"] == "date_or_holiday_gate_blocked"
     assert "error_class" not in run_state or run_state["error_class"] is None
@@ -4878,7 +4895,7 @@ def test_run_slot_1030et_evaluates_full_universe_when_no_preflight_artifact_exis
         artifacts_dir=tmp_path / "artifacts",
     )
     assert result.get("blocked") is not True
-    run_state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
+    run_state = json.loads(Path(result["run_state_path"]).read_bytes())
     assert run_state["counts"]["evaluated"] == len(config.tickers)
     assert run_state["run_classification"]["stream"] == "morning"
     assert run_state["run_classification"]["valid_afternoon_scheduled_evidence"] is False
@@ -4959,6 +4976,8 @@ def test_run_slot_1030et_still_runs_account_pinning_with_no_preflight_artifact(
     artifact state -- account pinning is a standard execution gate every live
     path crosses, not something the (now-removed) preflight-block early
     return needed its own extra copy of."""
+    import json
+
     from run_dca import run_slot
 
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
@@ -4976,6 +4995,10 @@ def test_run_slot_1030et_still_runs_account_pinning_with_no_preflight_artifact(
             broker=mismatched_broker,
             artifacts_dir=tmp_path / "artifacts",
         )
+    run_state = json.loads((tmp_path / "artifacts" / "run_state.json").read_bytes())
+    assert run_state["error_class"] == "scheduled_run_startup_failure"
+    assert "Refusing to trade account" in run_state["error_detail"]
+    assert run_state["run_classification_outcome"] == "failed_scheduled_run_startup"
 
 
 def test_run_slot_1230et_and_1530et_are_unaffected_by_a_missing_preflight_artifact(tmp_path, monkeypatch):
@@ -4999,7 +5022,7 @@ def test_run_slot_1230et_and_1530et_are_unaffected_by_a_missing_preflight_artifa
             broker=build_broker(config),
             artifacts_dir=tmp_path / f"artifacts_{slot}",
         )
-        run_state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
+        run_state = json.loads(Path(result["run_state_path"]).read_bytes())
         assert run_state["counts"]["evaluated"] == len(config.tickers), slot
 
 
@@ -5035,7 +5058,7 @@ def test_run_slot_without_a_guarded_prior_allocation_still_blocks_a_same_day_rep
 
     # The broker, not local bookkeeping, is the authority (Gate 6).
     assert captured.get("asked")
-    run_state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
+    run_state = json.loads(Path(result["run_state_path"]).read_bytes())
     placed = [c for c in run_state["buy_candidates"] if c["status"] not in {"skipped", "blocked"}]
     assert placed == []
     reasons = {c.get("skip_reason") for c in run_state["buy_candidates"]}
@@ -5135,7 +5158,7 @@ def test_run_slot_allows_a_guarded_top_up_the_old_forced_flag_used_to_block(tmp_
         prior_same_day_allocations=prior,
     )
 
-    run_state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
+    run_state = json.loads(Path(result["run_state_path"]).read_bytes())
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
     aapl = by_ticker["AAPL"]
     assert aapl.get("skip_reason") != "same-day broker order exists"

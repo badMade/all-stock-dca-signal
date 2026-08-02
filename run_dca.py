@@ -698,8 +698,8 @@ def _build_frozen_providers_from_raw(
         for path in sorted(raw_dir.iterdir()):
             name = path.name
             try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+                payload = json.loads(path.read_bytes())
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 continue
             # Unwrap the data envelope so both save paths read the same way:
             # (a) normalize_connector_payload() resolves output_path pointers and
@@ -1975,7 +1975,7 @@ def _run_pipeline_impl(
                         path = save_raw_input(
                             trading_day_raw, filename, payload, raw_dir=staging_dir
                         )
-                        written = json.loads(path.read_text(encoding="utf-8"))
+                        written = json.loads(path.read_bytes())
                         if "normalize_error" in written:
                             raise RuntimeError(
                                 f"normalization failed for {filename!r}: {written['normalize_error']}"
@@ -2747,7 +2747,7 @@ def _run_pipeline_impl(
             if oap_path.exists():
                 try:
                     prior_orders = (
-                        json.loads(oap_path.read_text(encoding="utf-8")).get(
+                        json.loads(oap_path.read_bytes()).get(
                             "orders", []
                         )
                         or []
@@ -2773,7 +2773,7 @@ def _run_pipeline_impl(
     from dca_reporting import generate_reports
 
     out = Path(artifacts_dir)
-    run_state = json.loads((out / "run_state.json").read_text(encoding="utf-8"))
+    run_state = json.loads((out / "run_state.json").read_bytes())
     orders_csv = out / "orders.csv"
     fills = _fills_from_orders_csv(orders_csv)
     # When raw/orders_after_place.json was persisted at order time, use it for
@@ -2792,7 +2792,7 @@ def _run_pipeline_impl(
                     if _oid and _tkr:
                         order_id_to_ticker[_oid] = _tkr
         persisted_fills = fills_from_order_history_payload(
-            json.loads(orders_after_place.read_text(encoding="utf-8")),
+            json.loads(orders_after_place.read_bytes()),
             order_id_to_ticker=order_id_to_ticker,
         )
         persisted_ids = {

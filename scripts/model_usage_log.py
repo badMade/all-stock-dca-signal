@@ -88,7 +88,7 @@ def _load_task_directory(manifest_path: str | Path) -> Dict[str, Dict[str, str]]
     manifest's ``model_usage_log.applies_to_daily_tasks_et`` list -- the
     single source of truth for which tasks are covered (see
     config/scheduled_tasks.json)."""
-    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    manifest = json.loads(Path(manifest_path).read_bytes())
     entries = manifest.get("model_usage_log", {}).get("applies_to_daily_tasks_et", [])
     directory: Dict[str, Dict[str, str]] = {}
     for entry in entries:

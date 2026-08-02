@@ -605,7 +605,7 @@ def test_scheduled_run_skips_artifacts_on_market_holiday(tmp_path):
     assert res["artifacts"]["status"] == "blocked"
     run_state_path = Path(res["paths"]["run_state"])
     assert run_state_path.exists()
-    persisted = json.loads(run_state_path.read_text())
+    persisted = json.loads(run_state_path.read_bytes())
     assert persisted["status"] == "blocked"
     # Full artifact shape -- not a hand-rolled stub.
     assert "run_id" in persisted
@@ -613,7 +613,7 @@ def test_scheduled_run_skips_artifacts_on_market_holiday(tmp_path):
     assert "signal_rows" in persisted
     # Same-day guard consumers must see today's (blocked) evidence rather than
     # a stale pointer left over from the last real trading session.
-    pointer = json.loads((Path(tmp_path) / "latest_morning_run.json").read_text())
+    pointer = json.loads((Path(tmp_path) / "latest_morning_run.json").read_bytes())
     assert pointer["trading_day"] == holiday.isoformat()
     assert pointer["valid_scheduled_evidence"] is True
 
@@ -646,12 +646,12 @@ def test_holiday_block_overwrites_stale_minimal_stub(tmp_path):
 
     ex.run(now, data)
 
-    persisted = _json.loads(stale_path.read_text())
+    persisted = _json.loads(stale_path.read_bytes())
     # Stale stub must have been overwritten with the full artifact shape.
     assert "run_id" in persisted
     assert "counts" in persisted
     assert persisted["status"] == "blocked"
-    pointer = _json.loads((Path(tmp_path) / "latest_morning_run.json").read_text())
+    pointer = _json.loads((Path(tmp_path) / "latest_morning_run.json").read_bytes())
     assert pointer["trading_day"] == holiday.isoformat()
     assert pointer["valid_scheduled_evidence"] is True
 
@@ -671,7 +671,7 @@ def test_scheduled_run_skips_artifacts_on_future_holiday_beyond_afternoon_window
     res = ex.run(now, data)
 
     assert res["artifacts"]["status"] == "blocked"
-    pointer = json.loads((Path(tmp_path) / "latest_morning_run.json").read_text())
+    pointer = json.loads((Path(tmp_path) / "latest_morning_run.json").read_bytes())
     assert pointer["trading_day"] == holiday.isoformat()
     assert pointer["valid_scheduled_evidence"] is True
 
@@ -773,7 +773,7 @@ def test_manual_runs_at_same_timestamp_do_not_collide(tmp_path):
 
 def test_classification_matches_morning_schema(tmp_path):
     schema_path = Path(__file__).resolve().parent / "schemas" / "morning_run_classification.schema.json"
-    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    schema = json.loads(schema_path.read_bytes())
     required = set(schema["required"])
     cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
     ex = MorningDCAExecutor(cfg)
@@ -855,7 +855,7 @@ def test_live_run_refreshes_both_morning_pointers(tmp_path):
     assert res["paths"]["latest_morning_live"] == str(live_pointer)
 
     for pointer in (run_pointer, live_pointer):
-        payload = json.loads(pointer.read_text(encoding="utf-8"))
+        payload = json.loads(pointer.read_bytes())
         assert payload["run_state_path"] == run_state_path
         assert payload["stream"] == "morning"
         assert payload["same_day_required"] is True
@@ -885,7 +885,7 @@ def test_a_run_blocked_before_placement_is_not_scheduled_evidence(tmp_path):
     ex = MorningDCAExecutor(cfg, mode="live")
     res = ex.run(_now_live(), FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03}))
 
-    run_state = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
+    run_state = json.loads(Path(res["paths"]["run_state"]).read_bytes())
     assert run_state["run_classification_outcome"] == "failed_scheduled_run_startup"
     assert run_state["is_trading_failure"] is True
     assert run_state["scheduled_evidence_denied"] is True
@@ -893,7 +893,7 @@ def test_a_run_blocked_before_placement_is_not_scheduled_evidence(tmp_path):
     assert derive_valid_scheduled_evidence(run_state) is False
     # The artifact is still written and the pointer still refreshed: proving the
     # slot fired is the whole reason this state exists.
-    payload = json.loads((Path(tmp_path) / "latest_morning_run.json").read_text(encoding="utf-8"))
+    payload = json.loads((Path(tmp_path) / "latest_morning_run.json").read_bytes())
     assert payload["valid_scheduled_evidence"] is False
 
 
@@ -924,7 +924,7 @@ def test_live_run_writes_budget_ledger_json(tmp_path):
     ledger_path = Path(res["paths"]["budget_ledger"])
     assert ledger_path.name == "budget_ledger.json"
     assert ledger_path.parent == Path(res["paths"]["run_state"]).parent
-    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    ledger = json.loads(ledger_path.read_bytes())
     assert ledger == res["artifacts"]["budget"]
     assert ledger["morning_daily_cap_usd"] == 90.0
     assert ledger["morning_weekly_cap_usd"] == 450.0
@@ -1731,7 +1731,7 @@ def test_morning_live_retry_preserves_prior_submitted_candidate_on_scheduled_pat
     assert res2["artifacts"]["broker_outcomes"]["BBB"]["status"] == "submitted"
     assert Path(res2["paths"]["run_state"]) == scheduled_path
 
-    persisted = json.loads(scheduled_path.read_text(encoding="utf-8"))
+    persisted = json.loads(scheduled_path.read_bytes())
     by_ticker = {row["ticker"]: row for row in persisted["buy_candidates"]}
     assert by_ticker["BBB"]["status"] == "submitted"
     # AAA's earlier submitted fill must survive the retry's overwrite so the
@@ -2000,7 +2000,7 @@ def test_maybe_block_for_holiday_preserves_submitted_run_state(tmp_path):
     assert result["artifacts"]["status"] != "blocked"
     assert result["artifacts"]["buy_candidates"][0]["status"] == "submitted"
     # File must be unchanged
-    on_disk = json.loads(state_path.read_text(encoding="utf-8"))
+    on_disk = json.loads(state_path.read_bytes())
     assert on_disk["status"] != "blocked"
 
 
@@ -2009,6 +2009,19 @@ def test_load_morning_config_falls_back_to_defaults_if_missing(tmp_path):
     from morning_dca import load_morning_config
 
     cfg = load_morning_config(str(tmp_path / "nonexistent"))
+    defaults = MorningConfig()
+    assert cfg.base_buy_amount_usd == defaults.base_buy_amount_usd
+    assert cfg.morning_daily_cap_usd == defaults.morning_daily_cap_usd
+
+
+def test_load_morning_config_falls_back_to_defaults_if_corrupt_utf8(tmp_path):
+    from morning_dca import load_morning_config
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "morning_dca.json").write_bytes(b"\xff\xfe\xff")
+
+    cfg = load_morning_config(str(cfg_dir))
     defaults = MorningConfig()
     assert cfg.base_buy_amount_usd == defaults.base_buy_amount_usd
     assert cfg.morning_daily_cap_usd == defaults.morning_daily_cap_usd
@@ -2237,7 +2250,7 @@ def test_classifications_validate_against_json_schema():
     jsonschema = pytest.importorskip("jsonschema")
 
     schema_path = Path(__file__).resolve().parent / "schemas" / "morning_run_classification.schema.json"
-    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    schema = json.loads(schema_path.read_bytes())
     cfg = MorningConfig(tickers=("SMALL",))
 
     watch = MorningDCAExecutor(cfg).run_classification(_now(), manual=False)
@@ -2261,7 +2274,7 @@ def test_historical_v1_live_classification_still_validates_against_schema():
     # fields did not exist yet) to verify it validates.
     jsonschema = pytest.importorskip("jsonschema")
     schema_path = Path(__file__).resolve().parent / "schemas" / "morning_run_classification.schema.json"
-    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    schema = json.loads(schema_path.read_bytes())
     cfg = MorningConfig(tickers=("SMALL",))
     historical_v1_rc = MorningDCAExecutor(cfg, mode="live").run_classification(_now_live(), manual=False)
     historical_v1_rc["state_schema_version"] = "morning-live-v1"
@@ -2478,10 +2491,10 @@ def test_preflight_machine_complete_validates_against_json_schema(tmp_path):
     Registry, Resource = referencing.Registry, referencing.Resource
 
     schemas_dir = Path(__file__).resolve().parent / "schemas"
-    main = json.loads((schemas_dir / "morning_preflight.schema.json").read_text(encoding="utf-8"))
+    main = json.loads((schemas_dir / "morning_preflight.schema.json").read_bytes())
     resources = [
         (name, Resource.from_contents(
-            json.loads((schemas_dir / name).read_text(encoding="utf-8"))))
+            json.loads((schemas_dir / name).read_bytes())))
         for name in ("morning_preflight.schema.json", "morning_run_classification.schema.json")
     ]
     registry = Registry().with_resources(resources)
@@ -2850,7 +2863,8 @@ def test_live_gate_degrades_to_full_universe_when_preflight_missing_scheduled(tm
     assert "run_classification" in art
     state_path = Path(res["paths"]["run_state"])
     assert state_path.exists()
-    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    persisted = json.loads(state_path.read_bytes())
+    assert persisted.get("status") != "blocked"
     assert persisted["trades"] is True
     assert persisted["run_id"] == art["run_id"]
     # Latest pointer must be updated for scheduled runs.
@@ -2863,7 +2877,7 @@ def test_live_gate_degrades_to_full_universe_when_preflight_missing_scheduled(tm
     assert persisted["run_classification"]["manual_run"] is False
     pointer_path = Path(state_root) / "latest_morning_run.json"
     assert pointer_path.exists()
-    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    pointer = json.loads(pointer_path.read_bytes())
     assert pointer["run_id"] == persisted["run_id"]
 
 
@@ -2888,7 +2902,7 @@ def test_live_gate_degrades_to_full_universe_when_preflight_missing_manual(tmp_p
 
 def test_preflight_classification_matches_morning_schema():
     schema_path = Path(__file__).resolve().parent / "schemas" / "morning_run_classification.schema.json"
-    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    schema = json.loads(schema_path.read_bytes())
     cfg = MorningConfig(tickers=("BIG",))
     rc = MorningDCAExecutor(cfg, mode=MORNING_PREFLIGHT_MODE).run_classification(
         _now_preflight(), manual=False
@@ -2962,7 +2976,7 @@ def test_live_gate_blocks_outside_approved_window(tmp_path):
     # checking "did today's scheduled task fire" doesn't see a stale pointer
     # left over from the last real trading session.
     for name in ("latest_morning_run.json", "latest_morning_live.json"):
-        pointer = json.loads((live_root / name).read_text())
+        pointer = json.loads((live_root / name).read_bytes())
         assert pointer["trading_day"] == "2026-07-08"
         assert pointer["valid_scheduled_evidence"] is True
     # Codex review r3623389445: this gate bypasses write_artifacts() entirely,
@@ -3010,10 +3024,10 @@ def test_outside_window_retry_refreshes_pointer_to_preserved_submitted_evidence(
     second = retry_ex.run(_now_live() + timedelta(minutes=1), data, broker=FakeLiveBroker())
 
     assert second["artifacts"]["buy_candidates"][0]["status"] == "submitted"
-    on_disk = json.loads(run_state_path.read_text(encoding="utf-8"))
+    on_disk = json.loads(run_state_path.read_bytes())
     assert on_disk["buy_candidates"][0]["status"] == "submitted"
     for name in ("latest_morning_run.json", "latest_morning_live.json"):
-        pointer = json.loads((live_root / name).read_text())
+        pointer = json.loads((live_root / name).read_bytes())
         assert pointer["trading_day"] == "2026-07-08"
         assert pointer["valid_scheduled_evidence"] is True
         assert pointer["run_state_path"] == str(run_state_path)
@@ -3066,7 +3080,7 @@ def test_scheduled_live_run_writing_run_state_then_failing_is_a_late_error(tmp_p
 
     attempt_log_root = Path(os.environ["DCA_ATTEMPT_LOG_ROOT"])
     marker_path = next(attempt_log_root.glob("*/morning.json"))
-    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker = json.loads(marker_path.read_bytes())
     assert marker["failure_phase"] == "after_run_artifact"
 
 
@@ -3133,7 +3147,7 @@ def test_scheduled_live_run_without_broker_fails_closed(tmp_path):
     assert res["artifacts"]["block_reason"] == "missing broker adapter for scheduled live execution"
     assert res["artifacts"]["trades"] is True
     assert res["artifacts"]["broker_outcomes"] == {}
-    written = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
+    written = json.loads(Path(res["paths"]["run_state"]).read_bytes())
     assert written["status"] == "blocked"
     assert written["run_classification"]["run_type"] == "morning_dca_live"
     # Codex review on PR #22: this fail-closed stub must go through the normal
@@ -3148,7 +3162,7 @@ def test_scheduled_live_run_without_broker_fails_closed(tmp_path):
     assert "latest_morning_run" in res["paths"]
     pointer_path = Path(res["paths"]["latest_morning_run"])
     assert pointer_path.exists()
-    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    pointer = json.loads(pointer_path.read_bytes())
     assert pointer["run_id"] == written["run_id"]
 
 
@@ -3419,7 +3433,7 @@ def test_blocked_live_retry_preserves_prior_submitted_evidence(tmp_path):
         "a later blocked scheduler-wiring retry must not overwrite prior submitted evidence"
     )
     assert second["artifacts"]["buy_candidates"][0]["status"] == "submitted"
-    on_disk = json.loads(run_state_path.read_text(encoding="utf-8"))
+    on_disk = json.loads(run_state_path.read_bytes())
     assert on_disk["buy_candidates"][0]["status"] == "submitted"
 
 
@@ -3459,7 +3473,7 @@ def test_blocked_live_retry_does_not_preserve_stale_non_submitted_block(tmp_path
     assert second["artifacts"]["block_reason"] == (
         "broker account mismatch: expected 999000111, got not-the-approved-account"
     )
-    on_disk = json.loads(run_state_path.read_text(encoding="utf-8"))
+    on_disk = json.loads(run_state_path.read_bytes())
     assert on_disk["block_reason"] == (
         "broker account mismatch: expected 999000111, got not-the-approved-account"
     )
@@ -3488,7 +3502,7 @@ def test_blocked_live_retry_recovers_from_corrupted_existing_run_state(tmp_path)
 
     assert result["artifacts"]["status"] == "blocked"
     assert result["artifacts"]["block_reason"] == "missing broker adapter for scheduled live execution"
-    on_disk = json.loads(Path(result["paths"]["run_state"]).read_text(encoding="utf-8"))
+    on_disk = json.loads(Path(result["paths"]["run_state"]).read_bytes())
     assert on_disk["block_reason"] == "missing broker adapter for scheduled live execution"
 
 
@@ -3517,7 +3531,7 @@ def test_blocked_live_retry_recovers_from_non_utf8_existing_run_state(tmp_path):
 
     assert result["artifacts"]["status"] == "blocked"
     assert result["artifacts"]["block_reason"] == "missing broker adapter for scheduled live execution"
-    on_disk = json.loads(Path(result["paths"]["run_state"]).read_text(encoding="utf-8"))
+    on_disk = json.loads(Path(result["paths"]["run_state"]).read_bytes())
     assert on_disk["block_reason"] == "missing broker adapter for scheduled live execution"
 
 
@@ -3554,7 +3568,7 @@ def test_blocked_live_retry_recovers_from_non_string_trading_day_in_existing_sta
 
     assert result["artifacts"]["status"] == "blocked"
     assert result["artifacts"]["block_reason"] == "missing broker adapter for scheduled live execution"
-    on_disk = json.loads(Path(result["paths"]["run_state"]).read_text(encoding="utf-8"))
+    on_disk = json.loads(Path(result["paths"]["run_state"]).read_bytes())
     assert on_disk["block_reason"] == "missing broker adapter for scheduled live execution"
 
 
@@ -3586,7 +3600,7 @@ def test_blocked_live_retry_recovers_from_non_object_existing_run_state(tmp_path
 
     assert result["artifacts"]["status"] == "blocked"
     assert result["artifacts"]["block_reason"] == "missing broker adapter for scheduled live execution"
-    on_disk = json.loads(Path(result["paths"]["run_state"]).read_text(encoding="utf-8"))
+    on_disk = json.loads(Path(result["paths"]["run_state"]).read_bytes())
     assert on_disk["block_reason"] == "missing broker adapter for scheduled live execution"
 
 
@@ -3619,7 +3633,7 @@ def test_blocked_live_retry_recovers_from_null_broker_outcomes_in_existing_state
 
     assert result["artifacts"]["status"] == "blocked"
     assert result["artifacts"]["block_reason"] == "missing broker adapter for scheduled live execution"
-    on_disk = json.loads(Path(result["paths"]["run_state"]).read_text(encoding="utf-8"))
+    on_disk = json.loads(Path(result["paths"]["run_state"]).read_bytes())
     assert on_disk["block_reason"] == "missing broker adapter for scheduled live execution"
 
 
@@ -3658,10 +3672,14 @@ def test_preflight_missing_on_retry_degrades_to_full_universe_not_a_block(tmp_pa
 
     retry_now = _now_live() + timedelta(minutes=1)
     second = ex.run(retry_now, data, broker=FakeLiveBroker())
+    run_state_path = Path(second["paths"]["run_state"])
 
     assert second["artifacts"].get("status") != "blocked", (
         "a missing same-day preflight artifact must not block a retry"
     )
+    assert second["artifacts"]["buy_candidates"][0]["status"] == "submitted"
+    on_disk = json.loads(run_state_path.read_bytes())
+    assert on_disk["buy_candidates"][0]["status"] == "submitted"
     assert second["artifacts"]["preflight_gate"]["preflight_found"] is False
     evaluated = {r["ticker"] for r in second["artifacts"]["signal_rows"]}
     assert evaluated == {"SMALL"}
@@ -4970,7 +4988,7 @@ def test_morning_scheduled_top_up_not_blocked_by_manual_fills_ordinary_ref_id(tm
     # run's top-up guard has a known reference price to top up against
     # instead of routing to missing_prior_price/manual review.
     manual_state_path = Path(manual_res["paths"]["run_state"])
-    manual_state = json.loads(manual_state_path.read_text(encoding="utf-8"))
+    manual_state = json.loads(manual_state_path.read_bytes())
     for row in manual_state["buy_candidates"]:
         if row["ticker"] == "NVDA":
             row["status"] = "filled"
@@ -6148,7 +6166,7 @@ def test_run_manual_logs_manual_run_origin(tmp_path):
     ex.run(now, data, manual=True)
 
     log_path = resolve_log_path(now.astimezone(timezone.utc), root=log_root)
-    entry = _json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+    entry = _json.loads(log_path.read_bytes().splitlines()[0])
     assert entry["run_origin"] == "manual"
 
 
@@ -6177,7 +6195,7 @@ def test_run_records_premium_routing_metadata_when_config_supplies_it(tmp_path):
     ex.run(now, data)
 
     log_path = resolve_log_path(now.astimezone(timezone.utc), root=log_root)
-    entry = _json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+    entry = _json.loads(log_path.read_bytes().splitlines()[0])
     assert entry["model_routing_mode"] == "premium"
     assert entry["reason_for_premium_model"] == "failure_recovery"
     assert entry["model_requested"] == "claude-opus-4-8"
@@ -6288,7 +6306,7 @@ def test_morning_live_run_writes_the_complete_root_level_artifact_set(tmp_path):
         assert (run_dir / name).exists(), f"{name} missing at the run root"
     assert validate_run_artifacts(run_dir, require_summary=True)
 
-    summary = json.loads((run_dir / "run_summary.json").read_text(encoding="utf-8"))
+    summary = json.loads((run_dir / "run_summary.json").read_bytes())
     assert summary["run_classification"] == res["artifacts"]["run_classification"]
 
 
@@ -6399,7 +6417,7 @@ def test_scheduled_startup_failure_still_writes_the_complete_artifact_set(tmp_pa
         assert (run_dir / name).exists(), f"{name} missing after a startup failure"
     assert validate_run_artifacts(run_dir, require_summary=True)
 
-    run_state = json.loads((run_dir / "run_state.json").read_text(encoding="utf-8"))
+    run_state = json.loads((run_dir / "run_state.json").read_bytes())
     assert run_state["status"] == "failed"
     assert run_state["error_class"] == "scheduled_run_startup_failure"
     # NOT the placement-failure outcome: no placement was attempted, so reporting
@@ -6497,7 +6515,7 @@ def test_calendar_blocked_live_run_carries_the_blocked_no_order_outcome(tmp_path
     assert artifacts["orders_submitted_count"] == 0
 
     run_dir = Path(res["paths"]["run_state"]).parent
-    summary = json.loads((run_dir / "run_summary.json").read_text(encoding="utf-8"))
+    summary = json.loads((run_dir / "run_summary.json").read_bytes())
     assert summary["completion_reason"] == "date_or_holiday_gate_blocked"
 
 
@@ -6657,7 +6675,7 @@ def test_a_late_failure_never_erases_an_order_already_placed(tmp_path):
 
     assert "NVDA" in broker.placed, "fixture precondition: the order was placed"
     run_dir = ex.run_state_dir(_now_live())
-    run_state = json.loads((run_dir / "run_state.json").read_text(encoding="utf-8"))
+    run_state = json.loads((run_dir / "run_state.json").read_bytes())
 
     assert run_state["orders_submitted_count"] == 1
     assert run_state["broker_outcomes"]["NVDA"]["status"] == "submitted"
@@ -6727,7 +6745,7 @@ def test_startup_failure_refreshes_the_same_day_pointer(tmp_path):
 
     pointer = Path(ex.state_root) / ex.latest_pointer_name
     assert pointer.exists(), "the stream pointer was never refreshed"
-    payload = json.loads(pointer.read_text(encoding="utf-8"))
+    payload = json.loads(pointer.read_bytes())
     assert payload["valid_scheduled_evidence"] is False
     assert payload["trading_day"] == "2026-07-08"
 
@@ -6810,7 +6828,7 @@ def test_a_completed_run_keeps_a_valid_pointer_when_only_the_pointer_write_fails
         ex.run(_now_live(), data, broker=_TopUpBroker())
 
     pointer = Path(ex.state_root) / ex.latest_pointer_name
-    payload = json.loads(pointer.read_text(encoding="utf-8"))
+    payload = json.loads(pointer.read_bytes())
     # The run itself completed, so its pointer stays valid evidence.
     assert payload["pointer_status"] == "valid"
     assert payload["valid_scheduled_evidence"] is True
@@ -6961,7 +6979,7 @@ def test_a_broken_companion_set_denies_evidence_in_the_state_itself(tmp_path):
     with pytest.raises(RuntimeError):
         ex.run(_now_live(), data, broker=_TopUpBroker())
 
-    persisted = json.loads((run_dir / "run_state.json").read_text(encoding="utf-8"))
+    persisted = json.loads((run_dir / "run_state.json").read_bytes())
     assert persisted["artifact_contract_failure"]["failure"] == "artifact_contract_failure"
     assert persisted["scheduled_evidence_denied"] is True
     assert derive_valid_scheduled_evidence(persisted) is False
@@ -6980,7 +6998,7 @@ def test_a_successful_batch_records_the_submitted_aggregate_status(tmp_path):
     assert res["artifacts"]["orders_submitted_count"] == 1
     # And it reaches the summary a status-based consumer reads.
     run_dir = Path(res["paths"]["run_state"]).parent
-    summary = json.loads((run_dir / "run_summary.json").read_text(encoding="utf-8"))
+    summary = json.loads((run_dir / "run_summary.json").read_bytes())
     assert summary["order_submit_status"] == "submitted"
 
 
@@ -7175,7 +7193,7 @@ def test_a_synthesized_morning_failure_state_carries_the_schema_required_fields(
         ex.run(_now_live(), data, broker=_TopUpBroker())
 
     run_dir = ex.run_state_dir(_now_live())
-    run_state = json.loads((run_dir / "run_state.json").read_text(encoding="utf-8"))
+    run_state = json.loads((run_dir / "run_state.json").read_bytes())
 
     schema = json.loads(
         (Path(__file__).resolve().parent / "schemas" / "run_state.schema.json").read_text(
@@ -7232,7 +7250,7 @@ def test_a_synthesized_morning_failure_replaces_stale_companions(tmp_path):
     assert (run_dir / "morning_signals.csv").read_text(encoding="utf-8").strip() != ""
     orders = (run_dir / "submitted_orders.csv").read_text(encoding="utf-8")
     assert "stale" not in orders
-    summary = json.loads((run_dir / "run_summary.json").read_text(encoding="utf-8"))
+    summary = json.loads((run_dir / "run_summary.json").read_bytes())
     assert "stale" not in summary
     assert summary["run_classification"] is not None
     assert validate_run_artifacts(run_dir, require_summary=True)
@@ -7316,7 +7334,7 @@ def test_a_mixed_dry_run_batch_keeps_its_dry_run_identity(tmp_path):
 
 def test_live_classification_stamps_the_loaded_account(tmp_path):
     schema_path = Path(__file__).resolve().parent / "schemas" / "morning_run_classification.schema.json"
-    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    schema = json.loads(schema_path.read_bytes())
     pattern = re.compile(schema["properties"]["account_number"]["pattern"])
 
     cfg = MorningConfig(
@@ -7373,7 +7391,7 @@ def test_live_classification_always_carries_an_account(tmp_path):
     unconditionally for trading modes.
     """
     schema_path = Path(__file__).resolve().parent / "schemas" / "morning_run_classification.schema.json"
-    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    schema = json.loads(schema_path.read_bytes())
     conditional = next(
         block
         for block in schema["allOf"]
@@ -7399,7 +7417,7 @@ def test_live_classification_always_carries_an_account(tmp_path):
 
 def _morning_schema():
     path = Path(__file__).resolve().parent / "schemas" / "morning_run_classification.schema.json"
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_bytes())
 
 
 @pytest.mark.parametrize(

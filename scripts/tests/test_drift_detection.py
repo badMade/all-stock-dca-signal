@@ -222,6 +222,17 @@ class DriftDetectionTests(unittest.TestCase):
         self.assertTrue(report.submitted_orders_empty)
         self.assertEqual(report.run_suspected_cause, CAUSE_ORDERS_EMPTY)
 
+    def test_invalid_utf8_run_state_is_ignored(self):
+        self._raw()
+        _write_csv(self.run_dir / "signals.csv", SIGNAL_FIELDS, [_signal("AAPL", incremental=3.0)])
+        _write_csv(self.run_dir / "submitted_orders.csv", ORDER_FIELDS, [])
+        (self.run_dir / "run_state.json").write_bytes(b"\xff\xfe\x00")
+
+        artifacts = load_run_artifacts(self.run_dir)
+
+        self.assertIsNone(artifacts.run_state)
+        self.assertEqual(artifacts.signal_rows[0]["ticker"], "AAPL")
+
     # --- output formats ------------------------------------------------------
     def test_json_and_markdown_outputs(self):
         self._raw()
@@ -256,7 +267,7 @@ class DriftDetectionTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertTrue(json_out.exists())
         self.assertTrue(md_out.exists())
-        self.assertTrue(json.loads(json_out.read_text())["drift_detected"])
+        self.assertTrue(json.loads(json_out.read_bytes())["drift_detected"])
 
     def test_cli_clean_run_exit_zero(self):
         self._raw()
@@ -679,6 +690,15 @@ class LoadRunArtifactsSignalSelectionTest(unittest.TestCase):
 
             self.assertEqual(artifacts.signals_path.name, "signals.csv")
             self.assertEqual(artifacts.signal_rows, [])
+
+    def test_invalid_utf8_run_state_is_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "run_state.json").write_bytes(b"\xff\xfe")
+
+            artifacts = load_run_artifacts(run_dir)
+
+            self.assertIsNone(artifacts.run_state)
 
 
 class SanitizeExceptionTests(unittest.TestCase):

@@ -399,7 +399,7 @@ def test_generate_reports_writes_all_files(tmp_path=None):
     for key in ["slippage_ranked", "missing_fills_report", "slippage_and_coverage_report", "latest_run_summary"]:
         assert Path(paths[key]).exists(), f"missing output: {key}"
 
-    summary = json.loads(Path(paths["latest_run_summary"]).read_text())
+    summary = json.loads(Path(paths["latest_run_summary"]).read_bytes())
     assert summary["execution_quality"]["target_price_missing"] == 1
 
     report = Path(paths["slippage_and_coverage_report"]).read_text()
@@ -414,7 +414,7 @@ def test_generate_reports_excludes_fills_by_ticker(tmp_path=None):
     directory = tmp_path or Path(tempfile.mkdtemp())
     # NVDA is a manual-run ticker that leaked into same-day broker fills.
     paths = generate_reports(_run_state(), _fills(), directory, excluded_tickers=frozenset(["NVDA"]))
-    summary = json.loads(Path(paths["latest_run_summary"]).read_text())
+    summary = json.loads(Path(paths["latest_run_summary"]).read_bytes())
     # AAPL + AMD remain filled; NVDA's excluded fill becomes a missing fill.
     assert summary["coverage"]["fills"] == 2
     assert "NVDA" not in Path(paths["slippage_ranked"]).read_text()
@@ -488,7 +488,7 @@ def test_generate_scheduled_reports_routes_through_classification(tmp_path=None)
         {"ticker": "NVDA", "fill_price": 49.5, "filled_qty": 0.06, "order_id": "O2"},
     ]
     paths = generate_scheduled_reports(day, fills, base / "reports", base=base)
-    summary = json.loads(Path(paths["latest_run_summary"]).read_text())
+    summary = json.loads(Path(paths["latest_run_summary"]).read_bytes())
     assert summary["coverage"]["fills"] == 1  # only AAPL; NVDA's O2 fill excluded as manual
     assert "NVDA" not in Path(paths["slippage_ranked"]).read_text()
 
@@ -520,7 +520,7 @@ def test_generate_scheduled_reports_retains_scheduled_fill_when_manual_order_sha
         {"ticker": "NVDA", "fill_price": 50.0, "filled_qty": 0.01, "order_id": "O3"},
     ]
     paths = generate_scheduled_reports(day, fills, base / "reports", base=base)
-    summary = json.loads(Path(paths["latest_run_summary"]).read_text())
+    summary = json.loads(Path(paths["latest_run_summary"]).read_bytes())
     # AAPL (O1) and the scheduled NVDA fill (O2) both survive; only the
     # manual NVDA order (O3) is excluded.
     assert summary["coverage"]["fills"] == 2
@@ -568,7 +568,7 @@ def test_generate_scheduled_reports_appends_model_usage_log_entry_when_root_conf
 
     log_path = resolve_log_path(datetime.now(timezone.utc), root=log_root)
     assert log_path.exists()
-    entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+    entry = json.loads(log_path.read_bytes().splitlines()[0])
     assert entry["cron_id"] == "67aa802b"
     # A distinct run_id/artifact for THIS reporting task, not the 15:20 live
     # run's own run_id/run_state.json -- the live run's run_id is still
@@ -603,7 +603,7 @@ def test_generate_scheduled_reports_records_premium_routing_metadata_when_suppli
         model_usage_reason_for_premium_model="explicit_user_request",
     )
     log_path = resolve_log_path(datetime.now(timezone.utc), root=log_root)
-    entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+    entry = json.loads(log_path.read_bytes().splitlines()[0])
     assert entry["model_routing_mode"] == "premium"
     assert entry["reason_for_premium_model"] == "explicit_user_request"
 
@@ -641,7 +641,7 @@ def test_generate_scheduled_reports_logs_even_when_report_generation_fails(tmp_p
 
     log_path = resolve_log_path(datetime.now(timezone.utc), root=log_root)
     assert log_path.exists()
-    entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+    entry = json.loads(log_path.read_bytes().splitlines()[0])
     assert entry["run_id"] == f"reporting_{day}_1700ET"
 
 
@@ -668,7 +668,7 @@ def test_generate_scheduled_reports_excludes_fills_for_confirmation_blocked_run(
     # to a confirmation-blocked run, which placed zero orders by contract.
     fills = [{"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 0.03, "order_id": "UNRELATED-1"}]
     paths = generate_scheduled_reports(day, fills, base / "reports", base=base)
-    summary = json.loads(Path(paths["latest_run_summary"]).read_text())
+    summary = json.loads(Path(paths["latest_run_summary"]).read_bytes())
     assert summary["coverage"]["fills"] == 0
 
 
@@ -709,7 +709,7 @@ def test_generate_scheduled_reports_raw_fallback_survives_null_broker_outcomes(t
 
     # Must not raise AttributeError/TypeError from the null broker_outcomes.
     paths = generate_scheduled_reports(day, [], base / "reports", base=base)
-    summary = json.loads(Path(paths["latest_run_summary"]).read_text())
+    summary = json.loads(Path(paths["latest_run_summary"]).read_bytes())
     assert summary["coverage"]["fills"] == 1, (
         "raw-fill fallback should have resolved AAPL's O1 fill despite null broker_outcomes"
     )
@@ -743,7 +743,7 @@ def test_generate_scheduled_reports_raw_fallback_survives_non_utf8_orders_file(t
     # report instead (no caller-supplied fill for O1, and the raw fallback
     # can't be read either).
     paths = generate_scheduled_reports(day, [], base / "reports", base=base)
-    summary = json.loads(Path(paths["latest_run_summary"]).read_text())
+    summary = json.loads(Path(paths["latest_run_summary"]).read_bytes())
     assert summary["coverage"]["fills"] == 0
 
 

@@ -362,7 +362,7 @@ def _load_pointer(pointer: str | Path | Dict[str, object]) -> Optional[Dict[str,
     if not path.exists():
         return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_bytes())
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return {"__malformed__": True}
     return data if isinstance(data, dict) else {"__malformed__": True}
@@ -533,7 +533,7 @@ def validate_pointer(
     run_state: Optional[Dict[str, object]] = None
     if ptr_path.exists():
         try:
-            loaded = json.loads(ptr_path.read_text(encoding="utf-8"))
+            loaded = json.loads(ptr_path.read_bytes())
             run_state = loaded if isinstance(loaded, dict) else None
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             return PointerValidation(
@@ -826,7 +826,7 @@ def select_same_day_run_state(
         candidate = Path(trading_day_dir) / run_state_filename
         if candidate.exists() and _within_root(candidate, root):
             try:
-                loaded = json.loads(candidate.read_text(encoding="utf-8"))
+                loaded = json.loads(candidate.read_bytes())
             except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                 loaded = None
             # A date-specific file living in today's expected directory is not
@@ -858,7 +858,7 @@ def select_same_day_run_state(
         )
         if result.is_valid and result.run_state_path:
             try:
-                loaded = json.loads(Path(result.run_state_path).read_text(encoding="utf-8"))
+                loaded = json.loads(Path(result.run_state_path).read_bytes())
             except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                 return None
             if isinstance(loaded, dict) and derive_valid_scheduled_evidence(loaded):
