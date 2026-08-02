@@ -495,7 +495,7 @@ def _resolve_cross_stream_prior_allocation_roots(
 
     # Resolve UPFRONT whether the override is CONFIGURED at all, and
     # separately whether it needs its own scan entry (ACTIVE) -- these are
-    # NOT the same question, and conflating them was itself a bug (Codex
+    # NOT the same question, and conflating them was itself an issue (Codex
     # review: "Drop the legacy fallback for covered nested overrides"). An
     # override that is a STRICT ANCESTOR of afternoon_root is a genuine
     # misconfiguration -- practically the whole cron tree, not a meaningful
@@ -2094,7 +2094,7 @@ def _run_pipeline_impl(
                             "orders_csv_path": str(_prior_orders_csv)
                         }
                     # Carry forward the SLOT's prior order evidence BEFORE the state
-                    # is serialized. This state overwrites the fixed-path
+                    # is serialized. This state overwrites the immutable-path
                     # run_state.json, and the contract writer regenerates
                     # submitted_orders.csv from its buy_candidates, so a retry after
                     # a successful attempt would otherwise erase real accepted orders
@@ -2442,7 +2442,7 @@ def _run_pipeline_impl(
                         # references from a clean reload"), never the
                         # reverse: alloc.reference_price is None here always
                         # keeps existing, protecting the same
-                        # already-resolved-ticker case fixed earlier in this
+                        # already-resolved-ticker case addressed earlier in this
                         # PR (Codex review: "Preserve resolved ticker context
                         # across the reload").
                         if (
@@ -2612,7 +2612,7 @@ def _run_pipeline_impl(
                     # -- was exactly what failed to be read), and unilaterally
                     # blocking the entire run over an unattributed scan
                     # failure would be a much larger behavior change than a
-                    # bounded-reload fix should make on its own; escalate
+                    # bounded-reload patch should make on its own; escalate
                     # loudly instead so an operator can decide whether the
                     # affected artifacts warrant a manual hold.
                     logger.error(

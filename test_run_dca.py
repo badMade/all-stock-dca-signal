@@ -373,7 +373,7 @@ def test_run_pipeline_scheduled_run_loads_market_open_top_up_context(tmp_path):
     # top-up context"): the new 9:35 AM market-open task (2ba19526, stream
     # 'market_open') is the first buy of the day, and its fills must count as
     # prior-allocation context for every later same-day run -- including the
-    # 3:30 afternoon final. Before the fix, _prior_run_is_scheduled classified
+    # 3:30 afternoon final. Before the patch, _prior_run_is_scheduled classified
     # a market_open-stream scheduled run the same as the excluded
     # scheduled-afternoon run, and market_open_dca was absent from
     # _CROSS_STREAM_PRIOR_ALLOCATION_ROOTS, so this fill was never loaded and
@@ -522,7 +522,7 @@ def test_run_pipeline_honors_configured_morning_artifact_root(tmp_path):
 
 
 def test_run_pipeline_preserves_sibling_root_fallback_when_tree_is_relocated(tmp_path):
-    # Codex follow-up review: fixing the above (honoring a stream's configured
+    # Codex follow-up review: correcting the above (honoring a stream's configured
     # root) regressed the OTHER case -- a caller that relocates the WHOLE
     # cron-tracking tree via a non-production artifacts_dir (tests, demo,
     # staging) without also pointing config_dir at a matching relocated
@@ -2761,7 +2761,7 @@ def test_run_pipeline_bounded_reload_poisons_reference_when_accepting_corrected_
     # AAPL's amount is unchanged, but the CLEAN reload's own record for this
     # ticker has an unknown reference price (e.g. a confirmed amount-only
     # fill with a valid base but no confirmed price yet) alongside a
-    # corrected base ($1 -> $2). The prior fix for "Accept corrected
+    # corrected base ($1 -> $2). The prior patch for "Accept corrected
     # allocation bases from a clean reload" would have kept the first
     # pass's stale KNOWN price ($100) while adopting the reload's corrected
     # base ($2) -- a combination neither pass actually produced. If the
@@ -2959,7 +2959,7 @@ def test_run_pipeline_bounded_reload_poisons_base_change_on_smaller_clean_reload
     # pass-one read is $5 fill / base $2 / reference $100. The CLEAN reload
     # reduces BOTH the amount ($5 -> $4) AND the base ($2 -> $1) while
     # leaving the reference UNCHANGED at $100 -- so the earlier
-    # "discard stale references" fix (which only checks reference_price)
+    # "discard stale references" patch (which only checks reference_price)
     # doesn't trigger, and the entire stale $5/$2/$100 snapshot survives
     # unmodified. Kept unpoisoned, the stale $2 base combined with the kept
     # $5 floor amount can still compute a target that permits a top-up the
@@ -3143,7 +3143,7 @@ def test_refresh_fills_from_broker_recovers_a_filled_row_missing_execution_detai
 def test_refresh_fills_from_broker_skips_a_genuinely_complete_filled_row(tmp_path):
     """A row already carrying a complete fill (status='filled' plus a usable
     avg_fill_price/quantity_filled) must still be treated as already known --
-    the fix for the incomplete case must not turn every filled row into a
+    the patch for the incomplete case must not turn every filled row into a
     redundant broker re-query."""
     from run_dca import _fills_from_orders_csv, _refresh_fills_from_broker
 
@@ -5103,7 +5103,7 @@ def test_run_slot_allows_a_guarded_top_up_the_old_forced_flag_used_to_block(tmp_
 
     DemoDataProvider has no get_bid_ask, so a *scheduled* run (spread_ok
     required) always blocks at the spread gate afterward regardless of this
-    fix -- that gate is downstream of and irrelevant to the same-day guard
+    patch -- that gate is downstream of and irrelevant to the same-day guard
     this test targets, so the status itself is not asserted here.
     """
     import json
