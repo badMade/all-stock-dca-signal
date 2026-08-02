@@ -76,6 +76,7 @@ from near_close_dca import (
     run_daily_compact,
     select_budget_tier,
     select_first_allocation_base_usd,
+    within_caps,
     write_run_artifacts,
 )
 from scripts.run_classification import PriorAllocation
@@ -174,6 +175,55 @@ def test_weekly_rollover_reserve_rolls_at_week_boundary():
     state.finalize_daily_budget(next_monday, config)
     state.allowed_spend_today(date(2026, 7, 14), config)
     assert state.weekly_rollover_reserve_usd == 600.0
+
+
+def test_record_buy_tracks_the_daily_order_count():
+    """StrategyState.day_order_count is a plain per-day tally, separate from
+    per-ticker buys_today, that record_buy bumps alongside the dollar
+    counters -- the mechanism within_caps()'s order-count cap reads."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+    assert state.day_order_count(trading_day) == 0
+    state.record_buy("AAPL", trading_day, 2.0)
+    assert state.day_order_count(trading_day) == 1
+    # A second, same-ticker top-up buy still consumes a second slot.
+    state.record_buy("AAPL", trading_day, 1.0)
+    assert state.day_order_count(trading_day) == 2
+    state.record_buy("IBM", trading_day, 2.0)
+    assert state.day_order_count(trading_day) == 3
+    # A different day is tracked independently.
+    assert state.day_order_count(date(2026, 7, 7)) == 0
+
+
+def test_within_caps_enforces_the_daily_order_count_cap():
+    """within_caps() is the one gate every scheduled slot (run_dca.run_slot /
+    run_pipeline -> near_close_dca) and manual run actually places orders
+    through, so config.max_orders_per_day has to be enforced here rather
+    than only in dca_runner.plan_orders(), which the live path never calls
+    (Codex review: "Apply the order-count cap to every live placement
+    path")."""
+    trading_day = date(2026, 7, 6)
+    config = StrategyConfig(max_orders_per_day=2)
+    state = StrategyState()
+    # Below the cap: two orders fit.
+    assert within_caps(1.0, state, trading_day, config) is True
+    state.record_buy("AAPL", trading_day, 1.0)
+    assert within_caps(1.0, state, trading_day, config) is True
+    state.record_buy("IBM", trading_day, 1.0)
+    # The cap is now reached; a third order must be refused even though
+    # dollar headroom remains.
+    assert within_caps(1.0, state, trading_day, config) is False
+
+
+def test_within_caps_is_uncapped_by_default():
+    """A directly constructed StrategyConfig (tests, demo mode) has
+    max_orders_per_day=None, matching pre-cap behavior exactly."""
+    trading_day = date(2026, 7, 6)
+    config = StrategyConfig()
+    state = StrategyState()
+    for _ in range(50):
+        state.record_buy("AAPL", trading_day, 0.01)
+    assert within_caps(0.01, state, trading_day, config) is True
 
 
 def test_ticker_universe():
@@ -470,6 +520,70 @@ def test_run_daily_compact_prior_allocation_scoped_to_its_own_ticker(tmp_path):
     for ticker in ("NVDA", "MSFT"):
         assert by_ticker[ticker]["top_up_guard_result"] == TOP_UP_NO_PRIOR_RUN
         assert by_ticker[ticker]["incremental_order_amount"] == 4.0
+
+
+def test_budget_tier_is_selected_from_post_topup_spend_not_pre_topup_desired(tmp_path):
+    """Tier selection must reflect what the batch will actually try to spend,
+    not each candidate's full first-allocation desired amount.
+
+    A single ticker with a $150 desired amount (5x the $30 base) but a $140
+    same-day prior allocation only needs a $10 incremental top-up. Selecting
+    the tier from the pre-topup $150 would pick Elevated ($240/$1,200,
+    TIER_SPEND_THRESHOLDS_USD's first boundary is $129); selecting it from the
+    actionable $10 correctly keeps Normal ($180/$900) -- authorizing real
+    daily-cap headroom the actionable plan never needed is exactly the
+    excess-spend risk this pins against (Codex review: "Select the tier
+    after applying top-up deltas").
+    """
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-tier-post-topup")
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
+        base_buy_amount_usd=30.0,
+        base_buy_amount_below_close_usd=30.0,
+        max_per_order_usd=200.0,
+    )
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 90.0})
+    # 10% drop vs. the prior close -> the ladder's 5x tier -> $30 base * 5 = $150 desired.
+    fin = _FakeData(SourceName.FINANCE, 90.0, 100.0, quote=(90.0, now))
+    rh = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 90.0, 100.0, quote=(90.0, now), bid_ask=(89.9, 90.1)
+    )
+    prior_same_day_allocations = {
+        "AAPL": PriorSameDayAllocation(
+            "AAPL",
+            amount_usd=140.0,
+            reference_price=95.0,  # above today's ~90.0 decision price -> qualifies for top-up
+            run_id="am",
+            source="scheduled",
+            selected_base_amount_usd=30.0,
+        ),
+    }
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(
+            artifacts_dir=artifacts_dir,
+            prior_same_day_allocations=prior_same_day_allocations,
+        ),
+    )
+
+    assert result["blocked"] is False
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    [candidate] = run_state["buy_candidates"]
+    assert candidate["top_up_guard_result"] == TOP_UP_INCREMENTAL
+    assert candidate["incremental_order_amount"] == pytest.approx(10.0, abs=0.01)
+    assert run_state["budget"]["budget_tier"] == "normal"
+    assert run_state["budget"]["daily_cap_usd"] == pytest.approx(180.0)
 
 
 def test_reconciled_decision_carries_target_fields():
@@ -4495,6 +4609,51 @@ def test_a_cap_blocked_candidate_never_reaches_the_spread_gate(tmp_path):
     assert candidate["spread_status"] == "not_evaluated"
     assert run_state["candidates_reaching_spread_gate"] == 0
     assert run_state["error_class"] != "missing_spread_data"
+    assert run_state["completion_reason"] == "blocked_before_spread_gate"
+
+
+def test_run_daily_compact_stops_at_the_order_count_cap(tmp_path):
+    """End-to-end proof that the roster-wide daily order-count circuit breaker
+    (config/budgets.json circuit_breakers.max_orders_per_day) actually binds
+    on the real live path -- run_daily_compact is what run_dca.run_slot() /
+    run_pipeline() call for every one of the seven scheduled slots, unlike
+    dca_runner.plan_orders(), which nothing live invokes (Codex review:
+    "Apply the order-count cap to every live placement path"). Ample dollar
+    headroom remains; only the count cap should block this candidate."""
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
+        max_orders_per_day=1,
+    )
+    state = StrategyState()
+    state.select_daily_budget(0.0, 0, config)
+    # One order already booked today -- at the cap, with the daily $ cap
+    # nowhere near exhausted.
+    state.record_buy("ZZZ", date(2026, 6, 29), 1.0)
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+    fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+    artifacts_dir = os.path.join(tmp_path, "runs", "order-count-cap")
+
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
+    )
+
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
+        run_state = json.load(handle)
+
+    [candidate] = run_state["buy_candidates"]
+    assert candidate["skip_reason"] == "cap would be exceeded"
     assert run_state["completion_reason"] == "blocked_before_spread_gate"
 
 

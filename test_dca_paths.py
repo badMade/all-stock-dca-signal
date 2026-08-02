@@ -1,19 +1,14 @@
 """Tests for dca_paths: the shared, deployment-relative artifact root.
 
 Two properties matter here. First, the runtime default (no env var set) must
-stay byte-for-byte the documented production path
-(``/home/user/workspace/cron_tracking``, same as ``BUNDLED_CRON_TRACKING_ROOT``
-and the ``${DCA_CRON_TRACKING_ROOT:-/home/user/workspace/cron_tracking}``
-fallback baked into ``config/scheduled_tasks.json``'s own shell commands) --
-a deployment that does not export ``$DCA_CRON_TRACKING_ROOT`` must keep
-reading/writing the exact tree its watchdogs and prior-allocation consumers
-already monitor (Codex review: "Keep the established production artifact
-default stable"; see claude/GATE5-PROPOSAL.md section 1.5, where an earlier
-review already settled this exact question: machine-specific repointing --
-e.g. for a Mac/local checkout where the bundled Linux path does not exist --
-is a matter of setting that one environment variable, not a code or constant
-change). Second, the override must actually redirect every stream, which is
-the point of the change.
+resolve to a real repo-relative path that exists on any checkout, so the
+same-day top-up guard can actually read prior allocations. Second, the override
+must actually redirect every stream, which is the point of the change.
+
+The bundled production path (``BUNDLED_CRON_TRACKING_ROOT``) is kept only as a
+rebasing sentinel -- ``config/*.json`` stores ~40 artifact paths against that
+string and ``rebase_bundled_root()`` keys off it to rewrite them onto the
+configured tree at load time.
 """
 
 from __future__ import annotations
@@ -56,12 +51,10 @@ STREAM_ROOTS = [
 ]
 
 
-def test_default_root_is_the_bundled_production_path(monkeypatch):
-    """With no override, cron_tracking_root() returns the documented production
-    default -- not some other, silently-relocated path."""
+def test_default_root_is_the_repo_relative_path(monkeypatch):
+    """With no override, cron_tracking_root() returns the repo-local default."""
     monkeypatch.delenv(CRON_TRACKING_ROOT_ENV, raising=False)
     assert cron_tracking_root() == DEFAULT_CRON_TRACKING_ROOT
-    assert cron_tracking_root() == BUNDLED_CRON_TRACKING_ROOT
 
 
 def test_env_override_replaces_the_root(monkeypatch):
@@ -82,12 +75,12 @@ def test_stream_root_joins_multiple_segments(monkeypatch):
 
 
 @pytest.mark.parametrize("module_name,attr,suffix", STREAM_ROOTS)
-def test_every_stream_root_defaults_to_the_shared_root(module_name, attr, suffix):
-    """Pin that every stream constant derives from the shared root.
+def test_every_stream_root_defaults_to_the_repo_relative_path(module_name, attr, suffix):
+    """Pin that every stream constant derives from the shared repo-relative root.
 
     These were 15 separate hardcoded absolute strings before the consolidation;
-    this asserts they all derive from DEFAULT_CRON_TRACKING_ROOT, which stays
-    the bundled production Linux path when $DCA_CRON_TRACKING_ROOT is unset.
+    this asserts they all derive from DEFAULT_CRON_TRACKING_ROOT, which is now
+    the repo-local cron_tracking/ directory rather than the legacy Linux path.
     """
     module = importlib.import_module(module_name)
     assert getattr(module, attr) == f"{DEFAULT_CRON_TRACKING_ROOT}/{suffix}"
@@ -404,22 +397,20 @@ def test_the_loaders_resolve_the_model_usage_root_at_load_time():
     assert roots == ["/srv/dca-model-usage/model_usage"] * 2, out.stdout
 
 
-# --- The unset default must stay the established production path ------------
+# --- The unset default must resolve on THIS machine --------------------------
 #
 # BUNDLED_CRON_TRACKING_ROOT ("/home/user/workspace/cron_tracking") is the
-# documented production tree every existing deployment that does not export
-# $DCA_CRON_TRACKING_ROOT already reads and writes -- including the shell
-# commands baked into config/scheduled_tasks.json, which fall back to this
-# same literal path via "${DCA_CRON_TRACKING_ROOT:-/home/user/workspace/cron_tracking}".
-# A deployment (e.g. a Mac/local checkout) that needs a different tree because
-# this one does not exist on that machine sets $DCA_CRON_TRACKING_ROOT
-# explicitly -- machine-specific repointing is an environment-variable
-# decision, not a constant change (see claude/GATE5-PROPOSAL.md section 1.5,
-# and Codex review: "Keep the established production artifact default
-# stable"). Silently changing DEFAULT_CRON_TRACKING_ROOT instead would move
-# every artifact writer/reader for every deployment that has NOT set the
-# variable, splitting them from the tree their watchdogs and prior-allocation
-# consumers already monitor.
+# Perplexity-era Linux path baked into config/*.json. It does not exist on the
+# Mac that now runs the seven-slot roster, and an absent prior-allocation root
+# "contributes nothing, so this is safe on days a stream did not run" -- except
+# here it is absent EVERY day, so the same-day top-up guard degrades to "no
+# prior allocation found" and every slot buys full size. It fails open, silently.
+# See claude/GATE5-PROPOSAL.md section 1.5.
+#
+# The sentinel value itself must NOT change: config/*.json records ~40 artifact
+# paths against that exact prefix and rebase_bundled_root() keys off it.
+# DEFAULT_CRON_TRACKING_ROOT is now the repo-relative cron_tracking/ directory
+# so an unconfigured checkout resolves to a real, writable local path.
 
 
 def test_bundled_sentinel_value_is_unchanged():
@@ -427,35 +418,46 @@ def test_bundled_sentinel_value_is_unchanged():
     assert BUNDLED_CRON_TRACKING_ROOT == "/home/user/workspace/cron_tracking"
 
 
-def test_unset_default_is_the_bundled_production_path(monkeypatch):
-    """With no override, the root must stay the documented production path --
-    not silently relocate to somewhere only this checkout can see."""
+def test_unset_default_resolves_inside_the_repo(monkeypatch):
+    """With no override, the root must be a real, writable, repo-relative path."""
     monkeypatch.delenv(CRON_TRACKING_ROOT_ENV, raising=False)
-    assert cron_tracking_root() == BUNDLED_CRON_TRACKING_ROOT
-    assert cron_tracking_root() == "/home/user/workspace/cron_tracking"
+    resolved = Path(cron_tracking_root())
+    assert resolved.is_absolute()
+    assert resolved == REPO_ROOT / "cron_tracking"
+    # The whole point: a path that actually exists here, so the top-up guard
+    # reads real prior allocations instead of finding nothing.
+    assert resolved.parent.is_dir()
+
+
+def test_unset_default_is_no_longer_the_unreachable_linux_path(monkeypatch):
+    monkeypatch.delenv(CRON_TRACKING_ROOT_ENV, raising=False)
+    assert cron_tracking_root() != BUNDLED_CRON_TRACKING_ROOT
+    assert cron_tracking_root() != "/home/user/workspace/cron_tracking"
 
 
 def test_the_repo_state_root_is_gitignored():
-    """A local override that points cron tracking inside this checkout (e.g. a
-    Mac/local deployment's $DCA_CRON_TRACKING_ROOT) must not get its run state
-    committed."""
+    """Run state is local operational data and must never be committed."""
     ignored = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert "cron_tracking/" in [line.strip() for line in ignored]
 
 
-def test_env_override_still_wins_over_the_default(monkeypatch):
+def test_env_override_still_wins_over_the_repo_default(monkeypatch):
     monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, "/srv/dca")
     assert cron_tracking_root() == "/srv/dca"
 
 
-def test_bundled_config_paths_are_a_no_op_when_unconfigured(monkeypatch):
-    """rebase_bundled_root() short-circuits when the configured root equals the
-    bundled one -- true by default now that DEFAULT_CRON_TRACKING_ROOT IS
-    BUNDLED_CRON_TRACKING_ROOT, so an unconfigured checkout leaves bundled
-    config paths untouched rather than rewriting them onto some other tree."""
+def test_bundled_config_paths_rebase_onto_the_repo_default(monkeypatch):
+    """The reason the sentinel and the default had to become two things.
+
+    rebase_bundled_root() short-circuits when the configured root equals the
+    bundled one. With them now distinct, an unconfigured checkout must still
+    rewrite bundled config paths onto the repo tree -- otherwise the executors
+    read the bundled tree while dca_paths' own constants point at the repo, and
+    readers and writers split across two roots (the PR #219 failure mode).
+    """
     monkeypatch.delenv(CRON_TRACKING_ROOT_ENV, raising=False)
-    original = f"{BUNDLED_CRON_TRACKING_ROOT}/midday_dca"
-    assert rebase_bundled_root(original) == original
+    rebased = rebase_bundled_root(f"{BUNDLED_CRON_TRACKING_ROOT}/midday_dca")
+    assert rebased == str(REPO_ROOT / "cron_tracking" / "midday_dca")
 
 
 def test_an_explicit_unrelated_absolute_path_is_still_untouched(monkeypatch):

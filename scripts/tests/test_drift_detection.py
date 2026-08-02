@@ -269,6 +269,42 @@ class DriftDetectionTests(unittest.TestCase):
         code = main(["--run-dir", str(self.run_dir / "does-not-exist")])
         self.assertEqual(code, 1)
 
+    def test_cli_slack_without_webhook_warns_and_still_exits_zero(self):
+        """--slack with no webhook configured is a warning, not a hard failure."""
+        self._raw()
+        _write_csv(self.run_dir / "signals.csv", SIGNAL_FIELDS, [_signal("AAPL", incremental=3.0)])
+        _write_csv(self.run_dir / "submitted_orders.csv", ORDER_FIELDS, [])
+        code = main(
+            [
+                "--run-dir",
+                str(self.run_dir),
+                "--slack",
+                "--slack-webhook-env",
+                "DEFINITELY_UNSET_DRIFT_HOOK_VAR",
+            ]
+        )
+        self.assertEqual(code, 0)
+
+    def test_cli_slack_send_failure_is_a_warning_not_a_crash(self):
+        """A Slack transport failure must not take down the CLI or mask the drift exit code."""
+        self._raw()
+        _write_csv(self.run_dir / "signals.csv", SIGNAL_FIELDS, [_signal("AAPL", incremental=3.0)])
+        _write_csv(self.run_dir / "submitted_orders.csv", ORDER_FIELDS, [])
+        with patch.object(
+            drift_detection, "send_slack_alert", side_effect=urllib.error.URLError("boom")
+        ):
+            code = main(
+                [
+                    "--run-dir",
+                    str(self.run_dir),
+                    "--slack",
+                    "--slack-webhook",
+                    "https://hooks.example/alert",
+                    "--fail-on-drift",
+                ]
+            )
+        self.assertEqual(code, 2)  # --fail-on-drift still governs the exit code
+
     # --- afternoon action=buy without reconciled candidate -------------------
     def test_afternoon_action_buy_without_candidate_is_not_drift(self):
         """Finance-alone action=buy with no buy_candidates.csv entry must not alert.

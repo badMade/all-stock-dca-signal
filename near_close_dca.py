@@ -645,6 +645,13 @@ class StrategyConfig:
     max_buys_per_ticker_per_day: int = 1
     one_order_per_ticker_per_day: bool = False
     max_bid_ask_spread_pct: float = 1.0
+    # Circuit breaker: max BUY ATTEMPTS placeable in one trading day, shared
+    # across all seven roster slots and manual buying (config/budgets.json
+    # circuit_breakers.max_orders_per_day). None (the default for a directly
+    # constructed StrategyConfig, e.g. in tests or demo mode) means uncapped;
+    # dca_config.load_strategy_config overlays the configured integer from
+    # budgets.json for every real config load.
+    max_orders_per_day: Optional[int] = None
     target_account_number: str = ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
     broker: BrokerName = BrokerName.ROBINHOOD
     dry_run: bool = True
@@ -732,6 +739,12 @@ class StrategyState:
     submitted_notional_by_week: Dict[tuple[int, int], float] = field(
         default_factory=dict
     )
+    # Buy ATTEMPTS booked for the day, shared across all seven roster slots
+    # (config/budgets.json circuit_breakers.max_orders_per_day). Bumped by
+    # record_buy alongside the dollar counters above, so it is reconstructed
+    # by the same same-day seeding path that rebuilds submitted_notional_by_day
+    # across separate slot invocations -- see _seed_prior_allocations.
+    submitted_order_count_by_day: Dict[date, int] = field(default_factory=dict)
     weekly_rollover_reserve_usd: float = 0.0
     selected_tier: Optional[BudgetTier] = None
     finalized_budget_days: Set[date] = field(default_factory=set)
@@ -766,12 +779,18 @@ class StrategyState:
         self.submitted_notional_by_week[iso_week_key(trading_day)] = (
             self.week_notional(trading_day) + notional_usd
         )
+        self.submitted_order_count_by_day[trading_day] = (
+            self.day_order_count(trading_day) + 1
+        )
 
     def day_notional(self, trading_day: date) -> float:
         return self.submitted_notional_by_day.get(trading_day, 0.0)
 
     def week_notional(self, trading_day: date) -> float:
         return self.submitted_notional_by_week.get(iso_week_key(trading_day), 0.0)
+
+    def day_order_count(self, trading_day: date) -> int:
+        return self.submitted_order_count_by_day.get(trading_day, 0)
 
     def current_tier(self) -> BudgetTier:
         """Return the tier selected for the current run, defaulting to Normal."""
@@ -1728,10 +1747,25 @@ def within_caps(
     caller that reduced a candidate's amount (e.g. the kill-switch's mid-batch
     cap in ``run_once``) checks caps against what will really be submitted,
     not the pre-cap ladder amount.
+
+    Also enforces ``config.max_orders_per_day`` (the roster-wide daily
+    order-count circuit breaker, config/budgets.json
+    circuit_breakers.max_orders_per_day) against ``state``'s running count of
+    buy attempts booked for ``trading_day`` -- this is the one gate every
+    scheduled slot (run_dca.run_slot/run_pipeline -> near_close_dca) and
+    manual run actually places orders through, unlike dca_runner.plan_orders(),
+    which only the disabled 12:30 assess() path calls (Codex review: "Apply
+    the order-count cap to every live placement path"). ``None`` means
+    uncapped, matching a directly constructed StrategyConfig's default.
     """
     if amount <= 0:
         return False
     if amount > state.remaining_spend_today(trading_day, config):
+        return False
+    if (
+        config.max_orders_per_day is not None
+        and state.day_order_count(trading_day) + 1 > config.max_orders_per_day
+    ):
         return False
     return True
 
@@ -7262,12 +7296,41 @@ def _run_once_impl(
     # Higher multiplier -> larger drop -> ticker alphabetical (see allocation_sort_key).
     buy_candidates.sort(key=allocation_sort_key)
 
+    # The top-up guard (and its same-day-order-check bypass) is only for the
+    # scheduled afternoon run: a manual run must still be blocked by its own
+    # same-day-order/max-buys checks even if a caller happens to also pass
+    # prior_same_day_allocations (e.g. an auto-loaded state root shared across
+    # call sites), or a manual run could unintentionally double-buy. Computed
+    # here, before tier selection below, so the tier can be selected from the
+    # same top-up-adjusted amounts the batch will actually spend.
+    guard_active = scheduled and prior_same_day_allocations is not None
+
     # ⚡ Bolt Optimization: Use a single pass loop instead of multiple sum() generators
     # to eliminate O(N) object overhead when iterating DataFrames/lists.
+    #
+    # planned_spend feeds tier selection (config/budgets.json budget_tiers),
+    # which sets the day's daily/weekly cap ceiling -- so it must reflect what
+    # the batch will actually try to spend, not each candidate's full
+    # first-allocation desired amount. A repeat same-day buy is capped by the
+    # same-day top-up guard to max(0, desired - prior), often to $0; summing
+    # the pre-guard desired amounts instead can select a materially higher
+    # tier (e.g. Elevated $240 instead of Normal $180) from spend that the
+    # guard was always going to shrink, authorizing real daily cap headroom
+    # the actionable plan never needed (Codex review: "Select the tier after
+    # applying top-up deltas"). evaluate_top_up_guard is a pure computation
+    # (no broker/state I/O); redoing it here to estimate each candidate's
+    # incremental amount is safe -- _process_buy_candidate below makes the
+    # real, authoritative per-candidate decision once the broker's own
+    # same-day exposure and duplicate checks are available. This estimate
+    # only feeds tier selection, never a placed order.
     planned_spend = 0.0
     high_multiplier_signals = 0
     for d in buy_candidates:
-        planned_spend += d.suggested_amount_usd
+        if guard_active:
+            prior = prior_same_day_allocations.get(d.ticker)
+            planned_spend += evaluate_top_up_guard(d, prior, config).incremental_order_amount
+        else:
+            planned_spend += d.suggested_amount_usd
         if d.buy_multiplier >= config.high_multiplier_threshold:
             high_multiplier_signals += 1
 
@@ -7276,13 +7339,6 @@ def _run_once_impl(
     # so a quiet week (no BUY candidates) still carries prior unused Normal-cap
     # capacity into the stress tier's ceiling.
     state.roll_weekly_reserve(trading_day, config)
-
-    # The top-up guard (and its same-day-order-check bypass) is only for the
-    # scheduled afternoon run: a manual run must still be blocked by its own
-    # same-day-order/max-buys checks even if a caller happens to also pass
-    # prior_same_day_allocations (e.g. an auto-loaded state root shared across
-    # call sites), or a manual run could unintentionally double-buy.
-    guard_active = scheduled and prior_same_day_allocations is not None
 
     _seed_prior_allocations(
         state,

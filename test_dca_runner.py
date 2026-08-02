@@ -36,7 +36,7 @@ import sys
 import threading
 import time as time_module
 import types
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -1195,6 +1195,26 @@ def early_close_slot(request):
     return dca_runner.SLOTS[request.param]
 
 
+@pytest.fixture(params=sorted(dca_runner.SLOTS))
+def all_slots(request):
+    """Every registered slot, so a gate test proves it holds for the whole
+    seven-slot roster instead of only the market-open (0935) slot that most
+    of this file's tests default to via ``_clean_kwargs``."""
+    return dca_runner.SLOTS[request.param]
+
+
+def test_gate0_early_close_does_not_silence_the_midday_slot():
+    """slot_should_end_silently compares slot.nominal_et, not window_end_et,
+    against 13:00 ET -- a documented, currently-inert gap (Codex review: "End
+    the midday window before an early market close"; see the method's
+    docstring). 1230's nominal is 12:30, so it pins TODAY's actual behavior
+    (not silenced) even though its window technically reaches the 13:00
+    early-close cutoff, distinguishing it from early_close_slot's
+    1330/1430/1530 (nominal strictly after 13:00, silenced)."""
+    status = dca_runner.market_day_status(date(2026, 11, 27))
+    assert not status.slot_should_end_silently(dca_runner.SLOTS["1230"])
+
+
 # ===========================================================================
 # C. Gate 1 -- time sanity
 # ===========================================================================
@@ -1232,6 +1252,27 @@ def test_gate1_naive_datetime_is_rejected_rather_than_assumed():
     """Timezone ambiguity around the 2026-11-01 EDT->EST switch must not be guessed."""
     with pytest.raises(ValueError):
         dca_runner.gate_time_sanity(datetime(2026, 7, 28, 9, 35), dca_runner.SLOTS["0935"])
+
+
+def test_gate1_window_bounds_hold_for_every_slot_not_just_0935(all_slots):
+    """The window checks above only ever exercised the 0935 slot. Each of the
+    other six slots has its own, different window_start_et/window_end_et
+    (dca_runner.py's SLOTS table), so passing for 0935 alone does not prove
+    gate_time_sanity's inclusive-start/exclusive-end arithmetic generalizes.
+    """
+    day = date(2026, 7, 28)
+    start = datetime.combine(day, time(*all_slots.window_start_et), tzinfo=ET)
+    end = datetime.combine(day, time(*all_slots.window_end_et), tzinfo=ET)
+
+    assert dca_runner.gate_time_sanity(start, all_slots)  # inclusive start
+    assert dca_runner.gate_time_sanity(end - timedelta(seconds=1), all_slots)
+    assert not dca_runner.gate_time_sanity(start - timedelta(seconds=1), all_slots)
+    assert not dca_runner.gate_time_sanity(end, all_slots)  # exclusive end
+
+
+def test_gate1_naive_datetime_is_rejected_for_every_slot(all_slots):
+    with pytest.raises(ValueError):
+        dca_runner.gate_time_sanity(datetime(2026, 7, 28, *all_slots.nominal_et), all_slots)
 
 
 def test_gate1_excludes_the_market_close_instant_for_the_final_slot():
@@ -1360,6 +1401,24 @@ def test_gate4_ignores_orders_from_other_days():
     assert dca_runner.gate_sole_executor([yesterday], spec, date(2026, 7, 28)) == []
 
 
+def test_gate4_window_boundaries_hold_for_every_slot_not_just_0935(all_slots):
+    """The boundary tests above only ever exercised the 0935 slot's own UTC
+    window. gate_sole_executor's window is inclusive on both ends (unlike
+    Gate 1's exclusive-end gate_time_sanity), so pin that per-slot rather
+    than assuming it generalizes from one slot's pass/fail cases."""
+    day = date(2026, 7, 28)
+    start, end = all_slots.window_bounds_utc(day)
+
+    assert dca_runner.gate_sole_executor([_order("AAPL", 2.0, start)], all_slots, day)
+    assert dca_runner.gate_sole_executor([_order("AAPL", 2.0, end)], all_slots, day)
+    assert dca_runner.gate_sole_executor(
+        [_order("AAPL", 2.0, start - timedelta(seconds=1))], all_slots, day
+    ) == []
+    assert dca_runner.gate_sole_executor(
+        [_order("AAPL", 2.0, end + timedelta(seconds=1))], all_slots, day
+    ) == []
+
+
 def test_assess_serializes_a_colliding_orders_non_string_symbol():
     """gate_sole_executor()'s row-shape check only confirms each row IS a
     BrokerOrder instance, never that its externally-supplied .symbol is
@@ -1481,11 +1540,13 @@ def test_gate6_a_terminal_order_with_no_fill_still_consumes_no_budget():
     assert snap.day_notional_usd == pytest.approx(0.0)
 
 
-def test_a_partially_filled_cancelled_order_blocks_another_same_day_buy():
+def test_a_partially_filled_cancelled_order_blocks_another_same_day_buy(monkeypatch):
     """The same partial-fill notional that must count toward budget must also
     count toward the one-order-per-ticker-per-day dedup, or a cancelled
     partial fill would let assess() plan a second same-day buy for the same
     ticker (Codex review: "Account for partially filled cancelled buys")."""
+    # first-slot-wins is now OFF by default (config/budgets.json order_rules.one_order_per_ticker_per_day=false, set 2026-07-31). This test covers that rule, so it pins it ON explicitly rather than depending on the shipped default.
+    monkeypatch.setattr(dca_runner, "ONE_ORDER_PER_TICKER_PER_DAY", True)
     earlier = [
         _order(
             "AAPL", 10.0, _utc(2026, 7, 28, 13, 0),  # 9:00 AM ET, before the 9:43 AM "now" below
@@ -1535,11 +1596,13 @@ def test_an_expired_broker_order_with_no_fill_is_classified_as_dead():
 
 
 @pytest.mark.parametrize("weird_side", ["BUY", " buy ", "Buy"])
-def test_an_uppercase_or_padded_buy_side_still_counts_and_blocks_resubmission(weird_side):
+def test_an_uppercase_or_padded_buy_side_still_counts_and_blocks_resubmission(weird_side, monkeypatch):
     """An uppercase or whitespace-padded side must not fail the exact-match
     comparison and be silently excluded from budget accounting and the
     same-day ticker interlock, treating real committed spend as zero (Codex
     review: "Normalize broker order sides before budget filtering")."""
+    # pins first-slot-wins ON; see the note on the partially-filled-cancelled test.
+    monkeypatch.setattr(dca_runner, "ONE_ORDER_PER_TICKER_PER_DAY", True)
     earlier = [_order("AAPL", 10.0, _utc(2026, 7, 28, 13, 0), side=weird_side)]
     r = dca_runner.assess(**_clean_kwargs(
         orders=earlier, candidates=[("AAPL", 2.0), ("MSFT", 2.0)]
@@ -1940,7 +2003,7 @@ def test_tier_selection_inputs_excludes_a_sub_cent_candidate():
     assert high_mult == 0
 
 
-def test_assess_does_not_escalate_the_tier_on_sub_cent_candidates_alone():
+def test_assess_does_not_escalate_the_tier_on_sub_cent_candidates_alone(monkeypatch):
     """Near the $129 Normal->Elevated escalation boundary, a sub-cent row
     that plan_orders() would refuse anyway must not be the thing that tips
     tier selection: 30 real 2x candidates ($4 each, $120 total, real,
@@ -1950,6 +2013,8 @@ def test_assess_does_not_escalate_the_tier_on_sub_cent_candidates_alone():
     escalate to Elevated -- the sub-cent row can never actually be placed,
     so it must never inflate the caps the REST of the batch spends against
     (Codex review: "Exclude sub-cent candidates from tier selection")."""
+    # raises the daily order-count cap out of the way: this test is about TIER SELECTION with 30 candidates, and the shipped cap of 8 (circuit_breakers.max_orders_per_day) would otherwise trim to_place to 8 and mask what is being asserted.
+    monkeypatch.setattr(dca_runner, "MAX_ORDERS_PER_DAY", 100)
     real_tickers = sorted(dca_runner.ACTIVE_TICKERS)[:30]
     candidates = [(t, 4.0, 2.0) for t in real_tickers] + [("QBTS", 9.996)]
     r = dca_runner.assess(**_clean_kwargs(candidates=candidates))
@@ -4004,6 +4069,82 @@ def test_execute_plan_rejects_a_run_id_not_bound_to_the_trading_day():
         )
 
 
+def _valid_execute_plan_kwargs(**over):
+    """A complete, otherwise-passing execute_plan() kwargs set for the
+    documented direct plan_orders() -> execute_plan() path (no assess()),
+    so a guard test only needs to override the one input it targets and a
+    monkeypatched collaborator, rather than reconstruct every required
+    field from scratch."""
+    snapshot = dca_runner.budget_snapshot([], date(2026, 7, 28))
+    tier = BudgetTier("normal", 180.0, 900.0)
+    candidates = [dca_runner.Candidate("AAPL", 2.0)]
+    plan = dca_runner.plan_orders(candidates=candidates, snapshot=snapshot, tier=tier)
+    base = dict(
+        plan=plan,
+        run_id="test-run-2026-07-28",
+        snapshot=snapshot,
+        tier=tier,
+        trading_day=date(2026, 7, 28),
+        orders=[],
+        orders_account_number=TEST_ACCOUNT_NUMBER,
+        now=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        now_fn=lambda: datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        slot_id="0935",
+        orders_fetched_at=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        buying_power_usd=TEST_BUYING_POWER_USD,
+        candidates=candidates,
+    )
+    base.update(over)
+    return base
+
+
+def test_execute_plan_refuses_when_the_market_calendar_is_unreadable(monkeypatch):
+    """execute_plan() is the only place Gates 0/1/3 are guaranteed to run at
+    all on the documented direct plan_orders() -> execute_plan() path (no
+    assess()), so a market_calendar.json read failure here must refuse to
+    place, mirroring assess()'s own Gate 0 exception handling, rather than
+    let a raw CalendarCoverageError/OSError/etc. escape past this live
+    placement boundary."""
+    broker = dca_runner.build_runner_broker(
+        place_fn=lambda **kw: {"id": "ok"},
+        enable_live_orders=True,
+        dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+
+    def _raise(trading_day):
+        raise dca_runner.CalendarCoverageError("2026 not covered")
+
+    monkeypatch.setattr(dca_runner, "market_day_status", _raise)
+    kwargs = _valid_execute_plan_kwargs()
+    plan = kwargs.pop("plan")
+    with pytest.raises(ValueError, match="market calendar unavailable"):
+        dca_runner.execute_plan(plan, broker, **kwargs)
+
+
+def test_execute_plan_refuses_when_the_trading_window_config_is_unreadable(monkeypatch):
+    """Mirrors assess()'s own conversion of an unreadable trading_window.json
+    into a refusal (Codex review: "Convert trading-window config failures
+    into ABORT"), but at the execute_plan() boundary, which is the only
+    place this recheck is guaranteed to run on the direct plan_orders() ->
+    execute_plan() path."""
+    broker = dca_runner.build_runner_broker(
+        place_fn=lambda **kw: {"id": "ok"},
+        enable_live_orders=True,
+        dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+
+    def _raise(trading_day):
+        raise KeyError("start_date")
+
+    monkeypatch.setattr(dca_runner, "gate_trading_window", _raise)
+    kwargs = _valid_execute_plan_kwargs()
+    plan = kwargs.pop("plan")
+    with pytest.raises(ValueError, match="trading window configuration unavailable"):
+        dca_runner.execute_plan(plan, broker, **kwargs)
+
+
 def test_execute_plan_redacts_a_malformed_broker_symbol():
     """Fresh evidence beyond assess()'s own equivalent fix: the documented
     direct execute_plan() boundary's bought_today check still normalized
@@ -4902,20 +5043,39 @@ def test_execute_plan_rejects_an_oversized_weekly_rollover_reserve_usd():
     Left uncaught, that would escape with a raw OverflowError instead of the
     documented ValueError every other malformed reserve already gets here,
     matching the same fix already applied to assess() (Codex review: "Handle
-    rollover-reserve overflow at the live boundary")."""
+    rollover-reserve overflow at the live boundary").
+
+    Candidates must actually justify a stress-tier selection: a single
+    ``AAPL`` candidate (as this test previously used) trips the EARLIER
+    "tier does not match select_budget_tier()'s own choice for this batch"
+    guard before weekly_rollover_reserve_usd is ever inspected, so the
+    ValueError this test asserted on was never actually the one described
+    above -- it was a coincidental one three checks earlier, and the
+    OverflowError guard itself had no regression coverage at all.
+    ``_stress_tier_candidates()`` is the same fixture the neighboring
+    verified-reserve tests already use to legitimately reach a stress tier.
+    """
     broker = dca_runner.build_runner_broker(
         place_fn=lambda **kw: {"id": "ok"},
         enable_live_orders=True,
         dry_run=False,
         account_number=TEST_ACCOUNT_NUMBER,
     )
-    plan = dca_runner.Plan(to_place=[dca_runner.PlannedOrder("AAPL", 2.0)])
-    with pytest.raises(ValueError):
+    candidates = _stress_tier_candidates()
+    snapshot = dca_runner.budget_snapshot([], date(2026, 7, 28))
+    tier = BudgetTier("stress", 360.0, 1800.0, uses_rollover_reserve=True)
+    plan = dca_runner.plan_orders(
+        dca_runner._parse_candidate_rows(candidates),
+        snapshot,
+        tier,
+        buying_power_usd=TEST_BUYING_POWER_USD,
+    )
+    with pytest.raises(ValueError, match="weekly_rollover_reserve_usd"):
         dca_runner.execute_plan(
             plan,
             broker,
             run_id="test-run-2026-07-28",
-            snapshot=dca_runner.budget_snapshot([], date(2026, 7, 28)),
+            snapshot=snapshot,
             trading_day=date(2026, 7, 28),
             orders=[],
             orders_account_number=TEST_ACCOUNT_NUMBER,
@@ -4923,10 +5083,10 @@ def test_execute_plan_rejects_an_oversized_weekly_rollover_reserve_usd():
             now_fn=lambda: datetime(2026, 7, 28, 9, 43, tzinfo=ET),
             slot_id="0935",
             orders_fetched_at=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
-            tier=BudgetTier("stress", 360.0, 1800.0, uses_rollover_reserve=True),
+            tier=tier,
             weekly_rollover_reserve_usd=10**1000,
             buying_power_usd=TEST_BUYING_POWER_USD,
-            candidates=[("AAPL", 2.0)],
+            candidates=candidates,
         )
 
 
@@ -4964,7 +5124,7 @@ def test_execute_plan_rejects_a_stress_batch_beyond_the_verified_reserve():
         )
 
 
-def test_execute_plan_allows_a_stress_batch_within_the_verified_reserve():
+def test_execute_plan_allows_a_stress_batch_within_the_verified_reserve(monkeypatch):
     """weekly_rollover_reserve_usd=900 (the reserve cap) is only accepted here
     because finalized_budget_days/submitted_notional_by_week actually justify
     it: a prior week finalized with zero spend leaves the full $900 unused,
@@ -4979,6 +5139,8 @@ def test_execute_plan_allows_a_stress_batch_within_the_verified_reserve():
     would produce from these same verified inputs (Codex review: "Rebuild
     the submitted plan from verified candidates"), so a hand-picked subset
     (e.g. just the GOOGL order) is no longer accepted here."""
+    # raises the daily order-count cap out of the way: this test is about the stress-tier weekly reserve, not the count cap.
+    monkeypatch.setattr(dca_runner, "MAX_ORDERS_PER_DAY", 100)
     calls = []
     current_week_key = iso_week_key(date(2026, 7, 28))
     prior_week_key = iso_week_key(date(2026, 7, 20))  # an earlier ISO week
@@ -7453,6 +7615,53 @@ def test_max_per_order_usd_matches_budgets_json_circuit_breaker():
     )
 
 
+# --- _load_max_orders_per_day: fail-closed config validation ------------------
+#
+# MAX_ORDERS_PER_DAY = _load_max_orders_per_day() runs once at import time, so
+# these branches have no way to be reached through execute_plan()/assess() in
+# an already-imported test process -- they must be exercised by calling the
+# loader directly against a swapped-in CONFIG_DIR, the same pattern used above
+# for _validated_max_per_order_hard_limit.
+
+
+def test_load_max_orders_per_day_rejects_a_missing_key(tmp_path, monkeypatch):
+    (tmp_path / "budgets.json").write_text(json.dumps({"circuit_breakers": {}}))
+    monkeypatch.setattr(dca_runner, "CONFIG_DIR", tmp_path)
+    with pytest.raises(ValueError, match="is missing"):
+        dca_runner._load_max_orders_per_day()
+
+
+@pytest.mark.parametrize("bad_value", ["8", 8.0, True, False, None])
+def test_load_max_orders_per_day_rejects_a_non_integer(tmp_path, monkeypatch, bad_value):
+    """A bool passes isinstance(x, int) (bool is an int subclass) and must be
+    rejected explicitly, same as every other config-sourced numeric guard in
+    this module."""
+    (tmp_path / "budgets.json").write_text(
+        json.dumps({"circuit_breakers": {"max_orders_per_day": bad_value}})
+    )
+    monkeypatch.setattr(dca_runner, "CONFIG_DIR", tmp_path)
+    with pytest.raises(ValueError, match="must be an"):
+        dca_runner._load_max_orders_per_day()
+
+
+@pytest.mark.parametrize("bad_value", [0, -1])
+def test_load_max_orders_per_day_rejects_a_non_positive_value(tmp_path, monkeypatch, bad_value):
+    (tmp_path / "budgets.json").write_text(
+        json.dumps({"circuit_breakers": {"max_orders_per_day": bad_value}})
+    )
+    monkeypatch.setattr(dca_runner, "CONFIG_DIR", tmp_path)
+    with pytest.raises(ValueError, match=">= 1"):
+        dca_runner._load_max_orders_per_day()
+
+
+def test_load_max_orders_per_day_accepts_a_valid_positive_integer(tmp_path, monkeypatch):
+    (tmp_path / "budgets.json").write_text(
+        json.dumps({"circuit_breakers": {"max_orders_per_day": 8}})
+    )
+    monkeypatch.setattr(dca_runner, "CONFIG_DIR", tmp_path)
+    assert dca_runner._load_max_orders_per_day() == 8
+
+
 def test_budget_tiers_match_config_budgets_json():
     """Tier values are hardcoded in near_close_dca and documented in config."""
     cfg = json.loads((dca_runner.CONFIG_DIR / "budgets.json").read_text(encoding="utf-8"))["budget_tiers"]
@@ -7718,6 +7927,20 @@ def test_assess_zero_candidates_proceeds_with_an_empty_plan():
     r = dca_runner.assess(**_clean_kwargs())
     assert r["verdict"] == "PROCEED"
     assert r["plan"]["to_place"] == []
+
+
+def test_assess_proceeds_for_every_slot_at_its_own_nominal_time(all_slots):
+    """Every assess()-level test above defaults to slot_id="0935" via
+    _clean_kwargs, so the full Gates-0/1/3/4/6 pipeline had never actually
+    run for the other six slots. Firing each slot at its own nominal_et on a
+    day inside the approved trading window (2026-07-28, used throughout this
+    file) must reach the same clean PROCEED, proving no gate silently
+    special-cases the market-open slot."""
+    now = datetime(2026, 7, 28, *all_slots.nominal_et, tzinfo=ET)
+    r = dca_runner.assess(**_clean_kwargs(slot_id=all_slots.slot_id, now=now))
+    assert r["verdict"] == "PROCEED"
+    assert r["slot"] == all_slots.slot_id
+    assert r["slot_label"] == all_slots.label
 
 
 def test_assess_reports_budget_actually_consumed_today():
@@ -8498,13 +8721,15 @@ def test_assess_weekend_ends_silently_even_with_unmaterializable_order_history()
     assert r["verdict"] == "END_SILENTLY"
 
 
-def test_assess_excludes_a_ticker_already_bought_earlier_today():
+def test_assess_excludes_a_ticker_already_bought_earlier_today(monkeypatch):
     """A 10:30 candidate for a ticker the 09:35 slot already bought must be refused.
 
     Otherwise the same ticker can be bought once per slot, up to seven times a
     day, violating one_order_per_ticker_per_day (Codex review: "Exclude
     tickers already bought earlier today").
     """
+    # pins first-slot-wins ON; this test exists to cover exactly that rule.
+    monkeypatch.setattr(dca_runner, "ONE_ORDER_PER_TICKER_PER_DAY", True)
     earlier = [_order("AAPL", 2.0, _utc(2026, 7, 28, 13, 40))]  # 09:40 ET, the 09:35 slot
     r = dca_runner.assess(**_clean_kwargs(
         slot_id="1030",
@@ -8544,3 +8769,119 @@ def test_assess_dedupe_keeps_the_allocation_priority_winner_for_tier_selection()
     r = dca_runner.assess(**_clean_kwargs(candidates=candidates))
     # 6 total 3x signals (AAPL's winning row + 5 others) -> Elevated, not Normal.
     assert r["budget"]["tier"] == "elevated"
+
+
+# ---------------------------------------------------------------------------
+# Daily order-count cap (config/budgets.json circuit_breakers.max_orders_per_day)
+# Added 2026-07-31 at Geoff's direction: at most 8 orders a day across all seven
+# slots and manual buying, changeable by editing that one config number.
+# ---------------------------------------------------------------------------
+
+
+def _count_cap_tier():
+    return dca_runner.select_budget_tier(0.0, 0)
+
+
+def _count_cap_cands(n):
+    """n whitelisted 1x candidates at the $2 base, so nothing is refused for
+    sizing reasons and only the count cap can stop the batch."""
+    return [dca_runner.Candidate(t, 2.0, 1.0) for t in sorted(dca_runner.ACTIVE_TICKERS)[:n]]
+
+
+def _count_cap_snapshot(day_order_count, *, day_notional_usd=0.0):
+    return dca_runner.BudgetSnapshot(
+        day=date(2026, 8, 4),
+        day_notional_usd=day_notional_usd,
+        week_notional_usd=day_notional_usd,
+        day_order_count=day_order_count,
+    )
+
+
+def test_the_daily_order_count_cap_stops_the_batch_at_the_configured_limit():
+    """Twelve placeable candidates, cap of 8, dollar headroom to spare: exactly
+    8 are planned and the rest are skipped for the count, not the notional."""
+    plan = dca_runner.plan_orders(_count_cap_cands(12), _count_cap_snapshot(0), _count_cap_tier())
+    assert len(plan.to_place) == dca_runner.MAX_ORDERS_PER_DAY == 8
+    assert len(plan.skipped) == 4
+    assert {reason for _, reason in plan.skipped} == {dca_runner.SKIPPED_DAILY_ORDER_COUNT_CAP}
+
+
+def test_the_daily_order_count_cap_counts_orders_already_placed_today():
+    """The cap is shared across the whole day, not per run: six orders already
+    submitted leaves room for two, whoever placed them."""
+    plan = dca_runner.plan_orders(_count_cap_cands(5), _count_cap_snapshot(6), _count_cap_tier())
+    assert len(plan.to_place) == 2
+    assert {reason for _, reason in plan.skipped} == {dca_runner.SKIPPED_DAILY_ORDER_COUNT_CAP}
+
+
+def test_the_daily_order_count_cap_places_nothing_once_the_day_is_full():
+    plan = dca_runner.plan_orders(_count_cap_cands(3), _count_cap_snapshot(8), _count_cap_tier())
+    assert plan.to_place == []
+    assert len(plan.skipped) == 3
+
+
+def test_the_daily_order_count_cap_is_changeable(monkeypatch):
+    """The limit is a config number, not a constant baked into the planner."""
+    monkeypatch.setattr(dca_runner, "MAX_ORDERS_PER_DAY", 3)
+    assert len(dca_runner.plan_orders(
+        _count_cap_cands(9), _count_cap_snapshot(0), _count_cap_tier()).to_place) == 3
+    monkeypatch.setattr(dca_runner, "MAX_ORDERS_PER_DAY", 20)
+    assert len(dca_runner.plan_orders(
+        _count_cap_cands(9), _count_cap_snapshot(0), _count_cap_tier()).to_place) == 9
+
+
+def test_the_dollar_caps_still_bind_independently_of_the_count_cap():
+    """The count cap is additional to the daily notional cap, not a replacement:
+    a day under 8 orders but at its dollar ceiling still stops."""
+    snapshot = _count_cap_snapshot(0, day_notional_usd=179.0)
+    plan = dca_runner.plan_orders(_count_cap_cands(3), snapshot, _count_cap_tier())
+    assert plan.to_place == []
+    assert dca_runner.SKIPPED_DAILY_CAP in {reason for _, reason in plan.skipped}
+
+
+def test_budget_snapshot_counts_todays_buy_attempts_including_dead_ones():
+    """A cancelled or rejected buy still consumed one of the day's orders."""
+    day = date(2026, 8, 4)
+    orders = [
+        dca_runner.BrokerOrder(
+            symbol="AAPL", side="buy", dollar_amount=2.0,
+            created_at=datetime(2026, 8, 4, 14, 0, tzinfo=timezone.utc), state="filled"),
+        dca_runner.BrokerOrder(
+            symbol="MSFT", side="buy", dollar_amount=2.0,
+            created_at=datetime(2026, 8, 4, 15, 0, tzinfo=timezone.utc), state="cancelled"),
+        dca_runner.BrokerOrder(  # a different day, must not count
+            symbol="AMD", side="buy", dollar_amount=2.0,
+            created_at=datetime(2026, 8, 3, 15, 0, tzinfo=timezone.utc), state="filled"),
+    ]
+    assert dca_runner.budget_snapshot(orders, day).day_order_count == 2
+
+
+def test_a_same_day_repeat_is_not_refused_when_first_slot_wins_is_off(monkeypatch):
+    """With one_order_per_ticker_per_day false, assess() must leave the ticker
+    alone so scripts/same_day_top_up_gate.py can size the top-up. If assess()
+    also refused it, the top-up path could never execute."""
+    monkeypatch.setattr(dca_runner, "ONE_ORDER_PER_TICKER_PER_DAY", False)
+    prior = dca_runner.BrokerOrder(
+        symbol="AAPL", side="buy", dollar_amount=2.0,
+        created_at=datetime(2026, 7, 28, 13, 40, tzinfo=timezone.utc), state="filled")
+    # A later slot, so the 09:40 ET prior buy sits OUTSIDE this slot's own
+    # sole-executor window and Gate 4 does not (correctly) abort on it first.
+    r = dca_runner.assess(**_clean_kwargs(
+        slot_id="1030",
+        now=datetime(2026, 7, 28, 10, 43, 14, tzinfo=ET),
+        orders=[prior],
+        candidates=[("AAPL", 2.0, 1.0)],
+    ))
+    assert r["verdict"] == "PROCEED"
+    assert [o["ticker"] for o in r["plan"]["to_place"]] == ["AAPL"]
+    assert not any(reason == dca_runner.REFUSED_ALREADY_BOUGHT_TODAY
+                   for _, reason in r["plan"]["refused"])
+
+
+def test_assess_reports_the_count_cap_and_the_ticker_rule_in_its_verdict():
+    """Both knobs are visible in the run evidence, so a report can show which
+    limit was in force without anyone re-reading config."""
+    r = dca_runner.assess(**_clean_kwargs())
+    assert r["budget"]["max_orders_per_day"] == dca_runner.MAX_ORDERS_PER_DAY
+    assert r["budget"]["one_order_per_ticker_per_day"] is False
+    assert r["budget"]["day_order_count"] == 0

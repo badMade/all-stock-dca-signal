@@ -218,6 +218,18 @@ def load_budgets(config_dir: Path) -> Dict[str, Any]:
         if not (math.isfinite(max_per_order) and max_per_order > 0):
             raise ValueError(f"max_per_order_usd must be a finite positive number, got {max_per_order}")
         out["max_per_order_usd"] = max_per_order
+    if isinstance(circuit_breakers, dict) and "max_orders_per_day" in circuit_breakers:
+        # Shared daily order-count circuit breaker (StrategyConfig.max_orders_per_day,
+        # enforced by near_close_dca.within_caps): the one gate every scheduled
+        # slot and manual run actually places orders through. A bool/non-int/
+        # non-positive value is refused rather than silently defaulting to
+        # uncapped -- this is exactly the kind of limit that should stop
+        # binding loudly, not quietly (Codex review: "Apply the order-count
+        # cap to every live placement path").
+        max_orders = circuit_breakers["max_orders_per_day"]
+        if isinstance(max_orders, bool) or not isinstance(max_orders, int) or max_orders <= 0:
+            raise ValueError(f"max_orders_per_day must be a positive integer, got {max_orders!r}")
+        out["max_orders_per_day"] = max_orders
     # order_rules.one_order_per_ticker_per_day is intentionally NOT overlaid here.
     # StrategyConfig.one_order_per_ticker_per_day defaults to False specifically to
     # preserve the legacy manual-morning -> scheduled-afternoon lower-price top-up

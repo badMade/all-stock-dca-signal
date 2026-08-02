@@ -2689,6 +2689,70 @@ def test_refresh_fills_from_broker(tmp_path):
     assert fills[0]["fill_price"] == 100.0
 
 
+def test_refresh_fills_from_broker_recovers_a_filled_row_missing_execution_details(tmp_path):
+    """A row marked status='filled' in orders.csv but still missing
+    avg_fill_price/quantity_filled is excluded from _fills_from_orders_csv's
+    own result (its data is not yet usable) -- so _refresh_fills_from_broker
+    must NOT also treat the bare 'filled' status as already-known and skip
+    re-querying it, or the order can never be recovered even once
+    get_order_fill() has complete data, and a real fill permanently reports
+    as an execution gap (Codex review: "Refresh filled rows whose execution
+    details are missing")."""
+    from near_close_dca import OrderFill
+    from run_dca import _fills_from_orders_csv, _refresh_fills_from_broker
+
+    csv_path = tmp_path / "orders.csv"
+    csv_path.write_text(
+        "ticker,status,order_id,avg_fill_price,quantity_filled\n"
+        "AAPL,filled,O1,,\n",
+        encoding="utf-8",
+    )
+
+    initial_fills = _fills_from_orders_csv(csv_path)
+    assert initial_fills == []  # excluded: incomplete execution data
+
+    class _Broker:
+        def get_order_fill(self, order_id):
+            assert order_id == "O1"
+            return OrderFill(avg_fill_price=101.5, quantity_filled=0.3)
+
+    fills = _refresh_fills_from_broker(csv_path, _Broker(), initial_fills)
+    assert len(fills) == 1
+    assert fills[0]["ticker"] == "AAPL"
+    assert fills[0]["order_id"] == "O1"
+    assert fills[0]["fill_price"] == 101.5
+    assert fills[0]["filled_qty"] == 0.3
+
+
+def test_refresh_fills_from_broker_skips_a_genuinely_complete_filled_row(tmp_path):
+    """A row already carrying a complete fill (status='filled' plus a usable
+    avg_fill_price/quantity_filled) must still be treated as already known --
+    the fix for the incomplete case must not turn every filled row into a
+    redundant broker re-query."""
+    from run_dca import _fills_from_orders_csv, _refresh_fills_from_broker
+
+    csv_path = tmp_path / "orders.csv"
+    csv_path.write_text(
+        "ticker,status,order_id,avg_fill_price,quantity_filled\n"
+        "AAPL,filled,O1,100.0,0.5\n",
+        encoding="utf-8",
+    )
+
+    initial_fills = _fills_from_orders_csv(csv_path)
+    assert len(initial_fills) == 1
+
+    calls = []
+
+    class _Broker:
+        def get_order_fill(self, order_id):
+            calls.append(order_id)
+            raise AssertionError("must not re-query an already-complete fill")
+
+    fills = _refresh_fills_from_broker(csv_path, _Broker(), initial_fills)
+    assert calls == []
+    assert fills == initial_fills
+
+
 def test_refresh_fills_from_broker_dedupes_and_preserves_order(tmp_path):
     import threading
     import time as time_module
@@ -2884,7 +2948,11 @@ def test_run_slot_raw_persistence_failure_preserves_the_slots_own_identity(tmp_p
     the afternoon (15:30, cron_id 10ce362c) scheduled run either --
     raw_persistence_failure_run_state is the OTHER early-exit builder that
     must thread classification_overrides/correlation_id (Codex review:
-    "Preserve slot identity on early failure artifacts")."""
+    "Preserve slot identity on early failure artifacts"). Exercises this on
+    the 10:30 slot specifically, so a same-day 9:45 preflight artifact must
+    be present -- otherwise run_slot's own preflight gate now blocks the run
+    before reaching raw persistence at all (Codex review: "Persist a missing
+    preflight as a blocked morning run")."""
     import json
 
     import run_dca as run_dca_module
@@ -2902,6 +2970,28 @@ def test_run_slot_raw_persistence_failure_preserves_the_slots_own_identity(tmp_p
         pass
 
     config = _demo_config()
+    cron_tracking_root = tmp_path / "cron_tracking"
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(cron_tracking_root))
+    preflight_dir = cron_tracking_root / "morning_dca_preflight" / "20260706_0945ET"
+    preflight_dir.mkdir(parents=True)
+    (preflight_dir / "run_state.json").write_text(
+        json.dumps({
+            "run_id": "morning_preflight_20260706",
+            "trading_day": "2026-07-06",
+            "overall_ok": True,
+            "run_classification": {
+                "run_origin": "scheduled",
+                "manual_run": False,
+                "stream": "morning",
+                "run_type": "morning_dca_preflight",
+                "state_schema_version": "morning-preflight-v2-machine-complete",
+            },
+            "per_ticker_eligibility": [
+                {"symbol": t, "eligible_to_execute": True} for t in config.tickers
+            ],
+        }),
+        encoding="utf-8",
+    )
     result = run_slot(
         "1030ET",
         now=_now_for_slot("1030ET"),
@@ -4347,7 +4437,15 @@ def test_run_slot_1030et_blocks_the_universe_when_no_preflight_artifact_exists(t
     evidence (Codex review: "Route the morning slot through its required
     preflight gate"). Routed only through the generic afternoon-shaped
     pipeline, run_slot("1030ET") never called MorningDCAExecutor's preflight
-    gate at all -- this is the regression test for that gap."""
+    gate at all -- this is the regression test for that gap.
+
+    A reduced-to-zero universe is not enough on its own: a run that merely
+    evaluates zero candidates reports completion_reason='no_ladder_candidates'
+    -- a normal, healthy no-op -- which a watchdog cannot distinguish from a
+    missing prerequisite. This must instead route through the same
+    blocked-run-stub contract config/morning_dca.json requires of
+    MorningDCAExecutor._apply_preflight_gate() (Codex review: "Persist a
+    missing preflight as a blocked morning run")."""
     import json
 
     from run_dca import run_slot
@@ -4366,6 +4464,7 @@ def test_run_slot_1030et_blocks_the_universe_when_no_preflight_artifact_exists(t
         broker=build_broker(config),
         artifacts_dir=tmp_path / "artifacts",
     )
+    assert result["blocked"] is True
     run_state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
     assert run_state["counts"]["evaluated"] == 0
     assert run_state["buy_candidates"] == []
@@ -4376,7 +4475,6 @@ def test_run_slot_1030et_blocks_the_universe_when_no_preflight_artifact_exists(t
     # hide a failed safety prerequisite from failure/watchdog reporting
     # entirely (Codex review: "Persist a blocked state when morning preflight
     # is missing", "Classify missing preflight as a startup failure").
-    assert result["blocked"] is True
     assert result["error_class"] == "scheduled_run_blocked_before_placement"
     assert run_state["run_classification_outcome"] == "failed_scheduled_run_startup"
     assert run_state["error_class"] == "scheduled_run_blocked_before_placement"

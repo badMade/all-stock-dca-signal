@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import sys
 from datetime import date
 from unittest import mock
@@ -23,6 +24,7 @@ from dca_risk import (
     deployed_usd,
     is_afternoon_scheduled_evidence,
     kill_switch_active,
+    main,
     rolling_cash_burn,
     seven_day_deployed,
 )
@@ -547,3 +549,69 @@ def test_deployed_usd_invalid_budget():
 
     state_no_budget = {}
     assert deployed_usd(state_no_budget) == 0.0
+
+
+# --- CLI: main() -------------------------------------------------------------
+#
+# Every case above exercises the report/guard functions directly; nothing
+# exercised the CLI entrypoint an operator or scheduled task actually runs.
+
+
+def test_main_prints_report_for_a_populated_state_root(tmp_path, capsys):
+    root = tmp_path / "scheduled_runs"
+    run_dir = root / "20260707_1520ET"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps(_scheduled_state("2026-07-07", 500.0)), encoding="utf-8"
+    )
+
+    rc = main(["--state-root", str(root), "--as-of", "2026-07-08"])
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["deployed_last_7d_usd_by_stream"][STREAM_SCHEDULED] == 500.0
+
+
+def test_main_on_a_missing_state_root_reports_zero_deployment(tmp_path, capsys):
+    """find_run_state_files treats a missing root as empty, not an error."""
+    rc = main(["--state-root", str(tmp_path / "does-not-exist"), "--as-of", "2026-07-08"])
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["scheduled_live"]["kill_switch_engaged"] is False
+
+
+def test_main_honors_monthly_allocation_and_kill_switch_fraction_overrides(tmp_path, capsys):
+    root = tmp_path / "scheduled_runs"
+    run_dir = root / "20260707_1520ET"
+    run_dir.mkdir(parents=True)
+    # $500 deployed; with a tiny override allocation and a low fraction, the
+    # kill-switch must engage even though the default config would not trip.
+    (run_dir / "run_state.json").write_text(
+        json.dumps(_scheduled_state("2026-07-07", 500.0)), encoding="utf-8"
+    )
+
+    rc = main(
+        [
+            "--state-root",
+            str(root),
+            "--as-of",
+            "2026-07-08",
+            "--monthly-allocation-usd",
+            "1000",
+            "--kill-switch-fraction",
+            "0.10",
+        ]
+    )
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["scheduled_live"]["kill_switch_engaged"] is True
+
+
+def test_main_defaults_as_of_to_today(tmp_path, capsys):
+    """Omitting --as-of must not crash; it defaults to today's date."""
+    rc = main(["--state-root", str(tmp_path / "does-not-exist")])
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["scheduled_live"]["kill_switch_engaged"] is False

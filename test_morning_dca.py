@@ -34,7 +34,7 @@ from pathlib import Path
 import pytest
 
 from dca_config import MissingConfigEnvError
-from dca_paths import BUNDLED_CRON_TRACKING_ROOT, CRON_TRACKING_ROOT_ENV
+from dca_paths import CRON_TRACKING_ROOT_ENV
 from morning_dca import (
     DEFAULT_MORNING_LIVE_STATE_ROOT,
     DEFAULT_MORNING_PREFLIGHT_STATE_ROOT,
@@ -7382,7 +7382,7 @@ def test_cap_seeding_default_scan_roots_are_resolved_at_call_time():
     # DEFAULT_AFTERNOON_TASK_ROOT is untouched by the override -- it is still
     # used elsewhere (e.g. test_dca_paths.py's byte-identical-defaults pin),
     # which is exactly why _compute_top_up naming it directly was wrong.
-    assert stale_import_time_constant == f"{BUNDLED_CRON_TRACKING_ROOT}/ce16ba6b", out.stdout
+    assert stale_import_time_constant == str(REPO_ROOT / "cron_tracking" / "ce16ba6b"), out.stdout
 
 
 def test_the_config_missing_fallback_resolves_the_live_account_at_call_time():

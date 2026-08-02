@@ -937,8 +937,17 @@ def _refresh_fills_from_broker(
     """Re-query the broker for submitted-but-unfilled orders and append any fresh fills.
 
     The immediate post-trade fill lookup can miss a fill that settles moments later; by the
-    3:45 reporting step it is available. Only orders not already recorded as filled are
-    re-queried, and lookup failures are swallowed so reporting never crashes.
+    3:45 reporting step it is available. Only orders not already recorded with a COMPLETE
+    fill (status='filled' AND a usable avg_fill_price/quantity_filled) are re-queried, and
+    lookup failures are swallowed so reporting never crashes.
+
+    A row whose CSV status is already 'filled' but whose avg_fill_price/quantity_filled is
+    still blank is NOT treated as already known: ``_fills_from_orders_csv`` excludes such a
+    row from ``fills`` for exactly this reason (its data is not yet usable), so skipping it
+    here too -- solely because the status column says 'filled' -- would make it permanently
+    unrecoverable: never counted as a fill, and never re-queried once ``get_order_fill()``
+    actually has complete data (Codex review: "Refresh filled rows whose execution details
+    are missing").
 
     Lookups run concurrently only when ``broker.supports_concurrent_fill_lookup`` is
     ``True``. ``get_order_fill`` is commonly a thin wrapper around a scheduler-owned MCP
@@ -955,10 +964,14 @@ def _refresh_fills_from_broker(
     with orders_csv.open(newline="", encoding="utf-8") as handle:
         for row in csv.DictReader(handle):
             order_id = row.get("order_id")
+            status = (row.get("status") or "").lower()
+            fill_price = (row.get("avg_fill_price") or "").strip()
+            filled_qty = (row.get("quantity_filled") or "").strip()
+            has_complete_fill_data = fill_price not in ("", "-") and filled_qty not in ("", "-")
             if (
                 not order_id
                 or order_id in known
-                or (row.get("status") or "").lower() == "filled"
+                or (status == "filled" and has_complete_fill_data)
             ):
                 continue
             # Deduplicate locally before fetching, regardless of lookup outcome, so a CSV

@@ -108,8 +108,6 @@ from run_classification import (  # noqa: E402
     write_run_artifacts,
 )
 
-from dca_paths import BUNDLED_CRON_TRACKING_ROOT  # noqa: E402
-
 TRADING_DAY = "2026-07-06"
 
 
@@ -4506,7 +4504,7 @@ def test_state_root_and_cron_tracking_root_resolve_at_call_time():
     assert lines[0] == "/srv/run-classification-probe/ce16ba6b", out.stdout
     assert lines[1] == "/srv/run-classification-probe", out.stdout
     # STATE_ROOT itself is untouched by the override -- it is still an
-    # import-time constant bound to the bundled production default (unset
-    # $DCA_CRON_TRACKING_ROOT at import time) -- which is exactly why
-    # state_root() naming it directly was wrong.
-    assert lines[2] == f"{BUNDLED_CRON_TRACKING_ROOT}/ce16ba6b", out.stdout
+    # import-time constant used elsewhere (e.g. its own module docstring
+    # references) -- which is exactly why state_root() naming it directly
+    # was wrong.
+    assert lines[2] == str(Path(__file__).resolve().parents[2] / "cron_tracking" / "ce16ba6b"), out.stdout

@@ -98,6 +98,7 @@ __all__ = [
     "SKIPPED_DAILY_CAP",
     "SKIPPED_WEEKLY_CAP",
     "SKIPPED_INSUFFICIENT_BUYING_POWER",
+    "SKIPPED_DAILY_ORDER_COUNT_CAP",
     "assess",
     "load_strategy_state",
     "save_strategy_state",
@@ -188,6 +189,7 @@ REFUSED_NON_CENT_AMOUNT = "non_cent_amount"
 SKIPPED_DAILY_CAP = "daily_cap_reached"
 SKIPPED_WEEKLY_CAP = "weekly_cap_reached"
 SKIPPED_INSUFFICIENT_BUYING_POWER = "insufficient_buying_power"
+SKIPPED_DAILY_ORDER_COUNT_CAP = "daily_order_count_cap_reached"
 
 
 class CalendarCoverageError(RuntimeError):
@@ -1023,6 +1025,12 @@ class BudgetSnapshot:
     day: date
     day_notional_usd: float
     week_notional_usd: float
+    # Buy ATTEMPTS already submitted for ``day`` across all seven slots and
+    # manual buying. Counts cancelled/rejected attempts too (is_buy_attempt,
+    # not counts_toward_budget): an attempt consumed one of the day's orders
+    # whether or not it filled, and over-counting is the safe direction for a
+    # cap. Defaults to 0 so existing direct constructions keep working.
+    day_order_count: int = 0
 
 
 def _committed_dollar_amount(order: BrokerOrder) -> float:
@@ -1119,7 +1127,17 @@ def budget_snapshot(orders, day: date) -> BudgetSnapshot:
             f"{day.isoformat()} overflowed to a non-finite value ({week_total!r}); true "
             "spend is unknown, refusing to treat it as usable"
         )
-    return BudgetSnapshot(day=day, day_notional_usd=day_total, week_notional_usd=week_total)
+    day_order_count = sum(
+        1
+        for order in orders
+        if order.is_buy_attempt and _require_aware(order.created_at).astimezone(ET).date() == day
+    )
+    return BudgetSnapshot(
+        day=day,
+        day_notional_usd=day_total,
+        week_notional_usd=week_total,
+        day_order_count=day_order_count,
+    )
 
 
 @dataclass(frozen=True)
@@ -1923,7 +1941,14 @@ def plan_orders(
         seen.add(ticker)
 
         prospective = running + cand.amount_usd
-        if snapshot.day_notional_usd + prospective > tier.daily_cap_usd:
+        # Order-count cap, config/budgets.json circuit_breakers.max_orders_per_day.
+        # Checked FIRST: it is an absolute count ceiling independent of notional,
+        # so a day already at the cap must stop the batch even when dollar
+        # headroom remains. Like the dollar caps it stops rather than back-fills,
+        # so the cap cannot depend on candidate ordering.
+        if snapshot.day_order_count + len(plan.to_place) + 1 > MAX_ORDERS_PER_DAY:
+            stop_reason = SKIPPED_DAILY_ORDER_COUNT_CAP
+        elif snapshot.day_notional_usd + prospective > tier.daily_cap_usd:
             stop_reason = SKIPPED_DAILY_CAP
         elif snapshot.week_notional_usd + prospective > effective_weekly_cap:
             stop_reason = SKIPPED_WEEKLY_CAP
@@ -4164,10 +4189,21 @@ def assess(
             "ABORT",
             f"broker order history contains a malformed symbol: {type(exc).__name__}",
         )
-    already_bought_refusals = [
-        (c.ticker, REFUSED_ALREADY_BOUGHT_TODAY) for c in cands if c.ticker in bought_today
-    ]
-    fresh_cands = [c for c in cands if c.ticker not in bought_today]
+    # Whether a same-day repeat is refused outright is a CONFIG decision, not a
+    # hardcoded one: config/budgets.json order_rules.one_order_per_ticker_per_day.
+    # True  -> first slot to buy a ticker wins it for the day (original behaviour).
+    # False -> same_day_top_up_policy governs instead, and the resize decision
+    #          belongs to scripts/same_day_top_up_gate.py, which the prompts run
+    #          separately. assess() must NOT also refuse the ticker here, or the
+    #          top-up path could never execute.
+    if ONE_ORDER_PER_TICKER_PER_DAY:
+        already_bought_refusals = [
+            (c.ticker, REFUSED_ALREADY_BOUGHT_TODAY) for c in cands if c.ticker in bought_today
+        ]
+        fresh_cands = [c for c in cands if c.ticker not in bought_today]
+    else:
+        already_bought_refusals = []
+        fresh_cands = list(cands)
 
     _valid_cands, planned_spend, high_mult = _tier_selection_inputs(fresh_cands)
     tier = select_budget_tier(planned_spend, high_mult)
@@ -4205,6 +4241,9 @@ def assess(
             "tier": tier.name,
             "daily_cap_usd": tier.daily_cap_usd,
             "weekly_cap_usd": effective_weekly_cap,
+            "day_order_count": snapshot.day_order_count,
+            "max_orders_per_day": MAX_ORDERS_PER_DAY,
+            "one_order_per_ticker_per_day": ONE_ORDER_PER_TICKER_PER_DAY,
         },
         plan={
             "to_place": [
@@ -4386,6 +4425,59 @@ def _validate_budget_tiers_against_config() -> None:
                     f"{TIER_SPEND_THRESHOLDS_USD[i]!r}, "
                     f"signals={TIER_HIGH_MULTIPLIER_SIGNAL_THRESHOLDS[i]!r})"
                 )
+
+
+def _load_max_orders_per_day() -> int:
+    """Read circuit_breakers.max_orders_per_day from config/budgets.json.
+
+    THE single knob for how many orders a day the roster may place, shared
+    across all seven slots and manual buying. Change that one number to raise
+    or lower the limit; no code edit is needed.
+
+    Fails closed: a missing, non-integer, boolean, or non-positive value raises
+    rather than defaulting, because a silently-defaulted count ceiling is
+    exactly the kind of limit that stops binding without anyone noticing.
+    """
+    breakers = _read_config("budgets.json")["circuit_breakers"]
+    try:
+        value = breakers["max_orders_per_day"]
+    except KeyError:
+        raise ValueError(
+            "config/budgets.json circuit_breakers.max_orders_per_day is missing; "
+            "it is a required safety limit and has no default"
+        ) from None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            "config/budgets.json circuit_breakers.max_orders_per_day must be an "
+            f"integer, got {value!r}"
+        )
+    if value < 1:
+        raise ValueError(
+            "config/budgets.json circuit_breakers.max_orders_per_day must be >= 1, "
+            f"got {value!r}"
+        )
+    return value
+
+
+def _load_one_order_per_ticker_per_day() -> bool:
+    """Read order_rules.one_order_per_ticker_per_day from config/budgets.json."""
+    rules = _read_config("budgets.json")["order_rules"]
+    try:
+        value = rules["one_order_per_ticker_per_day"]
+    except KeyError:
+        raise ValueError(
+            "config/budgets.json order_rules.one_order_per_ticker_per_day is missing"
+        ) from None
+    if not isinstance(value, bool):
+        raise ValueError(
+            "config/budgets.json order_rules.one_order_per_ticker_per_day must be a "
+            f"boolean, got {value!r}"
+        )
+    return value
+
+
+MAX_ORDERS_PER_DAY = _load_max_orders_per_day()
+ONE_ORDER_PER_TICKER_PER_DAY = _load_one_order_per_ticker_per_day()
 
 
 _validate_budget_tiers_against_config()

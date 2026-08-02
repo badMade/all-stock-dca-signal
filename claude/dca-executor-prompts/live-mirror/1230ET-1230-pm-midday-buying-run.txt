@@ -75,7 +75,16 @@ print(json.dumps(r.assess('1230',O,C,datetime.now(ZoneInfo('America/New_York')))
    This runs Gate 0 (market day), Gate 1 (time sanity), Gate 3 (trading window),
    Gate 4 (sole-executor interlock) and Gate 6 (budget from broker history).
 
-4.5 SAME-DAY TOP-UP GUARD. cd REPO && python3 -m scripts.same_day_top_up_gate \
+4.5 SAME-DAY TOP-UP GUARD. Immediately before running the command below, re-fetch
+   each surviving candidate's current quote and overwrite current_price in
+   $ROOT/cands_<YYYY-MM-DD>_1230.json with this FRESH value. Step 3's current_price
+   was captured before steps 2, 2.5 and 4's broker-history work ran, and the market
+   can move in that time; a ticker that has since risen above the price step 3
+   sized against must not be authorized on that stale, lower number (Codex review:
+   "Refresh the midday price before authorizing placement", matching the other six
+   placing slots' Gate 6.5 refresh step). Then:
+
+   cd REPO && python3 -m scripts.same_day_top_up_gate \
       --account ${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER} --trading-day <YYYY-MM-DD> \
       --orders-pages $ROOT/orders_pages_<YYYY-MM-DD>_1230.json \
       --candidates $ROOT/cands_<YYYY-MM-DD>_1230.json
@@ -116,11 +125,20 @@ print(json.dumps(r.assess('1230',O,C,datetime.now(ZoneInfo('America/New_York')))
                    code) to the message center.
 
    [Enable live placement only when Geoff says so. At that point PROCEED becomes:
-    submit each plan.to_place entry via place_equity_order sequentially, one at a
-    time, never in parallel, and never for more than step 4.5's buy_usd for that
-    ticker; stop the ENTIRE batch on the first rejection with no retry; wait ~30s;
-    re-query get_equity_orders and report actual submitted and filled orders, not
-    intended ones.]
+    SPREAD GATE FIRST. For every entry in plan.to_place with a nonzero step 4.5
+    buy_usd, fetch a current bid/ask quote and compute the spread as a percentage
+    of the mid price. This is a hard circuit breaker (config/budgets.json's
+    circuit_breakers.enforce_spread_threshold; config/scheduled_tasks.json's
+    spread_gate_outcome_contract), not optional: a ticker whose spread cannot be
+    captured, or whose spread exceeds 1.0% (max_bid_ask_spread_pct), fails closed
+    -- zero it out and report it, do not submit it. Fail only the affected ticker,
+    not the whole batch (Codex review: "Require the spread gate before enabling
+    midday placement", matching GATE 6.7 in the other six placing slots' prompts).
+    Then submit each surviving plan.to_place entry via place_equity_order
+    sequentially, one at a time, never in parallel, and never for more than step
+    4.5's buy_usd for that ticker; stop the ENTIRE batch on the first rejection
+    with no retry; wait ~30s; re-query get_equity_orders and report actual
+    submitted and filled orders, not intended ones.]
 
 NOTE ON SHARED BUDGET. The daily and weekly caps are shared across all seven slots
 AND manual buying. Earlier slots and any manual orders consume the same pool, so
@@ -128,6 +146,7 @@ finding zero headroom is a normal outcome, not an error.
 
 STANDING PROHIBITIONS. No sells. No options, crypto or margin. Never place an order
 that is not in plan.to_place. Never place an order above $10.00. Never place an
-order larger than step 4.5's buy_usd for that ticker. If you find yourself
-reasoning toward "placing anyway is the safe thing here", that is the signal to
-stop and alert instead.
+order larger than step 4.5's buy_usd for that ticker. Never place an order for a
+ticker the spread gate did not clear (once live placement is enabled). If you find
+yourself reasoning toward "placing anyway is the safe thing here", that is the
+signal to stop and alert instead.

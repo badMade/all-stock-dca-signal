@@ -46,25 +46,23 @@ time -- so this module recomputes just that one field per ticker before
 handing it to the decision function (Codex review: "Compare against the most
 recent valid reference price").
 
-KNOWN LIMITATION: reference price is broker average_price only. That same
-``reference_price_preference`` config also documents a fuller preference --
-logged ``target_price``, then ``decision_price``, and only then
-``average_fill_price`` -- read from a prior run's own artifacts (see
-``scripts.run_classification._PRICE_COLS``). This module cannot honor that
-fuller chain: it is deliberately stateless and broker-only (see WHAT THIS IS
-FOR above), and a raw broker order carries no logged target/decision price,
-only what was actually filled at (``normalize_order``'s ``average_price``).
-Recovering target/decision price would mean reading the same per-run
-artifacts whose absence this module exists to tolerate, reintroducing the
-exact fragility (a missing/unreachable state root read as "nothing to
-recover") this replacement was built to remove. Using the confirmed fill
-price is therefore a real, deliberate trade-off, not an oversight: it can be
-either more or less permissive than the full chain depending on whether a
-given fill happened to slip above or below its original target (Codex
-review: "Preserve the configured reference-price preference" -- flagged and
-accepted as a known gap rather than silently resolved either direction,
-since reintroducing artifact reads or making this gate permanently unable to
-authorize an automatic top-up both carry their own risk to a live strategy).
+That recomputed value is still only the average FILL price, never the
+documented preference's higher tiers (logged ``target_price``/
+``decision_price``) -- this gate has no artifact access to them. A buy that
+filled above its own decision price (the common direction for a market
+order) inflates the reference, which can wrongly authorize a top-up whose
+decision price sits between the true reference and the inflated one (Codex
+review: "Compare top-ups against the configured reference price"). Recovering
+target/decision price by reading a prior run's own artifacts would reintroduce
+the exact fragility (a missing/unreachable state root read as "nothing to
+recover") this replacement was built to remove -- so instead, a candidate may
+supply ``prior_logged_reference_price`` to override the fill-price fallback
+with the true logged reference WHEN THE CALLER ALREADY HAS IT (e.g. from its
+own or an earlier slot's orders.csv/run_state.json), without this gate ever
+reading an artifact itself or treating one's absence as "no prior exists";
+see ``evaluate_slot``'s docstring. Omitted, the gate still falls back to the
+broker-observed fill price, matching the documented preference's own
+last-resort tier.
 
 It also does not decide share-class equivalence. ``GOOG`` and ``GOOGL`` are
 scored as independent tickers here, exactly as ``config/tickers.json`` lists
@@ -111,6 +109,7 @@ import argparse
 import json
 import sys
 from dataclasses import replace
+from decimal import ROUND_DOWN, Decimal
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from scripts.broker_reconciliation import (
@@ -239,7 +238,9 @@ def _most_recent_reference_price(orders: Sequence[BrokerOrder]) -> Optional[floa
     against $100 and wrongly authorize a top-up (Codex review: "Fail closed
     when fill chronology is unavailable").
     """
-    latest_created_at: Optional[str] = None
+    from datetime import datetime, timezone
+
+    latest_created_at: Optional[datetime] = None
     latest_price: Optional[float] = None
     for order in orders:
         if order.side == "sell":
@@ -248,9 +249,16 @@ def _most_recent_reference_price(orders: Sequence[BrokerOrder]) -> Optional[floa
             continue
         if order.reference_price is None:
             return None
-        created_at = order.created_at
-        if not created_at:
+        created_at_raw = order.created_at
+        if not created_at_raw:
             return None
+        try:
+            created_at = datetime.fromisoformat(created_at_raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if created_at.tzinfo is None:
+            return None
+        created_at = created_at.astimezone(timezone.utc)
         if latest_created_at is None or created_at >= latest_created_at:
             latest_created_at = created_at
             latest_price = order.reference_price
@@ -270,6 +278,21 @@ def evaluate_slot(
     and one entry per candidate carrying ``buy_usd`` -- the amount the policy
     authorizes, which may be the full desired amount (first allocation today),
     a strictly smaller top-up, or $0.
+
+    A candidate may optionally carry ``prior_logged_reference_price``: the
+    prior same-day buy's own logged ``target_price``/``decision_price`` for
+    this ticker (config/scheduled_tasks.json's ``reference_price_preference``
+    puts both ahead of ``average_fill_price``). This gate has no artifact
+    access of its own -- ``BrokerOrder.reference_price`` is always the
+    average FILL price -- so without this override, a buy that filled above
+    its own decision price (the common direction for a market order) makes
+    the comparison too permissive: a later decision above the true prior
+    reference but still below the inflated fill-price reference wrongly
+    authorizes a top-up (Codex review: "Compare top-ups against the
+    configured reference price"). A caller that has the logged reference
+    (e.g. from its own or an earlier slot's orders.csv/run_state.json) should
+    supply it; when omitted, this falls back to the broker-observed fill
+    price, matching the documented preference's own last-resort tier.
 
     Raises ``ValueError`` if ``account_number`` is empty: an order snapshot that
     is not pinned to the account being traded proves nothing about it.
@@ -324,7 +347,31 @@ def evaluate_slot(
                 coverage_complete=True,
             ),
         )
-        prior = replace(prior, reference_price=_most_recent_reference_price(orders_by_symbol.get(ticker, [])))
+        # Prefer the caller-supplied logged target_price/decision_price (the
+        # documented preference's first two tiers) over this stateless gate's
+        # own broker-fill-price fallback -- see this function's docstring.
+        logged_reference_price = _f(candidate.get("prior_logged_reference_price"))
+        if logged_reference_price is not None and logged_reference_price <= 0:
+            logged_reference_price = None
+        reference_price = logged_reference_price
+        if reference_price is None:
+            reference_price = _most_recent_reference_price(orders_by_symbol.get(ticker, []))
+        # Normalize effective_prior_usd to cents BEFORE it feeds the desired -
+        # prior subtraction below. Reconstructing dollars from cumulative_quantity
+        # * average_price (both broker-reported at share/price precision) lands a
+        # small fraction of a cent off the requested notional even for whole-cent
+        # fills -- e.g. three genuine $1.00 buys can reconstruct as
+        # $3.0000041175. buy_usd's ROUND_DOWN below is a hard ceiling with no
+        # tolerance, so that noise previously survived all the way to the final
+        # answer and turned an intended $2.00 top-up into $1.99 (Codex review:
+        # "Preserve exact cents when rounding the top-up delta"). Rounding here
+        # -- not just at display time -- keeps the value used for arithmetic and
+        # the value reported in effective_prior_usd consistent.
+        prior = replace(
+            prior,
+            reference_price=reference_price,
+            effective_prior_usd=round(prior.effective_prior_usd, 2),
+        )
         if current_price is None or current_price <= 0:
             # decide_effective_top_up (via incremental_top_up_amount) only
             # checks current_price AFTER finding a prior allocation --  a
@@ -352,6 +399,9 @@ def evaluate_slot(
             )
             continue
         decision = decide_effective_top_up(ticker, desired, prior, current_price)
+        buy_usd = float(
+            Decimal(str(decision.incremental_usd)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        )
         decisions.append(
             {
                 "ticker": ticker,
@@ -359,7 +409,7 @@ def evaluate_slot(
                 "current_price": current_price,
                 "effective_prior_usd": prior.effective_prior_usd,
                 "reference_price": prior.reference_price,
-                "buy_usd": round(decision.incremental_usd, 2),
+                "buy_usd": buy_usd,
                 "reason": decision.reason,
                 "manual_review": decision.reason in _MANUAL_REVIEW_REASONS,
             }
@@ -423,7 +473,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--candidates",
         required=True,
-        help='JSON file: array of {"ticker","desired_usd","current_price"}.',
+        help=(
+            'JSON file: array of {"ticker","desired_usd","current_price"}. '
+            'An entry may optionally carry "prior_logged_reference_price" -- '
+            "this ticker's prior same-day buy's logged target_price/"
+            "decision_price, when the caller has it -- to compare against "
+            "instead of this gate's own broker-fill-price fallback (see "
+            "evaluate_slot's docstring)."
+        ),
     )
     args = parser.parse_args(argv)
 

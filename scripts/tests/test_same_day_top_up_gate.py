@@ -174,8 +174,14 @@ def test_prior_exposure_accumulates_across_every_slot_not_just_the_last_one():
     ]
     r = _run(pages, [{"ticker": "TRIN", "desired_usd": 5.00, "current_price": 17.10}])
     d = _by_ticker(r)["TRIN"]
-    assert d["effective_prior_usd"] == pytest.approx(3.00, abs=0.01)
-    assert d["buy_usd"] == pytest.approx(2.00, abs=0.01)
+    # Exact, not approximate: effective_prior_usd is normalized to cents before
+    # the subtraction below, so three genuine $1.00 fills must present as
+    # exactly $3.00 -- not $3.0000041175, the raw cumulative_quantity *
+    # average_price reconstruction -- and the top-up as exactly $2.00, not
+    # $1.99 (Codex review: "Preserve exact cents when rounding the top-up
+    # delta").
+    assert d["effective_prior_usd"] == 3.00
+    assert d["buy_usd"] == 2.00
 
 
 def test_the_reference_price_is_the_lowest_same_day_fill_not_the_most_recent():
@@ -199,6 +205,100 @@ def test_the_reference_price_is_the_lowest_same_day_fill_not_the_most_recent():
     assert d["reference_price"] == pytest.approx(17.3199)
     assert d["buy_usd"] == pytest.approx(0.0)
     assert d["reason"] == NO_LOWER_PRICE
+
+
+# --- preferring the caller's logged target/decision price over the fill price -
+
+# config/scheduled_tasks.json -> same_day_top_up_policy.reference_price_preference:
+# "The prior same-day reference price is resolved in order: logged
+# target_price, then decision_price, then average_fill_price." This gate has
+# no artifact access of its own, so BrokerOrder.reference_price is always the
+# average FILL price -- which, on positive slippage, can be HIGHER than the
+# true logged reference and wrongly authorize a top-up above it (Codex
+# review: "Compare top-ups against the configured reference price").
+
+
+def test_without_a_logged_reference_positive_slippage_wrongly_permits_a_topup():
+    """Pins the KNOWN LIMITATION this gate has without the override below: a
+    prior decision at $100 that filled at $101 leaves this gate no way to
+    tell that a new $100.50 decision is actually above the true $100
+    reference, so it authorizes a top-up a target/decision-price comparison
+    would have blocked. This is exactly why a caller that has the logged
+    reference should supply prior_logged_reference_price (see the next
+    test) -- this test is not an endorsement of the fallback's precision."""
+    pages = [_page([_fill("o1", "TRIN", 1.00, 101.00, "2026-07-30T13:58:14Z")])]
+    r = _run(pages, [{"ticker": "TRIN", "desired_usd": 4.00, "current_price": 100.50}])
+    d = _by_ticker(r)["TRIN"]
+    assert d["reference_price"] == pytest.approx(101.00)
+    assert d["reason"] == EFFECTIVE_TOP_UP
+    assert d["buy_usd"] > 0
+
+
+def test_a_logged_reference_price_blocks_a_topup_the_fill_price_would_permit():
+    """The fix: when the caller supplies the ticker's actual logged
+    target_price/decision_price from the prior buy, this gate compares
+    against THAT instead of the inflated fill price, correctly blocking a
+    new decision that is above the true reference even though it is below
+    the fill price."""
+    pages = [_page([_fill("o1", "TRIN", 1.00, 101.00, "2026-07-30T13:58:14Z")])]
+    r = _run(
+        pages,
+        [
+            {
+                "ticker": "TRIN",
+                "desired_usd": 4.00,
+                "current_price": 100.50,
+                "prior_logged_reference_price": 100.00,
+            }
+        ],
+    )
+    d = _by_ticker(r)["TRIN"]
+    assert d["reference_price"] == pytest.approx(100.00)
+    assert d["buy_usd"] == pytest.approx(0.0)
+    assert d["reason"] == NO_LOWER_PRICE
+
+
+def test_a_logged_reference_price_still_permits_a_genuine_topup():
+    """The override is a straight substitution, not an extra restriction: a
+    decision genuinely below the logged reference is still authorized."""
+    pages = [_page([_fill("o1", "TRIN", 1.00, 101.00, "2026-07-30T13:58:14Z")])]
+    r = _run(
+        pages,
+        [
+            {
+                "ticker": "TRIN",
+                "desired_usd": 4.00,
+                "current_price": 99.00,
+                "prior_logged_reference_price": 100.00,
+            }
+        ],
+    )
+    d = _by_ticker(r)["TRIN"]
+    assert d["reference_price"] == pytest.approx(100.00)
+    assert d["buy_usd"] == pytest.approx(3.00, abs=0.01)
+    assert d["reason"] == EFFECTIVE_TOP_UP
+
+
+@pytest.mark.parametrize("bad_value", [0, -5.0, "not-a-number", None, float("nan")])
+def test_an_invalid_logged_reference_price_falls_back_to_the_fill_price(bad_value):
+    """A non-positive, non-numeric, or non-finite override must not silently
+    poison or corrupt the comparison -- it is simply ignored, falling back
+    to this gate's own broker-fill-price reference."""
+    pages = [_page([_fill("o1", "TRIN", 1.00, 17.5599, "2026-07-30T13:58:14Z")])]
+    r = _run(
+        pages,
+        [
+            {
+                "ticker": "TRIN",
+                "desired_usd": 4.00,
+                "current_price": 17.3199,
+                "prior_logged_reference_price": bad_value,
+            }
+        ],
+    )
+    d = _by_ticker(r)["TRIN"]
+    assert d["reference_price"] == pytest.approx(17.5599)
+    assert d["buy_usd"] == pytest.approx(3.00, abs=0.01)
 
 
 def test_goog_and_googl_are_scored_as_independent_tickers():
@@ -600,6 +700,166 @@ def test_a_pending_order_still_poisons_the_most_recent_reference():
 
 def _write_json(path, payload):
     path.write_text(json.dumps(payload), encoding="utf-8")
+    return str(path)
+
+
+def _pinned_pages(pages, *, account=ACCOUNT, day=DAY):
+    """The current --orders-pages contract: query metadata bound to the
+    saved evidence (see _bind_saved_pages / "Bind replayed pages to the
+    requested account and day"). A bare array is the pre-pinning shape and
+    is rejected -- see test_main_rejects_the_pre_pinning_bare_array_shape."""
+    return {"account_number": account, "trading_day": day, "pages": pages}
+
+
+# --- CLI: the exit code IS the safety contract --------------------------------
+#
+# evaluate_slot() is well covered above; nothing exercised main() itself before
+# this section, which means the part an executor prompt actually depends on --
+# "Exit status is 0 on PROCEED and 2 on ABORT" (module docstring) -- had no
+# regression protection. A `return 0` slipping into the ABORT branch would pass
+# every test above and still authorize a run that thinks the gate blocked it.
+
+
+def test_cli_exits_zero_and_prints_proceed_on_clean_history(tmp_path, capsys):
+    pages_path = _write_json(tmp_path / "pages.json", _pinned_pages([_page([])]))
+    candidates_path = _write_json(
+        tmp_path / "candidates.json", [{"ticker": "SPCX", "desired_usd": 1.00, "current_price": 112.10}]
+    )
+    rc = gate.main(
+        [
+            "--account",
+            ACCOUNT,
+            "--trading-day",
+            DAY,
+            "--orders-pages",
+            pages_path,
+            "--candidates",
+            candidates_path,
+        ]
+    )
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["verdict"] == "PROCEED"
+
+
+def test_cli_exits_two_and_prints_abort_on_incomplete_history(tmp_path, capsys):
+    pages_path = _write_json(tmp_path / "pages.json", _pinned_pages([]))
+    candidates_path = _write_json(
+        tmp_path / "candidates.json", [{"ticker": "TRIN", "desired_usd": 4.00, "current_price": 17.32}]
+    )
+    rc = gate.main(
+        [
+            "--account",
+            ACCOUNT,
+            "--trading-day",
+            DAY,
+            "--orders-pages",
+            pages_path,
+            "--candidates",
+            candidates_path,
+        ]
+    )
+    assert rc == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["verdict"] == "ABORT"
+    assert out["reason"] == BROKER_HISTORY_INCOMPLETE
+    assert all(d["buy_usd"] == 0.0 for d in out["decisions"])
+
+
+def test_cli_exits_two_on_unreadable_orders_pages_file(tmp_path, capsys):
+    """A missing/unparsable input file must abort, not crash or read as empty."""
+    candidates_path = _write_json(
+        tmp_path / "candidates.json", [{"ticker": "TRIN", "desired_usd": 4.00, "current_price": 17.32}]
+    )
+    rc = gate.main(
+        [
+            "--account",
+            ACCOUNT,
+            "--trading-day",
+            DAY,
+            "--orders-pages",
+            str(tmp_path / "does-not-exist.json"),
+            "--candidates",
+            candidates_path,
+        ]
+    )
+    assert rc == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["verdict"] == "ABORT"
+    assert out["reason"] == BROKER_HISTORY_INCOMPLETE
+    assert out["decisions"] == []
+
+
+def test_cli_exits_two_on_malformed_json_input(tmp_path, capsys):
+    pages_path = tmp_path / "pages.json"
+    pages_path.write_text("{not valid json", encoding="utf-8")
+    candidates_path = _write_json(
+        tmp_path / "candidates.json", [{"ticker": "TRIN", "desired_usd": 4.00, "current_price": 17.32}]
+    )
+    rc = gate.main(
+        [
+            "--account",
+            ACCOUNT,
+            "--trading-day",
+            DAY,
+            "--orders-pages",
+            str(pages_path),
+            "--candidates",
+            candidates_path,
+        ]
+    )
+    assert rc == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["verdict"] == "ABORT"
+    assert out["reason"] == BROKER_HISTORY_INCOMPLETE
+
+
+def test_cli_exits_two_when_orders_pages_object_has_no_pages_array(tmp_path, capsys):
+    """A well-formed JSON object with none of the expected keys (no "pages",
+    no account/day metadata) must abort via the same binding check as a bare
+    array (test_main_rejects_the_pre_pinning_bare_array_shape) -- it just
+    fails a different isinstance check inside _bind_saved_pages."""
+    pages_path = _write_json(tmp_path / "pages.json", {"not": "the expected shape"})
+    candidates_path = _write_json(
+        tmp_path / "candidates.json", [{"ticker": "TRIN", "desired_usd": 4.00, "current_price": 17.32}]
+    )
+    rc = gate.main(
+        [
+            "--account",
+            ACCOUNT,
+            "--trading-day",
+            DAY,
+            "--orders-pages",
+            pages_path,
+            "--candidates",
+            candidates_path,
+        ]
+    )
+    assert rc == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["verdict"] == "ABORT"
+    assert out["reason"] == BROKER_HISTORY_INCOMPLETE
+
+
+def test_cli_exits_two_when_candidates_is_not_a_json_array(tmp_path, capsys):
+    pages_path = _write_json(tmp_path / "pages.json", _pinned_pages([_page([])]))
+    candidates_path = _write_json(tmp_path / "candidates.json", {"not": "a list"})
+    rc = gate.main(
+        [
+            "--account",
+            ACCOUNT,
+            "--trading-day",
+            DAY,
+            "--orders-pages",
+            pages_path,
+            "--candidates",
+            candidates_path,
+        ]
+    )
+    assert rc == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["verdict"] == "ABORT"
+    assert out["reason"] == BROKER_HISTORY_INCOMPLETE
 
 
 def test_main_proceeds_when_the_saved_metadata_matches(tmp_path, capsys):

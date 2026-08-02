@@ -1,4 +1,5 @@
 {
+  "$schema": "../schemas/market_calendar.schema.json",
   "$comment": "NYSE market calendar. Authoritative source: https://www.nyse.com/trade/hours-calendars (NYSE Group Holiday and Early Closings Calendar). Retrieved 2026-07-28. This file exists so the live executors never rely on model recall for the holiday schedule, which goes stale silently. early_close_1300 days close at 1:00 PM ET; any slot at or after 1:00 PM ET must end silently on those days. Extend this file before 2029 or the executors will abort rather than guess.",
   "source": "https://www.nyse.com/trade/hours-calendars",
   "retrieved": "2026-07-28",

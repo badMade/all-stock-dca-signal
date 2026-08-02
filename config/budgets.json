@@ -12,14 +12,16 @@
     "candidate_dollar_formula": "candidate_dollar_amount = selected_base_amount_usd * multiplier, where selected_base_amount_usd is $1.00 or $2.00 per the dynamic_first_allocation_scale.",
     "source_of_truth": "config/budgets.json:base_amount_usd and base_amount_below_close_usd (mirrored in config/sizing_ladder.json)",
     "no_fallback": "Never infer, discover, or fall back to $50.00 or any broker/account default base amount. The base is exactly $1.00 or $2.00 per the dynamic scale.",
-    "forbidden_fallback_values_usd": [50.0]
+    "forbidden_fallback_values_usd": [
+      50.0
+    ]
   },
   "high_multiplier_threshold": 3.0,
   "weekly_rollover_reserve_cap_usd": 900.0,
   "monthly_cash_allocation_usd": 3600.0,
   "risk_guard": {
     "monthly_cash_allocation_usd": 3600.0,
-    "kill_switch_7d_deploy_fraction": 0.40,
+    "kill_switch_7d_deploy_fraction": 0.4,
     "description": "Dynamic risk guard. A rolling 30-day cash-burn rate is tracked for visibility. When capital deployed in any trailing 7-day window exceeds kill_switch_7d_deploy_fraction (40%) of monthly_cash_allocation_usd, the graded ladder is capped at 1x: the strategy keeps buying dips at the base amount but stops scaling up until the 7-day window rolls back under the threshold. Deployment is counted only from scheduled-live afternoon evidence (run_origin='scheduled', manual_run=false, timestamp at/after 2:30 PM ET); manual and other streams are excluded. See docs/risk_management.md and dca_risk.py."
   },
   "budget_tiers": [
@@ -59,14 +61,30 @@
   "selection_rule": "Pick the highest tier triggered by EITHER planned spend or the count of 3x-or-greater signals. A 3x-or-greater signal is a buy candidate whose ladder multiplier is >= 3.0.",
   "allocation_priority": "Prioritize allocations by higher multiplier first, then larger percent drop, then ticker (alphabetical) for a deterministic tie-break. Flag any capped tickers.",
   "broker_roles": {
-    "robinhood": { "account": "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}", "role": "execution", "note": "Only execution broker/account for live and manual runs." },
-    "alpaca": { "role": "read_only", "note": "Read-only validation and account context only; never execution unless explicitly changed later." },
-    "finance": { "role": "read_only", "note": "Read-only market-data/validation context only; never execution." },
-    "yahoo": { "role": "read_only", "note": "Read-only market-data/validation context only; never execution." }
+    "robinhood": {
+      "account": "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}",
+      "role": "execution",
+      "note": "Only execution broker/account for live and manual runs."
+    },
+    "alpaca": {
+      "role": "read_only",
+      "note": "Read-only validation and account context only; never execution unless explicitly changed later."
+    },
+    "finance": {
+      "role": "read_only",
+      "note": "Read-only market-data/validation context only; never execution."
+    },
+    "yahoo": {
+      "role": "read_only",
+      "note": "Read-only market-data/validation context only; never execution."
+    }
   },
   "market_data_source_policy": {
     "primary_source": "finance",
-    "validation_context_sources": ["alpaca", "robinhood"],
+    "validation_context_sources": [
+      "alpaca",
+      "robinhood"
+    ],
     "fallback_source": "yahoo_finance_yfinance",
     "summary": "The Finance connector is the PRIMARY market-data source. Alpaca and Robinhood provide validation / context. Yahoo Finance through yfinance is a FALLBACK ONLY, used when the Finance connector data is unavailable, stale, incomplete, or unresolved. Fallback data must be labeled as fallback and must NOT weaken confidence, spread, trend, top-up, budget, whitelist, buy-only, regular-hours-only, or any safety rule. Robinhood remains the only execution broker.",
     "gfuz_exception": "GFUZ may use Robinhood as its PRIMARY source when the Finance connector cannot resolve it (see config/tickers.json:special_handling.GFUZ).",
@@ -109,15 +127,18 @@
       "skip if it would exceed available buying power",
       "skip any ticker not on the active whitelist",
       "skip if a strategy order for that ticker was already placed in this stream today"
-    ]
+    ],
+    "max_orders_per_day": 8,
+    "max_orders_per_day_note": "THE knob for how many orders a day the roster may place, shared across all seven slots AND manual buying. Change this one number to raise or lower it; nothing else needs editing. Counted as buy ATTEMPTS for the trading day in America/New_York (BrokerOrder.is_buy_attempt), so a cancelled or rejected buy still consumes one -- the conservative direction. Enforced on the real live path in near_close_dca.within_caps() (StrategyConfig.max_orders_per_day, overlaid from this value by dca_config.load_strategy_config), which every scheduled slot places orders through via run_dca.run_slot()/run_pipeline(); also enforced in dca_runner.plan_orders() as SKIPPED_DAILY_ORDER_COUNT_CAP for the separate assess()/plan_orders() path. Both stop the batch at the boundary rather than back-filling smaller orders."
   },
   "order_rules": {
-    "one_order_per_ticker_per_day": true,
+    "one_order_per_ticker_per_day": false,
     "one_order_per_ticker_per_stream": true,
     "order_type": "market",
     "notional_field": "dollar_amount",
     "time_in_force": "gfd",
-    "requires_review_before_submit": "Manual runs: review_equity_order must pass first. Scheduled live runs are pre-authorized (see execution_authorization_policy) and call place_equity_order directly after all internal checks pass, without review_equity_order."
+    "requires_review_before_submit": "Manual runs: review_equity_order must pass first. Scheduled live runs are pre-authorized (see execution_authorization_policy) and call place_equity_order directly after all internal checks pass, without review_equity_order.",
+    "one_order_per_ticker_per_day_note": "Set false 2026-07-31 at Geoff's direction. same_day_top_up_policy (config/scheduled_tasks.json) governs instead: a later slot may buy the same ticker again, but only RESIZED via scripts/same_day_top_up_gate.py and only at a strictly lower price. Set back to true to restore first-slot-wins."
   },
   "hard_limits": "Never exceed the max per-order $10 ceiling, the selected daily cap, the selected weekly cap, or available buying power. Caps are absolute ceilings; when a rule and an order conflict, the order is skipped."
 }

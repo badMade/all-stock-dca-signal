@@ -20,6 +20,8 @@ from dca_live_adapters import (
 )
 from near_close_dca import (
     EASTERN,
+    AlpacaBroker,
+    BrokerAdapter,
     BrokerName,
     DryRunBroker,
     OrderFill,
@@ -648,6 +650,204 @@ def test_broker_buying_power_parses_dict_response():
     assert RobinhoodBroker(buying_power_fn=lambda **k: resp).available_buying_power() == pytest.approx(137.0)
     # A dict with no recognizable amount field degrades to 0.0 (blocked), not a crash.
     assert RobinhoodBroker(buying_power_fn=lambda **k: {"data": {}}).available_buying_power() == 0.0
+
+
+# --- BrokerAdapter conformance --------------------------------------------------
+#
+# RobinhoodBroker's own docstring claims to be "a BrokerAdapter for Robinhood",
+# but nothing had ever checked that against near_close_dca.BrokerAdapter (the
+# Protocol every gate/reporting function is typed against) -- strategy logic is
+# exercised in tests almost entirely against DryRunBroker and ad-hoc test-local
+# fakes, so a RobinhoodBroker method silently drifting from the Protocol's
+# shape (renamed, dropped, or given an incompatible signature) would have no
+# test catching it; it would only surface against a real account.
+#
+# Two Protocol members carry their own default body in BrokerAdapter itself
+# (supports_concurrent_fill_lookup -> False, get_raw_placement_responses ->
+# []) rather than being abstract -- every real call site (run_dca.py's
+# `getattr(broker, "supports_concurrent_fill_lookup", False)`) already
+# treats them as optional-with-a-fallback, so an implementer omitting them
+# is not a conformance defect and must not be flagged as one.
+_BROKER_ADAPTER_OPTIONAL_MEMBERS = frozenset(
+    {"supports_concurrent_fill_lookup", "get_raw_placement_responses"}
+)
+
+
+@pytest.mark.parametrize(
+    "broker_cls",
+    [
+        RobinhoodBroker,
+        DryRunBroker,
+        pytest.param(
+            AlpacaBroker,
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "Pre-existing gap discovered by this conformance test: AlpacaBroker "
+                    "(documented as 'a skeleton' and not the live broker -- Robinhood is) "
+                    "never implements get_order_fill, a REQUIRED BrokerAdapter member with "
+                    "no default. run_dca._refresh_fills_from_broker calls it unconditionally "
+                    "on any BrokerAdapter; against an AlpacaBroker instance that raises "
+                    "AttributeError, silently swallowed by the surrounding `except Exception`, "
+                    "so every order permanently reports as unfilled rather than crashing. "
+                    "xfail(strict=True) so this stays visible rather than silently skipped, "
+                    "and turns into a failure (prompting cleanup of this marker) the day "
+                    "AlpacaBroker is wired up for real and the gap is closed."
+                ),
+            ),
+        ),
+    ],
+)
+def test_broker_implementations_satisfy_the_broker_adapter_protocol(broker_cls):
+    import inspect
+
+    instance = broker_cls()
+    for name in dir(BrokerAdapter):
+        if name.startswith("_"):
+            continue
+        protocol_member = inspect.getattr_static(BrokerAdapter, name)
+        if not callable(protocol_member) and not isinstance(protocol_member, property):
+            continue
+        if name in _BROKER_ADAPTER_OPTIONAL_MEMBERS and not hasattr(instance, name):
+            continue
+        assert hasattr(instance, name), f"{broker_cls.__name__} is missing BrokerAdapter.{name}"
+        if isinstance(protocol_member, property):
+            continue  # signature check below does not apply to a property
+        expected_params = list(inspect.signature(protocol_member).parameters)[1:]  # drop self
+        actual_params = list(inspect.signature(getattr(broker_cls, name)).parameters)[1:]
+        assert actual_params == expected_params, (
+            f"{broker_cls.__name__}.{name} parameters {actual_params} do not match "
+            f"BrokerAdapter.{name} parameters {expected_params}"
+        )
+
+
+def test_robinhood_broker_ref_id_prefix_finds_a_live_matching_order():
+    resp = {"data": {"orders": [{"state": "filled", "ref_id": "dca-runner-0935-2026-07-28-AAPL"}]}}
+    order = RobinhoodBroker(orders_fn=lambda **k: resp).same_day_strategy_order_exists_with_ref_id_prefix(
+        "AAPL", datetime(2026, 7, 28).date(), ("dca-runner-0935-2026-07-28-AAPL",)
+    )
+    assert order is not None
+    assert order["ref_id"] == "dca-runner-0935-2026-07-28-AAPL"
+
+
+def test_robinhood_broker_ref_id_prefix_ignores_non_live_states():
+    # A matching ref_id on a cancelled order is not a live duplicate.
+    resp = {"data": {"orders": [{"state": "cancelled", "ref_id": "dca-runner-0935-2026-07-28-AAPL"}]}}
+    order = RobinhoodBroker(orders_fn=lambda **k: resp).same_day_strategy_order_exists_with_ref_id_prefix(
+        "AAPL", datetime(2026, 7, 28).date(), ("dca-runner-0935-2026-07-28-AAPL",)
+    )
+    assert order is None
+
+
+def test_robinhood_broker_ref_id_prefix_requires_an_exact_match():
+    # A live order whose ref_id is not among the supplied prefixes is a
+    # different stream's order, not this stream's retry.
+    resp = {"data": {"orders": [{"state": "filled", "ref_id": "dca-runner-1030-2026-07-28-AAPL"}]}}
+    order = RobinhoodBroker(orders_fn=lambda **k: resp).same_day_strategy_order_exists_with_ref_id_prefix(
+        "AAPL", datetime(2026, 7, 28).date(), ("dca-runner-0935-2026-07-28-AAPL",)
+    )
+    assert order is None
+
+
+def test_robinhood_broker_ref_id_prefix_falls_back_across_client_id_field_names():
+    for field in ("client_order_id", "client_order_uuid", "client_id"):
+        resp = {"data": {"orders": [{"state": "filled", field: "manual-retry-1"}]}}
+        order = RobinhoodBroker(
+            orders_fn=lambda resp=resp, **k: resp
+        ).same_day_strategy_order_exists_with_ref_id_prefix(
+            "AAPL", datetime(2026, 7, 28).date(), ("manual-retry-1",)
+        )
+        assert order is not None, f"expected a match via {field!r}"
+
+
+def test_broker_tradability_defaults_to_true_without_a_callable():
+    """No tradability_fn wired is the permissive/simulated default, matching
+    every other RobinhoodBroker callable's degrade-safely behavior."""
+    assert RobinhoodBroker().is_tradable_for_fractional_buy("AAPL") is True
+
+
+def test_broker_tradability_skips_a_non_matching_symbol_before_the_real_one():
+    # A multi-symbol tradability response with an unrelated entry first must
+    # not be mistaken for AAPL's own result.
+    resp = {
+        "data": {
+            "results": [
+                {"symbol": "MSFT", "tradeable": False, "state": "inactive", "fractional_tradability": "untradable"},
+                {"symbol": "AAPL", "tradeable": True, "state": "active", "fractional_tradability": "tradable"},
+            ]
+        }
+    }
+    assert RobinhoodBroker(tradability_fn=lambda **k: resp).is_tradable_for_fractional_buy("AAPL") is True
+
+
+def test_broker_tradability_returns_false_when_the_symbol_is_absent_entirely():
+    # The response has results, but none for the requested ticker -- an
+    # unrecognized/unlisted symbol must fail closed (not tradable), not
+    # silently pass through the loop with no verdict.
+    resp = {"data": {"results": [{"symbol": "MSFT", "tradeable": True, "state": "active", "fractional_tradability": "tradable"}]}}
+    assert RobinhoodBroker(tradability_fn=lambda **k: resp).is_tradable_for_fractional_buy("AAPL") is False
+
+
+def test_broker_order_fill_defaults_to_none_without_a_callable():
+    assert RobinhoodBroker().get_order_fill("ORD-1") is None
+
+
+def test_broker_order_fill_defaults_to_none_for_an_empty_order_id():
+    assert RobinhoodBroker(order_fill_fn=lambda **k: {}).get_order_fill("") is None
+
+
+def test_broker_order_fill_accepts_a_bare_top_level_order_object():
+    # A response with no "orders"/"order" wrapper at all -- the order fields
+    # sit directly at the top level after _unwrap.
+    resp = {"data": {"id": "ORD-7", "cumulative_quantity": "3", "average_price": "10.00"}}
+    fill = RobinhoodBroker(order_fill_fn=lambda **k: resp).get_order_fill("ORD-7")
+    assert isinstance(fill, OrderFill)
+    assert fill.quantity_filled == pytest.approx(3.0)
+    assert fill.avg_fill_price == pytest.approx(10.0)
+
+
+def test_broker_order_fill_skips_non_matching_orders_in_a_multi_order_list():
+    resp = {
+        "data": {
+            "orders": [
+                {"id": "ORD-OTHER", "cumulative_quantity": "9", "average_price": "9.00"},
+                {"id": "ORD-TARGET", "cumulative_quantity": "1", "average_price": "20.00"},
+            ]
+        }
+    }
+    fill = RobinhoodBroker(order_fill_fn=lambda **k: resp).get_order_fill("ORD-TARGET")
+    assert isinstance(fill, OrderFill)
+    assert fill.avg_fill_price == pytest.approx(20.0)
+
+
+def test_broker_order_fill_returns_none_when_id_is_not_in_the_list():
+    resp = {"data": {"orders": [{"id": "ORD-OTHER", "cumulative_quantity": "1", "average_price": "1.00"}]}}
+    assert RobinhoodBroker(order_fill_fn=lambda **k: resp).get_order_fill("ORD-MISSING") is None
+
+
+@pytest.mark.parametrize(
+    "qty,price",
+    [("0", "10.00"), ("1", "0"), ("-1", "10.00"), ("1", "-5.00")],
+)
+def test_broker_order_fill_returns_none_for_a_non_positive_quantity_or_price(qty, price):
+    # A matched order that has not actually filled (zero/negative quantity or
+    # price) must report as unfilled, not a phantom zero-price fill.
+    resp = {"data": {"orders": [{"id": "ORD-1", "cumulative_quantity": qty, "average_price": price}]}}
+    assert RobinhoodBroker(order_fill_fn=lambda **k: resp).get_order_fill("ORD-1") is None
+
+
+def test_broker_get_raw_placement_responses_drains_the_buffer():
+    broker = RobinhoodBroker(
+        enable_live_orders=True,
+        place_fn=lambda **k: {"data": {"order": {"id": "ORD-1", "state": "confirmed"}}},
+    )
+    broker.place_market_buy("AAPL", 2.0, "ref-1")
+    first = broker.get_raw_placement_responses()
+    assert len(first) == 1
+    assert first[0]["order_id"] == "ORD-1"
+    # Drained: a second call (e.g. a reused broker in a later pipeline call)
+    # must not resurface the same response.
+    assert broker.get_raw_placement_responses() == []
 
 
 def test_interpret_review_empty_and_state_rejection():

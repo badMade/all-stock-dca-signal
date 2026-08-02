@@ -1,0 +1,39 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "market_calendar.schema.json",
+  "title": "NYSE market calendar (Gate 0 source of truth)",
+  "type": "object",
+  "required": ["years_covered", "holidays_closed", "early_close_1300"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "$comment": { "type": "string" },
+    "source": { "type": "string" },
+    "retrieved": { "type": "string", "format": "date" },
+    "timezone": { "type": "string" },
+    "early_close_time_et": { "type": "string", "pattern": "^[0-2][0-9]:[0-5][0-9]$" },
+    "years_covered": {
+      "type": "array",
+      "items": { "type": "integer", "minimum": 2000, "maximum": 2100 },
+      "minItems": 1,
+      "uniqueItems": true,
+      "description": "dca_runner.market_day_status() raises CalendarCoverageError for any date whose year is not in this list, rather than guessing whether the exchange is open."
+    },
+    "holidays_closed": {
+      "type": "array",
+      "items": { "type": "string", "format": "date" },
+      "uniqueItems": true,
+      "description": "Full-day closures. dca_runner._calendar_dates() parses every entry with date.fromisoformat(), so each must be a real calendar date in extended YYYY-MM-DD form."
+    },
+    "early_close_1300": {
+      "type": "array",
+      "items": { "type": "string", "format": "date" },
+      "uniqueItems": true,
+      "description": "Days the exchange closes at early_close_time_et (1:00 PM ET). Any slot at or after that time must end silently on these days."
+    },
+    "notes": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    }
+  },
+  "additionalProperties": false
+}

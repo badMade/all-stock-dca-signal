@@ -3462,7 +3462,6 @@ def test_cron_tracking_root_honours_the_env_override(monkeypatch, tmp_path):
     # production tree, bypassing the configurable root the entry point already
     # supported. The default is now env-aware so a relocated deployment works
     # even if the scheduler drops the flag.
-    from dca_paths import BUNDLED_CRON_TRACKING_ROOT
     from scripts.generate_credit_usage_proxy_report import (
         CRON_TRACKING_ROOT_ENV,
         _default_cron_tracking_root,
@@ -3471,7 +3470,7 @@ def test_cron_tracking_root_honours_the_env_override(monkeypatch, tmp_path):
 
     monkeypatch.delenv(CRON_TRACKING_ROOT_ENV, raising=False)
     bundled = _default_cron_tracking_root()
-    assert bundled == BUNDLED_CRON_TRACKING_ROOT
+    assert bundled == str(Path(__file__).resolve().parents[2] / "cron_tracking")
 
     monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, str(tmp_path))
     assert _default_cron_tracking_root() == str(tmp_path)

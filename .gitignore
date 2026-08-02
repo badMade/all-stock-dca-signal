@@ -38,3 +38,13 @@ artifacts/
 
 # Cowork folder-mount write probe artifact
 .__probe_write_test
+
+# FUSE orphan inodes. When a file under a Cowork/FUSE mount is overwritten while
+# a handle is still open, the old inode is relinked as .fuse_hidden<hex> in the
+# same directory and lingers until the handle closes. These are byte copies of
+# the PRE-EDIT file, so a redaction pass leaves un-redacted copies sitting in the
+# working tree, untracked and stageable by `git add .`. This repo is public and
+# the executor prompts carry a brokerage account number, so they must never be
+# committable. Ignoring them is belt-and-braces: delete them as well, since an
+# ignored file is still readable on disk.
+.fuse_hidden*

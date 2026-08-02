@@ -112,6 +112,115 @@ def test_sizing_ladder_schema_requires_status_before_making_the_reduced_base_con
         jsonschema.validate(document, schema)
 
 
+# --- schema rejection tests ---------------------------------------------------
+#
+# test_every_config_file_validates_against_its_referenced_schema (above) only
+# ever proves the shipped documents pass their own schema -- it says nothing
+# about whether the schema would catch a REAL regression. A schema that
+# accidentally dropped a `required` entry, loosened a `pattern`, or lost an
+# `enum` would keep passing that test forever. Each of these pins one
+# operationally meaningful invariant the schema is supposed to enforce, by
+# mutating a copy of the real shipped config (so everything else stays
+# realistic) and asserting the mutation is rejected.
+
+
+def test_budgets_schema_rejects_a_stress_tier_that_does_not_require_a_rollover_reserve():
+    """budget_tiers' if/then conditional requires requires_rollover_reserve to
+    be literally true for the "stress" tier -- the only tier authorized to
+    exceed Normal's weekly cap using the earned rollover reserve
+    (dca_runner.execute_plan's tier.uses_rollover_reserve gate). A schema
+    that silently stopped enforcing this would let a stress tier entry claim
+    it does NOT use the reserve while dca_runner's own BUDGET_TIERS constant
+    (matched against this same document by test_budget_tiers_match_config_budgets_json)
+    still trusts it, decoupling the two the same way the sizing-ladder gap did."""
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "budgets.schema.json").read_text(encoding="utf-8"))
+    document = json.loads(json.dumps(_load("budgets.json")))  # deep copy
+    stress = next(t for t in document["budget_tiers"] if t["name"] == "stress")
+    stress["requires_rollover_reserve"] = False
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(document, schema)
+
+
+def test_scheduled_tasks_schema_rejects_an_unrecognized_task_type():
+    """`type` is constrained to the four documented task kinds
+    (trading/monitoring/analytics/reminder); scripts/run_classification.py
+    and the executor prompts both branch on this field, so an unrecognized
+    value silently passing schema validation would only surface as a runtime
+    KeyError/behavioral gap far from where the config was actually edited."""
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "scheduled_tasks.schema.json").read_text(encoding="utf-8"))
+    document = json.loads(json.dumps(_load("scheduled_tasks.json")))  # deep copy
+    document["tasks"][0]["type"] = "bogus-task-type"
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(document, schema)
+
+
+def test_tickers_schema_rejects_a_malformed_ticker_symbol():
+    """`active` entries are constrained to ^[A-Z.]{1,6}$ -- uppercase letters
+    and dots only, at most 6 characters. A lowercase or otherwise malformed
+    entry here would still be accepted by the runtime's plain `in` checks
+    but silently never match a real broker symbol, and
+    test_active_tickers_have_no_duplicates/test_active_tickers_match_config_tickers_json
+    only check membership and duplication, not shape."""
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "tickers.schema.json").read_text(encoding="utf-8"))
+    document = json.loads(json.dumps(_load("tickers.json")))  # deep copy
+    document["active"].append("not-a-real-ticker")
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(document, schema)
+
+
+def test_trading_window_schema_rejects_a_malformed_decision_time():
+    """decision_time_et is constrained to HH:MM (00-29 hour digit family
+    aside, the real constraint the pattern enforces is two-digit,
+    zero-padded hour and a valid minute); a single-digit-hour spelling like
+    "9:35" -- exactly the kind of manual-edit slip a config like this
+    invites -- must be rejected rather than silently pass through to
+    whatever parses it downstream."""
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "trading_window.schema.json").read_text(encoding="utf-8"))
+    document = json.loads(json.dumps(_load("trading_window.json")))  # deep copy
+    document["decision_time_et"] = "9:35"
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(document, schema)
+
+
+def test_trading_window_schema_rejects_a_document_missing_start_date():
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "trading_window.schema.json").read_text(encoding="utf-8"))
+    document = json.loads(json.dumps(_load("trading_window.json")))  # deep copy
+    del document["start_date"]
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(document, schema)
+
+
+def test_notifications_schema_rejects_a_non_boolean_channel_enabled_flag():
+    """Every channel's `enabled` flag gates whether dca_alerts actually sends
+    to it; a string like "yes" is truthy in Python but is not the documented
+    boolean contract, and a schema that accepted it would let a manual edit
+    silently change what "enabled" means for that one channel."""
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "notifications.schema.json").read_text(encoding="utf-8"))
+    document = json.loads(json.dumps(_load("notifications.json")))  # deep copy
+    first_channel = next(iter(document["channels"]))
+    document["channels"][first_channel]["enabled"] = "yes"
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(document, schema)
+
+
+def test_reporting_schema_rejects_a_non_object_notion_block():
+    """`notion` is declared as an object (the notion sync's config surface);
+    a scalar left over from a botched manual edit must be rejected rather
+    than silently reach dca_notion_sync expecting a mapping."""
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "reporting.schema.json").read_text(encoding="utf-8"))
+    document = json.loads(json.dumps(_load("reporting.json")))  # deep copy
+    document["notion"] = "not-an-object"
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(document, schema)
+
+
 def _run_state_document(budget):
     return {
         "run_id": "test-run-2026-07-28",

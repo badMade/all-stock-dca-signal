@@ -18,6 +18,7 @@ from backup_strategy import (  # noqa: E402
     extract_schedule,
     extract_sizing_ladder,
     extract_tickers,
+    main,
     write_configs,
 )
 
@@ -249,6 +250,71 @@ def test_robust_to_imperfect_transcript():
     assert result["sizing_ladder"]["tiers"] == []
     assert result["budgets"] == {}
     assert result["schedule"]["tasks"] == []
+
+
+# --- CLI: main() ---------------------------------------------------------------
+#
+# Every case above exercises extract_all()/write_configs() directly; nothing
+# exercised the CLI entrypoint (--transcript / --write / --only / missing-file
+# exit code) that a human or agent actually runs.
+
+
+def test_main_missing_transcript_exits_two(tmp_path, capsys):
+    rc = main(["--transcript", str(tmp_path / "does-not-exist.md")])
+    assert rc == 2
+    assert "not found" in capsys.readouterr().err
+
+
+def test_main_without_write_only_prints_and_does_not_touch_disk(tmp_path, capsys):
+    transcript = tmp_path / "transcript.md"
+    transcript.write_text(SAMPLE, encoding="utf-8")
+    out_dir = tmp_path / "out"
+
+    rc = main(["--transcript", str(transcript), "--out-dir", str(out_dir)])
+
+    assert rc == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert len(printed["tickers"]["active"]) == 45
+    assert not out_dir.exists()
+
+
+def test_main_with_write_persists_config_files(tmp_path, capsys):
+    transcript = tmp_path / "transcript.md"
+    transcript.write_text(SAMPLE, encoding="utf-8")
+    out_dir = tmp_path / "out"
+
+    rc = main(["--transcript", str(transcript), "--out-dir", str(out_dir), "--write"])
+
+    assert rc == 0
+    stderr = capsys.readouterr().err
+    assert "wrote/updated" in stderr
+    assert (out_dir / "tickers.json").exists()
+    assert (out_dir / "sizing_ladder.json").exists()
+
+
+def test_main_write_with_only_restricts_which_files_are_written(tmp_path, capsys):
+    transcript = tmp_path / "transcript.md"
+    transcript.write_text(SAMPLE, encoding="utf-8")
+    out_dir = tmp_path / "out"
+
+    rc = main(
+        ["--transcript", str(transcript), "--out-dir", str(out_dir), "--write", "--only", "tickers"]
+    )
+
+    assert rc == 0
+    assert (out_dir / "tickers.json").exists()
+    assert not (out_dir / "sizing_ladder.json").exists()
+
+
+def test_main_write_with_nothing_extracted_reports_nothing_written(tmp_path, capsys):
+    transcript = tmp_path / "transcript.md"
+    transcript.write_text("totally unrelated text with no tickers or ladders", encoding="utf-8")
+    out_dir = tmp_path / "out"
+
+    rc = main(["--transcript", str(transcript), "--out-dir", str(out_dir), "--write"])
+
+    assert rc == 0
+    assert "nothing extracted to write" in capsys.readouterr().err
 
 
 def _run_all():

@@ -143,6 +143,41 @@ def test_budgets_maps_surviving_fields_only(tmp_path):
     }
 
 
+def test_budgets_overlays_max_orders_per_day(tmp_path):
+    """The roster-wide daily order-count circuit breaker
+    (near_close_dca.StrategyConfig.max_orders_per_day, enforced by
+    within_caps()) is overlaid the same way max_per_order_usd is, so a real
+    config load picks it up without every caller wiring it explicitly (Codex
+    review: "Apply the order-count cap to every live placement path")."""
+    _write(tmp_path, "budgets.json", {
+        "circuit_breakers": {"max_orders_per_day": 8},
+    })
+    out = load_budgets(tmp_path)
+    assert out == {"max_orders_per_day": 8}
+    config = load_strategy_config(tmp_path)
+    assert config.max_orders_per_day == 8
+
+
+@pytest.mark.parametrize("bad_value", [0, -1, True, 3.5, "8", None])
+def test_max_orders_per_day_rejects_non_positive_int(tmp_path, bad_value):
+    _write(tmp_path, "budgets.json", {
+        "circuit_breakers": {"max_orders_per_day": bad_value},
+    })
+    with pytest.raises(ValueError, match="max_orders_per_day must be a positive integer"):
+        load_budgets(tmp_path)
+
+
+def test_max_orders_per_day_defaults_to_uncapped_when_absent(tmp_path):
+    """A config directory with no circuit_breakers.max_orders_per_day key must
+    leave StrategyConfig's own None (uncapped) default untouched, matching
+    every other optional overlay in this module."""
+    _write(tmp_path, "budgets.json", {"circuit_breakers": {"max_per_order_usd": 10.0}})
+    out = load_budgets(tmp_path)
+    assert "max_orders_per_day" not in out
+    config = load_strategy_config(tmp_path)
+    assert config.max_orders_per_day is None
+
+
 def test_budgets_does_not_overlay_one_order_per_ticker_per_day(tmp_path):
     """The bundled config/budgets.json asserts order_rules.one_order_per_ticker_per_day:
     true for the seven-slot roster's own bookkeeping, but StrategyConfig defaults it to
