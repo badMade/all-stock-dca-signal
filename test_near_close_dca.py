@@ -8216,6 +8216,7 @@ def test_prior_allocations_count_against_cap(tmp_path):
         tickers=("AAPL",),
         approved_test_dates=frozenset({date(2026, 6, 29)}),
         base_buy_amount_usd=190.0,  # 190 * 2x = $380 > $360 stress cap
+        max_per_order_usd=500.0,
     )
     state = StrategyState()
     prior = {
@@ -8225,6 +8226,7 @@ def test_prior_allocations_count_against_cap(tmp_path):
             reference_price=99.0,
             run_id="manual_am",
             source="manual",
+            selected_base_amount_usd=190.0,
         )
     }
     broker = DryRunBroker(cash=5000.0, reference_prices={"AAPL": 98.0})
