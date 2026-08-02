@@ -7962,7 +7962,7 @@ def test_run_daily_compact_fully_offset_still_writes_valid_state(tmp_path):
     assert os.path.exists(result["run_state_path"])
     with open(result["run_state_path"], encoding="utf-8") as handle:
         run_state = json.load(handle)
-    # Fix 2: prior amounts are seeded into the ledger before the cap check,
+    # Prior amounts are seeded into the ledger before the cap check,
     # so day_notional reflects the 3 tickers x $2 prior spend even though the
     # afternoon incremental is $0 for all (price not below prior).
     assert run_state["budget"]["day_notional_usd"] == 6.0
@@ -8023,7 +8023,7 @@ def test_run_daily_compact_manual_run_does_not_block_scheduled(tmp_path):
     assert by_ticker["NVDA"]["skip_reason"] == "same-day broker order exists"
 
 
-# --- Fix 1: planned_amount_usd reflects the guarded incremental amount --------
+# --- planned_amount_usd reflects the guarded incremental amount ---------------
 
 
 def test_build_run_artifacts_uses_guarded_amount_as_planned_notional(tmp_path):
@@ -8196,7 +8196,7 @@ def test_build_run_artifacts_records_guards_effective_base_not_current_run_base(
     assert candidates["AAPL"]["decision_bar_close"] == 93.0
 
 
-# --- Fix 2: prior same-day allocations count against the daily/weekly cap ----
+# --- prior same-day allocations count against the daily/weekly cap -------------
 
 
 def test_prior_allocations_count_against_cap(tmp_path):
@@ -8207,8 +8207,8 @@ def test_prior_allocations_count_against_cap(tmp_path):
     which triggers stress tier ($360/day). Prior=$200 at $99; afternoon=$98 (below
     prior -> incremental = $380 - $200 = $180).
 
-    Without Fix 2: remaining = $360 (no seeding). $180 < $360 -> cap passes (BUG).
-    With    Fix 2: remaining = $360 - $200 = $160. $180 > $160 -> cap blocks (correct).
+    Without prior-allocation seeding: remaining = $360 (no seeding). $180 < $360 -> cap passes (REGRESSION).
+    With    prior-allocation seeding: remaining = $360 - $200 = $160. $180 > $160 -> cap blocks (correct).
     """
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
@@ -8253,7 +8253,7 @@ def test_prior_allocations_count_against_cap(tmp_path):
     # $200 prior seeded -> remaining = $360 - $200 = $160.
     # Guard: $380 desired - $200 prior = $180 incremental.
     # $180 > $160 remaining -> must be blocked.
-    # (Without Fix 2, remaining = $360 and $180 < $360 -> would slip through.)
+    # (Without prior-allocation seeding, remaining = $360 and $180 < $360 -> would slip through.)
     aapl = candidates["AAPL"]
     assert aapl["status"] in ("blocked", "skipped"), (
         f"AAPL should be blocked by cap (prior + incremental > cap); "
@@ -8261,7 +8261,7 @@ def test_prior_allocations_count_against_cap(tmp_path):
     )
 
 
-# --- Fix 3: load_prior_same_day_allocations reads full-report run_state ------
+# --- load_prior_same_day_allocations reads full-report run_state ---------------
 
 
 def test_load_prior_same_day_ignores_unreadable_or_invalid_json(tmp_path):
