@@ -5,6 +5,7 @@
   "timezone_note": "Cron expressions are in UTC. ET equivalents are in America/New_York and vary with DST. Confirm around DST transitions.",
   "change_note_2026_07_20": "SUPERSEDED for the task list by change_note_2026_07_27 and canonical_schedule_reconciliation_2026_07_27; the cost-conscious model routing policy itself still applies. Consolidated the cost-conscious model-routing policy for daily DCA into the authoritative model_routing_policy section and reaffirmed it on every active daily task (9:00 pre-market dashboard, 9:45 volatility scan, 9:45 pre-flight, 10:30 morning live, 12:30 midday live, 3:05 monitor, 3:20 final live, 3:35 slippage/latest-run sync, 3:40 watchdog). Daily DCA uses cost-conscious/default model routing where available; premium models (e.g. ChatGPT 5.5) are reserved for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Documentation/cost-behavior only: preserves the $2.00 base amount, 0x-to-5x ladder, Finance-primary read-only market-data policy, GFUZ/TXN active universe, BYDDY/VCX/TRLV/RVI exclusions, same-day top-up guards, safety rules, and run-classification text unchanged.",
   "change_note_2026_07_27": "Aligned this manifest with the user's canonical DCA schedule verified on 2026-07-27. Added the three canonical tasks that were missing (2ba19526 market-open live at 9:35 AM, bb4f6ef1 morning watchlist early-warning scan at 9:45 AM, 7be82b97 intraday live at 11:30 AM / 1:30 PM / 2:30 PM). Retimed 10ce362c from 3:20 PM to the canonical 3:30 PM ET (cron 30 19 * * 1-5 in EDT) and moved current/future scheduled evidence to 15:30 and the YYYYMMDD_1530ET convention, keeping YYYYMMDD_1520ET as a legacy/historical pattern so existing artifacts stay valid and the artifact root stays under ce16ba6b for continuity. Paused e3e6f09e. Retired b7961407, cd45e95b, d72aa525, d1f7a2c0, and the repo-internal morning-dca-0945 alias from every active schedule table; they are status=disabled with in_live_scheduler=false and no cron_utc. The drift detector itself is NOT retired and the 9:45 pre-flight artifact contract is preserved because 42173154 still gates on it. See canonical_schedule_reconciliation_2026_07_27 for the authoritative table. Schedule/config/documentation only: preserves the canonical first-buy and same-day top-up rule, the 2026-07-24 2:30 PM ET intraday recovery fills, the $2.00 base amount, the 0x-to-5x ladder, the active universe and BYDDY/VCX/TRLV/RVI exclusions, the Finance-primary provider policy with yfinance fallback and GFUZ Robinhood-primary handling, Robinhood-only execution on account <ROBINHOOD_ACCOUNT_NUMBER>, the scheduled run artifact contract, cost-conscious model routing, and the account-number obfuscation policy. No orders are placed by this change.",
+  "change_note_2026_08_03_pr_314": "PR #314 (commit d905769) documents and implements the same-day Perplexity-primary alias pointer fallback for 11:30 catch-up orchestration and other same-day pointer consumers. When the canonical latest pointer is missing, scripts/same_day_pointer.select_same_day_run_state() now checks date-specific run_state first, then the canonical latest pointer, then caller-supplied fallbacks, then a trading-day and stream-derived Perplexity-primary alias pointer. Alias fallback remains guarded by same-day date, stream, expected root containment, target run_state, scheduled non-manual evidence, and non-null run_classification validation before returning a state. Missing canonical pointers remain artifact-contract failures for diagnostics, but they are no longer terminal when a valid same-day alias pointer and complete artifacts exist. Schedule/config/documentation only: no trading rules, active universe, budget caps, broker policy, or task cadence changed.",
   "operating_mode": {
     "mode": "cost_saving_daily_compact",
     "requested_on_et": "2026-07-16",
@@ -2292,6 +2293,65 @@
     "see": "config/run_classification.json:watchdog_reconciliation_scope_patch_2026_07_27",
     "doc": "docs/schedule_manifest.md"
   },
+  "foreground_primary_and_close_window_patch_2026_07_30": {
+    "added": "2026-07-30",
+    "applies_to_tasks": ["67aa802b"],
+    "applies_to_tasks_note": "67aa802b is the post-trade slippage and Notion sync, retimed 2026-08-02 from 3:35 PM ET to 5:00 PM ET daily (see canonical_schedule_reconciliation_2026_07_27.retimed_on_2026_08_02). a46bf007, the 3:40 PM ET live-run watchdog, was ALSO in scope when this patch was added on 2026-07-30, but it was removed from the schedule entirely on 2026-08-02; it is kept in the task's own historical block below but no longer applies. This policy now governs only 67aa802b, the repo's one remaining close-of-day validator schedule entry; no 3:45 PM ET validator task exists and none is created here (Codex review: \"Target only the active close-of-day validator\").",
+    "creates_new_scheduled_task": false,
+    "trades": false,
+    "foreground_primary_surrogate_context": {
+      "problem": "On a day the operator drives execution in the foreground, the background scheduled stream legitimately produces no artifact. Both close-of-day validators escalated a missing-scheduled-evidence alert for that day, reporting an outage that did not happen. A recurring false alert trains an operator to ignore the alert that matters.",
+      "markers": [
+        "foreground_primary_surrogate_context=true (boolean field)",
+        "foreground_primary_surrogate_context (bare marker string, as a field value or a list entry)",
+        "run_origin='foreground_primary_surrogate'",
+        "run_origin='manual_foreground_primary'",
+        "valid_primary_executor_evidence=true"
+      ],
+      "marker_sources": "Same-day run_state.json, run_summary.json, latest pointers, and manifest entries. The top level plus the run_classification, classification, foreground_primary, foreground_primary_context, run_summary, and summary blocks are searched. Not a full recursive walk: an unbounded search would pick a marker out of a deep provenance blob that never meant to declare the day's mode.",
+      "marker_matching": "Exact equality only. A marker mentioned inside a prose note is documentation, not a declaration. The boolean spellings require literal true, so the string \"false\" and the integer 0 are not declarations.",
+      "effect": "Report foreground_primary_mode_active=true, list the foreground artifact paths used, and classify the fills/orders as foreground_primary_surrogate_context. Do not escalate a missing or invalid background scheduled evidence alert solely on the absence, incompleteness, or valid_scheduled_evidence=false state of the background scheduled artifact.",
+      "evidence_separation_is_absolute": "Foreground and manual fills remain valid_scheduled_evidence=false, valid_afternoon_scheduled_evidence=false, and top_up_context_only=true. There is no code path that flips them. Foreground primary mode explains why the background stream produced nothing; it never claims the background stream ran.",
+      "same_day_requirement": "A marker counts only on an artifact whose declared trading_day equals the current ET trading day. Prior-day markers and markers on artifacts declaring no trading_day are rejected, for the same reason the same-day pointer contract rejects a stale pointer.",
+      "still_escalate": [
+        "safety failures",
+        "broker/order mismatches",
+        "missing required foreground artifacts",
+        "stale same-day pointers",
+        "invalid schema",
+        "drift where a foreground signal says an order was placed but no broker or artifact record exists",
+        "invalid background scheduled artifacts when foreground primary mode is NOT active"
+      ],
+      "implementation": "scripts/foreground_primary.py",
+      "tests": "scripts/tests/test_foreground_primary.py, test_dca_reporting.py"
+    },
+    "close_window_signal_comparison": {
+      "summary": "JUL 30 2026 CLOSE-WINDOW SIGNAL COMPARISON PATCH. During the close-of-day validator pass, compute a read-only what_would_have_fired summary for the active watchlist. Use the current market-close decision price versus the prior completed regular-session close, apply the graded sizing ladder for summary purposes, and report which tickers would have fired in background scheduled mode and in foreground primary mode. When foreground_primary_surrogate_context is active, state that foreground primary mode is active and compare the foreground execution context against this watchlist signal summary rather than treating missing scheduled evidence as a failure.",
+      "analytics_only": true,
+      "must_not": "place, review, cancel, sell, or modify any order.",
+      "decision_price": "The current market-close decision price for the active watchlist ticker.",
+      "prior_close": "The prior COMPLETED regular-session close, never an in-progress session.",
+      "fields": [
+        "ticker",
+        "decision_price",
+        "prior_close",
+        "drop_pct",
+        "ladder_multiplier_capped_at_3x",
+        "background_mode_status",
+        "foreground_mode_status",
+        "reason_if_not_fired",
+        "data_source"
+      ],
+      "mode_status_values": ["would_have_fired", "no_signal", "would_have_fired_mode_not_active", "unknown_missing_data"],
+      "reason_if_not_fired_values": ["missing_or_invalid_decision_price", "missing_or_invalid_prior_close", "decision_price_not_below_prior_close", "drop_below_first_ladder_tier"],
+      "ladder_reporting_cap": "0x through 3x buckets. Anything the source ladder grades above 3x is reported as 3.0 with ladder_multiplier_label='3x_plus'. Reporting only; execution sizing is unchanged and still uses the full 0x-to-5x config/sizing_ladder.json ladder.",
+      "missing_quote_rule": "A watchlist ticker whose quote failed is still reported, as an unknown_missing_data row. A ticker silently dropped because its provider failed is indistinguishable from one that had no signal, and removing that ambiguity is the point of the summary.",
+      "purity": "scripts/close_window_signal.py performs no network I/O and writes nothing. The caller fetches quotes under market_data_source_policy and passes decision_price, prior_close, and data_source in, so the summary cannot become a second, drifting copy of the provider policy.",
+      "implementation": "scripts/close_window_signal.py",
+      "tests": "scripts/tests/test_foreground_primary.py"
+    },
+    "doc": "docs/schedule_manifest.md"
+  },
   "canonical_schedule_reconciliation_2026_07_27": {
     "verified_on_et": "2026-07-27",
     "purpose": "Reconcile this manifest against the user's canonical DCA schedule. The canonical_schedule_et table below is the single source of truth for which RECURRING tasks are active, at what ET time, and in what state. A task is an active schedule entry only if it appears in canonical_schedule_et OR in one_time_additions_after_canonical_verification (for one-time tasks added after the 2026-07-27 verification); a task in neither list is NOT an active schedule entry.",
@@ -2356,7 +2416,8 @@
       "cron_dst_convention_note": "Both cron_utc values above assume EDT (UTC-4), matching every other single-cron weekday/Friday task in this manifest (e.g. 10ce362c's 30 19 * * 1-5 for 3:30 PM ET, 041d9d90's own prior 0 21 * * 5 for 5:00 PM ET) -- a single fixed-UTC cron with an et_equivalent field explicitly labeled '(EDT)', not the paired EDT/EST cron pattern used only by the month-end tasks (c9fb1fb8/17a3b2a9), which exists solely because their programmatic month-end trigger check is disabled (see month_end_volatility_risk_policy.paired_schedules). This matches every other daily/weekly weekday task in this file and is the same DST caveat already documented centrally in docs/safeguards.md's Test window section (the live trading window intentionally stops before the 2026-11-01 EDT->EST transition for exactly this reason)."
     },
     "one_time_additions_after_canonical_verification": [
-      { "task_id": "onetime-1630-credit-usage-proxy-2026-07-27", "fires_at_et": "2026-07-27 4:30 PM ET", "role": "One-time 4:30 PM DCA credit-usage proxy report with recovery runs", "cadence": "One-time", "trading": false, "state": "active", "cron_utc": "30 20 27 7 *", "scheduler_registered": true, "executor": "scripts/generate_credit_usage_proxy_report.py", "contract": "credit_usage_proxy_report_2026_07_27" }
+      { "task_id": "onetime-1630-credit-usage-proxy-2026-07-27", "fires_at_et": "2026-07-27 4:30 PM ET", "role": "One-time 4:30 PM DCA credit-usage proxy report with recovery runs", "cadence": "One-time", "trading": false, "state": "active", "cron_utc": "30 20 27 7 *", "scheduler_registered": true, "executor": "scripts/generate_credit_usage_proxy_report.py", "contract": "credit_usage_proxy_report_2026_07_27" },
+      { "task_id": "174c4163", "fires_at_et": "2026-08-03 11:39 AM ET", "role": "One-time 11:30 AM Perplexity-primary intraday catch-up live buy (foreground primary surrogate context)", "cadence": "One-time", "trading": true, "state": "expired", "cron_utc": "39 15 3 8 *", "scheduler_registered": true, "no_python_entry_point": true, "contract": "perplexity_primary_1130_catchup_2026_08_03 (see the intraday task 7be82b97 above)", "one_time_expiry_note": "This entry fired exactly once on 2026-08-03 and MUST be deregistered from the scheduler afterward: standard 5-field crontab has no year field, so the literal pattern '39 15 3 8 *' would otherwise refire every August 3rd (2027-08-03 is a weekday). state='expired' records that deregistration here, not 'active'/'completed'. Independently of scheduler deregistration, config/trading_window.json's end_date=2026-10-30 already fails any 2027 re-fire of the underlying intraday executor (7be82b97) closed before it could place a live order, so a missed deregistration cannot itself cause a duplicate buy -- deregistration is still required for correctness/hygiene, not as the sole safety layer (Codex review: \"Deregister the one-time trading cron after it fires\")." }
     ],
     "added_on_2026_07_27": {
       "task_ids": ["2ba19526", "bb4f6ef1", "7be82b97"],
@@ -2662,7 +2723,7 @@
       "run_classification": {"run_origin": "scheduled", "run_type": "market_open_dca_live", "stream": "market_open", "manual_run": false, "cron_id": "2ba19526", "supersedes_cron_id": null, "scheduled_for_et": "09:35", "scheduled_window_start_et": "09:30", "scheduled_window_end_et": "09:40", "run_id": "market_open_live_YYYYMMDD_0935ET", "triggered_at_utc": "<ISO-8601 UTC timestamp of the actual 9:35 AM ET firing>", "state_schema_version": "market-open-live-v1", "trades": true, "execution_broker": "robinhood", "account_number": "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}", "valid_morning_evidence": false, "valid_afternoon_evidence": false, "schema_note": "MarketOpenDCAExecutor.run_classification() populates manual_run, run_id, triggered_at_utc, and state_schema_version exactly as documented in schemas/market_open_run_classification.schema.json -- codex review r3654173640."},
       "first_buy_of_day": true,
       "top_up_role": "As the first buy of the trading day this run normally has no same-day prior allocation, so it places the full desired amount per the canonical first-buy rule. Its fills become prior-allocation context for every later same-day run (10:30, 11:30, 12:30, 1:30, 2:30, 3:30) through the canonical same-day top-up rule. See canonical_first_buy_and_topup_rule.",
-      "artifacts": {"run_dir": "/home/user/workspace/cron_tracking/market_open_dca/YYYYMMDD_0935ET/", "always_write": ["run_state.json", "run_summary.json", "market_open_signals.csv", "submitted_orders.csv"], "always_write_even_when": "blocked, no orders placed, or error. submitted_orders.csv must be header-only (no data rows) when zero orders are submitted, matching the manifest's standard live artifact contract -- codex review r3654173644.", "signal_filename_note": "market_open_signals.csv is also recognized (alongside signals.csv/morning_signals.csv/midday_signals.csv/intraday_signals.csv) by scripts/drift_detection.py and scripts/scheduled_artifacts.py -- codex review r3654117268.", "latest_pointer": "/home/user/workspace/cron_tracking/market_open_dca/latest_market_open_run.json"},
+      "artifacts": {"run_dir": "/home/user/workspace/cron_tracking/market_open_dca/YYYYMMDD_0935ET/", "always_write": ["run_state.json", "run_summary.json", "market_open_signals.csv", "submitted_orders.csv"], "always_write_even_when": "blocked, no orders placed, or error. submitted_orders.csv must be header-only (no data rows) when zero orders are submitted, matching the manifest's standard live artifact contract -- codex review r3654173644.", "signal_filename_note": "market_open_signals.csv is also recognized (alongside signals.csv/morning_signals.csv/midday_signals.csv/intraday_signals.csv) by scripts/drift_detection.py and scripts/scheduled_artifacts.py -- codex review r3654117268.", "latest_pointer": "/home/user/workspace/cron_tracking/market_open_dca/latest_market_open_run.json", "perplexity_primary_aug_2026_pointer_aliases": ["/home/user/workspace/cron_tracking/perplexity_primary_YYYYMMDD/latest_market_open_run.json", "/home/user/workspace/cron_tracking/perplexity_primary_YYYYMMDD/latest_morning_run.json"], "pointer_contract_note_2026_08_03": "On 2026-08-03 the Perplexity-primary 09:35 run wrote complete root artifacts under /home/user/workspace/cron_tracking/perplexity_primary_YYYYMMDD/YYYY-MM-DD_0935ET/ with 25 submitted and filled orders, but latest pointer publication was missing for the expected same-day pointer check. Classify that condition as latest_pointer_missing_artifact_contract_failure, not as no_orders, not as an incomplete order run, and not as a failed buy pass when run_state.json, run_summary.json, signals.csv, and submitted_orders.csv exist and reconcile. Future 09:35 runs must publish the canonical latest_market_open_run.json pointer and, during Perplexity-primary mode, the Perplexity-primary alias pointer after writing the root files. Pointer absence is still a blocking artifact-contract defect for downstream discovery because later top-up loaders rely on same-day pointer validation."},
       "post_artifact_drift_check": {"enabled": true, "detector": "scripts/drift_detection.py", "run_after": "artifact_write", "command": "python scripts/drift_detection.py --run-dir <run_dir> --json-out <run_dir>/drift_report.json --md-out <run_dir>/drift_report.md --slack --fail-on-drift", "note": "Reconcile signals vs submitted orders immediately after writing artifacts. See drift_detection_policy."},
       "circuit_breakers": {"max_per_order_usd": 10.0, "enforce_budget_caps": true, "enforce_available_buying_power": true, "whitelist_only": true, "require_data_confidence": true, "enforce_spread_threshold": true, "require_trend_validation": false, "regular_hours_only": true, "one_strategy_order_per_ticker_per_run": true},
       "budget_ledger": {
@@ -2801,6 +2862,27 @@
         "requirement": "Before firing ANY of the three slots, the scheduler/agent invokes IntradayDCAExecutor for that slot, which fails closed on its own when the current America/New_York date is outside [config/trading_window.json:start_date, config/trading_window.json:end_date] inclusive or when trading_window.json cannot be read: it does not place any orders for that slot and writes a blocked run_state (see the standard live artifact contract) rather than skipping the artifact write entirely.",
         "dst_note": "cron_utc for this task is fixed-UTC/EDT-calibrated (see the top-level timezone_note); config/trading_window.json's end_date is deliberately set before the next EDT->EST transition for exactly this reason. This task must stop firing at or before that transition until the external cron/trigger gate is confirmed or updated for EST, the same constraint already documented for the morning/midday/afternoon live tasks.",
         "schema_file": "schemas/trading_window.schema.json"
+      },
+      "no_python_entry_point_removed_2026_08_03": "This task previously carried no_python_entry_point=true with a note directing the external scheduler/agent to run it directly. That flag is now stale and has been removed: executor_added_note above already states IntradayDCAExecutor 'supersedes no_python_entry_point=true,' but the flag and its contradicting note were left in place, so a scheduler treating no_python_entry_point as authoritative could still bypass IntradayDCAExecutor's approved-date gate, pooled budget ledger, and artifact handling by invoking the task directly (Codex review: 'Keep the intraday task wired to its executor'). The scheduler/agent MUST invoke IntradayDCAExecutor per executor/executor_mode/config_file above for every recurring 11:30/13:30/14:30 slot; only the one-time 2026-08-03 11:30 catch-up below (174c4163, a same-day incident response predating this fix) ran without it.",
+      "perplexity_primary_1130_catchup_2026_08_03": {
+        "scheduled_task_id": "174c4163",
+        "created_et": "2026-08-03 11:35",
+        "run_at_et": "2026-08-03 11:39",
+        "reason": "The active schedule did not contain an 11:30 Perplexity-primary live slot when checked at 11:35 ET, so the user requested a same-day 11:30 catch-up task.",
+        "classification": {
+          "run_origin": "manual",
+          "stream": "intraday",
+          "scheduled_for_et": "11:30",
+          "manual_run": true,
+          "foreground_primary_surrogate_context": true,
+          "valid_primary_executor_evidence": true,
+          "valid_scheduled_evidence": false
+        },
+        "classification_note_2026_08_03": "run_origin/manual_run corrected to 'manual'/true (from an invalid 'perplexity_primary'/false pairing): schemas/intraday_run_classification.schema.json's run_origin enum permits only 'scheduled' or 'manual', and same_day_pointer.derive_valid_scheduled_evidence() recognizes only run_origin='scheduled' with manual_run=false, so the original pairing would be rejected by every schema-aware and same-day-pointer consumer. The foreground-primary intent is carried instead by the recognised markers (foreground_primary_surrogate_context=true, valid_primary_executor_evidence=true) per scripts/foreground_primary.py, with valid_scheduled_evidence=false as that module's absolute evidence-separation invariant requires -- a foreground artifact is execution context, never scheduled evidence (Codex review: \"Use a valid classification for the 11:30 catch-up\").",
+        "artifact_root": "/home/user/workspace/cron_tracking/perplexity_primary_20260803/2026-08-03_1130ET/",
+        "required_artifacts": ["run_state.json", "run_summary.json", "signals.csv", "submitted_orders.csv"],
+        "top_up_context": "Must load /home/user/workspace/cron_tracking/perplexity_primary_20260803/2026-08-03_0935ET/ directly as same-day prior buy context for top-up calculations if the latest pointer is missing. The 09:35 fills are ticker-scoped top-up context only and do not prove any other stream ran.",
+        "downstream_context_note": "The 12:30, 13:30, 14:30, and 15:30 same-day runs may use this 11:30 catch-up artifact as prior top-up context only. It is not afternoon scheduled evidence and must not be counted as scheduled slippage evidence for any other stream."
       },
       "recorded_recovery": "See intraday_dca_scheduled_recovery_2026_07_24 for the 2026-07-24 2:30 PM ET scheduled recovery fills, which are preserved unchanged.",
       "preserved_note": "Preserves the canonical first-buy and same-day top-up rule, the $2.00 base amount, the 0x-to-5x graded ladder, the Finance-primary read-only market-data policy with Alpaca/Robinhood validation and yfinance fallback only when connector data is unavailable, stale, incomplete, or unresolved, the GFUZ Robinhood-primary handling, the GFUZ/TXN active universe with BYDDY/VCX/TRLV/RVI exclusions, Robinhood-only execution on account <ROBINHOOD_ACCOUNT_NUMBER>, all budget caps and circuit breakers, and the artifact contract.",
@@ -3409,6 +3491,48 @@
           "zero_order_rule": "A zero-order final run contributes zero scheduled slippage fills. Earlier same-day orders in raw context MUST NOT be attributed to it.",
           "evr_recovery_containment": "The 2:33 PM ET EVR recovery order remains same-day top-up context only and is never scheduled slippage evidence.",
           "see": "final_run_reconciliation_scope_2026_07_27"
+        },
+        "foreground_primary_surrogate_context": {
+          "added": "2026-07-30",
+          "policy": "foreground_primary_and_close_window_patch_2026_07_30",
+          "summary": "JUL 30 2026 FOREGROUND PRIMARY SURROGATE CONTEXT PATCH. If any same-day foreground/manual recovery artifact, run_state.json, run_summary.json, latest pointer, or manifest entry carries one of the recognised markers (foreground_primary_surrogate_context=true, the bare marker string foreground_primary_surrogate_context, run_origin='foreground_primary_surrogate', run_origin='manual_foreground_primary', or valid_primary_executor_evidence=true), treat that as intentional foreground primary mode for the current trading day. In foreground primary mode the 3:35 PM ET post-trade validator MUST NOT escalate a missing or invalid background scheduled evidence alert solely because the scheduled run artifact is absent, incomplete, or valid_scheduled_evidence=false. Report foreground_primary_mode_active=true, list the foreground artifact paths used, and classify those fills/orders as foreground_primary_surrogate_context.",
+          "evidence_separation": "Foreground and manual fills stay valid_scheduled_evidence=false, valid_afternoon_scheduled_evidence=false, and top_up_context_only=true. They are execution context for user-approved foreground primary operation. They never prove that background scheduled execution ran, and they are never scheduled slippage, scheduled reliability, or scheduled cost-basis evidence.",
+          "still_escalate": [
+            "safety failures",
+            "broker/order mismatches",
+            "missing required foreground artifacts",
+            "stale same-day pointers",
+            "invalid schema",
+            "drift where a foreground signal says an order was placed but no broker or artifact record exists",
+            "invalid background scheduled artifacts when foreground primary mode is NOT active"
+          ],
+          "same_day_requirement": "A marker only counts when the artifact carrying it declares trading_day equal to the current ET trading day. A prior-day marker, or a marker on an artifact that declares no trading day, is rejected: otherwise one foreground day would silence the missing-scheduled-evidence alert permanently.",
+          "interaction_with_final_run_reconciliation_scope": "Unchanged. A foreground artifact is never final-run evidence and never scheduled slippage evidence; the 19:30Z-to-19:35Z EDT window is untouched.",
+          "reporting_behavior": "dca_reporting.generate_scheduled_reports writes foreground_primary_context.json instead of raising when a marked same-day foreground artifact is supplied and nothing else is escalating.",
+          "implementation": "scripts/foreground_primary.py (detect_foreground_primary_context, evaluate_scheduled_evidence_alert)",
+          "see": "foreground_primary_and_close_window_patch_2026_07_30 and config/run_classification.json:foreground_primary_surrogate_context_2026_07_30"
+        },
+        "close_window_signal_comparison": {
+          "added": "2026-07-30",
+          "policy": "foreground_primary_and_close_window_patch_2026_07_30",
+          "summary": "JUL 30 2026 CLOSE-WINDOW SIGNAL COMPARISON PATCH. During the close-of-day validator pass, compute a read-only what_would_have_fired summary for the active watchlist. Use the current market-close decision price versus the prior completed regular-session close, apply the graded sizing ladder for summary purposes, and report which tickers would have fired in background scheduled mode and in foreground primary mode. When foreground_primary_surrogate_context is active, state that foreground primary mode is active and compare the foreground execution context against this watchlist signal summary rather than treating missing scheduled evidence as a failure.",
+          "analytics_only": true,
+          "must_not": "place, review, cancel, sell, or modify any order. No budget is consumed and no order path is exercised.",
+          "data_sources": "Finance connector primary market data, Alpaca and Robinhood validation/context, yfinance fallback only when needed. Unchanged from market_data_source_policy; this summary consumes the same reads, it does not add a provider.",
+          "fields": [
+            "ticker",
+            "decision_price",
+            "prior_close",
+            "drop_pct",
+            "ladder_multiplier_capped_at_3x",
+            "background_mode_status",
+            "foreground_mode_status",
+            "reason_if_not_fired",
+            "data_source"
+          ],
+          "ladder_reporting_cap": "Report 0x through 3x buckets. The live ladder in config/sizing_ladder.json runs to 5x; a drop the ladder grades above 3x is reported as 3.0 with ladder_multiplier_label='3x_plus' so the cap is visible. REPORTING ONLY: execution sizing continues to use the full ladder via near_close_dca.graded_buy_multiplier.",
+          "implementation": "scripts/close_window_signal.py (build_close_window_summary)",
+          "see": "foreground_primary_and_close_window_patch_2026_07_30"
         }
       },
       "notes": "Analytics only, no trading. Reads the scheduled live-run state and Robinhood order history, writes slippage/coverage artifacts, and updates the compact Notion Latest Run section only. Honors the run-classification policy (config/run_classification.json): scheduled-live metrics use only validated scheduled runs with manual order IDs excluded. Final manual buy overrides (final_manual_review/** and ce16ba6b/manual_runs/final_manual_override_* and midday_dca/manual_reruns/final_manual_override_*) are excluded from scheduled slippage/fills and shown only in the Manual Final Buy Override / Same-Day Top-Up Context section."

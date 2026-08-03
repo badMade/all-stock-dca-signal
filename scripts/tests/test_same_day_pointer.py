@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # cannot resolve from scripts/ alone.
 sys.path.insert(1, str(Path(__file__).resolve().parents[2]))
 
+import same_day_pointer as same_day_pointer_module  # noqa: E402
 from same_day_pointer import (  # noqa: E402
     STATUS_FUTURE_DATE,
     STATUS_MALFORMED,
@@ -504,6 +505,123 @@ def test_select_none_when_only_stale_pointer(tmp_path):
         pointer_path=pointer_path,
         today=TODAY,
     )
+    assert state is None
+
+
+def test_select_uses_perplexity_primary_alias_when_canonical_pointer_missing(tmp_path):
+    canonical_root = tmp_path / "intraday_dca"
+    canonical_day_dir = canonical_root / "20260721_1130ET"
+    alias_root = tmp_path / "perplexity_primary_20260721"
+    alias_state = _write_state(
+        alias_root,
+        "2026-07-21_1130ET",
+        _scheduled_state(stream="intraday"),
+    )
+    alias_pointer = alias_root / "latest_intraday_run.json"
+    alias_pointer.write_text(
+        json.dumps(
+            {
+                "run_id": "intraday_live_20260721_1130ET",
+                "run_state_path": str(alias_state),
+                "trading_day": TODAY,
+                "stream": "intraday",
+                "pointer_status": STATUS_VALID,
+                "same_day_required": True,
+                "valid_scheduled_evidence": True,
+                "updated_at_utc": "2026-07-21T15:35:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = select_same_day_run_state(
+        stream="intraday",
+        expected_root=canonical_root,
+        trading_day_dir=canonical_day_dir,
+        pointer_path=canonical_root / "latest_intraday_run.json",
+        fallback_pointer_paths=[(alias_pointer, alias_root)],
+        today=TODAY,
+    )
+
+    assert state is not None
+    assert state["trading_day"] == TODAY
+    assert state["run_classification"]["stream"] == "intraday"
+
+
+def test_select_uses_default_perplexity_primary_alias_for_1130_catchup(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(same_day_pointer_module, "CRON_TRACKING_ROOT", tmp_path)
+    canonical_root = tmp_path / "intraday_dca"
+    alias_root = tmp_path / "perplexity_primary_20260721"
+    alias_state = _write_state(
+        alias_root,
+        "2026-07-21_1130ET",
+        _scheduled_state(stream="intraday"),
+    )
+    alias_pointer = alias_root / "latest_intraday_run.json"
+    alias_pointer.write_text(
+        json.dumps(
+            {
+                "run_id": "intraday_live_20260721_1130ET",
+                "run_state_path": str(alias_state),
+                "trading_day": TODAY,
+                "stream": "intraday",
+                "pointer_status": STATUS_VALID,
+                "same_day_required": True,
+                "valid_scheduled_evidence": True,
+                "updated_at_utc": "2026-07-21T15:35:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = select_same_day_run_state(
+        stream="intraday",
+        expected_root=canonical_root,
+        trading_day_dir=canonical_root / "20260721_1130ET",
+        pointer_path=canonical_root / "latest_intraday_run.json",
+        today=TODAY,
+    )
+
+    assert state is not None
+    assert state["trading_day"] == TODAY
+    assert state["run_classification"]["stream"] == "intraday"
+
+
+def test_select_rejects_alias_pointer_without_alias_root(tmp_path):
+    canonical_root = tmp_path / "intraday_dca"
+    alias_root = tmp_path / "perplexity_primary_20260721"
+    alias_state = _write_state(
+        alias_root,
+        "2026-07-21_1130ET",
+        _scheduled_state(stream="intraday"),
+    )
+    alias_pointer = alias_root / "latest_intraday_run.json"
+    alias_pointer.write_text(
+        json.dumps(
+            {
+                "run_id": "intraday_live_20260721_1130ET",
+                "run_state_path": str(alias_state),
+                "trading_day": TODAY,
+                "stream": "intraday",
+                "pointer_status": STATUS_VALID,
+                "same_day_required": True,
+                "valid_scheduled_evidence": True,
+                "updated_at_utc": "2026-07-21T15:35:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = select_same_day_run_state(
+        stream="intraday",
+        expected_root=canonical_root,
+        pointer_path=canonical_root / "latest_intraday_run.json",
+        fallback_pointer_paths=[alias_pointer],
+        today=TODAY,
+    )
+
     assert state is None
 
 

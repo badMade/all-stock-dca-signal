@@ -40,7 +40,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from dca_fileio import atomic_write_text
@@ -86,6 +86,14 @@ RECOVERY_STREAMS = (
     "intraday_1330_recovery",
     "intraday_1430_recovery",
 )
+
+_STREAM_ALIAS_POINTER_FILENAMES = {
+    "market_open": "latest_market_open_run.json",
+    "morning": "latest_morning_run.json",
+    "midday": "latest_midday_run.json",
+    "intraday": "latest_intraday_run.json",
+    "afternoon": "latest_scheduled_run.json",
+}
 
 # Statuses that never count as same-day SCHEDULED evidence. STATUS_VALID_RECOVERY_CONTEXT
 # is listed because it is exactly that: usable, but not scheduled evidence. A
@@ -805,6 +813,8 @@ def select_same_day_run_state(
     expected_root: str | Path,
     trading_day_dir: Optional[str | Path] = None,
     pointer_path: Optional[str | Path] = None,
+    fallback_pointer_paths: Optional[Iterable[str | Path | Tuple[str | Path, str | Path]]] = None,
+    fallback_expected_root: Optional[str | Path] = None,
     today: Optional[str] = None,
     now: Optional[datetime] = None,
     run_state_filename: str = "run_state.json",
@@ -812,9 +822,18 @@ def select_same_day_run_state(
     """Resolve today's scheduled run_state, preferring a date-specific file.
 
     Order of preference (contract): a date-specific same-day run_state file
-    (under ``trading_day_dir``) is preferred over the latest pointer. Only a
-    scheduled, non-manual, same-day state is returned; anything else (stale,
-    manual, malformed, wrong stream, pointer to a prior day) yields ``None``.
+    (under ``trading_day_dir``) is preferred over the canonical latest pointer.
+    If both are unavailable or invalid, callers may supply same-day fallback
+    pointers (for example the Perplexity-primary alias root used by the 11:30
+    catch-up run). Only a scheduled, non-manual, same-day state is returned;
+    anything else (stale, manual, malformed, wrong stream, pointer to a prior
+    day) yields ``None``.
+
+    ``fallback_pointer_paths`` entries may be either a pointer path or
+    ``(pointer_path, expected_root)``. The latter is the safe form for alias
+    roots that deliberately sit outside the canonical stream root. A bare
+    fallback path is validated against ``fallback_expected_root`` when provided,
+    otherwise against ``expected_root``.
 
     Returns the loaded run_state dict, or ``None`` when no valid same-day
     scheduled state can be established.
@@ -849,21 +868,119 @@ def select_same_day_run_state(
                     return loaded
 
     if pointer_path is not None:
-        result = validate_pointer(
+        loaded = _load_valid_state_from_pointer(
             pointer_path,
             expected_stream=stream,
             expected_root=root,
             today=day,
             now=now,
         )
-        if result.is_valid and result.run_state_path:
-            try:
-                loaded = json.loads(Path(result.run_state_path).read_bytes())
-            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-                return None
-            if isinstance(loaded, dict) and derive_valid_scheduled_evidence(loaded):
-                return loaded
+        if loaded is not None:
+            return loaded
 
+    fallback_candidates = list(
+        _iter_fallback_pointers(
+            fallback_pointer_paths,
+            default_root=fallback_expected_root or root,
+        )
+    )
+    fallback_candidates.extend(_perplexity_primary_alias_pointer_candidates(stream, day))
+
+    for fallback_pointer, fallback_root in fallback_candidates:
+        loaded = _load_valid_state_from_pointer(
+            fallback_pointer,
+            expected_stream=stream,
+            expected_root=fallback_root,
+            today=day,
+            now=now,
+        )
+        if loaded is not None:
+            return loaded
+
+    return None
+
+
+def _perplexity_primary_alias_pointer_candidates(
+    stream: str,
+    trading_day: str,
+) -> Iterable[Tuple[Path, Path]]:
+    """Yield safe same-day Perplexity-primary alias pointer candidates.
+
+    The Aug 3 2026 11:30 catch-up incident showed that the canonical stream
+    pointer can be absent while the Perplexity-primary alias root has a
+    pointer and root artifacts. This default fallback lets orchestration
+    self-heal that class of pointer-missing event WHEN the alias run is
+    itself genuinely scheduled evidence, without accepting arbitrary fallback
+    paths: the alias root is derived only from the current trading day and the
+    pointer filename is derived only from the expected stream.
+
+    This is deliberately narrower than "self-heal the 11:30 catch-up": like
+    every other candidate ``select_same_day_run_state`` considers, an alias
+    candidate still has to satisfy :func:`derive_valid_scheduled_evidence`
+    (``run_origin='scheduled'``, ``manual_run=false``) through
+    :func:`_load_valid_state_from_pointer`. The 174c4163 catch-up's own
+    classification (config/scheduled_tasks.json:
+    perplexity_primary_1130_catchup_2026_08_03) is correctly ``run_origin=
+    'manual'``/``manual_run=true`` -- it never claims to be the background
+    scheduled run, per this same repo's evidence-separation contract
+    (scripts/foreground_primary.py) -- so this fallback returning ``None`` for
+    that specific run_state is correct, not a bug: a manual/foreground catch-up
+    must never be surfaced as SCHEDULED evidence, through this path or any
+    other (Codex review: "Accept the manual catch-up through the alias
+    fallback"). Same-day TOP-UP context for a manual/foreground run (which is
+    what the catch-up's own manifest block actually needs from later runs) is
+    resolved separately, by the existing prior_allocation_roots directory scan
+    in morning_dca.py/near_close_dca.py, which is not scoped to scheduled-only
+    evidence and already covers this alias root when it is listed there.
+    """
+    pointer_filename = _STREAM_ALIAS_POINTER_FILENAMES.get(stream)
+    if pointer_filename is None:
+        return
+    compact_day = trading_day.replace("-", "")
+    alias_root = Path(CRON_TRACKING_ROOT) / f"perplexity_primary_{compact_day}"
+    yield alias_root / pointer_filename, alias_root
+
+
+def _iter_fallback_pointers(
+    fallback_pointer_paths: Optional[Iterable[str | Path | Tuple[str | Path, str | Path]]],
+    *,
+    default_root: str | Path,
+) -> Iterable[Tuple[str | Path, Path]]:
+    """Yield ``(pointer_path, expected_root)`` pairs for fallback alias pointers."""
+    if not fallback_pointer_paths:
+        return
+    for entry in fallback_pointer_paths:
+        if isinstance(entry, tuple):
+            pointer, root = entry
+            yield pointer, Path(root)
+        else:
+            yield entry, Path(default_root)
+
+
+def _load_valid_state_from_pointer(
+    pointer_path: str | Path,
+    *,
+    expected_stream: str,
+    expected_root: str | Path,
+    today: str,
+    now: Optional[datetime] = None,
+) -> Optional[Dict[str, object]]:
+    """Load a run_state from a pointer only after full same-day validation."""
+    result = validate_pointer(
+        pointer_path,
+        expected_stream=expected_stream,
+        expected_root=expected_root,
+        today=today,
+        now=now,
+    )
+    if not result.is_valid or not result.run_state_path:
+        return None
+    try:
+        loaded = json.loads(Path(result.run_state_path).read_bytes())
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if isinstance(loaded, dict) and derive_valid_scheduled_evidence(loaded):
+        return loaded
     return None
 
 

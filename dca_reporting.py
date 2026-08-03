@@ -22,9 +22,10 @@ from __future__ import annotations
 import csv
 import json
 import math
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from dca_fileio import atomic_open_w, atomic_write_text
 
@@ -602,6 +603,24 @@ def _run_classification_helpers():
     return collect_manual_order_ids, select_scheduled_state_for_reporting
 
 
+def _foreground_primary_helpers():
+    """Import the Jul 30 2026 foreground-primary gate, tolerating either import
+    layout (repo-root namespace package ``scripts`` or ``scripts/`` on sys.path)."""
+    try:
+        from scripts.foreground_primary import (  # type: ignore
+            detect_foreground_primary_context,
+            evaluate_scheduled_evidence_alert,
+            reconcile_foreground_orders,
+        )
+    except ImportError:  # scripts/ directly on sys.path
+        from foreground_primary import (  # type: ignore
+            detect_foreground_primary_context,
+            evaluate_scheduled_evidence_alert,
+            reconcile_foreground_orders,
+        )
+    return detect_foreground_primary_context, evaluate_scheduled_evidence_alert, reconcile_foreground_orders
+
+
 def _model_usage_log_helper():
     """Import the model usage log writer, tolerating either import layout
     (repo-root namespace package ``scripts`` or ``scripts/`` on sys.path)."""
@@ -610,6 +629,186 @@ def _model_usage_log_helper():
     except ImportError:  # scripts/ directly on sys.path
         from model_usage_log import log_model_usage  # type: ignore
     return log_model_usage
+
+
+# Live stream name -> canonical cron_tracking subdirectory. Mirrors the
+# established source of truth for each root: scripts/run_classification.py's
+# STATE_ROOT (afternoon) and morning_dca.py's DEFAULT_MARKET_OPEN_TASK_ROOT /
+# DEFAULT_MORNING_LIVE_STATE_ROOT / DEFAULT_INTRADAY_TASK_ROOT, plus
+# midday_dca.py's DEFAULT_MIDDAY_LIVE_STATE_ROOT. Kept here (not in
+# scripts/foreground_primary.py, which is standard-library-only by contract)
+# so a foreground pointer's declared stream can be checked against the root
+# it is actually supposed to live under.
+_FOREGROUND_STREAM_SUBDIRS = {
+    "market_open": "market_open_dca",
+    "morning": "morning_dca",
+    "midday": "midday_dca",
+    "intraday": "intraday_dca",
+    "afternoon": "ce16ba6b",
+}
+
+
+def _foreground_expected_roots() -> Dict[str, str]:
+    """Expected artifact root per live stream, for pointer containment checks.
+
+    Without this, ``detect_foreground_primary_context``'s ``expected_roots``
+    stayed at its ``None`` default here, so a pointer's root-containment check
+    was silently skipped and a pointer targeting a same-day run_state OUTSIDE
+    the approved artifact tree could still activate foreground mode (Codex
+    review: "Supply expected roots when validating foreground pointers").
+    """
+    from dca_paths import stream_root
+
+    return {stream: stream_root(subdir) for stream, subdir in _FOREGROUND_STREAM_SUBDIRS.items()}
+
+
+def _realign_close_window_summary(
+    summary: Dict[str, Any],
+    *,
+    background_mode_active: bool,
+    foreground_primary_mode_active: bool,
+) -> Dict[str, Any]:
+    """Return a copy of ``summary`` with its mode flags/per-row statuses
+    corrected to the given, actually-determined background/foreground state.
+
+    ``summary`` (built by ``scripts.close_window_signal.build_close_window_summary``)
+    carries whatever ``background_mode_active``/``foreground_primary_mode_active``
+    its builder assumed at build time, which will not generally match what this
+    module determines afterward. Per-row ``*_mode_status`` is fully determined
+    by ``reason_if_not_fired`` plus the two mode flags (see
+    ``close_window_signal.build_close_window_row``), so it can be recomputed
+    here without re-deriving price/ladder inputs. ``would_have_fired_count``/
+    ``would_have_fired_tickers`` need no correction: they come from
+    ``reason_if_not_fired`` alone and are mode-independent.
+    """
+    try:
+        from scripts.close_window_signal import (  # type: ignore
+            STATUS_SIGNAL_MODE_NOT_ACTIVE,
+            STATUS_WOULD_HAVE_FIRED,
+        )
+    except ImportError:  # scripts/ directly on sys.path
+        from close_window_signal import (  # type: ignore
+            STATUS_SIGNAL_MODE_NOT_ACTIVE,
+            STATUS_WOULD_HAVE_FIRED,
+        )
+
+    realigned = dict(summary)
+    realigned["background_mode_active"] = background_mode_active
+    realigned["foreground_primary_mode_active"] = foreground_primary_mode_active
+    rows = realigned.get("rows")
+    if isinstance(rows, list):
+        realigned_rows = []
+        for row in rows:
+            if not isinstance(row, dict):
+                realigned_rows.append(row)
+                continue
+            row = dict(row)
+            if row.get("reason_if_not_fired") is None:
+                row["background_mode_status"] = (
+                    STATUS_WOULD_HAVE_FIRED if background_mode_active else STATUS_SIGNAL_MODE_NOT_ACTIVE
+                )
+                row["foreground_mode_status"] = (
+                    STATUS_WOULD_HAVE_FIRED if foreground_primary_mode_active else STATUS_SIGNAL_MODE_NOT_ACTIVE
+                )
+            realigned_rows.append(row)
+        realigned["rows"] = realigned_rows
+    return realigned
+
+
+def write_foreground_primary_report(
+    trading_day: str,
+    output_dir: str | Path,
+    *,
+    foreground_primary_artifacts: Optional[Iterable[str | Path | Mapping[str, Any]]],
+    scheduled_evidence_reasons: Sequence[str] = (),
+    blocking_findings: Sequence[str] = (),
+    close_window_summary: Optional[Dict[str, Any]] = None,
+    fills: Sequence[Dict[str, Any]] = (),
+) -> Optional[Path]:
+    """Write ``foreground_primary_context.json`` when the day ran foreground primary.
+
+    Returns the report path when foreground primary mode is active and nothing
+    else is escalating, and ``None`` otherwise, in which case the caller must
+    escalate as it always did. See scripts/foreground_primary.py for the rule.
+
+    ``fills`` is the caller-supplied broker fill/order list. It is reconciled
+    against every foreground artifact's claimed order IDs
+    (:func:`scripts.foreground_primary.reconcile_foreground_orders`) before the
+    alert is evaluated, so a same-day foreground artifact that claims an order
+    was placed with no matching broker fill drifts into
+    ``FINDING_FOREGROUND_DRIFT`` and escalates rather than being suppressed.
+    """
+    detect, evaluate, reconcile_orders = _foreground_primary_helpers()
+    # Materialized once and reused for both passes: a caller-supplied
+    # generator (the advertised Iterable type permits one) would otherwise be
+    # exhausted by detect(), leaving reconcile_orders() nothing to check and
+    # silently dropping FINDING_FOREGROUND_DRIFT (Codex review: "Materialize
+    # foreground artifact iterables before both passes").
+    artifacts = list(foreground_primary_artifacts) if foreground_primary_artifacts is not None else None
+    foreground = detect(artifacts, trading_day=trading_day, expected_roots=_foreground_expected_roots())
+    # Reconciled against foreground.accepted_artifacts, NOT the raw artifacts
+    # list: the raw list can carry a rejected candidate (prior-day, unmarked,
+    # or an invalid pointer) that happens to claim an order_id absent from
+    # fills, which produced a false FINDING_FOREGROUND_DRIFT and blocked an
+    # otherwise-valid foreground report (Codex review: "Reconcile only
+    # accepted foreground artifacts").
+    drift_findings = reconcile_orders(foreground.accepted_artifacts, fills)
+    alert = evaluate(
+        scheduled_evidence_ok=False,
+        scheduled_evidence_reasons=scheduled_evidence_reasons,
+        foreground=foreground,
+        blocking_findings=[*blocking_findings, *drift_findings],
+    )
+    if alert.escalate or not alert.foreground_primary_mode_active:
+        return None
+
+    payload: Dict[str, Any] = {
+        "trading_day": trading_day,
+        "patch": "foreground_primary_surrogate_context_2026_07_30",
+        "foreground_primary_context": foreground.to_report(),
+        "scheduled_evidence_alert": alert.to_report(),
+    }
+    if close_window_summary is not None:
+        # This report is only ever written on the branch where the background
+        # scheduled stream produced no valid evidence and foreground primary
+        # mode IS active (the early return above already enforced
+        # alert.foreground_primary_mode_active). The caller built
+        # close_window_summary before that was known, so its own embedded
+        # mode flags/per-row statuses can be stale -- e.g. still claiming
+        # background_mode_active=true while this report simultaneously
+        # declares foreground primary mode active, a self-contradictory
+        # artifact (Codex review: "Align summary modes with the detected
+        # foreground context"). Realign it to the state this function itself
+        # just determined.
+        payload["what_would_have_fired"] = _realign_close_window_summary(
+            close_window_summary,
+            background_mode_active=False,
+            foreground_primary_mode_active=True,
+        )
+    path = Path(output_dir) / "foreground_primary_context.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return path
+
+
+@dataclass(frozen=True)
+class ModelUsageConfig:
+    """Model-usage-tracking overrides for :func:`generate_scheduled_reports`.
+
+    Bundles the audit-log root and the ``log_model_usage`` cost-conscious
+    defaults' overrides (see ``scripts/model_usage_log.py``) into a single
+    opt-in object: ``log_root=None`` (the default) skips the audit-log
+    append entirely, and the remaining fields stay unset unless the caller
+    explicitly knows it used a permitted premium escalation. See
+    ``docs/cost_tracking.md`` ("What Python cannot know") for the full
+    contract these fields satisfy.
+    """
+
+    log_root: Optional[str | Path] = None
+    model_requested: Optional[str] = None
+    model_actual: Optional[str] = None
+    model_routing_mode: Optional[str] = None
+    reason_for_premium_model: Optional[str] = None
 
 
 def generate_scheduled_reports(
@@ -622,6 +821,10 @@ def generate_scheduled_reports(
     model_usage_model_actual: Optional[str] = None,
     model_usage_model_routing_mode: Optional[str] = None,
     model_usage_reason_for_premium_model: Optional[str] = None,
+    *,
+    foreground_primary_artifacts: Optional[Iterable[str | Path | Mapping[str, Any]]] = None,
+    close_window_summary: Optional[Dict[str, Any]] = None,
+    model_usage_config: Optional[ModelUsageConfig] = None,
 ) -> Dict[str, str]:
     """Task 67aa802b entry point: post-trade reports for the SCHEDULED run only.
 
@@ -633,20 +836,114 @@ def generate_scheduled_reports(
 
     ``fills`` is the same broker fill list ``generate_reports`` takes; ``base``
     overrides the artifact root (defaults to the contract's STATE_ROOT).
+
     ``model_usage_log_root`` is opt-in (see scripts/model_usage_log.py,
     config/scheduled_tasks.json -> model_usage_log): None (the default) skips
     the audit-log append entirely (appended even when report generation
-    raises, so a failed run is still recorded). The ``model_usage_model_*``/
-    ``model_usage_reason_for_premium_model`` kwargs override
-    ``log_model_usage``'s cost-conscious defaults -- this function has no
-    visibility into which model/agent actually drove the run, so they stay
-    unset unless the scheduler invoking this call explicitly knows it used a
-    permitted premium escalation and passes them.
+    raises, so a failed run is still recorded). ``model_usage_config.log_root``
+    is the new keyword-only alternative; any of the legacy
+    ``model_usage_model_*``/``model_usage_reason_for_premium_model`` kwargs
+    override the corresponding ``model_usage_config`` field, so old and new
+    call sites can both be satisfied.
+
+    The ``model_usage_log_root``/``model_usage_model_*``/
+    ``model_usage_reason_for_premium_model`` parameters are the pre-existing
+    interface documented at ``docs/cost_tracking.md:206-220`` and are kept
+    in their original positional-or-keyword slots (unchanged) for the
+    externally managed 67aa802b scheduler, which still calls this entry
+    point with them -- including positionally. ``model_usage_config`` is
+    the new keyword-only alternative; any of the legacy parameters that is
+    passed (non-``None``) overrides the corresponding ``model_usage_config``
+    field, so old and new call sites can both be satisfied.
+
+    ``foreground_primary_artifacts`` opts into the Jul 30 2026 foreground primary
+    surrogate context patch: same-day foreground ``run_state.json`` /
+    ``run_summary.json`` / pointer paths (or already-loaded manifest entries) to
+    check for a foreground primary marker when no valid scheduled state exists.
+    When one is found this function writes ``foreground_primary_context.json``
+    and returns its path instead of raising. Left as None (the default) the
+    missing-scheduled-state case raises exactly as it always has.
+    ``close_window_summary`` is the optional read-only what-would-have-fired
+    analytics block (see scripts/close_window_signal.py) embedded in that report.
     """
     collect_manual_order_ids, select_scheduled = _run_classification_helpers()
     base_path = Path(base) if base is not None else None
     selection = select_scheduled(trading_day, base=base_path)
+
+    # This reporting task's own identity/artifact -- distinct from the live
+    # run (selection.state_path) it is reporting ON, so the audit log points
+    # an auditor at what THIS task produced (output_dir), not the afternoon
+    # 15:30 live task's run_state.json. The live run's own run_id is kept in
+    # `notes` as an explicit input reference.
+    # Retimed 2026-08-02 from 3:35 PM ET to 5:00 PM ET daily (task 67aa802b,
+    # Geoff: "move the 3:35 slippage sync + compact Notion update to 5 pm
+    # daily") -- the audit run_id must match, or it claims the retired 3:35
+    # PM slot while build_entry() derives scheduled_for_et='17:00' from the
+    # manifest, producing internally contradictory audit data (Codex review:
+    # "Retag reporting runs with the new 17:00 slot").
+    report_run_id = f"reporting_{trading_day}_1700ET"
+    log_model_usage = _model_usage_log_helper()
+    # Merge model_usage_config with the legacy positional-or-keyword params:
+    # a non-None legacy param overrides the corresponding config field, so
+    # both the externally managed scheduler (which still calls with the
+    # legacy params, including positionally) and a new call site using only
+    # model_usage_config are satisfied, as documented above. Previously
+    # model_usage_config was accepted but never read here, so a caller using
+    # only the new alternative silently got root=None (skipping the audit-log
+    # append) and lost every routing override it set (Codex review: "Apply
+    # ModelUsageConfig before logging").
+    config = model_usage_config or ModelUsageConfig()
+    effective_log_root = model_usage_log_root if model_usage_log_root is not None else config.log_root
+    routing_overrides = {
+        "model_requested": model_usage_model_requested if model_usage_model_requested is not None else config.model_requested,
+        "model_actual": model_usage_model_actual if model_usage_model_actual is not None else config.model_actual,
+        "model_routing_mode": model_usage_model_routing_mode if model_usage_model_routing_mode is not None else config.model_routing_mode,
+        "reason_for_premium_model": (
+            model_usage_reason_for_premium_model
+            if model_usage_reason_for_premium_model is not None
+            else config.reason_for_premium_model
+        ),
+    }
+
+    def _log_model_usage(notes: str) -> None:
+        # Best-effort append even when report generation raises, so a failed
+        # report run is still recorded per the one-entry-per-task-run
+        # contract. Called on every path out of this function that reaches
+        # report generation or the foreground-primary success return, so a
+        # successful foreground-primary run appends a row exactly as a
+        # successful scheduled run does (Codex review: "Preserve model-usage
+        # logging on the foreground return").
+        log_model_usage(
+            root=effective_log_root,
+            run_id=report_run_id,
+            cron_id="67aa802b",
+            run_origin="scheduled",
+            artifact_path=str(output_dir),
+            triggered_at_utc=datetime.now(timezone.utc),
+            notes=notes,
+            **{k: v for k, v in routing_overrides.items() if v is not None},
+        )
+
     if not selection.ok:
+        # JUL 30 2026 FOREGROUND PRIMARY SURROGATE CONTEXT PATCH. A day the
+        # operator drove in the foreground legitimately has no background
+        # scheduled run_state, so raising here reported an outage that did not
+        # happen. Only a same-day, marker-carrying foreground artifact reaches
+        # the non-raising path, and it is recorded as CONTEXT: the report it
+        # writes states valid_scheduled_evidence=false. Callers that pass no
+        # foreground artifacts (every existing one) still raise exactly as
+        # before.
+        report_path = write_foreground_primary_report(
+            trading_day,
+            output_dir,
+            foreground_primary_artifacts=foreground_primary_artifacts,
+            scheduled_evidence_reasons=selection.errors,
+            close_window_summary=close_window_summary,
+            fills=fills,
+        )
+        if report_path is not None:
+            _log_model_usage(f"foreground primary context for {trading_day}: {report_path}")
+            return {"foreground_primary_context": str(report_path)}
         raise ValueError(
             f"no valid scheduled run_state for {trading_day}: "
             + "; ".join(selection.errors)
@@ -732,26 +1029,7 @@ def generate_scheduled_reports(
                     # UTF-8 persisted raw orders as a fallback miss").
                     pass
 
-    # This reporting task's own identity/artifact -- distinct from the live
-    # run (selection.state_path) it is reporting ON, so the audit log points
-    # an auditor at what THIS task produced (output_dir), not the afternoon
-    # 15:30 live task's run_state.json. The live run's own run_id is kept in
-    # `notes` as an explicit input reference.
-    # Retimed 2026-08-02 from 3:35 PM ET to 5:00 PM ET daily (task 67aa802b,
-    # Geoff: "move the 3:35 slippage sync + compact Notion update to 5 pm
-    # daily") -- the audit run_id must match, or it claims the retired 3:35
-    # PM slot while build_entry() derives scheduled_for_et='17:00' from the
-    # manifest, producing internally contradictory audit data (Codex review:
-    # "Retag reporting runs with the new 17:00 slot").
-    report_run_id = f"reporting_{trading_day}_1700ET"
     source_run_id = (selection.state or {}).get("run_id")
-    log_model_usage = _model_usage_log_helper()
-    routing_overrides = {
-        "model_requested": model_usage_model_requested,
-        "model_actual": model_usage_model_actual,
-        "model_routing_mode": model_usage_model_routing_mode,
-        "reason_for_premium_model": model_usage_reason_for_premium_model,
-    }
     try:
         report_paths = generate_reports(
             selection.state,
@@ -759,17 +1037,22 @@ def generate_scheduled_reports(
             output_dir,
             require_scheduled=True,
         )
+        # JUL 30 2026 CLOSE-WINDOW SIGNAL COMPARISON PATCH. Previously this
+        # summary was forwarded only on the foreground-primary path (inside
+        # `if not selection.ok`), so the normal background scheduled run --
+        # exactly the day the 3:35/5:00 validator most needs a
+        # what_would_have_fired comparison -- never received or wrote it
+        # (Codex review: "Emit the close-window summary on scheduled-run
+        # days"). Written alongside the other report files so a scheduled run
+        # gets the same comparison a foreground-primary run does.
+        if close_window_summary is not None:
+            close_window_path = Path(output_dir) / "close_window_summary.json"
+            close_window_path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(
+                close_window_path,
+                json.dumps({"what_would_have_fired": close_window_summary}, indent=2, sort_keys=True) + "\n",
+            )
+            report_paths = dict(report_paths, close_window_summary=str(close_window_path))
     finally:
-        # Best-effort append even when generate_reports raises, so a failed
-        # report run is still recorded per the one-entry-per-task-run contract.
-        log_model_usage(
-            root=model_usage_log_root,
-            run_id=report_run_id,
-            cron_id="67aa802b",
-            run_origin="scheduled",
-            artifact_path=str(output_dir),
-            triggered_at_utc=datetime.now(timezone.utc),
-            notes=f"post-trade reports for live run {source_run_id}",
-            **{k: v for k, v in routing_overrides.items() if v is not None},
-        )
+        _log_model_usage(f"post-trade reports for live run {source_run_id}")
     return report_paths

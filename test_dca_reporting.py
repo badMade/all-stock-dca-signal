@@ -1246,6 +1246,98 @@ def test_load_run_state(tmp_path):
     loaded_data = load_run_state(state_file)
     assert loaded_data == expected_data
 
+
+def test_generate_scheduled_reports_escalates_missing_scheduled_evidence_by_default(tmp_path=None):
+    import tempfile
+    from pathlib import Path
+
+    import pytest
+
+    from dca_reporting import generate_scheduled_reports
+
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-30"
+    with pytest.raises(ValueError, match="no valid scheduled run_state"):
+        generate_scheduled_reports(day, [], base / "reports", base=base)
+
+
+def test_generate_scheduled_reports_escalates_when_foreground_primary_is_not_active(tmp_path=None):
+    """A same-day foreground artifact with NO marker does not suppress the alert."""
+    import tempfile
+    from pathlib import Path
+
+    import pytest
+
+    from dca_reporting import generate_scheduled_reports
+
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-30"
+    unmarked = {"trading_day": day, "run_classification": {"run_origin": "manual"}}
+    with pytest.raises(ValueError, match="no valid scheduled run_state"):
+        generate_scheduled_reports(
+            day,
+            [],
+            base / "reports",
+            base=base,
+            foreground_primary_artifacts=[unmarked],
+        )
+
+
+def test_generate_scheduled_reports_reports_foreground_primary_mode_instead_of_escalating(tmp_path=None):
+    """Jul 30 2026 patch: a marked same-day foreground artifact is reported, not alerted."""
+    import tempfile
+    from pathlib import Path
+
+    from dca_reporting import generate_scheduled_reports
+    from scripts.close_window_signal import build_close_window_summary
+
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-30"
+    foreground = base / "foreground" / "run_state.json"
+    foreground.parent.mkdir(parents=True, exist_ok=True)
+    foreground.write_text(
+        json.dumps(
+            {
+                "trading_day": day,
+                "run_classification": {"run_origin": "manual_foreground_primary"},
+            }
+        )
+    )
+
+    summary = build_close_window_summary(
+        {"NVDA": {"decision_price": 98.0, "prior_close": 100.0, "data_source": "finance"}},
+        tiers=((0.001, 1.0), (0.02, 2.0)),
+        trading_day=day,
+        background_mode_active=False,
+        foreground_primary_mode_active=True,
+    )
+
+    paths = generate_scheduled_reports(
+        day,
+        [],
+        base / "reports",
+        base=base,
+        foreground_primary_artifacts=[foreground],
+        close_window_summary=summary,
+    )
+    report = json.loads(Path(paths["foreground_primary_context"]).read_text())
+
+    context = report["foreground_primary_context"]
+    assert context["foreground_primary_mode_active"] is True
+    assert context["foreground_artifact_paths"] == [str(foreground)]
+    # Evidence separation survives the round trip into the artifact.
+    assert context["valid_scheduled_evidence"] is False
+    assert context["valid_afternoon_scheduled_evidence"] is False
+    assert context["top_up_context_only"] is True
+
+    alert = report["scheduled_evidence_alert"]
+    assert alert["escalate"] is False
+    assert alert["suppressed_reasons"]
+
+    assert report["what_would_have_fired"]["analytics_only"] is True
+    assert report["what_would_have_fired"]["would_have_fired_tickers"] == ["NVDA"]
+
+
 def _run_all():
     import inspect
     import tempfile
