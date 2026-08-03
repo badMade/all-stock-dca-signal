@@ -7788,28 +7788,7 @@ def run_once(
     _IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
     scheduled = ctx.scheduled
     try:
-        return _run_once_impl(
-            ctx.now,
-            ctx.config,
-            ctx.state,
-            ctx.finance_data,
-            ctx.robinhood_data,
-            ctx.broker,
-            artifacts_dir=ctx.artifacts_dir,
-            run_result=ctx.run_result,
-            notifications_sent=ctx.notifications_sent,
-            cost_control_notes=ctx.cost_control_notes,
-            prior_same_day_allocations=ctx.prior_same_day_allocations,
-            deployment_history_root=ctx.deployment_history_root,
-            scheduled=ctx.scheduled,
-            classification_state_root=ctx.classification_state_root,
-            raw_persistence_state=ctx.raw_persistence_state,
-            classification_overrides=ctx.classification_overrides,
-            correlation_id=ctx.correlation_id,
-            stream=ctx.stream,
-            earlier_week_notional_usd=ctx.earlier_week_notional_usd,
-            earlier_week_scan_had_failures=ctx.earlier_week_scan_had_failures,
-        )
+        return _run_once_impl(ctx)
     except Exception as exc:  # noqa: BLE001 - always re-raised below
         if scheduled and ctx.artifacts_dir:
             try:
@@ -8154,27 +8133,28 @@ def config_broker_name() -> str:
 
 
 def _run_once_impl(
-    now: datetime,
-    config: StrategyConfig,
-    state: StrategyState,
-    finance_data: MarketDataProvider,
-    robinhood_data: MarketDataProvider,
-    broker: BrokerAdapter,
-    artifacts_dir: Optional[str | Path] = None,
-    run_result: Optional[RunResult] = None,
-    notifications_sent: Optional[int] = None,
-    cost_control_notes: Optional[Sequence[str]] = None,
-    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]] = None,
-    deployment_history_root: Optional[str | Path] = None,
-    scheduled: bool = True,
-    classification_state_root: Optional[str | Path] = None,
-    raw_persistence_state: Optional[Dict[str, object]] = None,
-    classification_overrides: Optional[Dict[str, Any]] = None,
-    correlation_id: Optional[str] = None,
-    stream: str = "afternoon",
-    earlier_week_notional_usd: float = 0.0,
-    earlier_week_scan_had_failures: bool = False,
+    ctx: RunContext,
 ) -> List[ReconciledDecision]:
+    now = ctx.now
+    config = ctx.config
+    state = ctx.state
+    finance_data = ctx.finance_data
+    robinhood_data = ctx.robinhood_data
+    broker = ctx.broker
+    artifacts_dir = ctx.artifacts_dir
+    run_result = ctx.run_result
+    notifications_sent = ctx.notifications_sent
+    cost_control_notes = ctx.cost_control_notes
+    prior_same_day_allocations = ctx.prior_same_day_allocations
+    deployment_history_root = ctx.deployment_history_root
+    scheduled = ctx.scheduled
+    classification_state_root = ctx.classification_state_root
+    raw_persistence_state = ctx.raw_persistence_state
+    classification_overrides = ctx.classification_overrides
+    correlation_id = ctx.correlation_id
+    stream = ctx.stream
+    earlier_week_notional_usd = ctx.earlier_week_notional_usd
+    earlier_week_scan_had_failures = ctx.earlier_week_scan_had_failures
     now_et = now.astimezone(EASTERN)
     trading_day = now_et.date()
     if run_result is not None:
