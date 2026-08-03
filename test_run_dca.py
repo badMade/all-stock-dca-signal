@@ -1741,7 +1741,7 @@ def test_compute_earlier_week_cross_stream_notional_includes_final_manual_review
     root (real budget-block-override fills, see
     scripts/run_classification.py's _ROOTS_NEVER_REACHED_BY_CORE_LOADER) that
     morning_dca.py's own default_cap_seed_roots() already scans. Before this
-    fix, _resolve_cross_stream_prior_allocation_roots (shared by both the
+    patch, _resolve_cross_stream_prior_allocation_roots (shared by both the
     same-day and this earlier-week afternoon scan) never included it, so a
     Monday final-manual override fill was invisible to a fresh Tuesday
     afternoon run's shared weekly cap."""
@@ -4939,7 +4939,7 @@ def test_run_slot_1030et_survives_a_failed_preflight_gate_artifact_rewrite(
     run_state.json read-modify-write that persists preflight_gate onto the
     canonical artifact is documented as best-effort (a full/unwritable
     artifact volume must not turn an already-completed trading run into an
-    exception), but the original fix only guarded the read, not the
+    exception), but the original patch only guarded the read, not the
     subsequent atomic_write_text call. An OSError from that write must be
     swallowed (logged, not raised) so the rest of run_slot's return path --
     including everything generate_full_reports/raw-response persistence do
