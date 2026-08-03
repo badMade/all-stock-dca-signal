@@ -45,7 +45,6 @@ strategies = [
     "yfinance",
     "vectorbt",
     "alpaca-py",
-    "newsapi-python",
     "transformers",
     "torch",
 ]

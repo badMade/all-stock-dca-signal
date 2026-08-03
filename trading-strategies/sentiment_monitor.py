@@ -4,7 +4,7 @@ task2_sentiment.py
 NLP-based stock sentiment monitoring and daily email briefing.
 
 Requirements:
-    pip install transformers torch newsapi-python requests pandas numpy jinja2
+    pip install transformers torch requests pandas numpy jinja2
 
 Environment variables:
     NEWS_API_KEY      - NewsAPI.org API key
@@ -31,7 +31,7 @@ import logging
 import os
 import smtplib
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -44,7 +44,6 @@ import numpy as np
 import requests
 import torch
 from jinja2 import Environment
-from newsapi import NewsApiClient
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
 
 # ---------------------------------------------------------------------------
@@ -515,10 +514,7 @@ class NewsCollector:
     def __init__(self, api_key: Optional[str] = None, days: int = DEFAULT_DAYS):
         self.api_key = api_key or os.getenv("NEWS_API_KEY", "")
         self.days = days
-        if self.api_key:
-            self.client = NewsApiClient(api_key=self.api_key)
-        else:
-            self.client = None
+        if not self.api_key:
             logger.warning(
                 "NEWS_API_KEY not set — NewsAPI will be skipped. "
                 "Set the env var to enable news headline collection."
@@ -535,19 +531,33 @@ class NewsCollector:
         Returns:
             List of dicts with keys: title, source, published_at, url.
         """
-        if not self.client:
+        if not self.api_key:
             return []
 
-        from_date = (datetime.utcnow() - timedelta(days=self.days)).strftime("%Y-%m-%d")
+        now = datetime.now(timezone.utc)
+        from_date = (now - timedelta(days=self.days)).strftime("%Y-%m-%d")
+        to_date = now.strftime("%Y-%m-%d")
+        params = {
+            "q": ticker,
+            "from": from_date,
+            "to": to_date,
+            "language": "en",
+            "sortBy": "relevancy",
+            "pageSize": NEWSAPI_PAGE_SIZE,
+        }
+        headers = {
+            "X-Api-Key": self.api_key,
+            "User-Agent": "all-stock-dca/1.0",
+        }
+
         try:
-            resp = self.client.get_everything(
-                q=ticker,
-                from_param=from_date,
-                language="en",
-                sort_by="relevancy",
-                page_size=NEWSAPI_PAGE_SIZE,
-            )
-            articles = resp.get("articles", [])
+            resp = requests.get("https://newsapi.org/v2/everything", params=params, headers=headers, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("status") != "ok":
+                logger.warning("NewsAPI error for %s: %s", ticker, data.get("message", "Unknown error"))
+                return []
+            articles = data.get("articles") or []
             results = []
             for art in articles:
                 title = art.get("title") or ""
@@ -606,8 +616,8 @@ class SECCollector:
                 params = {
                     "q": f'"{ticker}"',
                     "dateRange": "custom",
-                    "startdt": (datetime.utcnow() - timedelta(days=365)).strftime("%Y-%m-%d"),
-                    "enddt": datetime.utcnow().strftime("%Y-%m-%d"),
+                    "startdt": (datetime.now(timezone.utc) - timedelta(days=365)).strftime("%Y-%m-%d"),
+                    "enddt": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
                     "forms": form_type,
                     "_source": "period_of_report,file_date,display_names,period_of_report,entity_name",
                 }
@@ -786,7 +796,7 @@ class EmailBriefing:
             Rendered HTML string.
         """
         today_str = date.today().strftime("%B %d, %Y")
-        generated_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
         # Sort by |z-score| descending for "top movers"
         def sort_key(r):
