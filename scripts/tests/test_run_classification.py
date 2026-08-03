@@ -1690,6 +1690,112 @@ def test_validate_classification_accepts_the_seven_slot_rosters_morning_and_midd
     assert validate_classification(explicit_afternoon).ok
 
 
+def test_validate_classification_accepts_market_open_and_intraday_executor_identities():
+    # Codex review discussion_r3705349451 ("Register intraday identities with
+    # the runtime validator"): market_open_dca.py/intraday_dca.py (both
+    # subclassing morning_dca.MorningDCAExecutor) stamp their OWN run_type and
+    # state_schema_version -- not build_scheduled_classification()'s afternoon
+    # shape reused by the seven-slot roster above -- so accepting only the
+    # roster's morning/midday identities left every genuine market_open/
+    # intraday scheduled run still rejected here. dca_risk.classify_stream()
+    # calls this function, so the gap silently excluded real 14:30 intraday
+    # deployment from the afternoon kill-switch's trailing-7-day total.
+    market_open = {
+        "run_origin": "scheduled",
+        "run_type": "market_open_dca_live",
+        "stream": "market_open",
+        "trades": True,
+        "cron_id": "2ba19526",
+        "supersedes_cron_id": None,
+        "scheduled_for_et": "09:35",
+        "scheduled_window_start_et": "09:30",
+        "scheduled_window_end_et": "09:40",
+        "manual_run": False,
+        "run_id": "market_open_live_20260803_0935ET",
+        "triggered_at_utc": "2026-08-03T13:35:00Z",
+        "state_schema_version": "market-open-live-v1",
+    }
+    res = validate_classification(market_open)
+    assert res.ok, res.errors
+
+    intraday_1130 = {
+        "run_origin": "scheduled",
+        "run_type": "intraday_dca_live",
+        "stream": "intraday",
+        "trades": True,
+        "cron_id": "7be82b97",
+        "supersedes_cron_id": None,
+        "scheduled_for_et": "11:30",
+        "scheduled_window_start_et": "11:25",
+        "scheduled_window_end_et": "11:35",
+        "manual_run": False,
+        "run_id": "intraday_live_20260803_1130ET",
+        "triggered_at_utc": "2026-08-03T15:30:00Z",
+        "state_schema_version": "intraday-live-v1",
+    }
+    res = validate_classification(intraday_1130)
+    assert res.ok, res.errors
+
+    intraday_1430 = dict(intraday_1130)
+    intraday_1430.update(
+        scheduled_for_et="14:30",
+        scheduled_window_start_et="14:25",
+        scheduled_window_end_et="14:35",
+        run_id="intraday_live_20260803_1430ET",
+        triggered_at_utc="2026-08-03T18:30:00Z",
+    )
+    res = validate_classification(intraday_1430)
+    assert res.ok, res.errors
+
+    # Adversarial cases: identity fields must form a coherent tuple, mirroring
+    # the morning/midday checks above.
+    wrong_run_type = dict(market_open)
+    wrong_run_type["run_type"] = "morning_dca_live"
+    assert not validate_classification(wrong_run_type).ok
+
+    wrong_cron = dict(intraday_1130)
+    wrong_cron["cron_id"] = "2ba19526"
+    assert not validate_classification(wrong_cron).ok
+
+    mismatched_slot_window = dict(intraday_1130)
+    mismatched_slot_window["scheduled_window_end_et"] = "13:35"
+    assert not validate_classification(mismatched_slot_window).ok
+
+    hybrid_slot_run_id = dict(intraday_1130)
+    hybrid_slot_run_id["run_id"] = "intraday_live_20260803_1430ET"
+    assert not validate_classification(hybrid_slot_run_id).ok
+
+    unknown_scheduled_for_et = dict(intraday_1130)
+    unknown_scheduled_for_et["scheduled_for_et"] = "10:30"
+    assert not validate_classification(unknown_scheduled_for_et).ok
+
+    claims_afternoon_lineage = dict(market_open)
+    claims_afternoon_lineage["supersedes_cron_id"] = "ce16ba6b"
+    assert not validate_classification(claims_afternoon_lineage).ok
+
+    # The stream-identity fix must actually reach dca_risk's kill switch: a
+    # genuine 14:30 intraday run now classifies as scheduled evidence and, per
+    # is_afternoon_scheduled_evidence's own (unchanged) time floor, counts as
+    # afternoon deployment; an 11:30 run does not.
+    import dca_risk
+
+    state_1430 = {
+        "trading_day": "2026-08-03",
+        "generated_at": "2026-08-03T18:30:00Z",  # 14:30 ET
+        "run_classification": intraday_1430,
+    }
+    assert dca_risk.classify_stream(state_1430) == dca_risk.STREAM_SCHEDULED
+    assert dca_risk.is_afternoon_scheduled_evidence(state_1430) is True
+
+    state_1130 = {
+        "trading_day": "2026-08-03",
+        "generated_at": "2026-08-03T15:30:00Z",  # 11:30 ET
+        "run_classification": intraday_1130,
+    }
+    assert dca_risk.classify_stream(state_1130) == dca_risk.STREAM_SCHEDULED
+    assert dca_risk.is_afternoon_scheduled_evidence(state_1130) is False
+
+
 # --- Final manual buy override (2026-07-13 final-buy behavior) ---------------
 
 

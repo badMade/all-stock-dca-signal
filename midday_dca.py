@@ -46,6 +46,7 @@ from dca_config import (
     InvalidAccountNumberError,
     MissingConfigEnvError,
     get_config_dir,
+    load_per_ticker_sizing,
     load_tickers,
     resolve_broker_account,
 )
@@ -325,6 +326,7 @@ def load_midday_config(config_dir=None, *, allow_unpinned_account: bool = False)
         kwargs["tickers"] = ticker_cfg["tickers"]
     if "excluded_tickers" in ticker_cfg:
         kwargs["excluded_tickers"] = ticker_cfg["excluded_tickers"]
+    kwargs.update(load_per_ticker_sizing(config_dir_path))
 
     return MiddayConfig(**kwargs)
 
@@ -355,6 +357,11 @@ class MiddayDCAExecutor(MorningDCAExecutor):
     # manual override eat into the cap a scheduled midday retry checks
     # against, wrongly blocking buys the original 12:30 run would have allowed.
     scan_manual_reruns_for_ledger: bool = False
+    # Midday has never written a budget_ledger.json -- config/midday_dca.json has
+    # no ledger_dir/ledger_filename block, unlike config/morning_dca.json and the
+    # market-open/intraday task manifests. Preserved explicitly now that the base
+    # class flag, not a `stream == MORNING_STREAM` check, gates that write.
+    writes_budget_ledger: bool = False
 
     def __init__(
         self,

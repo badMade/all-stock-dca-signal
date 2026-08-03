@@ -284,6 +284,36 @@ def load_sizing_tiers(config_dir: Path) -> Dict[str, Any]:
     return out
 
 
+def load_per_ticker_sizing(config_dir: Path) -> Dict[str, Any]:
+    """Load validated historical per-symbol sizing calibrations when present."""
+    data = _read_json(config_dir / "per_ticker_sizing.json")
+    if data is None or data.get("status") != "active":
+        return {}
+    raw = data.get("tickers")
+    if not isinstance(raw, dict):
+        raise ValueError("per_ticker_sizing.json must contain a tickers object")
+    normalized: Dict[str, Dict[str, Any]] = {}
+    for ticker, model in raw.items():
+        if not isinstance(ticker, str) or not isinstance(model, dict):
+            raise ValueError("per-ticker sizing entries must map a symbol to an object")
+        tiers = model.get("tiers")
+        if not isinstance(tiers, list) or not tiers:
+            raise ValueError(f"per-ticker sizing tiers missing for {ticker}")
+        parsed_tiers = []
+        for tier in tiers:
+            if not isinstance(tier, dict) or "min_drop_pct" not in tier or "multiplier" not in tier:
+                raise ValueError(f"per-ticker sizing tier malformed for {ticker}")
+            parsed_tiers.append((float(tier["min_drop_pct"]) / 100.0, float(tier["multiplier"])))
+        full_base = max(1.0, float(model.get("base_amount_usd", 1.0)))
+        reduced_base = max(1.0, float(model.get("base_amount_below_close_usd", 1.0)))
+        normalized[ticker.upper()] = {
+            "tiers": tuple(sorted(parsed_tiers)),
+            "base_amount_usd": full_base,
+            "base_amount_below_close_usd": reduced_base,
+        }
+    return {"per_ticker_sizing": normalized}
+
+
 def load_backtest_sizing_tiers(config_dir: Path) -> tuple[tuple[float, float], ...]:
     """Return the analytics-only backtest ladder tiers as (fraction, multiplier).
 
@@ -404,6 +434,7 @@ def load_strategy_config(
     merged.update(load_tickers(config_dir))
     merged.update(load_budgets(config_dir))
     merged.update(load_sizing_tiers(config_dir))
+    merged.update(load_per_ticker_sizing(config_dir))
     merged.update(load_approved_dates(config_dir))
     merged.update(load_near_close_overrides(config_dir))
     merged.update(overrides)

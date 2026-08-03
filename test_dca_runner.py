@@ -2387,15 +2387,15 @@ def test_gate6_allocation_priority_orders_by_multiplier_then_drop_then_ticker():
         # Alphabetically first of the three, but the lowest multiplier: must
         # still be placed last, proving multiplier outranks the ticker tie-break.
         dca_runner.Candidate("AAAU", 2.0, multiplier=1.0),
-        dca_runner.Candidate("MSFT", 6.0, multiplier=3.0, drop_pct=4.5),
-        dca_runner.Candidate("AAPL", 6.0, multiplier=3.0, drop_pct=4.8),
+        dca_runner.Candidate("MSFT", 6.0, multiplier=3.0, drop_pct=6.1),
+        dca_runner.Candidate("AAPL", 6.0, multiplier=3.0, drop_pct=6.3),
     ]
     plan = dca_runner.plan_orders(
         candidates=candidates,
         snapshot=dca_runner.budget_snapshot([], date(2026, 7, 28)),
         tier=BudgetTier("normal", 180.0, 900.0),
     )
-    # AAPL and MSFT both 3x; AAPL's larger drop (4.8 > 4.5) puts it first.
+    # AAPL and MSFT both 3x; AAPL's larger drop (6.3 > 6.1) puts it first.
     assert [c.ticker for c in plan.to_place] == ["AAPL", "MSFT", "AAAU"]
 
 
@@ -8587,8 +8587,8 @@ def test_assess_carries_drop_pct_through_to_the_allocation_priority():
     multiplier candidates fall back to alphabetical ordering (Codex review:
     "Carry drop percentage through assess")."""
     candidates = [
-        ("MSFT", 6.0, 3.0, 4.5),
-        ("AAPL", 6.0, 3.0, 4.8),  # same multiplier, larger drop -> placed first
+        ("MSFT", 6.0, 3.0, 6.1),
+        ("AAPL", 6.0, 3.0, 6.3),  # same multiplier, larger drop -> placed first
     ]
     r = dca_runner.assess(**_clean_kwargs(candidates=candidates))
     assert [o["ticker"] for o in r["plan"]["to_place"]] == ["AAPL", "MSFT"]
@@ -8783,14 +8783,14 @@ def test_estimated_multiplier_falls_back_to_the_ladder_minimum_for_a_non_finite_
 
 
 def test_estimated_multiplier_infers_the_reduced_base_multiplier_from_a_usable_drop():
-    """Candidate("AAPL", 4.0, None, 6.5): no multiplier claim, but $4.00 is
-    exactly 4.0x the reduced $1.00 base, and 6.5% falls in the 4x tier's
-    [6.0, 7.0) drop range -- a genuine reduced-base 4x signal. Dividing
+    """Candidate("AAPL", 4.0, None, 7.0): no multiplier claim, but $4.00 is
+    exactly 4.0x the reduced $1.00 base, and 7.0% falls in the 4x tier's
+    [7.0, 7.5) drop range -- a genuine reduced-base 4x signal. Dividing
     amount_usd by the $2 base alone (the prior behavior) would estimate only
     2x ($4.00 / $2.00), understating both high-multiplier tier counting and
     allocation priority against real 3x candidates (Codex review: "Infer
     reduced-base multipliers from usable drops")."""
-    cand = dca_runner.Candidate("AAPL", 4.0, drop_pct=6.5)
+    cand = dca_runner.Candidate("AAPL", 4.0, drop_pct=7.0)
     assert dca_runner._estimated_multiplier(cand) == pytest.approx(4.0)
 
 
@@ -8798,9 +8798,9 @@ def test_estimated_multiplier_ignores_a_drop_that_disagrees_with_the_notional():
     """A usable drop_pct whose implied multiplier does NOT reproduce
     amount_usd on either base must not be trusted -- falls through to the
     plain notional-based estimate instead."""
-    # drop_pct=6.5 implies the 4x tier, but $3.00 is neither 4.0 x $2.00 nor
+    # drop_pct=7.0 implies the 4x tier, but $3.00 is neither 4.0 x $2.00 nor
     # 4.0 x $1.00 -- the drop-based inference must not apply here.
-    cand = dca_runner.Candidate("AAPL", 3.0, drop_pct=6.5)
+    cand = dca_runner.Candidate("AAPL", 3.0, drop_pct=7.0)
     assert dca_runner._estimated_multiplier(cand) == pytest.approx(1.5)  # 3.0 / 2.0 base
 
 
@@ -8808,7 +8808,7 @@ def test_assess_counts_a_reduced_base_signal_as_high_multiplier_via_its_drop():
     """The same reduced-base inference must reach assess()'s tier selection:
     a 4x reduced-base candidate with no multiplier claim must count toward
     high_mult, matching HIGH_MULTIPLIER_THRESHOLD (3.0x)."""
-    r = dca_runner.assess(**_clean_kwargs(candidates=[("AAPL", 4.0, None, 6.5)]))
+    r = dca_runner.assess(**_clean_kwargs(candidates=[("AAPL", 4.0, None, 7.0)]))
     assert r["verdict"] == "PROCEED"
     assert r["plan"]["to_place"][0]["ticker"] == "AAPL"
 

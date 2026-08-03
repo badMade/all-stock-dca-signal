@@ -77,6 +77,15 @@ py-modules = [
     # installed wheel (Codex review: "Ship the new runner in the installed
     # package").
     "dca_runner",
+    # The market-open (9:35) and intraday (11:30/1:30/2:30) live-execution
+    # stream executors, plus the cumulative sub-dollar credit ledger they
+    # (and near_close_dca's final-session top-up guard) depend on. Omitting
+    # these left the new executor and credit APIs importable only from a
+    # source checkout, not an installed wheel (Codex review: "Ship all newly
+    # added stream modules and configs").
+    "market_open_dca",
+    "intraday_dca",
+    "dca_cumulative",
 ]
 # scripts/run_classification.py is the run-classification contract used by both
 # the live artifact writer (near_close_dca.build_run_artifacts) and readers
@@ -92,6 +101,7 @@ packages = ["scripts"]
     "config/budgets.json",
     "config/tickers.json",
     "config/sizing_ladder.json",
+    "config/per_ticker_sizing.json",
     "config/backtest_sizing_ladder.json",
     "config/trading_window.json",
     "config/scheduled_tasks.json",
@@ -104,6 +114,13 @@ packages = ["scripts"]
     # loader").
     "config/market_calendar.json",
     "config/midday_dca.json",
+    # Read by market_open_dca.load_market_open_config /
+    # intraday_dca.load_intraday_config; without these an installed wheel's
+    # get_config_dir() resolution falls back to defaults for both new live
+    # streams (Codex review: "Ship all newly added stream modules and
+    # configs").
+    "config/market_open_dca.json",
+    "config/intraday_dca.json",
 ]
 
 [tool.pytest.ini_options]

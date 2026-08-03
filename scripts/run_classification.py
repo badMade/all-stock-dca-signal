@@ -55,7 +55,20 @@ STATE_SCHEMA_VERSION = "run-classification-v1"
 # scheduled/manual evidence as long as the required scheduled identity fields are
 # correct; v2 is treated as a stricter successor of v1, not a different contract.
 STATE_SCHEMA_VERSION_V2 = "run-classification-v2-preauthorized"
-ACCEPTED_STATE_SCHEMA_VERSIONS = (STATE_SCHEMA_VERSION, STATE_SCHEMA_VERSION_V2)
+# The in-repo market_open/intraday executors (morning_dca.MorningDCAExecutor
+# subclasses) stamp their own state_schema_version rather than one of the two
+# generic values above; both must be accepted here too or their scheduled
+# artifacts fail validate_classification() on version alone before the
+# stream-specific identity checks even run (Codex review: "Register intraday
+# identities with the runtime validator").
+MARKET_OPEN_LIVE_SCHEMA_VERSION = "market-open-live-v1"
+INTRADAY_LIVE_SCHEMA_VERSION = "intraday-live-v1"
+ACCEPTED_STATE_SCHEMA_VERSIONS = (
+    STATE_SCHEMA_VERSION,
+    STATE_SCHEMA_VERSION_V2,
+    MARKET_OPEN_LIVE_SCHEMA_VERSION,
+    INTRADAY_LIVE_SCHEMA_VERSION,
+)
 # run_origin of a pass that recovers a FAILED scheduled slot into its own
 # directory (e.g. the Jul 27 2026 12:30 pass, config/scheduled_tasks.json ->
 # midday_dca_scheduled_recovery_2026_07_27). Deliberately distinct from
@@ -357,6 +370,28 @@ MIDDAY_SLOT_CRON_ID = "a6239dae"
 MIDDAY_SLOT_SCHEDULED_FOR_ET = "12:30"
 MIDDAY_SLOT_SCHEDULED_WINDOW_START_ET = "12:25"
 MIDDAY_SLOT_SCHEDULED_WINDOW_END_ET = "12:35"
+# The in-repo executor streams (market_open_dca.py / intraday_dca.py, both
+# subclassing morning_dca.MorningDCAExecutor). Unlike MORNING_SLOT_STREAM/
+# MIDDAY_SLOT_STREAM above (the seven-slot roster's run_dca.run_slot() path,
+# which reuses the afternoon task's own run_type/state_schema_version via
+# build_scheduled_classification), these two streams are their own executor
+# classes with their own run_type and state_schema_version -- neither matches
+# SCHEDULED_RUN_TYPE nor the generic ACCEPTED_STATE_SCHEMA_VERSIONS tuple, so
+# they need their own dedicated identity checks below rather than reusing the
+# morning/midday branch shape (Codex review: "Register intraday identities
+# with the runtime validator" -- the standalone
+# schemas/intraday_run_classification.schema.json already validated this
+# shape, but this runtime function, which is what dca_risk.classify_stream()
+# actually calls, did not).
+MARKET_OPEN_STREAM = "market_open"
+MARKET_OPEN_LIVE_CRON_ID = "2ba19526"
+MARKET_OPEN_LIVE_RUN_TYPE = "market_open_dca_live"
+MARKET_OPEN_LIVE_SCHEDULED_FOR_ET = "09:35"
+MARKET_OPEN_LIVE_SCHEDULED_WINDOW_START_ET = "09:30"
+MARKET_OPEN_LIVE_SCHEDULED_WINDOW_END_ET = "09:40"
+INTRADAY_STREAM = "intraday"
+INTRADAY_LIVE_CRON_ID = "7be82b97"
+INTRADAY_LIVE_RUN_TYPE = "intraday_dca_live"
 # Date the retime took effect, as the same zero-padded YYYYMMDD string used in
 # run_id (so it can be compared lexicographically without a date parse). The
 # legacy identity tuple is accepted ONLY for a run_id dated strictly before
@@ -409,6 +444,17 @@ SCHEDULED_RUN_ID_RE = re.compile(r"^scheduled_[0-9]{8}_1530ET$")
 LEGACY_SCHEDULED_RUN_ID_RE = re.compile(r"^scheduled_([0-9]{8})_1520ET$")
 MORNING_SLOT_RUN_ID_RE = re.compile(r"^scheduled_[0-9]{8}_1030ET$")
 MIDDAY_SLOT_RUN_ID_RE = re.compile(r"^scheduled_[0-9]{8}_1230ET$")
+MARKET_OPEN_LIVE_RUN_ID_RE = re.compile(r"^market_open_live_[0-9]{8}_0935ET$")
+# Keyed by scheduled_for_et: intraday is a single stream shared across all
+# three fire times (morning_dca.MorningDCAExecutor.run_id() stamps the slot
+# into both scheduled_window_start_et/end_et and run_id via the profile's
+# folder_suffix), so a coherent identity check needs the slot-specific window
+# and run_id shape that scheduled_for_et actually selects, not one fixed tuple.
+INTRADAY_SLOT_IDENTITIES: Dict[str, tuple] = {
+    "11:30": ("11:25", "11:35", re.compile(r"^intraday_live_[0-9]{8}_1130ET$")),
+    "13:30": ("13:25", "13:35", re.compile(r"^intraday_live_[0-9]{8}_1330ET$")),
+    "14:30": ("14:25", "14:35", re.compile(r"^intraday_live_[0-9]{8}_1430ET$")),
+}
 # Accepts the canonical 1530ET id, the legacy 1520ET id (pre-2026-07-27 runs),
 # and the seven-slot roster's own 1030ET/1230ET ids -- every official
 # scheduled-slot run_id shape, so a manual run can never claim one of these
@@ -1398,8 +1444,6 @@ def validate_classification(rc: Dict[str, object]) -> ValidationResult:
     if origin == "scheduled":
         if manual_flag is not False:
             errors.append("scheduled run must have manual_run=false")
-        if rc.get("run_type") != SCHEDULED_RUN_TYPE:
-            errors.append(f"scheduled run_type must be {SCHEDULED_RUN_TYPE!r}")
         run_id = rc.get("run_id")
         run_id_is_str = isinstance(run_id, str)
         if not run_id_is_str:
@@ -1420,7 +1464,86 @@ def validate_classification(rc: Dict[str, object]) -> ValidationResult:
         # MORNING/MIDDAY branch instead of falling through to the afternoon
         # checks below, so it is correctly rejected there rather than accepted
         # as afternoon evidence.
-        if stream == MORNING_SLOT_STREAM:
+        #
+        # run_type is checked PER BRANCH, not once up front: the roster streams
+        # (morning/midday/afternoon/legacy) all reuse the afternoon task's own
+        # SCHEDULED_RUN_TYPE via build_scheduled_classification(), but
+        # market_open_dca.py/intraday_dca.py are their own executor classes
+        # with their own run_type (Codex review: "Register intraday identities
+        # with the runtime validator") -- a single shared run_type check here
+        # would reject every genuine market_open/intraday scheduled run before
+        # its branch below ever ran.
+        if stream == MARKET_OPEN_STREAM:
+            if rc.get("run_type") != MARKET_OPEN_LIVE_RUN_TYPE:
+                errors.append(f"market_open scheduled run_type must be {MARKET_OPEN_LIVE_RUN_TYPE!r}")
+            if rc.get("cron_id") != MARKET_OPEN_LIVE_CRON_ID:
+                errors.append(
+                    f"market_open scheduled run must have cron_id={MARKET_OPEN_LIVE_CRON_ID!r}"
+                )
+            if supersedes is not None:
+                errors.append(
+                    "market_open scheduled run must not carry supersedes_cron_id "
+                    "(that names the afternoon task's lineage)"
+                )
+            if rc.get("scheduled_window_end_et") != MARKET_OPEN_LIVE_SCHEDULED_WINDOW_END_ET:
+                errors.append(
+                    "market_open scheduled_window_end_et must be "
+                    f"{MARKET_OPEN_LIVE_SCHEDULED_WINDOW_END_ET!r}"
+                )
+            is_market_open_identity = (
+                scheduled_for_et == MARKET_OPEN_LIVE_SCHEDULED_FOR_ET
+                and window_start_et == MARKET_OPEN_LIVE_SCHEDULED_WINDOW_START_ET
+                and run_id_is_str
+                and bool(MARKET_OPEN_LIVE_RUN_ID_RE.match(run_id))
+            )
+            if run_id_is_str and not is_market_open_identity:
+                errors.append(
+                    "market_open scheduled_for_et, scheduled_window_start_et, and run_id must "
+                    f"form the coherent market_open tuple ({MARKET_OPEN_LIVE_SCHEDULED_FOR_ET!r}, "
+                    f"{MARKET_OPEN_LIVE_SCHEDULED_WINDOW_START_ET!r}, "
+                    "'market_open_live_YYYYMMDD_0935ET'); "
+                    f"got scheduled_for_et={scheduled_for_et!r}, "
+                    f"scheduled_window_start_et={window_start_et!r}, run_id={run_id!r}"
+                )
+        elif stream == INTRADAY_STREAM:
+            if rc.get("run_type") != INTRADAY_LIVE_RUN_TYPE:
+                errors.append(f"intraday scheduled run_type must be {INTRADAY_LIVE_RUN_TYPE!r}")
+            if rc.get("cron_id") != INTRADAY_LIVE_CRON_ID:
+                errors.append(f"intraday scheduled run must have cron_id={INTRADAY_LIVE_CRON_ID!r}")
+            if supersedes is not None:
+                errors.append(
+                    "intraday scheduled run must not carry supersedes_cron_id "
+                    "(that names the afternoon task's lineage)"
+                )
+            slot_identity = INTRADAY_SLOT_IDENTITIES.get(scheduled_for_et)
+            if slot_identity is None:
+                errors.append(
+                    "intraday scheduled_for_et must be one of "
+                    f"{sorted(INTRADAY_SLOT_IDENTITIES)!r}, got {scheduled_for_et!r}"
+                )
+            else:
+                expected_window_start_et, expected_window_end_et, slot_run_id_re = slot_identity
+                if rc.get("scheduled_window_end_et") != expected_window_end_et:
+                    errors.append(
+                        f"intraday scheduled_window_end_et must be {expected_window_end_et!r} "
+                        f"for scheduled_for_et={scheduled_for_et!r}"
+                    )
+                is_intraday_identity = (
+                    window_start_et == expected_window_start_et
+                    and run_id_is_str
+                    and bool(slot_run_id_re.match(run_id))
+                )
+                if run_id_is_str and not is_intraday_identity:
+                    errors.append(
+                        "intraday scheduled_window_start_et and run_id must form a coherent "
+                        f"tuple for scheduled_for_et={scheduled_for_et!r}: "
+                        f"({expected_window_start_et!r}, "
+                        f"'intraday_live_YYYYMMDD_{scheduled_for_et.replace(':', '')}ET'); "
+                        f"got scheduled_window_start_et={window_start_et!r}, run_id={run_id!r}"
+                    )
+        elif stream == MORNING_SLOT_STREAM:
+            if rc.get("run_type") != SCHEDULED_RUN_TYPE:
+                errors.append(f"morning scheduled run_type must be {SCHEDULED_RUN_TYPE!r}")
             if rc.get("cron_id") != MORNING_SLOT_CRON_ID:
                 errors.append(f"morning scheduled run must have cron_id={MORNING_SLOT_CRON_ID!r}")
             if supersedes is not None:
@@ -1451,6 +1574,8 @@ def validate_classification(rc: Dict[str, object]) -> ValidationResult:
                     f"scheduled_window_start_et={window_start_et!r}, run_id={run_id!r}"
                 )
         elif stream == MIDDAY_SLOT_STREAM:
+            if rc.get("run_type") != SCHEDULED_RUN_TYPE:
+                errors.append(f"midday scheduled run_type must be {SCHEDULED_RUN_TYPE!r}")
             if rc.get("cron_id") != MIDDAY_SLOT_CRON_ID:
                 errors.append(f"midday scheduled run must have cron_id={MIDDAY_SLOT_CRON_ID!r}")
             if supersedes is not None:
@@ -1492,6 +1617,8 @@ def validate_classification(rc: Dict[str, object]) -> ValidationResult:
             # afternoon validator", mirroring schemas/run_classification.
             # schema.json's own 'stream, when present, must be afternoon'
             # constraint on these two branches).
+            if rc.get("run_type") != SCHEDULED_RUN_TYPE:
+                errors.append(f"scheduled run_type must be {SCHEDULED_RUN_TYPE!r}")
             # Lineage of the repaired live task: accept the current task id OR the
             # superseded-task marker so continuity artifacts stay valid.
             if rc.get("cron_id") != CRON_ID and rc.get("supersedes_cron_id") != SUPERSEDES_CRON_ID:
@@ -1539,7 +1666,8 @@ def validate_classification(rc: Dict[str, object]) -> ValidationResult:
         else:
             errors.append(
                 f"scheduled run must have stream in (None, {AFTERNOON_STREAM!r}, "
-                f"{MORNING_SLOT_STREAM!r}, {MIDDAY_SLOT_STREAM!r}), got {stream!r}"
+                f"{MORNING_SLOT_STREAM!r}, {MIDDAY_SLOT_STREAM!r}, {MARKET_OPEN_STREAM!r}, "
+                f"{INTRADAY_STREAM!r}), got {stream!r}"
             )
     elif origin == "manual":
         if manual_flag is not True:

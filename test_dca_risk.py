@@ -114,9 +114,9 @@ def test_normal_case_no_kill_switch_preserves_ladder():
 
     assert guarded.deployed_last_7d_usd == 600.0
     assert kill_switch_engaged(guarded) is False
-    # A 2% drop still sizes to 2x, a 5%+ drop still to 3.5x — unchanged ladder.
-    assert graded_buy_multiplier(0.02, guarded) == 2.0
-    assert graded_buy_multiplier(0.05, guarded) == 3.5
+    # A 2% drop sizes to 1.5x, a 5%+ drop sizes to 2.5x — unchanged ladder.
+    assert graded_buy_multiplier(0.02, guarded) == 1.5
+    assert graded_buy_multiplier(0.05, guarded) == 2.5
 
 
 # --- Case 2: 7-day deployed > 40% monthly triggers cap to 1x -----------------

@@ -301,6 +301,32 @@ def test_pyproject_dev_extra_and_requirements_dev_txt_name_the_same_packages():
     )
 
 
+def test_pyproject_ships_every_live_stream_module_and_config():
+    """Codex review ("Ship all newly added stream modules and configs"): for
+    a wheel or non-editable install, [tool.setuptools] py-modules/data-files
+    are the only files shipped. market_open_dca.py, intraday_dca.py, and
+    dca_cumulative.py were added without also adding them to py-modules, and
+    config/market_open_dca.json/config/intraday_dca.json were added without
+    adding them to data-files -- so the new executor/credit APIs and their
+    checked-in stream configuration were unavailable outside a source
+    checkout."""
+    import tomllib
+
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    py_modules = set(pyproject["tool"]["setuptools"]["py-modules"])
+    config_data_files = set(
+        pyproject["tool"]["setuptools"]["data-files"]["share/all-stock-dca/config"]
+    )
+
+    for module in ("market_open_dca", "intraday_dca", "dca_cumulative"):
+        assert module in py_modules, f"{module} must be listed in [tool.setuptools] py-modules"
+
+    for config_file in ("config/market_open_dca.json", "config/intraday_dca.json"):
+        assert config_file in config_data_files, (
+            f"{config_file} must be listed in [tool.setuptools.data-files]"
+        )
+
+
 # --- Budget ladder -----------------------------------------------------------
 
 def test_budget_tiers_match_config_budgets_json():

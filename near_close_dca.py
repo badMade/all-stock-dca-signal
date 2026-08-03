@@ -75,6 +75,7 @@ from typing import (
 )
 from zoneinfo import ZoneInfo
 
+from dca_cumulative import CumulativeCreditLedger, apply_cumulative_credit
 from dca_fileio import atomic_open_w, atomic_write_text
 
 if TYPE_CHECKING:
@@ -598,6 +599,15 @@ class TopUpGuardOutcome:
     # the amount actually calculated (Codex review: "Persist the preserved
     # base on top-up candidates").
     effective_base_amount_usd: float = 0.0
+    # Set only when the cumulative sub-dollar credit path (dca_cumulative)
+    # determined incremental_order_amount, to the raw same-day price decline
+    # that was fed into it (NOT the resulting order amount). None whenever an
+    # ordinary ladder/price-step increment won instead. The caller settles the
+    # durable CumulativeCreditLedger with this value ONLY after the resulting
+    # order is actually confirmed submitted (Codex review: "Defer ledger
+    # updates until the submitted amount is known") -- this field alone never
+    # writes to the ledger.
+    cumulative_credit_decline_usd: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -713,26 +723,45 @@ class StrategyConfig:
     # threshold less than or equal to the actual drop wins; a drop below the first
     # threshold yields no buy (0x). There is no upper cutoff: any drop >= 8.0% is 5x.
     #     drop < 0.1%             -> 0x  (no buy)
-    #     0.1% <= drop < 1.0%     -> 1x
-    #     1.0% <= drop < 2.0%     -> 1.5x
-    #     2.0% <= drop < 3.0%     -> 2x
-    #     3.0% <= drop < 4.0%     -> 2.5x
-    #     4.0% <= drop < 5.0%     -> 3x
-    #     5.0% <= drop < 6.0%     -> 3.5x
-    #     6.0% <= drop < 7.0%     -> 4x
-    #     7.0% <= drop < 8.0%     -> 4.5x
+    #     0.1% <= drop < 2.0%     -> 1x
+    #     2.0% <= drop < 4.0%     -> 1.5x
+    #     4.0% <= drop < 5.0%     -> 2x
+    #     5.0% <= drop < 6.0%     -> 2.5x
+    #     6.0% <= drop < 6.5%     -> 3x
+    #     6.5% <= drop < 7.0%     -> 3.5x
+    #     7.0% <= drop < 7.5%     -> 4x
+    #     7.5% <= drop < 8.0%     -> 4.5x
     #     drop >= 8.0%            -> 5x
+    #
+    # Rescaled 2026-08-02 (user-directed). The prior curve stepped uniformly every
+    # 1% from 0.1% to 8%. This one is flatter on shallow dips (1x now runs to 2%,
+    # 1.5x to 4%) and back-loads the scaling into deep drops, slicing 6-8% every
+    # half percent. Same endpoints -- 0x below 0.1%, 5x at 8%+ -- so the $10
+    # per-order ceiling (5x * $2) is unchanged. Note the knock-on effect on budget
+    # tiering: high_multiplier_threshold counts 3x-or-greater signals, which now
+    # require a 6% drop rather than 4%, so tier escalation is correspondingly
+    # less frequent for the same market conditions.
     sizing_tiers: tuple[tuple[float, float], ...] = (
-        (0.001, 1.0),  # down 0.1% to <1.0%
-        (0.010, 1.5),  # down 1.0% to <2.0%
-        (0.020, 2.0),  # down 2.0% to <3.0%
-        (0.030, 2.5),  # down 3.0% to <4.0%
-        (0.040, 3.0),  # down 4.0% to <5.0%
-        (0.050, 3.5),  # down 5.0% to <6.0%
-        (0.060, 4.0),  # down 6.0% to <7.0%
-        (0.070, 4.5),  # down 7.0% to <8.0%
+        (0.001, 1.0),  # down 0.1% to <2.0%
+        (0.020, 1.5),  # down 2.0% to <4.0%
+        (0.040, 2.0),  # down 4.0% to <5.0%
+        (0.050, 2.5),  # down 5.0% to <6.0%
+        (0.060, 3.0),  # down 6.0% to <6.5%
+        (0.065, 3.5),  # down 6.5% to <7.0%
+        (0.070, 4.0),  # down 7.0% to <7.5%
+        (0.075, 4.5),  # down 7.5% to <8.0%
         (0.080, 5.0),  # down 8.0% or more (no upper cutoff)
     )
+    # Optional symbol-specific historical calibration loaded from
+    # config/per_ticker_sizing.json. Each value supplies ``tiers`` as
+    # (drop-fraction, multiplier), plus full/reduced base amounts. Symbols
+    # absent from this mapping keep the conservative shared ladder.
+    per_ticker_sizing: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    # Same-day price-step top-ups use the last executed buy's reference price.
+    # A $0.50 cumulative decline rounds up to the first $1 order. Above that
+    # floor, order notionals retain cent precision (for example $1.01/$2.99).
+    cumulative_top_up_min_drop_usd: float = 0.50
+    cumulative_top_up_min_order_usd: float = 1.00
 
     # --- Dynamic risk guard (rolling deployment kill-switch) -----------------
     # The monthly cash allocation the strategy is funded with, and the fraction
@@ -1797,8 +1826,23 @@ def kill_switch_engaged(config: StrategyConfig) -> bool:
     return config.deployed_last_7d_usd > threshold
 
 
+def _ticker_sizing(ticker: Optional[str], config: StrategyConfig) -> Mapping[str, Any]:
+    """Return validated symbol calibration, or an empty mapping for global fallback."""
+    if not ticker:
+        return {}
+    candidate = config.per_ticker_sizing.get(ticker.upper(), {})
+    return candidate if isinstance(candidate, Mapping) else {}
+
+
+def minimum_drop_for_ticker(config: StrategyConfig, ticker: Optional[str] = None) -> float:
+    """Return the first positive calibrated threshold for a symbol."""
+    calibration = _ticker_sizing(ticker, config)
+    tiers = calibration.get("tiers", config.sizing_tiers)
+    return min(float(threshold) for threshold, _ in tiers)
+
+
 def graded_buy_multiplier(
-    drop_vs_previous_close: float, config: StrategyConfig
+    drop_vs_previous_close: float, config: StrategyConfig, ticker: Optional[str] = None
 ) -> float:
     """Map a drop from prior close to a buy multiplier via the graded ladder.
 
@@ -1810,8 +1854,10 @@ def graded_buy_multiplier(
     positive multiplier is capped to 1x: the strategy still participates in a dip
     at the base amount but stops scaling up. A 0x (no-buy) stays 0x.
     """
+    calibration = _ticker_sizing(ticker, config)
+    tiers = calibration.get("tiers", config.sizing_tiers)
     multiplier = 0.0
-    for threshold, tier_multiplier in sorted(config.sizing_tiers):
+    for threshold, tier_multiplier in sorted(tiers):
         if drop_vs_previous_close >= threshold:
             multiplier = tier_multiplier
     multiplier = min(multiplier, 5.0)
@@ -1831,6 +1877,7 @@ def select_first_allocation_base_usd(
     previous_close: float,
     previous_low: Optional[float],
     config: StrategyConfig,
+    ticker: Optional[str] = None,
 ) -> tuple[float, str]:
     """Select the first-allocation base dollar amount before the ladder multiplier.
 
@@ -1847,14 +1894,22 @@ def select_first_allocation_base_usd(
     """
     if not (decision_price < previous_close):
         return 0.0, BASE_NOT_BELOW_CLOSE
+    calibration = _ticker_sizing(ticker, config)
+    # A model must never produce a sub-dollar notional. The $1 floor applies
+    # before the multiplier, so every positive tier produces at least $1.
+    full_base = max(1.0, float(calibration.get("base_amount_usd", config.base_buy_amount_usd)))
+    reduced_base = max(
+        1.0,
+        float(calibration.get("base_amount_below_close_usd", config.base_buy_amount_below_close_usd)),
+    )
     if (
         previous_low is not None
         and math.isfinite(previous_low)
         and 0 < previous_low <= previous_close
         and decision_price < previous_low
     ):
-        return config.base_buy_amount_usd, BASE_BELOW_CLOSE_AND_LOW
-    return config.base_buy_amount_below_close_usd, BASE_BELOW_CLOSE_ONLY
+        return full_base, BASE_BELOW_CLOSE_AND_LOW
+    return reduced_base, BASE_BELOW_CLOSE_ONLY
 
 
 # Substrings (checked case-insensitively) that indicate a provider raised because the
@@ -1939,9 +1994,9 @@ def evaluate_source_signal(
     intraday_trend_pct = (decision_price / lookback_price - 1.0) * 100.0
     drop_vs_previous_close = (previous_close - decision_price) / previous_close
     drop_vs_previous_close_pct = drop_vs_previous_close * 100.0
-    buy_multiplier = graded_buy_multiplier(drop_vs_previous_close, config)
+    buy_multiplier = graded_buy_multiplier(drop_vs_previous_close, config, ticker)
     selected_base_amount_usd, base_selection_reason = select_first_allocation_base_usd(
-        decision_price, previous_close, previous_low, config
+        decision_price, previous_close, previous_low, config, ticker
     )
     if buy_multiplier <= 0:
         # Canonical rule item 6: "not lower than close, OR multiplier is 0" ->
@@ -1953,7 +2008,21 @@ def evaluate_source_signal(
     suggested_amount_usd = selected_base_amount_usd * buy_multiplier
 
     below_previous_close = decision_price < previous_close
-    minimum_drop_met = drop_vs_previous_close >= config.minimum_drop_vs_previous_close
+    # A calibrated symbol's own first tier is the authoritative minimum drop
+    # (Codex review: "Let calibrated first tiers override the global
+    # floor") -- config/per_ticker_sizing.json is a deliberate, reviewed
+    # per-symbol model (e.g. AAAU's 0.01% first tier), not a misconfiguration
+    # to clamp up to the global default. Flooring it at
+    # config.minimum_drop_vs_previous_close would silently disable part of
+    # that checked-in model by vetoing a buy the calibrated ladder already
+    # approved (buy_multiplier > 0). Only an UNCALIBRATED (fallback) symbol
+    # is floored at the global minimum.
+    effective_minimum_drop = (
+        minimum_drop_for_ticker(config, ticker)
+        if _ticker_sizing(ticker, config)
+        else config.minimum_drop_vs_previous_close
+    )
+    minimum_drop_met = drop_vs_previous_close >= effective_minimum_drop
     intraday_trend_down = decision_price < lookback_price
     above_previous_close = decision_price > previous_close
     intraday_trend_up = decision_price > lookback_price
@@ -2291,10 +2360,22 @@ def resolve_top_up_desired_amount_usd(
     return round(current_suggested_amount_usd, 2), current_base_amount_usd
 
 
+def cumulative_price_step_amount_usd(
+    prior_reference_price: float, current_price: float, config: StrategyConfig
+) -> float:
+    """Return a cent-precise cumulative same-day top-up, floored at $1."""
+    decline = prior_reference_price - current_price
+    if decline < config.cumulative_top_up_min_drop_usd:
+        return 0.0
+    return round(max(config.cumulative_top_up_min_order_usd, decline), 2)
+
+
 def evaluate_top_up_guard(
     decision: ReconciledDecision,
     prior: Optional[PriorSameDayAllocation],
     config: StrategyConfig,
+    *,
+    existing_pending_credit_usd: float = 0.0,
 ) -> TopUpGuardOutcome:
     """Compute the same-day prior-run offset/top-up for one afternoon buy candidate.
 
@@ -2325,6 +2406,18 @@ def evaluate_top_up_guard(
     broker order history) or read ``prior_usd_rh``, so a same-day buy confirmed
     at the broker but missing/incomplete in the artifact trail is not yet folded
     into ``corrected_delta_usd`` here.
+
+    ``existing_pending_credit_usd`` is a same-day sub-dollar credit balance
+    the caller already durably persisted (via
+    ``CumulativeCreditLedger.pending_usd``) from an earlier session's decline
+    that never itself cleared the broker's $1 minimum. Passed in as plain
+    data -- this function stays a pure computation, performing no ledger I/O
+    itself (see ``_process_buy_candidate``, the only caller that reads it).
+    Defaults to 0.0 for the pure planned-spend tier-selection estimate (Codex
+    review: "Accumulate credits instead of resetting pending state" -- the
+    final 3:30 PM session's own contract is to close ANY positive pending
+    balance, even when THIS call's own decision price shows no further
+    decline).
     """
     desired, effective_base = resolve_top_up_desired_amount_usd(
         prior,
@@ -2340,6 +2433,7 @@ def evaluate_top_up_guard(
         *,
         skipped: bool,
         manual_review: bool = False,
+        cumulative_credit_decline_usd: Optional[float] = None,
     ) -> TopUpGuardOutcome:
         return TopUpGuardOutcome(
             ticker=decision.ticker,
@@ -2354,6 +2448,7 @@ def evaluate_top_up_guard(
             skipped=skipped,
             effective_base_amount_usd=effective_base,
             manual_review=manual_review,
+            cumulative_credit_decline_usd=cumulative_credit_decline_usd,
         )
 
     # No earlier same-day allocation: behave exactly like a normal scheduled run.
@@ -2382,14 +2477,73 @@ def evaluate_top_up_guard(
 
     # Only top up when buying into a lower price than the earlier same-day run.
     # Canonical rule item 12: not-strictly-lower and zero-delta both use the
-    # single unified TOP_UP_NOT_LOWER_OR_NO_DELTA code.
+    # single unified TOP_UP_NOT_LOWER_OR_NO_DELTA code. A recovered price
+    # still owes the final session's own flush of any pre-existing pending
+    # credit, though -- that balance was earned by an earlier decline this
+    # run's own (recovered) price no longer reflects, so it must not be
+    # silently stranded just because THIS call finds no further decline
+    # (Codex review: "Accumulate credits instead of resetting pending state").
     if afternoon_price >= prior.reference_price:
+        if existing_pending_credit_usd > 0:
+            flushed = apply_cumulative_credit(
+                existing_pending_credit_usd, 0.0, final_session=True
+            ).order_amount_usd
+            if flushed > 0:
+                return _outcome(
+                    flushed,
+                    TOP_UP_INCREMENTAL,
+                    skipped=False,
+                    cumulative_credit_decline_usd=0.0,
+                )
         return _outcome(0.0, TOP_UP_NOT_LOWER_OR_NO_DELTA, skipped=True)
 
-    incremental = desired - round(prior.amount_usd, 2)
+    price_step_incremental = cumulative_price_step_amount_usd(
+        prior.reference_price, afternoon_price, config
+    )
+    ladder_incremental = desired - round(prior.amount_usd, 2)
+    # If prior already exceeds the computed desired amount, don't buy more even
+    # with a further price decline — that would overshoot the day's target.
+    if ladder_incremental < 0:
+        return _outcome(0.0, TOP_UP_NOT_LOWER_OR_NO_DELTA, skipped=True)
+    # For sub-dollar ladder increments (< $1), the ladder and price-step
+    # floors above can both land at zero even though the price is genuinely
+    # lower (e.g. a $0.30 decline is below cumulative_top_up_min_drop_usd).
+    # near_close_dca is always the scheduled 3:30 PM final session, which
+    # dca_cumulative documents as closing any positive same-day credit by
+    # rounding it up to a whole-dollar order rather than dropping it (Codex
+    # review: "wire CumulativeCreditLedger into a real execution path" --
+    # dca_cumulative.apply_cumulative_credit/CumulativeCreditLedger were
+    # previously exercised only by their own unit tests). This computation is
+    # deliberately PURE (no ledger I/O): the caller (_process_buy_candidate)
+    # only durably settles the ledger once this candidate's order is actually
+    # confirmed submitted, using cumulative_credit_decline_usd below (Codex
+    # review: "Defer ledger updates until the submitted amount is known" --
+    # writing here, before cap/spread/buying-power/placement checks run,
+    # could flush and clear a credit for an order that ends up blocked,
+    # clamped, or never placed at all).
+    cumulative_credit_decline_usd: Optional[float] = None
+    if ladder_incremental < 1.0:
+        decline_usd = round(max(0.0, prior.reference_price - afternoon_price), 2)
+        cumulative_credit = (
+            apply_cumulative_credit(
+                existing_pending_credit_usd, decline_usd, final_session=True
+            ).order_amount_usd
+            if decline_usd > 0 or existing_pending_credit_usd > 0
+            else 0.0
+        )
+        if cumulative_credit > 0 and cumulative_credit >= max(ladder_incremental, price_step_incremental):
+            cumulative_credit_decline_usd = decline_usd
+        incremental = max(ladder_incremental, price_step_incremental, cumulative_credit)
+    else:
+        incremental = ladder_incremental
     if incremental <= 0:
         return _outcome(0.0, TOP_UP_NOT_LOWER_OR_NO_DELTA, skipped=True)
-    return _outcome(incremental, TOP_UP_INCREMENTAL, skipped=False)
+    return _outcome(
+        incremental,
+        TOP_UP_INCREMENTAL,
+        skipped=False,
+        cumulative_credit_decline_usd=cumulative_credit_decline_usd,
+    )
 
 
 def _signal_row(
@@ -6584,6 +6738,7 @@ class ProcessCandidateContext:
     run_result: Optional[RunResult]
     deployment_history_root: Optional[str | Path] = None
     stream: str = "afternoon"
+    credit_ledger: CumulativeCreditLedger = field(default_factory=CumulativeCreditLedger)
 
 
 def _process_buy_candidate(
@@ -6648,7 +6803,31 @@ def _process_buy_candidate(
                 )
             if broker_reported_usd > prior.amount_usd:
                 effective_prior = replace(prior, amount_usd=broker_reported_usd)
-        top_up_outcome = evaluate_top_up_guard(decision, effective_prior, ctx.config)
+        # Read (never write) any pre-existing same-day pending credit for
+        # this ticker so the final session's own contract -- flush ANY
+        # positive pending balance -- is honored even when this call's own
+        # decision price shows no further decline (Codex review: "Accumulate
+        # credits instead of resetting pending state"). A read failure (e.g.
+        # a transiently corrupt ledger file) falls back to 0.0 rather than
+        # aborting this candidate: the settle() call below already durably
+        # records the real outcome once placement succeeds, so a missed
+        # read here only means a rare pending balance is picked up on a
+        # later retry instead of this pass.
+        try:
+            existing_pending_credit_usd = ctx.credit_ledger.pending_usd(
+                ticker, ctx.trading_day.isoformat()
+            )
+        except Exception as exc:  # noqa: BLE001
+            existing_pending_credit_usd = 0.0
+            logger.warning(
+                "cumulative credit ledger pending-balance read failed for %s: %s", ticker, exc
+            )
+        top_up_outcome = evaluate_top_up_guard(
+            decision,
+            effective_prior,
+            ctx.config,
+            existing_pending_credit_usd=existing_pending_credit_usd,
+        )
 
     # A morning/manual run must NOT block the scheduled afternoon run: when the
     # top-up guard has a loaded prior allocation for this ticker, the earlier
@@ -7298,12 +7477,41 @@ def _process_buy_candidate(
             "buy_multiplier": decision.buy_multiplier,
             **spread_fields,
         }
-        # Publish the accepted order NOW, before any fallible follow-up. The
-        # batch only records an outcome once _process_buy_candidate RETURNS, so a
-        # raise in _log_execution's fill lookup below would leave this real,
-        # already-placed order out of the failure artifact entirely and let a
-        # later same-day run re-allocate it (Codex review).
+        # Publish the accepted order NOW, before any fallible follow-up
+        # (including the credit-ledger settlement right below). The batch
+        # only records an outcome once _process_buy_candidate RETURNS, so a
+        # raise in either the ledger settle() call or _log_execution's fill
+        # lookup below would otherwise leave this real, already-placed order
+        # out of the failure artifact entirely and let a later same-day run
+        # re-allocate it (Codex review: "Publish accepted orders before
+        # settling the credit ledger").
         _publish_in_flight_outcome(ticker, candidate_outcome)
+        # Durably settle the cumulative sub-dollar credit ledger ONLY now that
+        # the order is actually confirmed submitted -- not during
+        # evaluate_top_up_guard's earlier, pre-placement computation, which
+        # runs before the cap/spread/buying-power/review gates above and
+        # before this broker call could still block, clamp (e.g. the
+        # kill-switch base cap), or fail the placement (Codex review: "Defer
+        # ledger updates until the submitted amount is known"). Recording the
+        # ACTUAL submitted notional here, not the originally-computed
+        # decline-derived amount, keeps the ledger's audit trail accurate for
+        # a candidate the kill-switch or another gate shrank before placement.
+        # A corrupt/locked/unwritable ledger must never mask this real,
+        # already-placed and already-published order -- log and continue
+        # rather than raise (Codex review: same finding, "or make settlement
+        # failure non-fatal").
+        if top_up_outcome is not None and top_up_outcome.cumulative_credit_decline_usd is not None:
+            try:
+                ctx.credit_ledger.settle(
+                    ticker,
+                    ctx.trading_day.isoformat(),
+                    order_amount,
+                    stream=ctx.stream,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "cumulative credit ledger settlement failed for %s: %s", ticker, exc
+                )
 
     if ctx.run_result is not None:
         _log_execution(

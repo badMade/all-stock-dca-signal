@@ -60,6 +60,7 @@ from morning_dca import (
     _PersistingMarketDataProvider,
     _RawInputRecorder,
     _same_stream_order_exists,
+    load_max_orders_per_day,
     load_morning_config,
     load_same_day_preflight,
     nyse_holidays,
@@ -241,18 +242,19 @@ def test_ladder_brackets():
     # default base_buy_amount_usd rather than overriding it.
     ex = MorningDCAExecutor(MorningConfig())
     cases = {
-        0.0005: 0.0,   # < 0.1% -> 0x
-        0.001: 1.0,    # 0.1%   -> 1x
-        0.009: 1.0,    # < 1%   -> 1x
-        0.010: 1.5,    # 1%     -> 1.5x
-        0.020: 2.0,    # 2%     -> 2x
-        0.030: 2.5,    # 3%     -> 2.5x
-        0.040: 3.0,    # 4%     -> 3x
-        0.050: 3.5,    # 5%     -> 3.5x
-        0.060: 4.0,    # 6%     -> 4x
-        0.070: 4.5,    # 7%     -> 4.5x
-        0.080: 5.0,    # 8%     -> 5x
-        0.20: 5.0,     # >= 8%  -> 5x (no upper cutoff)
+        0.0005: 0.0,   # < 0.1%  -> 0x
+        0.001: 1.0,    # 0.1%    -> 1x
+        0.019: 1.0,    # < 2%    -> 1x
+        0.020: 1.5,    # 2%      -> 1.5x
+        0.039: 1.5,    # < 4%    -> 1.5x
+        0.040: 2.0,    # 4%      -> 2x
+        0.050: 2.5,    # 5%      -> 2.5x
+        0.060: 3.0,    # 6%      -> 3x
+        0.065: 3.5,    # 6.5%    -> 3.5x
+        0.070: 4.0,    # 7%      -> 4x
+        0.075: 4.5,    # 7.5%    -> 4.5x
+        0.080: 5.0,    # 8%      -> 5x
+        0.20: 5.0,     # >= 8%   -> 5x (no upper cutoff)
     }
     for drop, expected in cases.items():
         assert ex.multiplier_for_drop(drop) == expected, (drop, expected)
@@ -289,8 +291,8 @@ def test_signal_amounts_and_actions():
     assert sigs["TINY"].selected_base_amount_usd == 0.0
     assert sigs["TINY"].base_selection_reason == "not_below_prior_close_no_buy"
     assert sigs["SMALL"].action == Action.BUY
-    assert sigs["SMALL"].multiplier == 2.5  # 3% drop -> 2.5x on the 0x-to-5x ladder
-    assert sigs["SMALL"].hypothetical_amount_usd == 5.0
+    assert sigs["SMALL"].multiplier == 1.5  # 3% drop -> 1.5x on the 0x-to-5x ladder
+    assert sigs["SMALL"].hypothetical_amount_usd == 3.0
     assert sigs["BIG"].multiplier == 5.0  # 10% drop -> 5x
     assert sigs["BIG"].hypothetical_amount_usd == 10.0
 
@@ -340,19 +342,19 @@ class FixedDropProviderWithLow(FixedDropProvider):
 
 
 def test_morning_dynamic_first_allocation_base():
-    # Two tickers at the same 3% drop (2.5x) but on opposite sides of the prior low.
-    # SHALLOW closes at 97 (below prior close 100, above prior low 96) -> $1 base -> $2.50.
-    # DEEP closes at 97 too but with a higher prior low so it is below both -> $2 base -> $5.00.
+    # Two tickers at the same 3% drop (1.5x) but on opposite sides of the prior low.
+    # SHALLOW closes at 97 (below prior close 100, above prior low 96) -> $1 base -> $1.50.
+    # DEEP closes at 97 too but with a higher prior low so it is below both -> $2 base -> $3.00.
     cfg = MorningConfig(tickers=("SHALLOW",), base_buy_amount_usd=2.0, base_buy_amount_below_close_usd=1.0)
     ex = MorningDCAExecutor(cfg)
     shallow = FixedDropProviderWithLow(SourceName.ROBINHOOD, 100.0, {"SHALLOW": 0.03}, previous_low=96.0)
     sig = ex.evaluate(_now(), shallow)[0]
     assert sig.action == Action.BUY
-    assert sig.multiplier == 2.5
+    assert sig.multiplier == 1.5
     assert sig.previous_low == 96.0
     assert sig.selected_base_amount_usd == 1.0
     assert sig.base_selection_reason == "below_prior_close_only"
-    assert sig.hypothetical_amount_usd == 2.5
+    assert sig.hypothetical_amount_usd == 1.5
 
     cfg_deep = MorningConfig(tickers=("DEEP",), base_buy_amount_usd=2.0, base_buy_amount_below_close_usd=1.0)
     deep = FixedDropProviderWithLow(SourceName.ROBINHOOD, 100.0, {"DEEP": 0.03}, previous_low=98.0)
@@ -360,7 +362,7 @@ def test_morning_dynamic_first_allocation_base():
     assert sig_deep.action == Action.BUY
     assert sig_deep.selected_base_amount_usd == 2.0
     assert sig_deep.base_selection_reason == "below_prior_close_and_low"
-    assert sig_deep.hypothetical_amount_usd == 5.0
+    assert sig_deep.hypothetical_amount_usd == 3.0
 
 
 class FixedQuoteProvider(FixedDropProvider):
@@ -688,6 +690,53 @@ def test_manual_run_ignores_market_holiday_gate(tmp_path):
     res = ex.run(now, data, manual=True)
 
     assert "status" not in res["artifacts"] or res["artifacts"].get("status") != "blocked"
+    assert res["artifacts"]["signal_rows"]
+
+
+def test_scheduled_live_run_blocked_outside_slot_window(tmp_path):
+    # Codex review ("Reject scheduled runs outside their slot window"):
+    # self.profile's window_start_et/window_end_et (10:25-10:35 for the
+    # morning live slot) were only ever copied into run_classification for
+    # display -- nothing compared the actual firing time against them, so a
+    # delayed non-manual invocation (e.g. a stuck scheduler firing hours
+    # late) would still evaluate and place orders labeled as the on-time
+    # 10:30 scheduled run. 9:45 ET on a normal trading Wednesday is well
+    # outside that window.
+    now = datetime.combine(date(2026, 7, 8), time(9, 45), tzinfo=EASTERN)
+    cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    res = ex.run(now, data)
+
+    assert res["artifacts"]["status"] == "blocked"
+    assert res["artifacts"]["block_reason"] == "outside scheduled slot window"
+    assert res["artifacts"]["orders_submitted_count"] == 0
+
+
+def test_scheduled_live_run_allowed_inside_slot_window(tmp_path):
+    # Control: 10:30 ET is inside the morning live slot's 10:25-10:35 window.
+    now = _now_live()
+    cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    broker = RecordingLiveBroker(account="999000111", reference_prices={"SMALL": 97.0})
+
+    res = ex.run(now, data, broker=broker)
+
+    assert res["artifacts"].get("status") != "blocked"
+    assert res["artifacts"]["signal_rows"]
+
+
+def test_manual_run_ignores_slot_window_gate(tmp_path):
+    now = datetime.combine(date(2026, 7, 8), time(9, 45), tzinfo=EASTERN)
+    cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    res = ex.run(now, data, manual=True)
+
+    assert res["artifacts"].get("status") != "blocked"
     assert res["artifacts"]["signal_rows"]
 
 
@@ -1197,8 +1246,8 @@ def test_morning_run_reviews_places_and_records_orders_csv(tmp_path):
     # a dry-run order as real allocated capital.
     assert candidate["status"] == "dry_run"
     assert candidate["order_id"].startswith("DRY-RUN-SMALL")
-    assert candidate["planned_amount_usd"] == 7.5
-    assert res["artifacts"]["broker_outcomes"]["SMALL"]["submitted_amount_usd"] == 7.5
+    assert candidate["planned_amount_usd"] == 4.5
+    assert res["artifacts"]["broker_outcomes"]["SMALL"]["submitted_amount_usd"] == 4.5
     orders_csv_text = Path(res["paths"]["orders_csv"]).read_text(encoding="utf-8")
     assert orders_csv_text.startswith("ticker,order_id,notional_usd,status")
     assert "SMALL" in orders_csv_text
@@ -1248,19 +1297,19 @@ def test_morning_artifacts_include_planned_amount_for_prior_allocation_loader(tm
     res = ex.run(_now_live(), data, broker=broker, manual=True)
     candidate = res["artifacts"]["buy_candidates"][0]
 
-    assert candidate["planned_amount_usd"] == 7.5
-    assert res["artifacts"]["broker_outcomes"]["SMALL"]["submitted_amount_usd"] == 7.5
+    assert candidate["planned_amount_usd"] == 4.5
+    assert res["artifacts"]["broker_outcomes"]["SMALL"]["submitted_amount_usd"] == 4.5
 
 
 def test_morning_live_orders_are_blocked_before_exceeding_daily_cap(tmp_path):
     # AAA and BBB both drop 3% -> identical multiplier/drop_pct, so the
     # priority sort (multiplier DESC, drop_pct DESC, ticker ASC) places AAA
-    # first. Daily cap of $10 admits AAA ($7.50) but not BBB ($7.50 more would
+    # first. Daily cap of $6 admits AAA ($4.50) but not BBB ($4.50 more would
     # exceed the cap), so BBB is cap_exceeded rather than placed.
     cfg = MorningConfig(
         tickers=("AAA", "BBB"),
         base_buy_amount_usd=3.0,
-        morning_daily_cap_usd=10.0,
+        morning_daily_cap_usd=6.0,
         morning_weekly_cap_usd=100.0,
         morning_run_state_root=str(tmp_path),
     )
@@ -1280,7 +1329,7 @@ def test_morning_live_orders_are_blocked_before_exceeding_daily_cap(tmp_path):
     # cap_exceeded outcomes carry no submitted_amount_usd, so planned_amount_usd
     # is never overwritten from the (never-submitted) hypothetical amount.
     assert "planned_amount_usd" not in by_ticker["BBB"]
-    assert by_ticker["BBB"]["hypothetical_amount_usd"] == 7.5
+    assert by_ticker["BBB"]["hypothetical_amount_usd"] == 4.5
 
 
 def test_morning_live_ledger_seeds_cap_spend_from_earlier_same_process_day_run(tmp_path):
@@ -1289,14 +1338,14 @@ def test_morning_live_ledger_seeds_cap_spend_from_earlier_same_process_day_run(t
     # an empty ledger and could re-spend the daily cap. Simulate two separate
     # "processes" (two distinct MorningDCAExecutor instances, as a real retry
     # would be) hitting the same live run-state root on the same trading day:
-    # the first places AAA ($7.50 of a $10 daily cap); a fresh second instance
-    # must read that already-written run_state.json and see only $2.50 of
-    # headroom left, blocking BBB's $7.50 order as cap_exceeded rather than
-    # wrongly re-spending the full $10.
+    # the first places AAA ($4.50 of a $6 daily cap); a fresh second instance
+    # must read that already-written run_state.json and see only $1.50 of
+    # headroom left, blocking BBB's $4.50 order as cap_exceeded rather than
+    # wrongly re-spending the full $6.
     cfg = MorningConfig(
         tickers=("AAA",),
         base_buy_amount_usd=3.0,
-        morning_daily_cap_usd=10.0,
+        morning_daily_cap_usd=6.0,
         morning_weekly_cap_usd=100.0,
         morning_run_state_root=str(tmp_path),
     )
@@ -1311,7 +1360,7 @@ def test_morning_live_ledger_seeds_cap_spend_from_earlier_same_process_day_run(t
     cfg2 = MorningConfig(
         tickers=("BBB",),
         base_buy_amount_usd=3.0,
-        morning_daily_cap_usd=10.0,
+        morning_daily_cap_usd=6.0,
         morning_weekly_cap_usd=100.0,
         morning_run_state_root=str(tmp_path),
     )
@@ -1337,7 +1386,7 @@ def test_morning_live_ledger_seeds_weekly_cap_from_earlier_day_same_week(tmp_pat
         tickers=("AAA",),
         base_buy_amount_usd=3.0,
         morning_daily_cap_usd=100.0,
-        morning_weekly_cap_usd=10.0,
+        morning_weekly_cap_usd=6.0,
         morning_run_state_root=str(tmp_path),
     )
     ex1 = MorningDCAExecutor(cfg1, mode=MORNING_LIVE_MODE)
@@ -1345,14 +1394,14 @@ def test_morning_live_ledger_seeds_weekly_cap_from_earlier_day_same_week(tmp_pat
     broker1 = RecordingLiveBroker(account="999000111", reference_prices={"AAA": 97.0})
     res1 = ex1.run(monday, data1, broker=broker1, manual=True)
     assert res1["artifacts"]["broker_outcomes"]["AAA"]["status"] == "submitted"
-    assert res1["artifacts"]["buy_candidates"][0]["planned_amount_usd"] == 7.5
+    assert res1["artifacts"]["buy_candidates"][0]["planned_amount_usd"] == 4.5
 
     # Fresh process (fresh in-memory ledger) on Wednesday of the same week.
     cfg2 = MorningConfig(
         tickers=("BBB",),
         base_buy_amount_usd=3.0,
         morning_daily_cap_usd=100.0,
-        morning_weekly_cap_usd=10.0,
+        morning_weekly_cap_usd=6.0,
         morning_run_state_root=str(tmp_path),
     )
     ex2 = MorningDCAExecutor(cfg2, mode=MORNING_LIVE_MODE)
@@ -1360,9 +1409,9 @@ def test_morning_live_ledger_seeds_weekly_cap_from_earlier_day_same_week(tmp_pat
     broker2 = RecordingLiveBroker(account="999000111", reference_prices={"BBB": 97.0})
     res2 = ex2.run(_now_live(), data2, broker=broker2, manual=True)
 
-    # Monday already spent $7.50 of the $10 weekly cap, leaving only $2.50 of
-    # weekly headroom -- not the full $10 a same-day-only seed would wrongly
-    # leave available -- so BBB's $7.50 must be blocked.
+    # Monday already spent $4.50 of the $6 weekly cap, leaving only $1.50 of
+    # weekly headroom -- not the full $6 a same-day-only seed would wrongly
+    # leave available -- so BBB's $4.50 must be blocked.
     assert len(broker2.placed_orders) == 0
     bbb = res2["artifacts"]["buy_candidates"][0]
     assert bbb["status"] == "cap_exceeded"
@@ -1669,7 +1718,7 @@ def test_morning_live_ledger_seed_uses_larger_of_partial_filled_orders_and_order
     cfg = MorningConfig(
         tickers=("BBB",),
         morning_daily_cap_usd=100.0,
-        morning_weekly_cap_usd=12.0,
+        morning_weekly_cap_usd=10.0,
         morning_run_state_root=str(tmp_path),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -1677,10 +1726,10 @@ def test_morning_live_ledger_seed_uses_larger_of_partial_filled_orders_and_order
     broker = RecordingLiveBroker(account="999000111", reference_prices={"BBB": 97.0})
     res = ex.run(_now_live(), data, broker=broker, manual=True)
 
-    # $12 weekly cap: orders.csv's larger total ($8, not filled_orders.csv's
-    # partial $3) plus BBB's $7.50 = $15.50 > $12 -- must be blocked. Stopping
-    # at filled_orders.csv's $3 would leave $9 of headroom, enough to wrongly
-    # admit BBB's $7.50.
+    # $10 weekly cap: orders.csv's larger total ($8, not filled_orders.csv's
+    # partial $3) plus BBB's $3.00 = $11 > $10 -- must be blocked. Stopping
+    # at filled_orders.csv's $3 would leave $7 of headroom, enough to wrongly
+    # admit BBB's $3.00.
     assert len(broker.placed_orders) == 0, f"BBB wrongly admitted; placed={broker.placed_orders}"
     bbb = res["artifacts"]["buy_candidates"][0]
     assert bbb["status"] == "cap_exceeded"
@@ -1863,6 +1912,32 @@ def test_nan_completed_bar_close_is_rejected():
     assert any("non-positive" in w.lower() or "nan" in w.lower() for w in sig.warnings), (
         f"expected a rejection warning for NaN completed bar close; got: {sig.warnings}"
     )
+
+
+def test_calibrated_first_tier_overrides_global_minimum_drop():
+    # Codex review ("Let calibrated first tiers override the global floor" --
+    # "the equivalent check in MorningDCAExecutor has the same problem"):
+    # AAAU-style calibration with a first tier below the shared 0.1% minimum.
+    # A 0.05% drop clears the calibrated 0.01% first tier (multiplier=1x) but
+    # is still below the global 0.1% floor -- flooring it at the global
+    # minimum would silently veto a buy the checked-in per-symbol model
+    # already approved. Mirrors test_calibrated_first_tier_overrides_global_
+    # minimum_drop in test_near_close_dca.py.
+    cfg = MorningConfig(
+        tickers=("AAAU", "AAPL"),
+        per_ticker_sizing={"AAAU": {"tiers": ((0.0001, 1.0), (0.02, 1.5))}},
+    )
+    ex = MorningDCAExecutor(cfg)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"AAAU": 0.0005, "AAPL": 0.0005})
+
+    aaau_sig = ex.evaluate_signal("AAAU", _now(), data)
+    assert aaau_sig.action == Action.BUY
+    assert aaau_sig.multiplier == 1.0
+
+    # Control: the SAME drop for an uncalibrated symbol must still be
+    # floored at the global 0.1% minimum.
+    aapl_sig = ex.evaluate_signal("AAPL", _now(), data)
+    assert aapl_sig.action == Action.NO_ACTION
 
 
 def test_load_morning_config_reads_config_file(tmp_path):
@@ -3124,7 +3199,7 @@ def test_morning_live_no_broker_does_not_record_hypothetical_ledger_spend(tmp_pa
     res = ex.run(_now_live(), data, manual=True, broker=None)
     assert res["artifacts"].get("status") != "blocked"
     sm = res["artifacts"]["buy_candidates"][0]
-    assert sm["hypothetical_amount_usd"] == 5.0  # confirms this exercises the fix's target path
+    assert sm["hypothetical_amount_usd"] == 3.0  # confirms this exercises the fix's target path
     trading_day = _now_live().astimezone(EASTERN).date()
     assert ex.ledger.day_planned(trading_day) == 0.0
     assert ex.ledger.week_planned(trading_day) == 0.0
@@ -3810,10 +3885,152 @@ def test_morning_evaluate_top_up_reuses_first_allocation_base():
     assert row["selected_base_amount_usd"] == 1.0
 
 
+def test_morning_evaluate_top_up_routes_subdollar_ladder_increment_to_pending_credit():
+    # Codex review discussion_r3705349440 ("Route sub-dollar top-ups through
+    # the credit policy"): a ladder tier crossing from 1x to 1.3x on a $1 base
+    # produces a clean ladder_incremental of $0.30 -- below both Robinhood's
+    # $1 minimum and cumulative_top_up_min_drop_usd ($0.50, so the price-step
+    # floor is $0). The old code returned this $0.30 directly as
+    # incremental_order_amount (a sub-$1 broker order) or, once it hit $0,
+    # simply dropped it. It must instead be routed through
+    # apply_cumulative_credit (final_session=False, since this is never the
+    # 3:30 PM final session): a $0.30 credit alone stays pending.
+    from near_close_dca import TOP_UP_NO_INCREMENTAL
+
+    ex = MorningDCAExecutor(MorningConfig())
+    prior = PriorSameDayAllocation(
+        "AAPL",
+        amount_usd=1.0,
+        reference_price=100.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=1.0,
+    )
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=99.95,
+        previous_close=100.0,
+        drop_pct=0.05,
+        multiplier=1.3,
+        hypothetical_amount_usd=1.3,
+        selected_base_amount_usd=1.0,
+    )
+    outcome = ex._evaluate_top_up(signal, prior)
+    assert outcome.top_up_guard_result == TOP_UP_NO_INCREMENTAL
+    assert outcome.incremental_order_amount == 0.0
+    assert outcome.top_up_skipped is True
+    # The decline must still be reported so the caller can durably persist
+    # the new pending balance even though no broker order happens this run --
+    # a None here is exactly how a credit gets silently dropped.
+    assert outcome.cumulative_credit_decline_usd == 0.30
+
+
+def test_morning_evaluate_top_up_routes_subdollar_ladder_increment_to_a_dollar_order():
+    # Same ladder-tier-crossing shape as above but with existing pending
+    # credit from an earlier slot already at $0.25: $0.25 (existing) + $0.30
+    # (this decline) = $0.55, which crosses the 50-cent round-up threshold.
+    # The old code would have returned the raw $0.30 ladder_incremental
+    # (ignoring pending state entirely) as a sub-$1 order; the fix must
+    # instead round the ACCUMULATED total up to a full $1 order.
+    from near_close_dca import TOP_UP_INCREMENTAL
+
+    ex = MorningDCAExecutor(MorningConfig())
+    prior = PriorSameDayAllocation(
+        "AAPL",
+        amount_usd=1.0,
+        reference_price=100.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=1.0,
+    )
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=99.95,
+        previous_close=100.0,
+        drop_pct=0.05,
+        multiplier=1.3,
+        hypothetical_amount_usd=1.3,
+        selected_base_amount_usd=1.0,
+    )
+    outcome = ex._evaluate_top_up(signal, prior, existing_pending_credit_usd=0.25)
+    assert outcome.top_up_guard_result == TOP_UP_INCREMENTAL
+    assert outcome.incremental_order_amount == 1.0
+    assert outcome.top_up_skipped is False
+    assert outcome.cumulative_credit_decline_usd == 0.30
+
+
+def test_morning_compute_top_up_persists_pending_credit_and_is_retry_safe(tmp_path):
+    # End-to-end through _compute_top_up (the only caller that reads/writes
+    # the ledger; _evaluate_top_up itself stays pure). The sub-dollar decline
+    # must be durably recorded via CumulativeCreditLedger so a later same-day
+    # slot or the 3:30 PM final session can read it back with pending_usd().
+    # A retry of this exact same scheduled slot (the dated-slot run_state.json
+    # already reflects last attempt's credited decline) must NOT re-apply the
+    # same decline on top of the already-persisted balance.
+    from dca_cumulative import CumulativeCreditLedger
+
+    prior_root = tmp_path / "prior"
+    _write_prior_run_state(prior_root, "AAPL", amount_usd=1.0, decision_price=100.0, selected_base_amount_usd=1.0)
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAPL",))
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        base_buy_amount_usd=1.0,
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        prior_allocation_roots=(str(prior_root),),
+        cap_seed_roots=None,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "credits")
+    now = datetime.combine(date(2026, 7, 8), time(10, 30), tzinfo=EASTERN)
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=99.95,
+        previous_close=100.0,
+        drop_pct=0.05,
+        multiplier=1.3,
+        hypothetical_amount_usd=1.3,
+        selected_base_amount_usd=1.0,
+    )
+
+    outcomes = ex._compute_top_up(now, [signal])
+    assert outcomes["AAPL"].incremental_order_amount == 0.0
+    assert ex.credit_ledger.pending_usd("AAPL", "2026-07-08") == 0.30
+
+    # Simulate this slot's own dated artifact having already been written
+    # (as run() would do) with the credited decline on the AAPL row.
+    run_dir = ex.run_state_dir(now)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": "2026-07-08",
+            "buy_candidates": [{"ticker": "AAPL", "cumulative_credit_decline_usd": 0.30}],
+        }),
+        encoding="utf-8",
+    )
+
+    # A retry recomputing the identical signal/prior must not double-apply
+    # the same $0.30 decline on top of the $0.30 already persisted.
+    ex._compute_top_up(now, [signal])
+    assert ex.credit_ledger.pending_usd("AAPL", "2026-07-08") == 0.30
+
+
 def test_morning_top_up_guard_buys_incremental_when_prior_fill_exists(tmp_path):
     # Prior manual fill of $4.50 at $99.0 before the 10:30 AM live run. Stock
-    # has dropped 3% to $97.0 (below the $99.0 reference), so the guard allows
-    # an incremental top-up of $3.00 (desired $7.50 minus prior $4.50).
+    # has dropped 3% to $97.0 (below the $99.0 reference). 3% drop → 1.5x →
+    # desired $4.50 = prior $4.50, so ladder_incremental is $0. The price-step
+    # floor (max($1, $99-$97=$2) = $2) applies as a sub-dollar credit, placing
+    # $2.00.
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, TOP_UP_INCREMENTAL
 
     class _Broker:
@@ -3848,15 +4065,102 @@ def test_morning_top_up_guard_buys_incremental_when_prior_fill_exists(tmp_path):
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     broker = _Broker()
     # 3% drop: current $97.0 < prior ref $99.0 → incremental eligible
-    # desired = 2.5x * $3.00 = $7.50; incremental = $7.50 - $4.50 = $3.00
+    # desired = 1.5x * $3.00 = $4.50; ladder_inc = $4.50 - $4.50 = $0;
+    # price_step = max($1, $99-$97=$2) = $2 → incremental = $2.00
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.03})
     res = ex.run(_now_live(), data, broker=broker)
     candidates = {r["ticker"]: r for r in res["artifacts"].get("buy_candidates", [])}
     assert "TOPUP" in candidates, "TOPUP should appear as a buy candidate"
     row = candidates["TOPUP"]
     assert row.get("top_up_guard_result") == TOP_UP_INCREMENTAL
-    assert row.get("incremental_order_amount") == 3.0
-    assert broker.placed.get("TOPUP") == 3.0, "broker should place $3.00 incremental order"
+    assert row.get("incremental_order_amount") == 2.0
+    assert broker.placed.get("TOPUP") == 2.0, "broker should place $2.00 incremental order"
+
+
+def test_morning_place_broker_orders_settles_credit_ledger_after_confirmed_submission(tmp_path):
+    # Codex review discussion_r3705349440 ("Route sub-dollar top-ups through
+    # the credit policy"): once a credit-derived order is actually confirmed
+    # submitted, the durable ledger must be settled (cleared) using the real
+    # submitted notional -- mirroring near_close_dca's own "Defer ledger
+    # updates until the submitted amount is known" fix. The pre-existing
+    # $0.25 pending balance this test seeds must NOT still be sitting there
+    # after a confirmed $1.00 submission.
+    from dca_cumulative import CumulativeCreditLedger
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, TOP_UP_INCREMENTAL
+
+    class _Broker:
+        def __init__(self):
+            self.placed = {}
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return False
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.placed[ticker] = notional_usd
+            return f"ORDER-{ticker}"
+
+    cfg = MorningConfig(tickers=("AAPL",), base_buy_amount_usd=1.0)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 7, 8)
+    ex.credit_ledger.record("AAPL", trading_day.isoformat(), 0.25, stream="morning")
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.25
+
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=99.0,
+        previous_close=100.0,
+        drop_pct=1.0,
+        multiplier=1.0,
+        hypothetical_amount_usd=1.0,
+        selected_base_amount_usd=1.0,
+    )
+    outcome = TopUpOutcome(
+        ticker="AAPL",
+        desired_amount=1.30,
+        decision_price=99.0,
+        prior_same_day_amount=1.0,
+        prior_same_day_reference_price=100.0,
+        prior_same_day_run_id="manual_am",
+        prior_same_day_source="manual",
+        incremental_order_amount=1.0,
+        top_up_guard_result=TOP_UP_INCREMENTAL,
+        top_up_skipped=False,
+        effective_base_amount_usd=1.0,
+        cumulative_credit_decline_usd=0.30,
+    )
+    broker = _Broker()
+    outcomes = ex._place_broker_orders(
+        [signal],
+        trading_day,
+        broker,
+        {"AAPL": outcome},
+        remaining_daily=180.0,
+        remaining_weekly=900.0,
+    )
+    assert outcomes["AAPL"]["status"] == "submitted"
+    assert broker.placed["AAPL"] == 1.0
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.0
+    events = ex.credit_ledger.events(trading_day.isoformat())
+    assert events[-1]["decision"] == "settled"
+    assert events[-1]["submitted_amount_usd"] == 1.0
 
 
 def test_morning_top_up_guard_skips_when_price_not_below_reference(tmp_path):
@@ -3920,7 +4224,7 @@ def test_morning_top_up_guard_inactive_in_watchlist_mode(tmp_path):
     row = candidates["TOPUP"]
     assert "top_up_guard_result" not in row, "top-up guard must not run in watchlist mode"
     # Full hypothetical amount, not reduced by any prior fill
-    assert row.get("hypothetical_amount_usd") == 7.5
+    assert row.get("hypothetical_amount_usd") == 4.5
 
 
 def test_morning_top_up_guard_seeds_ledger_from_prior_fills(tmp_path):
@@ -3944,9 +4248,9 @@ def test_morning_top_up_guard_seeds_ledger_from_prior_fills(tmp_path):
             return f"ORDER-{ticker}"
 
     morning_root = tmp_path / "morning_prior"
-    # $85 prior morning fill on a different ticker at a reference price well below
+    # $86 prior morning fill on a different ticker at a reference price well below
     # current so per-ticker top-up would be eligible, but the cap is the binding constraint.
-    _write_prior_run_state(morning_root, "PRIOR_TICKER", amount_usd=85.0, decision_price=50.0)
+    _write_prior_run_state(morning_root, "PRIOR_TICKER", amount_usd=86.0, decision_price=50.0)
     pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
     cfg = MorningConfig(
         tickers=("TOPUP",),
@@ -3961,14 +4265,85 @@ def test_morning_top_up_guard_seeds_ledger_from_prior_fills(tmp_path):
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     broker = _Broker()
-    # 3% drop: TOPUP desired = 2.5x * $3 = $7.50; remaining cap = $90 - $85 = $5
+    # 3% drop: TOPUP desired = 1.5x * $3 = $4.50; remaining cap = $90 - $86 = $4
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.03})
     res = ex.run(_now_live(), data, broker=broker)
     broker_outcomes = res["artifacts"].get("broker_outcomes", {})
     assert broker_outcomes.get("TOPUP", {}).get("status") == "cap_exceeded", (
-        "TOPUP ($7.50 desired) should be cap-gated when prior morning fill consumed $85 of the $90 daily cap"
+        "TOPUP ($4.50 desired) should be cap-gated when prior morning fill consumed $86 of the $90 daily cap"
     )
     assert "TOPUP" not in broker.placed, "broker should not be called when cap is exhausted"
+
+
+def test_morning_cap_seeding_counts_every_prior_buy_attempt_not_one_per_ticker(tmp_path):
+    # Codex review discussion_r3705349432 ("Seed the cap from actual order
+    # attempts"): the cap-seeding block previously derived
+    # MorningConfig.max_orders_per_day's seed from "one attempt per DISTINCT
+    # ticker with a positive prior allocation" -- collapsing two same-day
+    # buys of MULTI into a single attempt, and missing FAILTICK's failed
+    # attempt entirely since it moved no capital (amount_usd stays 0). Two
+    # prior "filled" rows for MULTI plus one "failed" row for FAILTICK is a
+    # real attempt count of 3, not the 1 the old "one per ticker with a
+    # positive allocation" approximation would have produced.
+    prior_root = tmp_path / "prior"
+    first_dir = prior_root / "20260708_0900ET"
+    first_dir.mkdir(parents=True)
+    (first_dir / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": "2026-07-08",
+            "generated_at": "2026-07-08T09:00:00-04:00",
+            "run_classification": {"run_origin": "manual", "manual_run": True},
+            "buy_candidates": [
+                {
+                    "ticker": "MULTI",
+                    "status": "filled",
+                    "planned_amount_usd": 1.0,
+                    "decision_price": 50.0,
+                    "selected_base_amount_usd": 1.0,
+                },
+                {
+                    "ticker": "FAILTICK",
+                    "status": "failed",
+                },
+            ],
+        }),
+        encoding="utf-8",
+    )
+    second_dir = prior_root / "20260708_0930ET"
+    second_dir.mkdir(parents=True)
+    (second_dir / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": "2026-07-08",
+            "generated_at": "2026-07-08T09:30:00-04:00",
+            "run_classification": {"run_origin": "manual", "manual_run": True},
+            "buy_candidates": [
+                {
+                    "ticker": "MULTI",
+                    "status": "filled",
+                    "planned_amount_usd": 1.0,
+                    "decision_price": 49.0,
+                    "selected_base_amount_usd": 1.0,
+                },
+            ],
+        }),
+        encoding="utf-8",
+    )
+    pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
+    cfg = MorningConfig(
+        tickers=("TOPUP",),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        cap_seed_roots=(str(prior_root),),
+        max_orders_per_day=8,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    now = datetime.combine(date(2026, 7, 8), time(10, 30), tzinfo=EASTERN)
+
+    ex._compute_top_up(now, ())
+
+    assert ex.ledger.day_attempts(date(2026, 7, 8)) == 3
 
 
 def test_morning_top_up_guard_afternoon_fills_do_not_reduce_morning_cap(tmp_path):
@@ -4007,14 +4382,14 @@ def test_morning_top_up_guard_afternoon_fills_do_not_reduce_morning_cap(tmp_path
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     broker = _Broker()
-    # 3% drop: TOPUP desired = 2.5x * $3 = $7.50; full $90 cap available
+    # 3% drop: TOPUP desired = 1.5x * $3 = $4.50; full $90 cap available
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.03})
     res = ex.run(_now_live(), data, broker=broker)
     broker_outcomes = res["artifacts"].get("broker_outcomes", {})
     assert broker_outcomes.get("TOPUP", {}).get("status") == "submitted", (
         "TOPUP should be placed: afternoon fill in prior_allocation_roots must not exhaust morning cap"
     )
-    assert broker.placed.get("TOPUP") == 7.5, "full $7.50 graded order should be placed"
+    assert broker.placed.get("TOPUP") == 4.5, "full $4.50 graded order should be placed"
 
 
 def test_morning_top_up_guard_inactive_in_manual_live_run(tmp_path):
@@ -4087,8 +4462,8 @@ def test_morning_cap_seeding_is_idempotent_across_multiple_runs(tmp_path):
             return f"ORDER-{ticker}"
 
     morning_root = tmp_path / "morning_prior"
-    # $85 prior fill leaves $5 of the $90 cap. TOPUP graded at $7.50 exceeds $5.
-    _write_prior_run_state(morning_root, "PRIOR_TICKER", amount_usd=85.0, decision_price=50.0)
+    # $86 prior fill leaves $4 of the $90 cap. TOPUP graded at $4.50 exceeds $4.
+    _write_prior_run_state(morning_root, "PRIOR_TICKER", amount_usd=86.0, decision_price=50.0)
     pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
     cfg = MorningConfig(
         tickers=("TOPUP",),
@@ -4103,21 +4478,21 @@ def test_morning_cap_seeding_is_idempotent_across_multiple_runs(tmp_path):
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
 
-    # First run: $85 seeded → $5 remaining → TOPUP cap_exceeded
+    # First run: $86 seeded → $4 remaining → TOPUP cap_exceeded
     broker1 = _Broker()
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.03})
     res1 = ex.run(_now_live(), data, broker=broker1)
     assert res1["artifacts"].get("broker_outcomes", {}).get("TOPUP", {}).get("status") == "cap_exceeded"
-    assert ex.ledger.day_planned(date(2026, 7, 8)) == 85.0, "ledger should show $85 after first run"
+    assert ex.ledger.day_planned(date(2026, 7, 8)) == 86.0, "ledger should show $86 after first run"
 
-    # Second run on same instance with no new fills: ledger stays at $85 (no double-count)
+    # Second run on same instance with no new fills: ledger stays at $86 (no double-count)
     broker2 = _Broker()
     ex.run(_now_live(), data, broker=broker2)
-    assert ex.ledger.day_planned(date(2026, 7, 8)) == 85.0, (
+    assert ex.ledger.day_planned(date(2026, 7, 8)) == 86.0, (
         "ledger must not double-count prior fills across repeated runs on the same executor instance"
     )
 
-    # Write a new fill between runs ($4 more → total $89) — the incremental logic
+    # Write a new fill between runs ($4 more → total $90) — the incremental logic
     # must pick it up so the ledger reflects the real prior spend.
     run_dir2 = morning_root / "20260708_0901ET"
     run_dir2.mkdir(parents=True, exist_ok=True)
@@ -4134,8 +4509,8 @@ def test_morning_cap_seeding_is_idempotent_across_multiple_runs(tmp_path):
     )
     broker3 = _Broker()
     ex.run(_now_live(), data, broker=broker3)
-    assert ex.ledger.day_planned(date(2026, 7, 8)) == 89.0, (
-        "ledger must pick up new fills written between runs ($85 + $4 = $89)"
+    assert ex.ledger.day_planned(date(2026, 7, 8)) == 90.0, (
+        "ledger must pick up new fills written between runs ($86 + $4 = $90)"
     )
 
 
@@ -4216,20 +4591,20 @@ def test_cap_seed_scan_failure_poison_clears_on_a_recovered_rescan(tmp_path, mon
 
     # Second run, SAME executor instance: the artifact is now readable with a
     # real $10 fill, restoring $80 of real headroom -- enough for TOPUP's
-    # $7.50 desired order to place. The ledger must reflect the real $10
-    # external fill plus this run's own $7.50 placed order (17.50 total), not
+    # $4.50 desired order to place. The ledger must reflect the real $10
+    # external fill plus this run's own $4.50 placed order (14.50 total), not
     # stay pinned at the $90/$450 ceilings the first (failed) scan injected.
     broker2 = _Broker()
     ex.run(_now_live(), data, broker=broker2)
-    assert broker2.placed.get("TOPUP") == 7.5, (
+    assert broker2.placed.get("TOPUP") == 4.5, (
         "TOPUP should place once real remaining headroom is restored by the recovered scan"
     )
-    assert ex.ledger.day_planned(date(2026, 7, 8)) == 17.5, (
+    assert ex.ledger.day_planned(date(2026, 7, 8)) == 14.5, (
         "the earlier fail-closed poisoning must be cleared once the scan recovers"
     )
-    assert ex.ledger.week_planned(date(2026, 7, 8)) == 17.5
-    assert ex.ledger.remaining_daily(date(2026, 7, 8)) == 72.5
-    assert ex.ledger.remaining_weekly(date(2026, 7, 8)) == 432.5
+    assert ex.ledger.week_planned(date(2026, 7, 8)) == 14.5
+    assert ex.ledger.remaining_daily(date(2026, 7, 8)) == 75.5
+    assert ex.ledger.remaining_weekly(date(2026, 7, 8)) == 435.5
 
 
 def test_own_stream_earlier_weekday_run_state_failure_fails_closed(tmp_path):
@@ -4271,6 +4646,65 @@ def test_own_stream_earlier_weekday_run_state_failure_fails_closed(tmp_path):
 
     assert ex._cap_seed_scan_incomplete is True
     assert ex.ledger.week_planned(date(2026, 6, 30)) == 450.0
+
+
+def test_cap_seed_scan_finds_sibling_suffix_fills_under_the_current_stream_root(tmp_path):
+    """Codex review ("Seed the weekly cap from every intraday slot"):
+    intraday_dca's three slots (11:30/13:30/14:30) all share ONE state root
+    (IntradayConfig.cap_seed_roots includes intraday_dca's own root) but each
+    fires with its own folder_suffix. The day-loop above only ever matches
+    THIS instance's own folder_suffix, so alone it would miss an earlier
+    weekday's fill written under a DIFFERENT suffix under the same root --
+    and the generic cross-stream sibling scan used to skip the bare root
+    entirely whenever it equaled the current stream's own state_root
+    (reasoning: "the day-loop above already covers it"), which is only true
+    when a stream has exactly one folder_suffix per root. For a multi-suffix
+    stream like intraday, neither mechanism ever found the other suffixes'
+    earlier-weekday fills, silently undercounting the shared weekly cap.
+
+    Modeled with plain MorningConfig/MorningDCAExecutor, whose own
+    folder_suffix is fixed "1030ET", against a root holding two OTHER-suffix
+    prior-weekday artifacts -- exactly like a Tuesday 1:30 intraday run
+    relative to Monday's 11:30 and 2:30 fills.
+    """
+    live_root = tmp_path / "live"
+
+    def _write_prior_suffix_run(folder_suffix, run_id, amount):
+        run_dir = live_root / f"20260706_{folder_suffix}"
+        run_dir.mkdir(parents=True)
+        (run_dir / "run_state.json").write_text(
+            json.dumps({
+                "trading_day": "2026-07-06",
+                "run_id": run_id,
+                "buy_candidates": [
+                    {"ticker": "XXX", "status": "submitted", "planned_amount_usd": amount}
+                ],
+            }),
+            encoding="utf-8",
+        )
+
+    # Monday 2026-07-06, ISO week 28 -- same week as _now_live()'s Wednesday.
+    _write_prior_suffix_run("1130ET", "intraday_live_20260706_1130ET", 10.0)
+    _write_prior_suffix_run("1430ET", "intraday_live_20260706_1430ET", 15.0)
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("CCC",))
+    cfg = MorningConfig(
+        tickers=("CCC",),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        cap_seed_roots=(str(live_root),),
+        morning_daily_cap_usd=100.0,
+        morning_weekly_cap_usd=100.0,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    now = _now_live()
+
+    ex._compute_top_up(now, ())
+    ex._seed_ledger_from_prior_runs(now)
+
+    assert ex.ledger.week_planned(date(2026, 7, 8)) == 25.0
 
 
 def test_earlier_weekday_cap_seed_poison_clears_on_a_recovered_rescan(tmp_path):
@@ -4481,9 +4915,9 @@ def test_morning_cap_seeding_watermark_exclusive_of_own_recorded(tmp_path):
     # on the next scan and suppressing pickup of newly-written external fills.
     #
     # Scenario:
-    #   1. Manual run buys $7.50 → _own_recorded[day]=7.50, artifact in manual_runs/
+    #   1. Manual run buys $4.50 → _own_recorded[day]=4.50, artifact in manual_runs/
     #   2. External $4 fill appears in manual_runs/
-    #   3. Scheduled run 1: seeds $4 (incremental), writes $6 to ledger via record_buy_candidates
+    #   3. Scheduled run 1: seeds $4 (incremental), writes $4.50 to ledger via record_buy_candidates
     #      (but NOT to _own_recorded since manual=False)
     #   4. Another external $4 fill appears in manual_runs/
     #   5. Scheduled run 2: should seed another $4 — without the watermark fix it would
@@ -4524,14 +4958,14 @@ def test_morning_cap_seeding_watermark_exclusive_of_own_recorded(tmp_path):
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.03})
 
-    # Step 1: manual run at 9:00 AM — buys TICK ($7.50), writes artifact to manual_runs/.
+    # Step 1: manual run at 9:00 AM — buys TICK ($4.50), writes artifact to manual_runs/.
     # Use an earlier timestamp so the artifact's generated_at is before the 10:30 AM
     # boundary used by the scheduled run's cap-seeding scan (boundary check is strict <).
     _now_manual = datetime.combine(date(2026, 7, 8), time(9, 0), tzinfo=EASTERN)
     broker = _SimpleBroker()
     ex.run(_now_manual, data, broker=broker, manual=True)
     manual_amount = broker.placed.get("TICK", 0.0)
-    assert manual_amount == 7.5
+    assert manual_amount == 4.5
 
     # Step 2: an external fill of $4 appears in manual_runs/ (simulates another executor/session)
     ext_dir1 = manual_root / "20260708_0901ET"
@@ -4551,7 +4985,7 @@ def test_morning_cap_seeding_watermark_exclusive_of_own_recorded(tmp_path):
     ex.run(_now_live(), data, broker=broker)
     ledger_after_sched1 = ex.ledger.day_planned(date(2026, 7, 8))
     assert ledger_after_sched1 == manual_amount + 4.0, (
-        f"ledger should be manual($7.50) + external-seed($4) = $11.50, got {ledger_after_sched1}"
+        f"ledger should be manual($4.50) + external-seed($4) = $8.50, got {ledger_after_sched1}"
     )
 
     # Step 4: another external $4 fill appears in manual_runs/
@@ -4568,14 +5002,14 @@ def test_morning_cap_seeding_watermark_exclusive_of_own_recorded(tmp_path):
     )
 
     # Step 5: another scheduled run — must pick up the second external $4 fill.
-    # Without the watermark fix: _cap_seeded_amounts stored new_total=$11.50, so
-    # prev_total = 11.50 + _own_recorded(7.50) = 19.0 > new_total($15.50) → no increment.
+    # Without the watermark fix: _cap_seeded_amounts stored new_total=$8.50, so
+    # prev_total = 8.50 + _own_recorded(4.50) = 13.0 > new_total($12.50) → no increment.
     # With the fix: _cap_seeded_amounts stored new_total - own = $4.0, so
-    # prev_total = 4.0 + 7.50 = 11.50, incremental = 15.50 - 11.50 = 4.0 → seeds $4.
+    # prev_total = 4.0 + 4.50 = 8.50, incremental = 12.50 - 8.50 = 4.0 → seeds $4.
     ex.run(_now_live(), data, broker=broker)
     ledger_after_sched2 = ex.ledger.day_planned(date(2026, 7, 8))
     assert ledger_after_sched2 == manual_amount + 8.0, (
-        f"ledger should be manual($7.50) + ext1-seed($4) + ext2-seed($4) = $15.50, "
+        f"ledger should be manual($4.50) + ext1-seed($4) + ext2-seed($4) = $12.50, "
         f"got {ledger_after_sched2}"
     )
 
@@ -4733,6 +5167,70 @@ def test_morning_cap_seeding_picks_up_external_fill_after_own_retry_overwrite(tm
     )
 
 
+def test_shadow_run_suppresses_drift_check(tmp_path, monkeypatch):
+    """Codex review ("Suppress drift alerts for deliberate shadow runs"):
+    live_execution_enabled=False (market_open_dca.json/intraday_dca.json's
+    "SHIPS DISABLED" mode) drops the broker, so broker_outcomes stays None
+    and the auto_buy_signal reconciliation that clears it for deliberate
+    non-submissions never runs -- every eligible signal row would still read
+    auto_buy_signal=True next to an empty submitted_orders.csv. Running
+    drift detection against that mismatch would report every deliberate
+    shadow candidate as an unexpectedly missing order. A scheduled live run
+    with execution disabled must not invoke the drift check at all."""
+    import morning_dca as _md
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+    class _Broker:
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            return f"ORDER-{ticker}"
+
+    calls = []
+    monkeypatch.setattr(_md, "_run_drift_check", lambda run_dir: calls.append(run_dir))
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA",))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.03})
+
+    # Shadow mode: drift check must NOT run even though the ladder produces
+    # an eligible buy-signal row.
+    shadow_cfg = MorningConfig(
+        tickers=("AAA",),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "shadow"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+        live_execution_enabled=False,
+    )
+    MorningDCAExecutor(shadow_cfg, mode=MORNING_LIVE_MODE).run(_now_live(), data, broker=_Broker())
+    assert calls == []
+
+    # Control: the same scenario with execution enabled (the morning/midday
+    # default) must still run the drift check as before.
+    live_cfg = MorningConfig(
+        tickers=("AAA",),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    MorningDCAExecutor(live_cfg, mode=MORNING_LIVE_MODE).run(_now_live(), data, broker=_Broker())
+    assert len(calls) == 1
+
+
 def test_morning_ledger_seed_still_covers_scheduled_slot_when_cap_roots_are_manual_only(tmp_path):
     # Codex review ("Seed today's scheduled slot when cap roots do not cover
     # it"): cap_seed_roots may be configured narrowly to cover only
@@ -4753,7 +5251,7 @@ def test_morning_ledger_seed_still_covers_scheduled_slot_when_cap_roots_are_manu
         morning_run_state_root=str(live_root),
         preflight_run_state_root=str(pf_root),
         cap_seed_roots=(str(live_root / "manual_runs"),),  # narrow: excludes the scheduled slot
-        morning_daily_cap_usd=10.0,
+        morning_daily_cap_usd=6.0,
         morning_weekly_cap_usd=100.0,
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
@@ -4771,7 +5269,7 @@ def test_morning_ledger_seed_still_covers_scheduled_slot_when_cap_roots_are_manu
         morning_run_state_root=str(live_root),
         preflight_run_state_root=str(pf_root),
         cap_seed_roots=(str(live_root / "manual_runs"),),
-        morning_daily_cap_usd=10.0,
+        morning_daily_cap_usd=6.0,
         morning_weekly_cap_usd=100.0,
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
@@ -4822,14 +5320,14 @@ def test_morning_top_up_guard_no_prior_run_when_default_roots_empty(tmp_path):
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     broker = _Broker()
-    # 3% drop → desired 2.5x * $3.00 = $7.50; no prior fill → full amount placed
+    # 3% drop → desired 1.5x * $3.00 = $4.50; no prior fill → full amount placed
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.03})
     res = ex.run(_now_live(), data, broker=broker)
     candidates = {r["ticker"]: r for r in res["artifacts"].get("buy_candidates", [])}
     assert "TOPUP" in candidates
     row = candidates["TOPUP"]
     assert row.get("top_up_guard_result") == TOP_UP_NO_PRIOR_RUN
-    assert broker.placed.get("TOPUP") == 7.5, "full graded amount placed when no prior fill exists"
+    assert broker.placed.get("TOPUP") == 4.5, "full graded amount placed when no prior fill exists"
 
 
 # ---------------------------------------------------------------------------
@@ -4966,6 +5464,7 @@ def test_morning_scheduled_top_up_not_blocked_by_manual_fills_ordinary_ref_id(tm
     cfg = MorningConfig(
         tickers=("NVDA",),
         base_buy_amount_usd=3.0,
+        max_per_order_usd=15.0,
         morning_run_state_root=str(live_root),
         preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(live_root / "manual_runs"),),
@@ -4974,12 +5473,12 @@ def test_morning_scheduled_top_up_not_blocked_by_manual_fills_ordinary_ref_id(tm
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     broker = _RefIdTrackingBroker()
 
-    # Step 1: manual run, 3% drop -> 2.5x * $3 = $7.50 placed with the
+    # Step 1: manual run, 3% drop -> 1.5x * $3 = $4.50 placed with the
     # ORDINARY ref_id (top-up computation is disabled for manual+MORNING).
     manual_now = datetime.combine(date(2026, 7, 8), time(9, 0), tzinfo=EASTERN)
     manual_data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.03})
     manual_res = ex.run(manual_now, manual_data, broker=broker, manual=True)
-    assert broker.placed.get("NVDA") == pytest.approx(7.5)
+    assert broker.placed.get("NVDA") == pytest.approx(4.5)
     manual_ref_ids = list(broker._ref_ids)
     assert manual_ref_ids and "topup" not in manual_ref_ids[0][1]
 
@@ -4995,7 +5494,7 @@ def test_morning_scheduled_top_up_not_blocked_by_manual_fills_ordinary_ref_id(tm
     manual_state_path.write_text(json.dumps(manual_state), encoding="utf-8")
 
     # Step 2: scheduled run, deeper 10% drop -> 5x * $3 = $15 desired. The
-    # manual fill above is now visible as a prior allocation ($7.50 at the
+    # manual fill above is now visible as a prior allocation ($4.50 at the
     # manual run's decision price), so this should compute an incremental
     # top-up and actually place it, not skip it as a phantom duplicate.
     scheduled_data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
@@ -5502,6 +6001,59 @@ def test_morning_top_up_guard_seeds_daily_cap_with_prior_spend(tmp_path):
     )
 
 
+def test_max_orders_per_day_blocks_attempts_beyond_the_shared_cap(tmp_path):
+    # Codex review ("Enforce the shared daily order-count cap in new
+    # executors"): market_open_dca.py/intraday_dca.py place orders through
+    # this same inherited _place_broker_orders path, which previously had no
+    # max_orders_per_day enforcement at all -- only notional caps. With the
+    # cap set to 2, a batch of 3 qualifying candidates must place only the
+    # first 2 and block the 3rd on the daily attempt ceiling.
+    cfg = MorningConfig(
+        tickers=("AAA", "BBB", "CCC"),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path),
+        max_orders_per_day=2,
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.03, "BBB": 0.03, "CCC": 0.03})
+    broker = RecordingLiveBroker(account="999000111", reference_prices={"AAA": 97.0, "BBB": 97.0, "CCC": 97.0})
+
+    res = ex.run(_now_live(), data, broker=broker, manual=True)
+
+    broker_outcomes = res["artifacts"]["broker_outcomes"]
+    submitted = [t for t, oc in broker_outcomes.items() if oc["status"] == "submitted"]
+    blocked = [t for t, oc in broker_outcomes.items() if oc["status"] == "blocked"]
+    assert len(submitted) == 2
+    assert len(blocked) == 1
+    assert "order daily attempt cap" in broker_outcomes[blocked[0]]["skip_reason"]
+
+
+def test_max_orders_per_day_none_by_default_does_not_block():
+    # Control: without an explicit cap (the class default, matching every
+    # existing test in this file), the new gate must be a complete no-op.
+    cfg = MorningConfig(tickers=("AAA",), base_buy_amount_usd=3.0)
+    assert cfg.max_orders_per_day is None
+
+
+def test_load_max_orders_per_day_reads_budgets_json(tmp_path):
+    (tmp_path / "budgets.json").write_text(
+        json.dumps({"circuit_breakers": {"max_orders_per_day": 8}}), encoding="utf-8"
+    )
+    assert load_max_orders_per_day(tmp_path) == 8
+
+
+def test_load_max_orders_per_day_missing_file_returns_none(tmp_path):
+    assert load_max_orders_per_day(tmp_path) is None
+
+
+def test_load_max_orders_per_day_rejects_non_positive_value(tmp_path):
+    (tmp_path / "budgets.json").write_text(
+        json.dumps({"circuit_breakers": {"max_orders_per_day": 0}}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError):
+        load_max_orders_per_day(tmp_path)
+
+
 def test_morning_cap_seeding_runs_even_when_per_ticker_guard_disabled(tmp_path):
     # Codex review (PR #42): setting prior_allocation_roots=[] disables the per-ticker
     # guard but must NOT skip cap seeding. A morning manual fill of $85 recorded in
@@ -5521,7 +6073,7 @@ def test_morning_cap_seeding_runs_even_when_per_ticker_guard_disabled(tmp_path):
             return f"ORDER-{ticker}"
 
     morning_root = tmp_path / "morning_prior"
-    _write_prior_run_state(morning_root, "PRIOR_TICKER", amount_usd=85.0, decision_price=50.0)
+    _write_prior_run_state(morning_root, "PRIOR_TICKER", amount_usd=86.0, decision_price=50.0)
     pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
     cfg = MorningConfig(
         tickers=("TOPUP",),
@@ -5536,16 +6088,16 @@ def test_morning_cap_seeding_runs_even_when_per_ticker_guard_disabled(tmp_path):
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     broker = _Broker()
-    # 3% drop → desired $7.50; cap = $90 - $85 = $5 remaining → cap_exceeded
+    # 3% drop → desired $4.50; cap = $90 - $86 = $4 remaining → cap_exceeded
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.03})
     res = ex.run(_now_live(), data, broker=broker)
-    # Cap seeding must have run: ledger reflects the $85 prior fill
-    assert ex.ledger.day_planned(date(2026, 7, 8)) == 85.0, (
+    # Cap seeding must have run: ledger reflects the $86 prior fill
+    assert ex.ledger.day_planned(date(2026, 7, 8)) == 86.0, (
         "cap ledger must be seeded from prior fills even when per-ticker guard is disabled"
     )
     broker_outcomes = res["artifacts"].get("broker_outcomes", {})
     assert broker_outcomes.get("TOPUP", {}).get("status") == "cap_exceeded", (
-        "TOPUP should be cap-gated: prior $85 fill consumed most of $90 daily cap"
+        "TOPUP should be cap-gated: prior $86 fill consumed most of $90 daily cap"
     )
     assert "TOPUP" not in broker.placed, "broker should not be called when cap is exhausted"
 
@@ -5554,7 +6106,7 @@ def test_morning_cap_seeding_own_amount_scoped_to_cap_roots(tmp_path):
     # Codex review (PR #42 line 960): when cap_seed_roots does NOT cover
     # state_root/manual_runs/, own_amount must not be subtracted from prev_total
     # because own fills are absent from new_total. Without the fix an in-memory
-    # $7.50 own fill reduces prev_total below new_total and the external $4 is
+    # $4.50 own fill reduces prev_total below new_total and the external $4 is
     # never seeded, giving $4 too much daily headroom.
     import json as _json
 
@@ -5595,11 +6147,11 @@ def test_morning_cap_seeding_own_amount_scoped_to_cap_roots(tmp_path):
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.03})
 
-    # Step 1: manual run buys TICK ($7.50) → _own_recorded[day]=7.50
+    # Step 1: manual run buys TICK ($4.50) → _own_recorded[day]=4.50
     _now_manual = datetime.combine(date(2026, 7, 8), time(9, 0), tzinfo=EASTERN)
     broker = _SimpleBroker()
     ex.run(_now_manual, data, broker=broker, manual=True)
-    assert broker.placed.get("TICK") == 7.5
+    assert broker.placed.get("TICK") == 4.5
 
     # Step 2: an external $4 fill appears in external_cap_root (NOT under manual_runs)
     ext_dir = external_cap_root / "20260708_0901ET"
@@ -5615,11 +6167,11 @@ def test_morning_cap_seeding_own_amount_scoped_to_cap_roots(tmp_path):
     )
 
     # Step 3: scheduled run — TICK is dup-blocked. Cap seeding must pick up the
-    # external $4 fill even though own_amount=$7.50 is not in external_cap_root.
+    # external $4 fill even though own_amount=$4.50 is not in external_cap_root.
     ex.run(_now_live(), data, broker=broker)
     ledger_after = ex.ledger.day_planned(date(2026, 7, 8))
-    assert ledger_after == 7.5 + 4.0, (
-        f"ledger should be own($7.50) + external-seed($4) = $11.50, got {ledger_after}"
+    assert ledger_after == 4.5 + 4.0, (
+        f"ledger should be own($4.50) + external-seed($4) = $8.50, got {ledger_after}"
     )
 
 

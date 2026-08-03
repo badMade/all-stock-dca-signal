@@ -1,0 +1,129 @@
+{
+  "policy_id": "market-open-dca-live-v1",
+  "version": "2026-08-02",
+  "purpose": "Configuration and separation policy for the MARKET-OPEN graded-DCA stream: a single 9:35 AM ET live Robinhood execution (cron 2ba19526, run_type='market_open_dca_live', trades=true) on account <ROBINHOOD_ACCOUNT_NUMBER>. It uses the SAME shared 0x-to-5x ladder and dynamic $1/$2 base, the same active universe (excluding BYDDY/VCX/TRLV/RVI), and the same shared $180/$900 Normal-tier ceiling as every other live stream. It is INDEPENDENT of, and never valid evidence for, the morning (42173154), midday (a6239dae), intraday (7be82b97), or afternoon (10ce362c) streams.",
+  "stream": "market_open",
+  "added_on_et": "2026-08-02",
+  "added_reason": "Until now this slot had no in-repo Python entry point (config/scheduled_tasks.json:2ba19526 no_python_entry_point=true): an external scheduler/agent ran it directly from the task manifest's prose, so NONE of this repo's code enforced its trading-window cutoff, budget ledger, per-order ceiling, or same-day top-up guard. market_open_dca.py closes that gap by reusing the same MorningDCAExecutor pipeline the 10:30 and 12:30 streams already run on.",
+  "live_execution_enabled": false,
+  "live_execution_enabled_note": "SHIPS DISABLED. When false the executor runs the full evaluate/signal/top-up/budget/artifact path and writes every artifact, but never calls the broker -- a shadow run. Flip to true only after a full trading day of shadow output has been diffed against the orders the external scheduler actually placed for this slot, per docs/safeguards.md#live-execution-roster. The value is surfaced on every run_state as live_execution_enabled so a reader can tell a deliberate shadow run apart from a live run that simply found no candidates.",
+  "confidence_rule": "Trend validation is DISABLED for this slot (see trend_validation_exemption). A candidate whose price/drop passes the ladder is auto-buy eligible without a validated 60-minute intraday downtrend. Every other circuit breaker -- whitelist, budget caps, buying power, spread threshold, data confidence, per-order ceiling, regular-hours-only -- stays fully enforced.",
+  "trend_min_bars": 6,
+  "trend_validation_exemption": {
+    "decision": "User-confirmed 2026-07-27 (config/scheduled_tasks.json:2ba19526.trend_validation_exemption); mirrored here because market_open_dca.py now enforces it in code rather than leaving it to an external agent.",
+    "reason": "At 9:35 AM ET only five minutes of regular-session data exist, but the shared strategy contract's trend validation requires a completed 60-minute intraday downtrend. Requiring it here made every market-open buy impossible to validate, zeroing the slot. Exempted for this task only.",
+    "validate_trend": false
+  },
+  "live_task": {
+    "mode": "live",
+    "cron_id": "2ba19526",
+    "cron_expression_edt": "35 13 * * 1-5",
+    "supersedes_cron_id": null,
+    "name": "Weekday 9:35 AM market-open DCA live Robinhood execution",
+    "schedule_et": "09:35",
+    "schedule_human": "9:35 AM ET weekdays",
+    "window_start_et": "09:30",
+    "window_end_et": "09:40",
+    "run_type": "market_open_dca_live",
+    "state_schema_version": "market-open-live-v1",
+    "trades": true,
+    "broker_account": "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}",
+    "first_buy_of_day": true,
+    "note": "Live Robinhood execution using account <ROBINHOOD_ACCOUNT_NUMBER> (Alpaca/Finance/Yahoo stay read-only for validation/context). As the day's first buy it normally has no prior same-day allocation and places the full desired amount; its fills become prior-allocation context for every later same-day slot.",
+    "preflight_independence": "This slot fires at 9:35, ten minutes BEFORE the 9:45 pre-flight writer (bb4f6ef1). It must never gate on the pre-flight artifact -- that artifact does not exist yet when this run decides. Only the 10:30 morning stream consumes it."
+  },
+  "state_file_guarantee": {
+    "summary": "The 9:35 scheduled run MUST always write run_state.json, run_summary.json, market_open_signals.csv, and a header-only-when-empty submitted_orders.csv under the market-open root, plus latest_market_open_run.json, even when no orders are placed or execution is blocked.",
+    "always_write": [
+      "/home/user/workspace/cron_tracking/market_open_dca/YYYYMMDD_0935ET/run_state.json",
+      "/home/user/workspace/cron_tracking/market_open_dca/YYYYMMDD_0935ET/run_summary.json",
+      "/home/user/workspace/cron_tracking/market_open_dca/YYYYMMDD_0935ET/market_open_signals.csv",
+      "/home/user/workspace/cron_tracking/market_open_dca/YYYYMMDD_0935ET/submitted_orders.csv",
+      "/home/user/workspace/cron_tracking/market_open_dca/latest_market_open_run.json"
+    ],
+    "evidence_meaning": "A blocked/no-order artifact is valid proof that the 9:35 scheduled task FIRED, but it is NOT order or fill evidence.",
+    "no_silent_escalation": "Do NOT escalate without writing this state file unless the workspace itself is unavailable."
+  },
+  "sizing_ladder": {
+    "name": "market_open_0x_to_5x",
+    "drop_metric": "fraction_down_vs_previous_regular_session_close",
+    "base_amount_usd": 2.0,
+    "base_amount_below_close_usd": 1.0,
+    "no_buy_below_pct": 0.1,
+    "tiers": [
+      { "min_drop_pct": 0.1, "max_drop_pct": 2.0, "multiplier": 1.0 },
+      { "min_drop_pct": 2.0, "max_drop_pct": 4.0, "multiplier": 1.5 },
+      { "min_drop_pct": 4.0, "max_drop_pct": 5.0, "multiplier": 2.0 },
+      { "min_drop_pct": 5.0, "max_drop_pct": 6.0, "multiplier": 2.5 },
+      { "min_drop_pct": 6.0, "max_drop_pct": 6.5, "multiplier": 3.0 },
+      { "min_drop_pct": 6.5, "max_drop_pct": 7.0, "multiplier": 3.5 },
+      { "min_drop_pct": 7.0, "max_drop_pct": 7.5, "multiplier": 4.0 },
+      { "min_drop_pct": 7.5, "max_drop_pct": 8.0, "multiplier": 4.5 },
+      { "min_drop_pct": 8.0, "max_drop_pct": null, "multiplier": 5.0 }
+    ],
+    "tier_boundary_rule": "min inclusive, max exclusive; the largest tier threshold <= actual drop wins; drop < 0.1% = 0x (no buy).",
+    "separation_note": "This is the SAME shared 0x-to-5x live ladder every live stream uses (config/sizing_ladder.json). Max per order is 5x * $2 = $10."
+  },
+  "budget_ledger": {
+    "namespace": "market_open",
+    "market_open_daily_cap_usd": 180.0,
+    "market_open_weekly_cap_usd": 900.0,
+    "ledger_filename": "budget_ledger.json",
+    "shared_pool_note": "The shared Normal-tier ceiling every stream draws from (near_close_dca.BUDGET_TIERS[0], mirrored in config/budgets.json). cap_seed_roots below spans every sibling stream so this ledger sees the whole day's/week's cross-stream spend rather than only its own. Like morning and midday, this slot does not independently escalate to Elevated/High-volatility/Stress -- only the 3:30 final run does, from its fuller same-day view -- so it is only ever more conservative than the true escalated-day ceiling, never less.",
+    "supersedes_manifest_note": "This replaces the external-agent-enforced ledger described in config/scheduled_tasks.json:2ba19526.budget_ledger, whose cap_pooling_update_2026_08_02 note explains that market-open could not read pooled state back because it had no in-repo Python. It can now."
+  },
+  "top_up_rule": {
+    "description": "As the day's first slot this run normally finds no prior same-day allocation and places the full desired amount. The guard still runs so that a hand-placed manual recovery fill earlier the same day is honoured: the run then buys only max(0, desired - prior_same_day_amount), and only when its decision price is strictly below the prior same-day reference price.",
+    "boundary_et": "14:30",
+    "reference_price_preference": "The prior same-day reference price is resolved in this order: the run's logged target_price, then decision_price, then the confirmed average_fill_price (from orders.csv or a manual override's filled_orders.csv). A missing reference price means no automatic top-up: the candidate is flagged top_up_manual_review (manual_review_candidate) at $0.",
+    "prior_allocation_sources": "Only hand-placed manual recovery artifacts can precede 9:35, so prior_allocation_roots below is deliberately limited to the roots that can hold them. Every scheduled sibling stream fires later in the day and contributes nothing to this slot."
+  },
+  "artifact_paths": {
+    "live_run_state_root": "/home/user/workspace/cron_tracking/market_open_dca",
+    "live_scheduled_run_dir": "/home/user/workspace/cron_tracking/market_open_dca/YYYYMMDD_0935ET/",
+    "live_latest_run_pointer": "/home/user/workspace/cron_tracking/market_open_dca/latest_market_open_run.json",
+    "manual_rerun_root": "/home/user/workspace/cron_tracking/market_open_dca/manual_runs",
+    "run_state_filename": "run_state.json",
+    "prior_allocation_roots": [
+      "/home/user/workspace/cron_tracking/market_open_dca",
+      "/home/user/workspace/cron_tracking/morning_dca",
+      "/home/user/workspace/cron_tracking/final_manual_review"
+    ],
+    "prior_allocation_roots_note": "Deliberately narrower than the sibling streams' lists. Nothing scheduled runs before 9:35, so the only same-day prior allocation possible is a hand-placed manual fill. market_open_dca (this stream's own root) is included because MarketOpenDCAExecutor.run(..., manual=True) writes a successful manual recovery fill under its own market_open_dca/manual_runs tree -- omitting it left a recovery order placed shortly before 9:35 invisible to the scheduled invocation's own top-up guard, which saw no prior allocation and fell into the broad duplicate skip instead of submitting the intended incremental top-up (Codex review: 'Include market-open manual runs in the loaded roots'; matches default_market_open_prior_allocation_roots() in market_open_dca.py, which this checked-in list otherwise overrides). morning_dca is included because load_prior_same_day_allocations recurses, so it catches morning_dca/manual_recovery/YYYYMMDD_* (the documented missed-morning recovery root); final_manual_review catches the out-of-tree manual final-buy override root. All three contribute nothing on a normal day.",
+    "cap_seed_roots": [
+      "/home/user/workspace/cron_tracking/market_open_dca",
+      "/home/user/workspace/cron_tracking/morning_dca",
+      "/home/user/workspace/cron_tracking/midday_dca",
+      "/home/user/workspace/cron_tracking/intraday_dca",
+      "/home/user/workspace/cron_tracking/ce16ba6b",
+      "/home/user/workspace/cron_tracking/final_manual_review"
+    ],
+    "cap_seed_roots_note": "Every sibling stream, including this stream's own root so a restart/retry re-seeds from its own prior fills. Unlike prior_allocation_roots (which feeds only the PER-TICKER top-up guard's reference price), this feeds the shared daily/weekly cap. The later-firing siblings contribute nothing at 9:35 on a normal day, but listing them keeps a same-day retry or out-of-order recovery correctly pooled.",
+    "separation_note": "The market-open stream writes ONLY under its own root. It never writes into the morning, midday, intraday, or afternoon roots, never updates latest_scheduled_run.json, and never touches afternoon scheduled_runs/ folders."
+  },
+  "scheduled_run_classification": {
+    "live": {
+      "run_origin": "scheduled",
+      "run_type": "market_open_dca_live",
+      "stream": "market_open",
+      "cron_id": "2ba19526",
+      "supersedes_cron_id": null,
+      "scheduled_for_et": "09:35",
+      "scheduled_window_start_et": "09:30",
+      "scheduled_window_end_et": "09:40",
+      "manual_run": false,
+      "run_id_pattern": "market_open_live_YYYYMMDD_0935ET",
+      "trades": true,
+      "valid_morning_evidence": false,
+      "valid_afternoon_evidence": false,
+      "state_schema_version": "market-open-live-v1"
+    },
+    "schema": "schemas/market_open_run_classification.schema.json"
+  },
+  "downstream_separation_rules": [
+    "A market-open run_state has stream='market_open', valid_morning_evidence=false, and valid_afternoon_evidence=false; consumers must exclude it from every other stream's scheduled-live cost basis, slippage, reliability, and order-count metrics.",
+    "The market-open stream does not update latest_scheduled_run.json or write into any other stream's folders.",
+    "Market-open fills count as PRIOR-ALLOCATION CONTEXT for the same-day top-up guard of every later slot (10:30, 11:30, 12:30, 1:30, 2:30, 3:30); they are never those streams' scheduled evidence, slippage, watchdog confirmation, scheduled cost basis, or scheduled fill counts.",
+    "This slot must never gate on the 9:45 pre-flight artifact -- it fires ten minutes earlier."
+  ]
+}

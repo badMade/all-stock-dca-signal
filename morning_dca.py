@@ -68,9 +68,11 @@ from dca_config import (
     MissingConfigEnvError,
     get_config_dir,
     load_approved_dates,
+    load_per_ticker_sizing,
     load_tickers,
     resolve_broker_account,
 )
+from dca_cumulative import CumulativeCreditLedger, apply_cumulative_credit
 from dca_fileio import atomic_open_w, atomic_write_text
 from dca_paths import rebase_bundled_roots_in, stream_root
 from near_close_dca import (
@@ -91,13 +93,16 @@ from near_close_dca import (
     OrderConfirmationRequiredError,
     PriorSameDayAllocation,
     StrategyConfig,
+    _ticker_sizing,
     account_pinning_failure,
     completed_bar_anchor,
+    cumulative_price_step_amount_usd,
     graded_buy_multiplier,
     iso_week_key,
     latest_bar_at_or_before,
     load_prior_same_day_allocations_multi,
     merge_manual_top_up_context,
+    minimum_drop_for_ticker,
     nyse_holidays,
     quote_spread_pct,
     resolve_top_up_desired_amount_usd,
@@ -474,6 +479,15 @@ class TopUpOutcome:
     # matching field (Codex review: "Persist the preserved base on top-up
     # candidates").
     effective_base_amount_usd: float = 0.0
+    # Set only when a sub-dollar ladder increment was routed through the
+    # cumulative-credit policy: the price decline (prior.reference_price minus
+    # this candidate's decision price) that was fed into apply_cumulative_credit.
+    # None whenever the credit policy never ran (no prior allocation, price not
+    # below reference, or a >= $1 ladder increment). The caller uses this to
+    # decide whether the credit ledger needs a durable write -- see
+    # MorningDCAExecutor._compute_top_up and _place_broker_orders (Codex
+    # review: "Route sub-dollar top-ups through the credit policy").
+    cumulative_credit_decline_usd: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -494,6 +508,7 @@ class MorningConfig:
     # near_close_dca.select_first_allocation_base_usd.
     base_buy_amount_below_close_usd: float = 1.0
     sizing_tiers: Tuple[Tuple[float, float], ...] = MORNING_SIZING_TIERS
+    per_ticker_sizing: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     minimum_drop_vs_previous_close: float = MORNING_MINIMUM_DROP
     # None means "use the active mode's default decision anchor" (09:45 for the
     # watchlist scan, 10:30 for the live execution).
@@ -573,11 +588,29 @@ class MorningConfig:
     # circuit_breakers.max_per_order_usd. 5x * $2 base = $10 default. Any
     # single order amount above this is blocked before it reaches the broker.
     max_per_order_usd: float = 10.0
+    # Shared daily order-ATTEMPT circuit breaker loaded from config/budgets.json
+    # circuit_breakers.max_orders_per_day -- the same knob near_close_dca's own
+    # StrategyConfig.max_orders_per_day enforces, shared across all seven live
+    # slots and manual buying. None (the default for a directly constructed
+    # MorningConfig, e.g. tests) means uncapped; load_morning_config/
+    # load_stream_config overlay the configured integer for every real config
+    # load (Codex review: "Enforce the shared daily order-count cap in new
+    # executors"). See MorningLedger.day_attempts/record_attempt and
+    # _place_broker_orders for the enforcement itself.
+    max_orders_per_day: Optional[int] = None
     # Bid/ask spread circuit breaker for live placement, mirroring the
     # afternoon stream's StrategyConfig.max_bid_ask_spread_pct. A candidate
     # whose live quote spread exceeds this percent of the quote midpoint is
     # blocked before placement rather than bought at a stale/no-data price.
     max_bid_ask_spread_pct: float = 1.0
+    # Master placement switch for this stream. When False the executor still runs
+    # the full evaluate/signal/top-up/budget/artifact path and writes every
+    # artifact, but never calls the broker -- a shadow run whose decisions can be
+    # diffed against whatever actually traded the slot. Defaults True so morning
+    # and midday are unchanged; the market-open and intraday streams ship with it
+    # False in their JSON config until their output has been verified against a
+    # real trading day (docs/safeguards.md#live-execution-roster).
+    live_execution_enabled: bool = True
 
     def as_strategy_config(self) -> StrategyConfig:
         """Return a StrategyConfig view carrying the morning ladder.
@@ -591,6 +624,7 @@ class MorningConfig:
             base_buy_amount_usd=self.base_buy_amount_usd,
             base_buy_amount_below_close_usd=self.base_buy_amount_below_close_usd,
             sizing_tiers=tuple(self.sizing_tiers),
+            per_ticker_sizing=self.per_ticker_sizing,
             minimum_drop_vs_previous_close=self.minimum_drop_vs_previous_close,
             dry_run=True,
         )
@@ -611,6 +645,10 @@ class MorningLedger:
     weekly_cap_usd: float = DEFAULT_MORNING_WEEKLY_CAP_USD
     planned_by_day: Dict[date, float] = field(default_factory=dict)
     planned_by_week: Dict[Tuple[int, int], float] = field(default_factory=dict)
+    # Order-ATTEMPT counter for MorningConfig.max_orders_per_day (Codex review:
+    # "Enforce the shared daily order-count cap in new executors"). Separate
+    # from planned_by_day/_week, which track notional, not attempt counts.
+    attempts_by_day: Dict[date, int] = field(default_factory=dict)
 
     def record_hypothetical(self, trading_day: date, amount_usd: float) -> None:
         if amount_usd <= 0:
@@ -618,6 +656,23 @@ class MorningLedger:
         self.planned_by_day[trading_day] = self.day_planned(trading_day) + amount_usd
         week = iso_week_key(trading_day)
         self.planned_by_week[week] = self.planned_by_week.get(week, 0.0) + amount_usd
+
+    def day_attempts(self, trading_day: date) -> int:
+        return self.attempts_by_day.get(trading_day, 0)
+
+    def record_attempt(self, trading_day: date) -> None:
+        self.attempts_by_day[trading_day] = self.day_attempts(trading_day) + 1
+
+    def seed_day_attempts(self, trading_day: date, count: int) -> None:
+        """Raise today's attempt count to at least ``count``.
+
+        Monotonic (never decreases), so a retry re-seeding from the same
+        deterministic on-disk cross-stream state is idempotent -- unlike
+        ``record_attempt``, which increments once per real placement this
+        run makes.
+        """
+        if count > self.day_attempts(trading_day):
+            self.attempts_by_day[trading_day] = count
 
     def day_planned(self, trading_day: date) -> float:
         return self.planned_by_day.get(trading_day, 0.0)
@@ -819,6 +874,48 @@ def load_max_per_order_usd(config_dir_path: Path) -> Optional[float]:
             f"positive number, got {raw_val!r}"
         )
     return max_order
+
+
+def load_max_orders_per_day(config_dir_path: Path) -> Optional[int]:
+    """Read ``circuit_breakers.max_orders_per_day`` from ``config/budgets.json``.
+
+    Mirrors :func:`load_max_per_order_usd`'s fail-closed contract: returns the
+    value when present and valid, ``None`` when the file is absent or the key
+    is not set, raises ``ValueError`` when the key is present but invalid, and
+    raises ``RuntimeError`` when the file exists but cannot be read or parsed
+    -- a cap file that exists but is unreadable must not silently fall back to
+    the dataclass default and bypass a deliberate cap edit.
+    """
+    budgets_path = config_dir_path / "budgets.json"
+    if not budgets_path.exists():
+        return None
+    try:
+        budgets_raw = json.loads(budgets_path.read_bytes())
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        raise RuntimeError(
+            f"budgets.json exists but could not be read or parsed; "
+            f"refusing to silently bypass the daily order-count cap ({exc})"
+        ) from exc
+    if not isinstance(budgets_raw, dict):
+        raise RuntimeError(
+            f"budgets.json exists but is not a JSON object (got {type(budgets_raw).__name__}); "
+            "refusing to silently bypass the daily order-count cap"
+        )
+    cb = budgets_raw.get("circuit_breakers", {})
+    if not isinstance(cb, dict):
+        raise RuntimeError(
+            f"budgets.json circuit_breakers must be an object, got {type(cb).__name__}; "
+            "refusing to silently bypass the daily order-count cap"
+        )
+    if "max_orders_per_day" not in cb:
+        return None
+    raw_val = cb["max_orders_per_day"]
+    if isinstance(raw_val, bool) or not isinstance(raw_val, int) or raw_val <= 0:
+        raise ValueError(
+            f"budgets.json circuit_breakers.max_orders_per_day must be a positive "
+            f"integer, got {raw_val!r}"
+        )
+    return raw_val
 
 
 # A non-empty, unreachable date so the existing `bool(approved) and trading_day
@@ -1179,6 +1276,9 @@ def load_morning_config(
         max_order = load_max_per_order_usd(config_dir_path)
         if max_order is not None:
             kwargs["max_per_order_usd"] = max_order
+        max_orders_per_day = load_max_orders_per_day(config_dir_path)
+        if max_orders_per_day is not None:
+            kwargs["max_orders_per_day"] = max_orders_per_day
 
     # Overlay tickers.json so config-only emergency exclusions take effect without
     # a code deploy (mirrors the afternoon load_strategy_config ticker overlay).
@@ -1187,8 +1287,158 @@ def load_morning_config(
         kwargs["tickers"] = ticker_cfg["tickers"]
     if "excluded_tickers" in ticker_cfg:
         kwargs["excluded_tickers"] = ticker_cfg["excluded_tickers"]
+    kwargs.update(load_per_ticker_sizing(config_dir_path))
 
     return MorningConfig(**kwargs)
+
+
+def load_stream_config(
+    config_dir,
+    *,
+    filename: str,
+    config_cls: type,
+    daily_cap_key: str,
+    weekly_cap_key: str,
+    source_label: str,
+    allow_unpinned_account: bool = False,
+):
+    """Load a single-live-mode stream config into ``config_cls``.
+
+    The market-open and intraday streams read config files with the same shape as
+    ``config/midday_dca.json``, differing only in filename, budget-ledger key
+    names, and target dataclass. This is that shared body, so a new stream does
+    not re-copy ~150 lines of overlay logic per module.
+
+    ``load_midday_config`` predates this helper and keeps its own copy; it is live
+    code with its own regression tests and is deliberately left alone.
+
+    Graceful-fallback semantics match ``load_morning_config``: a missing or
+    unparseable file logs a warning and returns ``config_cls()`` defaults, still
+    resolving the fail-closed approved-date gate and the model-usage log root.
+    """
+    config_dir_path = get_config_dir() if config_dir is None else Path(config_dir)
+
+    cfg_path = config_dir_path / filename
+    # model_usage_log_root and approved_test_dates resolve at LOAD time, never
+    # from import-time constants: $DCA_CRON_TRACKING_ROOT set between import and
+    # config load would otherwise leave model-usage evidence under the old tree.
+    # morning_run_state_root deliberately stays unset in the fallback paths so
+    # run_dca.py's "did this stream's config actually configure a root"
+    # containment check still works; the executor resolves it from the profile's
+    # state_root_stream instead.
+    base_overrides = {
+        "approved_test_dates": _load_approved_dates_fail_closed(config_dir_path),
+        "model_usage_log_root": stream_root("model_usage"),
+        # Fail closed to shadow mode, not MorningConfig.live_execution_enabled's
+        # inherited True default: every stream built on this loader ships with
+        # live_execution_enabled=false in its own config (market_open_dca.json,
+        # intraday_dca.json -- "SHIPS DISABLED"), so a missing or unreadable
+        # config file must never silently promote a shadow-only stream to live
+        # broker placement precisely when its configuration cannot be trusted
+        # (Codex review: "Keep disabled streams disabled when config loading
+        # fails"). A config file that IS readable still overrides this below.
+        "live_execution_enabled": False,
+    }
+
+    if not cfg_path.exists():
+        _log.warning("%s not found at %s; using %s defaults", filename, cfg_path, config_cls.__name__)
+        return config_cls(**base_overrides)
+
+    try:
+        raw = json.loads(cfg_path.read_bytes())
+    except (UnicodeDecodeError, json.JSONDecodeError, OSError) as exc:
+        _log.warning("could not parse %s (%s); using %s defaults", cfg_path, exc, config_cls.__name__)
+        return config_cls(**base_overrides)
+
+    # Bundled absolute artifact paths follow $DCA_CRON_TRACKING_ROOT instead of
+    # overriding it. No-op when the variable is unset.
+    raw = rebase_bundled_roots_in(raw)
+
+    kwargs: Dict[str, Any] = dict(base_overrides)
+
+    if "trend_min_bars" in raw:
+        kwargs["trend_min_bars"] = int(raw["trend_min_bars"])
+    # Master placement switch. Absent means enabled, matching MorningConfig's
+    # default, so an existing stream's config gains nothing by omission.
+    if "live_execution_enabled" in raw:
+        kwargs["live_execution_enabled"] = bool(raw["live_execution_enabled"])
+
+    sizing = raw.get("sizing_ladder", {})
+    if "base_amount_usd" in sizing:
+        kwargs["base_buy_amount_usd"] = float(sizing["base_amount_usd"])
+    if "base_amount_below_close_usd" in sizing:
+        kwargs["base_buy_amount_below_close_usd"] = float(sizing["base_amount_below_close_usd"])
+    if "no_buy_below_pct" in sizing:
+        kwargs["minimum_drop_vs_previous_close"] = float(sizing["no_buy_below_pct"]) / 100.0
+    if "tiers" in sizing:
+        kwargs["sizing_tiers"] = tuple(
+            (float(t["min_drop_pct"]) / 100.0, float(t["multiplier"]))
+            for t in sizing["tiers"]
+        )
+
+    budget = raw.get("budget_ledger", {})
+    if daily_cap_key in budget:
+        kwargs["morning_daily_cap_usd"] = float(budget[daily_cap_key])
+    if weekly_cap_key in budget:
+        kwargs["morning_weekly_cap_usd"] = float(budget[weekly_cap_key])
+
+    live_task = raw.get("live_task", {})
+    if "broker_account" in live_task:
+        # The account number lives in the environment, never in git. These are
+        # live-only streams, so an unresolvable account is left explicitly None
+        # (not merely omitted -- omitting it would fall back to the import-time
+        # module constant, turning a pinning failure into a live run against an
+        # unintended account) so the executor reaches account_pinning_failure()
+        # and writes durable blocked evidence.
+        source = f"{source_label} live_task.broker_account"
+        try:
+            kwargs["target_account_number"] = resolve_broker_account(
+                live_task["broker_account"], source=source
+            )
+        except (MissingConfigEnvError, InvalidAccountNumberError):
+            if not allow_unpinned_account:
+                raise
+            kwargs["target_account_number"] = None
+            _log.warning(
+                "%s could not be resolved to a usable account; the live run will "
+                "fail closed and record account_pinning_failed",
+                source,
+            )
+
+    artifact_paths = raw.get("artifact_paths", {})
+    if "live_run_state_root" in artifact_paths:
+        kwargs["morning_run_state_root"] = artifact_paths["live_run_state_root"]
+
+    # An explicit [] is preserved as () so it fully disables the guard / cap
+    # seeding rather than falling through to the default_factory.
+    roots = artifact_paths.get("prior_allocation_roots")
+    if isinstance(roots, list):
+        kwargs["prior_allocation_roots"] = tuple(str(r) for r in roots)
+    cap_roots = artifact_paths.get("cap_seed_roots")
+    if isinstance(cap_roots, list):
+        kwargs["cap_seed_roots"] = tuple(str(r) for r in cap_roots)
+
+    if "model_usage_log_root" in artifact_paths:
+        configured_log_root = artifact_paths["model_usage_log_root"]
+        kwargs["model_usage_log_root"] = str(configured_log_root) if configured_log_root else None
+
+    max_order = load_max_per_order_usd(config_dir_path)
+    if max_order is not None:
+        kwargs["max_per_order_usd"] = max_order
+    max_orders_per_day = load_max_orders_per_day(config_dir_path)
+    if max_orders_per_day is not None:
+        kwargs["max_orders_per_day"] = max_orders_per_day
+
+    # Overlay tickers.json so config-only emergency exclusions take effect
+    # without a code deploy.
+    ticker_cfg = load_tickers(config_dir_path)
+    if "tickers" in ticker_cfg:
+        kwargs["tickers"] = ticker_cfg["tickers"]
+    if "excluded_tickers" in ticker_cfg:
+        kwargs["excluded_tickers"] = ticker_cfg["excluded_tickers"]
+    kwargs.update(load_per_ticker_sizing(config_dir_path))
+
+    return config_cls(**kwargs)
 
 
 def load_same_day_preflight(
@@ -1674,9 +1924,9 @@ class DCAExecutor:
     stream: str = "base"
     run_type: str = "dca"
 
-    def multiplier_for_drop(self, drop_fraction: float) -> float:
+    def multiplier_for_drop(self, drop_fraction: float, ticker: Optional[str] = None) -> float:
         """Map a drop (fraction of previous close) to a buy multiplier."""
-        return graded_buy_multiplier(drop_fraction, self.sizing_config)
+        return graded_buy_multiplier(drop_fraction, self.sizing_config, ticker)
 
     @property
     def sizing_config(self) -> StrategyConfig:  # pragma: no cover - abstract
@@ -1729,6 +1979,12 @@ class MorningDCAExecutor(DCAExecutor):
     # documented (near_close_dca.py) as feeding ONLY the afternoon top-up
     # guard, never the midday stream's own scheduled cap.
     scan_manual_reruns_for_ledger: bool = True
+    # Whether a live run persists a budget_ledger.json snapshot beside its other
+    # artifacts. True for morning (config/morning_dca.json's budget_ledger
+    # bootstrap contract) and for the market-open/intraday streams, whose task
+    # manifests define their own ledger_dir/ledger_filename. Midday overrides it
+    # to False: it has no such manifest block and never wrote one.
+    writes_budget_ledger: bool = True
 
     def __init__(
         self,
@@ -1750,6 +2006,12 @@ class MorningDCAExecutor(DCAExecutor):
             daily_cap_usd=self.config.morning_daily_cap_usd,
             weekly_cap_usd=self.config.morning_weekly_cap_usd,
         )
+        # Shares near_close_dca's default on-disk root (CumulativeCreditLedger's
+        # own stream_root("cumulative_dca_credits") default) so a sub-dollar
+        # credit accumulated by this stream can be picked up -- and eventually
+        # flushed -- by a later same-day slot or the 3:30 PM final session
+        # (Codex review: "Route sub-dollar top-ups through the credit policy").
+        self.credit_ledger = CumulativeCreditLedger()
         self._sizing_config = self.config.as_strategy_config()
         # stream_root() at CALL time, not self.profile["state_root"] (an
         # import-time constant): a $DCA_CRON_TRACKING_ROOT set between
@@ -1824,6 +2086,24 @@ class MorningDCAExecutor(DCAExecutor):
         return load_morning_config(
             config_dir, mode=mode, allow_unpinned_account=mode == MORNING_LIVE_MODE
         )
+
+    def _idempotency_stream(self) -> str:
+        """Namespace for the broker idempotency ref id / duplicate check.
+
+        Defaults to ``self.stream``. Overridden by :class:`IntradayDCAExecutor`
+        (Codex review, P1: "Scope intraday idempotency keys to each slot"):
+        all three intraday slots (11:30/13:30/14:30) share ONE ``self.stream``
+        value ("intraday", pinned by schemas/intraday_run_classification.schema.json
+        so run_classification and prior-allocation matching stay correct) --
+        but using that same value here for the ref_id/`_same_stream_order_exists`
+        check made every slot indistinguishable, so a later slot's legitimate,
+        lower-price incremental top-up matched an earlier slot's ref id and was
+        wrongly treated as an already-submitted retry, capping the ticker to at
+        most one intraday order all day. Never used for run_classification,
+        reporting, or ledger namespacing -- those must keep the shared
+        ``self.stream`` value.
+        """
+        return self.stream
 
     # -- Top-up guard (same-day prior-allocation offset) ---------------------
     def _compute_top_up(
@@ -1988,6 +2268,21 @@ class MorningDCAExecutor(DCAExecutor):
                     for a in cap_allocations.values()
                     if a.amount_usd > 0 and math.isfinite(a.amount_usd)
                 )
+                # Seed today's shared cross-stream order-ATTEMPT count
+                # (MorningConfig.max_orders_per_day) from the same cap_roots
+                # scan used for the dollar cap, using each ticker's own
+                # PriorSameDayAllocation.attempt_count -- not "1 per ticker
+                # with a positive allocation", which collapsed multiple
+                # same-day top-ups for one ticker into a single attempt and
+                # ignored rejected/cancelled/failed attempts entirely (they
+                # carry amount_usd == 0 but still consumed a shared slot).
+                # attempt_count is already deduplicated per ticker across
+                # every scanned root by load_prior_same_day_allocations_multi
+                # (Codex review: "Seed the cap from actual order attempts").
+                self.ledger.seed_day_attempts(
+                    trading_day,
+                    sum(a.attempt_count for a in cap_allocations.values()),
+                )
                 # Only credit each _own_recorded_* bucket when the corresponding
                 # on-disk location is actually covered by cap_seed_roots -- manual
                 # artifacts live under manual_root, scheduled artifacts live
@@ -2055,13 +2350,58 @@ class MorningDCAExecutor(DCAExecutor):
         for signal in signals:
             if signal.action != Action.BUY or signal.multiplier <= 0:
                 continue
-            outcomes[signal.ticker] = self._evaluate_top_up(
-                signal, prior_allocations.get(signal.ticker)
+            ticker = signal.ticker
+            try:
+                existing_pending_credit_usd = self.credit_ledger.pending_usd(
+                    ticker, trading_day.isoformat()
+                )
+            except Exception as exc:  # noqa: BLE001
+                existing_pending_credit_usd = 0.0
+                _log.warning(
+                    "cumulative credit ledger pending-balance read failed for %s: %s",
+                    ticker,
+                    exc,
+                )
+            outcome = self._evaluate_top_up(
+                signal,
+                prior_allocations.get(ticker),
+                existing_pending_credit_usd=existing_pending_credit_usd,
             )
+            if (
+                outcome.cumulative_credit_decline_usd is not None
+                and outcome.incremental_order_amount <= 0
+                and not self._credit_decline_already_recorded_this_slot(now, ticker)
+            ):
+                # The credit policy decided this decline stays pending -- no
+                # broker order will be attempted for this ticker this run, so
+                # there is no cap/spread/buying-power/placement gate to defer
+                # the write through (unlike the crosses-to-an-order case,
+                # which _place_broker_orders settles only once the order is
+                # actually confirmed submitted). Persist the new pending
+                # balance now so a later same-day slot or the 3:30 PM final
+                # session can read it back via pending_usd().
+                try:
+                    self.credit_ledger.record(
+                        ticker,
+                        trading_day.isoformat(),
+                        outcome.cumulative_credit_decline_usd,
+                        final_session=False,
+                        stream=self._idempotency_stream(),
+                        recorded_at=now.astimezone(timezone.utc).isoformat(),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    _log.warning(
+                        "cumulative credit ledger record failed for %s: %s", ticker, exc
+                    )
+            outcomes[ticker] = outcome
         return outcomes
 
     def _evaluate_top_up(
-        self, signal: "MorningSignal", prior: Optional[PriorSameDayAllocation]
+        self,
+        signal: "MorningSignal",
+        prior: Optional[PriorSameDayAllocation],
+        *,
+        existing_pending_credit_usd: float = 0.0,
     ) -> TopUpOutcome:
         """Apply the same-day top-up rule to one live buy candidate.
 
@@ -2075,6 +2415,15 @@ class MorningDCAExecutor(DCAExecutor):
         known (see ``near_close_dca.resolve_top_up_desired_amount_usd``) so a
         later, lower price cannot silently upgrade the whole day's target to
         the $2 scale.
+
+        ``existing_pending_credit_usd`` is a same-day sub-dollar credit
+        balance the caller already durably read (via
+        ``CumulativeCreditLedger.pending_usd``) from an earlier slot's
+        decline. Passed in as plain data -- this function stays a pure
+        computation, performing no ledger I/O itself; see
+        ``_compute_top_up`` and ``_place_broker_orders``, the only callers
+        that read/write the ledger (mirrors
+        ``near_close_dca.evaluate_top_up_guard``).
         """
         desired, effective_base = resolve_top_up_desired_amount_usd(
             prior, signal.multiplier, signal.hypothetical_amount_usd, signal.selected_base_amount_usd
@@ -2082,7 +2431,12 @@ class MorningDCAExecutor(DCAExecutor):
         price = signal.current_price
 
         def _outcome(
-            incremental: float, result: str, *, skipped: bool, manual_review: bool = False
+            incremental: float,
+            result: str,
+            *,
+            skipped: bool,
+            manual_review: bool = False,
+            cumulative_credit_decline_usd: Optional[float] = None,
         ) -> TopUpOutcome:
             return TopUpOutcome(
                 ticker=signal.ticker,
@@ -2097,6 +2451,7 @@ class MorningDCAExecutor(DCAExecutor):
                 top_up_skipped=skipped,
                 top_up_manual_review=manual_review,
                 effective_base_amount_usd=effective_base,
+                cumulative_credit_decline_usd=cumulative_credit_decline_usd,
             )
 
         if prior is None or prior.amount_usd <= 0:
@@ -2112,7 +2467,44 @@ class MorningDCAExecutor(DCAExecutor):
             return _outcome(0.0, TOP_UP_MISSING_PRIOR_PRICE, skipped=True, manual_review=True)
         if price >= prior.reference_price:
             return _outcome(0.0, TOP_UP_PRICE_NOT_BELOW, skipped=True)
-        incremental = desired - round(prior.amount_usd, 2)
+        ladder_incremental = desired - round(prior.amount_usd, 2)
+        if ladder_incremental < 0:
+            return _outcome(0.0, TOP_UP_NO_INCREMENTAL, skipped=True)
+        price_step_incremental = cumulative_price_step_amount_usd(
+            prior.reference_price, price, self.sizing_config
+        )
+        if ladder_incremental < 1.0:
+            # A ladder/price-step floor below $1 must never be submitted as a
+            # raw broker order (Robinhood's $1 minimum) nor silently dropped
+            # when it computes to $0 -- either would lose the credit for a
+            # later same-day slot or the 3:30 PM final session to pick up.
+            # Route the whole sub-dollar signal (the larger of the ladder
+            # target, the price-step floor, and the raw price decline) through
+            # the cumulative-credit policy instead: its own decision is always
+            # either $0 (stays pending) or >= $1 (Codex review: "Route
+            # sub-dollar top-ups through the credit policy"). This session is
+            # never the 3:30 PM final one, so final_session=False -- a credit
+            # below 50 cents simply stays pending rather than forcing an order.
+            decline_usd = round(max(0.0, prior.reference_price - price), 2)
+            credit_amount_usd = round(max(ladder_incremental, price_step_incremental, decline_usd), 2)
+            decision = apply_cumulative_credit(
+                existing_pending_credit_usd, credit_amount_usd, final_session=False
+            )
+            incremental = decision.order_amount_usd
+            if incremental <= 0:
+                return _outcome(
+                    0.0,
+                    TOP_UP_NO_INCREMENTAL,
+                    skipped=True,
+                    cumulative_credit_decline_usd=credit_amount_usd,
+                )
+            return _outcome(
+                incremental,
+                TOP_UP_INCREMENTAL,
+                skipped=False,
+                cumulative_credit_decline_usd=credit_amount_usd,
+            )
+        incremental = ladder_incremental
         if incremental <= 0:
             return _outcome(0.0, TOP_UP_NO_INCREMENTAL, skipped=True)
         return _outcome(incremental, TOP_UP_INCREMENTAL, skipped=False)
@@ -2168,6 +2560,14 @@ class MorningDCAExecutor(DCAExecutor):
         row["selected_base_amount_usd"] = outcome.effective_base_amount_usd
         if outcome.top_up_manual_review:
             row["execution_status"] = EXEC_MANUAL_REVIEW_CANDIDATE
+        # Persisted so a retry of this same scheduled slot can recognize an
+        # already-recorded pending credit (see
+        # _credit_decline_already_recorded_this_slot) instead of re-applying
+        # the same decline on top of the balance its own earlier attempt this
+        # slot already durably wrote (Codex review: "Route sub-dollar top-ups
+        # through the credit policy").
+        if outcome.cumulative_credit_decline_usd is not None:
+            row["cumulative_credit_decline_usd"] = outcome.cumulative_credit_decline_usd
 
     def _augment_artifacts(
         self, artifacts: Dict[str, Any], top_up_outcomes: Optional[Dict[str, Any]]
@@ -2428,16 +2828,32 @@ class MorningDCAExecutor(DCAExecutor):
 
         drop_fraction = (previous_close - current_price) / previous_close
         drop_pct = drop_fraction * 100.0
-        multiplier = self.multiplier_for_drop(drop_fraction)
+        multiplier = self.multiplier_for_drop(drop_fraction, ticker)
         selected_base_amount_usd, base_selection_reason = select_first_allocation_base_usd(
-            current_price, previous_close, previous_low, self.sizing_config
+            current_price, previous_close, previous_low, self.sizing_config, ticker
         )
         hypothetical = round(selected_base_amount_usd * multiplier, 2)
         execution_status: Optional[str] = None
         trend_validated: Optional[bool] = None
         mode_label = "watchlist" if self.mode == MORNING_WATCHLIST_MODE else "live"
 
-        if drop_fraction < self.config.minimum_drop_vs_previous_close or multiplier <= 0:
+        # A calibrated symbol's own first tier is the authoritative minimum
+        # drop (Codex review: "Let calibrated first tiers override the
+        # global floor" -- "the equivalent check in MorningDCAExecutor has
+        # the same problem"): config/per_ticker_sizing.json is a deliberate,
+        # reviewed per-symbol model, not a misconfiguration to clamp up to
+        # the global default. Only an UNCALIBRATED (fallback) symbol is
+        # floored at minimum_drop_vs_previous_close; see the identical fix
+        # in near_close_dca.evaluate_source_signal.
+        _effective_minimum_drop = (
+            minimum_drop_for_ticker(self.sizing_config, ticker)
+            if _ticker_sizing(ticker, self.sizing_config)
+            else self.sizing_config.minimum_drop_vs_previous_close
+        )
+        if (
+            drop_fraction < _effective_minimum_drop
+            or multiplier <= 0
+        ):
             # Keyed on multiplier <= 0 as well as the configured minimum drop:
             # a customized config can set minimum_drop_vs_previous_close below
             # the first positive sizing tier, so a drop can clear the minimum
@@ -2471,16 +2887,35 @@ class MorningDCAExecutor(DCAExecutor):
         else:
             action = Action.BUY
             reason = f"morning weakness {drop_pct:.2f}% vs prior close -> {multiplier:g}x ({mode_label})"
-            if self.profile["validate_trend"]:
-                # Confidence rule: price/drop passed, but only auto-buy when the
-                # intraday trend over the 60-minute window can be validated.
-                # Otherwise flag for manual review instead of buying.
-                trend_validated = self._trend_validated(bars, decision_dt, warnings)
-                if trend_validated:
-                    execution_status = EXEC_AUTO_BUY_ELIGIBLE
+            if self.mode == MORNING_LIVE_MODE:
+                if self.profile["validate_trend"]:
+                    # Confidence rule: price/drop passed, but only auto-buy when the
+                    # intraday trend over the 60-minute window can be validated.
+                    # Otherwise flag for manual review instead of buying.
+                    trend_validated = self._trend_validated(bars, decision_dt, warnings)
+                    if trend_validated:
+                        execution_status = EXEC_AUTO_BUY_ELIGIBLE
+                    else:
+                        execution_status = EXEC_MANUAL_REVIEW_CANDIDATE
+                        reason += "; intraday trend unvalidated -> manual_review_candidate (no auto-buy)"
                 else:
-                    execution_status = EXEC_MANUAL_REVIEW_CANDIDATE
-                    reason += "; intraday trend unvalidated -> manual_review_candidate (no auto-buy)"
+                    # Trend validation is exempted for this profile (market-open's
+                    # 9:35 slot: only 5 minutes of session data exist, so a
+                    # completed 60-minute downtrend can never validate -- see the
+                    # module docstring). The inherited candidate filter still
+                    # places a qualifying signal once live_execution_enabled is
+                    # turned on, so it must be marked auto-buy eligible the same
+                    # way a trend-validated signal is; leaving execution_status
+                    # at its None default would serialize auto_buy_signal=false
+                    # for a candidate the placement path actually attempts,
+                    # blinding scripts/drift_detection.py's missing-order check
+                    # to a lost or failed order (Codex review: "Mark trend-exempt
+                    # market-open buys as auto-buy eligible"). Scoped to
+                    # self.mode == MORNING_LIVE_MODE only: watchlist/preflight
+                    # profiles also have validate_trend=False but must keep
+                    # execution_status=None (test_watchlist_mode_never_sets_
+                    # execution_status), since they never place real orders.
+                    execution_status = EXEC_AUTO_BUY_ELIGIBLE
 
         return MorningSignal(
             ticker=ticker,
@@ -2865,6 +3300,13 @@ class MorningDCAExecutor(DCAExecutor):
             # overall_ok is false ONLY for global/account/auth/schema-write
             # failures; per-symbol unresolved/ineligible tickers do not count.
             artifacts["overall_ok"] = not blocking_errors
+        # Record the placement switch on every artifact so a reader can tell a
+        # shadow run (evaluated fully, deliberately placed nothing) apart from a
+        # live run that genuinely found no candidates. Both leave
+        # order_submit_status=no_orders, which alone is ambiguous.
+        artifacts["live_execution_enabled"] = getattr(
+            self.config, "live_execution_enabled", True
+        )
         self._augment_artifacts(artifacts, top_up_outcomes)
         return artifacts
 
@@ -2960,7 +3402,7 @@ class MorningDCAExecutor(DCAExecutor):
         # this always (re)writes the snapshot from the caps/spend already
         # computed into artifacts["budget"], so a missing ledger on disk is
         # bootstrapped rather than treated as an escalation condition.
-        if self.mode == MORNING_LIVE_MODE and self.stream == MORNING_STREAM:
+        if self.mode == MORNING_LIVE_MODE and self.writes_budget_ledger:
             ledger_path = out / self.config.budget_ledger_filename
             atomic_write_text(
                 ledger_path, json.dumps(artifacts["budget"], indent=2, sort_keys=True)
@@ -3175,6 +3617,43 @@ class MorningDCAExecutor(DCAExecutor):
             return None
         return {"artifacts": existing_artifacts, "paths": {"run_state": str(state_path)}}
 
+    def _credit_decline_already_recorded_this_slot(
+        self, now: datetime, ticker: str
+    ) -> bool:
+        """True if THIS slot's own earlier attempt today already recorded a
+        cumulative-credit decline for ``ticker``.
+
+        A scheduled retry re-invokes ``_compute_top_up`` from scratch and
+        would otherwise recompute the same decline and apply it AGAIN on top
+        of the pending balance its own earlier attempt this slot already
+        durably wrote via ``CumulativeCreditLedger.record`` -- inflating the
+        credit purely from being retried, not from any real additional price
+        decline (unlike the crosses-to-a-real-order case, which defers its
+        ledger write to ``_place_broker_orders`` and is naturally retry-safe
+        via the existing submitted-order duplicate check). Reads the same
+        dated-slot ``run_state.json`` ``_existing_submitted_run_state`` reads,
+        but regardless of whether anything was ever submitted, since a
+        pending-only credit never sets a "submitted" status.
+        """
+        state_path = self.run_state_dir(now) / "run_state.json"
+        if not state_path.exists():
+            return False
+        try:
+            existing_artifacts = json.loads(state_path.read_bytes())
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            return False
+        if not isinstance(existing_artifacts, dict):
+            return False
+        buy_candidates = existing_artifacts.get("buy_candidates")
+        if not isinstance(buy_candidates, list):
+            return False
+        return any(
+            isinstance(row, dict)
+            and row.get("ticker") == ticker
+            and row.get("cumulative_credit_decline_usd") is not None
+            for row in buy_candidates
+        )
+
     def _maybe_block_for_holiday(self, now: datetime, *, manual: bool) -> Optional[Dict[str, Any]]:
         """Return a blocked-run result when ``now`` falls on a weekend or NYSE holiday.
 
@@ -3213,14 +3692,45 @@ class MorningDCAExecutor(DCAExecutor):
             and bool(approved)
             and trading_day not in approved
         )
-        if manual or (not is_weekend and not is_holiday and not is_outside_window):
+        # Reject a scheduled live invocation outside its declared
+        # window_start_et/window_end_et slot window (Codex review: "Reject
+        # scheduled runs outside their slot window"). self.profile carries
+        # these bounds for every live stream built on this shared method
+        # (morning, midday, market-open, intraday), but until now they were
+        # only ever copied into run_classification for display -- nothing
+        # compared the actual firing time against them. Without this, a
+        # delayed non-manual invocation (e.g. a stuck scheduler retrying
+        # hours late) would evaluate the historical decision-time anchor,
+        # quote the CURRENT broker price/spread, place an order well outside
+        # the approved window, and still label the artifact as the on-time
+        # scheduled run. Scoped identically to is_outside_window above:
+        # watchlist/preflight modes and manual/recovery runs are unaffected.
+        is_outside_time_window = False
+        if self.mode == MORNING_LIVE_MODE and not manual:
+            window_start_et = self.profile.get("window_start_et")
+            window_end_et = self.profile.get("window_end_et")
+            if window_start_et and window_end_et:
+                now_et_time = now.astimezone(EASTERN).time()
+                is_outside_time_window = not (
+                    time.fromisoformat(window_start_et)
+                    <= now_et_time
+                    <= time.fromisoformat(window_end_et)
+                )
+        if manual or (
+            not is_weekend
+            and not is_holiday
+            and not is_outside_window
+            and not is_outside_time_window
+        ):
             return None
         if is_weekend:
             block_reason = "weekend"
         elif is_holiday:
             block_reason = "market holiday"
-        else:
+        elif is_outside_window:
             block_reason = "outside approved trading window"
+        else:
+            block_reason = "outside scheduled slot window"
         is_preflight = self.mode == MORNING_PREFLIGHT_MODE
         # Guard: if this date slot already has submitted-order evidence (e.g. the
         # 10:30 live run placed orders and then trading_window.json was briefly
@@ -3448,18 +3958,23 @@ class MorningDCAExecutor(DCAExecutor):
                 for cap_root in all_cap_roots:
                     if not cap_root.exists():
                         continue
-                    is_own_root = cap_root.resolve() == state_root.resolve()
-                    # The bare root itself is only scanned for SIBLING roots:
-                    # the current stream's own fixed scheduled-slot path for
-                    # earlier weekdays is already covered by the day-loop
-                    # above this block, and re-scanning it here would just
-                    # rediscover (harmlessly deduped) the same path -- but
-                    # afternoon's scheduled_runs/ subdirectory below is a
-                    # genuinely different location even for the current
-                    # stream, so it is NOT skipped.
-                    search_dirs = list(manual_subdirs) + ["scheduled_runs"]
-                    if not is_own_root:
-                        search_dirs = [""] + search_dirs
+                    # The bare root is scanned for every cap_seed_roots entry,
+                    # INCLUDING the current stream's own root: for a stream
+                    # whose profiles all share ONE root across MULTIPLE
+                    # folder_suffix values (e.g. intraday_dca's 1130ET/1330ET/
+                    # 1430ET slots), the day-loop above only matches THIS
+                    # instance's own folder_suffix, so an earlier weekday's
+                    # sibling-suffix fill under the same root (e.g. Monday's
+                    # 11:30/2:30 runs, from a Tuesday 1:30 run's point of view)
+                    # was never found by either mechanism and silently
+                    # excluded from the pooled weekly cap (Codex review:
+                    # "Seed the weekly cap from every intraday slot"). For a
+                    # stream with exactly one folder_suffix per root (morning,
+                    # midday, market-open, afternoon), the day-loop's own path
+                    # is rediscovered here and simply deduped via
+                    # _earlier_weekday_sibling_paths below -- a harmless no-op
+                    # superset, not a double count.
+                    search_dirs = [""] + list(manual_subdirs) + ["scheduled_runs"]
                     for subdir in search_dirs:
                         search_dir = cap_root / subdir if subdir else cap_root
                         if not search_dir.exists():
@@ -3857,6 +4372,22 @@ class MorningDCAExecutor(DCAExecutor):
                 }
                 continue
 
+            # Shared daily order-ATTEMPT ceiling (config/budgets.json
+            # circuit_breakers.max_orders_per_day, seeded cross-stream in
+            # _compute_top_up above) -- a pure local check, ahead of the
+            # broker round-trip, mirroring the per-order ceiling above (Codex
+            # review: "Enforce the shared daily order-count cap in new
+            # executors").
+            _max_orders_per_day = self.config.max_orders_per_day
+            if _max_orders_per_day is not None and self.ledger.day_attempts(trading_day) >= _max_orders_per_day:
+                outcomes[ticker] = {
+                    "status": "blocked",
+                    "skip_reason": f"exceeds {_max_orders_per_day} order daily attempt cap",
+                    "deliberate_skip": True,
+                    "budget_blocked": True,
+                }
+                continue
+
             # Bypass the broad same-day duplicate check only when there is an actual
             # cross-stream prior allocation (top-up guard result is not 'no_prior_run').
             # Even then, keep a same-stream ref-id check so retrying this stream after
@@ -3879,7 +4410,9 @@ class MorningDCAExecutor(DCAExecutor):
             dup_order: Optional[Dict[str, Any]] = None
             try:
                 if has_prior_allocation:
-                    dup_order = _same_stream_order_exists(broker, ticker, trading_day, self.stream)
+                    dup_order = _same_stream_order_exists(
+                        broker, ticker, trading_day, self._idempotency_stream()
+                    )
                     dup = dup_order is not None
                     duplicate_reason = "same-stream broker order exists"
                 else:
@@ -4081,12 +4614,19 @@ class MorningDCAExecutor(DCAExecutor):
             # incremental top-up as an already-submitted retry -- recording it
             # as "submitted" without ever calling place_market_buy (Codex
             # review, PR #42).
+            idempotency_stream = self._idempotency_stream()
             if has_prior_allocation:
-                ref_id = f"{self.stream}-dca-topup-{trading_day.isoformat()}-{ticker}"
+                ref_id = f"{idempotency_stream}-dca-topup-{trading_day.isoformat()}-{ticker}"
             elif manual:
-                ref_id = f"{self.stream}-dca-manual-{trading_day.isoformat()}-{ticker}"
+                ref_id = f"{idempotency_stream}-dca-manual-{trading_day.isoformat()}-{ticker}"
             else:
-                ref_id = f"{self.stream}-dca-{trading_day.isoformat()}-{ticker}"
+                ref_id = f"{idempotency_stream}-dca-{trading_day.isoformat()}-{ticker}"
+            # Counted as a buy ATTEMPT the moment the broker call is actually
+            # made, regardless of outcome -- mirrors near_close_dca's own
+            # max_orders_per_day semantics (a cancelled/rejected/failed buy
+            # still consumes one of the shared slots), and is what
+            # _compute_top_up's cross-stream seeding above counts too.
+            self.ledger.record_attempt(trading_day)
             try:
                 order_id = broker.place_market_buy(ticker, notional, ref_id=ref_id)
             except OrderConfirmationRequiredError:
@@ -4125,6 +4665,29 @@ class MorningDCAExecutor(DCAExecutor):
             submitted_this_week += notional
             reserved_buying_power += notional
             _log.info("Placed morning buy for %s: $%.2f, order_id=%s", ticker, notional, order_id)
+            # Durably settle the cumulative sub-dollar credit ledger ONLY now
+            # that the order is actually confirmed submitted -- not during
+            # _evaluate_top_up's earlier, pre-placement computation, which
+            # runs before the cap/spread/buying-power/duplicate gates above
+            # could still block this candidate (Codex review: "Defer ledger
+            # updates until the submitted amount is known", the same fix
+            # already applied to near_close_dca.evaluate_top_up_guard).
+            # Records the ACTUAL submitted notional, not the originally
+            # computed credit amount. A corrupt/locked/unwritable ledger must
+            # never mask this real, already-placed and already-published
+            # order -- log and continue rather than raise.
+            if top_up is not None and top_up.cumulative_credit_decline_usd is not None:
+                try:
+                    self.credit_ledger.settle(
+                        ticker,
+                        trading_day.isoformat(),
+                        notional,
+                        stream=self._idempotency_stream(),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    _log.warning(
+                        "cumulative credit ledger settlement failed for %s: %s", ticker, exc
+                    )
         # Stamp the spread verdict onto every outcome for a ticker that reached the
         # gate but was decided after it (tradability, buying power, review,
         # placement). The rows blocked AT the gate already carry their own verdict
@@ -4659,7 +5222,22 @@ class MorningDCAExecutor(DCAExecutor):
             0.0, self.ledger.remaining_weekly(trading_day) - prior_daily_seeded
         )
         broker_outcomes: Optional[Dict[str, Any]] = None
-        if self.mode == MORNING_LIVE_MODE and self.trades and not manual and broker is None:
+        # Placement switch (MorningConfig.live_execution_enabled). Dropping the
+        # broker reference here rather than short-circuiting the whole run routes
+        # a disabled stream through the existing no-broker branch below, so it
+        # still records hypothetical spend for cap/budget reporting and still
+        # writes the complete artifact set -- a shadow run, not a skipped one.
+        # A missing broker is only a blocking error when placement is enabled.
+        execution_enabled = getattr(self.config, "live_execution_enabled", True)
+        if not execution_enabled:
+            broker = None
+        if (
+            execution_enabled
+            and self.mode == MORNING_LIVE_MODE
+            and self.trades
+            and not manual
+            and broker is None
+        ):
             return self._blocked_live_result(
                 now, "missing broker adapter for scheduled live execution", signals, source
             )
@@ -4861,7 +5439,17 @@ class MorningDCAExecutor(DCAExecutor):
         # from disk and double-counts spend already reflected in self.ledger
         # (via record_buy_candidates above).
         self._seeded_prior_run_ids.add(artifacts["run_id"])
-        if self.mode == MORNING_LIVE_MODE and self.trades and not manual:
+        # execution_enabled=False (market_open_dca.json/intraday_dca.json's
+        # "SHIPS DISABLED" shadow mode) drops the broker above, so
+        # broker_outcomes stays None and the auto_buy_signal reconciliation
+        # block that clears it for deliberate skips/dry-runs never runs --
+        # every eligible signal row keeps auto_buy_signal=True while
+        # submitted_orders.csv is empty by design. Comparing the two would
+        # report every deliberate shadow candidate as an unexpectedly missing
+        # order (and potentially alert Slack) purely because placement itself
+        # is switched off, not because anything actually went wrong (Codex
+        # review: "Suppress drift alerts for deliberate shadow runs").
+        if self.mode == MORNING_LIVE_MODE and self.trades and not manual and execution_enabled:
             _run_drift_check(Path(paths["run_state"]).parent)
         return {"artifacts": artifacts, "paths": paths}
 

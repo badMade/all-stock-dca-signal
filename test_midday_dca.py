@@ -276,13 +276,15 @@ def test_midday_ladder_brackets():
     cases = {
         0.0005: 0.0,
         0.001: 1.0,
-        0.01: 1.5,
-        0.02: 2.0,
-        0.03: 2.5,
-        0.04: 3.0,
-        0.05: 3.5,
-        0.06: 4.0,
-        0.07: 4.5,
+        0.019: 1.0,
+        0.02: 1.5,
+        0.039: 1.5,
+        0.04: 2.0,
+        0.05: 2.5,
+        0.06: 3.0,
+        0.065: 3.5,
+        0.07: 4.0,
+        0.075: 4.5,
         0.08: 5.0,
         0.20: 5.0,
     }
@@ -449,21 +451,21 @@ def test_midday_cap_ledger_seeded_from_cross_stream_morning_fill(tmp_path):
     assert cfg.morning_daily_cap_usd == 180.0  # the shared Normal-tier ceiling, not an isolated 90.0
     ex = MiddayDCAExecutor(cfg, mode="live")
     broker = _Broker()
-    # 3% drop: TOPUP desired = 2.5x * $3 = $7.50; remaining shared cap = $180 - $170 = $10.
-    # $7.50 fits under $10, proving the fill was seen (a stale isolated-$90 cap
+    # 3% drop: TOPUP desired = 1.5x * $3 = $4.50; remaining shared cap = $180 - $170 = $10.
+    # $4.50 fits under $10, proving the fill was seen (a stale isolated-$90 cap
     # with no seeding at all would ALSO have allowed this by coincidence, so the
     # cap-exceeded case below is the one that actually proves seeding occurred).
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.03})
     res = ex.run(_now_midday(), data, broker=broker)
     broker_outcomes = res["artifacts"].get("broker_outcomes", {})
     assert broker_outcomes.get("TOPUP", {}).get("status") == "submitted"
-    assert broker.placed.get("TOPUP") == pytest.approx(7.50)
+    assert broker.placed.get("TOPUP") == pytest.approx(4.50)
 
-    # Now push the prior morning fill up to $175: remaining shared cap = $5,
-    # which TOPUP's $7.50 desired amount exceeds.
+    # Now push the prior morning fill up to $177: remaining shared cap = $3,
+    # which TOPUP's $4.50 desired amount exceeds.
     morning_root2 = tmp_path / "morning_prior_2"
     _write_prior_morning_run(
-        morning_root2, ticker="PRIOR_TICKER", planned_amount=175.0, generated_at="2026-07-08T10:30:00-04:00"
+        morning_root2, ticker="PRIOR_TICKER", planned_amount=177.0, generated_at="2026-07-08T10:30:00-04:00"
     )
     cfg2 = MiddayConfig(
         tickers=("TOPUP",),
@@ -477,8 +479,8 @@ def test_midday_cap_ledger_seeded_from_cross_stream_morning_fill(tmp_path):
     res2 = ex2.run(_now_midday(), data, broker=broker2)
     broker_outcomes2 = res2["artifacts"].get("broker_outcomes", {})
     assert broker_outcomes2.get("TOPUP", {}).get("status") == "cap_exceeded", (
-        "TOPUP ($7.50 desired) should be cap-gated once a $175 prior MORNING fill, "
-        "seeded cross-stream via cap_seed_roots, leaves only $5 of the shared $180 cap"
+        "TOPUP ($4.50 desired) should be cap-gated once a $177 prior MORNING fill, "
+        "seeded cross-stream via cap_seed_roots, leaves only $3 of the shared $180 cap"
     )
     assert "TOPUP" not in broker2.placed
 

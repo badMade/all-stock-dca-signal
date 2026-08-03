@@ -16,11 +16,12 @@ from dca_config import (
     load_backtest_sizing_tiers,
     load_budgets,
     load_near_close_overrides,
+    load_per_ticker_sizing,
     load_sizing_tiers,
     load_strategy_config,
     load_tickers,
 )
-from near_close_dca import StrategyConfig
+from near_close_dca import StrategyConfig, graded_buy_multiplier, select_first_allocation_base_usd
 
 
 def _write(dirpath, name, payload):
@@ -121,6 +122,27 @@ def test_sizing_tiers_malformed_raises(tmp_path):
     _write(tmp_path, "sizing_ladder.json", {"tiers": [{"min_drop_pct": 1.0}]})
     with pytest.raises(ValueError, match="missing min_drop_pct/multiplier"):
         load_sizing_tiers(tmp_path)
+
+
+def test_per_ticker_sizing_has_precise_ranges_and_one_dollar_floor(tmp_path):
+    _write(tmp_path, "per_ticker_sizing.json", {
+        "status": "active",
+        "tickers": {
+            "LOW": {
+                "base_amount_usd": 0.50,
+                "base_amount_below_close_usd": 0.25,
+                "tiers": [
+                    {"min_drop_pct": 0.1234, "multiplier": 1.0},
+                    {"min_drop_pct": 1.9876, "multiplier": 5.0},
+                ],
+            }
+        },
+    })
+    model = load_per_ticker_sizing(tmp_path)["per_ticker_sizing"]["LOW"]
+    config = StrategyConfig(per_ticker_sizing={"LOW": model})
+    assert model["tiers"][0][0] == pytest.approx(0.001234)
+    assert graded_buy_multiplier(0.001234, config, "LOW") == 1.0
+    assert select_first_allocation_base_usd(99.0, 100.0, None, config, "LOW")[0] == 1.0
 
 
 def test_budgets_maps_surviving_fields_only(tmp_path):

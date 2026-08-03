@@ -5121,8 +5121,8 @@ def test_run_slot_allows_a_guarded_top_up_the_old_forced_flag_used_to_block(tmp_
     check the way it was when run_slot forced
     one_order_per_ticker_per_day=True -- it now reaches
     near_close_dca.evaluate_top_up_guard, which computes the real strictly-
-    lower-price incremental top-up ($2.00 desired - $1.00 already bought =
-    $1.00 incremental) instead of a flat block.
+    lower-price incremental top-up ($3.00 desired - $1.00 already bought =
+    $2.00 incremental) instead of a flat block.
 
     DemoDataProvider has no get_bid_ask, so a *scheduled* run (spread_ok
     required) always blocks at the spread gate afterward regardless of this
@@ -5164,7 +5164,7 @@ def test_run_slot_allows_a_guarded_top_up_the_old_forced_flag_used_to_block(tmp_
     assert aapl.get("skip_reason") != "same-day broker order exists"
     assert aapl.get("top_up_guard_result") == "incremental_top_up"
     assert aapl.get("top_up_skipped") is False
-    assert aapl.get("incremental_order_amount") == 1.0
+    assert aapl.get("incremental_order_amount") == 2.0
 
 
 @pytest.mark.parametrize("slot", ["1030ET", "1230ET", "1530ET"])

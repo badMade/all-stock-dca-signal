@@ -16,6 +16,7 @@ from datetime import date, datetime, time, timedelta
 import pytest
 
 from conftest import FIXTURE_ACCOUNT_NUMBER
+from dca_cumulative import CumulativeCreditLedger
 from near_close_dca import (
     ACTIVE_TICKERS,
     BASE_BELOW_CLOSE_AND_LOW,
@@ -85,20 +86,20 @@ from scripts.run_classification import PriorAllocation
 LADDER_BOUNDARY_CASES = [
     (0.09, 0.0),  # below the 0.1% minimum -> no buy
     (0.1, 1.0),  # 1x tier begins
-    (0.999, 1.0),  # still 1x just under 1.0%
-    (1.0, 1.5),  # 1.5x tier begins
-    (1.999, 1.5),  # still 1.5x just under 2.0%
-    (2.0, 2.0),  # 2x tier begins
-    (2.999, 2.0),  # still 2x just under 3.0%
-    (3.0, 2.5),  # 2.5x tier begins
-    (3.999, 2.5),  # still 2.5x just under 4.0%
-    (4.0, 3.0),  # 3x tier begins
-    (4.999, 3.0),  # still 3x just under 5.0%
-    (5.0, 3.5),  # 3.5x tier begins
-    (5.999, 3.5),  # still 3.5x just under 6.0%
-    (6.0, 4.0),  # 4x tier begins
-    (6.999, 4.0),  # still 4x just under 7.0%
-    (7.0, 4.5),  # 4.5x tier begins
+    (1.999, 1.0),  # still 1x just under 2.0%
+    (2.0, 1.5),  # 1.5x tier begins
+    (3.999, 1.5),  # still 1.5x just under 4.0%
+    (4.0, 2.0),  # 2x tier begins
+    (4.999, 2.0),  # still 2x just under 5.0%
+    (5.0, 2.5),  # 2.5x tier begins
+    (5.999, 2.5),  # still 2.5x just under 6.0%
+    (6.0, 3.0),  # 3x tier begins
+    (6.499, 3.0),  # still 3x just under 6.5%
+    (6.5, 3.5),  # 3.5x tier begins
+    (6.999, 3.5),  # still 3.5x just under 7.0%
+    (7.0, 4.0),  # 4x tier begins
+    (7.499, 4.0),  # still 4x just under 7.5%
+    (7.5, 4.5),  # 4.5x tier begins
     (7.999, 4.5),  # still 4.5x just under 8.0%
     (8.0, 5.0),  # 5x tier begins
     (12.0, 5.0),  # no upper cutoff, still 5x
@@ -341,7 +342,7 @@ class _FakeDataWithLow(_FakeData):
 
 def test_first_allocation_below_close_only_uses_one_dollar_base():
     # Decision price below the prior close (100) but not below the prior low (95)
-    # -> $1 base scale. Drop is 2% -> 2x multiplier -> $1 * 2 = $2 suggested.
+    # -> $1 base scale. Drop is 2% -> 1.5x multiplier -> $1 * 1.5 = $1.50 suggested.
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     data = _FakeDataWithLow(
         SourceName.FINANCE, close_price=98.0, prev_close=100.0, prev_low=95.0
@@ -353,13 +354,13 @@ def test_first_allocation_below_close_only_uses_one_dollar_base():
     assert signal.previous_low == 95.0
     assert signal.base_selection_reason == BASE_BELOW_CLOSE_ONLY
     assert signal.selected_base_amount_usd == 1.0
-    assert signal.buy_multiplier == 2.0
-    assert signal.suggested_amount_usd == 1.0 * 2.0
+    assert signal.buy_multiplier == 1.5
+    assert signal.suggested_amount_usd == 1.0 * 1.5
 
 
 def test_first_allocation_below_close_and_low_uses_two_dollar_base():
     # Decision price below both the prior close (100) and the prior low (95)
-    # -> $2 base scale. Drop is 6% -> 4x multiplier -> $2 * 4 = $8 suggested.
+    # -> $2 base scale. Drop is 6% -> 3x multiplier -> $2 * 3 = $6 suggested.
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     data = _FakeDataWithLow(
         SourceName.FINANCE, close_price=94.0, prev_close=100.0, prev_low=95.0
@@ -371,8 +372,39 @@ def test_first_allocation_below_close_and_low_uses_two_dollar_base():
     assert signal.previous_low == 95.0
     assert signal.base_selection_reason == BASE_BELOW_CLOSE_AND_LOW
     assert signal.selected_base_amount_usd == 2.0
-    assert signal.buy_multiplier == 4.0
-    assert signal.suggested_amount_usd == 2.0 * 4.0
+    assert signal.buy_multiplier == 3.0
+    assert signal.suggested_amount_usd == 2.0 * 3.0
+
+
+def test_calibrated_first_tier_overrides_global_minimum_drop():
+    # Codex review ("Let calibrated first tiers override the global floor"):
+    # AAAU-style calibration with a first tier below the shared 0.1% minimum
+    # (config/per_ticker_sizing.json). A 0.05% drop clears the calibrated
+    # 0.01% first tier (buy_multiplier=1x) but is still below the global
+    # 0.1% floor -- flooring it at the global minimum would silently veto a
+    # buy the checked-in per-symbol model already approved.
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        per_ticker_sizing={"AAAU": {"tiers": ((0.0001, 1.0), (0.02, 1.5))}}
+    )
+    data = _FakeData(SourceName.FINANCE, close_price=99.95, prev_close=100.0)
+    signal = evaluate_source_signal("AAAU", now, config, data, interval_minutes=15)
+    assert signal.action == Action.BUY
+    assert signal.buy_multiplier == 1.0
+
+
+def test_uncalibrated_ticker_still_floored_at_global_minimum_drop():
+    # Control: the SAME 0.05% drop for an uncalibrated symbol (no
+    # per_ticker_sizing entry) must still be blocked by the global 0.1%
+    # minimum -- only an explicit calibration overrides the floor.
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        per_ticker_sizing={"AAAU": {"tiers": ((0.0001, 1.0), (0.02, 1.5))}}
+    )
+    data = _FakeData(SourceName.FINANCE, close_price=99.95, prev_close=100.0)
+    signal = evaluate_source_signal("AAPL", now, config, data, interval_minutes=15)
+    assert signal.action == Action.NO_ACTION
+    assert signal.reason == "below prior close but below 0.1% minimum drop"
 
 
 def test_first_allocation_above_close_is_no_buy():
@@ -519,7 +551,7 @@ def test_run_daily_compact_prior_allocation_scoped_to_its_own_ticker(tmp_path):
     # first allocation, which must be the full suggested amount.
     for ticker in ("NVDA", "MSFT"):
         assert by_ticker[ticker]["top_up_guard_result"] == TOP_UP_NO_PRIOR_RUN
-        assert by_ticker[ticker]["incremental_order_amount"] == 4.0
+        assert by_ticker[ticker]["incremental_order_amount"] == 3.0
 
 
 def test_budget_tier_is_selected_from_post_topup_spend_not_pre_topup_desired(tmp_path):
@@ -3220,19 +3252,19 @@ def test_same_day_ticker_deployment_already_recorded(tmp_path):
 
 def test_kill_switch_caps_later_candidates_within_the_same_batch(tmp_path):
     # No prior-day history is needed: two same-day candidates each priced at
-    # $4 (2x the $2 base) with a $7.50 monthly allocation (40% threshold = $3)
-    # mean the FIRST submitted order alone already crosses the threshold. The
-    # SECOND candidate in the same run must then be capped to the $2 base
-    # instead of keeping its uncapped 2x amount -- otherwise a volatile day
-    # could overshoot the guard well beyond the base amount before the guard
-    # is even visible to tomorrow's run.
+    # $3 (1.5x the $2 base on the 2% drop below) with a $5.00 monthly allocation
+    # (40% threshold = $2) mean the FIRST submitted order alone already crosses
+    # the threshold. The SECOND candidate in the same run must then be capped to
+    # the $2 base instead of keeping its uncapped 1.5x amount -- otherwise a
+    # volatile day could overshoot the guard well beyond the base amount before
+    # the guard is even visible to tomorrow's run.
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=("AAA", "BBB"),
         approved_test_dates=frozenset({date(2026, 6, 29)}),
-        monthly_cash_allocation_usd=7.5,
+        monthly_cash_allocation_usd=5.0,
     )
     state = StrategyState()
     broker = DryRunBroker(
@@ -3261,30 +3293,30 @@ def test_kill_switch_caps_later_candidates_within_the_same_batch(tmp_path):
     submitted = [c for c in run_state["buy_candidates"] if c["status"] == "submitted"]
     assert len(submitted) == 2
     # AAA is filled first (alphabetical tiebreak at equal multiplier/drop) at
-    # its full 2x amount, which alone crosses the $3 threshold.
-    assert by_ticker["AAA"]["planned_amount_usd"] == 4.0
-    assert by_ticker["AAA"]["buy_multiplier"] == 2.0
+    # its full 1.5x amount, which alone crosses the $2 threshold.
+    assert by_ticker["AAA"]["planned_amount_usd"] == 3.0
+    assert by_ticker["AAA"]["buy_multiplier"] == 1.5
     # BBB, priced after the threshold is crossed, is capped to the $2 base --
     # even though its ladder multiplier (still reported for audit purposes)
-    # remains 2.0, showing the cap is a dollar-amount guard, not a multiplier
+    # remains 1.5, showing the cap is a dollar-amount guard, not a multiplier
     # rewrite.
     assert by_ticker["BBB"]["planned_amount_usd"] == 2.0
-    assert by_ticker["BBB"]["buy_multiplier"] == 2.0
+    assert by_ticker["BBB"]["buy_multiplier"] == 1.5
 
 
 def test_manual_run_submissions_do_not_advance_in_batch_burn(tmp_path):
-    # Same setup as the scheduled in-batch test above (AAA/BBB, $7.50 monthly
+    # Same setup as the scheduled in-batch test above (AAA/BBB, $5.00 monthly
     # allocation), but scheduled=False: a manual run's own submissions must
     # never advance the scheduled-live 7-day figure the kill-switch reads, so
     # neither candidate is capped even though AAA's amount alone would cross
-    # the $3 threshold if counted.
+    # the $2 threshold if counted.
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-manual")
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=("AAA", "BBB"),
         approved_test_dates=frozenset({date(2026, 6, 29)}),
-        monthly_cash_allocation_usd=7.5,
+        monthly_cash_allocation_usd=5.0,
     )
     state = StrategyState()
     broker = DryRunBroker(
@@ -3308,8 +3340,8 @@ def test_manual_run_submissions_do_not_advance_in_batch_burn(tmp_path):
     ) as handle:
         run_state = json.load(handle)
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
-    assert by_ticker["AAA"]["planned_amount_usd"] == 4.0
-    assert by_ticker["BBB"]["planned_amount_usd"] == 4.0  # NOT capped to the $2 base
+    assert by_ticker["AAA"]["planned_amount_usd"] == 3.0
+    assert by_ticker["BBB"]["planned_amount_usd"] == 3.0  # NOT capped to the $2 base
     assert run_state["risk_guard"]["kill_switch_engaged"] is False
 
 
@@ -5034,7 +5066,9 @@ def test_run_daily_compact_blocks_orders_above_per_order_ceiling(tmp_path):
         tickers=("AAPL",),
         approved_test_dates=config.approved_test_dates,
         base_buy_amount_usd=10.0,
-        max_per_order_usd=15.0,
+        # The 2% drop below is 1.5x on the current ladder, so a $10 base plans
+        # $15; the ceiling sits below that so the candidate is blocked.
+        max_per_order_usd=10.0,
     )
     broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
 
@@ -5055,7 +5089,7 @@ def test_run_daily_compact_blocks_orders_above_per_order_ceiling(tmp_path):
 
     candidate = run_state["buy_candidates"][0]
     assert candidate["ticker"] == "AAPL"
-    assert candidate["planned_amount_usd"] == 20.0
+    assert candidate["planned_amount_usd"] == 15.0
     assert candidate["status"] == "blocked"
     assert candidate["skip_reason"] == "max per-order ceiling exceeded"
     assert run_state["usage_proxy"]["orders_placed_count"] == 0
@@ -5235,6 +5269,308 @@ def test_top_up_guard_prior_exceeds_afternoon_desired_buys_zero():
     assert outcome.top_up_guard_result == TOP_UP_NOT_LOWER_OR_NO_DELTA
     assert outcome.incremental_order_amount == 0.0
     assert outcome.skipped is True
+
+
+def test_top_up_guard_final_session_flushes_sub_threshold_decline_to_one_dollar():
+    # Codex review ("wire CumulativeCreditLedger into a real execution path"):
+    # the day's ladder target is already fully met (ladder_incremental == 0),
+    # but the price is $0.30 lower than the prior run's reference -- below
+    # cumulative_top_up_min_drop_usd (0.50), so neither the ladder nor the
+    # price-step floor alone would order anything. near_close_dca is always
+    # the scheduled 3:30 PM final session, so dca_cumulative's contract
+    # requires flushing that positive residual decline up to a $1 order
+    # instead of silently dropping it.
+    prior = PriorSameDayAllocation(
+        "AAPL",
+        amount_usd=6.0,
+        reference_price=99.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=3.0,
+    )
+    outcome = evaluate_top_up_guard(
+        _buy_decision("AAPL", 6.0, target_price=98.70), prior, StrategyConfig()
+    )
+    assert outcome.top_up_guard_result == TOP_UP_INCREMENTAL
+    assert outcome.incremental_order_amount == 1.0
+    assert outcome.skipped is False
+    # Codex review ("Defer ledger updates until the submitted amount is
+    # known"): evaluate_top_up_guard is a PURE computation with no ledger
+    # I/O -- it only reports which decline drove the credit-derived
+    # incremental (cumulative_credit_decline_usd) so the caller can settle
+    # the durable ledger later, once the resulting order is confirmed
+    # submitted, not here before any cap/spread/placement gate has run.
+    assert outcome.cumulative_credit_decline_usd == 0.30
+
+
+def test_top_up_guard_ordinary_ladder_increment_has_no_cumulative_credit_marker():
+    # A $3 ladder-derived top-up doesn't touch the cumulative credit
+    # mechanism at all, so cumulative_credit_decline_usd must stay None --
+    # only the genuinely credit-derived sub-dollar path sets it.
+    prior = PriorSameDayAllocation(
+        "AAPL",
+        amount_usd=3.0,
+        reference_price=99.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=3.0,
+    )
+    outcome = evaluate_top_up_guard(
+        _buy_decision("AAPL", 6.0, target_price=98.0), prior, StrategyConfig()
+    )
+    assert outcome.top_up_guard_result == TOP_UP_INCREMENTAL
+    assert outcome.incremental_order_amount == 3.0
+    assert outcome.cumulative_credit_decline_usd is None
+
+
+def test_cumulative_credit_settles_ledger_only_after_confirmed_submission(tmp_path):
+    # Codex review ("Defer ledger updates until the submitted amount is
+    # known"): the authoritative call site (_process_buy_candidate) must
+    # settle the durable CumulativeCreditLedger only once the credit-derived
+    # order is actually confirmed submitted, using the real submitted
+    # notional -- not during evaluate_top_up_guard's earlier, pre-placement
+    # computation, which runs before the cap/spread/buying-power/broker
+    # gates that could still block or shrink the order.
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=6.0,
+        reference_price=99.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=3.0,
+    )
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=2.0,
+        suggested_amount_usd=6.0,
+        selected_base_amount_usd=3.0,
+        target_price=98.70,
+    )
+    config = StrategyConfig(dry_run=False)
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.70})
+    ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 6, 29)
+
+    candidate_outcome, top_up_outcome, _, _, _ = _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=broker,
+            robinhood_data=None,
+            now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=False,
+            run_result=None,
+            credit_ledger=ledger,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert top_up_outcome.cumulative_credit_decline_usd == 0.30
+    assert candidate_outcome["status"] == "submitted"
+    assert candidate_outcome["submitted_amount_usd"] == 1.0
+    events = ledger.events(trading_day.isoformat())
+    assert len(events) == 1
+    assert events[0]["ticker"] == "AAPL"
+    assert events[0]["decision"] == "settled"
+    assert events[0]["submitted_amount_usd"] == 1.0
+
+
+def test_cumulative_credit_flushes_pre_existing_pending_balance_with_no_new_decline(tmp_path):
+    # Codex review ("Accumulate credits instead of resetting pending state"):
+    # a $0.20 credit was already pending for this ticker from earlier in the
+    # day. This afternoon's own decision price has recovered back to the
+    # prior run's exact reference price (no NEW decline at all), but the
+    # final 3:30 PM session's own contract is to flush ANY positive pending
+    # balance -- the guard must still round that pre-existing $0.20 up to a
+    # $1 order rather than silently stranding it just because this call
+    # found no further decline.
+    ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 6, 29)
+    ledger.record("AAPL", trading_day.isoformat(), 0.20, stream="morning")
+
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=6.0,
+        reference_price=99.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=3.0,
+    )
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=2.0,
+        suggested_amount_usd=6.0,
+        selected_base_amount_usd=3.0,
+        target_price=99.0,  # recovered back to the prior reference -- no new decline
+    )
+    config = StrategyConfig(dry_run=False)
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 99.0})
+
+    candidate_outcome, top_up_outcome, _, _, _ = _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=broker,
+            robinhood_data=None,
+            now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=False,
+            run_result=None,
+            credit_ledger=ledger,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert top_up_outcome.top_up_guard_result == TOP_UP_INCREMENTAL
+    assert top_up_outcome.cumulative_credit_decline_usd == 0.0
+    assert candidate_outcome["status"] == "submitted"
+    assert candidate_outcome["submitted_amount_usd"] == 1.0
+    events = ledger.events(trading_day.isoformat())
+    assert events[-1]["decision"] == "settled"
+    # The pending balance settle() resolved must be gone.
+    assert ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.0
+
+
+def test_cumulative_credit_ledger_untouched_when_order_is_blocked(tmp_path):
+    # The same credit-derived candidate, but blocked by the per-order
+    # ceiling before it ever reaches the broker -- the ledger must stay
+    # completely untouched (no premature flush of a credit for an order
+    # that was never actually placed), leaving the credit available for a
+    # later attempt.
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=6.0,
+        reference_price=99.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=3.0,
+    )
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=2.0,
+        suggested_amount_usd=6.0,
+        selected_base_amount_usd=3.0,
+        target_price=98.70,
+    )
+    config = StrategyConfig(dry_run=False, max_per_order_usd=0.50)
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.70})
+    ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 6, 29)
+
+    candidate_outcome, top_up_outcome, _, _, _ = _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=broker,
+            robinhood_data=None,
+            now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=False,
+            run_result=None,
+            credit_ledger=ledger,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert top_up_outcome.cumulative_credit_decline_usd == 0.30
+    assert candidate_outcome["status"] == "blocked"
+    events = ledger.events(trading_day.isoformat())
+    assert events == []
+
+
+class _RaisingSettleLedger:
+    """CumulativeCreditLedger double whose settle() always raises."""
+
+    def settle(self, ticker, trading_day, submitted_amount_usd, *, stream="unknown", recorded_at=None):
+        raise OSError("ledger is locked")
+
+
+def test_credit_ledger_settlement_failure_does_not_lose_the_placed_order():
+    # Codex review, P1 ("Publish accepted orders before settling the credit
+    # ledger"): if the broker accepts a credit-derived order but settle()
+    # raises because the ledger is corrupt, locked, or unwritable, the
+    # already-placed order must still be published to the in-flight-outcome
+    # tracker (so a failure artifact built from it never omits a real
+    # accepted order) and _process_buy_candidate must still return
+    # normally instead of propagating the ledger failure.
+    import near_close_dca as _n
+
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=6.0,
+        reference_price=99.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=3.0,
+    )
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=2.0,
+        suggested_amount_usd=6.0,
+        selected_base_amount_usd=3.0,
+        target_price=98.70,
+    )
+    config = StrategyConfig(dry_run=False)
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.70})
+    trading_day = date(2026, 6, 29)
+
+    _n._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    try:
+        candidate_outcome, top_up_outcome, _, _, _ = _process_buy_candidate(
+            decision,
+            ctx=ProcessCandidateContext(
+                config=config,
+                state=state,
+                broker=broker,
+                robinhood_data=None,
+                now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
+                trading_day=trading_day,
+                guard_active=True,
+                prior_same_day_allocations={"AAPL": prior},
+                scheduled=False,
+                run_result=None,
+                credit_ledger=_RaisingSettleLedger(),
+            ),
+            running_deployed_7d=0.0,
+        )
+        published = dict(_n._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"])
+    finally:
+        _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    assert top_up_outcome.cumulative_credit_decline_usd == 0.30
+    assert candidate_outcome["status"] == "submitted"
+    assert candidate_outcome["submitted_amount_usd"] == 1.0
+    assert published.get("AAPL", {}).get("status") == "submitted"
 
 
 def test_top_up_guard_missing_prior_price_is_conservative_manual_review():
@@ -7741,7 +8077,9 @@ def test_run_daily_compact_checks_per_order_cap_before_broker_duplicate_lookup(
         tickers=("AAPL",),
         approved_test_dates=config.approved_test_dates,
         base_buy_amount_usd=10.0,
-        max_per_order_usd=15.0,
+        # The 2% drop below is 1.5x on the current ladder, so a $10 base plans
+        # $15; the ceiling sits below that so the candidate is blocked.
+        max_per_order_usd=10.0,
     )
 
     class _TrackingBroker(DryRunBroker):
@@ -7876,8 +8214,8 @@ def test_load_prior_same_day_skips_non_utf8_artifact_without_crashing(tmp_path):
 def test_run_daily_compact_top_up_records_incremental(tmp_path):
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
-    # 100 -> 98 is a 2% drop -> 2x -> $4 desired. Morning bought $2 at 99.0; the
-    # afternoon quote is 98.0 (< 99.0) so only the $2 difference is bought.
+    # 100 -> 98 is a 2% drop -> 1.5x -> $3 desired. Morning bought $2 at 99.0; the
+    # afternoon quote is 98.0 (< 99.0) so only the $1 difference is bought.
     prior = {
         "AAPL": PriorSameDayAllocation(
             "AAPL",
@@ -7908,8 +8246,8 @@ def test_run_daily_compact_top_up_records_incremental(tmp_path):
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
     aapl = by_ticker["AAPL"]
     assert aapl["top_up_guard_result"] == TOP_UP_INCREMENTAL
-    assert aapl["incremental_order_amount"] == 2.0
-    assert aapl["afternoon_desired_amount"] == 4.0
+    assert aapl["incremental_order_amount"] == 1.0
+    assert aapl["afternoon_desired_amount"] == 3.0
     assert aapl["prior_same_day_amount"] == 2.0
     assert aapl["prior_same_day_reference_price"] == 99.0
     assert aapl["prior_same_day_run_id"] == "manual_am"
@@ -7923,7 +8261,7 @@ def test_run_daily_compact_top_up_records_incremental(tmp_path):
     # A ticker with no prior allocation still buys its full amount, using the
     # plain (non-topup) ref_id formula.
     assert by_ticker["NVDA"]["top_up_guard_result"] == TOP_UP_NO_PRIOR_RUN
-    assert by_ticker["NVDA"]["incremental_order_amount"] == 4.0
+    assert by_ticker["NVDA"]["incremental_order_amount"] == 3.0
     assert "graded-dca-topup" not in by_ticker["NVDA"]["order_id"]
     assert "graded-dca-2026-06-29-NVDA" in by_ticker["NVDA"]["order_id"]
 
@@ -8016,7 +8354,7 @@ def test_run_daily_compact_manual_run_does_not_block_scheduled(tmp_path):
     # Guard bypassed the same-day broker block and still topped up AAPL, which
     # has a loaded prior allocation.
     assert by_ticker["AAPL"]["status"] == "dry_run"
-    assert by_ticker["AAPL"]["incremental_order_amount"] == 2.0
+    assert by_ticker["AAPL"]["incremental_order_amount"] == 1.0
     # NVDA has NO loaded prior allocation, so the broker's same-day-order check
     # must still apply -- the guard bypass is scoped per-ticker, not blanket.
     assert by_ticker["NVDA"]["status"] == "skipped"
@@ -9726,7 +10064,9 @@ def test_flag_checks_the_hard_ceiling_before_its_own_broker_duplicate_lookup(tmp
         one_order_per_ticker_per_day=True,
         tickers=("AAPL",),
         base_buy_amount_usd=10.0,
-        max_per_order_usd=15.0,
+        # The 2% drop below is 1.5x on the current ladder, so a $10 base plans
+        # $15; the ceiling sits below that so the candidate is blocked.
+        max_per_order_usd=10.0,
     )
 
     class _TrackingBroker(DryRunBroker):
@@ -9842,7 +10182,7 @@ def test_flag_off_leaves_the_documented_top_up_bypass_intact(tmp_path):
         run_state = json.load(handle)
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
     assert by_ticker["AAPL"]["status"] == "dry_run"
-    assert by_ticker["AAPL"]["incremental_order_amount"] == 2.0
+    assert by_ticker["AAPL"]["incremental_order_amount"] == 1.0
 
 
 def test_seed_prior_allocations_still_seeds_notional_when_the_flag_is_on():
