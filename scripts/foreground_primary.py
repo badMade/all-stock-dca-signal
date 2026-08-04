@@ -184,7 +184,7 @@ def _load_artifact(artifact: str | Path | Mapping[str, Any]) -> Tuple[str, Optio
     if not path.exists():
         return (str(path), None, REASON_UNREADABLE)
     try:
-        loaded = json.loads(path.read_text(encoding="utf-8"))
+        loaded = json.loads(path.read_bytes())
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return (str(path), None, REASON_UNREADABLE)
     if not isinstance(loaded, dict):
@@ -304,7 +304,7 @@ def _validate_pointer_artifact(
     if not target_path.exists():
         return REASON_POINTER_MISSING_TARGET
     try:
-        target_payload = json.loads(target_path.read_text(encoding="utf-8"))
+        target_payload = json.loads(target_path.read_bytes())
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return REASON_POINTER_MISSING_TARGET
     if not isinstance(target_payload, dict):
@@ -442,7 +442,7 @@ def _candidate_source_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not raw_path:
         return payload
     try:
-        target = json.loads(Path(raw_path).read_text(encoding="utf-8"))
+        target = json.loads(Path(raw_path).read_bytes())
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return payload
     return target if isinstance(target, dict) else payload

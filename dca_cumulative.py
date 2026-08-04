@@ -197,7 +197,7 @@ class CumulativeCreditLedger:
                 "events": [],
             }
         try:
-            state = json.loads(path.read_text(encoding="utf-8"))
+            state = json.loads(path.read_bytes())
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(f"could not read cumulative credit ledger {path}") from exc
         if (

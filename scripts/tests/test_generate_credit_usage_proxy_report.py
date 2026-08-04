@@ -1223,7 +1223,7 @@ def test_main_write_defaults_derives_root_and_paths_without_any_shell_hardcoding
     expected = default_report_paths(TRADING_DAY, tmp_path)
     assert expected["json"].is_file()
     assert expected["md"].is_file()
-    assert json.loads(expected["json"].read_text(encoding="utf-8"))["trading_day"] == TRADING_DAY
+    assert json.loads(expected["json"].read_bytes())["trading_day"] == TRADING_DAY
 
 
 def test_main_write_defaults_is_ignored_when_explicit_paths_are_given(tmp_path):

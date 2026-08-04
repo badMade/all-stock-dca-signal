@@ -64,7 +64,7 @@ def main() -> int:
     parser.add_argument("--lookback-years", type=int, default=3)
     args = parser.parse_args()
 
-    active = json.loads(args.ticker_config.read_text(encoding="utf-8"))["active"]
+    active = json.loads(args.ticker_config.read_bytes())["active"]
     as_of = date.today()
     start_date = f"{as_of.year - args.lookback_years:04d}-{as_of.month:02d}-{as_of.day:02d}"
     tickers = {}

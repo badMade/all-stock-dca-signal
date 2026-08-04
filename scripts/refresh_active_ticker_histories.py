@@ -28,7 +28,7 @@ USER_AGENT = "Mozilla/5.0 (compatible; AllStockDCAHistoryRefresh/1.0)"
 
 def active_symbols(config_path: Path) -> list[str]:
     """Return the configured active symbols in their declared order."""
-    data = json.loads(config_path.read_text(encoding="utf-8"))
+    data = json.loads(config_path.read_bytes())
     active = data.get("active")
     if not isinstance(active, list) or not all(isinstance(symbol, str) for symbol in active):
         raise ValueError(f"{config_path} must contain an 'active' list of symbols")

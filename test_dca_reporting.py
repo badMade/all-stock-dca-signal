@@ -1320,7 +1320,7 @@ def test_generate_scheduled_reports_reports_foreground_primary_mode_instead_of_e
         foreground_primary_artifacts=[foreground],
         close_window_summary=summary,
     )
-    report = json.loads(Path(paths["foreground_primary_context"]).read_text())
+    report = json.loads(Path(paths["foreground_primary_context"]).read_bytes())
 
     context = report["foreground_primary_context"]
     assert context["foreground_primary_mode_active"] is True
