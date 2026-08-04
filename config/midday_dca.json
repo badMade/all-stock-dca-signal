@@ -5,6 +5,8 @@
   "stream": "midday",
   "confidence_rule": "A candidate whose price/drop passes the ladder is auto-bought ONLY when the intraday trend can be validated (>= trend_min_bars usable intraday bars at or before the 12:30 decision time). If price/drop passes but the intraday trend cannot be validated, the run must NOT auto-buy; it classifies the candidate as execution_status='manual_review_candidate'. There is no loosened trend-unavailable execution path.",
   "trend_min_bars": 6,
+  "live_execution_enabled": true,
+  "live_execution_enabled_note": "SHIPS ENABLED, unlike market_open_dca.json and intraday_dca.json ('SHIPS DISABLED'). The 12:30 midday stream (a6239dae) is one of the currently-functioning live executions, so this key records the live state that was previously only implicit in MiddayConfig.live_execution_enabled's inherited True default. It is stated explicitly here so the value is auditable and so load_midday_config() can distinguish 'config says live' from 'config could not be read' -- the latter now falls back to shadow mode rather than inheriting True. The value is surfaced on every run_state as live_execution_enabled.",
   "live_task": {
     "mode": "live",
     "cron_id": "a6239dae",

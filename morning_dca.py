@@ -58,7 +58,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple
 
 from dca_alerts import GuardedRunConfig, artifact_freshness_probe, attempt_log_root_sibling_to, guarded_run
 from dca_config import (
@@ -74,6 +74,11 @@ from dca_config import (
 )
 from dca_cumulative import CumulativeCreditLedger, apply_cumulative_credit
 from dca_fileio import atomic_open_w, atomic_write_text
+from dca_intraday_archive import (
+    archive_observations_safely,
+    observations_from_signal_rows,
+    write_run_snapshot,
+)
 from dca_paths import rebase_bundled_roots_in, stream_root
 from near_close_dca import (
     ACTIVE_TICKERS,
@@ -191,6 +196,29 @@ SIGNAL_CSV_FIELDS = (
     "spread_ok",
     "spread_pct",
     "spread_status",
+    # Price provenance and intraday OHLCV, appended 2026-08-04. These are the
+    # columns that make a signal row usable as an archived time-series
+    # observation rather than only as a one-run decision record: which feed the
+    # price came from, when that price was as of, and the decision bar's own
+    # OHLCV/volume. Appended at the END so a reader of an older signals.csv is
+    # unaffected (see dca_intraday_archive).
+    "price_source",
+    "price_as_of",
+    "previous_close_as_of",
+    "quote_price",
+    "quote_time",
+    "bar_timestamp",
+    "bar_open",
+    "bar_high",
+    "bar_low",
+    "bar_close",
+    "bar_volume",
+    "session_open",
+    "session_high",
+    "session_low",
+    "session_volume",
+    "bar_count",
+    "interval_minutes",
 )
 
 # Watchlist (9:45 AM ET) scan identity — analytics-only, no trading.
@@ -793,6 +821,11 @@ class MorningSignal:
     # watchlist mode (no execution decision is taken there).
     execution_status: Optional[str] = None
     trend_validated: Optional[bool] = None
+    # Price provenance + intraday OHLCV for the archived observation (see
+    # dca_intraday_archive). All optional and defaulted, so every existing
+    # construction site keeps working; MorningDCAExecutor._current_price fills
+    # them via its `provenance` out-parameter.
+    observation: Optional["PriceObservation"] = None
 
     def to_row(self) -> Dict[str, Any]:
         row = {
@@ -825,7 +858,110 @@ class MorningSignal:
         row.setdefault("spread_ok", None)
         row.setdefault("spread_pct", None)
         row.setdefault("spread_status", SPREAD_STATUS_NOT_EVALUATED)
+        # Observation columns are written on EVERY row, present or not, for the
+        # same reason as the spread columns above: a stable CSV header across
+        # mixed rows. A row whose price never resolved (NO_DATA) still carries
+        # the columns, empty -- which is itself the useful record that this
+        # ticker was polled at this slot and produced nothing.
+        row.update((self.observation or PriceObservation()).to_row())
         return row
+
+
+@dataclass(frozen=True)
+class PriceObservation:
+    """Where a decision price came from, and the intraday bars behind it.
+
+    Populated by :meth:`MorningDCAExecutor._current_price` (which writes into a
+    plain dict) and by :meth:`MorningDCAExecutor._session_stats`. Kept as its own
+    frozen record rather than a dozen more fields on :class:`MorningSignal` so
+    the archive's column set can grow without widening the signal dataclass.
+    """
+
+    price_source: Optional[str] = None
+    price_as_of: Optional[datetime] = None
+    previous_close_as_of: Optional[datetime] = None
+    quote_price: Optional[float] = None
+    quote_time: Optional[datetime] = None
+    bar_timestamp: Optional[datetime] = None
+    bar_open: Optional[float] = None
+    bar_high: Optional[float] = None
+    bar_low: Optional[float] = None
+    bar_close: Optional[float] = None
+    bar_volume: Optional[float] = None
+    # Regular-session aggregates from 9:30 ET through the decision anchor. The
+    # daily OHLCV archive cannot express these mid-session, which is the whole
+    # point of recording them per poll.
+    session_open: Optional[float] = None
+    session_high: Optional[float] = None
+    session_low: Optional[float] = None
+    session_volume: Optional[float] = None
+    bar_count: Optional[int] = None
+    interval_minutes: Optional[int] = None
+
+    _ROW_FIELDS: ClassVar[Tuple[str, ...]] = (
+        "price_source",
+        "price_as_of",
+        "previous_close_as_of",
+        "quote_price",
+        "quote_time",
+        "bar_timestamp",
+        "bar_open",
+        "bar_high",
+        "bar_low",
+        "bar_close",
+        "bar_volume",
+        "session_open",
+        "session_high",
+        "session_low",
+        "session_volume",
+        "bar_count",
+        "interval_minutes",
+    )
+
+    def to_row(self) -> Dict[str, Any]:
+        row: Dict[str, Any] = {}
+        for field_name in self._ROW_FIELDS:
+            value = getattr(self, field_name)
+            row[field_name] = value.isoformat() if isinstance(value, datetime) else value
+        return row
+
+
+def _finite_float_or_none(value: Any) -> Optional[float]:
+    """Coerce to a finite float, or ``None``. Never raises.
+
+    Used on raw provider values headed for the observation archive, where a
+    ``None``/``NaN``/unparseable price must land as an empty cell rather than
+    abort the run that was only trying to record it.
+    """
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def session_stats(bars: Sequence[Bar]) -> Dict[str, Any]:
+    """Aggregate regular-session bars into open/high/low/volume so far.
+
+    ``bars`` is the 9:30-ET-through-decision-anchor window the executor already
+    fetched, so this adds no provider calls. Returns ``{}`` for an empty or
+    entirely non-finite window rather than inventing zeroes -- a zero session
+    volume and an unknown session volume must not look the same in the archive.
+    """
+    opens = [b for b in sorted(bars, key=lambda b: b.timestamp) if math.isfinite(b.open)]
+    highs = [b.high for b in bars if math.isfinite(b.high)]
+    lows = [b.low for b in bars if math.isfinite(b.low)]
+    volumes = [b.volume for b in bars if math.isfinite(b.volume)]
+    stats: Dict[str, Any] = {}
+    if opens:
+        stats["session_open"] = opens[0].open
+    if highs:
+        stats["session_high"] = max(highs)
+    if lows:
+        stats["session_low"] = min(lows)
+    if volumes:
+        stats["session_volume"] = sum(volumes)
+    return stats
 
 
 def load_max_per_order_usd(config_dir_path: Path) -> Optional[float]:
@@ -1292,6 +1428,30 @@ def load_morning_config(
     return MorningConfig(**kwargs)
 
 
+def _coerce_live_execution_enabled(value: Any, *, source_label: str) -> bool:
+    """Interpret the master live-placement switch, failing closed on any
+    non-boolean JSON type.
+
+    ``bool(value)`` on a JSON string like ``"false"`` or ``"0"`` is truthy
+    for any non-empty string, so an operator who tried to disable live
+    trading with a quoted value would silently leave placement ENABLED --
+    the opposite of what the config says, in the one field that gates real
+    broker orders (Codex review: "Reject non-boolean values for the midday
+    live switch"). Only Python's actual ``bool`` is accepted; every other
+    type fails closed to ``False`` and is logged so the config drift is
+    visible in the run's own log output rather than silently taking effect.
+    """
+    if isinstance(value, bool):
+        return value
+    _log.warning(
+        "%s live_execution_enabled must be a JSON boolean, got %s (%r); disabling live execution",
+        source_label,
+        type(value).__name__,
+        value,
+    )
+    return False
+
+
 def load_stream_config(
     config_dir,
     *,
@@ -1377,7 +1537,9 @@ def load_stream_config(
     # Master placement switch. Absent means enabled, matching MorningConfig's
     # default, so an existing stream's config gains nothing by omission.
     if "live_execution_enabled" in raw:
-        kwargs["live_execution_enabled"] = bool(raw["live_execution_enabled"])
+        kwargs["live_execution_enabled"] = _coerce_live_execution_enabled(
+            raw["live_execution_enabled"], source_label=source_label
+        )
 
     sizing = raw.get("sizing_ladder", {})
     if "base_amount_usd" in sizing:
@@ -2367,9 +2529,77 @@ class MorningDCAExecutor(DCAExecutor):
             if signal.action != Action.BUY or signal.multiplier <= 0:
                 continue
             ticker = signal.ticker
+            slot_key = self._credit_idempotency_key(now, manual=manual)
+            try:
+                cached_decision = self.credit_ledger.recorded_decision(
+                    ticker, trading_day.isoformat(), slot_key
+                )
+            except Exception as exc:  # noqa: BLE001
+                cached_decision = None
+                _log.warning(
+                    "cumulative credit ledger idempotency read failed for %s: %s",
+                    ticker,
+                    exc,
+                )
+            if cached_decision is not None:
+                # THIS slot's own earlier attempt already durably recorded a
+                # stays-pending decline for this ticker (the only record()
+                # call site that supplies an idempotency_key is the
+                # stays-pending branch below). Recomputing from current price
+                # data here and combining it with pending_usd() -- which
+                # already reflects that earlier attempt's write -- would
+                # double count a single slot's decline across a crash retry:
+                # the combined total can cross the order threshold purely
+                # from being retried, and because it is then positive the
+                # stays-pending branch below (the only one that consults this
+                # idempotency key) is skipped, so the check never runs at all
+                # (Codex review: "Apply retry idempotency before recomputing
+                # the credit" -- "check the slot key before applying the
+                # current decline"). Reuse the cached decision unchanged
+                # instead: it is always order_amount_usd == 0 at this call
+                # site, so this candidate contributes no incremental order
+                # this run (see _effective_buy_amount, which would otherwise
+                # fall back to the full hypothetical amount for a ticker
+                # missing from this dict entirely).
+                prior = prior_allocations.get(ticker)
+                desired, effective_base = resolve_top_up_desired_amount_usd(
+                    prior, signal.multiplier, signal.hypothetical_amount_usd, signal.selected_base_amount_usd
+                )
+                outcomes[ticker] = TopUpOutcome(
+                    ticker=ticker,
+                    desired_amount=desired,
+                    decision_price=signal.current_price,
+                    prior_same_day_amount=round(prior.amount_usd, 2) if prior else 0.0,
+                    prior_same_day_reference_price=prior.reference_price if prior else None,
+                    prior_same_day_run_id=prior.run_id if prior else None,
+                    prior_same_day_source=prior.source if prior else None,
+                    incremental_order_amount=round(max(0.0, cached_decision.order_amount_usd), 2),
+                    top_up_guard_result=TOP_UP_NO_INCREMENTAL,
+                    top_up_skipped=True,
+                    effective_base_amount_usd=effective_base,
+                    cumulative_credit_decline_usd=None,
+                )
+                continue
             try:
                 existing_pending_credit_usd = self.credit_ledger.pending_usd(
                     ticker, trading_day.isoformat()
+                )
+                # THIS slot's own earlier (blocked) attempt may have already
+                # folded its decline into the durable balance above via
+                # preserve_pending(). Subtracting it back out before
+                # recomputing a fresh decline for this same slot avoids
+                # double-counting that same-slot contribution -- unlike the
+                # stays-pending case handled by recorded_decision above, a
+                # blocked placement must still be free to retry (a later
+                # gate check might now pass), so it cannot simply reuse a
+                # cached final decision here (Codex review: "Recognize
+                # preserved credits before recomputing the slot").
+                existing_pending_credit_usd = max(
+                    0.0,
+                    existing_pending_credit_usd
+                    - self.credit_ledger.preserved_credit_for_slot(
+                        ticker, trading_day.isoformat(), slot_key
+                    ),
                 )
             except Exception as exc:  # noqa: BLE001
                 existing_pending_credit_usd = 0.0
@@ -2386,7 +2616,20 @@ class MorningDCAExecutor(DCAExecutor):
             if (
                 outcome.cumulative_credit_decline_usd is not None
                 and outcome.incremental_order_amount <= 0
-                and not self._credit_decline_already_recorded_this_slot(now, ticker)
+                # _credit_decline_already_recorded_this_slot always reads the
+                # FIXED scheduled run_state_dir(now), regardless of `manual`.
+                # A manual run must never consult it: the ledger key it would
+                # be guarding against reusing is now manual-unique (see
+                # _credit_idempotency_key), but this artifact-based check has
+                # no such distinction -- a manual poll can find an UNRELATED
+                # scheduled slot's already-recorded pending decline for the
+                # same ticker and wrongly treat its own new, genuinely
+                # different decline as already recorded, silently dropping it
+                # (Codex review: "Bypass the scheduled artifact guard for
+                # manual credits"). Scheduled runs keep this belt-and-braces
+                # check alongside the ledger-based recorded_decision() short
+                # circuit above; manual runs rely on the ledger alone.
+                and (manual or not self._credit_decline_already_recorded_this_slot(now, ticker))
             ):
                 # The credit policy decided this decline stays pending -- no
                 # broker order will be attempted for this ticker this run, so
@@ -2404,6 +2647,36 @@ class MorningDCAExecutor(DCAExecutor):
                         final_session=False,
                         stream=self._idempotency_stream(),
                         recorded_at=now.astimezone(timezone.utc).isoformat(),
+                        # This slot's own dated state-directory name (or, for
+                        # a manual run, a stable per-invocation manual ID) --
+                        # stable across a scheduler retry of the SAME firing
+                        # but distinct for a new day, a different slot, or a
+                        # separate manual invocation. Makes the ledger itself
+                        # reject a double-apply if the process crashes after
+                        # this write but before run_state.json is persisted,
+                        # closing the gap left by
+                        # _credit_decline_already_recorded_this_slot's
+                        # artifact-only check above (Codex review: "Make
+                        # pending-credit recording retry-idempotent",
+                        # "Give distinct manual runs distinct credit keys").
+                        idempotency_key=slot_key,
+                        # existing_pending_credit_usd above already netted
+                        # THIS slot's own earlier preserved contribution out
+                        # of the ledger's raw pending balance so the ORDER
+                        # decision above wouldn't double-count it. record()
+                        # itself would otherwise re-read that same raw
+                        # (still includes this slot's stale, larger
+                        # contribution) balance and combine it with
+                        # outcome.cumulative_credit_decline_usd a second
+                        # time -- a retry recomputing a smaller decline could
+                        # then cross the order threshold from double-
+                        # counting alone and clear the pending balance even
+                        # though this run submitted no broker order (Codex
+                        # review: "Do not re-record adjusted credits against
+                        # the full ledger"). Passing the already-netted
+                        # baseline here keeps this write consistent with the
+                        # decision _evaluate_top_up actually made.
+                        pending_baseline_usd=existing_pending_credit_usd,
                     )
                 except Exception as exc:  # noqa: BLE001
                     _log.warning(
@@ -2661,6 +2934,31 @@ class MorningDCAExecutor(DCAExecutor):
             return f"{self.profile['manual_run_id_prefix']}_{now_utc.strftime('%Y%m%d_%H%M%S')}Z_{unique}"
         return f"{self.profile['scheduled_run_id_prefix']}_{now_et.strftime('%Y%m%d')}_{self.profile['folder_suffix']}"
 
+    def _credit_idempotency_key(self, now: datetime, *, manual: bool) -> str:
+        """A cumulative-credit-ledger idempotency key stable across retries of
+        ONE firing but distinct from every other firing.
+
+        Scheduled runs key on ``run_state_dir(now).name`` (the fixed dated
+        slot directory), which a scheduler retry of the same firing reuses
+        unchanged. Manual runs must NOT key on that same fixed slot
+        directory: unlike a scheduled retry, every legitimate manual rerun of
+        the same slot on a trading day is a distinct real invocation, and
+        sharing one key would make a later manual run's genuinely new credit
+        look like a retry of an earlier one and silently drop it (Codex
+        review: "Give distinct manual runs distinct credit keys"). Instead
+        this mints (and caches, so every credit-ledger call within the same
+        manual process invocation agrees) a stable per-invocation manual ID
+        via ``run_id(manual=True)``, which is itself already unique per
+        manual call thanks to its random suffix.
+        """
+        if not manual:
+            return self.run_state_dir(now).name
+        cached = getattr(self, "_cached_manual_credit_idempotency_key", None)
+        if cached is None:
+            cached = self.run_id(now, manual=True)
+            self._cached_manual_credit_idempotency_key = cached
+        return cached
+
     def run_classification(self, now: datetime, *, manual: bool = False) -> Dict[str, Any]:
         """Build the morning run-classification block for the active mode.
 
@@ -2825,7 +3123,31 @@ class MorningDCAExecutor(DCAExecutor):
             bars = []
             warnings.append(f"intraday provider error: {exc}")
 
-        current_price = self._current_price(data, ticker, decision_dt, bars, warnings)
+        # Price provenance + intraday OHLCV for the observation archive. Filled
+        # in by _current_price as it resolves the price, then folded into the
+        # signal so every artifact path (signals.csv, run_state, the archive)
+        # sees the same numbers from one evaluation (dca_intraday_archive).
+        #
+        # Restricted to bars at or before the same completed-bar anchor
+        # _current_price uses to pick the decision bar: the provider's
+        # request window ends at decision_dt, but when bar timestamps denote
+        # bar starts the newly opened bar at decision_dt is not yet complete
+        # and _current_price deliberately excludes it. Aggregating the
+        # unfiltered list here would let that bar's high/low/volume leak into
+        # the archived session statistics even though the decision price
+        # never reflects it (Codex review: "Exclude unfinished bars from
+        # session aggregates").
+        bar_anchor = completed_bar_anchor(decision_dt, self.config.interval_minutes, self._sizing_config)
+        completed_bars = [b for b in bars if b.timestamp <= bar_anchor]
+        provenance: Dict[str, Any] = dict(session_stats(completed_bars))
+        if prev_bar is not None:
+            provenance["previous_close_as_of"] = prev_bar.timestamp
+        current_price = self._current_price(
+            data, ticker, decision_dt, bars, warnings, provenance
+        )
+        observation = PriceObservation(
+            **{k: v for k, v in provenance.items() if k in PriceObservation._ROW_FIELDS}
+        )
 
         if previous_close is None or not previous_close or current_price is None:
             return MorningSignal(
@@ -2840,6 +3162,7 @@ class MorningDCAExecutor(DCAExecutor):
                 hypothetical_amount_usd=0.0,
                 warnings=tuple(warnings),
                 previous_low=previous_low,
+                observation=observation,
             )
 
         drop_fraction = (previous_close - current_price) / previous_close
@@ -2949,6 +3272,7 @@ class MorningDCAExecutor(DCAExecutor):
             previous_low=previous_low,
             selected_base_amount_usd=selected_base_amount_usd if action == Action.BUY else 0.0,
             base_selection_reason=base_selection_reason,
+            observation=observation,
         )
 
     def _trend_validated(
@@ -2999,9 +3323,45 @@ class MorningDCAExecutor(DCAExecutor):
         decision_dt: datetime,
         bars: Sequence[Bar],
         warnings: List[str],
+        provenance: Optional[Dict[str, Any]] = None,
     ) -> Optional[float]:
+        """Resolve the decision price, optionally recording where it came from.
+
+        ``provenance``, when supplied, is filled in with the price's origin
+        (``quote`` vs ``completed_bar``), its as-of timestamp, and the decision
+        bar's OHLCV. The return value is unchanged, so callers and tests that
+        only want the price are unaffected -- this exists because the price
+        alone, with no timestamp and no volume, is not enough to archive the
+        poll as a time series (see :mod:`dca_intraday_archive`).
+        """
         bar_anchor = completed_bar_anchor(decision_dt, self.config.interval_minutes, self._sizing_config)
         bar = latest_bar_at_or_before(bars, bar_anchor)
+
+        def _record(**fields: Any) -> None:
+            if provenance is not None:
+                provenance.update(fields)
+
+        _record(
+            interval_minutes=self.config.interval_minutes,
+            # Completed bars only, matching the same bar_anchor this method
+            # uses to pick the decision bar and the caller now uses to build
+            # session_stats: the provider's request window ends at
+            # decision_dt, so counting the full unfiltered list here would
+            # report one more completed interval than the OHLCV aggregates
+            # and decision price actually cover when a newly opened,
+            # not-yet-finished bar is included (Codex review: "Count only
+            # completed bars in archived observations").
+            bar_count=sum(1 for b in bars if b.timestamp <= bar_anchor),
+        )
+        if bar is not None:
+            _record(
+                bar_timestamp=bar.timestamp,
+                bar_open=bar.open,
+                bar_high=bar.high,
+                bar_low=bar.low,
+                bar_close=bar.close,
+                bar_volume=bar.volume,
+            )
 
         get_quote = getattr(data, "get_quote", None)
         if callable(get_quote):
@@ -3009,9 +3369,17 @@ class MorningDCAExecutor(DCAExecutor):
                 quote = get_quote(ticker, decision_dt)
                 if quote is not None and isinstance(quote, (tuple, list)) and len(quote) >= 1:
                     quote_time = quote[1] if len(quote) >= 2 else None
+                    # Record the raw quote whether or not it is accepted below:
+                    # a rejected quote is exactly the case where knowing what the
+                    # provider actually returned is worth having later.
+                    _record(
+                        quote_price=_finite_float_or_none(quote[0]),
+                        quote_time=quote_time if isinstance(quote_time, datetime) else None,
+                    )
                     if isinstance(quote_time, datetime) and bar_anchor <= quote_time <= decision_dt:
                         quote_price = float(quote[0])
                         if quote_price > 0:
+                            _record(price_source="quote", price_as_of=quote_time)
                             return quote_price
                         warnings.append(
                             f"quote price {quote_price!r} is not positive; falling back to completed bar"
@@ -3045,6 +3413,7 @@ class MorningDCAExecutor(DCAExecutor):
         if not math.isfinite(bar.close) or bar.close <= 0:
             warnings.append(f"completed bar close {bar.close!r} is not positive; rejecting")
             return None
+        _record(price_source="completed_bar", price_as_of=bar.timestamp)
         return bar.close
 
     def evaluate(self, now: datetime, data: Any, *, manual: bool = False) -> List[MorningSignal]:
@@ -3522,7 +3891,59 @@ class MorningDCAExecutor(DCAExecutor):
                 paths,
             )
 
+        self._archive_observations(artifacts, out, paths, run_state_path)
         return paths
+
+    def _archive_observations(
+        self,
+        artifacts: Dict[str, Any],
+        out: Path,
+        paths: Dict[str, str],
+        run_state_path: Path,
+    ) -> None:
+        """Record this poll's prices/timestamps in the shared intraday archive.
+
+        Runs for EVERY mode -- watchlist, pre-flight, live, manual -- because
+        every one of them prices the whole universe, and a price observed at
+        9:45 is no less real for having been observed by a read-only scan. The
+        archive's natural key includes the stream and slot, so the streams never
+        collide (see dca_intraday_archive.append_observations).
+
+        Best-effort by contract: a failure is recorded on the run_state as
+        ``intraday_archive.error`` and never raised. This runs after every other
+        artifact has already been written, so nothing a live run depends on is
+        downstream of it; ``run_state.json`` is then re-persisted so the summary
+        is durable, and even THAT re-write is guarded -- the already-valid
+        run_state on disk must survive a failure to annotate it.
+        """
+        observations = observations_from_signal_rows(
+            artifacts.get("signal_rows") or [],
+            run_classification=artifacts.get("run_classification") or {},
+            generated_at=artifacts.get("generated_at"),
+            data_source=str(artifacts.get("data_source") or ""),
+            trading_day=artifacts.get("trading_day"),
+        )
+        snapshot_path = write_run_snapshot(out, observations)
+        if snapshot_path:
+            paths["observations"] = snapshot_path
+        summary = archive_observations_safely(observations)
+        summary["observations"] = len(observations)
+        summary["run_snapshot"] = snapshot_path
+        artifacts["intraday_archive"] = summary
+        if not summary.get("ok"):
+            _log.warning(
+                "intraday observation archive write failed for %s: %s",
+                artifacts.get("run_id"),
+                summary.get("error"),
+            )
+        try:
+            atomic_write_text(
+                run_state_path, json.dumps(artifacts, indent=2, sort_keys=True)
+            )
+        except (OSError, TypeError, ValueError) as exc:  # noqa: BLE001
+            _log.warning(
+                "could not annotate run_state with intraday archive summary: %s", exc
+            )
 
     def _blocked_live_result(
         self,
@@ -4388,22 +4809,6 @@ class MorningDCAExecutor(DCAExecutor):
                 }
                 continue
 
-            # Shared daily order-ATTEMPT ceiling (config/budgets.json
-            # circuit_breakers.max_orders_per_day, seeded cross-stream in
-            # _compute_top_up above) -- a pure local check, ahead of the
-            # broker round-trip, mirroring the per-order ceiling above (Codex
-            # review: "Enforce the shared daily order-count cap in new
-            # executors").
-            _max_orders_per_day = self.config.max_orders_per_day
-            if _max_orders_per_day is not None and self.ledger.day_attempts(trading_day) >= _max_orders_per_day:
-                outcomes[ticker] = {
-                    "status": "blocked",
-                    "skip_reason": f"exceeds {_max_orders_per_day} order daily attempt cap",
-                    "deliberate_skip": True,
-                    "budget_blocked": True,
-                }
-                continue
-
             # Bypass the broad same-day duplicate check only when there is an actual
             # cross-stream prior allocation (top-up guard result is not 'no_prior_run').
             # Even then, keep a same-stream ref-id check so retrying this stream after
@@ -4512,9 +4917,39 @@ class MorningDCAExecutor(DCAExecutor):
                     outcomes[ticker] = {
                         "status": "skipped",
                         "skip_reason": f"{duplicate_reason} (duplicate top-up retry; already recorded by the original run)",
+                        # The original (non-duplicate) attempt already settled
+                        # this ticker's credit via _place_broker_orders'
+                        # confirmed-submission path, so the post-loop credit
+                        # preservation pass below must not treat this as an
+                        # unresolved block and record the decline a second time.
+                        "credit_already_resolved": True,
                     }
                 else:
                     outcomes[ticker] = {"status": "skipped", "skip_reason": duplicate_reason}
+                continue
+
+            # Shared daily order-ATTEMPT ceiling (config/budgets.json
+            # circuit_breakers.max_orders_per_day, seeded cross-stream in
+            # _compute_top_up above) -- a pure local check, ahead of the
+            # broker round-trip, mirroring the per-order ceiling above (Codex
+            # review: "Enforce the shared daily order-count cap in new
+            # executors"). Runs AFTER the duplicate-recovery check above, not
+            # before: a preserved duplicate creates no new attempt (it was
+            # already counted when the earlier attempt actually placed the
+            # order), so enforcing this cap first could wrongly block the
+            # recovery path and overwrite the dated-slot artifact's real
+            # "submitted" row with a fabricated "blocked" one on a retry that
+            # itself brought the shared attempt count to the cap (Codex
+            # review: "Check for preserved duplicates before enforcing the
+            # attempt cap").
+            _max_orders_per_day = self.config.max_orders_per_day
+            if _max_orders_per_day is not None and self.ledger.day_attempts(trading_day) >= _max_orders_per_day:
+                outcomes[ticker] = {
+                    "status": "blocked",
+                    "skip_reason": f"exceeds {_max_orders_per_day} order daily attempt cap",
+                    "deliberate_skip": True,
+                    "budget_blocked": True,
+                }
                 continue
 
             # Enforce daily/weekly caps against pre-run remaining budget.
@@ -4698,12 +5133,58 @@ class MorningDCAExecutor(DCAExecutor):
                         ticker,
                         trading_day.isoformat(),
                         notional,
+                        final_session=False,
                         stream=self._idempotency_stream(),
                     )
                 except Exception as exc:  # noqa: BLE001
                     _log.warning(
                         "cumulative credit ledger settlement failed for %s: %s", ticker, exc
                     )
+        # Preserve threshold-crossing credits that a LATER gate blocked before
+        # placement. _evaluate_top_up's cumulative_credit_decline_usd is only
+        # durably recorded above in two places: _compute_top_up (when the
+        # credit stays fully pending) and the confirmed-submission settle()
+        # call just above (when the order actually went through). A candidate
+        # whose combined pending+this-run credit crossed the order threshold
+        # (incremental_order_amount > 0) but was then blocked by the per-order
+        # ceiling, the shared attempt cap, a duplicate-check error, the daily/
+        # weekly cap, the spread gate, tradability, buying power, review, or
+        # the broker call itself falls through neither write -- the new
+        # decline this run computed would otherwise be silently lost rather
+        # than staying pending for a later slot or the 3:30 PM final session
+        # (Codex review: "Preserve threshold-crossing credits when placement
+        # is blocked"). Excludes "submitted"/"dry_run" (settled above) and
+        # outcomes explicitly marked credit_already_resolved (a same-stream
+        # duplicate whose credit was settled by the ORIGINAL attempt this slot).
+        for signal in candidates:
+            ticker = signal.ticker
+            top_up = (top_up_outcomes or {}).get(ticker)
+            if (
+                top_up is None
+                or top_up.cumulative_credit_decline_usd is None
+                or top_up.incremental_order_amount <= 0
+            ):
+                continue
+            outcome = outcomes.get(ticker)
+            if not isinstance(outcome, dict):
+                continue
+            if outcome.get("status") in ("submitted", "dry_run") or outcome.get(
+                "credit_already_resolved"
+            ):
+                continue
+            try:
+                self.credit_ledger.preserve_pending(
+                    ticker,
+                    trading_day.isoformat(),
+                    top_up.cumulative_credit_decline_usd,
+                    stream=self._idempotency_stream(),
+                    recorded_at=(now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat(),
+                    idempotency_key=self._credit_idempotency_key(now, manual=manual) if now is not None else None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _log.warning(
+                    "cumulative credit ledger preserve_pending failed for %s: %s", ticker, exc
+                )
         # Stamp the spread verdict onto every outcome for a ticker that reached the
         # gate but was decided after it (tradability, buying power, review,
         # placement). The rows blocked AT the gate already carry their own verdict
@@ -4787,6 +5268,17 @@ class MorningDCAExecutor(DCAExecutor):
         # allocations (Codex review).
         self._in_flight_broker_outcomes = {}
         self._in_flight_signals_by_ticker = {}
+        # Likewise for the manual credit-ledger idempotency key
+        # (_credit_idempotency_key): it is cached on first use WITHIN one
+        # run() call so every credit-ledger read/write inside that call
+        # agrees, but the executor instance is reused across calls, so
+        # leaving it set would hand a LATER manual invocation the FIRST
+        # invocation's key despite having its own distinct run_id. A later,
+        # genuinely lower-price manual poll would then look like an
+        # idempotent replay of the earlier one and have its new pending
+        # credit silently discarded (Codex review: "Reset the manual credit
+        # key for every run invocation").
+        self._cached_manual_credit_idempotency_key = None
         try:
             return guarded_run(
                 self.stream,

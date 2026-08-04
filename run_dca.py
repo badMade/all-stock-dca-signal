@@ -83,12 +83,14 @@ from scripts.model_usage_log import log_model_usage
 from scripts.run_classification import (
     CANONICAL_RETIME_DATE_YYYYMMDD,
     ERROR_CLASS_BLOCKED_BEFORE_PLACEMENT,
+    ERROR_CLASS_RECOVERY_FAILURE,
     LEGACY_SCHEDULED_WINDOW_START_ET,
     ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED,
     ORDER_SUBMIT_STATUS_SUBMITTED,
     RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION,
     SCHEDULED_WINDOW_START_ET,
     build_raw_persistence_state,
+    build_recovery_state,
     load_same_day_top_up_context,
     raw_persistence_failure_run_state,
     save_raw_input,
@@ -1363,6 +1365,52 @@ def _tickers_with_unresolved_same_day_context(
     )
 
 
+# Recovery triggers whose failure mode a SECOND IN-PROCESS ATTEMPT can plausibly
+# clear. Deliberately narrow: this process cannot re-fetch market data (see
+# _recovery_trigger_for), so the only genuinely transient class it can retry is
+# a filesystem/IO fault while staging, normalizing, or swapping raw/ -- a
+# partial write, an interrupted rename, a transient permission or ENOSPC blip.
+# Everything else is deterministic on the same in-memory payload and would fail
+# identically, so it escalates immediately rather than burning the single
+# permitted attempt (config/scheduled_tasks.json: failure_recovery_policy).
+RECOVERY_RETRY_TRIGGERS = frozenset({"raw_file_write_failure"})
+
+
+def _recovery_trigger_for(exc: BaseException) -> Optional[str]:
+    """Classify a raw-persistence failure into a ``RECOVERY_TRIGGER_REASONS`` value.
+
+    Returns ``None`` when the failure is not a recovery trigger at all (e.g. the
+    contract error raised for absent/empty ``raw_connector_inputs``, which is a
+    caller/configuration fault, not a transient one -- retrying it in-process
+    cannot help and stamping it as a recovery would misreport a config bug as a
+    transient blip).
+
+    IMPORTANT SCOPE NOTE. ``failure_recovery_policy`` in
+    ``config/scheduled_tasks.json`` describes recovery as "rerun the required
+    read-only inputs once, persist all raw responses first, recompute only from
+    the persisted files." Only the *second and third* clauses are implementable
+    here. ``run_dca.py`` receives ``raw_connector_inputs`` as an
+    already-fetched, immutable mapping and holds no MCP/broker/market-data
+    access of its own (docs/live_wiring.md: providers "arrive as injected
+    callables"), so it CANNOT re-fetch. ``transient_connector_throttling``
+    therefore classifies but never retries in-process -- clearing it requires a
+    fresh fetch, which only the invoking agent session can perform. This
+    function's job is to keep that boundary explicit instead of silently
+    pretending a full recovery ran.
+    """
+    # OSError covers PermissionError/FileNotFoundError/OSError(ENOSPC) raised by
+    # save_raw_input's write, the staging rmtree, and the raw/ <-> raw.bak
+    # renames -- the retryable class.
+    if isinstance(exc, OSError):
+        return "raw_file_write_failure"
+    if isinstance(exc, json.JSONDecodeError):
+        return "parsing_failure"
+    message = str(exc)
+    if "normalization failed" in message:
+        return "wrapper_normalization_failure"
+    return None
+
+
 def _prior_submitted_order_rows(run_dir: Path) -> List[Dict[str, Any]]:
     """Submitted-order rows already recorded for this slot by an earlier attempt.
 
@@ -1949,7 +1997,28 @@ def _run_pipeline_impl(
             # (inside the try) so a durable no-order run_state is always written.
             _needs_raw = raw_connector_inputs is not None or not config.dry_run
             if _needs_raw:
-                try:
+                # Captured BEFORE any attempt: _build_frozen_providers_from_raw
+                # WRAPS the providers it is given, so a retry must start from the
+                # originals. Re-freezing an already-frozen provider would stack a
+                # second replay layer over the first.
+                _base_finance_data = finance_data
+                _base_robinhood_data = robinhood_data
+                # Set only when a recovery retry is actually ATTEMPTED, so the
+                # escalation state below can distinguish "retried once and still
+                # failed" from "failed deterministically, no retry warranted".
+                _recovery_trigger: Optional[str] = None
+
+                def _persist_raw_and_freeze() -> Tuple[Dict[str, Any], Any, Any]:
+                    """Stage, normalize and swap ``raw/``, then freeze providers from it.
+
+                    Extracted so the automatic-failure-recovery path below can run
+                    it a second time. It is idempotent by construction: it rmtree's
+                    any leftover staging directory on entry, restores ``raw.bak``
+                    from an interrupted prior swap, and reads only the immutable
+                    ``raw_connector_inputs`` mapping plus the pre-attempt providers
+                    captured above -- so a second call neither sees nor leaves
+                    state from the first.
+                    """
                     if raw_connector_inputs is None or (
                         not config.dry_run and not raw_connector_inputs
                     ):
@@ -2013,29 +2082,108 @@ def _run_pipeline_impl(
                             shutil.rmtree(raw_backup)
                         else:
                             raw_backup.rename(raw_dir)
+                    _had_backup = False
                     if raw_dir.exists():
                         raw_dir.rename(raw_backup)
+                        _had_backup = True
                         try:
                             staging_dir.rename(raw_dir)
                         except Exception:
                             raw_backup.rename(raw_dir)
                             raise
-                        shutil.rmtree(raw_backup, ignore_errors=True)
+                        # raw_backup is deliberately NOT removed yet: it is the
+                        # prior successful run's raw audit/replay record, and
+                        # this swap alone does not guarantee this attempt's
+                        # raw/ is actually usable -- strict replay validation
+                        # happens next, in _build_frozen_providers_from_raw.
+                        # Removing the backup here would let a failure in that
+                        # validation (or in building the persistence state)
+                        # permanently destroy the prior good snapshot even
+                        # though this attempt never produced a usable
+                        # replacement (Codex review: "Keep the prior raw
+                        # snapshot until replay validation succeeds").
                     else:
                         staging_dir.rename(raw_dir)
-                    raw_persistence_state = build_raw_persistence_state(
-                        trading_day_raw, raw_dir=raw_dir
-                    )
                     # Rebuild both providers from the persisted, normalized files so
                     # run_daily_compact() computes from the exact archived snapshot and
                     # not potentially-stale live MCP calls made at a different time.
-                    finance_data, robinhood_data = _build_frozen_providers_from_raw(
-                        finance_data,
-                        robinhood_data,
-                        raw_dir,
-                        strict_finance=not config.dry_run,
-                        strict_robinhood=not config.dry_run,
-                    )
+                    try:
+                        _frozen_finance, _frozen_robinhood = _build_frozen_providers_from_raw(
+                            _base_finance_data,
+                            _base_robinhood_data,
+                            raw_dir,
+                            strict_finance=not config.dry_run,
+                            strict_robinhood=not config.dry_run,
+                        )
+                        _persistence_state = build_raw_persistence_state(
+                            trading_day_raw, raw_dir=raw_dir
+                        )
+                    except Exception:
+                        if _had_backup:
+                            # This attempt's raw/ never became usable -- restore
+                            # the prior successful run's snapshot rather than
+                            # leaving this attempt's (unusable) files in place.
+                            shutil.rmtree(raw_dir, ignore_errors=True)
+                            raw_backup.rename(raw_dir)
+                        raise
+                    if _had_backup:
+                        shutil.rmtree(raw_backup, ignore_errors=True)
+                    return (_persistence_state, _frozen_finance, _frozen_robinhood)
+
+                try:
+                    # AUTOMATIC FAILURE RECOVERY (failure_recovery_policy in
+                    # config/scheduled_tasks.json; docs/run_classification.md
+                    # #recovery-reruns). Exactly ONE in-process retry, and only for
+                    # a failure class a retry can plausibly clear -- see
+                    # _recovery_trigger_for for why that is filesystem/IO faults
+                    # only and why re-fetching connector data is out of scope here.
+                    # Nothing is loosened for the retry: it re-runs the identical
+                    # persist/normalize/swap/freeze sequence, and every downstream
+                    # signal, budget, spread, confidence, top-up and circuit-breaker
+                    # check still runs unchanged afterward. On success the run
+                    # continues in the SAME run directory and is stamped
+                    # recovery_rerun=true; it is never reclassified as manual.
+                    try:
+                        (
+                            raw_persistence_state,
+                            finance_data,
+                            robinhood_data,
+                        ) = _persist_raw_and_freeze()
+                    except Exception as _first_exc:  # noqa: BLE001 - classified below
+                        _first_trigger = _recovery_trigger_for(_first_exc)
+                        if _first_trigger not in RECOVERY_RETRY_TRIGGERS:
+                            # Deterministic on the same in-memory payload (or not a
+                            # recovery trigger at all): a second identical attempt
+                            # would fail identically, so escalate now rather than
+                            # spend the single permitted attempt.
+                            raise
+                        _recovery_trigger = _first_trigger
+                        logger.warning(
+                            "raw-persistence attempt 1 failed (%s: %s); running the single "
+                            "permitted automatic recovery retry in the same run directory",
+                            _first_trigger,
+                            _first_exc,
+                        )
+                        (
+                            raw_persistence_state,
+                            finance_data,
+                            robinhood_data,
+                        ) = _persist_raw_and_freeze()
+                        # Reached only when the retry itself succeeded, so both
+                        # flags are truthful: raw/ was rewritten before any compute,
+                        # and the providers below read only from those files.
+                        raw_persistence_state.update(
+                            build_recovery_state(
+                                _first_trigger,
+                                persisted_raw_first=True,
+                                recomputed_from_persisted=True,
+                            )
+                        )
+                        logger.warning(
+                            "automatic recovery retry SUCCEEDED (%s); continuing through the "
+                            "unchanged guarded path with recovery_rerun=true",
+                            _first_trigger,
+                        )
                 except (
                     Exception
                 ) as exc:  # noqa: BLE001 - failure must still write durable scheduled state
@@ -2085,6 +2233,46 @@ def _run_pipeline_impl(
                         classification_overrides=classification_overrides,
                         correlation_id=correlation_id,
                     )
+                    # Record the escalation when the single permitted recovery
+                    # retry was actually ATTEMPTED and still failed. Stamped only
+                    # in that case: a deterministic first failure escalates without
+                    # retrying (see the classifier above), and claiming
+                    # recovery_rerun/attempt=1 there would misreport a config or
+                    # payload fault as an exhausted transient recovery. The block
+                    # matches recovery_escalation_run_state()'s shape, which
+                    # run_state.schema.json requires whenever recovery_rerun=true;
+                    # it is merged into the existing failure state rather than
+                    # replacing it so the hardened prior-order preservation below
+                    # is kept intact.
+                    if _recovery_trigger is not None:
+                        failure_state["recovery_rerun"] = True
+                        failure_state["recovery"] = {
+                            "trigger_reason": _recovery_trigger,
+                            "attempt": 1,
+                            # The retry re-raised, so neither step completed.
+                            "persisted_raw_first": False,
+                            "recomputed_from_persisted": False,
+                            "escalated": True,
+                            "blocking_reason": str(exc),
+                        }
+                        # raw_persistence_failure_run_state() above always
+                        # stamps error_class=ERROR_CLASS_MISSING_RAW_INPUTS,
+                        # the generic first-attempt classification. An
+                        # exhausted recovery is a DIFFERENT failure mode --
+                        # the recovery contract's own recovery_escalation_run_state()
+                        # classifies it as ERROR_CLASS_RECOVERY_FAILURE -- so
+                        # without overriding it here, reporting keyed by
+                        # error_class misgroups an exhausted recovery as an
+                        # ordinary raw-persistence block on the very first
+                        # attempt (Codex review: "Stamp exhausted recovery
+                        # with recovery failure").
+                        failure_state["error_class"] = ERROR_CLASS_RECOVERY_FAILURE
+                        logger.error(
+                            "automatic recovery retry ALSO FAILED (%s: %s); escalating with "
+                            "a durable scheduled run_state rather than retrying further",
+                            _recovery_trigger,
+                            exc,
+                        )
                     # Preserve orders.csv from a prior successful run so that
                     # load_prior_same_day_allocations() can still find the fills
                     # even when this retry's raw-persistence fails.

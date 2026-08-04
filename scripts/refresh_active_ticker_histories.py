@@ -20,7 +20,9 @@ import urllib.parse
 from pathlib import Path
 from typing import Any
 
-DEFAULT_HISTORY_DIR = Path("ticker_histories")
+from dca_ticker_paths import configured_ticker_history_dir
+
+DEFAULT_HISTORY_DIR = configured_ticker_history_dir()
 DEFAULT_CONFIG = Path("config/tickers.json")
 FIELDS = ["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume", "Dividends", "Stock Splits"]
 USER_AGENT = "Mozilla/5.0 (compatible; AllStockDCAHistoryRefresh/1.0)"
@@ -121,13 +123,33 @@ def write_history(path: Path, rows: list[dict[str, str]]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--history-dir", type=Path, default=DEFAULT_HISTORY_DIR)
+    # No default= here on purpose: argparse would apply it unconditionally,
+    # so a caller who never passes --history-dir could not be distinguished
+    # from one who explicitly passed the default path. ticker_data/ is a
+    # gitignored symlink/mount to the managed Google Drive archive (CLAUDE.md:
+    # "Do not modify"); when it is missing, write_history()'s mkdir(parents=
+    # True) would otherwise silently materialize a real local ticker_data/
+    # stand-in that a later updater or calibration run checking
+    # configured_ticker_history_dir().is_dir() would mistake for the managed
+    # archive (Codex review: "Do not create a replacement ticker_data tree").
+    # An operator who passes --history-dir explicitly is opting into that
+    # location on purpose and is exempt from this guard.
+    parser.add_argument("--history-dir", type=Path, default=None)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--symbol", action="append", help="Refresh only this symbol; repeatable")
     parser.add_argument("--force", action="store_true", help="Replace an existing history file")
     parser.add_argument("--dry-run", action="store_true", help="Report the intended files without writing")
     parser.add_argument("--pause-seconds", type=float, default=1.0, help="Pause between remote requests")
     args = parser.parse_args()
+
+    using_default_history_dir = args.history_dir is None
+    history_dir = args.history_dir if args.history_dir is not None else DEFAULT_HISTORY_DIR
+    if using_default_history_dir and not history_dir.is_dir():
+        parser.error(
+            f"default ticker history archive {history_dir} does not exist "
+            "(missing or unmounted Drive link?) -- refusing to create a local stand-in; "
+            "pass --history-dir to write to a different location"
+        )
 
     configured = active_symbols(args.config)
     requested = args.symbol or configured
@@ -138,7 +160,7 @@ def main() -> int:
     failures: list[str] = []
     changed = 0
     for symbol in requested:
-        destination = args.history_dir / f"{symbol}.csv"
+        destination = history_dir / f"{symbol}.csv"
         if destination.exists() and not args.force:
             print(f"SKIP {symbol}: existing history")
             continue

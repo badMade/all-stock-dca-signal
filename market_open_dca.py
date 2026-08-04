@@ -49,6 +49,33 @@ diffed against whatever actually traded the slot before it is trusted with money
 Writes ONLY under its own run-state root
 ``<cron_tracking_root>/market_open_dca/YYYYMMDD_0935ET/`` and never touches the
 morning, midday, intraday, or afternoon artifact trees.
+
+Inherited behavior this slot gets for free (documented 2026-08-03; previously
+undocumented here and absent from ``config/market_open_dca.json``, so a reader
+of either file alone would not know these apply):
+
+* **Raw connector-input persistence.** ``MorningDCAExecutor._run_impl()`` gates
+  raw persistence on ``mode == MORNING_LIVE_MODE and trades and not manual`` --
+  which is stream-agnostic and therefore TRUE for this slot. Every quote/bar/
+  broker response is written under this run's ``raw/`` via
+  ``_PersistingMarketDataProvider``/``_PersistingBrokerAdapter`` BEFORE any
+  signal, budget, or top-up computation, and a persistence failure fails closed
+  through ``_blocked_live_result(error_class='missing_or_invalid_raw_inputs')``
+  before any order could be placed. ``config/market_open_dca.json`` has no
+  ``raw_data_persistence`` block (unlike ``config/morning_dca.json``) and omits
+  these files from its ``state_file_guarantee.always_write`` list, but they are
+  written regardless.
+* **Post-artifact drift detection.** The inherited ``_run_drift_check()`` call
+  fires for this slot too, reconciling signals against submitted orders. This
+  module contains no literal ``drift_detection`` reference precisely because it
+  does not override ``_run_impl``.
+* **``budget_ledger.json``.** ``writes_budget_ledger = True`` below causes
+  ``write_artifacts()`` to emit it on every live run; it is likewise missing
+  from the config's ``always_write`` list.
+
+Because all three arrive by NOT overriding ``_run_impl``/``write_artifacts``,
+overriding either method here without re-invoking ``super()`` would silently
+drop raw persistence, the fail-closed guard, and drift detection at once.
 """
 
 from __future__ import annotations

@@ -1079,6 +1079,129 @@ def test_load_midday_config_reads_config_file(tmp_path):
     assert cfg.prior_allocation_roots == ("/custom/morning/root",)
 
 
+def test_load_midday_config_rejects_a_quoted_live_execution_enabled(tmp_path):
+    # Codex review ("Reject non-boolean values for the midday live switch"):
+    # bool("false") is True in Python, so an operator who tried to disable
+    # live placement with a quoted JSON string would silently leave it
+    # enabled -- the opposite of what the config says, in the master switch
+    # that gates real broker orders. A malformed type must fail closed.
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "midday_dca.json").write_text(
+        json.dumps({"live_execution_enabled": "false"}), encoding="utf-8"
+    )
+
+    cfg = load_midday_config(str(cfg_dir))
+
+    assert cfg.live_execution_enabled is False
+
+
+def test_manual_run_does_not_consult_the_scheduled_artifact_guard(tmp_path):
+    # Codex review ("Bypass the scheduled artifact guard for manual
+    # credits"): _credit_decline_already_recorded_this_slot always reads the
+    # FIXED scheduled run_state_dir(now), regardless of the `manual` flag
+    # (morning's own manual path returns before ever reaching this check, so
+    # this is scoped to midday/intraday, which share the same
+    # _compute_top_up implementation). A manual poll's genuinely new decline
+    # for a ticker must not be silently dropped just because an UNRELATED
+    # scheduled slot already recorded its own (different) decline for that
+    # same ticker -- the manual ledger key is per-invocation-unique, so this
+    # is not a real retry of that scheduled slot.
+    #
+    # _evaluate_top_up is monkeypatched to return a fixed stays-pending
+    # decline directly, isolating the guard-bypass fix from the unrelated
+    # prior-allocation/base-selection plumbing that would otherwise need to
+    # be wired up just to reach a sub-dollar ladder increment.
+    from dca_cumulative import CumulativeCreditLedger
+    from morning_dca import TOP_UP_NO_INCREMENTAL, TopUpOutcome
+
+    cfg = MiddayConfig(
+        tickers=("AAPL",),
+        base_buy_amount_usd=1.0,
+        morning_run_state_root=str(tmp_path / "live"),
+        # A non-empty (but nonexistent, so nothing real is scanned) root:
+        # an EMPTY tuple would explicitly disable the whole per-ticker top-up
+        # guard and return {} before ever reaching the loop this test exercises.
+        prior_allocation_roots=(str(tmp_path / "no_prior"),),
+        cap_seed_roots=(),
+    )
+    ex = MiddayDCAExecutor(cfg, mode="live")
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "credits")
+    ex._evaluate_top_up = lambda signal, prior, *, existing_pending_credit_usd=0.0: TopUpOutcome(
+        ticker=signal.ticker,
+        desired_amount=1.0,
+        decision_price=signal.current_price,
+        prior_same_day_amount=0.0,
+        prior_same_day_reference_price=None,
+        prior_same_day_run_id=None,
+        prior_same_day_source=None,
+        incremental_order_amount=0.0,
+        top_up_guard_result=TOP_UP_NO_INCREMENTAL,
+        top_up_skipped=True,
+        cumulative_credit_decline_usd=0.30,
+    )
+    now = datetime(2026, 7, 8, 12, 30, tzinfo=EASTERN)
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=99.95,
+        previous_close=100.0,
+        drop_pct=0.05,
+        multiplier=1.3,
+        hypothetical_amount_usd=1.3,
+        selected_base_amount_usd=1.0,
+    )
+
+    # Simulate the SCHEDULED slot's own dated artifact already showing a
+    # recorded decline for AAPL -- as if an earlier scheduled run this same
+    # slot already credited it (unrelated to the manual run below).
+    run_dir = ex.run_state_dir(now)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": "2026-07-08",
+            "buy_candidates": [{"ticker": "AAPL", "cumulative_credit_decline_usd": 0.30}],
+        }),
+        encoding="utf-8",
+    )
+
+    # A manual run evaluating the SAME ticker must still record its own
+    # decline: it is not a retry of the scheduled slot above.
+    ex._compute_top_up(now, [signal], manual=True)
+    assert ex.credit_ledger.pending_usd("AAPL", "2026-07-08") == 0.30
+
+
+def test_load_midday_config_accepts_real_json_booleans(tmp_path):
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "midday_dca.json").write_text(
+        json.dumps({"live_execution_enabled": False}), encoding="utf-8"
+    )
+
+    cfg = load_midday_config(str(cfg_dir))
+
+    assert cfg.live_execution_enabled is False
+
+
+def test_load_midday_config_reads_shared_max_orders_per_day(tmp_path):
+    # Codex review ("Load the daily order cap for midday runs"): unlike
+    # load_morning_config/load_stream_config, load_midday_config never called
+    # load_max_orders_per_day, so MiddayConfig.max_orders_per_day stayed None
+    # and _place_broker_orders' shared eight-attempt cap never applied to the
+    # midday stream, letting it keep placing orders after the roster-wide
+    # daily attempt cap was already exhausted by an earlier stream.
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "midday_dca.json").write_text(json.dumps({}), encoding="utf-8")
+    (cfg_dir / "budgets.json").write_text(
+        json.dumps({"circuit_breakers": {"max_orders_per_day": 8}}), encoding="utf-8"
+    )
+    cfg = load_midday_config(str(cfg_dir))
+    assert cfg.max_orders_per_day == 8
+
+
 def test_load_midday_config_falls_back_on_invalid_utf8(tmp_path):
     cfg_dir = tmp_path / "config"
     cfg_dir.mkdir()

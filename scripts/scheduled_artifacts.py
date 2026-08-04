@@ -25,6 +25,7 @@ import json
 import math
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -975,6 +976,151 @@ def validate_run_artifacts(
     return ArtifactContractResult(not errors, errors)
 
 
+# --- Finalization grace period for a JUST-FIRED run --------------------------
+# Aug 3 2026 9:35 ET: a checker opened the run directory while the runner was
+# still mid-write. Only the raw-input subdirectory existed; the finalized
+# run_state.json, run_summary.json, and the order CSV had not appeared yet. The
+# check read that instant as a failed slot and escalated, and the run in fact
+# completed normally seconds later with 25 filled orders. Validating a run the
+# moment it fires is a race, not a verdict: a run directory is allowed to be
+# incomplete for a short window after the slot time.
+#
+# See docs/dca_operational_todos.md, "Artifact completion timing".
+
+# How long a caller waits for a just-fired run to finish writing before it
+# treats the artifact contract as failed, and how often it re-checks.
+FINALIZATION_GRACE_SECONDS = 20.0
+FINALIZATION_POLL_SECONDS = 1.0
+
+# run_state fields that mark a run as having REACHED a terminal state, in
+# preference order. A run mid-write has none of them: they are written with the
+# finalized state, not with the raw inputs. ``completion_reason`` is legitimately
+# null on a healthy run (morning_dca writes it as None), so no single field can
+# be required on its own -- any non-empty one satisfies the marker.
+COMPLETION_MARKER_FIELDS = (
+    "completion_reason",
+    "run_classification_outcome",
+    "order_submit_status",
+    "status",
+)
+
+
+def completion_marker(run_state: Any) -> Optional[str]:
+    """Name of the terminal completion marker ``run_state`` carries, or None.
+
+    None means the run has not yet declared a terminal state -- either it is
+    still being written, or its writer emits none of
+    :data:`COMPLETION_MARKER_FIELDS`. Callers must treat it as "not yet
+    finalized", never as "failed": absence of the marker is not evidence of a
+    bad run. See :func:`await_finalized_run_artifacts`.
+    """
+    if not isinstance(run_state, dict):
+        return None
+    for name in COMPLETION_MARKER_FIELDS:
+        value = run_state.get(name)
+        if value is not None and value != "":
+            return name
+    return None
+
+
+def read_run_state(run_dir: Path | str) -> Optional[Dict[str, Any]]:
+    """The run_state.json at ``run_dir``'s ROOT, or None when unusable.
+
+    Returns None -- never raises -- for a missing, unreadable, corrupt, or
+    non-object file, so a caller polling a directory that is still being written
+    can simply retry rather than special-case a half-flushed JSON file.
+    """
+    path = Path(run_dir) / RUN_STATE_FILENAME
+    try:
+        state = json.loads(path.read_bytes())
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+@dataclass
+class FinalizationResult:
+    """Outcome of waiting for a just-fired run to finish writing its artifacts.
+
+    ``contract`` is the LAST artifact-contract validation performed and stays
+    authoritative: ``ok``/``errors``/``bool()`` all delegate to it. ``finalized``
+    is the stricter reading -- the contract passed AND the run_state declares a
+    terminal state -- and is what a caller should require before reporting a run
+    as complete. A run whose contract passes but that never writes a completion
+    marker is reported ``ok=True, finalized=False``: the grace period can only
+    ever delay a verdict, never invent a failure the contract itself did not
+    find.
+    """
+
+    contract: ArtifactContractResult
+    finalized: bool
+    completion_marker: Optional[str] = None
+    waited_seconds: float = 0.0
+    polls: int = 1
+
+    @property
+    def ok(self) -> bool:
+        return self.contract.ok
+
+    @property
+    def errors(self) -> List[str]:
+        return self.contract.errors
+
+    def __bool__(self) -> bool:  # allow `if await_finalized_run_artifacts(...):`
+        return self.contract.ok
+
+
+def await_finalized_run_artifacts(
+    run_dir: Path | str,
+    *,
+    grace_seconds: float = FINALIZATION_GRACE_SECONDS,
+    poll_seconds: float = FINALIZATION_POLL_SECONDS,
+    sleep: Any = time.sleep,
+    monotonic: Any = time.monotonic,
+    **validate_kwargs: Any,
+) -> FinalizationResult:
+    """Validate a just-fired run's artifacts, allowing a short finalization window.
+
+    Re-runs :func:`validate_run_artifacts` until the run is finalized -- the
+    contract passes AND the run_state carries a completion marker (see
+    :func:`completion_marker`) -- or ``grace_seconds`` elapses. This is the check
+    to use on a run that fired MOMENTS ago; :func:`validate_run_artifacts` alone
+    remains correct for a run whose writer has already returned.
+
+    The window only ever delays the verdict. Once it expires the contract result
+    is returned exactly as :func:`validate_run_artifacts` computed it, so a run
+    that never writes a completion marker is not failed for that alone, and a
+    genuinely broken run is still reported with its real errors -- just
+    ``grace_seconds`` later. ``grace_seconds=0`` validates once with no wait.
+
+    ``sleep`` and ``monotonic`` are injectable so tests can drive the window
+    deterministically without real elapsed time. ``**validate_kwargs`` is passed
+    through to :func:`validate_run_artifacts` (``require_signals``,
+    ``require_submitted_orders``, ``require_summary``).
+    """
+    if poll_seconds <= 0:
+        # A non-positive interval spins without ever advancing an injected clock.
+        raise ValueError("poll_seconds must be positive")
+    started = monotonic()
+    polls = 0
+    while True:
+        polls += 1
+        contract = validate_run_artifacts(run_dir, **validate_kwargs)
+        marker = completion_marker(read_run_state(run_dir))
+        finalized = contract.ok and marker is not None
+        remaining = float(grace_seconds) - (monotonic() - started)
+        if finalized or remaining <= 0:
+            break
+        sleep(min(float(poll_seconds), remaining))
+    return FinalizationResult(
+        contract=contract,
+        finalized=finalized,
+        completion_marker=marker,
+        waited_seconds=monotonic() - started,
+        polls=polls,
+    )
+
+
 def csv_qualifying_notional_total(
     csv_path: Path, blank_status_means_filled: bool, *, skip_sink: Optional[List[Path]] = None
 ) -> float:
@@ -1168,6 +1314,13 @@ __all__ = [
     "write_submitted_orders_csv",
     "validate_run_artifacts",
     "ArtifactContractResult",
+    "FINALIZATION_GRACE_SECONDS",
+    "FINALIZATION_POLL_SECONDS",
+    "COMPLETION_MARKER_FIELDS",
+    "FinalizationResult",
+    "completion_marker",
+    "read_run_state",
+    "await_finalized_run_artifacts",
     "derive_valid_scheduled_evidence",
     "today_et",
     "csv_qualifying_notional_total",

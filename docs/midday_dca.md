@@ -195,18 +195,38 @@ largest tier threshold ≤ the actual drop wins.
 | Drop vs. prior close | Multiplier |
 |---|---|
 | < 0.1% | 0x (no buy) |
-| 0.1% – < 1% | 1x |
-| 1% – < 2% | 1.5x |
-| 2% – < 3% | 2x |
-| 3% – < 4% | 2.5x |
-| 4% – < 5% | 3x |
-| 5% – < 6% | 3.5x |
-| 6% – < 7% | 4x |
-| 7% – < 8% | 4.5x |
+| 0.1% – < 2% | 1x |
+| 2% – < 4% | 1.5x |
+| 4% – < 5% | 2x |
+| 5% – < 6% | 2.5x |
+| 6% – < 6.5% | 3x |
+| 6.5% – < 7% | 3.5x |
+| 7% – < 7.5% | 4x |
+| 7.5% – < 8% | 4.5x |
 | ≥ 8% | 5x (no upper cutoff) |
 
-Dollars = `base_amount_usd (default $2) × multiplier` (actual order size,
-subject to the top-up guard offset).
+**Corrected 2026-08-03.** This table previously showed a uniform 1%-step curve
+(0.1–<1% = 1x, 1–<2% = 1.5x, 2–<3% = 2x, …) that matched **neither the code nor
+any config file** — it was the superseded pre-2026-08-02 ladder shape. The rows
+above are verified against `config/midday_dca.json`'s `sizing_ladder.tiers`,
+which is byte-identical to `config/sizing_ladder.json` and to
+`MIDDAY_SIZING_TIERS = StrategyConfig().sizing_tiers` (`midday_dca.py`). The
+practical difference is large: a 3% drop is **1.5x**, not the 2.5x the old table
+claimed, and 3x now requires a **6%** drop rather than 4%.
+
+Dollars = `selected_base_amount_usd × multiplier`, where the base is the dynamic
+first-allocation base (**$2** below prior close *and* prior low, **$1** below
+prior close only) — not a flat $2 (actual order size, subject to the top-up
+guard offset).
+
+> **This shared table is the fallback, not the live curve.** As of 2026-08-04
+> `config/per_ticker_sizing.json` is `status: active` and carries an entry for
+> all 53 active symbols. 46 of them are volatility-calibrated from history; the
+> 7 listed in `fallback_tickers` (SPCX, DRAM, CBRS, FLKR, SATA, GFUZ, VT) have
+> too little history and carry a copy of the global fallback ladder instead.
+> `near_close_dca.graded_buy_multiplier` reads a ticker's calibrated tiers first
+> and falls back to the table above only for symbols with no entry — currently
+> none. See [strategy.md](strategy.md#sizing-ladder-latest-active).
 
 ## Budget ledger
 

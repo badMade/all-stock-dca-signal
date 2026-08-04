@@ -318,13 +318,63 @@ def test_pyproject_ships_every_live_stream_module_and_config():
         pyproject["tool"]["setuptools"]["data-files"]["share/all-stock-dca/config"]
     )
 
-    for module in ("market_open_dca", "intraday_dca", "dca_cumulative"):
+    for module in (
+        "market_open_dca",
+        "intraday_dca",
+        "dca_cumulative",
+        # dca_intraday_archive is imported unconditionally by both
+        # morning_dca and near_close_dca (Codex review: "Package the
+        # intraday archive module"); dca_ticker_paths is imported by the
+        # ticker-history update/calibration scripts.
+        "dca_intraday_archive",
+        "dca_ticker_paths",
+    ):
         assert module in py_modules, f"{module} must be listed in [tool.setuptools] py-modules"
 
     for config_file in ("config/market_open_dca.json", "config/intraday_dca.json"):
         assert config_file in config_data_files, (
             f"{config_file} must be listed in [tool.setuptools.data-files]"
         )
+
+
+def test_per_ticker_calibration_wires_the_artifact_event_to_the_guarded_command():
+    """Codex review ("Wire artifact events to event-calibrate"): the
+    claude-per-ticker-calibration task's upstream_trigger fires the SAME
+    command reused for the independent 6:30 PM ET scheduled run, which
+    scripts.run_ticker_maintenance's ``calibrate`` subcommand always runs
+    with force=True -- ignoring the event's own required_status/
+    required_nonempty_field guard and republishing unconditionally on a
+    partial or empty update event. A distinct ``artifact_event_command``
+    field pointing at the guarded ``event-calibrate`` subcommand (force=False)
+    closes that gap."""
+    tasks = _load("scheduled_tasks.json")["tasks"]
+    task = next(t for t in tasks if t["id"] == "claude-per-ticker-calibration")
+    assert task["trigger_mode"] == "scheduled_and_artifact_event"
+    assert task["command"].endswith("run_ticker_maintenance calibrate")
+    assert task["artifact_event_command"].endswith("run_ticker_maintenance event-calibrate")
+
+
+def test_no_live_task_routes_to_a_disabled_in_repo_executor():
+    """Codex review ("Do not route live slots to disabled executors"): a
+    task whose entry_point_status_* note says its in-repo executor SHIPS
+    DISABLED (config's own live_execution_enabled=false) must keep
+    no_python_entry_point=true. A scheduler that mechanically routes on
+    that flag going false -- as the mere presence of an entry_point might
+    otherwise suggest -- would silently replace real Robinhood placement
+    with a no-op shadow run, submitting zero orders with no error surfaced.
+    Flip the flag only together with enabling the executor's own config."""
+    tasks = _load("scheduled_tasks.json")["tasks"]
+    for task in tasks:
+        ships_disabled = any(
+            isinstance(value, str) and "SHIPS DISABLED" in value
+            for key, value in task.items()
+            if key.startswith("entry_point_status")
+        )
+        if ships_disabled:
+            assert task.get("no_python_entry_point") is True, (
+                f"{task.get('id')}: entry_point ships disabled but "
+                "no_python_entry_point is not true"
+            )
 
 
 # --- Budget ladder -----------------------------------------------------------

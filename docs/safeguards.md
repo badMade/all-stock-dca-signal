@@ -99,11 +99,32 @@ midday/manual spend). This is a real, live-code fix for the two in-repo
 Python streams, but it is NOT full parity with the eventual seven-slot design:
 morning and midday still only check against the flat shared Normal tier and
 never independently escalate to Elevated/High-volatility/Stress — only the
-3:30 final run does that, from its fuller same-day view — and market-open
-(`2ba19526`) / intraday (`7be82b97`) have no in-repo Python at all
-(`no_python_entry_point=true`), so pooling their spend is still only
-documented policy an external scheduler/agent must itself implement, same as
-the same-day top-up guard's Perplexity restatement. Once the seven-slot
+3:30 final run does that, from its fuller same-day view.
+
+**In-repo executors for market-open and intraday (2026-08-02).** The second
+half of that gap is now closed in code: market-open (`2ba19526`) and intraday
+(`7be82b97`) previously had no in-repo Python at all, so their trading-window
+cutoff, budget ledger, per-order ceiling, and same-day top-up guard existed
+only as prose an external scheduler/agent had to self-enforce. They now have
+`market_open_dca.py` (`MarketOpenDCAExecutor`) and `intraday_dca.py`
+(`IntradayDCAExecutor`, one stream across the 11:30/1:30/2:30 slots), both
+subclassing the same `MorningDCAExecutor` pipeline the 10:30 and 12:30 streams
+run on, so every one of those rules is enforced by the same tested code path.
+Writing real artifacts under `market_open_dca/` and `intraday_dca/` — roots
+every sibling stream already scanned and always found empty — also closes
+`claude/GATE5-PROPOSAL.md` §1.4's prior-allocation gap for these slots in both
+directions.
+
+**They ship disabled.** `config/market_open_dca.json` and
+`config/intraday_dca.json` both set `live_execution_enabled: false`: the
+executors evaluate fully and write every artifact but never call the broker.
+Until that flag is flipped, these slots' real orders still come from the
+external scheduler/agent exactly as before, and the in-repo executors are a
+shadow run whose decisions can be diffed against what actually traded. Flip
+the flag only after a full trading day of that comparison, and expect the
+per-order and cap behavior to match before trusting it with money. Each run
+records `live_execution_enabled` on its `run_state` so a shadow run is
+distinguishable from a live run that merely found no candidates. Once the seven-slot
 roster is wired, the daily and weekly caps in
 [Budget caps](#budget-caps) become fully **shared totals across all seven
 slots combined** with dynamic tier escalation available to every slot, not

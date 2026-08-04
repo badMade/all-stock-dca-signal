@@ -114,6 +114,7 @@ def test_normal_case_no_kill_switch_preserves_ladder():
 
     assert guarded.deployed_last_7d_usd == 600.0
     assert kill_switch_engaged(guarded) is False
+    # The current shared fallback ladder uses 1.5x at 2% and 2.5x at 5%.
     # A 2% drop sizes to 1.5x, a 5%+ drop sizes to 2.5x — unchanged ladder.
     assert graded_buy_multiplier(0.02, guarded) == 1.5
     assert graded_buy_multiplier(0.05, guarded) == 2.5

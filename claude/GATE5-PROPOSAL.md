@@ -88,6 +88,22 @@ batch". Per batch, not per day. Meanwhile `config/budgets.json` asserts
 `one_order_per_ticker_per_day: true` **and** `one_order_per_ticker_per_stream: true`.
 Nothing currently enforces the per-day form across seven slots.
 
+**Partially resolved 2026-08-02** for the four slots that had no in-repo code.
+`market_open_dca.py` and `intraday_dca.py` now give 9:35 and 11:30/1:30/2:30 real
+executors on the shared `MorningDCAExecutor` pipeline. Because they write real
+artifacts under `market_open_dca/` and `intraday_dca/` — roots every sibling
+stream's `prior_allocation_roots` already listed and always found empty — and
+because they scan those same sibling roots themselves, a ticker bought at one of
+these slots is now visible to the guard at every later slot, and vice versa. The
+"repeated full-size buys at successively higher prices" failure this section
+describes no longer has a path through them.
+
+Two caveats. First, both ship with `live_execution_enabled: false`, so until that
+flag is flipped the slots' real orders still come from the external agent, which
+is not bound by this code. Second, this closes the gap for the *five currently-live
+cron tasks*, not for the seven-slot Claude roster, which still ends every fire at
+`GATE5_DISABLED`.
+
 ### 1.5 Second silent-failure path: state roots point at a machine that no longer exists
 
 ```python
@@ -126,11 +142,16 @@ cross-stream same-day/week spend rather than just their own.
 This is a deliberately partial fix, not full parity with the seven-slot
 model's shared-total vision: morning and midday still don't dynamically
 escalate to Elevated/High-volatility/Stress on their own -- only the 3:30
-final run does that, from its fuller same-day view -- and market-open
-(`2ba19526`) / intraday (`7be82b97`) have no in-repo Python at all
-(`no_python_entry_point=true`), so their $180/$900 pooling exists only as
-documented policy an external scheduler/agent must implement itself, the same
-limitation as the same-day top-up guard's Perplexity restatement.
+final run does that, from its fuller same-day view.
+
+**Further resolved 2026-08-02**: market-open (`2ba19526`) and intraday
+(`7be82b97`) are no longer `no_python_entry_point=true`. `market_open_dca.py`
+and `intraday_dca.py` carry real `cap_seed_roots` spanning every sibling stream,
+so their $180/$900 pooling is now enforced by the same code path as morning and
+midday rather than being policy an external agent must implement itself. The
+three intraday slots additionally share ONE pooled ledger between them rather
+than getting $180/$900 each. Still gated behind `live_execution_enabled: false`
+in both configs until the shadow-run comparison is done.
 
 ---
 

@@ -18,6 +18,7 @@ environment (see the repository README).
 | [schedule_manifest.md](schedule_manifest.md) | The canonical 15-row recurring schedule (17 rows verified 2026-07-27; 2 removed 2026-08-02), one-time tasks, and retired entries |
 | [run_classification.md](run_classification.md) | Scheduled-vs-manual run contract (paths, required fields, exclusion rules) |
 | [drift_detection.md](drift_detection.md) | Post-artifact signals-vs-submitted-orders drift detector + Slack alerting |
+| [intraday_archive.md](intraday_archive.md) | Per-poll price/timestamp/volume archive under `ticker_data/_intraday/`, supplementing the daily OHLCV history |
 | [slack_webhook_injection.md](slack_webhook_injection.md) | How to inject the `DCA_DRIFT_SLACK_WEBHOOK` webhook across cron/systemd, agent/MCP scheduler, local shell, and GitHub Actions |
 | [reporting_workflow.md](reporting_workflow.md) | Daily/periodic artifact + Notion flow |
 | [notion_dashboard_template.md](notion_dashboard_template.md) | Notion page template + conceptual API sync |
@@ -37,8 +38,10 @@ environment (see the repository README).
 
 ## Key facts (quick reference)
 
-- **Active universe:** 52 tickers (includes `GFUZ`, `TXN`, `RKLB`, and the
-  2026-08-02 additions `GE`, `VRT`, `CAT`, `QQQ`, `QCOM`, `ABBV`, `JPM`);
+- **Active universe:** 53 tickers (includes `GFUZ`, `TXN`, `RKLB`, the
+  2026-08-02 additions `GE`, `VRT`, `CAT`, `QQQ`, `QCOM`, `ABBV`, `JPM`, and the
+  2026-08-04 addition `VT` — whitelisted without a broker instrument search, so
+  unverified until its first live run);
   `BYDDY`, `VCX`, `TRLV`, `RVI` excluded; `IRDMI→IRDM`, `GLWR→GLW`; `GFUZ` uses
   Robinhood primary data (finance `NOT_FOUND`).
 - **Latest ladder:** 0.1%→8%+, base $2, max **5x** (no upper cutoff). Older

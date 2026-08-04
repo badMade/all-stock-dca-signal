@@ -64,13 +64,13 @@ spread, whitelist, or circuit-breaker requirements.
 
 ## Active ticker universe
 
-52 active symbols (see [`config/tickers.json`](../config/tickers.json)):
+53 active symbols (see [`config/tickers.json`](../config/tickers.json)):
 
 ```
 DFTX TRIN AAAU SPCX EVR LUNR IRDM DXYZ LITE ASML DRAM STX
 MSFT AAPL AMAT AMD CBRS MRVL BTX STM SNDK WDC TSM AVGO NVDA QBTS FLKR
 INTC GOOGL GOOG AMZN GLW MA GS MU NFLX XLG TOPT QTOP SATA RGTI IBM GFUZ TXN RKLB
-GE VRT CAT QQQ QCOM ABBV JPM
+GE VRT CAT QQQ QCOM ABBV JPM VT
 ```
 
 - **Excluded:** `BYDDY`, `VCX`, `TRLV`, `RVI`
@@ -108,6 +108,25 @@ GE VRT CAT QQQ QCOM ABBV JPM
 > existing trading safety, pre-authorization, top-up, run-classification,
 > budget, cost-conscious, manual-exclusion, and recovery text.
 
+> **TICKER UNIVERSE UPDATE AUG 4 2026:** `VT` (Vanguard Total World Stock ETF)
+> is added to the active DCA universe, taking it to **53 symbols**. Read this
+> one differently from the additions above: every earlier symbol was confirmed
+> by a Robinhood instrument search before it was whitelisted, and `VT` was not
+> — the session that added it had no broker access, so `VT`'s state,
+> tradability, fractional tradability, and prior-close availability are
+> **unverified**. Nothing in the code assumes `VT` resolves; the per-run
+> preflight and data-confidence gates admit or gate it out fail-closed exactly
+> as they would any other symbol, so an unresolvable `VT` costs a gated-out
+> ticker, not a bad order. Confirm it on the first live run. `VT` is also
+> absent from `tickers.txt` (the history-fetch universe), so it has no
+> calibrated sizing and uses the global fallback ladder until history is
+> fetched and `scripts/generate_per_ticker_sizing.py` is re-run. Existing
+> exclusions remain BYDDY, VCX, TRLV, and RVI; corrected symbols IRDM and GLW
+> remain; IBM, GFUZ, TXN, RKLB, and the 2026-08-02 additions remain included.
+> This adds a whitelisted symbol only; it preserves all existing trading
+> safety, pre-authorization, top-up, run-classification, budget,
+> cost-conscious, manual-exclusion, and recovery text.
+
 ## Sizing ladder (latest, active)
 
 Maps the drop vs. previous close to a buy multiplier, applied to the selected
@@ -117,23 +136,43 @@ drop of 8% or more is 5x. See [`config/sizing_ladder.json`](../config/sizing_lad
 
 | Drop vs. prior close | Multiplier | Dollars ($2 base) | Dollars ($1 base) |
 |---|---|---|---|
-| < 0.1%          | 0x (no buy) | $0.00 | $0.00 |
-| 0.1% to < 1%    | 1x   | $2.00 | $1.00 |
-| 1% to < 2%      | 1.5x | $3.00 | $1.50 |
-| 2% to < 3%      | 2x   | $4.00 | $2.00 |
-| 3% to < 4%      | 2.5x | $5.00 | $2.50 |
-| 4% to < 5%      | 3x   | $6.00 | $3.00 |
-| 5% to < 6%      | 3.5x | $7.00 | $3.50 |
-| 6% to < 7%      | 4x   | $8.00 | $4.00 |
-| 7% to < 8%      | 4.5x | $9.00 | $4.50 |
-| >= 8%           | 5x   | $10.00 | $5.00 |
+| < 0.1%            | 0x (no buy) | $0.00 | $0.00 |
+| 0.1% to < 2%      | 1x   | $2.00 | $1.00 |
+| 2% to < 4%        | 1.5x | $3.00 | $1.50 |
+| 4% to < 5%        | 2x   | $4.00 | $2.00 |
+| 5% to < 6%        | 2.5x | $5.00 | $2.50 |
+| 6% to < 6.5%      | 3x   | $6.00 | $3.00 |
+| 6.5% to < 7%      | 3.5x | $7.00 | $3.50 |
+| 7% to < 7.5%      | 4x   | $8.00 | $4.00 |
+| 7.5% to < 8%      | 4.5x | $9.00 | $4.50 |
+| >= 8%             | 5x   | $10.00 | $5.00 |
+
+**Rescaled 2026-08-02.** The prior curve stepped uniformly every 1% from 0.1% to
+8%. This one is flatter on shallow dips — 1x now runs to 2% and 1.5x to 4% — and
+back-loads the scaling into deep drops, slicing 6–8% every half percent.
+Endpoints are unchanged, so the $10 max per order still stands. One knock-on
+effect worth tracking: budget-tier selection counts **3x-or-greater** signals,
+and 3x now needs a 6% drop rather than 4%, so escalation to
+Elevated/High-volatility/Stress is less frequent for the same market conditions.
+
+> **This table is the fallback, not the live curve.** As of 2026-08-04
+> [`config/per_ticker_sizing.json`](../config/per_ticker_sizing.json) is
+> `status: active` and carries an entry for all 53 active symbols. 46 are
+> **per-ticker, volatility-calibrated** (percentile-derived,
+> 1x/1.5x/2.5x/4x/5x, $1.00 base); the 7 in `fallback_tickers` (SPCX, DRAM,
+> CBRS, FLKR, SATA, GFUZ, VT) lack the 252 sessions of history the calibration
+> requires and carry a copy of the global fallback ladder instead.
+> `graded_buy_multiplier` reads a ticker's calibrated tiers first and falls back
+> to the shared table above only for symbols with no entry — currently none. The
+> table above therefore governs the fallback path and the test suite, while
+> per-ticker calibration governs live sizing for every whitelisted symbol.
 
 ### Historical / superseded ladders
 
-Older ladder variants — **including the 0.1%-to-12% sizing ladders** — are
-**historical and superseded**. The active ladder above (0.1% to 8%+, max 5x, no
-upper cutoff) is the only one in force. If a request references the "0.1% to 12%
-ladder," treat it as background context, not the current rule.
+Older ladder variants — **including the 0.1%-to-12% sizing ladders and the
+uniform 1%-step 0.1%-to-8% ladder this one replaced** — are **historical and
+superseded**. If a request references the "0.1% to 12% ladder," treat it as
+background context, not the current rule.
 
 ## Budget & tiered cap rules
 
@@ -195,6 +234,38 @@ candidates for review; they do not change the live base amount, ladder, or caps
 above.
 
 ## Same-day prior-run offset / top-up guard
+
+> **Read this first (added 2026-08-03): there are TWO top-up guards, and the
+> one described in this section failed OPEN in production.**
+>
+> **The incident (2026-07-30/31).** The filesystem-based guard described below
+> resolves prior same-day allocations by scanning run-state roots on disk. When
+> a state root was **missing** — not empty, but absent — the scan read that as
+> "no prior allocation for this ticker" and authorized a **full-size repeat
+> buy** instead of an incremental top-up. It failed toward buying more, not
+> less. `config/scheduled_tasks.json`'s
+> `same_day_top_up_guard_enforcement_2026_07_31` block records this.
+>
+> **The replacement.** `scripts/same_day_top_up_gate.py` sources prior same-day
+> allocation from **broker truth** (Robinhood `get_equity_orders` pages) rather
+> than from the filesystem, and fails **closed** on incomplete order history
+> (`BROKER_HISTORY_INCOMPLETE`) instead of treating absence as zero.
+>
+> **What is actually running today — be precise about this.** The gate is a
+> **standalone CLI**, invoked as
+> `python3 -m scripts.same_day_top_up_gate --account … --trading-day …
+> --orders-pages … --candidates …`. It is called by the **external executor
+> prompts**, NOT from any in-repo Python: `market_open_dca.py`,
+> `morning_dca.py`, `midday_dca.py`, `intraday_dca.py`, `near_close_dca.py`,
+> and `run_dca.py` contain **zero calls to it** (grep-verified 2026-08-03).
+> Every in-repo executor still uses the original filesystem `rglob` guard
+> described in the rest of this section — the one with the fail-open bug.
+>
+> **Practical consequence.** Whether a given run is protected by the fix
+> depends entirely on *who invoked it*: an external prompt that runs the gate
+> CLI is protected; any in-repo Python path is not. Wiring the gate into
+> `near_close_dca.evaluate_top_up_guard` is a live-money behavior change and is
+> tracked as an explicit follow-up, not done implicitly.
 
 One guard governs the **morning (10:30)**, **midday (12:30)**, and **afternoon
 (3:30 PM ET)** live streams as well as **manual override same-day fills**. An

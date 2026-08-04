@@ -558,6 +558,52 @@ tasks. See the `pointer_output_normalization_2026_07_20` block in
 
 ## Recovery reruns
 
+> **IMPLEMENTATION STATUS (2026-08-03): PARTIALLY implemented. Read the split
+> below before relying on any of it.**
+>
+> **✅ Implemented — `run_dca.py`'s raw-input persistence path.** That path now
+> performs exactly **one** automatic in-process recovery retry, in the **same
+> run directory**, and stamps the result on the run_state via
+> `build_recovery_state()`:
+> - Retried only for `raw_file_write_failure` (an `OSError` while staging,
+>   normalizing, or swapping `raw/` — a partial write, interrupted rename,
+>   permission or ENOSPC blip), classified by `run_dca._recovery_trigger_for()`.
+> - On success the run continues through the **unchanged** guarded path — every
+>   signal, budget, spread, confidence, top-up and circuit-breaker check still
+>   runs — and the state carries `recovery_rerun=true`, `recovery.attempt=1`,
+>   `recovery.escalated=false`. It is **never** reclassified as manual.
+> - If the one retry also fails, the run **escalates** with
+>   `recovery.escalated=true` and a `blocking_reason`, and does not retry again.
+> - A **deterministic** failure (`parsing_failure`,
+>   `wrapper_normalization_failure`, or a contract fault such as absent
+>   `raw_connector_inputs`) escalates **immediately without retrying** — a second
+>   identical attempt on the same in-memory payload would fail identically, and
+>   consuming the single permitted attempt there would misreport a payload or
+>   config bug as an exhausted transient recovery.
+>
+> **⚠️ Scope limit — "rerun the required read-only inputs" is NOT implemented
+> and cannot be, here.** `run_dca.py` receives `raw_connector_inputs` as an
+> already-fetched, immutable mapping and holds no MCP/broker/market-data access
+> of its own (`docs/live_wiring.md`: providers "arrive as injected callables").
+> It can re-run the *persist → normalize → recompute* half, never the *fetch*
+> half. **`transient_connector_throttling` therefore classifies but never
+> retries in-process** — clearing it requires a fresh fetch, which only the
+> invoking agent session can perform. Recovery from a throttled connector
+> remains an agent-level responsibility.
+>
+> **❌ Still NOT implemented — the four class-based stream executors.**
+> `recovery_rerun`, `recovery_reason`, and `recovery_attempts` appear **nowhere**
+> in `morning_dca.py`, and therefore nowhere in the `market_open_dca.py` /
+> `midday_dca.py` / `intraday_dca.py` subclasses that inherit its
+> `run()`/`_run_impl()`. Those still **fail closed on the first error** via
+> `_blocked_live_result(...)`, with no second attempt and no `recovery_rerun=true`
+> artifact. `config/morning_dca.json`'s
+> `automatic_failure_recovery.implementation_status` remains accurate for them.
+> `recovery_escalation_run_state()` also still has no non-test caller — the
+> escalation evidence above is merged into the existing hardened
+> `raw_persistence_failure_run_state` instead, so its prior-order preservation
+> is not lost.
+
 The five scheduled **live** tasks — market-open (`2ba19526`), morning
 (`42173154`), midday (`a6239dae`), intraday (`7be82b97`), and afternoon
 (`10ce362c`) — support **automatic failure recovery**. (Market-open and

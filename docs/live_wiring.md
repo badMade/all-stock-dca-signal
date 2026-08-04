@@ -9,7 +9,39 @@ How the strategy library becomes a running system, and where the safety gates ar
 | `near_close_dca.py` | Pure strategy library: signals, budgets, safeguards, artifacts. Standard library only. |
 | `dca_config.py` | Loads `config/*.json` onto `StrategyConfig` defaults (tickers, budgets, sizing ladder, approved trading window). |
 | `dca_live_adapters.py` | `RobinhoodDataProvider`, `FinanceDataProvider`, `RobinhoodBroker` — conform to the `MarketDataProvider` / `BrokerAdapter` protocols via **injected callables**. No credentials, no network in-module. |
-| `run_dca.py` | Orchestrator + CLI: config → providers/broker → `run_daily_compact` → post-trade reports. |
+| `run_dca.py` | Orchestrator + CLI: config → providers/broker → `run_daily_compact` → post-trade reports. Also hosts `run_slot()`, the seven-slot roster entry point. |
+| `dca_runner.py` | Committed live-runner entry point for the seven slots (gate sequence, durable state, budget arithmetic, order planning) via **injected callables**. Closes gap #1 in `PRODUCTION_READINESS.md`. See "Three entry points" below. |
+| `morning_dca.py` | `MorningDCAExecutor` — class-based per-stream pipeline. Subclassed by the four below. |
+| `market_open_dca.py`, `midday_dca.py`, `intraday_dca.py` | Thin `MorningDCAExecutor` subclasses (9:35 / 12:30 / 11:30·1:30·2:30). Override identity + a few flags only. |
+
+### Three entry points coexist — know which one you are editing
+
+This repo contains **three structurally different ways to execute a slot**.
+None is dead, but they are not interchangeable, and a fix applied to one does
+**not** propagate to the others. Verified 2026-08-03:
+
+| Entry point | Shape | Invoked by | Notes |
+|---|---|---|---|
+| `run_dca.run_slot()` | Function pipeline over `near_close_dca` primitives | `run_dca.py` itself; the 3:30 PM live path | The only path with a real `__main__` (via `near_close_dca.py`). Re-implements the morning preflight gate rather than calling `MorningDCAExecutor`'s. |
+| `MorningDCAExecutor` + 3 subclasses | Class hierarchy, one class per stream | **External agent/prompt** constructing the class and calling `.run(now, data, broker=…)` | **No in-repo caller and no CLI.** Nothing in this repository runs them; `grep` for `MiddayDCAExecutor(` etc. hits only their own modules and tests. |
+| `dca_runner.py` | Gate sequence + injected callables | **External agent session** holding MCP runtime access | Deliberate design, not abandoned: it exists so guardrails live in diffable code instead of truncatable prompt text. Covered by `test_live_reliability_contract.py` and pinned by `test_config_invariants.py`. |
+
+**Consequences worth internalizing before changing anything:**
+
+- **Duplicated logic drifts silently.** `run_slot()` carries its own copy of the
+  morning preflight gate, with a comment acknowledging the duplication
+  (`run_dca.py`: *"routed only through the generic pipeline, `run_slot("1030ET")`
+  never called that gate at all"*). A fix to `_apply_preflight_gate()` will not
+  reach `run_slot()`, or vice versa.
+- **"No in-repo callers" ≠ dead code.** The executor classes, `dca_runner.py`,
+  `dca_cost_tracker.py`, `dca_weekly_dashboard.py`, and
+  `scripts/same_day_top_up_gate.py` all have zero in-repo callers **by design** —
+  this repo is a library that external agent sessions drive. Deleting them
+  because grep shows no caller would break live automation that this repository
+  cannot see.
+- **Consolidating is a real decision, not a cleanup.** Making `run_slot()`
+  delegate to the executor classes would remove the duplication, but it changes
+  the live 3:30 PM path and needs its own review and acceptance run.
 
 ## Dependency injection (no secrets in the repo)
 

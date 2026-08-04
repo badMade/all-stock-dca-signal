@@ -77,6 +77,11 @@ from zoneinfo import ZoneInfo
 
 from dca_cumulative import CumulativeCreditLedger, apply_cumulative_credit
 from dca_fileio import atomic_open_w, atomic_write_text
+from dca_intraday_archive import (
+    archive_observations_safely,
+    observations_from_signal_rows,
+    write_run_snapshot,
+)
 
 if TYPE_CHECKING:
     from scripts.run_classification import PriorAllocation
@@ -229,6 +234,10 @@ ACTIVE_TICKERS = [
     "QCOM",
     "ABBV",
     "JPM",
+    # AUG 4 2026 (user-requested): VT (Vanguard Total World Stock ETF). Broker
+    # instrument resolution was not run in-repo -- see config/tickers.json's
+    # data_source_notes.VT before the first live allocation.
+    "VT",
 ]
 
 # BYDDY (ADR wind-down), VCX, TRLV, and RVI are excluded from the active universe.
@@ -2453,6 +2462,32 @@ def evaluate_top_up_guard(
 
     # No earlier same-day allocation: behave exactly like a normal scheduled run.
     if prior is None or prior.amount_usd <= 0:
+        # A ticker whose only earlier same-day activity was a sub-dollar
+        # decline that never itself crossed the broker's $1 minimum has NO
+        # prior_same_day_allocations entry at all (that dict tracks actual
+        # ORDERS, not pending credits) -- prior is None here for exactly
+        # that ticker, same as for a ticker with no same-day activity
+        # whatsoever. When this run's own decision is not BUY (desired <=
+        # 0), falling straight through to the plain "no prior" outcome
+        # below silently strands that pending credit forever: there is no
+        # prior.reference_price to gate a top-up against, so the flush
+        # branch further down (guarded by afternoon_price >=
+        # prior.reference_price) is never reached either (Codex review:
+        # "Flush pending credits even without prior context"). The final
+        # session's own contract is to close ANY positive pending balance
+        # regardless of today's decision price, so flush it here using the
+        # same final-session rounding as that later branch.
+        if desired <= 0 and existing_pending_credit_usd > 0:
+            flushed = apply_cumulative_credit(
+                existing_pending_credit_usd, 0.0, final_session=True
+            ).order_amount_usd
+            if flushed > 0:
+                return _outcome(
+                    flushed,
+                    TOP_UP_INCREMENTAL,
+                    skipped=False,
+                    cumulative_credit_decline_usd=0.0,
+                )
         return _outcome(desired, TOP_UP_NO_PRIOR_RUN, skipped=desired <= 0)
 
     # Prior amount is known but its first-allocation base ($1 or $2) could not
@@ -2523,17 +2558,28 @@ def evaluate_top_up_guard(
     # clamped, or never placed at all).
     cumulative_credit_decline_usd: Optional[float] = None
     if ladder_incremental < 1.0:
+        # The final-session credit decision must consider the LADDER
+        # increment itself, not just the rounded raw price decline: a
+        # preserved $1 base advancing from 1x to 1.5x makes ladder_incremental
+        # $0.50 even when the price moved by only a few tenths of a cent
+        # (decline_usd rounds to $0.00). Feeding decline_usd alone into
+        # apply_cumulative_credit would then skip it entirely and fall back to
+        # returning that raw $0.50 ladder amount as the order -- below the
+        # broker's $1 minimum every positive order here must meet (Codex
+        # review: "Route the ladder increment through the final-session
+        # minimum").
         decline_usd = round(max(0.0, prior.reference_price - afternoon_price), 2)
+        credit_amount_usd = round(max(ladder_incremental, price_step_incremental, decline_usd), 2)
         cumulative_credit = (
             apply_cumulative_credit(
-                existing_pending_credit_usd, decline_usd, final_session=True
+                existing_pending_credit_usd, credit_amount_usd, final_session=True
             ).order_amount_usd
-            if decline_usd > 0 or existing_pending_credit_usd > 0
+            if credit_amount_usd > 0 or existing_pending_credit_usd > 0
             else 0.0
         )
-        if cumulative_credit > 0 and cumulative_credit >= max(ladder_incremental, price_step_incremental):
-            cumulative_credit_decline_usd = decline_usd
-        incremental = max(ladder_incremental, price_step_incremental, cumulative_credit)
+        if cumulative_credit > 0:
+            cumulative_credit_decline_usd = credit_amount_usd
+        incremental = cumulative_credit
     else:
         incremental = ladder_incremental
     if incremental <= 0:
@@ -2570,6 +2616,12 @@ def _signal_row(
             "decision_bar_timestamp": None,
             "previous_close_timestamp": None,
             "lookback_bar_timestamp": None,
+            # Signal-time quote, appended 2026-08-04. SourceSignal has carried
+            # these since the target-price work; they were simply never
+            # serialized, so the archived 15:30 observation could not say
+            # whether the decision price was a live quote or a bar close.
+            "quote_price": None,
+            "quote_time": None,
         }
     return {
         "ticker": ticker,
@@ -2592,6 +2644,8 @@ def _signal_row(
         "decision_bar_timestamp": _iso_or_none(signal.decision_bar_timestamp),
         "previous_close_timestamp": _iso_or_none(signal.previous_close_timestamp),
         "lookback_bar_timestamp": _iso_or_none(signal.lookback_bar_timestamp),
+        "quote_price": signal.quote_price or None,
+        "quote_time": _iso_or_none(signal.quote_time),
     }
 
 
@@ -2740,9 +2794,26 @@ def _build_buy_candidates(
 ) -> List[Dict[str, Any]]:
     buy_candidates: List[Dict[str, Any]] = []
     for decision in decisions:
-        if decision.action != Action.BUY:
-            continue
         outcome = candidate_outcomes.get(decision.ticker, {})
+        # A ticker appended to the final session's buy_candidates solely
+        # because it carries a positive pending same-day credit (see
+        # _run_once_impl's flush-only injection, and _process_buy_candidate's
+        # matching order_amount fallback) has a non-BUY decision.action even
+        # when _process_buy_candidate went on to submit a real rounded
+        # flush order for it. Excluding every non-BUY decision here would
+        # drop that real order from buy_candidates.csv/counts entirely and
+        # could leave order_submit_status reporting no_candidates despite a
+        # submitted order, corrupting the run audit and downstream reporting
+        # (Codex review: "Include pending-credit flush orders in
+        # artifacts"). Only a non-BUY decision that never reached submission
+        # is skipped, matching the pre-existing behavior for every ordinary
+        # skipped/manual-review non-BUY ticker.
+        is_pending_credit_flush = decision.action != Action.BUY and outcome.get("status") in (
+            "submitted",
+            "dry_run",
+        )
+        if decision.action != Action.BUY and not is_pending_credit_flush:
+            continue
         target_price = _signal_target_price(decision)
         # planned_amount_usd: when the top-up guard is active for this ticker use
         # the incremental amount; otherwise use submitted_amount_usd (which
@@ -2784,6 +2855,7 @@ def _build_buy_candidates(
             "ticker": decision.ticker,
             "reason": decision.reason,
             "buy_multiplier": decision.buy_multiplier,
+            "is_pending_credit_flush": is_pending_credit_flush,
             # Recorded so a later same-day top-up guard reading this run back as
             # prior-allocation context can reuse this run's base if it was the
             # day's first allocation (see resolve_top_up_desired_amount_usd).
@@ -3308,11 +3380,134 @@ def write_run_artifacts(
     run_state_path = out / "run_state.json"
     atomic_write_text(run_state_path, serialized)
 
-    return {
+    paths = {
         "run_state": str(run_state_path),
         "signals": str(signals_path),
         "buy_candidates": str(candidates_path),
     }
+    return paths
+
+
+def _select_reconciled_signal_rows(
+    signal_rows: Sequence[Dict[str, Any]], decisions: Sequence[ReconciledDecision]
+) -> List[Dict[str, Any]]:
+    """Reduce two rows per ticker (finance, then Robinhood) to the ONE row
+    that actually produced each ticker's reconciled decision.
+
+    The scheduled natural key ``append_observations`` merges on is
+    ``(trading_day, stream, slot, ticker)`` -- source is deliberately not
+    part of it -- so archiving both providers' rows unfiltered would collapse
+    to whichever row happens to sort last, discarding the other provider's
+    row even when IT is the one the reconciled decision actually used
+    (Codex review: "Archive one reconciled near-close observation per
+    ticker"). A BUY decision's ``target_price_source`` names the winning
+    provider directly; a non-BUY decision has no "winning" provider, so this
+    prefers Finance (this system's primary data source, per the
+    Finance-primary-with-Robinhood-fallback policy) when it produced a real
+    signal, falling back to Robinhood only when Finance has none.
+    """
+    preferred_source: Dict[str, str] = {}
+    for decision in decisions:
+        if decision.target_price_source:
+            preferred_source[decision.ticker] = decision.target_price_source.split(":", 1)[0]
+        elif decision.finance_signal is not None and decision.finance_signal.action != Action.NO_DATA:
+            preferred_source[decision.ticker] = SourceName.FINANCE.value
+        elif decision.robinhood_signal is not None:
+            preferred_source[decision.ticker] = SourceName.ROBINHOOD.value
+        else:
+            preferred_source[decision.ticker] = SourceName.FINANCE.value
+
+    decision_by_ticker = {d.ticker: d for d in decisions}
+    selected: Dict[str, Dict[str, Any]] = {}
+    for row in signal_rows:
+        ticker = row.get("ticker")
+        if ticker is None:
+            continue
+        wanted = preferred_source.get(ticker)
+        if ticker in selected or (wanted is not None and row.get("source") != wanted):
+            continue
+        # Copied, never mutated in place: this same row object is also what
+        # write_run_artifacts() writes to signals.csv, and archiving must not
+        # leak fabricated columns into that unrelated artifact.
+        row = dict(row)
+        decision = decision_by_ticker.get(ticker)
+        if decision is not None and decision.target_price_source:
+            # signal_rows never serializes quote_price/quote_time (see
+            # _signal_row), so observations_from_signal_rows always fell
+            # back to decision_bar_close for "price" -- even when the
+            # reconciled decision actually sized and targeted the order from
+            # a live quote that differs from the completed bar. Overlaying
+            # the decision's own resolved target here (not the raw
+            # per-provider signal's quote_price, since decision.target_price
+            # is the authoritative execution target after reconciliation)
+            # onto the fields observations_from_signal_rows already reads
+            # keeps the shared archive's price consistent with what
+            # placement actually used (Codex review: "Archive the near-close
+            # target quote").
+            row["current_price"] = decision.target_price
+            row["price_source"] = decision.target_price_source
+            if decision.target_quote_time is not None:
+                row["price_as_of"] = decision.target_quote_time
+        selected[ticker] = row
+    return list(selected.values())
+
+
+def _archive_intraday_observations(
+    artifacts: Dict[str, Any],
+    out: Path,
+    decisions: Sequence[ReconciledDecision] = (),
+) -> Optional[str]:
+    """Record the 15:30 poll's prices/timestamps in the shared intraday archive.
+
+    The near-close signal rows are the only ones in this repo that already
+    carried their own timestamps (``decision_bar_timestamp``,
+    ``previous_close_timestamp``) -- they just had nowhere durable to accumulate.
+    This lands them in the same per-ticker archive the morning-family streams
+    write to, so all eight scheduled polls read back as one time series
+    (see dca_intraday_archive).
+
+    ``decisions`` reduces the two-rows-per-ticker (Finance, then Robinhood)
+    ``signal_rows`` down to one reconciled row per ticker before archiving --
+    see :func:`_select_reconciled_signal_rows`.
+
+    Best-effort and never raised: this run has already placed real orders and
+    written its full artifact set by the time it is called -- callers invoke
+    this ONLY after the scheduled contract's required run_summary.json and
+    submitted_orders.csv are already on disk (or, for a manual run with no
+    contract to finalize, right after write_run_artifacts), never before,
+    since a per-ticker archive lock can block for several seconds and must
+    never delay those required files past the just-fired-run grace period a
+    monitor uses to distinguish a genuinely incomplete run from one still
+    finishing (Codex review: "Finalize scheduled artifacts before waiting on
+    archive locks"). ``usage_proxy`` counters are deliberately NOT re-derived
+    to include observations.csv -- they were already settled against the two
+    CSVs write_run_artifacts wrote, and re-opening that accounting for an
+    observability file would change a figure other tooling reconciles
+    against.
+    """
+    try:
+        signal_rows = artifacts.get("signal_rows") or []
+        if decisions:
+            signal_rows = _select_reconciled_signal_rows(signal_rows, decisions)
+        observations = observations_from_signal_rows(
+            signal_rows,
+            run_classification=artifacts.get("run_classification") or {},
+            generated_at=artifacts.get("generated_at") or artifacts.get("as_of"),
+            data_source=str(artifacts.get("data_source") or ""),
+            trading_day=artifacts.get("trading_day"),
+        )
+    except Exception as exc:  # noqa: BLE001 - observability must not fail a run
+        logger.warning("could not build intraday observations: %s", exc)
+        return None
+    snapshot_path = write_run_snapshot(out, observations)
+    summary = archive_observations_safely(observations)
+    if not summary.get("ok"):
+        logger.warning(
+            "intraday observation archive write failed for %s: %s",
+            artifacts.get("run_id"),
+            summary.get("error"),
+        )
+    return snapshot_path
 
 
 def _backfill_orders_csv_usage(run_state_path: Path) -> None:
@@ -6612,6 +6807,20 @@ def _finalize_and_write_artifacts(
             _write_and_validate_scheduled_contract(artifacts, artifacts_dir)
         )
 
+    # Archived AFTER the scheduled contract's required run_summary.json and
+    # submitted_orders.csv are already on disk (or, for a manual run with no
+    # contract step, right after write_run_artifacts above): a per-ticker
+    # archive lock can block for several seconds when another process is
+    # writing the same ticker file, and the just-fired-run grace period a
+    # monitor uses to distinguish a genuinely incomplete run from one still
+    # finishing defaults to only 20 seconds -- ordinary archive contention
+    # must never delay those REQUIRED files and trigger a false escalation on
+    # a run that actually succeeded (Codex review: "Finalize scheduled
+    # artifacts before waiting on archive locks").
+    snapshot_path = _archive_intraday_observations(artifacts, Path(artifacts_dir), decisions)
+    if snapshot_path:
+        paths["observations"] = snapshot_path
+
     if scheduled and classification_state_root is not None:
         try:
             from scripts.run_classification import (
@@ -6747,7 +6956,25 @@ def _process_buy_candidate(
     running_deployed_7d: float,
 ) -> tuple[Dict[str, Any], Optional[TopUpGuardOutcome], float, int, int]:
     ticker = decision.ticker
-    order_amount = decision.suggested_amount_usd
+    # A ticker reaching this function solely because it carries a positive
+    # pending same-day credit -- not because its own signal is a fresh BUY
+    # (see _run_once_impl's flush-only injection into buy_candidates) -- has
+    # suggested_amount_usd pinned to 0.0 for a non-BUY decision. Starting
+    # order_amount from that would cap every later min(...) against it down
+    # to 0.0, silently discarding the flush the top-up guard computes below
+    # (Codex review: "Flush credits even when the final signal is not BUY").
+    # Bounded by max_per_order_usd rather than left literally unconstrained:
+    # the duplicate-check path below can fall back to this value as a dollar
+    # amount (dup_amount = order_amount) when a matched broker order carries
+    # no usable amount fields, so an unbounded sentinel (e.g. float("inf"))
+    # could get durably recorded as a same-day spend figure. The kill-switch
+    # cap, the guard's own incremental amount, and max_per_order_usd's own
+    # hard-ceiling check all still narrow this further down.
+    order_amount = (
+        decision.suggested_amount_usd
+        if decision.action == Action.BUY
+        else ctx.config.max_per_order_usd
+    )
     prior = ctx.prior_same_day_allocations.get(ticker) if ctx.guard_active else None
     ticker_guarded = ctx.guard_active and prior is not None
     top_up_outcome = None
@@ -8219,6 +8446,37 @@ def _run_once_impl(
     # same top-up-adjusted amounts the batch will actually spend.
     guard_active = scheduled and prior_same_day_allocations is not None
 
+    # Enumerate pending sub-dollar credits independently of the BUY-only
+    # buy_candidates list built above. A ticker that earned a pending credit
+    # earlier today but whose OWN final decision is not BUY (e.g. its price
+    # recovered to or above the previous close, so no ladder tier matches at
+    # all) would otherwise never reach _process_buy_candidate/
+    # evaluate_top_up_guard's existing "flush ANY positive pending balance"
+    # branch, permanently stranding that balance since this is always the
+    # final same-day session (Codex review: "Flush credits even when the
+    # final signal is not BUY"). Reusing the SAME decision object already
+    # computed by _evaluate_all_signals above (not synthesizing a BUY one)
+    # keeps evaluate_top_up_guard's own price/prior comparison authoritative.
+    credit_ledger = CumulativeCreditLedger()
+    if guard_active:
+        try:
+            pending_by_ticker = credit_ledger.pending_tickers(trading_day.isoformat())
+        except Exception as exc:  # noqa: BLE001
+            pending_by_ticker = {}
+            logger.warning(
+                "cumulative credit ledger pending-ticker scan failed: %s", exc
+            )
+        if pending_by_ticker:
+            already_included = {d.ticker for d in buy_candidates}
+            decisions_by_ticker = {d.ticker: d for d in decisions}
+            for ticker in pending_by_ticker:
+                if ticker in already_included:
+                    continue
+                flush_decision = decisions_by_ticker.get(ticker)
+                if flush_decision is not None:
+                    buy_candidates.append(flush_decision)
+            buy_candidates.sort(key=allocation_sort_key)
+
     # ⚡ Bolt Optimization: Use a single pass loop instead of multiple sum() generators
     # to eliminate O(N) object overhead when iterating DataFrames/lists.
     #
@@ -8242,7 +8500,17 @@ def _run_once_impl(
     for d in buy_candidates:
         if guard_active:
             prior = prior_same_day_allocations.get(d.ticker)
-            planned_spend += evaluate_top_up_guard(d, prior, config).incremental_order_amount
+            # Carry each candidate's enumerated pending balance (including a
+            # flush-only candidate appended above solely because it has a
+            # pending credit, whose own suggested_amount_usd/action never
+            # reflects that balance) into the estimate so a recovered pending
+            # credit that would round up to a real $1 order at execution time
+            # is not silently estimated at $0 for tier selection (Codex
+            # review: "Include pending flushes in planned spend").
+            existing_pending_credit_usd = pending_by_ticker.get(d.ticker, 0.0)
+            planned_spend += evaluate_top_up_guard(
+                d, prior, config, existing_pending_credit_usd=existing_pending_credit_usd
+            ).incremental_order_amount
         else:
             planned_spend += d.suggested_amount_usd
         if d.buy_multiplier >= config.high_multiplier_threshold:
@@ -8304,6 +8572,7 @@ def _run_once_impl(
         run_result=run_result,
         deployment_history_root=deployment_history_root,
         stream=stream,
+        credit_ledger=credit_ledger,
     )
     candidate_outcomes, top_up_outcomes, running_deployed_7d, err_inc, rev_inc = (
         _process_buy_candidates_batch(

@@ -31,24 +31,29 @@ from scripts.scheduled_artifacts import (  # noqa: E402
     AFTERNOON_LIVE_CRON_ID,
     AFTERNOON_LIVE_SUPERSEDES_CRON_ID,
     CANONICAL_RUN_SUMMARY_FILENAME,
+    COMPLETION_MARKER_FIELDS,
     ERROR_CLASS_COMPUTE_ONLY_NO_PLACEMENT,
     ERROR_CLASS_PLACEMENT_PHASE_UNREACHABLE,
     MORNING_LIVE_CRON_ID,
     ORDER_SUBMIT_STATUS_PLACEMENT_UNREACHABLE,
     PREFLIGHT_CRON_ID,
     PREFLIGHT_RUN_TYPE,
+    RUN_STATE_FILENAME,
     SCHEDULED_LIVE_REQUIRED_FILENAMES,
     SIGNALS_CSV_FILENAME,
     SUBMITTED_ORDERS_FIELDS,
+    await_finalized_run_artifacts,
     build_afternoon_live_run_classification,
     build_morning_live_run_classification,
     build_preflight_run_classification,
     build_run_summary,
+    completion_marker,
     has_planned_orders,
     is_compute_only_terminal_failure,
     mirror_run_classification,
     nested_only_artifacts,
     placement_unreachable_state_fields,
+    read_run_state,
     resolve_live_account_number,
     submitted_order_rows,
     validate_run_artifacts,
@@ -961,3 +966,193 @@ def test_a_pinned_run_keeps_the_evidence_flag_it_was_given(monkeypatch):
     rc = build_morning_live_run_classification(**MORNING_LIVE_KWARGS)
     assert rc["valid_scheduled_evidence"] is True
     assert "account_pinning_failed" not in rc
+
+
+# --- Finalization grace period (Aug 3 2026 9:35 incident) -------------------
+# The 9:35 run was read the instant it fired, when only its raw-input directory
+# existed, and the missing run_state/order CSV were reported as a failed slot.
+# The run in fact completed normally seconds later. A just-fired run gets a short
+# window to finish writing before its artifacts are judged.
+
+
+class _FakeClock:
+    """A monotonic clock that advances only when the code under test sleeps.
+
+    Keeps the grace-period tests deterministic and instant: no test waits on
+    real elapsed time, and every sleep the window performs is recorded.
+    """
+
+    def __init__(self, on_sleep=None):
+        self.now = 0.0
+        self.slept = []
+        self._on_sleep = on_sleep
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now += seconds
+        if self._on_sleep is not None:
+            self._on_sleep(len(self.slept))
+
+
+def test_a_finalized_run_passes_on_the_first_poll_without_waiting(tmp_path):
+    write_scheduled_run_artifacts(tmp_path, _live_run_state())
+    clock = _FakeClock()
+
+    result = await_finalized_run_artifacts(
+        tmp_path, require_summary=True, sleep=clock.sleep, monotonic=clock.monotonic
+    )
+
+    assert result and result.ok and result.finalized
+    assert result.errors == []
+    assert result.polls == 1
+    assert clock.slept == [], "a complete run must not be waited on at all"
+
+
+def test_a_run_still_writing_is_not_failed_but_waited_for(tmp_path):
+    """The incident itself: only the raw inputs exist when the check first looks."""
+    (tmp_path / "raw_inputs").mkdir()
+    (tmp_path / "raw_inputs" / "quotes.json").write_text("{}", encoding="utf-8")
+    clock = _FakeClock(
+        on_sleep=lambda count: (
+            write_scheduled_run_artifacts(tmp_path, _live_run_state()) if count == 3 else None
+        )
+    )
+
+    result = await_finalized_run_artifacts(
+        tmp_path, require_summary=True, sleep=clock.sleep, monotonic=clock.monotonic
+    )
+
+    assert result.finalized and result.ok
+    assert result.polls == 4, "should re-check after each sleep, not once"
+    assert result.waited_seconds == 3.0
+
+
+def test_a_genuinely_broken_run_still_reports_its_real_errors(tmp_path):
+    """The window delays the verdict; it never suppresses one."""
+    write_scheduled_run_artifacts(tmp_path, _live_run_state())
+    (tmp_path / "submitted_orders.csv").unlink()
+    clock = _FakeClock()
+
+    result = await_finalized_run_artifacts(
+        tmp_path, grace_seconds=5, require_summary=True, sleep=clock.sleep, monotonic=clock.monotonic
+    )
+
+    assert not result and not result.ok and not result.finalized
+    assert "missing submitted_orders.csv" in result.errors
+    assert result.waited_seconds == 5.0, "must not wait past the grace period"
+
+
+def test_an_empty_directory_fails_after_the_window_like_a_missing_run(tmp_path):
+    clock = _FakeClock()
+
+    result = await_finalized_run_artifacts(
+        tmp_path, grace_seconds=2, sleep=clock.sleep, monotonic=clock.monotonic
+    )
+
+    assert not result.ok and not result.finalized
+    assert result.completion_marker is None
+    assert f"missing {RUN_STATE_FILENAME}" in result.errors
+
+
+def test_a_zero_grace_validates_once_and_never_sleeps(tmp_path):
+    write_scheduled_run_artifacts(tmp_path, _live_run_state())
+    (tmp_path / "signals.csv").unlink()
+    clock = _FakeClock()
+
+    result = await_finalized_run_artifacts(
+        tmp_path, grace_seconds=0, sleep=clock.sleep, monotonic=clock.monotonic
+    )
+
+    assert not result.ok
+    assert result.polls == 1
+    assert clock.slept == []
+
+
+def test_a_missing_completion_marker_is_not_turned_into_a_failure(tmp_path):
+    """Fail-open: absence of a terminal marker is 'not yet finalized', not 'bad'.
+
+    A contract-valid run whose writer emits none of COMPLETION_MARKER_FIELDS
+    must still report ok=True once the window closes, or the grace period would
+    invent a failure validate_run_artifacts never found.
+    """
+    state = _live_run_state()
+    for name in COMPLETION_MARKER_FIELDS:
+        state.pop(name, None)
+    write_scheduled_run_artifacts(tmp_path, state)
+    clock = _FakeClock()
+
+    result = await_finalized_run_artifacts(
+        tmp_path, grace_seconds=3, require_summary=True, sleep=clock.sleep, monotonic=clock.monotonic
+    )
+
+    assert result.ok and bool(result) and result.errors == []
+    assert not result.finalized
+    assert result.completion_marker is None
+    assert result.waited_seconds == 3.0
+
+
+def test_the_window_never_overshoots_the_grace_on_a_coarse_poll(tmp_path):
+    clock = _FakeClock()
+
+    result = await_finalized_run_artifacts(
+        tmp_path, grace_seconds=2.5, poll_seconds=2, sleep=clock.sleep, monotonic=clock.monotonic
+    )
+
+    assert clock.slept == [2, 0.5]
+    assert result.waited_seconds == 2.5
+
+
+def test_a_nonpositive_poll_interval_is_rejected(tmp_path):
+    with pytest.raises(ValueError):
+        await_finalized_run_artifacts(tmp_path, poll_seconds=0)
+
+
+def test_validation_options_pass_through_to_the_contract(tmp_path):
+    """A preflight run waives the order CSV; the window must waive it too."""
+    state = _live_run_state()
+    write_scheduled_run_artifacts(tmp_path, state)
+    (tmp_path / "submitted_orders.csv").unlink()
+    clock = _FakeClock()
+
+    result = await_finalized_run_artifacts(
+        tmp_path,
+        require_submitted_orders=False,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+    )
+
+    assert result.ok and result.finalized
+    assert clock.slept == []
+
+
+@pytest.mark.parametrize(
+    "state, expected",
+    [
+        ({"completion_reason": "no_ladder_candidates"}, "completion_reason"),
+        ({"completion_reason": None, "order_submit_status": "submitted"}, "order_submit_status"),
+        ({"completion_reason": "", "status": "ok"}, "status"),
+        ({"run_classification_outcome": "scheduled_live"}, "run_classification_outcome"),
+        ({"completion_reason": None, "status": None}, None),
+        ({}, None),
+        (None, None),
+        ("run_state.json", None),
+    ],
+)
+def test_completion_marker_reports_the_first_non_empty_terminal_field(state, expected):
+    assert completion_marker(state) == expected
+
+
+def test_read_run_state_returns_none_rather_than_raising(tmp_path):
+    assert read_run_state(tmp_path) is None
+
+    (tmp_path / RUN_STATE_FILENAME).write_text("{not json", encoding="utf-8")
+    assert read_run_state(tmp_path) is None
+
+    (tmp_path / RUN_STATE_FILENAME).write_text("[1, 2]", encoding="utf-8")
+    assert read_run_state(tmp_path) is None, "a non-object run_state is unusable"
+
+    write_scheduled_run_artifacts(tmp_path, _live_run_state())
+    assert read_run_state(tmp_path)["run_id"] == "midday_live_20260727_1230ET"

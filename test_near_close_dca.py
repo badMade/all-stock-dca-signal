@@ -58,6 +58,7 @@ from near_close_dca import (
     _process_buy_candidate,
     _same_stream_order_exists,
     _seed_prior_allocations,
+    _select_reconciled_signal_rows,
     account_pinning_failure,
     allocation_sort_key,
     build_broker,
@@ -231,6 +232,9 @@ def test_ticker_universe():
     assert "IBM" in ACTIVE_TICKERS
     assert "TXN" in ACTIVE_TICKERS
     assert "RKLB" in ACTIVE_TICKERS
+    # Added 2026-08-04. Whitelisted without a broker instrument search, so the
+    # only in-repo guarantee is membership; run-time preflight gates the rest.
+    assert "VT" in ACTIVE_TICKERS
     assert "GFUZ" in ACTIVE_TICKERS
     assert "IRDM" in ACTIVE_TICKERS
     assert "GLW" in ACTIVE_TICKERS
@@ -5124,6 +5128,230 @@ def test_write_run_artifacts_ignores_stale_orders_csv(tmp_path):
     assert usage["total_artifact_bytes"] == state_size + written_csv_bytes
 
 
+def test_scheduled_finalize_archives_only_after_the_contract_is_written(tmp_path, monkeypatch):
+    # Codex review ("Finalize scheduled artifacts before waiting on archive
+    # locks"): a per-ticker archive lock can block for several seconds when
+    # another process is writing the same ticker file, but the just-fired-run
+    # grace period a monitor uses to distinguish a genuinely incomplete run
+    # from one still finishing defaults to only 20 seconds. Archiving must
+    # happen strictly AFTER the scheduled contract's required
+    # run_summary.json/submitted_orders.csv are written, never before, or
+    # ordinary archive contention can make a successfully submitted run
+    # appear incomplete and trigger a false escalation.
+    import near_close_dca as m
+
+    call_order = []
+    monkeypatch.setattr(m, "build_run_artifacts", lambda *a, **k: {"signal_rows": []})
+    monkeypatch.setattr(
+        m,
+        "write_run_artifacts",
+        lambda artifacts, artifacts_dir: (
+            call_order.append("write_run_artifacts") or {"run_state": "run_state.json"}
+        ),
+    )
+    monkeypatch.setattr(
+        m,
+        "_write_and_validate_scheduled_contract",
+        lambda artifacts, artifacts_dir: (call_order.append("contract") or True),
+    )
+    monkeypatch.setattr(
+        m,
+        "_archive_intraday_observations",
+        lambda artifacts, out, decisions=(): (call_order.append("archive") or None),
+    )
+
+    m._finalize_and_write_artifacts(
+        now=datetime(2026, 6, 29, 15, 30, tzinfo=EASTERN),
+        config=StrategyConfig(),
+        state=StrategyState(),
+        decisions=[],
+        candidate_outcomes={},
+        order_reviews_attempted=0,
+        errors_count=0,
+        notifications_sent=None,
+        cost_control_notes=None,
+        top_up_outcomes=None,
+        scheduled=True,
+        artifacts_dir=tmp_path,
+        classification_state_root=None,
+    )
+
+    assert call_order == ["write_run_artifacts", "contract", "archive"]
+
+
+def test_manual_finalize_archives_right_after_write_run_artifacts(tmp_path, monkeypatch):
+    # A manual run has no scheduled contract step to wait for -- archiving
+    # should proceed right after write_run_artifacts, and the contract
+    # helper must never be invoked at all.
+    import near_close_dca as m
+
+    call_order = []
+    monkeypatch.setattr(m, "build_run_artifacts", lambda *a, **k: {"signal_rows": []})
+    monkeypatch.setattr(
+        m,
+        "write_run_artifacts",
+        lambda artifacts, artifacts_dir: (
+            call_order.append("write_run_artifacts") or {"run_state": "run_state.json"}
+        ),
+    )
+    monkeypatch.setattr(
+        m,
+        "_write_and_validate_scheduled_contract",
+        lambda artifacts, artifacts_dir: (call_order.append("contract") or True),
+    )
+    monkeypatch.setattr(
+        m,
+        "_archive_intraday_observations",
+        lambda artifacts, out, decisions=(): (call_order.append("archive") or None),
+    )
+
+    m._finalize_and_write_artifacts(
+        now=datetime(2026, 6, 29, 15, 30, tzinfo=EASTERN),
+        config=StrategyConfig(),
+        state=StrategyState(),
+        decisions=[],
+        candidate_outcomes={},
+        order_reviews_attempted=0,
+        errors_count=0,
+        notifications_sent=None,
+        cost_control_notes=None,
+        top_up_outcomes=None,
+        scheduled=False,
+        artifacts_dir=tmp_path,
+        classification_state_root=None,
+    )
+
+    assert call_order == ["write_run_artifacts", "archive"]
+
+
+def test_select_reconciled_signal_rows_picks_the_buy_winning_provider(tmp_path):
+    # Codex review ("Archive one reconciled near-close observation per
+    # ticker"): at 15:30 signal_rows carries two rows per ticker (Finance
+    # then Robinhood), and the scheduled natural key
+    # (trading_day, stream, slot, ticker) has no source component, so
+    # archiving both unfiltered would collapse to whichever sorts last --
+    # Robinhood here -- even when Finance is the one that actually produced
+    # the reconciled BUY.
+    finance_signal = SourceSignal(
+        ticker="AAPL", source=SourceName.FINANCE, action=Action.BUY, reason="ok",
+        decision_price=98.0, quote_price=98.0,
+    )
+    robinhood_signal = SourceSignal(
+        ticker="AAPL", source=SourceName.ROBINHOOD, action=Action.BUY, reason="ok",
+        decision_price=97.0, quote_price=97.0,
+    )
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="finance and Robinhood agree on BUY",
+        finance_signal=finance_signal,
+        robinhood_signal=robinhood_signal,
+        target_price=98.0,
+        target_price_source="finance:signal_quote",
+    )
+    signal_rows = [
+        {"ticker": "AAPL", "source": "finance", "decision_bar_close": 98.0},
+        {"ticker": "AAPL", "source": "robinhood", "decision_bar_close": 97.0},
+    ]
+
+    selected = _select_reconciled_signal_rows(signal_rows, [decision])
+
+    assert len(selected) == 1
+    row = selected[0]
+    assert row["ticker"] == "AAPL"
+    assert row["source"] == "finance"
+    assert row["decision_bar_close"] == 98.0
+    # Codex review ("Archive the near-close target quote"): the row must
+    # also carry the RECONCILED execution target, not just the raw
+    # decision_bar_close, so the archived price matches what placement
+    # actually used.
+    assert row["current_price"] == 98.0
+    assert row["price_source"] == "finance:signal_quote"
+
+
+def test_select_reconciled_signal_rows_overlays_the_target_quote_time():
+    quote_time = datetime(2026, 6, 29, 15, 29, 50, tzinfo=EASTERN)
+    finance_signal = SourceSignal(
+        ticker="AAPL", source=SourceName.FINANCE, action=Action.BUY, reason="ok",
+        decision_price=98.0, quote_price=98.5, quote_time=quote_time,
+    )
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="Robinhood-only BUY because finance source is unavailable",
+        finance_signal=finance_signal,
+        robinhood_signal=None,
+        target_price=98.5,
+        target_price_source="finance:signal_quote",
+        target_quote_time=quote_time,
+    )
+    signal_rows = [{"ticker": "AAPL", "source": "finance", "decision_bar_close": 98.0}]
+
+    selected = _select_reconciled_signal_rows(signal_rows, [decision])
+
+    assert selected[0]["current_price"] == 98.5
+    assert selected[0]["price_as_of"] == quote_time
+
+
+def test_select_reconciled_signal_rows_does_not_mutate_the_original_signal_row():
+    # The same signal_rows list is also written to signals.csv by
+    # write_run_artifacts -- overlaying archive-only fields must never leak
+    # into that unrelated artifact.
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="ok",
+        finance_signal=None,
+        robinhood_signal=None,
+        target_price=98.0,
+        target_price_source="finance:signal_quote",
+    )
+    original_row = {"ticker": "AAPL", "source": "finance", "decision_bar_close": 98.0}
+    signal_rows = [original_row]
+
+    _select_reconciled_signal_rows(signal_rows, [decision])
+
+    assert "current_price" not in original_row
+    assert "price_source" not in original_row
+
+
+def test_select_reconciled_signal_rows_prefers_finance_for_non_buy_decisions():
+    # Neither provider "wins" a non-BUY decision (target_price_source stays
+    # empty), so this system's Finance-primary policy is used as the
+    # tie-break, falling back to Robinhood only when Finance has no signal.
+    decision_both = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.NO_ACTION,
+        reason="mixed or flat conditions",
+        finance_signal=SourceSignal(
+            ticker="AAPL", source=SourceName.FINANCE, action=Action.NO_ACTION, reason="ok"
+        ),
+        robinhood_signal=SourceSignal(
+            ticker="AAPL", source=SourceName.ROBINHOOD, action=Action.NO_ACTION, reason="ok"
+        ),
+    )
+    decision_finance_only = ReconciledDecision(
+        ticker="MSFT",
+        action=Action.NO_ACTION,
+        reason="mixed or flat conditions",
+        finance_signal=None,
+        robinhood_signal=SourceSignal(
+            ticker="MSFT", source=SourceName.ROBINHOOD, action=Action.NO_ACTION, reason="ok"
+        ),
+    )
+    signal_rows = [
+        {"ticker": "AAPL", "source": "finance"},
+        {"ticker": "AAPL", "source": "robinhood"},
+        {"ticker": "MSFT", "source": "finance"},
+        {"ticker": "MSFT", "source": "robinhood"},
+    ]
+
+    selected = _select_reconciled_signal_rows(signal_rows, [decision_both, decision_finance_only])
+
+    by_ticker = {row["ticker"]: row["source"] for row in selected}
+    assert by_ticker == {"AAPL": "finance", "MSFT": "robinhood"}
+
+
 def test_provider_error_manual_review_classified_as_data_error():
     fs = _no_data_signal(SourceName.FINANCE, provider_error=True)
     decision = ReconciledDecision(
@@ -5203,6 +5431,37 @@ def test_top_up_guard_no_prior_run_allocates_full_amount():
     assert outcome.incremental_order_amount == 6.0
     assert outcome.skipped is False
     assert outcome.manual_review is False
+
+
+def test_top_up_guard_flushes_a_pending_credit_with_no_prior_allocation():
+    # Codex review ("Flush pending credits even without prior context"): a
+    # ticker whose only earlier same-day activity was a sub-dollar decline
+    # that never itself crossed the broker's $1 minimum has NO
+    # prior_same_day_allocations entry at all -- that dict only tracks
+    # actual orders, not pending credits. prior is therefore None here, same
+    # as for a ticker with no same-day activity whatsoever. Before this fix,
+    # a non-BUY final decision for that ticker fell through to the plain
+    # "no prior" outcome (desired=0, since there's no BUY signal to size)
+    # without ever considering existing_pending_credit_usd, permanently
+    # stranding the credit since near_close_dca is always the final session.
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.NO_ACTION,
+        reason="price recovered above previous close",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=0.0,
+        suggested_amount_usd=0.0,
+        target_price=100.0,
+    )
+
+    outcome = evaluate_top_up_guard(
+        decision, None, StrategyConfig(), existing_pending_credit_usd=0.40
+    )
+
+    assert outcome.incremental_order_amount == 1.0
+    assert outcome.skipped is False
+    assert outcome.cumulative_credit_decline_usd == 0.0
 
 
 def test_top_up_guard_lower_price_buys_incremental_difference():
@@ -8412,6 +8671,99 @@ def test_build_run_artifacts_uses_guarded_amount_as_planned_notional(tmp_path):
     assert (
         candidates["AAPL"]["afternoon_desired_amount_usd"] == 6.0
     ), "original desired amount must be preserved in afternoon_desired_amount_usd"
+
+
+def test_build_run_artifacts_includes_a_submitted_pending_credit_flush(tmp_path):
+    # Codex review ("Include pending-credit flush orders in artifacts"): a
+    # ticker appended to buy_candidates solely because it carries a pending
+    # same-day credit has a non-BUY decision.action (its own signal recovered
+    # or is flat) even when _process_buy_candidate went on to submit a real
+    # rounded flush order for it. _build_buy_candidates must not drop that
+    # real order just because the underlying decision isn't a BUY, or the
+    # run's own audit (buy_candidates.csv, counts, order_submit_status)
+    # would show no evidence of an order that was actually placed.
+    from near_close_dca import (
+        TOP_UP_INCREMENTAL,
+        ArtifactRunContext,
+        TopUpGuardOutcome,
+        build_run_artifacts,
+    )
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
+    )
+    state = StrategyState()
+    # AAPL's own final-session signal recovered above the previous close --
+    # NOT a fresh BUY -- but it still carries an earlier pending credit that
+    # the final session's flush contract requires closing out.
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.NO_ACTION,
+        reason="above prior close and 60-minute trend up",
+        finance_signal=None,
+        robinhood_signal=None,
+    )
+    guard = TopUpGuardOutcome(
+        ticker="AAPL",
+        top_up_guard_result=TOP_UP_INCREMENTAL,
+        incremental_order_amount=1.0,
+        afternoon_desired_amount=0.0,
+        afternoon_decision_price=98.0,
+        prior_same_day_amount=0.0,
+        prior_same_day_reference_price=None,
+        prior_same_day_run_id=None,
+        prior_same_day_source=None,
+        skipped=False,
+        manual_review=False,
+    )
+    artifacts = build_run_artifacts(
+        now,
+        config,
+        state,
+        [decision],
+        candidate_outcomes={
+            "AAPL": {"order_id": "FLUSH-1", "status": "dry_run", "submitted_amount_usd": 1.0}
+        },
+        run_context=ArtifactRunContext(top_up_outcomes={"AAPL": guard}),
+    )
+
+    candidates = {c["ticker"]: c for c in artifacts["buy_candidates"]}
+    assert "AAPL" in candidates, "the submitted flush order is missing from buy_candidates"
+    assert candidates["AAPL"]["order_id"] == "FLUSH-1"
+    assert candidates["AAPL"]["status"] == "dry_run"
+    assert candidates["AAPL"]["planned_amount_usd"] == 1.0
+    assert candidates["AAPL"]["is_pending_credit_flush"] is True
+    assert artifacts["counts"]["buy_candidates"] == 1
+
+
+def test_build_run_artifacts_still_drops_a_non_buy_decision_with_no_order(tmp_path):
+    # The opposite of the flush case: an ordinary non-BUY ticker with no
+    # placed order must still be excluded from buy_candidates, unchanged.
+    from near_close_dca import ArtifactRunContext, build_run_artifacts
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
+    )
+    state = StrategyState()
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.NO_ACTION,
+        reason="mixed or flat conditions",
+        finance_signal=None,
+        robinhood_signal=None,
+    )
+    artifacts = build_run_artifacts(
+        now, config, state, [decision],
+        candidate_outcomes={},
+        run_context=ArtifactRunContext(top_up_outcomes=None),
+    )
+    assert artifacts["buy_candidates"] == []
 
 
 def test_build_run_artifacts_keeps_preserved_amount_for_duplicate(tmp_path):

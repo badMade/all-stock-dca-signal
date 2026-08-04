@@ -57,8 +57,10 @@ from morning_dca import (
     MorningDCAExecutor,
     MorningSignal,
     TopUpOutcome,
+    _coerce_live_execution_enabled,
     _load_approved_dates_fail_closed,
     default_prior_allocation_roots,
+    load_max_orders_per_day,
     load_max_per_order_usd,
 )
 from near_close_dca import (
@@ -198,6 +200,19 @@ def load_midday_config(config_dir=None, *, allow_unpinned_account: bool = False)
         return MiddayConfig(
             approved_test_dates=_load_approved_dates_fail_closed(config_dir_path),
             model_usage_log_root=stream_root("model_usage"),
+            # Fail closed to shadow mode rather than inheriting
+            # MiddayConfig.live_execution_enabled's True default. Midday IS a
+            # live stream (config/midday_dca.json sets live_execution_enabled
+            # true), but a run that cannot read its config does not know its
+            # caps, ticker universe, target account, or approved dates, and
+            # must not place real orders in that state. Note this is NOT
+            # covered by _load_approved_dates_fail_closed above: that guards a
+            # broken trading_window.json, a different file, so a missing
+            # midday_dca.json alone previously reached live placement with
+            # hardcoded defaults (Codex review: "Keep disabled streams
+            # disabled when config loading fails" -- load_stream_config's
+            # equivalent guard, which midday's separate loader never had).
+            live_execution_enabled=False,
         )
 
     approved_date_overrides = {
@@ -215,7 +230,9 @@ def load_midday_config(config_dir=None, *, allow_unpinned_account: bool = False)
         raw = json.loads(cfg_path.read_bytes())
     except (UnicodeDecodeError, json.JSONDecodeError, OSError) as exc:
         _log.warning("could not parse %s (%s); using MiddayConfig defaults", cfg_path, exc)
-        return MiddayConfig(**approved_date_overrides)
+        # Fail closed to shadow mode -- see the not-exists branch above for why
+        # an unreadable config must never reach live broker placement.
+        return MiddayConfig(**approved_date_overrides, live_execution_enabled=False)
 
     # See load_morning_config: bundled absolute artifact paths follow
     # $DCA_CRON_TRACKING_ROOT instead of overriding it. No-op when unset.
@@ -224,6 +241,18 @@ def load_midday_config(config_dir=None, *, allow_unpinned_account: bool = False)
     kwargs: Dict[str, Any] = dict(approved_date_overrides)
     if "trend_min_bars" in raw:
         kwargs["trend_min_bars"] = int(raw["trend_min_bars"])
+
+    # Master placement switch. Deliberately defaults to True (MiddayConfig's
+    # inherited default) when the key is absent from an OTHERWISE READABLE
+    # config, unlike load_stream_config's shadow-first streams: midday is a
+    # currently-functioning live execution, so treating an omitted key as
+    # "disabled" here would silently stop a trading stream. Fail-closed applies
+    # only to the unreadable/missing-config paths above, where nothing about
+    # the stream's configuration can be trusted.
+    if "live_execution_enabled" in raw:
+        kwargs["live_execution_enabled"] = _coerce_live_execution_enabled(
+            raw["live_execution_enabled"], source_label="midday_dca.json"
+        )
 
     sizing = raw.get("sizing_ladder", {})
     if "base_amount_usd" in sizing:
@@ -312,6 +341,17 @@ def load_midday_config(config_dir=None, *, allow_unpinned_account: bool = False)
     max_order = load_max_per_order_usd(config_dir_path)
     if max_order is not None:
         kwargs["max_per_order_usd"] = max_order
+
+    # Shared daily order-ATTEMPT ceiling (config/budgets.json
+    # circuit_breakers.max_orders_per_day), mirrors load_morning_config /
+    # load_stream_config. Without this, MiddayConfig.max_orders_per_day stayed
+    # None and _place_broker_orders' shared-cap check (which only enforces when
+    # non-null) never applied to the midday stream, letting it keep placing
+    # orders after the roster-wide daily attempt cap was already exhausted by
+    # an earlier stream.
+    max_orders_per_day = load_max_orders_per_day(config_dir_path)
+    if max_orders_per_day is not None:
+        kwargs["max_orders_per_day"] = max_orders_per_day
 
     # Overlay trading_window.json so scheduled live runs respect the approved date
     # window (empty frozenset = gate disabled; non-empty = only approved dates allowed).

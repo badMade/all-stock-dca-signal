@@ -138,10 +138,10 @@ restate them; see `docs/run_classification.md` and the schemas.
 | Effective-prior from artifacts + persisted fills | **Implemented (pre-existing)** | `scripts/run_classification.py` |
 | Fail-closed broker reconciliation engine (paging, raw persist, id fallback) | **Implemented, tested — engine only** | `scripts/broker_reconciliation.py` |
 | Effective-prior + fail-closed decision (`BROKER_HISTORY_INCOMPLETE`) | **Implemented, tested — engine only** | `scripts/broker_reconciliation.py` |
-| Unified decision reason codes | **Implemented, tested** | `scripts/reason_codes.py` |
+| Unified decision reason codes | **Implemented, tested — engine only** (corrected 2026-08-03) | `scripts/reason_codes.py` |
 | Run state machine (`pending→…→published`) | **Implemented, tested — engine only** | `scripts/run_state_machine.py` |
 | Chronological run ledger | **Implemented, tested — engine only** | `scripts/run_ledger.py` |
-| Incident correlation IDs | **Implemented, tested — engine only** | `scripts/correlation.py` |
+| Incident correlation IDs | **Partially WIRED — `build_correlation_id` is live; child/parent helpers engine only** (corrected 2026-08-03) | `scripts/correlation.py`, `run_dca.py` |
 | Scheduler leases | **Implemented, tested — engine only** | `scripts/scheduler_lease.py` |
 | Rich idempotency keys (date, window, symbol, strategy-ver, tier) | **Implemented, tested — engine only** | `scripts/idempotency.py` |
 | **Wiring the above into the live runner decision path** | **Pending (behavior change; separate review)** | `run_dca.py`, `near_close_dca.py`, `dca_live_adapters.py` |
@@ -154,3 +154,27 @@ restate them; see `docs/run_classification.md` and the schemas.
 intentionally NOT yet called from the live trading decision path. Wiring it in
 changes live-trading behavior and must be done deliberately, with its own review
 and a live-run acceptance checklist — not as a side effect of adding the engine.
+
+> **Two rows corrected 2026-08-03 after a grep-verified wiring audit.**
+> 1. **`reason_codes.py` was listed as plain "Implemented, tested"** with no
+>    "engine only" qualifier, implying it was live. It is not: its only
+>    non-test importers are `broker_reconciliation.py` and
+>    `same_day_top_up_gate.py`, *both of which are themselves unwired*, making it
+>    **transitively dead**. It is now tagged "engine only" like its siblings.
+> 2. **`correlation.py` was listed as "engine only" but is partly live** — the
+>    opposite error. `build_correlation_id` is a module-level import in
+>    `run_dca.py` and is called in the live slot path, with the resulting
+>    `correlation_id` written into `run_state.json`. The remaining helpers
+>    (`child_correlation_id`, `new_correlation_id`, `parent_of`, `is_child` —
+>    the recovery-attribution half) have no callers and stay engine-only.
+>
+> Independently verified as **genuinely unwired** (zero non-test callers):
+> `broker_reconciliation.py`, `run_state_machine.py`, `run_ledger.py`,
+> `scheduler_lease.py`, `idempotency.py`.
+>
+> **Note on `idempotency.py`:** the live executors do *not* use it. They each
+> implement their own simpler `_idempotency_stream()` string-based ref_id
+> scheme (`morning_dca.py`, `intraday_dca.py`, `near_close_dca.py`). Two
+> non-integrated idempotency implementations therefore coexist, and the rich
+> keyed scheme documented above is **not** what protects live runs against
+> duplicate orders today. Worth consolidating before relying on either.

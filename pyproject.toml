@@ -86,6 +86,17 @@ py-modules = [
     "market_open_dca",
     "intraday_dca",
     "dca_cumulative",
+    # Imported by scripts/run_tickers_daily_update.py, scripts/run_ticker_maintenance.py,
+    # and scripts/refresh_active_ticker_histories.py to resolve the ticker-history
+    # directory; without it those jobs fail with ModuleNotFoundError outside a
+    # source checkout.
+    "dca_ticker_paths",
+    # The durable intraday observation archive, imported unconditionally by
+    # both morning_dca and near_close_dca. Without it, importing the
+    # installed-wheel executors (or launching the packaged CLI) fails with
+    # ModuleNotFoundError outside a source checkout (Codex review: "Package
+    # the intraday archive module").
+    "dca_intraday_archive",
 ]
 # scripts/run_classification.py is the run-classification contract used by both
 # the live artifact writer (near_close_dca.build_run_artifacts) and readers

@@ -91,14 +91,27 @@ The live execution runs at **10:30 AM ET** (`cron_id=42173154`, cron
 validation/account context), the shared **$2 base 0x-to-5x live ladder**, and the
 `morning` budget ledger.
 
-It **depends on the same-day 9:45 pre-flight artifact** and evaluates **only
+It **uses the same-day 9:45 pre-flight artifact as a coarse pre-screen** and,
+when that artifact is present and valid, evaluates **only
 `eligible_to_execute=true` tickers**, then **recomputes a fresh price, prior
 close, spread, 60-minute downtrend, signal, and budget before placing**; if the
 trend cannot be validated it **skips / routes to manual review** (never
-auto-buys). If the pre-flight artifact is missing, a **scheduled** run **fails
-closed** — `_apply_preflight_gate()` evaluates zero tickers and writes a
-blocked `run_state.json` — rather than blocking all buys via a full-universe
-fallback; only a **manual** run degrades to the full universe with a warning.
+auto-buys).
+
+> **Changed 2026-08-02 — a missing pre-flight artifact no longer blocks.**
+> This section previously stated that a missing artifact made a **scheduled**
+> run **fail closed** (`_apply_preflight_gate()` evaluating zero tickers and
+> writing a blocked `run_state.json`), with only a **manual** run degrading to
+> the full universe. That is **no longer true for either run type.** Per Geoff's
+> 2026-08-02 direction ("should not block any later runs"),
+> `morning_preflight_eligible_tickers()` now **always degrades to the full
+> configured universe with a warning** — for scheduled and manual runs alike —
+> and `preflight_missing_block` is never set by anything anymore (the branch
+> that consumed it has been deleted from `_run_impl`). The warning is surfaced
+> on `artifacts["preflight_gate"]` for observability. The pre-flight artifact is
+> a coarse pre-screen only, never a hard gate the 10:30 slot depends on to run
+> at all. The **forbidden-root** rejection below is a separate rule and *does*
+> still fail closed.
 
 #### Pre-flight artifact location (added Jul 20 2026)
 
@@ -428,16 +441,40 @@ watchlist mode, actual order size in live mode).
 
 ## Budget ledger
 
-`MorningLedger` is a standalone budget session (namespace `morning`) tracking
-only morning notional. Configurable hooks:
+`MorningLedger` is a budget session (namespace `morning`) tracking morning
+notional. Configurable hooks:
 
-- `morning_daily_cap_usd` (default `90.0`)
-- `morning_weekly_cap_usd` (default `450.0`)
+- `morning_daily_cap_usd` (default `180.0`)
+- `morning_weekly_cap_usd` (default `900.0`)
+- `artifact_paths.cap_seed_roots` — the sibling-stream roots the ledger seeds
+  same-day/same-week spend from
 - per-mode roots `watchlist_run_state_root` / `live_run_state_root` (legacy
   `morning_run_state_root` mirrors the watchlist root)
 
-Exceeding a cap adds a warning to the run artifact; it never touches the
-afternoon daily/weekly ledger.
+Exceeding a cap adds a warning to the run artifact.
+
+> **Corrected 2026-08-03 — the caps here were stale, and the isolation claim
+> was wrong.** This section previously documented `90.0` / `450.0` defaults and
+> stated the morning ledger "never touches the afternoon daily/weekly ledger."
+> Both were superseded by the **2026-08-02 pooling fix** (Geoff: "caps aren't
+> pooled the way the target design intends — fix it") and neither was flagged as
+> outdated. Actual current behavior, verified in code and config:
+> `DEFAULT_MORNING_DAILY_CAP_USD = 180.0` and
+> `DEFAULT_MORNING_WEEKLY_CAP_USD = 900.0` (`morning_dca.py`), matching
+> `config/morning_dca.json`'s `budget_ledger` block — the **same shared
+> Normal-tier ceiling** (`near_close_dca.BUDGET_TIERS[0]`) every stream draws
+> from, not an isolated half-share. The ledger now **seeds from every sibling
+> stream's same-day/same-week artifacts** via
+> `artifact_paths.cap_seed_roots` — `morning_dca`, `market_open_dca`,
+> `midday_dca`, `intraday_dca`, the afternoon `ce16ba6b` root, and
+> `final_manual_review` — so morning spend and afternoon spend now draw down one
+> shared pool rather than two independent ones.
+>
+> **This is partial parity, not full parity.** Morning (and midday) check only
+> against the flat shared **Normal** tier and never independently escalate to
+> Elevated / High-volatility / Stress — only the 3:30 final run does that, from
+> its fuller same-day view. See
+> [safeguards.md](safeguards.md#live-execution-roster).
 
 ### Ledger location and bootstrap (added Jul 20 2026)
 
@@ -449,7 +486,7 @@ pre-flight root, the afternoon `ce16ba6b` tree, or any
 
 The task **does not require a pre-existing ledger file**. If none exists, it
 initializes the morning ledger from the configured `morning_daily_cap_usd`
-(default `90.0`) and `morning_weekly_cap_usd` (default `450.0`) caps, then writes
+(default `180.0`) and `morning_weekly_cap_usd` (default `900.0`) caps, then writes
 the resulting budget calculations (caps, same-day morning spend, remaining daily
 and weekly capacity) into the 10:30 `run_state.json`. A missing ledger file is
 **not** an escalation condition; it is bootstrapped from the configured caps.

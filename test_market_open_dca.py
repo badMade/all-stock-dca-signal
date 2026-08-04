@@ -1,26 +1,269 @@
-"""Self-tests for the market-open live-execution stream config loader.
+"""Self-tests for the market-open graded-DCA executor (9:35 AM ET live stream).
 
-Focused on the fail-closed config-loading fix (Codex review: "Keep disabled
-streams disabled when config loading fails") rather than full coverage of
-market_open_dca.py, which reuses morning_dca.MorningDCAExecutor's already
-heavily-tested pipeline.
+Scoped to the market-open stream's own deltas, the same way test_midday_dca.py
+is scoped relative to test_morning_dca.py: the shared evaluate/build/write
+pipeline is already covered by test_morning_dca.py and is inherited unchanged.
+
+What is market-open specific and therefore tested here:
+
+    - the trend-validation exemption (only ~5 minutes of session data exist at
+      9:35, so a completed 60-minute downtrend can never validate),
+    - independence from the 9:45 pre-flight artifact, which does not exist yet
+      when this slot decides,
+    - the ships-disabled placement switch,
+    - stream identity, artifact roots, and root-resolution timing.
+
+Runnable with ``pytest`` or ``python test_market_open_dca.py``.
 """
-
-import os
-
-os.environ.setdefault("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "999000111")
 
 import json
 from datetime import date, datetime, time, timedelta
+from pathlib import Path
 
+import pytest
+
+from conftest import FIXTURE_ACCOUNT_NUMBER
+from dca_paths import CRON_TRACKING_ROOT_ENV, stream_root
 from market_open_dca import (
+    DEFAULT_MARKET_OPEN_DAILY_CAP_USD,
+    DEFAULT_MARKET_OPEN_WEEKLY_CAP_USD,
+    MARKET_OPEN_LIVE_CRON_ID,
+    MARKET_OPEN_SIZING_TIERS,
+    MARKET_OPEN_STREAM,
     MarketOpenConfig,
     MarketOpenDCAExecutor,
+    default_market_open_cap_seed_roots,
     default_market_open_prior_allocation_roots,
     load_market_open_config,
 )
-from morning_dca import EASTERN, EXEC_AUTO_BUY_ELIGIBLE, Bar
-from near_close_dca import Action, SourceName, load_prior_same_day_allocations
+from morning_dca import EXEC_AUTO_BUY_ELIGIBLE, Bar
+from near_close_dca import EASTERN, Action, SourceName, StrategyConfig, load_prior_same_day_allocations
+from test_morning_dca import DecliningBarsProvider, FixedDropProvider
+
+TRADING_DAY = date(2026, 7, 8)
+
+
+def _now_market_open():
+    """Decision timestamp for the 9:35 AM ET live execution."""
+    return datetime.combine(TRADING_DAY, time(9, 35), tzinfo=EASTERN)
+
+
+class _Broker:
+    """Minimal successful broker that records every placement."""
+
+    def __init__(self):
+        self.placed = {}
+
+    def account_number(self):
+        return FIXTURE_ACCOUNT_NUMBER
+
+    def available_buying_power(self):
+        return 500.0
+
+    def same_day_strategy_order_exists(self, ticker, trading_day):
+        return False
+
+    def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, prefixes):
+        return False
+
+    def is_tradable_for_fractional_buy(self, ticker):
+        return True
+
+    def review_market_buy(self, ticker, notional_usd):
+        return True, "ok"
+
+    def place_market_buy(self, ticker, notional_usd, ref_id):
+        self.placed[ticker] = notional_usd
+        return f"ORDER-{ticker}"
+
+
+def _cfg(tmp_path, **overrides):
+    base = dict(
+        tickers=("TICK",),
+        morning_run_state_root=str(tmp_path / "market_open"),
+        target_account_number=FIXTURE_ACCOUNT_NUMBER,
+        approved_test_dates=frozenset({TRADING_DAY}),
+        prior_allocation_roots=(),
+        cap_seed_roots=(),
+    )
+    base.update(overrides)
+    return MarketOpenConfig(**base)
+
+
+# --- Ladder and caps are the shared ones -----------------------------------
+def test_market_open_ladder_is_the_shared_live_ladder():
+    assert MARKET_OPEN_SIZING_TIERS == StrategyConfig().sizing_tiers
+    ex = MarketOpenDCAExecutor(MarketOpenConfig())
+    assert ex.multiplier_for_drop(0.08) == 5.0
+    assert ex.multiplier_for_drop(0.0005) == 0.0
+
+
+def test_market_open_caps_are_the_shared_normal_tier_ceiling():
+    # Not an isolated per-stream share: the same $180/$900 every live stream
+    # draws from, so cross-stream seeding is meaningful.
+    assert DEFAULT_MARKET_OPEN_DAILY_CAP_USD == 180.0
+    assert DEFAULT_MARKET_OPEN_WEEKLY_CAP_USD == 900.0
+    ex = MarketOpenDCAExecutor(MarketOpenConfig())
+    assert ex.ledger.daily_cap_usd == 180.0
+    assert ex.ledger.weekly_cap_usd == 900.0
+    assert ex.ledger.namespace == MARKET_OPEN_STREAM
+
+
+# --- Stream identity --------------------------------------------------------
+def test_market_open_stream_identity_and_artifact_naming(tmp_path):
+    ex = MarketOpenDCAExecutor(_cfg(tmp_path))
+    now = _now_market_open()
+    assert ex.stream == "market_open"
+    assert ex.run_state_dir(now).name == "20260708_0935ET"
+    assert ex.run_id(now, manual=False) == "market_open_live_20260708_0935ET"
+    assert ex.signals_csv_name == "market_open_signals.csv"
+    assert ex.latest_pointer_name == "latest_market_open_run.json"
+
+
+def test_market_open_classification_fields(tmp_path):
+    rc = MarketOpenDCAExecutor(_cfg(tmp_path)).run_classification(_now_market_open(), manual=False)
+    assert rc["stream"] == "market_open"
+    assert rc["run_type"] == "market_open_dca_live"
+    assert rc["cron_id"] == MARKET_OPEN_LIVE_CRON_ID == "2ba19526"
+    assert rc["scheduled_for_et"] == "09:35"
+    assert rc["state_schema_version"] == "market-open-live-v1"
+    assert rc["trades"] is True
+    # Never evidence for any other stream.
+    assert rc["valid_morning_evidence"] is False
+    assert rc["valid_afternoon_evidence"] is False
+
+
+def test_market_open_classification_validates_against_json_schema(tmp_path):
+    jsonschema = pytest.importorskip("jsonschema")
+    schema_path = Path(__file__).resolve().parent / "schemas" / "market_open_run_classification.schema.json"
+    schema = json.loads(schema_path.read_bytes())
+    ex = MarketOpenDCAExecutor(_cfg(tmp_path))
+    for manual in (False, True):
+        jsonschema.validate(ex.run_classification(_now_market_open(), manual=manual), schema)
+
+
+# --- The trend-validation exemption (market-open specific) ------------------
+def test_market_open_is_exempt_from_trend_validation(tmp_path):
+    # config/scheduled_tasks.json:2ba19526.trend_validation_exemption, user-confirmed
+    # 2026-07-27: at 9:35 only ~5 minutes of session data exist, so requiring a
+    # completed 60-minute downtrend would make every market-open buy unbuyable.
+    ex = MarketOpenDCAExecutor(_cfg(tmp_path))
+    assert ex.profile["validate_trend"] is False
+
+
+def test_market_open_auto_buys_without_a_validatable_trend(tmp_path):
+    # FixedDropProvider emits FLAT bars, so no downward trend can be proven. A
+    # trend-validating stream would flag manual_review_candidate; this one must
+    # still reach an auto-buy-eligible BUY.
+    ex = MarketOpenDCAExecutor(_cfg(tmp_path))
+    flat = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.05})
+    signal = ex.evaluate(_now_market_open(), flat)[0]
+    assert signal.action == Action.BUY
+    assert signal.multiplier == 2.5
+    assert signal.execution_status != "manual_review_candidate"
+
+
+# --- Independence from the 9:45 pre-flight ----------------------------------
+def test_market_open_does_not_gate_on_the_preflight_artifact(tmp_path):
+    # This slot fires ten minutes BEFORE the 9:45 pre-flight writer, so the
+    # artifact cannot exist yet. The inherited pre-flight gate is scoped to the
+    # morning stream and must stay inert here -- otherwise every market-open run
+    # would fail closed to zero tickers.
+    ex = MarketOpenDCAExecutor(_cfg(tmp_path))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.05})
+    signals = ex.evaluate(_now_market_open(), data)
+    assert [s.ticker for s in signals] == ["TICK"]
+    assert ex.preflight_gate is None
+
+
+# --- The ships-disabled placement switch ------------------------------------
+def test_shipped_market_open_config_has_execution_disabled():
+    # The whole point of shipping this stream disabled. If this flips to True
+    # unintentionally, the 9:35 slot starts placing real orders.
+    cfg = load_market_open_config(allow_unpinned_account=True)
+    assert cfg.live_execution_enabled is False
+
+
+def test_market_open_disabled_writes_full_artifacts_and_places_nothing(tmp_path):
+    ex = MarketOpenDCAExecutor(_cfg(tmp_path, live_execution_enabled=False))
+    broker = _Broker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.05})
+    res = ex.run(_now_market_open(), data, broker=broker)
+
+    # Nothing was placed...
+    assert broker.placed == {}
+    # ...but the run still evaluated and still wrote a complete artifact set.
+    artifacts = res["artifacts"]
+    assert artifacts["live_execution_enabled"] is False
+    assert artifacts["signal_rows"], "a shadow run must still record its signals"
+    out = Path(res["paths"]["run_state"]).parent
+    for name in ("run_state.json", "run_summary.json", "market_open_signals.csv", "submitted_orders.csv"):
+        assert (out / name).exists(), f"{name} missing from a disabled run"
+    # submitted_orders.csv is header-only rather than absent.
+    assert (out / "submitted_orders.csv").read_text(encoding="utf-8").strip().splitlines()[0]
+
+
+def test_market_open_enabled_does_place(tmp_path):
+    # The complement of the test above: with the switch on, the same inputs do
+    # reach the broker -- proving the disabled case above is the switch working,
+    # not the fixture silently failing to produce a candidate.
+    ex = MarketOpenDCAExecutor(_cfg(tmp_path, live_execution_enabled=True))
+    broker = _Broker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.05})
+    ex.run(_now_market_open(), data, broker=broker)
+    assert broker.placed.get("TICK") == 5.0  # 2.5x * $2 base
+
+
+# --- Root resolution timing (Codex review, PR #219) -------------------------
+def test_market_open_default_roots_resolve_at_construction_not_import(monkeypatch, tmp_path):
+    # A literal module-level tuple would bind $DCA_CRON_TRACKING_ROOT at import
+    # time, leaving an executor built after the variable is set scanning the old
+    # tree and silently finding no prior allocations.
+    monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, str(tmp_path / "relocated"))
+    roots = default_market_open_prior_allocation_roots()
+    cap_roots = default_market_open_cap_seed_roots()
+    assert all(str(tmp_path / "relocated") in r for r in roots)
+    assert all(str(tmp_path / "relocated") in r for r in cap_roots)
+    assert MarketOpenConfig().prior_allocation_roots == roots
+
+
+def test_market_open_prior_allocation_roots_are_deliberately_narrow():
+    # Nothing scheduled runs before 9:35, so only hand-placed manual fills can
+    # precede it. morning_dca is included because the prior-allocation loader
+    # recurses and so catches morning_dca/manual_recovery/YYYYMMDD_*.
+    roots = default_market_open_prior_allocation_roots()
+    assert roots == (stream_root("market_open_dca"), stream_root("morning_dca"), stream_root("final_manual_review"))
+
+
+def test_market_open_cap_seed_roots_span_every_sibling_stream():
+    cap_roots = default_market_open_cap_seed_roots()
+    for sibling in ("market_open_dca", "morning_dca", "midday_dca", "intraday_dca", "ce16ba6b"):
+        assert stream_root(sibling) in cap_roots
+
+
+# --- Artifact-root separation ----------------------------------------------
+def test_market_open_writes_only_under_its_own_root(tmp_path):
+    root = tmp_path / "market_open"
+    ex = MarketOpenDCAExecutor(_cfg(tmp_path, live_execution_enabled=False))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.05})
+    res = ex.run(_now_market_open(), data, broker=_Broker())
+    for path in res["paths"].values():
+        assert str(root) in str(path), f"{path} escaped the market-open root"
+    # Never touches the afternoon pointer.
+    assert not (tmp_path / "latest_scheduled_run.json").exists()
+
+
+def test_market_open_blocked_outside_the_approved_window_still_writes_state(tmp_path):
+    # The gate this stream previously had no code-level equivalent of at all:
+    # before market_open_dca.py existed it would have kept placing orders past
+    # config/trading_window.json's end date.
+    ex = MarketOpenDCAExecutor(_cfg(tmp_path, approved_test_dates=frozenset({date(2026, 7, 9)})))
+    broker = _Broker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.05})
+    res = ex.run(_now_market_open(), data, broker=broker)
+    assert broker.placed == {}
+    assert res["artifacts"]["status"] == "blocked"
+    assert Path(res["paths"]["run_state"]).exists()
 
 
 def test_missing_config_file_fails_closed_to_shadow_mode(tmp_path):
@@ -60,6 +303,20 @@ def test_explicit_true_in_a_readable_config_still_overrides_the_fail_closed_defa
     )
     cfg = load_market_open_config(config_dir=str(tmp_path), allow_unpinned_account=True)
     assert cfg.live_execution_enabled is True
+
+
+def test_quoted_live_execution_enabled_fails_closed_instead_of_coercing_truthy(tmp_path):
+    # Codex review ("Reject non-boolean values for the midday live switch" --
+    # the same load_stream_config() bug affects every stream built on it,
+    # including this one): bool("false") is True in Python, so an operator
+    # who tried to disable live placement with a quoted JSON string would
+    # silently leave it enabled -- the opposite of what the config says, in
+    # the master switch that gates real broker orders.
+    (tmp_path / "market_open_dca.json").write_text(
+        json.dumps({"live_execution_enabled": "false"}), encoding="utf-8"
+    )
+    cfg = load_market_open_config(config_dir=str(tmp_path), allow_unpinned_account=True)
+    assert cfg.live_execution_enabled is False
 
 
 def _write_manual_recovery_run(root, subdir, ticker, amount_usd, decision_price):

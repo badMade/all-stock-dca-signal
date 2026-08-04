@@ -39,6 +39,9 @@ artifacts/
 # Claude Code agent directory
 .claude/
 
+# Local link to the Google Drive ticker archive (the archive itself is not source code).
+ticker_data
+
 # Cowork folder-mount write probe artifact
 .__probe_write_test
 

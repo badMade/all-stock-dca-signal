@@ -19,7 +19,9 @@
       { "et": "13:30", "task_id": "7be82b97", "role": "intraday live execution (1:30 slot)" },
       { "et": "14:30", "task_id": "7be82b97", "role": "intraday live execution (2:30 slot)" },
       { "et": "15:30", "task_id": "10ce362c", "role": "final live execution (final buy of the day)" },
-      { "et": "17:00", "task_id": "67aa802b", "role": "post-trade slippage + compact Notion latest-run sync" }
+      { "et": "17:00", "task_id": "67aa802b", "role": "post-trade slippage + compact Notion latest-run sync" },
+      { "et": "17:45", "task_id": "claude-tickers-daily-update", "role": "Claude-only ticker-history archive update" },
+      { "et": "18:30", "task_id": "claude-per-ticker-calibration", "role": "Claude-only event-gated per-ticker trigger recalculation" }
     ],
     "daily_mode_rules": [
       "Write compact artifacts only: machine-readable JSON/CSV, no long narrative summaries.",
@@ -399,11 +401,12 @@
   "afternoon_completion_rule": "REWRITTEN 2026-08-02: the 3:05 PM monitor-only signal check (e3e6f09e) and the 3:40 PM live-run watchdog (a46bf007) were both removed from the schedule entirely at the user's request; the watchdog no longer exists to anchor a 3:40 PM completion boundary. All afternoon trading now completes no later than 3:30 PM ET, when the final live execution (10ce362c) fires. Same-day post-trade artifact writing (post-trade slippage + compact Notion latest-run sync, 67aa802b) now runs at 5:00 PM ET daily (moved 2026-08-02 from 3:35 PM ET). The Friday weekly Notion performance dashboard refresh (041d9d90) runs at 5:30 PM ET (moved 2026-08-02 from 5:00 PM ET specifically to clear the collision with 67aa802b's new daily 5:00 PM slot on Fridays), and the month-end volatility risk refresh (c9fb1fb8 / 17a3b2a9) runs at 5:15 PM ET (also moved 2026-08-02, from its own prior 5:00 PM ET, for the same reason: it collided with 67aa802b's new daily 5:00 PM slot, and 5:15 PM also clears 041d9d90's Friday 5:30 PM slot since the final eligible market day can land on a Friday). 67aa802b, 041d9d90, and c9fb1fb8/17a3b2a9 are now the only DCA-related tasks approved to run after 3:30 PM ET.",
   "ticker_universe_policy": {
     "source_of_truth": "config/tickers.json",
-    "active_count": 52,
+    "active_count": 53,
     "summary": "Every universe-bearing scheduled task (pre-market dashboard, 9:45 scans, morning/midday/afternoon live streams, post-trade slippage sync, weekly/monthly refreshes) evaluates the active graded DCA universe in config/tickers.json:active. Only whitelisted active-universe tickers may be traded. BYDDY, VCX, TRLV, and RVI remain excluded. IRDMI->IRDM and GLWR->GLW remain corrected upstream.",
     "ticker_universe_update_2026_07_19": "TICKER UNIVERSE UPDATE JUL 19 2026: TXN is added to the active DCA universe and GFUZ remains active, taking the active universe to 44 symbols. Robinhood resolved TXN as Texas Instruments Incorporated Common Stock, state active, tradeable true, fractional tradability tradable, regular-hours dollar orders supported, and prior close available. Finance lookup resolved TXN as Texas Instruments Incorporated. Existing exclusions remain BYDDY, VCX, TRLV, and RVI; corrected symbols IRDM and GLW remain; IBM and GFUZ remain included (GFUZ with Robinhood primary if finance is unresolved). This adds whitelisted symbols only and preserves all existing trading safety, pre-authorization, same-day top-up, run-classification, budget, cost-conscious, manual-exclusion, and recovery language.",
     "ticker_universe_update_2026_07_27": "TICKER UNIVERSE UPDATE JUL 27 2026: RKLB (Rocket Lab Corporation) is added to the active DCA universe, taking the active universe to 45 symbols. Robinhood resolved RKLB as Rocket Lab Corporation Common Stock, state active, tradeable true, fractional tradability tradable, regular-hours dollar orders supported, and prior close available ($63.91 as of 2026-07-24). Existing exclusions remain BYDDY, VCX, TRLV, and RVI; corrected symbols IRDM and GLW remain; IBM, GFUZ, and TXN remain included. This adds a whitelisted symbol only and preserves all existing trading safety, pre-authorization, same-day top-up, run-classification, budget, cost-conscious, manual-exclusion, and recovery language.",
-    "ticker_universe_update_2026_08_02": "TICKER UNIVERSE UPDATE AUG 2 2026 (Codex review: 'Update the scheduled universe metadata for added tickers'): GE, VRT, CAT, QQQ, QCOM, ABBV, and JPM are added to the active DCA universe, taking the active universe to 52 symbols. Robinhood instrument search resolved all seven as real, distinct tradable instruments. DJX was also requested but NOT added -- it resolves only to a market index (Dow Jones Industrial Average Mini Index), not a tradable equity/ETF instrument; see config/tickers.json's notes for the full explanation. Existing exclusions remain BYDDY, VCX, TRLV, and RVI; corrected symbols IRDM and GLW remain; IBM, GFUZ, TXN, and RKLB remain included. This adds whitelisted symbols only and preserves all existing trading safety, pre-authorization, same-day top-up, run-classification, budget, cost-conscious, manual-exclusion, and recovery language."
+    "ticker_universe_update_2026_08_02": "TICKER UNIVERSE UPDATE AUG 2 2026 (Codex review: 'Update the scheduled universe metadata for added tickers'): GE, VRT, CAT, QQQ, QCOM, ABBV, and JPM are added to the active DCA universe, taking the active universe to 52 symbols. Robinhood instrument search resolved all seven as real, distinct tradable instruments. DJX was also requested but NOT added -- it resolves only to a market index (Dow Jones Industrial Average Mini Index), not a tradable equity/ETF instrument; see config/tickers.json's notes for the full explanation. Existing exclusions remain BYDDY, VCX, TRLV, and RVI; corrected symbols IRDM and GLW remain; IBM, GFUZ, TXN, and RKLB remain included. This adds whitelisted symbols only and preserves all existing trading safety, pre-authorization, same-day top-up, run-classification, budget, cost-conscious, manual-exclusion, and recovery language.",
+    "ticker_universe_update_2026_08_04": "TICKER UNIVERSE UPDATE AUG 4 2026 (user-requested): VT (Vanguard Total World Stock ETF) is added to the active DCA universe, taking the active universe to 53 symbols. UNVERIFIED INSTRUMENT: unlike every prior addition, VT was whitelisted without a Robinhood instrument search -- the session that added it had no broker access -- so its state, tradability, fractional tradability, and prior-close availability are unconfirmed. Nothing was added that assumes VT resolves; the existing per-run preflight and data-confidence gates admit or gate out VT fail-closed like any other symbol, and the first live run is the confirmation point. VT is also not in tickers.txt (the history-fetch universe), so it has no calibrated sizing entry and uses the global fallback ladder until history is fetched and scripts/generate_per_ticker_sizing.py is re-run. Existing exclusions remain BYDDY, VCX, TRLV, and RVI; corrected symbols IRDM and GLW remain; IBM, GFUZ, TXN, RKLB, and the AUG 2 additions remain included. This adds a whitelisted symbol only and preserves all existing trading safety, pre-authorization, same-day top-up, run-classification, budget, cost-conscious, manual-exclusion, and recovery language. NOTE: this edit also repaired pre-existing drift in canonical_first_buy_and_topup_rule.active_universe.active, which had not been updated for the AUG 2 additions and still listed 45 symbols."
   },
   "run_classification_policy": {
     "policy_file": "config/run_classification.json",
@@ -451,82 +454,7 @@
     "missing_prior_low": "A missing or unknown prior regular-session low is treated conservatively as not-below-low, so the first buy sizes from the $1.00 base when below the close.",
     "per_order_ceiling_usd": 10.0,
     "active_universe": {
-      "active": ["DFTX", "TRIN", "AAAU", "SPCX", "EVR", "LUNR", "IRDM", "DXYZ", "LITE", "ASML", "DRAM", "STX", "MSFT", "AAPL", "AMAT", "AMD", "CBRS", "MRVL", "BTX", "STM", "SNDK", "WDC", "TSM", "AVGO", "NVDA", "QBTS", "FLKR", "INTC", "GOOGL", "GOOG", "AMZN", "GLW", "MA", "GS", "MU", "NFLX", "XLG", "TOPT", "QTOP", "SATA", "RGTI", "IBM", "GFUZ", "TXN", "RKLB"],
-      "excluded": ["BYDDY", "VCX", "TRLV", "RVI"],
-      "symbol_corrections": {"IRDMI": "IRDM", "GLWR": "GLW"},
-      "source_of_truth": "config/tickers.json"
-    },
-    "data_provider_roles": {
-      "market_data_primary": "finance",
-      "validation_context": ["alpaca", "robinhood"],
-      "fallback": "yfinance",
-      "gfuz_primary": "robinhood",
-      "gfuz_note": "GFUZ may use Robinhood as the primary quote/prior-close source when the Finance connector cannot resolve it; Alpaca/Finance/Yahoo remain read-only validation/context only. See config/tickers.json:special_handling.GFUZ."
-    },
-    "execution_and_safety": {
-      "execution_broker": "robinhood",
-      "scheduled_live_placement": "Pre-authorized scheduled live execution calls place_equity_order directly after every internal check passes; scheduled live runs do NOT call review_equity_order.",
-      "safety": "Buy only, regular-hours only, whitelist only. No sells, cancellations, margin, options, crypto, or account changes."
-    },
-    "artifact_contract": {
-      "required_files": ["run_state.json", "run_summary.json", "latest_scheduled_run.json", "signals.csv", "submitted_orders.csv"],
-      "empty_orders_headers": "signals.csv and submitted_orders.csv must be written with headers even when no orders are submitted.",
-      "run_classification": "run_classification must be non-null."
-    },
-    "cost_conscious_mode": "Routine daily maintenance uses cost-conscious/default model behavior.",
-    "verified_live_task_ids": {
-      "as_of_et": "2026-07-24",
-      "task_ids": ["2ba19526", "42173154", "7be82b97", "a6239dae", "10ce362c"],
-      "note": "The live scheduled task text has already been updated and verified for these task ids."
-    },
-    "implementation": {
-      "first_buy_selector": "near_close_dca.select_first_allocation_base_usd (mirrored in morning_dca.py)",
-      "top_up_guard": "near_close_dca.evaluate_top_up_guard",
-      "audit_columns": ["previous_close", "previous_low", "selected_base_amount_usd", "base_selection_reason", "buy_multiplier"]
-    },
-    "policy_files": [
-      "config/tickers.json",
-      "config/budgets.json",
-      "config/sizing_ladder.json",
-      "near_close_dca.py",
-      "morning_dca.py",
-      "docs/strategy.md",
-      "docs/live_wiring.md"
-    ]
-  },
-  "canonical_first_buy_and_topup_rule": {
-    "approved_on_et": "2026-07-24",
-    "title": "JUL 24 2026 EXACT FIRST-BUY AND SAME-DAY TOP-UP RULE",
-    "summary": "Canonical per-ticker rule for selecting the first same-day buy base amount (before the ladder multiplier) and for governing later same-day top-ups. This is the source of truth; the code in near_close_dca.select_first_allocation_base_usd and near_close_dca.evaluate_top_up_guard, the morning mirror in morning_dca.py, and the base_selection_rule blocks in config/budgets.json and config/sizing_ladder.json all implement it, with one tracked exception -- see effective_prior_usd_gap_2026_07_24 below.",
-    "reason_strings": {
-      "below_prior_close_and_low": "First buy sized from the $2.00 base (base_amount_usd): current decision price is below BOTH yesterday's completed regular-session close AND low.",
-      "below_prior_close_only": "First buy sized from the $1.00 base (base_amount_below_close_usd): current decision price is below yesterday's close but NOT below yesterday's low. A missing or unknown prior low is treated conservatively as not-below-low ($1.00).",
-      "not_below_prior_close_no_buy": "No buy: current decision price is not below yesterday's close, or the active multiplier is 0.",
-      "same_day_topup_not_lower_or_no_delta": "Skip a same-day top-up: current decision price is not strictly below this ticker's prior same-day buy reference, or corrected_delta_usd resolves to 0."
-    },
-    "rules": [
-      "1. Apply this rule independently per ticker.",
-      "2. If a ticker has no same-day prior buy, fill, submitted order, valid order artifact, manual recovery fill, or broker-confirmed same-day context, treat the current evaluation as that ticker's first buy of the day.",
-      "3. For that first buy, compare the current decision price against yesterday's completed regular-session close AND yesterday's completed regular-session low for that ticker.",
-      "4. If the current price is lower than yesterday's close but NOT lower than yesterday's low, desired_usd = $1.00 x active multiplier (reason below_prior_close_only).",
-      "5. If the current price is lower than BOTH yesterday's close and yesterday's low, desired_usd = $2.00 x active multiplier (reason below_prior_close_and_low).",
-      "6. If the current price is not lower than yesterday's close, or the multiplier is 0, do not buy that ticker (reason not_below_prior_close_no_buy).",
-      "7. If there were no previous same-day buys for that ticker, always evaluate from yesterday's close and low; do not apply a same-day top-up blocker to a ticker with no prior same-day context.",
-      "8. Same-day buys in other tickers must never block a first allocation for this ticker.",
-      "9. If the ticker DOES have same-day prior buy context, ignore yesterday's low for that ticker and use that ticker's most recent valid same-day buy reference as the comparison reference.",
-      "10. For a subsequent same-day buy, buy again only when the current decision price is strictly lower than that ticker's prior same-day buy reference.",
-      "11. Recompute the desired allocation on the current active ladder, then buy only the difference: corrected_delta_usd = max(0, desired_usd - effective_prior_usd).",
-      "12. If the current price is not strictly lower than the same-day reference, or corrected_delta_usd is 0, skip that ticker with the concrete reason same_day_topup_not_lower_or_no_delta.",
-      "13. If same-day context cannot be resolved for one ticker, perform one bounded same-day context reload, then fail only that ticker closed without blocking other tickers."
-    ],
-    "effective_prior_usd_gap_2026_07_24": "KNOWN GAP, NOT YET IMPLEMENTED: rule 11's effective_prior_usd is specified to combine deduped same-day artifacts PLUS Robinhood same-day broker order history (see the JUL 23 2026 EFFECTIVE PRIOR ALLOCATION PATCH note in near_close_dca.py's module docstring and analysis/2026-07-23-live-reliability-fixes/live_task_reliability_update_2026-07-23.md section 6). near_close_dca.evaluate_top_up_guard does not yet compute effective_prior_usd or read prior_usd_rh; it subtracts only the artifact-derived prior.amount_usd (via PriorSameDayAllocation), so a same-day buy confirmed at the broker but missing or incomplete in the artifact trail is not yet folded into corrected_delta_usd and could be re-ordered as a first allocation. Until this lands, rule 11 is enforced operationally through the scheduled task text, not as a code-level runtime safeguard, matching the runtime-status caveat already tracked for the JUL 23 2026 patch.",
-    "top_up_scope_confirmation": "JUL 24 2026 TOP-UP SCOPE CONFIRMATION: same-day top-up logic is ticker-scoped. Prior same-day buys for one symbol are context for that symbol only and must never suppress first-allocation evaluation for another symbol.",
-    "per_ticker_independence": "Every ticker resolves its own same-day context. A ticker with no valid same-day context is always evaluated as a first buy against yesterday's close and low regardless of other tickers' same-day activity; a ticker with same-day context uses only its own same-day reference for top-up gating.",
-    "same_day_reference_resolution": "The comparison reference is the ticker's most recent valid same-day buy reference, and the runner implements exactly that. near_close_dca.load_prior_same_day_allocations / load_prior_same_day_allocations_multi / merge_manual_top_up_context and scripts.run_classification.load_same_day_top_up_context (via _merge_prior) resolve a ticker's aggregate same-day reference to the most recent valid same-day price by generated_at (ties and untimestamped runs defer to later scan/merge order, which is the more recent contributor); a manual fill folded in last is treated as the most recent reference. If any contributing same-day reference is unknown the aggregate reference is unknown and the guard routes to its conservative missing-price / manual_review $0 path. There is no lowest-price resolution and no lowest-vs-most-recent follow-up outstanding.",
-    "missing_prior_low": "A missing or unknown prior regular-session low is treated conservatively as not-below-low, so the first buy sizes from the $1.00 base when below the close.",
-    "per_order_ceiling_usd": 10.0,
-    "active_universe": {
-      "active": ["DFTX", "TRIN", "AAAU", "SPCX", "EVR", "LUNR", "IRDM", "DXYZ", "LITE", "ASML", "DRAM", "STX", "MSFT", "AAPL", "AMAT", "AMD", "CBRS", "MRVL", "BTX", "STM", "SNDK", "WDC", "TSM", "AVGO", "NVDA", "QBTS", "FLKR", "INTC", "GOOGL", "GOOG", "AMZN", "GLW", "MA", "GS", "MU", "NFLX", "XLG", "TOPT", "QTOP", "SATA", "RGTI", "IBM", "GFUZ", "TXN", "RKLB"],
+      "active": ["DFTX", "TRIN", "AAAU", "SPCX", "EVR", "LUNR", "IRDM", "DXYZ", "LITE", "ASML", "DRAM", "STX", "MSFT", "AAPL", "AMAT", "AMD", "CBRS", "MRVL", "BTX", "STM", "SNDK", "WDC", "TSM", "AVGO", "NVDA", "QBTS", "FLKR", "INTC", "GOOGL", "GOOG", "AMZN", "GLW", "MA", "GS", "MU", "NFLX", "XLG", "TOPT", "QTOP", "SATA", "RGTI", "IBM", "GFUZ", "TXN", "RKLB", "GE", "VRT", "CAT", "QQQ", "QCOM", "ABBV", "JPM", "VT"],
       "excluded": ["BYDDY", "VCX", "TRLV", "RVI"],
       "symbol_corrections": {"IRDMI": "IRDM", "GLWR": "GLW"},
       "source_of_truth": "config/tickers.json"
@@ -2753,6 +2681,10 @@
         "dst_note": "cron_utc for this task is fixed-UTC/EDT-calibrated (see the top-level timezone_note); config/trading_window.json's end_date is deliberately set before the next EDT->EST transition for exactly this reason. This task must stop firing at or before that transition until the external cron/trigger gate is confirmed or updated for EST, the same constraint already documented for the morning/midday/afternoon live tasks.",
         "schema_file": "schemas/trading_window.schema.json"
       },
+      "no_python_entry_point": true,
+      "no_python_entry_point_note": "market_open_dca.py provides an in-repo executor (MarketOpenDCAExecutor, config/market_open_dca.json) for shadow evaluation, but config/market_open_dca.json still ships live_execution_enabled=false (see entry_point_status_2026_08_02), so this flag is kept TRUE -- meaning the external scheduler/agent remains the authoritative real-order placement path for this slot. A scheduler mechanically routing on this flag to false (as market_open_dca.MarketOpenDCAExecutor's mere existence might otherwise suggest) would silently replace live Robinhood placement with a no-op shadow run, submitting zero orders at this slot with no error surfaced (Codex review: \"Do not route live slots to disabled executors\"). Flip to false ONLY together with flipping config/market_open_dca.json's live_execution_enabled to true. Previously true with the original note: 'There is no in-repo executor for this task; the external scheduler/agent runs it directly and must populate run_classification (including manual_run, run_id, triggered_at_utc, state_schema_version) and the full artifacts contract exactly as documented above -- codex review r3654173640.'",
+      "entry_point": "market_open_dca.MarketOpenDCAExecutor",
+      "entry_point_status_2026_08_02": "SHIPS DISABLED. config/market_open_dca.json sets live_execution_enabled=false, so the executor evaluates fully and writes every artifact but places no orders. Until it is enabled, this slot's real orders still come from the external scheduler/agent exactly as before (no_python_entry_point is kept true for exactly this reason -- see that field's note). Enable only after a trading day of shadow output has been diffed against the orders that agent actually placed -- see docs/safeguards.md#live-execution-roster.",
       "preserved_note": "Preserves the canonical first-buy and same-day top-up rule, the $2.00 base amount, the 0x-to-5x graded ladder, the Finance-primary read-only market-data policy with Alpaca/Robinhood validation and yfinance fallback only when connector data is unavailable, stale, incomplete, or unresolved, the GFUZ Robinhood-primary handling, the GFUZ/TXN active universe with BYDDY/VCX/TRLV/RVI exclusions, Robinhood-only execution on account <ROBINHOOD_ACCOUNT_NUMBER>, all budget caps and circuit breakers, and the artifact contract.",
       "notes": "Live Robinhood execution at 9:35 AM ET weekdays, the first buy of the trading day. Grades each active-universe ticker against yesterday's regular-session close on the shared $2-base 0x-to-5x ladder and places buy-only market-hours orders on Robinhood account <ROBINHOOD_ACCOUNT_NUMBER>. Never writes into the morning, midday, intraday, or afternoon artifact trees and never updates latest_scheduled_run.json; stream='market_open' and valid_afternoon_evidence=false, so it is never afternoon scheduled evidence."
     },
@@ -2836,7 +2768,7 @@
       "multi_slot_note": "One task definition fires at three ET slots. Each run records its own slot in scheduled_for_et and writes to its own slot directory, so the three runs never share a run_id or an artifact directory. The scheduler/agent selects the fired slot via IntradayDCAExecutor's slot constructor argument (see executor above).",
       "run_classification": {"run_origin": "scheduled", "run_type": "intraday_dca_live", "stream": "intraday", "manual_run": false, "cron_id": "7be82b97", "supersedes_cron_id": null, "scheduled_for_et": "(11:30|13:30|14:30) -- the slot that actually fired; never write this literal pattern string, it must be exactly one of the three values", "scheduled_window_note": "Each slot has a plus or minus 5 minute classification window: 11:25-11:35 for 11:30, 13:25-13:35 for 13:30, 14:25-14:35 for 14:30.", "run_id": "intraday_live_YYYYMMDD_(1130|1330|1430)ET -- matching the fired slot exactly, e.g. intraday_live_20260727_1130ET", "triggered_at_utc": "<ISO-8601 UTC timestamp of the actual firing>", "state_schema_version": "intraday-live-v1", "trades": true, "execution_broker": "robinhood", "account_number": "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}", "valid_morning_evidence": false, "valid_afternoon_evidence": false, "schema_note": "IntradayDCAExecutor.run_classification() populates manual_run, scheduled_for_et, run_id, triggered_at_utc, and state_schema_version per-slot exactly as documented in schemas/intraday_run_classification.schema.json -- codex review r3654173640."},
       "top_up_role": "Every intraday slot applies the canonical same-day top-up rule against the ticker's MOST RECENT valid same-day buy reference ordered by generated_at: buy again only when the current decision price is strictly lower than that reference, and then buy only corrected_delta_usd = max(0, desired_usd - effective_prior_usd). A missing prior reference means no automatic top-up. See canonical_first_buy_and_topup_rule and same_day_top_up_policy.",
-      "artifacts": {"run_dir": "/home/user/workspace/cron_tracking/intraday_dca/YYYYMMDD_<HHMM>ET/", "run_dir_examples": ["YYYYMMDD_1130ET", "YYYYMMDD_1330ET", "YYYYMMDD_1430ET"], "always_write": ["run_state.json", "run_summary.json", "signals.csv", "submitted_orders.csv"], "always_write_root_level": true, "always_write_root_level_note": "The four files MUST exist at the run_dir ROOT for every slot (11:30, 1:30, 2:30), on every outcome. Writing them only under an artifacts/ subfolder is NOT an acceptable final state. run_classification MUST be a non-null OBJECT in both run_state.json and run_summary.json, never null and never a bare string. submitted_orders.csv MUST carry its headers even when zero orders were submitted. Added 2026-07-27 after the 1:30 run wrote artifacts/-only and had to be repaired.", "always_write_even_when": "blocked, no orders placed, or error. submitted_orders.csv must be header-only (no data rows) when zero orders are submitted, matching the manifest's standard live artifact contract -- codex review r3654173644.", "signal_filename_note": "signals.csv is the CANONICAL intraday signal filename as of 2026-07-27, and is what the live 11:30, 1:30, and 2:30 runs actually persist. intraday_signals.csv remains an ACCEPTED LEGACY ALIAS for older artifacts. Both names, alongside morning_signals.csv/midday_signals.csv/market_open_signals.csv, are recognized by scripts/drift_detection.py and scripts/scheduled_artifacts.py -- codex review r3654117268.", "signal_filename_canonical": "signals.csv", "signal_filename_legacy_aliases": ["intraday_signals.csv"], "latest_pointer": "/home/user/workspace/cron_tracking/intraday_dca/latest_intraday_run.json"},
+      "artifacts": {"run_dir": "/home/user/workspace/cron_tracking/intraday_dca/YYYYMMDD_<HHMM>ET/", "run_dir_examples": ["YYYYMMDD_1130ET", "YYYYMMDD_1330ET", "YYYYMMDD_1430ET"], "always_write": ["run_state.json", "run_summary.json", "intraday_signals.csv", "submitted_orders.csv"], "always_write_root_level": true, "always_write_root_level_note": "The four files MUST exist at the run_dir ROOT for every slot (11:30, 1:30, 2:30), on every outcome. Writing them only under an artifacts/ subfolder is NOT an acceptable final state. run_classification MUST be a non-null OBJECT in both run_state.json and run_summary.json, never null and never a bare string. submitted_orders.csv MUST carry its headers even when zero orders were submitted. Added 2026-07-27 after the 1:30 run wrote artifacts/-only and had to be repaired.", "always_write_even_when": "blocked, no orders placed, or error. submitted_orders.csv must be header-only (no data rows) when zero orders are submitted, matching the manifest's standard live artifact contract -- codex review r3654173644.", "signal_filename_note": "intraday_signals.csv is the CANONICAL intraday signal filename (corrected 2026-08-03 -- codex review discussion_r3708709515: IntradayDCAExecutor's signals_csv_name class attribute always writes this stream-specific name, exactly the convention every sibling stream uses (morning_signals.csv/midday_signals.csv/market_open_signals.csv), so labeling the generic signals.csv canonical here was inconsistent with what the executor actually persists). Older pre-executor artifacts predating 2026-08-03 may carry the generic signals.csv name instead; both are recognized by scripts/drift_detection.py and scripts/scheduled_artifacts.py -- codex review r3654117268.", "signal_filename_canonical": "intraday_signals.csv", "signal_filename_legacy_aliases": ["signals.csv"], "latest_pointer": "/home/user/workspace/cron_tracking/intraday_dca/latest_intraday_run.json"},
       "post_artifact_drift_check": {"enabled": true, "detector": "scripts/drift_detection.py", "run_after": "artifact_write", "command": "python scripts/drift_detection.py --run-dir <run_dir> --json-out <run_dir>/drift_report.json --md-out <run_dir>/drift_report.md --slack --fail-on-drift", "note": "Reconcile signals vs submitted orders immediately after each slot writes artifacts. See drift_detection_policy."},
       "circuit_breakers": {"max_per_order_usd": 10.0, "enforce_budget_caps": true, "enforce_available_buying_power": true, "whitelist_only": true, "require_data_confidence": true, "enforce_spread_threshold": true, "require_trend_validation": true, "regular_hours_only": true, "one_strategy_order_per_ticker_per_run": true},
       "budget_ledger": {
@@ -2863,7 +2795,11 @@
         "dst_note": "cron_utc for this task is fixed-UTC/EDT-calibrated (see the top-level timezone_note); config/trading_window.json's end_date is deliberately set before the next EDT->EST transition for exactly this reason. This task must stop firing at or before that transition until the external cron/trigger gate is confirmed or updated for EST, the same constraint already documented for the morning/midday/afternoon live tasks.",
         "schema_file": "schemas/trading_window.schema.json"
       },
-      "no_python_entry_point_removed_2026_08_03": "This task previously carried no_python_entry_point=true with a note directing the external scheduler/agent to run it directly. That flag is now stale and has been removed: executor_added_note above already states IntradayDCAExecutor 'supersedes no_python_entry_point=true,' but the flag and its contradicting note were left in place, so a scheduler treating no_python_entry_point as authoritative could still bypass IntradayDCAExecutor's approved-date gate, pooled budget ledger, and artifact handling by invoking the task directly (Codex review: 'Keep the intraday task wired to its executor'). The scheduler/agent MUST invoke IntradayDCAExecutor per executor/executor_mode/config_file above for every recurring 11:30/13:30/14:30 slot; only the one-time 2026-08-03 11:30 catch-up below (174c4163, a same-day incident response predating this fix) ran without it.",
+      "no_python_entry_point": true,
+      "no_python_entry_point_note": "intraday_dca.py provides an in-repo executor (IntradayDCAExecutor, config/intraday_dca.json) covering all three slots for shadow evaluation, but config/intraday_dca.json still ships live_execution_enabled=false (see entry_point_status_2026_08_02), so this flag is kept TRUE -- meaning the external scheduler/agent remains the authoritative real-order placement path for these slots. A scheduler mechanically routing on this flag to false (as IntradayDCAExecutor's mere existence might otherwise suggest) would silently replace live Robinhood placement with a no-op shadow run, submitting zero orders at 11:30/13:30/14:30 with no error surfaced (Codex review: \"Do not route live slots to disabled executors\", extended here to intraday for the identical gap). Flip to false ONLY together with flipping config/intraday_dca.json's live_execution_enabled to true. Previously true with the original note: 'There is no in-repo executor for this task; the external scheduler/agent runs it directly for each of the three fired slots and must populate run_classification (including manual_run, scheduled_for_et, run_id, triggered_at_utc, state_schema_version) and the full artifacts contract exactly as documented above -- codex review r3654173640.'",
+      "entry_point": "intraday_dca.IntradayDCAExecutor",
+      "entry_point_slot_argument": "The caller passes the fired slot: IntradayDCAExecutor(slot='1130'|'1330'|'1430'). One stream, one cron_id, one pooled budget ledger; the slot varies only the fire time, run_id, and dated artifact folder.",
+      "entry_point_status_2026_08_02": "SHIPS DISABLED. config/intraday_dca.json sets live_execution_enabled=false, so the executor evaluates fully and writes every artifact but places no orders. Until it is enabled, these slots' real orders still come from the external scheduler/agent exactly as before (no_python_entry_point is kept true for exactly this reason -- see that field's note). Enable only after a trading day of shadow output has been diffed against the orders that agent actually placed -- see docs/safeguards.md#live-execution-roster.",
       "perplexity_primary_1130_catchup_2026_08_03": {
         "scheduled_task_id": "174c4163",
         "created_et": "2026-08-03 11:35",
@@ -3120,7 +3056,6 @@
       "raw_data_persistence": {
         "added": "2026-07-15",
         "confirmed": "2026-07-16",
-        "implementation_status": "NOT YET IMPLEMENTED in MorningDCAExecutor (morning_dca.py) as of 2026-07-18",
         "reason": "Before any signal computation, budget calculation, top-up calculation, or order placement, persist every raw Robinhood/Finance/Alpaca/Yahoo connector response first so the decision engine reads only from persisted files.",
         "raw_dir": "/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/raw/",
         "rules": [
@@ -3129,12 +3064,11 @@
           "The decision engine reads ONLY from persisted files; order of operations is fetch -> persist -> normalize -> compute -> place.",
           "If data fetch succeeds but raw persistence/normalization fails, do NOT place orders; still write run_state.json with the blocking reason (raw_persistence_error)."
         ],
-        "implementation_status": "NOT YET IMPLEMENTED in MorningDCAExecutor (morning_dca.py) as of 2026-07-19 -- flagged by Codex/Copilot review on PR #78. run() evaluates directly from the in-memory data provider; there is no raw_input_dir, no save_raw_input call, and raw_inputs_saved/raw_persistence_error are never populated. This section documents the intended contract, not current behavior. See config/morning_dca.json's raw_data_persistence.implementation_status."
+        "implementation_status": "IMPLEMENTED in MorningDCAExecutor (morning_dca.py) as of 2026-07-21, superseding the 2026-07-19 NOT-YET-IMPLEMENTED status this field previously carried (that text was stale: it claimed 'there is no raw_input_dir, no save_raw_input call, and raw_inputs_saved/raw_persistence_error are never populated', all three of which are now false, while pointing at a config/morning_dca.json status that had already been updated to IMPLEMENTED -- the two files contradicted each other). _run_impl() wraps the injected data provider and broker in _PersistingMarketDataProvider/_PersistingBrokerAdapter backed by _RawInputRecorder for scheduled live runs (morning_dca.py, is_scheduled_live gate), so every connector response is persisted via save_raw_input BEFORE signal/budget/top-up computation; artifacts carry raw_input_dir, raw_inputs_saved, and raw_persistence_error, and a persistence failure fails closed through _blocked_live_result(error_class='missing_or_invalid_raw_inputs') before any order is placed. Inherited unchanged by MarketOpenDCAExecutor, MiddayDCAExecutor, and IntradayDCAExecutor, which do not override _run_impl. See config/morning_dca.json's raw_data_persistence.implementation_status. NOTE on automatic_failure_recovery below (updated 2026-08-03): it is now PARTIALLY implemented, and only in run_dca.py, NOT in these executors. run_dca.py's raw-persistence path performs exactly one in-process recovery retry in the same run directory for the raw_file_write_failure trigger (a transient OSError while staging/normalizing/swapping raw/), stamping build_recovery_state() on success and escalating with recovery.escalated=true if the single retry also fails; deterministic triggers (parsing_failure, wrapper_normalization_failure) escalate immediately without consuming the attempt. The 'rerun the required read-only inputs' clause is NOT implemented and cannot be in run_dca.py, which has no MCP/market-data access of its own -- so transient_connector_throttling classifies but never retries in-process and stays an agent-level responsibility. The four class-based executors are UNCHANGED and still fail closed on first error: recovery_rerun/recovery_reason/recovery_attempts still appear nowhere in morning_dca.py. See docs/run_classification.md#recovery-reruns for the full split."
       },
       "automatic_failure_recovery": {
         "added": "2026-07-15",
         "confirmed": "2026-07-16",
-        "implementation_status": "NOT YET IMPLEMENTED in MorningDCAExecutor (morning_dca.py) as of 2026-07-18",
         "rules": [
           "If 10:30 fails because of internal persistence, parsing, wrapper-normalization, transient connector throttling, or a raw-file write problem AFTER data was fetched, immediately rerun the required read-only inputs once, persist all raw responses first, recompute only from persisted files, and continue the same guarded execution if safeguards pass.",
           "Reuse the same logical run directory with recovery_rerun=true; never classify a recovery rerun as manual.",
@@ -3554,6 +3488,73 @@
         "rules": "Weekly scheduled-live cost basis, slippage, reliability, and order-count metrics are computed only from validated scheduled runs with all manual order IDs excluded. Manual fills, if shown at all, appear only in a clearly labeled 'Manual Test Runs' section and never affect scheduled-live metrics."
       },
       "notes": "Analytics only, no trading. Recalculates and refreshes the full Notion performance dashboard. Runs at 5:30 PM ET Fridays (moved 2026-08-02 from 5:00 PM ET) so it starts after the daily 5:00 PM ET post-trade slippage + compact Notion latest-run sync (67aa802b) has finished writing the compact Latest Run section. No routine email. Scheduled-live metrics exclude manual runs per config/run_classification.json; manual fills are confined to a labeled Manual Test Runs section."
+    },
+    {
+      "id": "claude-tickers-daily-update",
+      "name": "Nightly ticker-history archive update",
+      "type": "analytics",
+      "status": "active",
+      "cron_utc": "45 21 * * 1-5",
+      "cron_utc_est": "45 22 * * 1-5",
+      "et_equivalent": "5:45 PM ET weekdays",
+      "dst_note": "cron_utc (45 21) is EDT-calibrated and fires at 4:45 PM EST, not 5:45 PM ET, after the fall-back DST transition -- the top-level timezone_note's 'scheduler must preserve America/New_York' is prose only and does not make this fixed expression DST-aware. Unlike the live trading tasks (see e.g. 2ba19526/7be82b97's dst_note), this task has no expiring trading_window.json to fail closed on, so it cannot simply stop firing at the transition -- it must keep running at 5:45 PM ET indefinitely. The external scheduler must either register this task with genuine America/New_York-aware scheduling (preferred, if supported) or switch the registered cron expression from cron_utc to cron_utc_est (45 22) at the EDT->EST transition and back at the next EST->EDT transition (Codex review: \"Encode an EST schedule for the new nightly tasks\").",
+      "trades": false,
+      "execution_owner": "claude_only",
+      "perplexity_excluded": true,
+      "allowed_runtimes": ["claude"],
+      "forbidden_runtimes": ["perplexity"],
+      "scheduler_registered": false,
+      "scheduler_registration_note": "This repository defines the task and command, but only the external Claude scheduler may register it. Do not substitute a Codex or Perplexity automation: that would violate execution_owner='claude_only'.",
+      "command": "python -m scripts.run_ticker_maintenance update --updater-script \"$DCA_TICKER_DAILY_UPDATE_SCRIPT\"",
+      "command_note": "Run from the repository root. The program defaults to the repository ticker_data path, which is the local link to the managed Google Drive ticker-history archive. DCA_TICKER_HISTORY_DIR is an optional explicit override only. DCA_TICKER_DAILY_UPDATE_SCRIPT identifies the maintained resumable archive updater.",
+      "run_artifact": "${DCA_CRON_TRACKING_ROOT}/ticker_history_update/YYYY-MM-DD/ticker_update_event.json",
+      "update_contract": {
+        "purpose": "Incrementally refresh the maintained ticker CSV archive and publish an event describing changed ticker symbols.",
+        "source_data": "The maintained archive updater's Yahoo Finance daily bars only; never Robinhood execution data and never Perplexity-provided data.",
+        "publish_rule": "The event is completed only after the upstream updater reports ALL_DONE. A partial event remains visible for audit but must not trigger a calibration publish.",
+        "output": "ticker_update_event.json with changed_tickers and changed_active_tickers. changed_active_tickers is the explicit handoff to claude-per-ticker-calibration.",
+        "audit_log": "The updater also appends a compact _daily_update_log.txt entry without deleting, blacklisting, or truncating archive CSVs.",
+        "trading_boundary": "Archive maintenance only. This task must never evaluate orders, access a brokerage, modify credit balances, or place a trade."
+      },
+      "notes": "CLAUDE ONLY. This task is deliberately separate from calibration: it emits a ticker-update event that the calibration task consumes. Do not register, run, delegate, mirror, or count it in any Perplexity schedule, Perplexity report, or Perplexity credit-usage analysis. No trading."
+    },
+    {
+      "id": "claude-per-ticker-calibration",
+      "name": "Event-gated per-ticker DCA trigger recalculation",
+      "type": "analytics",
+      "status": "active",
+      "cron_utc": "30 22 * * 1-5",
+      "cron_utc_est": "30 23 * * 1-5",
+      "et_equivalent": "6:30 PM ET weekdays",
+      "dst_note": "cron_utc (30 22) is EDT-calibrated and fires at 5:30 PM EST, not 6:30 PM ET, after the fall-back DST transition -- the top-level timezone_note's 'scheduler must preserve America/New_York' is prose only and does not make this fixed expression DST-aware. Like claude-tickers-daily-update above (whose completed-event trigger this task also listens for), this task has no expiring trading_window.json to fail closed on and must keep running at 6:30 PM ET indefinitely. The external scheduler must either register this task with genuine America/New_York-aware scheduling (preferred, if supported) or switch the registered cron expression from cron_utc to cron_utc_est (30 23) at the EDT->EST transition and back at the next EST->EDT transition (Codex review: \"Encode an EST schedule for the new nightly tasks\").",
+      "trigger_mode": "scheduled_and_artifact_event",
+      "upstream_trigger": {
+        "source_task_id": "claude-tickers-daily-update",
+        "event_artifact": "${DCA_CRON_TRACKING_ROOT}/ticker_history_update/YYYY-MM-DD/ticker_update_event.json",
+        "required_status": "completed",
+        "required_nonempty_field": "changed_active_tickers",
+        "behavior": "A completed event naming an active DCA ticker triggers this task immediately when the external Claude scheduler supports artifact events. That event run is deliberately separate from, and additional to, the independent 6:30 PM ET Claude-only scheduled recalculation."
+      },
+      "trades": false,
+      "execution_owner": "claude_only",
+      "perplexity_excluded": true,
+      "allowed_runtimes": ["claude"],
+      "forbidden_runtimes": ["perplexity"],
+      "scheduler_registered": false,
+      "scheduler_registration_note": "This repository defines the task and command, but only the external Claude scheduler may register it. Do not substitute a Codex or Perplexity automation: that would violate execution_owner='claude_only'.",
+      "command": "python -m scripts.run_ticker_maintenance calibrate",
+      "artifact_event_command": "python -m scripts.run_ticker_maintenance event-calibrate",
+      "command_note": "Run from the repository root. This is a distinct calibration program, not an archive updater. It defaults to the repository ticker_data path, which is the local link to the managed Google Drive ticker-history archive; DCA_TICKER_HISTORY_DIR is an optional explicit override. The scheduled 6:30 PM ET firing MUST run `command` (the `calibrate` subcommand, force=True), which remains independently runnable every weekday regardless of the upstream event's status. The upstream artifact-event firing (upstream_trigger) MUST run `artifact_event_command` (the `event-calibrate` subcommand, force=False) instead, which fails closed unless the same-day ticker_update_event.json is status=completed and names one or more changed active DCA tickers -- reusing `command`/--force for the event firing would ignore that guard and republish unconditionally on a partial or empty update event (Codex review: \"Wire artifact events to event-calibrate\"). There is no --force flag on the CLI; force is selected by which subcommand is invoked, not a flag.",
+      "run_artifact": "${DCA_CRON_TRACKING_ROOT}/per_ticker_calibration/YYYY-MM-DD/calibration_run.json",
+      "update_contract": {
+        "purpose": "Rebuild config/per_ticker_sizing.json for the next trading session after the separate nightly ticker archive update changes an active DCA ticker.",
+        "source_data": "Existing local daily OHLCV history only; this task makes no direct Yahoo request, uses no Robinhood execution data, and never accepts Perplexity-provided data.",
+        "publish_rule": "The independent scheduled run recalculates from the local archive. An artifact-event run fails closed unless it has a same-day completed ticker_update_event.json with non-empty changed_active_tickers and corresponding local CSV files; a skipped or blocked event run retains the existing model.",
+        "output": "config/per_ticker_sizing.json with calibrated thresholds, fallback symbols, sample-session counts, and the update date.",
+        "audit_log": "The run artifact records the upstream event, upstream status, triggering tickers, fallback tickers, and the explicit Claude-only/Perplexity-excluded ownership markers.",
+        "trading_boundary": "Analytics/configuration only. This task must never evaluate orders, access a brokerage, modify credit balances, or place a trade. Its output is consumed on the next regular DCA decision cycle."
+      },
+      "notes": "CLAUDE ONLY. This task remains separately runnable at 6:30 PM ET. It also talks to the ticker updater only through ticker_update_event.json: a completed update that changes an active ticker symbol can trigger an additional recalculation immediately where the external Claude scheduler supports artifact events. The event path is available for integration testing without merging the two programs. Do not register, run, delegate, mirror, or count this task in any Perplexity schedule, Perplexity report, or Perplexity credit-usage analysis. No trading."
     },
     {
       "id": "0656657a",

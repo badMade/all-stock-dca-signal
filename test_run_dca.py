@@ -3334,6 +3334,61 @@ def test_run_pipeline_raw_persistence_failure_preserves_prior_successful_raw_fil
     assert raw_file.read_text(encoding="utf-8") == prior_contents
 
 
+def test_a_failed_replay_validation_restores_the_prior_raw_snapshot(tmp_path):
+    # Codex review ("Keep the prior raw snapshot until replay validation
+    # succeeds"): if _build_frozen_providers_from_raw fails AFTER the staged
+    # directory has already been renamed into raw/ (e.g. because
+    # strict_robinhood finds no usable persisted batch), the swap had
+    # already deleted raw.bak, so the failure handler's cleanup (which only
+    # removes raw.tmp) permanently replaced the prior successful run's raw
+    # audit snapshot with this attempt's unusable one. raw/ must be restored
+    # to the prior successful attempt's contents in that case.
+    config = load_strategy_config(
+        approved_test_dates=frozenset({_now().date()}), dry_run=False
+    )
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
+    broker = DryRunBroker(account=config.target_account_number)
+
+    good_inputs = {
+        "quotes_batch1.json": {"results": [{"quote": {"symbol": "AAPL"}}]},
+        "historicals_batch1.json": {"results": [{"symbol": "AAPL", "interval": 5, "items": []}]},
+        "finance_bars_batch1.json": {"results": [{"ticker": "AAPL", "interval_minutes": 5, "bars": []}]},
+        "finance_close_batch1.json": {"results": [{"ticker": "AAPL", "previous_close": 149.0}]},
+    }
+    first = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        broker, artifacts_dir=scheduled_dir,
+        raw_connector_inputs=good_inputs,
+    )
+    assert "raw_persistence_error" not in first
+    raw_dir = scheduled_dir / "raw"
+    good_robinhood_file = raw_dir / "quotes_batch1.json"
+    assert good_robinhood_file.exists()
+    prior_contents = good_robinhood_file.read_text(encoding="utf-8")
+
+    # This attempt stages and swaps cleanly (valid JSON, normalizes fine),
+    # but omits every Robinhood-recognized filename -- strict_robinhood then
+    # raises AFTER raw/ already holds this attempt's finance-only files.
+    finance_only_inputs = {
+        "finance_bars_batch1.json": {"results": []},
+        "finance_close_batch1.json": {"results": []},
+    }
+    second = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        broker, artifacts_dir=scheduled_dir,
+        raw_connector_inputs=finance_only_inputs,
+    )
+
+    assert "raw_persistence_error" in second
+    assert not raw_dir.with_name("raw.bak").exists(), "backup must be cleaned up, not left dangling"
+    assert good_robinhood_file.exists(), (
+        "the prior successful run's Robinhood raw file was destroyed by the failed replay"
+    )
+    assert good_robinhood_file.read_text(encoding="utf-8") == prior_contents
+
+
 def test_run_pipeline_raw_persistence_failure_writes_error_state(tmp_path):
     import json
 
@@ -3357,6 +3412,182 @@ def test_run_pipeline_raw_persistence_failure_writes_error_state(tmp_path):
     assert run_state["raw_persistence_error"]
     assert run_state["raw_inputs_saved"] == []
     assert run_state["buy_candidates"] == []
+
+
+def _flaky_save_raw_input(monkeypatch, fail_times):
+    """Patch save_raw_input to raise OSError for the first ``fail_times`` calls.
+
+    OSError is the one failure class _recovery_trigger_for treats as retryable
+    (a transient staging/rename/ENOSPC fault), so this drives the automatic
+    failure-recovery path without touching any other behavior.
+    """
+    import run_dca as run_dca_module
+
+    real_save = run_dca_module.save_raw_input
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] <= fail_times:
+            raise OSError("transient raw-write fault (injected)")
+        return real_save(*args, **kwargs)
+
+    monkeypatch.setattr(run_dca_module, "save_raw_input", flaky)
+    return calls
+
+
+def test_run_pipeline_recovers_once_from_transient_raw_write_failure(tmp_path, monkeypatch):
+    """A transient raw-write fault is recovered in-process, not escalated.
+
+    The single permitted retry re-runs persist/normalize/swap/freeze, the run
+    then continues through the UNCHANGED guarded path, and the resulting state
+    is stamped recovery_rerun=true in the SAME run directory.
+    """
+    import json
+
+    calls = _flaky_save_raw_input(monkeypatch, fail_times=1)
+    config = _demo_config()
+    scheduled_dir = tmp_path / "cron_tracking" / "ce16ba6b" / "scheduled_runs" / "20260706_1530ET"
+    quotes_file = tmp_path / "quotes.json"
+    quotes_file.write_text('{"symbol": "AAPL", "price": 150.0}', encoding="utf-8")
+
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=scheduled_dir,
+        raw_connector_inputs={"quotes_batch1.json": {"output_path": str(quotes_file)}},
+    )
+
+    # Recovered, not escalated: the run completed normally.
+    assert "raw_persistence_error" not in result
+    assert result["blocked"] is False
+    assert calls["n"] == 2, "expected exactly one retry after the injected failure"
+    # raw/ was genuinely rewritten by the retry, in the same run directory.
+    assert (scheduled_dir / "raw" / "quotes_batch1.json").exists()
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    assert run_state["recovery_rerun"] is True
+    recovery = run_state["recovery"]
+    assert recovery["trigger_reason"] == "raw_file_write_failure"
+    assert recovery["attempt"] == 1
+    assert recovery["persisted_raw_first"] is True
+    assert recovery["recomputed_from_persisted"] is True
+    assert recovery["escalated"] is False
+    assert recovery["blocking_reason"] is None
+    # Never reclassified as manual by the recovery.
+    assert run_state["run_classification"]["run_origin"] == "scheduled"
+    assert run_state["run_classification"]["manual_run"] is False
+
+
+def test_run_pipeline_escalates_when_the_single_recovery_retry_also_fails(tmp_path, monkeypatch):
+    """Only ONE retry is permitted; a still-failing retry escalates with evidence."""
+    import json
+
+    calls = _flaky_save_raw_input(monkeypatch, fail_times=99)
+    config = _demo_config()
+    scheduled_dir = tmp_path / "cron_tracking" / "ce16ba6b" / "scheduled_runs" / "20260706_1530ET"
+    quotes_file = tmp_path / "quotes.json"
+    quotes_file.write_text('{"symbol": "AAPL", "price": 150.0}', encoding="utf-8")
+
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=scheduled_dir,
+        raw_connector_inputs={"quotes_batch1.json": {"output_path": str(quotes_file)}},
+    )
+
+    assert "raw_persistence_error" in result
+    # Bounded: the initial attempt plus exactly one recovery retry, never more.
+    assert calls["n"] == 2
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    assert run_state["order_submit_status"] == "not_submitted_error"
+    assert run_state["recovery_rerun"] is True
+    recovery = run_state["recovery"]
+    assert recovery["trigger_reason"] == "raw_file_write_failure"
+    assert recovery["attempt"] == 1
+    assert recovery["escalated"] is True
+    assert recovery["blocking_reason"]
+    # Codex review ("Stamp exhausted recovery with recovery failure"): an
+    # exhausted recovery is a distinct failure mode from an ordinary
+    # first-attempt raw-persistence block, and error_class-keyed reporting
+    # must be able to tell them apart.
+    assert run_state["error_class"] == "recovery_failure"
+    # The retry re-raised, so neither step completed -- reported honestly.
+    assert recovery["persisted_raw_first"] is False
+    assert recovery["recomputed_from_persisted"] is False
+    # No orders on an escalated run.
+    assert not (scheduled_dir / "orders.csv").exists()
+
+
+def test_run_pipeline_does_not_retry_a_deterministic_raw_failure(tmp_path, monkeypatch):
+    """A non-retryable failure escalates immediately without burning the attempt.
+
+    An unserializable payload fails identically on a second identical attempt, so
+    retrying it would waste the one permitted recovery and misreport a payload
+    fault as an exhausted transient recovery. It must escalate on attempt 1 with
+    NO recovery block.
+    """
+    import json
+
+    import run_dca as run_dca_module
+
+    class ExplodingPayload:
+        pass
+
+    real_save = run_dca_module.save_raw_input
+    calls = {"n": 0}
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return real_save(*args, **kwargs)
+
+    monkeypatch.setattr(run_dca_module, "save_raw_input", counting)
+
+    config = _demo_config()
+    scheduled_dir = tmp_path / "cron_tracking" / "ce16ba6b" / "scheduled_runs" / "20260706_1530ET"
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=scheduled_dir,
+        raw_connector_inputs={"quotes_batch1.json": ExplodingPayload()},
+    )
+
+    assert "raw_persistence_error" in result
+    assert calls["n"] == 1, "a deterministic failure must not be retried"
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    assert run_state["order_submit_status"] == "not_submitted_error"
+    # Unchanged from the pre-recovery behavior: no recovery block is claimed.
+    assert "recovery" not in run_state
+    assert run_state.get("recovery_rerun") is not True
+
+
+def test_recovery_trigger_classification():
+    """The classifier's boundaries, including the deliberate re-fetch exclusion."""
+    import json
+
+    from run_dca import RECOVERY_RETRY_TRIGGERS, _recovery_trigger_for
+
+    assert _recovery_trigger_for(OSError("ENOSPC")) == "raw_file_write_failure"
+    assert _recovery_trigger_for(PermissionError("denied")) == "raw_file_write_failure"
+    assert (
+        _recovery_trigger_for(RuntimeError("normalization failed for 'q.json': bad"))
+        == "wrapper_normalization_failure"
+    )
+    assert _recovery_trigger_for(json.JSONDecodeError("x", "y", 0)) == "parsing_failure"
+    # A contract/config fault is not a recovery trigger at all.
+    assert _recovery_trigger_for(RuntimeError("requires non-empty raw_connector_inputs")) is None
+
+    # Only the filesystem/IO class is retried in-process. Deterministic classes
+    # classify (for reporting) but must never consume the single attempt.
+    assert RECOVERY_RETRY_TRIGGERS == {"raw_file_write_failure"}
+    assert "wrapper_normalization_failure" not in RECOVERY_RETRY_TRIGGERS
+    assert "parsing_failure" not in RECOVERY_RETRY_TRIGGERS
+    # run_dca.py cannot re-fetch connector data, so throttling is out of scope here.
+    assert "transient_connector_throttling" not in RECOVERY_RETRY_TRIGGERS
 
 
 def test_run_slot_raw_persistence_failure_preserves_the_slots_own_identity(tmp_path, monkeypatch):

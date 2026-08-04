@@ -419,6 +419,22 @@ def test_quote_older_than_completed_bar_anchor_falls_back_to_bar():
     assert any("older than the completed bar anchor" in w for w in sig.warnings)
 
 
+def test_bar_count_excludes_the_unfinished_decision_bar():
+    # Codex review ("Count only completed bars in archived observations"):
+    # the provider's request window ends at decision_dt, so when bar
+    # timestamps denote bar starts (the default) the bar AT decision_dt is
+    # not yet complete. session_stats already excludes it from the OHLCV
+    # aggregates, but bar_count independently counted the full unfiltered
+    # list -- reporting one more completed interval than the aggregates and
+    # decision price actually cover.
+    decision_dt = _now()  # 09:45; FixedDropProvider yields bars at 09:30/35/40/45
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
+    sig = ex.evaluate(decision_dt, data)[0]
+    # 09:45 itself is the not-yet-complete bar; only 09:30/35/40 are completed.
+    assert sig.observation.bar_count == 3
+
+
 def test_non_positive_quote_price_falls_back_to_completed_bar():
     # A fresh, well-timestamped quote of $0 or negative must not be trusted --
     # evaluate_signal would otherwise treat it as a 100%+ drop and size a
@@ -818,6 +834,29 @@ def test_manual_runs_at_same_timestamp_do_not_collide(tmp_path):
     assert Path(res1["paths"]["run_state"]) != Path(res2["paths"]["run_state"])
     assert Path(res1["paths"]["run_state"]).exists()
     assert Path(res2["paths"]["run_state"]).exists()
+
+
+def test_manual_credit_idempotency_key_does_not_leak_across_run_invocations(tmp_path):
+    # Codex review ("Reset the manual credit key for every run invocation"):
+    # the manual credit-ledger idempotency key is cached on first use so
+    # every credit-ledger call WITHIN one run() invocation agrees, but the
+    # executor is reused across manual run() calls (see
+    # test_manual_runs_at_same_timestamp_do_not_collide above) -- without a
+    # reset, a SECOND manual run would silently inherit the FIRST's key
+    # despite getting its own distinct run_id, so a later, genuinely
+    # lower-price observation would look like an idempotent replay of the
+    # earlier one and have its new pending credit silently discarded.
+    cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
+    ex = MorningDCAExecutor(cfg)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    now = _now()
+
+    ex.run(now, data, manual=True)
+    key_1 = ex._credit_idempotency_key(now, manual=True)
+    ex.run(now, data, manual=True)
+    key_2 = ex._credit_idempotency_key(now, manual=True)
+
+    assert key_1 != key_2
 
 
 def test_classification_matches_morning_schema(tmp_path):
@@ -1722,7 +1761,7 @@ def test_morning_live_ledger_seed_uses_larger_of_partial_filled_orders_and_order
         morning_run_state_root=str(tmp_path),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.03})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.05})
     broker = RecordingLiveBroker(account="999000111", reference_prices={"BBB": 97.0})
     res = ex.run(_now_live(), data, broker=broker, manual=True)
 
@@ -4480,7 +4519,7 @@ def test_morning_cap_seeding_is_idempotent_across_multiple_runs(tmp_path):
 
     # First run: $86 seeded → $4 remaining → TOPUP cap_exceeded
     broker1 = _Broker()
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.03})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.05})
     res1 = ex.run(_now_live(), data, broker=broker1)
     assert res1["artifacts"].get("broker_outcomes", {}).get("TOPUP", {}).get("status") == "cap_exceeded"
     assert ex.ledger.day_planned(date(2026, 7, 8)) == 86.0, "ledger should show $86 after first run"

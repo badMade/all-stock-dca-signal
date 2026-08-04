@@ -56,6 +56,42 @@ Feb, Nov, Dec). Re-verify around DST transitions.
 > file's own detailed `e3e6f09e`/`a46bf007` sections below were not fully
 > rewritten for this change; treat them as historical.
 
+> **⚠️ NEITHER NIGHTLY TASK IS ACTUALLY REGISTERED WITH A SCHEDULER (verified
+> 2026-08-03).** Both `claude-tickers-daily-update` and
+> `claude-per-ticker-calibration` carry `"scheduler_registered": false` in
+> `config/scheduled_tasks.json`. The times stated below are the **intended**
+> schedule, not confirmed firing times — nothing in this repo or any registered
+> scheduler causes them to run automatically today. The underlying pipeline is
+> real and works correctly when invoked manually (the updater writes
+> `ticker_update_event.json`; `scripts/daily_per_ticker_calibration.py` consumes
+> it and regenerates `config/per_ticker_sizing.json`), so the gap is
+> registration only. **Practical consequence:** unless someone runs these by
+> hand, `config/per_ticker_sizing.json` — which governs live per-ticker order
+> sizing for all 53 symbols — goes stale, silently. Read the times below as
+> "should run at", not "runs at".
+>
+> **Nightly ticker update and per-ticker recalculation:**
+> `claude-tickers-daily-update` is scheduled for **5:45 PM ET on weekdays** and is the
+> separate owner of the managed ticker-history archive. When it finishes, it
+> writes a `ticker_update_event.json` handoff listing every changed ticker and
+> the subset in the active DCA universe. `claude-per-ticker-calibration` is
+> independently scheduled at **6:30 PM ET** to rebuild next-session trigger
+> percentages from the local archive. It can additionally use the update event
+> as an immediate trigger when the external Claude scheduler supports artifact
+> events. That event route is available for testing the two-job handoff without
+> merging the jobs. Both tasks are
+> **Claude only**: neither may be registered, run, mirrored, or counted by
+> Perplexity. They are analytics/configuration only and never connect to a
+> brokerage or place an order. The external Claude scheduler still needs to
+> register the manifest commands; a Codex automation is not a substitute for
+> that Claude-only registration.
+
+> **Ticker archive location:** the scheduled updater and recalculation tools
+> default to the repository's `ticker_data` path. On this Mac it is a local link
+> to the managed Google Drive `Tickers` folder, so the program and Drive use one
+> archive rather than separate copies that could drift. `DCA_TICKER_HISTORY_DIR`
+> remains an explicit override for a different archive.
+
 > **TICKER UNIVERSE UPDATE JUL 19 2026:** TXN is added to the active DCA
 > universe and GFUZ remains active, used by every universe-bearing scheduled
 > task (the pre-market dashboard, the 9:45 scans, the morning/midday/afternoon
@@ -983,7 +1019,7 @@ never estimated, inferred, or defaulted.
   |---|---|
   | `run_state.json` | `run_classification` must be a **non-null object**, never null and never a bare string |
   | `run_summary.json` | Same non-null `run_classification` object requirement |
-  | `signals.csv` | Canonical name. `intraday_signals.csv` remains an accepted **legacy alias** for older artifacts |
+  | `intraday_signals.csv` | Canonical name (corrected 2026-08-03), matching the stream-specific naming every sibling live stream uses. `signals.csv` remains an accepted **legacy alias** for pre-executor artifacts |
   | `submitted_orders.csv` | Must carry its **headers even when zero orders** were submitted. Header-only is correct for a zero-order run |
 
   **An `artifacts/` subfolder is not an acceptable final state.** Writing the four files
@@ -1574,13 +1610,15 @@ never estimated, inferred, or defaulted.
   America/New_York date is the final eligible market day of the month. If it is
   **not**, the run ends **silently** — no notification, no market-data pulls, no
   Notion updates, and no reporting.
-- **Active universe (52 symbols):** DFTX, TRIN, AAAU, SPCX, EVR, LUNR, IRDM, DXYZ,
+- **Active universe (53 symbols):** DFTX, TRIN, AAAU, SPCX, EVR, LUNR, IRDM, DXYZ,
   LITE, ASML, DRAM, STX, MSFT, AAPL, AMAT, AMD, CBRS, MRVL, BTX, STM, SNDK, WDC,
   TSM, AVGO, NVDA, QBTS, FLKR, INTC, GOOGL, GOOG, AMZN, GLW, MA, GS, MU, NFLX, XLG,
-  TOPT, QTOP, SATA, RGTI, IBM, GFUZ, TXN, RKLB, GE, VRT, CAT, QQQ, QCOM, ABBV, JPM
-  (the last seven added 2026-08-02). **Excluded:** BYDDY, VCX, TRLV, RVI.
+  TOPT, QTOP, SATA, RGTI, IBM, GFUZ, TXN, RKLB, GE, VRT, CAT, QQQ, QCOM, ABBV, JPM,
+  VT (GE through JPM added 2026-08-02; VT added 2026-08-04 **without** a broker
+  instrument search — treat it as unverified until its first live run resolves
+  it). **Excluded:** BYDDY, VCX, TRLV, RVI.
   **Corrections:** IRDMI→IRDM, GLWR→GLW. IBM, GFUZ, TXN, RKLB, and the
-  2026-08-02 additions remain included unless later removed. Source of truth:
+  2026-08-02 and 2026-08-04 additions remain included unless later removed. Source of truth:
   [`config/tickers.json`](../config/tickers.json).
 - **Data source policy:** Finance connector is **primary** for historical market
   data. **Alpaca and Robinhood are read-only** validation/context. **yfinance is a
