@@ -7,11 +7,12 @@ expects a fraction of the previous close (2.0% down == 0.02).
 
 import csv
 import json
+import logging
 import os
 import pathlib
 import tempfile
 from dataclasses import replace
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 
 import pytest
 
@@ -38,6 +39,7 @@ from near_close_dca import (
     USAGE_PROXY_FIELDS,
     Action,
     AlpacaBroker,
+    AlpacaConfig,
     Bar,
     BrokerName,
     CompactRunOptions,
@@ -1994,6 +1996,795 @@ def test_scheduled_top_up_not_blocked_by_manual_fills_ordinary_ref_id():
     assert (
         len(broker._orders) == 2
     ), "the scheduled run must place its own real incremental order"
+
+
+def test_alpaca_get_order_fill():
+    def mock_order_fill_fn(payload):
+        assert payload["input"]["orderId"] == "12345"
+        assert "isPaperAPI" in payload["input"]
+        return {
+            "order": {
+                "id": "12345",
+                "status": "filled",
+                "filled_qty": "10",
+                "filled_avg_price": "150.0",
+                "submitted_at": "2026-07-02T13:30:00Z",
+                "filled_at": "2026-07-02T13:30:05Z",
+            }
+        }
+
+    broker = AlpacaBroker(order_fill_fn=mock_order_fill_fn)
+    fill = broker.get_order_fill("12345")
+    assert fill is not None
+    assert fill.quantity_filled == 10.0
+    assert fill.avg_fill_price == 150.0
+
+    # test dryrun handling
+    assert broker.get_order_fill("DRYRUN-12345") is None
+
+    # test missing fn
+    broker_no_fn = AlpacaBroker()
+    assert broker_no_fn.get_order_fill("12345") is None
+
+
+def test_alpaca_get_order_fill_ignores_partial():
+    # If the order is partially_filled, returning an OrderFill causes build_execution_record
+    # to consider it fully filled, preventing subsequent refreshes. It must remain None
+    # (unfilled) until it's terminally "filled".
+    def mock_order_fill_fn(payload):
+        return {
+            "order": {
+                "id": "12345",
+                "status": "partially_filled",
+                "filled_qty": "5",
+                "filled_avg_price": "150.0",
+                "submitted_at": "2026-07-02T13:30:00Z",
+                "filled_at": "2026-07-02T13:30:05Z",
+            }
+        }
+
+    broker = AlpacaBroker(order_fill_fn=mock_order_fill_fn)
+    assert broker.get_order_fill("12345") is None
+
+
+def test_alpaca_get_order_fill_accepts_terminally_canceled_partial_fill():
+    # A 'canceled' or 'expired' order can still carry a real, positive
+    # filled_qty for shares that executed before the remainder was
+    # canceled/expired. Unlike 'partially_filled' (non-terminal, still
+    # eligible for refresh), these statuses will never progress further
+    # under this order id, so that execution must be recorded now or it
+    # becomes a permanent missing-fill gap (Codex review: "Record
+    # executions from terminally canceled Alpaca orders"). A resolved
+    # 'replaced' chain is covered separately by
+    # test_alpaca_get_order_fill_follows_replacement_chain.
+    def mock_order_fill_fn(payload):
+        return {
+            "order": {
+                "id": "12345",
+                "status": "canceled",
+                "filled_qty": "4",
+                "filled_avg_price": "150.0",
+                "submitted_at": "2026-07-02T13:30:00Z",
+                "filled_at": "2026-07-02T13:30:05Z",
+            }
+        }
+
+    broker = AlpacaBroker(order_fill_fn=mock_order_fill_fn)
+    fill = broker.get_order_fill("12345")
+    assert fill is not None
+    assert fill.quantity_filled == 4.0
+    assert fill.avg_fill_price == 150.0
+
+    def mock_order_fill_fn_expired(payload):
+        return {
+            "order": {
+                "id": "12345",
+                "status": "expired",
+                "filled_qty": "2",
+                "filled_avg_price": "148.5",
+            }
+        }
+
+    broker_expired = AlpacaBroker(order_fill_fn=mock_order_fill_fn_expired)
+    fill_expired = broker_expired.get_order_fill("12345")
+    assert fill_expired is not None
+    assert fill_expired.quantity_filled == 2.0
+
+    # A 'replaced' order with no replaced_by to follow at all does NOT fall
+    # back to the frozen partial from the original order: per Alpaca's
+    # documented semantics a genuinely replaced order always carries its
+    # replacement's id, so a missing one signals an incomplete/malformed
+    # response rather than a permanent characteristic. Report no fill and
+    # let a later refresh retry (Codex review: "Retry replacement chains
+    # without a usable next hop").
+    def mock_order_fill_fn_replaced_no_target(payload):
+        return {
+            "order": {
+                "id": "12345",
+                "status": "replaced",
+                "filled_qty": "3",
+                "filled_avg_price": "149.0",
+            }
+        }
+
+    broker_replaced = AlpacaBroker(order_fill_fn=mock_order_fill_fn_replaced_no_target)
+    assert broker_replaced.get_order_fill("12345") is None
+
+    # a canceled order with nothing executed still carries no fill.
+    def mock_order_fill_fn_no_fill(payload):
+        return {
+            "order": {
+                "id": "12345",
+                "status": "canceled",
+                "filled_qty": "0",
+                "filled_avg_price": "0",
+            }
+        }
+
+    broker_no_fill = AlpacaBroker(order_fill_fn=mock_order_fill_fn_no_fill)
+    assert broker_no_fill.get_order_fill("12345") is None
+
+
+def test_alpaca_get_order_fill_accepts_calculated_status_for_day_tif():
+    # Per Alpaca's own docs, 'calculated' means "completed for the day
+    # (either filled OR done for day), settlement pending" -- it is NOT a
+    # synonym for 'filled', so it must be gated the same way as
+    # 'done_for_day': a durable terminal signal only for a 'day' TIF order,
+    # with the same explicit-zero exemption (a day order can legitimately
+    # reach 'calculated' having executed nothing) (Codex review: "Gate
+    # calculated status on the order's TIF").
+    def mock_order_fill_fn(payload):
+        return {
+            "order": {
+                "id": "12345",
+                "status": "calculated",
+                "filled_qty": "10",
+                "filled_avg_price": "150.0",
+            }
+        }
+
+    broker = AlpacaBroker(
+        config=AlpacaConfig(time_in_force="day"), order_fill_fn=mock_order_fill_fn
+    )
+    fill = broker.get_order_fill("12345")
+    assert fill is not None
+    assert fill.quantity_filled == 10.0
+    assert fill.avg_fill_price == 150.0
+
+    def mock_order_fill_fn_no_fill(payload):
+        return {
+            "order": {
+                "id": "12345",
+                "status": "calculated",
+                "filled_qty": "0",
+                "filled_avg_price": "0",
+            }
+        }
+
+    broker_no_fill = AlpacaBroker(
+        config=AlpacaConfig(time_in_force="day"), order_fill_fn=mock_order_fill_fn_no_fill
+    )
+    assert broker_no_fill.get_order_fill("12345") is None
+
+
+def test_alpaca_get_order_fill_calculated_stays_non_terminal_for_other_tif():
+    # For any TIF other than 'day' (e.g. 'gtc'), a 'calculated' response
+    # might represent the done_for_day case rather than a true final fill
+    # -- Alpaca can resume working the order on a later trading day, so it
+    # must stay eligible for a later refresh rather than being accepted
+    # as final.
+    def mock_order_fill_fn(payload):
+        return {
+            "order": {
+                "id": "12345",
+                "status": "calculated",
+                "filled_qty": "10",
+                "filled_avg_price": "150.0",
+            }
+        }
+
+    broker = AlpacaBroker(
+        config=AlpacaConfig(time_in_force="gtc"), order_fill_fn=mock_order_fill_fn
+    )
+    assert broker.get_order_fill("12345") is None
+
+
+def test_alpaca_get_order_fill_accepts_done_for_day_for_day_tif():
+    # 'done_for_day' means Alpaca won't execute the order further today.
+    # That's a durable terminal signal ONLY for a 'day' time-in-force order
+    # (it expires with the trading day) -- must be accepted like
+    # 'canceled'/'expired', including the explicit-zero exemption, since a
+    # day order can legitimately end done_for_day having executed nothing
+    # at all (Codex review: "Accept done_for_day Alpaca fills").
+    def mock_order_fill_fn(payload):
+        return {
+            "order": {
+                "id": "12345",
+                "status": "done_for_day",
+                "filled_qty": "6",
+                "filled_avg_price": "150.0",
+            }
+        }
+
+    broker = AlpacaBroker(
+        config=AlpacaConfig(time_in_force="day"), order_fill_fn=mock_order_fill_fn
+    )
+    fill = broker.get_order_fill("12345")
+    assert fill is not None
+    assert fill.quantity_filled == 6.0
+    assert fill.avg_fill_price == 150.0
+
+    def mock_order_fill_fn_no_fill(payload):
+        return {
+            "order": {
+                "id": "12345",
+                "status": "done_for_day",
+                "filled_qty": "0",
+                "filled_avg_price": "0",
+            }
+        }
+
+    broker_no_fill = AlpacaBroker(
+        config=AlpacaConfig(time_in_force="day"), order_fill_fn=mock_order_fill_fn_no_fill
+    )
+    assert broker_no_fill.get_order_fill("12345") is None
+
+
+def test_alpaca_get_order_fill_done_for_day_stays_non_terminal_for_other_tif():
+    # For any TIF other than 'day' (e.g. 'gtc'), Alpaca can resume working
+    # the order on a later trading day after done_for_day -- it is NOT a
+    # durable terminal signal there, so it must stay eligible for a later
+    # refresh rather than being accepted as final.
+    def mock_order_fill_fn(payload):
+        return {
+            "order": {
+                "id": "12345",
+                "status": "done_for_day",
+                "filled_qty": "6",
+                "filled_avg_price": "150.0",
+            }
+        }
+
+    broker = AlpacaBroker(
+        config=AlpacaConfig(time_in_force="gtc"), order_fill_fn=mock_order_fill_fn
+    )
+    assert broker.get_order_fill("12345") is None
+
+
+def test_alpaca_get_order_fill_follows_replacement_chain():
+    # When the connector CAN resolve a 'replaced' order's replacement, follow
+    # it and aggregate: sum the filled quantity across every hop, compute the
+    # notional-weighted average price, keep the earliest submitted_at and the
+    # latest filled_at. Otherwise the original order's partial fill would be
+    # reported as the whole execution, or (if it filled nothing) the real
+    # fill on the replacement would be missed entirely (Codex review:
+    # "Reconcile the replaced_by order before returning").
+    orders_by_id = {
+        "12345": {
+            "id": "12345",
+            "status": "replaced",
+            "filled_qty": "3",
+            "filled_avg_price": "149.0",
+            "submitted_at": "2026-07-02T13:30:00Z",
+            "replaced_by": "67890",
+        },
+        "67890": {
+            "id": "67890",
+            "status": "filled",
+            "filled_qty": "7",
+            "filled_avg_price": "151.0",
+            "filled_at": "2026-07-02T13:31:00Z",
+        },
+    }
+
+    def mock_order_fill_fn(payload):
+        return {"order": orders_by_id[payload["input"]["orderId"]]}
+
+    broker = AlpacaBroker(order_fill_fn=mock_order_fill_fn)
+    fill = broker.get_order_fill("12345")
+    assert fill is not None
+    assert fill.quantity_filled == 10.0  # 3 (original) + 7 (replacement)
+    assert fill.avg_fill_price == pytest.approx((3 * 149.0 + 7 * 151.0) / 10.0)
+    assert fill.order_submitted_at == datetime(2026, 7, 2, 13, 30, 0, tzinfo=timezone.utc)
+    assert fill.order_filled_at == datetime(2026, 7, 2, 13, 31, 0, tzinfo=timezone.utc)
+
+
+def test_alpaca_get_order_fill_replacement_chain_still_open_stays_none():
+    # If the replacement order is itself still live (not yet terminal), the
+    # whole chain isn't resolved yet -- it must report no fill so a later
+    # refresh retries, not the partial accumulated so far.
+    orders_by_id = {
+        "12345": {
+            "id": "12345",
+            "status": "replaced",
+            "filled_qty": "3",
+            "filled_avg_price": "149.0",
+            "replaced_by": "67890",
+        },
+        "67890": {
+            "id": "67890",
+            "status": "partially_filled",
+            "filled_qty": "1",
+            "filled_avg_price": "151.0",
+        },
+    }
+
+    def mock_order_fill_fn(payload):
+        return {"order": orders_by_id[payload["input"]["orderId"]]}
+
+    broker = AlpacaBroker(order_fill_fn=mock_order_fill_fn)
+    assert broker.get_order_fill("12345") is None
+
+
+def test_alpaca_get_order_fill_replacement_lookup_failure_returns_none():
+    # A 'replaced' order DOES have a replaced_by to follow, but the lookup for
+    # that id comes back empty/mismatched (e.g. a stale or transient
+    # response). Unlike the no-replaced_by case, this must NOT fall back to
+    # the original's partial fill: build_execution_record() would persist it
+    # as a completed 'filled' record, and _refresh_fills_from_broker() would
+    # then never retry -- permanently omitting whatever the replacement order
+    # goes on to execute (Codex review: "Retry unresolved replacement-chain
+    # lookups").
+    def mock_order_fill_fn(payload):
+        # Always answers with the original order, regardless of which id was
+        # requested -- so looking up "67890" never resolves.
+        return {
+            "order": {
+                "id": "12345",
+                "status": "replaced",
+                "filled_qty": "3",
+                "filled_avg_price": "149.0",
+                "replaced_by": "67890",
+            }
+        }
+
+    broker = AlpacaBroker(order_fill_fn=mock_order_fill_fn)
+    assert broker.get_order_fill("12345") is None
+
+
+def test_alpaca_get_order_fill_replacement_terminal_invalid_numerics_returns_none():
+    # The chain resolves to a genuinely terminal 'filled' hop, but that
+    # hop's own fill numerics are missing/zero -- a malformed or incomplete
+    # response for that specific lookup. It must NOT fall back to the
+    # earlier hop's valid partial fill as if the chain were fully resolved,
+    # or a later real fill on the terminal hop would never be picked up
+    # (Codex review: "Retry chains whose terminal fill details are
+    # invalid").
+    orders_by_id = {
+        "12345": {
+            "id": "12345",
+            "status": "replaced",
+            "filled_qty": "3",
+            "filled_avg_price": "149.0",
+            "replaced_by": "67890",
+        },
+        "67890": {
+            "id": "67890",
+            "status": "filled",
+            "filled_qty": "0",
+            "filled_avg_price": "0",
+        },
+    }
+
+    def mock_order_fill_fn(payload):
+        return {"order": orders_by_id[payload["input"]["orderId"]]}
+
+    broker = AlpacaBroker(order_fill_fn=mock_order_fill_fn)
+    assert broker.get_order_fill("12345") is None
+
+
+def test_alpaca_get_order_fill_replacement_chain_exceeding_hop_cap_returns_none():
+    # A replacement chain deeper than the hop cap must report no fill rather
+    # than silently returning whatever partial had been accumulated when the
+    # cap was hit -- that partial reflects an unresolved chain, not a
+    # genuine terminal state (Codex review: "Retry replacement chains that
+    # exceed the lookup cap").
+    orders_by_id = {}
+    for i in range(15):
+        orders_by_id[str(i)] = {
+            "id": str(i),
+            "status": "replaced",
+            "filled_qty": "1",
+            "filled_avg_price": "100.0",
+            "replaced_by": str(i + 1),
+        }
+
+    def mock_order_fill_fn(payload):
+        return {"order": orders_by_id[payload["input"]["orderId"]]}
+
+    broker = AlpacaBroker(order_fill_fn=mock_order_fill_fn)
+    assert broker.get_order_fill("0") is None
+
+
+def test_alpaca_get_order_fill_preserves_submitted_at_from_zero_fill_hop():
+    # The original order is replaced before executing anything (zero fill),
+    # but it still has a real submitted_at that must count as the chain's
+    # earliest submission time even though this hop contributed no
+    # quantity -- otherwise end-to-end latency is understated using only the
+    # replacement's later submission time (Codex review: "Preserve
+    # submission times from zero-fill replacement hops").
+    orders_by_id = {
+        "12345": {
+            "id": "12345",
+            "status": "replaced",
+            "filled_qty": "0",
+            "filled_avg_price": "0",
+            "submitted_at": "2026-07-02T13:30:00Z",
+            "replaced_by": "67890",
+        },
+        "67890": {
+            "id": "67890",
+            "status": "filled",
+            "filled_qty": "10",
+            "filled_avg_price": "150.0",
+            "submitted_at": "2026-07-02T13:30:10Z",
+            "filled_at": "2026-07-02T13:31:00Z",
+        },
+    }
+
+    def mock_order_fill_fn(payload):
+        return {"order": orders_by_id[payload["input"]["orderId"]]}
+
+    broker = AlpacaBroker(order_fill_fn=mock_order_fill_fn)
+    fill = broker.get_order_fill("12345")
+    assert fill is not None
+    assert fill.quantity_filled == 10.0
+    assert fill.order_submitted_at == datetime(2026, 7, 2, 13, 30, 0, tzinfo=timezone.utc)
+    assert fill.order_filled_at == datetime(2026, 7, 2, 13, 31, 0, tzinfo=timezone.utc)
+
+
+def test_alpaca_get_order_fill_replacement_ends_in_unfilled_cancel():
+    # The chain resolves to a genuinely terminal 'canceled' hop that
+    # legitimately reports a zero fill (the replacement never executed
+    # before being canceled). Unlike a malformed 'filled' terminal hop, this
+    # IS a real, final answer -- the earlier hop's valid partial must still
+    # be returned, not discarded (Codex review: "Preserve earlier fills when
+    # a replacement ends unfilled").
+    orders_by_id = {
+        "12345": {
+            "id": "12345",
+            "status": "replaced",
+            "filled_qty": "3",
+            "filled_avg_price": "149.0",
+            "replaced_by": "67890",
+        },
+        "67890": {
+            "id": "67890",
+            "status": "canceled",
+            "filled_qty": "0",
+            "filled_avg_price": "0",
+        },
+    }
+
+    def mock_order_fill_fn(payload):
+        return {"order": orders_by_id[payload["input"]["orderId"]]}
+
+    broker = AlpacaBroker(order_fill_fn=mock_order_fill_fn)
+    fill = broker.get_order_fill("12345")
+    assert fill is not None
+    assert fill.quantity_filled == 3.0
+    assert fill.avg_fill_price == 149.0
+
+
+def test_alpaca_get_order_fill_replacement_ends_in_unfilled_cancel_with_null_price():
+    # Alpaca can report a canceled/expired unfilled order with
+    # filled_avg_price as JSON null rather than "0" or omitted -- order.get(
+    # key, 0.0) only substitutes the default when the key is ABSENT, so a
+    # present null reaches a bare float(None) and raises, discarding the
+    # earlier hop's real partial fill along with it. Must degrade to using
+    # the accumulated total, not crash (Codex review: "Accept null prices on
+    # unfilled canceled replacements").
+    orders_by_id = {
+        "12345": {
+            "id": "12345",
+            "status": "replaced",
+            "filled_qty": "3",
+            "filled_avg_price": "149.0",
+            "replaced_by": "67890",
+        },
+        "67890": {
+            "id": "67890",
+            "status": "canceled",
+            "filled_qty": "0",
+            "filled_avg_price": None,
+        },
+    }
+
+    def mock_order_fill_fn(payload):
+        return {"order": orders_by_id[payload["input"]["orderId"]]}
+
+    broker = AlpacaBroker(order_fill_fn=mock_order_fill_fn)
+    fill = broker.get_order_fill("12345")
+    assert fill is not None
+    assert fill.quantity_filled == 3.0
+    assert fill.avg_fill_price == 149.0
+
+
+def test_alpaca_get_order_fill_retries_replacement_with_unpriced_partial():
+    # An INTERMEDIATE 'replaced' hop reports a genuinely positive filled_qty
+    # but an unusable filled_avg_price (missing/zero/non-finite). A positive
+    # quantity means a real execution happened there; silently dropping it
+    # while continuing to follow replaced_by would under-report a fill known
+    # to have happened once the chain resolves using only the later hop's
+    # data. The whole chain must be treated as unresolved instead (Codex
+    # review: "Retry replacements with invalid partial-fill numerics").
+    orders_by_id = {
+        "12345": {
+            "id": "12345",
+            "status": "replaced",
+            "filled_qty": "3",
+            "filled_avg_price": "0",  # real qty, unusable price
+            "replaced_by": "67890",
+        },
+        "67890": {
+            "id": "67890",
+            "status": "filled",
+            "filled_qty": "7",
+            "filled_avg_price": "151.0",
+        },
+    }
+
+    def mock_order_fill_fn(payload):
+        return {"order": orders_by_id[payload["input"]["orderId"]]}
+
+    broker = AlpacaBroker(order_fill_fn=mock_order_fill_fn)
+    assert broker.get_order_fill("12345") is None
+
+
+def test_alpaca_get_order_fill_retries_canceled_replacement_with_invalid_quantity():
+    # A terminal 'canceled'/'expired' hop is trusted as a genuine zero fill
+    # ONLY when filled_qty is an explicit, finite zero. A missing,
+    # non-numeric, non-finite, or negative filled_qty is NOT proof nothing
+    # executed -- it's an ambiguous/malformed response -- so it must not be
+    # silently treated the same as a resolved zero fill and used to freeze
+    # an earlier hop's valid partial as final (Codex review: "Retry
+    # canceled replacements with invalid quantities").
+    base_replaced = {
+        "id": "12345",
+        "status": "replaced",
+        "filled_qty": "3",
+        "filled_avg_price": "149.0",
+        "replaced_by": "67890",
+    }
+
+    invalid_terminal_cases = [
+        {"status": "canceled"},  # filled_qty entirely absent
+        {"status": "canceled", "filled_qty": "-1"},
+        {"status": "canceled", "filled_qty": "not-a-number"},
+        {"status": "canceled", "filled_qty": "NaN"},
+        {"status": "expired", "filled_qty": None},
+    ]
+    for terminal_order in invalid_terminal_cases:
+        terminal_order = {"id": "67890", **terminal_order}
+        orders_by_id = {"12345": base_replaced, "67890": terminal_order}
+
+        def mock_order_fill_fn(payload, _orders=orders_by_id):
+            return {"order": _orders[payload["input"]["orderId"]]}
+
+        broker = AlpacaBroker(order_fill_fn=mock_order_fill_fn)
+        assert broker.get_order_fill("12345") is None, f"expected None for {terminal_order}"
+
+
+def test_alpaca_get_order_fill_rejects_mixed_timezone_awareness():
+    # A naive (offset-less) timestamp mixed with a timezone-aware one from
+    # another hop can't be safely subtracted downstream in
+    # build_execution_record()'s latency computation (TypeError: can't
+    # subtract offset-naive and offset-aware datetimes). The naive one must
+    # be treated as unknown rather than passed through, while the otherwise-
+    # valid fill quantity/price is still returned.
+    def mock_order_fill_fn(payload):
+        return {
+            "order": {
+                "id": "12345",
+                "status": "filled",
+                "filled_qty": "10",
+                "filled_avg_price": "150.0",
+                "submitted_at": "2026-07-02T13:30:00",  # naive: no offset/Z
+                "filled_at": "2026-07-02T13:31:00Z",  # aware
+            }
+        }
+
+    broker = AlpacaBroker(order_fill_fn=mock_order_fill_fn)
+    fill = broker.get_order_fill("12345")
+    assert fill is not None
+    assert fill.quantity_filled == 10.0
+    assert fill.order_submitted_at is None
+    assert fill.order_filled_at == datetime(2026, 7, 2, 13, 31, 0, tzinfo=timezone.utc)
+
+
+def test_alpaca_get_order_fill_replacement_cycle_returns_none():
+    # A cyclic replaced_by chain (A -> B -> A) must never loop forever, and
+    # must not fall back to whatever was accumulated before the cycle was
+    # detected: a cycle is definitionally invalid Alpaca data (an order
+    # can't be replaced by an order that replaced it), so it signals a
+    # malformed/incomplete response rather than a resolved chain -- report
+    # no fill and let a later refresh retry.
+    orders_by_id = {
+        "12345": {
+            "id": "12345",
+            "status": "replaced",
+            "filled_qty": "3",
+            "filled_avg_price": "149.0",
+            "replaced_by": "67890",
+        },
+        "67890": {
+            "id": "67890",
+            "status": "replaced",
+            "filled_qty": "0",
+            "filled_avg_price": "0",
+            "replaced_by": "12345",
+        },
+    }
+
+    def mock_order_fill_fn(payload):
+        return {"order": orders_by_id[payload["input"]["orderId"]]}
+
+    broker = AlpacaBroker(order_fill_fn=mock_order_fill_fn)
+    assert broker.get_order_fill("12345") is None
+
+
+def test_alpaca_get_order_fill_unwraps_data_envelope():
+    # An MCP/Pipedream connector response can arrive wrapped in one or more
+    # {"data": ...} layers (the same envelope dca_live_adapters._unwrap() and
+    # dca_reporting._unwrap_payload() already handle for other adapters).
+    # Failing to unwrap it here would report a genuine fill as a missing-fill
+    # gap (Codex review: "Unwrap connector data envelopes before parsing
+    # fills").
+    def mock_order_fill_fn_single_wrap(payload):
+        return {
+            "data": {
+                "order": {
+                    "id": "12345",
+                    "status": "filled",
+                    "filled_qty": "10",
+                    "filled_avg_price": "150.0",
+                }
+            }
+        }
+
+    broker = AlpacaBroker(order_fill_fn=mock_order_fill_fn_single_wrap)
+    fill = broker.get_order_fill("12345")
+    assert fill is not None
+    assert fill.quantity_filled == 10.0
+    assert fill.avg_fill_price == 150.0
+
+    def mock_order_fill_fn_double_wrap(payload):
+        return {
+            "data": {
+                "data": {
+                    "orders": [
+                        {
+                            "id": "12345",
+                            "status": "filled",
+                            "filled_qty": "5",
+                            "filled_avg_price": "100.0",
+                        }
+                    ]
+                }
+            }
+        }
+
+    broker_double = AlpacaBroker(order_fill_fn=mock_order_fill_fn_double_wrap)
+    fill_double = broker_double.get_order_fill("12345")
+    assert fill_double is not None
+    assert fill_double.quantity_filled == 5.0
+
+
+def test_alpaca_get_order_fill_rejects_invalid_fill_numerics():
+    # A terminal status alone is not enough: filled_qty <= 0 was already
+    # guarded, but a missing/zero/negative/non-finite filled_avg_price (or a
+    # non-finite filled_qty) must also be rejected, or _log_execution() would
+    # mark the order filled with corrupt numerics and the nonblank CSV values
+    # would stop _refresh_fills_from_broker() from ever retrying it (Codex
+    # review: "Reject non-positive and non-finite Alpaca fill values").
+    def _order_with(**overrides):
+        base = {
+            "id": "12345",
+            "status": "filled",
+            "filled_qty": "10",
+            "filled_avg_price": "150.0",
+        }
+        base.update(overrides)
+        return {"order": base}
+
+    invalid_cases = [
+        {"filled_avg_price": "0"},
+        {"filled_avg_price": "-150.0"},
+        {"filled_avg_price": "NaN"},
+        {"filled_avg_price": "Infinity"},
+        {"filled_qty": "NaN"},
+        {"filled_qty": "Infinity"},
+    ]
+    for overrides in invalid_cases:
+        order = _order_with(**overrides)
+
+        def mock_order_fill_fn(payload, _order=order):
+            return _order
+
+        broker = AlpacaBroker(order_fill_fn=mock_order_fill_fn)
+        assert broker.get_order_fill("12345") is None, f"expected None for {overrides}"
+
+
+def test_alpaca_get_order_fill_missing_timestamps_stay_none():
+    # A filled-order response omitting submitted_at/filled_at must leave those
+    # fields None rather than backfilling datetime.now(): two back-to-back
+    # now() calls would otherwise persist a fabricated near-zero latency as
+    # broker evidence (Codex review: "Preserve absent Alpaca fill timestamps
+    # as unknown").
+    def mock_order_fill_fn(payload):
+        return {
+            "order": {
+                "id": "12345",
+                "status": "filled",
+                "filled_qty": "10",
+                "filled_avg_price": "150.0",
+            }
+        }
+
+    broker = AlpacaBroker(order_fill_fn=mock_order_fill_fn)
+    fill = broker.get_order_fill("12345")
+    assert fill is not None
+    assert fill.order_submitted_at is None
+    assert fill.order_filled_at is None
+
+
+def test_alpaca_get_order_fill_malformed_response_returns_none():
+    # Parsing must happen inside the same guarded path as the network call: a
+    # None/non-dict payload, a missing fill value, or a malformed timestamp
+    # must degrade to an unfilled result instead of raising, since
+    # _log_execution() calls get_order_fill() without its own exception guard
+    # (Codex review: "Restore malformed-response handling inside the
+    # exception boundary").
+    def mock_order_fill_fn(payload):
+        return None
+
+    broker = AlpacaBroker(order_fill_fn=mock_order_fill_fn)
+    assert broker.get_order_fill("12345") is None
+
+    # A malformed timestamp degrades just that field to unknown rather than
+    # discarding the otherwise-valid fill quantity/price -- the primary
+    # purpose of this lookup -- and must not raise (it's caught internally
+    # by _parse_alpaca_timestamp, not just the outer exception boundary).
+    def mock_order_fill_fn_bad_timestamp(payload):
+        return {
+            "order": {
+                "id": "12345",
+                "status": "filled",
+                "filled_qty": "10",
+                "filled_avg_price": "150.0",
+                "submitted_at": "not-a-timestamp",
+            }
+        }
+
+    broker_bad_ts = AlpacaBroker(order_fill_fn=mock_order_fill_fn_bad_timestamp)
+    fill_bad_ts = broker_bad_ts.get_order_fill("12345")
+    assert fill_bad_ts is not None
+    assert fill_bad_ts.quantity_filled == 10.0
+    assert fill_bad_ts.order_submitted_at is None
+
+    def mock_order_fill_fn_bad_qty(payload):
+        return {
+            "order": {
+                "id": "12345",
+                "status": "filled",
+                "filled_qty": "not-a-number",
+                "filled_avg_price": "150.0",
+            }
+        }
+
+    broker_bad_qty = AlpacaBroker(order_fill_fn=mock_order_fill_fn_bad_qty)
+    assert broker_bad_qty.get_order_fill("12345") is None
+
+
+def test_alpaca_get_order_fill_warns_when_live_orders_enabled_without_fn(caplog):
+    # AlpacaBroker.get_order_fill must not fail silently: if live orders are
+    # enabled but no order_fill_fn is wired, every execution would otherwise
+    # be reported as unfilled with no signal that lookup is unimplemented.
+    config = AlpacaConfig(enable_live_orders=True)
+    broker = AlpacaBroker(config=config)
+    with caplog.at_level(logging.WARNING):
+        assert broker.get_order_fill("12345") is None
+    assert any("order_fill_fn" in record.message for record in caplog.records)
 
 
 def test_alpaca_broker_same_stream_check_fails_closed():

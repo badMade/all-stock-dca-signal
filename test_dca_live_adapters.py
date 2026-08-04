@@ -678,24 +678,7 @@ _BROKER_ADAPTER_OPTIONAL_MEMBERS = frozenset(
     [
         RobinhoodBroker,
         DryRunBroker,
-        pytest.param(
-            AlpacaBroker,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "Pre-existing gap discovered by this conformance test: AlpacaBroker "
-                    "(documented as 'a skeleton' and not the live broker -- Robinhood is) "
-                    "never implements get_order_fill, a REQUIRED BrokerAdapter member with "
-                    "no default. run_dca._refresh_fills_from_broker calls it unconditionally "
-                    "on any BrokerAdapter; against an AlpacaBroker instance that raises "
-                    "AttributeError, silently swallowed by the surrounding `except Exception`, "
-                    "so every order permanently reports as unfilled rather than crashing. "
-                    "xfail(strict=True) so this stays visible rather than silently skipped, "
-                    "and turns into a failure (prompting cleanup of this marker) the day "
-                    "AlpacaBroker is wired up for real and the gap is closed."
-                ),
-            ),
-        ),
+        AlpacaBroker,
     ],
 )
 def test_broker_implementations_satisfy_the_broker_adapter_protocol(broker_cls):

@@ -400,6 +400,7 @@ ALPACA_ACCOUNT_INFO_TOOL = "alpaca-get-account-info"
 ALPACA_LIST_ORDERS_TOOL = "alpaca-list-orders"
 ALPACA_LIST_POSITIONS_TOOL = "alpaca-list-positions"
 ALPACA_PLACE_ORDER_TOOL = "alpaca-place-order"
+ALPACA_GET_ORDER_TOOL = "alpaca-get-order"
 
 
 @dataclass(frozen=True)
@@ -1514,6 +1515,200 @@ def build_alpaca_account_info_payload(is_paper_api: bool) -> Dict[str, Any]:
     }
 
 
+def build_alpaca_get_order_payload(order_id: str, is_paper_api: bool) -> Dict[str, Any]:
+    """Build a payload for the Pipedream ``alpaca-get-order`` action.
+
+    ``order_id`` is sent under the connector's camel-cased ``orderId`` input key
+    (consistent with its other inputs, e.g. ``isPaperAPI``) -- not ``order_id`` --
+    or the action has no ID to look up and the request fails. ``is_paper_api``
+    selects paper vs. live trading, same as the other Alpaca payload builders.
+    """
+    return {
+        "source_id": ALPACA_SOURCE_ID,
+        "tool": ALPACA_GET_ORDER_TOOL,
+        "input": {"orderId": order_id, "isPaperAPI": is_paper_api},
+    }
+
+
+# Terminal Alpaca order statuses that can carry a real, durable fill under
+# their own order id (no further fills will ever land on this id). 'filled'
+# is the ordinary case; 'canceled'/'expired' can still report a positive
+# filled_qty for shares that executed before the remainder was canceled or
+# expired. That execution is real and must not be discarded, or such orders
+# become permanent missing-fill gaps (Codex review: "Record executions from
+# terminally canceled Alpaca orders"). 'partially_filled' is deliberately
+# excluded even though it also carries a positive filled_qty: it is NOT
+# terminal, so treating it as a complete fill here would make
+# build_execution_record() persist status='filled' and
+# _refresh_fills_from_broker() would then never re-query the order again
+# even though more shares may still execute.
+#
+# 'replaced' is handled separately (see _resolve_alpaca_order_fill): unlike
+# the statuses above, a replaced order's remaining quantity continues under
+# a *new* order id in its 'replaced_by' field, so it is not in this set.
+#
+# 'done_for_day' and 'calculated' are ALSO handled separately, not included
+# here. Per Alpaca's own docs, 'calculated' means "the order has been
+# completed for the day (either filled OR done for day), with settlement
+# calculations still pending" -- it is not a synonym for 'filled', it can
+# equally represent the done_for_day case. Both are durable terminal
+# signals ONLY for a 'day' time-in-force order (it expires with the trading
+# day, so no same-day-or-later execution can still land on it); Alpaca can
+# resume working any other TIF on a later trading day, so whether either
+# status is terminal depends on AlpacaConfig.time_in_force, which this
+# module-level constant can't see (Codex review: "Accept done_for_day
+# Alpaca fills" / "Gate calculated status on the order's TIF").
+_ALPACA_TERMINAL_FILL_STATUSES = frozenset({"filled", "canceled", "expired"})
+
+# Bounds how many 'replaced_by' hops _resolve_alpaca_order_fill will follow
+# for a single lookup, so a cyclic or pathologically long replacement chain
+# in a malformed response can never loop forever.
+_ALPACA_MAX_REPLACEMENT_HOPS = 10
+
+
+def _unwrap_alpaca_connector_response(payload: Any) -> Any:
+    """Unwrap nested ``{"data": ...}`` connector envelopes.
+
+    Same convention as ``dca_live_adapters._unwrap()`` and
+    ``dca_reporting._unwrap_payload()``: an MCP/Pipedream tool response can
+    arrive wrapped in one or more ``data`` layers (e.g.
+    ``{"data": {"order": {...}}}``) rather than the bare order envelope.
+    Keeps unwrapping until the payload stops being an unwrappable dict, with
+    a cycle guard for a malformed self-referential payload.
+    """
+    seen_ids: set = set()
+    while isinstance(payload, dict) and "data" in payload:
+        if id(payload) in seen_ids:
+            break
+        seen_ids.add(id(payload))
+        payload = payload["data"]
+    return payload
+
+
+def _extract_alpaca_order(data: Any, order_id: str) -> Optional[Dict[str, Any]]:
+    """Find the order dict matching ``order_id`` in an Alpaca get-order response.
+
+    Accepts a ``{"data": ...}``-wrapped envelope, list mode
+    (``{"orders": [...]}``), a single-order envelope (``{"order": {...}}``),
+    or a bare top-level order object.
+    """
+    data = _unwrap_alpaca_connector_response(data)
+    if not isinstance(data, dict):
+        return None
+    single = data.get("order") if isinstance(data.get("order"), dict) else None
+    if single is None and (data.get("id") or data.get("order_id")):
+        single = data
+    orders = data.get("orders") if isinstance(data.get("orders"), list) else ([single] if single else [])
+    for order in orders:
+        if not isinstance(order, dict):
+            continue
+        oid = order.get("id") or order.get("order_id")
+        if oid == order_id:
+            return order
+    return None
+
+
+def _alpaca_float_or_nan(value: Any) -> float:
+    """Best-effort float conversion; NaN for a missing, null, or non-numeric value.
+
+    ``order.get(key, 0.0)`` only substitutes the default when the key is
+    absent -- an explicit JSON ``null`` (e.g. a canceled order's unfilled
+    ``filled_avg_price``) comes through as Python ``None`` and would raise
+    from a bare ``float(None)``. Normalizing every unusable shape to NaN
+    lets callers use a single ``math.isfinite`` check regardless of why the
+    value is unusable.
+    """
+    if value is None:
+        return float("nan")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _parse_alpaca_order_fill(order: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    """Extract ``(filled_qty, filled_avg_price)`` for a hop with a genuine, usable fill.
+
+    Returns ``None`` for a missing, null, zero, negative, or non-finite
+    quantity or price -- covers both "genuinely nothing executed at this
+    hop" (legitimate, e.g. a canceled order with a null price that never
+    filled) and "a positive quantity but an unusable price" (ambiguous; see
+    ``_alpaca_has_unpriced_fill``, which the caller checks separately since
+    that case must not be silently treated the same as "nothing executed").
+    Submission/fill timestamps are handled separately by the caller: they
+    are meaningful even on a hop with no positive fill (e.g. an order
+    replaced before executing anything still has a real ``submitted_at``).
+    """
+    filled_qty = _alpaca_float_or_nan(order.get("filled_qty"))
+    if not math.isfinite(filled_qty) or filled_qty <= 0:
+        return None
+    filled_avg_price = _alpaca_float_or_nan(order.get("filled_avg_price"))
+    if not math.isfinite(filled_avg_price) or filled_avg_price <= 0:
+        return None
+    return filled_qty, filled_avg_price
+
+
+def _alpaca_has_unpriced_fill(order: Dict[str, Any]) -> bool:
+    """True when ``filled_qty`` is genuinely positive but ``filled_avg_price`` is unusable.
+
+    A positive quantity means a real execution happened at this hop --
+    unlike a missing/zero/null quantity (nothing executed, which is
+    legitimate), an unusable price here means the execution is real but its
+    notional can't be computed. ``_parse_alpaca_order_fill`` alone would
+    silently drop such a hop's contribution from the running total; the
+    caller instead treats this as an unresolved chain, since silently
+    dropping it would under-report a fill known to have happened (Codex
+    review: "Retry replacements with invalid partial-fill numerics").
+    """
+    filled_qty = _alpaca_float_or_nan(order.get("filled_qty"))
+    if not math.isfinite(filled_qty) or filled_qty <= 0:
+        return False
+    filled_avg_price = _alpaca_float_or_nan(order.get("filled_avg_price"))
+    return not math.isfinite(filled_avg_price) or filled_avg_price <= 0
+
+
+def _alpaca_qty_is_explicit_zero(order: Dict[str, Any]) -> bool:
+    """True when ``filled_qty`` is present and parses to exactly ``0``.
+
+    Distinguishes Alpaca's genuine "nothing executed" signal (an explicit,
+    finite zero) from a missing, non-numeric, non-finite, or negative
+    value on a terminal ``'canceled'``/``'expired'`` hop. Those other shapes
+    are ambiguous or malformed, not proof nothing executed, so the caller
+    must not silently treat them the same as a resolved zero fill (Codex
+    review: "Retry canceled replacements with invalid quantities").
+    """
+    raw = order.get("filled_qty")
+    if raw is None:
+        return False
+    try:
+        qty = float(raw)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(qty) and qty == 0
+
+
+def _parse_alpaca_timestamp(value: Optional[str]) -> Optional[datetime]:
+    """Parse an RFC3339 Alpaca timestamp, requiring timezone awareness.
+
+    Returns ``None`` for a missing value or one that parses to a naive
+    datetime (no offset). A naive result can't be safely compared against
+    another hop's timezone-aware timestamp -- build_execution_record()
+    subtracts submitted_at from filled_at to compute latency, and mixing a
+    naive and an aware datetime raises TypeError there, outside this
+    method's exception boundary. Treating it as unusable rather than
+    guessing a timezone keeps that subtraction safe.
+    """
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
+
+
 def build_alpaca_list_orders_payload(
     is_paper_api: bool,
     symbols: Sequence[str],
@@ -1590,12 +1785,14 @@ class AlpacaBroker:
         list_orders_fn: Optional[
             Callable[[Dict[str, Any]], List[Dict[str, Any]]]
         ] = None,
+        order_fill_fn: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
     ) -> None:
         self.config = config or AlpacaConfig()
         self._account = account
         self._place_order_fn = place_order_fn
         self._account_info_fn = account_info_fn
         self._list_orders_fn = list_orders_fn
+        self._order_fill_fn = order_fill_fn
 
     def account_number(self) -> str:
         return self._account
@@ -1680,6 +1877,177 @@ class AlpacaBroker:
             return self._place_order_fn(payload)
         mode = "PAPER" if self.config.is_paper_api else "LIVE"
         return f"ALPACA-DRYRUN-{mode}-{ticker}-{payload['input']['notional']}-{ref_id}"
+
+    def get_order_fill(self, order_id: str) -> Optional[OrderFill]:
+        if not order_id or "DRYRUN" in order_id:
+            return None
+        if self._order_fill_fn is None:
+            if self.config.enable_live_orders:
+                logger.warning(
+                    "AlpacaBroker.get_order_fill has no order_fill_fn wired while "
+                    "enable_live_orders is True; order %s will be reported as "
+                    "unfilled",
+                    order_id,
+                )
+            return None
+        try:
+            return self._resolve_alpaca_order_fill(order_id)
+        except Exception:  # noqa: BLE001 - a fill-lookup outage or malformed response must not abort the run
+            logger.exception("order-fill lookup failed for %s; recording as unfilled", order_id)
+            return None
+
+    def _resolve_alpaca_order_fill(self, order_id: str) -> Optional[OrderFill]:
+        """Resolve ``order_id`` to a fill, following any ``replaced_by`` chain.
+
+        An Alpaca order that is replaced (status ``'replaced'``) stops
+        accumulating fills under its own id; any remaining quantity continues
+        under a new order id in its ``'replaced_by'`` field. Follow that
+        chain, summing the filled quantity and computing the notional-
+        weighted average price across every hop, until reaching a status
+        that is genuinely terminal (``filled``/``canceled``/``expired``,
+        or ``done_for_day``/``calculated`` for a ``'day'`` time-in-force
+        order -- see ``_ALPACA_TERMINAL_FILL_STATUSES``) with no further
+        replacement -- or a non-terminal status (``partially_filled``,
+        ``new``, ...), which means the order isn't resolved yet and stays
+        eligible for a later refresh.
+
+        Every ambiguous or unresolved shape reports no fill rather than
+        freezing whatever was accumulated so far, so a later refresh gets a
+        chance to retry: an unresolvable ``replaced_by`` hop, a missing
+        ``replaced_by``/cyclic chain (per Alpaca's documented semantics a
+        genuinely replaced order always carries its replacement's id, so a
+        missing one signals an incomplete response, not a permanent
+        characteristic), a chain longer than the hop cap, a terminal
+        ``'filled'`` hop whose own numerics don't parse (a truly filled
+        order always has positive fill data), and ANY hop (intermediate or
+        terminal) with a genuinely positive quantity but an unusable price
+        (a real execution whose notional can't be computed). The one case
+        that IS trusted as final despite a hop's own numerics not parsing is
+        a terminal ``'canceled'``/``'expired'``/``'done_for_day'``/
+        ``'calculated'`` hop with a genuinely non-positive (explicit, finite
+        zero) quantity: those can legitimately report a zero fill (nothing
+        executed before the terminal state), which is a real answer, not
+        malformed data.
+        """
+        seen_ids = {order_id}
+        current_id = order_id
+        total_qty = 0.0
+        total_notional = 0.0
+        earliest_submitted_at: Optional[str] = None
+        latest_filled_at: Optional[str] = None
+
+        for hop_index in range(_ALPACA_MAX_REPLACEMENT_HOPS):
+            payload = build_alpaca_get_order_payload(current_id, self.config.is_paper_api)
+            data = self._order_fill_fn(payload)
+            order = _extract_alpaca_order(data, current_id)
+            if order is None:
+                return None
+
+            status = order.get("status")
+
+            # Only the ORIGINAL order's own submitted_at counts as the
+            # chain's earliest submission time -- every replacement is
+            # created strictly later, so substituting a later hop's
+            # submitted_at when the original omits one would understate
+            # elapsed time rather than leaving it honestly unknown (Codex
+            # review: "Keep incomplete replacement-chain timestamps
+            # unknown").
+            if hop_index == 0:
+                submitted_at_str = order.get("submitted_at")
+                if submitted_at_str:
+                    earliest_submitted_at = submitted_at_str
+
+            if _alpaca_has_unpriced_fill(order):
+                return None
+
+            parsed = _parse_alpaca_order_fill(order)
+            if parsed is not None:
+                filled_qty, filled_avg_price = parsed
+                total_qty += filled_qty
+                total_notional += filled_qty * filled_avg_price
+                # The LAST quantity-contributing hop's filled_at is the true
+                # completion time; if that hop omits it, the aggregate
+                # completion time is genuinely unknown -- don't keep an
+                # earlier, now-superseded hop's timestamp instead.
+                latest_filled_at = order.get("filled_at")
+
+            replaced_by = order.get("replaced_by")
+            if status == "replaced":
+                if replaced_by and replaced_by not in seen_ids:
+                    seen_ids.add(replaced_by)
+                    current_id = replaced_by
+                    continue
+                # No replaced_by to follow, or a cyclic chain (Codex review:
+                # "Retry replacement chains without a usable next hop").
+                return None
+
+            # 'done_for_day' means Alpaca won't execute the order any
+            # further today; 'calculated' per Alpaca's own docs means
+            # "completed for the day (either filled OR done for day),
+            # settlement pending" -- NOT a synonym for 'filled', it can
+            # equally BE the done_for_day case. Either way, that's only a
+            # durable terminal signal for a 'day' time-in-force order: it
+            # expires with the trading day, so no same-day-or-later
+            # execution can still land on it. For any other TIF (e.g.
+            # 'gtc'), Alpaca can resume working the order on a later
+            # trading day, so both stay non-terminal here (Codex review:
+            # "Accept done_for_day Alpaca fills" / "Gate calculated status
+            # on the order's TIF").
+            is_day_only_status_terminal = (
+                status in ("done_for_day", "calculated")
+                and self.config.time_in_force == "day"
+            )
+            if status not in _ALPACA_TERMINAL_FILL_STATUSES and not is_day_only_status_terminal:
+                # Genuinely non-terminal (e.g. partially_filled, new): not yet
+                # resolved, so report no fill and let a later refresh retry.
+                return None
+
+            if parsed is None and not (
+                status in ("canceled", "expired", "done_for_day", "calculated")
+                and _alpaca_qty_is_explicit_zero(order)
+            ):
+                # A 'filled' order always has positive fill numerics, so
+                # parsed being None there always means this response is
+                # malformed or incomplete (Codex review: "Retry chains
+                # whose terminal fill details are invalid"). A terminal
+                # 'canceled'/'expired'/'done_for_day'/'calculated' hop is
+                # trusted as a genuine zero fill ONLY when filled_qty is an
+                # explicit, finite zero -- a missing, non-numeric,
+                # non-finite, or negative value there is not proof nothing
+                # executed either (Codex review: "Retry canceled
+                # replacements with invalid quantities"). Either way,
+                # treating an earlier hop's partial as final here would
+                # freeze a possibly-stale number.
+                return None
+            break
+        else:
+            logger.warning(
+                "order-fill replacement chain for %s exceeded %d hops "
+                "without resolving; reporting no fill so a later refresh retries",
+                order_id,
+                _ALPACA_MAX_REPLACEMENT_HOPS,
+            )
+            return None
+
+        if total_qty <= 0:
+            return None
+
+        # A response omitting a timestamp -- or one that parses to a naive
+        # datetime, unsafe to compare against another hop's timezone-aware
+        # one -- leaves it unknown rather than fabricating a value: stamping
+        # with now() would persist a spurious near-zero latency as broker
+        # evidence, and a naive/aware mismatch would raise downstream in
+        # build_execution_record()'s latency subtraction (Codex review:
+        # "Reject mixed-awareness fill timestamps").
+        submitted_at = _parse_alpaca_timestamp(earliest_submitted_at)
+        filled_at = _parse_alpaca_timestamp(latest_filled_at)
+
+        return OrderFill(
+            avg_fill_price=total_notional / total_qty,
+            quantity_filled=total_qty,
+            order_submitted_at=submitted_at,
+            order_filled_at=filled_at,
+        )
 
 
 def account_pinning_failure(
