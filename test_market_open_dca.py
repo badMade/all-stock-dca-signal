@@ -40,6 +40,18 @@ def test_unparseable_config_file_fails_closed_to_shadow_mode(tmp_path):
     assert cfg.live_execution_enabled is False
 
 
+def test_non_object_json_config_file_fails_closed_to_shadow_mode(tmp_path):
+    # Copilot review ("load_stream_config() assumes the parsed JSON is a
+    # dict"): a file can be valid JSON but not an object -- "[]" parses
+    # without error, but every overlay in load_stream_config calls
+    # raw.get(...)/raw["..."], which raises AttributeError on a list instead
+    # of falling back to shadow-mode defaults like every other malformed-file
+    # case here.
+    (tmp_path / "market_open_dca.json").write_text("[]", encoding="utf-8")
+    cfg = load_market_open_config(config_dir=str(tmp_path), allow_unpinned_account=True)
+    assert cfg.live_execution_enabled is False
+
+
 def test_explicit_true_in_a_readable_config_still_overrides_the_fail_closed_default(tmp_path):
     # The fail-closed default must not prevent a real, readable config from
     # explicitly re-enabling live placement once it has been vetted.

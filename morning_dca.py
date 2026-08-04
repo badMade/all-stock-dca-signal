@@ -1350,6 +1350,22 @@ def load_stream_config(
         _log.warning("could not parse %s (%s); using %s defaults", cfg_path, exc, config_cls.__name__)
         return config_cls(**base_overrides)
 
+    # A file can be valid JSON but not an object (e.g. "[]", "42", "null") --
+    # every overlay below assumes raw.get(...)/raw["..."] on a dict, and a
+    # list/str/int/None has no .get(), so this would otherwise crash with
+    # AttributeError instead of falling back to shadow-mode defaults, the
+    # exact fail-closed behavior this loader documents for every other
+    # malformed-file case (Copilot review: "load_stream_config() assumes the
+    # parsed JSON is a dict").
+    if not isinstance(raw, dict):
+        _log.warning(
+            "%s did not contain a JSON object (got %s); using %s defaults",
+            cfg_path,
+            type(raw).__name__,
+            config_cls.__name__,
+        )
+        return config_cls(**base_overrides)
+
     # Bundled absolute artifact paths follow $DCA_CRON_TRACKING_ROOT instead of
     # overriding it. No-op when the variable is unset.
     raw = rebase_bundled_roots_in(raw)
