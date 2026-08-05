@@ -25,6 +25,14 @@ These instructions apply to the entire repository.
      (use any near-close timestamp, e.g. today's date at 15:45)
 6. Document any check that cannot be run and why.
 7. Before committing, review the diff for secrets, generated artifacts, and excessive churn.
+8. Before writing a new script, one-off snippet, or re-deriving strategy/gate logic by
+   reading `near_close_dca.py` or `dca_runner.py`, check whether an existing entry point
+   already does the job. Run `python scripts/agent_entry_points.py` (`--json` or `--search
+   <keyword>` also work) to list them. This matters most in a fresh/local session with
+   none of the repo already in context: re-deriving logic from an 8.7k-line module burns
+   far more tokens than invoking the command that already encapsulates it, and risks
+   silently drifting from the real logic. See also `docs/live_wiring.md`'s "Local agent
+   quick reference".
 
 ## Development setup
 

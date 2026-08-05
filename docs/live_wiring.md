@@ -456,3 +456,22 @@ python run_dca.py --demo --now 2026-07-06T15:45 --artifacts-dir artifacts/demo
 The CLI is dry-run only: a bare Python process has no MCP callables, so live trading is
 driven from the scheduler via `run_pipeline`. The CLI refuses to run if
 `config.dry_run` is False.
+
+## Local agent quick reference
+
+An agent working locally (or in any fresh session with no prior context loaded) should
+reach for an existing entry point before writing new code or re-deriving logic from this
+module. A few representative ones, beyond the CLI above:
+
+```bash
+python3 -m scripts.same_day_top_up_gate --account <acct> --trading-day <YYYY-MM-DD> \
+  --orders-pages <file> --candidates <file>        # authoritative same-day top-up sizing
+python scripts/drift_detection.py --run-dir <dir> [--slack]   # post-run drift detection
+python -c "import scripts.run_classification"     # scheduled-vs-manual; library API, no CLI --
+                                                    # see docs/run_classification.md
+```
+
+`scripts/agent_entry_points.py` is the live, authoritative index of these (`python
+scripts/agent_entry_points.py --json` for a machine-readable form); the rest are indexed
+per-topic in `docs/README.md`. `scripts/tests/test_agent_entry_points.py` keeps that index
+from drifting stale.

@@ -168,7 +168,8 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 |---|---|
 | `AGENTS.md` | The repo-wide agent operating contract (secrets policy, PR expectations) |
 | `docs/README.md` | Doc index + quick-reference facts (universe, ladder, budgets, test window) |
-| `docs/live_wiring.md` | Modules, dependency injection, the three entry points, state persistence |
+| `docs/live_wiring.md` | Modules, dependency injection, the three entry points, state persistence, local agent quick reference |
+| `scripts/agent_entry_points.py` | Live index of existing entry points to reuse instead of writing new code (`--json`/`--search`) |
 | `docs/reliability_spec.md` | Run-state lifecycle, broker snapshot contract, honest implementation-status matrix |
 | `docs/safeguards.md` | Binding broker/account rules, budget caps, live execution roster |
 | `docs/run_classification.md` | Scheduled-vs-manual contract: paths, required fields, exclusions |
