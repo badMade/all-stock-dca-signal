@@ -46,7 +46,7 @@ def _history_mtimes(history_dir: Path) -> dict[str, int]:
 
 def _active_tickers(ticker_config: Path) -> set[str]:
     """Read the active DCA symbols without making the archive depend on DCA code."""
-    data = json.loads(ticker_config.read_text(encoding="utf-8"))
+    data = json.loads(ticker_config.read_bytes())
     active = data.get("active")
     if not isinstance(active, list) or not all(isinstance(ticker, str) for ticker in active):
         raise ValueError(f"{ticker_config} must contain an active ticker list")

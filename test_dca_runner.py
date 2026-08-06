@@ -847,7 +847,7 @@ def test_state_with_an_oversized_ledger_value_fails_closed(tmp_path):
 def test_state_read_failure_raises_state_corrupt_error(tmp_path, monkeypatch):
     """path.exists() only proves the file was there a moment ago -- a
     permissions change, a filesystem I/O error, or the file being removed
-    between that check and the read all raise OSError from read_text()
+    between that check and the read all raise OSError from read_bytes()
     itself, which neither UnicodeDecodeError nor ValueError catches. Left
     uncaught, this would escape load_strategy_state's documented
     StateCorruptError fail-closed contract with a raw OSError instead (Codex
@@ -876,7 +876,7 @@ def test_state_read_failure_raises_state_corrupt_error(tmp_path, monkeypatch):
 
 
 def test_state_stat_failure_raises_state_corrupt_error(tmp_path, monkeypatch):
-    """A prior round wrapped read_text()'s own OSError, but the path.exists()
+    """A prior round wrapped read_bytes()'s own OSError, but the path.exists()
     stat probe that runs BEFORE that guarded block was untouched: an
     inaccessible ancestor directory or another filesystem error makes
     Path.exists() itself raise, not just return False, escaping

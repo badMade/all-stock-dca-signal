@@ -42,7 +42,7 @@ def archive_unavailable_reason(history_dir: Path, ticker_config: Path) -> dict[s
     if not history_dir.is_dir():
         return {"reason": "history_dir_missing", "history_dir": str(history_dir)}
     try:
-        active = json.loads(ticker_config.read_text(encoding="utf-8"))["active"]
+        active = json.loads(ticker_config.read_bytes())["active"]
     except (OSError, json.JSONDecodeError, KeyError) as exc:
         return {"reason": f"ticker_config_unreadable: {exc}"}
     if not active:
@@ -90,7 +90,7 @@ def session_count_regressions(
     which publish path (event-driven or standalone) produced it.
     """
     try:
-        previous = json.loads(output.read_text(encoding="utf-8"))
+        previous = json.loads(output.read_bytes())
     except (OSError, json.JSONDecodeError):
         return {}
     previous_tickers = previous.get("tickers")
@@ -165,7 +165,7 @@ def build_sizing_payload(
     that every history file refreshed successfully.  Separating calculation
     from file output prevents it from publishing a partial model.
     """
-    active = json.loads(ticker_config.read_text(encoding="utf-8"))["active"]
+    active = json.loads(ticker_config.read_bytes())["active"]
     effective_date = as_of or date.today()
     start_date = (
         f"{effective_date.year - lookback_years:04d}-{effective_date.month:02d}-{effective_date.day:02d}"

@@ -243,7 +243,7 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
 
 def _read_config(name: str) -> dict:
     return json.loads(
-        (CONFIG_DIR / name).read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_keys
+        (CONFIG_DIR / name).read_bytes(), object_pairs_hook=_reject_duplicate_keys
     )
 
 
@@ -5091,7 +5091,7 @@ def load_strategy_state(path=None) -> StrategyState:
     try:
         state_file_exists = path.exists()
     except OSError as exc:
-        # A prior round wrapped read_text()'s own OSError, but this stat
+        # A prior round wrapped read_bytes()'s own OSError, but this stat
         # probe ran BEFORE that guarded block: an inaccessible ancestor
         # directory or another filesystem error makes Path.exists() itself
         # raise, not just return False, escaping this function's documented
@@ -5112,7 +5112,7 @@ def load_strategy_state(path=None) -> StrategyState:
         # path.exists() above only proves the file was there a moment ago --
         # a permissions change, a filesystem I/O error, or the file being
         # removed between that check and this read all raise OSError from
-        # read_text() itself, which neither UnicodeDecodeError nor ValueError
+        # read_bytes() itself, which neither UnicodeDecodeError nor ValueError
         # (below) catches. Left uncaught, that would escape this function's
         # documented StateCorruptError fail-closed contract with a raw
         # exception instead, and state_transaction() would exit before ever

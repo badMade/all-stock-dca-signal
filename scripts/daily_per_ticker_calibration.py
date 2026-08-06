@@ -69,7 +69,7 @@ def rebuild_after_ticker_update(
 ) -> dict[str, Any]:
     """Publish a model from an event, or explicitly as a standalone run."""
     try:
-        update = json.loads(ticker_update_event.read_text(encoding="utf-8"))
+        update = json.loads(ticker_update_event.read_bytes())
     except (OSError, json.JSONDecodeError) as exc:
         update = {"status": "missing_or_invalid", "error": str(exc)}
     changed_active = update.get("changed_active_tickers", [])
