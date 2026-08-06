@@ -20,9 +20,9 @@
       { "et": "14:30", "task_id": "7be82b97", "role": "intraday live execution (2:30 slot)" },
       { "et": "15:30", "task_id": "10ce362c", "role": "final live execution (final buy of the day)" },
       { "et": "17:00", "task_id": "67aa802b", "role": "post-trade slippage + compact Notion latest-run sync" },
-      { "et": "17:45", "task_id": "claude-tickers-daily-update", "role": "Claude-only ticker-history archive update" },
-      { "et": "18:30", "task_id": "claude-per-ticker-calibration", "role": "Claude-only event-gated per-ticker trigger recalculation" }
+      { "et": "17:45", "task_id": "claude-tickers-daily-update", "role": "Claude-only ticker-history archive update" }
     ],
+    "daily_compact_chain_et_note": "claude-per-ticker-calibration is deliberately absent from this WEEKDAY chain as of 2026-08-05: its scheduled (non-event-triggered) firing moved to Fridays only (see its own task object's cron_utc/et_equivalent). Its artifact-event trigger (upstream_trigger, fired by a completed claude-tickers-daily-update event naming a changed active ticker) is DESIGNED to fire on any weekday regardless of this chain, once the task is registered with a scheduler that supports artifact events -- but scheduler_registered is still false on the task object itself, so neither that scheduled cadence nor this event trigger is actually firing today; config/per_ticker_sizing.json will not refresh on its own until someone runs the task manually or registers it.",
     "daily_mode_rules": [
       "Write compact artifacts only: machine-readable JSON/CSV, no long narrative summaries.",
       "Suppress no-op / heartbeat notifications entirely.",
@@ -3523,9 +3523,9 @@
       "name": "Event-gated per-ticker DCA trigger recalculation",
       "type": "analytics",
       "status": "active",
-      "cron_utc": "30 22 * * 1-5",
-      "cron_utc_est": "30 23 * * 1-5",
-      "et_equivalent": "6:30 PM ET weekdays",
+      "cron_utc": "30 22 * * 5",
+      "cron_utc_est": "30 23 * * 5",
+      "et_equivalent": "6:30 PM ET Fridays (weekly baseline recalculation; changed from weekdays 2026-08-05 at the owner's direction, so config/per_ticker_sizing.json would get a weekly refresh once this task is registered with a scheduler -- scheduler_registered is still false below, so this cadence is not actually firing yet)",
       "dst_note": "cron_utc (30 22) is EDT-calibrated and fires at 5:30 PM EST, not 6:30 PM ET, after the fall-back DST transition -- the top-level timezone_note's 'scheduler must preserve America/New_York' is prose only and does not make this fixed expression DST-aware. Like claude-tickers-daily-update above (whose completed-event trigger this task also listens for), this task has no expiring trading_window.json to fail closed on and must keep running at 6:30 PM ET indefinitely. The external scheduler must either register this task with genuine America/New_York-aware scheduling (preferred, if supported) or switch the registered cron expression from cron_utc to cron_utc_est (30 23) at the EDT->EST transition and back at the next EST->EDT transition (Codex review: \"Encode an EST schedule for the new nightly tasks\").",
       "trigger_mode": "scheduled_and_artifact_event",
       "upstream_trigger": {
@@ -3544,7 +3544,7 @@
       "scheduler_registration_note": "This repository defines the task and command, but only the external Claude scheduler may register it. Do not substitute a Codex or Perplexity automation: that would violate execution_owner='claude_only'.",
       "command": "python -m scripts.run_ticker_maintenance calibrate",
       "artifact_event_command": "python -m scripts.run_ticker_maintenance event-calibrate",
-      "command_note": "Run from the repository root. This is a distinct calibration program, not an archive updater. It defaults to the repository ticker_data path, which is the local link to the managed Google Drive ticker-history archive; DCA_TICKER_HISTORY_DIR is an optional explicit override. The scheduled 6:30 PM ET firing MUST run `command` (the `calibrate` subcommand, force=True), which remains independently runnable every weekday regardless of the upstream event's status. The upstream artifact-event firing (upstream_trigger) MUST run `artifact_event_command` (the `event-calibrate` subcommand, force=False) instead, which fails closed unless the same-day ticker_update_event.json is status=completed and names one or more changed active DCA tickers -- reusing `command`/--force for the event firing would ignore that guard and republish unconditionally on a partial or empty update event (Codex review: \"Wire artifact events to event-calibrate\"). There is no --force flag on the CLI; force is selected by which subcommand is invoked, not a flag.",
+      "command_note": "Run from the repository root. This is a distinct calibration program, not an archive updater. It defaults to the repository ticker_data path, which is the local link to the managed Google Drive ticker-history archive; DCA_TICKER_HISTORY_DIR is an optional explicit override. The scheduled 6:30 PM ET Friday firing MUST run `command` (the `calibrate` subcommand, force=True), which remains independently runnable on its own weekly schedule regardless of the upstream event's status. The upstream artifact-event firing (upstream_trigger) MUST run `artifact_event_command` (the `event-calibrate` subcommand, force=False) instead, which fails closed unless the same-day ticker_update_event.json is status=completed and names one or more changed active DCA tickers -- reusing `command`/--force for the event firing would ignore that guard and republish unconditionally on a partial or empty update event (Codex review: \"Wire artifact events to event-calibrate\"). There is no --force flag on the CLI; force is selected by which subcommand is invoked, not a flag.",
       "run_artifact": "${DCA_CRON_TRACKING_ROOT}/per_ticker_calibration/YYYY-MM-DD/calibration_run.json",
       "update_contract": {
         "purpose": "Rebuild config/per_ticker_sizing.json for the next trading session after the separate nightly ticker archive update changes an active DCA ticker.",

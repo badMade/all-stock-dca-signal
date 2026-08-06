@@ -42,6 +42,29 @@ finance, robinhood, broker, ...)`, called in-process with provider objects the
 old Perplexity scheduler injected. A Claude executor cannot satisfy Gate 5 by
 shelling out to anything. **Gate 5 has no runnable referent today.**
 
+**Partially resolved 2026-08-05:** `scripts/generate_buy_candidates.py` is now a
+committed, tested Gate 5 entry point — but ONLY for the 1530ET final-buy slot,
+one of this document's three *canonical*, already-live slots (§2), not one of
+the four new roster slots. This closes the PREREQUISITE this section
+describes ("Gate 5 has no runnable referent today") for 1530ET specifically:
+a real, tested command now exists to shell out to
+(`scripts/agent_entry_points.py`'s own index carries the exact command). It
+does **not**, by itself, make Gate 5 live for 1530ET: the actual scheduled
+prompt for this slot,
+`claude/dca-executor-prompts/7-executor-1530-cron_30_19.txt`, still tells the
+executor at its own Gate 5 step that no committed entry point exists and to
+end every fire with verdict `GATE5_DISABLED` — and that gate's own text is
+explicit that it "stays disabled until a human implements and names a real
+entry point here." The scheduler executes that prompt, not this proposal or
+the entry-point index, so 1530ET continues to alert `GATE5_DISABLED` on every
+fire exactly as before until a human makes that separate, deliberate call —
+wiring a live, real-money-trading prompt to a new code path is not a change
+this document (or the PR that added the entry point) makes unilaterally
+(Codex review: "Update the live 1530 prompt before declaring Gate 5
+runnable"). The "no runnable referent" gap above is otherwise unchanged: it
+still applies in full to the other six roster slots and to the seven-slot
+rollout this document's Recommendation (§5) advises against.
+
 ### 1.2 The repo has three streams, pinned to three specific times
 
 `config/scheduled_tasks.json` → `same_day_top_up_policy.summary`:

@@ -240,7 +240,8 @@ ACTIVE_TICKERS = [
     "VT",
 ]
 
-# BYDDY (ADR wind-down), VCX, TRLV, and RVI are excluded from the active universe.
+# BYDDY (ADR wind-down) is excluded from the active universe. VCX, TRLV, and
+# RVI are excluded by owner decision (confirmed 2026-08-05).
 EXCLUDED_TICKERS = {"BYDDY", "TRLV", "VCX", "RVI"}
 
 

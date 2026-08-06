@@ -114,6 +114,23 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         ),
     ),
     EntryPoint(
+        need="Generate Gate 5 buy candidates for the 1530ET final-buy slot",
+        command=(
+            "python3 -m scripts.generate_buy_candidates --slot 1530ET "
+            "--trading-day <YYYY-MM-DD> --market-data <file> --deployed-last-7d-usd <usd>"
+        ),
+        exists_path="scripts/generate_buy_candidates.py",
+        doc_ref="claude/GATE5-PROPOSAL.md",
+        symbols=("generate_candidates", "main"),
+        notes=(
+            "1530ET ONLY -- see the module's own SCOPE section. The other six roster "
+            "slots (0935/1030/1130/1230/1330/1430ET) are NOT covered: they run through "
+            "morning_dca.MorningDCAExecutor's separately-implemented evaluate_signal(), "
+            "not the near_close_dca functions this module calls, and using this command "
+            "for them would silently score against the wrong logic."
+        ),
+    ),
+    EntryPoint(
         need="Run the live gate sequence in-process: build a plan, then place it",
         command="plan = dca_runner.plan_orders(...); dca_runner.execute_plan(plan, ...)  # import and call, not a CLI",
         exists_path="dca_runner.py",

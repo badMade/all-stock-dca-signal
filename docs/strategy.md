@@ -157,10 +157,10 @@ Elevated/High-volatility/Stress is less frequent for the same market conditions.
 
 > **This table is the fallback, not the live curve.** As of 2026-08-04
 > [`config/per_ticker_sizing.json`](../config/per_ticker_sizing.json) is
-> `status: active` and carries an entry for all 53 active symbols. 46 are
+> `status: active` and carries an entry for all 53 active symbols. 47 are
 > **per-ticker, volatility-calibrated** (percentile-derived,
-> 1x/1.5x/2.5x/4x/5x, $1.00 base); the 7 in `fallback_tickers` (SPCX, DRAM,
-> CBRS, FLKR, SATA, GFUZ, VT) lack the 252 sessions of history the calibration
+> 1x/1.5x/2.5x/4x/5x, $1.00 base); the 6 in `fallback_tickers` (SPCX, DRAM,
+> CBRS, SATA, GFUZ, VT) lack the 252 sessions of history the calibration
 > requires and carry a copy of the global fallback ladder instead.
 > `graded_buy_multiplier` reads a ticker's calibrated tiers first and falls back
 > to the shared table above only for symbols with no entry — currently none. The
@@ -217,7 +217,14 @@ dimension.
 - Allocations are prioritized by **higher multiplier first, then larger percent
   drop, then ticker** (alphabetical) for a deterministic tie-break. Capped
   tickers are flagged.
-- **One strategy order per ticker per day.**
+- **One strategy order per ticker per stream per day.** The same ticker may
+  still be bought again later the same day by a *different* stream, subject to
+  the same-day top-up guard below — `config/budgets.json`'s
+  `one_order_per_ticker_per_day` is deliberately `false`; only
+  `one_order_per_ticker_per_stream` is enforced.
+- **Max 8 buy attempts per day, account-wide** — shared across every stream and
+  manual buying combined; counts attempts (including rejected/cancelled orders),
+  not just fills. See `config/budgets.json`'s `circuit_breakers.max_orders_per_day`.
 
 Caps are absolute ceilings: a run never exceeds the selected daily cap, the
 selected weekly cap, available buying power, or the broker/order-review limit.
@@ -459,7 +466,7 @@ See [`docs/safeguards.md`](safeguards.md) for the full list. Summary:
 
 - Only broker/account for live/manual runs: **Robinhood Agentic account `<ROBINHOOD_ACCOUNT_NUMBER>`**.
 - Alpaca is read-only validation / account context only (unless explicitly changed later).
-- One strategy order per ticker per day.
+- One strategy order per ticker per stream per day (see the top-up guard above for same-day repeat buys by a different stream).
 - Market buy orders with `dollar_amount` notional and `time_in_force = gfd`, only after `review_equity_order` passes.
 - No sells, options, crypto, margin expansion, order replacement, account changes, or trading outside regular hours.
 - Test window approved through **Fri Oct 30, 2026 inclusive**, per

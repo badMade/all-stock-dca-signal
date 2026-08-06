@@ -75,8 +75,12 @@ Feb, Nov, Dec). Re-verify around DST transitions.
 > separate owner of the managed ticker-history archive. When it finishes, it
 > writes a `ticker_update_event.json` handoff listing every changed ticker and
 > the subset in the active DCA universe. `claude-per-ticker-calibration` is
-> independently scheduled at **6:30 PM ET** to rebuild next-session trigger
-> percentages from the local archive. It can additionally use the update event
+> independently scheduled at **6:30 PM ET on Fridays** (changed from weekdays
+> 2026-08-05 at the owner's direction, so that once registered it gives
+> `config/per_ticker_sizing.json` a weekly refresh instead of none — per the
+> registration warning above, this cadence is not actually firing today) to
+> rebuild next-session trigger percentages from the local
+> archive. It can additionally use the update event
 > as an immediate trigger when the external Claude scheduler supports artifact
 > events. That event route is available for testing the two-job handoff without
 > merging the jobs. Both tasks are
