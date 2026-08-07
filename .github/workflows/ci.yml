@@ -31,12 +31,12 @@ jobs:
       # NOTE: actions are pinned by tag, not commit SHA. Tags are mutable, so
       # SHA pinning is the stronger posture; the dependabot config in this
       # directory keeps these current in the meantime.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
         with:
           persist-credentials: false
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -68,11 +68,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip

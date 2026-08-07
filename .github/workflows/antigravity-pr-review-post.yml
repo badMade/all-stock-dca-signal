@@ -209,7 +209,7 @@ jobs:
       # repository's default branch -- never the PR's code.
       - name: Checkout base branch (never PR head)
         if: steps.check.outputs.reviewed != 'true'
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           persist-credentials: false
 
@@ -273,7 +273,7 @@ jobs:
 
       - name: Set up Python
         if: steps.check.outputs.reviewed != 'true'
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 

@@ -47,7 +47,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout PR head
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0 # full history needed for git diff against origin/<base>
           persist-credentials: false
