@@ -2160,6 +2160,7 @@ def _placement_failure_reason(
     expected_side: str,
     expected_amount_usd: float,
     expected_ref_id: str | None = None,
+    account_number: str | None = None,
 ) -> str | None:
     """Return why ``response`` means "no order was actually placed", or None.
 
@@ -2329,8 +2330,11 @@ def _placement_failure_reason(
             # type (Codex review: "Redact mismatched client references
             # before recording failures").
             if isinstance(returned_ref_id, str):
+                redacted_ref_id = _SECRET_SHAPED_TOKEN_RE.sub("[REDACTED-TOKEN]", returned_ref_id)
+                if account_number is not None:
+                    redacted_ref_id = redacted_ref_id.replace(account_number, "[REDACTED-ACCOUNT]")
                 return (
-                    f"broker response client reference {returned_ref_id!r} does not match "
+                    f"broker response client reference {redacted_ref_id!r} does not match "
                     f"the requested order's {expected_ref_id!r}"
                 )
             return (
@@ -2378,8 +2382,11 @@ def _placement_failure_reason(
             # by type (Codex review: "Redact returned symbols before
             # storing failure evidence").
             if isinstance(returned_symbol, str):
+                redacted_symbol = _SECRET_SHAPED_TOKEN_RE.sub("[REDACTED-TOKEN]", returned_symbol)
+                if account_number is not None:
+                    redacted_symbol = redacted_symbol.replace(account_number, "[REDACTED-ACCOUNT]")
                 return (
-                    f"broker response symbol {returned_symbol!r} does not match the requested "
+                    f"broker response symbol {redacted_symbol!r} does not match the requested "
                     f"order's {expected_symbol!r}"
                 )
             return (
@@ -3702,6 +3709,7 @@ def execute_plan(
                 expected_side=order.side,
                 expected_amount_usd=order.amount_usd,
                 expected_ref_id=ref_id,
+                account_number=broker.account_number,
             )
         except Exception as exc:
             # exc's own message is connector-defined and can embed whatever
