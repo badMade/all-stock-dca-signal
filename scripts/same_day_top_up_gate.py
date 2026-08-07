@@ -331,6 +331,8 @@ def evaluate_slot(
     """
     if not str(account_number or "").strip():
         raise ValueError("account_number is required (account pinning) to evaluate the top-up gate")
+    if not str(trading_day or "").strip():
+        raise ValueError("trading_day is required (account pinning) to evaluate the top-up gate")
 
     if not pages:
         # An empty page list is missing evidence, not evidence of no buying --
