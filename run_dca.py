@@ -3031,7 +3031,7 @@ class DemoDataProvider:
 
     def _drop_fraction(self, ticker: str) -> float:
         # 0.0 .. ~4.5% depending on the ticker, stable across runs.
-        return (sum(ord(ch) for ch in ticker) % 46) / 1000.0
+        return (sum(ticker.encode('utf-8')) % 46) / 1000.0
 
     def get_intraday_bars(
         self, ticker: str, start: datetime, end: datetime, interval_minutes: int
