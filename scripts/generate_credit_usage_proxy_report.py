@@ -1770,52 +1770,11 @@ def _recovery_artifact_source(run_state: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _scan_recovery_runs(
-    cron_root: Path, trading_day: str, model_usage_entries: Optional[List[Dict[str, Any]]]
+def _scan_chain_slots_recovery(
+    cron_root: Path, day: str, trading_day: str, model_usage_entries: Optional[List[Dict[str, Any]]]
 ) -> tuple:
-    """``(rows, corrupted_attempt_streams)``: recovery/manual/repair/escalation
-    rows for recovery_and_escalation_runs, plus the set of streams whose
-    attempt_log history had an unparseable line (see
-    _read_all_attempt_markers).
-
-    Covers (a) any chain-slot run_state naming a recovery_artifact_types
-    signal of its own -- recovery_rerun, parent_recovery_submission, or
-    recovery_from_escalation (see _recovery_artifact_source) -- or a
-    repair/reconciliation-shaped filename scanned into an otherwise-valid
-    run (see _has_repair_artifact_filename): an in-place scheduled recovery
-    (scheduled_recovery_rule): its scheduled_runs row is already the
-    substantive valid_scheduled_evidence record (see _build_chain_row), so
-    this row is a CROSS-reference of that same artifact, not a separate run
-    -- it counts toward recovery_and_escalation_count but not
-    run_count_recovery, and its artifacts/model-usage rows are NOT re-summed
-    into the aggregate totals (see _usage_counts) since they'd otherwise
-    double-count the same underlying artifact (codex review
-    discussion_r3658263754, discussion_r3658332738, discussion_r3658509308);
-    (b) any chain slot classified failed_start_no_evidence -- this is that
-    failure's ONE substantive record (failed_start_no_evidence_rule); the
-    matching scheduled_runs row is a cross-reference only (see
-    _build_chain_row) -- and (c) any run_state under the documented
-    manual-run roots dated today (MANUAL_SCAN_SUBROOTS, which includes the
-    canonical ce16ba6b/manual_runs root -- codex review
-    discussion_r3658263744), classified from its own source artifact
-    (manual_recovery_classification_rule), never assumed manual_context_only
-    just because it is a recovery. Every row here carries
-    recovery_context_label='recovery context only'
-    (recovery_context_only_label_rule) in addition to its own classification.
-    """
     rows: List[Dict[str, Any]] = []
-    day = _yyyymmdd(trading_day)
-    # Streams whose attempt_log history had a line that failed to parse (see
-    # _read_all_attempt_markers's ``corrupted`` return). That line's own
-    # evidence is genuinely lost -- if it recorded an EARLIER attempt, the
-    # single-marker fallback can only ever recover the latest one -- so the
-    # recovery/error/retry counts derived from these streams' markers may be
-    # lower than the persisted history actually contains, with nothing else
-    # in the report saying so. Surfaced as a caveat by generate_report()
-    # rather than degrading the (many, interdependent) numeric counters
-    # themselves to not_available -- codex review discussion_r3661312403.
     corrupted_attempt_streams: set = set()
-
     for slot in CHAIN_SLOTS:
         run_dir_template = slot["run_dir"]
         if run_dir_template is None:
@@ -2146,6 +2105,13 @@ def _scan_recovery_runs(
                     }
                 )
 
+    return rows, corrupted_attempt_streams
+
+
+def _scan_manual_runs(
+    cron_root: Path, trading_day: str, model_usage_entries: Optional[List[Dict[str, Any]]]
+) -> tuple:
+    rows: List[Dict[str, Any]] = []
     # Dedup key for a manual run's stable identity across mirrored roots (the
     # documented final-manual-override flow writes the same execution under
     # both ce16ba6b/manual_runs and midday_dca/manual_reruns) -- codex review
@@ -2272,6 +2238,13 @@ def _scan_recovery_runs(
                 }
             )
 
+    return rows, seen_manual_dirs
+
+
+def _scan_orphan_csv_artifacts(
+    cron_root: Path, day: str, seen_manual_dirs: set
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
     # recovery_artifact_types_rule requires every recovery artifact TYPE to be
     # searched, not only those that happen to carry a run_state.json. An
     # order-reconciliation/repair pass can persist a submitted_orders.csv with
@@ -2337,6 +2310,58 @@ def _scan_recovery_runs(
                     "classification": "manual_context_only",
                 }
             )
+
+    return rows
+
+
+def _scan_recovery_runs(
+    cron_root: Path, trading_day: str, model_usage_entries: Optional[List[Dict[str, Any]]]
+) -> tuple:
+    """``(rows, corrupted_attempt_streams)``: recovery/manual/repair/escalation
+    rows for recovery_and_escalation_runs, plus the set of streams whose
+    attempt_log history had an unparseable line (see
+    _read_all_attempt_markers).
+
+    Covers (a) any chain-slot run_state naming a recovery_artifact_types
+    signal of its own -- recovery_rerun, parent_recovery_submission, or
+    recovery_from_escalation (see _recovery_artifact_source) -- or a
+    repair/reconciliation-shaped filename scanned into an otherwise-valid
+    run (see _has_repair_artifact_filename): an in-place scheduled recovery
+    (scheduled_recovery_rule): its scheduled_runs row is already the
+    substantive valid_scheduled_evidence record (see _build_chain_row), so
+    this row is a CROSS-reference of that same artifact, not a separate run
+    -- it counts toward recovery_and_escalation_count but not
+    run_count_recovery, and its artifacts/model-usage rows are NOT re-summed
+    into the aggregate totals (see _usage_counts) since they'd otherwise
+    double-count the same underlying artifact (codex review
+    discussion_r3658263754, discussion_r3658332738, discussion_r3658509308);
+    (b) any chain slot classified failed_start_no_evidence -- this is that
+    failure's ONE substantive record (failed_start_no_evidence_rule); the
+    matching scheduled_runs row is a cross-reference only (see
+    _build_chain_row) -- and (c) any run_state under the documented
+    manual-run roots dated today (MANUAL_SCAN_SUBROOTS, which includes the
+    canonical ce16ba6b/manual_runs root -- codex review
+    discussion_r3658263744), classified from its own source artifact
+    (manual_recovery_classification_rule), never assumed manual_context_only
+    just because it is a recovery. Every row here carries
+    recovery_context_label='recovery context only'
+    (recovery_context_only_label_rule) in addition to its own classification.
+    """
+    rows: List[Dict[str, Any]] = []
+    day = _yyyymmdd(trading_day)
+
+    chain_rows, corrupted_attempt_streams = _scan_chain_slots_recovery(
+        cron_root, day, trading_day, model_usage_entries
+    )
+    rows.extend(chain_rows)
+
+    manual_rows, seen_manual_dirs = _scan_manual_runs(
+        cron_root, trading_day, model_usage_entries
+    )
+    rows.extend(manual_rows)
+
+    orphan_rows = _scan_orphan_csv_artifacts(cron_root, day, seen_manual_dirs)
+    rows.extend(orphan_rows)
 
     return rows, corrupted_attempt_streams
 
