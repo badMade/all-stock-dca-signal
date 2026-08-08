@@ -18,8 +18,10 @@ in and forwards the rendered markdown to whatever Notion integration it owns.
 
 from __future__ import annotations
 
+import functools
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -54,13 +56,18 @@ def load_scheduled_run_states(base: str | Path) -> List[Dict[str, Any]]:
     return load_json_files(paths)
 
 
+@functools.lru_cache(maxsize=1024)
+def _load_cached_json(path_str: str, mtime: float) -> Dict[str, Any]:
+    return json.loads(Path(path_str).read_bytes())
+
+
 def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     """Load artifacts, skipping the minimal ``status: "blocked"`` run_state stubs
     written for date-gated days — they are not run days and would otherwise be
     counted into the weekly snapshot/table denominators — and skipping any
     manual run_states so manual candidates/notional never enter the
     scheduled-live weekly cost basis, reliability, or order-count metrics."""
-    loaded = [json.loads(Path(p).read_bytes()) for p in paths]
+    loaded = [_load_cached_json(str(p), os.path.getmtime(p)) for p in paths]
     return [
         data
         for data in loaded
