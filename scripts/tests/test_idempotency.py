@@ -96,3 +96,29 @@ def test_round_trip_parse_preserves_special_chars():
 def test_parse_rejects_non_string_input():
     assert parse_idempotency_key(None) is None
     assert parse_idempotency_key(123) is None
+
+def test_deterministic_ref_id_rejects_empty_key():
+    with pytest.raises(ValueError, match="key is required"):
+        deterministic_ref_id("")
+
+def test_build_idempotency_key_basic_example():
+    """Verify the exact example from the docstring."""
+    result = build_idempotency_key(
+        trade_date="2026-07-23",
+        window="1230et",
+        symbol="TXN",
+        strategy_version="v2-preauthorized",
+        tier="elevated",
+        kind="first"
+    )
+    assert result == "graded-dca:buy:first:2026-07-23:1230et:TXN:v2-preauthorized:elevated"
+
+def test_build_idempotency_key_rejects_empty_fields():
+    with pytest.raises(ValueError, match="idempotency key fields must be non-empty"):
+        build_idempotency_key(
+            trade_date="",
+            window="1230et",
+            symbol="txn",
+            strategy_version="v2",
+            tier="elevated"
+        )
