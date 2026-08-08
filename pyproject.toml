@@ -97,6 +97,7 @@ py-modules = [
     # ModuleNotFoundError outside a source checkout (Codex review: "Package
     # the intraday archive module").
     "dca_intraday_archive",
+    "validate_report",
 ]
 # scripts/run_classification.py is the run-classification contract used by both
 # the live artifact writer (near_close_dca.build_run_artifacts) and readers
