@@ -2462,54 +2462,28 @@ def _run_pipeline_impl(
                     )
                 )
                 # Merge by COMPLETENESS rather than replacing wholesale or
-                # trusting the reload just because a ticker was unresolved:
-                # amount_usd is the sum across every contributing artifact
-                # for that ticker, so whichever pass aggregated the LARGER
-                # amount read strictly more of that ticker's artifacts and
-                # is the more complete answer -- whether or not its
-                # reference price happens to be resolved (an unknown-price
-                # contributor can raise the amount while correctly
-                # poisoning the reference, which is itself the safe,
-                # conservative outcome). A SMALLER second-pass amount means
-                # the reload lost an artifact the first pass had -- e.g. an
-                # unconfirmed submission that made the first pass
-                # conservatively unresolved vanished from the reload, which
-                # must not be read as "resolved," only as "incomplete
-                # again" (Codex review: "Preserve unresolved context when
-                # the reload is incomplete"). Equal amounts fall back to
-                # resolution: take the reload ONLY if it turned an unknown
-                # price into a known one, never the reverse (Codex review:
-                # "Preserve resolved ticker context across the reload"). A
-                # ticker entirely absent from the first pass always takes
-                # the reload's result, since there is nothing to protect
-                # there.
-                #
-                # BUT that completeness reasoning only holds when the
-                # RELOAD (second pass) itself had zero skips anywhere.
-                # amount_usd alone cannot tell "the same contributor(s), now
-                # resolved/more complete" apart from "each scan missed a
-                # DIFFERENT real contributor" -- e.g. pass one reads only an
-                # unknown-price $5 submission (a $6 filled artifact for the
-                # SAME ticker fails to parse that pass), and the reload
-                # reads only that $6 fill (the $5 submission fails to parse
-                # THIS pass instead). $6 > $5 looks strictly more complete
-                # by amount alone, but the real aggregate is $11/unknown
-                # (Codex review: "Preserve uncertainty when unequal/equal
-                # contributors swap"). There is no per-artifact identity
-                # tracked here to rule this out directly, so the guard is
-                # gated on `second_scan_had_failures` specifically, NOT on
-                # whether the FIRST pass also had a skip: if the reload
-                # itself is clean, it read every artifact currently on disk
-                # for every ticker with zero exceptions, so its total is
-                # definitionally complete regardless of what the first pass
-                # missed (a first pass that skipped an artifact and a clean
-                # reload that then reads it is exactly the recovery this
-                # bounded reload exists to enable -- gating on the first
-                # pass's flag too would refuse that legitimate recovery
-                # whenever pass one had ANY unrelated skip, Codex review:
-                # "Use a clean reload after a failed first scan"). Only a
-                # reload that ITSELF skipped something can produce the
-                # swapped-contributor false confidence above.
+                # trusting the reload just because a ticker was unresolved.
+                # The merge rules are:
+                #   1. A ticker only in the reload is added IF the reload was
+                #      clean (zero skips); otherwise its reference/base are
+                #      poisoned to None so the guard routes through the
+                #      conservative missing_prior_price path instead of
+                #      trusting a possibly-partial total as complete.
+                #   2. A ticker present in BOTH passes is only fully trusted
+                #      when the reload itself had zero skips
+                #      (second_scan_had_failures=False / _reload_verified_complete=True).
+                #      The trust gate intentionally keys off the *reload's*
+                #      skip count -- not the first pass's -- because the reload
+                #      is the authoritative second read, and a single unread
+                #      file in that scan could be the file that would have
+                #      added another contributor to any ticker in the active
+                #      universe; we cannot enumerate who was affected.
+                #   3. When the reload is clean, "take the larger amount_usd"
+                #      still lets the merge fall through to the equal/smaller
+                #      branch, which can carry a fresher reference_price or
+                #      base_price even if the dollar amount didn't grow.
+                #      That reference/base correction path is preserved so the
+                #      guard does not price off a stale snapshot.
                 _reload_verified_complete = not second_scan_had_failures
                 prior_same_day_allocations = dict(first_pass)
                 for ticker, alloc in second_pass.items():
