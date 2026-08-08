@@ -5186,65 +5186,13 @@ def _resolve_recorded_orders_csv(
     return orders_csv_file
 
 
-def load_prior_same_day_allocations(
+def _parse_same_day_artifacts(
     state_root: str | Path,
+    additional_state_roots: Sequence[str | Path],
     trading_day: date,
-    *,
-    boundary_et: time = MORNING_MANUAL_BOUNDARY_ET,
-    additional_state_roots: Sequence[str | Path] = (),
-    include_scheduled_afternoon: bool = False,
-    skip_sink: Optional[List[Path]] = None,
-) -> Dict[str, PriorSameDayAllocation]:
-    """Aggregate earlier same-day allocation context for the scheduled afternoon guard.
-
-    Scans ``state_root`` (and any ``additional_state_roots``) recursively for
-    ``run_state*.json`` artifacts written earlier the same ``trading_day`` by
-    morning/midday/manual runs (including manual market-open recovery, manual
-    override reruns under ``.../manual_reruns/``, and the morning live stream),
-    and returns a per-ticker :class:`PriorSameDayAllocation`. These artifacts
-    are read as prior-allocation context ONLY -- they are deliberately never
-    surfaced as scheduled evidence, slippage, watchdog confirmation, scheduled
-    cost basis, or scheduled fill counts.
-
-    Eligibility mirrors the 2:30 PM ET boundary: only runs generated before
-    ``boundary_et`` on ``trading_day`` are read, scheduled *afternoon* runs are
-    ignored (morning/midday-stream runs stay eligible despite running on a
-    schedule; see ``_prior_run_is_scheduled``), and only buy candidates whose
-    status shows an order was placed contribute. Each contributing candidate's
-    reference price is resolved only after capital movement is confirmed, by policy
-    preference -- logged ``target_price``, then ``decision_price``, then the confirmed
-    ``average_fill_price`` (from ``orders.csv`` or a manual override's
-    ``filled_orders.csv``). An unconfirmed submitted candidate is retained as prior
-    allocation context with an unknown reference even if it logged target/decision
-    prices. When multiple earlier runs touched a ticker the dollar
-    amounts are summed and the ticker's *most recent* valid same-day reference price
-    wins (by ``generated_at``; ties and untimestamped runs fall back to later scan
-    order), so the afternoon run must beat that ticker's latest earlier entry price
-    before it tops up. If any contributing reference is unknown the aggregate
-    reference is unknown, routing the guard to its conservative missing-price /
-    manual_review $0 path.
-
-    ``include_scheduled_afternoon`` defaults to False, matching the normal
-    scheduled afternoon run's own guard invocation (which must never see another
-    afternoon-scheduled run as prior context). Set it True only for a distinct,
-    later same-day invocation -- e.g. a final manual buy override -- that needs
-    to see the day's already-completed scheduled run so it doesn't double-buy;
-    pass a ``boundary_et`` later than that run's timestamp to include it.
-
-    ``skip_sink``, when given, has the path of every ``run_state*.json``
-    candidate that could not be read or parsed appended to it (a file still
-    being flushed by a sibling stream's writer, or a transient read race).
-    Such a file contributes NO ticker to the returned mapping, so a caller
-    that only inspects the mapping for tickers with a known amount but an
-    unresolved reference price can miss this case entirely -- a skipped
-    file may be the ONLY same-day artifact for some ticker, leaving that
-    ticker absent rather than merely unresolved (Codex review: "Detect
-    artifacts skipped during the initial context scan"). Callers that need
-    to distinguish "no prior run" from "prior run present but its artifact
-    could not be scanned this pass" (e.g. run_dca's bounded same-day
-    context reload) should pass a list here and treat any entries in it as
-    reason enough to reload, independent of what the returned mapping shows.
-    """
+    skip_sink: Optional[List[Path]],
+) -> List[Tuple[Tuple[int, Any], Path, Dict[str, Any]]]:
+    trading_day_iso = trading_day.isoformat()
     # Deduplicate roots by resolved path so an additional_state_root that matches
     # state_root (or another additional root) doesn't cause double-counting.
     _seen_roots: set = set()
@@ -5255,8 +5203,6 @@ def load_prior_same_day_allocations(
             _seen_roots.add(_key)
             all_roots.append(_r)
 
-    aggregated: Dict[str, Dict[str, Any]] = {}
-    trading_day_iso = trading_day.isoformat()
     all_run_state_paths = sorted(
         set(
             p
@@ -5343,6 +5289,70 @@ def load_prior_same_day_allocations(
         _parsed_runs.append((sort_key, run_state_path, run_state))
 
     _parsed_runs.sort(key=lambda item: item[0])
+    return _parsed_runs
+
+
+def load_prior_same_day_allocations(
+    state_root: str | Path,
+    trading_day: date,
+    *,
+    boundary_et: time = MORNING_MANUAL_BOUNDARY_ET,
+    additional_state_roots: Sequence[str | Path] = (),
+    include_scheduled_afternoon: bool = False,
+    skip_sink: Optional[List[Path]] = None,
+) -> Dict[str, PriorSameDayAllocation]:
+    """Aggregate earlier same-day allocation context for the scheduled afternoon guard.
+
+    Scans ``state_root`` (and any ``additional_state_roots``) recursively for
+    ``run_state*.json`` artifacts written earlier the same ``trading_day`` by
+    morning/midday/manual runs (including manual market-open recovery, manual
+    override reruns under ``.../manual_reruns/``, and the morning live stream),
+    and returns a per-ticker :class:`PriorSameDayAllocation`. These artifacts
+    are read as prior-allocation context ONLY -- they are deliberately never
+    surfaced as scheduled evidence, slippage, watchdog confirmation, scheduled
+    cost basis, or scheduled fill counts.
+
+    Eligibility mirrors the 2:30 PM ET boundary: only runs generated before
+    ``boundary_et`` on ``trading_day`` are read, scheduled *afternoon* runs are
+    ignored (morning/midday-stream runs stay eligible despite running on a
+    schedule; see ``_prior_run_is_scheduled``), and only buy candidates whose
+    status shows an order was placed contribute. Each contributing candidate's
+    reference price is resolved only after capital movement is confirmed, by policy
+    preference -- logged ``target_price``, then ``decision_price``, then the confirmed
+    ``average_fill_price`` (from ``orders.csv`` or a manual override's
+    ``filled_orders.csv``). An unconfirmed submitted candidate is retained as prior
+    allocation context with an unknown reference even if it logged target/decision
+    prices. When multiple earlier runs touched a ticker the dollar
+    amounts are summed and the ticker's *most recent* valid same-day reference price
+    wins (by ``generated_at``; ties and untimestamped runs fall back to later scan
+    order), so the afternoon run must beat that ticker's latest earlier entry price
+    before it tops up. If any contributing reference is unknown the aggregate
+    reference is unknown, routing the guard to its conservative missing-price /
+    manual_review $0 path.
+
+    ``include_scheduled_afternoon`` defaults to False, matching the normal
+    scheduled afternoon run's own guard invocation (which must never see another
+    afternoon-scheduled run as prior context). Set it True only for a distinct,
+    later same-day invocation -- e.g. a final manual buy override -- that needs
+    to see the day's already-completed scheduled run so it doesn't double-buy;
+    pass a ``boundary_et`` later than that run's timestamp to include it.
+
+    ``skip_sink``, when given, has the path of every ``run_state*.json``
+    candidate that could not be read or parsed appended to it (a file still
+    being flushed by a sibling stream's writer, or a transient read race).
+    Such a file contributes NO ticker to the returned mapping, so a caller
+    that only inspects the mapping for tickers with a known amount but an
+    unresolved reference price can miss this case entirely -- a skipped
+    file may be the ONLY same-day artifact for some ticker, leaving that
+    ticker absent rather than merely unresolved (Codex review: "Detect
+    artifacts skipped during the initial context scan"). Callers that need
+    to distinguish "no prior run" from "prior run present but its artifact
+    could not be scanned this pass" (e.g. run_dca's bounded same-day
+    context reload) should pass a list here and treat any entries in it as
+    reason enough to reload, independent of what the returned mapping shows.
+    """
+    _parsed_runs = _parse_same_day_artifacts(state_root, additional_state_roots, trading_day, skip_sink)
+    aggregated: Dict[str, Dict[str, Any]] = {}
 
     for _, run_state_path, run_state in _parsed_runs:
         if _prior_run_is_scheduled(run_state) and not include_scheduled_afternoon:
