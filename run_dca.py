@@ -108,10 +108,10 @@ from scripts.scheduled_artifacts import (
 logger = logging.getLogger("near_close_dca.run")
 
 # Root for ad hoc intraday scheduled-recovery streams (e.g. the Jul 24 2026
-# 2:30 PM ET intraday_1430 recovery -- see config/scheduled_tasks.json
-# canonical_first_buy_and_topup_rule -> intraday_dca_scheduled_recovery_2026_07_24),
-# which have no dedicated *_dca.py module/config of their own but follow the
-# same ``cron_tracking/<stream>_dca/`` layout as the morning/midday roots.
+# 2:30 PM ET intraday_1430 recovery). See config/scheduled_tasks.json for the
+# intraday_dca_scheduled_recovery_2026_07_24 record and its canonical_first_buy_and_topup_rule note.
+# These streams have no dedicated *_dca.py module/config of their own but still write artifacts under
+# the same cron_tracking/{stream}_dca/{YYYYMMDD_HHMMET}/ directory pattern as the morning/midday roots.
 # Declared as its own root (rather than folded into
 # _CROSS_STREAM_PRIOR_ALLOCATION_ROOTS below, which also drives each stream's
 # OWN configured-root lookup in _resolve_cross_stream_prior_allocation_roots --
