@@ -4727,6 +4727,21 @@ def _state_to_json(state: StrategyState) -> dict:
 
 
 def _state_from_json(raw: dict) -> StrategyState:
+    """
+    Load a StrategyState from its JSON representation.
+
+    Validation ensures that each week's persisted total is at least the sum of
+    that week's daily entries, compared in whole cents (via _cents) rather than
+    a float tolerance (even $0.01 matters). A week total under its daily sum is corrupt,
+    as it would silently forget real spend and authorize another week's worth of buys.
+    (Codex review: "Reject inconsistent persisted daily and weekly ledgers" / "Reject cent-level persisted ledger mismatches").
+
+    The week total can legitimately exceed the daily sum, as operations like
+    bump_week_notional_only() / force_week_notional_to_worst_case_ceiling() /
+    reconcile_earlier_week_cross_stream_notional() may add EARLIER-weekday
+    cross-stream spend directly to the week bucket without a corresponding
+    submitted_notional_by_day entry in THIS state.
+    """
     state = StrategyState()
     ticker_spellings: dict[str, str] = {}
     state.buys_by_ticker_by_day = {}
@@ -4802,29 +4817,6 @@ def _state_from_json(raw: dict) -> StrategyState:
             ),
             "submitted_notional_by_week",
         )
-    # record_buy() always updates the day and week ledgers together in the
-    # same call, and neither is ever pruned independently of the other, so
-    # under any legitimately-written state each week's persisted total must
-    # be AT LEAST the sum of that week's daily entries -- it can legitimately
-    # exceed that sum too, since bump_week_notional_only()/
-    # force_week_notional_to_worst_case_ceiling()/
-    # reconcile_earlier_week_cross_stream_notional() add EARLIER-weekday
-    # cross-stream spend (or a fail-closed ceiling) to the week bucket ONLY,
-    # deliberately without a corresponding submitted_notional_by_day entry in
-    # THIS state (that spend belongs to a sibling stream or an earlier day's
-    # own history, not a ticker/day this state tracks -- Codex review:
-    # "Include prior-week sibling spend in the afternoon ledger"). A week
-    # total UNDER its daily sum -- e.g. $900 recorded for a Monday but $0 for
-    # that ISO week -- is still corrupt: StrategyState.week_notional() would
-    # silently forget real spend and authorize another week's worth of buys
-    # even though the same document proves it (Codex review: "Reject
-    # inconsistent persisted daily and weekly ledgers"). Compared in whole
-    # cents, not with a flat 0.01 tolerance: a tolerance of exactly one cent
-    # also accepts a real, corrupt one-cent shortfall (e.g. daily entries
-    # summing to $899.01 against a persisted $899.00) as if it were float
-    # non-associativity noise, when floating-point subtraction of the two can
-    # land just under that threshold even for a real discrepancy (Codex
-    # review: "Reject cent-level persisted ledger mismatches").
     expected_week_totals: dict[tuple[int, int], float] = {}
     for d, amount in state.submitted_notional_by_day.items():
         wk = iso_week_key(d)
