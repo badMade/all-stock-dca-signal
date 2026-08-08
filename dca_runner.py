@@ -2153,6 +2153,321 @@ def _envelope_failure(envelope: dict) -> str | None:
     return None
 
 
+
+def _check_placement_order_id(order: dict[str, Any]) -> str | None:
+    order_id = order.get("id") or order.get("order_id")
+    if (
+        not order_id
+        or isinstance(order_id, bool)
+        or not isinstance(order_id, (str, int, float))
+    ):
+        # A bare truthiness check would accept {"id": true} -- or a
+        # container like {"id": ["ORD"]}/{"id": {"value": "ORD"}} -- as
+        # proof an order exists, when none of those are a usable identifier
+        # at all: a malformed response could then be recorded as a
+        # successful submission with no real broker order id backing it
+        # (Codex review: "Reject boolean placement order IDs", "Reject
+        # non-scalar placement order IDs").
+        return "broker response carried no order id"
+    if isinstance(order_id, str) and not order_id.strip():
+        # A whitespace-only string is truthy, so the check above alone would
+        # accept {"id": "   "} as a usable identifier when it plainly is not
+        # (Codex review: "Reject blank and non-finite placement IDs").
+        return "broker response carried a blank order id"
+    if isinstance(order_id, (int, float)) and not math.isfinite(order_id):
+        # NaN and infinity are also truthy, so the same gap applies to a
+        # numeric id: neither is a real broker-assigned identifier (Codex
+        # review: "Reject blank and non-finite placement IDs").
+        return "broker response carried a non-finite order id"
+    if isinstance(order_id, (int, float)) and order_id <= 0:
+        # A finite negative (or zero) numeric id is also truthy and passes
+        # every check above -- e.g. a wrapper using -1 as a sentinel for "no
+        # order id was actually assigned" -- which is exactly as unusable as
+        # NaN/infinity despite being finite (Codex review: "Reject negative
+        # numeric placement IDs").
+        return "broker response carried a non-positive order id"
+    return None
+
+
+def _check_placement_ref_id(
+    order: dict[str, Any], expected_ref_id: str | None, account_number: str | None = None
+) -> str | None:
+    if expected_ref_id is not None:
+        # Key presence, not truthiness: an `or` chain of order.get(...) calls
+        # would treat a present-but-falsy reference ("", 0, False) as though
+        # the field were entirely absent and cascade to the next one,
+        # letting a wrapper that explicitly returned no usable idempotency
+        # key for THIS request still pass this check via an unrelated
+        # fallback field (Codex review: "Reject falsy returned client
+        # references"). Mirrors the symbol check's own key-presence idiom
+        # below -- except a present ``None`` value is NOT treated the same
+        # as an absent key here: a wrapper returning ``{"ref_id": null}``
+        # (or that key entirely) still carries no usable idempotency
+        # confirmation, and skipping the check for it (as the symbol check's
+        # own idiom does for a present-but-null symbol) would let a
+        # cached/stale response pass this check via that explicit null
+        # (Codex review: "Reject null returned client references").
+        if "ref_id" in order:
+            returned_ref_id, ref_id_present = order["ref_id"], True
+        elif "client_order_id" in order:
+            returned_ref_id, ref_id_present = order["client_order_id"], True
+        elif "client_order_uuid" in order:
+            returned_ref_id, ref_id_present = order["client_order_uuid"], True
+        elif "client_id" in order:
+            returned_ref_id, ref_id_present = order["client_id"], True
+        else:
+            returned_ref_id, ref_id_present = None, False
+        # Only checked when the response actually carries a client
+        # reference KEY (present, even if its value is null): a cached/stale
+        # response can otherwise pass every symbol/side/amount check above
+        # (a prior order for the same ticker, side, and notional) while
+        # confirming a DIFFERENT request entirely (Codex review: "Verify a
+        # returned client reference before recording success").
+        if ref_id_present and str(returned_ref_id) != expected_ref_id:
+            # A mismatched client reference can be arbitrary connector data
+            # -- a dict or object carrying a token or other request
+            # metadata, not just a stale string -- rather than a real
+            # idempotency key: str(returned_ref_id) is only used for the
+            # comparison above, so a non-string value reaches here
+            # unexamined. execute_plan() copies this failure string into
+            # ExecutionResult.failure_reason, which is persisted/alerted, so
+            # only a plain string mismatch (useful diagnostic text, e.g. a
+            # stale ref_id) is embedded; anything else is reported only by
+            # type (Codex review: "Redact mismatched client references
+            # before recording failures").
+            if isinstance(returned_ref_id, str):
+                redacted_ref_id = _SECRET_SHAPED_TOKEN_RE.sub("[REDACTED-TOKEN]", returned_ref_id)
+                if account_number is not None:
+                    redacted_ref_id = redacted_ref_id.replace(account_number, "[REDACTED-ACCOUNT]")
+                return (
+                    f"broker response client reference {redacted_ref_id!r} does not match "
+                    f"the requested order's {expected_ref_id!r}"
+                )
+            return (
+                f"broker response client reference does not match the requested order's "
+                f"{expected_ref_id!r} (returned type={type(returned_ref_id).__name__})"
+            )
+    return None
+
+
+def _check_placement_symbol(order: dict[str, Any], expected_symbol: str, account_number: str | None = None) -> str | None:
+    # Key presence, not truthiness: `order.get("symbol") or order.get(...)`
+    # would otherwise read a present-but-falsy malformed value (`""`, `0`,
+    # `False`) as "no symbol reported" and skip this check entirely, letting
+    # a response that did not actually identify the created order pass as if
+    # the broker had confirmed nothing about symbol identity at all (Codex
+    # review: "Reject falsy returned symbols").
+    if "symbol" in order:
+        returned_symbol, symbol_present = order["symbol"], True
+    elif "instrument_symbol" in order:
+        returned_symbol, symbol_present = order["instrument_symbol"], True
+    else:
+        returned_symbol, symbol_present = None, False
+    if symbol_present:
+        # A present key with an explicit null value is NOT the same as the
+        # key being absent: `if returned_symbol is not None` alone would
+        # skip this check for {"symbol": null}, letting a valid-looking
+        # order id/state/amount/client-reference alone be recorded as a
+        # successful submission without ever confirming the returned order
+        # is for the requested ticker -- the same gap already closed for a
+        # present null client reference (Codex review: "Reject a present
+        # null placement symbol").
+        if returned_symbol is None:
+            return "broker response carried a null symbol"
+        try:
+            normalized_returned_symbol = _normalize_ticker(str(returned_symbol))
+        except ValueError:
+            return f"broker response symbol is not usable (type={type(returned_symbol).__name__})"
+        if normalized_returned_symbol != expected_symbol:
+            # A malformed or mismatched broker response's "symbol" can be
+            # arbitrary connector data -- a dict carrying an access token
+            # or request headers, for instance -- rather than a real
+            # ticker: str(returned_symbol) here only needs to be nonempty
+            # to reach this branch, not actually ticker-shaped, so its full
+            # repr was previously embedded in this failure string, which
+            # execute_plan() copies into ExecutionResult.failure_reason and
+            # persists/alerts. A genuine string mismatch (e.g. "MSFT"
+            # returned for a requested "AAPL") is not secret-shaped and
+            # stays useful diagnostic text; anything else is reported only
+            # by type (Codex review: "Redact returned symbols before
+            # storing failure evidence").
+            if isinstance(returned_symbol, str):
+                redacted_symbol = _SECRET_SHAPED_TOKEN_RE.sub("[REDACTED-TOKEN]", returned_symbol)
+                if account_number is not None:
+                    redacted_symbol = redacted_symbol.replace(account_number, "[REDACTED-ACCOUNT]")
+                return (
+                    f"broker response symbol {redacted_symbol!r} does not match the requested "
+                    f"order's {expected_symbol!r}"
+                )
+            return (
+                f"broker response symbol does not match the requested order's "
+                f"{expected_symbol!r} (returned type={type(returned_symbol).__name__})"
+            )
+    return None
+
+
+def _check_placement_side(order: dict[str, Any], expected_side: str) -> str | None:
+    # Key presence, not truthiness: `order.get("side")` would otherwise read
+    # a present-but-null side ({"side": null}) as though the field were
+    # entirely absent and skip this check, letting a valid-looking
+    # id/reference/symbol/amount response alone be recorded as a successful
+    # buy with no usable confirmation the returned order is a buy at all,
+    # rather than a stale or mismatched order (Codex review: "Reject a
+    # present null placement side").
+    if "side" in order:
+        returned_side = order["side"]
+        if returned_side is None:
+            return "broker response carried a null side"
+        # Stripped as well as lowercased, mirroring the terminal-state check
+        # below: a whitespace-padded " buy " is a real accepted order, but
+        # the unstripped comparison would treat it as a mismatch, halt the
+        # batch, and drop the real order out of `submitted` (Codex review:
+        # "Normalize the returned placement side before comparison").
+        if str(returned_side).strip().lower() != expected_side:
+            # A malformed or mismatched broker response's "side" can be
+            # arbitrary connector data -- a dict carrying an access token,
+            # account identifier, or request headers, for instance --
+            # rather than a real side string: str(returned_side) only
+            # needs to differ from expected_side to reach this branch, not
+            # actually be a plausible side. A genuine string mismatch is
+            # not itself secret-shaped, but is still scrubbed of any
+            # token-shaped substring for defense in depth; anything else
+            # is reported only by type (Codex review: "Redact returned
+            # sides before storing failures").
+            if isinstance(returned_side, str):
+                return (
+                    "broker response side "
+                    f"{_SECRET_SHAPED_TOKEN_RE.sub('[REDACTED-TOKEN]', returned_side)!r} "
+                    f"does not match the requested order's {expected_side!r}"
+                )
+            return (
+                f"broker response side does not match the requested order's "
+                f"{expected_side!r} (returned type={type(returned_side).__name__})"
+            )
+    return None
+
+
+def _check_placement_amount(order: dict[str, Any], expected_amount_usd: float) -> str | None:
+    # Key presence, not truthiness: a present-but-null dollar_amount
+    # ({"dollar_amount": null}) is not the same as the field being omitted
+    # -- if the wrapper returned null because it could not confirm the
+    # processed amount, a larger broker notional (and therefore a per-order
+    # or aggregate cap overrun) could be hidden behind the remaining fields
+    # alone (Codex review: "Reject a present null returned notional").
+    if "dollar_amount" in order:
+        returned_amount = order["dollar_amount"]
+        if returned_amount is None:
+            return "broker response carried a null dollar_amount"
+        if isinstance(returned_amount, bool):
+            # Checked BEFORE float(): float(True) succeeds as 1.0, so a
+            # response carrying dollar_amount=true would otherwise be
+            # accepted for a requested $1 order despite the broker
+            # supplying no numeric confirmation of the processed amount
+            # (Codex review: "Reject boolean returned notionals before
+            # conversion").
+            return f"broker response dollar_amount {returned_amount!r} is not a number"
+        try:
+            returned_amount = float(returned_amount)
+        except (TypeError, ValueError):
+            # A nonnumeric dollar_amount can be arbitrary connector data --
+            # a dict or token-bearing string, for instance -- rather than a
+            # malformed but plain numeric-looking value. A genuine string
+            # is scrubbed of any token-shaped substring for defense in
+            # depth; anything else is reported only by type (Codex review:
+            # "Redact malformed returned notionals").
+            if isinstance(returned_amount, str):
+                return (
+                    "broker response dollar_amount "
+                    f"{_SECRET_SHAPED_TOKEN_RE.sub('[REDACTED-TOKEN]', returned_amount)!r} "
+                    "is not a number"
+                )
+            return (
+                "broker response dollar_amount is not a number "
+                f"(type={type(returned_amount).__name__})"
+            )
+        # A tolerance of a full cent (0.01) accepted an exact one-cent
+        # mismatch (e.g. $10.01 returned for a requested $10.00) as a match,
+        # even though that one cent can be exactly what pushed the order over
+        # the per-order/daily/weekly/buying-power ceilings this module
+        # enforced against the REQUESTED amount (Codex review: "Reject a
+        # one-cent returned-notional mismatch"). Amounts are cent-rounded
+        # strings on the wire, so a tolerance far below half a cent still
+        # absorbs float noise (e.g. 1.9999999999998 vs 2.0) without accepting
+        # any real cent-level difference.
+        if not math.isfinite(returned_amount) or abs(returned_amount - expected_amount_usd) > 0.001:
+            return (
+                f"broker response dollar_amount {returned_amount!r} does not match the "
+                f"requested order's ${expected_amount_usd:.2f}"
+            )
+    return None
+
+
+def _check_placement_state(order: dict[str, Any]) -> str | None:
+    if "state" in order:
+        raw_state = order["state"]
+        # Key presence, not a blanket str() coercion: str(False)/str([])/
+        # str({"value": "rejected"}) all produce a value that is not in
+        # _DEAD_PLACEMENT_STATES, so a present-but-malformed state would
+        # otherwise read as a healthy, non-terminal order and be recorded as
+        # submitted even though the wrapper never provided a usable state at
+        # all (Codex review: "Reject non-string placement states"). An
+        # OMITTED state key is unaffected -- there is nothing to distinguish
+        # from a healthy default.
+        if not isinstance(raw_state, str):
+            # raw_state's full repr was previously embedded here, but this
+            # failure reason is exactly what execute_plan() records as
+            # ExecutionResult.failure_reason and persists/alerts -- and a
+            # malformed broker response's "state" field can be arbitrary
+            # connector data (an object carrying an access token, account
+            # identifier, or request headers) rather than a real order
+            # state string. _redacted_envelope_error() never processes
+            # order metadata like this, and the downstream
+            # account-number-specific replace only catches that one known
+            # secret, so only a safe classification (the value's type) is
+            # reported here, matching the redaction already applied to
+            # every other malformed broker field (Codex review: "Redact
+            # malformed placement states before recording them").
+            return f"broker response carried a non-string order state (type={type(raw_state).__name__})"
+        # Stripped as well as lowercased: a whitespace-padded " rejected " or
+        # "cancelled\t" would otherwise fail this membership test and be
+        # recorded as a successful submission despite the broker rejecting
+        # or cancelling the order (Codex review: "Strip returned order
+        # states before terminal-state checks").
+        state = raw_state.strip().lower()
+        if not state:
+            # A present "state" key whose value is blank or whitespace-only
+            # (e.g. {"state": "   "}) normalizes to "", which is not in
+            # _DEAD_PLACEMENT_STATES and would otherwise read exactly like
+            # the OMITTED-key case just above -- a healthy default -- and be
+            # recorded as submitted even though the wrapper supplied the key
+            # but no usable value at all. Failing closed here mirrors the
+            # non-string check just above: a KEY THAT IS PRESENT must supply
+            # something usable (Codex review: "Reject blank placement
+            # states").
+            return f"broker response carried a blank order state: {raw_state!r}"
+        if state in _DEAD_PLACEMENT_STATES:
+            return f"order came back in terminal state {state!r}"
+        if state not in _CANONICAL_LIVE_ORDER_STATES:
+            # A present, nonblank state that is neither a recognized dead
+            # state NOR one of dca_live_adapters._LIVE_ORDER_STATES (e.g.
+            # "error", "denied", or an unrecognized "mystery") fell through
+            # this far as a healthy default: every nonterminal string was
+            # treated as proof a live order exists, when an unrecognized
+            # state is untrustworthy evidence, not confirmation of a real
+            # submission (Codex review: "Require a recognized live
+            # placement state"). Confirmed a string by this point, but a
+            # malformed/hostile broker response could still set it to
+            # something token-shaped; _redacted_envelope_error() only ever
+            # processes envelope["error"], never order metadata like this
+            # field, so the same token-shaped redaction is applied directly
+            # here too (Codex review: "Redact malformed placement states
+            # before recording them").
+            return (
+                "broker response carried an unrecognized order state: "
+                f"{_SECRET_SHAPED_TOKEN_RE.sub('[REDACTED-TOKEN]', state)!r}"
+            )
+    return None
+
 def _placement_failure_reason(
     response: object,
     *,
@@ -2249,303 +2564,20 @@ def _placement_failure_reason(
     # failure INSIDE the unwrapped order (e.g. {"success": false, "error":
     # "denied", "id": "ORD", "state": "queued"}) still carries a truthy id
     # and a nonterminal state, so without this the checks below would read
-    # it as a healthy submission and record the ticker as placed despite the
-    # broker reporting failure (Codex review: "Inspect order-level failure
+    # those valid fields alone and treat the response as a successful
+    # submission (Codex review: "Check order-level placement failure
     # envelopes").
     order_failure = _envelope_failure(order)
     if order_failure is not None:
         return order_failure
-    order_id = order.get("id") or order.get("order_id")
-    if (
-        not order_id
-        or isinstance(order_id, bool)
-        or not isinstance(order_id, (str, int, float))
-    ):
-        # A bare truthiness check would accept {"id": true} -- or a
-        # container like {"id": ["ORD"]}/{"id": {"value": "ORD"}} -- as
-        # proof an order exists, when none of those are a usable identifier
-        # at all: a malformed response could then be recorded as a
-        # successful submission with no real broker order id backing it
-        # (Codex review: "Reject boolean placement order IDs", "Reject
-        # non-scalar placement order IDs").
-        return "broker response carried no order id"
-    if isinstance(order_id, str) and not order_id.strip():
-        # A whitespace-only string is truthy, so the check above alone would
-        # accept {"id": "   "} as a usable identifier when it plainly is not
-        # (Codex review: "Reject blank and non-finite placement IDs").
-        return "broker response carried a blank order id"
-    if isinstance(order_id, (int, float)) and not math.isfinite(order_id):
-        # NaN and infinity are also truthy, so the same gap applies to a
-        # numeric id: neither is a real broker-assigned identifier (Codex
-        # review: "Reject blank and non-finite placement IDs").
-        return "broker response carried a non-finite order id"
-    if isinstance(order_id, (int, float)) and order_id <= 0:
-        # A finite negative (or zero) numeric id is also truthy and passes
-        # every check above -- e.g. a wrapper using -1 as a sentinel for "no
-        # order id was actually assigned" -- which is exactly as unusable as
-        # NaN/infinity despite being finite (Codex review: "Reject negative
-        # numeric placement IDs").
-        return "broker response carried a non-positive order id"
-    if expected_ref_id is not None:
-        # Key presence, not truthiness: an `or` chain of order.get(...) calls
-        # would treat a present-but-falsy reference ("", 0, False) as though
-        # the field were entirely absent and cascade to the next one,
-        # letting a wrapper that explicitly returned no usable idempotency
-        # key for THIS request still pass this check via an unrelated
-        # fallback field (Codex review: "Reject falsy returned client
-        # references"). Mirrors the symbol check's own key-presence idiom
-        # below -- except a present ``None`` value is NOT treated the same
-        # as an absent key here: a wrapper returning ``{"ref_id": null}``
-        # (or that key entirely) still carries no usable idempotency
-        # confirmation, and skipping the check for it (as the symbol check's
-        # own idiom does for a present-but-null symbol) would let a
-        # cached/stale response pass this check via that explicit null
-        # (Codex review: "Reject null returned client references").
-        if "ref_id" in order:
-            returned_ref_id, ref_id_present = order["ref_id"], True
-        elif "client_order_id" in order:
-            returned_ref_id, ref_id_present = order["client_order_id"], True
-        elif "client_order_uuid" in order:
-            returned_ref_id, ref_id_present = order["client_order_uuid"], True
-        elif "client_id" in order:
-            returned_ref_id, ref_id_present = order["client_id"], True
-        else:
-            returned_ref_id, ref_id_present = None, False
-        # Only checked when the response actually carries a client
-        # reference KEY (present, even if its value is null): a cached/stale
-        # response can otherwise pass every symbol/side/amount check above
-        # (a prior order for the same ticker, side, and notional) while
-        # confirming a DIFFERENT request entirely (Codex review: "Verify a
-        # returned client reference before recording success").
-        if ref_id_present and str(returned_ref_id) != expected_ref_id:
-            # A mismatched client reference can be arbitrary connector data
-            # -- a dict or object carrying a token or other request
-            # metadata, not just a stale string -- rather than a real
-            # idempotency key: str(returned_ref_id) is only used for the
-            # comparison above, so a non-string value reaches here
-            # unexamined. execute_plan() copies this failure string into
-            # ExecutionResult.failure_reason, which is persisted/alerted, so
-            # only a plain string mismatch (useful diagnostic text, e.g. a
-            # stale ref_id) is embedded; anything else is reported only by
-            # type (Codex review: "Redact mismatched client references
-            # before recording failures").
-            if isinstance(returned_ref_id, str):
-                redacted_ref_id = _SECRET_SHAPED_TOKEN_RE.sub("[REDACTED-TOKEN]", returned_ref_id)
-                if account_number is not None:
-                    redacted_ref_id = redacted_ref_id.replace(account_number, "[REDACTED-ACCOUNT]")
-                return (
-                    f"broker response client reference {redacted_ref_id!r} does not match "
-                    f"the requested order's {expected_ref_id!r}"
-                )
-            return (
-                f"broker response client reference does not match the requested order's "
-                f"{expected_ref_id!r} (returned type={type(returned_ref_id).__name__})"
-            )
-    # Key presence, not truthiness: `order.get("symbol") or order.get(...)`
-    # would otherwise read a present-but-falsy malformed value (`""`, `0`,
-    # `False`) as "no symbol reported" and skip this check entirely, letting
-    # a response that did not actually identify the created order pass as if
-    # the broker had confirmed nothing about symbol identity at all (Codex
-    # review: "Reject falsy returned symbols").
-    if "symbol" in order:
-        returned_symbol, symbol_present = order["symbol"], True
-    elif "instrument_symbol" in order:
-        returned_symbol, symbol_present = order["instrument_symbol"], True
-    else:
-        returned_symbol, symbol_present = None, False
-    if symbol_present:
-        # A present key with an explicit null value is NOT the same as the
-        # key being absent: `if returned_symbol is not None` alone would
-        # skip this check for {"symbol": null}, letting a valid-looking
-        # order id/state/amount/client-reference alone be recorded as a
-        # successful submission without ever confirming the returned order
-        # is for the requested ticker -- the same gap already closed for a
-        # present null client reference (Codex review: "Reject a present
-        # null placement symbol").
-        if returned_symbol is None:
-            return "broker response carried a null symbol"
-        try:
-            normalized_returned_symbol = _normalize_ticker(str(returned_symbol))
-        except ValueError:
-            return f"broker response symbol is not usable (type={type(returned_symbol).__name__})"
-        if normalized_returned_symbol != expected_symbol:
-            # A malformed or mismatched broker response's "symbol" can be
-            # arbitrary connector data -- a dict carrying an access token
-            # or request headers, for instance -- rather than a real
-            # ticker: str(returned_symbol) here only needs to be nonempty
-            # to reach this branch, not actually ticker-shaped, so its full
-            # repr was previously embedded in this failure string, which
-            # execute_plan() copies into ExecutionResult.failure_reason and
-            # persists/alerts. A genuine string mismatch (e.g. "MSFT"
-            # returned for a requested "AAPL") is not secret-shaped and
-            # stays useful diagnostic text; anything else is reported only
-            # by type (Codex review: "Redact returned symbols before
-            # storing failure evidence").
-            if isinstance(returned_symbol, str):
-                redacted_symbol = _SECRET_SHAPED_TOKEN_RE.sub("[REDACTED-TOKEN]", returned_symbol)
-                if account_number is not None:
-                    redacted_symbol = redacted_symbol.replace(account_number, "[REDACTED-ACCOUNT]")
-                return (
-                    f"broker response symbol {redacted_symbol!r} does not match the requested "
-                    f"order's {expected_symbol!r}"
-                )
-            return (
-                f"broker response symbol does not match the requested order's "
-                f"{expected_symbol!r} (returned type={type(returned_symbol).__name__})"
-            )
-    # Key presence, not truthiness: `order.get("side")` would otherwise read
-    # a present-but-null side ({"side": null}) as though the field were
-    # entirely absent and skip this check, letting a valid-looking
-    # id/reference/symbol/amount response alone be recorded as a successful
-    # buy with no usable confirmation the returned order is a buy at all,
-    # rather than a stale or mismatched order (Codex review: "Reject a
-    # present null placement side").
-    if "side" in order:
-        returned_side = order["side"]
-        if returned_side is None:
-            return "broker response carried a null side"
-        # Stripped as well as lowercased, mirroring the terminal-state check
-        # below: a whitespace-padded " buy " is a real accepted order, but
-        # the unstripped comparison would treat it as a mismatch, halt the
-        # batch, and drop the real order out of `submitted` (Codex review:
-        # "Normalize the returned placement side before comparison").
-        if str(returned_side).strip().lower() != expected_side:
-            # A malformed or mismatched broker response's "side" can be
-            # arbitrary connector data -- a dict carrying an access token,
-            # account identifier, or request headers, for instance --
-            # rather than a real side string: str(returned_side) only
-            # needs to differ from expected_side to reach this branch, not
-            # actually be a plausible side. A genuine string mismatch is
-            # not itself secret-shaped, but is still scrubbed of any
-            # token-shaped substring for defense in depth; anything else
-            # is reported only by type (Codex review: "Redact returned
-            # sides before storing failures").
-            if isinstance(returned_side, str):
-                return (
-                    "broker response side "
-                    f"{_SECRET_SHAPED_TOKEN_RE.sub('[REDACTED-TOKEN]', returned_side)!r} "
-                    f"does not match the requested order's {expected_side!r}"
-                )
-            return (
-                f"broker response side does not match the requested order's "
-                f"{expected_side!r} (returned type={type(returned_side).__name__})"
-            )
-    # Key presence, not truthiness: a present-but-null dollar_amount
-    # ({"dollar_amount": null}) is not the same as the field being omitted
-    # -- if the wrapper returned null because it could not confirm the
-    # processed amount, a larger broker notional (and therefore a per-order
-    # or aggregate cap overrun) could be hidden behind the remaining fields
-    # alone (Codex review: "Reject a present null returned notional").
-    if "dollar_amount" in order:
-        returned_amount = order["dollar_amount"]
-        if returned_amount is None:
-            return "broker response carried a null dollar_amount"
-        if isinstance(returned_amount, bool):
-            # Checked BEFORE float(): float(True) succeeds as 1.0, so a
-            # response carrying dollar_amount=true would otherwise be
-            # accepted for a requested $1 order despite the broker
-            # supplying no numeric confirmation of the processed amount
-            # (Codex review: "Reject boolean returned notionals before
-            # conversion").
-            return f"broker response dollar_amount {returned_amount!r} is not a number"
-        try:
-            returned_amount = float(returned_amount)
-        except (TypeError, ValueError):
-            # A nonnumeric dollar_amount can be arbitrary connector data --
-            # a dict or token-bearing string, for instance -- rather than a
-            # malformed but plain numeric-looking value. A genuine string
-            # is scrubbed of any token-shaped substring for defense in
-            # depth; anything else is reported only by type (Codex review:
-            # "Redact malformed returned notionals").
-            if isinstance(returned_amount, str):
-                return (
-                    "broker response dollar_amount "
-                    f"{_SECRET_SHAPED_TOKEN_RE.sub('[REDACTED-TOKEN]', returned_amount)!r} "
-                    "is not a number"
-                )
-            return (
-                "broker response dollar_amount is not a number "
-                f"(type={type(returned_amount).__name__})"
-            )
-        # A tolerance of a full cent (0.01) accepted an exact one-cent
-        # mismatch (e.g. $10.01 returned for a requested $10.00) as a match,
-        # even though that one cent can be exactly what pushed the order over
-        # the per-order/daily/weekly/buying-power ceilings this module
-        # enforced against the REQUESTED amount (Codex review: "Reject a
-        # one-cent returned-notional mismatch"). Amounts are cent-rounded
-        # strings on the wire, so a tolerance far below half a cent still
-        # absorbs float noise (e.g. 1.9999999999998 vs 2.0) without accepting
-        # any real cent-level difference.
-        if not math.isfinite(returned_amount) or abs(returned_amount - expected_amount_usd) > 0.001:
-            return (
-                f"broker response dollar_amount {returned_amount!r} does not match the "
-                f"requested order's ${expected_amount_usd:.2f}"
-            )
-    if "state" in order:
-        raw_state = order["state"]
-        # Key presence, not a blanket str() coercion: str(False)/str([])/
-        # str({"value": "rejected"}) all produce a value that is not in
-        # _DEAD_PLACEMENT_STATES, so a present-but-malformed state would
-        # otherwise read as a healthy, non-terminal order and be recorded as
-        # submitted even though the wrapper never provided a usable state at
-        # all (Codex review: "Reject non-string placement states"). An
-        # OMITTED state key is unaffected -- there is nothing to distinguish
-        # from a healthy default.
-        if not isinstance(raw_state, str):
-            # raw_state's full repr was previously embedded here, but this
-            # failure reason is exactly what execute_plan() records as
-            # ExecutionResult.failure_reason and persists/alerts -- and a
-            # malformed broker response's "state" field can be arbitrary
-            # connector data (an object carrying an access token, account
-            # identifier, or request headers) rather than a real order
-            # state string. _redacted_envelope_error() never processes
-            # order metadata like this, and the downstream
-            # account-number-specific replace only catches that one known
-            # secret, so only a safe classification (the value's type) is
-            # reported here, matching the redaction already applied to
-            # every other malformed broker field (Codex review: "Redact
-            # malformed placement states before recording them").
-            return f"broker response carried a non-string order state (type={type(raw_state).__name__})"
-        # Stripped as well as lowercased: a whitespace-padded " rejected " or
-        # "cancelled\t" would otherwise fail this membership test and be
-        # recorded as a successful submission despite the broker rejecting
-        # or cancelling the order (Codex review: "Strip returned order
-        # states before terminal-state checks").
-        state = raw_state.strip().lower()
-        if not state:
-            # A present "state" key whose value is blank or whitespace-only
-            # (e.g. {"state": "   "}) normalizes to "", which is not in
-            # _DEAD_PLACEMENT_STATES and would otherwise read exactly like
-            # the OMITTED-key case just above -- a healthy default -- and be
-            # recorded as submitted even though the wrapper supplied the key
-            # but no usable value at all. Failing closed here mirrors the
-            # non-string check just above: a KEY THAT IS PRESENT must supply
-            # something usable (Codex review: "Reject blank placement
-            # states").
-            return f"broker response carried a blank order state: {raw_state!r}"
-        if state in _DEAD_PLACEMENT_STATES:
-            return f"order came back in terminal state {state!r}"
-        if state not in _CANONICAL_LIVE_ORDER_STATES:
-            # A present, nonblank state that is neither a recognized dead
-            # state NOR one of dca_live_adapters._LIVE_ORDER_STATES (e.g.
-            # "error", "denied", or an unrecognized "mystery") fell through
-            # this far as a healthy default: every nonterminal string was
-            # treated as proof a live order exists, when an unrecognized
-            # state is untrustworthy evidence, not confirmation of a real
-            # submission (Codex review: "Require a recognized live
-            # placement state"). Confirmed a string by this point, but a
-            # malformed/hostile broker response could still set it to
-            # something token-shaped; _redacted_envelope_error() only ever
-            # processes envelope["error"], never order metadata like this
-            # field, so the same token-shaped redaction is applied directly
-            # here too (Codex review: "Redact malformed placement states
-            # before recording them").
-            return (
-                "broker response carried an unrecognized order state: "
-                f"{_SECRET_SHAPED_TOKEN_RE.sub('[REDACTED-TOKEN]', state)!r}"
-            )
-    return None
-
+    return (
+        _check_placement_order_id(order)
+        or _check_placement_ref_id(order, expected_ref_id, account_number)
+        or _check_placement_symbol(order, expected_symbol, account_number)
+        or _check_placement_side(order, expected_side)
+        or _check_placement_amount(order, expected_amount_usd)
+        or _check_placement_state(order)
+    )
 
 # Matches an ISO-shaped YYYY-MM-DD substring anywhere in a caller-supplied
 # run_id. A plain `trading_day.isoformat() in run_id` substring test accepts
