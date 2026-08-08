@@ -7425,35 +7425,9 @@ def _process_buy_candidate(
             existing_pending_credit_usd=existing_pending_credit_usd,
         )
 
-    # A morning/manual run must NOT block the scheduled afternoon run: when the
-    # top-up guard has a loaded prior allocation for this ticker, the earlier
-    # same-day allocation is handled via the top-up guard below, so the
-    # broker's broad same-day-order block further down is intentionally
-    # bypassed here for guarded tickers. That bypass must not also blind a RETRY of
-    # this same scheduled afternoon run to an order it already placed for this
-    # ticker on an earlier attempt today -- prior_same_day_allocations
-    # deliberately excludes this stream's own earlier same-day runs (see
-    # load_prior_same_day_allocations), so nothing else would catch that case.
-    # A narrower same-stream ref-id check closes that gap without reopening the
-    # broad block for a legitimate cross-stream top-up.
-    #
-    # This runs BEFORE the top-up guard's own skip-return, the kill-switch
-    # cap, and the per-order ceiling below: a retry's freshly recomputed
-    # top-up math (or a freshly recomputed order_amount that happens to sit
-    # above max_per_order_usd) must never suppress or overwrite evidence of an
-    # order this same stream already placed earlier the same run (Codex
-    # review, PR #231: "Check for an existing order before returning from the
-    # top-up guard").
-    #
-    # Skipped entirely under config.dry_run: this whole check exists only to
-    # prevent a REAL duplicate broker order, and a dry run never submits one
-    # (the placement branch further down short-circuits into a simulated
-    # order instead of calling the broker at all -- see "if config.dry_run"
-    # below). Querying the broker's narrow duplicate lookup here anyway would
-    # let a fail-closed adapter (e.g. AlpacaBroker, which now raises when it
-    # cannot verify a real duplicate) block a harmless simulated candidate
-    # for a risk that cannot occur in dry-run mode (Codex review, PR #231:
-    # "Allow guarded Alpaca simulations through the duplicate hook").
+    # Narrow check for retries of this same stream (avoiding duplicate orders on retries).
+    # Skipped in dry-runs since they never submit real orders.
+    # Runs before top-up guard checks to prioritize existing same-stream orders.
     if ticker_guarded and not ctx.config.dry_run:
         try:
             dup_order = _same_stream_order_exists(ctx.broker, ticker, ctx.trading_day, ctx.stream)
