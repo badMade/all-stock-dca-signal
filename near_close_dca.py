@@ -3686,25 +3686,11 @@ def _apply_no_order_classification(
 # CSV artifacts a run may leave beside run_state.json, and the status recorded in
 # the minimal run_state stub written when the date gate blocks execution.
 _RUN_CSV_NAMES = ("signals.csv", "buy_candidates.csv", "orders.csv")
-# The subset write_run_artifacts() itself settles usage against -- deliberately
-# excludes orders.csv, which lands later on the compact path (see
-# _backfill_orders_csv_usage). Any recount that must stay consistent with that
-# original settlement (e.g. _archive_intraday_observations' archive-annotation
-# rewrite) has to use this subset too, not _RUN_CSV_NAMES: a directory reused
-# from an earlier attempt can already contain a stale orders.csv on disk, and
-# _RUN_CSV_NAMES would silently attribute that leftover file's bytes to a run
-# that has not written its own orders.csv yet (Codex review: "Exclude stale
-# orders when resettling archive usage").
-_PRE_ORDER_CSV_NAMES = ("signals.csv", "buy_candidates.csv")
 RUN_STATUS_BLOCKED = "blocked"
 
 
 def _existing_csv_artifacts(out: Path) -> List[Path]:
     return [out / name for name in _RUN_CSV_NAMES if (out / name).exists()]
-
-
-def _pre_order_csv_artifacts(out: Path) -> List[Path]:
-    return [out / name for name in _PRE_ORDER_CSV_NAMES if (out / name).exists()]
 
 
 def _serialize_run_state(run_state: Dict[str, Any]) -> str:
@@ -3839,7 +3825,6 @@ def _archive_intraday_observations(
     artifacts: Dict[str, Any],
     out: Path,
     decisions: Sequence[ReconciledDecision] = (),
-    run_state_path: Optional[Path] = None,
 ) -> Optional[str]:
     """Record the 15:30 poll's prices/timestamps in the shared intraday archive.
 
@@ -3868,52 +3853,6 @@ def _archive_intraday_observations(
     CSVs write_run_artifacts wrote, and re-opening that accounting for an
     observability file would change a figure other tooling reconciles
     against.
-
-    Unlike the morning-family path (``MorningDCAExecutor._archive_observations``),
-    a failed archive write here previously left no trace once process logs
-    were gone: a summary with ``ok: false`` was only logged, not persisted.
-    When ``run_state_path`` is given (the on-disk path
-    :func:`write_run_artifacts` already wrote for this run), the archive
-    summary is now annotated and run_state.json is re-persisted with it,
-    mirroring the morning-family contract so post-run artifact consumers can
-    detect an unavailable shared archive after the fact (Codex review:
-    "Persist near-close archive failures in run state"). Two things this
-    annotation must NOT do, both from a later Codex pass on the first fix:
-
-    * Serialize the in-memory ``artifacts`` dict verbatim over the file.
-      ``_write_and_validate_scheduled_contract`` (called by every scheduled
-      caller before this) amends the ON-DISK run_state.json in place with
-      ``status='blocked'``/``artifact_contract_failure`` on a contract
-      breach without touching this function's ``artifacts`` argument;
-      overwriting the file with that now-stale in-memory copy would erase
-      the rejection every consumer downstream relies on (Codex review:
-      "Preserve contract-failure markers when annotating run state"). The
-      CURRENT on-disk state is therefore read fresh and used as the base --
-      and if that read fails (missing file, transient I/O error, or content
-      that doesn't decode to a JSON object), the annotation is abandoned
-      entirely rather than falling back to ``artifacts``: silently
-      replacing an unreadable-but-possibly-rejected file with a stale guess
-      is the same erasure risk through a different door (Codex review:
-      "Skip annotation when persisted run state is unreadable").
-    * Leave ``usage_proxy.state_file_bytes``/``total_artifact_bytes`` stale.
-      Those were already settled by :func:`write_run_artifacts` against the
-      serialized size BEFORE this annotation grew the file; re-running the
-      same settlement pass here keeps them accurate (Codex review:
-      "Recalculate usage bytes after expanding run state").
-    * Attribute a stale ``orders.csv`` left over from an earlier attempt in a
-      reused artifact directory to THIS run. ``write_run_artifacts`` already
-      excluded ``orders.csv`` from its own settlement (it lands later, on the
-      compact path), so this recount reuses that same
-      ``_pre_order_csv_artifacts`` subset rather than ``_existing_csv_artifacts``
-      -- otherwise a crash or an observer reading between this annotation and
-      ``run_daily_compact`` replacing ``orders.csv`` would see
-      ``csv_artifact_count``/``total_artifact_bytes`` include bytes from a file
-      this run did not write (Codex review: "Exclude stale orders when
-      resettling archive usage"). ``_backfill_orders_csv_usage`` remains the
-      only place that folds the CURRENT ``orders.csv`` in, after it exists.
-
-    Re-persisting is itself best-effort: a failure to annotate must never
-    invalidate the already-valid run_state on disk.
     """
     try:
         signal_rows = artifacts.get("signal_rows") or []
@@ -3931,60 +3870,12 @@ def _archive_intraday_observations(
         return None
     snapshot_path = write_run_snapshot(out, observations)
     summary = archive_observations_safely(observations)
-    summary["observations"] = len(observations)
-    summary["run_snapshot"] = snapshot_path
-    artifacts["intraday_archive"] = summary
     if not summary.get("ok"):
         logger.warning(
             "intraday observation archive write failed for %s: %s",
             artifacts.get("run_id"),
             summary.get("error"),
         )
-    if run_state_path is not None:
-        try:
-            try:
-                on_disk = json.loads(run_state_path.read_bytes())
-            except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
-                # write_run_artifacts() already wrote this exact file
-                # immediately before every caller reaches this point, so a
-                # read/decode failure here means a transient problem reading
-                # an EXISTING on-disk state (e.g. a transient I/O error on
-                # synchronized storage), not a legitimately missing file.
-                # Falling back to serializing the stale in-memory `artifacts`
-                # as a replacement would blindly overwrite whatever
-                # _write_and_validate_scheduled_contract (or any other
-                # writer) already amended directly onto the file -- exactly
-                # the failure the contract-preservation fix above guards
-                # against, just reached through the read path instead of a
-                # successful-but-stale read (Codex review: "Skip annotation
-                # when persisted run state is unreadable"). Abandon the
-                # annotation rather than guess at a replacement.
-                logger.warning(
-                    "could not read run_state to annotate intraday archive "
-                    "summary, skipping annotation: %s", exc
-                )
-                return snapshot_path
-            if not isinstance(on_disk, dict):
-                logger.warning(
-                    "run_state at %s did not contain an object, skipping "
-                    "intraday archive annotation", run_state_path
-                )
-                return snapshot_path
-            target = on_disk
-            target["intraday_archive"] = summary
-            usage = target.get("usage_proxy")
-            if isinstance(usage, dict):
-                csv_paths = _pre_order_csv_artifacts(run_state_path.parent)
-                usage["csv_artifact_count"] = len(csv_paths)
-                csv_bytes = sum(path.stat().st_size for path in csv_paths)
-                serialized = _settle_usage_bytes(target, usage, csv_bytes)
-            else:
-                serialized = _serialize_run_state(target)
-            atomic_write_text(run_state_path, serialized)
-        except (OSError, TypeError, ValueError) as exc:  # noqa: BLE001
-            logger.warning(
-                "could not annotate run_state with intraday archive summary: %s", exc
-            )
     return snapshot_path
 
 
@@ -7295,9 +7186,7 @@ def _finalize_and_write_artifacts(
     # must never delay those REQUIRED files and trigger a false escalation on
     # a run that actually succeeded (Codex review: "Finalize scheduled
     # artifacts before waiting on archive locks").
-    snapshot_path = _archive_intraday_observations(
-        artifacts, Path(artifacts_dir), decisions, run_state_path=Path(paths["run_state"])
-    )
+    snapshot_path = _archive_intraday_observations(artifacts, Path(artifacts_dir), decisions)
     if snapshot_path:
         paths["observations"] = snapshot_path
 

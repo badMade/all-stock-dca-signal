@@ -872,7 +872,6 @@ def decide_effective_top_up(
     desired_usd: float,
     effective: EffectivePrior,
     current_price: Optional[float],
-    minimum_order_usd: float = 0.0,
 ) -> TopUpDecision:
     """Decide the incremental buy for one symbol, failing closed on incomplete history.
 
@@ -882,10 +881,8 @@ def decide_effective_top_up(
     top-up invariant is delegated to
     :func:`scripts.run_classification.incremental_top_up_amount` (buy
     ``max(0, desired - effective_prior)`` only when ``current_price`` is strictly
-    below the reference price, and skip below-minimum incremental deltas by
-    returning ``below_broker_minimum_order_size``), and its
-    ``top_up_guard_result`` is mapped onto the canonical reason vocabulary
-    (including ``BELOW_BROKER_MINIMUM_ORDER_SIZE`` for that minimum-order skip).
+    below the reference price), and its ``top_up_guard_result`` is mapped onto the
+    canonical reason vocabulary.
     """
     if not effective.coverage_complete:
         return TopUpDecision(
@@ -901,7 +898,6 @@ def decide_effective_top_up(
         effective.effective_prior_usd,
         current_price,
         effective.reference_price,
-        minimum_order_usd=minimum_order_usd,
     )
     # from_top_up_guard maps the on-disk top_up_guard_result codes onto the
     # canonical reason vocabulary (no_prior_run -> FIRST_ALLOCATION, etc.).

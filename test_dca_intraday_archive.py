@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from dca_intraday_archive import (
     OBSERVATION_FIELDS,
     IntradayObservation,
+    _safe_ticker_filename,
     _slot_from_classification,
     append_observations,
     archive_observations_safely,
@@ -492,3 +493,19 @@ def test_append_observations_respects_the_intraday_archive_dir_override_when_tic
     assert result["rows_added"] == 1
     assert override_dir.is_dir()
     assert not missing_root.exists()
+
+
+def test_safe_ticker_filename_preserves_non_ascii_alphanumeric_characters():
+    # Regression for PR #330 review comment: a naive ASCII-only regex swap
+    # rewrote every non-ASCII letter to "_", so distinct Unicode tickers
+    # (e.g. an accented symbol vs. a CJK symbol) collapsed onto the same
+    # archive filename and mixed their observations together.
+    assert _safe_ticker_filename("É") == "É.csv"
+    assert _safe_ticker_filename("東京") == "東京.csv"
+    assert _safe_ticker_filename("É") != _safe_ticker_filename("東京")
+
+
+def test_safe_ticker_filename_still_replaces_path_hostile_characters():
+    assert _safe_ticker_filename("../etc/passwd") == "_ETC_PASSWD.csv"
+    assert _safe_ticker_filename("A/B") == "A_B.csv"
+    assert _safe_ticker_filename("BRK.B") == "BRK.B.csv"

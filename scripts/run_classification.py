@@ -32,7 +32,6 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, time, timezone
-from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set
 from zoneinfo import ZoneInfo
@@ -3792,7 +3791,6 @@ def incremental_top_up_amount(
     prior_usd: float,
     current_price: Optional[float],
     reference_price: Optional[float],
-    minimum_order_usd: float = 0.0,
 ) -> tuple[float, str]:
     """Apply the same-day top-up guard for one ticker.
 
@@ -3809,18 +3807,9 @@ def incremental_top_up_amount(
         return 0.0, "missing_prior_price"
     if not (current_price < reference_price):
         return 0.0, "price_not_below_prior_run"
-    # Cent-normalize before comparing/returning: plain float subtraction of
-    # cent-denominated amounts can land a hair below the true value (e.g.
-    # 2.01 - 1.01 == 0.9999999999999998), which would wrongly trip the
-    # minimum-order check for an exact $1.00 top-up (Codex review: "Compare
-    # cent-normalized amounts to the broker minimum").
-    incremental = float(
-        Decimal(str(desired_amount - prior_usd)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    )
+    incremental = desired_amount - prior_usd
     if incremental <= 0:
         return 0.0, "no_incremental_difference"
-    if incremental < minimum_order_usd:
-        return 0.0, "below_broker_minimum_order_size"
     return incremental, "incremental_top_up"
 
 

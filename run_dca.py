@@ -495,26 +495,12 @@ def _resolve_cross_stream_prior_allocation_roots(
     _env_market_open_root = os.environ.get("DCA_MARKET_OPEN_LIVE_STATE_ROOT")
     market_open_root = Path(_env_market_open_root) if _env_market_open_root else None
 
-    # Resolve UPFRONT whether the override is CONFIGURED at all, and
-    # separately whether it needs its own scan entry (ACTIVE) -- these are
-    # NOT the same question, and conflating them was itself an issue (Codex
-    # review: "Drop the legacy fallback for covered nested overrides"). An
-    # override that is a STRICT ANCESTOR of afternoon_root is a genuine
-    # misconfiguration -- practically the whole cron tree, not a meaningful
-    # "intraday root" -- so it is invalid and treated exactly as if unset.
-    # But an override NESTED under (or EQUAL TO) afternoon_root is a real,
-    # deliberately-configured location; it just doesn't need a separate
-    # scan entry because the caller's own recursive afternoon scan already
-    # covers it -- including the equal case, which is trivially covered by
-    # that same scan (Codex review: "Treat an override equal to the
-    # afternoon root as covered"; an ancestor-or-equal check previously
-    # treated the equal case as the ancestor misconfiguration too).
-    # Suppressing the legacy cron_base/intraday_dca fallback must track the
-    # former (was a valid override configured), not the latter (does it
-    # need its own scan entry) -- otherwise a nested (or equal) override
-    # incorrectly resurrects the legacy fallback, and if that stale tree
-    # still holds artifacts from before the relocation, they get aggregated
-    # alongside the (already-covered) real data.
+    # Resolve UPFRONT whether the override is CONFIGURED at all, and separately
+    # whether it needs its own scan entry (ACTIVE). Strict ancestors are invalid
+    # misconfigurations. Nested or equal overrides are valid but do not need
+    # separate scan entries, as the afternoon scan already covers them.
+    # We must suppress the legacy fallback based on the 'CONFIGURED' state, not
+    # the 'ACTIVE' state, to prevent re-aggregating stale artifacts.
     _intraday_is_ancestor_of_afternoon = (
         intraday_root is not None
         and _is_within(afternoon_root.resolve(), intraday_root.resolve())
@@ -3031,7 +3017,7 @@ class DemoDataProvider:
 
     def _drop_fraction(self, ticker: str) -> float:
         # 0.0 .. ~4.5% depending on the ticker, stable across runs.
-        return (sum(ord(ch) for ch in ticker) % 46) / 1000.0
+        return (sum(ticker.encode('utf-8')) % 46) / 1000.0
 
     def get_intraday_bars(
         self, ticker: str, start: datetime, end: datetime, interval_minutes: int

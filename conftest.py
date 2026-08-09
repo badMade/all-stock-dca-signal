@@ -55,21 +55,3 @@ def _isolate_attempt_log_root(monkeypatch, tmp_path):
     overrides it explicitly afterward.
     """
     monkeypatch.setenv("DCA_ATTEMPT_LOG_ROOT", str(tmp_path / "attempt_log"))
-
-
-@pytest.fixture(autouse=True)
-def _clear_dca_runner_config_cache():
-    """Clear dca_runner._read_config cache between tests so monkeypatched CONFIG_DIR takes effect."""
-    import sys
-
-    def _maybe_clear() -> None:
-        module = sys.modules.get("dca_runner")
-        if module is None:
-            return
-        read_config = getattr(module, "_read_config", None)
-        if read_config is not None and hasattr(read_config, "cache_clear"):
-            read_config.cache_clear()
-
-    _maybe_clear()
-    yield
-    _maybe_clear()

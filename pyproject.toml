@@ -71,7 +71,6 @@ py-modules = [
     "dca_cost_tracker",
     "dca_notion_sync",
     "dca_weekly_dashboard",
-    "validate_report",
     "run_dca",
     # The seven-slot live-runner entrypoint (docs/live_wiring.md); omitting it
     # here means `import dca_runner` only works from a source checkout, not an

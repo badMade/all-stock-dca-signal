@@ -39,6 +39,7 @@ from __future__ import annotations
 import csv
 import io
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -242,13 +243,27 @@ def _cell(value: Any) -> str:
     return str(value)
 
 
+# Matches everything except ASCII letters/digits and the literal separators we
+# allow through unsanitized. Anything caught here still gets a second look in
+# `_replace_non_filename_char` below, because `str.isalnum()` is Unicode-aware
+# (e.g. "É" or "東") and the ASCII-only regex class can't express that — a
+# naive `sub('_', ...)` here would silently rewrite Unicode tickers to `_`
+# and collapse distinct symbols onto the same archive file.
+_TICKER_FILENAME_PATTERN = re.compile(r"[^a-zA-Z0-9\-_.^]")
+
+
+def _replace_non_filename_char(match: "re.Match[str]") -> str:
+    char = match.group(0)
+    return char if char.isalnum() else "_"
+
+
 def _safe_ticker_filename(ticker: str) -> str:
     """Map a ticker to a filename, refusing anything that could escape the dir.
 
     Tickers reach this module from config and from parsed artifacts, so a
     malformed or hostile symbol must not be able to write outside the archive.
     """
-    cleaned = "".join(c if (c.isalnum() or c in "-_.^") else "_" for c in str(ticker).strip())
+    cleaned = _TICKER_FILENAME_PATTERN.sub(_replace_non_filename_char, str(ticker).strip())
     cleaned = cleaned.strip(".")
     if not cleaned:
         raise ValueError(f"ticker {ticker!r} has no filename-safe characters")

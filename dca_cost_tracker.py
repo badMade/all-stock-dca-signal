@@ -220,8 +220,7 @@ def build_cost_tracker_markdown(aggregate: Dict[str, Any]) -> str:
     lines.append("")
     lines.append("| Proxy metric | Total |")
     lines.append("| --- | --- |")
-    for field in _NUMERIC_PROXY_FIELDS:
-        lines.append(f"| {field} | {totals.get(field, 0.0)} |")
+    lines.extend(f"| {field} | {totals.get(field, 0.0)} |" for field in _NUMERIC_PROXY_FIELDS)
     lines.append("")
     return "\n".join(lines)
 

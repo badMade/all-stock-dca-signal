@@ -6,7 +6,7 @@ import multiprocessing
 import os
 
 from scripts import scheduler_lease
-from scripts.scheduler_lease import Lease, SchedulerLease, window_key
+from scripts.scheduler_lease import Lease, SchedulerLease, _iso, _read_text_safe, _safe, window_key
 
 
 def _lease(tmp_path, key="2026-07-23__midday__1230et"):
@@ -594,3 +594,48 @@ def test_atomic_take_returns_none_on_a_plain_os_error(tmp_path, monkeypatch):
     assert result is None
     assert lease.read().holder_id == "runner"  # unchanged
     assert lease.release("runner") is False  # same path, through the public API
+
+def test_safe_function_edge_cases():
+    assert _safe("Hello World!") == "hello-world"
+    assert _safe("   spaces   ") == "spaces"
+    assert _safe("---") == "na" # only hyphens
+    assert _safe("") == "na"
+    assert _safe("123_456") == "123-456"
+    assert _safe("!@#$%^") == "na"
+    assert _safe(None) == "none"
+    assert _safe(123) == "123"
+    assert _safe("-already-safe-") == "already-safe"
+
+def test_window_key_edge_cases():
+    assert window_key("", "", "") == "na__na__na"
+    assert window_key("DAY", " STREAM! ", "WINDOW") == "day__stream__window"
+
+def test_iso_formatting():
+    assert _iso(0.0) == "1970-01-01T00:00:00Z"
+    assert _iso(1704067200.0) == "2024-01-01T00:00:00Z" # Jan 1 2024
+
+def test_read_text_safe_success_and_failure(tmp_path):
+    test_file = tmp_path / "test.txt"
+    test_file.write_text("hello world", encoding="utf-8")
+
+    assert _read_text_safe(test_file) == "hello world"
+    assert _read_text_safe(tmp_path / "nonexistent.txt") == ""
+
+    # create a directory to trigger an OSError when read_text is called
+    test_dir = tmp_path / "a_dir"
+    test_dir.mkdir()
+    assert _read_text_safe(test_dir) == ""
+
+def test_read_lease_oserror(tmp_path, monkeypatch):
+    lease = _lease(tmp_path)
+    # create the file so exists() is true
+    lease.path.parent.mkdir(parents=True, exist_ok=True)
+    lease.path.write_text("{}", encoding="utf-8")
+
+    # mock read_text to raise OSError
+    from pathlib import Path
+    def mock_read_text(*args, **kwargs):
+        raise OSError("simulated error")
+    monkeypatch.setattr(Path, "read_text", mock_read_text)
+
+    assert lease.read() is None

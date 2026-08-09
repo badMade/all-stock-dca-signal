@@ -314,42 +314,6 @@ def load_per_ticker_sizing(config_dir: Path) -> Dict[str, Any]:
     return {"per_ticker_sizing": normalized}
 
 
-def load_broker_minimum_order_usd(config_dir: Path) -> float:
-    """Return the broker's minimum order size from ``per_ticker_sizing.json``.
-
-    Read independently of the ``status`` gate that :func:`load_per_ticker_sizing`
-    applies -- this is a broker constraint, not a calibration, so it still
-    applies while calibration is inactive. Defaults to ``0.0`` (no minimum
-    enforced) when the file or field is absent; a present-but-non-numeric,
-    negative, or non-finite value fails closed rather than being silently
-    ignored -- JSON's parser accepts ``NaN``/``Infinity``, and either one (or a
-    negative threshold) would make every ``incremental < minimum_order_usd``
-    comparison false, silently disabling the minimum-order protection (Codex
-    review: "Reject invalid numeric minimum-order values").
-    """
-    data = _read_json(config_dir / "per_ticker_sizing.json")
-    if data is None or "minimum_order_usd" not in data:
-        return 0.0
-    value = data["minimum_order_usd"]
-    return validate_broker_minimum_order_usd(value, source="per_ticker_sizing.json minimum_order_usd")
-
-
-def validate_broker_minimum_order_usd(value: Any, *, source: str) -> float:
-    """Validate a candidate broker minimum-order-size value.
-
-    Shared by :func:`load_broker_minimum_order_usd` (the config file) and any
-    caller accepting one as a CLI override, so both paths reject the same
-    non-numeric/negative/non-finite values instead of only the config path
-    being fail-closed.
-    """
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise ValueError(f"{source} must be numeric, got {value!r}")
-    numeric = float(value)
-    if not math.isfinite(numeric) or numeric < 0:
-        raise ValueError(f"{source} must be finite and non-negative, got {value!r}")
-    return numeric
-
-
 def load_backtest_sizing_tiers(config_dir: Path) -> tuple[tuple[float, float], ...]:
     """Return the analytics-only backtest ladder tiers as (fraction, multiplier).
 

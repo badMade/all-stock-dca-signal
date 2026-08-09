@@ -40,7 +40,6 @@ See ``test_dca_runner.py`` for the behavioural contract; it was written first.
 
 from __future__ import annotations
 
-import functools
 import json
 import math
 import os
@@ -49,8 +48,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timezone
 from pathlib import Path
-from types import MappingProxyType
-from typing import Any, Callable, Mapping
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from dca_config import get_config_dir
@@ -243,76 +241,10 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
     return result
 
 
-def _freeze_config_value(value: Any) -> Any:
-    """Recursively freeze a parsed-JSON value so no nested dict/list escapes the
-    shared cache entry mutable.
-
-    ``MappingProxyType`` on its own only protects the TOP-LEVEL dict: a caller
-    that mutates a nested value -- e.g. clearing ``market_calendar.json``'s
-    ``holidays_closed`` list or changing a field inside ``circuit_breakers`` --
-    would silently corrupt the cached object for every subsequent safety-gate
-    read, whereas the pre-caching implementation reparsed a clean object from
-    disk every time (Codex review: "Freeze nested configuration values before
-    caching"). Every nested dict becomes a ``MappingProxyType`` and every
-    nested list becomes a ``tuple``; scalars pass through unchanged.
-    """
-    if isinstance(value, dict):
-        return MappingProxyType({key: _freeze_config_value(val) for key, val in value.items()})
-    if isinstance(value, list):
-        return tuple(_freeze_config_value(item) for item in value)
-    return value
-
-
-@functools.lru_cache(maxsize=128)
-def _read_config_cached(name: str, raw_bytes: bytes) -> Mapping[str, Any]:
-    """Parse and freeze ``config/<name>``, keyed by ``name`` AND the file's
-    exact content.
-
-    Three earlier passes at this cache key (mtime alone; mtime + size) were
-    each defeated by a variant of the same problem: any signal DERIVED from
-    filesystem metadata can be fooled by a filesystem with coarser timestamp
-    resolution than the gap between two writes, or by a deployment tool that
-    preserves timestamps -- including an equal-BYTE-COUNT edit landing on a
-    preserved mtime, which mtime+size still cannot tell apart (Codex review:
-    "Invalidate equal-size configuration replacements", after "Use more than
-    mtime to invalidate cached configs", after "Invalidate cached configs
-    when their files change"). Keying on the content itself, rather than on
-    any proxy for it, closes the whole class: this cache entry is stale if
-    and only if ``raw_bytes`` is stale, which is impossible by construction
-    since ``_read_config`` (below) always re-reads the file first. A
-    long-lived runner process (``gate_trading_window()`` / Gate 0's
-    ``market_day_status()``) therefore never serves a superseded trading
-    window or market closure -- it still avoids the repeated JSON-parse-and-
-    freeze cost this module was written to cut, just not a repeated read()
-    syscall, which was never the expensive part (the measured win was
-    ~0.2s/1000 calls of parsing, not of reading a few-KB file).
-    """
-    data = json.loads(raw_bytes, object_pairs_hook=_reject_duplicate_keys)
-    if not isinstance(data, dict):
-        raise ValueError(f"{name} must be a JSON object, got {type(data).__name__}")
-    return _freeze_config_value(data)
-
-
-def _read_config(name: str) -> Mapping[str, Any]:
-    """Load ``config/<name>``, cached by its exact byte content.
-
-    Always re-reads the file's raw bytes -- the read is cheap for these
-    small config files, and it is what makes the content-addressed cache in
-    ``_read_config_cached`` correct by construction rather than reliant on
-    filesystem metadata (see that function's docstring for why metadata
-    alone kept failing). Reading bytes rather than decoding via
-    ``read_text`` also lets ``json.loads`` auto-detect a UTF-8 BOM or
-    UTF-16/32 encoding, as it always could before this module cached config
-    reads at all (Codex review: "Preserve BOM-aware configuration
-    decoding").
-    """
-    return _read_config_cached(name, (CONFIG_DIR / name).read_bytes())
-
-
-# Tests clear this between runs (via ``dca_runner._read_config.cache_clear()``)
-# so a monkeypatched ``CONFIG_DIR`` takes effect immediately; delegate to the
-# actual lru_cache-decorated function underneath.
-_read_config.cache_clear = _read_config_cached.cache_clear
+def _read_config(name: str) -> dict:
+    return json.loads(
+        (CONFIG_DIR / name).read_bytes(), object_pairs_hook=_reject_duplicate_keys
+    )
 
 
 def _positive_finite_config_number(value: object, field: str, config_name: str) -> float:
@@ -641,9 +573,7 @@ def _validated_active_tickers() -> frozenset:
     """
     active = _read_config("tickers.json")["active"]
     if (
-        # _read_config freezes JSON arrays into tuples (see _freeze_config_value),
-        # so the well-formed shape here is a tuple, not a list.
-        not isinstance(active, (list, tuple))
+        not isinstance(active, list)
         or not active
         or not all(isinstance(t, str) and t.strip() and t == t.strip().upper() for t in active)
     ):
@@ -800,9 +730,7 @@ def _calendar_dates(cal: dict, key: str) -> frozenset:
     ``assess()`` already applies to a missing/malformed calendar file.
     """
     value = cal.get(key)
-    # _read_config freezes JSON arrays into tuples (see _freeze_config_value),
-    # so the well-formed shape here is a tuple, not a list.
-    if not isinstance(value, (list, tuple)) or not all(isinstance(v, str) for v in value):
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
         raise ValueError(f"market_calendar.json {key!r} must be a list of date strings, got {value!r}")
     try:
         return frozenset(date.fromisoformat(v) for v in value)
@@ -2403,7 +2331,7 @@ def _placement_failure_reason(
             # before recording failures").
             if isinstance(returned_ref_id, str):
                 redacted_ref_id = _SECRET_SHAPED_TOKEN_RE.sub("[REDACTED-TOKEN]", returned_ref_id)
-                if account_number:
+                if account_number is not None:
                     redacted_ref_id = redacted_ref_id.replace(account_number, "[REDACTED-ACCOUNT]")
                 return (
                     f"broker response client reference {redacted_ref_id!r} does not match "
@@ -2455,7 +2383,7 @@ def _placement_failure_reason(
             # storing failure evidence").
             if isinstance(returned_symbol, str):
                 redacted_symbol = _SECRET_SHAPED_TOKEN_RE.sub("[REDACTED-TOKEN]", returned_symbol)
-                if account_number:
+                if account_number is not None:
                     redacted_symbol = redacted_symbol.replace(account_number, "[REDACTED-ACCOUNT]")
                 return (
                     f"broker response symbol {redacted_symbol!r} does not match the requested "
@@ -3288,7 +3216,7 @@ def execute_plan(
         bought_today = {
             _normalize_ticker(o.symbol)
             for o in orders
-            if _is_same_day_buy_attempt(o, trading_day)
+            if o.is_buy_attempt and _require_aware(o.created_at).astimezone(ET).date() == trading_day
         }
     except ValueError as exc:
         # _normalize_ticker()'s raised message embeds the malformed
@@ -3824,6 +3752,40 @@ def execute_plan(
 # ---------------------------------------------------------------------------
 # State persistence
 # ---------------------------------------------------------------------------
+
+
+def _json_number(value: object, field: str) -> float:
+    """Reject a persisted ledger value (or candidate field) that is not a
+    usable JSON number.
+
+    ``_state_to_json`` never writes a ``bool`` or a numeric string for a
+    notional field, so a document carrying either is hand-edited or corrupt.
+    ``float()`` would otherwise coerce both silently -- ``float(False) ==
+    0.0`` and ``float("123.45") == 123.45`` -- so a persisted positive day or
+    week spend replaced with ``false`` would load as ``0.0`` and let the
+    rehydrated state authorize additional buys after forgetting prior spend
+    (Codex review: "Reject non-number ledger values before float
+    coercion"). ``bool`` is checked before ``(int, float)`` since ``bool`` is
+    a subclass of ``int`` in Python.
+
+    A syntactically valid but astronomically large JSON integer (e.g.
+    ``10**1000``, which ``json.loads`` parses as a plain Python ``int`` of
+    unbounded size) makes ``float()`` raise ``OverflowError`` rather than
+    ``ValueError``. Neither ``assess()``'s malformed-candidate handler nor
+    ``load_strategy_state()``'s corruption wrapper -- the two callers of
+    this shared conversion -- catch that exception type, so it would crash
+    the scheduled run outright instead of producing the documented
+    ``ABORT``/``StateCorruptError`` (Codex review: "Convert oversized JSON
+    numbers into a controlled rejection"). Converting it into the same
+    ``ValueError`` this function already raises for every other unusable
+    value lets both callers' existing handling cover it too.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a JSON number, got {value!r}")
+    try:
+        return float(value)
+    except OverflowError as exc:
+        raise ValueError(f"{field} is too large to represent as a float, got {value!r}") from exc
 
 
 def _is_malformed_usd_type(value) -> bool:
@@ -4745,39 +4707,6 @@ def _dedup_date_keyed(items, parse_value):
         result[day] = parse_value(raw_value)
     return result
 
-
-def _json_number(value: object, field: str) -> float:
-    """Reject a persisted ledger value (or candidate field) that is not a
-    usable JSON number.
-
-    ``_state_to_json`` never writes a ``bool`` or a numeric string for a
-    notional field, so a document carrying either is hand-edited or corrupt.
-    ``float()`` would otherwise coerce both silently -- ``float(False) ==
-    0.0`` and ``float("123.45") == 123.45`` -- so a persisted positive day or
-    week spend replaced with ``false`` would load as ``0.0`` and let the
-    rehydrated state authorize additional buys after forgetting prior spend
-    (Codex review: "Reject non-number ledger values before float
-    coercion"). ``bool`` is checked before ``(int, float)`` since ``bool`` is
-    a subclass of ``int`` in Python.
-
-    A syntactically valid but astronomically large JSON integer (e.g.
-    ``10**1000``, which ``json.loads`` parses as a plain Python ``int`` of
-    unbounded size) makes ``float()`` raise ``OverflowError`` rather than
-    ``ValueError``. Neither ``assess()``'s malformed-candidate handler nor
-    ``load_strategy_state()``'s corruption wrapper -- the two callers of
-    this shared conversion -- catch that exception type, so it would crash
-    the scheduled run outright instead of producing the documented
-    ``ABORT``/``StateCorruptError`` (Codex review: "Convert oversized JSON
-    numbers into a controlled rejection"). Converting it into the same
-    ``ValueError`` this function already raises for every other unusable
-    value lets both callers' existing handling cover it too.
-    """
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{field} must be a JSON number, got {value!r}")
-    try:
-        return float(value)
-    except OverflowError as exc:
-        raise ValueError(f"{field} is too large to represent as a float, got {value!r}") from exc
 
 
 def _finite_nonneg(value: float, field: str) -> float:

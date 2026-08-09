@@ -202,3 +202,78 @@ def test_trailing_seqless_line_still_continues_sequence(tmp_path):
     )
     e = RunLedger(path).append(_event(run_ledger.SCHEDULED_RUN))
     assert e.seq == 8
+
+def test_137_empty_line_ignored(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    path.write_text("\n\n" + json.dumps({"seq": 1, "event_type": "fill"}) + "\n")
+    ledger = RunLedger(path)
+    events = ledger._existing_events()
+    assert len(events) == 1
+
+def test_171_empty_file_tail_max(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    path.touch()
+    ledger = RunLedger(path)
+    max_seq, covers_whole = ledger._tail_seq_max()
+    assert max_seq is None
+    assert covers_whole is True
+
+def test_184_empty_line_in_tail_max(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    path.write_text("\n\n" + json.dumps({"seq": 1, "event_type": "fill"}) + "\n\n")
+    ledger = RunLedger(path)
+    max_seq, covers_whole = ledger._tail_seq_max()
+    assert max_seq == 1
+    assert covers_whole is True
+
+def test_205_207_large_file_fallback_full_scan(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    # We want to test that _next_seq falls back to full scan when max seq in tail is lower than the actual max seq in the file.
+    # Write a large enough file so tail read does not cover the whole file
+    # The tail chunk is max 65536 bytes. We will write ~70k bytes of data.
+    with open(path, "w") as f:
+        # Write highest seq at the very beginning (outside tail chunk)
+        f.write(json.dumps({"seq": 9999, "event_type": "fill", "padding": "x" * 100}) + "\n")
+        for i in range(1, 601):
+            f.write(json.dumps({"seq": i, "event_type": "fill", "padding": "x" * 100}) + "\n")
+
+    ledger = RunLedger(path)
+
+    # Verify covers_whole is False
+    tail_max, covers_whole = ledger._tail_seq_max()
+    assert covers_whole is False
+    assert tail_max == 600
+
+    # Now next_seq should do a full scan and find 9999 + 1 = 10000
+    next_seq = ledger._next_seq()
+    assert next_seq == 10000
+
+def test_263_264_needs_leading_newline_oserror(tmp_path, monkeypatch):
+    path = tmp_path / "ledger.jsonl"
+    ledger = RunLedger(path)
+
+    _real_open = Path.open
+    def raise_oserror(self, *args, **kwargs):
+        raise OSError("Simulated OSError")
+
+    monkeypatch.setattr(Path, "open", raise_oserror)
+
+    assert ledger._needs_leading_newline() is False
+
+def test_282_filter_trading_day(tmp_path):
+    ledger = RunLedger(tmp_path / "ledger.jsonl")
+    ledger.append(_event(run_ledger.SCHEDULED_RUN, trading_day="2026-07-23"))
+    ledger.append(_event(run_ledger.SCHEDULED_RUN, trading_day="2026-07-24"))
+
+    filtered = ledger.filter(trading_day="2026-07-23")
+    assert len(filtered) == 1
+    assert filtered[0].trading_day == "2026-07-23"
+
+def test_286_filter_correlation_id(tmp_path):
+    ledger = RunLedger(tmp_path / "ledger.jsonl")
+    ledger.append(_event(run_ledger.SCHEDULED_RUN, correlation_id="id1"))
+    ledger.append(_event(run_ledger.SCHEDULED_RUN, correlation_id="id2"))
+
+    filtered = ledger.filter(correlation_id="id1")
+    assert len(filtered) == 1
+    assert filtered[0].correlation_id == "id1"

@@ -131,7 +131,7 @@ def adjusted_low_drops(history_path: Path, start_date: str) -> list[float]:
             try:
                 if row["Date"] >= start_date:
                     prices.append((float(row["Close"]), float(row["Adj Close"]), float(row["Low"])))
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, ValueError):
                 continue
     drops = []
     for (_, prior_adjusted_close, _), (close, adjusted_close, low) in zip(prices, prices[1:], strict=False):

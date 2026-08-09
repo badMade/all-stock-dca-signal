@@ -67,6 +67,14 @@ for _ in $(seq 1 30); do
   sleep 30
 done
 if [ -d "$run_dir" ]; then
+<<<<<<< HEAD
+  for _ in $(seq 1 40); do
+    if [ -f "$run_dir/submitted_orders.csv" ] || [ -f "$run_dir/orders.csv" ] || [ -f "$run_dir/filled_orders.csv" ]; then
+      break
+    fi
+    sleep 15
+  done
+=======
   # require_submitted_orders=False: the strict scheduled-run contract only
   # accepts the literal submitted_orders.csv, but this backup check -- like
   # the detector it feeds (ORDER_CSV_NAMES/load_run_artifacts in
@@ -94,8 +102,8 @@ import os
 import sys
 import time
 
-sys.path.insert(0, "scripts")
-from scheduled_artifacts import await_finalized_run_artifacts
+sys.path.insert(0, ".")
+from scripts.scheduled_artifacts import await_finalized_run_artifacts
 
 run_dir = os.environ["RUN_DIR"]
 grace_seconds = 600.0
@@ -116,9 +124,11 @@ result = await_finalized_run_artifacts(
 
 remaining = grace_seconds - result.waited_seconds
 while remaining > 0 and not order_evidence_present():
-    time.sleep(min(poll_seconds, remaining))
-    remaining -= poll_seconds
+    slept = min(poll_seconds, remaining)
+    time.sleep(slept)
+    remaining -= slept
 PY
+>>>>>>> b12979a (Fix drift-check import path)
 fi
 
 # Two distinct ways this backup check can find a run that never really

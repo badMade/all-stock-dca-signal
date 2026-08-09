@@ -19,7 +19,6 @@ pip install transformers torch newsapi-python requests
 # Standard library
 # ---------------------------------------------------------------------------
 import argparse
-import asyncio
 import html
 import json
 import logging
@@ -39,7 +38,7 @@ from zoneinfo import ZoneInfo  # Python 3.9+; use pytz if < 3.9
 # ---------------------------------------------------------------------------
 # Third-party (installed via pip install transformers torch newsapi-python requests)
 # ---------------------------------------------------------------------------
-import aiohttp
+import requests
 
 # ---------------------------------------------------------------------------
 # Module-level logger — configured in main() so callers that import this
@@ -65,7 +64,6 @@ MAX_FLAGGED_TICKERS: int = 3          # cap email to top-N most extreme movers
 MAX_HEADLINES_PER_TICKER: int = 50    # NewsAPI page size per ticker
 MAX_SEC_FILINGS: int = 5              # EDGAR EFTS results per ticker
 TOP_HEADLINES_IN_EMAIL: int = 3       # per-ticker headline slots in email body
-MAX_CONCURRENT_TICKERS: int = 5       # cap in-flight tickers so EDGAR/NewsAPI calls stay under fair-use limits
 
 # SEC EDGAR full-text search endpoint — free, no API key required
 # https://efts.sec.gov/LATEST/search-index?q=AAPL&forms=8-K,10-K,10-Q
@@ -188,7 +186,7 @@ def score_texts(pipe, texts: List[str]) -> List[dict]:
 # News collection — NewsAPI
 # ===========================================================================
 
-async def fetch_news_headlines(session: aiohttp.ClientSession, ticker: str, api_key: str, lookback_days: int) -> List[dict]:
+def fetch_news_headlines(ticker: str, api_key: str, lookback_days: int) -> List[dict]:
     """
     Pull recent headlines from NewsAPI for a given ticker symbol.
     Returns a list of item dicts (unsorted).
@@ -215,12 +213,10 @@ async def fetch_news_headlines(session: aiohttp.ClientSession, ticker: str, api_
     }
 
     try:
-        async with session.get(
-            "https://newsapi.org/v2/everything", params=params, headers=headers, timeout=15
-        ) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        resp = requests.get("https://newsapi.org/v2/everything", params=params, headers=headers, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as exc:
         safe_exc = str(exc).replace(api_key, "***") if api_key else str(exc)
         log.warning("NewsAPI request failed for %s: %s", ticker, safe_exc)
         return []
@@ -250,7 +246,7 @@ async def fetch_news_headlines(session: aiohttp.ClientSession, ticker: str, api_
 # SEC EDGAR collection
 # ===========================================================================
 
-async def fetch_sec_filings(session: aiohttp.ClientSession, ticker: str, lookback_days: int) -> List[dict]:
+def fetch_sec_filings(ticker: str, lookback_days: int) -> List[dict]:
     """
     Pull recent 8-K, 10-K, and 10-Q filings from SEC EDGAR Full-Text Search.
 
@@ -283,10 +279,10 @@ async def fetch_sec_filings(session: aiohttp.ClientSession, ticker: str, lookbac
     }
 
     try:
-        async with session.get(SEC_EFTS_URL, params=params, headers=headers, timeout=20) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        resp = requests.get(SEC_EFTS_URL, params=params, headers=headers, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as exc:
         log.warning("SEC EDGAR request failed for %s: %s", ticker, exc)
         return []
     except json.JSONDecodeError:
@@ -322,8 +318,7 @@ async def fetch_sec_filings(session: aiohttp.ClientSession, ticker: str, lookbac
 # Scoring pipeline — ties together data collection and FinBERT
 # ===========================================================================
 
-async def compute_ticker_score(
-    session: aiohttp.ClientSession,
+def compute_ticker_score(
     ticker: str,
     pipe,
     news_api_key: Optional[str],
@@ -342,13 +337,13 @@ async def compute_ticker_score(
 
     # --- NewsAPI ---
     if news_api_key:
-        news_items = await fetch_news_headlines(session, ticker, news_api_key, lookback_days)
+        news_items = fetch_news_headlines(ticker, news_api_key, lookback_days)
         items.extend(news_items)
     else:
         log.debug("Skipping NewsAPI for %s (no key)", ticker)
 
     # --- SEC EDGAR ---
-    sec_items = await fetch_sec_filings(session, ticker, lookback_days)
+    sec_items = fetch_sec_filings(ticker, lookback_days)
     items.extend(sec_items)
 
     if not items:
@@ -991,34 +986,15 @@ def run(args: argparse.Namespace) -> int:
     # ------------------------------------------------------------------
     results: Dict[str, dict] = {}
 
-    async def process_all_tickers():
-        # Bound concurrent SEC EDGAR / NewsAPI requests so a large watchlist
-        # can't blow through the SEC's 10-requests-per-second fair-access
-        # limit (each ticker fires at most one EDGAR call and one NewsAPI
-        # call, so capping in-flight tickers caps in-flight EDGAR requests).
-        sem = asyncio.Semaphore(MAX_CONCURRENT_TICKERS)
-
-        async def _run_one(session: aiohttp.ClientSession, ticker: str):
-            async with sem:
-                log.info("[%s] Processing…", ticker)
-                return await compute_ticker_score(session, ticker, pipe, news_api_key, lookback)
-
-        async with aiohttp.ClientSession() as session:
-            tasks = [_run_one(session, ticker) for ticker in tickers]
-            return await asyncio.gather(*tasks, return_exceptions=True)
-
-    scored_results = asyncio.run(process_all_tickers())
-
-    for ticker, score_res in zip(tickers, scored_results):
-        if isinstance(score_res, Exception):
-            log.error("[%s] Unexpected error during scoring: %s", ticker, score_res)
-            log.debug(
-                "Exception details:\n%s",
-                "".join(traceback.format_exception(type(score_res), score_res, score_res.__traceback__)),
-            )
+    for ticker in tickers:
+        log.info("[%s] Processing…", ticker)
+        try:
+            score, scored_items = compute_ticker_score(ticker, pipe, news_api_key, lookback)
+        except Exception as exc:
+            log.error("[%s] Unexpected error during scoring: %s", ticker, exc)
+            log.debug(traceback.format_exc())
+            # Use 0.0 so the ticker still appears in the summary table
             score, scored_items = 0.0, []
-        else:
-            score, scored_items = score_res
 
         # Update history *before* computing z so today's score is in the file
         # but we exclude today from the reference population in compute_zscore().
