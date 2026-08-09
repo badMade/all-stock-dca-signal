@@ -1585,7 +1585,8 @@ def run_pipeline(
         if run_state_path:
             try:
                 run_id = json.loads(
-                    Path(run_state_path).read_text(encoding="utf-8")
+                    # ⚡ Bolt Optimization: Keep I/O in binary; json.loads accepts bytes and decodes internally before parsing
+                    Path(run_state_path).read_bytes()
                 ).get("run_id")
             except (OSError, json.JSONDecodeError):
                 run_id = None
@@ -2856,7 +2857,8 @@ def _run_pipeline_impl(
         if run_state_path:
             try:
                 run_state_obj = json.loads(
-                    Path(run_state_path).read_text(encoding="utf-8")
+                    # ⚡ Bolt Optimization: json.loads accepts bytes directly, skipping string allocation
+                    Path(run_state_path).read_bytes()
                 )
             except (OSError, json.JSONDecodeError):
                 run_state_obj = None
@@ -2994,7 +2996,8 @@ def _run_pipeline_impl(
             candidate["target_price_missing"] = False
     report_paths = generate_reports(run_state, fills, out)
     summary = json.loads(
-        Path(report_paths["latest_run_summary"]).read_text(encoding="utf-8")
+        # ⚡ Bolt Optimization: json.loads accepts bytes directly, skipping string allocation
+        Path(report_paths["latest_run_summary"]).read_bytes()
     )
     sync_paths = write_compact_sync(summary, out)
     result["reports"] = report_paths
