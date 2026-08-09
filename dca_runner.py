@@ -2160,6 +2160,7 @@ def _placement_failure_reason(
     expected_side: str,
     expected_amount_usd: float,
     expected_ref_id: str | None = None,
+    account_number: str | None = None,
 ) -> str | None:
     """Return why ``response`` means "no order was actually placed", or None.
 
@@ -2329,8 +2330,11 @@ def _placement_failure_reason(
             # type (Codex review: "Redact mismatched client references
             # before recording failures").
             if isinstance(returned_ref_id, str):
+                redacted_ref_id = _SECRET_SHAPED_TOKEN_RE.sub("[REDACTED-TOKEN]", returned_ref_id)
+                if account_number:
+                    redacted_ref_id = redacted_ref_id.replace(account_number, "[REDACTED-ACCOUNT]")
                 return (
-                    f"broker response client reference {returned_ref_id!r} does not match "
+                    f"broker response client reference {redacted_ref_id!r} does not match "
                     f"the requested order's {expected_ref_id!r}"
                 )
             return (
@@ -2378,8 +2382,11 @@ def _placement_failure_reason(
             # by type (Codex review: "Redact returned symbols before
             # storing failure evidence").
             if isinstance(returned_symbol, str):
+                redacted_symbol = _SECRET_SHAPED_TOKEN_RE.sub("[REDACTED-TOKEN]", returned_symbol)
+                if account_number:
+                    redacted_symbol = redacted_symbol.replace(account_number, "[REDACTED-ACCOUNT]")
                 return (
-                    f"broker response symbol {returned_symbol!r} does not match the requested "
+                    f"broker response symbol {redacted_symbol!r} does not match the requested "
                     f"order's {expected_symbol!r}"
                 )
             return (
@@ -3209,7 +3216,7 @@ def execute_plan(
         bought_today = {
             _normalize_ticker(o.symbol)
             for o in orders
-            if o.is_buy_attempt and _require_aware(o.created_at).astimezone(ET).date() == trading_day
+            if _is_same_day_buy_attempt(o, trading_day)
         }
     except ValueError as exc:
         # _normalize_ticker()'s raised message embeds the malformed
@@ -3702,6 +3709,7 @@ def execute_plan(
                 expected_side=order.side,
                 expected_amount_usd=order.amount_usd,
                 expected_ref_id=ref_id,
+                account_number=broker.account_number,
             )
         except Exception as exc:
             # exc's own message is connector-defined and can embed whatever
@@ -3744,6 +3752,280 @@ def execute_plan(
 # ---------------------------------------------------------------------------
 # State persistence
 # ---------------------------------------------------------------------------
+
+
+def _is_malformed_usd_type(value) -> bool:
+    """Check if a value's type is unsuitable for a USD amount (non-numeric or bool)."""
+    return isinstance(value, bool) or not isinstance(value, (int, float))
+
+
+def _is_unusable_usd_value(value: float) -> bool:
+    """Check if a numeric value is unsuitable for a USD amount (NaN, infinity, or negative)."""
+    try:
+        return not math.isfinite(value) or value < 0
+    except OverflowError:
+        return True
+
+
+def _is_same_day_buy_attempt(order, trading_day) -> bool:
+    """Check if an order is a buy attempt on the given trading day."""
+    return order.is_buy_attempt and _require_aware(order.created_at).astimezone(ET).date() == trading_day
+
+
+def _is_stale_rollover_reserve(reserve_usd: float, week_key, trading_day) -> bool:
+    """Check if a rollover reserve is nonzero but stale (missing key or from a prior week)."""
+    return reserve_usd != 0.0 and week_key != iso_week_key(trading_day)
+
+
+def _effective_weekly_cap(tier, weekly_rollover_reserve_usd: float) -> float:
+    """Derive the effective weekly ceiling from the selected tier and rollover reserve."""
+    if tier.uses_rollover_reserve:
+        return min(tier.weekly_cap_usd, NORMAL_WEEKLY_CAP_USD + weekly_rollover_reserve_usd)
+    return tier.weekly_cap_usd
+
+
+def _redact_malformed_symbol(symbol) -> str:
+    """Return a symbol as-is if string, or redact its value if it is an arbitrary connector object."""
+    if isinstance(symbol, str):
+        return symbol
+    return f"<non-string symbol, type={type(symbol).__name__}>"
+
+
+def _validate_weekly_rollover_reserve(weekly_rollover_reserve_usd: float) -> None:
+    if _is_malformed_usd_type(weekly_rollover_reserve_usd):
+        # math.isfinite(True) succeeds since bool is an int subclass, so a
+        # boolean reserve would otherwise be retained as $1 and inflate the
+        # derived Stress-tier weekly ceiling by that amount (Codex review:
+        # "Reject boolean rollover-reserve values").
+        raise ValueError(
+            "assess: weekly_rollover_reserve_usd must be a finite, non-negative number, "
+            f"got {weekly_rollover_reserve_usd!r}"
+        )
+    if _is_unusable_usd_value(weekly_rollover_reserve_usd):
+        # A syntactically valid but astronomically large JSON integer (e.g.
+        # 10**1000, which json.loads parses as a plain Python int of
+        # unbounded size, injected via persisted StrategyState) passes the
+        # isinstance check above but makes math.isfinite() raise
+        # OverflowError rather than return False. This validation runs
+        # before `out()` is even defined (let alone Gate 0), so there is no
+        # ABORT payload to build yet -- treated as unusable here, the same
+        # way it is for every other malformed reserve, rather than letting
+        # OverflowError escape past this point entirely (Codex review:
+        # "Catch oversized rollover reserves before finiteness checks").
+        raise ValueError(
+            "assess: weekly_rollover_reserve_usd must be a finite, non-negative number, "
+            f"got {weekly_rollover_reserve_usd!r}"
+        )
+
+
+def _evaluate_gate_0_market_day(trading_day: date, slot) -> tuple[str, str] | None:
+    try:
+        status = market_day_status(trading_day)
+    except CalendarCoverageError as exc:
+        # A stale scheduler firing in a year the calendar doesn't cover must
+        # still produce an ABORT payload so Gate 9 can alert and write run
+        # evidence, not raise past the caller (Codex review: "Convert
+        # calendar coverage failures into an abort verdict").
+        return "ABORT", f"market calendar unavailable, cannot confirm trading day: {exc}"
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        # market_day_status() reads market_calendar.json off disk and indexes
+        # into it directly; a missing file (OSError/FileNotFoundError),
+        # malformed JSON (ValueError -- json.JSONDecodeError is a subclass),
+        # bad encoding (ValueError -- UnicodeDecodeError is a subclass), or a
+        # missing/wrong-shaped key (KeyError/TypeError) all mean the same
+        # thing Gate 0 already handles for CalendarCoverageError: the
+        # calendar cannot be trusted. Without this, a deployment/config
+        # failure would raise past assess() before Gate 9 could write
+        # evidence or alert (Codex review: "Convert unreadable calendar
+        # files into an abort verdict").
+        return "ABORT", f"market calendar unavailable, cannot confirm trading day: {exc}"
+    if status.slot_should_end_silently(slot):
+        why = "exchange closed" if status.is_closed else "early close, slot is after 13:00 ET"
+        return "END_SILENTLY", why
+    return None
+
+
+def _evaluate_gate_3_trading_window(trading_day: date) -> str | None:
+    try:
+        in_window = gate_trading_window(trading_day)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        # gate_trading_window() reads config/trading_window.json and parses
+        # its dates directly; a missing file, malformed JSON, or an invalid
+        # date string all mean the same thing Gate 0 already handles for
+        # market_calendar.json: the config cannot be trusted, and this
+        # deployment/configuration failure must not raise past assess()
+        # before Gate 9 can write evidence or alert (Codex review: "Convert
+        # trading-window config failures into ABORT").
+        return f"trading window configuration unavailable, cannot confirm date: {exc}"
+    if not in_window:
+        return f"{trading_day} is outside the approved trading window"
+    return None
+
+
+def _materialize_orders(orders) -> tuple[list | None, str | None]:
+    try:
+        orders_list = list(orders)
+    except Exception as exc:
+        # exc's own message is broker/wrapper-defined and can embed an
+        # account number, an access token, or other connector context; this
+        # ABORT reason is exactly what the executor prompts persist as run
+        # evidence and may send through alert channels. Only a safe
+        # classification, the exception's type name, is recorded here --
+        # never its message -- matching the same fix already applied to the
+        # placement path's own raised exceptions (Codex review: "Redact
+        # broker-history exceptions before returning evidence").
+        return None, f"order history could not be materialized: {type(exc).__name__}"
+    try:
+        _reject_non_broker_order_rows(orders_list)
+    except ValueError as exc:
+        return None, f"broker order history contains a malformed row: {exc}"
+    return orders_list, None
+
+
+def _evaluate_gate_4_sole_executor(orders: list, slot, trading_day: date, slot_id: str) -> tuple[str | None, dict | None]:
+    try:
+        collisions = gate_sole_executor(orders, slot, trading_day)
+    except (AttributeError, ValueError) as exc:
+        # ValueError: a naive created_at raised by _require_aware(). AttributeError:
+        # a malformed row itself -- None, a raw dict, or anything else without a
+        # .created_at attribute -- raises AttributeError from gate_sole_executor's
+        # own `o.created_at` access, before _require_aware() ever runs (Codex
+        # review: "Convert malformed history rows into ABORT"). Either way this
+        # must produce an ABORT payload, not escape assess()'s documented
+        # never-raises contract before Gate 9 can write evidence or alert (Codex
+        # review: "Convert malformed broker timestamps into an abort verdict").
+        return f"broker order history contains a malformed row or timestamp: {exc}", None
+    if collisions:
+        return (
+            f"orders already present in the {slot_id} ET window, a second executor may be live",
+            {"colliding_orders": [_redact_malformed_symbol(o.symbol) for o in collisions]},
+        )
+    return None, None
+
+
+def _check_buying_power(buying_power_usd: float | None) -> str | None:
+    if buying_power_usd is None:
+        # Every executor prompt's Gate 6 requires "fail closed -- abort and
+        # alert rather than assuming it is sufficient" when buying power
+        # cannot be confirmed. Treating an omitted buying_power_usd as
+        # unlimited headroom (plan_orders()'s own, lower-level default)
+        # would let assess() return PROCEED with a placeable plan despite no
+        # confirmed funds, which the prompt-driven callers then submit
+        # directly at Gate 7 (Codex review: "Abort assessment when buying
+        # power is unavailable"). Checked after Gates 0/1/3/4 so a weekend/
+        # holiday still ends silently rather than aborting over unconfirmed
+        # buying power on a day nothing was going to be bought anyway.
+        return "buying power could not be confirmed, refusing to plan a batch"
+    if _is_malformed_usd_type(buying_power_usd):
+        # A supplied-but-unusable buying_power_usd is not caught by the None
+        # check above and would otherwise reach plan_orders(), whose own
+        # finiteness check either raises a bare ValueError (NaN/infinity/
+        # negative) or, for a bool, does not raise at all: math.isfinite(True)
+        # succeeds since bool is an int subclass, so a $1 live order could be
+        # placed despite zero confirmed balance; a string raises TypeError.
+        # Every one of these must produce the same fail-closed ABORT the
+        # omitted case above already gets, not escape assess()'s never-raises
+        # contract (Codex review: "Return ABORT for malformed buying power",
+        # "Reject nonnumeric buying-power values"). At this point
+        # buying_power_usd has NOT yet been confirmed numeric, so it can
+        # still be arbitrary data the injected account-data layer returned
+        # instead of a scalar -- a dict or object carrying an account
+        # identifier, token, or other request metadata, for instance -- and
+        # this ABORT reason is exactly what gets persisted as run evidence
+        # and sent through alert channels. Only a safe classification (the
+        # value's type) is recorded here, never its repr, matching the
+        # redaction already applied to every other malformed broker input
+        # this function converts into an ABORT reason (Codex review: "Redact
+        # malformed buying-power values from evidence").
+        return (
+            f"buying power is unusable (type={type(buying_power_usd).__name__}), refusing to "
+            "plan a batch"
+        )
+    if _is_unusable_usd_value(buying_power_usd):
+        # A syntactically valid but astronomically large JSON integer (e.g.
+        # 10**1000, which json.loads parses as a plain Python int of
+        # unbounded size) passes the isinstance check above but makes
+        # math.isfinite() raise OverflowError rather than return False,
+        # escaping assess()'s never-raises contract entirely instead of
+        # producing the documented ABORT (Codex review: "Convert oversized
+        # buying power into an abort").
+        return f"buying power is unusable ({buying_power_usd!r}), refusing to plan a batch"
+    return None
+
+
+def _build_budget_snapshot(orders: list, trading_day: date):
+    try:
+        snapshot = budget_snapshot(orders, trading_day)
+    except BudgetDataError as exc:
+        # budget_snapshot()'s raised message embeds the offending order's
+        # symbol and amount via repr(), and either can be arbitrary
+        # connector data a malfunctioning broker wrapper supplied instead
+        # of a real ticker/notional -- a dict carrying an access token or
+        # account identifier, for instance. This ABORT reason is exactly
+        # what gets persisted as run evidence and sent through alert
+        # channels, so only a safe classification (the exception's type
+        # name) is recorded here, matching the redaction already applied
+        # to every other exception this function converts into an ABORT
+        # reason (Codex review: "Redact malformed broker notionals from
+        # abort evidence").
+        return None, f"broker history contains an unusable notional: {type(exc).__name__}"
+    except ValueError as exc:
+        # This ValueError is not only a malformed timestamp from
+        # _require_aware(): budget_snapshot() also touches
+        # order.counts_toward_budget, which calls _normalize_side()/
+        # _is_dead_order_state() -- both raise ValueError embedding the
+        # malformed side/state value's full repr, and either can be
+        # arbitrary connector data (a dict carrying an access token or
+        # account identifier, for instance). Only a safe classification
+        # (the exception's type name) is recorded here, matching the
+        # redaction already applied to the neighboring BudgetDataError path
+        # above (Codex review: "Redact malformed history metadata in abort
+        # evidence").
+        return None, f"broker order history contains a malformed row: {type(exc).__name__}"
+    return snapshot, None
+
+
+def _parse_and_validate_candidates(candidates):
+    try:
+        cands = _parse_candidate_rows(candidates)
+    except Exception as exc:
+        # exc's own message can originate from a lazy candidates iterable
+        # (e.g. a generator wrapping a live market-data/signal-generation
+        # call) that raises while being consumed, and can embed a
+        # market-data token, account context, or other connector detail;
+        # this ABORT reason is exactly what the executor prompts persist as
+        # run evidence and may send through alert channels. Only a safe
+        # classification, the exception's type name, is recorded here --
+        # never its message -- matching the same fix already applied to the
+        # broker-history and placement exception paths (Codex review:
+        # "Redact candidate-source exceptions from assessment evidence").
+        return None, f"candidate row is malformed, cannot build a plan: {type(exc).__name__}"
+    return cands, None
+
+
+def _get_bought_today_tickers(orders: list, trading_day: date):
+    try:
+        bought_today = {
+            _normalize_ticker(o.symbol)
+            for o in orders
+            if _is_same_day_buy_attempt(o, trading_day)
+        }
+    except ValueError as exc:
+        # A malformed symbol (None, a bool, ...) on a same-day buy raises
+        # from _normalize_ticker() before this comprehension can decide
+        # whether the order is even relevant, escaping assess()'s
+        # never-raises contract before Gate 9 could write evidence or alert
+        # (Codex review: "Convert malformed broker symbols into an abort
+        # verdict"). exc's own message embeds the malformed value's full
+        # repr, and a broker wrapper's BrokerOrder.symbol can be arbitrary
+        # connector data -- a dict carrying an account identifier or token,
+        # for instance -- so only a safe classification, the exception's
+        # type name, is recorded here, matching the redaction already
+        # applied to every other exception this function converts into an
+        # ABORT reason (Codex review: "Redact malformed broker symbols from
+        # abort evidence").
+        return None, f"broker order history contains a malformed symbol: {type(exc).__name__}"
+    return bought_today, None
 
 
 def assess(
@@ -4054,141 +4336,27 @@ def assess(
         )
 
     # Gate 6 -- budget from broker history
-    if buying_power_usd is None:
-        # Every executor prompt's Gate 6 requires "fail closed -- abort and
-        # alert rather than assuming it is sufficient" when buying power
-        # cannot be confirmed. Treating an omitted buying_power_usd as
-        # unlimited headroom (plan_orders()'s own, lower-level default)
-        # would let assess() return PROCEED with a placeable plan despite no
-        # confirmed funds, which the prompt-driven callers then submit
-        # directly at Gate 7 (Codex review: "Abort assessment when buying
-        # power is unavailable"). Checked after Gates 0/1/3/4 so a weekend/
-        # holiday still ends silently rather than aborting over unconfirmed
-        # buying power on a day nothing was going to be bought anyway.
-        return out("ABORT", "buying power could not be confirmed, refusing to plan a batch")
-    if isinstance(buying_power_usd, bool) or not isinstance(buying_power_usd, (int, float)):
-        # A supplied-but-unusable buying_power_usd is not caught by the None
-        # check above and would otherwise reach plan_orders(), whose own
-        # finiteness check either raises a bare ValueError (NaN/infinity/
-        # negative) or, for a bool, does not raise at all: math.isfinite(True)
-        # succeeds since bool is an int subclass, so a $1 live order could be
-        # placed despite zero confirmed balance; a string raises TypeError.
-        # Every one of these must produce the same fail-closed ABORT the
-        # omitted case above already gets, not escape assess()'s never-raises
-        # contract (Codex review: "Return ABORT for malformed buying power",
-        # "Reject nonnumeric buying-power values"). At this point
-        # buying_power_usd has NOT yet been confirmed numeric, so it can
-        # still be arbitrary data the injected account-data layer returned
-        # instead of a scalar -- a dict or object carrying an account
-        # identifier, token, or other request metadata, for instance -- and
-        # this ABORT reason is exactly what gets persisted as run evidence
-        # and sent through alert channels. Only a safe classification (the
-        # value's type) is recorded here, never its repr, matching the
-        # redaction already applied to every other malformed broker input
-        # this function converts into an ABORT reason (Codex review: "Redact
-        # malformed buying-power values from evidence").
-        return out(
-            "ABORT",
-            f"buying power is unusable (type={type(buying_power_usd).__name__}), refusing to "
-            "plan a batch",
-        )
-    try:
-        buying_power_is_unusable = not math.isfinite(buying_power_usd) or buying_power_usd < 0
-    except OverflowError:
-        # A syntactically valid but astronomically large JSON integer (e.g.
-        # 10**1000, which json.loads parses as a plain Python int of
-        # unbounded size) passes the isinstance check above but makes
-        # math.isfinite() raise OverflowError rather than return False,
-        # escaping assess()'s never-raises contract entirely instead of
-        # producing the documented ABORT (Codex review: "Convert oversized
-        # buying power into an abort").
-        buying_power_is_unusable = True
-    if buying_power_is_unusable:
-        return out(
-            "ABORT",
-            f"buying power is unusable ({buying_power_usd!r}), refusing to plan a batch",
-        )
-    try:
-        snapshot = budget_snapshot(orders, trading_day)
-    except BudgetDataError as exc:
-        # budget_snapshot()'s raised message embeds the offending order's
-        # symbol and amount via repr(), and either can be arbitrary
-        # connector data a malfunctioning broker wrapper supplied instead
-        # of a real ticker/notional -- a dict carrying an access token or
-        # account identifier, for instance. This ABORT reason is exactly
-        # what gets persisted as run evidence and sent through alert
-        # channels, so only a safe classification (the exception's type
-        # name) is recorded here, matching the redaction already applied
-        # to every other exception this function converts into an ABORT
-        # reason (Codex review: "Redact malformed broker notionals from
-        # abort evidence").
-        return out(
-            "ABORT",
-            f"broker history contains an unusable notional: {type(exc).__name__}",
-        )
-    except ValueError as exc:
-        # This ValueError is not only a malformed timestamp from
-        # _require_aware(): budget_snapshot() also touches
-        # order.counts_toward_budget, which calls _normalize_side()/
-        # _is_dead_order_state() -- both raise ValueError embedding the
-        # malformed side/state value's full repr, and either can be
-        # arbitrary connector data (a dict carrying an access token or
-        # account identifier, for instance). Only a safe classification
-        # (the exception's type name) is recorded here, matching the
-        # redaction already applied to the neighboring BudgetDataError path
-        # above (Codex review: "Redact malformed history metadata in abort
-        # evidence").
-        return out(
-            "ABORT",
-            f"broker order history contains a malformed row: {type(exc).__name__}",
-        )
-    try:
-        cands = _parse_candidate_rows(candidates)
-    except Exception as exc:
-        # exc's own message can originate from a lazy candidates iterable
-        # (e.g. a generator wrapping a live market-data/signal-generation
-        # call) that raises while being consumed, and can embed a
-        # market-data token, account context, or other connector detail;
-        # this ABORT reason is exactly what the executor prompts persist as
-        # run evidence and may send through alert channels. Only a safe
-        # classification, the exception's type name, is recorded here --
-        # never its message -- matching the same fix already applied to the
-        # broker-history and placement exception paths (Codex review:
-        # "Redact candidate-source exceptions from assessment evidence").
-        return out(
-            "ABORT",
-            f"candidate row is malformed, cannot build a plan: {type(exc).__name__}",
-        )
+    buying_power_error = _check_buying_power(buying_power_usd)
+    if buying_power_error is not None:
+        return out("ABORT", buying_power_error)
 
-    # Exclude tickers that already have a same-day buy elsewhere in the seven-
-    # slot roster: a 10:30 candidate for a ticker the 09:35 slot already bought
-    # would otherwise plan a second same-day buy, violating
-    # config/budgets.json's one_order_per_ticker_per_day (Codex review:
-    # "Exclude tickers already bought earlier today").
-    try:
-        bought_today = {
-            _normalize_ticker(o.symbol)
-            for o in orders
-            if o.is_buy_attempt and _require_aware(o.created_at).astimezone(ET).date() == trading_day
-        }
-    except ValueError as exc:
-        # A malformed symbol (None, a bool, ...) on a same-day buy raises
-        # from _normalize_ticker() before this comprehension can decide
-        # whether the order is even relevant, escaping assess()'s
-        # never-raises contract before Gate 9 could write evidence or alert
-        # (Codex review: "Convert malformed broker symbols into an abort
-        # verdict"). exc's own message embeds the malformed value's full
-        # repr, and a broker wrapper's BrokerOrder.symbol can be arbitrary
-        # connector data -- a dict carrying an account identifier or token,
-        # for instance -- so only a safe classification, the exception's
-        # type name, is recorded here, matching the redaction already
-        # applied to every other exception this function converts into an
-        # ABORT reason (Codex review: "Redact malformed broker symbols from
-        # abort evidence").
-        return out(
-            "ABORT",
-            f"broker order history contains a malformed symbol: {type(exc).__name__}",
-        )
+    snapshot, snapshot_error = _build_budget_snapshot(orders, trading_day)
+    if snapshot_error is not None:
+        return out("ABORT", snapshot_error)
+    if snapshot is None:
+        return out("ABORT", "budget snapshot could not be built")
+
+    cands, cands_error = _parse_and_validate_candidates(candidates)
+    if cands_error is not None:
+        return out("ABORT", cands_error)
+    if cands is None:
+        return out("ABORT", "candidate rows could not be parsed")
+
+    bought_today, bought_today_error = _get_bought_today_tickers(orders, trading_day)
+    if bought_today_error is not None:
+        return out("ABORT", bought_today_error)
+    if bought_today is None:
+        return out("ABORT", "broker order history could not be evaluated")
     # Whether a same-day repeat is refused outright is a CONFIG decision, not a
     # hardcoded one: config/budgets.json order_rules.one_order_per_ticker_per_day.
     # True  -> first slot to buy a ticker wins it for the day (original behaviour).
@@ -4215,18 +4383,12 @@ def assess(
     # check outright, or a persisted/caller-supplied reserve with no key
     # would keep applying to every future week forever (Codex review:
     # "Require a week key for every nonzero rollover reserve").
-    if weekly_rollover_reserve_usd != 0.0 and weekly_rollover_reserve_week_key != iso_week_key(
-        trading_day
-    ):
+    if _is_stale_rollover_reserve(weekly_rollover_reserve_usd, weekly_rollover_reserve_week_key, trading_day):
         weekly_rollover_reserve_usd = 0.0
     # Derived from THIS run's tier, never a caller-precomputed value -- see
     # the docstring above (Codex review: "Derive the weekly ceiling from the
     # tier selected here").
-    effective_weekly_cap = (
-        min(tier.weekly_cap_usd, NORMAL_WEEKLY_CAP_USD + weekly_rollover_reserve_usd)
-        if tier.uses_rollover_reserve
-        else tier.weekly_cap_usd
-    )
+    effective_weekly_cap = _effective_weekly_cap(tier, weekly_rollover_reserve_usd)
     plan = plan_orders(
         fresh_cands, snapshot, tier, weekly_cap_usd=effective_weekly_cap, buying_power_usd=buying_power_usd
     )
