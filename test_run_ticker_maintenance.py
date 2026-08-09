@@ -106,6 +106,7 @@ def test_main_calibrate_command(tmp_path, monkeypatch, capsys):
     captured = capsys.readouterr()
     output = json.loads(captured.out)
     assert output["status"] == "completed"
+    assert output["calibrated_tickers"] == 0
 
 def test_main_update_command_missing_script(monkeypatch, capsys):
     monkeypatch.delenv("DCA_TICKER_DAILY_UPDATE_SCRIPT", raising=False)
