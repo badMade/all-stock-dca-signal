@@ -69,7 +69,6 @@ from morning_dca import (
 )
 from near_close_dca import (
     EASTERN,
-    ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
     Action,
     Bar,
     DryRunBroker,
@@ -5408,10 +5407,10 @@ def _seed_prior(
 
 
 class _TopUpBroker:
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER as _acct
     def __init__(self):
         self.placed = {}
-    def account_number(self):
-        return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+    def account_number(self): return self._acct
     def available_buying_power(self): return 1000.0
     def same_day_strategy_order_exists(self, ticker, trading_day): return False
     def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
@@ -5455,11 +5454,14 @@ class _RefIdTrackingBroker:
     real prior placements instead of a fixture that always returns False.
     """
 
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER as _acct
+
     def __init__(self):
         self.placed = {}  # ticker -> notional (last placement)
         self._ref_ids = []  # list of (ticker, ref_id) placed so far
 
-    def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+    def account_number(self):
+        return self._acct
 
     def available_buying_power(self):
         return 1000.0

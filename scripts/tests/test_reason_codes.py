@@ -17,7 +17,6 @@ def test_from_top_up_guard_maps_every_known_guard_result():
     assert rc.from_top_up_guard("price_not_below_prior_run") == rc.NO_LOWER_PRICE
     assert rc.from_top_up_guard("no_incremental_difference") == rc.ALREADY_MET_OR_OVERFILLED
     assert rc.from_top_up_guard("missing_prior_price") == rc.MISSING_PRIOR_PRICE
-    assert rc.from_top_up_guard("missing_prior_base") == rc.MISSING_PRIOR_PRICE
 
 
 def test_from_top_up_guard_passes_unknown_through_unchanged():

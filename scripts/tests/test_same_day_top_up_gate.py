@@ -508,7 +508,10 @@ def test_the_account_number_must_be_supplied():
 
 
 def test_the_trading_day_must_be_supplied():
-    """Account pinning: a snapshot of the wrong trading day proves nothing."""
+    """An empty trading_day would let same-day reconciliation scope its
+    created_at_gte filter to nothing, treating an unbounded history window
+    as proof no buy occurred today (Codex review: "Reject an empty trading
+    day before replaying pages")."""
     with pytest.raises(ValueError):
         _run([_page([])], [{"ticker": "TRIN", "desired_usd": 1.0, "current_price": 17.0}], day="")
 

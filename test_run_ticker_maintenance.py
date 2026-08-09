@@ -44,3 +44,34 @@ def test_update_execution_emits_the_event_consumed_by_calibration(tmp_path):
     )
     assert calibration["status"] == "completed"
     assert calibration["trigger_source"] == "ticker_update_event"
+
+
+def test_main_calibrate_command(tmp_path, monkeypatch, capsys):
+    import json
+
+    from scripts.run_ticker_maintenance import main
+
+    history_dir = tmp_path / "histories"
+    history_dir.mkdir()
+    ticker_config = tmp_path / "tickers.json"
+    ticker_config.write_text('{"active": []}', encoding="utf-8")
+
+    artifacts_dir = tmp_path / "calibration"
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_ticker_maintenance",
+            "calibrate",
+            "--history-dir", str(history_dir),
+            "--ticker-config", str(ticker_config),
+            "--output", str(tmp_path / "per_ticker_sizing.json"),
+            "--artifacts-dir", str(artifacts_dir),
+        ],
+    )
+
+    assert main() == 0
+    captured = capsys.readouterr()
+    output = json.loads(captured.out)
+    assert output["status"] == "completed"
+    assert output["calibrated_tickers"] == 0
