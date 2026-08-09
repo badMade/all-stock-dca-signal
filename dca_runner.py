@@ -3975,6 +3975,11 @@ def _evaluate_gate_4_sole_executor(orders: list, slot, trading_day: date, slot_i
     return None, None
 
 
+# ---------------------------------------------------------------------------
+# assess() helpers
+# ---------------------------------------------------------------------------
+
+
 def _check_buying_power(buying_power_usd: float | None) -> str | None:
     if buying_power_usd is None:
         # Every executor prompt's Gate 6 requires "fail closed -- abort and
