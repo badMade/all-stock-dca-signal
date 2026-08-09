@@ -67,12 +67,58 @@ for _ in $(seq 1 30); do
   sleep 30
 done
 if [ -d "$run_dir" ]; then
-  for _ in $(seq 1 40); do
-    if [ -f "$run_dir/submitted_orders.csv" ] || [ -f "$run_dir/orders.csv" ] || [ -f "$run_dir/filled_orders.csv" ]; then
-      break
-    fi
-    sleep 15
-  done
+  # require_submitted_orders=False: the strict scheduled-run contract only
+  # accepts the literal submitted_orders.csv, but this backup check -- like
+  # the detector it feeds (ORDER_CSV_NAMES/load_run_artifacts in
+  # scripts/drift_detection.py) -- must also finalize on the documented
+  # orders.csv/filled_orders.csv fallbacks. Passing the strict default here
+  # made the wait block for the full 600s grace period even when an accepted
+  # fallback file was already written, because contract.ok could never turn
+  # True without the exact submitted_orders.csv name (codex review
+  # discussion_r3742447653).
+  #
+  # That alone is not enough, though: on the compact live path,
+  # near_close_dca.write_run_artifacts finalizes run_state.json (including
+  # the order_submit_status completion marker) BEFORE orders.csv is written
+  # -- _backfill_orders_csv_usage exists specifically because orders.csv
+  # "lands after write_run_artifacts has already finalized run_state.json".
+  # So waiving order evidence from the contract entirely let this wait return
+  # the instant run_state/signals finalize, possibly before ANY order file
+  # exists, reopening the same race for the drift detector invoked right
+  # after this block (codex review discussion_r3742506962 follow-up). The
+  # explicit poll below closes that gap: after the run_state/signals wait
+  # above returns, keep waiting -- within the SAME overall 600s budget -- for
+  # one of the accepted order-evidence names to actually appear.
+  RUN_DIR="$run_dir" python3 - <<'PY'
+import os
+import sys
+import time
+
+sys.path.insert(0, "scripts")
+from scheduled_artifacts import await_finalized_run_artifacts
+
+run_dir = os.environ["RUN_DIR"]
+grace_seconds = 600.0
+poll_seconds = 15.0
+order_csv_names = ("submitted_orders.csv", "orders.csv", "filled_orders.csv")
+
+
+def order_evidence_present() -> bool:
+    return any(os.path.exists(os.path.join(run_dir, name)) for name in order_csv_names)
+
+
+result = await_finalized_run_artifacts(
+    run_dir,
+    grace_seconds=grace_seconds,
+    poll_seconds=poll_seconds,
+    require_submitted_orders=False,
+)
+
+remaining = grace_seconds - result.waited_seconds
+while remaining > 0 and not order_evidence_present():
+    time.sleep(min(poll_seconds, remaining))
+    remaining -= poll_seconds
+PY
 fi
 
 # Two distinct ways this backup check can find a run that never really
