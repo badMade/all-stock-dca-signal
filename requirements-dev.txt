@@ -27,3 +27,7 @@ pytest-cov==7.1.0
 # clean `pip install -r requirements-dev.txt` must not depend on what else
 # happened to pull it in.
 pyyaml==6.0.3
+# Self-Heal Optional Deps
+types-requests==2.32.0.20241016
+types-PyYAML==6.0.12.20240917
+types-beautifulsoup4==4.12.0.20241020
