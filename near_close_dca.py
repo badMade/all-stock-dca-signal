@@ -60,7 +60,6 @@ from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import (
-    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -82,9 +81,6 @@ from dca_intraday_archive import (
     observations_from_signal_rows,
     write_run_snapshot,
 )
-
-if TYPE_CHECKING:
-    from scripts.run_classification import PriorAllocation
 
 try:  # pragma: no cover - import shim for flat sys.path
     from scripts.run_classification import (
@@ -5973,9 +5969,17 @@ def load_prior_same_day_allocations_multi(
     return merged
 
 
+class _ManualTopUpAllocation(Protocol):
+    prior_usd: float
+    reference_price: Optional[float]
+    sources: List[str]
+    attempt_count: int
+    reference_ts: Optional[int]
+
+
 def merge_manual_top_up_context(
     prior_same_day_allocations: Dict[str, PriorSameDayAllocation],
-    manual_context: Dict[str, "PriorAllocation"],
+    manual_context: Dict[str, _ManualTopUpAllocation],
 ) -> None:
     """Fold same-day MANUAL fills into a top-up guard's prior-allocation input.
 
