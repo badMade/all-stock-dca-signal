@@ -42,6 +42,7 @@ gate = pytest.importorskip(
 
 from scripts.reason_codes import (  # noqa: E402
     ALREADY_MET_OR_OVERFILLED,
+    BELOW_BROKER_MINIMUM_ORDER_SIZE,
     BROKER_HISTORY_INCOMPLETE,
     EFFECTIVE_TOP_UP,
     FIRST_ALLOCATION,
@@ -81,9 +82,9 @@ def _page(orders, *, next_cursor=None):
     return {"data": body}
 
 
-def _run(pages, candidates, *, account=ACCOUNT, day=DAY):
+def _run(pages, candidates, *, account=ACCOUNT, day=DAY, minimum_order_usd=0.0):
     return gate.evaluate_slot(
-        pages=pages, candidates=candidates, account_number=account, trading_day=day
+        pages=pages, candidates=candidates, account_number=account, trading_day=day, minimum_order_usd=minimum_order_usd
     )
 
 
@@ -125,6 +126,21 @@ def test_a_lower_price_and_a_larger_desired_amount_buys_only_the_difference():
     assert d["effective_prior_usd"] == pytest.approx(1.00, abs=0.01)
     assert d["reason"] == EFFECTIVE_TOP_UP
 
+
+def test_a_buy_below_broker_minimum_order_size_is_skipped():
+    """An incremental top-up whose amount falls below the broker minimum
+    must be skipped and return BELOW_BROKER_MINIMUM_ORDER_SIZE."""
+    # Desired = $3.00, Prior = $2.50 -> Incremental = $0.50.
+    # $0.50 < $1.00 minimum_order_usd, so buy_usd should be $0.
+    r = _run(
+        pages=[_page([_fill("o1", "XYZ", 2.50, 100.0, "2026-07-30T13:58:14Z")])],
+        candidates=[{"ticker": "XYZ", "desired_usd": 3.00, "current_price": 95.0}],
+        minimum_order_usd=1.00,
+    )
+    assert r["verdict"] == "PROCEED"
+    d = _by_ticker(r)["XYZ"]
+    assert d["buy_usd"] == 0.0
+    assert d["reason"] == BELOW_BROKER_MINIMUM_ORDER_SIZE
 
 def test_a_price_equal_to_the_reference_is_not_strictly_below_and_buys_zero():
     """'strictly below' is strict. Equal is not below.
@@ -993,3 +1009,115 @@ def test_main_rejects_the_pre_pinning_bare_array_shape(tmp_path, capsys):
     )
     assert exit_code == 2
     assert json.loads(capsys.readouterr().out)["verdict"] == "ABORT"
+
+
+# --- CLI: the broker minimum order size must reach evaluate_slot() -----------
+#
+# evaluate_slot()'s minimum_order_usd defaults to 0.0 (no minimum enforced) --
+# a safe default for direct callers that size it themselves, but main() must
+# never invoke evaluate_slot() at that silent default: doing so authorizes
+# sub-minimum incremental top-ups the broker will reject (Copilot review:
+# "main() currently calls evaluate_slot(...) without supplying
+# minimum_order_usd"; Codex review, P1: "Pass the broker minimum through the
+# production CLI").
+
+
+def _minimum_order_cli_args(tmp_path, *, minimum_order_usd_flag=None):
+    orders_path = tmp_path / "orders.json"
+    candidates_path = tmp_path / "candidates.json"
+    # Desired $3.00, prior $2.50 -> incremental $0.50: below a $1.00 minimum,
+    # at or above a $0.00/unset one.
+    _write_json(
+        orders_path,
+        _pinned_pages([_page([_fill("o1", "XYZ", 2.50, 100.0, "2026-07-30T13:58:14Z")])]),
+    )
+    _write_json(candidates_path, [{"ticker": "XYZ", "desired_usd": 3.00, "current_price": 95.0}])
+    args = [
+        "--account", ACCOUNT,
+        "--trading-day", DAY,
+        "--orders-pages", str(orders_path),
+        "--candidates", str(candidates_path),
+    ]
+    if minimum_order_usd_flag is not None:
+        # "=value" form: a bare "--minimum-order-usd -inf" makes argparse treat
+        # "-inf" as an unrecognized option rather than this flag's value.
+        args += [f"--minimum-order-usd={minimum_order_usd_flag}"]
+    return args
+
+
+def test_cli_loads_the_configured_broker_minimum_when_no_flag_is_passed(tmp_path, capsys, monkeypatch):
+    """The regression this closes: running the CLI the way the live executor
+    does -- with no --minimum-order-usd override -- must still enforce a
+    configured minimum, not silently fall back to evaluate_slot's 0.0
+    default."""
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "per_ticker_sizing.json").write_text(
+        json.dumps({"status": "active", "minimum_order_usd": 1.0, "tickers": {}}), encoding="utf-8"
+    )
+    monkeypatch.setenv("DCA_CONFIG_DIR", str(config_dir))
+
+    exit_code = gate.main(_minimum_order_cli_args(tmp_path))
+
+    assert exit_code == 0
+    out = json.loads(capsys.readouterr().out)
+    decision = _by_ticker(out)["XYZ"]
+    assert decision["buy_usd"] == 0.0
+    assert decision["reason"] == BELOW_BROKER_MINIMUM_ORDER_SIZE
+
+
+def test_cli_minimum_order_usd_flag_overrides_the_configured_default(tmp_path, capsys, monkeypatch):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "per_ticker_sizing.json").write_text(
+        json.dumps({"status": "active", "minimum_order_usd": 1.0, "tickers": {}}), encoding="utf-8"
+    )
+    monkeypatch.setenv("DCA_CONFIG_DIR", str(config_dir))
+
+    exit_code = gate.main(_minimum_order_cli_args(tmp_path, minimum_order_usd_flag=0.0))
+
+    assert exit_code == 0
+    out = json.loads(capsys.readouterr().out)
+    decision = _by_ticker(out)["XYZ"]
+    assert decision["buy_usd"] == 0.50
+    assert decision["reason"] == EFFECTIVE_TOP_UP
+
+
+def test_cli_defaults_to_no_minimum_when_config_has_none(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("DCA_CONFIG_DIR", str(tmp_path / "no-such-config-dir"))
+
+    exit_code = gate.main(_minimum_order_cli_args(tmp_path))
+
+    assert exit_code == 0
+    out = json.loads(capsys.readouterr().out)
+    decision = _by_ticker(out)["XYZ"]
+    assert decision["buy_usd"] == 0.50
+    assert decision["reason"] == EFFECTIVE_TOP_UP
+
+
+def test_a_cent_epsilon_below_a_dollar_still_counts_as_the_exact_minimum():
+    """desired=2.01/prior=1.01 subtracts to 0.9999999999999998 in plain float
+    arithmetic -- one epsilon short of the true $1.00 delta. That must not
+    read as below a $1.00 minimum (Codex review: "Compare cent-normalized
+    amounts to the broker minimum")."""
+    r = _run(
+        pages=[_page([_fill("o1", "XYZ", 1.01, 100.0, "2026-07-30T13:58:14Z")])],
+        candidates=[{"ticker": "XYZ", "desired_usd": 2.01, "current_price": 95.0}],
+        minimum_order_usd=1.00,
+    )
+    d = _by_ticker(r)["XYZ"]
+    assert d["buy_usd"] == 1.00
+    assert d["reason"] == EFFECTIVE_TOP_UP
+
+
+@pytest.mark.parametrize("bad_value", [-1.0, "nan", "inf", "-inf"])
+def test_cli_rejects_a_negative_or_non_finite_minimum_order_usd_flag(tmp_path, capsys, bad_value):
+    """argparse's type=float parses "nan"/"inf" same as the config file's JSON
+    parser does -- either would silently disable the minimum-order check by
+    making every incremental < minimum_order_usd comparison false, so the
+    override must fail closed the same way the config-loaded default does."""
+    exit_code = gate.main(_minimum_order_cli_args(tmp_path, minimum_order_usd_flag=bad_value))
+
+    assert exit_code == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["verdict"] == "ABORT"

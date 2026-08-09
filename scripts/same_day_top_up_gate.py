@@ -116,6 +116,7 @@ from dataclasses import replace
 from decimal import ROUND_DOWN, Decimal
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+import dca_config
 from scripts.broker_reconciliation import (
     BrokerOrder,
     EffectivePrior,
@@ -295,6 +296,7 @@ def evaluate_slot(
     candidates: Sequence[Mapping[str, Any]],
     account_number: str,
     trading_day: str,
+    minimum_order_usd: float = 0.0,
 ) -> Dict[str, Any]:
     """Size every candidate against today's broker-observed prior exposure.
 
@@ -467,7 +469,7 @@ def evaluate_slot(
                 }
             )
             continue
-        decision = decide_effective_top_up(ticker, desired, prior, current_price)
+        decision = decide_effective_top_up(ticker, desired, prior, current_price, minimum_order_usd=minimum_order_usd)
         buy_usd = float(
             Decimal(str(decision.incremental_usd)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
         )
@@ -556,7 +558,38 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "docstring)."
         ),
     )
+    parser.add_argument(
+        "--minimum-order-usd",
+        type=float,
+        default=None,
+        help=(
+            "Broker minimum order size in USD; an incremental top-up sized below "
+            "this is skipped (BELOW_BROKER_MINIMUM_ORDER_SIZE) rather than placed. "
+            "Defaults to config/per_ticker_sizing.json's minimum_order_usd (0.0, "
+            "i.e. no minimum enforced, if that file or field is absent)."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    try:
+        if args.minimum_order_usd is not None:
+            # argparse's type=float accepts "nan"/"inf"/negative strings same as
+            # the config file does, so the override needs the same fail-closed
+            # validation as the config-loaded default (Codex review: "Reject
+            # invalid numeric minimum-order values").
+            minimum_order_usd = dca_config.validate_broker_minimum_order_usd(
+                args.minimum_order_usd, source="--minimum-order-usd"
+            )
+        else:
+            minimum_order_usd = dca_config.load_broker_minimum_order_usd(dca_config.get_config_dir())
+    except ValueError as exc:
+        print(
+            json.dumps(
+                _abort(BROKER_HISTORY_INCOMPLETE, [], [f"invalid_minimum_order_usd:{exc}"]),
+                indent=2,
+            )
+        )
+        return 2
 
     try:
         with open(args.orders_pages, encoding="utf-8") as handle:
@@ -590,6 +623,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         candidates=candidates,
         account_number=args.account,
         trading_day=args.trading_day,
+        minimum_order_usd=minimum_order_usd,
     )
     print(json.dumps(result, indent=2))
     return 0 if result["verdict"] == "PROCEED" else 2

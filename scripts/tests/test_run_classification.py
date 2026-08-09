@@ -2821,6 +2821,8 @@ def test_incremental_top_up_amount_guard():
     assert incremental_top_up_amount(3.0, 2.0, None, None) == (0.0, "missing_prior_price")
     # Desired already covered by prior -> $0.
     assert incremental_top_up_amount(2.0, 3.0, 390.0, 399.1364) == (0.0, "no_incremental_difference")
+    # Incremental difference below broker minimum order size -> $0.
+    assert incremental_top_up_amount(3.0, 2.5, 390.0, 399.1364, minimum_order_usd=1.0) == (0.0, "below_broker_minimum_order_size")
 
 
 # --- No-order outcome vs failure (Jul 27 2026 1:30 PM ET) -------------------

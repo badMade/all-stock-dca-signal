@@ -48,6 +48,9 @@ MISSING_PRIOR_PRICE = "MISSING_PRIOR_PRICE"
 #: No current decision price available -> cannot evaluate the top-up invariant.
 MISSING_CURRENT_PRICE = "MISSING_CURRENT_PRICE"
 
+#: Incremental amount is below broker minimum order size.
+BELOW_BROKER_MINIMUM_ORDER_SIZE = "BELOW_BROKER_MINIMUM_ORDER_SIZE"
+
 # --- Safety / fail-closed blocks ---------------------------------------------
 
 #: Same-day broker order history could not be proven complete (pagination did
@@ -84,6 +87,7 @@ ALL_REASONS: FrozenSet[str] = frozenset(
         ALREADY_FILLED,
         MISSING_PRIOR_PRICE,
         MISSING_CURRENT_PRICE,
+        BELOW_BROKER_MINIMUM_ORDER_SIZE,
         BROKER_HISTORY_INCOMPLETE,
         STALE_POINTER,
         SAFETY_CAP,
@@ -106,6 +110,7 @@ NO_BUY_REASONS: FrozenSet[str] = frozenset(
         ALREADY_FILLED,
         MISSING_PRIOR_PRICE,
         MISSING_CURRENT_PRICE,
+        BELOW_BROKER_MINIMUM_ORDER_SIZE,
         BROKER_HISTORY_INCOMPLETE,
         STALE_POINTER,
         SAFETY_CAP,
@@ -145,6 +150,7 @@ _TOP_UP_GUARD_TO_CANONICAL: Dict[str, str] = {
     "no_incremental_difference": ALREADY_MET_OR_OVERFILLED,
     "missing_prior_price": MISSING_PRIOR_PRICE,
     "missing_prior_base": MISSING_PRIOR_PRICE,
+    "below_broker_minimum_order_size": BELOW_BROKER_MINIMUM_ORDER_SIZE,
 }
 
 
@@ -175,6 +181,7 @@ __all__ = [
     "ALREADY_FILLED",
     "MISSING_PRIOR_PRICE",
     "MISSING_CURRENT_PRICE",
+    "BELOW_BROKER_MINIMUM_ORDER_SIZE",
     "BROKER_HISTORY_INCOMPLETE",
     "STALE_POINTER",
     "SAFETY_CAP",

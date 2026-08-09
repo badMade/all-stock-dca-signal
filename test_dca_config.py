@@ -14,6 +14,7 @@ from dca_config import (
     get_config_dir,
     load_approved_dates,
     load_backtest_sizing_tiers,
+    load_broker_minimum_order_usd,
     load_budgets,
     load_near_close_overrides,
     load_per_ticker_sizing,
@@ -143,6 +144,56 @@ def test_per_ticker_sizing_has_precise_ranges_and_one_dollar_floor(tmp_path):
     assert model["tiers"][0][0] == pytest.approx(0.001234)
     assert graded_buy_multiplier(0.001234, config, "LOW") == 1.0
     assert select_first_allocation_base_usd(99.0, 100.0, None, config, "LOW")[0] == 1.0
+
+
+def test_broker_minimum_order_usd_reads_top_level_field(tmp_path):
+    _write(tmp_path, "per_ticker_sizing.json", {
+        "status": "active",
+        "minimum_order_usd": 1.0,
+        "tickers": {},
+    })
+    assert load_broker_minimum_order_usd(tmp_path) == 1.0
+
+
+def test_broker_minimum_order_usd_applies_regardless_of_calibration_status(tmp_path):
+    """This is a broker constraint, not a calibration -- it must still be read
+    while status != 'active', unlike load_per_ticker_sizing's own tickers
+    dict, which load_per_ticker_sizing gates on 'active' and returns {} for."""
+    _write(tmp_path, "per_ticker_sizing.json", {
+        "status": "draft",
+        "minimum_order_usd": 2.5,
+        "tickers": {},
+    })
+    assert load_per_ticker_sizing(tmp_path) == {}
+    assert load_broker_minimum_order_usd(tmp_path) == 2.5
+
+
+def test_broker_minimum_order_usd_defaults_to_zero_when_file_absent(tmp_path):
+    assert load_broker_minimum_order_usd(tmp_path) == 0.0
+
+
+def test_broker_minimum_order_usd_defaults_to_zero_when_field_absent(tmp_path):
+    _write(tmp_path, "per_ticker_sizing.json", {"status": "active", "tickers": {}})
+    assert load_broker_minimum_order_usd(tmp_path) == 0.0
+
+
+@pytest.mark.parametrize("bad_value", [True, "1.0", None, [1.0]])
+def test_broker_minimum_order_usd_rejects_non_numeric_value(tmp_path, bad_value):
+    _write(tmp_path, "per_ticker_sizing.json", {"minimum_order_usd": bad_value, "tickers": {}})
+    with pytest.raises(ValueError, match="minimum_order_usd must be numeric"):
+        load_broker_minimum_order_usd(tmp_path)
+
+
+@pytest.mark.parametrize("bad_value", [-1.0, float("nan"), float("inf"), float("-inf")])
+def test_broker_minimum_order_usd_rejects_negative_or_non_finite_value(tmp_path, bad_value):
+    """A negative or non-finite (NaN/Infinity) minimum makes every
+    `incremental < minimum_order_usd` comparison false, silently disabling
+    the broker-minimum protection -- JSON's parser accepts NaN/Infinity
+    literals, so this must fail closed rather than load them (Codex review:
+    "Reject invalid numeric minimum-order values")."""
+    _write(tmp_path, "per_ticker_sizing.json", {"minimum_order_usd": bad_value, "tickers": {}})
+    with pytest.raises(ValueError, match="must be finite and non-negative"):
+        load_broker_minimum_order_usd(tmp_path)
 
 
 def test_budgets_maps_surviving_fields_only(tmp_path):
