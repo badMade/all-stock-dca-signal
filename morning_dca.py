@@ -798,6 +798,20 @@ def preflight_ticker_eligibility_row(signal: "MorningSignal") -> Dict[str, Any]:
 
 
 @dataclass(frozen=True)
+class OrderPlacementContext:
+    """Encapsulates parameters required to place broker orders."""
+    candidates: List["MorningSignal"]
+    trading_day: Any
+    broker: BrokerAdapter
+    top_up_outcomes: Optional[Dict[str, Any]]
+    remaining_daily: float
+    remaining_weekly: float
+    manual: bool = False
+    data: Any = None
+    now: Optional[datetime] = None
+
+
+@dataclass(frozen=True)
 class MorningSignal:
     """One morning signal row for a single ticker."""
 
@@ -4686,17 +4700,10 @@ class MorningDCAExecutor(DCAExecutor):
                         0.0, self.ledger.week_planned(trading_day) - poisoned_week
                     )
 
+
     def _place_broker_orders(
         self,
-        candidates: List[MorningSignal],
-        trading_day: Any,
-        broker: BrokerAdapter,
-        top_up_outcomes: Optional[Dict[str, Any]],
-        remaining_daily: float,
-        remaining_weekly: float,
-        manual: bool = False,
-        data: Any = None,
-        now: Optional[datetime] = None,
+        context: OrderPlacementContext
     ) -> Dict[str, Any]:
         """Attempt broker order placement for each EXEC_AUTO_BUY_ELIGIBLE candidate.
 
@@ -4725,6 +4732,15 @@ class MorningDCAExecutor(DCAExecutor):
         pre-authorization policy in config/budgets.json. Manual runs still call
         review_market_buy first.
         """
+        candidates = context.candidates
+        trading_day = context.trading_day
+        broker = context.broker
+        top_up_outcomes = context.top_up_outcomes
+        remaining_daily = context.remaining_daily
+        remaining_weekly = context.remaining_weekly
+        manual = context.manual
+        data = context.data
+        now = context.now
         if not candidates:
             return {}
         outcomes: Dict[str, Any] = {}
@@ -5777,17 +5793,17 @@ class MorningDCAExecutor(DCAExecutor):
                 if not manual:
                     return self._blocked_live_result(now, mismatch, signals, source)
                 raise RuntimeError(mismatch)
-            broker_outcomes = self._place_broker_orders(
-                auto_buy_candidates,
-                trading_day,
-                broker,
-                top_up_outcomes,
+            broker_outcomes = self._place_broker_orders(OrderPlacementContext(
+                candidates=auto_buy_candidates,
+                trading_day=trading_day,
+                broker=broker,
+                top_up_outcomes=top_up_outcomes,
                 remaining_daily=pre_run_remaining_daily,
                 remaining_weekly=pre_run_remaining_weekly,
                 manual=manual,
                 data=data,
                 now=now,
-            )
+            ))
         # In live mode record only candidates whose orders were actually submitted
         # so cap-exceeded orders do not inflate the ledger and corrupt budget reporting.
         # A "duplicate_preserved" outcome (a same-stream top-up duplicate retry)

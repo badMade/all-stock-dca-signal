@@ -54,6 +54,7 @@ from morning_dca import (
     MorningDCAExecutor,
     MorningLedger,
     MorningSignal,
+    OrderPlacementContext,
     TopUpOutcome,
     _csv_qualifying_notional_total,
     _PersistingBrokerAdapter,
@@ -4187,14 +4188,14 @@ def test_morning_place_broker_orders_settles_credit_ledger_after_confirmed_submi
         cumulative_credit_decline_usd=0.30,
     )
     broker = _Broker()
-    outcomes = ex._place_broker_orders(
-        [signal],
-        trading_day,
-        broker,
-        {"AAPL": outcome},
+    outcomes = ex._place_broker_orders(OrderPlacementContext(
+        candidates=[signal],
+        trading_day=trading_day,
+        broker=broker,
+        top_up_outcomes={"AAPL": outcome},
         remaining_daily=180.0,
         remaining_weekly=900.0,
-    )
+    ))
     assert outcomes["AAPL"]["status"] == "submitted"
     assert broker.placed["AAPL"] == 1.0
     assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.0
