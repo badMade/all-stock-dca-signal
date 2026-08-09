@@ -3786,6 +3786,20 @@ def execute_plan(
 # ---------------------------------------------------------------------------
 
 
+
+def _is_unusable_amount_type(val) -> bool:
+    return isinstance(val, bool) or not isinstance(val, (int, float))
+
+
+def _is_unusable_amount_value(val: object) -> bool:
+    if isinstance(val, bool):
+        return True
+    try:
+        return not math.isfinite(val) or val < 0
+    except (OverflowError, TypeError):
+        return True
+
+
 def assess(
     slot_id: str,
     orders,
@@ -3891,9 +3905,7 @@ def assess(
     docs/live_wiring.md's "Gate sequence" section (Codex review: "Return execution
     context from assess").
     """
-    if isinstance(weekly_rollover_reserve_usd, bool) or not isinstance(
-        weekly_rollover_reserve_usd, (int, float)
-    ):
+    if _is_unusable_amount_type(weekly_rollover_reserve_usd):
         # math.isfinite(True) succeeds since bool is an int subclass, so a
         # boolean reserve would otherwise be retained as $1 and inflate the
         # derived Stress-tier weekly ceiling by that amount (Codex review:
@@ -3902,11 +3914,7 @@ def assess(
             "assess: weekly_rollover_reserve_usd must be a finite, non-negative number, "
             f"got {weekly_rollover_reserve_usd!r}"
         )
-    try:
-        reserve_is_unusable = (
-            not math.isfinite(weekly_rollover_reserve_usd) or weekly_rollover_reserve_usd < 0
-        )
-    except OverflowError:
+    if _is_unusable_amount_value(weekly_rollover_reserve_usd):
         # A syntactically valid but astronomically large JSON integer (e.g.
         # 10**1000, which json.loads parses as a plain Python int of
         # unbounded size, injected via persisted StrategyState) passes the
@@ -3917,8 +3925,6 @@ def assess(
         # way it is for every other malformed reserve, rather than letting
         # OverflowError escape past this point entirely (Codex review:
         # "Catch oversized rollover reserves before finiteness checks").
-        reserve_is_unusable = True
-    if reserve_is_unusable:
         raise ValueError(
             "assess: weekly_rollover_reserve_usd must be a finite, non-negative number, "
             f"got {weekly_rollover_reserve_usd!r}"
@@ -4106,7 +4112,7 @@ def assess(
         # holiday still ends silently rather than aborting over unconfirmed
         # buying power on a day nothing was going to be bought anyway.
         return out("ABORT", "buying power could not be confirmed, refusing to plan a batch")
-    if isinstance(buying_power_usd, bool) or not isinstance(buying_power_usd, (int, float)):
+    if _is_unusable_amount_type(buying_power_usd):
         # A supplied-but-unusable buying_power_usd is not caught by the None
         # check above and would otherwise reach plan_orders(), whose own
         # finiteness check either raises a bare ValueError (NaN/infinity/
@@ -4132,9 +4138,7 @@ def assess(
             f"buying power is unusable (type={type(buying_power_usd).__name__}), refusing to "
             "plan a batch",
         )
-    try:
-        buying_power_is_unusable = not math.isfinite(buying_power_usd) or buying_power_usd < 0
-    except OverflowError:
+    if _is_unusable_amount_value(buying_power_usd):
         # A syntactically valid but astronomically large JSON integer (e.g.
         # 10**1000, which json.loads parses as a plain Python int of
         # unbounded size) passes the isinstance check above but makes
@@ -4142,8 +4146,6 @@ def assess(
         # escaping assess()'s never-raises contract entirely instead of
         # producing the documented ABORT (Codex review: "Convert oversized
         # buying power into an abort").
-        buying_power_is_unusable = True
-    if buying_power_is_unusable:
         return out(
             "ABORT",
             f"buying power is unusable ({buying_power_usd!r}), refusing to plan a batch",
