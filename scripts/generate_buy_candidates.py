@@ -1495,7 +1495,6 @@ def _require_populated_config(config_dir: Path) -> None:
     for name in _REQUIRED_CONFIG_FILENAMES:
         path = config_dir / name
         try:
-            # ⚡ Bolt Optimization: Keep I/O in binary; json.loads accepts bytes and decodes internally before parsing
             json.loads(path.read_bytes(), object_pairs_hook=dca_runner._reject_duplicate_keys)
         except ValueError as exc:
             raise ValueError(f"{path} is malformed or has a duplicate JSON key: {exc}") from exc
@@ -1583,7 +1582,6 @@ def _require_populated_config(config_dir: Path) -> None:
     # checking against the RAW JSON, before load_per_ticker_sizing
     # normalizes them (Codex review: "Validate raw per-ticker sizing
     # before normalization").
-    # ⚡ Bolt Optimization: json.loads accepts bytes directly, skipping string allocation
     raw_per_ticker_sizing = json.loads((config_dir / "per_ticker_sizing.json").read_bytes())
     raw_tickers = raw_per_ticker_sizing.get("tickers")
     if isinstance(raw_tickers, dict):
@@ -1735,7 +1733,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # scoring ever sees the discarded row (Codex review: "Reject duplicate
     # keys in market-data JSON").
     payload = json.loads(
-        # ⚡ Bolt Optimization: json.loads accepts bytes directly, skipping string allocation
         args.market_data.read_bytes(), object_pairs_hook=dca_runner._reject_duplicate_keys
     )
     # "sources" missing ENTIRELY is malformed input, not "both providers returned
