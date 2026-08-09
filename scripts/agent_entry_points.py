@@ -54,7 +54,12 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         exists_path="run_dca.py",
         doc_ref="docs/live_wiring.md",
         symbols=("main",),
-        notes="The standard pre-handoff smoke test (see AGENTS.md).",
+        notes=(
+            "The standard pre-handoff smoke test (see AGENTS.md). "
+            "Use an approved weekday timestamp (Mon–Fri, 15:45 ET recommended) — a weekend "
+            "or out-of-window date hits the date gate, skips report generation, and exits 0 "
+            "without exercising the full pipeline."
+        ),
     ),
     EntryPoint(
         need="Size a same-day top-up buy from broker order history",
@@ -69,7 +74,7 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
     ),
     EntryPoint(
         need="Decide whether a run is scheduled or manual, and where its artifacts belong",
-        command="import scripts.run_classification  # library API, no standalone CLI",
+        command="python -c 'import scripts.run_classification'  # library API, no standalone CLI",
         exists_path="scripts/run_classification.py",
         doc_ref="docs/run_classification.md",
         symbols=("build_scheduled_classification",),
@@ -85,11 +90,11 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
     ),
     EntryPoint(
         need="Back up the live strategy config from a pasted thread/notes dump",
-        command="python scripts/backup_strategy.py --transcript <file> [--write]",
+        command="python scripts/backup_strategy.py --transcript <file> --write",
         exists_path="scripts/backup_strategy.py",
         doc_ref="docs/README.md",
         symbols=("main",),
-        notes="--transcript is required; --write persists the extracted config files.",
+        notes="--transcript is required; --write persists the extracted config files (omit for a dry-run preview only).",
     ),
     EntryPoint(
         need="Regenerate per-ticker sizing overrides",
@@ -104,13 +109,18 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
     ),
     EntryPoint(
         need="Recalibrate per-ticker signal parameters for the day",
-        command="python -m scripts.daily_per_ticker_calibration",
-        exists_path="scripts/daily_per_ticker_calibration.py",
+        command="python -m scripts.run_ticker_maintenance calibrate",
+        exists_path="scripts/run_ticker_maintenance.py",
         doc_ref="docs/README.md",
-        symbols=("main",),
+        symbols=("main", "run_calibration"),
         notes=(
-            "Module form required: running the file directly (python scripts/x.py) puts "
-            "scripts/ rather than the repo root on sys.path and fails on `import dca_fileio`."
+            "The `calibrate` subcommand is the independent, force=True path that "
+            "config/scheduled_tasks.json names as the canonical scheduled command -- it "
+            "recalculates from the local archive unconditionally. Its sibling "
+            "`event-calibrate` (force=False) instead requires a same-day, status=completed "
+            "ticker_update_event.json naming a changed active ticker, and otherwise leaves "
+            "config/per_ticker_sizing.json untouched and exits nonzero; do not substitute it "
+            "when the need is an unconditional daily recalibration."
         ),
     ),
     EntryPoint(
@@ -132,17 +142,26 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
     ),
     EntryPoint(
         need="Run the live gate sequence in-process: build a plan, then place it",
-        command="plan = dca_runner.plan_orders(...); dca_runner.execute_plan(plan, ...)  # import and call, not a CLI",
+        command=(
+            "snapshot = dca_runner.budget_snapshot(orders, day); "
+            "tier = near_close_dca.select_budget_tier(planned_spend_usd, high_multiplier_signal_count); "
+            "plan = dca_runner.plan_orders(candidates, snapshot, tier); "
+            "dca_runner.execute_plan(plan, broker, snapshot=snapshot, tier=tier)  # import and call, not a CLI"
+        ),
         exists_path="dca_runner.py",
         doc_ref="docs/live_wiring.md",
-        symbols=("plan_orders", "execute_plan"),
+        symbols=("plan_orders", "execute_plan", "budget_snapshot"),
         notes=(
-            "Requires injected callables mapped to Robinhood MCP tools. Build plan/snapshot/tier "
-            "via plan_orders() and pass those SAME objects into execute_plan() -- do not round-trip "
-            "through assess()'s JSON dict, which cannot be reconstructed back into a live Plan "
-            "(see docs/live_wiring.md). assess() is a separate, JSON-serializable gate-check summary "
-            "for prompt-driven sessions that have no way to hold a live Python object between tool "
-            "calls; a real Python caller should call plan_orders()/execute_plan() directly instead."
+            "Requires injected callables mapped to Robinhood MCP tools. plan_orders() takes an "
+            "already-built BudgetSnapshot and BudgetTier as input -- it does not construct them -- "
+            "and returns only a Plan, so obtain or construct the snapshot (dca_runner.budget_snapshot) "
+            "and select the tier (near_close_dca.select_budget_tier) first, then pass both into "
+            "plan_orders(). Reuse those SAME snapshot/tier objects, plus the returned plan, in "
+            "execute_plan() -- do not round-trip through assess()'s JSON dict, which cannot be "
+            "reconstructed back into a live Plan (see docs/live_wiring.md). assess() is a separate, "
+            "JSON-serializable gate-check summary for prompt-driven sessions that have no way to hold a "
+            "live Python object between tool calls; a real Python caller should call "
+            "plan_orders()/execute_plan() directly instead."
         ),
     ),
 )

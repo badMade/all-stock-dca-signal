@@ -23,16 +23,16 @@ sys.path.insert(0, str(REPO_ROOT))
 from scripts.agent_entry_points import ENTRY_POINTS, main  # noqa: E402
 
 
-def _defined_names(path: Path) -> set:
-    """Every function/class/constant name a module defines, at any nesting level.
+def _defined_names(path: Path) -> set[str]:
+    """Every module-level function/class/constant name a module defines.
 
-    AST-based rather than regex-based so a symbol pointing at an ``async def``,
-    an indented (nested/method) definition, or a module-level constant is
-    verified correctly instead of silently never matching.
+    AST-based rather than regex-based so a symbol rename is caught reliably.
+    Restricting to module-level statements ensures `ENTRY_POINTS[*].symbols`
+    reflect names callers can access as `module.<name>`.
     """
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    names = set()
-    for node in ast.walk(tree):
+    names: set[str] = set()
+    for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             names.add(node.name)
         elif isinstance(node, ast.Assign):
