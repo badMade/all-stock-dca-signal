@@ -31,7 +31,7 @@ import json
 import logging
 import os
 import shutil
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -1556,13 +1556,7 @@ def run_pipeline(
     )
 
     def _invoke() -> Dict[str, Any]:
-        result = _run_pipeline_impl(
-            now,
-            config,
-            state,
-            finance_data,
-            robinhood_data,
-            broker,
+        ctx = RunContext(
             artifacts_dir=artifacts_dir,
             run_label=run_label,
             scheduled=scheduled,
@@ -1579,6 +1573,15 @@ def run_pipeline(
             correlation_id=correlation_id,
             stream=stream_name,
             preflight_gate=preflight_gate,
+        )
+        result = _run_pipeline_impl(
+            now,
+            config,
+            state,
+            finance_data,
+            robinhood_data,
+            broker,
+            ctx=ctx,
         )
         run_state_path = result.get("run_state_path")
         run_id = None
@@ -1826,6 +1829,28 @@ def _final_buy_trend_override_window_start(now: datetime) -> time:
     return time(hh, mm)
 
 
+
+@dataclass(frozen=True)
+class RunContext:
+    """Parameters for the DCA pipeline execution."""
+    artifacts_dir: str | Path
+    run_label: str = "daily"
+    scheduled: bool = True
+    generate_full_reports: bool = False
+    ignore_trend_filter: bool = False
+    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]] = None
+    prior_allocation_state_root: Optional[str | Path] = None
+    deployment_history_root: Optional[str | Path] = None
+    classification_state_root: Optional[str | Path] = None
+    config_dir: Optional[str | Path] = None
+    raw_connector_inputs: Optional[Mapping[str, Any]] = None
+    required_raw_filenames: Optional[frozenset] = None
+    classification_overrides: Optional[Dict[str, Any]] = None
+    correlation_id: Optional[str] = None
+    stream: str = "afternoon"
+    preflight_gate: Optional[Dict[str, Any]] = None
+
+
 def _run_pipeline_impl(
     now: datetime,
     config: StrategyConfig,
@@ -1834,22 +1859,7 @@ def _run_pipeline_impl(
     robinhood_data: MarketDataProvider,
     broker: BrokerAdapter,
     *,
-    artifacts_dir: str | Path,
-    run_label: str = "daily",
-    scheduled: bool = True,
-    generate_full_reports: bool = False,
-    ignore_trend_filter: bool = False,
-    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]] = None,
-    prior_allocation_state_root: Optional[str | Path] = None,
-    deployment_history_root: Optional[str | Path] = None,
-    classification_state_root: Optional[str | Path] = None,
-    config_dir: Optional[str | Path] = None,
-    raw_connector_inputs: Optional[Mapping[str, Any]] = None,
-    required_raw_filenames: Optional[frozenset] = None,
-    classification_overrides: Optional[Dict[str, Any]] = None,
-    correlation_id: Optional[str] = None,
-    stream: str = "afternoon",
-    preflight_gate: Optional[Dict[str, Any]] = None,
+    ctx: RunContext,
 ) -> Dict[str, Any]:
     """Run one compact DCA cycle and (optionally) the full post-trade report set.
 
@@ -1931,6 +1941,23 @@ def _run_pipeline_impl(
     now just means ``run_slot`` passed through the full universe already, and
     this function evaluates it normally like any other run.
     """
+
+    artifacts_dir = ctx.artifacts_dir
+    run_label = ctx.run_label
+    scheduled = ctx.scheduled
+    generate_full_reports = ctx.generate_full_reports
+    ignore_trend_filter = ctx.ignore_trend_filter
+    prior_same_day_allocations = ctx.prior_same_day_allocations
+    prior_allocation_state_root = ctx.prior_allocation_state_root
+    deployment_history_root = ctx.deployment_history_root
+    classification_state_root = ctx.classification_state_root
+    config_dir = ctx.config_dir
+    raw_connector_inputs = ctx.raw_connector_inputs
+    required_raw_filenames = ctx.required_raw_filenames
+    classification_overrides = ctx.classification_overrides
+    correlation_id = ctx.correlation_id
+    stream = ctx.stream
+    preflight_gate = ctx.preflight_gate
     # Drain any leftover raw placement responses from a prior run on this broker
     # instance (e.g. a manual run_pipeline() call that preceded this scheduled one).
     # Without this, a non-scheduled manual call would leave its responses in the
