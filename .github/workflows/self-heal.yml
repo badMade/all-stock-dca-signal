@@ -1,0 +1,299 @@
+name: Self-heal (auto-fix & PR)
+
+# TRUST BOUNDARY -- read this before editing. Same family of concern as
+# antigravity-pr-review-post.yml and drift-check.yml (see docs/pr_review_workflow.md
+# and drift-check.yml's own header); this job additionally holds
+# `contents: write` and `pull-requests: write`, so it gets the most
+# conservative treatment of the three:
+#
+#   1. No `workflow_dispatch`. `workflow_dispatch` runs the copy of THIS FILE
+#      that lives on whatever ref is selected at dispatch time, not the
+#      default branch's copy -- so a dispatched run against an arbitrary ref
+#      would execute that ref's own edits to this workflow with a
+#      contents-write/PR-write token in scope. drift-check.yml's header
+#      documents the identical reasoning for why it has no on-demand trigger
+#      either. `workflow_run` does not have this problem: GitHub always runs
+#      the default branch's copy of a `workflow_run`-triggered workflow.
+#   2. `event == 'push'` only, never `pull_request`. The triggering CI run's
+#      checked-out code becomes CODE THIS JOB EXECUTES (ruff, pytest, and
+#      whatever `scripts/self_heal.py` finds on that ref) with a
+#      write-scoped token -- unlike antigravity-pr-review-post.yml, which
+#      only ever downloads PR content as inert diff *text*. Restricting to
+#      `push` means the only code that ever runs here was pushed by someone
+#      who already has write access to this repository (this repo's CI
+#      pushes are to `main` or `claude/**`, never a fork), never a
+#      pull_request-supplied fork branch.
+#   3. Branch-name loop guard (`head_branch` not `selfheal-*`) so a self-heal
+#      PR's own CI failure can never re-trigger this workflow.
+#
+# No self-scheduling / periodic re-tuning of this workflow's own trigger is
+# implemented on purpose: a workflow that rewrites its own CI wiring via bot
+# commits is a materially different (and larger) risk surface than a
+# reactive auto-fixer, and isn't something this repo's existing automation
+# does anywhere else.
+#
+# KNOWN LIMITATION -- ci.yml never runs on the branch/PR this job opens, and
+# that is left as-is rather than "fixed" with a swappable credential:
+#   * The default `GITHUB_TOKEN` deliberately can't trigger other workflow
+#     runs (GitHub's own loop-prevention: see
+#     https://docs.github.com/en/actions/how-tos/writing-workflows/choosing-when-your-workflow-runs/triggering-a-workflow#triggering-a-workflow-from-a-workflow).
+#   * Even a token that COULD trigger workflows wouldn't help here anyway:
+#     ci.yml's own `on:` filters only match pushes to `main`/`claude/**` and
+#     PRs based on `main` (ci.yml lines 4-7) -- this job pushes to
+#     `selfheal-*` and opens the PR against whatever branch failed (often
+#     `claude/**`, not `main`), so neither of ci.yml's triggers fire
+#     regardless of credential (Codex review, PR #379).
+#   * A swappable long-lived credential (a repository-secret PAT/App token)
+#     was considered and deliberately rejected: this job's earlier steps run
+#     `scripts/self_heal.py` AS IT EXISTS ON THE FAILING COMMIT (it has to,
+#     to repair that commit), so a broader, longer-lived credential sitting
+#     in the same job as that code is exactly the unsafe pattern
+#     docs/pr_review_workflow.md's trust boundary exists to avoid -- a
+#     compromised or buggy self_heal.py on that commit could exfiltrate it
+#     via `$GITHUB_ENV`/a PATH-shadowing binary before the later PR step
+#     ever runs. `github.token` is the deliberately narrower alternative:
+#     scoped to exactly this run and exactly the three permissions granted
+#     below, so even a fully compromised repair step gains nothing beyond
+#     what its own author (who already has push access, per point 2 above)
+#     could already do directly. Properly fixing the CI-triggering gap needs
+#     the same two-workflow split antigravity-pr-review-post.yml uses --
+#     an unprivileged job that only uploads a diff as inert data, and a
+#     separate privileged job (default-branch YAML, never running the
+#     failing commit's code) that applies it and pushes -- which is a
+#     larger, separate change, not a same-PR patch.
+#
+# Consequence: `scripts/healthcheck.py`'s own run (logs attached as an
+# artifact, summarized in the PR body) is the only automated verification a
+# self-heal PR gets today. A human reviewer should treat that as sufficient
+# given how narrow the one repair this workflow performs is (a ruff lint
+# auto-fix), or get a real ci.yml run by pulling this branch and merging (or
+# cherry-picking) it into the failing branch themselves, then pushing that
+# directly -- a push authenticated as a human, not this bot, isn't subject to
+# the GITHUB_TOKEN loop-prevention above and does trigger ci.yml normally.
+# Two things that look like they'd trigger CI but don't, so are worth naming
+# explicitly (Codex review, PR #379): pushing an empty commit to the FAILING
+# branch runs ci.yml against that branch's still-unrepaired tip, not this
+# fix, so it verifies nothing about the fix itself; and retargeting this
+# PR's base to `main` doesn't fire `pull_request` at all (base-edits aren't
+# among the default activity types ci.yml listens for) even before
+# considering that this bot's own token couldn't trigger it either.
+
+on:
+  workflow_run:
+    workflows: ["CI"] # matches ci.yml's `name: CI`, not its filename
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: selfheal-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+jobs:
+  self-heal:
+    name: Attempt auto-fix and open a PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: |
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'push' &&
+      !startsWith(github.event.workflow_run.head_branch, 'selfheal-')
+    permissions:
+      contents: write
+      pull-requests: write
+      # `gh label create`/`gh pr create --label` both write repository/PR
+      # labels, which GitHub scopes under the Issues permission (PRs are
+      # issues for labeling purposes) -- without this, the label step 403s
+      # under `set -e` after the fix is already committed and pushed,
+      # exiting before `gh pr create` and leaving an orphaned branch with no
+      # PR (Codex review, PR #379).
+      issues: write
+    steps:
+      - name: Checkout the failing commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+
+      # ci.yml's "test" job matrixes Python 3.11/3.12; both are set up here
+      # (rather than just one) so scripts/healthcheck.py can verify a repair
+      # against both interpreters before this workflow claims it fixed CI
+      # (Codex review, PR #379: a single-interpreter healthcheck can pass
+      # while a real 3.11-only regression in the matrix stays red). Each
+      # setup-python call adds that version's own `pythonX.Y` binary to
+      # PATH without removing the other's.
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements-dev.txt
+            production-safe-agent-loop/requirements.txt
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements-dev.txt
+            production-safe-agent-loop/requirements.txt
+
+      # Four isolated virtualenvs, one per environment ci.yml actually runs:
+      # its 3.11- and 3.12-matrixed "test" job (requirements-dev.txt only),
+      # its 3.11-pinned production-safe-agent-loop job (requirements-dev.txt
+      # PLUS production-safe-agent-loop/requirements.txt), and its
+      # 3.12-pinned audit job (just pip-audit). Installing
+      # production-safe-agent-loop's extra deps into the SAME environment
+      # used for core verification would let an undeclared core import that
+      # only those extras happen to provide look healthy here while ci.yml's
+      # real "test" job -- which never installs them -- fails on it for real
+      # (Codex review, PR #379).
+      - name: Create isolated verification environments
+        run: |
+          set -euo pipefail
+
+          python3.11 -m venv "$RUNNER_TEMP/venv-core311"
+          python3.12 -m venv "$RUNNER_TEMP/venv-core312"
+          python3.11 -m venv "$RUNNER_TEMP/venv-psal"
+          python3.12 -m venv "$RUNNER_TEMP/venv-audit"
+
+          "$RUNNER_TEMP/venv-core311/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/venv-core311/bin/python" -m pip install -r requirements-dev.txt
+
+          "$RUNNER_TEMP/venv-core312/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/venv-core312/bin/python" -m pip install -r requirements-dev.txt
+
+          "$RUNNER_TEMP/venv-psal/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/venv-psal/bin/python" -m pip install -r requirements-dev.txt -r production-safe-agent-loop/requirements.txt
+
+          "$RUNNER_TEMP/venv-audit/bin/python" -m pip install --upgrade pip pip-audit
+
+          {
+            echo "CORE311_PY=$RUNNER_TEMP/venv-core311/bin/python"
+            echo "CORE312_PY=$RUNNER_TEMP/venv-core312/bin/python"
+            echo "PSAL_PY=$RUNNER_TEMP/venv-psal/bin/python"
+            echo "AUDIT_PY=$RUNNER_TEMP/venv-audit/bin/python"
+          } >> "$GITHUB_ENV"
+
+      # `set -o pipefail` is belt-and-suspenders here, not decorative: without
+      # it, this step's exit status would be `tee`'s (always 0), not
+      # healthcheck.py's/self_heal.py's, so `continue-on-error` combined with
+      # `steps.repair.outcome` downstream could read a real failure as
+      # success (Codex review, PR #379).
+      - name: Healthcheck (pre-repair, informational only)
+        id: pre
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          python3.12 scripts/healthcheck.py \
+            --python "$CORE311_PY" --python "$CORE312_PY" \
+            --psal-python "$PSAL_PY" --audit-python "$AUDIT_PY" \
+            2>&1 | tee "$RUNNER_TEMP/selfheal-pre.txt"
+
+      - name: Attempt self-heal repair
+        id: repair
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          python3.12 scripts/self_heal.py \
+            --python "$CORE311_PY" --python "$CORE312_PY" \
+            --psal-python "$PSAL_PY" --audit-python "$AUDIT_PY" \
+            --ruff-python "$CORE312_PY" \
+            2>&1 | tee "$RUNNER_TEMP/selfheal-repair.txt"
+
+      - name: Collect logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfheal-logs-${{ github.event.workflow_run.head_sha }}
+          path: |
+            ${{ runner.temp }}/selfheal-pre.txt
+            ${{ runner.temp }}/selfheal-repair.txt
+          if-no-files-found: warn
+
+      # scripts/self_heal.py exits 0 only when its repair produced BOTH a
+      # passing post-repair healthcheck (under both interpreters) AND a
+      # non-empty diff -- that is the single fail-closed gate; nothing here
+      # re-derives that decision.
+      #
+      # `always() &&` is required, not decorative: an `if` with no explicit
+      # status-check function gets an implicit `success()` ANDed onto it by
+      # GitHub Actions, which would silently skip this step -- discarding a
+      # verified repair -- if the "Collect logs" step above (itself
+      # `if: always()`) failed for an unrelated reason like a transient
+      # artifact-upload error (Codex review, PR #379).
+      - name: Create PR with fix
+        if: always() && steps.repair.outcome == 'success'
+        env:
+          # github.token only -- see the KNOWN LIMITATION note at the top of
+          # this file for why a swappable long-lived credential was
+          # deliberately rejected here, and why ci.yml won't auto-trigger on
+          # the resulting branch/PR regardless of which credential is used.
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          FAILED_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          FAILED_RUN_URL: ${{ github.event.workflow_run.html_url }}
+          PRE_OUTCOME: ${{ steps.pre.outcome }}
+        # No heredocs here on purpose: a heredoc body written inside this
+        # indented `run: |` block carries that indentation as literal leading
+        # whitespace into the commit message / PR body text, and GitHub
+        # Markdown treats 4+ leading spaces as a code block -- which would
+        # silently break the whole PR body's rendering. `-m`/`printf` keep
+        # each string a single logical line, so there's no indentation to leak.
+        run: |
+          set -euo pipefail
+
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "No changes to commit; nothing to open a PR for."
+            exit 0
+          fi
+
+          # Deterministic per failing commit (no timestamp) so re-running this
+          # workflow against the same commit updates the existing branch/PR
+          # instead of opening a duplicate.
+          BRANCH="selfheal-${HEAD_SHA:0:12}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add -A
+          git commit \
+            -m "[Self-Heal] Auto-fix from CI failure on ${FAILED_BRANCH}" \
+            -m "Applied by scripts/self_heal.py after ${FAILED_RUN_URL} failed."
+
+          # persist-credentials is false on the checkout step by design (see
+          # the trust-boundary header above), so authenticate this push
+          # explicitly with the token this job already holds.
+          #
+          # Plain --force, not --force-with-lease: this checkout never
+          # fetched $BRANCH, so there is no local remote-tracking ref for
+          # --force-with-lease to compare against, and it refuses the push as
+          # stale on every rerun that follows the first one (Codex review,
+          # PR #379) -- exactly the retry case this deterministic branch name
+          # exists for. Plain --force is safe here because $BRANCH
+          # (selfheal-<sha>) is a deterministic, bot-exclusive name no human
+          # ever pushes to.
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "HEAD:refs/heads/$BRANCH"
+
+          EXISTING_PR="$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$EXISTING_PR" ]; then
+            echo "PR #$EXISTING_PR already open for $BRANCH; branch updated, nothing further to do."
+            exit 0
+          fi
+
+          # --force makes label creation idempotent (no error if it already
+          # exists) rather than requiring `gh pr create --label` to fail the
+          # whole run the first time this workflow ever opens a PR.
+          gh label create self-heal --description "Automated CI auto-fix, needs human review" --color ededed --force >/dev/null
+
+          BODY="$(printf '## Self-Heal Auto-PR\n\nOpened automatically after [this CI run](%s) failed on `%s` (%s).\n\n**Repair applied:** ruff lint auto-fix (`scripts/self_heal.py`) -- the only scripted repair this workflow is allowed to attempt (see that script'"'"'s module docstring for why the usual reinstall/lockfile/snapshot/stub repairs do not apply to this repo).\n\n**Verification:** `scripts/healthcheck.py` passed under both Python 3.11 and 3.12, each in its own isolated environment matching ci.yml'"'"'s actual per-job installs, against this diff before the PR was opened. Pre-repair healthcheck outcome: `%s`. Full logs are attached as the `selfheal-logs-%s` artifact on this workflow run.\n\n**CI on this PR:** ci.yml does NOT run automatically here (this workflow'"'"'s own token can'"'"'t trigger it, and ci.yml'"'"'s branch filters would not match this branch/PR base even if it could -- see this workflow'"'"'s file header for why, and for two things that look like they'"'"'d fix that but don'"'"'t). The healthcheck run above is this PR'"'"'s only automated verification. For a real ci.yml run against this exact fix, merge or cherry-pick this branch into `%s` yourself and push that directly -- a human-authenticated push does trigger ci.yml normally.\n\nReview before merging -- this PR was not auto-merged.\n' "$FAILED_RUN_URL" "$FAILED_BRANCH" "$HEAD_SHA" "$PRE_OUTCOME" "$HEAD_SHA" "$FAILED_BRANCH")"
+
+          gh pr create \
+            --title "[Self-Heal] Auto-fix CI failure on ${FAILED_BRANCH}" \
+            --body "$BODY" \
+            --label "self-heal" \
+            --head "$BRANCH" \
+            --base "${FAILED_BRANCH}"
