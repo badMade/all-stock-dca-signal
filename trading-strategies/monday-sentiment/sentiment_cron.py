@@ -28,6 +28,7 @@ import shutil
 import smtplib
 import sys
 import traceback
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -107,6 +108,28 @@ COMPANY_NAMES: Dict[str, str] = {
 # ===========================================================================
 # Data structures (simple dicts rather than dataclasses to stay lean)
 # ===========================================================================
+
+def _sanitize_exception(exc: BaseException) -> str:
+    """Render ``exc`` as its class name plus, only for known-safe cases, a
+    short reason -- never its full message.
+
+    A delivery failure can raise exceptions whose message embeds the
+    complete offending URL/path -- e.g. ``http.client.InvalidURL`` for a
+    webhook URL containing a space or control character quotes the whole
+    path back -- and webhook URLs commonly carry auth tokens in that path.
+    Logging ``str(exc)`` unconditionally would expose those tokens to stderr.
+    Mirrored identically from dca_alerts._sanitize_exception.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"{type(exc).__name__}: HTTP {exc.code}"
+    if isinstance(exc, urllib.error.URLError):
+        reason = exc.reason
+        if isinstance(reason, OSError) and getattr(reason, "errno", None) is not None:
+            return f"{type(exc).__name__}: errno {reason.errno}"
+        if isinstance(reason, BaseException):
+            return f"{type(exc).__name__}: {type(reason).__name__}"
+        return type(exc).__name__
+    return type(exc).__name__
 
 def make_item(text: str, source: str, item_type: str) -> dict:
     """
@@ -229,6 +252,11 @@ async def fetch_news_headlines(session: aiohttp.ClientSession, ticker: str, api_
             resp.raise_for_status()
             data = await resp.json()
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        # api_key is the only secret that could plausibly appear in an
+        # aiohttp exception string for this call (it's sent as a header,
+        # never in the URL/params) -- redact it directly rather than
+        # collapsing to _sanitize_exception's class-name-only fallback,
+        # which would erase useful diagnostic detail for no security gain.
         safe_exc = str(exc).replace(api_key, "***") if api_key else str(exc)
         log.warning("NewsAPI request failed for %s: %s", ticker, safe_exc)
         return []
@@ -334,7 +362,10 @@ async def fetch_sec_filings(
             resp.raise_for_status()
             data = await resp.json()
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-        log.warning("SEC EDGAR request failed for %s: %s", ticker, exc)
+        # No secret is involved in this request, but the raw exception can
+        # still embed the full request URL (query params/host) -- sanitize
+        # it the same way the other network calls in this module do.
+        log.warning("SEC EDGAR request failed for %s: %s", ticker, _sanitize_exception(exc))
         return []
     except json.JSONDecodeError:
         log.warning("SEC EDGAR returned non-JSON for %s", ticker)
@@ -972,11 +1003,20 @@ def send_email(
         log.info("Email sent to %s via %s:%d", recipient, smtp_host, smtp_port)
         return True
     except smtplib.SMTPAuthenticationError as exc:
-        log.error("SMTP authentication failed: %s", exc)
+        safe_exc = str(exc)
+        if smtp_password:
+            safe_exc = safe_exc.replace(smtp_password, "***")
+        log.error("SMTP authentication failed: %s", safe_exc)
     except smtplib.SMTPException as exc:
-        log.error("SMTP error: %s", exc)
+        safe_exc = str(exc)
+        if smtp_password:
+            safe_exc = safe_exc.replace(smtp_password, "***")
+        log.error("SMTP error: %s", safe_exc)
     except OSError as exc:
-        log.error("Network error sending email: %s", exc)
+        safe_exc = str(exc)
+        if smtp_password:
+            safe_exc = safe_exc.replace(smtp_password, "***")
+        log.error("Network error sending email: %s", safe_exc)
     return False
 
 
@@ -1063,11 +1103,17 @@ def run(args: argparse.Namespace) -> int:
 
     for ticker, score_res in zip(tickers, scored_results):
         if isinstance(score_res, Exception):
-            log.error("[%s] Unexpected error during scoring: %s", ticker, score_res)
-            log.debug(
-                "Exception details:\n%s",
-                "".join(traceback.format_exception(type(score_res), score_res, score_res.__traceback__)),
-            )
+            safe_exc = _sanitize_exception(score_res)
+            # Stack frames only (traceback.format_tb), never format_exception
+            # -- the latter's final line is the exception's own str(), which
+            # is exactly the unredacted message _sanitize_exception exists to
+            # suppress.
+            safe_traceback = "".join(traceback.format_tb(score_res.__traceback__))
+            if news_api_key:
+                safe_exc = safe_exc.replace(news_api_key, "***")
+                safe_traceback = safe_traceback.replace(news_api_key, "***")
+            log.error("[%s] Unexpected error during scoring: %s", ticker, safe_exc)
+            log.debug("Exception details (stack only):\n%s", safe_traceback)
             score, scored_items = 0.0, []
         else:
             score, scored_items = score_res

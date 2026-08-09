@@ -31,6 +31,8 @@ import logging
 import os
 import smtplib
 import sys
+import traceback
+import urllib.error
 from datetime import date, datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -577,7 +579,14 @@ class NewsCollector:
             logger.info("NewsAPI: %d articles for %s", len(results), ticker)
             return results
         except Exception as exc:
-            safe_exc = str(exc).replace(self.api_key, "***") if self.api_key else str(exc)
+            # self.api_key is the only secret that can appear here (it's sent
+            # as a header, never in the URL), so redact it directly rather
+            # than collapsing to _sanitize_exception's class-name-only
+            # fallback, which drops the redaction marker regression tests
+            # rely on (codex review discussion_r3742559536).
+            safe_exc = str(exc)
+            if self.api_key:
+                safe_exc = safe_exc.replace(self.api_key, "***")
             logger.error("NewsAPI error for %s: %s", ticker, safe_exc)
             return []
 
@@ -650,7 +659,7 @@ class SECCollector:
                         "url": f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={ticker}&type={form_type}",
                     })
             except Exception as exc:
-                logger.warning("SEC EDGAR error for %s / %s: %s", ticker, form_type, exc)
+                logger.warning("SEC EDGAR error for %s / %s: %s", ticker, form_type, _sanitize_exception(exc))
 
         logger.info("SEC EDGAR: %d filing snippets for %s", len(results), ticker)
         return results
@@ -905,13 +914,38 @@ class EmailBriefing:
                 server.sendmail(self.smtp_user, [self.recipient], msg.as_string())
             logger.info("Email sent to %s via %s:%d", self.recipient, self.smtp_host, self.smtp_port)
         except smtplib.SMTPException as exc:
-            logger.error("Failed to send email: %s", exc)
+            safe_exc = str(exc)
+            if self.smtp_password:
+                safe_exc = safe_exc.replace(self.smtp_password, "***")
+            logger.error("Failed to send email: %s", safe_exc)
             raise
 
 
 # ===========================================================================
 # Helper functions
 # ===========================================================================
+
+def _sanitize_exception(exc: BaseException) -> str:
+    """Render ``exc`` as its class name plus, only for known-safe cases, a
+    short reason -- never its full message.
+
+    A delivery failure can raise exceptions whose message embeds the
+    complete offending URL/path -- e.g. ``http.client.InvalidURL`` for a
+    webhook URL containing a space or control character quotes the whole
+    path back -- and webhook URLs commonly carry auth tokens in that path.
+    Logging ``str(exc)`` unconditionally would expose those tokens to stderr.
+    Mirrored identically from dca_alerts._sanitize_exception.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"{type(exc).__name__}: HTTP {exc.code}"
+    if isinstance(exc, urllib.error.URLError):
+        reason = exc.reason
+        if isinstance(reason, OSError) and getattr(reason, "errno", None) is not None:
+            return f"{type(exc).__name__}: errno {reason.errno}"
+        if isinstance(reason, BaseException):
+            return f"{type(exc).__name__}: {type(reason).__name__}"
+        return type(exc).__name__
+    return type(exc).__name__
 
 def _direction(score: float, zscore: Optional[float]) -> str:
     """
@@ -1166,7 +1200,16 @@ if __name__ == "__main__":
         logger.info("Interrupted by user.")
         sys.exit(0)
     except Exception as exc:
-        logger.exception("Fatal error in pipeline: %s", exc)
+        safe_exc = str(exc)
+        safe_traceback = traceback.format_exc()
+        if os.getenv("SMTP_PASSWORD"):
+            safe_exc = safe_exc.replace(os.getenv("SMTP_PASSWORD", ""), "***")
+            safe_traceback = safe_traceback.replace(os.getenv("SMTP_PASSWORD", ""), "***")
+        if os.getenv("NEWS_API_KEY"):
+            safe_exc = safe_exc.replace(os.getenv("NEWS_API_KEY", ""), "***")
+            safe_traceback = safe_traceback.replace(os.getenv("NEWS_API_KEY", ""), "***")
+        logger.error("Fatal error in pipeline: %s", safe_exc)
+        logger.debug(safe_traceback)
         sys.exit(1)
 
     # Summary printout (non-dry-run mode)

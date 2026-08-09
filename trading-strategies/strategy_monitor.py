@@ -535,9 +535,12 @@ class StrategyRunner:
                 results[strat["name"]] = ret
             except Exception as exc:
                 logger.error(
-                    "Strategy '%s' simulation failed: %s", strat["name"], exc
+                    "Strategy '%s' simulation failed: %s", strat["name"], type(exc).__name__
                 )
-                logger.debug(traceback.format_exc())
+                # Stack frames only -- traceback.format_exc()'s final line is
+                # str(exc), which can embed a full URL/token and would undo
+                # the redaction above (codex review discussion_r3742558644).
+                logger.debug("".join(traceback.format_tb(exc.__traceback__)))
                 results[strat["name"]] = pd.Series(dtype=float)
 
         return results
@@ -1092,7 +1095,7 @@ class SheetsWriter:
             logger.error("SheetsWriter HTTP error %d: %s", exc.code, self._sanitize(body))
             return False
         except Exception as exc:
-            logger.error("SheetsWriter failed: %s", exc)
+            logger.error("SheetsWriter failed: %s", self._sanitize(str(exc)))
             return False
 
     @staticmethod
@@ -1344,8 +1347,13 @@ class MonitorOrchestrator:
                 try:
                     self.emailer.send(html_body, subject)
                 except Exception as exc:
-                    logger.error("Email send failed: %s", exc)
-                    logger.debug(traceback.format_exc())
+                    safe_exc = str(exc)
+                    safe_traceback = traceback.format_exc()
+                    if self.cfg.get("SMTP_PASSWORD"):
+                        safe_exc = safe_exc.replace(self.cfg["SMTP_PASSWORD"], "***")
+                        safe_traceback = safe_traceback.replace(self.cfg["SMTP_PASSWORD"], "***")
+                    logger.error("Email send failed: %s", safe_exc)
+                    logger.debug(safe_traceback)
                     exit_code = 1
             else:
                 logger.info(
@@ -1530,8 +1538,16 @@ if __name__ == "__main__":
         logger.info("Interrupted by user.")
         sys.exit(0)
     except Exception as exc:
-        logger.critical("Unhandled exception: %s", exc)
-        logger.debug(traceback.format_exc())
+        safe_exc = str(exc)
+        safe_traceback = traceback.format_exc()
+        if effective_config.get("SMTP_PASSWORD"):
+            safe_exc = safe_exc.replace(effective_config["SMTP_PASSWORD"], "***")
+            safe_traceback = safe_traceback.replace(effective_config["SMTP_PASSWORD"], "***")
+        if effective_config.get("PIPEDREAM_TOKEN"):
+            safe_exc = safe_exc.replace(effective_config["PIPEDREAM_TOKEN"], "***")
+            safe_traceback = safe_traceback.replace(effective_config["PIPEDREAM_TOKEN"], "***")
+        logger.critical("Unhandled exception: %s", safe_exc)
+        logger.debug(safe_traceback)
         sys.exit(1)
 
     sys.exit(code)

@@ -66,9 +66,9 @@ except ImportError:
 
 # Optional rich for prettier console output
 try:
+    from rich import box
     from rich.console import Console
     from rich.table import Table
-    from rich import box
     RICH_AVAILABLE = True
     console = Console()
 except ImportError:
