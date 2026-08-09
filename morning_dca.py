@@ -798,20 +798,6 @@ def preflight_ticker_eligibility_row(signal: "MorningSignal") -> Dict[str, Any]:
 
 
 @dataclass(frozen=True)
-class OrderPlacementContext:
-    """Encapsulates parameters required to place broker orders."""
-    candidates: List["MorningSignal"]
-    trading_day: Any
-    broker: BrokerAdapter
-    top_up_outcomes: Optional[Dict[str, Any]]
-    remaining_daily: float
-    remaining_weekly: float
-    manual: bool = False
-    data: Any = None
-    now: Optional[datetime] = None
-
-
-@dataclass(frozen=True)
 class MorningSignal:
     """One morning signal row for a single ticker."""
 
@@ -4259,18 +4245,96 @@ class MorningDCAExecutor(DCAExecutor):
         )
         return {"artifacts": artifacts, "paths": paths}
 
-    def _gather_seed_candidate_paths(
-        self,
-        trading_day: date,
-        week_start: date,
-        scheduled_path: Path,
-    ) -> Tuple[List[Tuple[Path, bool]], set[Path], Dict[Path, Dict[str, Any]]]:
-        candidate_paths: List[Tuple[Path, bool]] = []
-        _earlier_weekday_sibling_paths: set[Path] = set()
+    def _seed_ledger_from_prior_runs(self, now: datetime) -> None:
+        """Fold already-submitted same-day/same-week spend into the ledger.
 
+        ``MorningLedger`` is in-memory and this executor is normally instantiated
+        fresh per invocation (a new cron process each time), so a retried or
+        manually rerun live task would otherwise see an empty ledger and could
+        re-spend a cap that an earlier run already spent against. This scans
+        this stream's own live run-state artifacts under this stream's
+        scheduled-folder naming for every day in the current ISO week up to and
+        including today -- the fixed scheduled path for today specifically (a
+        retry overwrites that same path, so the pre-retry file must be read
+        before that happens) -- plus, when :attr:`scan_manual_reruns_for_ledger`
+        is true, any ``manual_run_subdir`` reruns.
+
+        Each already ``submitted``/``filled`` buy candidate's amount from an
+        earlier day in the same ISO week folds into ``planned_by_week`` only
+        (the daily bucket stays scoped to today, and that day already ended).
+        This guards the weekly cap across a fresh process starting later in
+        the week. A file dated today folds into both ``planned_by_day`` and
+        ``planned_by_week`` (via ``record_hypothetical``) UNLESS this stream
+        has ``cap_seed_roots`` configured, in which case ``_compute_top_up``'s
+        cap_seed_roots scan already seeds today's own-stream spend from the
+        same on-disk artifacts and this method must not seed it a second time.
+
+        Guards against double-counting a run's own on-disk artifact if the
+        SAME executor instance calls ``run()`` again later: ``run()`` adds its
+        own ``run_id`` to ``self._seeded_prior_run_ids`` right after writing,
+        so a later same-instance seeding pass recognizes and skips it (its
+        spend is already reflected in ``self.ledger`` from that first call).
+        A different (fresh) instance scanning the same file for the first time
+        still folds it in correctly.
+
+        Also records today's own submitted/filled rows from the fixed
+        scheduled path (not manual reruns, which write to unique paths and are
+        never overwritten) into ``self._prior_same_day_candidate_rows`` so
+        ``run()`` can carry them forward into the artifact it's about to
+        overwrite on a same-day scheduled retry.
+
+        Watchlist/preflight modes never place real orders, so caps are never
+        enforced there and this is a no-op outside live mode.
+        """
+        self._prior_same_day_candidate_rows = []
+        if self.mode != MORNING_LIVE_MODE:
+            return
+        trading_day = now.astimezone(EASTERN).date()
+        this_week = iso_week_key(trading_day)
         state_root = Path(self.state_root)
         folder_suffix = self.profile["folder_suffix"]
+        # _compute_top_up's cap_seed_roots scan already seeds TODAY's own-stream
+        # spend (both planned_by_day and planned_by_week) when cap_seed_roots is
+        # configured AND actually covers the scheduled dated-slot path --
+        # seeding it again here would double-count the same on-disk artifact.
+        # Only skip today's amount in that case; a narrower cap_seed_roots
+        # config that covers only manual_runs/ (explicitly supported by
+        # _compute_top_up's own_manual_in_scan/own_scheduled_in_scan split)
+        # never sees the scheduled slot, so this method must remain the one
+        # seeding it or a scheduled retry could re-spend the full cap.
+        # Not restricted to the morning stream (2026-08-02): _compute_top_up's
+        # cap_seed_roots block above is stream-agnostic and now runs for any
+        # stream with cap_seed_roots configured (midday included, since its
+        # own cap ledger became genuinely cross-stream-pooled too), so this
+        # double-count guard must recognize that for every such stream, not
+        # just morning.
+        _cap_seed_roots = getattr(self.config, "cap_seed_roots", None)
+        _today_seeded_by_cap_roots = bool(_cap_seed_roots) and any(
+            Path(self.state_root).is_relative_to(Path(r)) for r in _cap_seed_roots
+        )
 
+        scheduled_path = self.run_state_dir(now) / "run_state.json"
+        candidate_paths: List[Tuple[Path, bool]] = []
+        # Paths whose read/parse failure must fail closed (Codex review:
+        # "Fail closed on unreadable prior-week cap artifacts"), tracked
+        # separately from same-day/own-stream candidate_paths so a read/parse
+        # failure on ONE of these specifically can fail closed without also
+        # tripping on TODAY's own-stream miss, which has its own, separate
+        # handling elsewhere (_compute_top_up's skip_sink). Despite the name,
+        # this covers every EARLIER-weekday candidate discovered below,
+        # including THIS stream's own fixed scheduled path for an earlier
+        # day -- not just the cross-stream sibling-root scan further down.
+        # An earlier fix only added cross-stream sibling paths here, missing
+        # that the day-loop immediately below ALSO discovers this stream's
+        # OWN earlier-weekday fixed paths (e.g. Monday's own run_state.json,
+        # scanned again on Tuesday); an unreadable one of those silently
+        # skipped without setting _cap_seed_scan_incomplete, since neither
+        # this set nor _compute_top_up (which only ever covers TODAY) caught
+        # it, letting Monday's own spend vanish from the weekly ledger
+        # (Codex review: "Fail closed on unreadable own-stream prior-week
+        # states").
+        _earlier_weekday_sibling_paths: set = set()
+        week_start = trading_day - timedelta(days=trading_day.weekday())
         day = week_start
         while day <= trading_day:
             path = state_root / f"{day.strftime('%Y%m%d')}_{folder_suffix}" / "run_state.json"
@@ -4281,9 +4345,49 @@ class MorningDCAExecutor(DCAExecutor):
                     _earlier_weekday_sibling_paths.add(path)
             day += timedelta(days=1)
 
-        _cap_seed_roots = getattr(self.config, "cap_seed_roots", None)
+        # Cross-stream EARLIER-WEEKDAY seeding (Codex review, 2026-08-02:
+        # "Include earlier weekdays in cross-stream cap seeding"). The loop
+        # above only scans THIS stream's own root. _compute_top_up's own
+        # cap_seed_roots block already covers every sibling stream for TODAY
+        # specifically, but never for earlier days in the ISO week -- so
+        # without this, a Tuesday midday run never saw Monday's market-open/
+        # morning spend against the shared weekly cap, understating real
+        # week-to-date spend. Glob each sibling root generically
+        # (YYYYMMDD_*ET) rather than assuming this stream's own
+        # folder_suffix, since every sibling stream uses its own slot-time
+        # suffix (per-slot state-file guarantee, docs/safeguards.md).
+        # Deliberately scoped to day < trading_day only: TODAY's cross-stream
+        # seeding stays exclusively _compute_top_up's job, which tracks it
+        # via a different dedup key (_cap_seeded_amounts) than this method's
+        # own _seeded_prior_run_ids -- scanning today here too would let the
+        # two independent dedup mechanisms double-count the same fill.
         if _cap_seed_roots:
+            # Every known manual-subtree naming convention across EVERY
+            # cap_seed_roots entry, including the current stream's OWN root
+            # -- Codex review: "Scan nested manual runs when seeding prior
+            # weekdays" and, in a later pass, "Include the current stream's
+            # nested manual artifacts": the separate own-stream day-loop
+            # above only checks the fixed scheduled-slot path (plus, for
+            # morning specifically, manual_runs/ but only for TODAY via
+            # scan_manual_reruns_for_ledger) -- so an EARLIER-weekday manual
+            # recovery/rerun under the current stream's own root (e.g. a
+            # morning manual_recovery/ backfill, or any midday
+            # manual_reruns/manual_recovery from a prior weekday) was
+            # invisible to the weekly ledger. Each manual subdirectory nests
+            # its dated run folders the same way the scheduled root does
+            # (e.g. midday_dca/manual_runs/20260721_1345ET/run_state.json),
+            # so the same day_str + "_*ET" glob pattern applies one level
+            # deeper.
             manual_subdirs = ("manual_runs", "manual_reruns", "manual_recovery")
+            # The afternoon stream (near_close_dca / ce16ba6b) nests its
+            # SCHEDULED artifacts one level deeper than every other stream --
+            # config/run_classification.json's scheduled_run_dir is
+            # ce16ba6b/scheduled_runs/YYYYMMDD_1530ET/run_state.json, not a
+            # bare ce16ba6b/YYYYMMDD_1530ET/ -- so the bare-root glob below
+            # never finds afternoon's own scheduled runs at all (Codex
+            # review: "Scan prior-week afternoon scheduled runs"). Harmless
+            # no-op for every other stream, whose roots have no
+            # scheduled_runs/ subdirectory.
             all_cap_roots = [Path(r) for r in _cap_seed_roots]
             earlier_day = week_start
             while earlier_day < trading_day:
@@ -4291,18 +4395,42 @@ class MorningDCAExecutor(DCAExecutor):
                 for cap_root in all_cap_roots:
                     if not cap_root.exists():
                         continue
+                    # The bare root is scanned for every cap_seed_roots entry,
+                    # INCLUDING the current stream's own root: for a stream
+                    # whose profiles all share ONE root across MULTIPLE
+                    # folder_suffix values (e.g. intraday_dca's 1130ET/1330ET/
+                    # 1430ET slots), the day-loop above only matches THIS
+                    # instance's own folder_suffix, so an earlier weekday's
+                    # sibling-suffix fill under the same root (e.g. Monday's
+                    # 11:30/2:30 runs, from a Tuesday 1:30 run's point of view)
+                    # was never found by either mechanism and silently
+                    # excluded from the pooled weekly cap (Codex review:
+                    # "Seed the weekly cap from every intraday slot"). For a
+                    # stream with exactly one folder_suffix per root (morning,
+                    # midday, market-open, afternoon), the day-loop's own path
+                    # is rediscovered here and simply deduped via
+                    # _earlier_weekday_sibling_paths below -- a harmless no-op
+                    # superset, not a double count.
                     search_dirs = [""] + list(manual_subdirs) + ["scheduled_runs"]
                     for subdir in search_dirs:
                         search_dir = cap_root / subdir if subdir else cap_root
                         if not search_dir.exists():
                             continue
+                        # Wildcard-prefixed day match (not anchored to the
+                        # start of the directory name): final_manual_review's
+                        # own dated dirs are named
+                        # budget_block_override_YYYYMMDD_HHMMET, not a bare
+                        # YYYYMMDD_*ET (Codex review: "Include out-of-tree
+                        # manual fills in pooled roots"). Harmless superset
+                        # for every other root, whose dated dirs already
+                        # start with YYYYMMDD and match either way.
                         for path in sorted(search_dir.glob(f"*{day_str}_*ET/run_state.json")):
                             if path in _earlier_weekday_sibling_paths:
                                 continue
                             candidate_paths.append((path, False))
                             _earlier_weekday_sibling_paths.add(path)
                 earlier_day += timedelta(days=1)
-
+        # Cache parsed manual-run states to avoid re-reading files in the main loop.
         _manual_state_cache: Dict[Path, Dict[str, Any]] = {}
         if self.scan_manual_reruns_for_ledger:
             manual_root = state_root / self.manual_run_subdir
@@ -4317,144 +4445,230 @@ class MorningDCAExecutor(DCAExecutor):
                     filtered_manual.append((p, False))
                 candidate_paths.extend(filtered_manual)
 
-        return candidate_paths, _earlier_weekday_sibling_paths, _manual_state_cache
-
-    def _process_seed_candidate(
-        self,
-        path: Path,
-        is_scheduled_today: bool,
-        _manual_state_cache: Dict[Path, Dict[str, Any]],
-        _earlier_weekday_sibling_paths: set,
-        trading_day: date,
-        this_week: str,
-        now: datetime,
-        _today_seeded_by_cap_roots: bool,
-    ) -> None:
-        if path in _manual_state_cache:
-            state = _manual_state_cache[path]
-        else:
-            try:
-                state = json.loads(path.read_bytes())
-            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        for path, is_scheduled_today in candidate_paths:
+            if path in _manual_state_cache:
+                state = _manual_state_cache[path]
+            else:
+                try:
+                    state = json.loads(path.read_bytes())
+                except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                    # An unreadable/mid-write artifact from the earlier-weekday
+                    # sibling scan is exactly as unverifiable as a same-day
+                    # skip_sink miss -- fail closed rather than silently
+                    # undercounting this week's shared spend (Codex review:
+                    # "Fail closed on unreadable prior-week cap artifacts").
+                    # A same-day/own-stream miss is NOT included here: that
+                    # case is already covered by _compute_top_up's own
+                    # skip_sink/fail-closed handling and flagging it again
+                    # here would be redundant, not more correct.
+                    if path in _earlier_weekday_sibling_paths:
+                        self._cap_seed_scan_incomplete = True
+                        self._cap_seed_scan_incomplete_paths.append(str(path))
+                    continue
+            # A valid JSON document whose root is a list, string, or other
+            # non-object value (e.g. a partially recovered artifact) has no
+            # .get() -- skip it rather than raising AttributeError and
+            # crashing the retry before it can reach the fail-closed path.
+            if not isinstance(state, dict):
                 if path in _earlier_weekday_sibling_paths:
                     self._cap_seed_scan_incomplete = True
                     self._cap_seed_scan_incomplete_paths.append(str(path))
-                return
-        if not isinstance(state, dict):
-            if path in _earlier_weekday_sibling_paths:
-                self._cap_seed_scan_incomplete = True
-                self._cap_seed_scan_incomplete_paths.append(str(path))
-            return
-        file_trading_day_str = state.get("trading_day")
-        try:
-            file_trading_day = (
-                date.fromisoformat(file_trading_day_str) if file_trading_day_str else None
-            )
-        except (TypeError, ValueError):
-            file_trading_day = None
-        if file_trading_day is None:
-            if path in _earlier_weekday_sibling_paths:
-                self._cap_seed_scan_incomplete = True
-                self._cap_seed_scan_incomplete_paths.append(str(path))
-            return
-        if file_trading_day > trading_day:
-            return
-        if iso_week_key(file_trading_day) != this_week:
-            return
-        if _run_state_after_boundary(state, now):
-            return
-        run_id = state.get("run_id")
-        if run_id is None:
-            if path in _earlier_weekday_sibling_paths:
-                self._cap_seed_scan_incomplete = True
-                self._cap_seed_scan_incomplete_paths.append(str(path))
-            return
-        already_seeded = run_id in self._seeded_prior_run_ids
-        if already_seeded:
-            if is_scheduled_today:
-                _bcs = state.get("buy_candidates") or []
-                if isinstance(_bcs, list):
-                    submitted_rows_only = [
-                        c for c in _bcs
-                        if isinstance(c, dict) and c.get("status") in ("submitted", "filled")
-                    ]
-                    if submitted_rows_only:
-                        self._prior_same_day_candidate_rows.extend(submitted_rows_only)
-            return
-        total = 0.0
-        submitted_rows = []
-        _buy_candidates = state.get("buy_candidates") or []
-        if not isinstance(_buy_candidates, list):
-            _buy_candidates = []
-        for candidate in _buy_candidates:
-            if not isinstance(candidate, dict):
                 continue
-            if candidate.get("status") not in ("submitted", "filled"):
-                continue
-            amount = candidate.get("planned_amount_usd")
-            if amount is None:
-                amount = candidate.get("hypothetical_amount_usd")
+            file_trading_day_str = state.get("trading_day")
             try:
-                amount = float(amount)
+                file_trading_day = (
+                    date.fromisoformat(file_trading_day_str) if file_trading_day_str else None
+                )
             except (TypeError, ValueError):
+                file_trading_day = None
+            if file_trading_day is None:
+                # Missing or unparseable trading_day on an otherwise-valid
+                # JSON object is invalid required metadata, not a legitimate
+                # out-of-scope artifact -- fail closed for an earlier-weekday
+                # sibling path the same way a non-object root already does
+                # (Codex review: "Fail closed when prior-week state metadata
+                # is invalid"). A future-dated or different-week artifact
+                # (checked below) is NOT this case: its metadata is valid, it
+                # is simply out of this scan's scope, so it stays an ordinary
+                # skip.
+                if path in _earlier_weekday_sibling_paths:
+                    self._cap_seed_scan_incomplete = True
+                    self._cap_seed_scan_incomplete_paths.append(str(path))
                 continue
-            if not math.isfinite(amount):
+            if file_trading_day > trading_day:
                 continue
-            if amount > 0:
-                total += amount
-                submitted_rows.append(candidate)
+            if iso_week_key(file_trading_day) != this_week:
+                continue
+            # Applies to manual reruns AND the day-by-day scheduled/fixed-slot
+            # paths alike: a replayed/backfilled run (this call's own `now`)
+            # must not seed cap spend out of an artifact that was actually
+            # written later in the day than the decision being reproduced --
+            # e.g. a delayed scheduled invocation whose fixed YYYYMMDD_1030ET/
+            # run_state.json ends up with a generated_at well after 10:30.
+            if _run_state_after_boundary(state, now):
+                continue
+            run_id = state.get("run_id")
+            if run_id is None:
+                # Same reasoning as the missing-trading_day case above: a
+                # valid JSON object with no run_id has invalid required
+                # metadata, not merely nothing-to-seed-from (Codex review:
+                # "Fail closed when prior-week state metadata is invalid").
+                if path in _earlier_weekday_sibling_paths:
+                    self._cap_seed_scan_incomplete = True
+                    self._cap_seed_scan_incomplete_paths.append(str(path))
+                continue
+            already_seeded = run_id in self._seeded_prior_run_ids
+            if already_seeded:
+                # Ledger already has this run's spend; skip re-seeding, but
+                # still load submitted rows from the scheduled path so a second
+                # call to run() on the SAME executor instance (same run_id)
+                # carries them forward into _prior_same_day_candidate_rows.
+                if is_scheduled_today:
+                    _bcs = state.get("buy_candidates") or []
+                    if isinstance(_bcs, list):
+                        submitted_rows_only = [
+                            c for c in _bcs
+                            if isinstance(c, dict) and c.get("status") in ("submitted", "filled")
+                        ]
+                        if submitted_rows_only:
+                            self._prior_same_day_candidate_rows.extend(submitted_rows_only)
+                continue
+            total = 0.0
+            submitted_rows = []
+            _buy_candidates = state.get("buy_candidates") or []
+            if not isinstance(_buy_candidates, list):
+                _buy_candidates = []
+            for candidate in _buy_candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                if candidate.get("status") not in ("submitted", "filled"):
+                    continue
+                amount = candidate.get("planned_amount_usd")
+                if amount is None:
+                    amount = candidate.get("hypothetical_amount_usd")
+                try:
+                    amount = float(amount)
+                except (TypeError, ValueError):
+                    continue
+                # Reject inf/-inf/nan for the same reason as the CSV cross-check
+                # below: an infinite amount would seed infinite cap spend.
+                if not math.isfinite(amount):
+                    continue
+                if amount > 0:
+                    total += amount
+                    submitted_rows.append(candidate)
 
-        filled_orders_csv = path.parent / "filled_orders.csv"
-        orders_csv = path.parent / "orders.csv"
-        submitted_orders_csv = path.parent / "submitted_orders.csv"
-        _csv_skip_sink: Optional[List[Path]] = (
-            [] if path in _earlier_weekday_sibling_paths else None
-        )
-        csv_total = _csv_qualifying_notional_total(
-            filled_orders_csv, blank_status_means_filled=True, skip_sink=_csv_skip_sink
-        )
-        if orders_csv.exists() and orders_csv != filled_orders_csv:
-            csv_total = max(
-                csv_total,
-                _csv_qualifying_notional_total(
-                    orders_csv, blank_status_means_filled=False, skip_sink=_csv_skip_sink
-                ),
+            # Cross-check against the broker-order log written alongside
+            # run_state.json: a Copilot Autofix pass flagged that the JSON
+            # buy_candidates total could under-report actual submitted/filled
+            # spend, so take whichever total is larger as the true
+            # already-spent amount for cap-seeding purposes.
+            # filled_orders.csv (the confirmed-fill source written by manual
+            # midday overrides) is generally the more trustworthy signal, since
+            # orders.csv is always written with blank avg_fill_price /
+            # quantity_filled fields and would shadow real fill data -- but a
+            # PARTIAL filled_orders.csv (some rows confirmed, others still only
+            # in orders.csv as submitted-not-yet-confirmed) can under-report
+            # relative to orders.csv's total. Take the larger of the two
+            # qualifying totals, consistent with the same "take whichever is
+            # larger" policy already applied against the JSON total above,
+            # rather than treating the two files as mutually exclusive.
+            filled_orders_csv = path.parent / "filled_orders.csv"
+            orders_csv = path.parent / "orders.csv"
+            # submitted_orders.csv is the CANONICAL evidence source for the
+            # market-open/intraday streams, which have no in-repo Python code
+            # writing buy_candidates/filled_orders.csv/orders.csv -- their
+            # Claude-executor prompts write only run_state.json (via Gate 9)
+            # and submitted_orders.csv (via Gate 6.5-style bookkeeping). Without
+            # this, a valid earlier-weekday market-open/intraday run whose
+            # evidence exists ONLY in submitted_orders.csv contributed $0 to
+            # this week's shared ledger (Codex review: "Read canonical
+            # submitted-order files for prior weekdays").
+            submitted_orders_csv = path.parent / "submitted_orders.csv"
+            # For an earlier-weekday sibling path, a CSV that EXISTS but
+            # cannot be read/parsed must fail closed rather than silently
+            # read as "no orders in this file" -- Codex review: "Fail closed
+            # when prior-week order CSVs cannot be parsed". Scoped to
+            # earlier-weekday sibling paths only, matching this method's
+            # other fail-closed handling; today's own-stream scan has its
+            # own separate skip_sink handling in _compute_top_up.
+            _csv_skip_sink: Optional[List[Path]] = (
+                [] if path in _earlier_weekday_sibling_paths else None
             )
-        if submitted_orders_csv.exists() and submitted_orders_csv not in (
-            filled_orders_csv,
-            orders_csv,
-        ):
-            csv_total = max(
-                csv_total,
-                _csv_qualifying_notional_total(
-                    submitted_orders_csv, blank_status_means_filled=False, skip_sink=_csv_skip_sink
-                ),
+            csv_total = _csv_qualifying_notional_total(
+                filled_orders_csv, blank_status_means_filled=True, skip_sink=_csv_skip_sink
             )
-        if _csv_skip_sink:
-            self._cap_seed_scan_incomplete = True
-            self._cap_seed_scan_incomplete_paths.extend(str(p) for p in _csv_skip_sink)
-        total = max(total, csv_total)
-        if not _csv_skip_sink:
-            self._seeded_prior_run_ids.add(run_id)
-            if total > 0:
-                if file_trading_day == trading_day:
-                    if not _today_seeded_by_cap_roots:
-                        self.ledger.record_hypothetical(trading_day, total)
-                else:
-                    self.ledger.planned_by_week[this_week] = (
-                        self.ledger.planned_by_week.get(this_week, 0.0) + total
-                    )
-        if is_scheduled_today and submitted_rows:
-            self._prior_same_day_candidate_rows.extend(submitted_rows)
+            if orders_csv.exists() and orders_csv != filled_orders_csv:
+                csv_total = max(
+                    csv_total,
+                    _csv_qualifying_notional_total(
+                        orders_csv, blank_status_means_filled=False, skip_sink=_csv_skip_sink
+                    ),
+                )
+            if submitted_orders_csv.exists() and submitted_orders_csv not in (
+                filled_orders_csv,
+                orders_csv,
+            ):
+                csv_total = max(
+                    csv_total,
+                    _csv_qualifying_notional_total(
+                        submitted_orders_csv, blank_status_means_filled=False, skip_sink=_csv_skip_sink
+                    ),
+                )
+            if _csv_skip_sink:
+                self._cap_seed_scan_incomplete = True
+                self._cap_seed_scan_incomplete_paths.extend(str(p) for p in _csv_skip_sink)
+            total = max(total, csv_total)
+            # Only cache this run_id as seeded -- and only credit its total to
+            # the ledger -- when its OWN CSV scan this pass didn't fail. A run
+            # whose CSV was transiently malformed/mid-write must be rescanned
+            # on a later pass once it becomes readable: caching it here would
+            # make the already_seeded check above skip it forever, even after
+            # the file is repaired, permanently losing whatever spend exists
+            # only in that CSV (Codex review: "Do not cache prior runs whose
+            # CSV scan failed"). The overall week-level fail-closed poisoning
+            # below already accounts conservatively for this run's possible
+            # shortfall this pass; adding its partial total to the ledger now
+            # would also risk double-counting it once a later successful
+            # rescan adds the correct, complete total.
+            if not _csv_skip_sink:
+                self._seeded_prior_run_ids.add(run_id)
+                if total > 0:
+                    if file_trading_day == trading_day:
+                        # Only seed today's own bucket here when cap_seed_roots isn't
+                        # already doing it (see _today_seeded_by_cap_roots above) --
+                        # otherwise the same on-disk artifact would be double-counted.
+                        if not _today_seeded_by_cap_roots:
+                            self.ledger.record_hypothetical(trading_day, total)
+                    else:
+                        # Cross-day-in-week seeding only bumps the shared weekly
+                        # bucket; the daily bucket stays scoped to trading_day.
+                        self.ledger.planned_by_week[this_week] = (
+                            self.ledger.planned_by_week.get(this_week, 0.0) + total
+                        )
+            if is_scheduled_today and submitted_rows:
+                self._prior_same_day_candidate_rows.extend(submitted_rows)
 
-    def _apply_cap_seed_poisoning(
-        self,
-        _earlier_weekday_sibling_paths: set,
-        trading_day: date,
-        this_week: str,
-    ) -> None:
         if _earlier_weekday_sibling_paths:
             if self._cap_seed_scan_incomplete:
+                # FAIL CLOSED: an earlier-weekday sibling artifact that could
+                # not be read/parsed (see the skip-and-flag handling above)
+                # means real week-to-date cross-stream spend is understated.
+                # Force the shared weekly bucket to the cap itself -- zero
+                # remaining headroom for the rest of this run -- rather than
+                # place against an unproven, possibly too-low figure (same
+                # fail-closed policy _compute_top_up already applies to a
+                # same-day skip_sink miss; Codex review: "Fail closed on
+                # unreadable prior-week cap artifacts"). Injects only the
+                # INCREMENTAL delta needed to reach the ceiling (shared
+                # tracking dict with _compute_top_up's cap_seed_roots block,
+                # since both represent the same "this week's shared bucket is
+                # untrustworthy" state) and records exactly how much was
+                # injected, so a later successful scan (the else branch
+                # below) can subtract it back out instead of leaving the
+                # ledger permanently pinned once the transient failure clears
+                # (Codex review: "Clear prior-week cap poisoning after a
+                # recovered scan").
                 week_poison_delta = max(
                     0.0, self.ledger.weekly_cap_usd - self.ledger.week_planned(trading_day)
                 )
@@ -4472,58 +4686,17 @@ class MorningDCAExecutor(DCAExecutor):
                         0.0, self.ledger.week_planned(trading_day) - poisoned_week
                     )
 
-    def _seed_ledger_from_prior_runs(self, now: datetime) -> None:
-        """Fold already-submitted same-day/same-week spend into the ledger.
-
-        ``MorningLedger`` is in-memory and this executor is normally instantiated
-        fresh per invocation (a new cron process each time), so a retried or
-        manually rerun live task would otherwise see an empty ledger and could
-        re-spend a cap that an earlier run already spent against.
-
-        - Earlier weekdays in the current ISO week seed only ``planned_by_week``.
-        - Today's scheduled-slot artifact seeds day+week unless that same artifact
-          is already being counted via ``cap_seed_roots``.
-        - Unreadable/invalid earlier-weekday artifacts or order CSVs fail closed by
-          poisoning the week's planned total up to the weekly cap (zero headroom).
-        - Submitted/filled rows from today's fixed scheduled path are cached into
-          ``_prior_same_day_candidate_rows`` so a scheduled retry can carry them
-          forward before overwriting ``run_state.json``.
-        """
-        self._prior_same_day_candidate_rows = []
-        if self.mode != MORNING_LIVE_MODE:
-            return
-        trading_day = now.astimezone(EASTERN).date()
-        this_week = iso_week_key(trading_day)
-
-        _cap_seed_roots = getattr(self.config, "cap_seed_roots", None)
-        _today_seeded_by_cap_roots = bool(_cap_seed_roots) and any(
-            Path(self.state_root).is_relative_to(Path(r)) for r in _cap_seed_roots
-        )
-
-        scheduled_path = self.run_state_dir(now) / "run_state.json"
-        week_start = trading_day - timedelta(days=trading_day.weekday())
-
-        candidate_paths, _earlier_weekday_sibling_paths, _manual_state_cache = (
-            self._gather_seed_candidate_paths(trading_day, week_start, scheduled_path)
-        )
-
-        for path, is_scheduled_today in candidate_paths:
-            self._process_seed_candidate(
-                path,
-                is_scheduled_today,
-                _manual_state_cache,
-                _earlier_weekday_sibling_paths,
-                trading_day,
-                this_week,
-                now,
-                _today_seeded_by_cap_roots,
-            )
-
-        self._apply_cap_seed_poisoning(_earlier_weekday_sibling_paths, trading_day, this_week)
-
     def _place_broker_orders(
         self,
-        context: OrderPlacementContext
+        candidates: List[MorningSignal],
+        trading_day: Any,
+        broker: BrokerAdapter,
+        top_up_outcomes: Optional[Dict[str, Any]],
+        remaining_daily: float,
+        remaining_weekly: float,
+        manual: bool = False,
+        data: Any = None,
+        now: Optional[datetime] = None,
     ) -> Dict[str, Any]:
         """Attempt broker order placement for each EXEC_AUTO_BUY_ELIGIBLE candidate.
 
@@ -4552,15 +4725,6 @@ class MorningDCAExecutor(DCAExecutor):
         pre-authorization policy in config/budgets.json. Manual runs still call
         review_market_buy first.
         """
-        candidates = context.candidates
-        trading_day = context.trading_day
-        broker = context.broker
-        top_up_outcomes = context.top_up_outcomes
-        remaining_daily = context.remaining_daily
-        remaining_weekly = context.remaining_weekly
-        manual = context.manual
-        data = context.data
-        now = context.now
         if not candidates:
             return {}
         outcomes: Dict[str, Any] = {}
@@ -5613,17 +5777,17 @@ class MorningDCAExecutor(DCAExecutor):
                 if not manual:
                     return self._blocked_live_result(now, mismatch, signals, source)
                 raise RuntimeError(mismatch)
-            broker_outcomes = self._place_broker_orders(OrderPlacementContext(
-                candidates=auto_buy_candidates,
-                trading_day=trading_day,
-                broker=broker,
-                top_up_outcomes=top_up_outcomes,
+            broker_outcomes = self._place_broker_orders(
+                auto_buy_candidates,
+                trading_day,
+                broker,
+                top_up_outcomes,
                 remaining_daily=pre_run_remaining_daily,
                 remaining_weekly=pre_run_remaining_weekly,
                 manual=manual,
                 data=data,
                 now=now,
-            ))
+            )
         # In live mode record only candidates whose orders were actually submitted
         # so cap-exceeded orders do not inflate the ledger and corrupt budget reporting.
         # A "duplicate_preserved" outcome (a same-stream top-up duplicate retry)

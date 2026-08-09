@@ -2153,321 +2153,6 @@ def _envelope_failure(envelope: dict) -> str | None:
     return None
 
 
-
-def _check_placement_order_id(order: dict[str, Any]) -> str | None:
-    order_id = order.get("id") or order.get("order_id")
-    if (
-        not order_id
-        or isinstance(order_id, bool)
-        or not isinstance(order_id, (str, int, float))
-    ):
-        # A bare truthiness check would accept {"id": true} -- or a
-        # container like {"id": ["ORD"]}/{"id": {"value": "ORD"}} -- as
-        # proof an order exists, when none of those are a usable identifier
-        # at all: a malformed response could then be recorded as a
-        # successful submission with no real broker order id backing it
-        # (Codex review: "Reject boolean placement order IDs", "Reject
-        # non-scalar placement order IDs").
-        return "broker response carried no order id"
-    if isinstance(order_id, str) and not order_id.strip():
-        # A whitespace-only string is truthy, so the check above alone would
-        # accept {"id": "   "} as a usable identifier when it plainly is not
-        # (Codex review: "Reject blank and non-finite placement IDs").
-        return "broker response carried a blank order id"
-    if isinstance(order_id, (int, float)) and not math.isfinite(order_id):
-        # NaN and infinity are also truthy, so the same gap applies to a
-        # numeric id: neither is a real broker-assigned identifier (Codex
-        # review: "Reject blank and non-finite placement IDs").
-        return "broker response carried a non-finite order id"
-    if isinstance(order_id, (int, float)) and order_id <= 0:
-        # A finite negative (or zero) numeric id is also truthy and passes
-        # every check above -- e.g. a wrapper using -1 as a sentinel for "no
-        # order id was actually assigned" -- which is exactly as unusable as
-        # NaN/infinity despite being finite (Codex review: "Reject negative
-        # numeric placement IDs").
-        return "broker response carried a non-positive order id"
-    return None
-
-
-def _check_placement_ref_id(
-    order: dict[str, Any], expected_ref_id: str | None, account_number: str | None = None
-) -> str | None:
-    if expected_ref_id is not None:
-        # Key presence, not truthiness: an `or` chain of order.get(...) calls
-        # would treat a present-but-falsy reference ("", 0, False) as though
-        # the field were entirely absent and cascade to the next one,
-        # letting a wrapper that explicitly returned no usable idempotency
-        # key for THIS request still pass this check via an unrelated
-        # fallback field (Codex review: "Reject falsy returned client
-        # references"). Mirrors the symbol check's own key-presence idiom
-        # below -- except a present ``None`` value is NOT treated the same
-        # as an absent key here: a wrapper returning ``{"ref_id": null}``
-        # (or that key entirely) still carries no usable idempotency
-        # confirmation, and skipping the check for it (as the symbol check's
-        # own idiom does for a present-but-null symbol) would let a
-        # cached/stale response pass this check via that explicit null
-        # (Codex review: "Reject null returned client references").
-        if "ref_id" in order:
-            returned_ref_id, ref_id_present = order["ref_id"], True
-        elif "client_order_id" in order:
-            returned_ref_id, ref_id_present = order["client_order_id"], True
-        elif "client_order_uuid" in order:
-            returned_ref_id, ref_id_present = order["client_order_uuid"], True
-        elif "client_id" in order:
-            returned_ref_id, ref_id_present = order["client_id"], True
-        else:
-            returned_ref_id, ref_id_present = None, False
-        # Only checked when the response actually carries a client
-        # reference KEY (present, even if its value is null): a cached/stale
-        # response can otherwise pass every symbol/side/amount check above
-        # (a prior order for the same ticker, side, and notional) while
-        # confirming a DIFFERENT request entirely (Codex review: "Verify a
-        # returned client reference before recording success").
-        if ref_id_present and str(returned_ref_id) != expected_ref_id:
-            # A mismatched client reference can be arbitrary connector data
-            # -- a dict or object carrying a token or other request
-            # metadata, not just a stale string -- rather than a real
-            # idempotency key: str(returned_ref_id) is only used for the
-            # comparison above, so a non-string value reaches here
-            # unexamined. execute_plan() copies this failure string into
-            # ExecutionResult.failure_reason, which is persisted/alerted, so
-            # only a plain string mismatch (useful diagnostic text, e.g. a
-            # stale ref_id) is embedded; anything else is reported only by
-            # type (Codex review: "Redact mismatched client references
-            # before recording failures").
-            if isinstance(returned_ref_id, str):
-                redacted_ref_id = _SECRET_SHAPED_TOKEN_RE.sub("[REDACTED-TOKEN]", returned_ref_id)
-                if account_number:
-                    redacted_ref_id = redacted_ref_id.replace(account_number, "[REDACTED-ACCOUNT]")
-                return (
-                    f"broker response client reference {redacted_ref_id!r} does not match "
-                    f"the requested order's {expected_ref_id!r}"
-                )
-            return (
-                f"broker response client reference does not match the requested order's "
-                f"{expected_ref_id!r} (returned type={type(returned_ref_id).__name__})"
-            )
-    return None
-
-
-def _check_placement_symbol(order: dict[str, Any], expected_symbol: str, account_number: str | None = None) -> str | None:
-    # Key presence, not truthiness: `order.get("symbol") or order.get(...)`
-    # would otherwise read a present-but-falsy malformed value (`""`, `0`,
-    # `False`) as "no symbol reported" and skip this check entirely, letting
-    # a response that did not actually identify the created order pass as if
-    # the broker had confirmed nothing about symbol identity at all (Codex
-    # review: "Reject falsy returned symbols").
-    if "symbol" in order:
-        returned_symbol, symbol_present = order["symbol"], True
-    elif "instrument_symbol" in order:
-        returned_symbol, symbol_present = order["instrument_symbol"], True
-    else:
-        returned_symbol, symbol_present = None, False
-    if symbol_present:
-        # A present key with an explicit null value is NOT the same as the
-        # key being absent: `if returned_symbol is not None` alone would
-        # skip this check for {"symbol": null}, letting a valid-looking
-        # order id/state/amount/client-reference alone be recorded as a
-        # successful submission without ever confirming the returned order
-        # is for the requested ticker -- the same gap already closed for a
-        # present null client reference (Codex review: "Reject a present
-        # null placement symbol").
-        if returned_symbol is None:
-            return "broker response carried a null symbol"
-        try:
-            normalized_returned_symbol = _normalize_ticker(str(returned_symbol))
-        except ValueError:
-            return f"broker response symbol is not usable (type={type(returned_symbol).__name__})"
-        if normalized_returned_symbol != expected_symbol:
-            # A malformed or mismatched broker response's "symbol" can be
-            # arbitrary connector data -- a dict carrying an access token
-            # or request headers, for instance -- rather than a real
-            # ticker: str(returned_symbol) here only needs to be nonempty
-            # to reach this branch, not actually ticker-shaped, so its full
-            # repr was previously embedded in this failure string, which
-            # execute_plan() copies into ExecutionResult.failure_reason and
-            # persists/alerts. A genuine string mismatch (e.g. "MSFT"
-            # returned for a requested "AAPL") is not secret-shaped and
-            # stays useful diagnostic text; anything else is reported only
-            # by type (Codex review: "Redact returned symbols before
-            # storing failure evidence").
-            if isinstance(returned_symbol, str):
-                redacted_symbol = _SECRET_SHAPED_TOKEN_RE.sub("[REDACTED-TOKEN]", returned_symbol)
-                if account_number:
-                    redacted_symbol = redacted_symbol.replace(account_number, "[REDACTED-ACCOUNT]")
-                return (
-                    f"broker response symbol {redacted_symbol!r} does not match the requested "
-                    f"order's {expected_symbol!r}"
-                )
-            return (
-                f"broker response symbol does not match the requested order's "
-                f"{expected_symbol!r} (returned type={type(returned_symbol).__name__})"
-            )
-    return None
-
-
-def _check_placement_side(order: dict[str, Any], expected_side: str) -> str | None:
-    # Key presence, not truthiness: `order.get("side")` would otherwise read
-    # a present-but-null side ({"side": null}) as though the field were
-    # entirely absent and skip this check, letting a valid-looking
-    # id/reference/symbol/amount response alone be recorded as a successful
-    # buy with no usable confirmation the returned order is a buy at all,
-    # rather than a stale or mismatched order (Codex review: "Reject a
-    # present null placement side").
-    if "side" in order:
-        returned_side = order["side"]
-        if returned_side is None:
-            return "broker response carried a null side"
-        # Stripped as well as lowercased, mirroring the terminal-state check
-        # below: a whitespace-padded " buy " is a real accepted order, but
-        # the unstripped comparison would treat it as a mismatch, halt the
-        # batch, and drop the real order out of `submitted` (Codex review:
-        # "Normalize the returned placement side before comparison").
-        if str(returned_side).strip().lower() != expected_side:
-            # A malformed or mismatched broker response's "side" can be
-            # arbitrary connector data -- a dict carrying an access token,
-            # account identifier, or request headers, for instance --
-            # rather than a real side string: str(returned_side) only
-            # needs to differ from expected_side to reach this branch, not
-            # actually be a plausible side. A genuine string mismatch is
-            # not itself secret-shaped, but is still scrubbed of any
-            # token-shaped substring for defense in depth; anything else
-            # is reported only by type (Codex review: "Redact returned
-            # sides before storing failures").
-            if isinstance(returned_side, str):
-                return (
-                    "broker response side "
-                    f"{_SECRET_SHAPED_TOKEN_RE.sub('[REDACTED-TOKEN]', returned_side)!r} "
-                    f"does not match the requested order's {expected_side!r}"
-                )
-            return (
-                f"broker response side does not match the requested order's "
-                f"{expected_side!r} (returned type={type(returned_side).__name__})"
-            )
-    return None
-
-
-def _check_placement_amount(order: dict[str, Any], expected_amount_usd: float) -> str | None:
-    # Key presence, not truthiness: a present-but-null dollar_amount
-    # ({"dollar_amount": null}) is not the same as the field being omitted
-    # -- if the wrapper returned null because it could not confirm the
-    # processed amount, a larger broker notional (and therefore a per-order
-    # or aggregate cap overrun) could be hidden behind the remaining fields
-    # alone (Codex review: "Reject a present null returned notional").
-    if "dollar_amount" in order:
-        returned_amount = order["dollar_amount"]
-        if returned_amount is None:
-            return "broker response carried a null dollar_amount"
-        if isinstance(returned_amount, bool):
-            # Checked BEFORE float(): float(True) succeeds as 1.0, so a
-            # response carrying dollar_amount=true would otherwise be
-            # accepted for a requested $1 order despite the broker
-            # supplying no numeric confirmation of the processed amount
-            # (Codex review: "Reject boolean returned notionals before
-            # conversion").
-            return f"broker response dollar_amount {returned_amount!r} is not a number"
-        try:
-            returned_amount = float(returned_amount)
-        except (TypeError, ValueError):
-            # A nonnumeric dollar_amount can be arbitrary connector data --
-            # a dict or token-bearing string, for instance -- rather than a
-            # malformed but plain numeric-looking value. A genuine string
-            # is scrubbed of any token-shaped substring for defense in
-            # depth; anything else is reported only by type (Codex review:
-            # "Redact malformed returned notionals").
-            if isinstance(returned_amount, str):
-                return (
-                    "broker response dollar_amount "
-                    f"{_SECRET_SHAPED_TOKEN_RE.sub('[REDACTED-TOKEN]', returned_amount)!r} "
-                    "is not a number"
-                )
-            return (
-                "broker response dollar_amount is not a number "
-                f"(type={type(returned_amount).__name__})"
-            )
-        # A tolerance of a full cent (0.01) accepted an exact one-cent
-        # mismatch (e.g. $10.01 returned for a requested $10.00) as a match,
-        # even though that one cent can be exactly what pushed the order over
-        # the per-order/daily/weekly/buying-power ceilings this module
-        # enforced against the REQUESTED amount (Codex review: "Reject a
-        # one-cent returned-notional mismatch"). Amounts are cent-rounded
-        # strings on the wire, so a tolerance far below half a cent still
-        # absorbs float noise (e.g. 1.9999999999998 vs 2.0) without accepting
-        # any real cent-level difference.
-        if not math.isfinite(returned_amount) or abs(returned_amount - expected_amount_usd) > 0.001:
-            return (
-                f"broker response dollar_amount {returned_amount!r} does not match the "
-                f"requested order's ${expected_amount_usd:.2f}"
-            )
-    return None
-
-
-def _check_placement_state(order: dict[str, Any]) -> str | None:
-    if "state" in order:
-        raw_state = order["state"]
-        # Key presence, not a blanket str() coercion: str(False)/str([])/
-        # str({"value": "rejected"}) all produce a value that is not in
-        # _DEAD_PLACEMENT_STATES, so a present-but-malformed state would
-        # otherwise read as a healthy, non-terminal order and be recorded as
-        # submitted even though the wrapper never provided a usable state at
-        # all (Codex review: "Reject non-string placement states"). An
-        # OMITTED state key is unaffected -- there is nothing to distinguish
-        # from a healthy default.
-        if not isinstance(raw_state, str):
-            # raw_state's full repr was previously embedded here, but this
-            # failure reason is exactly what execute_plan() records as
-            # ExecutionResult.failure_reason and persists/alerts -- and a
-            # malformed broker response's "state" field can be arbitrary
-            # connector data (an object carrying an access token, account
-            # identifier, or request headers) rather than a real order
-            # state string. _redacted_envelope_error() never processes
-            # order metadata like this, and the downstream
-            # account-number-specific replace only catches that one known
-            # secret, so only a safe classification (the value's type) is
-            # reported here, matching the redaction already applied to
-            # every other malformed broker field (Codex review: "Redact
-            # malformed placement states before recording them").
-            return f"broker response carried a non-string order state (type={type(raw_state).__name__})"
-        # Stripped as well as lowercased: a whitespace-padded " rejected " or
-        # "cancelled\t" would otherwise fail this membership test and be
-        # recorded as a successful submission despite the broker rejecting
-        # or cancelling the order (Codex review: "Strip returned order
-        # states before terminal-state checks").
-        state = raw_state.strip().lower()
-        if not state:
-            # A present "state" key whose value is blank or whitespace-only
-            # (e.g. {"state": "   "}) normalizes to "", which is not in
-            # _DEAD_PLACEMENT_STATES and would otherwise read exactly like
-            # the OMITTED-key case just above -- a healthy default -- and be
-            # recorded as submitted even though the wrapper supplied the key
-            # but no usable value at all. Failing closed here mirrors the
-            # non-string check just above: a KEY THAT IS PRESENT must supply
-            # something usable (Codex review: "Reject blank placement
-            # states").
-            return f"broker response carried a blank order state: {raw_state!r}"
-        if state in _DEAD_PLACEMENT_STATES:
-            return f"order came back in terminal state {state!r}"
-        if state not in _CANONICAL_LIVE_ORDER_STATES:
-            # A present, nonblank state that is neither a recognized dead
-            # state NOR one of dca_live_adapters._LIVE_ORDER_STATES (e.g.
-            # "error", "denied", or an unrecognized "mystery") fell through
-            # this far as a healthy default: every nonterminal string was
-            # treated as proof a live order exists, when an unrecognized
-            # state is untrustworthy evidence, not confirmation of a real
-            # submission (Codex review: "Require a recognized live
-            # placement state"). Confirmed a string by this point, but a
-            # malformed/hostile broker response could still set it to
-            # something token-shaped; _redacted_envelope_error() only ever
-            # processes envelope["error"], never order metadata like this
-            # field, so the same token-shaped redaction is applied directly
-            # here too (Codex review: "Redact malformed placement states
-            # before recording them").
-            return (
-                "broker response carried an unrecognized order state: "
-                f"{_SECRET_SHAPED_TOKEN_RE.sub('[REDACTED-TOKEN]', state)!r}"
-            )
-    return None
-
 def _placement_failure_reason(
     response: object,
     *,
@@ -2475,7 +2160,6 @@ def _placement_failure_reason(
     expected_side: str,
     expected_amount_usd: float,
     expected_ref_id: str | None = None,
-    account_number: str | None = None,
 ) -> str | None:
     """Return why ``response`` means "no order was actually placed", or None.
 
@@ -2564,20 +2248,297 @@ def _placement_failure_reason(
     # failure INSIDE the unwrapped order (e.g. {"success": false, "error":
     # "denied", "id": "ORD", "state": "queued"}) still carries a truthy id
     # and a nonterminal state, so without this the checks below would read
-    # those valid fields alone and treat the response as a successful
-    # submission (Codex review: "Check order-level placement failure
+    # it as a healthy submission and record the ticker as placed despite the
+    # broker reporting failure (Codex review: "Inspect order-level failure
     # envelopes").
     order_failure = _envelope_failure(order)
     if order_failure is not None:
         return order_failure
-    return (
-        _check_placement_order_id(order)
-        or _check_placement_ref_id(order, expected_ref_id, account_number)
-        or _check_placement_symbol(order, expected_symbol, account_number)
-        or _check_placement_side(order, expected_side)
-        or _check_placement_amount(order, expected_amount_usd)
-        or _check_placement_state(order)
-    )
+    order_id = order.get("id") or order.get("order_id")
+    if (
+        not order_id
+        or isinstance(order_id, bool)
+        or not isinstance(order_id, (str, int, float))
+    ):
+        # A bare truthiness check would accept {"id": true} -- or a
+        # container like {"id": ["ORD"]}/{"id": {"value": "ORD"}} -- as
+        # proof an order exists, when none of those are a usable identifier
+        # at all: a malformed response could then be recorded as a
+        # successful submission with no real broker order id backing it
+        # (Codex review: "Reject boolean placement order IDs", "Reject
+        # non-scalar placement order IDs").
+        return "broker response carried no order id"
+    if isinstance(order_id, str) and not order_id.strip():
+        # A whitespace-only string is truthy, so the check above alone would
+        # accept {"id": "   "} as a usable identifier when it plainly is not
+        # (Codex review: "Reject blank and non-finite placement IDs").
+        return "broker response carried a blank order id"
+    if isinstance(order_id, (int, float)) and not math.isfinite(order_id):
+        # NaN and infinity are also truthy, so the same gap applies to a
+        # numeric id: neither is a real broker-assigned identifier (Codex
+        # review: "Reject blank and non-finite placement IDs").
+        return "broker response carried a non-finite order id"
+    if isinstance(order_id, (int, float)) and order_id <= 0:
+        # A finite negative (or zero) numeric id is also truthy and passes
+        # every check above -- e.g. a wrapper using -1 as a sentinel for "no
+        # order id was actually assigned" -- which is exactly as unusable as
+        # NaN/infinity despite being finite (Codex review: "Reject negative
+        # numeric placement IDs").
+        return "broker response carried a non-positive order id"
+    if expected_ref_id is not None:
+        # Key presence, not truthiness: an `or` chain of order.get(...) calls
+        # would treat a present-but-falsy reference ("", 0, False) as though
+        # the field were entirely absent and cascade to the next one,
+        # letting a wrapper that explicitly returned no usable idempotency
+        # key for THIS request still pass this check via an unrelated
+        # fallback field (Codex review: "Reject falsy returned client
+        # references"). Mirrors the symbol check's own key-presence idiom
+        # below -- except a present ``None`` value is NOT treated the same
+        # as an absent key here: a wrapper returning ``{"ref_id": null}``
+        # (or that key entirely) still carries no usable idempotency
+        # confirmation, and skipping the check for it (as the symbol check's
+        # own idiom does for a present-but-null symbol) would let a
+        # cached/stale response pass this check via that explicit null
+        # (Codex review: "Reject null returned client references").
+        if "ref_id" in order:
+            returned_ref_id, ref_id_present = order["ref_id"], True
+        elif "client_order_id" in order:
+            returned_ref_id, ref_id_present = order["client_order_id"], True
+        elif "client_order_uuid" in order:
+            returned_ref_id, ref_id_present = order["client_order_uuid"], True
+        elif "client_id" in order:
+            returned_ref_id, ref_id_present = order["client_id"], True
+        else:
+            returned_ref_id, ref_id_present = None, False
+        # Only checked when the response actually carries a client
+        # reference KEY (present, even if its value is null): a cached/stale
+        # response can otherwise pass every symbol/side/amount check above
+        # (a prior order for the same ticker, side, and notional) while
+        # confirming a DIFFERENT request entirely (Codex review: "Verify a
+        # returned client reference before recording success").
+        if ref_id_present and str(returned_ref_id) != expected_ref_id:
+            # A mismatched client reference can be arbitrary connector data
+            # -- a dict or object carrying a token or other request
+            # metadata, not just a stale string -- rather than a real
+            # idempotency key: str(returned_ref_id) is only used for the
+            # comparison above, so a non-string value reaches here
+            # unexamined. execute_plan() copies this failure string into
+            # ExecutionResult.failure_reason, which is persisted/alerted, so
+            # only a plain string mismatch (useful diagnostic text, e.g. a
+            # stale ref_id) is embedded; anything else is reported only by
+            # type (Codex review: "Redact mismatched client references
+            # before recording failures").
+            if isinstance(returned_ref_id, str):
+                return (
+                    f"broker response client reference {returned_ref_id!r} does not match "
+                    f"the requested order's {expected_ref_id!r}"
+                )
+            return (
+                f"broker response client reference does not match the requested order's "
+                f"{expected_ref_id!r} (returned type={type(returned_ref_id).__name__})"
+            )
+    # Key presence, not truthiness: `order.get("symbol") or order.get(...)`
+    # would otherwise read a present-but-falsy malformed value (`""`, `0`,
+    # `False`) as "no symbol reported" and skip this check entirely, letting
+    # a response that did not actually identify the created order pass as if
+    # the broker had confirmed nothing about symbol identity at all (Codex
+    # review: "Reject falsy returned symbols").
+    if "symbol" in order:
+        returned_symbol, symbol_present = order["symbol"], True
+    elif "instrument_symbol" in order:
+        returned_symbol, symbol_present = order["instrument_symbol"], True
+    else:
+        returned_symbol, symbol_present = None, False
+    if symbol_present:
+        # A present key with an explicit null value is NOT the same as the
+        # key being absent: `if returned_symbol is not None` alone would
+        # skip this check for {"symbol": null}, letting a valid-looking
+        # order id/state/amount/client-reference alone be recorded as a
+        # successful submission without ever confirming the returned order
+        # is for the requested ticker -- the same gap already closed for a
+        # present null client reference (Codex review: "Reject a present
+        # null placement symbol").
+        if returned_symbol is None:
+            return "broker response carried a null symbol"
+        try:
+            normalized_returned_symbol = _normalize_ticker(str(returned_symbol))
+        except ValueError:
+            return f"broker response symbol is not usable (type={type(returned_symbol).__name__})"
+        if normalized_returned_symbol != expected_symbol:
+            # A malformed or mismatched broker response's "symbol" can be
+            # arbitrary connector data -- a dict carrying an access token
+            # or request headers, for instance -- rather than a real
+            # ticker: str(returned_symbol) here only needs to be nonempty
+            # to reach this branch, not actually ticker-shaped, so its full
+            # repr was previously embedded in this failure string, which
+            # execute_plan() copies into ExecutionResult.failure_reason and
+            # persists/alerts. A genuine string mismatch (e.g. "MSFT"
+            # returned for a requested "AAPL") is not secret-shaped and
+            # stays useful diagnostic text; anything else is reported only
+            # by type (Codex review: "Redact returned symbols before
+            # storing failure evidence").
+            if isinstance(returned_symbol, str):
+                return (
+                    f"broker response symbol {returned_symbol!r} does not match the requested "
+                    f"order's {expected_symbol!r}"
+                )
+            return (
+                f"broker response symbol does not match the requested order's "
+                f"{expected_symbol!r} (returned type={type(returned_symbol).__name__})"
+            )
+    # Key presence, not truthiness: `order.get("side")` would otherwise read
+    # a present-but-null side ({"side": null}) as though the field were
+    # entirely absent and skip this check, letting a valid-looking
+    # id/reference/symbol/amount response alone be recorded as a successful
+    # buy with no usable confirmation the returned order is a buy at all,
+    # rather than a stale or mismatched order (Codex review: "Reject a
+    # present null placement side").
+    if "side" in order:
+        returned_side = order["side"]
+        if returned_side is None:
+            return "broker response carried a null side"
+        # Stripped as well as lowercased, mirroring the terminal-state check
+        # below: a whitespace-padded " buy " is a real accepted order, but
+        # the unstripped comparison would treat it as a mismatch, halt the
+        # batch, and drop the real order out of `submitted` (Codex review:
+        # "Normalize the returned placement side before comparison").
+        if str(returned_side).strip().lower() != expected_side:
+            # A malformed or mismatched broker response's "side" can be
+            # arbitrary connector data -- a dict carrying an access token,
+            # account identifier, or request headers, for instance --
+            # rather than a real side string: str(returned_side) only
+            # needs to differ from expected_side to reach this branch, not
+            # actually be a plausible side. A genuine string mismatch is
+            # not itself secret-shaped, but is still scrubbed of any
+            # token-shaped substring for defense in depth; anything else
+            # is reported only by type (Codex review: "Redact returned
+            # sides before storing failures").
+            if isinstance(returned_side, str):
+                return (
+                    "broker response side "
+                    f"{_SECRET_SHAPED_TOKEN_RE.sub('[REDACTED-TOKEN]', returned_side)!r} "
+                    f"does not match the requested order's {expected_side!r}"
+                )
+            return (
+                f"broker response side does not match the requested order's "
+                f"{expected_side!r} (returned type={type(returned_side).__name__})"
+            )
+    # Key presence, not truthiness: a present-but-null dollar_amount
+    # ({"dollar_amount": null}) is not the same as the field being omitted
+    # -- if the wrapper returned null because it could not confirm the
+    # processed amount, a larger broker notional (and therefore a per-order
+    # or aggregate cap overrun) could be hidden behind the remaining fields
+    # alone (Codex review: "Reject a present null returned notional").
+    if "dollar_amount" in order:
+        returned_amount = order["dollar_amount"]
+        if returned_amount is None:
+            return "broker response carried a null dollar_amount"
+        if isinstance(returned_amount, bool):
+            # Checked BEFORE float(): float(True) succeeds as 1.0, so a
+            # response carrying dollar_amount=true would otherwise be
+            # accepted for a requested $1 order despite the broker
+            # supplying no numeric confirmation of the processed amount
+            # (Codex review: "Reject boolean returned notionals before
+            # conversion").
+            return f"broker response dollar_amount {returned_amount!r} is not a number"
+        try:
+            returned_amount = float(returned_amount)
+        except (TypeError, ValueError):
+            # A nonnumeric dollar_amount can be arbitrary connector data --
+            # a dict or token-bearing string, for instance -- rather than a
+            # malformed but plain numeric-looking value. A genuine string
+            # is scrubbed of any token-shaped substring for defense in
+            # depth; anything else is reported only by type (Codex review:
+            # "Redact malformed returned notionals").
+            if isinstance(returned_amount, str):
+                return (
+                    "broker response dollar_amount "
+                    f"{_SECRET_SHAPED_TOKEN_RE.sub('[REDACTED-TOKEN]', returned_amount)!r} "
+                    "is not a number"
+                )
+            return (
+                "broker response dollar_amount is not a number "
+                f"(type={type(returned_amount).__name__})"
+            )
+        # A tolerance of a full cent (0.01) accepted an exact one-cent
+        # mismatch (e.g. $10.01 returned for a requested $10.00) as a match,
+        # even though that one cent can be exactly what pushed the order over
+        # the per-order/daily/weekly/buying-power ceilings this module
+        # enforced against the REQUESTED amount (Codex review: "Reject a
+        # one-cent returned-notional mismatch"). Amounts are cent-rounded
+        # strings on the wire, so a tolerance far below half a cent still
+        # absorbs float noise (e.g. 1.9999999999998 vs 2.0) without accepting
+        # any real cent-level difference.
+        if not math.isfinite(returned_amount) or abs(returned_amount - expected_amount_usd) > 0.001:
+            return (
+                f"broker response dollar_amount {returned_amount!r} does not match the "
+                f"requested order's ${expected_amount_usd:.2f}"
+            )
+    if "state" in order:
+        raw_state = order["state"]
+        # Key presence, not a blanket str() coercion: str(False)/str([])/
+        # str({"value": "rejected"}) all produce a value that is not in
+        # _DEAD_PLACEMENT_STATES, so a present-but-malformed state would
+        # otherwise read as a healthy, non-terminal order and be recorded as
+        # submitted even though the wrapper never provided a usable state at
+        # all (Codex review: "Reject non-string placement states"). An
+        # OMITTED state key is unaffected -- there is nothing to distinguish
+        # from a healthy default.
+        if not isinstance(raw_state, str):
+            # raw_state's full repr was previously embedded here, but this
+            # failure reason is exactly what execute_plan() records as
+            # ExecutionResult.failure_reason and persists/alerts -- and a
+            # malformed broker response's "state" field can be arbitrary
+            # connector data (an object carrying an access token, account
+            # identifier, or request headers) rather than a real order
+            # state string. _redacted_envelope_error() never processes
+            # order metadata like this, and the downstream
+            # account-number-specific replace only catches that one known
+            # secret, so only a safe classification (the value's type) is
+            # reported here, matching the redaction already applied to
+            # every other malformed broker field (Codex review: "Redact
+            # malformed placement states before recording them").
+            return f"broker response carried a non-string order state (type={type(raw_state).__name__})"
+        # Stripped as well as lowercased: a whitespace-padded " rejected " or
+        # "cancelled\t" would otherwise fail this membership test and be
+        # recorded as a successful submission despite the broker rejecting
+        # or cancelling the order (Codex review: "Strip returned order
+        # states before terminal-state checks").
+        state = raw_state.strip().lower()
+        if not state:
+            # A present "state" key whose value is blank or whitespace-only
+            # (e.g. {"state": "   "}) normalizes to "", which is not in
+            # _DEAD_PLACEMENT_STATES and would otherwise read exactly like
+            # the OMITTED-key case just above -- a healthy default -- and be
+            # recorded as submitted even though the wrapper supplied the key
+            # but no usable value at all. Failing closed here mirrors the
+            # non-string check just above: a KEY THAT IS PRESENT must supply
+            # something usable (Codex review: "Reject blank placement
+            # states").
+            return f"broker response carried a blank order state: {raw_state!r}"
+        if state in _DEAD_PLACEMENT_STATES:
+            return f"order came back in terminal state {state!r}"
+        if state not in _CANONICAL_LIVE_ORDER_STATES:
+            # A present, nonblank state that is neither a recognized dead
+            # state NOR one of dca_live_adapters._LIVE_ORDER_STATES (e.g.
+            # "error", "denied", or an unrecognized "mystery") fell through
+            # this far as a healthy default: every nonterminal string was
+            # treated as proof a live order exists, when an unrecognized
+            # state is untrustworthy evidence, not confirmation of a real
+            # submission (Codex review: "Require a recognized live
+            # placement state"). Confirmed a string by this point, but a
+            # malformed/hostile broker response could still set it to
+            # something token-shaped; _redacted_envelope_error() only ever
+            # processes envelope["error"], never order metadata like this
+            # field, so the same token-shaped redaction is applied directly
+            # here too (Codex review: "Redact malformed placement states
+            # before recording them").
+            return (
+                "broker response carried an unrecognized order state: "
+                f"{_SECRET_SHAPED_TOKEN_RE.sub('[REDACTED-TOKEN]', state)!r}"
+            )
+    return None
+
 
 # Matches an ISO-shaped YYYY-MM-DD substring anywhere in a caller-supplied
 # run_id. A plain `trading_day.isoformat() in run_id` substring test accepts
@@ -3741,7 +3702,6 @@ def execute_plan(
                 expected_side=order.side,
                 expected_amount_usd=order.amount_usd,
                 expected_ref_id=ref_id,
-                account_number=broker.account_number,
             )
         except Exception as exc:
             # exc's own message is connector-defined and can embed whatever
@@ -3784,262 +3744,6 @@ def execute_plan(
 # ---------------------------------------------------------------------------
 # State persistence
 # ---------------------------------------------------------------------------
-
-
-
-def _validate_weekly_rollover_reserve(weekly_rollover_reserve_usd: float) -> None:
-    if isinstance(weekly_rollover_reserve_usd, bool) or not isinstance(
-        weekly_rollover_reserve_usd, (int, float)
-    ):
-        # math.isfinite(True) succeeds since bool is an int subclass, so a
-        # boolean reserve would otherwise be retained as $1 and inflate the
-        # derived Stress-tier weekly ceiling by that amount (Codex review:
-        # "Reject boolean rollover-reserve values").
-        raise ValueError(
-            "assess: weekly_rollover_reserve_usd must be a finite, non-negative number, "
-            f"got {weekly_rollover_reserve_usd!r}"
-        )
-    try:
-        reserve_is_unusable = (
-            not math.isfinite(weekly_rollover_reserve_usd) or weekly_rollover_reserve_usd < 0
-        )
-    except OverflowError:
-        # A syntactically valid but astronomically large JSON integer (e.g.
-        # 10**1000, which json.loads parses as a plain Python int of
-        # unbounded size, injected via persisted StrategyState) passes the
-        # isinstance check above but makes math.isfinite() raise
-        # OverflowError rather than return False. This validation runs
-        # before `out()` is even defined (let alone Gate 0), so there is no
-        # ABORT payload to build yet -- treated as unusable here, the same
-        # way it is for every other malformed reserve, rather than letting
-        # OverflowError escape past this point entirely (Codex review:
-        # "Catch oversized rollover reserves before finiteness checks").
-        reserve_is_unusable = True
-    if reserve_is_unusable:
-        raise ValueError(
-            "assess: weekly_rollover_reserve_usd must be a finite, non-negative number, "
-            f"got {weekly_rollover_reserve_usd!r}"
-        )
-
-
-def _evaluate_gate_0_market_day(trading_day: date, slot) -> tuple[str, str] | None:
-    try:
-        status = market_day_status(trading_day)
-    except CalendarCoverageError as exc:
-        # A stale scheduler firing in a year the calendar doesn't cover must
-        # still produce an ABORT payload so Gate 9 can alert and write run
-        # evidence, not raise past the caller (Codex review: "Convert
-        # calendar coverage failures into an abort verdict").
-        return "ABORT", f"market calendar unavailable, cannot confirm trading day: {exc}"
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        # market_day_status() reads market_calendar.json off disk and indexes
-        # into it directly; a missing file (OSError/FileNotFoundError),
-        # malformed JSON (ValueError -- json.JSONDecodeError is a subclass),
-        # bad encoding (ValueError -- UnicodeDecodeError is a subclass), or a
-        # missing/wrong-shaped key (KeyError/TypeError) all mean the same
-        # thing Gate 0 already handles for CalendarCoverageError: the
-        # calendar cannot be trusted. Without this, a deployment/config
-        # failure would raise past assess() before Gate 9 could write
-        # evidence or alert (Codex review: "Convert unreadable calendar
-        # files into an abort verdict").
-        return "ABORT", f"market calendar unavailable, cannot confirm trading day: {exc}"
-    if status.slot_should_end_silently(slot):
-        why = "exchange closed" if status.is_closed else "early close, slot is after 13:00 ET"
-        return "END_SILENTLY", why
-    return None
-
-
-def _evaluate_gate_3_trading_window(trading_day: date) -> str | None:
-    try:
-        in_window = gate_trading_window(trading_day)
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        # gate_trading_window() reads config/trading_window.json and parses
-        # its dates directly; a missing file, malformed JSON, or an invalid
-        # date string all mean the same thing Gate 0 already handles for
-        # market_calendar.json: the config cannot be trusted, and this
-        # deployment/configuration failure must not raise past assess()
-        # before Gate 9 can write evidence or alert (Codex review: "Convert
-        # trading-window config failures into ABORT").
-        return f"trading window configuration unavailable, cannot confirm date: {exc}"
-    if not in_window:
-        return f"{trading_day} is outside the approved trading window"
-    return None
-
-
-def _materialize_orders(orders) -> tuple[list | None, str | None]:
-    try:
-        orders_list = list(orders)
-    except Exception as exc:
-        # exc's own message is broker/wrapper-defined and can embed an
-        # account number, an access token, or other connector context; this
-        # ABORT reason is exactly what the executor prompts persist as run
-        # evidence and may send through alert channels. Only a safe
-        # classification, the exception's type name, is recorded here --
-        # never its message -- matching the same fix already applied to the
-        # placement path's own raised exceptions (Codex review: "Redact
-        # broker-history exceptions before returning evidence").
-        return None, f"order history could not be materialized: {type(exc).__name__}"
-    try:
-        _reject_non_broker_order_rows(orders_list)
-    except ValueError as exc:
-        return None, f"broker order history contains a malformed row: {exc}"
-    return orders_list, None
-
-
-def _evaluate_gate_4_sole_executor(orders: list, slot, trading_day: date, slot_id: str) -> tuple[str | None, dict | None]:
-    try:
-        collisions = gate_sole_executor(orders, slot, trading_day)
-    except (AttributeError, ValueError) as exc:
-        # ValueError: a naive created_at raised by _require_aware(). AttributeError:
-        # a malformed row itself -- None, a raw dict, or anything else without a
-        # .created_at attribute -- raises AttributeError from gate_sole_executor's
-        # own `o.created_at` access, before _require_aware() ever runs (Codex
-        # review: "Convert malformed history rows into ABORT"). Either way this
-        # must produce an ABORT payload, not escape assess()'s documented
-        # never-raises contract before Gate 9 can write evidence or alert (Codex
-        # review: "Convert malformed broker timestamps into an abort verdict").
-        return f"broker order history contains a malformed row or timestamp: {exc}", None
-    if collisions:
-        return (
-            f"orders already present in the {slot_id} ET window, a second executor may be live",
-            {
-                "colliding_orders": [
-                    o.symbol if isinstance(o.symbol, str)
-                    else f"<non-string symbol, type={type(o.symbol).__name__}>"
-                    for o in collisions
-                ]
-            }
-        )
-    return None, None
-
-
-def _check_buying_power(buying_power_usd: float | None) -> str | None:
-    if buying_power_usd is None:
-        # Every executor prompt's Gate 6 requires "fail closed -- abort and
-        # alert rather than assuming it is sufficient" when buying power
-        # cannot be confirmed. Treating an omitted buying_power_usd as
-        # unlimited headroom (plan_orders()'s own, lower-level default)
-        # would let assess() return PROCEED with a placeable plan despite no
-        # confirmed funds, which the prompt-driven callers then submit
-        # directly at Gate 7 (Codex review: "Abort assessment when buying
-        # power is unavailable"). Checked after Gates 0/1/3/4 so a weekend/
-        # holiday still ends silently rather than aborting over unconfirmed
-        # buying power on a day nothing was going to be bought anyway.
-        return "buying power could not be confirmed, refusing to plan a batch"
-    if isinstance(buying_power_usd, bool) or not isinstance(buying_power_usd, (int, float)):
-        # A supplied-but-unusable buying_power_usd is not caught by the None
-        # check above and would otherwise reach plan_orders(), whose own
-        # finiteness check either raises a bare ValueError (NaN/infinity/
-        # negative) or, for a bool, does not raise at all: math.isfinite(True)
-        # succeeds since bool is an int subclass, so a $1 live order could be
-        # placed despite zero confirmed balance; a string raises TypeError.
-        # Every one of these must produce the same fail-closed ABORT the
-        # omitted case above already gets, not escape assess()'s never-raises
-        # contract (Codex review: "Return ABORT for malformed buying power",
-        # "Reject nonnumeric buying-power values"). At this point
-        # buying_power_usd has NOT yet been confirmed numeric, so it can
-        # still be arbitrary data the injected account-data layer returned
-        # instead of a scalar -- a dict or object carrying an account
-        # identifier, token, or other request metadata, for instance -- and
-        # this ABORT reason is exactly what gets persisted as run evidence
-        # and sent through alert channels. Only a safe classification (the
-        # value's type) is recorded here, never its repr, matching the
-        # redaction already applied to every other malformed broker input
-        # this function converts into an ABORT reason (Codex review: "Redact
-        # malformed buying-power values from evidence").
-        return (
-            f"buying power is unusable (type={type(buying_power_usd).__name__}), refusing to "
-            "plan a batch"
-        )
-    try:
-        buying_power_is_unusable = not math.isfinite(buying_power_usd) or buying_power_usd < 0
-    except OverflowError:
-        # A syntactically valid but astronomically large JSON integer (e.g.
-        # 10**1000, which json.loads parses as a plain Python int of
-        # unbounded size) passes the isinstance check above but makes
-        # math.isfinite() raise OverflowError rather than return False,
-        # escaping assess()'s never-raises contract entirely instead of
-        # producing the documented ABORT (Codex review: "Convert oversized
-        # buying power into an abort").
-        buying_power_is_unusable = True
-    if buying_power_is_unusable:
-        return f"buying power is unusable ({buying_power_usd!r}), refusing to plan a batch"
-    return None
-
-
-def _build_budget_snapshot(orders: list, trading_day: date):
-    try:
-        snapshot = budget_snapshot(orders, trading_day)
-    except BudgetDataError as exc:
-        # budget_snapshot()'s raised message embeds the offending order's
-        # symbol and amount via repr(), and either can be arbitrary
-        # connector data a malfunctioning broker wrapper supplied instead
-        # of a real ticker/notional -- a dict carrying an access token or
-        # account identifier, for instance. This ABORT reason is exactly
-        # what gets persisted as run evidence and sent through alert
-        # channels, so only a safe classification (the exception's type
-        # name) is recorded here, matching the redaction already applied
-        # to every other exception this function converts into an ABORT
-        # reason (Codex review: "Redact malformed broker notionals from
-        # abort evidence").
-        return None, f"broker history contains an unusable notional: {type(exc).__name__}"
-    except ValueError as exc:
-        # This ValueError is not only a malformed timestamp from
-        # _require_aware(): budget_snapshot() also touches
-        # order.counts_toward_budget, which calls _normalize_side()/
-        # _is_dead_order_state() -- both raise ValueError embedding the
-        # malformed side/state value's full repr, and either can be
-        # arbitrary connector data (a dict carrying an access token or
-        # account identifier, for instance). Only a safe classification
-        # (the exception's type name) is recorded here, matching the
-        # redaction already applied to the neighboring BudgetDataError path
-        # above (Codex review: "Redact malformed history metadata in abort
-        # evidence").
-        return None, f"broker order history contains a malformed row: {type(exc).__name__}"
-    return snapshot, None
-
-
-def _parse_and_validate_candidates(candidates):
-    try:
-        cands = _parse_candidate_rows(candidates)
-    except Exception as exc:
-        # exc's own message can originate from a lazy candidates iterable
-        # (e.g. a generator wrapping a live market-data/signal-generation
-        # call) that raises while being consumed, and can embed a
-        # market-data token, account context, or other connector detail;
-        # this ABORT reason is exactly what the executor prompts persist as
-        # run evidence and may send through alert channels. Only a safe
-        # classification, the exception's type name, is recorded here --
-        # never its message -- matching the same fix already applied to the
-        # broker-history and placement exception paths (Codex review:
-        # "Redact candidate-source exceptions from assessment evidence").
-        return None, f"candidate row is malformed, cannot build a plan: {type(exc).__name__}"
-    return cands, None
-
-
-def _get_bought_today_tickers(orders: list, trading_day: date):
-    try:
-        bought_today = {
-            _normalize_ticker(o.symbol)
-            for o in orders
-            if o.is_buy_attempt and _require_aware(o.created_at).astimezone(ET).date() == trading_day
-        }
-    except ValueError as exc:
-        # A malformed symbol (None, a bool, ...) on a same-day buy raises
-        # from _normalize_ticker() before this comprehension can decide
-        # whether the order is even relevant, escaping assess()'s
-        # never-raises contract before Gate 9 could write evidence or alert
-        # (Codex review: "Convert malformed broker symbols into an abort
-        # verdict"). exc's own message embeds the malformed value's full
-        # repr, and a broker wrapper's BrokerOrder.symbol can be arbitrary
-        # connector data -- a dict carrying an account identifier or token,
-        # for instance -- so only a safe classification, the exception's
-        # type name, is recorded here, matching the redaction already
-        # applied to every other exception this function converts into an
-        # ABORT reason (Codex review: "Redact malformed broker symbols from
-        # abort evidence").
-        return None, f"broker order history contains a malformed symbol: {type(exc).__name__}"
-    return bought_today, None
 
 
 def assess(
@@ -4147,9 +3851,50 @@ def assess(
     docs/live_wiring.md's "Gate sequence" section (Codex review: "Return execution
     context from assess").
     """
-    _validate_weekly_rollover_reserve(weekly_rollover_reserve_usd)
+    if isinstance(weekly_rollover_reserve_usd, bool) or not isinstance(
+        weekly_rollover_reserve_usd, (int, float)
+    ):
+        # math.isfinite(True) succeeds since bool is an int subclass, so a
+        # boolean reserve would otherwise be retained as $1 and inflate the
+        # derived Stress-tier weekly ceiling by that amount (Codex review:
+        # "Reject boolean rollover-reserve values").
+        raise ValueError(
+            "assess: weekly_rollover_reserve_usd must be a finite, non-negative number, "
+            f"got {weekly_rollover_reserve_usd!r}"
+        )
+    try:
+        reserve_is_unusable = (
+            not math.isfinite(weekly_rollover_reserve_usd) or weekly_rollover_reserve_usd < 0
+        )
+    except OverflowError:
+        # A syntactically valid but astronomically large JSON integer (e.g.
+        # 10**1000, which json.loads parses as a plain Python int of
+        # unbounded size, injected via persisted StrategyState) passes the
+        # isinstance check above but makes math.isfinite() raise
+        # OverflowError rather than return False. This validation runs
+        # before `out()` is even defined (let alone Gate 0), so there is no
+        # ABORT payload to build yet -- treated as unusable here, the same
+        # way it is for every other malformed reserve, rather than letting
+        # OverflowError escape past this point entirely (Codex review:
+        # "Catch oversized rollover reserves before finiteness checks").
+        reserve_is_unusable = True
+    if reserve_is_unusable:
+        raise ValueError(
+            "assess: weekly_rollover_reserve_usd must be a finite, non-negative number, "
+            f"got {weekly_rollover_reserve_usd!r}"
+        )
     slot = SLOTS[slot_id]  # KeyError on an unknown slot is correct: fail loud.
     if not isinstance(now, datetime):
+        # now.astimezone(ET) below assumes `now` IS a datetime -- an injected
+        # scheduler/time layer supplying None, an ISO timestamp string, or
+        # anything else makes that call raise a bare AttributeError before
+        # `out()` (right below) is even defined, escaping assess()'s
+        # documented never-raises contract with no ABORT payload at all
+        # instead of the fail-closed evidence/alert path Gate 9 expects
+        # (Codex review: "Validate the assessment clock before converting
+        # it"). trading_day cannot be derived from a non-datetime `now`, so
+        # this ABORT payload (matching out()'s own shape) reports it as
+        # unknown rather than guessing.
         return {
             "slot": slot_id,
             "slot_label": slot.label,
@@ -4173,12 +3918,41 @@ def assess(
         return payload
 
     if now.tzinfo is None:
+        # now.astimezone(ET) above silently interprets a naive value in the
+        # host's local timezone rather than raising, so trading_day may
+        # already be wrong by the time this is checked -- but Gate 1's
+        # gate_time_sanity() explicitly rejects a naive datetime, and
+        # nothing before it caught that ValueError, letting a naive
+        # assessment clock (e.g. the common datetime.now() with no tzinfo)
+        # escape assess()'s never-raises contract before Gate 9 could write
+        # evidence or alert (Codex review: "Convert a naive assessment
+        # clock into an abort verdict").
         return out("ABORT", "assessment clock is naive, cannot confirm the actual firing time")
 
     # Gate 0 -- market day
-    gate_0_result = _evaluate_gate_0_market_day(trading_day, slot)
-    if gate_0_result is not None:
-        return out(gate_0_result[0], gate_0_result[1])
+    try:
+        status = market_day_status(trading_day)
+    except CalendarCoverageError as exc:
+        # A stale scheduler firing in a year the calendar doesn't cover must
+        # still produce an ABORT payload so Gate 9 can alert and write run
+        # evidence, not raise past the caller (Codex review: "Convert
+        # calendar coverage failures into an abort verdict").
+        return out("ABORT", f"market calendar unavailable, cannot confirm trading day: {exc}")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        # market_day_status() reads market_calendar.json off disk and indexes
+        # into it directly; a missing file (OSError/FileNotFoundError),
+        # malformed JSON (ValueError -- json.JSONDecodeError is a subclass),
+        # bad encoding (ValueError -- UnicodeDecodeError is a subclass), or a
+        # missing/wrong-shaped key (KeyError/TypeError) all mean the same
+        # thing Gate 0 already handles for CalendarCoverageError: the
+        # calendar cannot be trusted. Without this, a deployment/config
+        # failure would raise past assess() before Gate 9 could write
+        # evidence or alert (Codex review: "Convert unreadable calendar
+        # files into an abort verdict").
+        return out("ABORT", f"market calendar unavailable, cannot confirm trading day: {exc}")
+    if status.slot_should_end_silently(slot):
+        why = "exchange closed" if status.is_closed else "early close, slot is after 13:00 ET"
+        return out("END_SILENTLY", why)
 
     # Gate 1 -- time sanity. An off-schedule firing is a scheduler fault.
     if not gate_time_sanity(now, slot):
@@ -4189,45 +3963,232 @@ def assess(
         )
 
     # Gate 3 -- approved trading window
-    gate_3_result = _evaluate_gate_3_trading_window(trading_day)
-    if gate_3_result is not None:
-        return out("ABORT", gate_3_result)
+    try:
+        in_window = gate_trading_window(trading_day)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        # gate_trading_window() reads config/trading_window.json and parses
+        # its dates directly; a missing file, malformed JSON, or an invalid
+        # date string all mean the same thing Gate 0 already handles for
+        # market_calendar.json: the config cannot be trusted, and this
+        # deployment/configuration failure must not raise past assess()
+        # before Gate 9 can write evidence or alert (Codex review: "Convert
+        # trading-window config failures into ABORT").
+        return out("ABORT", f"trading window configuration unavailable, cannot confirm date: {exc}")
+    if not in_window:
+        return out("ABORT", f"{trading_day} is outside the approved trading window")
 
-    # Gate 4 - materialize orders
-    orders_list, orders_error = _materialize_orders(orders)
-    if orders_error is not None:
-        return out("ABORT", orders_error)
-    if orders_list is None:
-        return out("ABORT", "order history could not be materialized")
+    # Materialized once, immediately before Gate 4 (gate_sole_executor) makes
+    # the first pass -- deliberately AFTER Gates 0/1/3 above, none of which
+    # need broker history at all: a weekend/holiday/early-close afternoon,
+    # an off-schedule firing, or a date outside the approved trading window
+    # must still produce the documented END_SILENTLY/ABORT verdict without
+    # ever touching `orders`, rather than paying for (and failing on) a
+    # broker-history fetch/materialization that was never needed to answer
+    # those questions (Codex review: "Run the calendar gate before consuming
+    # broker history"). A single-pass iterable (e.g. a generator) would
+    # otherwise be exhausted here, leaving Gate 6's budget_snapshot() and the
+    # bought-today dedup with no broker history at all (Codex review:
+    # "Materialize order history before running multiple gates"). ``orders``
+    # is externally injected broker-history data (see docs/live_wiring.md); a
+    # broker-history layer returning ``None``, or a lazy iterable that
+    # raises while being consumed, must fail closed into the documented
+    # ABORT verdict here rather than raising past assess()'s never-raises
+    # contract before Gate 9 can write evidence or alert (Codex review:
+    # "Return ABORT when order history cannot be materialized").
+    try:
+        orders = list(orders)
+    except Exception as exc:
+        # exc's own message is broker/wrapper-defined and can embed an
+        # account number, an access token, or other connector context; this
+        # ABORT reason is exactly what the executor prompts persist as run
+        # evidence and may send through alert channels. Only a safe
+        # classification, the exception's type name, is recorded here --
+        # never its message -- matching the same fix already applied to the
+        # placement path's own raised exceptions (Codex review: "Redact
+        # broker-history exceptions before returning evidence").
+        return out(
+            "ABORT", f"order history could not be materialized: {type(exc).__name__}"
+        )
+    try:
+        _reject_non_broker_order_rows(orders)
+    except ValueError as exc:
+        return out("ABORT", f"broker order history contains a malformed row: {exc}")
 
     # Gate 4 -- sole-executor interlock
-    gate_4_error, extra = _evaluate_gate_4_sole_executor(orders_list, slot, trading_day, slot_id)
-    if gate_4_error is not None:
-        return out("ABORT", gate_4_error, **(extra or {}))
+    try:
+        collisions = gate_sole_executor(orders, slot, trading_day)
+    except (AttributeError, ValueError) as exc:
+        # ValueError: a naive created_at raised by _require_aware(). AttributeError:
+        # a malformed row itself -- None, a raw dict, or anything else without a
+        # .created_at attribute -- raises AttributeError from gate_sole_executor's
+        # own `o.created_at` access, before _require_aware() ever runs (Codex
+        # review: "Convert malformed history rows into ABORT"). Either way this
+        # must produce an ABORT payload, not escape assess()'s documented
+        # never-raises contract before Gate 9 can write evidence or alert (Codex
+        # review: "Convert malformed broker timestamps into an abort verdict").
+        return out("ABORT", f"broker order history contains a malformed row or timestamp: {exc}")
+    if collisions:
+        return out(
+            "ABORT",
+            f"orders already present in the {slot_id} ET window, a second executor may be live",
+            # `_reject_non_broker_order_rows()` only confirms each row IS a
+            # BrokerOrder instance, never that its externally-supplied
+            # `.symbol` is itself JSON-native (e.g. a caller-constructed
+            # BrokerOrder(symbol=date(...), ...)) or even a real ticker at
+            # all: it can be arbitrary connector data, a dict carrying an
+            # access token, account identifier, or request metadata.
+            # `out()`'s payload is documented as JSON-serialisable, and this
+            # ABORT reason is exactly what gets persisted as run evidence
+            # and sent through alert channels -- str()-ing a non-string
+            # symbol made it JSON-safe but not secret-safe, since str() on a
+            # dict still serializes its full contents. A plain string
+            # symbol (even a malformed one, e.g. an unnormalized ticker) is
+            # not secret-shaped and is included as-is; anything else is
+            # reported only by type (Codex review: "Redact malformed
+            # symbols from collision evidence").
+            colliding_orders=[
+                o.symbol if isinstance(o.symbol, str)
+                else f"<non-string symbol, type={type(o.symbol).__name__}>"
+                for o in collisions
+            ],
+        )
 
     # Gate 6 -- budget from broker history
-    buying_power_error = _check_buying_power(buying_power_usd)
-    if buying_power_error is not None:
-        return out("ABORT", buying_power_error)
+    if buying_power_usd is None:
+        # Every executor prompt's Gate 6 requires "fail closed -- abort and
+        # alert rather than assuming it is sufficient" when buying power
+        # cannot be confirmed. Treating an omitted buying_power_usd as
+        # unlimited headroom (plan_orders()'s own, lower-level default)
+        # would let assess() return PROCEED with a placeable plan despite no
+        # confirmed funds, which the prompt-driven callers then submit
+        # directly at Gate 7 (Codex review: "Abort assessment when buying
+        # power is unavailable"). Checked after Gates 0/1/3/4 so a weekend/
+        # holiday still ends silently rather than aborting over unconfirmed
+        # buying power on a day nothing was going to be bought anyway.
+        return out("ABORT", "buying power could not be confirmed, refusing to plan a batch")
+    if isinstance(buying_power_usd, bool) or not isinstance(buying_power_usd, (int, float)):
+        # A supplied-but-unusable buying_power_usd is not caught by the None
+        # check above and would otherwise reach plan_orders(), whose own
+        # finiteness check either raises a bare ValueError (NaN/infinity/
+        # negative) or, for a bool, does not raise at all: math.isfinite(True)
+        # succeeds since bool is an int subclass, so a $1 live order could be
+        # placed despite zero confirmed balance; a string raises TypeError.
+        # Every one of these must produce the same fail-closed ABORT the
+        # omitted case above already gets, not escape assess()'s never-raises
+        # contract (Codex review: "Return ABORT for malformed buying power",
+        # "Reject nonnumeric buying-power values"). At this point
+        # buying_power_usd has NOT yet been confirmed numeric, so it can
+        # still be arbitrary data the injected account-data layer returned
+        # instead of a scalar -- a dict or object carrying an account
+        # identifier, token, or other request metadata, for instance -- and
+        # this ABORT reason is exactly what gets persisted as run evidence
+        # and sent through alert channels. Only a safe classification (the
+        # value's type) is recorded here, never its repr, matching the
+        # redaction already applied to every other malformed broker input
+        # this function converts into an ABORT reason (Codex review: "Redact
+        # malformed buying-power values from evidence").
+        return out(
+            "ABORT",
+            f"buying power is unusable (type={type(buying_power_usd).__name__}), refusing to "
+            "plan a batch",
+        )
+    try:
+        buying_power_is_unusable = not math.isfinite(buying_power_usd) or buying_power_usd < 0
+    except OverflowError:
+        # A syntactically valid but astronomically large JSON integer (e.g.
+        # 10**1000, which json.loads parses as a plain Python int of
+        # unbounded size) passes the isinstance check above but makes
+        # math.isfinite() raise OverflowError rather than return False,
+        # escaping assess()'s never-raises contract entirely instead of
+        # producing the documented ABORT (Codex review: "Convert oversized
+        # buying power into an abort").
+        buying_power_is_unusable = True
+    if buying_power_is_unusable:
+        return out(
+            "ABORT",
+            f"buying power is unusable ({buying_power_usd!r}), refusing to plan a batch",
+        )
+    try:
+        snapshot = budget_snapshot(orders, trading_day)
+    except BudgetDataError as exc:
+        # budget_snapshot()'s raised message embeds the offending order's
+        # symbol and amount via repr(), and either can be arbitrary
+        # connector data a malfunctioning broker wrapper supplied instead
+        # of a real ticker/notional -- a dict carrying an access token or
+        # account identifier, for instance. This ABORT reason is exactly
+        # what gets persisted as run evidence and sent through alert
+        # channels, so only a safe classification (the exception's type
+        # name) is recorded here, matching the redaction already applied
+        # to every other exception this function converts into an ABORT
+        # reason (Codex review: "Redact malformed broker notionals from
+        # abort evidence").
+        return out(
+            "ABORT",
+            f"broker history contains an unusable notional: {type(exc).__name__}",
+        )
+    except ValueError as exc:
+        # This ValueError is not only a malformed timestamp from
+        # _require_aware(): budget_snapshot() also touches
+        # order.counts_toward_budget, which calls _normalize_side()/
+        # _is_dead_order_state() -- both raise ValueError embedding the
+        # malformed side/state value's full repr, and either can be
+        # arbitrary connector data (a dict carrying an access token or
+        # account identifier, for instance). Only a safe classification
+        # (the exception's type name) is recorded here, matching the
+        # redaction already applied to the neighboring BudgetDataError path
+        # above (Codex review: "Redact malformed history metadata in abort
+        # evidence").
+        return out(
+            "ABORT",
+            f"broker order history contains a malformed row: {type(exc).__name__}",
+        )
+    try:
+        cands = _parse_candidate_rows(candidates)
+    except Exception as exc:
+        # exc's own message can originate from a lazy candidates iterable
+        # (e.g. a generator wrapping a live market-data/signal-generation
+        # call) that raises while being consumed, and can embed a
+        # market-data token, account context, or other connector detail;
+        # this ABORT reason is exactly what the executor prompts persist as
+        # run evidence and may send through alert channels. Only a safe
+        # classification, the exception's type name, is recorded here --
+        # never its message -- matching the same fix already applied to the
+        # broker-history and placement exception paths (Codex review:
+        # "Redact candidate-source exceptions from assessment evidence").
+        return out(
+            "ABORT",
+            f"candidate row is malformed, cannot build a plan: {type(exc).__name__}",
+        )
 
-    snapshot, snapshot_error = _build_budget_snapshot(orders_list, trading_day)
-    if snapshot_error is not None:
-        return out("ABORT", snapshot_error)
-    if snapshot is None:
-        return out("ABORT", "budget snapshot could not be built")
-
-    cands, cands_error = _parse_and_validate_candidates(candidates)
-    if cands_error is not None:
-        return out("ABORT", cands_error)
-    if cands is None:
-        return out("ABORT", "candidate rows could not be parsed")
-
-    bought_today, bought_today_error = _get_bought_today_tickers(orders_list, trading_day)
-    if bought_today_error is not None:
-        return out("ABORT", bought_today_error)
-    if bought_today is None:
-        return out("ABORT", "broker order history could not be evaluated")
-
+    # Exclude tickers that already have a same-day buy elsewhere in the seven-
+    # slot roster: a 10:30 candidate for a ticker the 09:35 slot already bought
+    # would otherwise plan a second same-day buy, violating
+    # config/budgets.json's one_order_per_ticker_per_day (Codex review:
+    # "Exclude tickers already bought earlier today").
+    try:
+        bought_today = {
+            _normalize_ticker(o.symbol)
+            for o in orders
+            if o.is_buy_attempt and _require_aware(o.created_at).astimezone(ET).date() == trading_day
+        }
+    except ValueError as exc:
+        # A malformed symbol (None, a bool, ...) on a same-day buy raises
+        # from _normalize_ticker() before this comprehension can decide
+        # whether the order is even relevant, escaping assess()'s
+        # never-raises contract before Gate 9 could write evidence or alert
+        # (Codex review: "Convert malformed broker symbols into an abort
+        # verdict"). exc's own message embeds the malformed value's full
+        # repr, and a broker wrapper's BrokerOrder.symbol can be arbitrary
+        # connector data -- a dict carrying an account identifier or token,
+        # for instance -- so only a safe classification, the exception's
+        # type name, is recorded here, matching the redaction already
+        # applied to every other exception this function converts into an
+        # ABORT reason (Codex review: "Redact malformed broker symbols from
+        # abort evidence").
+        return out(
+            "ABORT",
+            f"broker order history contains a malformed symbol: {type(exc).__name__}",
+        )
     # Whether a same-day repeat is refused outright is a CONFIG decision, not a
     # hardcoded one: config/budgets.json order_rules.one_order_per_ticker_per_day.
     # True  -> first slot to buy a ticker wins it for the day (original behaviour).
@@ -4246,12 +4207,21 @@ def assess(
 
     _valid_cands, planned_spend, high_mult = _tier_selection_inputs(fresh_cands)
     tier = select_budget_tier(planned_spend, high_mult)
-
+    # A reserve computed for an earlier week is stale and must not keep
+    # inflating this week's ceiling -- see the docstring above (Codex review:
+    # "Refresh the rollover reserve for the current week"). A missing key is
+    # treated as stale too whenever the reserve is nonzero: a real reserve is
+    # never legitimately unkeyed, so `None` must not bypass the freshness
+    # check outright, or a persisted/caller-supplied reserve with no key
+    # would keep applying to every future week forever (Codex review:
+    # "Require a week key for every nonzero rollover reserve").
     if weekly_rollover_reserve_usd != 0.0 and weekly_rollover_reserve_week_key != iso_week_key(
         trading_day
     ):
         weekly_rollover_reserve_usd = 0.0
-
+    # Derived from THIS run's tier, never a caller-precomputed value -- see
+    # the docstring above (Codex review: "Derive the weekly ceiling from the
+    # tier selected here").
     effective_weekly_cap = (
         min(tier.weekly_cap_usd, NORMAL_WEEKLY_CAP_USD + weekly_rollover_reserve_usd)
         if tier.uses_rollover_reserve
@@ -4285,6 +4255,8 @@ def assess(
             "total_notional_usd": plan.total_notional_usd,
         },
     )
+
+
 def _week_key_to_str(key: tuple[int, int]) -> str:
     return f"{key[0]}-{key[1]:02d}"
 
@@ -4747,21 +4719,6 @@ def _state_to_json(state: StrategyState) -> dict:
 
 
 def _state_from_json(raw: dict) -> StrategyState:
-    """
-    Load a StrategyState from its JSON representation.
-
-    Validation ensures that each week's persisted total is at least the sum of
-    that week's daily entries, compared in whole cents (via _cents) rather than
-    a float tolerance (even $0.01 matters). A week total under its daily sum is corrupt,
-    as it would silently forget real spend and authorize another week's worth of buys.
-    (Codex review: "Reject inconsistent persisted daily and weekly ledgers" / "Reject cent-level persisted ledger mismatches").
-
-    The week total can legitimately exceed the daily sum, as operations like
-    bump_week_notional_only() / force_week_notional_to_worst_case_ceiling() /
-    reconcile_earlier_week_cross_stream_notional() may add EARLIER-weekday
-    cross-stream spend directly to the week bucket without a corresponding
-    submitted_notional_by_day entry in THIS state.
-    """
     state = StrategyState()
     ticker_spellings: dict[str, str] = {}
     state.buys_by_ticker_by_day = {}
@@ -4837,6 +4794,29 @@ def _state_from_json(raw: dict) -> StrategyState:
             ),
             "submitted_notional_by_week",
         )
+    # record_buy() always updates the day and week ledgers together in the
+    # same call, and neither is ever pruned independently of the other, so
+    # under any legitimately-written state each week's persisted total must
+    # be AT LEAST the sum of that week's daily entries -- it can legitimately
+    # exceed that sum too, since bump_week_notional_only()/
+    # force_week_notional_to_worst_case_ceiling()/
+    # reconcile_earlier_week_cross_stream_notional() add EARLIER-weekday
+    # cross-stream spend (or a fail-closed ceiling) to the week bucket ONLY,
+    # deliberately without a corresponding submitted_notional_by_day entry in
+    # THIS state (that spend belongs to a sibling stream or an earlier day's
+    # own history, not a ticker/day this state tracks -- Codex review:
+    # "Include prior-week sibling spend in the afternoon ledger"). A week
+    # total UNDER its daily sum -- e.g. $900 recorded for a Monday but $0 for
+    # that ISO week -- is still corrupt: StrategyState.week_notional() would
+    # silently forget real spend and authorize another week's worth of buys
+    # even though the same document proves it (Codex review: "Reject
+    # inconsistent persisted daily and weekly ledgers"). Compared in whole
+    # cents, not with a flat 0.01 tolerance: a tolerance of exactly one cent
+    # also accepts a real, corrupt one-cent shortfall (e.g. daily entries
+    # summing to $899.01 against a persisted $899.00) as if it were float
+    # non-associativity noise, when floating-point subtraction of the two can
+    # land just under that threshold even for a real discrepancy (Codex
+    # review: "Reject cent-level persisted ledger mismatches").
     expected_week_totals: dict[tuple[int, int], float] = {}
     for d, amount in state.submitted_notional_by_day.items():
         wk = iso_week_key(d)

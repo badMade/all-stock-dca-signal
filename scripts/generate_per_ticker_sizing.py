@@ -46,14 +46,6 @@ def archive_unavailable_reason(history_dir: Path, ticker_config: Path) -> dict[s
     except (OSError, json.JSONDecodeError, KeyError) as exc:
         return {"reason": f"ticker_config_unreadable: {exc}"}
     if not active:
-        # An empty active universe is a valid, deliberate no-op state (e.g.
-        # the DCA strategy is fully paused) -- scripts/run_ticker_maintenance
-        # calibrate depends on this succeeding trivially rather than being
-        # refused. This function has no visibility into whether --output
-        # currently holds a non-empty published calibration, so it cannot
-        # safely distinguish that case from a tickers.json truncated by a
-        # bad merge; only the case it CAN detect -- a present but partially
-        # missing archive -- is guarded by the coverage check below.
         return None
     missing = sorted(ticker for ticker in active if not (history_dir / f"{ticker}.csv").is_file())
     coverage = 1.0 - (len(missing) / len(active))
@@ -140,11 +132,6 @@ def adjusted_low_drops(history_path: Path, start_date: str) -> list[float]:
                 if row["Date"] >= start_date:
                     prices.append((float(row["Close"]), float(row["Adj Close"]), float(row["Low"])))
             except (KeyError, TypeError, ValueError):
-                # A row truncated below the header (e.g. by a corrupted
-                # archive merge) leaves the missing trailing fields as None
-                # under csv.DictReader, and float(None) raises TypeError
-                # rather than ValueError -- without catching it here, one
-                # bad row would abort calibration for the whole ticker.
                 continue
     drops = []
     for (_, prior_adjusted_close, _), (close, adjusted_close, low) in zip(prices, prices[1:], strict=False):

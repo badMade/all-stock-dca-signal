@@ -129,34 +129,20 @@ class CumulativeCreditLedger:
         check, preserving the original always-apply behavior for callers that
         cannot supply a stable key.
 
-        ``pending_baseline_usd``, when provided together with
-        ``idempotency_key``, signals that a retry of a slot which earlier
-        called :meth:`preserve_pending` wants its OWN prior contribution
-        netted out of the ledger's balance before applying a fresh,
-        possibly SMALLER decline for this same slot -- otherwise this call
-        would silently combine the fresh decline with the ledger's raw
-        (still includes this slot's stale, larger contribution) balance and
-        could cross the order threshold purely from the retry, clearing the
-        pending balance even though no broker order was actually submitted
-        this run (Codex review: "Do not re-record adjusted credits against
-        the full ledger").
-
-        The caller's own pre-lock ``pending_usd()`` /
-        ``preserved_credit_for_slot()`` reads (whose difference is
-        typically passed here) happen BEFORE this call acquires the ledger
-        lock, so a concurrent stream can record/settle/preserve this same
-        ticker in between; using that stale snapshot as an absolute
-        replacement value would silently discard the concurrent update
-        despite the cross-process lock. So whenever ``idempotency_key`` is
-        also provided, the netted baseline is instead RECOMPUTED here,
-        atomically, from the state already loaded under this call's own
-        lock: this slot's own unconsumed preserved contribution (looked up
-        fresh by ``idempotency_key``) is subtracted from the ledger's
-        CURRENT balance, not the value the caller computed earlier (Codex
-        review: "Rebase retry adjustments inside the ledger lock"). The
-        caller-supplied ``pending_baseline_usd`` is used verbatim only when
-        ``idempotency_key`` is omitted, since there is then no slot key to
-        rebase against. ``None`` (the default) preserves the original
+        ``pending_baseline_usd``, when provided, is used INSTEAD OF the
+        ledger's own current pending balance as the starting point for this
+        credit. A retry of a slot that earlier called :meth:`preserve_pending`
+        already has ITS OWN prior contribution sitting in the ledger's
+        pending balance; a caller that nets that out first (via
+        :meth:`pending_usd` minus :meth:`preserved_credit_for_slot`) to
+        recompute a fresh, possibly SMALLER decline for this same slot must
+        pass that netted baseline here, or this call would silently combine
+        the fresh decline with the ledger's raw (still includes this slot's
+        stale, larger contribution) balance and could cross the order
+        threshold purely from the retry -- clearing the pending balance even
+        though no broker order was actually submitted this run (Codex
+        review: "Do not re-record adjusted credits against the full
+        ledger"). ``None`` (the default) preserves the original
         read-the-ledger's-own-balance behavior.
         """
         symbol = ticker.strip().upper()
@@ -172,58 +158,14 @@ class CumulativeCreditLedger:
             if dedup_key is not None and dedup_key in recorded_keys:
                 cached = recorded_keys[dedup_key]
                 return CumulativeCreditDecision(**_decision_fields(cached))
-            rebased = False
-            if pending_baseline_usd is None:
-                pending = state["pending_usd_by_ticker"].get(symbol, 0.0)
-            elif idempotency_key:
-                # Rebase atomically against the state just loaded under this
-                # call's own lock instead of trusting the caller's pre-lock
-                # snapshot (see the docstring above).
-                rebased = True
-                preserve_key = f"preserve:{symbol}:{idempotency_key}"
-                cached_preserve = recorded_keys.get(preserve_key)
-                own_contribution = (
-                    0.0
-                    if cached_preserve is None or cached_preserve.get("consumed_by_settlement")
-                    else float(cached_preserve.get("incremental_credit_usd", 0.0))
-                )
-                pending = max(
-                    0.0,
-                    round(state["pending_usd_by_ticker"].get(symbol, 0.0) - own_contribution, 2),
-                )
-            else:
-                pending = float(pending_baseline_usd)
+            pending = (
+                state["pending_usd_by_ticker"].get(symbol, 0.0)
+                if pending_baseline_usd is None
+                else float(pending_baseline_usd)
+            )
             decision = apply_cumulative_credit(
                 pending, incremental_credit_usd, final_session=final_session
             )
-            if rebased and not final_session and decision.order_amount_usd > 0:
-                # The only production call site for the rebase branch above
-                # (morning_dca.py's stays-pending write) is reached ONLY
-                # after the caller has already committed, using its own
-                # (potentially staler) baseline, to placing no order this
-                # run -- it never inspects this method's return value,
-                # relying on the documented invariant that this call always
-                # yields order_amount_usd == 0. The atomic rebase can now see
-                # a fresher, larger balance (e.g. a concurrent stream's
-                # contribution the caller's own decision never knew about)
-                # that crosses the regular-session threshold on its own;
-                # silently honoring that here would clear the pending
-                # balance as though an order were submitted when none will
-                # be, permanently losing the credit (Codex review: "Prevent
-                # rebasing from creating an unsubmitted order"). Keep the
-                # full combined total pending instead -- exactly as
-                # :meth:`preserve_pending` would -- and defer the
-                # order-or-not decision to whichever later evaluation (a
-                # retry of this slot or a later slot) actually has the
-                # opportunity to place an order.
-                total = round(pending + float(incremental_credit_usd), 2)
-                decision = CumulativeCreditDecision(
-                    pending_before_usd=float(pending),
-                    incremental_credit_usd=float(incremental_credit_usd),
-                    order_amount_usd=0.0,
-                    pending_after_usd=total,
-                    final_session=final_session,
-                )
             if decision.pending_after_usd > 0:
                 state["pending_usd_by_ticker"][symbol] = decision.pending_after_usd
             else:
@@ -557,16 +499,10 @@ class CumulativeCreditLedger:
             # own monotonic "sequence" stamped by _next_sequence() at
             # preserve time, so consumption here is explicitly sorted by
             # that instead of relying on dict order. An entry only
-            # PARTIALLY covered by the remaining submitted amount is not
-            # marked consumed (a later retry of that exact slot must still
-            # be free to attempt the genuinely-outstanding remainder), but
-            # its recorded incremental_credit_usd IS reduced to that
-            # remainder: leaving the stale full amount in place would make
-            # preserved_credit_for_slot keep reporting the ORIGINAL
-            # preserved total even though part of it was just paid by this
-            # settlement, letting a delayed retry of that slot recompute
-            # and resubmit for credit already bought (Codex review: "Track
-            # partially consumed preserve entries").
+            # partially covered by the remaining submitted amount is left
+            # unconsumed rather than guessed at: preserved_credit_for_slot's
+            # ordinary subtraction still applies to it via the retained
+            # pending_after balance above.
             recorded_keys = state.setdefault("recorded_idempotency_keys", {})
             preserve_prefix = f"preserve:{symbol}:"
             candidates = [
@@ -576,22 +512,15 @@ class CumulativeCreditLedger:
             ]
             candidates.sort(key=lambda item: (item[0], item[1]))
             covered = 0.0
-            submitted_rounded = round(submitted, 2)
             for _sequence, _key, cached in candidates:
+                amount = float(cached.get("incremental_credit_usd", 0.0))
                 # Cent-precision tolerance: these are all round(x, 2) dollar
                 # amounts, but summing floats can land a hair past the
                 # target (e.g. 0.1 + 0.2 != 0.3 to the last bit).
-                available = round(submitted_rounded - covered, 2)
-                if available <= 0:
+                if round(covered + amount, 2) > round(submitted, 2) + 0.001:
                     break
-                amount = float(cached.get("incremental_credit_usd", 0.0))
-                if round(amount, 2) <= available + 0.001:
-                    covered = round(covered + amount, 2)
-                    cached["consumed_by_settlement"] = True
-                else:
-                    cached["incremental_credit_usd"] = round(amount - available, 2)
-                    covered = round(covered + available, 2)
-                    break
+                covered = round(covered + amount, 2)
+                cached["consumed_by_settlement"] = True
             state["events"].append(
                 {
                     "ticker": symbol,

@@ -54,7 +54,6 @@ from morning_dca import (
     MorningDCAExecutor,
     MorningLedger,
     MorningSignal,
-    OrderPlacementContext,
     TopUpOutcome,
     _csv_qualifying_notional_total,
     _PersistingBrokerAdapter,
@@ -70,7 +69,6 @@ from morning_dca import (
 )
 from near_close_dca import (
     EASTERN,
-    ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
     Action,
     Bar,
     DryRunBroker,
@@ -4188,14 +4186,14 @@ def test_morning_place_broker_orders_settles_credit_ledger_after_confirmed_submi
         cumulative_credit_decline_usd=0.30,
     )
     broker = _Broker()
-    outcomes = ex._place_broker_orders(OrderPlacementContext(
-        candidates=[signal],
-        trading_day=trading_day,
-        broker=broker,
-        top_up_outcomes={"AAPL": outcome},
+    outcomes = ex._place_broker_orders(
+        [signal],
+        trading_day,
+        broker,
+        {"AAPL": outcome},
         remaining_daily=180.0,
         remaining_weekly=900.0,
-    ))
+    )
     assert outcomes["AAPL"]["status"] == "submitted"
     assert broker.placed["AAPL"] == 1.0
     assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.0
@@ -5409,10 +5407,10 @@ def _seed_prior(
 
 
 class _TopUpBroker:
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER as _acct
     def __init__(self):
         self.placed = {}
-    def account_number(self):
-        return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+    def account_number(self): return self._acct
     def available_buying_power(self): return 1000.0
     def same_day_strategy_order_exists(self, ticker, trading_day): return False
     def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
@@ -5456,11 +5454,14 @@ class _RefIdTrackingBroker:
     real prior placements instead of a fixture that always returns False.
     """
 
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER as _acct
+
     def __init__(self):
         self.placed = {}  # ticker -> notional (last placement)
         self._ref_ids = []  # list of (ticker, ref_id) placed so far
 
-    def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+    def account_number(self):
+        return self._acct
 
     def available_buying_power(self):
         return 1000.0

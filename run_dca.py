@@ -31,7 +31,7 @@ import json
 import logging
 import os
 import shutil
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -108,10 +108,10 @@ from scripts.scheduled_artifacts import (
 logger = logging.getLogger("near_close_dca.run")
 
 # Root for ad hoc intraday scheduled-recovery streams (e.g. the Jul 24 2026
-# 2:30 PM ET intraday_1430 recovery). See config/scheduled_tasks.json for the
-# intraday_dca_scheduled_recovery_2026_07_24 record and its canonical_first_buy_and_topup_rule note.
-# These streams have no dedicated *_dca.py module/config of their own but still write artifacts under
-# the same cron_tracking/{stream}_dca/{YYYYMMDD_HHMMET}/ directory pattern as the morning/midday roots.
+# 2:30 PM ET intraday_1430 recovery -- see config/scheduled_tasks.json
+# canonical_first_buy_and_topup_rule -> intraday_dca_scheduled_recovery_2026_07_24),
+# which have no dedicated *_dca.py module/config of their own but follow the
+# same ``cron_tracking/<stream>_dca/`` layout as the morning/midday roots.
 # Declared as its own root (rather than folded into
 # _CROSS_STREAM_PRIOR_ALLOCATION_ROOTS below, which also drives each stream's
 # OWN configured-root lookup in _resolve_cross_stream_prior_allocation_roots --
@@ -495,12 +495,26 @@ def _resolve_cross_stream_prior_allocation_roots(
     _env_market_open_root = os.environ.get("DCA_MARKET_OPEN_LIVE_STATE_ROOT")
     market_open_root = Path(_env_market_open_root) if _env_market_open_root else None
 
-    # Resolve UPFRONT whether the override is CONFIGURED at all, and separately
-    # whether it needs its own scan entry (ACTIVE). Strict ancestors are invalid
-    # misconfigurations. Nested or equal overrides are valid but do not need
-    # separate scan entries, as the afternoon scan already covers them.
-    # We must suppress the legacy fallback based on the 'CONFIGURED' state, not
-    # the 'ACTIVE' state, to prevent re-aggregating stale artifacts.
+    # Resolve UPFRONT whether the override is CONFIGURED at all, and
+    # separately whether it needs its own scan entry (ACTIVE) -- these are
+    # NOT the same question, and conflating them was itself an issue (Codex
+    # review: "Drop the legacy fallback for covered nested overrides"). An
+    # override that is a STRICT ANCESTOR of afternoon_root is a genuine
+    # misconfiguration -- practically the whole cron tree, not a meaningful
+    # "intraday root" -- so it is invalid and treated exactly as if unset.
+    # But an override NESTED under (or EQUAL TO) afternoon_root is a real,
+    # deliberately-configured location; it just doesn't need a separate
+    # scan entry because the caller's own recursive afternoon scan already
+    # covers it -- including the equal case, which is trivially covered by
+    # that same scan (Codex review: "Treat an override equal to the
+    # afternoon root as covered"; an ancestor-or-equal check previously
+    # treated the equal case as the ancestor misconfiguration too).
+    # Suppressing the legacy cron_base/intraday_dca fallback must track the
+    # former (was a valid override configured), not the latter (does it
+    # need its own scan entry) -- otherwise a nested (or equal) override
+    # incorrectly resurrects the legacy fallback, and if that stale tree
+    # still holds artifacts from before the relocation, they get aggregated
+    # alongside the (already-covered) real data.
     _intraday_is_ancestor_of_afternoon = (
         intraday_root is not None
         and _is_within(afternoon_root.resolve(), intraday_root.resolve())
@@ -1556,7 +1570,13 @@ def run_pipeline(
     )
 
     def _invoke() -> Dict[str, Any]:
-        ctx = RunContext(
+        result = _run_pipeline_impl(
+            now,
+            config,
+            state,
+            finance_data,
+            robinhood_data,
+            broker,
             artifacts_dir=artifacts_dir,
             run_label=run_label,
             scheduled=scheduled,
@@ -1573,15 +1593,6 @@ def run_pipeline(
             correlation_id=correlation_id,
             stream=stream_name,
             preflight_gate=preflight_gate,
-        )
-        result = _run_pipeline_impl(
-            now,
-            config,
-            state,
-            finance_data,
-            robinhood_data,
-            broker,
-            ctx=ctx,
         )
         run_state_path = result.get("run_state_path")
         run_id = None
@@ -1829,28 +1840,6 @@ def _final_buy_trend_override_window_start(now: datetime) -> time:
     return time(hh, mm)
 
 
-
-@dataclass(frozen=True)
-class RunContext:
-    """Parameters for the DCA pipeline execution."""
-    artifacts_dir: str | Path
-    run_label: str = "daily"
-    scheduled: bool = True
-    generate_full_reports: bool = False
-    ignore_trend_filter: bool = False
-    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]] = None
-    prior_allocation_state_root: Optional[str | Path] = None
-    deployment_history_root: Optional[str | Path] = None
-    classification_state_root: Optional[str | Path] = None
-    config_dir: Optional[str | Path] = None
-    raw_connector_inputs: Optional[Mapping[str, Any]] = None
-    required_raw_filenames: Optional[frozenset] = None
-    classification_overrides: Optional[Dict[str, Any]] = None
-    correlation_id: Optional[str] = None
-    stream: str = "afternoon"
-    preflight_gate: Optional[Dict[str, Any]] = None
-
-
 def _run_pipeline_impl(
     now: datetime,
     config: StrategyConfig,
@@ -1859,7 +1848,22 @@ def _run_pipeline_impl(
     robinhood_data: MarketDataProvider,
     broker: BrokerAdapter,
     *,
-    ctx: RunContext,
+    artifacts_dir: str | Path,
+    run_label: str = "daily",
+    scheduled: bool = True,
+    generate_full_reports: bool = False,
+    ignore_trend_filter: bool = False,
+    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]] = None,
+    prior_allocation_state_root: Optional[str | Path] = None,
+    deployment_history_root: Optional[str | Path] = None,
+    classification_state_root: Optional[str | Path] = None,
+    config_dir: Optional[str | Path] = None,
+    raw_connector_inputs: Optional[Mapping[str, Any]] = None,
+    required_raw_filenames: Optional[frozenset] = None,
+    classification_overrides: Optional[Dict[str, Any]] = None,
+    correlation_id: Optional[str] = None,
+    stream: str = "afternoon",
+    preflight_gate: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run one compact DCA cycle and (optionally) the full post-trade report set.
 
@@ -1941,23 +1945,6 @@ def _run_pipeline_impl(
     now just means ``run_slot`` passed through the full universe already, and
     this function evaluates it normally like any other run.
     """
-
-    artifacts_dir = ctx.artifacts_dir
-    run_label = ctx.run_label
-    scheduled = ctx.scheduled
-    generate_full_reports = ctx.generate_full_reports
-    ignore_trend_filter = ctx.ignore_trend_filter
-    prior_same_day_allocations = ctx.prior_same_day_allocations
-    prior_allocation_state_root = ctx.prior_allocation_state_root
-    deployment_history_root = ctx.deployment_history_root
-    classification_state_root = ctx.classification_state_root
-    config_dir = ctx.config_dir
-    raw_connector_inputs = ctx.raw_connector_inputs
-    required_raw_filenames = ctx.required_raw_filenames
-    classification_overrides = ctx.classification_overrides
-    correlation_id = ctx.correlation_id
-    stream = ctx.stream
-    preflight_gate = ctx.preflight_gate
     # Drain any leftover raw placement responses from a prior run on this broker
     # instance (e.g. a manual run_pipeline() call that preceded this scheduled one).
     # Without this, a non-scheduled manual call would leave its responses in the
@@ -2489,28 +2476,54 @@ def _run_pipeline_impl(
                     )
                 )
                 # Merge by COMPLETENESS rather than replacing wholesale or
-                # trusting the reload just because a ticker was unresolved.
-                # The merge rules are:
-                #   1. A ticker only in the reload is added IF the reload was
-                #      clean (zero skips); otherwise its reference/base are
-                #      poisoned to None so the guard routes through the
-                #      conservative missing_prior_price path instead of
-                #      trusting a possibly-partial total as complete.
-                #   2. A ticker present in BOTH passes is only fully trusted
-                #      when the reload itself had zero skips
-                #      (second_scan_had_failures=False / _reload_verified_complete=True).
-                #      The trust gate intentionally keys off the *reload's*
-                #      skip count -- not the first pass's -- because the reload
-                #      is the authoritative second read, and a single unread
-                #      file in that scan could be the file that would have
-                #      added another contributor to any ticker in the active
-                #      universe; we cannot enumerate who was affected.
-                #   3. When the reload is clean, "take the larger amount_usd"
-                #      still lets the merge fall through to the equal/smaller
-                #      branch, which can carry a fresher reference_price or
-                #      base_price even if the dollar amount didn't grow.
-                #      That reference/base correction path is preserved so the
-                #      guard does not price off a stale snapshot.
+                # trusting the reload just because a ticker was unresolved:
+                # amount_usd is the sum across every contributing artifact
+                # for that ticker, so whichever pass aggregated the LARGER
+                # amount read strictly more of that ticker's artifacts and
+                # is the more complete answer -- whether or not its
+                # reference price happens to be resolved (an unknown-price
+                # contributor can raise the amount while correctly
+                # poisoning the reference, which is itself the safe,
+                # conservative outcome). A SMALLER second-pass amount means
+                # the reload lost an artifact the first pass had -- e.g. an
+                # unconfirmed submission that made the first pass
+                # conservatively unresolved vanished from the reload, which
+                # must not be read as "resolved," only as "incomplete
+                # again" (Codex review: "Preserve unresolved context when
+                # the reload is incomplete"). Equal amounts fall back to
+                # resolution: take the reload ONLY if it turned an unknown
+                # price into a known one, never the reverse (Codex review:
+                # "Preserve resolved ticker context across the reload"). A
+                # ticker entirely absent from the first pass always takes
+                # the reload's result, since there is nothing to protect
+                # there.
+                #
+                # BUT that completeness reasoning only holds when the
+                # RELOAD (second pass) itself had zero skips anywhere.
+                # amount_usd alone cannot tell "the same contributor(s), now
+                # resolved/more complete" apart from "each scan missed a
+                # DIFFERENT real contributor" -- e.g. pass one reads only an
+                # unknown-price $5 submission (a $6 filled artifact for the
+                # SAME ticker fails to parse that pass), and the reload
+                # reads only that $6 fill (the $5 submission fails to parse
+                # THIS pass instead). $6 > $5 looks strictly more complete
+                # by amount alone, but the real aggregate is $11/unknown
+                # (Codex review: "Preserve uncertainty when unequal/equal
+                # contributors swap"). There is no per-artifact identity
+                # tracked here to rule this out directly, so the guard is
+                # gated on `second_scan_had_failures` specifically, NOT on
+                # whether the FIRST pass also had a skip: if the reload
+                # itself is clean, it read every artifact currently on disk
+                # for every ticker with zero exceptions, so its total is
+                # definitionally complete regardless of what the first pass
+                # missed (a first pass that skipped an artifact and a clean
+                # reload that then reads it is exactly the recovery this
+                # bounded reload exists to enable -- gating on the first
+                # pass's flag too would refuse that legitimate recovery
+                # whenever pass one had ANY unrelated skip, Codex review:
+                # "Use a clean reload after a failed first scan"). Only a
+                # reload that ITSELF skipped something can produce the
+                # swapped-contributor false confidence above.
                 _reload_verified_complete = not second_scan_had_failures
                 prior_same_day_allocations = dict(first_pass)
                 for ticker, alloc in second_pass.items():
@@ -3018,7 +3031,7 @@ class DemoDataProvider:
 
     def _drop_fraction(self, ticker: str) -> float:
         # 0.0 .. ~4.5% depending on the ticker, stable across runs.
-        return (sum(ticker.encode('utf-8')) % 46) / 1000.0
+        return (sum(ord(ch) for ch in ticker) % 46) / 1000.0
 
     def get_intraday_bars(
         self, ticker: str, start: datetime, end: datetime, interval_minutes: int

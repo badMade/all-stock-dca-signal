@@ -805,21 +805,6 @@ def test_scheduled_validate_pointer_still_rejects_recovery_pointer(tmp_path):
     assert bool(result) is False
 
 
-def test_is_recovery_stream():
-    from same_day_pointer import RECOVERY_STREAMS, is_recovery_stream
-
-    # Valid streams
-    for stream in RECOVERY_STREAMS:
-        assert is_recovery_stream(stream) is True
-
-    # Invalid streams
-    assert is_recovery_stream("morning") is False
-    assert is_recovery_stream("market_open") is False
-    assert is_recovery_stream("") is False
-    assert is_recovery_stream(None) is False
-    assert is_recovery_stream(123) is False
-
-
 def test_recovery_status_is_rejected_for_scheduled_consumers():
     from same_day_pointer import (
         REJECTED_STATUSES,

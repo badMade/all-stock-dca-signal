@@ -9,8 +9,6 @@ from dca_intraday_archive import read_ticker_observations
 from scripts.backfill_intraday_archive import (
     _classification_from_path,
     _effective_trading_day,
-    iter_run_states,
-    load_run_state,
     main,
     observations_for_run_state,
 )
@@ -201,41 +199,3 @@ def test_default_archive_dir_guard_runs_for_backfills_too(tmp_path, monkeypatch)
 
     assert exit_code == 2
     assert not missing_ticker_data.exists()
-
-
-def test_iter_run_states(tmp_path):
-    assert list(iter_run_states(tmp_path)) == []
-
-    (tmp_path / "a").mkdir()
-    (tmp_path / "a" / "run_state.json").write_text("{}")
-    (tmp_path / "b").mkdir()
-    (tmp_path / "b" / "run_state.json").write_text("{}")
-    (tmp_path / "b" / "other.json").write_text("{}")
-
-    paths = list(iter_run_states(tmp_path))
-    assert len(paths) == 2
-    assert tmp_path / "a" / "run_state.json" in paths
-    assert tmp_path / "b" / "run_state.json" in paths
-
-
-def test_load_run_state(tmp_path):
-    path = tmp_path / "run_state.json"
-
-    # Valid
-    path.write_text('{"key": "value"}')
-    assert load_run_state(path) == {"key": "value"}
-
-    # Invalid JSON
-    path.write_text('{"key": "value"')
-    assert load_run_state(path) is None
-
-    # Not a dict
-    path.write_text('["list"]')
-    assert load_run_state(path) is None
-
-    # Unreadable
-    path.write_bytes(b'\x80\x81')
-    assert load_run_state(path) is None
-
-    # Missing file
-    assert load_run_state(tmp_path / "missing.json") is None

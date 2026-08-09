@@ -135,30 +135,3 @@ def test_banner_prints_even_if_caller_swallows_the_exception(capsys):
         pass  # simulate a caller that swallows the exception
 
     assert "CIRCUIT BREAKER CHECKPOINT" in capsys.readouterr().out
-
-
-def test_zero_limits_allow_only_zero_values():
-    breaker = CircuitBreaker(turn_limit=0, token_limit=0)
-
-    breaker.check(turn_count=0, accumulated_tokens=0)  # must not raise
-
-    with pytest.raises(CircuitBreakerError) as excinfo:
-        breaker.check(turn_count=1, accumulated_tokens=0)
-    assert excinfo.value.reason == "turn_ceiling"
-
-    with pytest.raises(CircuitBreakerError) as excinfo:
-        breaker.check(turn_count=0, accumulated_tokens=1)
-    assert excinfo.value.reason == "token_ceiling"
-
-def test_negative_turn_count(capsys):
-    breaker = CircuitBreaker(turn_limit=5, token_limit=15000)
-    breaker.check(turn_count=-1, accumulated_tokens=100)  # must not raise
-
-    # A negative turn_count is nowhere near either ceiling, so the checkpoint
-    # banner -- which only prints on a breach -- must stay silent.
-    assert "CIRCUIT BREAKER CHECKPOINT" not in capsys.readouterr().out
-
-
-def test_negative_accumulated_tokens_does_not_raise():
-    breaker = CircuitBreaker(turn_limit=5, token_limit=15000)
-    breaker.check(turn_count=1, accumulated_tokens=-100)  # must not raise

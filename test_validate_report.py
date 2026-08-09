@@ -118,7 +118,7 @@ def test_validate_duration_overflow_to_infinity(mock_print, mock_exit):
     with patch('builtins.open', mock_open(read_data=read_data)):
         with pytest.raises(SystemExit):
             validate()
-        assert "has wrong type" in mock_print.call_args[0][0]
+        assert "must be a finite non-negative number" in mock_print.call_args[0][0]
         mock_exit.assert_called_with(1)
 
 
@@ -139,7 +139,7 @@ def test_validate_negative_duration(mock_print, mock_exit):
     with patch('builtins.open', mock_open(read_data=json.dumps(data))):
         with pytest.raises(SystemExit):
             validate()
-        assert "has wrong type" in mock_print.call_args[0][0]
+        assert "must be a finite non-negative number" in mock_print.call_args[0][0]
         mock_exit.assert_called_with(1)
 
 
@@ -150,7 +150,7 @@ def test_validate_negative_duration_float(mock_print, mock_exit):
     with patch('builtins.open', mock_open(read_data=json.dumps(data))):
         with pytest.raises(SystemExit):
             validate()
-        assert "has wrong type" in mock_print.call_args[0][0]
+        assert "must be a finite non-negative number" in mock_print.call_args[0][0]
         mock_exit.assert_called_with(1)
 
 

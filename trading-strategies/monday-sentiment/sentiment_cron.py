@@ -65,6 +65,7 @@ MAX_FLAGGED_TICKERS: int = 3          # cap email to top-N most extreme movers
 MAX_HEADLINES_PER_TICKER: int = 50    # NewsAPI page size per ticker
 MAX_SEC_FILINGS: int = 5              # EDGAR EFTS results per ticker
 TOP_HEADLINES_IN_EMAIL: int = 3       # per-ticker headline slots in email body
+MAX_CONCURRENT_TICKERS: int = 5       # cap in-flight tickers so EDGAR/NewsAPI calls stay under fair-use limits
 
 # SEC EDGAR full-text search endpoint — free, no API key required
 # https://efts.sec.gov/LATEST/search-index?q=AAPL&forms=8-K,10-K,10-Q
@@ -991,17 +992,30 @@ def run(args: argparse.Namespace) -> int:
     results: Dict[str, dict] = {}
 
     async def process_all_tickers():
+        # Bound concurrent SEC EDGAR / NewsAPI requests so a large watchlist
+        # can't blow through the SEC's 10-requests-per-second fair-access
+        # limit (each ticker fires at most one EDGAR call and one NewsAPI
+        # call, so capping in-flight tickers caps in-flight EDGAR requests).
+        sem = asyncio.Semaphore(MAX_CONCURRENT_TICKERS)
+
+        async def _run_one(session: aiohttp.ClientSession, ticker: str):
+            async with sem:
+                log.info("[%s] Processing…", ticker)
+                return await compute_ticker_score(session, ticker, pipe, news_api_key, lookback)
+
         async with aiohttp.ClientSession() as session:
-            tasks = [compute_ticker_score(session, ticker, pipe, news_api_key, lookback) for ticker in tickers]
+            tasks = [_run_one(session, ticker) for ticker in tickers]
             return await asyncio.gather(*tasks, return_exceptions=True)
 
     scored_results = asyncio.run(process_all_tickers())
 
     for ticker, score_res in zip(tickers, scored_results):
-        log.info("[%s] Processing…", ticker)
         if isinstance(score_res, Exception):
             log.error("[%s] Unexpected error during scoring: %s", ticker, score_res)
-            log.debug("".join(traceback.format_exception(type(score_res), score_res, score_res.__traceback__)))
+            log.debug(
+                "Exception details:\n%s",
+                "".join(traceback.format_exception(type(score_res), score_res, score_res.__traceback__)),
+            )
             score, scored_items = 0.0, []
         else:
             score, scored_items = score_res

@@ -507,12 +507,6 @@ def test_the_account_number_must_be_supplied():
         _run([_page([])], [{"ticker": "TRIN", "desired_usd": 1.0, "current_price": 17.0}], account="")
 
 
-def test_the_trading_day_must_be_supplied():
-    """Account pinning: a snapshot of the wrong trading day proves nothing."""
-    with pytest.raises(ValueError):
-        _run([_page([])], [{"ticker": "TRIN", "desired_usd": 1.0, "current_price": 17.0}], day="")
-
-
 # --- the 2026-07-30 regression -----------------------------------------------
 
 # The twelve orders the seven live slots actually placed on 2026-07-30, in

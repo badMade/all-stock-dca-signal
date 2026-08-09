@@ -75,12 +75,12 @@ def validate(filepath='testing_report.json'):
                 # decoding rather than raising, so isinstance(..., (int,
                 # float)) alone would silently accept it as a valid duration.
                 if isinstance(value, float) and not math.isfinite(value):
-                    print(f"Error: Item {i} field '{field}' has wrong type")
+                    print(f"Error: Item {i} field '{field}' must be a finite non-negative number")
                     sys.exit(1)
                 # Elapsed test durations cannot be negative; a negative value
                 # indicates corrupted timing data rather than a real result.
                 if value < 0:
-                    print(f"Error: Item {i} field '{field}' has wrong type")
+                    print(f"Error: Item {i} field '{field}' must be a finite non-negative number")
                     sys.exit(1)
 
     print("Validation successful")

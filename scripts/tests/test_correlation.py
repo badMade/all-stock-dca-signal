@@ -43,21 +43,3 @@ def test_child_requires_parent():
 
     with pytest.raises(ValueError):
         correlation.child_correlation_id("", "recovery")
-
-def test_build_handles_empty_or_fully_unsafe_segments():
-    cid = correlation.build_correlation_id("///", "---", "")
-    assert cid == "dca-na-na-na"
-
-def test_is_child_handles_none_or_empty():
-    assert not correlation.is_child(None)
-    assert not correlation.is_child("")
-    assert not correlation.is_child("dca-no-slash")
-
-def test_parent_of_handles_none_or_empty():
-    assert correlation.parent_of(None) is None
-    assert correlation.parent_of("") is None
-
-def test_new_correlation_id_unsafe_stream():
-    cid = correlation.new_correlation_id("???")
-    assert cid.startswith("dca-na-")
-

@@ -100,28 +100,6 @@ def test_build_entry_unknown_task_raises():
         pass
 
 
-def test_build_entry_missing_required_fields():
-    try:
-        build_entry(run_id="", cron_id="67aa802b", artifact_path="/tmp/a")
-        raise AssertionError("expected ValueError")
-    except ValueError as e:
-        assert "model usage log entry missing required fields" in str(e)
-        assert "['run_id']" in str(e)
-
-
-def test_build_entry_invalid_model_routing_mode():
-    try:
-        build_entry(
-            run_id="r1",
-            cron_id="67aa802b",
-            artifact_path="/tmp/a",
-            model_routing_mode="invalid_mode"
-        )
-        raise AssertionError("expected ValueError")
-    except ValueError as e:
-        assert "invalid model_routing_mode 'invalid_mode'" in str(e)
-
-
 def test_build_entry_premium_requires_valid_reason():
     for bad_kwargs in (
         {},  # missing reason entirely

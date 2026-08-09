@@ -33,6 +33,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 from dca_fileio import atomic_open_w
 from scripts.same_day_pointer import (
     _utc_now_iso,
+    derive_valid_scheduled_evidence,
+    today_et,
 )
 
 RUN_STATE_FILENAME = "run_state.json"
@@ -169,7 +171,7 @@ def build_preflight_run_classification(
     """Non-null run_classification for the 9:45 pre-flight validation run.
 
     ``valid_scheduled_evidence`` must be derived from the completed run_state
-    (see :func:`scripts.same_day_pointer.derive_valid_scheduled_evidence`), never asserted blindly.
+    (see :func:`derive_valid_scheduled_evidence`), never asserted blindly.
     Includes every field schemas/morning_run_classification.schema.json
     requires for a scheduled run_type='morning_dca_preflight' document
     (trades, valid_afternoon_evidence, and the pinned scheduled window), not
@@ -1319,5 +1321,7 @@ __all__ = [
     "completion_marker",
     "read_run_state",
     "await_finalized_run_artifacts",
+    "derive_valid_scheduled_evidence",
+    "today_et",
     "csv_qualifying_notional_total",
 ]
