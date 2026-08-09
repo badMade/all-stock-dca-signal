@@ -32,6 +32,7 @@ These tests define that contract for the first time.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time as time_module
@@ -7989,6 +7990,90 @@ def test_read_config_rejects_duplicate_keys(tmp_path, monkeypatch):
     monkeypatch.setattr(dca_runner, "CONFIG_DIR", tmp_path)
     with pytest.raises(ValueError):
         dca_runner._read_config("market_calendar.json")
+
+
+def test_read_config_picks_up_edits(tmp_path, monkeypatch):
+    """``_read_config`` re-reads the file's bytes on every call and caches by
+    that content, not by ``name`` alone, so an operator's edit to a config
+    file is picked up on the NEXT read instead of being served from a stale
+    cache entry for the rest of a long-lived runner process's life (Codex
+    review: "Invalidate cached configs when their files change")."""
+    config_path = tmp_path / "trading_window.json"
+    config_path.write_text(json.dumps({"start_et": "15:25", "end_et": "15:35"}))
+    monkeypatch.setattr(dca_runner, "CONFIG_DIR", tmp_path)
+    first = dca_runner._read_config("trading_window.json")
+    assert first["start_et"] == "15:25"
+
+    config_path.write_text(json.dumps({"start_et": "15:20", "end_et": "15:35"}))
+    second = dca_runner._read_config("trading_window.json")
+    assert second["start_et"] == "15:20"
+
+
+def test_read_config_picks_up_equal_size_edits_with_a_preserved_mtime(tmp_path, monkeypatch):
+    """Two earlier cache-key designs (mtime alone; mtime + size) were each
+    defeated by a variant of the same problem: a filesystem with coarser
+    timestamp resolution than the gap between two writes, or a deployment
+    tool that preserves timestamps, can leave an edited file's metadata
+    completely unchanged -- including its size, for an equal-byte-count edit
+    like ``"15:25"`` -> ``"15:20"`` (Codex review: "Invalidate equal-size
+    configuration replacements"). Forcing BOTH mtime and size to stay
+    identical across the edit and still observing the new value proves the
+    cache key is the file's actual content, not a metadata proxy for it."""
+    config_path = tmp_path / "trading_window.json"
+    config_path.write_text(json.dumps({"start_et": "15:25", "end_et": "15:35"}))
+    monkeypatch.setattr(dca_runner, "CONFIG_DIR", tmp_path)
+    first = dca_runner._read_config("trading_window.json")
+    assert first["start_et"] == "15:25"
+
+    frozen_mtime_ns = config_path.stat().st_mtime_ns
+    frozen_size = config_path.stat().st_size
+    config_path.write_text(json.dumps({"start_et": "15:20", "end_et": "15:35"}))  # same length
+    os.utime(config_path, ns=(frozen_mtime_ns, frozen_mtime_ns))
+    assert config_path.stat().st_mtime_ns == frozen_mtime_ns
+    assert config_path.stat().st_size == frozen_size
+
+    second = dca_runner._read_config("trading_window.json")
+    assert second["start_et"] == "15:20"
+
+
+def test_read_config_handles_a_utf8_bom(tmp_path, monkeypatch):
+    """``json.loads`` auto-detects a UTF-8 BOM (and UTF-16/32) when given
+    bytes, but a BOM-prefixed file decoded via ``read_text(encoding="utf-8")``
+    keeps the BOM as a leading character in the resulting str and fails to
+    parse. Reading raw bytes here (rather than ``read_text``) preserves that
+    auto-detection instead of regressing on a BOM-prefixed config saved by
+    some Windows editors (Codex review: "Preserve BOM-aware configuration
+    decoding")."""
+    config_path = tmp_path / "trading_window.json"
+    payload = json.dumps({"start_et": "15:25", "end_et": "15:35"}).encode("utf-8")
+    config_path.write_bytes(b"\xef\xbb\xbf" + payload)
+    monkeypatch.setattr(dca_runner, "CONFIG_DIR", tmp_path)
+    cfg = dca_runner._read_config("trading_window.json")
+    assert cfg["start_et"] == "15:25"
+
+
+def test_read_config_freezes_nested_lists_and_dicts(tmp_path, monkeypatch):
+    """``MappingProxyType`` on its own only protects the TOP-LEVEL dict
+    returned by ``_read_config``; a nested list (``holidays_closed``) or
+    nested dict (``circuit_breakers``) must be frozen too, or a caller
+    mutating either would silently corrupt the cached object for every
+    subsequent safety-gate read for the rest of the process's life (Codex
+    review: "Freeze nested configuration values before caching")."""
+    (tmp_path / "market_calendar.json").write_text(
+        json.dumps({"years_covered": [2026], "holidays_closed": ["2026-12-25"], "early_close_1300": []})
+    )
+    (tmp_path / "budgets.json").write_text(json.dumps({"circuit_breakers": {"max_per_order_usd": 100}}))
+    monkeypatch.setattr(dca_runner, "CONFIG_DIR", tmp_path)
+
+    cal = dca_runner._read_config("market_calendar.json")
+    assert isinstance(cal["holidays_closed"], tuple)
+    with pytest.raises(AttributeError):
+        cal["holidays_closed"].append("2026-01-01")
+
+    budgets = dca_runner._read_config("budgets.json")
+    assert isinstance(budgets["circuit_breakers"], types.MappingProxyType)
+    with pytest.raises(TypeError):
+        budgets["circuit_breakers"]["max_per_order_usd"] = 999
 
 
 @pytest.mark.parametrize("bad_holidays", [{}, "", {"2026-07-03": True}, "2026-07-03"])
