@@ -23,6 +23,7 @@ dist/
 *.orig
 *.diff
 *.patch
+*.bak
 
 # Local run output
 artifacts/
