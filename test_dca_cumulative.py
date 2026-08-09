@@ -197,6 +197,26 @@ def test_record_with_a_netted_baseline_does_not_double_count_this_slots_own_pres
     assert ledger.pending_usd("xyz", "2026-08-03") == 0.20
 
 
+def test_record_with_idempotency_rebases_from_locked_state_not_caller_baseline(tmp_path):
+    # With an idempotency key, record() must recompute from the CURRENT locked
+    # ledger state (minus this slot's own unconsumed preserve entry, if any),
+    # not trust a caller-supplied pre-lock baseline that may now be stale.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.record("xyz", "2026-08-03", 0.40, stream="morning")
+
+    decision = ledger.record(
+        "xyz",
+        "2026-08-03",
+        0.10,
+        idempotency_key="slot-1",
+        pending_baseline_usd=0.0,
+    )
+
+    assert decision.pending_before_usd == 0.40
+    assert decision.order_amount_usd == 1.0
+    assert ledger.pending_usd("xyz", "2026-08-03") == 0.0
+
+
 def test_recorded_decision_returns_none_for_a_preserve_only_slot(tmp_path):
     # A blocked placement must still be free to retry (a later gate check
     # might now pass), so recorded_decision() -- which short-circuits a
@@ -275,9 +295,8 @@ def test_settle_retains_the_balance_a_clamped_order_did_not_cover(tmp_path):
     # partial settlement"): the FIRST $0.80 contribution IS fully covered by
     # the $1 submitted and must be marked consumed (else a delayed retry of
     # that exact slot could recompute and resubmit for credit already
-    # bought); the remaining two, only partially/never covered, stay
-    # unconsumed so their own delayed retries still go through the ordinary
-    # subtraction path against the genuinely-outstanding $1.40.
+    # bought); the second entry is partially covered and must be reduced to
+    # its real $0.60 remainder, while the third stays at $0.80.
     ledger = CumulativeCreditLedger(tmp_path)
     ledger.preserve_pending("xyz", "2026-08-03", 0.80, idempotency_key="slot-1")
     ledger.preserve_pending("xyz", "2026-08-03", 0.80, idempotency_key="slot-2")
@@ -290,9 +309,10 @@ def test_settle_retains_the_balance_a_clamped_order_did_not_cover(tmp_path):
     decision = ledger.recorded_decision("xyz", "2026-08-03", "slot-1")
     assert decision is not None and decision.order_amount_usd == 0.0
     assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "slot-1") == 0.0
-    for slot in ("slot-2", "slot-3"):
-        assert ledger.recorded_decision("xyz", "2026-08-03", slot) is None
-        assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", slot) == 0.80
+    assert ledger.recorded_decision("xyz", "2026-08-03", "slot-2") is None
+    assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "slot-2") == 0.60
+    assert ledger.recorded_decision("xyz", "2026-08-03", "slot-3") is None
+    assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "slot-3") == 0.80
 
 
 def test_settle_still_fully_clears_a_balance_the_submission_covers(tmp_path):
@@ -324,7 +344,7 @@ def test_settle_covers_exactly_one_of_two_equal_preserved_credits(tmp_path):
     assert ledger.pending_usd("xyz", "2026-08-03") == 0.60
     assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "slot-1") == 0.0
     assert ledger.recorded_decision("xyz", "2026-08-03", "slot-1") is not None
-    assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "slot-2") == 0.80
+    assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "slot-2") == 0.60
     assert ledger.recorded_decision("xyz", "2026-08-03", "slot-2") is None
 
 
@@ -347,14 +367,15 @@ def test_settle_consumes_the_earliest_preserved_credit_first_despite_key_sort_or
     # morning's slot was preserved FIRST and must be the one fully consumed.
     assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "morning_run_1030") == 0.0
     assert ledger.recorded_decision("xyz", "2026-08-03", "morning_run_1030") is not None
-    # midday's slot was preserved SECOND and must remain retriable.
-    assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "midday_run_1230") == 0.80
+    # midday's slot was preserved SECOND and must remain retriable with only
+    # its genuine uncovered remainder.
+    assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "midday_run_1230") == 0.60
     assert ledger.recorded_decision("xyz", "2026-08-03", "midday_run_1230") is None
 
 
 def test_settle_consumes_nothing_when_the_first_entry_alone_exceeds_submission(tmp_path):
-    # A submission smaller than even the first preserved entry must not mark
-    # anything consumed -- there is nothing it fully covers.
+    # A submission smaller than the first preserved entry must not mark it
+    # consumed, but it does reduce that entry to the uncovered remainder.
     ledger = CumulativeCreditLedger(tmp_path)
     ledger.preserve_pending("xyz", "2026-08-03", 0.80, idempotency_key="slot-1")
 
@@ -362,7 +383,7 @@ def test_settle_consumes_nothing_when_the_first_entry_alone_exceeds_submission(t
 
     assert ledger.pending_usd("xyz", "2026-08-03") == 0.30
     assert ledger.recorded_decision("xyz", "2026-08-03", "slot-1") is None
-    assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "slot-1") == 0.80
+    assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "slot-1") == 0.30
 
 
 def test_settle_does_not_affect_a_different_tickers_preserved_credit(tmp_path):

@@ -6382,6 +6382,50 @@ def test_execute_plan_redacts_a_non_string_mismatched_client_reference():
     assert "dict" in result.failure_reason
 
 
+@pytest.mark.parametrize("ref_id_field", ["ref_id", "client_order_id", "client_order_uuid", "client_id"])
+def test_execute_plan_redacts_a_string_mismatched_client_reference(ref_id_field):
+    """A string mismatched client reference can still contain token/account-shaped
+    substrings from broker metadata and must be redacted before it is persisted."""
+    secret_account_number = "123456789"  # synthetic, allow-listed account-shaped value
+    broker = dca_runner.build_runner_broker(
+        place_fn=lambda **kw: {
+            "id": "ORD",
+            "state": "queued",
+            "symbol": "AAPL",
+            "side": "buy",
+            ref_id_field: f"{secret_account_number}-ghp_abcdefghijklmnopqrstuvwxyz123456",
+        },
+        enable_live_orders=True,
+        dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    snapshot = dca_runner.budget_snapshot([], date(2026, 7, 28))
+    tier = BudgetTier("normal", 180.0, 900.0)
+    plan = dca_runner.plan_orders(
+        candidates=[dca_runner.Candidate("AAPL", 2.0)], snapshot=snapshot, tier=tier
+    )
+    result = dca_runner.execute_plan(
+        plan,
+        broker,
+        run_id="test-run-2026-07-28",
+        snapshot=snapshot,
+        trading_day=date(2026, 7, 28),
+        orders=[],
+        tier=tier,
+        orders_account_number=TEST_ACCOUNT_NUMBER,
+        now=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        now_fn=lambda: datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        slot_id="0935",
+        orders_fetched_at=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        buying_power_usd=TEST_BUYING_POWER_USD,
+        candidates=[dca_runner.Candidate("AAPL", 2.0)],
+    )
+    assert result.halted_on == "AAPL"
+    assert secret_account_number not in result.failure_reason
+    assert "ghp_abcdefghijklmnopqrstuvwxyz123456" not in result.failure_reason
+    assert "[REDACTED-TOKEN]" in result.failure_reason
+
+
 def test_execute_plan_redacts_a_malformed_success_flag():
     """A malformed success/ok/approved flag can be arbitrary connector data
     -- a dict carrying an access token or account identifier, for instance

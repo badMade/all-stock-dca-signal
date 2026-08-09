@@ -449,6 +449,7 @@ def test_append_observations_refuses_to_create_the_archive_root_when_missing(tmp
 
     assert result["ok"] is False
     assert "does not exist" in result["error"]
+    assert "DCA_TICKER_HISTORY_DIR" in result["error"]
     assert not missing_root.exists()
 
 

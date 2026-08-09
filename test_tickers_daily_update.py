@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from scripts.run_tickers_daily_update import run_incremental_update
 
 
@@ -182,3 +184,15 @@ def test_a_hung_invocation_degrades_to_partial_instead_of_hanging_forever(tmp_pa
 
     assert result["status"] == "partial"
     assert result["errors"] and "timeout" in result["errors"][0]
+
+
+def test_missing_history_dir_error_points_to_supported_override(tmp_path):
+    updater = tmp_path / "incremental_update.py"
+    _write_updater(updater, "print('ALL_DONE')\n")
+
+    with pytest.raises(FileNotFoundError, match="DCA_TICKER_HISTORY_DIR"):
+        run_incremental_update(
+            updater_script=updater,
+            history_dir=tmp_path / "missing-histories",
+            artifacts_dir=tmp_path / "events",
+        )
