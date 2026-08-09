@@ -373,7 +373,9 @@ def append_observations(
         # Report unavailable instead of creating anything.
         raise FileNotFoundError(
             f"ticker history archive root {configured_ticker_history_dir()} does not exist "
-            "(missing or unmounted Drive link?) -- refusing to create a local stand-in"
+            "(missing or unmounted Drive link, or this package is not running from a "
+            "repository checkout?) -- refusing to create a local stand-in. Set "
+            "DCA_TICKER_HISTORY_DIR to the shared archive location."
         )
     directory.mkdir(parents=True, exist_ok=True)
     rows_added = 0

@@ -3122,7 +3122,7 @@ def _derive_order_submit_status(
             ORDER_SUBMIT_STATUS_SUBMITTED,
         )
     except ImportError:
-        from run_classification import (
+        from run_classification import (  # type: ignore
             ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED,
             ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED,
             ORDER_SUBMIT_STATUS_DRY_RUN,
@@ -3383,7 +3383,7 @@ def build_run_artifacts(
             build_scheduled_classification,
         )
     except ImportError:
-        from run_classification import (
+        from run_classification import (  # type: ignore
             build_manual_classification,
             build_scheduled_classification,
         )
@@ -3548,7 +3548,7 @@ def build_run_artifacts(
         try:
             from scripts.same_day_pointer import derive_valid_scheduled_evidence
         except ImportError:
-            from same_day_pointer import derive_valid_scheduled_evidence
+            from same_day_pointer import derive_valid_scheduled_evidence  # type: ignore
         run_classification["valid_scheduled_evidence"] = (
             derive_valid_scheduled_evidence(artifacts)
         )
@@ -3821,6 +3821,7 @@ def _archive_intraday_observations(
     artifacts: Dict[str, Any],
     out: Path,
     decisions: Sequence[ReconciledDecision] = (),
+    run_state_path: Optional[Path] = None,
 ) -> Optional[str]:
     """Record the 15:30 poll's prices/timestamps in the shared intraday archive.
 
@@ -3849,6 +3850,37 @@ def _archive_intraday_observations(
     CSVs write_run_artifacts wrote, and re-opening that accounting for an
     observability file would change a figure other tooling reconciles
     against.
+
+    Unlike the morning-family path (``MorningDCAExecutor._archive_observations``),
+    a failed archive write here previously left no trace once process logs
+    were gone: a summary with ``ok: false`` was only logged, not persisted.
+    When ``run_state_path`` is given (the on-disk path
+    :func:`write_run_artifacts` already wrote for this run), the archive
+    summary is now annotated and run_state.json is re-persisted with it,
+    mirroring the morning-family contract so post-run artifact consumers can
+    detect an unavailable shared archive after the fact (Codex review:
+    "Persist near-close archive failures in run state"). Two things this
+    annotation must NOT do, both from a later Codex pass on the first fix:
+
+    * Serialize the in-memory ``artifacts`` dict verbatim over the file.
+      ``_write_and_validate_scheduled_contract`` (called by every scheduled
+      caller before this) amends the ON-DISK run_state.json in place with
+      ``status='blocked'``/``artifact_contract_failure`` on a contract
+      breach without touching this function's ``artifacts`` argument;
+      overwriting the file with that now-stale in-memory copy would erase
+      the rejection every consumer downstream relies on (Codex review:
+      "Preserve contract-failure markers when annotating run state"). The
+      CURRENT on-disk state is therefore read fresh and used as the base,
+      falling back to ``artifacts`` only if the file is missing or
+      unreadable.
+    * Leave ``usage_proxy.state_file_bytes``/``total_artifact_bytes`` stale.
+      Those were already settled by :func:`write_run_artifacts` against the
+      serialized size BEFORE this annotation grew the file; re-running the
+      same settlement pass here keeps them accurate (Codex review:
+      "Recalculate usage bytes after expanding run state").
+
+    Re-persisting is itself best-effort: a failure to annotate must never
+    invalidate the already-valid run_state on disk.
     """
     try:
         signal_rows = artifacts.get("signal_rows") or []
@@ -3866,12 +3898,36 @@ def _archive_intraday_observations(
         return None
     snapshot_path = write_run_snapshot(out, observations)
     summary = archive_observations_safely(observations)
+    summary["observations"] = len(observations)
+    summary["run_snapshot"] = snapshot_path
+    artifacts["intraday_archive"] = summary
     if not summary.get("ok"):
         logger.warning(
             "intraday observation archive write failed for %s: %s",
             artifacts.get("run_id"),
             summary.get("error"),
         )
+    if run_state_path is not None:
+        try:
+            try:
+                on_disk = json.loads(run_state_path.read_bytes())
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                on_disk = None
+            target = on_disk if isinstance(on_disk, dict) else artifacts
+            target["intraday_archive"] = summary
+            usage = target.get("usage_proxy")
+            if isinstance(usage, dict):
+                csv_paths = _existing_csv_artifacts(run_state_path.parent)
+                usage["csv_artifact_count"] = len(csv_paths)
+                csv_bytes = sum(path.stat().st_size for path in csv_paths)
+                serialized = _settle_usage_bytes(target, usage, csv_bytes)
+            else:
+                serialized = _serialize_run_state(target)
+            atomic_write_text(run_state_path, serialized)
+        except (OSError, TypeError, ValueError) as exc:  # noqa: BLE001
+            logger.warning(
+                "could not annotate run_state with intraday archive summary: %s", exc
+            )
     return snapshot_path
 
 
@@ -4002,7 +4058,7 @@ def _recovery_root_for(run_dir: Path) -> Path:
         from scripts.run_classification import recovery_root_for
     except ImportError:  # pragma: no cover - exercised via the scripts/ path
         try:
-            from run_classification import recovery_root_for
+            from run_classification import recovery_root_for  # type: ignore
         except ImportError:
             return run_dir
     return recovery_root_for(run_dir)
@@ -4312,7 +4368,7 @@ def _load_terminal_order_states() -> frozenset:
         from scripts.broker_reconciliation import _TERMINAL_ORDER_STATES
     except ImportError:  # pragma: no cover - exercised via the scripts/ path
         try:
-            from broker_reconciliation import _TERMINAL_ORDER_STATES
+            from broker_reconciliation import _TERMINAL_ORDER_STATES  # type: ignore
         except ImportError:
             return frozenset(
                 {"cancelled", "canceled", "rejected", "failed", "voided", "expired"}
@@ -7192,7 +7248,9 @@ def _finalize_and_write_artifacts(
     # must never delay those REQUIRED files and trigger a false escalation on
     # a run that actually succeeded (Codex review: "Finalize scheduled
     # artifacts before waiting on archive locks").
-    snapshot_path = _archive_intraday_observations(artifacts, Path(artifacts_dir), decisions)
+    snapshot_path = _archive_intraday_observations(
+        artifacts, Path(artifacts_dir), decisions, run_state_path=Path(paths["run_state"])
+    )
     if snapshot_path:
         paths["observations"] = snapshot_path
 
@@ -7203,7 +7261,7 @@ def _finalize_and_write_artifacts(
                 validate_classification,
             )
         except ImportError:
-            from run_classification import (
+            from run_classification import (  # type: ignore
                 update_latest_scheduled_run_pointer,
                 validate_classification,
             )

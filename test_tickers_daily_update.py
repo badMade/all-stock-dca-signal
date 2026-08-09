@@ -3,11 +3,33 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from scripts.run_tickers_daily_update import run_incremental_update
 
 
 def _write_updater(path: Path, body: str) -> None:
     path.write_text(body, encoding="utf-8")
+
+
+def test_missing_history_dir_error_names_the_override_env_var(tmp_path):
+    # Codex review ("Resolve the archive outside the installed package"):
+    # DEFAULT_TICKER_HISTORY_DIR is only correct for a repository checkout;
+    # installed (non-editable) deployments resolve it under site-packages
+    # instead, where it never exists. The failure must name the escape
+    # hatch (DCA_TICKER_HISTORY_DIR) rather than leaving the operator to
+    # guess.
+    updater = tmp_path / "incremental_update.py"
+    _write_updater(updater, "print('ALL_DONE')\n")
+    missing_history_dir = tmp_path / "does-not-exist"
+
+    with pytest.raises(FileNotFoundError, match="DCA_TICKER_HISTORY_DIR"):
+        run_incremental_update(
+            updater_script=updater,
+            history_dir=missing_history_dir,
+            ticker_config=tmp_path / "tickers.json",
+            artifacts_dir=tmp_path / "events",
+        )
 
 
 def test_wrapper_runs_until_the_external_updater_reports_complete(tmp_path):

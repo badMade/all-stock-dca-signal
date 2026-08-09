@@ -275,9 +275,13 @@ def test_settle_retains_the_balance_a_clamped_order_did_not_cover(tmp_path):
     # partial settlement"): the FIRST $0.80 contribution IS fully covered by
     # the $1 submitted and must be marked consumed (else a delayed retry of
     # that exact slot could recompute and resubmit for credit already
-    # bought); the remaining two, only partially/never covered, stay
-    # unconsumed so their own delayed retries still go through the ordinary
-    # subtraction path against the genuinely-outstanding $1.40.
+    # bought). The SECOND is only partially covered ($0.20 of its $0.80): it
+    # stays unconsumed (still retriable) but its own recorded contribution is
+    # reduced to the genuinely outstanding $0.60, not left at the stale $0.80
+    # (Codex review: "Track partially consumed preserve entries" -- else a
+    # delayed retry of that slot could recompute and resubmit the $0.20
+    # portion that this settlement already paid). The THIRD, never reached,
+    # is untouched.
     ledger = CumulativeCreditLedger(tmp_path)
     ledger.preserve_pending("xyz", "2026-08-03", 0.80, idempotency_key="slot-1")
     ledger.preserve_pending("xyz", "2026-08-03", 0.80, idempotency_key="slot-2")
@@ -290,9 +294,10 @@ def test_settle_retains_the_balance_a_clamped_order_did_not_cover(tmp_path):
     decision = ledger.recorded_decision("xyz", "2026-08-03", "slot-1")
     assert decision is not None and decision.order_amount_usd == 0.0
     assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "slot-1") == 0.0
-    for slot in ("slot-2", "slot-3"):
-        assert ledger.recorded_decision("xyz", "2026-08-03", slot) is None
-        assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", slot) == 0.80
+    assert ledger.recorded_decision("xyz", "2026-08-03", "slot-2") is None
+    assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "slot-2") == 0.60
+    assert ledger.recorded_decision("xyz", "2026-08-03", "slot-3") is None
+    assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "slot-3") == 0.80
 
 
 def test_settle_still_fully_clears_a_balance_the_submission_covers(tmp_path):
@@ -315,6 +320,10 @@ def test_settle_covers_exactly_one_of_two_equal_preserved_credits(tmp_path):
     # on partial settlement"): two blocked $0.80 credits followed by a
     # later $1 clamped final order. $0.60 genuinely remains outstanding, but
     # the first slot's own $0.80 IS fully paid and must not be revivable.
+    # The second slot's own contribution is only partially paid ($0.20 of
+    # its $0.80): preserved_credit_for_slot must report the genuinely
+    # outstanding $0.60, not the stale original $0.80 (Codex review: "Track
+    # partially consumed preserve entries").
     ledger = CumulativeCreditLedger(tmp_path)
     ledger.preserve_pending("xyz", "2026-08-03", 0.80, idempotency_key="slot-1")
     ledger.preserve_pending("xyz", "2026-08-03", 0.80, idempotency_key="slot-2")
@@ -324,7 +333,7 @@ def test_settle_covers_exactly_one_of_two_equal_preserved_credits(tmp_path):
     assert ledger.pending_usd("xyz", "2026-08-03") == 0.60
     assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "slot-1") == 0.0
     assert ledger.recorded_decision("xyz", "2026-08-03", "slot-1") is not None
-    assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "slot-2") == 0.80
+    assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "slot-2") == 0.60
     assert ledger.recorded_decision("xyz", "2026-08-03", "slot-2") is None
 
 
@@ -347,14 +356,18 @@ def test_settle_consumes_the_earliest_preserved_credit_first_despite_key_sort_or
     # morning's slot was preserved FIRST and must be the one fully consumed.
     assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "morning_run_1030") == 0.0
     assert ledger.recorded_decision("xyz", "2026-08-03", "morning_run_1030") is not None
-    # midday's slot was preserved SECOND and must remain retriable.
-    assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "midday_run_1230") == 0.80
+    # midday's slot was preserved SECOND and must remain retriable; only
+    # $0.20 of its $0.80 was paid, so $0.60 is genuinely still outstanding.
+    assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "midday_run_1230") == 0.60
     assert ledger.recorded_decision("xyz", "2026-08-03", "midday_run_1230") is None
 
 
 def test_settle_consumes_nothing_when_the_first_entry_alone_exceeds_submission(tmp_path):
     # A submission smaller than even the first preserved entry must not mark
-    # anything consumed -- there is nothing it fully covers.
+    # anything consumed -- there is nothing it fully covers. But $0.50 of the
+    # $0.80 WAS paid, so the slot's own recorded contribution must shrink to
+    # the genuinely outstanding $0.30, not stay at the stale $0.80 (Codex
+    # review: "Track partially consumed preserve entries").
     ledger = CumulativeCreditLedger(tmp_path)
     ledger.preserve_pending("xyz", "2026-08-03", 0.80, idempotency_key="slot-1")
 
@@ -362,7 +375,7 @@ def test_settle_consumes_nothing_when_the_first_entry_alone_exceeds_submission(t
 
     assert ledger.pending_usd("xyz", "2026-08-03") == 0.30
     assert ledger.recorded_decision("xyz", "2026-08-03", "slot-1") is None
-    assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "slot-1") == 0.80
+    assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "slot-1") == 0.30
 
 
 def test_settle_does_not_affect_a_different_tickers_preserved_credit(tmp_path):
@@ -385,3 +398,120 @@ def test_unconsumed_preserved_credit_still_allows_a_fresh_retry(tmp_path):
 
     assert ledger.recorded_decision("xyz", "2026-08-03", "slot-1") is None
     assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "slot-1") == 0.40
+
+
+def test_settle_does_not_let_a_partially_paid_entry_be_resubmitted_in_full(tmp_path):
+    # Codex review ("Track partially consumed preserve entries"): preserved
+    # credits of $0.60 and $1.40 followed by a $1.00 settlement leave $1.00
+    # genuinely pending ($0.60 fully paid off the first entry, $0.40 paid
+    # off the second). Before the fix, the second entry's own recorded
+    # contribution stayed at the stale full $1.40 -- a retry of that exact
+    # slot would recompute and resubmit $1.40, restoring the $0.40 that was
+    # already bought.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.preserve_pending("xyz", "2026-08-03", 0.60, idempotency_key="slot-1")
+    ledger.preserve_pending("xyz", "2026-08-03", 1.40, idempotency_key="slot-2")
+    assert ledger.pending_usd("xyz", "2026-08-03") == 2.00
+
+    ledger.settle("xyz", "2026-08-03", 1.0, stream="afternoon")
+
+    assert ledger.pending_usd("xyz", "2026-08-03") == 1.00
+    assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "slot-1") == 0.0
+    assert ledger.recorded_decision("xyz", "2026-08-03", "slot-1") is not None
+    # slot-2 is still retriable (not fully paid) but must report only the
+    # genuinely outstanding $1.00, not the stale original $1.40.
+    assert ledger.recorded_decision("xyz", "2026-08-03", "slot-2") is None
+    assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "slot-2") == 1.00
+
+
+def test_record_rebases_a_netted_baseline_against_a_concurrent_ledger_update(tmp_path):
+    # Codex review ("Rebase retry adjustments inside the ledger lock"): a
+    # caller normally computes pending_baseline_usd from pending_usd() minus
+    # preserved_credit_for_slot() BEFORE calling record(), which acquires
+    # its own separate lock. A concurrent stream can preserve/record/settle
+    # the same ticker in between. record() must rebase this slot's own
+    # preserved contribution against the ledger's CURRENT balance -- read
+    # atomically under its own lock -- rather than blindly trusting the
+    # caller's now-stale snapshot, which would silently discard the
+    # concurrent stream's update despite the cross-process lock.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.preserve_pending("xyz", "2026-08-03", 0.80, idempotency_key="slot-1")
+
+    # Caller's pre-lock snapshot: this slot's own $0.80 nets out to $0.00.
+    stale_baseline = ledger.pending_usd(
+        "xyz", "2026-08-03"
+    ) - ledger.preserved_credit_for_slot("xyz", "2026-08-03", "slot-1")
+    assert stale_baseline == 0.0
+
+    # A DIFFERENT, concurrent slot preserves its own unrelated $0.10 blocked
+    # credit for the same ticker after the caller's snapshot but before
+    # slot-1's record() call.
+    ledger.preserve_pending("xyz", "2026-08-03", 0.10, idempotency_key="slot-2")
+    assert ledger.pending_usd("xyz", "2026-08-03") == 0.90
+
+    # slot-1 now recomputes a fresh, smaller $0.05 decline and calls
+    # record() with its now-stale pre-lock baseline.
+    decision = ledger.record(
+        "xyz",
+        "2026-08-03",
+        0.05,
+        idempotency_key="slot-1",
+        pending_baseline_usd=stale_baseline,
+    )
+
+    # Correct atomic rebase: current balance ($0.90) minus slot-1's own
+    # unconsumed preserved contribution ($0.80) = $0.10, not the stale
+    # $0.00 the caller read before slot-2's concurrent preserve.
+    assert decision.pending_before_usd == 0.10
+    assert decision.order_amount_usd == 0.0
+    assert decision.pending_after_usd == 0.15
+    # slot-2's concurrent $0.10 contribution must survive in the final
+    # balance ($0.10 + the fresh $0.05 = $0.15), not be silently discarded
+    # by overwriting the ledger with a decision derived from the stale
+    # $0.00 baseline (which would have left only $0.05 pending).
+    assert ledger.pending_usd("xyz", "2026-08-03") == 0.15
+    assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "slot-2") == 0.10
+
+
+def test_record_rebase_never_crosses_the_order_threshold_on_its_own(tmp_path):
+    # Codex review ("Prevent rebasing from creating an unsubmitted order"):
+    # morning_dca.py's only production call site for record()'s rebase
+    # branch is reached ONLY after the caller already decided, from its own
+    # (staler) baseline, to place no order this run -- it never inspects
+    # the returned decision, relying on the invariant that this call always
+    # yields order_amount_usd == 0. If the atomic rebase sees a fresher,
+    # larger balance (e.g. a concurrent stream's contribution) that alone
+    # crosses the regular-session threshold, honoring that here would clear
+    # the pending balance as though an order were submitted -- but no order
+    # actually gets placed (the caller ignores the return value), silently
+    # losing the credit. The rebase must instead keep the full combined
+    # total pending, exactly like preserve_pending, and defer the
+    # order-or-not decision to a later evaluation.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.preserve_pending("xyz", "2026-08-03", 0.30, idempotency_key="slot-1")
+
+    stale_baseline = ledger.pending_usd(
+        "xyz", "2026-08-03"
+    ) - ledger.preserved_credit_for_slot("xyz", "2026-08-03", "slot-1")
+    assert stale_baseline == 0.0
+
+    # A concurrent stream preserves its own unrelated $0.30 for the same
+    # ticker after the caller's snapshot but before slot-1's record() call.
+    ledger.preserve_pending("xyz", "2026-08-03", 0.30, idempotency_key="slot-2")
+    assert ledger.pending_usd("xyz", "2026-08-03") == 0.60
+
+    # slot-1 retries with a fresh $0.30 decline. Rebased atomically, this
+    # would total $0.60 ($0.30 netted baseline + $0.30 fresh) -- enough to
+    # cross the $0.50 threshold on its own -- but nobody will place an
+    # order for it.
+    decision = ledger.record(
+        "xyz",
+        "2026-08-03",
+        0.30,
+        idempotency_key="slot-1",
+        pending_baseline_usd=stale_baseline,
+    )
+
+    assert decision.order_amount_usd == 0.0
+    assert decision.pending_after_usd == 0.60
+    assert ledger.pending_usd("xyz", "2026-08-03") == 0.60
