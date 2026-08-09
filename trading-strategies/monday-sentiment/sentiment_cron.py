@@ -19,6 +19,7 @@ pip install transformers torch newsapi-python requests
 # Standard library
 # ---------------------------------------------------------------------------
 import argparse
+import asyncio
 import html
 import json
 import logging
@@ -38,7 +39,7 @@ from zoneinfo import ZoneInfo  # Python 3.9+; use pytz if < 3.9
 # ---------------------------------------------------------------------------
 # Third-party (installed via pip install transformers torch newsapi-python requests)
 # ---------------------------------------------------------------------------
-import requests
+import aiohttp
 
 # ---------------------------------------------------------------------------
 # Module-level logger — configured in main() so callers that import this
@@ -64,6 +65,15 @@ MAX_FLAGGED_TICKERS: int = 3          # cap email to top-N most extreme movers
 MAX_HEADLINES_PER_TICKER: int = 50    # NewsAPI page size per ticker
 MAX_SEC_FILINGS: int = 5              # EDGAR EFTS results per ticker
 TOP_HEADLINES_IN_EMAIL: int = 3       # per-ticker headline slots in email body
+MAX_CONCURRENT_TICKERS: int = 5       # cap in-flight tickers so EDGAR/NewsAPI calls stay under fair-use limits
+# SEC's fair-access policy asks for no more than ~10 requests/second
+# (https://www.sec.gov/developer). MAX_CONCURRENT_TICKERS only bounds how
+# many ticker tasks are in flight at once — with fast EDGAR responses each
+# completed slot is refilled immediately, so concurrency alone does not cap
+# the request RATE. SEC_MAX_REQUESTS_PER_SECOND drives an explicit
+# time-based limiter (SecRateLimiter, below) around the EDGAR call itself,
+# with headroom under SEC's stated ceiling (codex review discussion_r3742435139).
+SEC_MAX_REQUESTS_PER_SECOND: float = 8.0
 
 # SEC EDGAR full-text search endpoint — free, no API key required
 # https://efts.sec.gov/LATEST/search-index?q=AAPL&forms=8-K,10-K,10-Q
@@ -186,7 +196,7 @@ def score_texts(pipe, texts: List[str]) -> List[dict]:
 # News collection — NewsAPI
 # ===========================================================================
 
-def fetch_news_headlines(ticker: str, api_key: str, lookback_days: int) -> List[dict]:
+async def fetch_news_headlines(session: aiohttp.ClientSession, ticker: str, api_key: str, lookback_days: int) -> List[dict]:
     """
     Pull recent headlines from NewsAPI for a given ticker symbol.
     Returns a list of item dicts (unsorted).
@@ -213,10 +223,12 @@ def fetch_news_headlines(ticker: str, api_key: str, lookback_days: int) -> List[
     }
 
     try:
-        resp = requests.get("https://newsapi.org/v2/everything", params=params, headers=headers, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.RequestException as exc:
+        async with session.get(
+            "https://newsapi.org/v2/everything", params=params, headers=headers, timeout=15
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         safe_exc = str(exc).replace(api_key, "***") if api_key else str(exc)
         log.warning("NewsAPI request failed for %s: %s", ticker, safe_exc)
         return []
@@ -246,7 +258,41 @@ def fetch_news_headlines(ticker: str, api_key: str, lookback_days: int) -> List[
 # SEC EDGAR collection
 # ===========================================================================
 
-def fetch_sec_filings(ticker: str, lookback_days: int) -> List[dict]:
+class SecRateLimiter:
+    """
+    Time-based limiter enforcing SEC EDGAR's fair-access request rate.
+
+    Unlike a plain asyncio.Semaphore — which only bounds how many requests
+    are concurrently in flight and lets a completed slot be refilled
+    instantly — this enforces a minimum spacing between requests, so the
+    achieved rate never exceeds `max_per_second` regardless of how many
+    ticker tasks are running or how fast EDGAR responds
+    (codex review discussion_r3742435139). One instance is shared across
+    all ticker tasks in a run.
+    """
+
+    def __init__(self, max_per_second: float) -> None:
+        self._min_interval = 1.0 / max_per_second
+        self._lock = asyncio.Lock()
+        self._next_allowed_at = 0.0
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            loop = asyncio.get_event_loop()
+            now = loop.time()
+            wait = self._next_allowed_at - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+                now = loop.time()
+            self._next_allowed_at = max(now, self._next_allowed_at) + self._min_interval
+
+
+async def fetch_sec_filings(
+    session: aiohttp.ClientSession,
+    ticker: str,
+    lookback_days: int,
+    rate_limiter: SecRateLimiter,
+) -> List[dict]:
     """
     Pull recent 8-K, 10-K, and 10-Q filings from SEC EDGAR Full-Text Search.
 
@@ -256,6 +302,10 @@ def fetch_sec_filings(ticker: str, lookback_days: int) -> List[dict]:
     We take the filing title + extracted text snippet (if present) as the
     item text. The snippet is typically the first few hundred words of the
     filing, which is enough for reliable FinBERT classification.
+
+    `rate_limiter` paces the request itself against SEC's fair-access
+    policy — see SecRateLimiter above for why this can't just be the
+    ticker-level concurrency cap.
 
     Endpoint docs: https://efts.sec.gov/LATEST/search-index (unofficial)
     """
@@ -278,11 +328,12 @@ def fetch_sec_filings(ticker: str, lookback_days: int) -> List[dict]:
         "Accept": "application/json",
     }
 
+    await rate_limiter.acquire()
     try:
-        resp = requests.get(SEC_EFTS_URL, params=params, headers=headers, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.RequestException as exc:
+        async with session.get(SEC_EFTS_URL, params=params, headers=headers, timeout=20) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         log.warning("SEC EDGAR request failed for %s: %s", ticker, exc)
         return []
     except json.JSONDecodeError:
@@ -318,11 +369,13 @@ def fetch_sec_filings(ticker: str, lookback_days: int) -> List[dict]:
 # Scoring pipeline — ties together data collection and FinBERT
 # ===========================================================================
 
-def compute_ticker_score(
+async def compute_ticker_score(
+    session: aiohttp.ClientSession,
     ticker: str,
     pipe,
     news_api_key: Optional[str],
     lookback_days: int,
+    sec_rate_limiter: SecRateLimiter,
 ) -> Tuple[float, List[dict]]:
     """
     Collect all available text items for a ticker, score them with FinBERT,
@@ -337,13 +390,13 @@ def compute_ticker_score(
 
     # --- NewsAPI ---
     if news_api_key:
-        news_items = fetch_news_headlines(ticker, news_api_key, lookback_days)
+        news_items = await fetch_news_headlines(session, ticker, news_api_key, lookback_days)
         items.extend(news_items)
     else:
         log.debug("Skipping NewsAPI for %s (no key)", ticker)
 
     # --- SEC EDGAR ---
-    sec_items = fetch_sec_filings(ticker, lookback_days)
+    sec_items = await fetch_sec_filings(session, ticker, lookback_days, sec_rate_limiter)
     items.extend(sec_items)
 
     if not items:
@@ -986,15 +1039,38 @@ def run(args: argparse.Namespace) -> int:
     # ------------------------------------------------------------------
     results: Dict[str, dict] = {}
 
-    for ticker in tickers:
-        log.info("[%s] Processing…", ticker)
-        try:
-            score, scored_items = compute_ticker_score(ticker, pipe, news_api_key, lookback)
-        except Exception as exc:
-            log.error("[%s] Unexpected error during scoring: %s", ticker, exc)
-            log.debug(traceback.format_exc())
-            # Use 0.0 so the ticker still appears in the summary table
+    async def process_all_tickers():
+        # Bound concurrent SEC EDGAR / NewsAPI requests so a large watchlist
+        # does not create too many simultaneous in-flight calls.
+        sem = asyncio.Semaphore(MAX_CONCURRENT_TICKERS)
+        # Separately, pace the actual EDGAR request rate — the semaphore
+        # above only caps how many ticker tasks run at once, and with fast
+        # responses that lets far more than SEC_MAX_REQUESTS_PER_SECOND
+        # requests start within a second (codex review discussion_r3742435139).
+        # One limiter instance is shared by every ticker task in this run.
+        sec_rate_limiter = SecRateLimiter(SEC_MAX_REQUESTS_PER_SECOND)
+
+        async def _run_one(session: aiohttp.ClientSession, ticker: str):
+            async with sem:
+                log.info("[%s] Queuing…", ticker)
+                return await compute_ticker_score(session, ticker, pipe, news_api_key, lookback, sec_rate_limiter)
+
+        async with aiohttp.ClientSession() as session:
+            tasks = [_run_one(session, ticker) for ticker in tickers]
+            return await asyncio.gather(*tasks, return_exceptions=True)
+
+    scored_results = asyncio.run(process_all_tickers())
+
+    for ticker, score_res in zip(tickers, scored_results):
+        if isinstance(score_res, Exception):
+            log.error("[%s] Unexpected error during scoring: %s", ticker, score_res)
+            log.debug(
+                "Exception details:\n%s",
+                "".join(traceback.format_exception(type(score_res), score_res, score_res.__traceback__)),
+            )
             score, scored_items = 0.0, []
+        else:
+            score, scored_items = score_res
 
         # Update history *before* computing z so today's score is in the file
         # but we exclude today from the reference population in compute_zscore().

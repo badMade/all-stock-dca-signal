@@ -67,14 +67,6 @@ for _ in $(seq 1 30); do
   sleep 30
 done
 if [ -d "$run_dir" ]; then
-<<<<<<< HEAD
-  for _ in $(seq 1 40); do
-    if [ -f "$run_dir/submitted_orders.csv" ] || [ -f "$run_dir/orders.csv" ] || [ -f "$run_dir/filled_orders.csv" ]; then
-      break
-    fi
-    sleep 15
-  done
-=======
   # require_submitted_orders=False: the strict scheduled-run contract only
   # accepts the literal submitted_orders.csv, but this backup check -- like
   # the detector it feeds (ORDER_CSV_NAMES/load_run_artifacts in
@@ -128,7 +120,6 @@ while remaining > 0 and not order_evidence_present():
     time.sleep(slept)
     remaining -= slept
 PY
->>>>>>> b12979a (Fix drift-check import path)
 fi
 
 # Two distinct ways this backup check can find a run that never really
