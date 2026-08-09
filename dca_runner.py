@@ -2237,7 +2237,7 @@ def _check_placement_ref_id(
             # before recording failures").
             if isinstance(returned_ref_id, str):
                 redacted_ref_id = _SECRET_SHAPED_TOKEN_RE.sub("[REDACTED-TOKEN]", returned_ref_id)
-                if account_number is not None:
+                if account_number:
                     redacted_ref_id = redacted_ref_id.replace(account_number, "[REDACTED-ACCOUNT]")
                 return (
                     f"broker response client reference {redacted_ref_id!r} does not match "
@@ -2293,7 +2293,7 @@ def _check_placement_symbol(order: dict[str, Any], expected_symbol: str, account
             # storing failure evidence").
             if isinstance(returned_symbol, str):
                 redacted_symbol = _SECRET_SHAPED_TOKEN_RE.sub("[REDACTED-TOKEN]", returned_symbol)
-                if account_number is not None:
+                if account_number:
                     redacted_symbol = redacted_symbol.replace(account_number, "[REDACTED-ACCOUNT]")
                 return (
                     f"broker response symbol {redacted_symbol!r} does not match the requested "

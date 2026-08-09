@@ -18,6 +18,7 @@ in and forwards the rendered markdown to whatever Notion integration it owns.
 
 from __future__ import annotations
 
+import copy
 import functools
 import json
 import math
@@ -66,8 +67,12 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     written for date-gated days — they are not run days and would otherwise be
     counted into the weekly snapshot/table denominators — and skipping any
     manual run_states so manual candidates/notional never enter the
-    scheduled-live weekly cost basis, reliability, or order-count metrics."""
-    loaded = [_load_cached_json(str(p), os.path.getmtime(p)) for p in paths]
+    scheduled-live weekly cost basis, reliability, or order-count metrics.
+
+    Deep-copies each cache hit: ``_load_cached_json`` is memoized, so a caller
+    that mutates a returned dict would otherwise corrupt the shared cache entry
+    for every subsequent caller of the same path/mtime."""
+    loaded = [copy.deepcopy(_load_cached_json(str(p), os.path.getmtime(p))) for p in paths]
     return [
         data
         for data in loaded

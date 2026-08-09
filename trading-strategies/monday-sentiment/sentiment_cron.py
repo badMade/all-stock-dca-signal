@@ -19,6 +19,7 @@ pip install transformers torch newsapi-python requests
 # Standard library
 # ---------------------------------------------------------------------------
 import argparse
+import asyncio
 import html
 import json
 import logging
@@ -38,7 +39,7 @@ from zoneinfo import ZoneInfo  # Python 3.9+; use pytz if < 3.9
 # ---------------------------------------------------------------------------
 # Third-party (installed via pip install transformers torch newsapi-python requests)
 # ---------------------------------------------------------------------------
-import requests
+import aiohttp
 
 # ---------------------------------------------------------------------------
 # Module-level logger — configured in main() so callers that import this
@@ -186,7 +187,7 @@ def score_texts(pipe, texts: List[str]) -> List[dict]:
 # News collection — NewsAPI
 # ===========================================================================
 
-def fetch_news_headlines(ticker: str, api_key: str, lookback_days: int) -> List[dict]:
+async def fetch_news_headlines(session: aiohttp.ClientSession, ticker: str, api_key: str, lookback_days: int) -> List[dict]:
     """
     Pull recent headlines from NewsAPI for a given ticker symbol.
     Returns a list of item dicts (unsorted).
@@ -213,10 +214,12 @@ def fetch_news_headlines(ticker: str, api_key: str, lookback_days: int) -> List[
     }
 
     try:
-        resp = requests.get("https://newsapi.org/v2/everything", params=params, headers=headers, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.RequestException as exc:
+        async with session.get(
+            "https://newsapi.org/v2/everything", params=params, headers=headers, timeout=15
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         safe_exc = str(exc).replace(api_key, "***") if api_key else str(exc)
         log.warning("NewsAPI request failed for %s: %s", ticker, safe_exc)
         return []
@@ -246,7 +249,7 @@ def fetch_news_headlines(ticker: str, api_key: str, lookback_days: int) -> List[
 # SEC EDGAR collection
 # ===========================================================================
 
-def fetch_sec_filings(ticker: str, lookback_days: int) -> List[dict]:
+async def fetch_sec_filings(session: aiohttp.ClientSession, ticker: str, lookback_days: int) -> List[dict]:
     """
     Pull recent 8-K, 10-K, and 10-Q filings from SEC EDGAR Full-Text Search.
 
@@ -279,10 +282,10 @@ def fetch_sec_filings(ticker: str, lookback_days: int) -> List[dict]:
     }
 
     try:
-        resp = requests.get(SEC_EFTS_URL, params=params, headers=headers, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.RequestException as exc:
+        async with session.get(SEC_EFTS_URL, params=params, headers=headers, timeout=20) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         log.warning("SEC EDGAR request failed for %s: %s", ticker, exc)
         return []
     except json.JSONDecodeError:
@@ -318,7 +321,8 @@ def fetch_sec_filings(ticker: str, lookback_days: int) -> List[dict]:
 # Scoring pipeline — ties together data collection and FinBERT
 # ===========================================================================
 
-def compute_ticker_score(
+async def compute_ticker_score(
+    session: aiohttp.ClientSession,
     ticker: str,
     pipe,
     news_api_key: Optional[str],
@@ -337,13 +341,13 @@ def compute_ticker_score(
 
     # --- NewsAPI ---
     if news_api_key:
-        news_items = fetch_news_headlines(ticker, news_api_key, lookback_days)
+        news_items = await fetch_news_headlines(session, ticker, news_api_key, lookback_days)
         items.extend(news_items)
     else:
         log.debug("Skipping NewsAPI for %s (no key)", ticker)
 
     # --- SEC EDGAR ---
-    sec_items = fetch_sec_filings(ticker, lookback_days)
+    sec_items = await fetch_sec_filings(session, ticker, lookback_days)
     items.extend(sec_items)
 
     if not items:
@@ -986,15 +990,21 @@ def run(args: argparse.Namespace) -> int:
     # ------------------------------------------------------------------
     results: Dict[str, dict] = {}
 
-    for ticker in tickers:
+    async def process_all_tickers():
+        async with aiohttp.ClientSession() as session:
+            tasks = [compute_ticker_score(session, ticker, pipe, news_api_key, lookback) for ticker in tickers]
+            return await asyncio.gather(*tasks, return_exceptions=True)
+
+    scored_results = asyncio.run(process_all_tickers())
+
+    for ticker, score_res in zip(tickers, scored_results):
         log.info("[%s] Processing…", ticker)
-        try:
-            score, scored_items = compute_ticker_score(ticker, pipe, news_api_key, lookback)
-        except Exception as exc:
-            log.error("[%s] Unexpected error during scoring: %s", ticker, exc)
-            log.debug(traceback.format_exc())
-            # Use 0.0 so the ticker still appears in the summary table
+        if isinstance(score_res, Exception):
+            log.error("[%s] Unexpected error during scoring: %s", ticker, score_res)
+            log.debug("".join(traceback.format_exception(type(score_res), score_res, score_res.__traceback__)))
             score, scored_items = 0.0, []
+        else:
+            score, scored_items = score_res
 
         # Update history *before* computing z so today's score is in the file
         # but we exclude today from the reference population in compute_zscore().
