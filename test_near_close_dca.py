@@ -5948,7 +5948,9 @@ def test_scheduled_finalize_archives_only_after_the_contract_is_written(tmp_path
     monkeypatch.setattr(
         m,
         "_archive_intraday_observations",
-        lambda artifacts, out, decisions=(): (call_order.append("archive") or None),
+        lambda artifacts, out, decisions=(), run_state_path=None: (
+            call_order.append("archive") or None
+        ),
     )
 
     m._finalize_and_write_artifacts(
@@ -5993,7 +5995,9 @@ def test_manual_finalize_archives_right_after_write_run_artifacts(tmp_path, monk
     monkeypatch.setattr(
         m,
         "_archive_intraday_observations",
-        lambda artifacts, out, decisions=(): (call_order.append("archive") or None),
+        lambda artifacts, out, decisions=(), run_state_path=None: (
+            call_order.append("archive") or None
+        ),
     )
 
     m._finalize_and_write_artifacts(
@@ -6013,6 +6017,265 @@ def test_manual_finalize_archives_right_after_write_run_artifacts(tmp_path, monk
     )
 
     assert call_order == ["write_run_artifacts", "archive"]
+
+
+def test_archive_intraday_observations_persists_failure_to_run_state(tmp_path, monkeypatch):
+    # Codex review ("Persist near-close archive failures in run state"):
+    # unlike the morning-family path, a failed shared-archive write here
+    # previously left no trace once process logs were gone -- the run_state
+    # on disk never carried an intraday_archive.error a post-run consumer
+    # could detect. Once run_state_path is supplied, an ok:false summary
+    # must be annotated onto the artifacts dict AND persisted to that path,
+    # without raising or blocking the (already-successful) trading run.
+    import near_close_dca as m
+
+    monkeypatch.setattr(m, "write_run_snapshot", lambda out, observations: None)
+    monkeypatch.setattr(
+        m,
+        "archive_observations_safely",
+        lambda observations: {"ok": False, "error": "archive unavailable"},
+    )
+
+    run_state_path = tmp_path / "run_state.json"
+    run_state_path.write_text(json.dumps({"run_id": "r1", "signal_rows": []}))
+    artifacts = {"run_id": "r1", "signal_rows": [], "trading_day": "2026-08-03"}
+
+    result = m._archive_intraday_observations(
+        artifacts, tmp_path, run_state_path=run_state_path
+    )
+
+    assert result is None
+    assert artifacts["intraday_archive"]["ok"] is False
+    assert artifacts["intraday_archive"]["error"] == "archive unavailable"
+    persisted = json.loads(run_state_path.read_text())
+    assert persisted["intraday_archive"]["ok"] is False
+    assert persisted["intraday_archive"]["error"] == "archive unavailable"
+
+
+def test_archive_intraday_observations_persists_success_summary_too(tmp_path, monkeypatch):
+    import near_close_dca as m
+
+    monkeypatch.setattr(m, "write_run_snapshot", lambda out, observations: "snap.json")
+    monkeypatch.setattr(
+        m, "archive_observations_safely", lambda observations: {"ok": True}
+    )
+
+    run_state_path = tmp_path / "run_state.json"
+    run_state_path.write_text(json.dumps({"run_id": "r1", "signal_rows": []}))
+    artifacts = {"run_id": "r1", "signal_rows": [], "trading_day": "2026-08-03"}
+
+    result = m._archive_intraday_observations(
+        artifacts, tmp_path, run_state_path=run_state_path
+    )
+
+    assert result == "snap.json"
+    persisted = json.loads(run_state_path.read_text())
+    assert persisted["intraday_archive"]["ok"] is True
+    assert persisted["intraday_archive"]["run_snapshot"] == "snap.json"
+
+
+def test_archive_intraday_observations_preserves_contract_failure_markers(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Preserve contract-failure markers when annotating run
+    # state"): _write_and_validate_scheduled_contract amends the ON-DISK
+    # run_state.json in place (status='blocked', artifact_contract_failure)
+    # WITHOUT touching the in-memory artifacts dict this function receives.
+    # Serializing that now-stale in-memory copy over the file would silently
+    # erase the rejection every downstream consumer (select_same_day_run_state,
+    # load_scheduled_run_states) relies on.
+    import near_close_dca as m
+
+    monkeypatch.setattr(m, "write_run_snapshot", lambda out, observations: None)
+    monkeypatch.setattr(
+        m, "archive_observations_safely", lambda observations: {"ok": True}
+    )
+
+    run_state_path = tmp_path / "run_state.json"
+    # The on-disk file already carries the contract-failure amendment that
+    # _write_and_validate_scheduled_contract would have written; the
+    # in-memory artifacts dict below deliberately does NOT have it, exactly
+    # as it would look after that earlier write bypassed the caller's copy.
+    run_state_path.write_text(
+        json.dumps(
+            {
+                "run_id": "r1",
+                "signal_rows": [],
+                "status": "blocked",
+                "artifact_contract_failure": {"reason": "scheduled-run artifact contract failed"},
+                "run_classification": {"valid_scheduled_evidence": False},
+            }
+        )
+    )
+    artifacts = {
+        "run_id": "r1",
+        "signal_rows": [],
+        "trading_day": "2026-08-03",
+        "status": "ok",
+        "run_classification": {"valid_scheduled_evidence": True},
+    }
+
+    m._archive_intraday_observations(artifacts, tmp_path, run_state_path=run_state_path)
+
+    persisted = json.loads(run_state_path.read_text())
+    assert persisted["status"] == "blocked"
+    assert persisted["artifact_contract_failure"]["reason"] == "scheduled-run artifact contract failed"
+    assert persisted["run_classification"]["valid_scheduled_evidence"] is False
+    assert persisted["intraday_archive"]["ok"] is True
+
+
+def test_archive_intraday_observations_skips_annotation_when_run_state_unreadable(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Skip annotation when persisted run state is
+    # unreadable"): a read/decode failure on the ALREADY-WRITTEN
+    # run_state.json (e.g. a transient I/O error, or corruption) must not
+    # fall back to serializing the stale in-memory `artifacts` dict as a
+    # replacement -- that would erase whatever a scheduled-contract
+    # rejection had already amended directly onto the file, the same
+    # erasure risk test_archive_intraday_observations_preserves_contract_failure_markers
+    # guards against, just reached through the read-failure path instead of
+    # a successful-but-stale read. The annotation must be abandoned, leaving
+    # the unreadable file untouched, rather than replaced with a guess.
+    import near_close_dca as m
+
+    monkeypatch.setattr(m, "write_run_snapshot", lambda out, observations: None)
+    monkeypatch.setattr(
+        m, "archive_observations_safely", lambda observations: {"ok": True}
+    )
+
+    run_state_path = tmp_path / "run_state.json"
+    original_text = "not valid json{{{"
+    run_state_path.write_text(original_text)
+    artifacts = {"run_id": "r1", "signal_rows": [], "trading_day": "2026-08-03"}
+
+    result = m._archive_intraday_observations(
+        artifacts, tmp_path, run_state_path=run_state_path
+    )
+
+    assert result is None
+    assert run_state_path.read_text() == original_text
+
+
+def test_archive_intraday_observations_skips_annotation_when_run_state_not_an_object(
+    tmp_path, monkeypatch
+):
+    # Same guard as the unreadable-file case above, for the sibling failure
+    # mode where the file parses as valid JSON but not the expected object
+    # shape -- falling back to `artifacts` here would be just as unsafe.
+    import near_close_dca as m
+
+    monkeypatch.setattr(m, "write_run_snapshot", lambda out, observations: None)
+    monkeypatch.setattr(
+        m, "archive_observations_safely", lambda observations: {"ok": True}
+    )
+
+    run_state_path = tmp_path / "run_state.json"
+    original_text = json.dumps([1, 2, 3])
+    run_state_path.write_text(original_text)
+    artifacts = {"run_id": "r1", "signal_rows": [], "trading_day": "2026-08-03"}
+
+    m._archive_intraday_observations(artifacts, tmp_path, run_state_path=run_state_path)
+
+    assert run_state_path.read_text() == original_text
+
+
+def test_archive_intraday_observations_resettles_usage_bytes(tmp_path, monkeypatch):
+    # Codex review ("Recalculate usage bytes after expanding run state"):
+    # write_run_artifacts() already settled state_file_bytes/
+    # total_artifact_bytes against the serialized size BEFORE this
+    # annotation grows the file with the intraday_archive object; leaving
+    # them at their pre-annotation values understates
+    # dca_cost_tracker.py's artifact-I/O cost proxy.
+    import near_close_dca as m
+
+    monkeypatch.setattr(m, "write_run_snapshot", lambda out, observations: None)
+    monkeypatch.setattr(
+        m, "archive_observations_safely", lambda observations: {"ok": True}
+    )
+
+    (tmp_path / "signals.csv").write_text("ticker\nAAPL\n")
+    run_state_path = tmp_path / "run_state.json"
+    base_state = {
+        "run_id": "r1",
+        "signal_rows": [],
+        "usage_proxy": {"csv_artifact_count": 1, "state_file_bytes": 1, "total_artifact_bytes": 1},
+    }
+    run_state_path.write_text(json.dumps(base_state))
+    artifacts = dict(base_state, trading_day="2026-08-03")
+
+    m._archive_intraday_observations(artifacts, tmp_path, run_state_path=run_state_path)
+
+    persisted = json.loads(run_state_path.read_text())
+    usage = persisted["usage_proxy"]
+    state_bytes = len(json.dumps(persisted, indent=2, sort_keys=True).encode("utf-8"))
+    csv_bytes = (tmp_path / "signals.csv").stat().st_size
+    assert usage["state_file_bytes"] == state_bytes
+    assert usage["total_artifact_bytes"] == state_bytes + csv_bytes
+
+
+def test_archive_intraday_observations_excludes_stale_orders_csv_from_resettle(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Exclude stale orders when resettling archive usage"):
+    # a reused artifact directory can already contain an orders.csv left
+    # over from an earlier attempt at the time this annotation runs --
+    # write_run_daily_compact() has not replaced it with the CURRENT run's
+    # orders.csv yet. write_run_artifacts() deliberately excluded orders.csv
+    # from its own settlement for exactly this reason; this resettlement
+    # pass must reuse that same signals.csv/buy_candidates.csv-only subset
+    # rather than counting whatever orders.csv happens to be on disk, or a
+    # stale file's bytes get attributed to a run that did not produce them.
+    import near_close_dca as m
+
+    monkeypatch.setattr(m, "write_run_snapshot", lambda out, observations: None)
+    monkeypatch.setattr(
+        m, "archive_observations_safely", lambda observations: {"ok": True}
+    )
+
+    (tmp_path / "signals.csv").write_text("ticker\nAAPL\n")
+    (tmp_path / "orders.csv").write_text("ticker,amount_usd\nAAPL,5.00\n")
+    run_state_path = tmp_path / "run_state.json"
+    base_state = {
+        "run_id": "r1",
+        "signal_rows": [],
+        "usage_proxy": {"csv_artifact_count": 1, "state_file_bytes": 1, "total_artifact_bytes": 1},
+    }
+    run_state_path.write_text(json.dumps(base_state))
+    artifacts = dict(base_state, trading_day="2026-08-03")
+
+    m._archive_intraday_observations(artifacts, tmp_path, run_state_path=run_state_path)
+
+    persisted = json.loads(run_state_path.read_text())
+    usage = persisted["usage_proxy"]
+    state_bytes = len(json.dumps(persisted, indent=2, sort_keys=True).encode("utf-8"))
+    csv_bytes = (tmp_path / "signals.csv").stat().st_size
+    assert usage["csv_artifact_count"] == 1
+    assert usage["state_file_bytes"] == state_bytes
+    assert usage["total_artifact_bytes"] == state_bytes + csv_bytes
+
+
+def test_archive_intraday_observations_without_run_state_path_does_not_persist(
+    tmp_path, monkeypatch
+):
+    # Backward compatible: omitting run_state_path (the default) must not
+    # attempt to write anywhere, matching every existing caller that has no
+    # durable run_state to annotate.
+    import near_close_dca as m
+
+    monkeypatch.setattr(m, "write_run_snapshot", lambda out, observations: None)
+    monkeypatch.setattr(
+        m,
+        "archive_observations_safely",
+        lambda observations: {"ok": False, "error": "archive unavailable"},
+    )
+    artifacts = {"run_id": "r1", "signal_rows": [], "trading_day": "2026-08-03"}
+
+    result = m._archive_intraday_observations(artifacts, tmp_path)
+
+    assert result is None
+    assert artifacts["intraday_archive"]["ok"] is False
+    assert not (tmp_path / "run_state.json").exists()
 
 
 def test_select_reconciled_signal_rows_picks_the_buy_winning_provider(tmp_path):
