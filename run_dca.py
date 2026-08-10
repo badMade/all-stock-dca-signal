@@ -793,7 +793,7 @@ def _build_frozen_providers_from_raw(
         # expose none at all (fail closed) when it has none either, rather than
         # silently falling back to frozen data.
         _live_get_bid_ask = getattr(original_robinhood, "get_bid_ask", None)
-        frozen_robinhood.get_bid_ask = (
+        frozen_robinhood.get_bid_ask = (  # type: ignore[attr-defined]
             _live_get_bid_ask
             if callable(_live_get_bid_ask)
             else (lambda ticker, as_of: None)
