@@ -2946,6 +2946,42 @@ def test_live_gate_restricts_to_preflight_eligible(tmp_path):
     assert evaluated == {"BIG"}
 
 
+def test_live_csv_artifacts_include_gated_out_ticker_rows(tmp_path):
+    preflight_root = tmp_path / "preflight"
+    pf = MorningDCAExecutor(
+        MorningConfig(tickers=("BIG", "FLAT"), morning_run_state_root=str(preflight_root)),
+        mode=MORNING_PREFLIGHT_MODE,
+    )
+    pf.run(
+        _now_preflight(),
+        FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.03, "FLAT": 0.0}),
+    )
+
+    live = MorningDCAExecutor(
+        MorningConfig(
+            tickers=("BIG", "FLAT"),
+            morning_run_state_root=str(tmp_path / "live"),
+            preflight_run_state_root=str(preflight_root),
+        ),
+        mode=MORNING_LIVE_MODE,
+    )
+    res = live.run(
+        _now_live(),
+        DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10, "FLAT": 0.10}),
+        broker=FakeLiveBroker(),
+    )
+
+    run_dir = Path(res["paths"]["run_state"]).parent
+    with (run_dir / "morning_signals.csv").open(newline="", encoding="utf-8") as handle:
+        rows = {row["ticker"]: row for row in csv.DictReader(handle)}
+    assert set(rows) == {"BIG", "FLAT"}
+    assert rows["BIG"]["auto_buy_signal"] == "True"
+    assert rows["FLAT"]["action"] == Action.SKIP.value
+    assert rows["FLAT"]["reason"] == "preflight_gate_gated_out"
+    assert rows["FLAT"]["auto_buy_signal"] == "False"
+    assert not (run_dir / "validation.csv").exists()
+
+
 def test_live_gate_degrades_to_full_universe_when_preflight_missing_scheduled(tmp_path):
     # NON-BLOCKING as of 2026-08-02 (Geoff: "should not block any later
     # runs"), superseding the old fail-closed contract (Codex review #77):

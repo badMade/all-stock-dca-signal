@@ -3695,6 +3695,80 @@ class MorningDCAExecutor(DCAExecutor):
         self._augment_artifacts(artifacts, top_up_outcomes)
         return artifacts
 
+    def _complete_signal_rows_for_output(
+        self, rows: Sequence[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Return CSV rows that include every configured active ticker at least once.
+
+        This is an artifact-contract guard only. Evaluation and order selection use the real
+        ``signals`` list before this helper runs; missing tickers are materialized only when
+        writing signals.csv/validation.csv so a ticker gated out by preflight stays visible.
+        Any extra/unknown or duplicate rows from the input are preserved after the configured set.
+        """
+        configured = [
+            ticker
+            for ticker in self.config.tickers
+            if ticker not in self.config.excluded_tickers
+        ]
+        ticker_key = "ticker"
+        if rows and any("symbol" in row for row in rows) and not any(
+            "ticker" in row for row in rows
+        ):
+            ticker_key = "symbol"
+        row_by_ticker: Dict[str, Dict[str, Any]] = {}
+        extras: List[Dict[str, Any]] = []
+        for row in rows:
+            copied = dict(row)
+            ticker = copied.get("ticker") or copied.get("symbol")
+            if ticker and ticker not in row_by_ticker:
+                row_by_ticker[str(ticker)] = copied
+            else:
+                extras.append(copied)
+
+        gated_out = set()
+        if isinstance(self.preflight_gate, dict):
+            gated_out = {str(t) for t in self.preflight_gate.get("gated_out_tickers", [])}
+
+        completed: List[Dict[str, Any]] = []
+        for ticker in configured:
+            if ticker in row_by_ticker:
+                completed.append(row_by_ticker[ticker])
+                continue
+            reason = (
+                "preflight_gate_gated_out"
+                if ticker in gated_out
+                else "not_evaluated_missing_signal_row"
+            )
+            completed.append(
+                {
+                    ticker_key: ticker,
+                    "source": "not_evaluated",
+                    "action": Action.SKIP.value,
+                    "reason": reason,
+                    "current_price": None,
+                    "previous_close": None,
+                    "drop_pct": None,
+                    "multiplier": 0.0,
+                    "previous_low": None,
+                    "selected_base_amount_usd": 0.0,
+                    "base_selection_reason": reason,
+                    "hypothetical_amount_usd": 0.0,
+                    "warnings": reason,
+                    "execution_status": None,
+                    "trend_validated": None,
+                    "auto_buy_signal": False,
+                    "spread_ok": None,
+                    "spread_pct": None,
+                    "spread_status": SPREAD_STATUS_NOT_EVALUATED,
+                }
+            )
+
+        for ticker, row in row_by_ticker.items():
+            if ticker not in configured:
+                completed.append(row)
+        completed.extend(extras)
+        return completed
+
     def _same_day_pointer_payload(
         self,
         artifacts: Dict[str, Any],
@@ -3777,7 +3851,10 @@ class MorningDCAExecutor(DCAExecutor):
         atomic_write_text(run_state_path, json.dumps(artifacts, indent=2, sort_keys=True))
 
         signals_path = out / self.signals_csv_name
-        _write_csv(signals_path, artifacts["signal_rows"])
+        output_signal_rows = self._complete_signal_rows_for_output(
+            artifacts["signal_rows"]
+        )
+        _write_csv(signals_path, output_signal_rows)
 
         paths = {"run_state": str(run_state_path), "signals": str(signals_path)}
 
@@ -3829,7 +3906,7 @@ class MorningDCAExecutor(DCAExecutor):
         if is_preflight:
             # validation.csv: the per-ticker eligible_to_execute verdict.
             validation_path = out / "validation.csv"
-            _write_csv(validation_path, artifacts["signal_rows"])
+            _write_csv(validation_path, output_signal_rows)
             paths["validation"] = str(validation_path)
             # run_summary.json: a compact roll-up of the pre-flight verdict.
             summary_path = out / "run_summary.json"
