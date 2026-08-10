@@ -29,7 +29,9 @@ from close_window_signal import (  # noqa: E402
     LABEL_CAPPED,
     REASON_DROP_BELOW_FIRST_TIER,
     REASON_MISSING_DECISION_PRICE,
+    REASON_MISSING_LOOKBACK_PRICE,
     REASON_NOT_BELOW_PRIOR_CLOSE,
+    REASON_TREND_NOT_DOWN,
     REPORTED_MULTIPLIER_CAP,
     STATUS_NO_SIGNAL,
     STATUS_SIGNAL_MODE_NOT_ACTIVE,
@@ -43,6 +45,8 @@ from foreground_primary import (  # noqa: E402
     FINDING_SAFETY_FAILURE,
     FOREGROUND_PRIMARY_MARKER,
     REASON_NO_ARTIFACTS,
+    REASON_POINTER_STALE,
+    REASON_POINTER_UNKNOWN_STREAM,
     REASON_UNREADABLE,
     REASON_WRONG_DAY,
     detect_foreground_primary_context,
@@ -186,6 +190,69 @@ def test_no_artifacts_supplied_is_not_foreground_primary_mode():
 
 
 # --------------------------------------------------------------------------
+# Same-day latest-pointer validation
+# --------------------------------------------------------------------------
+
+
+def _pointer_target(tmp_path, trading_day=TODAY):
+    target = tmp_path / "morning_dca" / "run_state.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({"trading_day": trading_day}), encoding="utf-8")
+    return target
+
+
+def _pointer_payload(target, *, stream="morning", pointer_status=None):
+    payload = {
+        "trading_day": TODAY,
+        FOREGROUND_PRIMARY_MARKER: True,
+        "run_id": "morning_live_20260730_1030ET",
+        "run_state_path": str(target),
+        "stream": stream,
+    }
+    if pointer_status is not None:
+        payload["pointer_status"] = pointer_status
+    return payload
+
+
+def test_pointer_status_valid_recovery_context_is_accepted(tmp_path):
+    target = _pointer_target(tmp_path)
+    pointer = _pointer_payload(target, pointer_status="valid_recovery_context")
+    context = detect_foreground_primary_context(
+        [pointer], trading_day=TODAY, expected_roots={"morning": str(tmp_path / "morning_dca")}
+    )
+    assert context.active is True
+    assert context.rejected == []
+
+
+def test_pointer_status_stale_is_still_rejected(tmp_path):
+    target = _pointer_target(tmp_path)
+    pointer = _pointer_payload(target, pointer_status="stale")
+    context = detect_foreground_primary_context(
+        [pointer], trading_day=TODAY, expected_roots={"morning": str(tmp_path / "morning_dca")}
+    )
+    assert context.active is False
+    assert context.rejected[0][1] == REASON_POINTER_STALE
+
+
+def test_pointer_with_stream_absent_from_expected_roots_is_rejected(tmp_path):
+    target = _pointer_target(tmp_path)
+    pointer = _pointer_payload(target, stream="not_a_real_stream")
+    context = detect_foreground_primary_context(
+        [pointer], trading_day=TODAY, expected_roots={"morning": str(tmp_path / "morning_dca")}
+    )
+    assert context.active is False
+    assert context.rejected[0][1] == REASON_POINTER_UNKNOWN_STREAM
+
+
+def test_pointer_stream_check_is_skipped_when_no_expected_roots_supplied(tmp_path):
+    target = _pointer_target(tmp_path)
+    pointer = _pointer_payload(target, stream="not_a_real_stream")
+    context = detect_foreground_primary_context([pointer], trading_day=TODAY)
+    assert context.active is True
+    assert context.rejected == []
+
+
+# --------------------------------------------------------------------------
 # Escalation gating
 # --------------------------------------------------------------------------
 
@@ -258,7 +325,12 @@ def test_valid_scheduled_evidence_escalates_nothing():
 def test_close_window_summary_grades_the_watchlist_and_compares_modes():
     summary = build_close_window_summary(
         {
-            "NVDA": {"decision_price": 98.0, "prior_close": 100.0, "data_source": "finance"},
+            "NVDA": {
+                "decision_price": 98.0,
+                "prior_close": 100.0,
+                "lookback_price": 99.0,
+                "data_source": "finance",
+            },
             "MSFT": {"decision_price": 101.0, "prior_close": 100.0, "data_source": "finance"},
             "GFUZ": {"decision_price": 99.999, "prior_close": 100.0, "data_source": "robinhood"},
             "LUNR": {"prior_close": 100.0, "data_source": "yfinance_fallback"},
@@ -314,10 +386,54 @@ def test_close_window_summary_grades_the_watchlist_and_compares_modes():
     assert rows["LUNR"]["foreground_mode_status"] == STATUS_UNKNOWN_MISSING_DATA
 
 
+def test_close_window_summary_treats_missing_lookback_price_as_unknown_not_fired():
+    """A ticker that clears the drop/tier checks but has no lookback_price cannot be
+    trend-validated, so it must not be reported as would_have_fired (Codex review:
+    "Require trend data before reporting a fired signal")."""
+    summary = build_close_window_summary(
+        {"NVDA": {"decision_price": 98.0, "prior_close": 100.0, "data_source": "finance"}},
+        tiers=LADDER,
+        trading_day=TODAY,
+        background_mode_active=True,
+        foreground_primary_mode_active=True,
+    )
+    row = summary["rows"][0]
+    assert row["reason_if_not_fired"] == REASON_MISSING_LOOKBACK_PRICE
+    assert row["background_mode_status"] == STATUS_UNKNOWN_MISSING_DATA
+    assert row["foreground_mode_status"] == STATUS_UNKNOWN_MISSING_DATA
+    assert summary["would_have_fired_tickers"] == []
+
+
+def test_close_window_summary_trend_gate_blocks_fired_verdict_when_price_above_lookback():
+    """lookback_price present but the trend isn't down: REASON_TREND_NOT_DOWN, not fired."""
+    summary = build_close_window_summary(
+        {
+            "NVDA": {
+                "decision_price": 98.0,
+                "prior_close": 100.0,
+                "lookback_price": 97.0,
+                "data_source": "finance",
+            }
+        },
+        tiers=LADDER,
+        trading_day=TODAY,
+    )
+    row = summary["rows"][0]
+    assert row["reason_if_not_fired"] == REASON_TREND_NOT_DOWN
+    assert row["background_mode_status"] == STATUS_NO_SIGNAL
+
+
 def test_close_window_summary_caps_the_reported_multiplier_at_3x():
     # A 9% drop is 5x on the live ladder; the summary reports 3x plus a label.
     summary = build_close_window_summary(
-        {"RGTI": {"decision_price": 91.0, "prior_close": 100.0, "data_source": "finance"}},
+        {
+            "RGTI": {
+                "decision_price": 91.0,
+                "prior_close": 100.0,
+                "lookback_price": 92.0,
+                "data_source": "finance",
+            }
+        },
         tiers=LADDER,
         trading_day=TODAY,
         background_mode_active=True,
@@ -335,6 +451,42 @@ def test_reported_multiplier_leaves_the_0x_to_3x_buckets_untouched():
         assert reported_multiplier(raw) == (raw, None)
     assert reported_multiplier(3.5) == (3.0, LABEL_CAPPED)
     assert reported_multiplier(5.0) == (3.0, LABEL_CAPPED)
+
+
+def test_close_window_summary_grades_a_calibrated_ticker_with_its_own_ladder():
+    """A ticker present in per_ticker_tiers is graded with its own calibrated
+    ladder, not the shared global tiers (Codex review: "Grade each ticker
+    with its active per-ticker ladder"). A modest LUNR decline clears the
+    lenient global first tier (0.1%) but stays below LUNR's stricter
+    calibrated first tier (5%), so it must not be reported as fired."""
+    quotes = {
+        "LUNR": {
+            "decision_price": 98.0,
+            "prior_close": 100.0,
+            "lookback_price": 99.0,
+            "data_source": "finance",
+        },
+    }
+    per_ticker_tiers = {"LUNR": ((0.05, 1.0), (0.08, 2.0))}
+
+    global_only = build_close_window_summary(
+        quotes, tiers=LADDER, trading_day=TODAY,
+    )
+    assert global_only["would_have_fired_tickers"] == ["LUNR"]
+
+    calibrated = build_close_window_summary(
+        quotes, tiers=LADDER, trading_day=TODAY, per_ticker_tiers=per_ticker_tiers,
+    )
+    assert calibrated["would_have_fired_tickers"] == []
+    row = calibrated["rows"][0]
+    assert row["reason_if_not_fired"] == REASON_DROP_BELOW_FIRST_TIER
+
+    # A ticker absent from per_ticker_tiers still falls back to the shared ladder.
+    quotes["NVDA"] = quotes.pop("LUNR")
+    fallback = build_close_window_summary(
+        quotes, tiers=LADDER, trading_day=TODAY, per_ticker_tiers=per_ticker_tiers,
+    )
+    assert fallback["would_have_fired_tickers"] == ["NVDA"]
 
 
 def test_close_window_summary_matches_the_live_ladder_loaded_from_config():

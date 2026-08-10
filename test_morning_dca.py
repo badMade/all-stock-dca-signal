@@ -2972,6 +2972,7 @@ def test_live_csv_artifacts_include_gated_out_ticker_rows(tmp_path):
     )
 
     run_dir = Path(res["paths"]["run_state"]).parent
+    assert not (run_dir / "validation.csv").exists()
     with (run_dir / "morning_signals.csv").open(newline="", encoding="utf-8") as handle:
         rows = {row["ticker"]: row for row in csv.DictReader(handle)}
     assert set(rows) == {"BIG", "FLAT"}
@@ -2979,7 +2980,6 @@ def test_live_csv_artifacts_include_gated_out_ticker_rows(tmp_path):
     assert rows["FLAT"]["action"] == Action.SKIP.value
     assert rows["FLAT"]["reason"] == "preflight_gate_gated_out"
     assert rows["FLAT"]["auto_buy_signal"] == "False"
-    assert not (run_dir / "validation.csv").exists()
 
 
 def test_live_gate_degrades_to_full_universe_when_preflight_missing_scheduled(tmp_path):

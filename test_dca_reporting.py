@@ -1305,7 +1305,14 @@ def test_generate_scheduled_reports_reports_foreground_primary_mode_instead_of_e
     )
 
     summary = build_close_window_summary(
-        {"NVDA": {"decision_price": 98.0, "prior_close": 100.0, "data_source": "finance"}},
+        {
+            "NVDA": {
+                "decision_price": 98.0,
+                "prior_close": 100.0,
+                "lookback_price": 99.0,
+                "data_source": "finance",
+            }
+        },
         tiers=((0.001, 1.0), (0.02, 2.0)),
         trading_day=day,
         background_mode_active=False,
@@ -1336,6 +1343,112 @@ def test_generate_scheduled_reports_reports_foreground_primary_mode_instead_of_e
 
     assert report["what_would_have_fired"]["analytics_only"] is True
     assert report["what_would_have_fired"]["would_have_fired_tickers"] == ["NVDA"]
+
+
+def test_generate_scheduled_reports_keeps_malformed_scheduled_state_blocking_in_foreground_mode(tmp_path=None):
+    """A malformed/unreadable scheduled run_state.json must keep escalating even
+    with a valid same-day foreground marker present (Codex review: "Keep
+    malformed scheduled artifacts blocking in foreground mode") -- unlike a
+    genuinely absent run_state, which foreground primary context may explain."""
+    import tempfile
+    from pathlib import Path
+
+    import pytest
+
+    from dca_reporting import generate_scheduled_reports
+    from scripts.run_classification import RUN_STATE_FILENAME, scheduled_run_dir
+
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-30"
+
+    state_path = scheduled_run_dir(day, base) / RUN_STATE_FILENAME
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text("{not valid json", encoding="utf-8")
+
+    foreground = {
+        "trading_day": day,
+        "run_classification": {"run_origin": "manual_foreground_primary"},
+    }
+    with pytest.raises(ValueError, match="no valid scheduled run_state"):
+        generate_scheduled_reports(
+            day,
+            [],
+            base / "reports",
+            base=base,
+            foreground_primary_artifacts=[foreground],
+        )
+
+
+def test_generate_scheduled_reports_forwards_blocking_findings_to_foreground_report(tmp_path=None):
+    """blocking_findings passed into the entry point must escalate even when a
+    valid foreground marker is present (Codex review: "Thread validator
+    blocking findings through the entry point")."""
+    import tempfile
+    from pathlib import Path
+
+    import pytest
+
+    from dca_reporting import generate_scheduled_reports
+
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-30"
+    foreground = {
+        "trading_day": day,
+        "run_classification": {"run_origin": "manual_foreground_primary"},
+    }
+    with pytest.raises(ValueError, match="no valid scheduled run_state"):
+        generate_scheduled_reports(
+            day,
+            [],
+            base / "reports",
+            base=base,
+            foreground_primary_artifacts=[foreground],
+            blocking_findings=["safety_failure"],
+        )
+
+
+def test_generate_scheduled_reports_logs_model_usage_when_foreground_report_raises(tmp_path, monkeypatch):
+    """The per-run model-usage audit entry must still be appended when
+    write_foreground_primary_report itself raises (e.g. a JSON serialization
+    or atomic-write failure), matching the scheduled branch's own
+    try/finally (Codex review: "Log model usage when foreground report
+    writing fails")."""
+    import pytest
+
+    import dca_reporting
+    from dca_reporting import generate_scheduled_reports
+
+    base = tmp_path / "root"
+    day = "2026-07-30"
+    foreground = {
+        "trading_day": day,
+        "run_classification": {"run_origin": "manual_foreground_primary"},
+    }
+
+    calls = []
+
+    def fake_log_model_usage(**kwargs):
+        calls.append(kwargs)
+        return None
+
+    def raising_write(*args, **kwargs):
+        raise RuntimeError("boom: simulated atomic write failure")
+
+    monkeypatch.setattr(dca_reporting, "_model_usage_log_helper", lambda: fake_log_model_usage)
+    monkeypatch.setattr(dca_reporting, "write_foreground_primary_report", raising_write)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        generate_scheduled_reports(
+            day,
+            [],
+            base / "reports",
+            base=base,
+            foreground_primary_artifacts=[foreground],
+            model_usage_log_root=str(base / "model_usage"),
+        )
+
+    assert len(calls) == 1
+    assert calls[0]["run_id"] == f"reporting_{day}_1700ET"
 
 
 def _run_all():

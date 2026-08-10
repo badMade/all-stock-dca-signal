@@ -51,6 +51,7 @@ REASON_MISSING_PRIOR_CLOSE = "missing_or_invalid_prior_close"
 REASON_NOT_BELOW_PRIOR_CLOSE = "decision_price_not_below_prior_close"
 REASON_DROP_BELOW_FIRST_TIER = "drop_below_first_ladder_tier"
 REASON_TREND_NOT_DOWN = "sixty_minute_trend_not_down"
+REASON_MISSING_LOOKBACK_PRICE = "missing_or_invalid_lookback_price"
 
 
 def _positive_float(value: Any) -> Optional[float]:
@@ -115,6 +116,25 @@ class CloseWindowRow:
     lookback_price: Optional[float] = None
 
 
+def _tiers_for_ticker(
+    ticker: str,
+    tiers: Sequence[Tuple[float, float]],
+    per_ticker_tiers: Optional[Mapping[str, Sequence[Tuple[float, float]]]],
+) -> Sequence[Tuple[float, float]]:
+    """Select the ladder to grade ``ticker`` with.
+
+    Mirrors ``near_close_dca._ticker_sizing(ticker, config).get('tiers',
+    config.sizing_tiers)``: a ticker present in ``per_ticker_tiers`` (built
+    from ``config/per_ticker_sizing.json``, e.g. via
+    ``StrategyConfig.per_ticker_sizing``) is graded with its own calibrated
+    tiers; every other ticker falls back to the shared global ``tiers``.
+    """
+    if per_ticker_tiers is None:
+        return tiers
+    candidate = per_ticker_tiers.get(ticker.upper()) if ticker else None
+    return candidate if candidate else tiers
+
+
 def build_close_window_row(
     ticker: str,
     quote: Mapping[str, Any],
@@ -122,24 +142,40 @@ def build_close_window_row(
     tiers: Sequence[Tuple[float, float]],
     background_mode_active: bool,
     foreground_primary_mode_active: bool,
+    per_ticker_tiers: Optional[Mapping[str, Sequence[Tuple[float, float]]]] = None,
 ) -> CloseWindowRow:
     """Grade one ticker. See :func:`build_close_window_summary`.
 
-    ``quote`` may optionally carry ``lookback_price`` (the 60-minute intraday
-    lookback bar close). When present, a signal is graded ``would_have_fired``
-    only when ``decision_price < lookback_price`` too, mirroring the live
-    signal path's trend gate (``near_close_dca.graded_buy_multiplier``'s
-    ``intraday_trend_down`` check) so the summary does not overstate what
-    would actually have fired. ``lookback_price`` is optional and omitted by
-    every existing caller today; when absent the trend gate is not applied,
-    preserving prior behavior exactly (Codex review: "Include the trend gate
-    in fired verdicts").
+    ``quote`` should carry ``lookback_price`` (the 60-minute intraday lookback
+    bar close). A signal is graded ``would_have_fired`` only when
+    ``decision_price < lookback_price`` too, mirroring the live signal path's
+    trend gate (``near_close_dca.graded_buy_multiplier``'s
+    ``intraday_trend_down`` check), which the active afternoon contract always
+    requires. A ticker that otherwise clears the drop/tier checks but has no
+    usable ``lookback_price`` cannot be trend-validated, so it is graded
+    ``unknown_missing_data`` with :data:`REASON_MISSING_LOOKBACK_PRICE` rather
+    than ``would_have_fired`` -- silently skipping the gate for a missing
+    value would let a ticker the live path rejects (current price below
+    yesterday's close but not below its lookback price) be systematically
+    reported as fired (Codex review: "Require trend data before reporting a
+    fired signal").
+
+    ``per_ticker_tiers``, when supplied, selects a per-ticker calibrated
+    ladder (see :func:`_tiers_for_ticker`) the same way the live path's
+    ``near_close_dca.graded_buy_multiplier`` does via ``_ticker_sizing``.
+    Grading every row with the single global ``tiers`` regardless of an
+    active ``config/per_ticker_sizing.json`` calibration could clear a
+    ticker's global first tier while remaining below that ticker's own,
+    stricter calibrated first tier, systematically over-reporting
+    ``would_have_fired`` relative to what live execution would actually do
+    (Codex review: "Grade each ticker with its active per-ticker ladder").
     """
     decision_price = _positive_float(quote.get("decision_price"))
     prior_close = _positive_float(quote.get("prior_close"))
     lookback_price = _positive_float(quote.get("lookback_price"))
     data_source = quote.get("data_source")
     data_source = data_source if isinstance(data_source, str) and data_source else None
+    tiers = _tiers_for_ticker(ticker, tiers, per_ticker_tiers)
 
     if decision_price is None or prior_close is None:
         reason = REASON_MISSING_DECISION_PRICE if decision_price is None else REASON_MISSING_PRIOR_CLOSE
@@ -166,10 +202,18 @@ def build_close_window_row(
         reason = REASON_NOT_BELOW_PRIOR_CLOSE
     elif raw_multiplier <= 0:
         reason = REASON_DROP_BELOW_FIRST_TIER
-    elif lookback_price is not None and decision_price >= lookback_price:
+    elif lookback_price is None:
+        reason = REASON_MISSING_LOOKBACK_PRICE
+    elif decision_price >= lookback_price:
         reason = REASON_TREND_NOT_DOWN
 
-    if reason is not None:
+    if reason == REASON_MISSING_LOOKBACK_PRICE:
+        # Trend cannot be validated at all, which is a data gap, not a
+        # negative signal -- keep it distinguishable from a real no-signal
+        # verdict the same way missing decision_price/prior_close is.
+        background_status = STATUS_UNKNOWN_MISSING_DATA
+        foreground_status = STATUS_UNKNOWN_MISSING_DATA
+    elif reason is not None:
         background_status = STATUS_NO_SIGNAL
         foreground_status = STATUS_NO_SIGNAL
     else:
@@ -203,6 +247,7 @@ def build_close_window_summary(
     watchlist: Optional[Iterable[str]] = None,
     background_mode_active: bool = True,
     foreground_primary_mode_active: bool = False,
+    per_ticker_tiers: Optional[Mapping[str, Sequence[Tuple[float, float]]]] = None,
 ) -> Dict[str, Any]:
     """Build the read-only ``what_would_have_fired`` summary for the watchlist.
 
@@ -211,14 +256,24 @@ def build_close_window_summary(
     ``decision_price`` is the current market-close decision price and
     ``prior_close`` is the prior COMPLETED regular-session close. ``tiers`` is
     the graded ladder as ``(drop_fraction, multiplier)`` pairs, i.e. exactly
-    ``StrategyConfig.sizing_tiers`` (see ``dca_config.load_sizing_tiers``).
-    ``lookback_price`` is the optional 60-minute intraday lookback bar close;
-    when a caller supplies it, a ticker fires only when ``decision_price`` is
-    also below it, mirroring the live signal path's trend gate
-    (``near_close_dca.graded_buy_multiplier``). Omitting it (every existing
-    caller today) does not apply the trend gate, so the summary can overstate
-    would-have-fired signals relative to the live path in that case -- see
-    ``REASON_TREND_NOT_DOWN``.
+    ``StrategyConfig.sizing_tiers`` (see ``dca_config.load_sizing_tiers``), used
+    as the fallback ladder for any ticker not present in ``per_ticker_tiers``.
+    ``lookback_price`` is the 60-minute intraday lookback bar close. A ticker
+    fires only when ``decision_price`` is also below it, mirroring the live
+    signal path's trend gate (``near_close_dca.graded_buy_multiplier``), which
+    the active afternoon contract always requires. A ticker missing
+    ``lookback_price`` cannot be trend-validated, so it is reported
+    ``unknown_missing_data`` (``REASON_MISSING_LOOKBACK_PRICE``) rather than
+    ``would_have_fired`` -- see ``REASON_TREND_NOT_DOWN`` for the case where
+    ``lookback_price`` is present but the trend gate itself fails.
+
+    ``per_ticker_tiers`` maps ticker to that ticker's calibrated ``(drop_fraction,
+    multiplier)`` tiers (e.g. built from ``StrategyConfig.per_ticker_sizing`` /
+    ``config/per_ticker_sizing.json``, one ``tiers`` list per entry). When a
+    ticker has a calibrated entry it is graded with that ladder instead of the
+    shared ``tiers``, matching ``near_close_dca.graded_buy_multiplier``'s own
+    ``_ticker_sizing`` selection. Omitting it grades every ticker with the
+    shared ``tiers``, same as before this parameter existed.
 
     ``watchlist`` pins the tickers and their order; when omitted the keys of
     ``quotes`` are used, sorted. A watchlist ticker with no quote is still
@@ -241,6 +296,7 @@ def build_close_window_summary(
             tiers=tiers,
             background_mode_active=background_mode_active,
             foreground_primary_mode_active=foreground_primary_mode_active,
+            per_ticker_tiers=per_ticker_tiers,
         )
         for ticker in tickers
     ]
@@ -294,6 +350,7 @@ __all__ = [
     "REASON_NOT_BELOW_PRIOR_CLOSE",
     "REASON_DROP_BELOW_FIRST_TIER",
     "REASON_TREND_NOT_DOWN",
+    "REASON_MISSING_LOOKBACK_PRICE",
     "SUMMARY_CSV_FIELDS",
     "CloseWindowRow",
     "reported_multiplier",

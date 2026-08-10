@@ -825,6 +825,7 @@ def generate_scheduled_reports(
     foreground_primary_artifacts: Optional[Iterable[str | Path | Mapping[str, Any]]] = None,
     close_window_summary: Optional[Dict[str, Any]] = None,
     model_usage_config: Optional[ModelUsageConfig] = None,
+    blocking_findings: Sequence[str] = (),
 ) -> Dict[str, str]:
     """Task 67aa802b entry point: post-trade reports for the SCHEDULED run only.
 
@@ -865,6 +866,17 @@ def generate_scheduled_reports(
     missing-scheduled-state case raises exactly as it always has.
     ``close_window_summary`` is the optional read-only what-would-have-fired
     analytics block (see scripts/close_window_signal.py) embedded in that report.
+
+    ``blocking_findings`` are real failures the caller already detected
+    (safety failures, broker/order mismatches, stale same-day pointers,
+    missing required foreground artifacts -- see
+    ``scripts.foreground_primary.BLOCKING_FINDING_CODES``) that must escalate
+    even when foreground primary mode is active, forwarded verbatim to
+    :func:`write_foreground_primary_report`. Previously this entry point
+    exposed no such parameter, so a caller that detected one of these
+    failures had to either bypass this function entirely or watch it return
+    foreground success while suppressing the missing scheduled run (Codex
+    review: "Thread validator blocking findings through the entry point").
     """
     collect_manual_order_ids, select_scheduled = _run_classification_helpers()
     base_path = Path(base) if base is not None else None
@@ -933,16 +945,48 @@ def generate_scheduled_reports(
         # writes states valid_scheduled_evidence=false. Callers that pass no
         # foreground artifacts (every existing one) still raise exactly as
         # before.
-        report_path = write_foreground_primary_report(
-            trading_day,
-            output_dir,
-            foreground_primary_artifacts=foreground_primary_artifacts,
-            scheduled_evidence_reasons=selection.errors,
-            close_window_summary=close_window_summary,
-            fills=fills,
-        )
+        #
+        # selection.errors represents two different failure shapes:
+        # selection.state_path is None only when no scheduled run_state file
+        # exists at all -- a genuinely absent background run that foreground
+        # primary context legitimately explains. Any other selection.errors
+        # (selection.state_path is not None) means an artifact WAS found but
+        # is unreadable or fails classification/schema validation, which stays
+        # a blocking artifact-contract failure regardless of foreground mode
+        # (Codex review: "Keep malformed scheduled artifacts blocking in
+        # foreground mode") -- it is forwarded as blocking_findings, not as a
+        # suppressible scheduled_evidence_reasons entry.
+        if selection.state_path is None:
+            scheduled_evidence_reasons: Sequence[str] = selection.errors
+            malformed_scheduled_state_findings: Sequence[str] = ()
+        else:
+            scheduled_evidence_reasons = ()
+            malformed_scheduled_state_findings = selection.errors
+
+        report_path = None
+        try:
+            report_path = write_foreground_primary_report(
+                trading_day,
+                output_dir,
+                foreground_primary_artifacts=foreground_primary_artifacts,
+                scheduled_evidence_reasons=scheduled_evidence_reasons,
+                blocking_findings=[*malformed_scheduled_state_findings, *blocking_findings],
+                close_window_summary=close_window_summary,
+                fills=fills,
+            )
+        finally:
+            # Logged on every exit from this attempt -- success, a still-
+            # escalating None result, or write_foreground_primary_report
+            # raising (e.g. a JSON serialization or atomic-write failure) --
+            # matching the scheduled branch's own try/finally below instead of
+            # only logging after a successful return (Codex review: "Log
+            # model usage when foreground report writing fails").
+            _log_model_usage(
+                f"foreground primary context for {trading_day}: {report_path}"
+                if report_path is not None
+                else f"foreground primary context attempt for {trading_day} did not produce a report"
+            )
         if report_path is not None:
-            _log_model_usage(f"foreground primary context for {trading_day}: {report_path}")
             return {"foreground_primary_context": str(report_path)}
         raise ValueError(
             f"no valid scheduled run_state for {trading_day}: "

@@ -3698,12 +3698,15 @@ class MorningDCAExecutor(DCAExecutor):
     def _complete_signal_rows_for_output(
         self, rows: Sequence[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """Return CSV rows that include every configured active ticker at least once.
+        """Return CSV rows containing every configured active ticker exactly once.
 
-        This is an artifact-contract guard only. Evaluation and order selection use the real
-        ``signals`` list before this helper runs; missing tickers are materialized only when
-        writing signals.csv/validation.csv so a ticker gated out by preflight stays visible.
-        Any extra/unknown or duplicate rows from the input are preserved after the configured set.
+        This is an artifact-contract guard only. Evaluation and order selection
+        use the real ``signals`` list before this helper runs; missing rows are
+        materialized only when writing signals.csv or validation.csv so a ticker
+        dropped by a gate, join, provider edge case, or recovery path is visible
+        downstream as a skipped row instead of disappearing from the artifact.
+        Any extra/unknown or duplicate rows from the input are preserved after
+        the configured set.
         """
         configured = [
             ticker

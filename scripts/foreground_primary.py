@@ -78,6 +78,16 @@ REASON_POINTER_MALFORMED = "pointer_malformed_or_missing_required_keys"
 REASON_POINTER_STALE = "pointer_stale_or_not_declared_valid"
 REASON_POINTER_OUTSIDE_ROOT = "pointer_target_outside_expected_root"
 REASON_POINTER_MISSING_TARGET = "pointer_target_run_state_missing_or_unreadable"
+REASON_POINTER_UNKNOWN_STREAM = "pointer_stream_not_in_expected_roots"
+
+# pointer_status values a same-day latest-pointer artifact may declare and
+# still be trusted (mirrors scripts/same_day_pointer.py's STATUS_VALID and
+# STATUS_VALID_RECOVERY_CONTEXT). A foreground/recovery-context pointer must
+# not claim scheduled evidence, so it is schema-valid at "valid_recovery_context"
+# rather than "valid"; rejecting it here made a marker carried by one of the
+# documented latest-pointer sources unable to activate foreground mode (Codex
+# review: "Allow a valid foreground-context pointer status").
+_POINTER_ACCEPTED_STATUSES = ("valid", "valid_recovery_context")
 
 # Keys that mark a payload as a same-day latest-pointer artifact (see
 # scripts/same_day_pointer.py) rather than a run_state/run_summary itself. A
@@ -269,8 +279,8 @@ def _validate_pointer_artifact(
     """Structurally validate a same-day latest-pointer artifact.
 
     Mirrors the load-bearing checks of ``same_day_pointer.validate_pointer``
-    (required keys, a declared ``pointer_status`` of anything other than
-    ``"valid"``, root containment when ``expected_root`` is known, and a
+    (required keys, a declared ``pointer_status`` outside
+    :data:`_POINTER_ACCEPTED_STATUSES`, root containment when ``expected_root`` is known, and a
     same-day target that actually exists and is readable) without importing
     that module -- this module stays standard-library-only by contract.
 
@@ -287,7 +297,7 @@ def _validate_pointer_artifact(
         return REASON_POINTER_MALFORMED
 
     declared_status = payload.get("pointer_status")
-    if declared_status is not None and declared_status != "valid":
+    if declared_status is not None and declared_status not in _POINTER_ACCEPTED_STATUSES:
         return REASON_POINTER_STALE
 
     raw_path = str(payload.get("run_state_path", "")).strip()
@@ -340,14 +350,16 @@ def detect_foreground_primary_context(
     A latest-pointer artifact (one carrying the same_day_pointer required keys
     -- ``run_id``, ``run_state_path``, ``trading_day``, ``stream``) gets an
     additional structural pass before its marker/day fields are trusted: it is
-    rejected when it declares a non-``"valid"`` ``pointer_status``, when its
-    target run_state is missing or unreadable, when the target's own
-    ``trading_day`` does not match, or -- when ``expected_roots`` supplies a
-    root for the pointer's declared ``stream`` -- when ``run_state_path``
-    resolves outside that root. See :func:`_validate_pointer_artifact`. Without
-    this a stale, malformed, or out-of-root pointer that merely carries today's
-    date and a marker field would activate foreground primary mode and suppress
-    a missing-scheduled-evidence alert that is explicitly meant to keep
+    rejected when it declares a ``pointer_status`` outside
+    :data:`_POINTER_ACCEPTED_STATUSES`, when its target run_state is missing or
+    unreadable, when the target's own ``trading_day`` does not match, when
+    ``expected_roots`` is supplied but the pointer's declared ``stream`` is not
+    one of its keys, or -- when ``expected_roots`` supplies a root for the
+    pointer's declared ``stream`` -- when ``run_state_path`` resolves outside
+    that root. See :func:`_validate_pointer_artifact`. Without this a stale,
+    malformed, unmapped-stream, or out-of-root pointer that merely carries
+    today's date and a marker field would activate foreground primary mode and
+    suppress a missing-scheduled-evidence alert that is explicitly meant to keep
     escalating.
 
     Never raises. An unreadable or malformed artifact is recorded in
@@ -377,9 +389,20 @@ def detect_foreground_primary_context(
             continue
         if _looks_like_pointer(payload):
             stream = payload.get("stream")
-            expected_root = None
-            if expected_roots and isinstance(stream, str) and stream in expected_roots:
+            if expected_roots is not None:
+                # When a caller supplies expected_roots at all, every permitted
+                # stream must resolve to a validated root. Falling through to
+                # expected_root=None for a stream absent from the map (a typo
+                # or a malformed/unknown stream) would silently disable the
+                # containment check instead of rejecting the pointer, letting
+                # it target any readable same-day JSON file (Codex review:
+                # "Reject pointers whose stream has no expected root").
+                if not isinstance(stream, str) or stream not in expected_roots:
+                    context.rejected.append((source, REASON_POINTER_UNKNOWN_STREAM))
+                    continue
                 expected_root = Path(expected_roots[stream])
+            else:
+                expected_root = None
             pointer_rejection = _validate_pointer_artifact(payload, trading_day, expected_root)
             if pointer_rejection is not None:
                 context.rejected.append((source, pointer_rejection))
