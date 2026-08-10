@@ -1034,6 +1034,19 @@ class SheetsWriter:
         import urllib.error
         import urllib.parse
         import urllib.request
+        from urllib.parse import urlparse
+
+        # `urlopen` follows a 30x `Location` header by default and preserves
+        # the `Authorization` header while doing so — a compromised or
+        # misconfigured upstream could redirect this request to an internal
+        # host (or an ftp://file:// URL) and receive the Pipedream bearer
+        # token. `_API_BASE` never legitimately redirects, so treat any
+        # redirect attempt as a failure instead of validating and following it.
+        class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                raise urllib.error.HTTPError(
+                    newurl, code, "SheetsWriter: refusing to follow redirect", headers, fp
+                )
 
         if not self.spreadsheet_id:
             logger.warning("SheetsWriter: no GOOGLE_SHEET_ID configured — skipping.")
@@ -1061,6 +1074,11 @@ class SheetsWriter:
             })
 
         url = f"{self._API_BASE}/add-rows"
+
+        parsed_url = urlparse(url)
+        if parsed_url.scheme.lower() != "https" or parsed_url.netloc.lower() != "api.pipedream.com":
+            logger.error("SheetsWriter: blocked unsafe Sheets API URL %s", url)
+            return False
         payload = json.dumps({
             "spreadsheetId": self.spreadsheet_id,
             "worksheetId":   self.sheet_name,
@@ -1078,7 +1096,8 @@ class SheetsWriter:
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            opener = urllib.request.build_opener(_NoRedirectHandler)
+            with opener.open(req, timeout=20) as resp:  # noqa: S310
                 status_code = resp.status
                 if status_code in (200, 201):
                     logger.info(

@@ -37,3 +37,8 @@
 **Vulnerability:** The email report template in `sentiment_cron.py` dynamically constructed HTML using f-strings and interpolated unsanitized variables (`ticker` and `company`).
 **Learning:** When rendering HTML without a proper templating engine (like Jinja2 with autoescaping), raw variables fetched from external sources or user input can introduce XSS vulnerabilities.
 **Prevention:** Always sanitize variables interpolated into HTML f-strings using `html.escape()`. Be sure to cast the variable to a string if its type is not guaranteed to avoid `TypeError`.
+
+## 2026-08-10 - SSRF in strategy_monitor.py
+**Vulnerability:** `urllib.request.urlopen` is used in `trading-strategies/strategy_monitor.py`; if the target URL ever becomes configurable/untrusted, it could enable SSRF (including `file://` reads).
+**Learning:** Static analyzers (Ruff `S310`) flag `urlopen` based on syntax, so add explicit allowlisting (and/or an explicit suppression) when the URL is trusted.
+**Prevention:** Keep the endpoint hardcoded to `https://api.pipedream.com/...` (or validate scheme + host allowlist) before calling `urlopen`, and keep `# noqa: S310` on the call site. `urlopen` also follows redirects (preserving `Authorization`) by default, so build the opener with a custom `HTTPRedirectHandler` that refuses to follow them rather than trusting the initial-URL check alone.
