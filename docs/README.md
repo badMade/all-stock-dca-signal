@@ -13,6 +13,7 @@ environment (see the repository README).
 |---|---|
 | [reliability_spec.md](reliability_spec.md) | Formal run-state, reconciliation, and artifact-contract spec + honest implementation-status matrix |
 | [strategy.md](strategy.md) | Strategy overview, ticker universe, latest sizing ladder, budgets |
+| [ticker_advisory.md](ticker_advisory.md) | The `ticker-advisor/` tool: scores candidate tickers, proposes universe additions for manual review |
 | [live_wiring.md](live_wiring.md) | Live providers/broker adapters, orchestrator/CLI, and the two placement safety gates |
 | [safeguards.md](safeguards.md) | Broker/account, trading constraints, budget caps, test window |
 | [schedule_manifest.md](schedule_manifest.md) | The canonical 15-row recurring schedule (17 rows verified 2026-07-27; 2 removed 2026-08-02), one-time tasks, and retired entries |

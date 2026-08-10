@@ -164,6 +164,21 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
             "plan_orders()/execute_plan() directly instead."
         ),
     ),
+    EntryPoint(
+        need="Score candidate tickers for the active universe (health/backtest/sentiment)",
+        command="python ticker-advisor/advise_tickers.py --candidates TICK1 TICK2 [--skip-sentiment]",
+        exists_path="ticker-advisor/advise_tickers.py",
+        doc_ref="docs/ticker_advisory.md",
+        symbols=("main",),
+        notes=(
+            "Self-contained subproject, own requirements.txt (cd ticker-advisor && pip install -r "
+            "requirements.txt first) -- not importable from the core repo's stdlib-only environment. "
+            "Writes a ranked report and a proposed config/tickers.json diff to "
+            "analysis/<date>-ticker-advisory/; never edits config/tickers.json or "
+            "near_close_dca.ACTIVE_TICKERS itself. Broker tradability still needs manual verification "
+            "via Robinhood MCP before applying -- see docs/ticker_advisory.md."
+        ),
+    ),
 )
 
 

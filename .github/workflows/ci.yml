@@ -132,3 +132,40 @@ jobs:
       - name: Run tests
         working-directory: production-safe-agent-loop
         run: python -m pytest tests/
+
+  ticker-advisor:
+    name: Lint & test (ticker-advisor)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Deliberately NOT `pip install -r ticker-advisor/requirements.txt` here:
+      # that pulls in vectorbt and a multi-GB torch/transformers install for
+      # every CI run. Install only the lightweight signals (health metrics,
+      # RSI/MA-crossover signal generation, scoring, report, pricing) --
+      # the vectorbt-backed backtest and the real FinBERT model load are
+      # importorskip-guarded in tests/, so they skip cleanly here rather
+      # than failing, and still run wherever the full requirements.txt is
+      # installed (a contributor's machine, a manual full-dep CI dispatch).
+      - name: Install lightweight tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install pandas numpy scipy requests
+
+      - name: Ruff lint
+        # Same rationale as production-safe-agent-loop's step above: this
+        # subproject is excluded from the root pyproject.toml's ruff scope.
+        run: ruff check --isolated --select=E,F,B --line-length=120 ticker-advisor
+
+      - name: Run tests (lightweight subset; heavy-dep tests skip)
+        working-directory: ticker-advisor
+        run: python -m pytest tests/

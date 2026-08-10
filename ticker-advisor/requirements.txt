@@ -1,0 +1,14 @@
+# Third-party dependencies for the ticker-advisor tool. These are heavy and
+# NOT required to run the core near-close graded DCA strategy -- see this
+# subproject's own README.md and the root CLAUDE.md's "Standard library only
+# at runtime" invariant.
+pandas
+numpy
+scipy
+yfinance
+vectorbt
+requests
+# Sentiment scoring only; large ML stack (multi-GB torch install).
+transformers
+torch
+pytest>=8.0.0

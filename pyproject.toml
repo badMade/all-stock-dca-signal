@@ -140,14 +140,14 @@ packages = ["scripts"]
 [tool.pytest.ini_options]
 testpaths = ["."]
 python_files = ["test_*.py"]
-# production-safe-agent-loop/ is a self-contained tool with its own deps
-# (anthropic, requests, beautifulsoup4) that aren't installed by
-# requirements-dev.txt; run its suite from within that directory instead
-# (pip install -r production-safe-agent-loop/requirements.txt, then
-# cd production-safe-agent-loop && python -m pytest tests/), so keep it
-# out of the core "pytest" sweep the same way ruff already excludes it
-# below.
-addopts = "-q --ignore=production-safe-agent-loop"
+# production-safe-agent-loop/ and ticker-advisor/ are self-contained tools
+# with their own deps (production-safe-agent-loop: anthropic, requests,
+# beautifulsoup4; ticker-advisor: pandas, vectorbt, transformers/torch, ...)
+# that aren't installed by requirements-dev.txt; run each suite from within
+# its own directory instead (pip install -r <dir>/requirements.txt, then
+# cd <dir> && python -m pytest tests/), so keep both out of the core
+# "pytest" sweep the same way ruff already excludes them below.
+addopts = "-q --ignore=production-safe-agent-loop --ignore=ticker-advisor"
 
 [tool.coverage.run]
 # Measure the code that runs in production, not the suite that exercises it.
@@ -164,6 +164,11 @@ omit = [
     "analysis/*",
     ".github/*",
     "setup.py",
+    # Self-contained heavy-dep subproject with its own pytest run, excluded
+    # from the root "pytest --ignore" sweep above -- without this omit entry
+    # its ~900 uncovered lines would count against the 90% gate for code the
+    # root suite never executes (see ticker-advisor/README.md).
+    "ticker-advisor/*",
 ]
 
 [tool.coverage.report]
@@ -180,9 +185,10 @@ line-length = 120
 # ".github" tree is CI config plus tooling scripts injected into the CI workspace
 # by external review integrations (not tracked core source), so it is excluded
 # too -- the CI lint step is scoped to "core modules", matching this exclude.
-# production-safe-agent-loop/ is likewise a self-contained tool with its own
-# requirements.txt and test suite, run independently of the core gate.
-extend-exclude = ["trading-strategies", "analysis", ".github", "production-safe-agent-loop"]
+# production-safe-agent-loop/ and ticker-advisor/ are likewise self-contained
+# tools with their own requirements.txt and test suite, each run independently
+# of the core gate (own ruff invocation in .github/workflows/ci.yml).
+extend-exclude = ["trading-strategies", "analysis", ".github", "production-safe-agent-loop", "ticker-advisor"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B"]

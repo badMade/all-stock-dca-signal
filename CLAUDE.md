@@ -32,7 +32,7 @@ ruff check .
 
 # Tests — ~3,030 tests, ~30s for the whole suite
 .venv/bin/python -m pytest                # pyproject addopts already supply -q and the
-                                          # --ignore=production-safe-agent-loop exclusion
+                                          # --ignore=production-safe-agent-loop --ignore=ticker-advisor exclusions
 .venv/bin/python -m pytest test_midday_dca.py -q
 .venv/bin/python -m pytest test_midday_dca.py::test_some_case -q
 
@@ -47,13 +47,16 @@ Two suites sit outside the root `pytest` sweep and must be run separately:
 
 ```bash
 .venv/bin/python -m pytest scripts/tests -q          # reliability engines, run classification, drift
-cd production-safe-agent-loop && python -m pytest tests/   # own requirements.txt
+(cd production-safe-agent-loop && python -m pytest tests/)   # own requirements.txt
 ruff check --isolated --select=E,F,B --line-length=120 production-safe-agent-loop
+(cd ticker-advisor && pip install -r requirements.txt && python -m pytest tests/)   # own requirements.txt
+ruff check --isolated --select=E,F,B --line-length=120 ticker-advisor
 ```
 
 CI (`.github/workflows/ci.yml`) runs lint + coverage-gated tests on Python 3.11 and 3.12, the
-demo smoke test, `pip-audit` on `requirements-dev.txt`, and the `production-safe-agent-loop`
-suite. Dev tool versions are **pinned** in `requirements-dev.txt` on purpose — bump deliberately.
+demo smoke test, `pip-audit` on `requirements-dev.txt`, and the `production-safe-agent-loop` and
+`ticker-advisor` suites. Dev tool versions are **pinned** in `requirements-dev.txt` on purpose —
+bump deliberately.
 
 ## Architecture
 
@@ -156,8 +159,9 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 - Tests are flat top-level `test_<module>.py` files beside the module; `scripts/` tests live in
   `scripts/tests/`. Add or update tests for every behavior change, and a regression test for
   every bug fix.
-- `trading-strategies/`, `analysis/`, `.github/`, and `production-safe-agent-loop/` are excluded
-  from the core ruff gate and the coverage source — they carry their own deps and conventions.
+- `trading-strategies/`, `analysis/`, `.github/`, `production-safe-agent-loop/`, and
+  `ticker-advisor/` are excluded from the core ruff gate and the coverage source — they carry
+  their own deps and conventions.
 - Check `git status --short` before editing and preserve existing user changes. Keep patches
   small; avoid unrelated refactors. Review the diff for secrets and generated artifacts before
   committing.
@@ -175,6 +179,7 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 | `docs/run_classification.md` | Scheduled-vs-manual contract: paths, required fields, exclusions |
 | `docs/schedule_manifest.md` | The canonical recurring schedule |
 | `docs/strategy.md` | Strategy overview, ticker universe, sizing ladder, budgets |
+| `docs/ticker_advisory.md` | The `ticker-advisor/` tool: scores candidate tickers, proposes universe additions for manual review |
 | `docs/drift_detection.md`, `docs/reporting_workflow.md`, `docs/cost_tracking.md` | Post-run detection, reporting, and cost policy |
 | `docs/pr_review_workflow.md` | The two-workflow PR review split and its trust boundary |
 | `PRODUCTION_READINESS.md` | Tracked gaps between the library and a fully live system |
