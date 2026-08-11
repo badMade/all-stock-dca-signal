@@ -4851,11 +4851,13 @@ def test_persisting_broker_adapter_records_buying_power_and_tradability(tmp_path
     assert recorder.error is None
     assert any(name.startswith("buying_power_") for name in recorder.saved_filenames)
     assert any(name.startswith("tradability_AAPL_") for name in recorder.saved_filenames)
-    # Optional non-protocol broker methods still forward through __getattr__.
+    # The guarded same-stream duplicate query is also raw input, rather than
+    # being forwarded unrecorded through __getattr__.
     assert (
         wrapped.same_day_strategy_order_exists_with_ref_id_prefix("AAPL", date(2026, 7, 8), [])
         is None
     )
+    assert any(name.startswith("orders_since_midnight_AAPL_") for name in recorder.saved_filenames)
 
 
 def test_scheduled_live_run_persists_raw_inputs_on_success(tmp_path):
@@ -4938,15 +4940,21 @@ class _Unserializable:
 
 
 class _BadTradabilityBroker(FakeLiveBroker):
+    def __init__(self):
+        self.place_calls = []
+
     def is_tradable_for_fractional_buy(self, ticker):
         return _Unserializable()
 
+    def place_market_buy(self, ticker, notional_usd, ref_id):
+        self.place_calls.append((ticker, notional_usd, ref_id))
+        return super().place_market_buy(ticker, notional_usd, ref_id)
 
-def test_scheduled_live_run_surfaces_non_fatal_raw_persistence_error(tmp_path):
-    # A persistence failure discovered only once broker-side calls begin
-    # (evaluate() already succeeded, so nothing blocks up front) must not
-    # retroactively block an order that already passed every safety check --
-    # it is recorded on the final run_state for operator visibility instead.
+
+def test_scheduled_live_run_fails_closed_on_pre_placement_broker_raw_error(tmp_path):
+    # Broker-side safety inputs are persisted immediately before they are used.
+    # If tradability cannot be written, fail closed before place_market_buy()
+    # rather than writing a seemingly successful scheduled artifact.
     pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
@@ -4956,11 +4964,14 @@ def test_scheduled_live_run_surfaces_non_fatal_raw_persistence_error(tmp_path):
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
-    res = ex.run(_now_live(), data, broker=_BadTradabilityBroker())
+    broker = _BadTradabilityBroker()
+    res = ex.run(_now_live(), data, broker=broker)
     artifacts = res["artifacts"]
-    assert artifacts.get("status") != "blocked"
-    assert "raw_persistence_error" in artifacts
-    assert "SMALL" in artifacts.get("broker_outcomes", {})
+    assert artifacts["status"] == "blocked"
+    assert artifacts["error_class"] == "missing_or_invalid_raw_inputs"
+    assert "raw input persistence failed" in artifacts["block_reason"]
+    assert artifacts["broker_outcomes"] == {}
+    assert broker.place_calls == []
 
 
 if __name__ == "__main__":

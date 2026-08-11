@@ -1092,6 +1092,26 @@ class _PersistingBrokerAdapter:
         )
         return value
 
+    def same_day_strategy_order_exists_with_ref_id_prefix(
+        self, ticker: str, trading_day: date, ref_id_prefixes: Sequence[str]
+    ) -> Any:
+        """Return and persist the guarded top-up idempotency query response."""
+        checker = getattr(self._inner, "same_day_strategy_order_exists_with_ref_id_prefix", None)
+        if not callable(checker):
+            raise RuntimeError("broker does not support same-stream ref-id duplicate checks for guarded top-ups")
+        value = checker(ticker, trading_day, ref_id_prefixes)
+        self._recorder.persist(
+            "orders_since_midnight",
+            ticker,
+            {
+                "ticker": ticker,
+                "trading_day": trading_day.isoformat(),
+                "ref_id_prefixes": list(ref_id_prefixes),
+                "same_stream_order": value,
+            },
+        )
+        return value
+
     def is_tradable_for_fractional_buy(self, ticker: str) -> bool:
         value = self._inner.is_tradable_for_fractional_buy(ticker)
         self._recorder.persist("tradability", ticker, {"ticker": ticker, "tradable": value})
@@ -2716,6 +2736,12 @@ class MorningDCAExecutor(DCAExecutor):
         # makes an unnecessary broker/account round-trip.
         batch_buying_power: Optional[float] = None
         reserved_buying_power = 0.0
+
+        def raw_persistence_failed() -> bool:
+            """Stop before submission when the decorated broker could not save an input."""
+            recorder = getattr(broker, "_recorder", None)
+            return bool(recorder is not None and recorder.error)
+
         for signal in candidates:
             ticker = signal.ticker
             top_up = (top_up_outcomes or {}).get(ticker)
@@ -2780,6 +2806,10 @@ class MorningDCAExecutor(DCAExecutor):
                 }
                 _log.warning("Duplicate-check error for %s: %s", ticker, exc)
                 continue
+            if raw_persistence_failed():
+                # The duplicate response is an order-placement input. Do not
+                # let a failed audit write turn into a later submission.
+                break
             if dup:
                 if has_prior_allocation and not manual:
                     # A same-stream top-up duplicate on a SCHEDULED retry means
@@ -2874,6 +2904,8 @@ class MorningDCAExecutor(DCAExecutor):
                     }
                     _log.warning("Spread quote error for %s: %s", ticker, exc)
                     continue
+                if raw_persistence_failed():
+                    break
                 max_spread = self.config.max_bid_ask_spread_pct
                 if spread_pct is not None and spread_pct > max_spread:
                     outcomes[ticker] = {
@@ -2893,11 +2925,15 @@ class MorningDCAExecutor(DCAExecutor):
                 }
                 _log.warning("Tradability lookup error for %s: %s", ticker, exc)
                 continue
+            if raw_persistence_failed():
+                break
             if not tradable:
                 outcomes[ticker] = {"status": "blocked", "skip_reason": "not tradable for fractional buy", "deliberate_skip": True}
                 continue
             if batch_buying_power is None:
                 batch_buying_power = broker.available_buying_power()
+            if raw_persistence_failed():
+                break
             if batch_buying_power - reserved_buying_power < notional:
                 outcomes[ticker] = {"status": "blocked", "skip_reason": "insufficient buying power", "deliberate_skip": True}
                 continue
@@ -3110,6 +3146,14 @@ class MorningDCAExecutor(DCAExecutor):
                         now, f"failed to retrieve broker account number: {exc}", signals, source
                     )
                 raise RuntimeError(f"Failed to retrieve broker account number: {exc}") from exc
+            if raw_recorder is not None and raw_recorder.error:
+                return self._blocked_live_result(
+                    now,
+                    f"raw input persistence failed: {raw_recorder.error}",
+                    signals,
+                    source,
+                    error_class="missing_or_invalid_raw_inputs",
+                )
             if expected_account and actual_account != expected_account:
                 mismatch = f"broker account mismatch: expected {expected_account}, got {actual_account}"
                 if not manual:
@@ -3126,6 +3170,19 @@ class MorningDCAExecutor(DCAExecutor):
                 data=data,
                 now=now,
             )
+            if raw_recorder is not None and raw_recorder.error:
+                # _place_broker_orders checks after every persisted broker or
+                # market-data input and stops before the next submission.
+                # Convert that stopped execution into the promised valid
+                # failure-state artifact rather than merely annotating a run
+                # that may otherwise look eligible for execution.
+                return self._blocked_live_result(
+                    now,
+                    f"raw input persistence failed: {raw_recorder.error}",
+                    signals,
+                    source,
+                    error_class="missing_or_invalid_raw_inputs",
+                )
         # In live mode record only candidates whose orders were actually submitted
         # so cap-exceeded orders do not inflate the ledger and corrupt budget reporting.
         # A "duplicate_preserved" outcome (a same-stream top-up duplicate retry)
@@ -3268,13 +3325,9 @@ class MorningDCAExecutor(DCAExecutor):
             artifacts["raw_input_dir"] = str(raw_dir)
             artifacts["raw_inputs_saved"] = raw_recorder.saved_filenames
             if raw_recorder.error:
-                # Persistence failed only after order placement had already
-                # begun (evaluate()-stage failures are caught above, before
-                # any order is placed) -- the safeguards that validated each
-                # already-placed order (budget, tradability, spread, trend)
-                # are unaffected by a failure to also write its audit copy to
-                # disk, so this does not retroactively block the run; it is
-                # surfaced here for operator visibility instead.
+                # Defensive visibility for a future post-placement raw input.
+                # Current pre-placement reads are checked above and fail
+                # closed before an order can be submitted.
                 artifacts["raw_persistence_error"] = raw_recorder.error
         paths = self.write_artifacts(artifacts, now)
         # Fold this run's own run_id into the seen-set so a LATER run() call on
