@@ -115,7 +115,7 @@ def test_updated_active_ticker_is_published_for_calibration(tmp_path):
 
     assert result["changed_tickers"] == ["ABC"]
     assert result["changed_active_tickers"] == ["ABC"]
-    event = json.loads((events_dir / "ticker_update_event.json").read_text(encoding="utf-8"))
+    event = json.loads((events_dir / "ticker_update_event.json").read_bytes())
     assert event["changed_active_tickers"] == ["ABC"]
 
 

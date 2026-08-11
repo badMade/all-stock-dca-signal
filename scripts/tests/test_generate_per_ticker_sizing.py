@@ -85,7 +85,7 @@ def test_default_run_refuses_to_publish_a_session_count_regression(tmp_path, mon
     assert "REFUSED" in stderr
     assert "ABC" in stderr
     # The stale published payload must survive untouched.
-    assert json.loads(output.read_text(encoding="utf-8"))["tickers"]["ABC"]["sample_sessions"] == 300
+    assert json.loads(output.read_bytes())["tickers"]["ABC"]["sample_sessions"] == 300
 
 
 def test_run_publishes_normally_when_the_archive_has_sufficient_coverage(tmp_path, monkeypatch):

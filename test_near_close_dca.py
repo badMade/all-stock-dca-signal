@@ -6043,7 +6043,7 @@ def test_archive_intraday_observations_persists_failure_to_run_state(tmp_path, m
     assert result is None
     assert artifacts["intraday_archive"]["ok"] is False
     assert artifacts["intraday_archive"]["error"] == "archive unavailable"
-    persisted = json.loads(run_state_path.read_text())
+    persisted = json.loads(run_state_path.read_bytes())
     assert persisted["intraday_archive"]["ok"] is False
     assert persisted["intraday_archive"]["error"] == "archive unavailable"
 
@@ -6065,7 +6065,7 @@ def test_archive_intraday_observations_persists_success_summary_too(tmp_path, mo
     )
 
     assert result == "snap.json"
-    persisted = json.loads(run_state_path.read_text())
+    persisted = json.loads(run_state_path.read_bytes())
     assert persisted["intraday_archive"]["ok"] is True
     assert persisted["intraday_archive"]["run_snapshot"] == "snap.json"
 
@@ -6113,7 +6113,7 @@ def test_archive_intraday_observations_preserves_contract_failure_markers(
 
     m._archive_intraday_observations(artifacts, tmp_path, run_state_path=run_state_path)
 
-    persisted = json.loads(run_state_path.read_text())
+    persisted = json.loads(run_state_path.read_bytes())
     assert persisted["status"] == "blocked"
     assert persisted["artifact_contract_failure"]["reason"] == "scheduled-run artifact contract failed"
     assert persisted["run_classification"]["valid_scheduled_evidence"] is False
@@ -6146,7 +6146,7 @@ def test_archive_intraday_observations_resettles_usage_bytes(tmp_path, monkeypat
 
     m._archive_intraday_observations(artifacts, tmp_path, run_state_path=run_state_path)
 
-    persisted = json.loads(run_state_path.read_text())
+    persisted = json.loads(run_state_path.read_bytes())
     usage = persisted["usage_proxy"]
     state_bytes = len(json.dumps(persisted, indent=2, sort_keys=True).encode("utf-8"))
     csv_bytes = (tmp_path / "signals.csv").stat().st_size

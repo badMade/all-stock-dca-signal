@@ -1284,7 +1284,7 @@ def test_main_merges_pre_filtered_exclusions_into_proposed_diff(tmp_path, monkey
     )
 
     assert exit_code == 0
-    diff = json.loads((out_dir / "proposed_tickers_diff.json").read_text(encoding="utf-8"))
+    diff = json.loads((out_dir / "proposed_tickers_diff.json").read_bytes())
     assert "AAPL" in diff["skipped_already_active"]
     assert "BRK-B" in diff["skipped_invalid_symbol_shape"]
 

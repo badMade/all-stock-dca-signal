@@ -153,7 +153,7 @@ def _merge_results(batches: List[Any]) -> Dict[str, Any]:
 
 
 def build_data_provider(data_file: Path) -> RobinhoodDataProvider:
-    payload = json.loads(data_file.read_text())
+    payload = json.loads(data_file.read_bytes())
     historicals_batches = payload.get("historicals") or []
     quotes_batches = payload.get("quotes") or []
     if not isinstance(historicals_batches, list):

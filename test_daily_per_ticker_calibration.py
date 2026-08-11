@@ -41,8 +41,8 @@ def test_active_ticker_update_event_triggers_a_calibration(tmp_path):
     assert result["execution_owner"] == "claude_only"
     assert result["perplexity_involved"] is False
     assert result["triggering_tickers"] == ["ABC"]
-    assert json.loads(output.read_text(encoding="utf-8"))["tickers"]["ABC"]["sample_sessions"] == 0
-    artifact = json.loads((artifacts_dir / "calibration_run.json").read_text(encoding="utf-8"))
+    assert json.loads(output.read_bytes())["tickers"]["ABC"]["sample_sessions"] == 0
+    artifact = json.loads((artifacts_dir / "calibration_run.json").read_bytes())
     assert artifact["upstream_status"] == "completed"
 
 
@@ -167,7 +167,7 @@ def test_standalone_run_refuses_to_publish_a_truncated_ticker_history(tmp_path):
 
     assert result["status"] == "blocked_session_count_regression"
     assert result["session_count_regressions"]["ABC"]["previous"] == 300
-    published = json.loads(output.read_text(encoding="utf-8"))
+    published = json.loads(output.read_bytes())
     assert published["tickers"]["ABC"]["sample_sessions"] == 300  # unchanged live config
 
 
