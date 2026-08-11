@@ -97,6 +97,26 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         notes="--transcript is required; --write persists the extracted config files (omit for a dry-run preview only).",
     ),
     EntryPoint(
+        need="Build a consolidated ledger of every confirmed buy across all streams/days",
+        command=(
+            "python -m scripts.purchase_history "
+            "[--cron-tracking-root <dir>] [--output-dir <dir>] [--additional-root <dir> ...]"
+        ),
+        exists_path="scripts/purchase_history.py",
+        doc_ref="docs/purchase_history.md",
+        symbols=("collect_purchase_records", "build_ticker_rollup", "write_purchase_history", "main"),
+        notes=(
+            "Read-only reporting tool, never on the live buy path -- same category as "
+            "backup_strategy.py / drift_detection.py. Writes purchase_history.csv (one row per "
+            "confirmed fill) and purchase_history_by_ticker.json (per-ticker rollup). "
+            "--additional-root (repeatable) is needed when a stream's live artifact root has "
+            "been relocated outside the cron-tracking tree; see docs/purchase_history.md's "
+            "Limitations section, which also documents known gaps (morning/midday currently "
+            "contribute no confirmed fills; same-ticker multiple orders within one CSV collapse "
+            "to one row)."
+        ),
+    ),
+    EntryPoint(
         need="Regenerate per-ticker sizing overrides",
         command="python -m scripts.generate_per_ticker_sizing",
         exists_path="scripts/generate_per_ticker_sizing.py",
