@@ -2614,7 +2614,8 @@ def test_gate6_accepts_a_candidate_whose_drop_matches_its_claimed_multiplier():
 def test_gate6_accepts_a_kill_switch_capped_minimum_multiplier_despite_a_mismatched_drop():
     """near_close_dca.graded_buy_multiplier()'s 7-day kill-switch caps a deep-drop
     signal's multiplier down to the ladder's minimum (1.0x) while the candidate
-    still carries its real, uncapped drop_pct (claude/GATE5-PROPOSAL.md #3.6).
+    still carries its real, uncapped drop_pct (the now-removed GATE5 proposal
+    doc's #3.6; see PRODUCTION_READINESS.md gap #1).
     ("AAPL", 2.0, multiplier=1.0, drop_pct=8.5) is exactly that: a real 1.0x
     notional match, but drop_pct=8.5 falls far outside 1.0x's own narrow
     [0.1, 1.0) tier range. The drop/multiplier consistency check must not

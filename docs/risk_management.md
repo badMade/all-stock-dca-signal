@@ -111,7 +111,7 @@ Deployment is accounted **per stream** and never mixed
     `run_state.json` artifacts is for audit only until per-slot readers exist
     (Codex review, PR #232: "Write scheduled evidence where consumers scan").
     Not exploitable today: Gate 5 is a hard abort (verdict `GATE5_DISABLED`)
-    in every executor prompt (`claude/GATE5-PROPOSAL.md`), so none of these
+    in every executor prompt (`PRODUCTION_READINESS.md`), so none of these
     slots place real orders yet.
 - **Manual** runs (`run_origin='manual'` / `manual_run=true`) are tracked
   separately and **never** counted toward scheduled-live deployment.

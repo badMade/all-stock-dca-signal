@@ -10,9 +10,11 @@ Every one of the seven canonical live-execution prompts
 (``claude/dca-executor-prompts/live-mirror/*.txt``) has a Gate 5 step reading
 "Run the repo's own signal generation for this slot ... Use the repo entry
 point, never a reimplementation" -- and until now there was no such entry
-point to run (``claude/GATE5-PROPOSAL.md`` section 1.1). Every fire has hit
-``GATE5_DISABLED`` since 2026-07-30 and placed nothing, including on days with
-a broadly down tape (``claude/GATE5-WATCHDOG-FIXES-2026-07-30.md``).
+point to run (the now-removed GATE5 proposal doc's section 1.1; see
+``PRODUCTION_READINESS.md`` gap #1). Every fire has hit ``GATE5_DISABLED``
+since 2026-07-30 and placed nothing, including on days with a broadly down
+tape (formerly documented in the now-removed GATE5 incident-fix log; see
+``PRODUCTION_READINESS.md``).
 
 SCOPE -- read this before extending to another slot
 -----------------------------------------------------

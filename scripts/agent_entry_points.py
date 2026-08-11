@@ -150,7 +150,7 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
             "--trading-day <YYYY-MM-DD> --market-data <file> --deployed-last-7d-usd <usd>"
         ),
         exists_path="scripts/generate_buy_candidates.py",
-        doc_ref="claude/GATE5-PROPOSAL.md",
+        doc_ref="docs/strategy.md",
         symbols=("generate_candidates", "main"),
         notes=(
             "1530ET ONLY -- see the module's own SCOPE section. The other six roster "

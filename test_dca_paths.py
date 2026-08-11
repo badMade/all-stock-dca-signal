@@ -405,7 +405,7 @@ def test_the_loaders_resolve_the_model_usage_root_at_load_time():
 # "contributes nothing, so this is safe on days a stream did not run" -- except
 # here it is absent EVERY day, so the same-day top-up guard degrades to "no
 # prior allocation found" and every slot buys full size. It fails open, silently.
-# See claude/GATE5-PROPOSAL.md section 1.5.
+# See the now-removed GATE5 proposal doc's section 1.5 (PRODUCTION_READINESS.md gap #1).
 #
 # The sentinel value itself must NOT change: config/*.json records ~40 artifact
 # paths against that exact prefix and rebase_bundled_root() keys off it.

@@ -57,7 +57,7 @@ environment (see the repository README).
   Claude-executed roster (weekdays 9:35 AM through 3:30 PM ET) is the
   intended eventual replacement, but every one of those seven prompts
   hard-aborts at Gate 5 (no signal-generation entry point exists yet; see
-  `claude/GATE5-PROPOSAL.md`), so it runs alongside the five Perplexity-era
+  `PRODUCTION_READINESS.md`), so it runs alongside the five Perplexity-era
   tasks, not instead of them, until Gate 5 is wired. See
   [safeguards.md](safeguards.md#live-execution-roster) for the current
   roster. Robinhood account `<ROBINHOOD_ACCOUNT_NUMBER>` only; Alpaca read-only.

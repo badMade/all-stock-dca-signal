@@ -10,7 +10,8 @@ scheduler/agent ran all three slots directly from the manifest's prose, so none
 of this repo's code enforced their approved-trading-window cutoff, budget ledger,
 per-order ceiling, or same-day top-up guard.
 
-It also closes the specific gap ``claude/GATE5-PROPOSAL.md`` section 1.4 raised:
+It also closes the specific gap the now-removed GATE5 proposal doc's section 1.4 raised
+(see ``PRODUCTION_READINESS.md`` gap #1):
 fills at 11:30/1:30/2:30 existed nowhere in the prior-allocation chain, so a
 ticker bought at one of those slots was invisible to the guard at the next and
 would be re-bought full-size at a successively higher price -- exactly what the

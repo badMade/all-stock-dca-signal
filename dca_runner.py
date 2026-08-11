@@ -1308,11 +1308,18 @@ def _candidate_drop_mismatches_claimed_multiplier(cand: Candidate) -> bool:
 
     ``cand.multiplier`` equal to the ladder's configured MINIMUM
     (``MIN_LADDER_MULTIPLIER``) is exempt from this check's UPPER bound: the
-    documented 7-day risk-guard kill-switch (``claude/GATE5-PROPOSAL.md``
-    #3.6) caps a deep-drop signal's multiplier down to that floor while the
-    candidate still carries its REAL, uncapped ``drop_pct`` -- callers are
-    explicitly required to perform this capping before candidates ever
-    reach ``assess()``/``plan_orders()``. Without this exemption, a
+    documented 7-day risk-guard kill-switch (``docs/risk_management.md``
+    #2 -- applied inside ``near_close_dca.graded_buy_multiplier`` via
+    ``dca_risk.apply_risk_guard``, not in this module) caps a deep-drop
+    signal's multiplier down to that floor while the candidate still
+    carries its REAL, uncapped ``drop_pct`` -- callers are explicitly
+    required to perform this capping before candidates ever reach
+    ``assess()``/``plan_orders()`` (a stale prior version of this reference
+    pointed at ``PRODUCTION_READINESS.md`` #3.6, a section that never
+    existed there -- the actual worked mechanics lived in the now-removed
+    ``GATE5-PROPOSAL.md`` and are restored here from ``docs/risk_management.md``'s
+    own, currently-accurate section instead (Codex review: "Restore the
+    detailed kill-switch reference")). Without this exemption, a
     legitimate capped candidate like ``Candidate("AAPL", 2.0,
     multiplier=1.0, drop_pct=8.5)`` would be refused as inconsistent purely
     because its real drop falls outside the floor tier's own narrow range,
@@ -2867,8 +2874,9 @@ def execute_plan(
     rather than reusing an earlier fetch.
 
     One placement-time gap this function still does NOT close, documented in
-    ``claude/GATE5-PROPOSAL.md`` §3.7 as a requirement for whatever eventually
-    calls it live: ``gate_sole_executor``'s read-only broker-history check,
+    ``PRODUCTION_READINESS.md``'s state-durability gap (#2) as a requirement
+    for whatever eventually calls it live: ``gate_sole_executor``'s read-only
+    broker-history check,
     even rerun here, cannot by itself make two concurrent executor instances
     mutually exclusive (that needs an atomic run/slot lease this module has
     no mechanism to provide) -- it closes the "history already shows a
@@ -4162,7 +4170,7 @@ def assess(
     Does NOT apply the 7-day deployment kill-switch (docs/risk_management.md):
     ``candidates`` are planned at the notional they arrive with. The caller
     (the not-yet-built signal-generation entry point, see
-    claude/GATE5-PROPOSAL.md#36-the-7-day-deployment-kill-switch-must-be-applied-before-candidates-reach-assess)
+    PRODUCTION_READINESS.md's 7-day deployment kill-switch gap)
     must already have capped every multiplier to 1x before calling this
     function whenever that guard is tripped (Codex review: "Enforce the
     rolling risk guard before planning").

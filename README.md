@@ -121,9 +121,23 @@ print(base_amount_usd * multiplier)
 | `scripts/` | Backup and run-classification utilities. |
 | `docs/` | Detailed strategy docs, runbooks, and operational notes. |
 | `test_*.py`, `scripts/tests/` | Automated tests. |
-| `trading-strategies/`, `analysis/` | Optional research tooling and historical analysis artifacts. |
+| `ticker-advisor/`, `trading-strategies/`, `analysis/`, `production-safe-agent-loop/` | Adjacent projects — see below. |
 | `tickers.txt`, `historical_stock_data.csv`, `stock_fetch_progress.json` | Operational data files used by fetch/analysis scripts; do not delete. |
 | `FETCH_*.md`, `FILE_MANIFEST.txt`, `FINAL_EXECUTION_REPORT.md`, `TASK_SUMMARY.txt`, `README_*.md` | Generated operational reports from fetch runs; treat as read-only artifacts. |
+
+## Adjacent projects
+
+Each of these is a self-contained subproject with its own dependencies and tests, excluded
+from the core repo's stdlib-only ruff/coverage gates (see `CLAUDE.md`). None is imported by
+`near_close_dca.py` or any other core strategy module — each is invoked separately, on its own
+schedule or by hand.
+
+| Project | What it does | Run it |
+| --- | --- | --- |
+| `ticker-advisor/` | Scores candidate tickers on strategy-health, backtested performance, and sentiment signals; proposes universe additions for manual review. Never edits `config/tickers.json` itself. | `cd ticker-advisor && pip install -r requirements.txt && python advise_tickers.py --candidates TICK1 TICK2` — see `docs/ticker_advisory.md`. |
+| `trading-strategies/` | Separate research tree: a standalone vectorbt-based backtester plus strategy/sentiment monitors, decoupled from the live pipeline. | `cd trading-strategies && pip install -r requirements.txt` — see `trading-strategies/README.md`. |
+| `analysis/` | Dated one-off analysis folders: ladder revisions, execution audits, reliability writeups. Nothing here runs on a schedule. | Browse `analysis/README.md` for an index of what's in each dated folder. |
+| `production-safe-agent-loop/` | Two safety primitives for running an AI agent loop against something that costs real money: a turn/token circuit breaker, and a forced pre-flight spec. Not wired into any live executor today. | `cd production-safe-agent-loop && pip install -r requirements.txt && python -m pytest tests/` — see `production-safe-agent-loop/README.md`. |
 
 ## Agentic workflow compatibility
 

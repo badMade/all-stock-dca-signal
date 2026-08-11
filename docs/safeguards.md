@@ -70,7 +70,7 @@ instead of alerting on it as an anomaly, and the one empirical fact (what
 value Perplexity's own orders actually carry in `placed_agent`) that must be
 confirmed against real order history before that addition is more than a
 placeholder. That document also carries the paste-ready Perplexity-side
-mirror of the same check. Gate 5 itself (see `claude/GATE5-PROPOSAL.md`) is
+mirror of the same check. Gate 5 itself (see `PRODUCTION_READINESS.md`) is
 untouched by this — no callable signal-generation entry point exists yet, so
 none of the seven Claude prompts can place a single order today regardless of
 what Gate 4 decides. As of 2026-07-30 the `GATE5_DISABLED` verdict alerts on
@@ -112,7 +112,8 @@ subclassing the same `MorningDCAExecutor` pipeline the 10:30 and 12:30 streams
 run on, so every one of those rules is enforced by the same tested code path.
 Writing real artifacts under `market_open_dca/` and `intraday_dca/` — roots
 every sibling stream already scanned and always found empty — also closes
-`claude/GATE5-PROPOSAL.md` §1.4's prior-allocation gap for these slots in both
+the prior-allocation gap for these slots that the now-removed GATE5 proposal
+doc's §1.4 identified (see PRODUCTION_READINESS.md gap #1), in both
 directions.
 
 **They ship disabled.** `config/market_open_dca.json` and

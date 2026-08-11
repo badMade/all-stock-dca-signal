@@ -4699,7 +4699,7 @@ def test_fallback_discovery_roots_keep_nested_configured_roots(tmp_path, monkeyp
 # reimplementation." Until now no such entry point existed: main() is dry-run
 # only (run_dca.py:2169, :2178) and the live path was an in-process
 # run_pipeline() call the retired Perplexity scheduler supplied with MCP
-# provider objects. See claude/GATE5-PROPOSAL.md.
+# provider objects. See PRODUCTION_READINESS.md.
 #
 # Scope decision (2026-07-29): only the three canonical slots ship. They map 1:1
 # onto the morning/midday/afternoon streams that same_day_top_up_policy already
@@ -5298,7 +5298,8 @@ def test_run_slot_without_a_guarded_prior_allocation_still_blocks_a_same_day_rep
 
 @pytest.mark.parametrize("slot", ["1030ET", "1230ET", "1530ET"])
 def test_run_slot_no_longer_forces_one_order_per_ticker_per_day(slot, tmp_path):
-    """Human decision, GATE5-PROPOSAL.md #4 item 2 (2026-07-30): guarded top-up,
+    """Human decision, 2026-07-30 (formerly documented in the now-removed GATE5
+    proposal doc's #4 item 2): guarded top-up,
     not "first slot wins". run_slot must stop forcing
     one_order_per_ticker_per_day=True so near_close_dca's existing
     strictly-lower-price top-up guard (already exercised by

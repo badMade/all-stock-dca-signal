@@ -8,8 +8,9 @@ What is intraday specific and therefore tested here:
     - one stream and one cron id across THREE fire times, with per-slot run ids
       and artifact folders but a constant ``stream`` value,
     - one pooled budget ledger shared by all three slots,
-    - the prior-allocation chain that claude/GATE5-PROPOSAL.md section 1.4
-      identified as missing for these slots,
+    - the prior-allocation chain that the now-removed GATE5 proposal doc's
+      section 1.4 identified as missing for these slots (see
+      PRODUCTION_READINESS.md gap #1),
     - the ships-disabled placement switch.
 
 Runnable with ``pytest`` or ``python test_intraday_dca.py``.
@@ -301,7 +302,7 @@ def test_intraday_enabled_does_place(tmp_path):
     assert broker.placed.get("TICK") == 5.0  # 2.5x * $2 base
 
 
-# --- The prior-allocation chain GATE5-PROPOSAL section 1.4 flagged ----------
+# --- The prior-allocation chain the now-removed GATE5 proposal's section 1.4 flagged --------
 def test_prior_allocation_roots_cover_every_earlier_same_day_stream():
     # The specific gap: a ticker bought at an earlier slot used to be invisible
     # to the guard at the next one, so it was re-bought full size at a higher
@@ -339,7 +340,7 @@ def test_a_later_slot_sees_an_earlier_slots_fill_as_prior_allocation(tmp_path):
     placed = broker.placed.get("TICK")
     assert placed is not None and placed < 5.0, (
         "the 1:30 slot re-bought the full amount instead of topping up -- the "
-        "GATE5-PROPOSAL section 1.4 gap has reopened"
+        "prior-allocation gap (PRODUCTION_READINESS.md gap #1) has reopened"
     )
 
 

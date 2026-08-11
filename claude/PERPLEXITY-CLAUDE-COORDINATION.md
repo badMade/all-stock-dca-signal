@@ -286,7 +286,7 @@ per slot. The Claude-primary intent is achieved structurally, not by
 special-casing one engine over the other:
 
 - **Today:** Claude cannot complete Gate 5 for any slot (no signal-generation
-  entry point exists yet -- see `claude/GATE5-PROPOSAL.md`), so it never
+  entry point exists yet), so it never
   places an order, so Perplexity's own per-slot check (§4) never finds a
   Claude order in the window and always proceeds. Perplexity wins every slot
   by construction, which matches exactly what Geoff described: "for now
@@ -329,7 +329,7 @@ Gate 4 decides.
 ## 6. What this supersedes
 
 `docs/safeguards.md`'s "Live execution roster" section and
-`claude/GATE5-PROPOSAL.md` / `claude/dca-executor-prompts/0-setup-card.md`
+`claude/dca-executor-prompts/0-setup-card.md`
 previously described the seven-slot roster running alongside the five legacy
 tasks only as a **transitional** state, with an explicit instruction that
 once Gate 5 is wired and the old tasks retire, any future overlap "must

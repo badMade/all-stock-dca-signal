@@ -206,7 +206,7 @@ caps. Neither
 `assess` nor `plan_orders` applies the 7-day deployment kill-switch
 (`docs/risk_management.md`) -- candidates must already be scaled down (multiplier capped
 to 1x) by the caller before reaching `assess` whenever that guard is tripped; see
-`claude/GATE5-PROPOSAL.md` §3.6. `dca_runner.execute_plan(plan, broker, *, run_id=None,
+the now-removed GATE5 proposal doc's §3.6 (see PRODUCTION_READINESS.md gap #1). `dca_runner.execute_plan(plan, broker, *, run_id=None,
 snapshot=None, tier=None, trading_day=None, orders=None, weekly_cap_usd=None,
 weekly_rollover_reserve_usd=None, weekly_rollover_reserve_week_key=None,
 finalized_budget_days=None, submitted_notional_by_week=None, buying_power_usd=None,
@@ -364,7 +364,7 @@ way rather than propagating. Behaviour is pinned by `test_dca_runner.py`.
 `claude/dca-executor-prompts/` actually calls `assess()` or `execute_plan()` today -- each
 still restates the same gate logic in prose for the executing LLM session to follow by
 reading config files and calling MCP tools directly, and Gate 5 is a hard abort in every
-prompt (see `claude/GATE5-PROPOSAL.md`), so `execute_plan()` is never reached from a live
+prompt (see `PRODUCTION_READINESS.md`), so `execute_plan()` is never reached from a live
 run at all. This module is the committed, tested gate/budget/placement logic gap #1 in
 `PRODUCTION_READINESS.md` calls for -- the part that can no longer silently vanish to
 prompt-text truncation -- but closing that gap fully still requires wiring each prompt to

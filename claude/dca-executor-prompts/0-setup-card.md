@@ -21,9 +21,9 @@ market-open, `42173154` 10:30 morning, `7be82b97` 11:30/1:30/2:30 intraday, `a62
 12:30 midday, `10ce362c` 3:30 final) -- these are the account's ONLY currently-functioning
 scheduled DCA execution. Every one of the seven new prompt files below ends every fire at
 Gate 5 with the `GATE5_DISABLED` verdict (no callable signal-generation entry point exists
-yet; see `claude/GATE5-PROPOSAL.md`), so none of them can place a single order today. As of
+yet; see `PRODUCTION_READINESS.md`), so none of them can place a single order today. As of
 2026-07-30 this verdict alerts on every fire (see each file's Gate 5/Gate 9 and
-`claude/GATE5-WATCHDOG-FIXES-2026-07-30.md`) -- it no longer places nothing silently, only
+`PRODUCTION_READINESS.md`) -- it no longer places nothing silently, only
 places nothing. Retiring the five old tasks before Gate 5 is resolved leaves the account
 with zero functioning scheduled execution for however long that takes (Codex review:
 "Keep the old executors until replacements can pass Gate 5") -- create and schedule all
@@ -71,13 +71,20 @@ prompt files below, and `GATE4_EXPECTED_OVERLAP` was brought in line with it the
 the same reason, in the three prompts where it applies; **repaste all seven prompts from this
 repo into their live Cowork tasks to pick up both changes** -- editing the committed `.txt`
 files alone does not change what a task already pasted into Cowork does (see
-`claude/GATE5-WATCHDOG-FIXES-2026-07-30.md`). Accept the resulting alert volume (up to seven
+`PRODUCTION_READINESS.md`). Accept the resulting alert volume (up to seven
 alerts a day, every weekday, until a real entry point exists) as the cost of that trade-off.
 The Gate 4 sole-executor-interlock
 double-order risk this section used to warn about only becomes real once a human
-finishes `claude/GATE5-PROPOSAL.md` and wires a real signal-generation entry point into
-these prompts, and Gate 5 in all seven must revert from its disabled `GATE5_DISABLED`
-classification to a real abort-and-alert check on failure, the same as every other gate.
+wires a real signal-generation entry point into these prompts, and Gate 5 in all seven
+must revert from its disabled `GATE5_DISABLED` classification to a real abort-and-alert
+check on failure, the same as every other gate. `PRODUCTION_READINESS.md` is a point-in-
+time (2026-07-26) repository-readiness snapshot, not an implementation plan -- it does
+not carry the activation requirements, safety analysis, or producer decisions an operator
+would need to actually do this wiring. That material used to live in `GATE5-PROPOSAL.md`
+(removed 2026-08-11); the current source for it is `claude/SEVEN-SLOT-TRANSITION-PROPOSAL.md`
+§4 ("Five-task → seven-slot transition sequencing"), which also documents this whole file's
+own successor prompt generation (Codex review: "Point Gate 5 operators to the actual
+implementation plan").
 
 **Correction, 2026-08-02:** this section (and this whole file, which documents
 the SUPERSEDED prompt generation — see `claude/dca-executor-prompts/README.md`)
@@ -115,7 +122,7 @@ nothing but also alert nothing) regardless of prompt length. It does NOT
 address the underlying length problem: shrinking each
 prompt down toward the ~5,850-character precedent -- replacing inlined
 long-form explanations with compact references to `docs/safeguards.md`,
-`claude/GATE5-PROPOSAL.md`, and the other repo sources already cited
+`PRODUCTION_READINESS.md`, and the other repo sources already cited
 throughout -- is a larger rewrite left as a deliberate follow-up, not
 attempted here, since a rushed compaction pass risks introducing new errors
 into carefully-reviewed safety text. Until that follow-up lands, paste each
@@ -128,9 +135,16 @@ from what looks like the 10:30 slot the same day. A same-day review draft
 concluded this contradicted this card and `2-executor-1030-cron_30_14.txt`,
 but that draft compared the alert against prompt text first committed by the
 PR #232 merge over ten hours *after* the alert fired, so it couldn't actually
-confirm what was deployed at 10:30 AM. See
-`claude/GATE5-ALERT-INCIDENT-2026-07-29.md` (now revised) for the corrected,
-more hedged version — no prompt or config change resulted either way.
+confirm what was deployed at 10:30 AM. The fuller incident writeup
+(`GATE5-ALERT-INCIDENT-2026-07-29.md`, revised twice on 2026-07-30 to reach
+this weaker, hedged conclusion) was removed 2026-08-11 -- `PRODUCTION_READINESS.md`
+is an unrelated, unchanged 2026-07-26 readiness snapshot that predates the
+alert and never contained this chronology, so it is not a substitute source
+(Codex review: "Retain a real link to the alert review"). This paragraph is
+now the retained summary of that document's conclusion: no prompt or config
+change resulted either way, and the alert-file-durability/legacy-`42173154`-task
+findings from §4-§6 of the removed document remain informally noted but are
+no longer independently retrievable from this repo.
 
 **Crons are UTC and assume EDT.** On 2026-11-01 every one fires an hour early
 in ET; each needs +1 hour then, and the live-test window in

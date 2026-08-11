@@ -1756,7 +1756,8 @@ def run_slot(
     slot_config = replace(
         config,
         tickers=slot_tickers,
-        # Human decision (GATE5-PROPOSAL.md #4 item 2, 2026-07-30): guarded
+        # Human decision (2026-07-30, formerly documented in the now-removed GATE5
+        # proposal doc's #4 item 2): guarded
         # top-up, not "first slot wins". False (rather than omitting the
         # override, which would leave whatever config/budgets.json's own
         # order_rules.one_order_per_ticker_per_day says) lets

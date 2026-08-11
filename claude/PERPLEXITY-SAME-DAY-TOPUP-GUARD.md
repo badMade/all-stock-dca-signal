@@ -13,7 +13,7 @@ themselves.
 > (`"status": "active"` on all five legacy tasks), and a 2026-07-31 17:50 ET
 > Slack post all said the opposite. Asked directly, Geoff confirmed: he turned
 > Perplexity back on because the Claude seven-slot roster's own tasks were
-> failing (Gate 5 hard-aborts every fire — see `claude/GATE5-PROPOSAL.md` —  so
+> failing (Gate 5 hard-aborts every fire, so
 > that roster places nothing; Perplexity was the only executor actually
 > trading). He intends to turn it off again once the Claude side is functioning
 > reliably, but that has not happened yet as of this commit. So the PR #293

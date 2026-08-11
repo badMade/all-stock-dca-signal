@@ -8,7 +8,7 @@
 > ONLY currently-functioning live execution, not a stream that has been
 > replaced. A seven-slot Claude roster is the intended eventual replacement;
 > every one of those seven prompts hard-aborts at Gate 5 until a
-> signal-generation entry point is wired (see `claude/GATE5-PROPOSAL.md`),
+> signal-generation entry point is wired (see `PRODUCTION_READINESS.md`),
 > so it runs alongside the five tasks referenced below, not instead of them.
 > See [`safeguards.md`](safeguards.md#live-execution-roster) for the current
 > roster.

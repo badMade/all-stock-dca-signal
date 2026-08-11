@@ -26,11 +26,25 @@ Characteristics of this generation:
 * The account is addressed directly rather than through the environment: the
   live text hard-codes it at each call site (here shown redacted), instead of
   reading it from `ROBINHOOD_AGENTIC_ACCOUNT_NUMBER` at run time.
-* Live placement is ON for six slots (the 1230 slot is the exception; its
-  prompt drives `dca_runner.assess()` and its placement is explicitly OFF).
+* Live placement is ON for six slots. The 1230 slot is the exception, and its
+  `live-mirror/` copy is currently AHEAD of what was actually captured
+  2026-07-31: PR #412 rewrote it so Gates 0/1/3/4/6 call `dca_runner.py`'s
+  individual gate functions directly -- `market_day_status`,
+  `gate_time_sanity`, `gate_trading_window`, `gate_sole_executor`,
+  `budget_snapshot`, `plan_orders` -- rather than `dca_runner.assess()`,
+  since `assess()` bakes in dynamic budget-tier escalation that
+  `config/midday_dca.json` forbids for this slot, and its placement (Gate 7)
+  stays explicitly OFF pending validation. Per this file's own policy above,
+  editing the committed copy changes nothing about the live task: until a
+  human applies this text via `update_scheduled_task` and the mirror is
+  re-captured, the ACTUAL live 1230 task is still whatever was captured
+  2026-07-31 (the `assess()`-based version this bullet used to describe),
+  not what `live-mirror/1230ET-1230-pm-midday-buying-run.txt` currently
+  contains. Diff against a fresh capture before trusting this bullet as
+  "what actually runs."
 * Gate 5 tells the executor to run the repo's signal generation and to abort if
   it errors — which it does, every day, because no such entry point exists for
-  the seven-slot roster (see `../GATE5-PROPOSAL.md`).
+  the seven-slot roster (see `../../PRODUCTION_READINESS.md`).
 * `GATE 6.5 - SAME-DAY TOP-UP GUARD` (step 4.5 in the 1230 slot) invokes
   `scripts/same_day_top_up_gate.py`.
 

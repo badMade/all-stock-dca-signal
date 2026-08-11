@@ -8,7 +8,7 @@
 > execution -- do not retire them. A seven-slot Claude roster is the
 > intended eventual replacement; every one of those seven prompts hard-aborts
 > at Gate 5 until a signal-generation entry point is wired (see
-> `claude/GATE5-PROPOSAL.md`), so it runs alongside the five tasks below, not
+> `PRODUCTION_READINESS.md`), so it runs alongside the five tasks below, not
 > instead of them. [`safeguards.md`](safeguards.md#live-execution-roster) is
 > authoritative for the current roster until this file is reconciled.
 
@@ -835,7 +835,7 @@ implementation as a trigger to reimplement signal generation directly from
 Robinhood/Finance connector data and place live orders via
 `place_equity_order`, bypassing the repo's own vetted logic entirely. That
 directly contradicted the standing prohibition against building a buy list
-without the repo, and contradicted `claude/GATE5-PROPOSAL.md`'s own safety
+without the repo, and contradicted `PRODUCTION_READINESS.md`'s own safety
 analysis, which found real unresolved gaps in the seven-slot roster (the
 same-day top-up guard doesn't cover four of the seven slots, stale
 per-stream budget caps, a sole-executor race) and recommended keeping live
@@ -847,7 +847,7 @@ no reference is left dangling. **A missing repo entry point remains a
 no-trade condition today: the current `claude/dca-executor-prompts/*.txt`
 Gate 5 text ends the run with a `GATE5_DISABLED` verdict (silent no longer —
 it alerts on every fire as of 2026-07-30, per
-`claude/GATE5-WATCHDOG-FIXES-2026-07-30.md`, though still not a trigger for
+`PRODUCTION_READINESS.md`, though still not a trigger for
 connector-native execution) until a human implements a real
 signal-generation entry point, at which point it reverts to a normal
 abort-and-alert check on failure like every other gate. No executor should
