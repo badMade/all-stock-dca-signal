@@ -140,6 +140,24 @@ live Perplexity-era roster and have not yet been reconciled with the
 seven-slot model's naming above; that reconciliation is separate from, and
 does not change, which roster is actually placing orders today.
 
+**Perplexity compatible-executor carve-out (2026-08-07, expires 2026-08-14).**
+Six of the seven Cowork-scheduled Claude tasks (935, 1030, 1130, 330, 130,
+230 -- all but 1230) now implement `claude/PERPLEXITY-CLAUDE-COORDINATION.md`
+§3's Gate 4 addition: a competing-executor order tagged `placed_agent='agentic'`
+no longer aborts the run outright. It stands down per-ticker instead (that
+ticker excluded from this slot's candidate list; everything else proceeds
+normally), and only a rogue (non-`'agentic'`, non-Geoff) order still triggers
+the full abort-and-alert. This was directed by Geoff on 2026-08-07 despite the
+value being **accepted, not confirmed**: the order data that prompted the
+request (330's 3:30 PM abort) is at least as consistent with a duplicate
+firing of that same Claude task as with a genuine Perplexity fill, since both
+would carry the same `'agentic'` tag and there is currently no way to tell
+them apart. See the coordination doc's 2026-08-07 update note for the full
+caveat. **Re-review by 2026-08-14** -- the carve-out reverts automatically to
+the prior full-abort behavior in each task's prompt text after that date
+unless renewed. The 1230 slot is unchanged (§5.5: its Gate 4 runs in
+`dca_runner.py` code, not prompt text, and its live placement is off anyway).
+
 ## Market-data source policy
 
 - The **Finance connector is the PRIMARY market-data source** for quotes, prior

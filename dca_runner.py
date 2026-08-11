@@ -4078,6 +4078,7 @@ def assess(
     weekly_rollover_reserve_usd: float = 0.0,
     weekly_rollover_reserve_week_key: tuple[int, int] | None = None,
     buying_power_usd: float | None = None,
+    sole_executor_grace_period_active: bool = False,
 ) -> dict:
     """Run Gates 0, 1, 3, 4 and 6 and return a JSON-serialisable verdict.
 
@@ -4351,30 +4352,43 @@ def assess(
         # review: "Convert malformed broker timestamps into an abort verdict").
         return out("ABORT", f"broker order history contains a malformed row or timestamp: {exc}")
     if collisions:
-        return out(
-            "ABORT",
-            f"orders already present in the {slot_id} ET window, a second executor may be live",
-            # `_reject_non_broker_order_rows()` only confirms each row IS a
-            # BrokerOrder instance, never that its externally-supplied
-            # `.symbol` is itself JSON-native (e.g. a caller-constructed
-            # BrokerOrder(symbol=date(...), ...)) or even a real ticker at
-            # all: it can be arbitrary connector data, a dict carrying an
-            # access token, account identifier, or request metadata.
-            # `out()`'s payload is documented as JSON-serialisable, and this
-            # ABORT reason is exactly what gets persisted as run evidence
-            # and sent through alert channels -- str()-ing a non-string
-            # symbol made it JSON-safe but not secret-safe, since str() on a
-            # dict still serializes its full contents. A plain string
-            # symbol (even a malformed one, e.g. an unnormalized ticker) is
-            # not secret-shaped and is included as-is; anything else is
-            # reported only by type (Codex review: "Redact malformed
-            # symbols from collision evidence").
-            colliding_orders=[
-                o.symbol if isinstance(o.symbol, str)
-                else f"<non-string symbol, type={type(o.symbol).__name__}>"
-                for o in collisions
-            ],
-        )
+        # `_reject_non_broker_order_rows()` only confirms each row IS a
+        # BrokerOrder instance, never that its externally-supplied
+        # `.symbol` is itself JSON-native (e.g. a caller-constructed
+        # BrokerOrder(symbol=date(...), ...)) or even a real ticker at
+        # all: it can be arbitrary connector data, a dict carrying an
+        # access token, account identifier, or request metadata.
+        # `out()`'s payload is documented as JSON-serialisable, and this
+        # ABORT reason is exactly what gets persisted as run evidence
+        # and sent through alert channels -- str()-ing a non-string
+        # symbol made it JSON-safe but not secret-safe, since str() on a
+        # dict still serializes its full contents. A plain string
+        # symbol (even a malformed one, e.g. an unnormalized ticker) is
+        # not secret-shaped and is included as-is; anything else is
+        # reported only by type (Codex review: "Redact malformed
+        # symbols from collision evidence").
+        collision_symbols = [
+            o.symbol if isinstance(o.symbol, str)
+            else f"<non-string symbol, type={type(o.symbol).__name__}>"
+            for o in collisions
+        ]
+        if not sole_executor_grace_period_active:
+            return out(
+                "ABORT",
+                f"orders already present in the {slot_id} ET window, a second executor may be live",
+                colliding_orders=collision_symbols,
+            )
+        # Grace period is active: let the run proceed to Gate 6 rather than
+        # aborting, but always record the collision evidence so run artifacts
+        # show a grace-period override was applied (caller-supplied flag,
+        # mirroring buying_power_usd -- assess() never reads config to decide
+        # whether the window is still active, the caller does that check).
+        _gate4_grace_extra: dict = {
+            "gate4_grace_period_applied": True,
+            "gate4_collisions": collision_symbols,
+        }
+    else:
+        _gate4_grace_extra = {}
 
     # Gate 6 -- budget from broker history
     buying_power_error = _check_buying_power(buying_power_usd)
@@ -4438,6 +4452,7 @@ def assess(
     return out(
         "PROCEED",
         "gates passed",
+        **_gate4_grace_extra,
         budget={
             "day_notional_usd": snapshot.day_notional_usd,
             "week_notional_usd": snapshot.week_notional_usd,

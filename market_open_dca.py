@@ -107,7 +107,7 @@ MARKET_OPEN_LIVE_CRON_ID = "2ba19526"
 MARKET_OPEN_LIVE_RUN_TYPE = "market_open_dca_live"
 MARKET_OPEN_LIVE_SCHEDULED_FOR_ET = "09:35"
 MARKET_OPEN_LIVE_WINDOW_START_ET = "09:30"
-MARKET_OPEN_LIVE_WINDOW_END_ET = "09:40"
+MARKET_OPEN_LIVE_WINDOW_END_ET = "09:50"
 MARKET_OPEN_LIVE_SCHEMA_VERSION = "market-open-live-v1"
 
 # Artifact root: a sibling of, and never nested under, any other stream's root.

@@ -1709,7 +1709,7 @@ def test_validate_classification_accepts_market_open_and_intraday_executor_ident
         "supersedes_cron_id": None,
         "scheduled_for_et": "09:35",
         "scheduled_window_start_et": "09:30",
-        "scheduled_window_end_et": "09:40",
+        "scheduled_window_end_et": "09:50",
         "manual_run": False,
         "run_id": "market_open_live_20260803_0935ET",
         "triggered_at_utc": "2026-08-03T13:35:00Z",

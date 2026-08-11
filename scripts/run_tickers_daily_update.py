@@ -79,8 +79,10 @@ def run_incremental_update(
         raise FileNotFoundError(f"configured ticker updater does not exist: {updater_script}")
     if not history_dir.is_dir():
         raise FileNotFoundError(
-            f"ticker history directory does not exist: {history_dir} "
-            "(set DCA_TICKER_HISTORY_DIR to the managed archive root)"
+            f"ticker history directory does not exist: {history_dir} -- set "
+            "DCA_TICKER_HISTORY_DIR to the shared archive location (required "
+            "when this package is not run from a repository checkout; see "
+            "dca_ticker_paths.configured_ticker_history_dir)"
         )
     if max_invocations < 1:
         raise ValueError("max_invocations must be at least one")

@@ -1687,6 +1687,65 @@ def test_assess_redacts_a_secret_carrying_colliding_orders_symbol():
     assert "shh" not in serialized
 
 
+def test_assess_gate4_grace_period_defaults_to_off_and_still_aborts():
+    """Regression guard for the new sole_executor_grace_period_active kwarg:
+    leaving it unset (the default) must reproduce today's ABORT behavior
+    byte-for-byte on the reason and colliding_orders fields. Every existing
+    Gate 4 caller (all seven scheduled prompts, today) omits this kwarg
+    entirely, so its default must be a strict no-op -- proposed 2026-08-09
+    per Geoff's request to let a same-window collision pass through when
+    another AI (Perplexity) may be trading the same Robinhood account this
+    week, without weakening Gate 4 for every other caller or every other
+    week."""
+    colliding = _order("AAPL", 2.0, _utc(2026, 7, 28, 13, 45))
+    r = dca_runner.assess(**_clean_kwargs(orders=[colliding]))
+    assert r["verdict"] == "ABORT"
+    assert r["reason"] == "orders already present in the 0935 ET window, a second executor may be live"
+    assert r["colliding_orders"] == ["AAPL"]
+    assert "gate4_grace_period_applied" not in r
+
+
+def test_assess_gate4_grace_period_allows_proceed_despite_collision():
+    """With sole_executor_grace_period_active=True, a same-window collision
+    that would normally ABORT instead lets the run continue to Gate 6 as
+    though Gate 4 passed -- but the collision is never silently dropped:
+    the returned payload still carries gate4_grace_period_applied=True and
+    the same colliding_orders evidence Gate 9 would otherwise have alerted
+    on, so a human reviewing run artifacts this week can see a grace-period
+    override was applied rather than assuming Gate 4 found nothing. This is
+    a caller-supplied flag (mirroring buying_power_usd,
+    weekly_rollover_reserve_usd): assess() itself never reads config or a
+    clock to decide whether the grace period is active, and never silently
+    re-derives an expiry -- the caller (executor prompt / scheduler) is
+    responsible for checking config/scheduled_tasks.json's dated grace
+    window before passing True, keeping assess() pure and unit-testable."""
+    colliding = _order("AAPL", 2.0, _utc(2026, 7, 28, 13, 45))
+    r = dca_runner.assess(
+        **_clean_kwargs(
+            orders=[colliding],
+            candidates=[("MSFT", 2.0)],
+            sole_executor_grace_period_active=True,
+        )
+    )
+    assert r["verdict"] == "PROCEED"
+    assert r["gate4_grace_period_applied"] is True
+    assert r["gate4_collisions"] == ["AAPL"]
+    assert [o["ticker"] for o in r["plan"]["to_place"]] == ["MSFT"]
+
+
+def test_assess_gate4_grace_period_flag_alone_does_not_fabricate_a_collision():
+    """The grace-period fields must only appear when Gate 4 actually found a
+    collision -- a run with the flag set but an empty window must look
+    identical to today's plain PROCEED (no phantom gate4_collisions: []
+    noise on every ordinary run for the rest of the week)."""
+    r = dca_runner.assess(
+        **_clean_kwargs(candidates=[("MSFT", 2.0)], sole_executor_grace_period_active=True)
+    )
+    assert r["verdict"] == "PROCEED"
+    assert "gate4_grace_period_applied" not in r
+    assert "gate4_collisions" not in r
+
+
 # ===========================================================================
 # F. Gate 6 -- budget, computed from broker history
 # ===========================================================================

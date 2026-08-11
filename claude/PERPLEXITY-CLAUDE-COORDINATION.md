@@ -11,6 +11,31 @@ confirmed against real Robinhood order data before this is fully load-bearing
 -- see §3.** Until then, treat this as the mechanism, not yet a finished,
 verified fix.
 
+**Update 2026-08-07 -- shipped as a temporary, unconfirmed carve-out, not a
+finished fix.** The 3:30 PM final slot aborted today (Gate 4) on 8 orders
+tagged `placed_agent='agentic'`, created 19:33:07-19:33:41Z -- squarely inside
+the interlock window, but also squarely overlapping this same slot's own
+`lastRunAt` (19:33:14Z per the scheduler), so the evidence is at least as
+consistent with a duplicate/double-fire of this Claude task as with a genuine
+Perplexity fill. The §3 empirical-confirmation step below was NOT completed:
+no known Perplexity order was checked against a known timestamp. Geoff
+directed proceeding anyway, accepting that residual risk, scoped to expire
+2026-08-14 (re-review after that date). `PERPLEXITY_PLACED_AGENT_VALUE` below
+is therefore ACCEPTED, not CONFIRMED. The §3 Gate 4 addition (ticker-level
+exclusion, rogue-vs-compatible split) is now live in six of the seven
+scheduled Claude tasks (935, 1030, 1130, 1230's midday text is UNCHANGED --
+see next paragraph --, 330, 130, 230), each carrying its own copy of this
+carve-out with the same 2026-08-14 expiry note. The §4 Perplexity-side mirror
+below was NOT pasted into Perplexity's own prompts as part of this update
+(Perplexity cannot read this repo -- see §4 -- so that remains a manual step
+for Geoff).
+
+The 1230 (12:30 PM) slot's Gate 4 is NOT covered by this update: per §5.5
+below, it runs through `dca_runner.assess()`'s `gate_sole_executor()`, which
+deliberately ignores `placed_agent` entirely, so the carve-out cannot be
+applied there without a real code change to `dca_runner.py`. Low urgency in
+practice, since that slot's live placement is still off pending validation.
+
 ## 1. What "first come, first serve" actually means here
 
 There is still no medium both engines can read and write (see
@@ -139,7 +164,12 @@ real value (and how it was confirmed -- which order IDs, which timestamps)
 directly in this section.
 
 ```
-PERPLEXITY_PLACED_AGENT_VALUE = "<TBD -- confirm against real order history>"
+PERPLEXITY_PLACED_AGENT_VALUE = "agentic"  # ACCEPTED 2026-08-07 by Geoff's direction,
+                                            # NOT independently confirmed against a known
+                                            # Perplexity order/timestamp -- see the
+                                            # 2026-08-07 update note above. Also the value
+                                            # this task's own orders would carry. Expires
+                                            # 2026-08-14; re-confirm properly or renew.
 ```
 
 Gate 4's classification, once that value is real (this is the mirror of the
