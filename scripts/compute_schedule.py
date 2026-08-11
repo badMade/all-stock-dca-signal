@@ -18,11 +18,19 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import Sequence
 from typing import Callable, Optional, Tuple
 
 
-def run_cmd(cmd):
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+def run_cmd(cmd: Sequence[str]):
+    if isinstance(cmd, str):
+        raise TypeError("run_cmd requires an argument sequence, not a shell-style string command")
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError:
+        return None
+
     if result.returncode != 0:
         return None
     return result.stdout.strip()
@@ -42,7 +50,7 @@ def compute_cadence():
     propagate uncaught means the caller's process exits nonzero and the schedule file is
     never rewritten, which is the fail-closed behavior wanted here.
     """
-    commits_output = run_cmd("git log --since='30 days ago' --format='%aI'")
+    commits_output = run_cmd(["git", "log", "--since=30 days ago", "--format=%aI"])
     if commits_output is None:
         raise RuntimeError("`git log` failed; refusing to compute a cadence from missing telemetry.")
 

@@ -10,6 +10,8 @@ Covers the two behaviors a Codex review flagged on PR #389:
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import compute_schedule  # noqa: E402
@@ -160,3 +162,12 @@ def test_update_schedule_file_writes_override_flag(tmp_path):
 
     schedule, rationale, override = compute_schedule.parse_schedule_file(str(schedule_file))
     assert (schedule, rationale, override) == ("0 3 * * *", "High velocity.", True)
+
+
+def test_run_cmd_returns_none_when_executable_missing():
+    assert compute_schedule.run_cmd(["/path/that/does/not/exist"]) is None
+
+
+def test_run_cmd_rejects_string_commands():
+    with pytest.raises(TypeError, match="argument sequence"):
+        compute_schedule.run_cmd("git log --since=30 days ago --format=%aI")
