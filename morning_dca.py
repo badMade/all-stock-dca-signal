@@ -2327,23 +2327,47 @@ class MorningDCAExecutor(DCAExecutor):
         existing = self._existing_submitted_run_state(now)
         if existing is not None:
             existing_artifacts = existing["artifacts"]
-            existing_artifacts["status"] = "blocked"
-            existing_artifacts["block_reason"] = block_reason
+            # Merge the preserved submitted evidence into a FRESH artifact
+            # built the normal way, rather than rewriting the raw on-disk
+            # dict directly: _existing_submitted_run_state() validates only
+            # the buy_candidates/broker_outcomes containers, so a
+            # structurally partial existing file (missing e.g.
+            # run_classification/budget/signal_rows) would raise KeyError if
+            # handed straight to write_artifacts() (Codex review, PR #420:
+            # "Validate preserved artifacts before rewriting them"). Building
+            # fresh also means this attempt's own error_class/
+            # raw_persistence_error are never contaminated by a DIFFERENT
+            # stale failure the preserved artifact may have recorded (Codex
+            # review, PR #420: "Clear stale failure metadata when rewriting a
+            # retry") -- only what is set below, for THIS attempt, appears.
+            artifacts = self.build_artifacts(now, signals, source, manual=False)
+            preserved_candidates = existing_artifacts.get("buy_candidates")
+            if isinstance(preserved_candidates, list) and preserved_candidates:
+                artifacts["buy_candidates"] = preserved_candidates
+                artifacts["counts"]["buy_candidates"] = len(preserved_candidates)
+            preserved_outcomes = existing_artifacts.get("broker_outcomes")
+            if isinstance(preserved_outcomes, dict) and preserved_outcomes:
+                artifacts["broker_outcomes"] = preserved_outcomes
+            artifacts["status"] = "blocked"
+            artifacts["block_reason"] = block_reason
             if error_class is not None:
-                existing_artifacts["error_class"] = error_class
+                artifacts["error_class"] = error_class
             if raw_recorder is not None:
-                existing_artifacts["raw_input_dir"] = str(raw_recorder.raw_dir)
-                existing_artifacts["raw_inputs_saved"] = raw_recorder.saved_filenames
+                artifacts["raw_input_dir"] = str(raw_recorder.raw_dir)
+                artifacts["raw_inputs_saved"] = raw_recorder.saved_filenames
                 if raw_recorder.error:
-                    existing_artifacts["raw_persistence_error"] = raw_recorder.error
-            # write_artifacts() re-derives the same dated-slot output directory
-            # from existing_artifacts["run_classification"]/now, so this
-            # overwrites the same run_state.json (+ CSVs) and refreshes the
-            # scheduled latest pointer to it -- downstream consumers still see
-            # a valid, intentional run for this slot, now describing the
-            # CURRENT attempt's failure rather than a stale one.
-            existing["paths"] = self.write_artifacts(existing_artifacts, now)
-            return existing
+                    artifacts["raw_persistence_error"] = raw_recorder.error
+            # write_artifacts() derives the same dated-slot output directory
+            # from artifacts["run_classification"]/now, so this overwrites
+            # the same run_state.json (+ CSVs) and refreshes the scheduled
+            # latest pointer to it -- downstream consumers still see a valid,
+            # intentional run for this slot, now describing the CURRENT
+            # attempt's failure (with the earlier submission still intact)
+            # rather than a stale, unchanged one.
+            paths = self.write_artifacts(artifacts, now)
+            if self.mode == MORNING_LIVE_MODE and self.trades:
+                _run_drift_check(Path(paths["run_state"]).parent)
+            return {"artifacts": artifacts, "paths": paths}
         artifacts = self.build_artifacts(now, signals, source, manual=False)
         artifacts["status"] = "blocked"
         artifacts["block_reason"] = block_reason

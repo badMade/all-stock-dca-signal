@@ -5030,6 +5030,89 @@ def test_blocked_live_run_preserves_earlier_submission_on_later_raw_failure(tmp_
     assert on_disk["broker_outcomes"]["AAA"]["status"] == "submitted"
 
 
+def test_blocked_live_retry_clears_stale_raw_failure_metadata(tmp_path):
+    # Codex review on PR #420 ("Clear stale failure metadata when rewriting a
+    # retry"): when the preserved artifact came from a raw-persistence
+    # failure (error_class/raw_persistence_error set) and a LATER retry fails
+    # for an unrelated, non-raw reason (missing broker), the rewritten
+    # artifact must not keep attributing the current wiring failure to the
+    # earlier, different raw-input error.
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA", "BBB"))
+    cfg = MorningConfig(
+        tickers=("AAA", "BBB"),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    raw_dir = ex.run_state_dir(_now_live()) / "raw"
+    broker = _PartialSubmitThenRawFailBroker(raw_dir)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05, "BBB": 0.05})
+
+    first = ex.run(_now_live(), data, broker=broker)
+    assert first["artifacts"]["status"] == "blocked"
+    assert first["artifacts"]["error_class"] == "missing_or_invalid_raw_inputs"
+    assert "raw_persistence_error" in first["artifacts"]
+    run_state_path = Path(first["paths"]["run_state"])
+
+    # The first attempt's broker deliberately corrupted raw/ (a file instead
+    # of a directory) to force its own raw-persistence failure -- repair it so
+    # the second attempt's own raw writes succeed and its failure is purely
+    # the (unrelated) missing-broker wiring problem under test.
+    if raw_dir.is_file():
+        raw_dir.unlink()
+
+    # Second attempt at the SAME slot: a wiring failure unrelated to raw
+    # persistence. The earlier submission must survive, but the stale raw
+    # error_class/raw_persistence_error must NOT be carried forward.
+    second = ex.run(_now_live(), data, broker=None)
+
+    assert second["artifacts"]["status"] == "blocked"
+    assert second["artifacts"]["block_reason"] == "missing broker adapter for scheduled live execution"
+    assert "error_class" not in second["artifacts"]
+    assert "raw_persistence_error" not in second["artifacts"]
+    submitted_rows = [c for c in second["artifacts"]["buy_candidates"] if c.get("status") == "submitted"]
+    assert {c["ticker"] for c in submitted_rows} == {"AAA"}
+    on_disk = json.loads(run_state_path.read_text(encoding="utf-8"))
+    assert "error_class" not in on_disk
+    assert "raw_persistence_error" not in on_disk
+    assert on_disk["broker_outcomes"]["AAA"]["status"] == "submitted"
+
+
+def test_blocked_live_retry_preserves_evidence_from_partial_run_state(tmp_path):
+    # Codex review on PR #420 ("Validate preserved artifacts before rewriting
+    # them"): a preserved run_state that only has the minimal shape
+    # _existing_submitted_run_state() actually validates (a submitted
+    # buy_candidates/broker_outcomes row) -- and is otherwise missing
+    # run_classification/budget/signal_rows -- must not raise KeyError when
+    # the next blocked retry rewrites it. Regression for
+    # {"buy_candidates": [{"status": "submitted"}]}.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps({"buy_candidates": [{"ticker": "SMALL", "status": "submitted"}]}),
+        encoding="utf-8",
+    )
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data, broker=None)
+
+    artifacts = res["artifacts"]
+    assert artifacts["status"] == "blocked"
+    assert artifacts["block_reason"] == "missing broker adapter for scheduled live execution"
+    submitted_rows = [c for c in artifacts["buy_candidates"] if c.get("status") == "submitted"]
+    assert {c["ticker"] for c in submitted_rows} == {"SMALL"}
+    assert Path(res["paths"]["run_state"]).exists()
+
+
 class _Unserializable:
     def __repr__(self):
         return "<unserializable>"

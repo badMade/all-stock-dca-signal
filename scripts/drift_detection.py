@@ -397,6 +397,19 @@ def _row_block_evidence(row: Mapping[str, Any]) -> List[str]:
 def _infer_run_cause(art: RunArtifacts, submitted_orders_empty: bool) -> str:
     """Pick the single most-likely run-level cause of missing orders."""
     state = art.run_state or {}
+    # Morning/midday stamp an explicit machine-readable raw-persistence
+    # failure (error_class="missing_or_invalid_raw_inputs" plus
+    # raw_persistence_error) onto a blocked run_state written by
+    # _blocked_live_result(). Trust that directly ahead of every other cause
+    # below -- those streams are excluded from the raw_dir_present check
+    # further down, so without this a broker-side raw-write failure (e.g. a
+    # tradability check that failed to serialize) would fall through to
+    # CAUSE_ORDERS_EMPTY/CAUSE_ORDERS_MISSING and report the wrong cause and
+    # recovery guidance even though the run state names the real failure.
+    if state.get("error_class") == "missing_or_invalid_raw_inputs" or state.get(
+        "raw_persistence_error"
+    ):
+        return CAUSE_RAW_MISSING
     # Morning and midday streams never write a raw/ directory; skip the raw-dir
     # check for them so a genuine placement failure isn't misdiagnosed as a raw
     # persistence problem (which would suggest re-running for raw persistence

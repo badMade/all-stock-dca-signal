@@ -51,17 +51,46 @@ def load_scheduled_run_states(base: str | Path) -> List[Dict[str, Any]]:
     return load_json_files(paths)
 
 
+def _has_submitted_evidence(data: Dict[str, Any]) -> bool:
+    """True when a run_state carries at least one real submitted order.
+
+    Morning/midday's ``_blocked_live_result()`` can mark a run
+    ``status: "blocked"`` (a later candidate's raw persistence failed) while
+    still carrying a genuine earlier submission in ``buy_candidates``/
+    ``broker_outcomes`` -- that submission must not disappear from weekly
+    order/notional metrics just because the run as a whole is flagged blocked.
+    """
+    buy_candidates = data.get("buy_candidates")
+    if isinstance(buy_candidates, list) and any(
+        isinstance(row, dict) and row.get("status") == "submitted" for row in buy_candidates
+    ):
+        return True
+    broker_outcomes = data.get("broker_outcomes")
+    if isinstance(broker_outcomes, dict) and any(
+        isinstance(outcome, dict) and outcome.get("status") == "submitted"
+        for outcome in broker_outcomes.values()
+    ):
+        return True
+    return False
+
+
 def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     """Load artifacts, skipping the minimal ``status: "blocked"`` run_state stubs
     written for date-gated days — they are not run days and would otherwise be
     counted into the weekly snapshot/table denominators — and skipping any
     manual run_states so manual candidates/notional never enter the
-    scheduled-live weekly cost basis, reliability, or order-count metrics."""
+    scheduled-live weekly cost basis, reliability, or order-count metrics.
+
+    A blocked run that nonetheless carries a real submitted order (a later
+    candidate's raw persistence failed after an earlier one was placed) is
+    NOT skipped -- see :func:`_has_submitted_evidence`.
+    """
     loaded = [json.loads(Path(p).read_text(encoding="utf-8")) for p in paths]
     return [
         data
         for data in loaded
-        if data.get("status") != "blocked" and not _is_manual_run_state(data)
+        if (data.get("status") != "blocked" or _has_submitted_evidence(data))
+        and not _is_manual_run_state(data)
     ]
 
 

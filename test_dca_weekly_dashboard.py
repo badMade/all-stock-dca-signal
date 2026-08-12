@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dca_weekly_dashboard import _is_manual_run_state
+import json
+
+from dca_weekly_dashboard import _has_submitted_evidence, _is_manual_run_state, load_json_files
 
 
 def test_is_manual_run_state_no_classification():
@@ -47,3 +49,45 @@ def test_is_manual_run_state_manual_run_true():
 def test_is_manual_run_state_both_manual():
     """Test when both run_origin and manual_run indicate manual."""
     assert _is_manual_run_state({"run_classification": {"run_origin": "manual", "manual_run": True}}) is True
+
+
+# Codex review on PR #420 ("Retain blocked artifacts that contain submitted
+# orders"): morning/midday's _blocked_live_result() can now write
+# status="blocked" while buy_candidates/broker_outcomes still carry a real
+# earlier submission -- that evidence must not disappear from the weekly
+# order/notional metrics just because the run as a whole is flagged blocked.
+def test_has_submitted_evidence_empty_blocked_stub():
+    assert _has_submitted_evidence({"status": "blocked"}) is False
+    assert _has_submitted_evidence({"status": "blocked", "buy_candidates": [], "broker_outcomes": {}}) is False
+
+
+def test_has_submitted_evidence_from_buy_candidates():
+    data = {"status": "blocked", "buy_candidates": [{"ticker": "AAA", "status": "submitted"}]}
+    assert _has_submitted_evidence(data) is True
+
+
+def test_has_submitted_evidence_from_broker_outcomes():
+    data = {"status": "blocked", "broker_outcomes": {"AAA": {"status": "submitted"}}}
+    assert _has_submitted_evidence(data) is True
+
+
+def test_load_json_files_keeps_blocked_run_with_submitted_evidence(tmp_path):
+    empty_stub = tmp_path / "empty_stub.json"
+    empty_stub.write_text(json.dumps({"status": "blocked", "trading_day": "2026-08-10"}), encoding="utf-8")
+    partial_block = tmp_path / "partial_block.json"
+    partial_block.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-11",
+                "buy_candidates": [{"ticker": "AAA", "status": "submitted"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    clean_run = tmp_path / "clean_run.json"
+    clean_run.write_text(json.dumps({"status": "ok", "trading_day": "2026-08-12"}), encoding="utf-8")
+
+    loaded = load_json_files([empty_stub, partial_block, clean_run])
+    trading_days = {d["trading_day"] for d in loaded}
+    assert trading_days == {"2026-08-11", "2026-08-12"}

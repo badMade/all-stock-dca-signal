@@ -85,6 +85,29 @@ def _month_prefix(year: int, month: int) -> str:
     return f"{year:04d}-{month:02d}"
 
 
+def _has_submitted_evidence(data: Dict[str, Any]) -> bool:
+    """True when a run_state carries at least one real submitted order.
+
+    Morning/midday's ``_blocked_live_result()`` can mark a run
+    ``status: "blocked"`` (a later candidate's raw persistence failed) while
+    still carrying a genuine earlier submission in ``buy_candidates``/
+    ``broker_outcomes`` -- that submission must not disappear from the monthly
+    usage/cost rollup just because the run as a whole is flagged blocked.
+    """
+    buy_candidates = data.get("buy_candidates")
+    if isinstance(buy_candidates, list) and any(
+        isinstance(row, dict) and row.get("status") == "submitted" for row in buy_candidates
+    ):
+        return True
+    broker_outcomes = data.get("broker_outcomes")
+    if isinstance(broker_outcomes, dict) and any(
+        isinstance(outcome, dict) and outcome.get("status") == "submitted"
+        for outcome in broker_outcomes.values()
+    ):
+        return True
+    return False
+
+
 def collect_month_run_states(
     root: str | Path,
     year: int,
@@ -95,7 +118,10 @@ def collect_month_run_states(
     Files that cannot be parsed as JSON or lack a matching ``trading_day`` are
     skipped so a single bad artifact never breaks the monthly rollup. Minimal
     ``status: "blocked"`` stubs written for date-gated days are also skipped —
-    they carry no usage data and are not analyzed runs.
+    they carry no usage data and are not analyzed runs. A blocked run that
+    nonetheless carries a real submitted order (a later candidate's raw
+    persistence failed after an earlier one was placed) is NOT skipped — see
+    :func:`_has_submitted_evidence`.
     """
     prefix = _month_prefix(year, month)
     run_states: List[Dict[str, Any]] = []
@@ -105,7 +131,7 @@ def collect_month_run_states(
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("skipping unreadable run-state artifact %s: %s", path, exc)
             continue
-        if data.get("status") == "blocked":
+        if data.get("status") == "blocked" and not _has_submitted_evidence(data):
             continue
         trading_day = data.get("trading_day")
         if isinstance(trading_day, str) and trading_day.startswith(prefix):
