@@ -2724,6 +2724,12 @@ def test_blocked_live_retry_preserves_prior_submitted_evidence(tmp_path):
     # if that state already has real submitted-order evidence -- that evidence
     # is required for same-day top-up guards and reporting, and a sparse
     # blocked stub would erase it.
+    #
+    # Copilot review on PR #420 ("Surface persistence failures on scheduled
+    # retries") tightened this further: the CURRENT attempt's failure must
+    # still be visible (status="blocked", block_reason set) rather than
+    # returning the earlier attempt's state completely unchanged, which hid a
+    # genuine new failure behind a stale successful-looking status.
     pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
@@ -2742,14 +2748,17 @@ def test_blocked_live_retry_preserves_prior_submitted_evidence(tmp_path):
     assert run_state_path.exists()
 
     # Second scheduled attempt at the SAME slot: broker adapter missing this
-    # time (a wiring regression). The prior submitted evidence must survive.
+    # time (a wiring regression). The prior submitted evidence must survive,
+    # but this attempt's own failure must be visible too.
     second = ex.run(_now_live(), data, broker=None)
 
-    assert second["artifacts"].get("status") != "blocked", (
+    assert second["artifacts"].get("status") == "blocked"
+    assert second["artifacts"].get("block_reason")
+    assert second["artifacts"]["buy_candidates"][0]["status"] == "submitted", (
         "a later blocked scheduler-wiring retry must not overwrite prior submitted evidence"
     )
-    assert second["artifacts"]["buy_candidates"][0]["status"] == "submitted"
     on_disk = json.loads(run_state_path.read_text(encoding="utf-8"))
+    assert on_disk["status"] == "blocked"
     assert on_disk["buy_candidates"][0]["status"] == "submitted"
 
 
@@ -4932,6 +4941,93 @@ def test_scheduled_live_run_fails_closed_when_raw_persistence_fails_before_place
     assert "raw input persistence failed" in artifacts["block_reason"]
     assert artifacts["broker_outcomes"] == {}
     assert Path(res["paths"]["run_state"]).exists()
+
+
+def test_blocked_live_result_carries_raw_persistence_fields(tmp_path):
+    # Codex review on PR #420 ("Retain the standard raw-persistence failure
+    # fields"): the fresh blocked-stub path in _blocked_live_result() bypasses
+    # the normal end-of-run() block that stamps raw_input_dir/raw_inputs_saved/
+    # raw_persistence_error, so a blocked scheduled run must not lose those
+    # documented machine-readable fields just because the failure happened
+    # before broker placement.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "raw").write_text("not a directory", encoding="utf-8")
+
+    broker = FakeLiveBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data, broker=broker)
+
+    artifacts = res["artifacts"]
+    assert artifacts["status"] == "blocked"
+    assert artifacts["raw_input_dir"] == str(run_dir / "raw")
+    assert artifacts["raw_inputs_saved"] == []
+    assert "failed to persist" in artifacts["raw_persistence_error"]
+    on_disk = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
+    assert "raw_persistence_error" in on_disk
+
+
+class _PartialSubmitThenRawFailBroker(FakeLiveBroker):
+    """Submits the first candidate, then breaks raw persistence for the next.
+
+    Simulates a raw-persistence failure that happens mid-loop, AFTER an
+    earlier candidate has already been submitted -- the scenario Codex/Copilot
+    review flagged on PR #420 ("Preserve orders submitted before a later
+    persistence failure" / "Surface persistence failures on scheduled
+    retries"): the already-placed order must survive in the final artifact
+    instead of being discarded by a blank ``broker_outcomes={}`` stub.
+    """
+
+    def __init__(self, raw_dir):
+        self._raw_dir = raw_dir
+        self._tradability_calls = 0
+
+    def is_tradable_for_fractional_buy(self, ticker):
+        self._tradability_calls += 1
+        if self._tradability_calls > 1:
+            # Corrupt the raw directory so the NEXT persisted broker response
+            # (this tradability check, for the second candidate) fails to
+            # save -- but only after the first candidate has already been
+            # fully placed.
+            if self._raw_dir.is_dir():
+                import shutil
+
+                shutil.rmtree(self._raw_dir)
+            self._raw_dir.write_text("not a directory", encoding="utf-8")
+        return True
+
+
+def test_blocked_live_run_preserves_earlier_submission_on_later_raw_failure(tmp_path):
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA", "BBB"))
+    cfg = MorningConfig(
+        tickers=("AAA", "BBB"),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    raw_dir = ex.run_state_dir(_now_live()) / "raw"
+    broker = _PartialSubmitThenRawFailBroker(raw_dir)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05, "BBB": 0.05})
+
+    res = ex.run(_now_live(), data, broker=broker)
+    artifacts = res["artifacts"]
+
+    assert artifacts["status"] == "blocked"
+    assert artifacts["error_class"] == "missing_or_invalid_raw_inputs"
+    assert artifacts["broker_outcomes"]["AAA"]["status"] == "submitted"
+    submitted_rows = [c for c in artifacts["buy_candidates"] if c.get("status") == "submitted"]
+    assert {c["ticker"] for c in submitted_rows} == {"AAA"}
+    on_disk = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
+    assert on_disk["broker_outcomes"]["AAA"]["status"] == "submitted"
 
 
 class _Unserializable:

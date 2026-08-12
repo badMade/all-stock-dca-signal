@@ -195,7 +195,7 @@ orders are placed** and the task still writes `run_state.json` with
 > and broker adapter in `_PersistingMarketDataProvider` /
 > `_PersistingBrokerAdapter` for every SCHEDULED (non-manual) live run: each
 > previous-close/intraday-bar/quote/bid-ask response and each account-number/
-> buying-power/tradability/broad-same-day-order-existence/guarded-same-stream-duplicate-check broker query is persisted
+> buying-power/tradability/broad-same-day-order-existence/guarded-same-stream-duplicate-check broker query are persisted
 > via `scripts.run_classification.save_raw_input` the moment it is obtained —
 > before `evaluate_signal()`/`_place_broker_orders()` computes from it. This
 > differs from the afternoon `run_dca.py` pattern in one respect: morning

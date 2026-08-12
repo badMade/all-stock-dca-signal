@@ -2281,6 +2281,7 @@ class MorningDCAExecutor(DCAExecutor):
         source: str,
         *,
         error_class: Optional[str] = None,
+        raw_recorder: Optional["_RawInputRecorder"] = None,
     ) -> Dict[str, Any]:
         """Write and return a fail-closed live-run result before broker placement.
 
@@ -2295,14 +2296,27 @@ class MorningDCAExecutor(DCAExecutor):
         scheduled pointer is still updated: watchdog/latest-pointer consumers
         see this as an intentional block rather than a malformed or missing run.
 
+        ``raw_recorder``, when passed by a raw-persistence-failure caller, stamps
+        the same ``raw_input_dir``/``raw_inputs_saved``/``raw_persistence_error``
+        fields onto the blocked artifact that a normal completed run carries
+        (see the end of ``run()``) -- this early-return path bypasses that
+        block entirely, so without this the documented machine-readable
+        raw-persistence fields would silently disappear from blocked scheduled
+        states, even though ``block_reason``/``error_class`` still describe the
+        failure in prose.
+
         Before writing a fresh blocked stub, checks whether this scheduled
         slot's run_state.json already exists and carries genuine submitted-order
         evidence (a buy_candidates row or broker_outcomes entry with
         status == "submitted") from an earlier attempt this run. If so, that
-        state is returned UNCHANGED: a later scheduler-wiring failure (missing
-        broker, wrong account) must never erase real broker-order evidence a
-        same-day top-up guard depends on. An existing state that is unreadable,
-        not a dict, or has no submitted evidence is NOT preserved -- it is
+        submitted evidence is kept, but THIS attempt's block_reason/error_class
+        (and raw-persistence fields) are stamped onto it and it is rewritten to
+        disk -- returning it completely unchanged (as before) hid a genuine
+        current-attempt failure behind whatever status the earlier attempt
+        happened to write, so a retry that failed for a NEW reason (e.g. a
+        broker-side raw write) looked indistinguishable from a clean run to
+        operators and watchdogs. An existing state that is unreadable, not a
+        dict, or has no submitted evidence is NOT preserved -- it is
         overwritten with the fresh block_reason, so a second, different wiring
         failure is never hidden behind a stale first one.
 
@@ -2312,25 +2326,23 @@ class MorningDCAExecutor(DCAExecutor):
         """
         existing = self._existing_submitted_run_state(now)
         if existing is not None:
-            # Refresh the scheduled latest pointer to the preserved state so downstream
-            # consumers still see a valid, intentional run for this slot.
-            pointer_name = self.latest_pointer_name
-            pointer = Path(self.state_root) / pointer_name
-            pointer.parent.mkdir(parents=True, exist_ok=True)
-            pointer.write_text(
-                json.dumps(
-                    {
-                        "run_id": existing["artifacts"].get("run_id"),
-                        "run_state_path": existing["paths"]["run_state"],
-                        "trading_day": existing["artifacts"].get("trading_day"),
-                        "stream": existing["artifacts"].get("stream", self.stream),
-                    },
-                    indent=2,
-                    sort_keys=True,
-                ),
-                encoding="utf-8",
-            )
-            existing["paths"][pointer_name.replace(".json", "")] = str(pointer)
+            existing_artifacts = existing["artifacts"]
+            existing_artifacts["status"] = "blocked"
+            existing_artifacts["block_reason"] = block_reason
+            if error_class is not None:
+                existing_artifacts["error_class"] = error_class
+            if raw_recorder is not None:
+                existing_artifacts["raw_input_dir"] = str(raw_recorder.raw_dir)
+                existing_artifacts["raw_inputs_saved"] = raw_recorder.saved_filenames
+                if raw_recorder.error:
+                    existing_artifacts["raw_persistence_error"] = raw_recorder.error
+            # write_artifacts() re-derives the same dated-slot output directory
+            # from existing_artifacts["run_classification"]/now, so this
+            # overwrites the same run_state.json (+ CSVs) and refreshes the
+            # scheduled latest pointer to it -- downstream consumers still see
+            # a valid, intentional run for this slot, now describing the
+            # CURRENT attempt's failure rather than a stale one.
+            existing["paths"] = self.write_artifacts(existing_artifacts, now)
             return existing
         artifacts = self.build_artifacts(now, signals, source, manual=False)
         artifacts["status"] = "blocked"
@@ -2338,6 +2350,11 @@ class MorningDCAExecutor(DCAExecutor):
         if error_class is not None:
             artifacts["error_class"] = error_class
         artifacts["broker_outcomes"] = {}
+        if raw_recorder is not None:
+            artifacts["raw_input_dir"] = str(raw_recorder.raw_dir)
+            artifacts["raw_inputs_saved"] = raw_recorder.saved_filenames
+            if raw_recorder.error:
+                artifacts["raw_persistence_error"] = raw_recorder.error
         paths = self.write_artifacts(artifacts, now)
         # A blocked scheduled live run may have committed signals but placed no
         # orders — exactly the scenario the drift detector guards against. Run the
@@ -3099,6 +3116,7 @@ class MorningDCAExecutor(DCAExecutor):
                 signals,
                 source,
                 error_class="missing_or_invalid_raw_inputs",
+                raw_recorder=raw_recorder,
             )
         trading_day = now.astimezone(EASTERN).date()
         top_up_outcomes = self._compute_top_up(now, signals, manual=manual)
@@ -3132,6 +3150,11 @@ class MorningDCAExecutor(DCAExecutor):
             0.0, self.ledger.remaining_weekly(trading_day) - prior_daily_seeded
         )
         broker_outcomes: Optional[Dict[str, Any]] = None
+        # Set below when raw persistence fails AFTER at least one candidate in
+        # this call already reached "submitted" -- the artifact still needs to
+        # be written (with that real submission intact) but stamped as blocked
+        # rather than treated as a clean run. None on every other path.
+        raw_persistence_partial_block: Optional[str] = None
         if self.mode == MORNING_LIVE_MODE and self.trades and not manual and broker is None:
             return self._blocked_live_result(
                 now, "missing broker adapter for scheduled live execution", signals, source
@@ -3153,6 +3176,7 @@ class MorningDCAExecutor(DCAExecutor):
                     signals,
                     source,
                     error_class="missing_or_invalid_raw_inputs",
+                    raw_recorder=raw_recorder,
                 )
             if expected_account and actual_account != expected_account:
                 mismatch = f"broker account mismatch: expected {expected_account}, got {actual_account}"
@@ -3175,14 +3199,34 @@ class MorningDCAExecutor(DCAExecutor):
                 # market-data input and stops before the next submission.
                 # Convert that stopped execution into the promised valid
                 # failure-state artifact rather than merely annotating a run
-                # that may otherwise look eligible for execution.
-                return self._blocked_live_result(
-                    now,
-                    f"raw input persistence failed: {raw_recorder.error}",
-                    signals,
-                    source,
-                    error_class="missing_or_invalid_raw_inputs",
+                # that may otherwise look eligible for execution -- UNLESS an
+                # earlier candidate in this same call already reached
+                # "submitted" before persistence failed on a later one.
+                # _blocked_live_result() writes broker_outcomes={} and no
+                # buy_candidates rows, so calling it here would silently drop
+                # that already-placed order from the ledger and same-day
+                # duplicate-check artifact. Fail closed with an empty
+                # broker_outcomes only when nothing was actually submitted;
+                # otherwise fall through to the normal record/build/write path
+                # below so the real submission is recorded, and stamp the
+                # block reason onto that artifact afterward so it is never
+                # mistaken for a fully clean run (Codex/Copilot review,
+                # PR #420: "Preserve orders submitted before a later
+                # persistence failure").
+                any_submitted = any(
+                    isinstance(oc, dict) and oc.get("status") == "submitted"
+                    for oc in broker_outcomes.values()
                 )
+                if not any_submitted:
+                    return self._blocked_live_result(
+                        now,
+                        f"raw input persistence failed: {raw_recorder.error}",
+                        signals,
+                        source,
+                        error_class="missing_or_invalid_raw_inputs",
+                        raw_recorder=raw_recorder,
+                    )
+                raw_persistence_partial_block = f"raw input persistence failed: {raw_recorder.error}"
         # In live mode record only candidates whose orders were actually submitted
         # so cap-exceeded orders do not inflate the ledger and corrupt budget reporting.
         # A "duplicate_preserved" outcome (a same-stream top-up duplicate retry)
@@ -3232,6 +3276,15 @@ class MorningDCAExecutor(DCAExecutor):
             candidates_to_record = [] if morning_live_no_broker else auto_buy_candidates
             self.record_buy_candidates(trading_day, candidates_to_record, top_up_outcomes, _track_own=None)
         artifacts = self.build_artifacts(now, signals, source, manual=manual, top_up_outcomes=top_up_outcomes, broker_outcomes=broker_outcomes)
+        if raw_persistence_partial_block:
+            # A real order above was submitted and IS recorded in this
+            # artifact -- unlike _blocked_live_result()'s empty stub -- but a
+            # later candidate never got evaluated because its raw audit write
+            # failed. Mark the run blocked so operators/watchdogs see the
+            # failure instead of a run that looks fully clean.
+            artifacts["status"] = "blocked"
+            artifacts["block_reason"] = raw_persistence_partial_block
+            artifacts["error_class"] = "missing_or_invalid_raw_inputs"
         if broker_outcomes is not None:
             # Update buy_candidate rows with broker outcome so downstream
             # load_prior_same_day_allocations can read "submitted" status,
