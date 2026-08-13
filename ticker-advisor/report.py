@@ -71,7 +71,16 @@ def render_markdown(
         lines.append("## Run parameters")
         lines.append("")
         for key, value in run_metadata.items():
-            lines.append(f"- **{key}**: {value}")
+            # A run_metadata value is not always a table cell -- e.g.
+            # sentiment_unavailable_reason can carry a real multiline FinBERT
+            # init traceback, or --history-dir can be an attacker/user
+            # supplied path -- and this list-item line was previously
+            # rendered with no escaping at all, unlike the score table cells
+            # a few lines below. An embedded newline splits this bullet
+            # across extra Markdown lines and can inject a heading or other
+            # report structure into scores.md (Codex review on PR #429:
+            # "Escape run metadata before rendering Markdown").
+            lines.append(f"- **{key}**: {_escape_markdown_table_cell(str(value))}")
         lines.append("")
     lines.extend(
         [

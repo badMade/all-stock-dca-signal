@@ -155,11 +155,16 @@ jobs:
       # importorskip-guarded in tests/, so they skip cleanly here rather
       # than failing, and still run wherever the full requirements.txt is
       # installed (a contributor's machine, a manual full-dep CI dispatch).
+      # pandas_market_calendars (used by advise_tickers.py's benchmark-
+      # calendar-gap detection) is included here, unlike vectorbt/torch --
+      # it's a pure-Python calendar lookup with no heavy binary/GPU deps,
+      # so there's no install-time cost to justify importorskip-guarding it
+      # the same way.
       - name: Install lightweight tooling
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
-          pip install pandas numpy scipy requests
+          pip install pandas numpy scipy requests pandas_market_calendars
 
       - name: Ruff lint
         # Same rationale as production-safe-agent-loop's step above: this

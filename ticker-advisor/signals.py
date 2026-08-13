@@ -30,6 +30,7 @@ import pandas as pd
 
 TRADING_DAYS = 252
 DEFAULT_RISK_FREE_RATE = 0.05
+_ZERO_VARIANCE_TOLERANCE = 1e-12
 
 _URL_PATTERN = re.compile(r"https?://\S+")
 
@@ -74,7 +75,7 @@ def _sharpe(excess: pd.Series) -> float:
     # the intended NaN (Copilot review on PR #403, surfaced via a test
     # using a constant return series that should have been flagged
     # zero-variance, not silently accepted as a huge positive Sharpe).
-    if pd.isna(std) or std < 1e-12:
+    if pd.isna(std) or std < _ZERO_VARIANCE_TOLERANCE:
         return float("nan")
     return float((excess.mean() / std) * math.sqrt(TRADING_DAYS))
 
@@ -88,7 +89,7 @@ def _sortino(excess: pd.Series) -> float:
     # exhibit the same floating-point epsilon-instead-of-exact-zero
     # behavior in practice (verified empirically), but the threshold costs
     # nothing and keeps all three variance guards consistent.
-    if pd.isna(downside_std) or downside_std < 1e-12:
+    if pd.isna(downside_std) or downside_std < _ZERO_VARIANCE_TOLERANCE:
         return float("nan")
     return float((excess.mean() / downside_std) * math.sqrt(TRADING_DAYS))
 
@@ -143,7 +144,7 @@ def _beta_alpha(returns: pd.Series, benchmark: pd.Series, rf_daily: float) -> tu
     # constant series (e.g. the same float literal repeated 300 times) can
     # still come back as a tiny nonzero float (~1e-19) from floating-point
     # summation, not a hard zero -- confirmed empirically, not a hypothetical.
-    if bm_col.std(ddof=0) < 1e-12:
+    if bm_col.std(ddof=0) < _ZERO_VARIANCE_TOLERANCE:
         return float("nan"), float("nan")
     regression = stats.linregress(bm_col, ret_col)
     slope = float(regression.slope)
@@ -392,6 +393,34 @@ _PARENTHESIZED_PATTERN = re.compile(r"\(([^)]*)\)")
 # candidate batch").
 SEC_MAX_REQUESTS_PER_SECOND = 8.0
 
+# EFTS's search-index hits are search-relevance metadata, not filing
+# content -- a normal (non-highlighted) query gets no "_text" field at all,
+# so requiring one to be present discarded nearly every otherwise-valid
+# issuer hit and silently starved the SEC-only sentiment fallback (Codex
+# review on PR #429: "Fetch SEC filing content before requiring _text").
+# When "_text" is absent, fetch the actual filing document instead and
+# extract a bounded, tag-stripped snippet from it -- capped well short of
+# a full 10-K (often hundreds of KB) since only a representative excerpt is
+# needed for FinBERT sentiment, not the complete filing.
+_HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
+_WHITESPACE_RUN_PATTERN = re.compile(r"\s+")
+_MAX_FILING_SNIPPET_CHARS = 4000
+# Modern filings are inline-XBRL: a <head> full of CSS/metadata and an
+# <ix:header> block of hidden tagged facts routinely precede the visible
+# narrative, and a naive strip-tags-then-truncate can consume the entire
+# _MAX_FILING_SNIPPET_CHARS budget on that boilerplate before reaching any
+# actual prose -- FinBERT would then score filing metadata, not filing
+# CONTENT, the same "score CONTENT, not metadata" line this module already
+# draws elsewhere (Codex review on PR #429: "Extract visible filing prose
+# before truncating"). DOTALL so ".*?" spans the (frequently multi-line)
+# block content; non-greedy so a document with more than one such block
+# doesn't collapse everything between the first open tag and the last close
+# tag of the same name into one match.
+_HTML_HIDDEN_BLOCK_PATTERN = re.compile(
+    r"<(script|style|head|ix:header)\b[^>]*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL
+)
+_HTML_BODY_PATTERN = re.compile(r"<body\b[^>]*>(.*)</body\s*>", re.IGNORECASE | re.DOTALL)
+
 
 class _SecRateLimiter:
     """Enforce a minimum spacing between successive SEC EDGAR requests."""
@@ -430,6 +459,76 @@ def _parenthesized_tickers(display_name: str) -> set[str]:
     return {symbol.strip().upper() for symbol in match.group(1).split(",") if symbol.strip()}
 
 
+def _sec_filing_document_url(hit: dict, source: dict) -> str | None:
+    """Build the URL of the actual filing document an EFTS hit refers to.
+
+    EFTS's own "_id" field for a hit is formatted "{accession-no}:{primary-
+    document-filename}" (e.g. "0001193125-26-012345:aapl-20260101.htm"),
+    and "_source.ciks" is a list of zero-padded CIK strings -- both
+    verifiable only against EFTS's documented schema, since this dev
+    environment has no network egress to sec.gov to confirm against a live
+    response (same caveat as this module's other SEC-schema assumptions).
+    Returns None -- letting the caller fall back to excluding the hit,
+    exactly as before this fetch existed -- for any hit that doesn't have
+    both pieces in the expected shape, rather than guessing.
+    """
+    hit_id = hit.get("_id")
+    if not isinstance(hit_id, str) or ":" not in hit_id:
+        return None
+    accession_no, _, filename = hit_id.partition(":")
+    accession_no = accession_no.strip()
+    filename = filename.strip()
+    if not accession_no or not filename:
+        return None
+    ciks = source.get("ciks")
+    if not isinstance(ciks, list) or not ciks:
+        return None
+    cik = ciks[0]
+    if not isinstance(cik, str) or not cik.strip().lstrip("0"):
+        return None
+    try:
+        cik_number = int(cik)
+    except ValueError:
+        return None
+    accession_no_nodash = accession_no.replace("-", "")
+    if not accession_no_nodash.isdigit():
+        return None
+    return f"https://www.sec.gov/Archives/edgar/data/{cik_number}/{accession_no_nodash}/{filename}"
+
+
+def _extract_filing_snippet(raw_document: str) -> str | None:
+    """Reduce a fetched filing document to a bounded, sentiment-scorable text snippet.
+
+    Filing documents are HTML (occasionally plain text) and can run to
+    hundreds of KB for a 10-K -- far more than FinBERT's tokenizer needs or
+    a sentiment excerpt should require. Strips markup, collapses
+    whitespace, and caps the result well short of the full document.
+    Returns None for a document that reduces to nothing usable (a blank
+    document, or one that was entirely markup with no text content).
+    """
+    if not isinstance(raw_document, str):
+        return None
+    # Drop <script>/<style>/<head>/<ix:header> blocks (content included, not
+    # just the tags) before anything else -- otherwise their content would
+    # still be present as plain text after generic tag-stripping below, and
+    # could consume the truncation budget before any visible prose is
+    # reached (see the module-level comment on _HTML_HIDDEN_BLOCK_PATTERN).
+    without_hidden_blocks = _HTML_HIDDEN_BLOCK_PATTERN.sub(" ", raw_document)
+    # Prefer the <body> content specifically when present -- narrows to the
+    # visible document even when boilerplate outside <body> (a <head> this
+    # particular document didn't close properly, XML/DOCTYPE preamble)
+    # wasn't already caught above. Falls back to the whole (already-
+    # cleaned) document for a plain-text filing or a fragment with no
+    # <body> tag at all.
+    body_match = _HTML_BODY_PATTERN.search(without_hidden_blocks)
+    visible_html = body_match.group(1) if body_match else without_hidden_blocks
+    without_tags = _HTML_TAG_PATTERN.sub(" ", visible_html)
+    collapsed = _WHITESPACE_RUN_PATTERN.sub(" ", without_tags).strip()
+    if not collapsed:
+        return None
+    return collapsed[:_MAX_FILING_SNIPPET_CHARS]
+
+
 def fetch_sec_filings(
     ticker: str,
     *,
@@ -437,6 +536,7 @@ def fetch_sec_filings(
     days: int | None = None,
     timeout: float = 10.0,
     fetcher: Callable[[], dict] | None = None,
+    document_fetcher: Callable[[str], str] | None = None,
     errors: list[str] | None = None,
     as_of: "date | None" = None,
 ) -> list[dict[str, str]]:
@@ -473,6 +573,18 @@ def fetch_sec_filings(
     "no filings" in sentiment_score()'s result, silently degrading the
     composite with no explanation in scores.md (Codex review on PR #403:
     "Preserve SEC request failures in the report").
+
+    ``document_fetcher`` is an injectable ``(url) -> raw document text``
+    for tests, used to retrieve the actual filing when a hit has no
+    "_text" snippet in the search-index response itself -- the normal case
+    for a non-highlighted EFTS query. Without it, every such hit was
+    discarded outright even though it was a genuine issuer match, silently
+    starving the SEC-only sentiment fallback for users without a NewsAPI
+    key (Codex review on PR #429: "Fetch SEC filing content before
+    requiring _text"). A per-hit document fetch failure (403, timeout,
+    unparseable response) excludes just that hit -- matching this
+    function's existing "degrade, don't raise" contract -- rather than
+    aborting the whole candidate's SEC signal.
     """
     if fetcher is None:
         def fetcher() -> dict:
@@ -499,6 +611,18 @@ def fetch_sec_filings(
             response = requests.get(SEC_EDGAR_FULL_TEXT_SEARCH_URL, params=params, headers=headers, timeout=timeout)
             response.raise_for_status()
             return response.json()
+
+    if document_fetcher is None:
+        def document_fetcher(url: str) -> str:
+            import os
+
+            import requests
+
+            headers = {"User-Agent": os.environ.get("SEC_EDGAR_USER_AGENT", _DEFAULT_SEC_EDGAR_USER_AGENT)}
+            _sec_rate_limiter.acquire()
+            response = requests.get(url, headers=headers, timeout=timeout)
+            response.raise_for_status()
+            return response.text
 
     try:
         payload = fetcher()
@@ -632,17 +756,33 @@ def fetch_sec_filings(
         form_type = raw_form_type if isinstance(raw_form_type, str) else ""
         raw_snippet = hit.get("_text") or source.get("_text")
         snippet = raw_snippet if isinstance(raw_snippet, str) else None
-        # Previously fell back to "COMPANY NAME (TICKER) 10-K" (issuer
-        # name + form type) when no "_text" snippet was present -- that's
-        # metadata about the filing, not sentiment-bearing filing
-        # CONTENT, and FinBERT scoring it isn't neutral-by-construction;
-        # it can dilute otherwise-valid NewsAPI sentiment or manufacture a
-        # nonzero SEC sentiment component when zero actual filing text was
-        # ever available. Excluding the hit instead of fabricating text
-        # for it is the honest "no usable signal here" outcome, matching
-        # this function's own "degrade, don't invent" contract elsewhere
-        # (Antigravity review on PR #403: "Do not score filing metadata
-        # as filing sentiment").
+        # A normal (non-highlighted) EFTS query returns NO "_text" field at
+        # all -- it's only populated when the request explicitly asks for
+        # highlighting, which this module's search request does not.
+        # Requiring "_text" therefore discarded nearly every otherwise-
+        # valid issuer hit, and with no NewsAPI key configured that meant
+        # NO sentiment signal at all rather than a degraded one (Codex
+        # review on PR #429: "Fetch SEC filing content before requiring
+        # _text"). Fetch the actual filing document instead of giving up --
+        # still real filing CONTENT, not fabricated metadata like the
+        # previous "COMPANY NAME (TICKER) 10-K" fallback this module
+        # already rejected once (Antigravity review on PR #403: "Do not
+        # score filing metadata as filing sentiment"). A fetch failure (no
+        # URL derivable from the hit, a 403/timeout, an empty document)
+        # excludes just this hit, matching the prior behavior exactly.
+        if snippet is None:
+            document_url = _sec_filing_document_url(hit, source)
+            if document_url is not None:
+                try:
+                    raw_document = document_fetcher(document_url)
+                except Exception as exc:  # noqa: BLE001 -- one hit's document fetch must not abort the batch
+                    if errors is not None:
+                        errors.append(
+                            f"SEC filing document fetch failed for {ticker}: {_sanitize_fetch_error(exc)}"
+                        )
+                    raw_document = None
+                if raw_document is not None:
+                    snippet = _extract_filing_snippet(raw_document)
         if snippet:
             filings.append({"ticker": ticker, "text": snippet, "form": form_type})
     return filings
@@ -830,6 +970,44 @@ def compute_ticker_sentiment(scored_items: list[dict[str, float]]) -> float | No
     return float(weighted_sum / total_weight)
 
 
+def _resolve_finbert_revision(
+    model_name: str, revision: str, *, resolver: Callable[[str, str], str | None] | None = None
+) -> str:
+    """Resolve a mutable Hub ref (e.g. "main") to the commit SHA it currently points at.
+
+    ``resolver`` is an injectable ``(model_name, revision) -> sha | None`` for
+    tests -- production code never has to mock ``huggingface_hub`` directly,
+    matching this repo's injected-callable convention.
+
+    Raises whatever the resolver raises (no network egress, huggingface_hub
+    not importable, an HfApi error) or a ``ValueError`` for an unusable
+    response, rather than degrading to the unresolved ``revision`` -- a
+    silent fallback would let the analyzer proceed and persist
+    ``finbert_revision: "main"`` looking exactly like a successfully pinned
+    run, so a later run whose resolution DID succeed (or that happened to
+    hit a different upstream commit under the same unresolved "main") could
+    silently diverge under identical recorded metadata, defeating the
+    auditability this exists for (Codex review on PR #429: "Reject
+    unresolved mutable FinBERT revisions"). This is safe to let propagate
+    out of ``FinbertSentimentAnalyzer.__init__`` -- its caller in
+    advise_tickers.py already wraps construction in a try/except that
+    degrades to skipping sentiment for the run (recording the reason in
+    ``sentiment_unavailable_reason``) rather than crashing it, the same
+    path any other constructor failure already takes.
+    """
+    if resolver is None:
+
+        def resolver(name: str, rev: str) -> str | None:
+            from huggingface_hub import HfApi
+
+            return HfApi().model_info(name, revision=rev).sha
+
+    resolved = resolver(model_name, revision)
+    if not isinstance(resolved, str) or not resolved:
+        raise ValueError(f"could not resolve a concrete commit SHA for {model_name}@{revision!r}: got {resolved!r}")
+    return resolved
+
+
 class FinbertSentimentAnalyzer:
     """Loads FinBERT once; reuse a single instance across every candidate.
 
@@ -839,7 +1017,12 @@ class FinbertSentimentAnalyzer:
     construct its own.
     """
 
-    def __init__(self, model_name: str = "ProsusAI/finbert", revision: str | None = None) -> None:
+    def __init__(
+        self,
+        model_name: str = "ProsusAI/finbert",
+        revision: str | None = None,
+        revision_resolver: Callable[[str, str], str | None] | None = None,
+    ) -> None:
         import os
 
         from transformers import AutoModelForSequenceClassification, AutoTokenizer
@@ -858,6 +1041,26 @@ class FinbertSentimentAnalyzer:
         # $FINBERT_MODEL_REVISION for a deployment that wants to pin a
         # specific commit SHA for true cross-run reproducibility.
         self.revision = revision or os.environ.get("FINBERT_MODEL_REVISION", "main")
+        # An explicit revision/env override is already a caller-chosen pin
+        # (a tag, branch, or commit SHA) and resolving it further would
+        # silently override that intent. Only the untouched default -- the
+        # mutable "main" branch -- still needs to be turned into a concrete
+        # commit before use: leaving it as the literal string "main" means
+        # identical parameters can silently load a different tokenizer/model
+        # commit run over run as the upstream branch advances, while both
+        # reports keep recording finbert_revision: "main", defeating the
+        # auditability this metadata exists for (Codex review on PR #429:
+        # "Resolve an immutable FinBERT revision"). A resolution failure
+        # (no network egress, huggingface_hub not importable) propagates
+        # rather than silently falling back to the unresolved "main" --
+        # advise_tickers.py's caller already degrades a construction
+        # failure to skipping sentiment for the run rather than crashing
+        # it, so raising here is what actually prevents a silently
+        # unpinned run from looking identical to a successfully pinned one
+        # (Codex review on PR #429: "Reject unresolved mutable FinBERT
+        # revisions").
+        if self.revision == "main":
+            self.revision = _resolve_finbert_revision(model_name, self.revision, resolver=revision_resolver)
         self._tokenizer = AutoTokenizer.from_pretrained(model_name, revision=self.revision)
         self._model = AutoModelForSequenceClassification.from_pretrained(model_name, revision=self.revision)
         self._model.eval()

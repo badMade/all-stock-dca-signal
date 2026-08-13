@@ -83,6 +83,24 @@ def test_render_markdown_escapes_pipes_and_newlines_in_rationale():
     assert "\n" not in table_lines[0]
 
 
+def test_render_markdown_escapes_newlines_in_run_metadata():
+    # A run_metadata value can carry a real multiline FinBERT initialization
+    # error (sentiment_unavailable_reason) or a path from --history-dir --
+    # inserting either unescaped into this list-item line splits it across
+    # extra Markdown lines and can inject a heading or other report
+    # structure into scores.md (Codex review on PR #429: "Escape run
+    # metadata before rendering Markdown").
+    scores = {"ADDME": _score("ADDME", 1.0, "ADD")}
+    run_metadata = {"sentiment_unavailable_reason": "init failed: line one\n## Injected heading\nline two"}
+
+    markdown = render_markdown(scores, run_metadata=run_metadata)
+    metadata_lines = [line for line in markdown.splitlines() if "sentiment_unavailable_reason" in line]
+
+    assert len(metadata_lines) == 1  # the whole value stayed on one bullet line
+    assert "## Injected heading" not in markdown.splitlines()  # never landed on its own line
+    assert "\n" not in metadata_lines[0]
+
+
 def test_render_proposed_diff_only_includes_add_classified():
     scores = {
         "ADDME": _score("ADDME", 1.0, "ADD"),

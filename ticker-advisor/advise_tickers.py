@@ -219,7 +219,7 @@ def _load_legacy_symbol_corrections(repo_root: Path) -> dict[str, str]:
     """
     path = repo_root / "config" / "tickers.json"
     try:
-        payload = json.loads(path.read_bytes())
+        payload = json.loads(path.read_text(encoding="utf-8"))
         # Syntactically valid JSON with a non-object top level (null, a
         # bare list, ...) makes .get() raise AttributeError, OUTSIDE this
         # except clause, aborting the whole CLI with a traceback before any
@@ -255,7 +255,7 @@ def _load_current_universe(repo_root: Path) -> tuple[frozenset[str], frozenset[s
     """
     path = repo_root / "config" / "tickers.json"
     try:
-        payload = json.loads(path.read_bytes())
+        payload = json.loads(path.read_text(encoding="utf-8"))
         # Same non-object-top-level risk as _load_legacy_symbol_corrections
         # above (Codex review on PR #403: "Validate the ticker-config root
         # before reading mappings") -- raise here so the except clause
@@ -381,6 +381,46 @@ def _allocate_default_output_dir(output_root: Path, now: datetime, *, max_attemp
             continue
         return candidate_dir
     return None
+
+
+def _detect_benchmark_calendar_gaps(benchmark_calendar: pd.DatetimeIndex) -> list[pd.Timestamp]:
+    """Flag likely trading sessions within the benchmark's own range that it has no row for.
+
+    ``benchmark_calendar`` is the ONLY session calendar this module has --
+    score_candidate() reindexes every candidate onto it (restricted to that
+    candidate's own observed range) to turn an entirely-missing session row
+    into an ordinary NaN the existing gap-exclusion logic already handles.
+    But that only works if the benchmark's own calendar is itself complete:
+    when the benchmark history omits a trading-session row, that date is
+    silently absent from ``benchmark_calendar`` too, so a candidate missing
+    the SAME row is reindexed onto an equally incomplete calendar and comes
+    out looking gap-free -- both series bridge the same multi-session move
+    undetected (Codex review on PR #429: "Validate the benchmark calendar
+    independently").
+
+    This cross-checks ``benchmark_calendar`` against ``pandas_market_
+    calendars``' real NYSE trading-session calendar instead of trusting it
+    as ground truth. An earlier version of this function approximated the
+    exchange calendar with federal holidays + weekends, but that's a
+    materially different calendar -- Good Friday is an NYSE holiday but
+    not a federal one, while Columbus Day/Veterans Day are federal
+    holidays the market trades straight through. Flagging Good Friday as
+    a "gap" and having the caller union it into every candidate's
+    reindex calendar would inject a SYNTHETIC missing session into every
+    candidate's history on a real non-trading day, degrading health/
+    backtest scoring across the whole run instead of only around a
+    genuine data-quality issue (Codex review on PR #429: "Use an exchange
+    calendar before adding gap dates"). The real NYSE calendar has no such
+    false positives, so callers can safely union its result directly.
+    """
+    if benchmark_calendar.empty:
+        return []
+    import pandas_market_calendars as mcal
+
+    nyse_sessions = mcal.get_calendar("NYSE").schedule(
+        start_date=benchmark_calendar.min(), end_date=benchmark_calendar.max()
+    ).index
+    return list(pd.DatetimeIndex(nyse_sessions).difference(benchmark_calendar))
 
 
 def _json_safe(value: object) -> object:
@@ -853,12 +893,14 @@ def main(argv: list[str] | None = None) -> int:
     # shared-root selection below (Antigravity review on PR #403: "Treat
     # blank output-root overrides as unset"). Matches the DCA_CRON_TRACKING_ROOT
     # branch immediately below, which already used .get() truthiness.
+    output_root_is_implicit_default = False
     if os.environ.get("TICKER_ADVISOR_OUTPUT_ROOT"):
         output_root = Path(os.environ["TICKER_ADVISOR_OUTPUT_ROOT"])
     elif os.environ.get("DCA_CRON_TRACKING_ROOT"):
         output_root = Path(dca_paths.stream_root("ticker_advisor_analysis"))
     else:
         output_root = REPO_ROOT / "analysis"
+        output_root_is_implicit_default = True
     if args.output_dir is not None:
         output_dir = args.output_dir
         try:
@@ -876,8 +918,39 @@ def main(argv: list[str] | None = None) -> int:
         try:
             allocated_dir = _allocate_default_output_dir(output_root, now)
         except OSError as exc:
-            print(f"error: could not create a default output directory under {output_root}: {exc}", file=sys.stderr)
-            return 2
+            # The fully-implicit default (no TICKER_ADVISOR_OUTPUT_ROOT or
+            # DCA_CRON_TRACKING_ROOT override) writes into the checkout's own
+            # analysis/ tree so its reports are git-tracked, per
+            # docs/ticker_advisory.md's documented layout -- but that
+            # assumes the checkout itself is writable. On a read-only or
+            # installed deployment that assumption fails and the command
+            # previously aborted here even though a perfectly good writable
+            # artifact root (dca_paths' shared, configurable tree, the same
+            # one $DCA_CRON_TRACKING_ROOT already routes through above) was
+            # available the whole time (Codex review on PR #429: "Route
+            # default output through the shared artifact root"). Falling
+            # back automatically here, rather than requiring the caller to
+            # pass --output-dir/TICKER_ADVISOR_OUTPUT_ROOT by hand, is safe
+            # ONLY because this is the implicit default; an explicit
+            # override that fails to create is a real configuration error
+            # the caller needs to see, not something to silently paper over.
+            if not output_root_is_implicit_default:
+                print(f"error: could not create a default output directory under {output_root}: {exc}", file=sys.stderr)
+                return 2
+            fallback_root = Path(dca_paths.stream_root("ticker_advisor_analysis"))
+            print(
+                f"warning: could not create the default output directory under {output_root} ({exc}); "
+                f"falling back to {fallback_root}",
+                file=sys.stderr,
+            )
+            try:
+                allocated_dir = _allocate_default_output_dir(fallback_root, now)
+            except OSError as fallback_exc:
+                print(
+                    f"error: could not create a default output directory under {fallback_root}: {fallback_exc}",
+                    file=sys.stderr,
+                )
+                return 2
         if allocated_dir is None:
             print("error: could not allocate a unique output directory after 1000 attempts", file=sys.stderr)
             return 2
@@ -886,6 +959,7 @@ def main(argv: list[str] | None = None) -> int:
     benchmark_returns: pd.Series | None = None
     benchmark_calendar: pd.DatetimeIndex | None = None
     benchmark_fallback_reason: str | None = None
+    benchmark_calendar_gap_warning: str | None = None
     try:
         # now=now anchors the benchmark's future/current-date/staleness
         # cutoffs to the SAME single run instant every candidate below
@@ -909,6 +983,34 @@ def main(argv: list[str] | None = None) -> int:
         # review on PR #403: "Detect missing index sessions as
         # price-history gaps").
         benchmark_calendar = benchmark_frame.index
+        benchmark_calendar_gaps = _detect_benchmark_calendar_gaps(benchmark_calendar)
+        if benchmark_calendar_gaps:
+            gap_dates = [day.date().isoformat() for day in benchmark_calendar_gaps]
+            shown = ", ".join(gap_dates[:10])
+            suffix = "" if len(gap_dates) <= 10 else f" (+{len(gap_dates) - 10} more)"
+            benchmark_calendar_gap_warning = (
+                f"benchmark calendar was missing {len(gap_dates)} likely trading session(s) "
+                f"({shown}{suffix}); added to the calendar used for every candidate's missing-session "
+                "detection below, since a candidate missing the SAME session would otherwise have been "
+                "reindexed onto an equally incomplete calendar and come out looking gap-free"
+            )
+            print(f"warning: {benchmark_calendar_gap_warning}", file=sys.stderr)
+            # Warning alone leaves the exact loophole this check exists to
+            # close: score_candidate() reindexes every candidate onto
+            # `benchmark_calendar` restricted to that candidate's own
+            # observed range, so a session missing from BOTH the benchmark
+            # and a candidate stays invisible to that reindex unless the
+            # gap date is actually IN the calendar. Unioning the detected
+            # gaps in turns them into ordinary expected sessions for that
+            # reindex -- a candidate that has a real price row for one of
+            # these dates keeps it unaffected; a candidate that's ALSO
+            # missing it now gets the same NaN-gap detection every other
+            # missing session already receives (Codex review on PR #429:
+            # "Stop scoring when the benchmark calendar has a gap"). No
+            # benchmark PRICE data exists for these dates -- benchmark_
+            # returns is intentionally left untouched -- only calendar
+            # membership is being corrected here.
+            benchmark_calendar = benchmark_calendar.union(pd.DatetimeIndex(benchmark_calendar_gaps))
     except PriceHistoryUnavailable as exc:
         # Not just beta/alpha -- score_candidate()'s missing-session
         # detection also depends entirely on this same benchmark_calendar
@@ -1044,6 +1146,7 @@ def main(argv: list[str] | None = None) -> int:
         "effective_weights": effective_weights,
         "benchmark": args.benchmark,
         "benchmark_fallback_reason": benchmark_fallback_reason,
+        "benchmark_calendar_gap_warning": benchmark_calendar_gap_warning,
         "lookback_years": args.lookback_years,
         # --history-dir determines BOTH candidate and benchmark price
         # inputs and can materially change every health/backtest score --

@@ -18,6 +18,8 @@ import pytest
 from signals import (
     _HEALTH_METRIC_KEYS,
     MIN_OBSERVATIONS,
+    _extract_filing_snippet,
+    _sec_filing_document_url,
     _wilder_rsi,
     generate_ma_crossover_signals,
     strategy_health_score,
@@ -81,7 +83,11 @@ def test_strategy_health_score_flat_benchmark_degrades_to_nan_beta_not_a_crash()
     benchmark = pd.Series([0.0005] * n, index=index)  # zero variance
     returns = pd.Series([0.0007] * n, index=index)
 
-    metrics = strategy_health_score(returns, benchmark)
+    # The guard must run before scipy. Relying on linregress to reject this
+    # input is version-dependent: some releases return a zero slope with a
+    # precision-loss warning instead of raising ValueError.
+    with mock.patch("scipy.stats.linregress", side_effect=AssertionError("regression must not run")):
+        metrics = strategy_health_score(returns, benchmark)
 
     assert math.isnan(metrics["beta"])
     assert math.isnan(metrics["alpha"])
@@ -647,6 +653,176 @@ def test_fetch_sec_filings_excludes_hit_with_no_text_snippet():
     }
 
     assert fetch_sec_filings("ACME", fetcher=lambda: fixture) == []
+
+
+def test_fetch_sec_filings_fetches_document_when_text_snippet_absent():
+    # A normal (non-highlighted) EFTS query returns NO "_text" field at
+    # all -- requiring one discarded nearly every otherwise-valid issuer
+    # hit and, with no NewsAPI key configured, left the SEC-only fallback
+    # with no sentiment signal whatsoever (Codex review on PR #429: "Fetch
+    # SEC filing content before requiring _text"). When the hit carries
+    # enough EFTS metadata (_id, _source.ciks) to derive the filing
+    # document's URL, fetch and use ITS content instead of discarding the
+    # hit.
+    from signals import fetch_sec_filings
+
+    fixture = {
+        "hits": {
+            "hits": [
+                {
+                    "_id": "0001193125-26-012345:acme-20260101.htm",
+                    "_source": {
+                        "display_names": ["ACME CORP (ACME)"],
+                        "file_type": "10-K",
+                        "ciks": ["0000320193"],
+                    },
+                },
+            ]
+        }
+    }
+    fetched_urls = []
+
+    def fake_document_fetcher(url):
+        fetched_urls.append(url)
+        return "<html><body><p>ACME Corp reported strong quarterly earnings.</p></body></html>"
+
+    filings = fetch_sec_filings("ACME", fetcher=lambda: fixture, document_fetcher=fake_document_fetcher)
+
+    assert fetched_urls == ["https://www.sec.gov/Archives/edgar/data/320193/000119312526012345/acme-20260101.htm"]
+    assert len(filings) == 1
+    assert "ACME Corp reported strong quarterly earnings." in filings[0]["text"]
+    assert "<p>" not in filings[0]["text"]  # markup stripped
+
+
+def test_fetch_sec_filings_excludes_hit_when_document_fetch_fails():
+    from signals import fetch_sec_filings
+
+    fixture = {
+        "hits": {
+            "hits": [
+                {
+                    "_id": "0001193125-26-012345:acme-20260101.htm",
+                    "_source": {
+                        "display_names": ["ACME CORP (ACME)"],
+                        "file_type": "10-K",
+                        "ciks": ["0000320193"],
+                    },
+                },
+            ]
+        }
+    }
+
+    def broken_document_fetcher(url):
+        raise ConnectionError("boom")
+
+    errors: list[str] = []
+    filings = fetch_sec_filings(
+        "ACME", fetcher=lambda: fixture, document_fetcher=broken_document_fetcher, errors=errors
+    )
+
+    assert filings == []
+    assert any("ACME" in message and "boom" in message for message in errors)
+
+
+def test_fetch_sec_filings_skips_document_fetch_without_derivable_url():
+    # A hit with no "_id"/"_source.ciks" in the expected shape gives no
+    # basis to construct a filing URL -- must degrade to excluding the hit
+    # (the prior behavior) rather than guessing at a URL, and must not
+    # even attempt a document fetch.
+    from signals import fetch_sec_filings
+
+    fixture = {
+        "hits": {
+            "hits": [
+                {"_source": {"display_names": ["ACME CORP (ACME)"], "file_type": "10-K"}},
+            ]
+        }
+    }
+
+    def unexpected_document_fetcher(url):
+        raise AssertionError("document fetch must not run without a derivable URL")
+
+    filings = fetch_sec_filings("ACME", fetcher=lambda: fixture, document_fetcher=unexpected_document_fetcher)
+
+    assert filings == []
+
+
+@pytest.mark.parametrize(
+    "hit,source",
+    [
+        ({}, {}),  # no "_id" at all
+        ({"_id": "no-colon-here"}, {}),  # missing the ":filename" separator
+        ({"_id": "0001193125-26-012345:acme.htm"}, {}),  # no "_source.ciks"
+        ({"_id": "0001193125-26-012345:acme.htm"}, {"ciks": []}),  # empty ciks list
+        ({"_id": "0001193125-26-012345:acme.htm"}, {"ciks": ["not-a-number"]}),  # non-numeric cik
+        ({"_id": "not-numeric-accession:acme.htm"}, {"ciks": ["0000320193"]}),  # non-numeric accession
+    ],
+)
+def test_sec_filing_document_url_returns_none_for_malformed_hits(hit, source):
+    # No basis to construct a filing URL from any of these shapes -- must
+    # return None so the caller degrades to excluding the hit, exactly as
+    # before this fetch existed, rather than raising or guessing.
+    assert _sec_filing_document_url(hit, source) is None
+
+
+def test_sec_filing_document_url_builds_url_from_wellformed_hit():
+    hit = {"_id": "0001193125-26-012345:acme-20260101.htm"}
+    source = {"ciks": ["0000320193"]}
+
+    url = _sec_filing_document_url(hit, source)
+
+    assert url == "https://www.sec.gov/Archives/edgar/data/320193/000119312526012345/acme-20260101.htm"
+
+
+def test_extract_filing_snippet_strips_tags_collapses_whitespace_and_caps_length():
+    raw = "<html><body>  <p>Hello</p>\n\n<p>World</p>  " + ("x" * 10_000) + "</body></html>"
+
+    snippet = _extract_filing_snippet(raw)
+
+    assert snippet.startswith("Hello World")
+    assert "<p>" not in snippet
+    assert len(snippet) <= 4000
+
+
+def test_extract_filing_snippet_returns_none_for_blank_or_non_string():
+    assert _extract_filing_snippet("   <html>  </html>  ") is None
+    assert _extract_filing_snippet(None) is None
+    assert _extract_filing_snippet(12345) is None
+
+
+def test_extract_filing_snippet_drops_head_style_script_and_hidden_xbrl_before_truncating():
+    # A real inline-XBRL filing's <head> (CSS, metadata) and <ix:header>
+    # (hidden tagged facts) routinely precede the visible narrative -- a
+    # naive strip-tags-then-truncate can consume the whole snippet budget
+    # on that boilerplate before reaching any actual prose, so FinBERT
+    # would score filing metadata rather than filing CONTENT (Codex review
+    # on PR #429: "Extract visible filing prose before truncating").
+    raw = (
+        "<html><head><style>.big{font-size:900px}</style>"
+        + ("A" * 5000)  # boilerplate CSS/metadata bulk that must NOT survive
+        + "</head>"
+        "<ix:header>" + ("B" * 5000) + "</ix:header>"
+        "<script>console.log('C');</script>"
+        "<body><p>Actual issuer earnings narrative here.</p></body></html>"
+    )
+
+    snippet = _extract_filing_snippet(raw)
+
+    assert snippet == "Actual issuer earnings narrative here."
+    assert "A" * 10 not in snippet
+    assert "B" * 10 not in snippet
+    assert "console.log" not in snippet
+
+
+def test_extract_filing_snippet_falls_back_to_whole_document_without_a_body_tag():
+    # A plain-text filing (or a fragment EFTS returns with no <body> at
+    # all) has nothing to narrow to -- the cleaned whole document is still
+    # the best available text, not an empty result.
+    raw = "Plain-text filing narrative with no HTML wrapper at all."
+
+    snippet = _extract_filing_snippet(raw)
+
+    assert snippet == raw
 
 
 def test_fetch_sec_filings_scopes_the_default_request_to_days(monkeypatch):

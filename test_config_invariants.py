@@ -921,6 +921,15 @@ _NON_ACCOUNT_LITERALS = frozenset(
         "5151032",
         # Google support-article id inside a documentation URL.
         "185833",
+        # Fictional SEC EDGAR accession-number/CIK fixture pieces in
+        # ticker-advisor/signals.py's _sec_filing_document_url() docstring
+        # example and ticker-advisor/tests/test_signals.py's fetch_sec_filings
+        # document-fetch tests -- SEC filing identifiers, not a brokerage
+        # account number.
+        "0001193125",
+        "012345",
+        "0000320193",
+        "320193",
         # The microsecond component of an RFC3339 timestamp asserted in
         # test_dca_live_adapters.py -- neither a date nor an account.
         "201412",

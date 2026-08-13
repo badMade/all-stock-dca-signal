@@ -15,6 +15,7 @@ import advise_tickers
 from advise_tickers import (
     PriceHistoryUnavailable,
     _allocate_default_output_dir,
+    _detect_benchmark_calendar_gaps,
     _json_safe,
     _load_candidates,
     _load_current_universe,
@@ -294,6 +295,71 @@ def test_allocate_default_output_dir_returns_none_when_exhausted(tmp_path):
     result = _allocate_default_output_dir(tmp_path, now, max_attempts=0)
 
     assert result is None
+
+
+def test_detect_benchmark_calendar_gaps_finds_missing_business_day():
+    # A business day (not a weekend, not a US federal holiday) that's
+    # simply absent from the benchmark's own fetched index means the
+    # SOURCE itself omitted a real trading session -- previously invisible
+    # because benchmark_calendar was the only calendar this module had and
+    # was trusted unconditionally (Codex review on PR #429: "Validate the
+    # benchmark calendar independently"). 2026-08-11 (Tuesday) is dropped
+    # from an otherwise-contiguous business-day week.
+    calendar = pd.DatetimeIndex(
+        ["2026-08-10", "2026-08-12", "2026-08-13", "2026-08-14"]  # Mon, Wed, Thu, Fri -- Tue missing
+    )
+
+    gaps = _detect_benchmark_calendar_gaps(calendar)
+
+    assert pd.Timestamp("2026-08-11") in gaps
+
+
+def test_detect_benchmark_calendar_gaps_ignores_weekends_and_holidays():
+    # A calendar that's genuinely complete (skips only weekends and the
+    # federal holiday in range) must not be flagged -- only PR #403's
+    # concern (a fixed calendar producing false positives on real
+    # holidays) would make this check worse than not having it at all.
+    calendar = pd.date_range("2026-07-01", "2026-07-10", freq="B")  # includes July 4 (Sat) already excluded
+
+    gaps = _detect_benchmark_calendar_gaps(calendar)
+
+    assert gaps == []
+
+
+def test_detect_benchmark_calendar_gaps_handles_empty_calendar():
+    assert _detect_benchmark_calendar_gaps(pd.DatetimeIndex([])) == []
+
+
+def test_detect_benchmark_calendar_gaps_does_not_flag_good_friday():
+    # Good Friday is an NYSE holiday but NOT a US federal one -- an earlier
+    # version of this function approximated the exchange calendar with
+    # federal holidays + weekends and would have flagged a benchmark
+    # calendar that correctly excludes Good Friday as "missing" a session.
+    # Unioning that false positive into every candidate's reindex calendar
+    # would inject a synthetic gap on a real non-trading day and degrade
+    # health/backtest scoring across the whole run (Codex review on PR
+    # #429: "Use an exchange calendar before adding gap dates"). 2026's
+    # Good Friday is April 3.
+    calendar = pd.DatetimeIndex(["2026-04-01", "2026-04-02", "2026-04-06", "2026-04-07"])  # Good Friday (04-03) out
+
+    gaps = _detect_benchmark_calendar_gaps(calendar)
+
+    assert pd.Timestamp("2026-04-03") not in gaps
+
+
+def test_detect_benchmark_calendar_gaps_flags_missing_session_on_a_columbus_day_week():
+    # Columbus Day is a US federal holiday but the NYSE trades through it --
+    # the real exchange calendar must still flag a genuinely missing
+    # session in the same week rather than mistaking Columbus Day itself
+    # for the gap.
+    calendar = pd.DatetimeIndex(
+        ["2026-10-12", "2026-10-14", "2026-10-15", "2026-10-16"]  # Mon(Columbus Day), Wed, Thu, Fri -- Tue missing
+    )
+
+    gaps = _detect_benchmark_calendar_gaps(calendar)
+
+    assert pd.Timestamp("2026-10-13") in gaps
+    assert pd.Timestamp("2026-10-12") not in gaps
 
 
 def test_write_atomic_writes_full_content_and_leaves_no_temp_file(tmp_path):
@@ -1096,6 +1162,62 @@ def test_main_persists_benchmark_fallback_reason_in_run_metadata(tmp_path, monke
     assert "stale" in captured["benchmark_fallback_reason"]
 
 
+def test_main_extends_benchmark_calendar_with_detected_gaps(tmp_path, monkeypatch):
+    # A warning alone leaves score_candidate()'s reindex blind to a session
+    # missing from BOTH the benchmark and a candidate -- unioning the
+    # detected gap date into benchmark_calendar turns it into an ordinary
+    # expected session for every candidate's own missing-session check
+    # (Codex review on PR #429: "Stop scoring when the benchmark calendar
+    # has a gap").
+    import pandas as pd
+
+    # A dated benchmark index (bdate_range, not _usable_fake_frame()'s bare
+    # RangeIndex) with a midweek business day dropped -- a likely trading
+    # session absent from the fetched history, exactly what
+    # _detect_benchmark_calendar_gaps() flags.
+    dated_index = pd.bdate_range("2026-08-03", periods=60)
+    dropped_day = next(d for d in dated_index if d.strftime("%A") == "Wednesday")
+    gappy_index = dated_index.drop(dropped_day)
+
+    def fake_fetch_price_history(ticker, **kwargs):
+        frame = _usable_fake_frame()
+        index = gappy_index if ticker == "SPY" else dated_index
+        return frame.iloc[: len(index)].set_index(index)
+
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", fake_fetch_price_history)
+
+    captured_run_metadata = {}
+
+    def fake_render_markdown(scores, **kwargs):
+        captured_run_metadata.update(kwargs.get("run_metadata") or {})
+        return "# fake report\n"
+
+    monkeypatch.setattr(advise_tickers, "render_markdown", fake_render_markdown)
+
+    captured_score_candidate_kwargs = {}
+    real_score_candidate = advise_tickers.score_candidate
+
+    def capturing_score_candidate(ticker, **kwargs):
+        captured_score_candidate_kwargs.update(kwargs)
+        return real_score_candidate(ticker, **kwargs)
+
+    monkeypatch.setattr(advise_tickers, "score_candidate", capturing_score_candidate)
+
+    exit_code = advise_tickers.main(
+        ["--candidates", "ZZZZZZ", "--skip-sentiment", "--output-dir", str(tmp_path / "out")]
+    )
+
+    assert exit_code == 0
+    assert captured_run_metadata.get("benchmark_calendar_gap_warning") is not None
+    passed_calendar = captured_score_candidate_kwargs["benchmark_calendar"]
+    assert isinstance(passed_calendar, pd.DatetimeIndex)
+    # The fetched (gappy) benchmark frame's own index is missing the
+    # dropped Wednesday, but the calendar actually passed to score_candidate
+    # must have it added back in.
+    assert dropped_day not in gappy_index
+    assert dropped_day in passed_calendar
+
+
 def test_main_normalizes_benchmark_symbol_before_price_lookup(tmp_path, monkeypatch):
     # pricing.py's archive lookup builds its path as a literal
     # f"{ticker}.csv" with no case-folding of its own -- on a case-
@@ -1137,6 +1259,41 @@ def test_main_default_output_root_falls_back_to_cron_tracking_root(tmp_path, mon
 
     assert exit_code == 0
     assert (tmp_path / "cron-root" / "ticker_advisor_analysis").is_dir()
+
+
+def test_main_falls_back_to_shared_root_when_implicit_default_is_unwritable(tmp_path, monkeypatch):
+    # The fully-implicit default (neither TICKER_ADVISOR_OUTPUT_ROOT nor
+    # DCA_CRON_TRACKING_ROOT set) writes into the checkout's own analysis/
+    # tree so reports are git-tracked -- but a read-only or installed
+    # deployment can't write there at all, and the command previously
+    # aborted outright instead of falling back to the same shared,
+    # configurable artifact root $DCA_CRON_TRACKING_ROOT already routes
+    # through when it IS set (Codex review on PR #429: "Route default
+    # output through the shared artifact root").
+    monkeypatch.delenv("TICKER_ADVISOR_OUTPUT_ROOT", raising=False)
+    monkeypatch.delenv("DCA_CRON_TRACKING_ROOT", raising=False)
+
+    real_allocate = advise_tickers._allocate_default_output_dir
+    fallback_root = tmp_path / "shared-root" / "ticker_advisor_analysis"
+    calls = []
+
+    def flaky_allocate(output_root, now, **kwargs):
+        calls.append(output_root)
+        if output_root == advise_tickers.REPO_ROOT / "analysis":
+            raise OSError("read-only file system")
+        return real_allocate(output_root, now, **kwargs)
+
+    monkeypatch.setattr(advise_tickers, "_allocate_default_output_dir", flaky_allocate)
+    monkeypatch.setattr(advise_tickers.dca_paths, "stream_root", lambda name: str(fallback_root))
+
+    fake_frame = _usable_fake_frame()
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: fake_frame)
+
+    exit_code = advise_tickers.main(["--candidates", "ZZZZZZ", "--skip-sentiment"])
+
+    assert exit_code == 0
+    assert calls == [advise_tickers.REPO_ROOT / "analysis", fallback_root]
+    assert fallback_root.is_dir()
 
 
 def test_main_treats_blank_output_root_override_as_unset(tmp_path, monkeypatch):
@@ -1284,7 +1441,7 @@ def test_main_merges_pre_filtered_exclusions_into_proposed_diff(tmp_path, monkey
     )
 
     assert exit_code == 0
-    diff = json.loads((out_dir / "proposed_tickers_diff.json").read_bytes())
+    diff = json.loads((out_dir / "proposed_tickers_diff.json").read_text(encoding="utf-8"))
     assert "AAPL" in diff["skipped_already_active"]
     assert "BRK-B" in diff["skipped_invalid_symbol_shape"]
 

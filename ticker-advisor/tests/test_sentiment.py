@@ -212,8 +212,104 @@ def test_finbert_sentiment_analyzer_passes_same_revision_to_both_downloads():
     assert captured["model_revision"] == "abc123"
 
 
-def test_finbert_sentiment_analyzer_defaults_to_main_when_unset(monkeypatch):
+def test_finbert_sentiment_analyzer_raises_when_revision_resolution_fails(monkeypatch):
+    # A resolution failure must propagate, not silently fall back to the
+    # unresolved "main" -- a silent fallback would let construction
+    # succeed and persist finbert_revision: "main" indistinguishable from
+    # a genuinely-pinned run, defeating the auditability this exists for
+    # (Codex review on PR #429: "Reject unresolved mutable FinBERT
+    # revisions"). advise_tickers.py's caller already degrades a
+    # construction failure to skipping sentiment for the run, so raising
+    # here is safe -- it does not crash the whole advisory run.
     monkeypatch.delenv("FINBERT_MODEL_REVISION", raising=False)
+
+    class _FakeConfig:
+        id2label = {0: "negative", 1: "neutral", 2: "positive"}
+
+    class _FakeModel:
+        config = _FakeConfig()
+
+        def eval(self):
+            return self
+
+    fake_transformers = types.SimpleNamespace(
+        AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda model_name, revision=None: object()),
+        AutoModelForSequenceClassification=types.SimpleNamespace(
+            from_pretrained=lambda model_name, revision=None: _FakeModel()
+        ),
+    )
+
+    def failing_resolver(model_name, revision):
+        raise ConnectionError("no network egress")
+
+    with mock.patch.dict(sys.modules, {"transformers": fake_transformers}):
+        with pytest.raises(ConnectionError):
+            signals.FinbertSentimentAnalyzer(revision_resolver=failing_resolver)
+
+
+def test_finbert_sentiment_analyzer_raises_when_resolver_returns_unusable_value(monkeypatch):
+    monkeypatch.delenv("FINBERT_MODEL_REVISION", raising=False)
+
+    fake_transformers = types.SimpleNamespace(
+        AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda model_name, revision=None: object()),
+        AutoModelForSequenceClassification=types.SimpleNamespace(
+            from_pretrained=lambda model_name, revision=None: object()
+        ),
+    )
+
+    with mock.patch.dict(sys.modules, {"transformers": fake_transformers}):
+        with pytest.raises(ValueError):
+            signals.FinbertSentimentAnalyzer(revision_resolver=lambda model_name, revision: None)
+
+
+def test_finbert_sentiment_analyzer_resolves_main_to_a_commit_sha():
+    # The mutable "main" branch previously stayed "main" in both
+    # self.revision and every from_pretrained() call -- so identical
+    # parameters could load a different upstream commit run over run while
+    # scores.json kept recording finbert_revision: "main", defeating the
+    # auditability that metadata exists for (Codex review on PR #429:
+    # "Resolve an immutable FinBERT revision"). A resolved SHA must be
+    # threaded through to both downloads AND persisted on the instance.
+    captured = {}
+
+    class _FakeConfig:
+        id2label = {0: "negative", 1: "neutral", 2: "positive"}
+
+    class _FakeModel:
+        config = _FakeConfig()
+
+        def eval(self):
+            return self
+
+    def fake_tokenizer_from_pretrained(model_name, revision=None):
+        captured["tokenizer_revision"] = revision
+        return object()
+
+    def fake_model_from_pretrained(model_name, revision=None):
+        captured["model_revision"] = revision
+        return _FakeModel()
+
+    fake_transformers = types.SimpleNamespace(
+        AutoTokenizer=types.SimpleNamespace(from_pretrained=fake_tokenizer_from_pretrained),
+        AutoModelForSequenceClassification=types.SimpleNamespace(from_pretrained=fake_model_from_pretrained),
+    )
+
+    def fake_resolver(model_name, revision):
+        assert revision == "main"
+        return "deadbeef" * 5
+
+    with mock.patch.dict(sys.modules, {"transformers": fake_transformers}):
+        analyzer = signals.FinbertSentimentAnalyzer(revision_resolver=fake_resolver)
+
+    assert analyzer.revision == "deadbeef" * 5
+    assert captured["tokenizer_revision"] == "deadbeef" * 5
+    assert captured["model_revision"] == "deadbeef" * 5
+
+
+def test_finbert_sentiment_analyzer_keeps_explicit_pin_unresolved():
+    # An explicit revision (a tag, branch, or SHA the caller/deployment
+    # chose) is already a pin -- resolving it further would silently
+    # override that choice, so the resolver must not be consulted at all.
     captured = {}
 
     class _FakeConfig:
@@ -237,8 +333,11 @@ def test_finbert_sentiment_analyzer_defaults_to_main_when_unset(monkeypatch):
         AutoModelForSequenceClassification=types.SimpleNamespace(from_pretrained=fake_model_from_pretrained),
     )
 
-    with mock.patch.dict(sys.modules, {"transformers": fake_transformers}):
-        analyzer = signals.FinbertSentimentAnalyzer()
+    def fail_resolver(model_name, revision):
+        raise AssertionError("resolver must not run for an explicit pin")
 
-    assert analyzer.revision == "main"
-    assert captured["revision"] == "main"
+    with mock.patch.dict(sys.modules, {"transformers": fake_transformers}):
+        analyzer = signals.FinbertSentimentAnalyzer(revision="v1.0", revision_resolver=fail_resolver)
+
+    assert analyzer.revision == "v1.0"
+    assert captured["revision"] == "v1.0"
