@@ -156,6 +156,173 @@ def test_scheduled_tasks_schema_rejects_an_unrecognized_task_type():
         jsonschema.validate(document, schema)
 
 
+def test_inverse_martingale_schema_rejects_a_missing_basis():
+    """Each per-ticker entry requires ``basis`` (and, via the if/then/else
+    branch, the matching recovery-offset field for that basis) -- a document
+    that drops it should be rejected outright rather than silently defaulting
+    to one basis at load time."""
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "inverse_martingale.schema.json").read_bytes())
+    document = json.loads(json.dumps(_load("inverse_martingale.json")))  # deep copy
+    document["tickers"]["AAPL"] = {
+        "enabled": True,
+        "tiers": [{"drop_pct": 1.0, "units": 1.0}],
+        "recovery_offset_pct": 1.0,
+        # deliberately omits "basis"
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(document, schema)
+
+
+def test_inverse_martingale_schema_rejects_pct_basis_missing_recovery_offset():
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "inverse_martingale.schema.json").read_bytes())
+    document = json.loads(json.dumps(_load("inverse_martingale.json")))  # deep copy
+    document["tickers"]["AAPL"] = {
+        "enabled": True,
+        "basis": "pct",
+        "tiers": [{"drop_pct": 1.0, "units": 1.0}],
+        # deliberately omits "recovery_offset_pct"
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(document, schema)
+
+
+def test_inverse_martingale_schema_rejects_a_pct_tier_missing_drop_pct():
+    """Regression test for "Require the basis-specific tier threshold in the
+    schema". Previously each tier item only required ``units``, so a
+    ``basis: "pct"`` entry with no ``drop_pct`` on a tier passed schema
+    validation even though load_inverse_martingale_config() immediately
+    raises on it -- letting an operator or automated config check approve a
+    document that would abort strategy startup."""
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "inverse_martingale.schema.json").read_bytes())
+    document = json.loads(json.dumps(_load("inverse_martingale.json")))  # deep copy
+    document["tickers"]["AAPL"] = {
+        "enabled": True,
+        "basis": "pct",
+        "tiers": [{"units": 1.0}],  # deliberately omits "drop_pct"
+        "recovery_offset_pct": 1.0,
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(document, schema)
+
+
+def test_inverse_martingale_schema_rejects_a_stddev_tier_missing_sigma_multiple():
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "inverse_martingale.schema.json").read_bytes())
+    document = json.loads(json.dumps(_load("inverse_martingale.json")))  # deep copy
+    document["tickers"]["AAPL"] = {
+        "enabled": True,
+        "basis": "stddev",
+        "tiers": [{"units": 1.0}],  # deliberately omits "sigma_multiple"
+        "recovery_offset_sigma": 0.5,
+        "stddev_window_days": 20,
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(document, schema)
+
+
+def test_inverse_martingale_schema_accepts_a_well_formed_pct_entry():
+    """Sanity check that the new tier-level if/then/else doesn't over-reject
+    a genuinely valid document."""
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "inverse_martingale.schema.json").read_bytes())
+    document = json.loads(json.dumps(_load("inverse_martingale.json")))  # deep copy
+    document["tickers"]["AAPL"] = {
+        "enabled": True,
+        "basis": "pct",
+        "tiers": [
+            {"drop_pct": 1.0, "units": 1.0},
+            {"drop_pct": 2.0, "units": 2.0},
+        ],
+        "recovery_offset_pct": 1.0,
+    }
+    jsonschema.validate(document, schema)  # must not raise
+
+
+def test_inverse_martingale_schema_allows_a_ticker_entry_to_omit_enabled():
+    """Regression test for "Allow ticker entries to inherit enabled_default".
+
+    dca_config.load_inverse_martingale_config() explicitly supports a ticker
+    entry that omits `enabled`, falling back to the top-level
+    `enabled_default` -- the schema previously required `enabled` on every
+    entry, rejecting exactly the configuration runtime code and tests treat
+    as supported.
+    """
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "inverse_martingale.schema.json").read_bytes())
+    document = json.loads(json.dumps(_load("inverse_martingale.json")))  # deep copy
+    document["enabled_default"] = True
+    document["tickers"]["AAPL"] = {
+        # deliberately omits "enabled" -- must fall back to enabled_default
+        "basis": "pct",
+        "tiers": [{"drop_pct": 1.0, "units": 1.0}],
+        "recovery_offset_pct": 1.0,
+    }
+    jsonschema.validate(document, schema)  # must not raise
+
+
+def test_ml_sizing_adjustment_schema_rejects_an_out_of_bounds_adjustment():
+    """``adjustments`` values are constrained to [0.5, 1.5] at the schema
+    level too -- a corrupted publish should be rejected by structure alone,
+    not rely solely on dca_config.load_ml_sizing_adjustment's own runtime
+    bounds check."""
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "ml_sizing_adjustment.schema.json").read_bytes())
+    document = json.loads(json.dumps(_load("ml_sizing_adjustment.json")))  # deep copy
+    document["adjustments"]["AAPL"] = 3.0
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(document, schema)
+
+
+def test_ml_sizing_adjustment_schema_rejects_missing_bounds():
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "ml_sizing_adjustment.schema.json").read_bytes())
+    document = json.loads(json.dumps(_load("ml_sizing_adjustment.json")))  # deep copy
+    del document["bounds"]
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(document, schema)
+
+
+def test_ml_sizing_adjustment_schema_rejects_active_status_with_null_generated_at():
+    """Regression test for "Require a timestamp for active ML adjustments".
+
+    An active document with a missing/null generated_at previously passed
+    schema validation while dca_config.load_ml_sizing_adjustment() silently
+    treats it as a no-op -- config validation would approve a document the
+    runtime actually disables, letting a malformed "active" publish look
+    schema-valid.
+    """
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "ml_sizing_adjustment.schema.json").read_bytes())
+    document = json.loads(json.dumps(_load("ml_sizing_adjustment.json")))  # deep copy
+    document["status"] = "active"
+    document["generated_at"] = None
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(document, schema)
+
+
+def test_ml_sizing_adjustment_schema_still_allows_null_generated_at_when_inactive():
+    """The inactive template (the shipped default) must remain valid with a
+    null generated_at -- the new constraint only applies when active."""
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "ml_sizing_adjustment.schema.json").read_bytes())
+    document = json.loads(json.dumps(_load("ml_sizing_adjustment.json")))  # deep copy
+    assert document["status"] == "inactive"
+    assert document["generated_at"] is None
+    jsonschema.validate(document, schema)  # must not raise
+
+
+def test_ml_sizing_adjustment_schema_accepts_active_status_with_a_real_generated_at():
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "ml_sizing_adjustment.schema.json").read_bytes())
+    document = json.loads(json.dumps(_load("ml_sizing_adjustment.json")))  # deep copy
+    document["status"] = "active"
+    document["generated_at"] = "2026-08-12T00:00:00+00:00"
+    jsonschema.validate(document, schema)  # must not raise
+
+
 def test_tickers_schema_rejects_a_malformed_ticker_symbol():
     """`active` entries are constrained to ^[A-Z.]{1,6}$ -- uppercase letters
     and dots only, at most 6 characters. A lowercase or otherwise malformed

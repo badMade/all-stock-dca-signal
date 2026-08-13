@@ -31,11 +31,13 @@ import json
 import logging
 import os
 import shutil
+import tempfile
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+import dca_paths
 from dca_alerts import (
     GuardedRunConfig,
     artifact_freshness_probe,
@@ -3150,8 +3152,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     configure_logging(args.log_level)
 
-    config = load_strategy_config(args.config_dir)
-    if not config.dry_run:
+    # A preliminary load, used ONLY to resolve `now` below (decision_time_et,
+    # for the no-`--now` fallback) -- NOT the config the rest of this run
+    # uses. Its own ml_sizing_adjustment staleness check (if any) was just
+    # evaluated against the real wall clock, which is wrong for a replay
+    # (`--now <past timestamp>`); reloaded below, correctly, once the actual
+    # reference time is known (Codex review: "Validate ML staleness against
+    # the run timestamp").
+    preliminary_config = load_strategy_config(args.config_dir)
+    if not preliminary_config.dry_run:
         logger.error(
             "Refusing to run: config.dry_run is False. The CLI is dry-run only; drive live runs via run_pipeline()."
         )
@@ -3163,7 +3172,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 2
 
-    now = _resolve_now(args.now, config)
+    now = _resolve_now(args.now, preliminary_config)
+    config = load_strategy_config(args.config_dir, now=now)
     trading_day = now.astimezone(EASTERN).date()
     artifacts_dir = (
         Path(args.artifacts_dir)
@@ -3181,17 +3191,49 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info("Starting DEMO dry-run for %s -> %s", trading_day, artifacts_dir)
     finance, robinhood, broker = _demo_runtime(config)
     state = StrategyState()
-    result = run_pipeline(
-        now,
-        config,
-        state,
-        finance,
-        robinhood,
-        broker,
-        artifacts_dir=artifacts_dir,
-        run_label=args.run_label,
-        generate_full_reports=args.report,
-    )
+    # run_pipeline() defaults to scheduled=True (unset here, matching every
+    # real scheduled invocation), and several trackers it touches along that
+    # path -- InverseMartingaleLedger, CumulativeCreditLedger,
+    # scripts/same_day_top_up_gate, etc. -- gate their bookkeeping on
+    # `scheduled` alone, not `config.dry_run`. --artifacts-dir only isolates
+    # THIS run's own run_state/report artifacts; dca_paths.stream_root()'s
+    # separate $DCA_CRON_TRACKING_ROOT-derived tree those trackers read and
+    # write is untouched by it, so an enrolled ticker's REAL, live
+    # inverse-Martingale cycle (or credit ledger, or top-up-gate state)
+    # would otherwise be read and MUTATED by this synthetic-data smoke test
+    # -- directly contradicting both this module's own "Nothing contacts a
+    # broker or the network" claim and AGENTS.md's "third standard
+    # pre-handoff check" (Codex review: "Keep CLI demos out of the live
+    # accumulator"). stream_root()/cron_tracking_root() read
+    # $DCA_CRON_TRACKING_ROOT at CALL time, not at dca_paths' own import
+    # time (see that module's own "Resolution timing" docstring section),
+    # so overriding it here -- for exactly the duration of this one
+    # run_pipeline() call, restored immediately after -- correctly isolates
+    # every stream tracker this demo run touches without threading a new
+    # override parameter through run_pipeline's own multi-layer call chain.
+    # Restored (not left set) because main() is also called in-process,
+    # repeatedly, from test_run_dca.py -- an unrestored override would leak
+    # into whichever test runs next in the same pytest process.
+    _demo_cron_tracking_root_backup = os.environ.get(dca_paths.CRON_TRACKING_ROOT_ENV)
+    with tempfile.TemporaryDirectory(prefix="dca-demo-cron-tracking-") as demo_cron_tracking_root:
+        os.environ[dca_paths.CRON_TRACKING_ROOT_ENV] = demo_cron_tracking_root
+        try:
+            result = run_pipeline(
+                now,
+                config,
+                state,
+                finance,
+                robinhood,
+                broker,
+                artifacts_dir=artifacts_dir,
+                run_label=args.run_label,
+                generate_full_reports=args.report,
+            )
+        finally:
+            if _demo_cron_tracking_root_backup is None:
+                os.environ.pop(dca_paths.CRON_TRACKING_ROOT_ENV, None)
+            else:
+                os.environ[dca_paths.CRON_TRACKING_ROOT_ENV] = _demo_cron_tracking_root_backup
     logger.info("Done. Artifacts:\n%s", json.dumps(result, indent=2, default=str))
     return 0
 

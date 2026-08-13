@@ -100,6 +100,11 @@ py-modules = [
     # ModuleNotFoundError outside a source checkout (Codex review: "Package
     # the intraday archive module").
     "dca_intraday_archive",
+    # The opt-in inverse-Martingale deferred-accumulation sizing mode. Imported
+    # unconditionally by near_close_dca (_run_once_impl's injection site) and
+    # by dca_config.load_inverse_martingale_config; without it here, both fail
+    # with ModuleNotFoundError outside a source checkout.
+    "dca_inverse_martingale",
 ]
 # scripts/run_classification.py is the run-classification contract used by both
 # the live artifact writer (near_close_dca.build_run_artifacts) and readers
@@ -135,6 +140,11 @@ packages = ["scripts"]
     # configs").
     "config/market_open_dca.json",
     "config/intraday_dca.json",
+    # Read by dca_config.load_inverse_martingale_config / load_ml_sizing_adjustment;
+    # without these an installed wheel's get_config_dir() resolution falls back
+    # to defaults (both modes fully off) for a checkout that intended them active.
+    "config/inverse_martingale.json",
+    "config/ml_sizing_adjustment.json",
 ]
 
 [tool.pytest.ini_options]
@@ -147,7 +157,7 @@ python_files = ["test_*.py"]
 # its own directory instead (pip install -r <dir>/requirements.txt, then
 # cd <dir> && python -m pytest tests/), so keep both out of the core
 # "pytest" sweep the same way ruff already excludes them below.
-addopts = "-q --ignore=production-safe-agent-loop --ignore=ticker-advisor"
+addopts = "-q --ignore=production-safe-agent-loop --ignore=ticker-advisor --ignore=ml-forecaster"
 
 [tool.coverage.run]
 # Measure the code that runs in production, not the suite that exercises it.
@@ -169,6 +179,9 @@ omit = [
     # its ~900 uncovered lines would count against the 90% gate for code the
     # root suite never executes (see ticker-advisor/README.md).
     "ticker-advisor/*",
+    # Same reasoning as ticker-advisor/ above -- own pytest run, own heavy deps
+    # (scikit-learn/pandas/numpy), excluded from the root sweep and gate.
+    "ml-forecaster/*",
 ]
 
 [tool.coverage.report]
@@ -188,7 +201,14 @@ line-length = 120
 # production-safe-agent-loop/ and ticker-advisor/ are likewise self-contained
 # tools with their own requirements.txt and test suite, each run independently
 # of the core gate (own ruff invocation in .github/workflows/ci.yml).
-extend-exclude = ["trading-strategies", "analysis", ".github", "production-safe-agent-loop", "ticker-advisor"]
+extend-exclude = [
+    "trading-strategies",
+    "analysis",
+    ".github",
+    "production-safe-agent-loop",
+    "ticker-advisor",
+    "ml-forecaster",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B"]

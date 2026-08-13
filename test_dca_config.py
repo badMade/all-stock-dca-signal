@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -15,13 +15,24 @@ from dca_config import (
     load_approved_dates,
     load_backtest_sizing_tiers,
     load_budgets,
+    load_inverse_martingale_config,
+    load_ml_sizing_adjustment,
     load_near_close_overrides,
     load_per_ticker_sizing,
     load_sizing_tiers,
     load_strategy_config,
     load_tickers,
 )
-from near_close_dca import StrategyConfig, graded_buy_multiplier, select_first_allocation_base_usd
+from near_close_dca import (
+    EASTERN,
+    Action,
+    Bar,
+    SourceName,
+    StrategyConfig,
+    evaluate_source_signal,
+    graded_buy_multiplier,
+    select_first_allocation_base_usd,
+)
 
 
 def _write(dirpath, name, payload):
@@ -145,6 +156,899 @@ def test_per_ticker_sizing_has_precise_ranges_and_one_dollar_floor(tmp_path):
     assert select_first_allocation_base_usd(99.0, 100.0, None, config, "LOW")[0] == 1.0
 
 
+def test_inverse_martingale_missing_file_is_a_no_op(tmp_path):
+    assert load_inverse_martingale_config(tmp_path) == {}
+
+
+def test_inverse_martingale_inactive_status_is_a_no_op(tmp_path):
+    _write(tmp_path, "inverse_martingale.json", {"status": "inactive", "tickers": {}})
+    assert load_inverse_martingale_config(tmp_path) == {}
+
+
+def test_inverse_martingale_disabled_ticker_entry_is_dropped(tmp_path):
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active",
+        "enabled_default": False,
+        "tickers": {
+            "AAPL": {
+                "enabled": False,
+                "basis": "pct",
+                "tiers": [{"drop_pct": 1.0, "units": 1.0}],
+                "recovery_offset_pct": 1.0,
+            }
+        },
+    })
+    out = load_inverse_martingale_config(tmp_path)
+    assert out["inverse_martingale"] == {}
+
+
+def test_inverse_martingale_case_folded_duplicate_symbol_raises_even_when_the_duplicate_is_disabled(tmp_path):
+    """Regression test for "Reject case-folded duplicate enrollment
+    symbols". An enabled "AAPL" and a disabled "aapl" are both individually
+    schema-valid, but normalized[] is keyed by the UPPERCASED symbol -- the
+    disabled entry, meant to suppress the ticker, would otherwise be
+    silently dropped by the enabled-filter BEFORE ever colliding with the
+    enabled entry, leaving the ticker enrolled against one configuration
+    entry's explicit intent. This must raise, not silently prefer whichever
+    entry the enabled-filter didn't skip.
+    """
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active",
+        "enabled_default": False,
+        "tickers": {
+            "AAPL": {
+                "enabled": True,
+                "basis": "pct",
+                "tiers": [{"drop_pct": 1.0, "units": 1.0}],
+                "recovery_offset_pct": 1.0,
+            },
+            "aapl": {
+                "enabled": False,
+                "basis": "pct",
+                "tiers": [{"drop_pct": 1.0, "units": 1.0}],
+                "recovery_offset_pct": 1.0,
+            },
+        },
+    })
+    with pytest.raises(ValueError, match="duplicate"):
+        load_inverse_martingale_config(tmp_path)
+
+
+def test_inverse_martingale_case_folded_duplicate_symbol_raises_when_both_are_enabled(tmp_path):
+    """Two ENABLED case-variant entries would otherwise silently overwrite
+    one another in `normalized` with no error and no way to know which
+    basis/tier/recovery configuration actually won."""
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active",
+        "enabled_default": False,
+        "tickers": {
+            "AAPL": {
+                "enabled": True,
+                "basis": "pct",
+                "tiers": [{"drop_pct": 1.0, "units": 1.0}],
+                "recovery_offset_pct": 1.0,
+            },
+            "Aapl": {
+                "enabled": True,
+                "basis": "stddev",
+                "tiers": [{"sigma_multiple": 1.0, "units": 1.0}],
+                "recovery_offset_sigma": 0.5,
+                "stddev_window_days": 20,
+            },
+        },
+    })
+    with pytest.raises(ValueError, match="duplicate"):
+        load_inverse_martingale_config(tmp_path)
+
+
+def test_inverse_martingale_enabled_default_true_enrolls_a_ticker_omitting_enabled(tmp_path):
+    """Regression test for "Honor the configured default enrollment switch".
+
+    A ticker entry that omits its own `enabled` field must fall back to the
+    top-level `enabled_default`, not an unconditional False -- previously
+    `enabled_default: true` had NO effect anywhere at runtime.
+    """
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active",
+        "enabled_default": True,
+        "tickers": {
+            "AAPL": {
+                # deliberately omits "enabled" -- must fall back to enabled_default
+                "basis": "pct",
+                "tiers": [{"drop_pct": 1.0, "units": 1.0}],
+                "recovery_offset_pct": 1.0,
+            }
+        },
+    })
+    out = load_inverse_martingale_config(tmp_path)
+    assert "AAPL" in out["inverse_martingale"]
+    assert out["inverse_martingale_enabled_default"] is True
+
+
+def test_inverse_martingale_explicit_enabled_false_overrides_a_true_default(tmp_path):
+    """A per-ticker `enabled: false` must still opt that ticker out even when
+    enabled_default is true -- the default is only a FALLBACK for an omitted
+    field, not a floor."""
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active",
+        "enabled_default": True,
+        "tickers": {
+            "AAPL": {
+                "enabled": False,
+                "basis": "pct",
+                "tiers": [{"drop_pct": 1.0, "units": 1.0}],
+                "recovery_offset_pct": 1.0,
+            }
+        },
+    })
+    out = load_inverse_martingale_config(tmp_path)
+    assert out["inverse_martingale"] == {}
+
+
+def test_inverse_martingale_enabled_default_false_still_requires_explicit_opt_in(tmp_path):
+    """The pre-existing default behavior: with enabled_default left at its
+    own False default, a ticker omitting `enabled` stays un-enrolled."""
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active",
+        "tickers": {
+            "AAPL": {
+                "basis": "pct",
+                "tiers": [{"drop_pct": 1.0, "units": 1.0}],
+                "recovery_offset_pct": 1.0,
+            }
+        },
+    })
+    out = load_inverse_martingale_config(tmp_path)
+    assert out["inverse_martingale"] == {}
+
+
+def test_inverse_martingale_non_bool_enabled_default_raises(tmp_path):
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active", "enabled_default": "true", "tickers": {},
+    })
+    with pytest.raises(ValueError, match="enabled_default must be a boolean"):
+        load_inverse_martingale_config(tmp_path)
+
+
+def test_inverse_martingale_pct_basis_round_trips(tmp_path):
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active",
+        "enabled_default": False,
+        "unit_usd": 2.0,
+        "max_cycle_days": 10,
+        "max_fire_attempts": 3,
+        "tickers": {
+            "aapl": {
+                "enabled": True,
+                "basis": "pct",
+                "tiers": [
+                    {"drop_pct": 2.0, "units": 2.0},
+                    {"drop_pct": 1.0, "units": 1.0},
+                ],
+                "recovery_offset_pct": 1.0,
+            }
+        },
+    })
+    out = load_inverse_martingale_config(tmp_path)
+    assert out["inverse_martingale_unit_usd"] == 2.0
+    assert out["inverse_martingale_max_cycle_days"] == 10
+    assert out["inverse_martingale_max_fire_attempts"] == 3
+    model = out["inverse_martingale"]["AAPL"]
+    assert model["basis"] == "pct"
+    assert model["tiers"] == ((1.0, 1.0), (2.0, 2.0))
+    assert model["recovery_offset"] == 1.0
+
+
+def test_inverse_martingale_duplicate_tier_threshold_raises(tmp_path):
+    """Regression test for "Reject duplicate tier thresholds at load time"
+    (Copilot review). evaluate_inverse_martingale_step's tier-crossing loop
+    credits a tier when `threshold not in crossed_before`, and
+    crossed_before is only updated after the WHOLE loop finishes evaluating
+    this run's tiers -- so two configured tiers sharing the identical
+    threshold both read as "not yet crossed" in the same evaluation and
+    both get credited, double-accumulating for what is really one dip
+    level.
+    """
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active",
+        "tickers": {
+            "AAPL": {
+                "enabled": True,
+                "basis": "pct",
+                "tiers": [
+                    {"drop_pct": 1.0, "units": 1.0},
+                    {"drop_pct": 1.0, "units": 2.0},  # duplicate threshold, different units
+                ],
+                "recovery_offset_pct": 1.0,
+            }
+        },
+    })
+    with pytest.raises(ValueError, match="duplicate"):
+        load_inverse_martingale_config(tmp_path)
+
+
+def test_inverse_martingale_stddev_basis_requires_window(tmp_path):
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active",
+        "tickers": {
+            "MSFT": {
+                "enabled": True,
+                "basis": "stddev",
+                "tiers": [{"sigma_multiple": 1.0, "units": 1.0}],
+                "recovery_offset_sigma": 0.5,
+                # deliberately omits stddev_window_days
+            }
+        },
+    })
+    with pytest.raises(ValueError, match="stddev fields missing"):
+        load_inverse_martingale_config(tmp_path)
+
+
+def test_inverse_martingale_missing_basis_raises(tmp_path):
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active",
+        "tickers": {"AAPL": {"enabled": True, "tiers": [{"drop_pct": 1.0, "units": 1.0}]}},
+    })
+    with pytest.raises(ValueError, match="basis missing"):
+        load_inverse_martingale_config(tmp_path)
+
+
+def test_inverse_martingale_nonpositive_tier_threshold_raises(tmp_path):
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active",
+        "tickers": {"AAPL": {
+            "enabled": True, "basis": "pct",
+            "tiers": [{"drop_pct": 0.0, "units": 1.0}],
+            "recovery_offset_pct": 1.0,
+        }},
+    })
+    with pytest.raises(ValueError, match="drop_pct must be positive"):
+        load_inverse_martingale_config(tmp_path)
+
+
+def test_inverse_martingale_negative_units_raises(tmp_path):
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active",
+        "tickers": {"AAPL": {
+            "enabled": True, "basis": "pct",
+            "tiers": [{"drop_pct": 1.0, "units": -1.0}],
+            "recovery_offset_pct": 1.0,
+        }},
+    })
+    with pytest.raises(ValueError, match="units must be positive"):
+        load_inverse_martingale_config(tmp_path)
+
+
+def test_inverse_martingale_nonpositive_recovery_offset_raises(tmp_path):
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active",
+        "tickers": {"AAPL": {
+            "enabled": True, "basis": "pct",
+            "tiers": [{"drop_pct": 1.0, "units": 1.0}],
+            "recovery_offset_pct": 0.0,
+        }},
+    })
+    with pytest.raises(ValueError, match="recovery_offset_pct must be positive"):
+        load_inverse_martingale_config(tmp_path)
+
+
+def test_inverse_martingale_stddev_window_must_exceed_one(tmp_path):
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active",
+        "tickers": {"AAPL": {
+            "enabled": True, "basis": "stddev",
+            "tiers": [{"sigma_multiple": 1.0, "units": 1.0}],
+            "recovery_offset_sigma": 0.5, "stddev_window_days": 1,
+        }},
+    })
+    with pytest.raises(ValueError, match="stddev_window_days must be > 1"):
+        load_inverse_martingale_config(tmp_path)
+
+
+def test_inverse_martingale_nonpositive_global_unit_usd_raises(tmp_path):
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active", "unit_usd": -1.0, "tickers": {},
+    })
+    with pytest.raises(ValueError, match="unit_usd must be positive"):
+        load_inverse_martingale_config(tmp_path)
+
+
+def test_inverse_martingale_nonpositive_max_cycle_days_raises(tmp_path):
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active", "max_cycle_days": 0, "tickers": {},
+    })
+    with pytest.raises(ValueError, match="max_cycle_days must be positive"):
+        load_inverse_martingale_config(tmp_path)
+
+
+def test_inverse_martingale_nonpositive_max_fire_attempts_raises(tmp_path):
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active", "max_fire_attempts": 0, "tickers": {},
+    })
+    with pytest.raises(ValueError, match="max_fire_attempts must be positive"):
+        load_inverse_martingale_config(tmp_path)
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+def test_inverse_martingale_non_finite_tier_threshold_raises(tmp_path, bad_value):
+    """Regression test for "Reject non-finite inverse-Martingale values".
+
+    json.dumps/json.loads round-trip NaN/Infinity/-Infinity by default (a
+    non-standard but Python-json-accepted extension), and a NaN or infinite
+    threshold compares false against "<= 0" -- the positivity check alone
+    would silently accept it.
+    """
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active",
+        "tickers": {"AAPL": {
+            "enabled": True, "basis": "pct",
+            "tiers": [{"drop_pct": bad_value, "units": 1.0}],
+            "recovery_offset_pct": 1.0,
+        }},
+    })
+    with pytest.raises(ValueError, match="drop_pct must be positive and finite"):
+        load_inverse_martingale_config(tmp_path)
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+def test_inverse_martingale_non_finite_tier_units_raises(tmp_path, bad_value):
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active",
+        "tickers": {"AAPL": {
+            "enabled": True, "basis": "pct",
+            "tiers": [{"drop_pct": 1.0, "units": bad_value}],
+            "recovery_offset_pct": 1.0,
+        }},
+    })
+    with pytest.raises(ValueError, match="units must be positive and finite"):
+        load_inverse_martingale_config(tmp_path)
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf")])
+def test_inverse_martingale_non_finite_recovery_offset_raises(tmp_path, bad_value):
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active",
+        "tickers": {"AAPL": {
+            "enabled": True, "basis": "pct",
+            "tiers": [{"drop_pct": 1.0, "units": 1.0}],
+            "recovery_offset_pct": bad_value,
+        }},
+    })
+    with pytest.raises(ValueError, match="recovery_offset_pct must be positive and finite"):
+        load_inverse_martingale_config(tmp_path)
+
+
+def test_inverse_martingale_non_finite_stddev_window_days_raises(tmp_path):
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active",
+        "tickers": {"AAPL": {
+            "enabled": True, "basis": "stddev",
+            "tiers": [{"sigma_multiple": 1.0, "units": 1.0}],
+            "recovery_offset_sigma": 0.5, "stddev_window_days": float("nan"),
+        }},
+    })
+    with pytest.raises(ValueError, match="stddev_window_days must be a finite whole number"):
+        load_inverse_martingale_config(tmp_path)
+
+
+def test_inverse_martingale_fractional_stddev_window_days_raises(tmp_path):
+    """Regression test for "Reject fractional integer limits before truncating".
+
+    2.9 would silently truncate to 2 via int() -- a smaller, unintended
+    window -- rather than being refused as schema-invalid.
+    """
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active",
+        "tickers": {"AAPL": {
+            "enabled": True, "basis": "stddev",
+            "tiers": [{"sigma_multiple": 1.0, "units": 1.0}],
+            "recovery_offset_sigma": 0.5, "stddev_window_days": 2.9,
+        }},
+    })
+    with pytest.raises(ValueError, match="stddev_window_days must be a finite whole number"):
+        load_inverse_martingale_config(tmp_path)
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf")])
+def test_inverse_martingale_non_finite_global_unit_usd_raises(tmp_path, bad_value):
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active", "unit_usd": bad_value, "tickers": {},
+    })
+    with pytest.raises(ValueError, match="unit_usd must be positive and finite"):
+        load_inverse_martingale_config(tmp_path)
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf")])
+def test_inverse_martingale_non_finite_max_cycle_days_raises(tmp_path, bad_value):
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active", "max_cycle_days": bad_value, "tickers": {},
+    })
+    with pytest.raises(ValueError, match="max_cycle_days must be positive and finite"):
+        load_inverse_martingale_config(tmp_path)
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf")])
+def test_inverse_martingale_non_finite_max_fire_attempts_raises(tmp_path, bad_value):
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active", "max_fire_attempts": bad_value, "tickers": {},
+    })
+    with pytest.raises(ValueError, match="max_fire_attempts must be positive and finite"):
+        load_inverse_martingale_config(tmp_path)
+
+
+def test_inverse_martingale_boolean_tier_threshold_raises(tmp_path):
+    """Regression test for "Reject booleans in inverse-Martingale numeric
+    fields". bool is a subclass of int in Python -- float(True) == 1.0 --
+    so without an explicit bool exclusion, "drop_pct": true would silently
+    become a real 1.0 (100%) threshold instead of being rejected as the
+    schema-invalid input it is.
+    """
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active",
+        "tickers": {"AAPL": {
+            "enabled": True, "basis": "pct",
+            "tiers": [{"drop_pct": True, "units": 1.0}],
+            "recovery_offset_pct": 1.0,
+        }},
+    })
+    with pytest.raises(ValueError, match="must be a number, not a boolean"):
+        load_inverse_martingale_config(tmp_path)
+
+
+def test_inverse_martingale_boolean_tier_units_raises(tmp_path):
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active",
+        "tickers": {"AAPL": {
+            "enabled": True, "basis": "pct",
+            "tiers": [{"drop_pct": 1.0, "units": True}],
+            "recovery_offset_pct": 1.0,
+        }},
+    })
+    with pytest.raises(ValueError, match="must be a number, not a boolean"):
+        load_inverse_martingale_config(tmp_path)
+
+
+def test_inverse_martingale_boolean_recovery_offset_pct_raises(tmp_path):
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active",
+        "tickers": {"AAPL": {
+            "enabled": True, "basis": "pct",
+            "tiers": [{"drop_pct": 1.0, "units": 1.0}],
+            "recovery_offset_pct": True,
+        }},
+    })
+    with pytest.raises(ValueError, match="must be a number, not a boolean"):
+        load_inverse_martingale_config(tmp_path)
+
+
+def test_inverse_martingale_boolean_recovery_offset_sigma_raises(tmp_path):
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active",
+        "tickers": {"AAPL": {
+            "enabled": True, "basis": "stddev",
+            "tiers": [{"sigma_multiple": 1.0, "units": 1.0}],
+            "recovery_offset_sigma": True, "stddev_window_days": 20,
+        }},
+    })
+    with pytest.raises(ValueError, match="must be a number, not a boolean"):
+        load_inverse_martingale_config(tmp_path)
+
+
+def test_inverse_martingale_boolean_stddev_window_days_raises(tmp_path):
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active",
+        "tickers": {"AAPL": {
+            "enabled": True, "basis": "stddev",
+            "tiers": [{"sigma_multiple": 1.0, "units": 1.0}],
+            "recovery_offset_sigma": 0.5, "stddev_window_days": True,
+        }},
+    })
+    with pytest.raises(ValueError, match="must be a number, not a boolean"):
+        load_inverse_martingale_config(tmp_path)
+
+
+def test_inverse_martingale_boolean_global_unit_usd_raises(tmp_path):
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active", "unit_usd": True, "tickers": {},
+    })
+    with pytest.raises(ValueError, match="must be a number, not a boolean"):
+        load_inverse_martingale_config(tmp_path)
+
+
+def test_inverse_martingale_boolean_max_cycle_days_raises(tmp_path):
+    """A boolean is especially dangerous here: True coerces to 1.0, a real
+    (if extreme) 1-day abandonment cutoff that would otherwise load
+    successfully instead of being rejected as schema-invalid."""
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active", "max_cycle_days": True, "tickers": {},
+    })
+    with pytest.raises(ValueError, match="must be a number, not a boolean"):
+        load_inverse_martingale_config(tmp_path)
+
+
+def test_inverse_martingale_boolean_max_fire_attempts_raises(tmp_path):
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active", "max_fire_attempts": True, "tickers": {},
+    })
+    with pytest.raises(ValueError, match="must be a number, not a boolean"):
+        load_inverse_martingale_config(tmp_path)
+
+
+def test_inverse_martingale_fractional_max_cycle_days_raises(tmp_path):
+    """Regression test for "Reject fractional integer limits before truncating".
+
+    0.5 passes the ">0" positivity check but truncates to 0 via int() --
+    silently defeating the positivity check it just passed and letting an
+    enrolled ticker's cycle abandon itself after effectively zero days.
+    """
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active", "max_cycle_days": 0.5, "tickers": {},
+    })
+    with pytest.raises(ValueError, match="max_cycle_days must be positive and finite, and a whole number"):
+        load_inverse_martingale_config(tmp_path)
+
+
+def test_inverse_martingale_fractional_max_fire_attempts_raises(tmp_path):
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active", "max_fire_attempts": 0.5, "tickers": {},
+    })
+    with pytest.raises(ValueError, match="max_fire_attempts must be positive and finite, and a whole number"):
+        load_inverse_martingale_config(tmp_path)
+
+
+def test_inverse_martingale_non_bool_enabled_raises(tmp_path):
+    """Regression test for "Require a boolean before enabling the accumulator".
+
+    The schema-invalid string "false" is truthy in Python -- without an
+    explicit isinstance(..., bool) check this would silently ENABLE the
+    accumulator against the operator's obvious intent.
+    """
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active",
+        "tickers": {"AAPL": {
+            "enabled": "false", "basis": "pct",
+            "tiers": [{"drop_pct": 1.0, "units": 1.0}],
+            "recovery_offset_pct": 1.0,
+        }},
+    })
+    with pytest.raises(ValueError, match="enabled must be a boolean"):
+        load_inverse_martingale_config(tmp_path)
+
+
+def test_load_strategy_config_leaves_inverse_martingale_off_by_default(tmp_path):
+    config = load_strategy_config(tmp_path)
+    assert config.inverse_martingale_enabled_default is False
+    assert config.inverse_martingale == {}
+
+
+def test_ml_sizing_adjustment_missing_file_is_a_no_op(tmp_path):
+    assert load_ml_sizing_adjustment(tmp_path) == {}
+
+
+def test_ml_sizing_adjustment_inactive_status_is_a_no_op(tmp_path):
+    _write(tmp_path, "ml_sizing_adjustment.json", {"status": "inactive"})
+    assert load_ml_sizing_adjustment(tmp_path) == {}
+
+
+def _fresh_ml_payload(**overrides):
+    payload = {
+        "status": "active",
+        "generated_at": "2026-08-10T00:00:00+00:00",
+        "max_staleness_hours": 240,
+        "bounds": {"min_multiplier": 0.8, "max_multiplier": 1.2},
+        "adjustments": {"AAPL": 1.05},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_ml_sizing_adjustment_valid_fresh_file_applies(tmp_path):
+    _write(tmp_path, "ml_sizing_adjustment.json", _fresh_ml_payload())
+    now = datetime(2026, 8, 10, 12, tzinfo=timezone.utc)
+    out = load_ml_sizing_adjustment(tmp_path, now=now)
+    assert out == {"ml_sizing_adjustment": {"AAPL": 1.05}}
+
+
+def test_ml_sizing_adjustment_naive_injected_now_still_applies_fresh_file(tmp_path):
+    """Regression test for "Normalize the injected staleness clock".
+
+    A naive `now` (no tzinfo) -- e.g. from a replay/test caller using a
+    plain datetime(...) -- must be normalized the same way generated_at
+    already is, not raise TypeError subtracting an aware datetime from a
+    naive one.
+    """
+    _write(tmp_path, "ml_sizing_adjustment.json", _fresh_ml_payload())
+    naive_now = datetime(2026, 8, 10, 12)  # no tzinfo
+    out = load_ml_sizing_adjustment(tmp_path, now=naive_now)
+    assert out == {"ml_sizing_adjustment": {"AAPL": 1.05}}
+
+
+def test_ml_sizing_adjustment_naive_injected_now_still_detects_staleness(tmp_path):
+    _write(tmp_path, "ml_sizing_adjustment.json", _fresh_ml_payload())
+    naive_now = datetime(2026, 8, 10, 0) + timedelta(hours=241)  # no tzinfo, past the 240h budget
+    assert load_ml_sizing_adjustment(tmp_path, now=naive_now) == {}
+
+
+def test_load_strategy_config_threads_now_into_ml_sizing_staleness(tmp_path):
+    """Regression test for "Validate ML staleness against the run timestamp".
+
+    load_strategy_config()'s own `now=` parameter must reach
+    load_ml_sizing_adjustment(), not just that function called directly --
+    otherwise a replay caller has no way to make load_strategy_config()
+    itself judge the published file's freshness against anything but the
+    real wall clock.
+    """
+    _write(tmp_path, "ml_sizing_adjustment.json", _fresh_ml_payload())
+
+    fresh_now = datetime(2026, 8, 10, 12, tzinfo=timezone.utc)  # within the 240h budget
+    config = load_strategy_config(tmp_path, now=fresh_now)
+    assert config.ml_sizing_adjustment == {"AAPL": 1.05}
+
+    stale_now = datetime(2026, 8, 10, 12, tzinfo=timezone.utc) + timedelta(hours=241)
+    config = load_strategy_config(tmp_path, now=stale_now)
+    assert config.ml_sizing_adjustment == {}
+
+
+def test_ml_sizing_adjustment_stale_file_is_a_no_op(tmp_path):
+    _write(tmp_path, "ml_sizing_adjustment.json", _fresh_ml_payload())
+    now = datetime(2026, 8, 10, 0, tzinfo=timezone.utc) + timedelta(hours=241)
+    assert load_ml_sizing_adjustment(tmp_path, now=now) == {}
+
+
+def test_ml_sizing_adjustment_future_generated_at_is_a_no_op(tmp_path):
+    # A clock skew or corrupted timestamp in the future must not be trusted.
+    _write(tmp_path, "ml_sizing_adjustment.json", _fresh_ml_payload())
+    now = datetime(2026, 8, 9, 0, tzinfo=timezone.utc)
+    assert load_ml_sizing_adjustment(tmp_path, now=now) == {}
+
+
+def test_ml_sizing_adjustment_out_of_bounds_value_rejects_whole_file(tmp_path):
+    _write(tmp_path, "ml_sizing_adjustment.json", _fresh_ml_payload(
+        adjustments={"AAPL": 1.05, "MSFT": 5.0},
+    ))
+    now = datetime(2026, 8, 10, 12, tzinfo=timezone.utc)
+    assert load_ml_sizing_adjustment(tmp_path, now=now) == {}
+
+
+def test_ml_sizing_adjustment_case_folded_duplicate_symbol_rejects_whole_file(tmp_path):
+    """Regression test for "Reject case-folded duplicate ML adjustment
+    symbols". Both "AAPL" and "aapl" individually pass every check, but
+    normalized[] is keyed by the UPPERCASED symbol -- without a duplicate
+    check, whichever one this loop reaches last would silently win, with
+    JSON insertion order (not something an operator can reliably reason
+    about) deciding which live sizing multiplier actually applies.
+    """
+    _write(tmp_path, "ml_sizing_adjustment.json", _fresh_ml_payload(
+        adjustments={"AAPL": 1.05, "aapl": 0.95},
+    ))
+    now = datetime(2026, 8, 10, 12, tzinfo=timezone.utc)
+    assert load_ml_sizing_adjustment(tmp_path, now=now) == {}
+
+
+def test_ml_sizing_adjustment_boolean_value_rejects_whole_file(tmp_path):
+    """bool is a subclass of int in Python -- isinstance(True, (int, float))
+    is True -- so without an explicit bool exclusion, a malformed
+    "adjustments": {"AAPL": true} would silently coerce to float(True) ==
+    1.0, itself always inside [min_multiplier, max_multiplier] (min <= 1.0
+    <= max is enforced separately), and pass through as a real, live 1.0
+    sizing adjustment instead of being rejected as invalid input (Antigravity
+    review: "Boolean Values Converted to Multipliers")."""
+    _write(tmp_path, "ml_sizing_adjustment.json", _fresh_ml_payload(
+        adjustments={"AAPL": True},
+    ))
+    now = datetime(2026, 8, 10, 12, tzinfo=timezone.utc)
+    assert load_ml_sizing_adjustment(tmp_path, now=now) == {}
+
+
+def test_ml_sizing_adjustment_oversized_integer_rejects_whole_file(tmp_path):
+    """Regression test for "Reject oversized JSON integers before float
+    conversion". json.loads() parses an arbitrarily large JSON integer into
+    a Python int with no size limit of its own -- a 400-digit adjustment
+    value passes the real-non-bool-int type check but overflows float()'s
+    own finite range, raising an uncaught OverflowError. Since this loader
+    runs inside every load_strategy_config() call, that would abort live
+    strategy startup entirely instead of returning the documented
+    fail-closed {} for a malformed publish.
+    """
+    huge_int = 10**400
+    _write(tmp_path, "ml_sizing_adjustment.json", _fresh_ml_payload(
+        adjustments={"AAPL": huge_int},
+    ))
+    now = datetime(2026, 8, 10, 12, tzinfo=timezone.utc)
+    assert load_ml_sizing_adjustment(tmp_path, now=now) == {}
+
+
+@pytest.mark.parametrize("bad_bounds", [
+    {"min_multiplier": True, "max_multiplier": 1.2},
+    {"min_multiplier": 0.8, "max_multiplier": True},
+])
+def test_ml_sizing_adjustment_boolean_bound_rejects_whole_file(tmp_path, bad_bounds):
+    """Regression test for "Reject booleans in ML multiplier bounds". A
+    hand-edited or malformed publication with "min_multiplier": true would
+    otherwise silently coerce to float(True) == 1.0 -- itself always a
+    valid bound (min <= 1.0 <= max is enforced separately) -- applying a
+    live sizing adjustment from a payload that is actually schema-invalid
+    instead of the documented fail-closed no-op.
+    """
+    _write(tmp_path, "ml_sizing_adjustment.json", _fresh_ml_payload(
+        bounds=bad_bounds, adjustments={"AAPL": 1.05},
+    ))
+    now = datetime(2026, 8, 10, 12, tzinfo=timezone.utc)
+    assert load_ml_sizing_adjustment(tmp_path, now=now) == {}
+
+
+@pytest.mark.parametrize("bad_bounds", [
+    {"min_multiplier": 10**400, "max_multiplier": 1.2},
+    {"min_multiplier": 0.8, "max_multiplier": 10**400},
+])
+def test_ml_sizing_adjustment_oversized_bound_rejects_whole_file(tmp_path, bad_bounds):
+    """Regression test for "Catch overflow while parsing multiplier bounds".
+
+    A 400-digit JSON integer in bounds.min_multiplier/max_multiplier passes
+    _reject_bool_numeric()'s real-non-bool-numeric check but overflows
+    float()'s own finite range there, raising OverflowError -- distinct from
+    the already-caught (KeyError, TypeError, ValueError). Since this loader
+    runs inside every load_strategy_config() call, an uncaught OverflowError
+    here aborted strategy startup entirely instead of the documented
+    fail-closed {} no-op for this optional publication.
+    """
+    _write(tmp_path, "ml_sizing_adjustment.json", _fresh_ml_payload(
+        bounds=bad_bounds, adjustments={"AAPL": 1.05},
+    ))
+    now = datetime(2026, 8, 10, 12, tzinfo=timezone.utc)
+    assert load_ml_sizing_adjustment(tmp_path, now=now) == {}
+
+
+def test_ml_sizing_adjustment_malformed_generated_at_is_a_no_op(tmp_path):
+    _write(tmp_path, "ml_sizing_adjustment.json", _fresh_ml_payload(generated_at="not-a-date"))
+    assert load_ml_sizing_adjustment(tmp_path) == {}
+
+
+@pytest.mark.parametrize("naive_generated_at", ["2026-08-10", "2026-08-10T00:00:00"])
+def test_ml_sizing_adjustment_date_only_or_timezone_less_generated_at_is_a_no_op(tmp_path, naive_generated_at):
+    """Regression test for "Reject date-only publication timestamps".
+    schemas/ml_sizing_adjustment.schema.json declares generated_at as
+    "format": "date-time" -- RFC 3339 requires a timezone offset, but
+    datetime.fromisoformat() is more permissive and happily parses a
+    date-only string or a timezone-less timestamp as NAIVE. Previously that
+    naive value was silently assumed to be UTC instead of refused as the
+    schema-invalid publication it actually is -- schema validation itself
+    never runs against an alternate DCA_CONFIG_DIR this loader might read
+    from.
+    """
+    _write(tmp_path, "ml_sizing_adjustment.json", _fresh_ml_payload(generated_at=naive_generated_at))
+    now = datetime(2026, 8, 10, 12, tzinfo=timezone.utc)
+    assert load_ml_sizing_adjustment(tmp_path, now=now) == {}
+
+
+def test_ml_sizing_adjustment_malformed_json_is_a_no_op_not_a_raise(tmp_path):
+    """Regression test for "Catch malformed ML publication JSON". Unlike
+    load_inverse_martingale_config (which deliberately RAISES on a
+    malformed file), a truncated/invalid-JSON ml_sizing_adjustment.json
+    must fold into the same documented {} no-op as every other malformed-
+    payload case -- this loader runs unconditionally inside
+    load_strategy_config(), so an uncaught ValueError here would abort
+    startup for every scheduled run over one optional, ancillary
+    sizing-nudge publish, not merely disable the nudge itself.
+    """
+    (tmp_path / "ml_sizing_adjustment.json").write_text("{not valid json", encoding="utf-8")
+    assert load_ml_sizing_adjustment(tmp_path) == {}
+
+
+def test_ml_sizing_adjustment_non_object_json_is_a_no_op_not_a_raise(tmp_path):
+    (tmp_path / "ml_sizing_adjustment.json").write_text("[1, 2, 3]", encoding="utf-8")
+    assert load_ml_sizing_adjustment(tmp_path) == {}
+
+
+def test_ml_sizing_adjustment_missing_bounds_is_a_no_op(tmp_path):
+    payload = _fresh_ml_payload()
+    del payload["bounds"]
+    _write(tmp_path, "ml_sizing_adjustment.json", payload)
+    assert load_ml_sizing_adjustment(tmp_path) == {}
+
+
+@pytest.mark.parametrize("bad_staleness", [float("nan"), float("inf"), float("-inf"), 0, -5])
+def test_ml_sizing_adjustment_non_finite_or_nonpositive_staleness_is_a_no_op(tmp_path, bad_staleness):
+    _write(tmp_path, "ml_sizing_adjustment.json", _fresh_ml_payload(max_staleness_hours=bad_staleness))
+    now = datetime(2026, 8, 10, 12, tzinfo=timezone.utc)
+    assert load_ml_sizing_adjustment(tmp_path, now=now) == {}
+
+
+def test_ml_sizing_adjustment_unrepresentably_large_staleness_is_a_no_op(tmp_path):
+    """Regression test for "Bound staleness values before constructing a
+    timedelta". A value like 1e308 is finite (passes math.isfinite) but not
+    REPRESENTABLE as a timedelta (internally bounded to roughly
+    roughly +/-2.7 million years) -- timedelta(hours=1e308) raises OverflowError.
+    Uncaught, that would abort this ENTIRE load_strategy_config() call
+    instead of the documented fail-closed {} no-op -- and since
+    max_staleness_hours is read from a PERSISTED file, one malformed
+    publish would break every subsequent load until manually fixed.
+    """
+    _write(tmp_path, "ml_sizing_adjustment.json", _fresh_ml_payload(max_staleness_hours=1e308))
+    now = datetime(2026, 8, 10, 12, tzinfo=timezone.utc)
+    assert load_ml_sizing_adjustment(tmp_path, now=now) == {}
+
+
+def test_ml_sizing_adjustment_rejects_bounds_wider_than_the_schema_hard_limit(tmp_path):
+    # 0.01..100 is internally consistent (min <= 1.0 <= max) but far outside
+    # the schema's real 0.5..1.5 ceiling -- must not be trusted just because
+    # the file declares it.
+    _write(tmp_path, "ml_sizing_adjustment.json", _fresh_ml_payload(
+        bounds={"min_multiplier": 0.01, "max_multiplier": 100.0},
+        adjustments={"AAPL": 1.05},
+    ))
+    now = datetime(2026, 8, 10, 12, tzinfo=timezone.utc)
+    assert load_ml_sizing_adjustment(tmp_path, now=now) == {}
+
+
+def test_ml_sizing_adjustment_no_op_leaves_graded_multiplier_unchanged():
+    config_without = StrategyConfig()
+    config_with_empty = StrategyConfig(ml_sizing_adjustment={})
+    assert (
+        graded_buy_multiplier(0.02, config_without, "AAPL")
+        == graded_buy_multiplier(0.02, config_with_empty, "AAPL")
+    )
+
+
+def test_ml_sizing_adjustment_applies_only_to_configured_ticker():
+    config = StrategyConfig(ml_sizing_adjustment={"AAPL": 1.1})
+    base = StrategyConfig()
+    assert graded_buy_multiplier(0.02, config, "AAPL") == pytest.approx(
+        graded_buy_multiplier(0.02, base, "AAPL") * 1.1
+    )
+    assert graded_buy_multiplier(0.02, config, "MSFT") == graded_buy_multiplier(0.02, base, "MSFT")
+
+
+class _FixedSignalData:
+    """Minimal MarketDataProvider fake: constant prior close and a
+    caller-supplied decision price, with a declining 60-minute trend so
+    evaluate_source_signal's trend filter is satisfied."""
+
+    def __init__(self, prev_close: float, decision_price: float):
+        self._prev = prev_close
+        self._price = decision_price
+        self.source = SourceName.FINANCE
+
+    def get_previous_close_bar(self, ticker, as_of):
+        ts = datetime.combine(as_of.date() - timedelta(days=1), datetime.min.time().replace(hour=16), tzinfo=EASTERN)
+        return Bar(ts, self._prev, self._prev, self._prev, self._prev, 1000)
+
+    def get_intraday_bars(self, ticker, start, end, interval_minutes):
+        bars = []
+        cursor = start
+        late_threshold = end - timedelta(minutes=30)
+        while cursor <= end:
+            price = self._price if cursor >= late_threshold else self._price + 2.0
+            bars.append(Bar(cursor, price, price, price, price, 100))
+            cursor += timedelta(minutes=interval_minutes)
+        return bars
+
+    def get_quote(self, ticker, as_of):
+        return (self._price, as_of)
+
+
+def test_ml_adjustment_cannot_push_a_real_buy_below_the_broker_minimum():
+    """A low ml_sizing_adjustment factor (schema allows down to 0.5) combined
+    with the base 1x tier must never produce a sub-dollar suggested amount
+    for a genuine buy -- brokers reject sub-dollar notional orders."""
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    data = _FixedSignalData(prev_close=100.0, decision_price=99.0)  # -1.0% -> 1x tier
+    config = StrategyConfig(ml_sizing_adjustment={"AAPL": 0.5})
+    signal = evaluate_source_signal("AAPL", now, config, data, 15)
+    assert signal.action == Action.BUY
+    assert signal.buy_multiplier == pytest.approx(0.5)  # the ML factor is still visible on the multiplier
+    assert signal.suggested_amount_usd >= 1.0  # but the final dollar amount is floored
+
+
+def test_ml_adjustment_does_not_floor_a_genuine_no_buy():
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    data = _FixedSignalData(prev_close=100.0, decision_price=100.5)  # above prior close -> no buy
+    config = StrategyConfig(ml_sizing_adjustment={"AAPL": 0.5})
+    signal = evaluate_source_signal("AAPL", now, config, data, 15)
+    assert signal.action != Action.BUY
+    assert signal.suggested_amount_usd == 0.0
+
+
 def test_budgets_maps_surviving_fields_only(tmp_path):
     # Daily/weekly caps live in the BUDGET_TIERS ladder, not StrategyConfig; only the
     # base amount, rollover-reserve cap, and hard per-order ceiling are overlaid.
@@ -250,6 +1154,20 @@ def test_read_json_valid(tmp_path):
     file_path.write_text('{"key": "value"}', encoding="utf-8")
     assert _read_json(file_path) == {"key": "value"}
 
+def test_read_json_rejects_duplicate_top_level_keys(tmp_path):
+    file_path = tmp_path / "dup.json"
+    file_path.write_text('{"AAPL": {"enabled": true}, "AAPL": {"enabled": false}}', encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate key 'AAPL'"):
+        _read_json(file_path)
+
+def test_read_json_rejects_duplicate_nested_keys(tmp_path):
+    file_path = tmp_path / "dup_nested.json"
+    file_path.write_text(
+        '{"tickers": {"AAPL": {"enabled": true, "enabled": false}}}', encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="duplicate key 'enabled'"):
+        _read_json(file_path)
+
 
 def test_load_near_close_overrides_missing_file(tmp_path):
     assert load_near_close_overrides(tmp_path) == {}
@@ -266,6 +1184,51 @@ def test_load_near_close_overrides_filters_unknown_and_excluded(tmp_path):
         }
     )
     assert load_near_close_overrides(tmp_path) == {"base_buy_amount_usd": 5.0}
+
+
+def test_load_near_close_overrides_excludes_sizing_validated_fields(tmp_path):
+    """Regression test for "Prevent generic overrides from bypassing sizing validation".
+
+    inverse_martingale/ml_sizing_adjustment (and their scalar siblings) each
+    have their own dedicated, validated loader; letting near_close_dca.json
+    set them directly would let an unchecked value silently replace an
+    already-validated one, since load_near_close_overrides() is merged AFTER
+    both dedicated loaders in load_strategy_config().
+    """
+    _write(
+        tmp_path,
+        "near_close_dca.json",
+        {
+            "base_buy_amount_usd": 5.0,
+            "inverse_martingale_enabled_default": True,
+            "inverse_martingale_unit_usd": 999.0,
+            "inverse_martingale_max_cycle_days": 1,
+            "inverse_martingale_max_fire_attempts": 1,
+            "inverse_martingale": {"AAPL": {"enabled": True}},
+            "ml_sizing_adjustment": {"AAPL": 1.4999},
+        },
+    )
+    assert load_near_close_overrides(tmp_path) == {"base_buy_amount_usd": 5.0}
+
+
+def test_load_strategy_config_near_close_overrides_cannot_bypass_inverse_martingale_validation(tmp_path):
+    """End-to-end: even with a validated inverse_martingale.json present,
+    near_close_dca.json cannot inject a different, unvalidated
+    inverse_martingale mapping through the generic override path."""
+    _write(tmp_path, "inverse_martingale.json", {
+        "status": "active",
+        "tickers": {"AAPL": {
+            "enabled": True, "basis": "pct",
+            "tiers": [{"drop_pct": 1.0, "units": 1.0}],
+            "recovery_offset_pct": 1.0,
+        }},
+    })
+    _write(tmp_path, "near_close_dca.json", {
+        "inverse_martingale": {"MSFT": {"enabled": True}},
+    })
+    config = load_strategy_config(tmp_path)
+    assert set(config.inverse_martingale) == {"AAPL"}
+
 
 def test_load_backtest_sizing_tiers_valid(tmp_path):
     _write(tmp_path, "backtest_sizing_ladder.json", {

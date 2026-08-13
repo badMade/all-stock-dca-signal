@@ -332,6 +332,44 @@ def test_cli_end_to_end(tmp_path, monkeypatch):
     assert document["candidates"][0]["ticker"] == "TEST"
 
 
+def test_cli_passes_the_candidate_trading_day_now_to_load_strategy_config(tmp_path, monkeypatch):
+    """Regression test for "Use the candidate trading day for ML freshness".
+
+    load_strategy_config's `now` kwarg is what load_ml_sizing_adjustment
+    checks config/ml_sizing_adjustment.json's generated_at staleness
+    against -- omitting it here would silently fall back to the real wall
+    clock, judging a historical/replay --trading-day's ML freshness against
+    "today" instead of the trading day this run is actually scoring:
+    applying a publish from the future relative to the replay, or skipping
+    one that was genuinely fresh AT that day. main() already derives `now`
+    from --trading-day + the slot's decision time at line ~1671; this
+    asserts that exact value reaches load_strategy_config unchanged.
+    """
+    data = _market_data("TEST", early_price=100.0, late_price=96.0, previous_close=100.0, previous_low=97.0)
+    market_data_path = tmp_path / "market_data.json"
+    market_data_path.write_text(json.dumps(data), encoding="utf-8")
+
+    captured_kwargs: dict = {}
+
+    def _capturing_load_strategy_config(*_args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return _config()
+
+    monkeypatch.setattr(gbc, "load_strategy_config", _capturing_load_strategy_config)
+
+    exit_code = gbc.main(
+        [
+            "--slot", SLOT,
+            "--trading-day", DAY.isoformat(),
+            "--market-data", str(market_data_path),
+            "--deployed-last-7d-usd", "0",
+        ]
+    )
+    assert exit_code == 0
+    expected_now = datetime.combine(DAY, gbc.SLOT_SPECS[SLOT]["decision_time_et"], tzinfo=ET)
+    assert captured_kwargs.get("now") == expected_now
+
+
 @pytest.mark.parametrize("raw_value", ["nan", "-1", "-inf"])
 def test_cli_rejects_non_finite_or_negative_deployed_last_7d_usd(tmp_path, monkeypatch, raw_value):
     """A NaN or negative --deployed-last-7d-usd must fail argument parsing.

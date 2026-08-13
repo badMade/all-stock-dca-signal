@@ -42,6 +42,18 @@ None is dead, but they are not interchangeable, and a fix applied to one does
 - **Consolidating is a real decision, not a cleanup.** Making `run_slot()`
   delegate to the executor classes would remove the duplication, but it changes
   the live 3:30 PM path and needs its own review and acceptance run.
+- **New signal/sizing logic added to one entry point does not reach the others.**
+  Two examples that both currently touch only `near_close_dca.graded_buy_multiplier()`
+  / `evaluate_source_signal()` (the `run_dca.run_slot()` / `run_pipeline()` path):
+  the opt-in inverse-Martingale accumulator (`dca_inverse_martingale.py`, see
+  `docs/inverse_martingale.md`) and the ml-forecaster sizing nudge
+  (`config/ml_sizing_adjustment.json`, see `docs/ticker_advisory.md`'s Phase 2
+  section). Neither reaches `MorningDCAExecutor.evaluate_signal()`
+  (`morning_dca.py`, a separate reimplementation that never calls
+  `graded_buy_multiplier`) or `dca_runner.py` (which takes pre-decided
+  candidates and never computes a signal itself). Do not assume either is live
+  on the market-open/midday/intraday executor-class streams or the seven-slot
+  gate-sequence runner without checking first.
 
 ## Dependency injection (no secrets in the repo)
 

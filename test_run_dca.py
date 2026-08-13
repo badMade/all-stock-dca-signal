@@ -3266,12 +3266,128 @@ def test_cli_refuses_without_demo(tmp_path):
     assert rc == 2
 
 
+def test_cli_demo_does_not_touch_the_real_cron_tracking_root(tmp_path, monkeypatch):
+    """Regression test for "Keep CLI demos out of the live accumulator".
+
+    --demo is documented (CLAUDE.md's "third standard pre-handoff check",
+    AGENTS.md) as a safe, synthetic-data smoke test that never touches live
+    state ("Nothing contacts a broker or the network"). But run_pipeline()
+    defaults to scheduled=True (unset by the --demo branch), and several
+    trackers it drives along that path -- InverseMartingaleLedger among them
+    -- gate their bookkeeping on `scheduled` alone, not `config.dry_run`.
+    --artifacts-dir only isolates THIS run's own run_state/report artifacts;
+    dca_paths.stream_root()'s separate $DCA_CRON_TRACKING_ROOT-derived tree
+    those trackers read and write is a different root entirely. Enroll a
+    real ticker so this demo run actually exercises the accumulator (a
+    ~1.7% synthetic dip on AAPL crosses a 0.5%-threshold tier), point
+    DCA_CRON_TRACKING_ROOT at a real-looking root with a pre-existing file,
+    and confirm main() never writes into it -- and restores the env var
+    afterward, since main() is also called in-process, repeatedly, by other
+    tests in this same module.
+    """
+    import os
+    from dataclasses import replace
+
+    import run_dca
+
+    real_root = tmp_path / "real_cron_tracking"
+    real_root.mkdir()
+    canary = real_root / "canary.txt"
+    canary.write_text("do not touch", encoding="utf-8")
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(real_root))
+
+    real_load_strategy_config = run_dca.load_strategy_config
+
+    def enrolled_load_strategy_config(*args, **kwargs):
+        config = real_load_strategy_config(*args, **kwargs)
+        return replace(
+            config,
+            inverse_martingale={
+                "AAPL": {"basis": "pct", "tiers": ((0.5, 1.0),), "recovery_offset": 1.0}
+            },
+        )
+
+    monkeypatch.setattr(run_dca, "load_strategy_config", enrolled_load_strategy_config)
+
+    # Capture the isolated temp root main() actually points trackers at,
+    # instead of letting TemporaryDirectory clean it up on __exit__, so this
+    # test can prove the accumulator really ran (and wrote there) rather than
+    # the real root merely being untouched because nothing ever reached it.
+    captured_isolated_root: list[str] = []
+    real_temporary_directory = run_dca.tempfile.TemporaryDirectory
+
+    class _NonCleaningTemporaryDirectory(real_temporary_directory):
+        def __exit__(self, *exc_info):
+            # TemporaryDirectory also registers a weakref.finalize at
+            # construction time that deletes the directory on garbage
+            # collection, independent of __exit__ -- detach it too, or the
+            # directory vanishes the moment this object is collected.
+            self._finalizer.detach()
+            captured_isolated_root.append(self.name)
+            # Deliberately skip cleanup so the test can inspect it afterward.
+
+    monkeypatch.setattr(run_dca.tempfile, "TemporaryDirectory", _NonCleaningTemporaryDirectory)
+
+    artifacts_dir = tmp_path / "demo_artifacts"
+    rc = run_dca.main(["--demo", "--now", "2026-07-06T15:45", "--artifacts-dir", str(artifacts_dir)])
+    assert rc == 0
+
+    # The env var must be restored to exactly what this test set it to.
+    assert os.environ.get("DCA_CRON_TRACKING_ROOT") == str(real_root)
+    # And the real root must be completely untouched -- still just the canary,
+    # no inverse_martingale_dca/ (or any other stream tracker) directory.
+    assert [p.name for p in real_root.iterdir()] == ["canary.txt"]
+
+    # The accumulator DID run -- just against the isolated temp root, proving
+    # this test is actually exercising the fix rather than passing trivially
+    # because nothing ever touched a tracker.
+    [isolated_root] = captured_isolated_root
+    tracker_path = Path(isolated_root) / "inverse_martingale_dca" / "AAPL" / "tracker.json"
+    assert tracker_path.exists()
+
+
 def test_cli_refuses_when_dry_run_false(tmp_path, monkeypatch):
     import run_dca
 
     monkeypatch.setattr(run_dca, "load_strategy_config", lambda *a, **k: StrategyConfig(dry_run=False))
     rc = run_dca.main(["--demo", "--artifacts-dir", str(tmp_path)])
     assert rc == 2
+
+
+def test_cli_reloads_config_with_the_resolved_replay_now_for_ml_staleness(tmp_path, monkeypatch):
+    """Regression test for "Validate ML staleness against the run timestamp".
+
+    main() must reload config with `now=` set to the RESOLVED --now replay
+    timestamp (not the real wall clock) before the run proceeds, so
+    ml_sizing_adjustment.json's staleness is judged against the replay's own
+    intended "now" -- otherwise a currently-live publish could be applied to
+    historical decisions from the future relative to the replay, or a
+    publish that was genuinely fresh at the replay date could be wrongly
+    treated as stale, silently contaminating the replayed decisions.
+    """
+    import run_dca
+
+    captured_now_kwargs = []
+    real_load_strategy_config = run_dca.load_strategy_config
+
+    def spying_load_strategy_config(*args, **kwargs):
+        captured_now_kwargs.append(kwargs.get("now"))
+        return real_load_strategy_config(*args, **kwargs)
+
+    monkeypatch.setattr(run_dca, "load_strategy_config", spying_load_strategy_config)
+
+    rc = run_dca.main(["--demo", "--now", "2026-07-06T15:45", "--artifacts-dir", str(tmp_path)])
+    assert rc == 0
+
+    # Two loads: the preliminary one (now=None, used only to resolve the
+    # decision_time_et fallback -- never the config the run actually uses),
+    # then the real reload with now= the RESOLVED replay timestamp, not
+    # whatever the real wall clock happens to be right now.
+    assert len(captured_now_kwargs) == 2
+    assert captured_now_kwargs[0] is None
+    resolved_now = captured_now_kwargs[1]
+    assert resolved_now is not None
+    assert (resolved_now.year, resolved_now.month, resolved_now.day) == (2026, 7, 6)
 
 
 def test_run_pipeline_persists_raw_inputs_before_compute(tmp_path):

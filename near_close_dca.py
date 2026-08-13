@@ -81,6 +81,16 @@ from dca_intraday_archive import (
     observations_from_signal_rows,
     write_run_snapshot,
 )
+from dca_inverse_martingale import (
+    STATUS_FIRING,
+    STATUS_NONE,
+    CorruptedLedgerStateError,
+    InverseMartingaleLedger,
+    InverseMartingaleStep,
+    evaluate_inverse_martingale_step,
+    resolved_marker,
+    stddev_reference_for_ticker,
+)
 
 try:  # pragma: no cover - import shim for flat sys.path
     from scripts.run_classification import (
@@ -423,6 +433,10 @@ class SourceSignal:
     intraday_trend_pct: float = 0.0
     drop_vs_previous_close_pct: float = 0.0
     buy_multiplier: float = 0.0
+    # Mirrors ReconciledDecision.ladder_multiplier -- see that field's own
+    # docstring. Carried on the per-source signal so reconcile_signals()
+    # can copy it, from whichever signal wins, onto the merged decision.
+    ladder_multiplier: float = 0.0
     suggested_amount_usd: float = 0.0
     # Prior regular-session low and the first-allocation base scale selected from
     # it (see StrategyConfig.base_buy_amount_below_close_usd and
@@ -454,6 +468,26 @@ class ReconciledDecision:
     finance_signal: Optional[SourceSignal]
     robinhood_signal: Optional[SourceSignal]
     buy_multiplier: float = 0.0
+    # The graded ladder's OWN tier match -- before the ML sizing nudge, the
+    # 5x cap, or the kill-switch cap that buy_multiplier already reflects.
+    # Exists specifically so the high_multiplier_threshold selloff-breadth
+    # count (how many tickers are showing a genuinely deep, ladder-severity
+    # dip this run -- see select_budget_tier's own docstring) is judged on
+    # the ladder's real classification, not on a per-ticker ML nudge. Without
+    # this distinction, an ML factor moving several tickers' FINAL
+    # multipliers across the threshold (e.g. six 2.5x ladder matches each
+    # nudged to 3.0x by a 1.2 factor) would escalate the day's budget caps
+    # purely from independent per-ticker forecasts, not from an actual
+    # broad market selloff -- and a factor below 1.0 could just as easily
+    # suppress a genuine broad-selloff signal from being counted at all
+    # (Codex review: "Preserve the raw ladder tier for selloff-breadth
+    # counting"). Defaults to 0.0 (matching buy_multiplier's own default)
+    # for every decision that never goes through raw_ladder_multiplier() --
+    # a synthetic (inverse-Martingale fire / credit-flush) candidate's
+    # buy_multiplier is likewise always 0.0 or explicitly set, so the two
+    # fields never legitimately diverge outside the one real ladder-signal
+    # construction site.
+    ladder_multiplier: float = 0.0
     suggested_amount_usd: float = 0.0
     # The first-allocation base ($1 or $2) behind suggested_amount_usd (see
     # select_first_allocation_base_usd). Persisted so a later same-day top-up
@@ -466,6 +500,12 @@ class ReconciledDecision:
     target_price_source: str = ""
     target_quote_time: Optional[datetime] = None
     decision_bar_close: float = 0.0
+    # "" for every ordinary signal-derived decision. Set to
+    # "inverse_martingale" only for a synthetic fire candidate injected by the
+    # opt-in accumulator (see dca_inverse_martingale.py and _run_once_impl's
+    # injection site) so _process_buy_candidate's ref_id construction can
+    # namespace it distinctly from a normal ladder buy.
+    synthetic_source: str = ""
 
 
 # 2:30 PM ET boundary. Morning/manual (market-open recovery and future morning
@@ -764,6 +804,21 @@ class StrategyConfig:
     # (drop-fraction, multiplier), plus full/reduced base amounts. Symbols
     # absent from this mapping keep the conservative shared ladder.
     per_ticker_sizing: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    # Opt-in deferred-accumulation ("inverse Martingale") sizing mode, loaded
+    # from config/inverse_martingale.json via dca_config.load_inverse_martingale_config.
+    # Off by default (empty mapping) -- see dca_inverse_martingale.py and
+    # docs/inverse_martingale.md. Untouched by any path that builds a bare
+    # StrategyConfig() without loading config, so behavior there is unaffected.
+    inverse_martingale_enabled_default: bool = False
+    inverse_martingale_unit_usd: float = 1.0
+    inverse_martingale_max_cycle_days: int = 30
+    inverse_martingale_max_fire_attempts: int = 5
+    inverse_martingale: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    # Published, bounded per-ticker multiplier nudge from the ml-forecaster/
+    # sibling tool (config/ml_sizing_adjustment.json via
+    # dca_config.load_ml_sizing_adjustment). Empty by default -> every
+    # ticker's lookup returns the implicit 1.0 no-op in graded_buy_multiplier.
+    ml_sizing_adjustment: Mapping[str, float] = field(default_factory=dict)
     # Same-day price-step top-ups use the last executed buy's reference price.
     # A $0.50 cumulative decline rounds up to the first $1 order. Above that
     # floor, order notionals retain cent precision (for example $1.01/$2.99).
@@ -2208,11 +2263,57 @@ def _ticker_sizing(ticker: Optional[str], config: StrategyConfig) -> Mapping[str
     return candidate if isinstance(candidate, Mapping) else {}
 
 
+def _inverse_martingale_config(ticker: Optional[str], config: StrategyConfig) -> Mapping[str, Any]:
+    """Return this ticker's validated inverse-Martingale calibration, or ``{}``.
+
+    ``{}`` means the mode is fully off for this ticker -- either it has no
+    entry in ``config.inverse_martingale`` (see
+    ``dca_config.load_inverse_martingale_config``, which already drops any
+    ``enabled: false`` entry at load time) or ``ticker`` is falsy.
+    """
+    if not ticker:
+        return {}
+    candidate = config.inverse_martingale.get(ticker.upper(), {})
+    return candidate if isinstance(candidate, Mapping) else {}
+
+
 def minimum_drop_for_ticker(config: StrategyConfig, ticker: Optional[str] = None) -> float:
     """Return the first positive calibrated threshold for a symbol."""
     calibration = _ticker_sizing(ticker, config)
     tiers = calibration.get("tiers", config.sizing_tiers)
     return min(float(threshold) for threshold, _ in tiers)
+
+
+def raw_ladder_multiplier(
+    drop_vs_previous_close: float, config: StrategyConfig, ticker: Optional[str] = None
+) -> float:
+    """The graded ladder's own tier match -- BEFORE the ML nudge, the 5x cap, or
+    the kill-switch cap -- for a drop from prior close.
+
+    ``drop_vs_previous_close`` is a fraction (0.02 == 2.0% down). The largest tier
+    threshold less than or equal to the drop determines the multiplier; a drop
+    below the first threshold returns 0.0 (no buy). See StrategyConfig.sizing_tiers.
+
+    Factored out of :func:`graded_buy_multiplier` so a caller that needs the
+    ladder's OWN severity classification -- e.g. the high_multiplier_threshold
+    selloff-breadth count that escalates the day's budget tier -- can read it
+    without the ML sizing nudge or kill-switch cap distorting it (see
+    ReconciledDecision.ladder_multiplier's own docstring for why that distinction
+    matters).
+    """
+    if _inverse_martingale_config(ticker, config):
+        # Mirrors graded_buy_multiplier's own identical suppression -- see
+        # that function's docstring for the full rationale. An enrolled
+        # ticker's ladder is fully suppressed, so its raw tier match is
+        # always 0 too, not just its final (ML/cap-adjusted) multiplier.
+        return 0.0
+    calibration = _ticker_sizing(ticker, config)
+    tiers = calibration.get("tiers", config.sizing_tiers)
+    multiplier = 0.0
+    for threshold, tier_multiplier in sorted(tiers):
+        if drop_vs_previous_close >= threshold:
+            multiplier = tier_multiplier
+    return multiplier
 
 
 def graded_buy_multiplier(
@@ -2228,12 +2329,18 @@ def graded_buy_multiplier(
     positive multiplier is capped to 1x: the strategy still participates in a dip
     at the base amount but stops scaling up. A 0x (no-buy) stays 0x.
     """
-    calibration = _ticker_sizing(ticker, config)
-    tiers = calibration.get("tiers", config.sizing_tiers)
-    multiplier = 0.0
-    for threshold, tier_multiplier in sorted(tiers):
-        if drop_vs_previous_close >= threshold:
-            multiplier = tier_multiplier
+    multiplier = raw_ladder_multiplier(drop_vs_previous_close, config, ticker)
+    if multiplier > 0:
+        # ml-forecaster's published, bounded (see config/ml_sizing_adjustment.json
+        # "bounds") per-ticker nudge. Absent/stale/malformed publishes are
+        # already normalized to an empty mapping by
+        # dca_config.load_ml_sizing_adjustment, so .get(..., 1.0) is a
+        # provable no-op with no ML output configured. Applied only to a
+        # positive tier match -- a 0x (no-buy) drop must stay 0x regardless of
+        # the ML factor. Applied BEFORE the kill-switch cap below so the
+        # kill-switch remains the final word on scaling.
+        ml_factor = config.ml_sizing_adjustment.get((ticker or "").upper(), 1.0)
+        multiplier = multiplier * ml_factor
     multiplier = min(multiplier, 5.0)
     if kill_switch_engaged(config):
         multiplier = min(multiplier, 1.0)
@@ -2369,6 +2476,11 @@ def evaluate_source_signal(
     drop_vs_previous_close = (previous_close - decision_price) / previous_close
     drop_vs_previous_close_pct = drop_vs_previous_close * 100.0
     buy_multiplier = graded_buy_multiplier(drop_vs_previous_close, config, ticker)
+    # See ReconciledDecision.ladder_multiplier's own docstring: the raw
+    # ladder tier match, before the ML nudge/caps buy_multiplier already
+    # reflects, kept separately for the high_multiplier_threshold selloff-
+    # breadth count.
+    ladder_multiplier = raw_ladder_multiplier(drop_vs_previous_close, config, ticker)
     selected_base_amount_usd, base_selection_reason = select_first_allocation_base_usd(
         decision_price, previous_close, previous_low, config, ticker
     )
@@ -2380,6 +2492,18 @@ def evaluate_source_signal(
         # carry a below_prior_close_only/and_low reason despite being a no-buy.
         base_selection_reason = BASE_NOT_BELOW_CLOSE
     suggested_amount_usd = selected_base_amount_usd * buy_multiplier
+    if buy_multiplier > 0:
+        # ml-forecaster's per-ticker nudge (already folded into buy_multiplier
+        # by graded_buy_multiplier) can push an otherwise-valid tier match's
+        # effective multiplier below 1.0 -- its published bounds allow
+        # factors down to 0.5 -- which combined with the $1-floored base can
+        # still land a genuine buy below the broker's $1 minimum notional
+        # (e.g. a 1x tier * 0.5 factor = $0.50). Re-floor the FINAL dollar
+        # amount here, not the multiplier itself (which would distort tier
+        # semantics like high_multiplier_threshold comparisons elsewhere),
+        # and only when this is a genuine buy -- a 0x (no-buy) must stay $0
+        # (Codex review: "Keep ML-adjusted buys above the broker minimum").
+        suggested_amount_usd = max(1.0, suggested_amount_usd)
 
     below_previous_close = decision_price < previous_close
     # A calibrated symbol's own first tier is the authoritative minimum drop
@@ -2440,6 +2564,7 @@ def evaluate_source_signal(
         intraday_trend_pct=intraday_trend_pct,
         drop_vs_previous_close_pct=drop_vs_previous_close_pct,
         buy_multiplier=buy_multiplier if action == Action.BUY else 0.0,
+        ladder_multiplier=ladder_multiplier if action == Action.BUY else 0.0,
         suggested_amount_usd=suggested_amount_usd if action == Action.BUY else 0.0,
         previous_low=previous_low,
         selected_base_amount_usd=(
@@ -2519,6 +2644,7 @@ def reconcile_signals(
             finance_signal=finance_signal,
             robinhood_signal=robinhood_signal,
             buy_multiplier=winning_signal.buy_multiplier,
+            ladder_multiplier=winning_signal.ladder_multiplier,
             suggested_amount_usd=winning_signal.suggested_amount_usd,
             selected_base_amount_usd=winning_signal.selected_base_amount_usd,
             **_target_fields(winning_signal),
@@ -2541,6 +2667,7 @@ def reconcile_signals(
             finance_signal=finance_signal,
             robinhood_signal=robinhood_signal,
             buy_multiplier=robinhood_signal.buy_multiplier,
+            ladder_multiplier=robinhood_signal.ladder_multiplier,
             suggested_amount_usd=robinhood_signal.suggested_amount_usd,
             selected_base_amount_usd=robinhood_signal.selected_base_amount_usd,
             **_target_fields(robinhood_signal),
@@ -2675,6 +2802,253 @@ def _signal_target_price(decision: ReconciledDecision) -> Optional[float]:
         if signal is not None and signal.decision_price > 0:
             return signal.decision_price
     return None
+
+
+def _signal_previous_close(decision: ReconciledDecision) -> Optional[float]:
+    """Return the prior regular-session close used as the drop basis.
+
+    Mirrors :func:`_signal_target_price`'s finance-preferred, Robinhood-fallback
+    order. Returns ``None`` when neither source carried a usable value.
+    """
+    for signal in (decision.finance_signal, decision.robinhood_signal):
+        if signal is not None and signal.previous_close > 0:
+            return signal.previous_close
+    return None
+
+
+# Same-source-price-agreement tolerance used only by the inverse-Martingale
+# accumulator's cross-source safety check (see
+# _inverse_martingale_reconciled_price) -- not related to the broker spread
+# gate's max_bid_ask_spread_pct, which bounds a single source's own bid/ask.
+_INVERSE_MARTINGALE_SOURCE_AGREEMENT_TOLERANCE = 0.02
+
+
+def _inverse_martingale_reconciled_price(decision: ReconciledDecision) -> Optional[Tuple[float, float]]:
+    """Cross-source-verified ``(decision_price, previous_close)``, or ``None``.
+
+    The accumulator bypasses ``evaluate_source_signal``'s normal action-based
+    BUY gate: an enrolled ticker's ladder multiplier is forced to ``0.0`` by
+    ``graded_buy_multiplier``, so ``decision.action`` is never ``BUY`` and
+    ``reconcile_signals``'s own finance/Robinhood-disagreement handling never
+    gets a chance to run for it (Codex review: "Reconcile provider prices
+    before firing the accumulator" -- without this, a single source alone
+    reporting a recovery, while the other stays at the low or errors, could
+    fire a real order despite the two providers actively disagreeing).
+
+    This applies the same safety bar directly to the two raw signals instead:
+    both sources must be present, neither may carry a ``provider_error``, and
+    their decision prices AND prior closes must agree within
+    ``_INVERSE_MARTINGALE_SOURCE_AGREEMENT_TOLERANCE``. Deliberately more
+    conservative than ``reconcile_signals`` (which allows a Robinhood-only
+    BUY when finance is merely unavailable, not erroring): a disagreement or
+    single-source gap here only delays this ticker's fire to a later run
+    (deferred, not lost), so there is no reason to accept single-source
+    trust for a decision that risks a synthetic, non-ladder-gated order.
+    """
+    finance = decision.finance_signal
+    robinhood = decision.robinhood_signal
+    if finance is None or robinhood is None:
+        return None
+    if finance.provider_error or robinhood.provider_error:
+        return None
+    # A NaN/inf price from either source must be caught explicitly, not
+    # inferred from the positivity/tolerance checks below: EVERY comparison
+    # against NaN is false (so "nan <= 0" never rejects it), and "inf > x"
+    # is true while "inf > inf" is false -- an infinite finance.decision_price
+    # would sail past the tolerance check below (since it computes
+    # tolerance * inf = inf too, and inf is never > inf), then win
+    # _signal_target_price's own "> 0" preference check (inf > 0 is true),
+    # handing an infinite decision_price to the accumulator. Fed into
+    # evaluate_inverse_martingale_step, an infinite decision_price makes
+    # drop_metric go to -inf (a "price" infinitely above the prior close),
+    # which makes ANY active cycle's recovery check
+    # ((lowest_drop_seen - drop_metric) >= recovery_offset) trivially true --
+    # firing a real synthetic order regardless of the actual accumulated
+    # balance's true price history (Codex review: "Reject non-finite
+    # reconciled prices").
+    if not (
+        math.isfinite(finance.decision_price)
+        and math.isfinite(robinhood.decision_price)
+        and math.isfinite(finance.previous_close)
+        and math.isfinite(robinhood.previous_close)
+    ):
+        return None
+    if finance.decision_price <= 0 or robinhood.decision_price <= 0:
+        return None
+    if finance.previous_close <= 0 or robinhood.previous_close <= 0:
+        return None
+    tolerance = _INVERSE_MARTINGALE_SOURCE_AGREEMENT_TOLERANCE
+    if abs(finance.decision_price - robinhood.decision_price) > tolerance * finance.decision_price:
+        return None
+    if abs(finance.previous_close - robinhood.previous_close) > tolerance * finance.previous_close:
+        return None
+    decision_price = _signal_target_price(decision)
+    previous_close = _signal_previous_close(decision)
+    if decision_price is None or previous_close is None:
+        return None
+    return decision_price, previous_close
+
+
+def _inverse_martingale_advance_age_for_missing_data(
+    ledger: InverseMartingaleLedger, ticker: str, trading_day: date
+) -> None:
+    """Keep an active cycle's age clock ticking through a session where this
+    ticker's decision data is unusable (missing signal, provider error, or a
+    cross-source disagreement _inverse_martingale_reconciled_price refuses).
+
+    The injection site `continue`s past both of those cases BEFORE the
+    ledger is ever read for a real evaluation -- so an active cycle simply
+    never advanced trading_days_active/last_evaluated_trading_day for that
+    session, no matter how many sessions in a row this happened. A ticker
+    with unavailable data for well over max_cycle_days could then return
+    months later and still fire its stale accumulated balance (evaluated
+    against today's price but accumulated against a cycle-start reference
+    close from a completely different market regime), and the same thing
+    happens if a ticker leaves and later rejoins the active universe (Codex
+    review: "Age cycles across missing-data sessions"). This performs the
+    SAME age-only bookkeeping evaluate_inverse_martingale_step's own
+    trading_days_active counter does, without running a real evaluation (no
+    price data to evaluate against) and without touching anything else
+    about the cycle.
+
+    Best-effort, via the ledger's own compare-and-swap: if a concurrent
+    process's REAL evaluation for this ticker has already moved the state
+    (e.g. a different stream that DOES have data for this ticker this same
+    session), that write already leaves the age current for real reasons,
+    and this one is simply skipped rather than retried or forced.
+
+    A `settlement_pending` cycle is left COMPLETELY untouched, never even
+    having its age fields bumped -- a partial fire's owning process is
+    still between its own claim and its own deferred settlement, and this
+    helper's `dict(tracker_state)` copy would otherwise carry
+    `settlement_pending` forward into a NEW on-disk state that still
+    matches `expected_prior_state` for a compare-and-swap here, but no
+    longer matches the EXACT state the owning process's settlement step
+    expects: that settlement's own compare-and-swap would then fail,
+    silently discarding whatever it placed if it succeeded, or leaving
+    `settlement_pending` stuck forever (no other process would ever clear
+    it) if it didn't (Codex review: "Preserve pending settlement leases
+    during age-only updates"). Mirrors
+    evaluate_inverse_martingale_step()'s own refusal to advance a pending
+    lease at all -- the pending lease always wins, here too.
+
+    Stamps `last_evaluated_is_real=False` alongside the date, NOT
+    `last_evaluated_stream` -- that field is deliberately left at whatever
+    a REAL evaluation last set it to (or absent, on a genuinely fresh
+    tracker). `last_evaluated_trading_day` still has to move to today, or a
+    genuine same-day evaluation later would increment `trading_days_active`
+    a second time for one calendar day -- but that means a STATUS_FIRING
+    tracker last really evaluated on an EARLIER day by, say, "afternoon"
+    would otherwise carry that stale stream name forward into today's date
+    stamp. If "afternoon" also happens to be the first stream with usable
+    data TODAY, evaluate_inverse_martingale_step's STATUS_FIRING same-day
+    guard (`last_evaluated_trading_day == today and last_evaluated_stream
+    in (None, stream)`) would misread that as a retry of a stream that
+    never actually touched this ticker today, and silently swallow the
+    real continuation instead of placing it -- indefinitely, if only that
+    one stream ever has usable data (Codex review: "Separate age updates
+    from the retry stream identity"). `last_evaluated_is_real=False` is the
+    third signal that guard now also checks, specifically to distinguish
+    "the date moved because of a fabricated age-only bump" from "the date
+    moved because THIS stream genuinely evaluated the ticker today" --
+    every real evaluation path in dca_inverse_martingale.py restamps it
+    back to True the moment it actually runs.
+    """
+    try:
+        tracker_state = ledger.read(ticker)
+    except CorruptedLedgerStateError as exc:
+        # Same "skip only this ticker, leave the file for manual recovery"
+        # contract as the real-evaluation branch's identical handling.
+        logger.error("inverse-Martingale ledger unreadable for %s: %s", ticker, exc)
+        return
+    if not tracker_state or tracker_state.get("status", STATUS_NONE) == STATUS_NONE:
+        return  # no active cycle to age
+    if tracker_state.get("settlement_pending"):
+        return  # a pending settlement lease is never touched by an age-only update
+    trading_day_iso = trading_day.isoformat()
+    if tracker_state.get("last_evaluated_trading_day") == trading_day_iso:
+        return  # already advanced (or genuinely evaluated) today
+    status = tracker_state.get("status", STATUS_NONE)
+    accumulated = float(tracker_state.get("accumulated_usd", 0.0))
+    new_state = dict(tracker_state)
+    new_state["trading_days_active"] = int(tracker_state.get("trading_days_active", 0)) + 1
+    new_state["last_evaluated_trading_day"] = trading_day_iso
+    new_state["last_evaluated_is_real"] = False
+    ledger.claim_fire(
+        ticker,
+        expected_prior_state=tracker_state,
+        new_state=new_state,
+        step=InverseMartingaleStep(
+            status_before=status,
+            status_after=status,
+            accumulated_usd_before=accumulated,
+            accumulated_usd_after=accumulated,
+            newly_crossed_tiers=(),
+            fired=False,
+            fire_amount_usd=0.0,
+            reason="data_unavailable_age_advanced",
+        ),
+    )
+
+
+def _inverse_martingale_reset_if_disabled_mid_cycle(
+    ledger: InverseMartingaleLedger, ticker: str, trading_day: date, stream: str
+) -> None:
+    """Abandon an active cycle when its ticker is no longer enrolled.
+
+    The injection site skips a ticker entirely -- never even reading its
+    ledger -- as soon as `_inverse_martingale_config` returns `{}` (the
+    ticker has no entry in config.inverse_martingale, or its `enabled` flag
+    was flipped to false). Left alone, that ticker's tracker.json sits
+    completely frozen: not aged, not abandoned, not reset. Meanwhile
+    `graded_buy_multiplier` no longer sees this ticker as enrolled either,
+    so the NORMAL ladder resumes buying its dips immediately -- and if an
+    operator later re-enrolls the ticker under the SAME tier/basis/unit_usd
+    configuration (an identical fingerprint), the frozen cycle wakes back
+    up and can fire the balance it accumulated before AND during the
+    disabled interval as a real order, on top of whatever the ladder
+    already bought in the meantime for the same descent (Codex review:
+    "Reset active cycles when enrollment is disabled"). Disabling
+    enrollment must abandon any active cycle outright, the same as any
+    other "this cycle's assumptions no longer hold" reset
+    (cycle_reset_basis_changed, cycle_reset_tier_config_changed) --
+    a future re-enrollment then starts genuinely fresh.
+
+    Best-effort via the ledger's own compare-and-swap, matching
+    _inverse_martingale_advance_age_for_missing_data's philosophy: a lost
+    CAS means a concurrent process already moved this ticker's state (real
+    enrollment, a real fire, etc.), and this reset is simply skipped rather
+    than forced over it. A `settlement_pending` cycle is left untouched for
+    the same reason that helper leaves one untouched too: overwriting it
+    here (even with a clean resolved_marker) would still move the on-disk
+    state out from under the owning process's own settlement compare-and-
+    swap, silently discarding whatever it placed.
+    """
+    try:
+        tracker_state = ledger.read(ticker)
+    except CorruptedLedgerStateError as exc:
+        logger.error("inverse-Martingale ledger unreadable for %s: %s", ticker, exc)
+        return
+    status = tracker_state.get("status", STATUS_NONE) if tracker_state else STATUS_NONE
+    if not tracker_state or status == STATUS_NONE:
+        return  # nothing active to reset (already none, or never started)
+    if tracker_state.get("settlement_pending"):
+        return  # a pending settlement lease is never touched by this reset either
+    ledger.claim_fire(
+        ticker,
+        expected_prior_state=tracker_state,
+        new_state=resolved_marker(trading_day, stream),
+        step=InverseMartingaleStep(
+            status_before=status,
+            status_after=STATUS_NONE,
+            accumulated_usd_before=float(tracker_state.get("accumulated_usd", 0.0)),
+            accumulated_usd_after=0.0,
+            newly_crossed_tiers=(),
+            fired=False,
+            fire_amount_usd=0.0,
+            reason="cycle_reset_enrollment_disabled",
+        ),
+    )
 
 
 def _afternoon_decision_price(decision: ReconciledDecision) -> Optional[float]:
@@ -3220,6 +3594,11 @@ def _build_buy_candidates(
             "ticker": decision.ticker,
             "reason": decision.reason,
             "buy_multiplier": decision.buy_multiplier,
+            # See ReconciledDecision.ladder_multiplier's own docstring --
+            # the high_multiplier_threshold selloff-breadth count just below
+            # reads THIS field, not buy_multiplier, so an ML sizing nudge
+            # can't move a ticker across the threshold on its own.
+            "ladder_multiplier": decision.ladder_multiplier,
             "is_pending_credit_flush": is_pending_credit_flush,
             # Recorded so a later same-day top-up guard reading this run back as
             # prior-allocation context can reuse this run's base if it was the
@@ -3481,7 +3860,12 @@ def build_run_artifacts(
     skipped_count = 0
     for c in buy_candidates:
         planned_spend += c["planned_amount_usd"]
-        if (c.get("buy_multiplier") or 0.0) >= config.high_multiplier_threshold:
+        # ladder_multiplier, not buy_multiplier: this count feeds a market-
+        # BREADTH signal (select_budget_tier), and buy_multiplier already
+        # has the ML sizing nudge folded in -- see ReconciledDecision.
+        # ladder_multiplier's own docstring for why that distinction matters
+        # here specifically.
+        if (c.get("ladder_multiplier") or 0.0) >= config.high_multiplier_threshold:
             high_multiplier_signals += 1
         if c.get("status") == "submitted":
             submitted_count += 1
@@ -8042,13 +8426,27 @@ def _process_buy_candidate(
     # retry -- recording it as "submitted" without ever calling
     # place_market_buy (Codex review, PR #231: "Separate manual ref IDs from
     # scheduled retry IDs"; mirrors morning_dca.py's identical fix, PR #42).
+    # A synthetic inverse-Martingale fire candidate (decision.synthetic_source
+    # == "inverse_martingale") gets its own "-imart-" segment so it is
+    # distinguishable in the order history / same-stream duplicate checks from
+    # an ordinary ladder buy for the same ticker/day. The injection site
+    # (_run_once_impl) never lets a guarded ticker (one with a prior same-day
+    # allocation) reach this function as a fire candidate, so this branch and
+    # the "topup" branch above it are mutually exclusive in practice; the
+    # ordering here still puts "topup" first so a future caller that violated
+    # that invariant would fail toward the more conservative, already
+    # extensively reviewed top-up ref-id convention rather than the newer one.
     ref_id = (
         f"{_graded_dca_ref_id_prefix(ctx.stream, 'topup')}-{ctx.trading_day.isoformat()}-{ticker}"
         if ticker_guarded
         else (
+            f"{_graded_dca_ref_id_prefix(ctx.stream, 'imart')}-{ctx.trading_day.isoformat()}-{ticker}"
+            if decision.synthetic_source == "inverse_martingale"
+            else (
             f"{_graded_dca_ref_id_prefix(ctx.stream)}-{ctx.trading_day.isoformat()}-{ticker}"
             if ctx.scheduled
             else f"{_graded_dca_ref_id_prefix(ctx.stream, 'manual')}-{ctx.trading_day.isoformat()}-{ticker}"
+            )
         )
     )
     if ctx.config.dry_run:
@@ -8908,6 +9306,398 @@ def _run_once_impl(
                     buy_candidates.append(flush_decision)
             buy_candidates.sort(key=allocation_sort_key)
 
+    # Opt-in inverse-Martingale deferred-accumulation sizing mode (off by
+    # default; see dca_inverse_martingale.py and config/inverse_martingale.json).
+    # Tracks what the normal ladder would have bought at each dip tier without
+    # buying, then fires the accumulated total as ONE order once price
+    # recovers by the configured offset. Gated on `scheduled` so an ad hoc,
+    # manual, or --demo invocation never advances or fires a real multi-day
+    # accumulator cycle. Placed here, BEFORE the planned_spend loop below, so
+    # a fire this run is correctly reflected in tier selection -- exactly
+    # like the credit-ledger flush above.
+    #
+    # Cleanup pass for tickers whose accumulator cycle is no longer backed by
+    # an active enrollment -- runs regardless of whether config.inverse_
+    # martingale is non-empty, unlike the tracking/firing block below. If
+    # scoped to that block's own `if ... and config.inverse_martingale:`
+    # guard, disabling enrollment for EVERY ticker at once (the mapping
+    # empties out entirely, or the feature is made inactive) would skip past
+    # this cleanup completely -- leaving every previously-active cycle
+    # frozen with no path back to reset, the same bug the per-ticker
+    # disabled-enrollment reset below was meant to close, just at the
+    # whole-mapping granularity instead of the per-ticker one (Codex review:
+    # "Run enrollment cleanup when the mapping becomes empty"). Scoped to
+    # the ON-DISK ledger tree, not `tradable_tickers`, so it also covers a
+    # ticker that left the active universe entirely, not just one still-
+    # tradable but disabled. Gated cheaply on the ledger root directory
+    # actually existing -- for the overwhelming majority of runs (the
+    # feature has never been used at all), stream_root(
+    # "inverse_martingale_dca") was never created, so this costs one
+    # directory-existence check and nothing more.
+    # Skipped entirely for the "morning" stream: run_dca.run_slot("1030ET")
+    # temporarily narrows config.tickers to the 9:45 pre-flight-admitted
+    # subset (`slot_config = replace(config, tickers=slot_tickers, ...)`,
+    # run_dca.py's own morning-only preflight gate), so `tradable_tickers`
+    # below is a SLOT-FILTERED evaluation subset during this stream, not the
+    # canonical configured universe -- unlike "midday"/"afternoon", which
+    # always see the full config.tickers. Without this guard, a ticker
+    # merely gated out of THIS ONE morning slot (a transient reason -- a
+    # wide spread, missing data -- not a genuine removal from config/
+    # tickers.json) would look identical, from this cleanup pass's own
+    # tradable-set check, to a ticker genuinely dropped from the universe or
+    # excluded, and its real accumulated balance would be discarded even
+    # though the ticker remains globally active and simply returns in the
+    # midday/afternoon slots the same day (Codex review: "Preserve cycles
+    # excluded only from the current slot"). Deferring this cleanup to
+    # "midday"/"afternoon" instead -- both of which always see the true
+    # canonical universe -- costs a genuinely-removed ticker's own cleanup
+    # at most a few hours' delay later the same day, not a false discard of
+    # real state.
+    if scheduled and stream != "morning":
+        im_cleanup_ledger = InverseMartingaleLedger()
+        if im_cleanup_ledger.root.is_dir():
+            # A ticker still enrolled in config.inverse_martingale is only
+            # SAFE to leave alone here if it also stays reachable by the
+            # tracking/firing loop below, which iterates tradable_tickers
+            # (config.tickers minus config.excluded_tickers), not every
+            # config.inverse_martingale key. A ticker removed from
+            # config.tickers entirely, or added to excluded_tickers, while
+            # its inverse-Martingale entry remains enabled/enrolled passes
+            # `_inverse_martingale_config(...)` truthy here and would
+            # otherwise be skipped as "still enrolled" -- but it can never
+            # be evaluated again (not in tradable_tickers), so its balance
+            # and age freeze indefinitely, bypassing max_cycle_days
+            # entirely, and can resume as a stale obligation from a
+            # completely different market regime if the ticker is later
+            # restored to the active universe (Codex review: "Reset cycles
+            # for tickers outside the tradable universe"). Reset exactly
+            # like a disabled-enrollment cycle -- the same "no longer
+            # reachable, no longer trustworthy" contract, just a different
+            # removal path.
+            im_tradable_set = frozenset(tradable_tickers)
+            for im_ticker_dir in sorted(im_cleanup_ledger.root.iterdir()):
+                if not im_ticker_dir.is_dir():
+                    continue
+                im_cleanup_ticker = im_ticker_dir.name
+                if _inverse_martingale_config(im_cleanup_ticker, config) and im_cleanup_ticker in im_tradable_set:
+                    continue  # still enrolled AND tradable -- nothing to clean up
+                _inverse_martingale_reset_if_disabled_mid_cycle(
+                    im_cleanup_ledger, im_cleanup_ticker, trading_day, stream
+                )
+
+    # im_pending_fires carries this run's fired-but-not-yet-settled
+    # accumulator steps forward to the deferred-settlement block below (after
+    # _process_buy_candidates_batch runs) -- see that block's own comment for
+    # why settlement cannot happen here.
+    im_pending_fires: Dict[str, Tuple[Dict[str, Any], Dict[str, Any], InverseMartingaleStep]] = {}
+    if scheduled and config.inverse_martingale:
+        already_included = {d.ticker for d in buy_candidates}
+        decisions_by_ticker = {d.ticker: d for d in decisions}
+        im_ledger = InverseMartingaleLedger()
+        for im_ticker in tradable_tickers:
+            im_cfg = _inverse_martingale_config(im_ticker, config)
+            if not im_cfg:
+                # Already handled by the cleanup pass above, which runs
+                # regardless of whether config.inverse_martingale is empty
+                # -- nothing further to do for this ticker here.
+                continue
+            # `already_included` reflects EVERY candidate buy_candidates
+            # already carries this run -- a genuine normal-ladder BUY, or a
+            # non-BUY decision the credit-ledger flush block just above
+            # appended so a same-day cumulative-credit balance can flush
+            # (see that block's own comment: it deliberately reuses the
+            # ticker's real, non-BUY final decision). _process_buy_
+            # candidates_batch's outcome tracking is keyed by ticker, so
+            # only one candidate per ticker can flow through a single run
+            # -- but that only means a SECOND candidate cannot be injected
+            # for this ticker, not that tracking must stop. An earlier
+            # version of this code skipped this ticker's evaluation
+            # ENTIRELY whenever already_included matched, which not only
+            # blocked injecting a fire candidate (correct) but also
+            # silently dropped tier tracking for the rest of the day --
+            # if this is the FINAL scheduled slot and the FIRST time price
+            # crosses a tier, that crossing is never persisted at all, and
+            # is gone for good once tomorrow starts from a fresh
+            # previous_close reference (Codex review: "Track tiers despite
+            # a pending-credit flush candidate"). Mirrors the identical fix
+            # already applied for a PRIOR same-day allocation (guard_active)
+            # just below: tracking always runs; only fire-injection defers.
+            im_batch_occupied = im_ticker in already_included
+            im_signal = decisions_by_ticker.get(im_ticker)
+            if im_signal is None:
+                _inverse_martingale_advance_age_for_missing_data(im_ledger, im_ticker, trading_day)
+                continue
+            # Enrollment forces this ticker's normal buy_multiplier to 0.0
+            # (see graded_buy_multiplier), so decision.action is never BUY
+            # here and reconcile_signals' own finance/Robinhood-disagreement
+            # handling never runs for it. Apply the same cross-source safety
+            # bar directly to the two raw signals instead of trusting
+            # whichever source happens to report a price first.
+            im_reconciled_price = _inverse_martingale_reconciled_price(im_signal)
+            if im_reconciled_price is None:
+                _inverse_martingale_advance_age_for_missing_data(im_ledger, im_ticker, trading_day)
+                continue
+            im_decision_price, im_previous_close = im_reconciled_price
+            im_stddev_reference = None
+            if im_cfg["basis"] == "stddev":
+                im_stddev_reference = stddev_reference_for_ticker(
+                    im_ticker,
+                    as_of=trading_day,
+                    window_days=int(im_cfg.get("stddev_window_days", 20)),
+                )
+            try:
+                im_tracker_state = im_ledger.read(im_ticker)
+            except CorruptedLedgerStateError as exc:
+                # A truncated/malformed tracker.json (or an unsupported
+                # ledger version) must NOT be silently treated as "no cycle
+                # yet" -- evaluating from a fabricated {} would start a
+                # fresh cycle and this ticker's own compare-and-swap write
+                # below would then overwrite the damaged file, permanently
+                # discarding whatever dollar balance it held with no way to
+                # recover it (Codex review: "Refuse unreadable accumulator
+                # state instead of resetting it"). Skip ONLY this ticker
+                # this run -- leaving the file untouched for manual
+                # recovery -- rather than crashing the whole scheduled run
+                # over one ticker's corrupted state.
+                logger.error("inverse-Martingale ledger unreadable for %s: %s", im_ticker, exc)
+                continue
+            im_new_state, im_step = evaluate_inverse_martingale_step(
+                im_tracker_state,
+                decision_price=im_decision_price,
+                previous_close=im_previous_close,
+                trading_day=trading_day,
+                tier_config=im_cfg["tiers"],
+                unit_usd=config.inverse_martingale_unit_usd,
+                recovery_offset=im_cfg["recovery_offset"],
+                max_cycle_days=config.inverse_martingale_max_cycle_days,
+                max_fire_attempts=config.inverse_martingale_max_fire_attempts,
+                basis=im_cfg["basis"],
+                stddev_reference=im_stddev_reference,
+                per_order_cap_usd=config.max_per_order_usd,
+                stream=stream,
+            )
+            im_guarded = guard_active and prior_same_day_allocations.get(im_ticker) is not None
+            if im_step.fired and im_step.fire_amount_usd > 0 and (im_guarded or im_batch_occupied):
+                # This ticker cannot safely carry a fire candidate this run,
+                # for one of two independent reasons:
+                #   - im_guarded: a prior same-day allocation exists (bought
+                #     earlier today by a DIFFERENT stream/entry point) --
+                #     _process_buy_candidate would treat it as ticker_guarded
+                #     and run the top-up guard's ladder-multiplier-based
+                #     delta math against a flat, non-ladder dollar amount,
+                #     which that guard was never designed to interpret.
+                #   - im_batch_occupied: buy_candidates already carries a
+                #     candidate for this ticker THIS run (a normal-ladder
+                #     BUY, or a non-BUY credit-ledger flush) --
+                #     _process_buy_candidates_batch's outcome tracking is
+                #     keyed by ticker, so a second candidate for the same
+                #     ticker in the same run would corrupt outcome tracking
+                #     for all but the last one.
+                # Do NOT claim/persist im_new_state's fire-branch accounting
+                # (a reduced accumulated_usd, a settlement_pending lease, or
+                # a resolved_marker that collapses the cycle straight to
+                # "none") -- the SAME recovery must be re-evaluated fresh,
+                # from the unchanged pre-fire balance/status, on a later
+                # unblocked run rather than being silently claimed and then
+                # never placed.
+                #
+                # The cycle's AGE must still advance, though. A bare
+                # `continue` here (this branch's prior behavior) leaves
+                # trading_days_active and last_evaluated_trading_day frozen
+                # at whatever they were before this evaluation -- so a
+                # ticker that happens to recover into a blocked slot every
+                # single session never ages at all, no matter how many real
+                # trading sessions pass, and max_cycle_days can never
+                # abandon it (Codex review: "Advance cycle age when
+                # deferring a guarded recovery"). This mirrors
+                # _inverse_martingale_advance_age_for_missing_data's
+                # philosophy -- bump only the age fields, touch nothing else
+                # -- but starts from im_tracker_state (already read above,
+                # no need to re-read the ledger) rather than im_new_state,
+                # so none of the fire branch's accounting can leak through:
+                # im_new_state's own trading_days_active is absent entirely
+                # when the fire fully resolves the cycle (resolved_marker
+                # carries no per-cycle fields at all), so it can't be reused
+                # here regardless.
+                im_prior_trading_days_active = int(im_tracker_state.get("trading_days_active", 0))
+                if im_tracker_state.get("last_evaluated_trading_day") != trading_day.isoformat():
+                    im_prior_trading_days_active += 1
+                im_aged_state = dict(im_tracker_state)
+                im_aged_state["trading_days_active"] = im_prior_trading_days_active
+                im_aged_state["last_evaluated_trading_day"] = trading_day.isoformat()
+                # This is an age-only bump, not a real evaluation by
+                # `stream` -- last_evaluated_stream is deliberately left
+                # untouched (still whatever a real evaluation last set it
+                # to), and last_evaluated_is_real is stamped False so a
+                # later same-day evaluation from the stream that ends up
+                # matching that stale, carried-forward name isn't misread
+                # as a retry of ITS OWN prior (nonexistent) evaluation
+                # today. Mirrors _inverse_martingale_advance_age_for_
+                # missing_data's identical fix -- see that helper's own
+                # docstring and dca_inverse_martingale.py's STATUS_FIRING
+                # same-day guard for the full rationale (Codex review:
+                # "Mark deferred-fire age updates as non-real").
+                im_aged_state["last_evaluated_is_real"] = False
+                im_ledger.claim_fire(
+                    im_ticker,
+                    expected_prior_state=im_tracker_state,
+                    new_state=im_aged_state,
+                    step=InverseMartingaleStep(
+                        status_before=im_step.status_before,
+                        status_after=im_step.status_before,
+                        accumulated_usd_before=im_step.accumulated_usd_before,
+                        accumulated_usd_after=im_step.accumulated_usd_before,
+                        newly_crossed_tiers=(),
+                        fired=False,
+                        fire_amount_usd=0.0,
+                        reason=(
+                            "fire_deferred_same_day_guard" if im_guarded else "fire_deferred_batch_occupied"
+                        ),
+                    ),
+                )
+                continue
+            if im_step.fired and im_step.fire_amount_usd > 0:
+                # Atomically CLAIM this fire (compare-and-swap on the
+                # pre-fire state) before doing anything else with it. Two
+                # overlapping scheduled-stream processes (a slow/retried
+                # earlier slot still running when a later one starts) could
+                # otherwise both read the SAME pre-fire tracker state here,
+                # both independently decide to fire, and both reach broker
+                # placement for the same descent -- neither the ledger's
+                # per-write lock alone nor the same-stream duplicate check
+                # would catch it, since these candidates are deliberately
+                # never ticker_guarded (Codex review: "Reserve each fire
+                # atomically before broker placement"). A lost claim means
+                # another process already claimed this ticker this run;
+                # skip it entirely -- it is that OTHER process's candidate to
+                # carry to placement, not lost.
+                if not im_ledger.claim_fire(
+                    im_ticker,
+                    expected_prior_state=im_tracker_state,
+                    new_state=im_new_state,
+                    step=im_step,
+                ):
+                    continue
+                # Full settlement (confirming, adjusting, or rolling back the
+                # claim) is DEFERRED until the real placement outcome is
+                # known -- see the block below, after
+                # _process_buy_candidates_batch runs. The claim above already
+                # reserved the ticker (preventing a concurrent duplicate
+                # claim); it does not yet know whether THIS run's own
+                # placement will actually succeed.
+                # im_tracker_state (the PRE-claim, pre-fire persisted state)
+                # is carried forward alongside im_new_state so the deferred
+                # settlement can rebuild a correct continuation/rollback
+                # state even when im_new_state is the minimal post-full-fire
+                # marker (see dca_inverse_martingale.resolved_marker) -- that
+                # marker deliberately carries no per-cycle fields
+                # (cycle_reference_close, stddev_reference,
+                # crossed_tier_thresholds), so building a partial-fire
+                # continuation FROM it would silently drop the frozen sigma
+                # reference a stddev-basis cycle needs on its next
+                # evaluation (Codex review: "Retain the frozen sigma in
+                # partial-fire state").
+                im_pending_fires[im_ticker] = (im_tracker_state, im_new_state, im_step)
+                fire_decision = replace(
+                    im_signal,
+                    action=Action.BUY,
+                    reason="inverse_martingale_fire",
+                    buy_multiplier=0.0,
+                    # Enrollment forces every source signal for this ticker
+                    # to a non-BUY action (buy_multiplier=0.0), so
+                    # reconcile_signals() never took the Action.BUY branch
+                    # that would have populated target_price/target_price_
+                    # source/target_quote_time/decision_bar_close via
+                    # _target_fields() -- im_signal's own copies of these
+                    # fields are still ReconciledDecision's bare defaults
+                    # (target_price=0.0, target_price_source="", etc.).
+                    # Left unset, every filled inverse-Martingale order is
+                    # logged against a $0 target: build_execution_record()'s
+                    # `if target_price:` guard skips slippage_pct entirely,
+                    # and downstream execution-quality classification reads
+                    # the same zero target, corrupting the execution-quality
+                    # artifacts for every synthetic fire (Codex review:
+                    # "Populate execution targets on synthetic fire
+                    # decisions"). im_signal.finance_signal is guaranteed
+                    # present and verified here -- _inverse_martingale_
+                    # reconciled_price() above already required both
+                    # sources present, error-free, and in agreement before
+                    # this branch could ever be reached -- so it's safe to
+                    # source the target fields from it directly, matching
+                    # reconcile_signals()'s own finance-preferred convention.
+                    **_target_fields(im_signal.finance_signal),
+                    # evaluate_inverse_martingale_step() itself already floors
+                    # fire_amount_usd to the broker minimum (Codex review:
+                    # "Keep sub-dollar fires in the accumulator" -- the floor
+                    # used to live only here, understating what the ledger
+                    # actually claimed/settled against relative to what was
+                    # really submitted). This max() is now pure defense in
+                    # depth against that invariant, not the primary floor.
+                    suggested_amount_usd=max(1.0, im_step.fire_amount_usd),
+                    # The kill-switch cap in _process_buy_candidate clamps
+                    # order_amount to THIS field when the risk guard is
+                    # engaged -- setting it to the full fire amount would make
+                    # that cap a complete no-op for these synthetic
+                    # candidates. Use the accumulator's own per-unit base
+                    # instead (also floored at $1 for the same broker-minimum
+                    # reason above), so an engaged kill switch still caps a
+                    # fire down to the base amount, exactly as it does for a
+                    # normal ladder buy (Codex review: "Preserve the
+                    # kill-switch cap for synthetic fires").
+                    selected_base_amount_usd=max(1.0, config.inverse_martingale_unit_usd),
+                    synthetic_source="inverse_martingale",
+                )
+                buy_candidates.append(fire_decision)
+                already_included.add(im_ticker)
+                # Replace this ticker's entry in decisions_by_ticker (and,
+                # after the loop, in `decisions` itself -- the SAME list
+                # object run_result.decisions already references) with the
+                # synthetic fire decision. Without this, _build_buy_candidates
+                # and the signals.csv auto_buy_signal reconciliation both
+                # read the ORIGINAL pre-fire decision (non-BUY, enrollment's
+                # forced buy_multiplier=0.0) for this ticker even though
+                # candidate_outcomes now shows a real submitted order for
+                # it -- misclassifying a genuine inverse-Martingale fire as
+                # a pending-credit flush, with the wrong reason/multiplier,
+                # and leaving both source signal rows' auto_buy_signal at
+                # False (Codex review: "Preserve the synthetic fire decision
+                # in run artifacts").
+                decisions_by_ticker[im_ticker] = fire_decision
+            else:
+                # Not a fire this run (tier crossed, awaiting recovery, or a
+                # cycle abandoned by max_cycle_days/max_fire_attempts). Write
+                # via the SAME compare-and-swap the fire branch above uses,
+                # not an unconditional record_step() -- two overlapping
+                # processes evaluating the same ticker from the same
+                # snapshot but different prices could otherwise have one
+                # successfully claim_fire() a real order while the other,
+                # slightly slower to reach this else branch, unconditionally
+                # overwrites that claim with its own (now-stale) non-fire
+                # state. The fire would still be submitted, but its later
+                # settlement CAS would then fail against this overwritten
+                # state, stranding the already-spent balance in the ledger
+                # to be fired again later (Codex review: "Compare-and-swap
+                # every accumulator transition"). A lost CAS here means
+                # another process already advanced this ticker past the
+                # state this evaluation started from; skip writing rather
+                # than clobber it -- the ticker is re-evaluated fresh from
+                # whatever that other process left on a later run.
+                im_ledger.claim_fire(
+                    im_ticker,
+                    expected_prior_state=im_tracker_state,
+                    new_state=im_new_state,
+                    step=im_step,
+                )
+        buy_candidates.sort(key=allocation_sort_key)
+        # decisions_by_ticker preserves the original per-ticker key order
+        # from decisions (dict reassignment does not move an existing key),
+        # so this rebuild in place keeps `decisions` -- and, since
+        # run_result.decisions was assigned by reference to this SAME list
+        # object earlier in this function, run_result.decisions too --
+        # correctly reflecting any tickers this block replaced with a
+        # synthetic fire decision.
+        decisions[:] = list(decisions_by_ticker.values())
+
     # ⚡ Bolt Optimization: Use a single pass loop instead of multiple sum() generators
     # to eliminate O(N) object overhead when iterating DataFrames/lists.
     #
@@ -8944,7 +9734,9 @@ def _run_once_impl(
             ).incremental_order_amount
         else:
             planned_spend += d.suggested_amount_usd
-        if d.buy_multiplier >= config.high_multiplier_threshold:
+        # ladder_multiplier, not buy_multiplier -- see the identical
+        # comment on the other high_multiplier_threshold count above.
+        if d.ladder_multiplier >= config.high_multiplier_threshold:
             high_multiplier_signals += 1
 
     state.select_daily_budget(planned_spend, high_multiplier_signals, config)
@@ -9013,6 +9805,178 @@ def _run_once_impl(
     )
     errors_count += err_inc
     order_reviews_attempted += rev_inc
+
+    # Deferred inverse-Martingale settlement: now that _process_buy_candidates_batch
+    # has actually attempted every candidate (including the synthetic fires
+    # claimed above), resolve each claimed ticker's ledger using the REAL
+    # outcome instead of the pre-placement estimate computed at claim time.
+    #
+    # A claimed-but-unplaced amount is never simply left alone: this run
+    # already committed to it via claim_fire()'s compare-and-swap (so a
+    # concurrent process could not independently re-claim the same ticker),
+    # so "do nothing" here would strand that reservation forever. Instead
+    # every claimed ticker is explicitly resolved against however much was
+    # ACTUALLY placed (0 for a fully blocked/failed/dry-run attempt, a
+    # partial amount if a downstream cap such as the kill switch reduced it,
+    # or the full claimed amount in the common case), and the unplaced
+    # remainder -- if any -- is carried forward with its attempt count
+    # incremented, so it is retried on a later run rather than lost, and so
+    # repeated blocks/failures still converge on max_fire_attempts instead of
+    # relying solely on the much longer max_cycle_days cutoff (Codex review:
+    # "Count failed fire submissions toward the attempt limit").
+    #
+    # dry_run is deliberately NOT treated as a placement: no real broker
+    # order is ever submitted in that mode (mirrors record_buy() itself,
+    # which likewise never fires on the dry_run branch of
+    # _process_buy_candidate), so crediting a dry-run "success" as settled
+    # would defeat this mode's "deferred, not lost" contract for a repeated
+    # dry-run/--demo invocation (Codex review: "Preserve accumulator
+    # balances during dry runs").
+    if im_pending_fires:
+        im_settlement_ledger = InverseMartingaleLedger()
+        for im_ticker, (im_pre_fire_state, im_fired_state, im_fired_step) in im_pending_fires.items():
+            im_outcome = candidate_outcomes.get(im_ticker, {})
+            im_placed_amount = (
+                im_outcome.get("submitted_amount_usd") if im_outcome.get("status") == "submitted" else 0.0
+            ) or 0.0
+            if abs(im_placed_amount - im_fired_step.fire_amount_usd) < 0.005:
+                # Common case: the full claimed amount was actually placed --
+                # the claim already written by claim_fire() is correct as-is,
+                # EXCEPT for settlement_pending: the claim site sets that flag
+                # to reserve BOTH a partial-fire remainder (status stays
+                # "firing") AND a full-resolution claim (status collapses to
+                # "none") against a concurrent second claim/re-arm (see the
+                # guard in dca_inverse_martingale.evaluate_inverse_martingale_
+                # step()), and this settlement IS that flag's release point --
+                # leaving it set here would permanently freeze the ticker's
+                # accumulator, since nothing else ever clears it (Codex
+                # review: "Reserve partial fires until their placement
+                # settles"; "Keep full-fire claims leased until settlement").
+                # Stripping the flag is sufficient for both shapes: a
+                # partial-fire's stripped state is a normal STATUS_FIRING
+                # continuation, and a full-fire's stripped state is already
+                # the complete, minimal resolved_marker() shape claim_fire()
+                # wrote (status "none", last_evaluated_trading_day/stream) --
+                # neither needs any further reshaping here.
+                im_settlement_state = {k: v for k, v in im_fired_state.items() if k != "settlement_pending"}
+                im_settlement_step = im_fired_step
+            else:
+                # Either the placement was fully blocked/failed/dry-run
+                # (im_placed_amount == 0) or a downstream cap (most likely the
+                # kill-switch cap, now clamped to config.inverse_martingale_unit_usd
+                # -- see the claim site) reduced it below what was claimed. Roll
+                # the claim back to reflect however much was ACTUALLY placed.
+                im_adjusted_remainder = round(im_fired_step.accumulated_usd_before - im_placed_amount, 2)
+                if im_adjusted_remainder <= 0:
+                    im_adjusted_state = resolved_marker(trading_day, stream)
+                    im_adjusted_status_after = STATUS_NONE
+                else:
+                    # Built from im_pre_fire_state (the state read BEFORE the
+                    # claim), not im_fired_state -- a full-fire claim's
+                    # im_fired_state is the minimal post-resolution marker with
+                    # no per-cycle fields at all, so building a continuation FROM
+                    # it would silently drop cycle_reference_close/
+                    # stddev_reference/crossed_tier_thresholds, leaving a
+                    # frozen-stddev cycle permanently stuck (stddev_unavailable)
+                    # on its very next evaluation (Codex review: "Retain the
+                    # frozen sigma in partial-fire state").
+                    im_adjusted_state = dict(im_pre_fire_state)
+                    im_adjusted_state["status"] = STATUS_FIRING
+                    im_adjusted_state["accumulated_usd"] = im_adjusted_remainder
+                    # A dry-run outcome (config.dry_run=True) never reaches a
+                    # real broker at all -- im_placed_amount is unconditionally
+                    # 0 for it, exactly like a genuinely blocked/failed live
+                    # attempt, but it must NOT consume the same
+                    # max_fire_attempts retry budget: a scheduled dry-run/
+                    # --demo invocation exercising a recovered cycle would
+                    # otherwise silently abandon the accumulated balance after
+                    # max_fire_attempts dry runs, despite no broker order ever
+                    # having been submitted (Codex review: "Do not count dry
+                    # runs as fire attempts"). Preserve the PRE-fire attempt
+                    # count unchanged rather than bumping/initializing it.
+                    im_adjusted_state["fire_attempts"] = (
+                        int(im_pre_fire_state.get("fire_attempts", 0))
+                        if im_outcome.get("status") == "dry_run"
+                        else (
+                            1
+                            if im_fired_step.status_before != STATUS_FIRING
+                            else int(im_pre_fire_state.get("fire_attempts", 0)) + 1
+                        )
+                    )
+                    im_adjusted_state["last_evaluated_trading_day"] = trading_day.isoformat()
+                    # im_pre_fire_state's own last_evaluated_stream (carried
+                    # forward by the dict(im_pre_fire_state) copy above) can
+                    # be STALE -- stamped by whichever stream last touched
+                    # this cycle BEFORE this run's own claim, not necessarily
+                    # this run's own `stream`. Left unstamped, a genuine
+                    # same-stream retry of THIS slot (this settlement's own
+                    # rollback state, re-evaluated after a crash/restart)
+                    # would find last_evaluated_stream not in (None, stream)
+                    # and fail to match the STATUS_FIRING same-day retry
+                    # guard in evaluate_inverse_martingale_step -- treating
+                    # the retry as a genuinely new continuation, re-
+                    # incrementing fire_attempts and, once no
+                    # settlement_pending lease is set, submitting another
+                    # real order for what is really the same logical slot
+                    # (Codex review: "Stamp the settling stream on partial
+                    # rollbacks").
+                    im_adjusted_state["last_evaluated_stream"] = stream
+                    # im_pre_fire_state's own last_evaluated_is_real (also
+                    # carried forward by the dict(im_pre_fire_state) copy
+                    # above) can likewise be STALE -- False, if an age-only
+                    # bump (not a real per-stream evaluation) happened to be
+                    # the last thing to touch this cycle before this run's
+                    # own claim. Left unstamped, that stale False would make
+                    # dca_inverse_martingale.py's own STATUS_FIRING
+                    # same-stream retry guard (`tracker_state.get(
+                    # "last_evaluated_is_real", True)`) treat THIS run's own
+                    # genuine settlement as if it never really happened --
+                    # bypassing the guard on a same-day retry of this exact
+                    # slot and letting fire_attempts increment (or a second
+                    # real order submit) for what is really the same
+                    # logical continuation (Codex review: "Stamp rollback
+                    # evaluations as real"). This settlement IS a genuine
+                    # per-stream evaluation, so restamp it True alongside
+                    # the stream identity, matching every other real
+                    # evaluation site in dca_inverse_martingale.py.
+                    im_adjusted_state["last_evaluated_is_real"] = True
+                    im_adjusted_status_after = STATUS_FIRING
+                im_settlement_state = im_adjusted_state
+                im_settlement_step = replace(
+                    im_fired_step,
+                    fire_amount_usd=im_placed_amount,
+                    accumulated_usd_after=im_adjusted_remainder,
+                    status_after=im_adjusted_status_after,
+                )
+            # Settlement itself is a compare-and-swap against im_fired_state --
+            # the EXACT state this process's own earlier claim_fire() call
+            # wrote to disk -- rather than an unconditional record_step().
+            # When an accumulated balance exceeds max_per_order_usd, the
+            # claim above already writes an ordinary (non-leased)
+            # STATUS_FIRING continuation state, which looks to any other
+            # reader exactly like a normal, available-to-claim cycle -- a
+            # second overlapping process evaluating this same ticker could
+            # read it, decide to fire the remainder, and successfully
+            # claim_fire() its own chunk before THIS process reaches
+            # settlement. An unconditional overwrite here would then either
+            # discard that other process's legitimately claimed remainder or
+            # resurrect money this process already placed, depending on
+            # write order (Codex review: "Serialize partial-fire claims
+            # through settlement"). A failed CAS means exactly that
+            # collision happened; skip writing rather than clobber the
+            # newer state -- whichever process is currently ahead keeps
+            # ownership of the ledger's bookkeeping for this cycle. This
+            # narrows, but does not eliminate, the crash-recoverability gap
+            # documented in docs/inverse_martingale.md's "Known limitation"
+            # (this process's own placed order is still not reconciled
+            # against the broker's order history if its settlement write is
+            # skipped here).
+            im_settlement_ledger.claim_fire(
+                im_ticker,
+                expected_prior_state=im_fired_state,
+                new_state=im_settlement_state,
+                step=im_settlement_step,
+            )
 
     # Reflect any in-batch kill-switch engagement in the config used to build
     # this run's artifacts, so the risk_guard audit block (and

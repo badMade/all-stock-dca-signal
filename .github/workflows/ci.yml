@@ -169,3 +169,45 @@ jobs:
       - name: Run tests (lightweight subset; heavy-dep tests skip)
         working-directory: ticker-advisor
         run: python -m pytest tests/
+
+  ml-forecaster:
+    name: Lint & test (ml-forecaster)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Unlike ticker-advisor's requirements.txt, this one has no vectorbt/
+      # torch/transformers -- pandas/numpy/scikit-learn/scipy install quickly,
+      # so the full requirements.txt is used directly rather than a
+      # hand-picked lightweight subset.
+      - name: Install dependencies
+        # jsonschema (needed for this job's schema-validation tests) comes
+        # from requirements-dev.txt's own pin (jsonschema==4.26.0) -- a
+        # separate, unpinned `pip install jsonschema` here would be a no-op
+        # today (pip doesn't reinstall/upgrade an already-satisfied,
+        # unversioned request), but is a landmine: it silently defeats the
+        # pin's protection the moment that pin is ever removed or loosened,
+        # contradicting CLAUDE.md's "Dev tool versions are pinned ...
+        # bump deliberately" (Antigravity review: "Unpinned Dependency
+        # Re-installation in CI Workflow").
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -r ml-forecaster/requirements.txt
+
+      - name: Ruff lint
+        # Excluded from the root pyproject.toml's ruff scope, same reasoning
+        # as production-safe-agent-loop/ and ticker-advisor/ above.
+        run: ruff check --isolated --select=E,F,B --line-length=120 ml-forecaster
+
+      - name: Run tests
+        working-directory: ml-forecaster
+        run: python -m pytest tests/

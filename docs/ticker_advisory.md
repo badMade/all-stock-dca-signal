@@ -79,3 +79,24 @@ constraints already established for this tool:
 Per `CLAUDE.md`'s "Consolidating is a decision, not a cleanup" principle, wiring this in deserves
 its own dedicated review once the ticker-advisory scoring pipeline above has a track record —
 this document exists to record the intended shape of that follow-up, not to implement it.
+
+### Implemented: the ml-forecaster sibling tool
+
+A related, but separate, mechanism following the same shape now exists: `ml-forecaster/` (a
+sibling directory, isolated from the core stdlib-only gate exactly like `ticker-advisor/`) trains
+a pooled, regularized (Ridge) regression over the active universe's OHLCV history, predicting a
+forward 5-day return conditional on today being a dip day, walk-forward validated and
+guard-published (refuses to overwrite a better-performing prior model). Its output is
+`config/ml_sizing_adjustment.json` (schema: `schemas/ml_sizing_adjustment.schema.json`) — a
+bounded (±20%, hard-capped in the schema itself), staleness-checked, per-ticker multiplier that
+`near_close_dca.graded_buy_multiplier()` (`near_close_dca.py`) applies as a small nudge on top of
+the primary ladder, never as a replacement for it. Consumption is entirely read-only, stdlib
+`json`-only (`dca_config.load_ml_sizing_adjustment`), and fails closed to a pure no-op (every
+ticker's factor is 1.0) on a missing, malformed, stale, or out-of-bounds publish — see that
+function's docstring for the exact fail-closed contract.
+
+This is a distinct mechanism from the ticker-advisory composite score above (different model,
+different config file, different consumption point), built to the same design principles this
+section already laid out: bounded, offline, guard-published, fail-closed. Like the accumulator
+in `docs/inverse_martingale.md`, it is wired into the canonical `near_close_dca.py` path only —
+see `docs/live_wiring.md`'s "Three entry points" section.

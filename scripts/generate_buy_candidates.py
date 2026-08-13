@@ -1774,7 +1774,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ticker_errors = payload.get("ticker_errors", {})
 
     _require_populated_config(args.config_dir)
-    config = load_strategy_config(args.config_dir, deployed_last_7d_usd=args.deployed_last_7d_usd)
+    # Explicitly pass `now` (derived from --trading-day above, not the real
+    # wall clock) so load_ml_sizing_adjustment's freshness check judges
+    # config/ml_sizing_adjustment.json's generated_at against the candidate
+    # trading day this run is actually scoring, not "today" -- omitting it
+    # would apply a publish that's from the future relative to a historical/
+    # replay trading day, or skip one that was genuinely fresh AT that day
+    # (Codex review: "Use the candidate trading day for ML freshness"; see
+    # load_strategy_config's own `now` docstring for the general contract).
+    config = load_strategy_config(args.config_dir, now=now, deployed_last_7d_usd=args.deployed_last_7d_usd)
 
     # already_covered_tickers shape/content is validated inside
     # generate_candidates itself (_validate_already_covered_tickers), same

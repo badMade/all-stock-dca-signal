@@ -56,6 +56,7 @@ from near_close_dca import (
     _check_execution_gates,
     _earlier_selected_base,
     _graded_dca_ref_id_prefix,
+    _inverse_martingale_reconciled_price,
     _iso_or_none,
     _process_buy_candidate,
     _same_stream_order_exists,
@@ -115,6 +116,24 @@ def test_ladder_boundaries():
         drop_fraction = drop_pct / 100.0
         actual = graded_buy_multiplier(drop_fraction, config)
         assert actual == expected, f"drop {drop_pct}% -> {actual}, expected {expected}"
+
+
+def test_raw_ladder_multiplier_ignores_the_ml_nudge_and_caps():
+    """Regression test for "Preserve the raw ladder tier for selloff-breadth
+    counting". raw_ladder_multiplier() must return the ladder's OWN tier
+    match, unaffected by the ml-forecaster sizing nudge (or the kill-switch
+    cap) that graded_buy_multiplier() applies on top of it -- a 5.0% drop
+    is a 2.5x ladder tier regardless of any per-ticker ML factor.
+    """
+    from near_close_dca import raw_ladder_multiplier
+
+    config = StrategyConfig(ml_sizing_adjustment={"AAPL": 1.2})
+    drop_fraction = 5.0 / 100.0  # the 2.5x ladder tier
+    assert raw_ladder_multiplier(drop_fraction, config, "AAPL") == 2.5
+    # graded_buy_multiplier applies the SAME ticker's ML factor on top --
+    # 2.5 * 1.2 = 3.0, crossing the default high_multiplier_threshold (3.0)
+    # that raw_ladder_multiplier's own 2.5 never reaches.
+    assert graded_buy_multiplier(drop_fraction, config, "AAPL") == pytest.approx(3.0)
 
 
 def test_base_amount_is_two_dollars():
@@ -945,6 +964,63 @@ def test_reconcile_signals_agree_pairs_multiplier_with_winning_signal():
         decision.selected_base_amount_usd * decision.buy_multiplier
         == decision.suggested_amount_usd
     )
+
+
+def _im_signal(source, *, decision_price=100.0, previous_close=100.0):
+    return SourceSignal(
+        ticker="AAPL",
+        source=source,
+        action=Action.NO_ACTION,
+        reason="test",
+        decision_price=decision_price,
+        previous_close=previous_close,
+    )
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+def test_inverse_martingale_reconciled_price_rejects_non_finite_finance_decision_price(bad_value):
+    """Regression test for "Reject non-finite reconciled prices".
+
+    Every comparison against NaN is false, and "inf > tolerance * inf" is
+    also false -- without an explicit finiteness check, a non-finite
+    decision_price from either source would sail past both the positivity
+    check and the cross-source tolerance check below it. An infinite
+    decision_price in particular would make drop_metric go to -inf in
+    evaluate_inverse_martingale_step, trivially satisfying ANY active
+    cycle's recovery check and firing a real synthetic order.
+    """
+    finance = _im_signal(SourceName.FINANCE, decision_price=bad_value)
+    robinhood = _im_signal(SourceName.ROBINHOOD, decision_price=100.0)
+    decision = ReconciledDecision(
+        ticker="AAPL", action=Action.NO_ACTION, reason="test",
+        finance_signal=finance, robinhood_signal=robinhood,
+    )
+    assert _inverse_martingale_reconciled_price(decision) is None
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+def test_inverse_martingale_reconciled_price_rejects_non_finite_previous_close(bad_value):
+    finance = _im_signal(SourceName.FINANCE, previous_close=bad_value)
+    robinhood = _im_signal(SourceName.ROBINHOOD, previous_close=100.0)
+    decision = ReconciledDecision(
+        ticker="AAPL", action=Action.NO_ACTION, reason="test",
+        finance_signal=finance, robinhood_signal=robinhood,
+    )
+    assert _inverse_martingale_reconciled_price(decision) is None
+
+
+def test_inverse_martingale_reconciled_price_accepts_agreeing_finite_signals():
+    finance = _im_signal(SourceName.FINANCE, decision_price=99.0, previous_close=100.0)
+    robinhood = _im_signal(SourceName.ROBINHOOD, decision_price=99.1, previous_close=100.0)
+    decision = ReconciledDecision(
+        ticker="AAPL", action=Action.NO_ACTION, reason="test",
+        finance_signal=finance, robinhood_signal=robinhood,
+    )
+    result = _inverse_martingale_reconciled_price(decision)
+    assert result is not None
+    decision_price, previous_close = result
+    assert decision_price == pytest.approx(99.0)
+    assert previous_close == pytest.approx(100.0)
 
 
 def test_earlier_selected_base_picks_by_timestamp_not_argument_order():
@@ -9690,6 +9766,59 @@ def test_build_run_artifacts_includes_a_submitted_pending_credit_flush(tmp_path)
     assert candidates["AAPL"]["planned_amount_usd"] == 1.0
     assert candidates["AAPL"]["is_pending_credit_flush"] is True
     assert artifacts["counts"]["buy_candidates"] == 1
+
+
+def test_build_run_artifacts_counts_selloff_breadth_from_the_raw_ladder_tier(tmp_path):
+    """Regression test for "Preserve the raw ladder tier for selloff-breadth
+    counting". The high_multiplier_threshold count that escalates the day's
+    budget tier (select_budget_tier) must be judged on each ticker's RAW
+    ladder tier match, not on buy_multiplier -- which already has the
+    ml-forecaster sizing nudge folded in. Six tickers here each have a raw
+    ladder tier of 2.5x (below the 3.0x threshold) that an ML factor of 1.2
+    nudged up to a FINAL buy_multiplier of 3.0x (at/above the threshold).
+    If the count used buy_multiplier, six such tickers would independently
+    escalate the budget tier from "normal" straight to "elevated" purely
+    from per-ticker ML forecasts -- not from an actual broad market
+    selloff. Using ladder_multiplier instead, the tier must stay "normal".
+    """
+    from near_close_dca import ArtifactRunContext, build_run_artifacts
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    tickers = ("AAA", "BBB", "CCC", "DDD", "EEE", "FFF")
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=tickers,
+        approved_test_dates=frozenset({date(2026, 6, 29)}),
+    )
+    state = StrategyState()
+    decisions = [
+        ReconciledDecision(
+            ticker=ticker,
+            action=Action.BUY,
+            reason="test buy candidate",
+            finance_signal=None,
+            robinhood_signal=None,
+            buy_multiplier=3.0,  # ML-nudged final multiplier -- AT the threshold
+            ladder_multiplier=2.5,  # raw ladder tier -- BELOW the threshold
+            suggested_amount_usd=5.0,
+            target_price=98.0,
+        )
+        for ticker in tickers
+    ]
+    candidate_outcomes = {
+        ticker: {"order_id": f"{ticker}-1", "status": "dry_run", "submitted_amount_usd": 5.0}
+        for ticker in tickers
+    }
+    artifacts = build_run_artifacts(
+        now, config, state, decisions,
+        candidate_outcomes=candidate_outcomes,
+        run_context=ArtifactRunContext(),
+    )
+    assert len(artifacts["buy_candidates"]) == 6
+    assert state.selected_tier is not None
+    assert state.selected_tier.name == "normal", (
+        "6 tickers nudged across the threshold by ML alone must not escalate the budget tier"
+    )
 
 
 def test_build_run_artifacts_still_drops_a_non_buy_decision_with_no_order(tmp_path):

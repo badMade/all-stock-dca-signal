@@ -30,7 +30,7 @@ python -m pip install --upgrade pip && pip install -r requirements-dev.txt
 # Lint (ruff, line-length 120, rules E,F,I,B; E501 ignored)
 ruff check .
 
-# Tests — ~3,030 tests, ~30s for the whole suite
+# Tests — ~3,500 tests, ~45s for the whole suite
 .venv/bin/python -m pytest                # pyproject addopts already supply -q and the
                                           # --ignore=production-safe-agent-loop --ignore=ticker-advisor exclusions
 .venv/bin/python -m pytest test_midday_dca.py -q
@@ -51,12 +51,16 @@ Two suites sit outside the root `pytest` sweep and must be run separately:
 ruff check --isolated --select=E,F,B --line-length=120 production-safe-agent-loop
 (cd ticker-advisor && pip install -r requirements.txt && python -m pytest tests/)   # own requirements.txt
 ruff check --isolated --select=E,F,B --line-length=120 ticker-advisor
+(cd ml-forecaster && pip install -r requirements.txt && python -m pytest tests/)   # own requirements.txt
+ruff check --isolated --select=E,F,B --line-length=120 ml-forecaster
 ```
 
 CI (`.github/workflows/ci.yml`) runs lint + coverage-gated tests on Python 3.11 and 3.12, the
-demo smoke test, `pip-audit` on `requirements-dev.txt`, and the `production-safe-agent-loop` and
-`ticker-advisor` suites. Dev tool versions are **pinned** in `requirements-dev.txt` on purpose —
-bump deliberately.
+demo smoke test, `pip-audit` on `requirements-dev.txt`, and the `production-safe-agent-loop`,
+`ticker-advisor`, and `ml-forecaster` suites (the sizing-adjustment ML retrain pipeline, see
+`docs/ticker_advisory.md`'s "Implemented: the ml-forecaster sibling tool" section) each in their
+own job. Dev tool versions are **pinned** in `requirements-dev.txt` on purpose — bump
+deliberately.
 
 ## Architecture
 
@@ -67,7 +71,7 @@ bump deliberately.
 | Orchestration | `run_dca.py` — `run_pipeline()`, `run_slot()`, `main()` (CLI); `dca_runner.py` — the gate-sequence live runner (Gate 0 market day → Gate 1 time sanity → Gate 3 window → Gate 4 sole-executor → Gate 6 budget → Gate 7 placement → Gate 9 evidence) |
 | Config & paths | `dca_config.py` (discovery, `expand_config_env`, fail-closed loading), `dca_paths.py` (`cron_tracking_root()`, `stream_root()`), `dca_ticker_paths.py` |
 | Broker/data | `dca_live_adapters.py` — `RobinhoodDataProvider`, `FinanceDataProvider`, `RobinhoodBroker`, all built from **injected callables** that map 1:1 to Robinhood MCP tools |
-| Money & risk | `dca_risk.py`, `dca_cumulative.py` (cumulative sub-dollar credit ledger), `dca_cost_tracker.py` |
+| Money & risk | `dca_risk.py`, `dca_cumulative.py` (cumulative sub-dollar credit ledger), `dca_cost_tracker.py`, `dca_inverse_martingale.py` (opt-in deferred-accumulation sizing mode, off by default — see `docs/inverse_martingale.md`) |
 | Output | `dca_reporting.py`, `dca_alerts.py`, `dca_fileio.py`, `dca_notion_sync.py`, `dca_weekly_dashboard.py` |
 | Reliability engines | `scripts/broker_reconciliation.py`, `run_state_machine.py`, `run_ledger.py`, `idempotency.py`, `scheduler_lease.py`, `reason_codes.py`, `correlation.py`, `same_day_pointer.py`, `same_day_top_up_gate.py`, `file_lock.py` |
 | Ops utilities | `scripts/run_classification.py`, `drift_detection.py`, `backup_strategy.py`, `run_ticker_maintenance.py`, `daily_per_ticker_calibration.py`, `generate_per_ticker_sizing.py`, `workflow_policy.py` |
@@ -159,9 +163,9 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 - Tests are flat top-level `test_<module>.py` files beside the module; `scripts/` tests live in
   `scripts/tests/`. Add or update tests for every behavior change, and a regression test for
   every bug fix.
-- `trading-strategies/`, `analysis/`, `.github/`, `production-safe-agent-loop/`, and
-  `ticker-advisor/` are excluded from the core ruff gate and the coverage source — they carry
-  their own deps and conventions.
+- `trading-strategies/`, `analysis/`, `.github/`, `production-safe-agent-loop/`,
+  `ticker-advisor/`, and `ml-forecaster/` are excluded from the core ruff gate and the coverage
+  source — they carry their own deps and conventions.
 - Check `git status --short` before editing and preserve existing user changes. Keep patches
   small; avoid unrelated refactors. Review the diff for secrets and generated artifacts before
   committing.
@@ -180,6 +184,7 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 | `docs/schedule_manifest.md` | The canonical recurring schedule |
 | `docs/strategy.md` | Strategy overview, ticker universe, sizing ladder, budgets |
 | `docs/ticker_advisory.md` | The `ticker-advisor/` tool: scores candidate tickers, proposes universe additions for manual review |
+| `docs/inverse_martingale.md` | Opt-in deferred-accumulation sizing mode: tracks dip-tier amounts instead of buying into a decline, fires once on recovery |
 | `docs/drift_detection.md`, `docs/reporting_workflow.md`, `docs/cost_tracking.md` | Post-run detection, reporting, and cost policy |
 | `docs/pr_review_workflow.md` | The two-workflow PR review split and its trust boundary |
 | `PRODUCTION_READINESS.md` | Tracked gaps between the library and a fully live system |

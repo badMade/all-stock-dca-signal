@@ -19,7 +19,7 @@ import math
 import os
 import re
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -141,12 +141,38 @@ def resolve_broker_account(value: Any, *, source: str) -> str:
     return expanded
 
 
+def _reject_duplicate_keys(pairs: List[Any]) -> Dict[str, Any]:
+    """``object_pairs_hook`` that raises on a duplicate key in one JSON object.
+
+    ``json.loads`` silently keeps the LAST occurrence of a duplicate object
+    key by default -- a corrupt or hand-edited ``config/inverse_martingale.json``
+    with two ``"AAPL"`` entries (differing only in ``enabled``), or a
+    ``config/ml_sizing_adjustment.json`` with two ``"AAPL"`` adjustments, would
+    otherwise load successfully with whichever entry happened to come last
+    silently winning, before either loader's own case-folded duplicate check
+    ever gets a chance to see the discarded one (Codex review: "Reject
+    duplicate sizing-configuration keys"). Applies at every nesting level:
+    ``json.loads`` invokes this hook for every JSON object it parses, not just
+    the top-level document. Mirrors ``dca_runner._reject_duplicate_keys``
+    exactly -- duplicated rather than imported, since ``dca_runner`` itself
+    imports from this module and a reverse import would be circular.
+    """
+    seen: set[str] = set()
+    result: Dict[str, Any] = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate key {key!r} in JSON document")
+        seen.add(key)
+        result[key] = value
+    return result
+
+
 def _read_json(path: Path) -> Optional[Dict[str, Any]]:
     if not path.exists():
         return None
     try:
-        data = json.loads(path.read_bytes())
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        data = json.loads(path.read_bytes(), object_pairs_hook=_reject_duplicate_keys)
+    except (json.JSONDecodeError, ValueError, OSError, UnicodeDecodeError) as exc:
         raise ValueError(f"could not parse config file {path}: {exc}") from exc
     if not isinstance(data, dict):
         raise ValueError(f"config file {path} must contain a JSON object, got {type(data).__name__}")
@@ -314,6 +340,399 @@ def load_per_ticker_sizing(config_dir: Path) -> Dict[str, Any]:
     return {"per_ticker_sizing": normalized}
 
 
+def _reject_bool_numeric(raw_value: Any, description: str) -> float:
+    """``float(raw_value)``, but explicitly rejecting a JSON boolean first.
+
+    ``bool`` is a subclass of ``int`` in Python, so ``float(True) == 1.0``
+    and ``float(False) == 0.0`` would otherwise silently coerce a
+    schema-invalid boolean into a real, plausible-looking numeric value --
+    e.g. ``"unit_usd": true`` becomes a real $1/unit rate, or
+    ``"max_fire_attempts": true`` becomes a real 1-attempt retry budget,
+    both loading successfully instead of failing closed on the
+    schema-invalid input they actually are (Codex review: "Reject booleans
+    in inverse-Martingale numeric fields").
+    """
+    if isinstance(raw_value, bool):
+        raise ValueError(f"{description} must be a number, not a boolean")
+    return float(raw_value)
+
+
+def load_inverse_martingale_config(config_dir: Path) -> Dict[str, Any]:
+    """Load the opt-in inverse-Martingale accumulator config, fail-closed.
+
+    Returns ``{}`` (mode fully disabled for every ticker) when the file is
+    absent, malformed, or ``status`` is not ``"active"`` -- exactly the same
+    contract as :func:`load_per_ticker_sizing`. A malformed per-ticker entry
+    raises rather than being silently dropped, matching this repo's existing
+    "fail closed, loudly" convention for calibration data (see
+    ``load_per_ticker_sizing`` above) -- a config typo should break config
+    loading, not silently disable one ticker's accumulator.
+    """
+    data = _read_json(config_dir / "inverse_martingale.json")
+    if data is None or data.get("status") != "active":
+        return {}
+    raw = data.get("tickers", {})
+    if not isinstance(raw, dict):
+        raise ValueError("inverse_martingale.json must contain a tickers object")
+    # The per-ticker `enabled` fallback below: previously every ticker
+    # entry defaulted to False regardless of this value, so a
+    # schema-valid "enabled_default": true had NO effect anywhere at
+    # runtime -- enrollment is decided solely by presence in the returned
+    # `normalized` mapping, and every ticker omitting its own `enabled`
+    # field was silently dropped from it either way (Codex review: "Honor
+    # the configured default enrollment switch"). Validated the same
+    # strict-boolean way the per-ticker field is, just below.
+    default_enabled_raw = data.get("enabled_default", False)
+    if not isinstance(default_enabled_raw, bool):
+        raise ValueError("inverse_martingale.json enabled_default must be a boolean")
+    normalized: Dict[str, Dict[str, Any]] = {}
+    seen_symbols: set[str] = set()
+    for ticker, model in raw.items():
+        if not isinstance(ticker, str) or not isinstance(model, dict):
+            raise ValueError("inverse_martingale tickers entries must map a symbol to an object")
+        # Detect a case-folded duplicate (e.g. "AAPL" and "aapl") BEFORE the
+        # enabled/disabled filtering below -- both keys are individually
+        # schema-valid, but `normalized` is keyed by the UPPERCASED symbol
+        # (see the assignment at the end of this loop), so two variants of
+        # the same real ticker collide there regardless of which one this
+        # loop happens to reach last. Checking after the enabled filter
+        # would miss the most dangerous case entirely: a disabled "aapl"
+        # entry meant to suppress the ticker gets silently skip()ed via
+        # `continue` before ever being compared against an earlier enabled
+        # "AAPL" entry, leaving the ticker enrolled -- suppressing the
+        # normal ladder and firing accumulator orders -- even though one
+        # configuration entry explicitly says it should be off. Two ENABLED
+        # variants are just as dangerous the other way: whichever one this
+        # loop reaches last silently overwrites the other in `normalized`,
+        # with no error and no way for an operator to know which
+        # basis/tier/recovery configuration actually won (Codex review:
+        # "Reject case-folded duplicate enrollment symbols").
+        upper_ticker = ticker.upper()
+        if upper_ticker in seen_symbols:
+            raise ValueError(f"inverse_martingale tickers contains a case-folded duplicate symbol: {ticker!r}")
+        seen_symbols.add(upper_ticker)
+        enabled_raw = model.get("enabled", default_enabled_raw)
+        # A truthy-but-non-bool value (e.g. the schema-invalid string
+        # "false", which Python treats as truthy) would otherwise silently
+        # ENABLE the accumulator against the operator's obvious intent --
+        # require an actual JSON boolean and fail closed (loudly) on
+        # anything else, matching this function's own "malformed entry
+        # raises rather than being silently guessed at" convention (Codex
+        # review: "Require a boolean before enabling the accumulator").
+        if not isinstance(enabled_raw, bool):
+            raise ValueError(f"inverse_martingale enabled must be a boolean for {ticker}")
+        if not enabled_raw:
+            continue
+        basis = model.get("basis")
+        if basis not in ("pct", "stddev"):
+            raise ValueError(f"inverse_martingale basis missing/invalid for {ticker}")
+        tiers_raw = model.get("tiers")
+        if not isinstance(tiers_raw, list) or not tiers_raw:
+            raise ValueError(f"inverse_martingale tiers missing for {ticker}")
+        threshold_key = "drop_pct" if basis == "pct" else "sigma_multiple"
+        parsed_tiers = []
+        seen_thresholds: set[float] = set()
+        for tier in tiers_raw:
+            if not isinstance(tier, dict) or threshold_key not in tier or "units" not in tier:
+                raise ValueError(f"inverse_martingale tier malformed for {ticker}")
+            threshold_value = _reject_bool_numeric(tier[threshold_key], f"inverse_martingale {threshold_key} for {ticker}")
+            units_value = _reject_bool_numeric(tier["units"], f"inverse_martingale tier units for {ticker}")
+            # evaluate_inverse_martingale_step's tier-crossing loop credits a
+            # tier when `threshold not in crossed_before` -- crossed_before is
+            # only updated AFTER the whole loop finishes evaluating this run's
+            # tiers (see near_close_dca.py's own comment on this), so two
+            # configured tiers sharing the identical threshold both read as
+            # "not yet crossed" in the SAME evaluation and both get credited,
+            # double-accumulating for what is really one dip level (Codex
+            # review: "Reject duplicate tier thresholds at load time"). Checked
+            # before the positivity/finiteness validation below so a duplicate
+            # is reported on its own terms rather than shadowed by whichever
+            # error a malformed value might also trigger.
+            if threshold_value in seen_thresholds:
+                raise ValueError(
+                    f"inverse_martingale tiers contains a duplicate {threshold_key} {threshold_value!r} for {ticker}"
+                )
+            seen_thresholds.add(threshold_value)
+            # A nonpositive threshold/units, unit_usd, recovery offset, or
+            # cycle/attempt limit could accumulate a negative balance,
+            # trigger an immediate spurious fire, or loop indefinitely --
+            # none of that is caught by the runtime evaluator itself
+            # (evaluate_inverse_martingale_step trusts its inputs), and
+            # schema validation is skipped entirely when load_strategy_config
+            # reads a non-default DCA_CONFIG_DIR (test_every_config_file_...
+            # only validates the shipped config/ tree). Validate here so a
+            # malformed alternate config fails closed at load time regardless
+            # (Codex review: "Reject nonpositive inverse-Martingale tier
+            # values at load time"). Python's json module accepts the
+            # non-standard NaN/Infinity/-Infinity tokens by default, and
+            # both compare false against "<= 0" -- a NaN threshold would
+            # never cross, and an infinite one would suppress the ladder
+            # (enrollment alone does that) while never firing; check
+            # finiteness explicitly rather than relying on the positivity
+            # check alone to catch it (Codex review: "Reject non-finite
+            # inverse-Martingale values").
+            if not math.isfinite(threshold_value) or threshold_value <= 0:
+                raise ValueError(f"inverse_martingale {threshold_key} must be positive and finite for {ticker}")
+            if not math.isfinite(units_value) or units_value <= 0:
+                raise ValueError(f"inverse_martingale tier units must be positive and finite for {ticker}")
+            parsed_tiers.append((threshold_value, units_value))
+        entry: Dict[str, Any] = {
+            "basis": basis,
+            "tiers": tuple(sorted(parsed_tiers)),
+        }
+        if basis == "pct":
+            if "recovery_offset_pct" not in model:
+                raise ValueError(f"inverse_martingale recovery_offset_pct missing for {ticker}")
+            recovery_offset = _reject_bool_numeric(
+                model["recovery_offset_pct"], f"inverse_martingale recovery_offset_pct for {ticker}"
+            )
+            if not math.isfinite(recovery_offset) or recovery_offset <= 0:
+                raise ValueError(f"inverse_martingale recovery_offset_pct must be positive and finite for {ticker}")
+            entry["recovery_offset"] = recovery_offset
+        else:
+            if "recovery_offset_sigma" not in model or "stddev_window_days" not in model:
+                raise ValueError(f"inverse_martingale stddev fields missing for {ticker}")
+            recovery_offset = _reject_bool_numeric(
+                model["recovery_offset_sigma"], f"inverse_martingale recovery_offset_sigma for {ticker}"
+            )
+            stddev_window_days_raw = _reject_bool_numeric(
+                model["stddev_window_days"], f"inverse_martingale stddev_window_days for {ticker}"
+            )
+            # A fractional value (e.g. 2.9) silently truncates to a smaller
+            # whole number of days via int() -- reject anything that is not
+            # already an exact integer rather than guessing which whole
+            # number the operator meant (Codex review: "Reject fractional
+            # integer limits before truncating").
+            if not math.isfinite(stddev_window_days_raw) or stddev_window_days_raw != int(stddev_window_days_raw):
+                raise ValueError(f"inverse_martingale stddev_window_days must be a finite whole number for {ticker}")
+            stddev_window_days = int(stddev_window_days_raw)
+            if not math.isfinite(recovery_offset) or recovery_offset <= 0:
+                raise ValueError(
+                    f"inverse_martingale recovery_offset_sigma must be positive and finite for {ticker}"
+                )
+            if stddev_window_days <= 1:
+                raise ValueError(f"inverse_martingale stddev_window_days must be > 1 for {ticker}")
+            entry["recovery_offset"] = recovery_offset
+            entry["stddev_window_days"] = stddev_window_days
+        normalized[ticker.upper()] = entry
+    unit_usd = _reject_bool_numeric(data.get("unit_usd", 1.0), "inverse_martingale.json unit_usd")
+    max_cycle_days_raw = _reject_bool_numeric(data.get("max_cycle_days", 30), "inverse_martingale.json max_cycle_days")
+    max_fire_attempts_raw = _reject_bool_numeric(
+        data.get("max_fire_attempts", 5), "inverse_martingale.json max_fire_attempts"
+    )
+    if not math.isfinite(unit_usd) or unit_usd <= 0:
+        raise ValueError("inverse_martingale.json unit_usd must be positive and finite")
+    # A positive-but-fractional value (e.g. 0.5) passes the ">0" check above
+    # but truncates to 0 via int() below -- silently defeating the very
+    # positivity this just validated (an enrolled ticker's normal ladder is
+    # already suppressed, so a cycle that can abandon itself after 0 days or
+    # 0 attempts is a real, not cosmetic, misconfiguration). Require an exact
+    # whole number rather than truncating a fraction (Codex review: "Reject
+    # fractional integer limits before truncating").
+    if not math.isfinite(max_cycle_days_raw) or max_cycle_days_raw <= 0 or max_cycle_days_raw != int(max_cycle_days_raw):
+        raise ValueError("inverse_martingale.json max_cycle_days must be positive and finite, and a whole number")
+    if (
+        not math.isfinite(max_fire_attempts_raw)
+        or max_fire_attempts_raw <= 0
+        or max_fire_attempts_raw != int(max_fire_attempts_raw)
+    ):
+        raise ValueError("inverse_martingale.json max_fire_attempts must be positive and finite, and a whole number")
+    max_cycle_days = int(max_cycle_days_raw)
+    max_fire_attempts = int(max_fire_attempts_raw)
+    return {
+        "inverse_martingale_enabled_default": default_enabled_raw,
+        "inverse_martingale_unit_usd": unit_usd,
+        "inverse_martingale_max_cycle_days": max_cycle_days,
+        "inverse_martingale_max_fire_attempts": max_fire_attempts,
+        "inverse_martingale": normalized,
+    }
+
+
+def load_ml_sizing_adjustment(config_dir: Path, *, now: Optional[datetime] = None) -> Dict[str, Any]:
+    """Load the ML-forecaster's published sizing adjustment, fail-closed.
+
+    Returns ``{}`` (every ticker's adjustment is the implicit 1.0 no-op) when
+    the file is absent, malformed, ``status`` is not ``"active"``,
+    ``generated_at`` cannot be parsed, ``generated_at`` is older than
+    ``max_staleness_hours``, or any published adjustment falls outside the
+    file's own declared ``bounds`` -- a corrupted or stale publish must never
+    partially apply. Staleness is checked ONLY here; the multiplier lookup in
+    ``near_close_dca.graded_buy_multiplier`` does no I/O and trusts whatever
+    this function already validated.
+
+    Unlike :func:`load_inverse_martingale_config` (which deliberately RAISES
+    on a malformed file -- see its own docstring's "fail closed, loudly"
+    rationale for calibration data), a truncated/invalid-JSON/non-object
+    ``ml_sizing_adjustment.json`` is caught HERE and folded into the same
+    documented ``{}`` no-op as every other malformed-payload case above,
+    rather than propagating ``_read_json``'s ``ValueError``. This loader
+    runs unconditionally inside ``load_strategy_config()``, the single
+    entry point every scheduled run uses to build its config -- an
+    unhandled parse failure here would abort strategy startup entirely over
+    one optional, ancillary sizing-nudge publish, not merely disable the
+    nudge itself (Codex review: "Catch malformed ML publication JSON").
+    """
+    try:
+        data = _read_json(config_dir / "ml_sizing_adjustment.json")
+    except ValueError as exc:
+        logger.warning("ml_sizing_adjustment.json could not be read: %s", exc)
+        return {}
+    if data is None or data.get("status") != "active":
+        return {}
+    generated_at_raw = data.get("generated_at")
+    max_staleness_hours = data.get("max_staleness_hours")
+    if not isinstance(generated_at_raw, str) or not isinstance(max_staleness_hours, (int, float)):
+        return {}
+    if isinstance(max_staleness_hours, bool) or not math.isfinite(max_staleness_hours) or max_staleness_hours <= 0:
+        # A NaN/Infinity/nonpositive value passes the bare isinstance check
+        # above but would raise ValueError/OverflowError constructing the
+        # timedelta below -- since this loader runs during
+        # load_strategy_config, that would abort strategy startup instead of
+        # returning the documented empty no-op (Codex review: "Fail closed
+        # on non-finite staleness values").
+        return {}
+    try:
+        generated_at = datetime.fromisoformat(generated_at_raw)
+    except ValueError:
+        return {}
+    if generated_at.tzinfo is None:
+        # schemas/ml_sizing_adjustment.schema.json declares generated_at as
+        # "format": "date-time" -- RFC 3339's date-time format REQUIRES a
+        # timezone offset ("Z" or +HH:MM). Python's datetime.fromisoformat()
+        # is more permissive than RFC 3339, though: it happily parses a
+        # date-only string ("2026-08-12") or a full timestamp with no
+        # offset, both producing a NAIVE datetime here. Silently assuming
+        # UTC for either (this function's prior behavior) would apply the
+        # live sizing multipliers from a publication that never actually
+        # conformed to its own declared schema -- schema validation itself
+        # only runs against the shipped config/ tree, never against an
+        # alternate DCA_CONFIG_DIR this loader might be pointed at, the same
+        # gap already closed for out-of-range bounds/boolean values
+        # elsewhere in this function (Codex review: "Reject date-only
+        # publication timestamps"). The real publish pipeline
+        # (ml-forecaster/publish.py) always resolves generated_at to an
+        # aware datetime before writing it, so a genuinely fresh, legitimate
+        # publish is never naive here -- fail closed instead of guessing.
+        return {}
+    reference_now = now if now is not None else datetime.now(timezone.utc)
+    # A caller-injected `now` (e.g. a replay/test harness) may be naive,
+    # while `generated_at` above is always normalized to aware UTC just a
+    # few lines up -- subtracting a naive datetime from an aware one raises
+    # TypeError instead of returning the documented fail-closed {} no-op
+    # (Codex review: "Normalize the injected staleness clock").
+    if reference_now.tzinfo is None:
+        reference_now = reference_now.replace(tzinfo=timezone.utc)
+    age = reference_now - generated_at
+    try:
+        # A finite max_staleness_hours already passed the isfinite check
+        # above, but "finite" does not mean "representable" -- an extreme
+        # value like 1e308 still raises OverflowError constructing the
+        # timedelta below (timedelta is internally bounded to roughly
+        # roughly +/-2.7 million years). Uncaught, that would abort THIS load_strategy_
+        # config() call entirely instead of the documented fail-closed {}
+        # no-op -- and since max_staleness_hours is read from a PERSISTED
+        # file, a single malformed publish would break every subsequent
+        # load until manually fixed (Codex review: "Bound staleness values
+        # before constructing a timedelta").
+        staleness_budget = timedelta(hours=float(max_staleness_hours))
+    except OverflowError:
+        return {}
+    if age < timedelta(0) or age > staleness_budget:
+        return {}
+    bounds = data.get("bounds")
+    if not isinstance(bounds, dict):
+        return {}
+    try:
+        # bool is a subclass of int in Python -- float(True) == 1.0 -- so a
+        # hand-edited or malformed publication with "min_multiplier": true
+        # would otherwise silently pass as a real 1.0 bound (itself always
+        # valid, since min <= 1.0 <= max is enforced below), applying a
+        # live sizing adjustment from a payload that is actually
+        # schema-invalid instead of the documented fail-closed no-op
+        # (Codex review: "Reject booleans in ML multiplier bounds").
+        # Reuses the same guard load_inverse_martingale_config()'s numeric
+        # fields already apply.
+        min_multiplier = _reject_bool_numeric(bounds["min_multiplier"], "ml_sizing_adjustment.json bounds.min_multiplier")
+        max_multiplier = _reject_bool_numeric(bounds["max_multiplier"], "ml_sizing_adjustment.json bounds.max_multiplier")
+    except (KeyError, TypeError, ValueError, OverflowError):
+        # json.loads() parses an arbitrarily large JSON integer into an
+        # unbounded Python int with no size limit of its own -- a 400-digit
+        # "min_multiplier"/"max_multiplier" passes the isinstance(int, float)
+        # check inside _reject_bool_numeric() but overflows float's finite
+        # range, raising OverflowError rather than one of the other already-
+        # caught exception types. This loader runs inside every
+        # load_strategy_config() call, so an uncaught OverflowError here
+        # aborted strategy startup entirely instead of the documented
+        # fail-closed {} no-op for this optional publication (Codex review:
+        # "Catch overflow while parsing multiplier bounds"). Mirrors the
+        # identical guard already applied to the per-ticker adjustment
+        # value's own float() conversion below.
+        return {}
+    # Enforce schemas/ml_sizing_adjustment.schema.json's own HARD limits here
+    # too, not just internal consistency (min <= 1.0 <= max) -- schema
+    # validation only ever runs against the shipped config/ tree
+    # (test_every_config_file_validates_against_its_referenced_schema), never
+    # against an alternate DCA_CONFIG_DIR this loader might be pointed at, so
+    # a manually edited or malformed file from such a directory could
+    # otherwise declare arbitrarily wide bounds (e.g. 0.01..100) and have
+    # every adjustment validated against THOSE instead of the schema's real
+    # 0.5..1.5 ceiling (Codex review: "Enforce the schema limits when loading
+    # ML bounds").
+    if not (0.5 <= min_multiplier <= 1.0 <= max_multiplier <= 1.5):
+        return {}
+    raw_adjustments = data.get("adjustments", {})
+    if not isinstance(raw_adjustments, dict):
+        return {}
+    normalized: Dict[str, float] = {}
+    seen_symbols: set[str] = set()
+    for ticker, value in raw_adjustments.items():
+        # bool is a subclass of int in Python -- isinstance(True, (int, float))
+        # is True -- so without the explicit bool exclusion here (already
+        # applied to max_staleness_hours above), a malformed
+        # `"adjustments": {"AAPL": true}` would silently coerce to
+        # float(True) == 1.0, itself always inside [min_multiplier,
+        # max_multiplier] (since min <= 1.0 <= max is enforced above), and
+        # pass through as a real, live 1.0 sizing adjustment instead of
+        # being rejected as the invalid input it is.
+        if not isinstance(ticker, str) or isinstance(value, bool) or not isinstance(value, (int, float)):
+            return {}
+        # A case-folded duplicate (e.g. both "AAPL" and "aapl" published)
+        # would otherwise both pass every check above and collide in
+        # `normalized`, keyed by the UPPERCASED symbol -- whichever one this
+        # loop reaches last silently wins, with JSON insertion order (an
+        # implementation detail, not something an operator can reliably
+        # reason about) deciding which live sizing multiplier actually
+        # applies (Codex review: "Reject case-folded duplicate ML
+        # adjustment symbols"). Matches load_inverse_martingale_config's
+        # identical duplicate check, but rejects the whole publish (this
+        # function's own established fail-closed contract for any malformed
+        # entry) rather than raising.
+        upper_ticker = ticker.upper()
+        if upper_ticker in seen_symbols:
+            return {}
+        seen_symbols.add(upper_ticker)
+        # json.loads() parses an arbitrarily large JSON integer into a
+        # Python int with no size limit of its own -- a malformed or
+        # externally supplied publication carrying, say, a 400-digit
+        # adjustment value passes every check above (it's a real, non-bool
+        # int) but overflows float()'s own finite range, raising an
+        # uncaught OverflowError. Since this loader runs inside every
+        # load_strategy_config() call, that would abort live strategy
+        # startup entirely instead of returning this function's documented
+        # fail-closed {} for a malformed publish.
+        try:
+            multiplier = float(value)
+        except OverflowError:
+            return {}
+        if not (min_multiplier <= multiplier <= max_multiplier):
+            # A single out-of-bounds entry rejects the whole publish rather
+            # than silently dropping just that ticker's adjustment -- simpler
+            # fail-closed semantics than per-ticker filtering.
+            return {}
+        normalized[upper_ticker] = multiplier
+    return {"ml_sizing_adjustment": normalized}
+
+
 def load_backtest_sizing_tiers(config_dir: Path) -> tuple[tuple[float, float], ...]:
     """Return the analytics-only backtest ladder tiers as (fraction, multiplier).
 
@@ -390,12 +809,37 @@ def load_near_close_overrides(config_dir: Path) -> Dict[str, Any]:
     ``dry_run`` and ``broker`` are excluded from the allowed set — they must
     never be set from file config so that loading config alone can never enable
     live trading.
+
+    The inverse-Martingale and ML-sizing-adjustment fields are excluded too, for
+    a different reason: those two have their OWN dedicated, validated loaders
+    (:func:`load_inverse_martingale_config`, :func:`load_ml_sizing_adjustment`)
+    that reject nonpositive/non-finite tier values, out-of-schema bounds, and
+    stale timestamps -- and this function's own generic pass-through applies
+    none of that validation. Since ``load_strategy_config`` merges this
+    function's output AFTER both dedicated loaders, letting these fields
+    through here would let a ``near_close_dca.json`` entry silently replace an
+    already-validated ``inverse_martingale``/``ml_sizing_adjustment`` value
+    with an unchecked one -- e.g. injecting a stale or out-of-range
+    ``ml_sizing_adjustment``, or an ``inverse_martingale`` entry with malformed
+    limits that still suppresses the normal ladder for that ticker (Codex
+    review: "Prevent generic overrides from bypassing sizing validation"). An
+    operator who genuinely wants to change either must edit that field's own
+    config file instead.
     """
     data = _read_json(config_dir / "near_close_dca.json")
     if data is None:
         return {}
     valid_fields = {f.name for f in dataclasses.fields(StrategyConfig)}
-    excluded = {"dry_run", "broker"}
+    excluded = {
+        "dry_run",
+        "broker",
+        "inverse_martingale_enabled_default",
+        "inverse_martingale_unit_usd",
+        "inverse_martingale_max_cycle_days",
+        "inverse_martingale_max_fire_attempts",
+        "inverse_martingale",
+        "ml_sizing_adjustment",
+    }
     out: Dict[str, Any] = {}
     for key, value in data.items():
         if key in valid_fields and key not in excluded:
@@ -407,6 +851,7 @@ def load_strategy_config(
     config_dir: str | Path = DEFAULT_CONFIG_DIR,
     *,
     base: Optional[StrategyConfig] = None,
+    now: Optional[datetime] = None,
     **overrides: Any,
 ) -> StrategyConfig:
     """Return a :class:`StrategyConfig` with ``config/*.json`` overlaid on ``base``.
@@ -415,6 +860,17 @@ def load_strategy_config(
     ``overrides``. ``dry_run`` and ``broker`` are never set from JSON — they stay at
     their ``base`` values unless passed as explicit overrides — so loading config can
     never by itself enable live trading.
+
+    ``now`` is the reference time :func:`load_ml_sizing_adjustment` checks
+    ``ml_sizing_adjustment.json``'s ``generated_at`` staleness against;
+    ``None`` (the default) means the real wall clock. A caller REPLAYING a
+    historical run (``run_dca.py --now <past timestamp>``) must pass that
+    same timestamp here too, or the published file's freshness is judged
+    against the real "today" instead of the replay's intended "now" --
+    applying a publish that is from the future relative to the replay, or
+    omitting one that was genuinely fresh AT the replay date, either way
+    silently contaminating the replayed decisions (Codex review: "Validate
+    ML staleness against the run timestamp").
     """
     config_dir = Path(config_dir)
     base = base or StrategyConfig()
@@ -435,6 +891,8 @@ def load_strategy_config(
     merged.update(load_budgets(config_dir))
     merged.update(load_sizing_tiers(config_dir))
     merged.update(load_per_ticker_sizing(config_dir))
+    merged.update(load_inverse_martingale_config(config_dir))
+    merged.update(load_ml_sizing_adjustment(config_dir, now=now))
     merged.update(load_approved_dates(config_dir))
     merged.update(load_near_close_overrides(config_dir))
     merged.update(overrides)

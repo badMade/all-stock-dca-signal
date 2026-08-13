@@ -28,6 +28,13 @@ dist/
 artifacts/
 .coverage
 
+# scripts/file_lock.py sidecar lock files (e.g. config/ml_sizing_adjustment.json.lock
+# from ml-forecaster/publish.py's cross_process_lock) -- the flock path opens these
+# in append mode and never unlinks them, so they persist as untracked files next to
+# whatever they guard after every retrain that reaches the guarded-publish critical
+# section, even a refused one.
+*.lock
+
 # production-safe-agent-loop/ defaults to relative db paths (spec.db,
 # ledger.db); if a script or REPL is ever run from the repo root instead of
 # from within that subdirectory, SQLite creates the file here instead of
