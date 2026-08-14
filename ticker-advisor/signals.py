@@ -1040,7 +1040,8 @@ class FinbertSentimentAnalyzer:
         # into run_metadata; overridable via the `revision` argument or
         # $FINBERT_MODEL_REVISION for a deployment that wants to pin a
         # specific commit SHA for true cross-run reproducibility.
-        self.revision = revision or os.environ.get("FINBERT_MODEL_REVISION", "main")
+        env_revision = os.environ.get("FINBERT_MODEL_REVISION")
+        self.revision = revision or (env_revision or "main")
         # An explicit revision/env override is already a caller-chosen pin
         # (a tag, branch, or commit SHA) and resolving it further would
         # silently override that intent. Only the untouched default -- the
