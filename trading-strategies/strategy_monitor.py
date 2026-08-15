@@ -1008,7 +1008,7 @@ class SheetsWriter:
 
         # Mask the explicit token if known
         if self.token:
-            body = body.replace(self.token, "***")
+            body = body.replace(str(self.token), "***")
 
         # Mask generic Bearer tokens
         import re
@@ -1368,8 +1368,9 @@ class MonitorOrchestrator:
                     safe_exc = str(exc)
                     safe_traceback = traceback.format_exc()
                     if self.cfg.get("SMTP_PASSWORD"):
-                        safe_exc = safe_exc.replace(self.cfg["SMTP_PASSWORD"], "***")
-                        safe_traceback = safe_traceback.replace(self.cfg["SMTP_PASSWORD"], "***")
+                        smtp_pw = str(self.cfg["SMTP_PASSWORD"])
+                        safe_exc = safe_exc.replace(smtp_pw, "***")
+                        safe_traceback = safe_traceback.replace(smtp_pw, "***")
                     logger.error("Email send failed: %s", safe_exc)
                     logger.debug(safe_traceback)
                     exit_code = 1
@@ -1526,6 +1527,11 @@ def _apply_config_overrides(
         else:
             merged[key] = val
 
+    # Normalize configured secrets to strings if provided
+    for secret_key in ("SMTP_PASSWORD", "PIPEDREAM_TOKEN"):
+        if secret_key in merged and merged[secret_key] is not None:
+            merged[secret_key] = str(merged[secret_key])
+
     return merged
 
 
@@ -1559,11 +1565,13 @@ if __name__ == "__main__":
         safe_exc = str(exc)
         safe_traceback = traceback.format_exc()
         if effective_config.get("SMTP_PASSWORD"):
-            safe_exc = safe_exc.replace(effective_config["SMTP_PASSWORD"], "***")
-            safe_traceback = safe_traceback.replace(effective_config["SMTP_PASSWORD"], "***")
+            smtp_pw = str(effective_config["SMTP_PASSWORD"])
+            safe_exc = safe_exc.replace(smtp_pw, "***")
+            safe_traceback = safe_traceback.replace(smtp_pw, "***")
         if effective_config.get("PIPEDREAM_TOKEN"):
-            safe_exc = safe_exc.replace(effective_config["PIPEDREAM_TOKEN"], "***")
-            safe_traceback = safe_traceback.replace(effective_config["PIPEDREAM_TOKEN"], "***")
+            pipedream_tok = str(effective_config["PIPEDREAM_TOKEN"])
+            safe_exc = safe_exc.replace(pipedream_tok, "***")
+            safe_traceback = safe_traceback.replace(pipedream_tok, "***")
         logger.critical("Unhandled exception: %s", safe_exc)
         logger.debug(safe_traceback)
         sys.exit(1)

@@ -84,3 +84,20 @@ def test_fetch_headlines_error_message_redacts_key():
     logged_message = mock_logger.error.call_args[0][2]
     assert API_KEY not in logged_message
     assert "***" in logged_message
+
+
+def test_fatal_exception_logging_omits_arbitrary_exception_message():
+    secret = "token-not-stored-in-a-configured-environment-variable"
+    message = f"request failed for https://example.test/hook/{secret}"
+
+    try:
+        raise RuntimeError(message)
+    except RuntimeError as exc:
+        with patch.object(sentiment_monitor, "logger") as mock_logger:
+            sentiment_monitor._log_fatal_exception(exc)
+
+    logged_output = repr(mock_logger.error.call_args_list) + repr(mock_logger.debug.call_args_list)
+    assert secret not in logged_output
+    assert "https://example.test" not in logged_output
+    assert "RuntimeError" in logged_output
+    assert "test_fatal_exception_logging_omits_arbitrary_exception_message" in logged_output

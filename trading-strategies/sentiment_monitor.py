@@ -586,7 +586,7 @@ class NewsCollector:
             # rely on (codex review discussion_r3742559536).
             safe_exc = str(exc)
             if self.api_key:
-                safe_exc = safe_exc.replace(self.api_key, "***")
+                safe_exc = safe_exc.replace(str(self.api_key), "***")
             logger.error("NewsAPI error for %s: %s", ticker, safe_exc)
             return []
 
@@ -916,7 +916,7 @@ class EmailBriefing:
         except smtplib.SMTPException as exc:
             safe_exc = str(exc)
             if self.smtp_password:
-                safe_exc = safe_exc.replace(self.smtp_password, "***")
+                safe_exc = safe_exc.replace(str(self.smtp_password), "***")
             logger.error("Failed to send email: %s", safe_exc)
             raise
 
@@ -947,6 +947,14 @@ def _sanitize_exception(exc: BaseException) -> str:
         return type(exc).__name__
     return type(exc).__name__
 
+def _log_fatal_exception(exc: BaseException) -> None:
+    """Log a fatal pipeline exception without rendering its message."""
+    safe_exc = _sanitize_exception(exc)
+    # format_exc()/format_exception() append str(exc), which may contain a
+    # credential-bearing URL.  format_tb() emits stack frames only.
+    safe_traceback = "".join(traceback.format_tb(exc.__traceback__))
+    logger.error("Fatal error in pipeline: %s", safe_exc)
+    logger.error("Exception details (stack only):\n%s", safe_traceback)
 def _direction(score: float, zscore: Optional[float]) -> str:
     """
     Map a sentiment score + z-score to a direction string for CSS/display.
@@ -1200,16 +1208,7 @@ if __name__ == "__main__":
         logger.info("Interrupted by user.")
         sys.exit(0)
     except Exception as exc:
-        safe_exc = str(exc)
-        safe_traceback = traceback.format_exc()
-        if os.getenv("SMTP_PASSWORD"):
-            safe_exc = safe_exc.replace(os.getenv("SMTP_PASSWORD", ""), "***")
-            safe_traceback = safe_traceback.replace(os.getenv("SMTP_PASSWORD", ""), "***")
-        if os.getenv("NEWS_API_KEY"):
-            safe_exc = safe_exc.replace(os.getenv("NEWS_API_KEY", ""), "***")
-            safe_traceback = safe_traceback.replace(os.getenv("NEWS_API_KEY", ""), "***")
-        logger.error("Fatal error in pipeline: %s", safe_exc)
-        logger.debug(safe_traceback)
+        _log_fatal_exception(exc)
         sys.exit(1)
 
     # Summary printout (non-dry-run mode)
