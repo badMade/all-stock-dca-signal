@@ -21,7 +21,35 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-strategy_monitor = pytest.importorskip("strategy_monitor")
+# Stub missing optional research dependencies during import so SheetsWriter SSRF regression tests always run in CI
+# without polluting global sys.modules for the rest of the test suite.
+_stubs = {}
+for _mod in (
+    "numpy",
+    "pandas",
+    "vectorbt",
+    "yfinance",
+    "alpaca",
+    "alpaca.data",
+    "alpaca.data.historical",
+    "alpaca.data.requests",
+    "alpaca.data.timeframe",
+    "jinja2",
+    "scipy",
+    "scipy.stats",
+):
+    if _mod not in sys.modules:
+        try:
+            __import__(_mod)
+        except ImportError:
+            _stubs[_mod] = MagicMock()
+            sys.modules[_mod] = _stubs[_mod]
+
+try:
+    import strategy_monitor  # noqa: E402
+finally:
+    for _mod in _stubs:
+        sys.modules.pop(_mod, None)
 
 CONFIG = {
     "GOOGLE_SHEET_ID":   "sheet123",
@@ -46,11 +74,15 @@ def test_write_rows_rejects_non_https_scheme(monkeypatch):
     )
     writer = strategy_monitor.SheetsWriter(CONFIG)
 
-    with patch("urllib.request.build_opener") as mock_build_opener:
+    with (
+        patch("urllib.request.build_opener") as mock_build_opener,
+        patch("urllib.request.urlopen") as mock_urlopen,
+    ):
         result = writer.write_rows({}, {}, "2026-08-10")
 
     assert result is False
     mock_build_opener.assert_not_called()
+    mock_urlopen.assert_not_called()
 
 
 def test_write_rows_rejects_untrusted_host(monkeypatch):
@@ -61,22 +93,30 @@ def test_write_rows_rejects_untrusted_host(monkeypatch):
     )
     writer = strategy_monitor.SheetsWriter(CONFIG)
 
-    with patch("urllib.request.build_opener") as mock_build_opener:
+    with (
+        patch("urllib.request.build_opener") as mock_build_opener,
+        patch("urllib.request.urlopen") as mock_urlopen,
+    ):
         result = writer.write_rows({}, {}, "2026-08-10")
 
     assert result is False
     mock_build_opener.assert_not_called()
+    mock_urlopen.assert_not_called()
 
 
 def test_write_rows_rejects_file_scheme(monkeypatch):
     monkeypatch.setattr(strategy_monitor.SheetsWriter, "_API_BASE", "file:///etc/passwd")
     writer = strategy_monitor.SheetsWriter(CONFIG)
 
-    with patch("urllib.request.build_opener") as mock_build_opener:
+    with (
+        patch("urllib.request.build_opener") as mock_build_opener,
+        patch("urllib.request.urlopen") as mock_urlopen,
+    ):
         result = writer.write_rows({}, {}, "2026-08-10")
 
     assert result is False
     mock_build_opener.assert_not_called()
+    mock_urlopen.assert_not_called()
 
 
 def test_write_rows_uses_redirect_blocking_opener_on_trusted_url():
@@ -89,6 +129,9 @@ def test_write_rows_uses_redirect_blocking_opener_on_trusted_url():
 
     assert result is True
     mock_build_opener.assert_called_once()
+    mock_opener.open.assert_called_once()
+    req = mock_opener.open.call_args.args[0]
+    assert req.get_header("Authorization") == f"Bearer {CONFIG['PIPEDREAM_TOKEN']}"
     handler_cls = mock_build_opener.call_args[0][0]
     assert issubclass(handler_cls, urllib.request.HTTPRedirectHandler)
 

@@ -1032,7 +1032,6 @@ class SheetsWriter:
         Returns True on success, False on any failure.
         """
         import urllib.error
-        import urllib.parse
         import urllib.request
         from urllib.parse import urlparse
 
