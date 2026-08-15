@@ -2821,6 +2821,20 @@ def test_incremental_top_up_amount_guard():
     assert incremental_top_up_amount(3.0, 2.0, None, None) == (0.0, "missing_prior_price")
     # Desired already covered by prior -> $0.
     assert incremental_top_up_amount(2.0, 3.0, 390.0, 399.1364) == (0.0, "no_incremental_difference")
+    # Top up difference is below the broker minimum order size -> skip and $0.
+    assert incremental_top_up_amount(2.5, 2.0, 390.0, 399.1364, minimum_order_usd=1.0) == (0.0, "below_broker_minimum_order_size")
+    # Binary float subtraction precision: 2.30 - 1.30 in binary floats produces 0.9999999999999998,
+    # but cent-quantization must treat it as exactly $1.00 and authorize the order.
+    assert incremental_top_up_amount(2.30, 1.30, 390.0, 399.1364, minimum_order_usd=1.0) == (1.0, "incremental_top_up")
+    # Non-positive and boolean minimum_order_usd must fail fast.
+    with pytest.raises(ValueError, match="minimum_order_usd must be a positive number"):
+        incremental_top_up_amount(3.0, 2.0, 390.0, 399.1364, minimum_order_usd=0.0)
+    with pytest.raises(ValueError, match="minimum_order_usd must be a positive number"):
+        incremental_top_up_amount(3.0, 2.0, 390.0, 399.1364, minimum_order_usd=-1.0)
+    with pytest.raises(ValueError, match="minimum_order_usd must be a positive number"):
+        incremental_top_up_amount(3.0, 2.0, 390.0, 399.1364, minimum_order_usd=True)
+    with pytest.raises(ValueError, match="minimum_order_usd must be a positive number"):
+        incremental_top_up_amount(3.0, 2.0, 390.0, 399.1364, minimum_order_usd=False)
 
 
 # --- No-order outcome vs failure (Jul 27 2026 1:30 PM ET) -------------------

@@ -42,6 +42,7 @@ gate = pytest.importorskip(
 
 from scripts.reason_codes import (  # noqa: E402
     ALREADY_MET_OR_OVERFILLED,
+    BELOW_BROKER_MINIMUM_ORDER_SIZE,
     BROKER_HISTORY_INCOMPLETE,
     EFFECTIVE_TOP_UP,
     FIRST_ALLOCATION,
@@ -81,9 +82,14 @@ def _page(orders, *, next_cursor=None):
     return {"data": body}
 
 
-def _run(pages, candidates, *, account=ACCOUNT, day=DAY):
+def _run(pages, candidates, *, account=ACCOUNT, day=DAY, minimum_order_usd=None, config_dir=None):
     return gate.evaluate_slot(
-        pages=pages, candidates=candidates, account_number=account, trading_day=day
+        pages=pages,
+        candidates=candidates,
+        account_number=account,
+        trading_day=day,
+        minimum_order_usd=minimum_order_usd,
+        config_dir=config_dir,
     )
 
 
@@ -151,6 +157,88 @@ def test_a_desired_amount_at_or_below_the_prior_buys_zero_even_when_price_fell()
     d = _by_ticker(r)["AAPL"]
     assert d["buy_usd"] == pytest.approx(0.0)
     assert d["reason"] == ALREADY_MET_OR_OVERFILLED
+
+
+def test_top_up_difference_below_broker_minimum_is_skipped_and_recorded():
+    """A positive top-up delta that is below the broker minimum order size is skipped.
+
+    When desired ($2.50) exceeds prior ($2.00) at a strictly lower price, the
+    computed incremental delta is $0.50. Under a $1.00 broker minimum, this
+    un-placeable order must produce buy_usd=0.0 and canonical reason
+    BELOW_BROKER_MINIMUM_ORDER_SIZE instead of failing at the broker.
+    """
+    pages = [_page([_fill("o1", "TRIN", 2.00, 17.5599, "2026-07-30T13:58:14Z")])]
+    r = _run(pages, [{"ticker": "TRIN", "desired_usd": 2.50, "current_price": 17.3199}], minimum_order_usd=1.0)
+    assert r["verdict"] == "PROCEED"
+    d = _by_ticker(r)["TRIN"]
+    assert d["buy_usd"] == pytest.approx(0.0)
+    assert d["reason"] == BELOW_BROKER_MINIMUM_ORDER_SIZE
+
+    # Under a smaller minimum (e.g. $0.25), the same $0.50 delta is authorized.
+    r_small = _run(pages, [{"ticker": "TRIN", "desired_usd": 2.50, "current_price": 17.3199}], minimum_order_usd=0.25)
+    assert r_small["verdict"] == "PROCEED"
+    d_small = _by_ticker(r_small)["TRIN"]
+    assert d_small["buy_usd"] == pytest.approx(0.50, abs=0.01)
+    assert d_small["reason"] == EFFECTIVE_TOP_UP
+
+
+def test_top_up_with_float_subtraction_at_exact_minimum_boundary():
+    """Cent-quantization prevents float subtraction from skipping an exact minimum buy.
+
+    desired ($2.30) - prior ($1.30) produces 0.9999999999999998 in raw float arithmetic.
+    Cent-quantized comparison must treat this delta as exactly $1.00 and authorize it.
+    """
+    pages = [_page([_fill("o1", "TRIN", 1.30, 17.5599, "2026-07-30T13:58:14Z")])]
+    r = _run(pages, [{"ticker": "TRIN", "desired_usd": 2.30, "current_price": 17.3199}], minimum_order_usd=1.0)
+    assert r["verdict"] == "PROCEED"
+    d = _by_ticker(r)["TRIN"]
+    assert d["buy_usd"] == pytest.approx(1.00, abs=0.01)
+    assert d["reason"] == EFFECTIVE_TOP_UP
+
+
+def test_evaluate_slot_validates_minimum_order_usd():
+    """Non-positive and boolean minimum_order_usd must fail fast."""
+    pages = [_page([])]
+    cands = [{"ticker": "SPCX", "desired_usd": 1.00, "current_price": 112.10}]
+    with pytest.raises(ValueError, match="minimum_order_usd must be a positive number"):
+        _run(pages, cands, minimum_order_usd=0.0)
+    with pytest.raises(ValueError, match="minimum_order_usd must be a positive number"):
+        _run(pages, cands, minimum_order_usd=-1.0)
+    with pytest.raises(ValueError, match="minimum_order_usd must be a positive number"):
+        _run(pages, cands, minimum_order_usd=True)
+    with pytest.raises(ValueError, match="minimum_order_usd must be a positive number"):
+        _run(pages, cands, minimum_order_usd=False)
+
+
+def test_evaluate_slot_resolves_minimum_order_usd_from_config(tmp_path):
+    """When minimum_order_usd is omitted, load the configured value from config_dir."""
+    config_file = tmp_path / "per_ticker_sizing.json"
+    config_file.write_text(
+        json.dumps(
+            {
+                "status": "active",
+                "minimum_order_usd": 2.0,
+                "tickers": {
+                    "TRIN": {
+                        "base_amount_usd": 1.0,
+                        "tiers": [{"min_drop_pct": 0.1, "multiplier": 1.0}],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    pages = [_page([_fill("o1", "TRIN", 2.00, 17.5599, "2026-07-30T13:58:14Z")])]
+    # delta is $1.50, which is < configured $2.00 minimum -> skip
+    r = _run(
+        pages,
+        [{"ticker": "TRIN", "desired_usd": 3.50, "current_price": 17.3199}],
+        config_dir=tmp_path,
+    )
+    assert r["verdict"] == "PROCEED"
+    d = _by_ticker(r)["TRIN"]
+    assert d["buy_usd"] == pytest.approx(0.0)
+    assert d["reason"] == BELOW_BROKER_MINIMUM_ORDER_SIZE
 
 
 # --- the seven-slot picture --------------------------------------------------

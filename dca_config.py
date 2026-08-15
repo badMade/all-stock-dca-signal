@@ -283,6 +283,23 @@ def load_budgets(config_dir: Path) -> Dict[str, Any]:
     return out
 
 
+def _reject_bool_numeric(raw_value: Any, description: str) -> float:
+    """``float(raw_value)``, but explicitly rejecting a JSON boolean first.
+
+    ``bool`` is a subclass of ``int`` in Python, so ``float(True) == 1.0``
+    and ``float(False) == 0.0`` would otherwise silently coerce a
+    schema-invalid boolean into a real, plausible-looking numeric value --
+    e.g. ``"unit_usd": true`` becomes a real $1/unit rate, or
+    ``"max_fire_attempts": true`` becomes a real 1-attempt retry budget,
+    both loading successfully instead of failing closed on the
+    schema-invalid input they actually are (Codex review: "Reject booleans
+    in inverse-Martingale numeric fields").
+    """
+    if isinstance(raw_value, bool):
+        raise ValueError(f"{description} must be a number, not a boolean")
+    return float(raw_value)
+
+
 def load_sizing_tiers(config_dir: Path) -> Dict[str, Any]:
     """Convert sizing_ladder.json tiers into StrategyConfig ``sizing_tiers`` (fractions)."""
     data = _read_json(config_dir / "sizing_ladder.json")
@@ -307,6 +324,11 @@ def load_sizing_tiers(config_dir: Path) -> Dict[str, Any]:
         out["base_buy_amount_usd"] = float(data["base_amount_usd"])
     if "base_amount_below_close_usd" in data:
         out["base_buy_amount_below_close_usd"] = float(data["base_amount_below_close_usd"])
+    if "minimum_order_usd" in data:
+        min_order = _reject_bool_numeric(data["minimum_order_usd"], "sizing_ladder.json minimum_order_usd")
+        if min_order <= 0:
+            raise ValueError(f"sizing_ladder.json minimum_order_usd must be positive, got {min_order}")
+        out["minimum_order_usd"] = min_order
     return out
 
 
@@ -337,24 +359,13 @@ def load_per_ticker_sizing(config_dir: Path) -> Dict[str, Any]:
             "base_amount_usd": full_base,
             "base_amount_below_close_usd": reduced_base,
         }
-    return {"per_ticker_sizing": normalized}
-
-
-def _reject_bool_numeric(raw_value: Any, description: str) -> float:
-    """``float(raw_value)``, but explicitly rejecting a JSON boolean first.
-
-    ``bool`` is a subclass of ``int`` in Python, so ``float(True) == 1.0``
-    and ``float(False) == 0.0`` would otherwise silently coerce a
-    schema-invalid boolean into a real, plausible-looking numeric value --
-    e.g. ``"unit_usd": true`` becomes a real $1/unit rate, or
-    ``"max_fire_attempts": true`` becomes a real 1-attempt retry budget,
-    both loading successfully instead of failing closed on the
-    schema-invalid input they actually are (Codex review: "Reject booleans
-    in inverse-Martingale numeric fields").
-    """
-    if isinstance(raw_value, bool):
-        raise ValueError(f"{description} must be a number, not a boolean")
-    return float(raw_value)
+    out: Dict[str, Any] = {"per_ticker_sizing": normalized}
+    if "minimum_order_usd" in data:
+        min_order = _reject_bool_numeric(data["minimum_order_usd"], "per_ticker_sizing.json minimum_order_usd")
+        if min_order <= 0:
+            raise ValueError(f"per_ticker_sizing.json minimum_order_usd must be positive, got {min_order}")
+        out["minimum_order_usd"] = min_order
+    return out
 
 
 def load_inverse_martingale_config(config_dir: Path) -> Dict[str, Any]:

@@ -872,6 +872,7 @@ def decide_effective_top_up(
     desired_usd: float,
     effective: EffectivePrior,
     current_price: Optional[float],
+    minimum_order_usd: float = 1.0,
 ) -> TopUpDecision:
     """Decide the incremental buy for one symbol, failing closed on incomplete history.
 
@@ -898,6 +899,7 @@ def decide_effective_top_up(
         effective.effective_prior_usd,
         current_price,
         effective.reference_price,
+        minimum_order_usd,
     )
     # from_top_up_guard maps the on-disk top_up_guard_result codes onto the
     # canonical reason vocabulary (no_prior_run -> FIRST_ALLOCATION, etc.).

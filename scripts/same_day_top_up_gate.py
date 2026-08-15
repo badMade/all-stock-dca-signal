@@ -114,7 +114,8 @@ import json
 import sys
 from dataclasses import replace
 from decimal import ROUND_DOWN, Decimal
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 from scripts.broker_reconciliation import (
     BrokerOrder,
@@ -130,6 +131,35 @@ __all__ = ["evaluate_slot", "main"]
 #: Reasons that mean "$0 and a human should look at this", as distinct from
 #: "$0 because the policy's arithmetic legitimately landed on zero".
 _MANUAL_REVIEW_REASONS = frozenset({MISSING_PRIOR_PRICE, MISSING_CURRENT_PRICE, BROKER_HISTORY_INCOMPLETE})
+
+
+def _resolve_minimum_order_usd(
+    minimum_order_usd: Optional[float] = None,
+    config_dir: Optional[Union[str, Path]] = None,
+) -> float:
+    """Resolve the active broker minimum order size.
+
+    If ``minimum_order_usd`` is explicitly supplied, validate and return it.
+    Otherwise, load the configured value from ``config/per_ticker_sizing.json``
+    (falling back to $1.00 if absent or unreadable).
+    """
+    if minimum_order_usd is not None:
+        if isinstance(minimum_order_usd, bool) or minimum_order_usd <= 0:
+            raise ValueError(
+                f"minimum_order_usd must be a positive number, got {minimum_order_usd!r}"
+            )
+        return float(minimum_order_usd)
+
+    try:
+        from dca_config import DEFAULT_CONFIG_DIR, load_per_ticker_sizing
+
+        cd = Path(config_dir) if config_dir is not None else DEFAULT_CONFIG_DIR
+        loaded = load_per_ticker_sizing(cd)
+        if "minimum_order_usd" in loaded:
+            return float(loaded["minimum_order_usd"])
+    except Exception:
+        pass
+    return 1.0
 
 
 class _PageReplayer:
@@ -295,6 +325,8 @@ def evaluate_slot(
     candidates: Sequence[Mapping[str, Any]],
     account_number: str,
     trading_day: str,
+    minimum_order_usd: Optional[float] = None,
+    config_dir: Optional[Union[str, Path]] = None,
 ) -> Dict[str, Any]:
     """Size every candidate against today's broker-observed prior exposure.
 
@@ -333,6 +365,10 @@ def evaluate_slot(
         raise ValueError("account_number is required (account pinning) to evaluate the top-up gate")
     if not str(trading_day or "").strip():
         raise ValueError("trading_day is required (account pinning) to evaluate the top-up gate")
+
+    effective_minimum_order_usd = _resolve_minimum_order_usd(
+        minimum_order_usd, config_dir=config_dir
+    )
 
     if not pages:
         # An empty page list is missing evidence, not evidence of no buying --
@@ -469,7 +505,9 @@ def evaluate_slot(
                 }
             )
             continue
-        decision = decide_effective_top_up(ticker, desired, prior, current_price)
+        decision = decide_effective_top_up(
+            ticker, desired, prior, current_price, effective_minimum_order_usd
+        )
         buy_usd = float(
             Decimal(str(decision.incremental_usd)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
         )
@@ -558,6 +596,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "docstring)."
         ),
     )
+    parser.add_argument(
+        "--config-dir",
+        type=Path,
+        default=None,
+        help="Optional path to directory containing config JSON files.",
+    )
+    parser.add_argument(
+        "--minimum-order-usd",
+        type=float,
+        default=None,
+        help="The minimum order size allowed by the broker (defaults to minimum_order_usd in config/per_ticker_sizing.json, or 1.0).",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -592,6 +642,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         candidates=candidates,
         account_number=args.account,
         trading_day=args.trading_day,
+        minimum_order_usd=args.minimum_order_usd,
+        config_dir=args.config_dir,
     )
     print(json.dumps(result, indent=2))
     return 0 if result["verdict"] == "PROCEED" else 2

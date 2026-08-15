@@ -32,6 +32,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, time, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set
 from zoneinfo import ZoneInfo
@@ -3791,6 +3792,7 @@ def incremental_top_up_amount(
     prior_usd: float,
     current_price: Optional[float],
     reference_price: Optional[float],
+    minimum_order_usd: float = 1.0,
 ) -> tuple[float, str]:
     """Apply the same-day top-up guard for one ticker.
 
@@ -3801,16 +3803,28 @@ def incremental_top_up_amount(
     allocation exists but no comparable price is available, it conservatively
     buys $0 and flags manual review (``missing_prior_price``).
     """
+    if isinstance(minimum_order_usd, bool) or minimum_order_usd <= 0:
+        raise ValueError(
+            f"minimum_order_usd must be a positive number, got {minimum_order_usd!r}"
+        )
     if prior_usd <= 0:
         return max(0.0, desired_amount), "no_prior_run"
     if reference_price is None or current_price is None:
         return 0.0, "missing_prior_price"
     if not (current_price < reference_price):
         return 0.0, "price_not_below_prior_run"
-    incremental = desired_amount - prior_usd
-    if incremental <= 0:
+    # Quantize to cents via Decimal to avoid float subtraction precision issues
+    # (e.g. 2.30 - 1.30 producing 0.9999999999999998, which would incorrectly
+    # skip a valid $1.00 top-up when minimum_order_usd is 1.0).
+    desired_dec = Decimal(str(round(desired_amount, 2)))
+    prior_dec = Decimal(str(round(prior_usd, 2)))
+    min_order_dec = Decimal(str(round(minimum_order_usd, 2)))
+    incremental_dec = desired_dec - prior_dec
+    if incremental_dec <= 0:
         return 0.0, "no_incremental_difference"
-    return incremental, "incremental_top_up"
+    if incremental_dec < min_order_dec:
+        return 0.0, "below_broker_minimum_order_size"
+    return float(incremental_dec), "incremental_top_up"
 
 
 # --- Scheduled-state selection for reporting ---------------------------------

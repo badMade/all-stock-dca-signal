@@ -537,6 +537,7 @@ class MorningConfig:
     base_buy_amount_below_close_usd: float = 1.0
     sizing_tiers: Tuple[Tuple[float, float], ...] = MORNING_SIZING_TIERS
     per_ticker_sizing: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    minimum_order_usd: float = 1.0
     minimum_drop_vs_previous_close: float = MORNING_MINIMUM_DROP
     # None means "use the active mode's default decision anchor" (09:45 for the
     # watchlist scan, 10:30 for the live execution).

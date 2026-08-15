@@ -741,6 +741,7 @@ class StrategyConfig:
     # selection, so the per-order ceiling stays 5x * $2 = $10.
     base_buy_amount_usd: float = 2.0
     base_buy_amount_below_close_usd: float = 1.0
+    minimum_order_usd: float = 1.0
     max_per_order_usd: float = 10.0
     weekly_rollover_reserve_cap_usd: float = 900.0
     high_multiplier_threshold: float = 3.0

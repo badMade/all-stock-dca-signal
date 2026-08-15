@@ -156,6 +156,46 @@ def test_per_ticker_sizing_has_precise_ranges_and_one_dollar_floor(tmp_path):
     assert select_first_allocation_base_usd(99.0, 100.0, None, config, "LOW")[0] == 1.0
 
 
+def test_load_per_ticker_sizing_loads_minimum_order_usd(tmp_path):
+    _write(tmp_path, "per_ticker_sizing.json", {
+        "status": "active",
+        "minimum_order_usd": 2.50,
+        "tickers": {
+            "LOW": {
+                "base_amount_usd": 1.0,
+                "tiers": [{"min_drop_pct": 0.1, "multiplier": 1.0}],
+            }
+        },
+    })
+    res = load_per_ticker_sizing(tmp_path)
+    assert res["minimum_order_usd"] == 2.50
+    config = load_strategy_config(tmp_path)
+    assert config.minimum_order_usd == 2.50
+
+
+def test_load_per_ticker_sizing_rejects_invalid_minimum_order_usd(tmp_path):
+    for invalid in [0, -1.0, True, False]:
+        _write(tmp_path, "per_ticker_sizing.json", {
+            "status": "active",
+            "minimum_order_usd": invalid,
+            "tickers": {},
+        })
+        with pytest.raises(ValueError):
+            load_per_ticker_sizing(tmp_path)
+
+
+def test_load_sizing_tiers_rejects_invalid_minimum_order_usd(tmp_path):
+    for invalid in [0, -1.0, True, False]:
+        _write(tmp_path, "sizing_ladder.json", {
+            "status": "active",
+            "base_amount_usd": 2.0,
+            "minimum_order_usd": invalid,
+            "tiers": [{"min_drop_pct": 0.1, "multiplier": 1.0}],
+        })
+        with pytest.raises(ValueError):
+            load_sizing_tiers(tmp_path)
+
+
 def test_inverse_martingale_missing_file_is_a_no_op(tmp_path):
     assert load_inverse_martingale_config(tmp_path) == {}
 

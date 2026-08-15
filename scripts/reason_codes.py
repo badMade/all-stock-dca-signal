@@ -40,6 +40,8 @@ NO_LOWER_PRICE = "NO_LOWER_PRICE"
 #: The symbol's effective prior allocation already meets or exceeds the desired
 #: amount -> nothing left to buy.
 ALREADY_MET_OR_OVERFILLED = "ALREADY_MET_OR_OVERFILLED"
+#: The incremental top-up was computed but is below the broker minimum.
+BELOW_BROKER_MINIMUM_ORDER_SIZE = "BELOW_BROKER_MINIMUM_ORDER_SIZE"
 #: A same-day order/fill already exists for the symbol (duplicate guard).
 ALREADY_FILLED = "ALREADY_FILLED"
 #: Prior allocation exists but no comparable reference price is available ->
@@ -81,6 +83,7 @@ ALL_REASONS: FrozenSet[str] = frozenset(
         EFFECTIVE_TOP_UP,
         NO_LOWER_PRICE,
         ALREADY_MET_OR_OVERFILLED,
+        BELOW_BROKER_MINIMUM_ORDER_SIZE,
         ALREADY_FILLED,
         MISSING_PRIOR_PRICE,
         MISSING_CURRENT_PRICE,
@@ -103,6 +106,7 @@ NO_BUY_REASONS: FrozenSet[str] = frozenset(
     {
         NO_LOWER_PRICE,
         ALREADY_MET_OR_OVERFILLED,
+        BELOW_BROKER_MINIMUM_ORDER_SIZE,
         ALREADY_FILLED,
         MISSING_PRIOR_PRICE,
         MISSING_CURRENT_PRICE,
@@ -143,6 +147,7 @@ _TOP_UP_GUARD_TO_CANONICAL: Dict[str, str] = {
     "incremental_top_up": EFFECTIVE_TOP_UP,
     "price_not_below_prior_run": NO_LOWER_PRICE,
     "no_incremental_difference": ALREADY_MET_OR_OVERFILLED,
+    "below_broker_minimum_order_size": BELOW_BROKER_MINIMUM_ORDER_SIZE,
     "missing_prior_price": MISSING_PRIOR_PRICE,
     "missing_prior_base": MISSING_PRIOR_PRICE,
 }
@@ -172,6 +177,7 @@ __all__ = [
     "EFFECTIVE_TOP_UP",
     "NO_LOWER_PRICE",
     "ALREADY_MET_OR_OVERFILLED",
+    "BELOW_BROKER_MINIMUM_ORDER_SIZE",
     "ALREADY_FILLED",
     "MISSING_PRIOR_PRICE",
     "MISSING_CURRENT_PRICE",
