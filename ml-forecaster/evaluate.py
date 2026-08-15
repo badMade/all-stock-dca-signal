@@ -36,8 +36,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-import model as model_module
 from features import TARGET_COLUMN
+import model as model_module
 
 DEFAULT_N_SPLITS = 5
 

@@ -529,7 +529,10 @@ def evaluate_inverse_martingale_step(
     ``tracker_state`` is this ticker's persisted state (``{}`` if a cycle has
     never started). ``decision_price``/``previous_close`` are the same two
     prices ``evaluate_source_signal`` already computed for this ticker this
-    run -- no additional data-provider call is made here.
+    run -- no additional data-provider call is made here. ``previous_close``
+    seeds ``cycle_reference_close`` only when a cycle starts; every later
+    step uses that persisted snapshot, so a changing daily previous close
+    cannot manufacture a recovery or move the cycle's tier thresholds.
 
     ``stream`` identifies which of the (up to three) canonical scheduled
     slots this evaluation belongs to -- "morning", "midday", or "afternoon"
