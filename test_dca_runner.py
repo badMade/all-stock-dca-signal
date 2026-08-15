@@ -6453,7 +6453,7 @@ def test_execute_plan_redacts_a_string_mismatched_client_reference(ref_id_field)
             "state": "queued",
             "symbol": "AAPL",
             "side": "buy",
-            ref_id_field: f"{secret_account_number}-ghp_abcdefghijklmnopqrstuvwxyz123456",
+            ref_id_field: f"{secret_account_number}-token_xxxxxxxxxxxxxxxxxxxxxxxx",
         },
         enable_live_orders=True,
         dry_run=False,
@@ -6482,7 +6482,7 @@ def test_execute_plan_redacts_a_string_mismatched_client_reference(ref_id_field)
     )
     assert result.halted_on == "AAPL"
     assert secret_account_number not in result.failure_reason
-    assert "ghp_abcdefghijklmnopqrstuvwxyz123456" not in result.failure_reason
+    assert "token_xxxxxxxxxxxxxxxxxxxxxxxx" not in result.failure_reason
     assert "[REDACTED-TOKEN]" in result.failure_reason
 
 

@@ -364,7 +364,7 @@ def evaluate_slot(
     if not str(account_number or "").strip():
         raise ValueError("account_number is required (account pinning) to evaluate the top-up gate")
     if not str(trading_day or "").strip():
-        raise ValueError("trading_day is required (account pinning) to evaluate the top-up gate")
+        raise ValueError("trading_day is required (day pinning) to evaluate the top-up gate")
 
     effective_minimum_order_usd = _resolve_minimum_order_usd(
         minimum_order_usd, config_dir=config_dir
