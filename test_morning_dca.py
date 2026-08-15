@@ -56,10 +56,12 @@ from morning_dca import (
     MorningSignal,
     TopUpOutcome,
     _csv_qualifying_notional_total,
+    _forbidden_preflight_root_reason,
     _PersistingBrokerAdapter,
     _PersistingMarketDataProvider,
     _RawInputRecorder,
     _same_stream_order_exists,
+    _sanitize_budget_ledger_filename,
     load_max_orders_per_day,
     load_morning_config,
     load_same_day_preflight,
@@ -2877,6 +2879,300 @@ def test_load_same_day_preflight_fails_closed_when_overall_ok_false(tmp_path):
     )
 
     assert load_same_day_preflight(str(tmp_path), date(2026, 7, 8)) is None
+
+
+@pytest.mark.parametrize("alias_kind", ["symlink", "parent_segment"])
+def test_forbidden_preflight_root_canonicalizes_aliases(tmp_path, alias_kind):
+    forbidden_root = tmp_path / "live" / "morning_dca"
+    forbidden_root.mkdir(parents=True)
+    if alias_kind == "symlink":
+        alias = tmp_path / "preflight_alias"
+        alias.symlink_to(forbidden_root, target_is_directory=True)
+    else:
+        alias_parent = forbidden_root / "discarded"
+        alias_parent.mkdir()
+        alias = alias_parent / ".."
+
+    reason = _forbidden_preflight_root_reason(str(alias), (str(forbidden_root),))
+
+    assert reason is not None
+    assert "forbidden" in reason
+
+
+def test_load_same_day_preflight_rejects_artifact_symlink_into_forbidden_root(tmp_path):
+    allowed_root = tmp_path / "preflight"
+    allowed_run_dir = allowed_root / "20260708_0945ET"
+    allowed_run_dir.mkdir(parents=True)
+    forbidden_root = tmp_path / "live" / "morning_dca"
+    forbidden_root.mkdir(parents=True)
+    forbidden_state = forbidden_root / "run_state.json"
+    forbidden_state.write_text(
+        json.dumps({
+            "run_id": "morning_preflight_20260708",
+            "trading_day": "2026-07-08",
+            "overall_ok": True,
+            "eligible_to_execute_tickers": ["SMALL"],
+            "per_ticker_eligibility": [{"symbol": "SMALL", "eligible_to_execute": True}],
+            "run_classification": {
+                "stream": "morning",
+                "run_type": "morning_dca_preflight",
+                "manual_run": False,
+                "state_schema_version": "morning-preflight-v2-machine-complete",
+            },
+        }),
+        encoding="utf-8",
+    )
+    (allowed_run_dir / "run_state.json").symlink_to(forbidden_state)
+
+    loaded = load_same_day_preflight(
+        str(allowed_root),
+        date(2026, 7, 8),
+        forbidden_roots=(str(forbidden_root),),
+    )
+    assert loaded is None
+
+
+def test_load_same_day_preflight_bounded_recovery_handles_oserror(tmp_path, monkeypatch):
+    root = tmp_path / "preflight"
+    root.mkdir()
+
+    def _raising_iterdir(_self):
+        raise OSError("Simulated disk error or permission error")
+
+    monkeypatch.setattr(Path, "iterdir", _raising_iterdir)
+
+    assert load_same_day_preflight(str(root), date(2026, 7, 8), bounded_recovery=True) is None
+
+
+def test_load_same_day_preflight_rejects_artifact_symlink_outside_preflight_root(tmp_path):
+    allowed_root = tmp_path / "preflight"
+    allowed_run_dir = allowed_root / "20260708_0945ET"
+    allowed_run_dir.mkdir(parents=True)
+    external_dir = tmp_path / "somewhere_else"
+    external_dir.mkdir(parents=True)
+    external_state = external_dir / "run_state.json"
+    external_state.write_text(
+        json.dumps({
+            "run_id": "morning_preflight_20260708",
+            "trading_day": "2026-07-08",
+            "overall_ok": True,
+            "eligible_to_execute_tickers": ["SMALL"],
+            "per_ticker_eligibility": [{"symbol": "SMALL", "eligible_to_execute": True}],
+            "run_classification": {
+                "stream": "morning",
+                "run_type": "morning_dca_preflight",
+                "manual_run": False,
+                "state_schema_version": "morning-preflight-v2-machine-complete",
+            },
+        }),
+        encoding="utf-8",
+    )
+    (allowed_run_dir / "run_state.json").symlink_to(external_state)
+
+    loaded = load_same_day_preflight(
+        str(allowed_root),
+        date(2026, 7, 8),
+    )
+    assert loaded is None
+
+
+@pytest.mark.parametrize(
+    "raw_filename",
+    [
+        "..",
+        ".",
+        "foo/..",
+        "foo/.",
+        "/",
+        "\\",
+        "",
+        None,
+        "raw",
+        "orders.csv",
+        "RAW",
+        "Orders.csv",
+        "buy_candidates.csv",
+        "run_state.json",
+        "submitted_orders.csv",
+        "../..",
+        "../foo/..",
+    ],
+)
+def test_sanitize_budget_ledger_filename_rejects_parent_and_reserved_names(raw_filename):
+    assert _sanitize_budget_ledger_filename(raw_filename) == "budget_ledger.json"
+
+
+def test_write_artifacts_rejects_parent_directory_ledger_filename(tmp_path):
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "out"),
+        budget_ledger_filename="..",
+    )
+    ex = MorningDCAExecutor(cfg, mode="live")
+    artifacts = ex.build_artifacts(_now_live(), [], "none", manual=False)
+    artifacts["budget"] = {"daily_cap_usd": 180.0, "morning_spend_usd": 0.0}
+
+    paths = ex.write_artifacts(artifacts, _now_live())
+
+    assert "budget_ledger" in paths
+    ledger_path = Path(paths["budget_ledger"])
+    assert ledger_path.parent == ex.run_state_dir(_now_live())
+    assert ledger_path.name == "budget_ledger.json"
+    assert ledger_path.exists()
+
+
+@pytest.mark.parametrize(
+    "bad_name",
+    [
+        "raw",
+        "orders.csv",
+        "RAW",
+        "Orders.csv",
+        "submitted_orders.csv",
+        "buy_candidates.csv",
+        "run_summary.json",
+        "drift_report.json",
+    ],
+)
+def test_write_artifacts_rejects_run_owned_destinations(tmp_path, bad_name):
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "out"),
+        budget_ledger_filename=bad_name,
+    )
+    ex = MorningDCAExecutor(cfg, mode="live")
+    artifacts = ex.build_artifacts(_now_live(), [], "none", manual=False)
+    artifacts["budget"] = {"daily_cap_usd": 180.0, "morning_spend_usd": 0.0}
+
+    paths = ex.write_artifacts(artifacts, _now_live())
+
+    assert "budget_ledger" in paths
+    ledger_path = Path(paths["budget_ledger"])
+    assert ledger_path.parent == ex.run_state_dir(_now_live())
+    assert ledger_path.name == "budget_ledger.json"
+    assert ledger_path.exists()
+
+
+def test_write_artifacts_sanitizes_budget_ledger_filename(tmp_path):
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "out"),
+        budget_ledger_filename="../../escaped_ledger.json",
+    )
+    ex = MorningDCAExecutor(cfg, mode="live")
+    artifacts = ex.build_artifacts(_now_live(), [], "none", manual=False)
+    artifacts["budget"] = {"daily_cap_usd": 180.0, "morning_spend_usd": 0.0}
+
+    paths = ex.write_artifacts(artifacts, _now_live())
+
+    assert "budget_ledger" in paths
+    ledger_path = Path(paths["budget_ledger"])
+    assert ledger_path.parent == ex.run_state_dir(_now_live())
+    assert ledger_path.name == "escaped_ledger.json"
+    assert ledger_path.exists()
+
+
+def test_maybe_block_for_holiday_writes_budget_ledger(tmp_path):
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "out"),
+        budget_ledger_filename="budget_ledger.json",
+        approved_test_dates=(),
+    )
+    ex = MorningDCAExecutor(cfg, mode="live")
+    weekend_now = datetime(2026, 7, 11, 10, 30, tzinfo=EASTERN)
+    res = ex._maybe_block_for_holiday(weekend_now, manual=False)
+
+    assert res is not None
+    assert "budget_ledger" in res["paths"]
+    ledger_path = Path(res["paths"]["budget_ledger"])
+    assert ledger_path.exists()
+    assert ledger_path.name == "budget_ledger.json"
+
+
+def test_maybe_block_for_holiday_seeds_prior_spend_in_budget_ledger(tmp_path):
+    # Set up earlier spend on Monday 2026-07-06 ($50)
+    state_root = tmp_path / "out"
+    prior_dir = state_root / "20260706_1030ET"
+    prior_dir.mkdir(parents=True)
+    prior_state = {
+        "run_id": "morning_live_20260706_1030ET",
+        "trading_day": "2026-07-06",
+        "broker_outcomes": {
+            "SMALL": {"status": "submitted", "submitted_amount_usd": 50.0, "order_id": "ord-1"}
+        },
+        "buy_candidates": [
+            {
+                "symbol": "SMALL",
+                "planned_amount_usd": 50.0,
+                "status": "submitted",
+            }
+        ],
+        "budget": {"daily_cap_usd": 180.0, "weekly_spent_usd": 50.0, "weekly_cap_usd": 900.0},
+    }
+    (prior_dir / "run_state.json").write_text(json.dumps(prior_state), encoding="utf-8")
+
+    # Run blocked holiday/weekend check on Saturday 2026-07-11
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(state_root),
+        budget_ledger_filename="budget_ledger.json",
+        approved_test_dates=(),
+    )
+    ex = MorningDCAExecutor(cfg, mode="live")
+    weekend_now = datetime(2026, 7, 11, 10, 30, tzinfo=EASTERN)
+    res = ex._maybe_block_for_holiday(weekend_now, manual=False)
+
+    assert res is not None
+    assert "budget_ledger" in res["paths"]
+    ledger_data = json.loads(Path(res["paths"]["budget_ledger"]).read_text(encoding="utf-8"))
+    assert ledger_data["hypothetical_week_spend_usd"] == 50.0
+    assert ledger_data["remaining_weekly_usd"] == 850.0
+
+
+def test_maybe_block_for_holiday_seeds_same_day_pooled_spend(tmp_path):
+    # Set up sibling market-open stream running at 9:35 AM on Wednesday 2026-07-08 with $30 spend
+    sibling_root = tmp_path / "market_open"
+    sibling_dir = sibling_root / "20260708_0935ET"
+    sibling_dir.mkdir(parents=True)
+    sibling_state = {
+        "run_id": "market_open_live_20260708_0935ET",
+        "trading_day": "2026-07-08",
+        "generated_at": "2026-07-08T09:35:05-04:00",
+        "broker_outcomes": {
+            "SMALL": {"status": "submitted", "submitted_amount_usd": 30.0, "order_id": "ord-mo-1"}
+        },
+        "buy_candidates": [
+            {
+                "ticker": "SMALL",
+                "planned_amount_usd": 30.0,
+                "status": "submitted",
+            }
+        ],
+        "budget": {"daily_cap_usd": 180.0, "weekly_spent_usd": 30.0, "weekly_cap_usd": 900.0},
+    }
+    (sibling_dir / "run_state.json").write_text(json.dumps(sibling_state), encoding="utf-8")
+
+    state_root = tmp_path / "morning"
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(state_root),
+        cap_seed_roots=(str(sibling_root), str(state_root)),
+        budget_ledger_filename="budget_ledger.json",
+        approved_test_dates=(date(2026, 7, 7),),  # 2026-07-08 is outside approved window
+    )
+    ex = MorningDCAExecutor(cfg, mode="live")
+    # Invocation at 10:30 ET on the same day 2026-07-08
+    blocked_now = datetime(2026, 7, 8, 10, 30, tzinfo=EASTERN)
+    res = ex._maybe_block_for_holiday(blocked_now, manual=False)
+
+    assert res is not None
+    assert "budget_ledger" in res["paths"]
+    ledger_data = json.loads(Path(res["paths"]["budget_ledger"]).read_text(encoding="utf-8"))
+    assert ledger_data["hypothetical_day_spend_usd"] == 30.0
+    assert ledger_data["remaining_daily_usd"] == 150.0
+    assert ledger_data["hypothetical_week_spend_usd"] == 30.0
+    assert ledger_data["remaining_weekly_usd"] == 870.0
 
 
 def test_live_gate_degrades_to_full_universe_when_preflight_found_but_empty(tmp_path):

@@ -1621,7 +1621,11 @@ def load_stream_config(
 
 
 def load_same_day_preflight(
-    preflight_root: str, trading_day: date, *, bounded_recovery: bool = True
+    preflight_root: str,
+    trading_day: date,
+    *,
+    bounded_recovery: bool = True,
+    forbidden_roots: Sequence[str] = (),
 ) -> Optional[Dict[str, Any]]:
     """Load the same-day 9:45 pre-flight artifact for the 10:30 live gate.
 
@@ -1666,6 +1670,11 @@ def load_same_day_preflight(
     direct path join) so a regression in the primary path construction does
     not silently fail closed without ever finding an artifact that is actually
     on disk.
+
+    Before the selected artifact is read, its canonical path is checked
+    against ``forbidden_roots``. This final-path check prevents a symlink
+    below an otherwise allowed pre-flight root from redirecting the live gate
+    into a forbidden live-output or cron-ID tree.
     """
     root = Path(preflight_root)
     expected_dir_name = f"{trading_day.strftime('%Y%m%d')}_0945ET"
@@ -1688,14 +1697,18 @@ def load_same_day_preflight(
                     pointer_state_path = candidate
         if pointer_state_path is not None:
             state_path = pointer_state_path
-        elif bounded_recovery and root.is_dir():
+        elif bounded_recovery:
             recovered_path = None
-            for entry in sorted(root.iterdir()):
-                if entry.name == expected_dir_name and entry.is_dir():
-                    candidate = entry / "run_state.json"
-                    if candidate.exists():
-                        recovered_path = candidate
-                    break
+            try:
+                if root.is_dir():
+                    for entry in sorted(root.iterdir()):
+                        if entry.name == expected_dir_name and entry.is_dir():
+                            candidate = entry / "run_state.json"
+                            if candidate.exists():
+                                recovered_path = candidate
+                            break
+            except OSError:
+                return None
             if recovered_path is None:
                 return None
             state_path = recovered_path
@@ -1703,7 +1716,16 @@ def load_same_day_preflight(
         else:
             return None
     try:
-        state = json.loads(state_path.read_bytes())
+        resolved_root = root.resolve()
+        resolved_state_path = state_path.resolve()
+    except (OSError, RuntimeError):
+        return None
+    if resolved_root not in resolved_state_path.parents:
+        return None
+    if _forbidden_preflight_root_reason(str(resolved_state_path), forbidden_roots) is not None:
+        return None
+    try:
+        state = json.loads(resolved_state_path.read_bytes())
     except (json.JSONDecodeError, OSError):
         return None
     if not isinstance(state, dict):
@@ -1961,6 +1983,75 @@ class _PersistingBrokerAdapter:
         return getattr(self._inner, name)
 
 
+_RESERVED_ARTIFACT_FILENAMES = frozenset({
+    "",
+    ".",
+    "..",
+    "raw",
+    "manual_runs",
+    "manual_reruns",
+    "manual_recovery",
+    "scheduled_runs",
+    "run_state.json",
+    "run_summary.json",
+    "latest_run_summary.json",
+    "morning_signals.csv",
+    "midday_signals.csv",
+    "market_open_signals.csv",
+    "intraday_signals.csv",
+    "signals.csv",
+    "submitted_orders.csv",
+    "filled_orders.csv",
+    "orders.csv",
+    "buy_candidates.csv",
+    "validation.csv",
+    "observations.csv",
+    "slippage_ranked.csv",
+    "missing_fills_report.csv",
+    "drift_report.json",
+    "drift_report.md",
+    "slippage_and_coverage_report.md",
+    "weekly_performance_dashboard.md",
+    "notion_latest_run_compact.md",
+    "notion_latest_run_payload.json",
+    "gfuz_supplemental_preflight.json",
+    "latest_morning_run.json",
+    "latest_preflight.json",
+    "latest_scheduled_run.json",
+    "latest_midday_run.json",
+    "latest_market_open_run.json",
+    "latest_intraday_run.json",
+    "latest_dca_run.json",
+    "latest_trade_run.json",
+})
+
+
+def _sanitize_budget_ledger_filename(raw_filename: Optional[str]) -> str:
+    """Return a safe single-file basename for the budget ledger snapshot.
+
+    Rejects empty strings, directory traversal segments ('.', '..'), path
+    separators, run-owned directories, and reserved artifact filenames,
+    falling back to the canonical 'budget_ledger.json'.
+    """
+    if not raw_filename or not isinstance(raw_filename, str):
+        return "budget_ledger.json"
+    cleaned = raw_filename.strip()
+    if cleaned.endswith(("/", "\\", "/.", "\\.", "/..", "\\..")):
+        return "budget_ledger.json"
+    name = Path(cleaned).name.strip()
+    if (
+        not name
+        or name in _RESERVED_ARTIFACT_FILENAMES
+        or name.lower() in _RESERVED_ARTIFACT_FILENAMES
+        or name.startswith("..")
+        or name == "."
+        or "/" in name
+        or "\\" in name
+    ):
+        return "budget_ledger.json"
+    return name
+
+
 def _strip_template_segments(path: str) -> str:
     """Drop ``YYYYMMDD*`` template path segments (e.g. ``YYYYMMDD_1030ET``).
 
@@ -1970,8 +2061,8 @@ def _strip_template_segments(path: str) -> str:
     actual root (``.../morning_dca``) so it can be compared against a
     configured ``preflight_run_state_root``.
     """
-    segments = [seg for seg in path.rstrip("/").split("/") if "YYYYMMDD" not in seg]
-    return "/".join(segments)
+    segments = [segment for segment in Path(path).parts if "YYYYMMDD" not in segment]
+    return str(Path(*segments))
 
 
 def _forbidden_preflight_root_reason(
@@ -1983,10 +2074,16 @@ def _forbidden_preflight_root_reason(
     the same-day 9:45 pre-flight artifact must never be read from the 10:30
     live output directory or a bare cron-id path (the Jul 20 2026 incident).
     """
-    resolved = str(Path(root)).rstrip("/")
+    try:
+        resolved = Path(root).resolve()
+    except (OSError, RuntimeError):
+        resolved = Path(root)
     for forbidden in forbidden_roots:
-        normalized = _strip_template_segments(str(forbidden))
-        if resolved == normalized or resolved.startswith(normalized + "/"):
+        try:
+            normalized = Path(_strip_template_segments(str(forbidden))).resolve()
+        except (OSError, RuntimeError):
+            normalized = Path(_strip_template_segments(str(forbidden)))
+        if resolved == normalized or normalized in resolved.parents:
             return (
                 f"preflight_run_state_root {root!r} resolves under a forbidden "
                 f"must_not_look_under path ({forbidden!r}); refusing to read the "
@@ -2041,7 +2138,12 @@ def morning_preflight_eligible_tickers(
         # re-evaluates the whole universe itself instead of a pre-screened
         # subset; every other safeguard at 10:30 is unaffected).
         return list(tickers), {"preflight_found": False, "warning": forbidden_reason}
-    loaded = load_same_day_preflight(root, trading_day, bounded_recovery=preflight_bounded_recovery)
+    loaded = load_same_day_preflight(
+        root,
+        trading_day,
+        bounded_recovery=preflight_bounded_recovery,
+        forbidden_roots=forbidden_roots,
+    )
     if loaded is None:
         # NON-BLOCKING (see the note above): a missing or unparseable same-day
         # pre-flight artifact degrades to the full configured universe with a
@@ -2284,6 +2386,91 @@ class MorningDCAExecutor(DCAExecutor):
         """
         return self.stream
 
+    def _seed_same_day_cap_from_roots(self, now: datetime) -> None:
+        """Seed this stream's cap ledger from ``cap_seed_roots`` for same-day spend.
+
+        Runs for ALL live runs (scheduled, manual, and blocked) so prior same-day/week
+        fills always reduce remaining_daily/remaining_weekly before placing orders or
+        writing blocked ledger snapshots.
+        """
+        if self.mode != MORNING_LIVE_MODE:
+            return
+        cap_roots = getattr(self.config, "cap_seed_roots", None)
+        if not cap_roots:
+            return
+        trading_day = now.astimezone(EASTERN).date()
+        boundary_et = now.astimezone(EASTERN).time()
+        seed_key = (frozenset(cap_roots), trading_day)
+        cap_skip_sink: List[Path] = []
+        cap_allocations = load_prior_same_day_allocations_multi(
+            cap_roots,
+            trading_day,
+            boundary_et=boundary_et,
+            include_scheduled_afternoon=True,
+            skip_sink=cap_skip_sink,
+        )
+        this_week = iso_week_key(trading_day)
+        if cap_skip_sink:
+            self._cap_seed_scan_incomplete = True
+            self._cap_seed_scan_incomplete_paths = [str(p) for p in cap_skip_sink]
+            day_poison_delta = max(
+                0.0, self.ledger.daily_cap_usd - self.ledger.day_planned(trading_day)
+            )
+            if day_poison_delta > 0:
+                self.ledger.planned_by_day[trading_day] = (
+                    self.ledger.day_planned(trading_day) + day_poison_delta
+                )
+                self._cap_seed_poison_day[trading_day] = (
+                    self._cap_seed_poison_day.get(trading_day, 0.0) + day_poison_delta
+                )
+            week_poison_delta = max(
+                0.0, self.ledger.weekly_cap_usd - self.ledger.week_planned(trading_day)
+            )
+            if week_poison_delta > 0:
+                self.ledger.planned_by_week[this_week] = (
+                    self.ledger.week_planned(trading_day) + week_poison_delta
+                )
+                self._cap_seed_poison_week[this_week] = (
+                    self._cap_seed_poison_week.get(this_week, 0.0) + week_poison_delta
+                )
+        else:
+            poisoned_day = self._cap_seed_poison_day.pop(trading_day, 0.0)
+            if poisoned_day > 0:
+                self.ledger.planned_by_day[trading_day] = max(
+                    0.0, self.ledger.day_planned(trading_day) - poisoned_day
+                )
+            poisoned_week = self._cap_seed_poison_week.pop(this_week, 0.0)
+            if poisoned_week > 0:
+                self.ledger.planned_by_week[this_week] = max(
+                    0.0, self.ledger.week_planned(trading_day) - poisoned_week
+                )
+            new_total = sum(
+                a.amount_usd
+                for a in cap_allocations.values()
+                if a.amount_usd > 0 and math.isfinite(a.amount_usd)
+            )
+            self.ledger.seed_day_attempts(
+                trading_day,
+                sum(a.attempt_count for a in cap_allocations.values()),
+            )
+            manual_root = str(Path(self.state_root) / self.manual_run_subdir)
+            own_manual_in_scan = any(
+                Path(manual_root).is_relative_to(Path(r)) for r in cap_roots
+            )
+            own_scheduled_in_scan = any(
+                Path(self.state_root).is_relative_to(Path(r)) for r in cap_roots
+            )
+            own_amount = (
+                self._own_recorded_manual.get(trading_day, 0.0) if own_manual_in_scan else 0.0
+            ) + (
+                self._own_recorded_scheduled.get(trading_day, 0.0) if own_scheduled_in_scan else 0.0
+            )
+            prev_total = self._cap_seeded_amounts.get(seed_key, 0.0) + own_amount
+            incremental = new_total - prev_total
+            if incremental > 0:
+                self._cap_seeded_amounts[seed_key] = new_total - own_amount
+                self.ledger.record_hypothetical(trading_day, incremental)
+
     # -- Top-up guard (same-day prior-allocation offset) ---------------------
     def _compute_top_up(
         self, now: datetime, signals: Sequence["MorningSignal"], *, manual: bool = False
@@ -2355,142 +2542,7 @@ class MorningDCAExecutor(DCAExecutor):
                 roots = list(dict.fromkeys(configured))
         trading_day = now.astimezone(EASTERN).date()
         boundary_et = now.astimezone(EASTERN).time()
-        # Seed this stream's cap ledger for ALL live runs (scheduled and manual) so
-        # prior same-day/week fills always reduce remaining_daily/remaining_weekly
-        # before _place_broker_orders. Uses cap_seed_roots, which now (2026-08-02,
-        # see DEFAULT_MORNING_DAILY_CAP_USD's comment) spans every sibling stream's
-        # root so the shared $180/$900 ceiling reflects real cross-stream spend,
-        # not just this stream's own. Incremental seeding: repeated calls pick up
-        # new fills without double-counting. This runs even when
-        # prior_allocation_roots=[] disables the per-ticker guard.
-        # Previously gated to `self.stream == MORNING_STREAM` only -- the block
-        # below is entirely stream-agnostic (reads self.config/self.state_root/
-        # self.ledger generically) and midday's own MiddayConfig.cap_seed_roots
-        # (config/midday_dca.json, added 2026-08-02) was simply never reached
-        # because of that restriction, leaving midday's cap ledger with zero
-        # cross-stream visibility. Runs for any stream that has cap_seed_roots
-        # configured, not morning specifically.
-        cap_roots = getattr(self.config, "cap_seed_roots", None)
-        if cap_roots:
-            seed_key = (frozenset(cap_roots), trading_day)
-            cap_skip_sink: List[Path] = []
-            cap_allocations = load_prior_same_day_allocations_multi(
-                cap_roots,
-                trading_day,
-                boundary_et=boundary_et,
-                # Cap purposes want EVERY same-day contribution counted,
-                # including a same-day SCHEDULED afternoon run -- unlike the
-                # per-ticker top-up guard below (``roots``), which deliberately
-                # excludes it (the afternoon guard must never see another
-                # afternoon-scheduled run as prior context). Without this, a
-                # manual morning/midday invocation running after the 3:30
-                # final slot undercounts real same-day spend and could let
-                # the day exceed the shared $180 cap (Codex review: "Count
-                # scheduled afternoon fills in late manual runs").
-                include_scheduled_afternoon=True,
-                # FAIL CLOSED on unreadable cross-stream evidence rather than
-                # silently under-counting it (Codex review: "Fail closed when
-                # cross-stream cap evidence is unreadable").
-                skip_sink=cap_skip_sink,
-            )
-            this_week = iso_week_key(trading_day)
-            if cap_skip_sink:
-                # A sibling stream's cap artifact could not be read or parsed
-                # (partially written, malformed, a missing referenced CSV).
-                # new_total below would then understate real cross-stream
-                # spend, letting this run place against overstated headroom.
-                # Treat capacity as fully exhausted for this run instead --
-                # remaining_daily/remaining_weekly become 0 -- rather than
-                # place on an unproven, possibly-too-low figure.
-                self._cap_seed_scan_incomplete = True
-                self._cap_seed_scan_incomplete_paths = [str(p) for p in cap_skip_sink]
-                # Inject only the INCREMENTAL top-up needed to reach the
-                # ceiling (not a flat max() overwrite), and remember exactly
-                # how much was injected. A long-lived executor's next retry
-                # reuses this same self.ledger; once the transient failure
-                # clears, the success branch below subtracts this recorded
-                # delta back out before applying the real incremental spend,
-                # so the poisoning never outlives the scan that caused it.
-                day_poison_delta = max(
-                    0.0, self.ledger.daily_cap_usd - self.ledger.day_planned(trading_day)
-                )
-                if day_poison_delta > 0:
-                    self.ledger.planned_by_day[trading_day] = (
-                        self.ledger.day_planned(trading_day) + day_poison_delta
-                    )
-                    self._cap_seed_poison_day[trading_day] = (
-                        self._cap_seed_poison_day.get(trading_day, 0.0) + day_poison_delta
-                    )
-                week_poison_delta = max(
-                    0.0, self.ledger.weekly_cap_usd - self.ledger.week_planned(trading_day)
-                )
-                if week_poison_delta > 0:
-                    self.ledger.planned_by_week[this_week] = (
-                        self.ledger.week_planned(trading_day) + week_poison_delta
-                    )
-                    self._cap_seed_poison_week[this_week] = (
-                        self._cap_seed_poison_week.get(this_week, 0.0) + week_poison_delta
-                    )
-            else:
-                poisoned_day = self._cap_seed_poison_day.pop(trading_day, 0.0)
-                if poisoned_day > 0:
-                    self.ledger.planned_by_day[trading_day] = max(
-                        0.0, self.ledger.day_planned(trading_day) - poisoned_day
-                    )
-                poisoned_week = self._cap_seed_poison_week.pop(this_week, 0.0)
-                if poisoned_week > 0:
-                    self.ledger.planned_by_week[this_week] = max(
-                        0.0, self.ledger.week_planned(trading_day) - poisoned_week
-                    )
-                new_total = sum(
-                    a.amount_usd
-                    for a in cap_allocations.values()
-                    if a.amount_usd > 0 and math.isfinite(a.amount_usd)
-                )
-                # Seed today's shared cross-stream order-ATTEMPT count
-                # (MorningConfig.max_orders_per_day) from the same cap_roots
-                # scan used for the dollar cap, using each ticker's own
-                # PriorSameDayAllocation.attempt_count -- not "1 per ticker
-                # with a positive allocation", which collapsed multiple
-                # same-day top-ups for one ticker into a single attempt and
-                # ignored rejected/cancelled/failed attempts entirely (they
-                # carry amount_usd == 0 but still consumed a shared slot).
-                # attempt_count is already deduplicated per ticker across
-                # every scanned root by load_prior_same_day_allocations_multi
-                # (Codex review: "Seed the cap from actual order attempts").
-                self.ledger.seed_day_attempts(
-                    trading_day,
-                    sum(a.attempt_count for a in cap_allocations.values()),
-                )
-                # Only credit each _own_recorded_* bucket when the corresponding
-                # on-disk location is actually covered by cap_seed_roots -- manual
-                # artifacts live under manual_root, scheduled artifacts live
-                # directly under state_root (run_state_dir()). The two are gated
-                # independently (not via a single state_root-covers-everything
-                # check) because cap_seed_roots may cover one without the other,
-                # e.g. a legacy/narrower config scanning only manual_runs/. When a
-                # location isn't covered, its own fills are absent from new_total
-                # so subtracting them would suppress external fill pickup.
-                own_manual_in_scan = any(
-                    Path(manual_root).is_relative_to(Path(r)) for r in cap_roots
-                )
-                own_scheduled_in_scan = any(
-                    Path(self.state_root).is_relative_to(Path(r)) for r in cap_roots
-                )
-                own_amount = (
-                    self._own_recorded_manual.get(trading_day, 0.0) if own_manual_in_scan else 0.0
-                ) + (
-                    self._own_recorded_scheduled.get(trading_day, 0.0) if own_scheduled_in_scan else 0.0
-                )
-                prev_total = self._cap_seeded_amounts.get(seed_key, 0.0) + own_amount
-                incremental = new_total - prev_total
-                if incremental > 0:
-                    # Store only the external (non-own) portion so _own_recorded
-                    # additions by later scheduled-run record_buy_candidates calls
-                    # do not inflate prev_total beyond new_total and suppress
-                    # pickup of subsequent external fills.
-                    self._cap_seeded_amounts[seed_key] = new_total - own_amount
-                    self.ledger.record_hypothetical(trading_day, incremental)
+        self._seed_same_day_cap_from_roots(now)
         # Per-ticker incremental outcomes on the MORNING stream: scheduled runs
         # only. A manual morning recovery run relies on same_day_strategy_order_exists
         # as its sole duplicate-order gate. Other streams (midday) keep the
@@ -3869,7 +3921,10 @@ class MorningDCAExecutor(DCAExecutor):
         # computed into artifacts["budget"], so a missing ledger on disk is
         # bootstrapped rather than treated as an escalation condition.
         if self.mode == MORNING_LIVE_MODE and self.writes_budget_ledger:
-            ledger_path = out / self.config.budget_ledger_filename
+            ledger_filename = _sanitize_budget_ledger_filename(
+                self.config.budget_ledger_filename
+            )
+            ledger_path = out / ledger_filename
             atomic_write_text(
                 ledger_path, json.dumps(artifacts["budget"], indent=2, sort_keys=True)
             )
@@ -4263,6 +4318,9 @@ class MorningDCAExecutor(DCAExecutor):
                 existing["paths"],
             )
             return existing
+        if self.mode == MORNING_LIVE_MODE:
+            self._seed_ledger_from_prior_runs(now)
+            self._seed_same_day_cap_from_roots(now)
         artifacts = self.build_artifacts(now, [], "none", manual=manual)
         artifacts["status"] = "blocked"
         artifacts["block_reason"] = block_reason
@@ -4307,6 +4365,15 @@ class MorningDCAExecutor(DCAExecutor):
             signals_path = out / self.signals_csv_name
             _write_csv(signals_path, artifacts.get("signal_rows") or [])
             paths["signals"] = str(signals_path)
+            if self.writes_budget_ledger and artifacts.get("budget"):
+                ledger_filename = _sanitize_budget_ledger_filename(
+                    self.config.budget_ledger_filename
+                )
+                ledger_path = out / ledger_filename
+                atomic_write_text(
+                    ledger_path, json.dumps(artifacts["budget"], indent=2, sort_keys=True)
+                )
+                paths["budget_ledger"] = str(ledger_path)
             summary_path = out / "run_summary.json"
             atomic_write_text(
                 summary_path,
