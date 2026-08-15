@@ -1485,9 +1485,15 @@ def test_ledger_raises_when_a_tracker_file_is_misplaced_into_the_wrong_ticker_di
     misft_dir.mkdir()
     (misft_dir / "tracker.json").write_text(aapl_path.read_text(encoding="utf-8"), encoding="utf-8")
 
-    with pytest.raises(CorruptedLedgerStateError):
+    with pytest.raises(
+        CorruptedLedgerStateError,
+        match=r"under MSFT's directory.*records ticker 'AAPL'",
+    ):
         ledger.read("MSFT")
 
+    # Refusing the read is fail-closed: it must not rewrite or otherwise
+    # "repair" the misplaced source balance into MSFT-owned state.
+    assert (misft_dir / "tracker.json").read_text(encoding="utf-8") == aapl_path.read_text(encoding="utf-8")
     # AAPL's own (correctly-placed) file is completely unaffected.
     assert ledger.read("AAPL")["status"] == STATUS_DIPPING
 
