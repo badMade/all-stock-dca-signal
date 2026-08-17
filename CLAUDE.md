@@ -53,13 +53,16 @@ ruff check --isolated --select=E,F,B --line-length=120 production-safe-agent-loo
 ruff check --isolated --select=E,F,B --line-length=120 ticker-advisor
 (cd ml-forecaster && pip install -r requirements.txt && python -m pytest tests/)   # own requirements.txt
 ruff check --isolated --select=E,F,B --line-length=120 ml-forecaster
+(cd wondrous-octopus && pip install -r requirements.txt && python -m pytest tests/)   # own requirements.txt (torch: CPU wheel suffices)
+ruff check --isolated --select=E,F,B --line-length=120 wondrous-octopus
 ```
 
 CI (`.github/workflows/ci.yml`) runs lint + coverage-gated tests on Python 3.11 and 3.12, the
 demo smoke test, `pip-audit` on `requirements-dev.txt`, and the `production-safe-agent-loop`,
-`ticker-advisor`, and `ml-forecaster` suites (the sizing-adjustment ML retrain pipeline, see
-`docs/ticker_advisory.md`'s "Implemented: the ml-forecaster sibling tool" section) each in their
-own job. Dev tool versions are **pinned** in `requirements-dev.txt` on purpose — bump
+`ticker-advisor`, `ml-forecaster` (the sizing-adjustment ML retrain pipeline, see
+`docs/ticker_advisory.md`'s "Implemented: the ml-forecaster sibling tool" section), and
+`wondrous-octopus` (walk-forward OHLC forecasting, see `docs/wondrous_octopus.md`) suites each
+in their own job. Dev tool versions are **pinned** in `requirements-dev.txt` on purpose — bump
 deliberately.
 
 ## Architecture
@@ -164,8 +167,8 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
   `scripts/tests/`. Add or update tests for every behavior change, and a regression test for
   every bug fix.
 - `trading-strategies/`, `analysis/`, `.github/`, `production-safe-agent-loop/`,
-  `ticker-advisor/`, and `ml-forecaster/` are excluded from the core ruff gate and the coverage
-  source — they carry their own deps and conventions.
+  `ticker-advisor/`, `ml-forecaster/`, and `wondrous-octopus/` are excluded from the core ruff
+  gate and the coverage source — they carry their own deps and conventions.
 - Check `git status --short` before editing and preserve existing user changes. Keep patches
   small; avoid unrelated refactors. Review the diff for secrets and generated artifacts before
   committing.
@@ -185,6 +188,7 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 | `docs/strategy.md` | Strategy overview, ticker universe, sizing ladder, budgets |
 | `docs/ticker_advisory.md` | The `ticker-advisor/` tool: scores candidate tickers, proposes universe additions for manual review |
 | `docs/inverse_martingale.md` | Opt-in deferred-accumulation sizing mode: tracks dip-tier amounts instead of buying into a decline, fires once on recovery |
+| `docs/wondrous_octopus.md` | The `wondrous-octopus/` tool: walk-forward, online-updated next-day OHLC forecasting across the whole archive; research artifacts only, never wired into live sizing |
 | `docs/drift_detection.md`, `docs/reporting_workflow.md`, `docs/cost_tracking.md` | Post-run detection, reporting, and cost policy |
 | `docs/pr_review_workflow.md` | The two-workflow PR review split and its trust boundary |
 | `PRODUCTION_READINESS.md` | Tracked gaps between the library and a fully live system |

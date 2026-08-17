@@ -157,7 +157,8 @@ python_files = ["test_*.py"]
 # its own directory instead (pip install -r <dir>/requirements.txt, then
 # cd <dir> && python -m pytest tests/), so keep both out of the core
 # "pytest" sweep the same way ruff already excludes them below.
-addopts = "-q --ignore=production-safe-agent-loop --ignore=ticker-advisor --ignore=ml-forecaster"
+# wondrous-octopus/ (pandas/numpy/scikit-learn/torch) follows the same rule.
+addopts = "-q --ignore=production-safe-agent-loop --ignore=ticker-advisor --ignore=ml-forecaster --ignore=wondrous-octopus"
 
 [tool.coverage.run]
 # Measure the code that runs in production, not the suite that exercises it.
@@ -182,6 +183,9 @@ omit = [
     # Same reasoning as ticker-advisor/ above -- own pytest run, own heavy deps
     # (scikit-learn/pandas/numpy), excluded from the root sweep and gate.
     "ml-forecaster/*",
+    # Same reasoning again -- own pytest run, own heavy deps (torch on top of
+    # the ml-forecaster set), excluded from the root sweep and gate.
+    "wondrous-octopus/*",
 ]
 
 [tool.coverage.report]
@@ -208,6 +212,7 @@ extend-exclude = [
     "production-safe-agent-loop",
     "ticker-advisor",
     "ml-forecaster",
+    "wondrous-octopus",
 ]
 
 [tool.ruff.lint]

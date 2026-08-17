@@ -1,0 +1,9 @@
+[tool.pytest.ini_options]
+# Self-contained pytest config for wondrous-octopus, mirroring
+# ml-forecaster/pyproject.toml (itself mirroring ticker-advisor's and
+# production-safe-agent-loop's). Without this file pytest walks up to the
+# repo-root pyproject.toml, which sets rootdir to the repo root and applies
+# addopts/testpaths scoped to the core, stdlib-only DCA suite -- not this
+# heavy-dep subproject.
+testpaths = ["tests"]
+python_files = ["test_*.py"]
