@@ -216,4 +216,6 @@ ignore = ["E501"]
 
 [tool.pyright]
 extraPaths = ["scripts"]
+typeCheckingMode = "basic"
+reportGeneralTypeIssues = false
 

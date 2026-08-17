@@ -234,7 +234,7 @@ def _is_iso_utc_timestamp(value: object) -> bool:
     return parsed.tzinfo is not None and parsed.utcoffset() is not None
 
 
-def _validate_recovery_state(state: object, trading_day: Optional[str] = None) -> bool:
+def _validate_recovery_state(state: Optional[Mapping[str, object]], trading_day: Optional[str] = None) -> bool:
     """Delegate to run_classification's canonical recovery-contract validator.
 
     Imported lazily and by both module paths: this file is imported as

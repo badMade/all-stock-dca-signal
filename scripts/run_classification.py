@@ -207,7 +207,8 @@ def is_valid_recovery_context_state(
 
     day = trading_day or state_day
     classification = state.get("run_classification")
-    return validate_recovery_classification(classification, day)
+    classification_map = classification if isinstance(classification, Mapping) else None
+    return validate_recovery_classification(classification_map, day)
 
 
 def validate_recovery_classification(
@@ -627,9 +628,17 @@ def _et_seconds(value: object) -> Optional[int]:
     return hh * 3600 + mm * 60 + ss
 
 
-_CANONICAL_WINDOW_START_MIN = _et_minutes(SCHEDULED_WINDOW_START_ET)  # 15:25
-_LEGACY_WINDOW_START_MIN = _et_minutes(LEGACY_SCHEDULED_WINDOW_START_ET)  # 15:15
-_WINDOW_END_MIN = _et_minutes(SCHEDULED_WINDOW_END_ET)      # 15:35
+_canonical_start = _et_minutes(SCHEDULED_WINDOW_START_ET)
+assert _canonical_start is not None
+_CANONICAL_WINDOW_START_MIN: int = _canonical_start
+
+_legacy_start = _et_minutes(LEGACY_SCHEDULED_WINDOW_START_ET)
+assert _legacy_start is not None
+_LEGACY_WINDOW_START_MIN: int = _legacy_start
+
+_end_min = _et_minutes(SCHEDULED_WINDOW_END_ET)
+assert _end_min is not None
+_WINDOW_END_MIN: int = _end_min
 
 
 def _attribution_window_start_min(rc: object) -> int:
