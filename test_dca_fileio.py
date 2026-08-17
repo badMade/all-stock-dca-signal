@@ -545,3 +545,47 @@ def test_ordinary_repeated_writes_are_unaffected(tmp_path):
     for index in range(5):
         atomic_write_text(target, '{"n": %d}' % index)
     assert target.read_text(encoding="utf-8") == '{"n": 4}'
+
+
+def test_fsync_dir_success(tmp_path):
+    from unittest import mock
+
+    from dca_fileio import _fsync_dir
+    with mock.patch("os.open", return_value=42) as m_open, \
+         mock.patch("os.fsync") as m_fsync, \
+         mock.patch("os.close") as m_close:
+
+        _fsync_dir(tmp_path)
+
+        m_open.assert_called_once_with(tmp_path, os.O_RDONLY)
+        m_fsync.assert_called_once_with(42)
+        m_close.assert_called_once_with(42)
+
+
+def test_fsync_dir_open_oserror(tmp_path):
+    from unittest import mock
+
+    from dca_fileio import _fsync_dir
+    with mock.patch("os.open", side_effect=OSError) as m_open, \
+         mock.patch("os.fsync") as m_fsync, \
+         mock.patch("os.close") as m_close:
+
+        _fsync_dir(tmp_path)
+
+        m_open.assert_called_once_with(tmp_path, os.O_RDONLY)
+        m_fsync.assert_not_called()
+        m_close.assert_not_called()
+
+def test_fsync_dir_fsync_oserror(tmp_path):
+    from unittest import mock
+
+    from dca_fileio import _fsync_dir
+    with mock.patch("os.open", return_value=42) as m_open, \
+         mock.patch("os.fsync", side_effect=OSError) as m_fsync, \
+         mock.patch("os.close") as m_close:
+
+        _fsync_dir(tmp_path)
+
+        m_open.assert_called_once_with(tmp_path, os.O_RDONLY)
+        m_fsync.assert_called_once_with(42)
+        m_close.assert_called_once_with(42)

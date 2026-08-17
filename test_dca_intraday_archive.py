@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from dca_intraday_archive import (
     OBSERVATION_FIELDS,
     IntradayObservation,
+    _iso_or_blank,
     _slot_from_classification,
     append_observations,
     archive_observations_safely,
@@ -493,3 +494,14 @@ def test_append_observations_respects_the_intraday_archive_dir_override_when_tic
     assert result["rows_added"] == 1
     assert override_dir.is_dir()
     assert not missing_root.exists()
+
+
+def test_iso_or_blank():
+    assert _iso_or_blank(None) == ""
+    assert _iso_or_blank("") == ""
+
+    dt = datetime(2023, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    assert _iso_or_blank(dt) == "2023-01-01T12:00:00+00:00"
+
+    assert _iso_or_blank("2023-01-01") == "2023-01-01"
+    assert _iso_or_blank(123) == "123"
