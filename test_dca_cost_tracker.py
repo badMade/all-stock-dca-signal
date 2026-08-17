@@ -101,7 +101,7 @@ def test_collect_skips_unparseable_files(tmp_path):
     _write_runs(tmp_path, [_run_state("2026-06-29")])
     bad_dir = tmp_path / "runs/bad"
     bad_dir.mkdir(parents=True, exist_ok=True)
-    (bad_dir / "run_state.json").write_text("{not valid json")
+    (bad_dir / "run_state.json").write_text('{"trading_day": "2026-06-30", not valid json')
 
     states = collect_month_run_states(tmp_path, 2026, 6)
     assert len(states) == 1  # bad file skipped, good one kept
@@ -163,6 +163,32 @@ def test_payload_is_connector_agnostic():
 
     with_page = build_cost_tracker_payload(agg, page_id="PAGE123")
     assert with_page["page_id"] == "PAGE123"
+
+
+def test_build_cost_tracker_payload():
+    agg = {"month_label": "2026-06", "totals": {}, "components": []}
+    payload = build_cost_tracker_payload(agg, page_id="page_123")
+    assert payload["title"] == COST_TRACKER_TITLE
+    assert payload["page_id"] == "page_123"
+    assert payload["month_label"] == "2026-06"
+    assert payload["aggregate"] == agg
+    assert payload["value_type"] == "estimate_proxy"
+    assert isinstance(payload["markdown"], str)
+
+
+def test_collect_skips_unreadable_files(tmp_path):
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    bad_dir = tmp_path / "runs/bad"
+    bad_dir.mkdir(parents=True, exist_ok=True)
+    (bad_dir / "run_state.json").write_bytes(b"\x80abc")
+
+    states = collect_month_run_states(tmp_path, 2026, 6)
+    assert len(states) == 1  # bad file skipped, good one kept
+
+
+def test_markdown_no_components():
+    md = build_cost_tracker_markdown({})
+    assert "| _no runs_ | 0 | - | 0 |" in md
 
 
 def test_generate_cost_tracker_writes_files(tmp_path):
