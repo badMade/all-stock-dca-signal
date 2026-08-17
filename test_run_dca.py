@@ -153,6 +153,17 @@ def test_is_within():
     assert _is_within(Path("/"), base) is False
 
 
+def test_slot_time_et():
+    from run_dca import _slot_time_et
+    assert _slot_time_et("1030ET") == time(10, 30)
+    assert _slot_time_et("1530ET") == time(15, 30)
+    assert _slot_time_et("0935ET") == time(9, 35)
+
+    # without ET
+    assert _slot_time_et("1030") == time(10, 30)
+    assert _slot_time_et("0935") == time(9, 35)
+
+
 def test_demo_provider_produces_downtrend_bars():
     prov = DemoDataProvider(SourceName.FINANCE)
     start = datetime.combine(datetime(2026, 7, 6).date(), time(9, 30), tzinfo=EASTERN)
