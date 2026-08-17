@@ -75,7 +75,7 @@ from typing import (
 from zoneinfo import ZoneInfo
 
 from dca_cumulative import CumulativeCreditLedger, apply_cumulative_credit
-from dca_fileio import atomic_open_w, atomic_write_text
+from dca_fileio import atomic_open_w, atomic_write_text, order_csv_covers
 from dca_intraday_archive import (
     archive_observations_safely,
     observations_from_signal_rows,
@@ -5698,6 +5698,12 @@ def load_prior_same_day_allocations(
 
     aggregated: Dict[str, Dict[str, Any]] = {}
     trading_day_iso = trading_day.isoformat()
+    # Encode ONCE, outside the per-file loop (Copilot review: "precompute the
+    # UTF-8 bytes once before iterating"): the substring fast-path below runs
+    # for every candidate artifact in a recursively scanned historical corpus,
+    # and re-encoding an invariant date string per file would hand back part of
+    # the allocation saving that reading bytes instead of text just bought.
+    trading_day_iso_bytes = trading_day_iso.encode("utf-8")
     all_run_state_paths = sorted(
         set(
             p
@@ -5718,8 +5724,8 @@ def load_prior_same_day_allocations(
     _parsed_runs: List[Tuple[Tuple[int, Any], Path, Dict[str, Any]]] = []
     for _order, run_state_path in enumerate(all_run_state_paths):
         try:
-            raw_text = run_state_path.read_text(encoding="utf-8")
-        except (OSError, ValueError):
+            raw_bytes = run_state_path.read_bytes()
+        except OSError:
             # Transient read failure (e.g. the file is still being flushed by
             # a sibling stream's writer) -- surfaced via skip_sink rather than
             # silently dropped, since a caller may need to know this scan was
@@ -5759,13 +5765,13 @@ def load_prior_same_day_allocations(
         same_day_mtime = _mtime_matches_trading_day(run_state_path, trading_day)
         if (
             not same_day_mtime
-            and trading_day_iso not in raw_text
-            and "\\u" not in raw_text
+            and trading_day_iso_bytes not in raw_bytes
+            and b"\\u" not in raw_bytes
         ):
             continue
 
         try:
-            run_state = json.loads(raw_text)
+            run_state = json.loads(raw_bytes)
         except ValueError:
             # Partial JSON mid-flush is the other half of the parse-race this
             # loader must not silently absorb -- same skip_sink signal (and
@@ -8736,27 +8742,6 @@ def _process_buy_candidates_batch(
 _IN_FLIGHT_CANDIDATE_OUTCOMES: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
 
-def _order_csv_covers(path: Path, expected_rows: Sequence[Dict[str, Any]]) -> bool:
-    """True when every expected order already appears in the CSV at ``path``.
-
-    validate_run_artifacts checks only the header, so a stale order CSV from an
-    earlier attempt passes it while omitting orders the state records.
-    """
-    expected = {
-        str(row.get("order_id") or f"ticker:{row.get('ticker')}")
-        for row in expected_rows
-    }
-    if not expected:
-        return True
-    try:
-        with path.open(newline="", encoding="utf-8") as handle:
-            present = {
-                str(row.get("order_id") or f"ticker:{row.get('ticker')}")
-                for row in csv.DictReader(handle)
-            }
-    except (OSError, UnicodeDecodeError, csv.Error):
-        return False
-    return expected.issubset(present)
 
 
 def _failure_candidate_row(ticker: str, outcome: Dict[str, Any]) -> Dict[str, Any]:
@@ -9113,13 +9098,13 @@ def _write_afternoon_failure_artifacts(
         write_signals_csv(out, run_state.get("signal_rows") or [])
     expected_orders = submitted_order_rows(run_state.get("broker_outcomes") or {})
     orders_csv = out / "submitted_orders.csv"
-    # _order_csv_covers returns True for an empty expected set without reading
+    # order_csv_covers returns True for an empty expected set without reading
     # the file, so on a synthesized state that placed nothing a stale CSV would
     # otherwise survive untouched.
     if (
         state_is_synthesized
         or not orders_csv.exists()
-        or not _order_csv_covers(orders_csv, expected_orders)
+        or not order_csv_covers(orders_csv, expected_orders)
     ):
         # A stale CSV from an earlier attempt must never be advertised as the
         # canonical order record for a state that knows about more orders.
@@ -9157,7 +9142,7 @@ def _write_afternoon_failure_artifacts(
         )
 
         contract = validate_run_artifacts(out, require_summary=True)
-        if not contract or not _order_csv_covers(orders_csv, expected_orders):
+        if not contract or not order_csv_covers(orders_csv, expected_orders):
             run_state["artifact_contract_failure"] = artifact_contract_failure(
                 "scheduled-run artifact contract failed",
                 detail="; ".join(contract.errors)

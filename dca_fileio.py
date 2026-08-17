@@ -13,10 +13,11 @@ module (including ``scripts/*``) can use it without cycles.
 
 from __future__ import annotations
 
+import csv
 import os
 from contextlib import contextmanager
 from pathlib import Path
-from typing import IO, Iterator, NamedTuple
+from typing import IO, Any, Dict, Iterator, NamedTuple, Sequence
 from uuid import uuid4
 
 
@@ -355,3 +356,27 @@ def _fsync_dir(directory: Path) -> None:
         pass
     finally:
         os.close(fd)
+
+
+def order_csv_covers(path: Path, expected_rows: Sequence[Dict[str, Any]]) -> bool:
+    """True when every expected order already appears in the CSV at ``path``.
+
+    validate_run_artifacts checks only the header, so a stale order CSV from an
+    earlier attempt passes it while omitting orders the freshly-written state
+    records. Comparing the actual rows is what catches that (Codex review).
+    """
+    expected = {
+        str(row.get("order_id") or f"ticker:{row.get('ticker')}")
+        for row in expected_rows
+    }
+    if not expected:
+        return True
+    try:
+        with path.open(newline="", encoding="utf-8") as handle:
+            present = {
+                str(row.get("order_id") or f"ticker:{row.get('ticker')}")
+                for row in csv.DictReader(handle)
+            }
+    except (OSError, UnicodeDecodeError, csv.Error):
+        return False
+    return expected.issubset(present)

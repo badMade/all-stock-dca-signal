@@ -216,3 +216,53 @@ jobs:
       - name: Run tests
         working-directory: ml-forecaster
         run: python -m pytest tests/
+
+  wondrous-octopus:
+    name: Lint & test (wondrous-octopus)
+    runs-on: ubuntu-latest
+    # 20 (not the sibling-standard 10): the CPU torch wheel adds ~200 MB of
+    # download plus the transformer tests' training time.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          # Cache the ~200 MB CPU torch wheel between runs (the other
+          # sibling jobs' installs are small enough not to bother).
+          cache: "pip"
+          cache-dependency-path: wondrous-octopus/requirements.txt
+
+      # The INVERSE of ticker-advisor's install choice (its comment above):
+      # there FinBERT/torch is peripheral, so CI skips the multi-GB pull and
+      # lets those tests importorskip away. Here the torch model IS the
+      # subproject's centerpiece -- a CI run that never executes it provides
+      # no signal -- so CI installs the CPU-only wheel from PyTorch's own
+      # index (~200 MB, an order of magnitude smaller than the default CUDA
+      # bundle). The importorskip guards STAY in tests/, so removing the
+      # torch line later degrades the torch tests to skips, never failures.
+      # Order matters: the CPU torch wheel installs FIRST, so the
+      # requirements.txt line's unpinned `torch` is already satisfied and
+      # pip never reaches for the multi-GB default CUDA bundle. Installing
+      # the subproject's own requirements file (rather than a hand-picked
+      # list) keeps CI aligned with the local-dev instructions in CLAUDE.md
+      # (Antigravity review: "Dependencies mismatch in CI job").
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r wondrous-octopus/requirements.txt
+
+      - name: Ruff lint
+        # Excluded from the root pyproject.toml's ruff scope, same reasoning
+        # as the other sibling subprojects above.
+        run: ruff check --isolated --select=E,F,B --line-length=120 wondrous-octopus
+
+      - name: Run tests
+        working-directory: wondrous-octopus
+        run: python -m pytest tests/
