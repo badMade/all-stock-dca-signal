@@ -73,7 +73,7 @@ from dca_config import (
     resolve_broker_account,
 )
 from dca_cumulative import CumulativeCreditLedger, apply_cumulative_credit
-from dca_fileio import atomic_open_w, atomic_write_text
+from dca_fileio import atomic_open_w, atomic_write_text, order_csv_covers
 from dca_intraday_archive import (
     archive_observations_safely,
     observations_from_signal_rows,
@@ -5661,13 +5661,13 @@ class MorningDCAExecutor(DCAExecutor):
         # Rewrite whenever the state records an order the CSV may not: a stale
         # file from an earlier attempt would otherwise be advertised as the
         # canonical order record for a state that knows about more (Codex review).
-        # _order_csv_covers returns True for an empty expected set without ever
+        # order_csv_covers returns True for an empty expected set without ever
         # reading the file, so on a synthesized state that placed nothing a stale
         # CSV would survive untouched.
         if (
             state_is_synthesized
             or not orders_path.exists()
-            or not _order_csv_covers(orders_path, order_rows)
+            or not order_csv_covers(orders_path, order_rows)
         ):
             write_submitted_orders_csv(out, order_rows)
         paths["submitted_orders"] = str(orders_path)
@@ -5787,7 +5787,7 @@ class MorningDCAExecutor(DCAExecutor):
                     run_state.get("buy_candidates") or [],
                 )
             )
-            return _order_csv_covers(run_dir / "submitted_orders.csv", expected)
+            return order_csv_covers(run_dir / "submitted_orders.csv", expected)
         except Exception:  # noqa: BLE001 - fail closed; never mask the run failure
             _log.exception("could not validate the artifact set at %s", run_dir)
             return False
@@ -6110,27 +6110,6 @@ class MorningDCAExecutor(DCAExecutor):
         return {"artifacts": artifacts, "paths": paths}
 
 
-def _order_csv_covers(path: Path, expected_rows: Sequence[Dict[str, Any]]) -> bool:
-    """True when every expected order already appears in the CSV at ``path``.
-
-    validate_run_artifacts checks only the header, so a stale order CSV from an
-    earlier attempt passes it while omitting orders the freshly-written state
-    records. Comparing the actual rows is what catches that (Codex review).
-    """
-    expected = {
-        str(row.get("order_id") or f"ticker:{row.get('ticker')}") for row in expected_rows
-    }
-    if not expected:
-        return True
-    try:
-        with path.open(newline="", encoding="utf-8") as handle:
-            present = {
-                str(row.get("order_id") or f"ticker:{row.get('ticker')}")
-                for row in csv.DictReader(handle)
-            }
-    except (OSError, UnicodeDecodeError, csv.Error):
-        return False
-    return expected.issubset(present)
 
 
 def _merge_placements_into_state(

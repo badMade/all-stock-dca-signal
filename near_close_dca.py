@@ -75,7 +75,7 @@ from typing import (
 from zoneinfo import ZoneInfo
 
 from dca_cumulative import CumulativeCreditLedger, apply_cumulative_credit
-from dca_fileio import atomic_open_w, atomic_write_text
+from dca_fileio import atomic_open_w, atomic_write_text, order_csv_covers
 from dca_intraday_archive import (
     archive_observations_safely,
     observations_from_signal_rows,
@@ -8736,27 +8736,6 @@ def _process_buy_candidates_batch(
 _IN_FLIGHT_CANDIDATE_OUTCOMES: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
 
-def _order_csv_covers(path: Path, expected_rows: Sequence[Dict[str, Any]]) -> bool:
-    """True when every expected order already appears in the CSV at ``path``.
-
-    validate_run_artifacts checks only the header, so a stale order CSV from an
-    earlier attempt passes it while omitting orders the state records.
-    """
-    expected = {
-        str(row.get("order_id") or f"ticker:{row.get('ticker')}")
-        for row in expected_rows
-    }
-    if not expected:
-        return True
-    try:
-        with path.open(newline="", encoding="utf-8") as handle:
-            present = {
-                str(row.get("order_id") or f"ticker:{row.get('ticker')}")
-                for row in csv.DictReader(handle)
-            }
-    except (OSError, UnicodeDecodeError, csv.Error):
-        return False
-    return expected.issubset(present)
 
 
 def _failure_candidate_row(ticker: str, outcome: Dict[str, Any]) -> Dict[str, Any]:
@@ -9113,13 +9092,13 @@ def _write_afternoon_failure_artifacts(
         write_signals_csv(out, run_state.get("signal_rows") or [])
     expected_orders = submitted_order_rows(run_state.get("broker_outcomes") or {})
     orders_csv = out / "submitted_orders.csv"
-    # _order_csv_covers returns True for an empty expected set without reading
+    # order_csv_covers returns True for an empty expected set without reading
     # the file, so on a synthesized state that placed nothing a stale CSV would
     # otherwise survive untouched.
     if (
         state_is_synthesized
         or not orders_csv.exists()
-        or not _order_csv_covers(orders_csv, expected_orders)
+        or not order_csv_covers(orders_csv, expected_orders)
     ):
         # A stale CSV from an earlier attempt must never be advertised as the
         # canonical order record for a state that knows about more orders.
@@ -9157,7 +9136,7 @@ def _write_afternoon_failure_artifacts(
         )
 
         contract = validate_run_artifacts(out, require_summary=True)
-        if not contract or not _order_csv_covers(orders_csv, expected_orders):
+        if not contract or not order_csv_covers(orders_csv, expected_orders):
             run_state["artifact_contract_failure"] = artifact_contract_failure(
                 "scheduled-run artifact contract failed",
                 detail="; ".join(contract.errors)

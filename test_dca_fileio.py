@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from dca_fileio import atomic_open_w, atomic_write_text
+from dca_fileio import atomic_open_w, atomic_write_text, order_csv_covers
 
 
 def test_atomic_write_text_creates_file(tmp_path):
@@ -547,6 +547,34 @@ def test_ordinary_repeated_writes_are_unaffected(tmp_path):
     assert target.read_text(encoding="utf-8") == '{"n": 4}'
 
 
+def test_order_csv_covers_returns_true_without_expected_rows(tmp_path):
+    assert order_csv_covers(tmp_path / "orders.csv", []) is True
+
+
+def test_order_csv_covers_returns_false_for_missing_csv(tmp_path):
+    expected_rows = [{"order_id": "abc123", "ticker": "SPY"}]
+    assert order_csv_covers(tmp_path / "orders.csv", expected_rows) is False
+
+
+def test_order_csv_covers_returns_false_for_unreadable_csv(tmp_path):
+    path = tmp_path / "orders.csv"
+    path.write_bytes(b"\xff")
+    expected_rows = [{"order_id": "abc123", "ticker": "SPY"}]
+    assert order_csv_covers(path, expected_rows) is False
+
+
+def test_order_csv_covers_returns_true_when_expected_order_ids_are_present(tmp_path):
+    path = tmp_path / "orders.csv"
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["order_id", "ticker"])
+        writer.writeheader()
+        writer.writerow({"order_id": "abc123", "ticker": "SPY"})
+        writer.writerow({"order_id": "def456", "ticker": "QQQ"})
+
+    expected_rows = [{"order_id": "abc123"}, {"order_id": "def456"}]
+    assert order_csv_covers(path, expected_rows) is True
+
+
 def test_fsync_dir_success(tmp_path):
     from unittest import mock
 
@@ -575,6 +603,7 @@ def test_fsync_dir_open_oserror(tmp_path):
         m_open.assert_called_once_with(tmp_path, os.O_RDONLY)
         m_fsync.assert_not_called()
         m_close.assert_not_called()
+
 
 def test_fsync_dir_fsync_oserror(tmp_path):
     from unittest import mock
