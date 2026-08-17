@@ -2219,16 +2219,15 @@ def _order_ids_from_orders_csv(csv_path: Path) -> Set[str]:
             reader = csv.reader(handle)
             try:
                 header = next(reader)
-                oid_idx = header.index("order_id")
+                idx = header.index("order_id")
             except (StopIteration, ValueError):
                 return ids
+
             for row in reader:
-                try:
-                    oid = row[oid_idx].strip()
+                if len(row) > idx:
+                    oid = row[idx].strip()
                     if oid and oid != "-":
                         ids.add(oid)
-                except IndexError:
-                    pass
     except (OSError, csv.Error, UnicodeDecodeError):
         return set()
     return ids
