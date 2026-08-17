@@ -67,3 +67,6 @@
 ## 2026-08-03 - Optimize local JSON parsing
 **Learning:** `json.loads` has optimized underlying C code that accepts bytes natively. When parsing local JSON files, `path.read_text(encoding="utf-8")` introduces unnecessary Python-level string decoding overhead. Calling `path.read_bytes()` directly and letting `json.loads` handle the byte stream is about 15% faster and maintains identical error handling behavior.
 **Action:** When reading local JSON files for parsing via `json.loads`, prefer `json.loads(path.read_bytes())` over `json.loads(path.read_text(encoding="utf-8"))` to skip intermediate string allocation.
+## 2024-05-19 - Avoid csv.DictReader in loops
+**Learning:** `csv.DictReader` allocates a new `dict` for every single row parsed. When processing many rows or looping through multiple large CSV files, these per-row dictionary allocations create significant memory pressure and CPU overhead, slowing down the parsing process.
+**Action:** When extracting specific columns from CSVs in performance-critical paths, use `csv.reader`. Extract the header once, find the integer indices of the target columns, and then use list indexing (`row[index]`) in the loop to avoid per-row dictionary allocations.
