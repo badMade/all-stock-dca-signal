@@ -10125,6 +10125,31 @@ def test_load_prior_same_day_skip_sink_records_truncated_prefix_missing_day(tmp_
     assert set(skip_sink) == {empty_json, truncated_prefix_json}
 
 
+def test_load_prior_same_day_skip_sink_records_undecodable_bytes(tmp_path):
+    # The loader reads bytes and hands them straight to json.loads (see
+    # .jules/bolt.md 2026-08-03), so a same-day artifact containing invalid
+    # UTF-8 no longer fails at read time the way read_text(encoding="utf-8")
+    # made it fail -- it fails at the parse instead, where json.loads raises
+    # UnicodeDecodeError (a ValueError subclass). Both handlers record
+    # skip_sink, so the observable outcome must be unchanged: a garbled
+    # same-day file is still reported as an incomplete scan rather than
+    # silently dropped or escaping as an uncaught exception.
+    root = tmp_path / "state_root"
+    root.mkdir()
+
+    undecodable_json = root / "run_state_undecodable.json"
+    undecodable_json.write_bytes(b'{"trading_day": "2026-06-29", "x": "\xff\xfe"}')
+    _stamp_mtime_on_trading_day(undecodable_json, date(2026, 6, 29))
+
+    skip_sink: list = []
+    allocations = load_prior_same_day_allocations(
+        root, date(2026, 6, 29), skip_sink=skip_sink
+    )
+
+    assert allocations == {}
+    assert skip_sink == [undecodable_json]
+
+
 def test_load_prior_same_day_skip_sink_records_nested_brace_truncation(tmp_path):
     # Codex review ("Parse JSON before declaring a brace-terminated prefix
     # complete"): a truncated write can end at the closing brace of a

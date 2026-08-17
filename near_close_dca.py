@@ -5698,6 +5698,12 @@ def load_prior_same_day_allocations(
 
     aggregated: Dict[str, Dict[str, Any]] = {}
     trading_day_iso = trading_day.isoformat()
+    # Encode ONCE, outside the per-file loop (Copilot review: "precompute the
+    # UTF-8 bytes once before iterating"): the substring fast-path below runs
+    # for every candidate artifact in a recursively scanned historical corpus,
+    # and re-encoding an invariant date string per file would hand back part of
+    # the allocation saving that reading bytes instead of text just bought.
+    trading_day_iso_bytes = trading_day_iso.encode("utf-8")
     all_run_state_paths = sorted(
         set(
             p
@@ -5718,8 +5724,8 @@ def load_prior_same_day_allocations(
     _parsed_runs: List[Tuple[Tuple[int, Any], Path, Dict[str, Any]]] = []
     for _order, run_state_path in enumerate(all_run_state_paths):
         try:
-            raw_text = run_state_path.read_text(encoding="utf-8")
-        except (OSError, ValueError):
+            raw_bytes = run_state_path.read_bytes()
+        except OSError:
             # Transient read failure (e.g. the file is still being flushed by
             # a sibling stream's writer) -- surfaced via skip_sink rather than
             # silently dropped, since a caller may need to know this scan was
@@ -5759,13 +5765,13 @@ def load_prior_same_day_allocations(
         same_day_mtime = _mtime_matches_trading_day(run_state_path, trading_day)
         if (
             not same_day_mtime
-            and trading_day_iso not in raw_text
-            and "\\u" not in raw_text
+            and trading_day_iso_bytes not in raw_bytes
+            and b"\\u" not in raw_bytes
         ):
             continue
 
         try:
-            run_state = json.loads(raw_text)
+            run_state = json.loads(raw_bytes)
         except ValueError:
             # Partial JSON mid-flush is the other half of the parse-race this
             # loader must not silently absorb -- same skip_sink signal (and

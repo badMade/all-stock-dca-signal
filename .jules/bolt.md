@@ -68,6 +68,10 @@
 **Learning:** `json.loads` has optimized underlying C code that accepts bytes natively. When parsing local JSON files, `path.read_text(encoding="utf-8")` introduces unnecessary Python-level string decoding overhead. Calling `path.read_bytes()` directly and letting `json.loads` handle the byte stream is about 15% faster and maintains identical error handling behavior.
 **Action:** When reading local JSON files for parsing via `json.loads`, prefer `json.loads(path.read_bytes())` over `json.loads(path.read_text(encoding="utf-8"))` to skip intermediate string allocation.
 
+## 2026-08-13 - Hoist invariant encodes out of the loop you just optimized
+**Learning:** Converting a per-file `read_text(encoding="utf-8")` to `read_bytes()` moves the pre-parse substring fast-path onto bytes, which tempts an in-loop `needle.encode("utf-8")`. The needle is loop-invariant, so re-encoding it per file hands back part of the allocation saving the bytes switch just bought. Byte-literal needles (`b"\\u"`) have no such cost; only the interpolated ones do.
+**Action:** When switching a hot read loop from text to bytes, encode every loop-invariant needle ONCE above the loop and compare against the precomputed `bytes` inside it.
+
 ## 2024-05-18 - Replacing DictReader with csv.reader for parsing CSV
 **Learning:** `csv.DictReader` has a high overhead because it allocates a new dictionary for every single row parsed. In loops over many large CSV files where only a single column is needed, this overhead is noticeable.
 **Action:** When extracting a specific column from large CSVs, prefer `csv.reader`, finding the column index from the header row first, and accessing it directly by index in the loop (with a boundary check). This can yield a 2x+ speedup.
