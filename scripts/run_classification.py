@@ -136,7 +136,7 @@ RECOVERY_STATE_SCHEMA_VERSIONS = tuple(
 
 
 def is_valid_recovery_context_state(
-    state: Optional[Mapping[str, object]], trading_day: Optional[str] = None
+    state: Optional[Mapping[str, Any]], trading_day: Optional[str] = None
 ) -> bool:
     """THE state-level scheduled-recovery check. Single source of truth.
 
@@ -212,7 +212,7 @@ def is_valid_recovery_context_state(
 
 
 def validate_recovery_classification(
-    classification: Optional[Mapping[str, object]], trading_day: Optional[str] = None
+    classification: Optional[Mapping[str, Any]], trading_day: Optional[str] = None
 ) -> bool:
     """THE scheduled-recovery contract check. Single source of truth.
 
@@ -580,7 +580,7 @@ def _parse_iso_datetime(text: str) -> Optional[datetime]:
         return None
 
 
-def _et_minutes(value: object) -> Optional[int]:
+def _et_minutes(value: Any) -> Optional[int]:
     """Minutes-since-midnight in **ET** for an order timestamp.
 
     Accepts a bare ET wall-clock ('15:30', '15:30:33'), a naive ISO datetime
@@ -603,7 +603,7 @@ def _et_minutes(value: object) -> Optional[int]:
     return hh * 60 + mm
 
 
-def _et_seconds(value: object) -> Optional[int]:
+def _et_seconds(value: Any) -> Optional[int]:
     """Seconds-since-midnight in **ET** for an order timestamp.
 
     Same source handling as :func:`_et_minutes`, but preserves sub-minute
@@ -641,7 +641,7 @@ assert _end_min is not None
 _WINDOW_END_MIN: int = _end_min
 
 
-def _attribution_window_start_min(rc: object) -> int:
+def _attribution_window_start_min(rc: Any) -> int:
     """Choose the order-attribution window start from the validated state's
     OWN scheduled identity, not a single window-wide constant.
 
@@ -661,7 +661,7 @@ def _attribution_window_start_min(rc: object) -> int:
     return _LEGACY_WINDOW_START_MIN
 
 
-def _in_scheduled_window_et(submitted_at_et: object, window_start_min: int) -> bool:
+def _in_scheduled_window_et(submitted_at_et: Any, window_start_min: int) -> bool:
     """True only if an ET timestamp falls within the scheduled window (inclusive)."""
     minutes = _et_minutes(submitted_at_et)
     if minutes is None:
@@ -734,7 +734,7 @@ def build_scheduled_classification(
     scheduled_window_end_et: str = SCHEDULED_WINDOW_END_ET,
     run_id: Optional[str] = None,
     valid_afternoon_scheduled_evidence: Optional[bool] = None,
-) -> Dict[str, object]:
+) -> Dict[str, Any]:
     """Return a fully-populated scheduled run_classification block.
 
     Stamps ``stream="afternoon"`` (this builder is the 15:30 ET scheduled live
@@ -774,7 +774,7 @@ def build_scheduled_classification(
     cross-check ``stream`` (Codex review: "Deny afternoon evidence in
     non-afternoon schema branches").
     """
-    block: Dict[str, object] = {
+    block: Dict[str, Any] = {
         "run_origin": "scheduled",
         "run_type": SCHEDULED_RUN_TYPE,
         "cron_id": cron_id,
@@ -797,7 +797,7 @@ def build_scheduled_classification(
 
 def build_manual_classification(
     triggered_at_utc: Optional[str] = None, run_id: Optional[str] = None
-) -> Dict[str, object]:
+) -> Dict[str, Any]:
     """Return a manual run_classification block with a distinct run_id."""
     ts = triggered_at_utc or _utc_now_iso()
     return {
@@ -814,7 +814,7 @@ def build_manual_classification(
 
 def build_final_manual_override_classification(
     triggered_at_utc: Optional[str] = None, run_id: Optional[str] = None
-) -> Dict[str, object]:
+) -> Dict[str, Any]:
     """Return a manual run_classification block for a final manual buy override.
 
     The final-buy behavior (full active-universe scan, trend filter ignored for the
@@ -941,23 +941,23 @@ def raw_input_dir(trading_day: str, base: Optional[Path] = None) -> Path:
 
 def quotes_batch_filename(n: int) -> str:
     """Deterministic filename for a persisted quotes batch (1-based)."""
-    return f"quotes_batch{int(n)}.json"
+    return f"quotes_batch{n}.json"
 
 
 def historicals_batch_filename(n: int) -> str:
     """Deterministic filename for a persisted historicals batch (1-based)."""
-    return f"historicals_batch{int(n)}.json"
+    return f"historicals_batch{n}.json"
 
 
 def place_filename(symbol: str) -> str:
     """Deterministic filename for a persisted per-symbol place response."""
-    safe = re.sub(r"[^0-9A-Za-z._-]", "", str(symbol).upper()) or "UNKNOWN"
+    safe = re.sub(r"[^0-9A-Za-z._-]", "", symbol.upper()) or "UNKNOWN"
     return f"place_{safe}.json"
 
 
 def normalize_connector_payload(
-    payload: object, *, read_pointer: bool = True, base_dir: Optional[Path] = None
-) -> Dict[str, object]:
+    payload: Any, *, read_pointer: bool = True, base_dir: Optional[Path] = None
+) -> Dict[str, Any]:
     """Normalize a raw connector response into an inline, parseable JSON object.
 
     Some connectors return a large result indirectly as
@@ -973,7 +973,7 @@ def normalize_connector_payload(
     if not isinstance(payload, Mapping):
         return {"data": payload, "normalized": False}
 
-    result: Dict[str, object] = dict(payload)
+    result: Dict[str, Any] = dict(payload)
     pointer = result.get("output_path")
     if not (read_pointer and isinstance(pointer, str) and pointer):
         if isinstance(pointer, str) and pointer:
@@ -997,7 +997,7 @@ def normalize_connector_payload(
 def save_raw_input(
     trading_day: str,
     filename: str,
-    payload: object,
+    payload: Any,
     *,
     base: Optional[Path] = None,
     raw_dir: Optional[Path] = None,
@@ -1024,8 +1024,8 @@ def save_raw_input(
     no pointer to resolve (plain inline data) is not a failure and persists
     normally.
     """
-    safe = Path(str(filename)).name
-    if not safe or safe != str(filename):
+    safe = Path(filename).name
+    if not safe or safe != filename:
         raise ValueError(f"raw input filename must be a bare filename, got {filename!r}")
     try:
         to_write = normalize_connector_payload(payload) if normalize else payload
@@ -1060,7 +1060,7 @@ def build_raw_persistence_state(
     base: Optional[Path] = None,
     raw_dir: Optional[Path] = None,
     recovery_from_escalation: bool = False,
-) -> Dict[str, object]:
+) -> Dict[str, Any]:
     """Build the run_state fields recording raw-input persistence for a run.
 
     Reflects what is actually on disk under raw/ at call time, so the run_state
@@ -1074,7 +1074,7 @@ def build_raw_persistence_state(
     return {
         "raw_input_dir": str(out_dir),
         "raw_inputs_saved": saved,
-        "recovery_from_escalation": bool(recovery_from_escalation),
+        "recovery_from_escalation": recovery_from_escalation,
     }
 
 
@@ -1164,8 +1164,8 @@ def raw_persistence_failure_run_state(
         "run_classification": run_classification,
         "raw_input_dir": str(out_dir),
         "raw_inputs_saved": [],
-        "recovery_from_escalation": bool(recovery_from_escalation),
-        "raw_persistence_error": str(error),
+        "recovery_from_escalation": recovery_from_escalation,
+        "raw_persistence_error": error,
     }
     if correlation_id is not None:
         state["correlation_id"] = correlation_id
@@ -1279,7 +1279,7 @@ def build_recovery_state(
     persisted_raw_first: bool,
     recomputed_from_persisted: bool,
     attempt: int = 1,
-) -> Dict[str, object]:
+) -> Dict[str, Any]:
     """Build the run_state fields recording a successful automatic recovery rerun.
 
     Merge the returned dict into the run_state produced by the recovery attempt
@@ -1300,8 +1300,8 @@ def build_recovery_state(
         "recovery": {
             "trigger_reason": trigger_reason,
             "attempt": attempt,
-            "persisted_raw_first": bool(persisted_raw_first),
-            "recomputed_from_persisted": bool(recomputed_from_persisted),
+            "persisted_raw_first": persisted_raw_first,
+            "recomputed_from_persisted": recomputed_from_persisted,
             "escalated": False,
             "blocking_reason": None,
         },
@@ -1318,8 +1318,8 @@ def recovery_escalation_run_state(
     triggered_at_utc: Optional[str] = None,
     generated_at: Optional[str] = None,
     broker: str = "robinhood",
-    budget: Optional[Dict[str, object]] = None,
-) -> Dict[str, object]:
+    budget: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Build a valid scheduled run_state for an escalated recovery attempt.
 
     Contract: if the single recovery attempt also fails, or a safety/account/
@@ -1378,10 +1378,10 @@ def recovery_escalation_run_state(
         "recovery": {
             "trigger_reason": trigger_reason,
             "attempt": 1,
-            "persisted_raw_first": bool(persisted_raw_first),
-            "recomputed_from_persisted": bool(recomputed_from_persisted),
+            "persisted_raw_first": persisted_raw_first,
+            "recomputed_from_persisted": recomputed_from_persisted,
             "escalated": True,
-            "blocking_reason": str(blocking_reason),
+            "blocking_reason": blocking_reason,
         },
     }
     # Same denial as the raw-persistence builder, and for the same reason: an
@@ -1401,7 +1401,7 @@ class ValidationResult:
         return self.ok
 
 
-def validate_classification(rc: Dict[str, object]) -> ValidationResult:
+def validate_classification(rc: Optional[Mapping[str, Any]]) -> ValidationResult:
     """Validate a run_classification block against the contract.
 
     Mirrors run_classification.schema.json but usable at runtime with no
@@ -1525,7 +1525,7 @@ def validate_classification(rc: Dict[str, object]) -> ValidationResult:
                     "intraday scheduled run must not carry supersedes_cron_id "
                     "(that names the afternoon task's lineage)"
                 )
-            slot_identity = INTRADAY_SLOT_IDENTITIES.get(scheduled_for_et)
+            slot_identity = INTRADAY_SLOT_IDENTITIES.get(scheduled_for_et) if isinstance(scheduled_for_et, str) else None
             if slot_identity is None:
                 errors.append(
                     "intraday scheduled_for_et must be one of "
@@ -1703,7 +1703,7 @@ def validate_classification(rc: Dict[str, object]) -> ValidationResult:
     return ValidationResult(not errors, errors)
 
 
-def is_preauthorized_v2(state_or_rc: Dict[str, object]) -> bool:
+def is_preauthorized_v2(state_or_rc: Mapping[str, Any]) -> bool:
     """True if a run_state (or its run_classification block) is tagged v2-preauthorized."""
     rc = state_or_rc
     if isinstance(state_or_rc, dict) and isinstance(state_or_rc.get("run_classification"), dict):
@@ -1711,7 +1711,7 @@ def is_preauthorized_v2(state_or_rc: Dict[str, object]) -> bool:
     return isinstance(rc, dict) and rc.get("state_schema_version") == STATE_SCHEMA_VERSION_V2
 
 
-def is_manual_state(state: Dict[str, object]) -> bool:
+def is_manual_state(state: Mapping[str, Any]) -> bool:
     """True if a run_state is manual by EITHER origin or flag (defensive OR)."""
     rc = state.get("run_classification") if isinstance(state, dict) else None
     if not isinstance(rc, dict):
@@ -1719,7 +1719,7 @@ def is_manual_state(state: Dict[str, object]) -> bool:
     return rc.get("run_origin") == "manual" or rc.get("manual_run") is True
 
 
-def is_scheduled_state(state: Dict[str, object]) -> bool:
+def is_scheduled_state(state: Mapping[str, Any]) -> bool:
     """True only if a run_state is a *valid* scheduled run.
 
     A manual flag anywhere wins: a state that is both marked scheduled and
@@ -1755,7 +1755,7 @@ def is_scheduled_state(state: Dict[str, object]) -> bool:
     return rc.get("run_origin") == "scheduled" and bool(validate_classification(rc))
 
 
-def order_submit_status(state: Optional[Dict[str, object]]) -> Optional[str]:
+def order_submit_status(state: Optional[Mapping[str, Any]]) -> Optional[str]:
     """Return the run_state's top-level order_submit_status, or None if absent."""
     if not isinstance(state, dict):
         return None
@@ -1763,7 +1763,7 @@ def order_submit_status(state: Optional[Dict[str, object]]) -> Optional[str]:
     return value if isinstance(value, str) and value else None
 
 
-def is_confirmation_blocked(state: Optional[Dict[str, object]]) -> bool:
+def is_confirmation_blocked(state: Optional[Mapping[str, Any]]) -> bool:
     """True if the run passed review but submission was blocked awaiting confirmation.
 
     Such a run is valid scheduled-run evidence that the task fired but carries no
@@ -1791,7 +1791,7 @@ class NoOrderOutcome:
     candidates_reaching_spread_gate: int
     candidates_blocked_missing_spread: int
 
-    def as_run_state_fields(self) -> Dict[str, object]:
+    def as_run_state_fields(self) -> Dict[str, Any]:
         """The exact top-level run_state fields this outcome requires."""
         return {
             "run_classification_outcome": self.run_classification,
@@ -1862,11 +1862,11 @@ def classify_no_order_run(
     spread error_class already established above wins, since that is the more
     specific cause.
     """
-    reaching = max(0, int(candidates_reaching_spread_gate))
-    blocked = max(0, int(candidates_blocked_missing_spread))
+    reaching = max(0, candidates_reaching_spread_gate)
+    blocked = max(0, candidates_blocked_missing_spread)
     # A row cannot be blocked at a gate it never reached.
     blocked = min(blocked, reaching)
-    evaluated = reaching if candidates_evaluated is None else max(0, int(candidates_evaluated))
+    evaluated = reaching if candidates_evaluated is None else max(0, candidates_evaluated)
     # A candidate cannot reach the gate without having been evaluated.
     evaluated = max(evaluated, reaching)
 
@@ -1894,7 +1894,7 @@ def classify_no_order_run(
     # did submit nothing) but never a null error_class, so a summary or
     # reliability consumer can see the run was degraded. A concrete spread cause
     # below is more specific and wins.
-    degraded = ERROR_CLASS_DEGRADED_MARKET_DATA if int(data_errors) > 0 else None
+    degraded = ERROR_CLASS_DEGRADED_MARKET_DATA if data_errors > 0 else None
 
     if reaching == 0:
         return NoOrderOutcome(
@@ -1931,7 +1931,7 @@ def classify_no_order_run(
     )
 
 
-def deny_scheduled_evidence(state: Dict[str, object]) -> Dict[str, object]:
+def deny_scheduled_evidence(state: Dict[str, Any]) -> Dict[str, Any]:
     """Mark ``state`` as something no consumer may count as scheduled evidence.
 
     Two markers, because two different consumers read two different places:
@@ -1961,8 +1961,8 @@ def deny_scheduled_evidence(state: Dict[str, object]) -> Dict[str, object]:
 
 
 def stamp_failure_classification(
-    state: Dict[str, object], *, submitted: int, error_detail: str
-) -> Dict[str, object]:
+    state: Dict[str, Any], *, submitted: int, error_detail: str
+) -> Dict[str, Any]:
     """Mark ``state`` as a run that FAILED, choosing the label from ``submitted``.
 
     Both runners merge an in-flight placement into a state an earlier attempt at
@@ -1996,7 +1996,7 @@ def stamp_failure_classification(
 
 def spread_gate_fields(
     *, spread_pct: Optional[float], max_spread_pct: float, evaluated: bool = True
-) -> Dict[str, object]:
+) -> Dict[str, Any]:
     """Row-level spread fields for a signal/candidate row.
 
     Every row that reaches the spread gate records whether its own spread was
@@ -2012,13 +2012,13 @@ def spread_gate_fields(
     if spread_pct > max_spread_pct:
         return {
             "spread_ok": False,
-            "spread_pct": float(spread_pct),
+            "spread_pct": spread_pct,
             "spread_status": SPREAD_STATUS_NOT_OK,
         }
-    return {"spread_ok": True, "spread_pct": float(spread_pct), "spread_status": SPREAD_STATUS_OK}
+    return {"spread_ok": True, "spread_pct": spread_pct, "spread_status": SPREAD_STATUS_OK}
 
 
-def row_blocked_for_missing_spread(row: Optional[Mapping[str, object]]) -> bool:
+def row_blocked_for_missing_spread(row: Optional[Mapping[str, Any]]) -> bool:
     """True when a persisted row was failed closed because its spread was unproven.
 
     Accepts the legacy ``missing_bid_ask`` status persisted by the Jul 27 2026
@@ -2033,7 +2033,7 @@ def row_blocked_for_missing_spread(row: Optional[Mapping[str, object]]) -> bool:
 # --- Writing artifacts -------------------------------------------------------
 
 def update_latest_scheduled_run_pointer(
-    run_state: Dict[str, object], run_state_path: str | Path, base: Optional[Path] = None
+    run_state: Dict[str, Any], run_state_path: str | Path, base: Optional[Path] = None
 ) -> Path:
     """Write/refresh latest_scheduled_run.json to point at an already-written scheduled run_state.
 
@@ -2123,7 +2123,7 @@ def update_latest_scheduled_run_pointer(
                 "stream": rc.get("stream") or "afternoon",
                 "pointer_status": pointer_status,
                 "same_day_required": True,
-                "valid_scheduled_evidence": bool(valid_scheduled_evidence),
+                "valid_scheduled_evidence": valid_scheduled_evidence,
                 "cron_id": rc.get("cron_id"),
                 "supersedes_cron_id": rc.get("supersedes_cron_id"),
                 "triggered_at_utc": rc.get("triggered_at_utc"),
@@ -2138,7 +2138,7 @@ def update_latest_scheduled_run_pointer(
 
 
 def write_run_artifacts(
-    run_state: Dict[str, object], base: Optional[Path] = None
+    run_state: Dict[str, Any], base: Optional[Path] = None
 ) -> Dict[str, str]:
     """Persist a run_state to the correct directory for its origin.
 
@@ -2148,11 +2148,13 @@ def write_run_artifacts(
     Returns a dict of the paths written.
     """
     rc = run_state.get("run_classification")
-    result = validate_classification(rc if isinstance(rc, dict) else {})
+    if not isinstance(rc, dict):
+        raise ValueError("refusing to write run_state missing run_classification dict")
+    result = validate_classification(rc)
     if not result:
         raise ValueError("refusing to write invalid run_classification: " + "; ".join(result.errors))
 
-    origin = rc["run_origin"]
+    origin = rc.get("run_origin")
     written: Dict[str, str] = {}
 
     if origin == "scheduled":
@@ -2166,7 +2168,7 @@ def write_run_artifacts(
         pointer = update_latest_scheduled_run_pointer(run_state, state_path, base)
         written["latest_scheduled_run"] = str(pointer)
     else:  # manual
-        ts = re.sub(r"[^0-9]", "", str(rc.get("triggered_at_utc", ""))) or rc["run_id"]
+        ts = re.sub(r"[^0-9]", "", str(rc.get("triggered_at_utc", ""))) or str(rc.get("run_id", ""))
         out_dir = manual_run_dir(ts, base)
         out_dir.mkdir(parents=True, exist_ok=True)
         state_path = out_dir / RUN_STATE_FILENAME
@@ -2185,7 +2187,7 @@ def _iter_run_state_files(root: Path) -> Iterable[Path]:
     return sorted(root.rglob("run_state*.json"))
 
 
-def _order_ids_from_state(state: Dict[str, object]) -> Set[str]:
+def _order_ids_from_state(state: Mapping[str, Any]) -> Set[str]:
     # Both fields are read defensively: `state.get(k, []) or []` still yields the
     # raw value for a malformed non-list such as `buy_candidates: 1`, and
     # iterating it raised TypeError out of the whole watchdog collection loop --
@@ -2233,7 +2235,7 @@ def _order_ids_from_orders_csv(csv_path: Path) -> Set[str]:
     return ids
 
 
-def _referenced_orders_csvs(state: Dict[str, object], run_dir: Path) -> List[Path]:
+def _referenced_orders_csvs(state: Mapping[str, Any], run_dir: Path) -> List[Path]:
     """Resolve the orders CSV(s) a run_state points at or sits beside.
 
     Manual runs from ``near_close_dca.run_and_report()`` keep their order IDs only
@@ -2276,7 +2278,7 @@ def _referenced_orders_csvs(state: Dict[str, object], run_dir: Path) -> List[Pat
 
 
 def _referenced_orders_csvs_within(
-    state: Dict[str, object], run_dir: Path, root: Path
+    state: Mapping[str, Any], run_dir: Path, root: Path
 ) -> List[Path]:
     """:func:`_referenced_orders_csvs`, filtered to paths inside ``root``.
 
@@ -2416,7 +2418,7 @@ _OVERRIDABLE_EARLIER_SCHEDULED_SUBROOT_ENV = {
 }
 
 
-def _is_earlier_stream_scheduled_state(state: object) -> bool:
+def _is_earlier_stream_scheduled_state(state: Any) -> bool:
     """True for a valid SCHEDULED run of any stream, not just the afternoon one.
 
     :func:`is_scheduled_state` cannot be used here: it delegates to
@@ -2893,7 +2895,7 @@ except ImportError:  # pragma: no cover
 _TERMINAL_NON_FILL_STATES = frozenset(_BROKER_TERMINAL)
 
 
-def _executed_quantity(row: Mapping[str, object]) -> Optional[float]:
+def _executed_quantity(row: Mapping[str, Any]) -> Optional[float]:
     """Executed share count for a row, or None when no executed column exists.
 
     An EXPLICIT ZERO in an executed column is authoritative and stops the
@@ -2913,7 +2915,7 @@ def _executed_quantity(row: Mapping[str, object]) -> Optional[float]:
         return value if math.isfinite(value) else None
     return _row_number(row, _QUANTITY_COLS)
 
-def _executed_quantity_is_explicit_zero(row: Mapping[str, object]) -> bool:
+def _executed_quantity_is_explicit_zero(row: Mapping[str, Any]) -> bool:
     """True only when a quantity column states a definitive numeric ZERO.
 
     Mirrors near_close_dca._executed_quantity_is_explicit_zero. Stricter than
@@ -2974,7 +2976,7 @@ def top_up_context_roots(
 
 
 def is_top_up_context_state(
-    state: Dict[str, object], trading_day: Optional[str] = None
+    state: Mapping[str, Any], trading_day: Optional[str] = None
 ) -> bool:
     """True only for a same-day run usable as prior-allocation context.
 
@@ -3061,7 +3063,7 @@ class PriorAllocation:
     attempt_count: int = 0
 
 
-def _row_ticker(row: Mapping[str, object]) -> Optional[str]:
+def _row_ticker(row: Mapping[str, Any]) -> Optional[str]:
     for col in _TICKER_COLS:
         value = row.get(col)
         if isinstance(value, str) and value.strip():
@@ -3069,7 +3071,7 @@ def _row_ticker(row: Mapping[str, object]) -> Optional[str]:
     return None
 
 
-def _row_number(row: Mapping[str, object], cols: Iterable[str]) -> Optional[float]:
+def _row_number(row: Mapping[str, Any], cols: Iterable[str]) -> Optional[float]:
     import math
 
     for col in cols:
@@ -3086,7 +3088,7 @@ def _row_number(row: Mapping[str, object], cols: Iterable[str]) -> Optional[floa
     return None
 
 
-def _rows_from_buy_candidates(state: Dict[str, object]) -> List[Dict[str, object]]:
+def _rows_from_buy_candidates(state: Mapping[str, Any]) -> List[Dict[str, Any]]:
     """Convert a run_state's embedded buy_candidates into row-shaped dicts.
 
     Lets a run whose fills live only in ``buy_candidates`` (no orders CSV at
@@ -3101,7 +3103,7 @@ def _rows_from_buy_candidates(state: Dict[str, object]) -> List[Dict[str, object
     (Codex review: "Do not skip final-review artifacts outside the core scan
     roots").
     """
-    rows: List[Dict[str, object]] = []
+    rows: List[Dict[str, Any]] = []
     # `state.get(k, []) or []` still yields the raw value for a malformed
     # non-list such as buy_candidates: 1, and iterating it raised TypeError out
     # of load_same_day_top_up_context() -- aborting the whole afternoon context
@@ -3130,7 +3132,7 @@ def _rows_from_buy_candidates(state: Dict[str, object]) -> List[Dict[str, object
 
 def _read_csv_rows(
     csv_path: Path, *, skip_sink: Optional[List[Path]] = None
-) -> List[Dict[str, object]]:
+) -> List[Dict[str, Any]]:
     """Read one orders CSV's rows, keeping only submitted/filled statuses.
 
     Each returned row is tagged with an internal ``_confirmed_fill`` bool: True
@@ -3177,7 +3179,7 @@ def _read_csv_rows(
         if skip_sink is not None:
             skip_sink.append(csv_path)
         raw_rows = raw_rows[:-1]
-    rows: List[Dict[str, object]] = []
+    rows: List[Dict[str, Any]] = []
     for row in raw_rows:
         status = (row.get("status") or "").strip().lower()
         if status and status not in ("submitted", "filled"):
@@ -3290,19 +3292,19 @@ def _dedupe_rank(row: Mapping[str, object]) -> int:
 
 
 def _dedupe_rows_by_order_id(
-    rows: Iterable[Dict[str, object]],
-) -> List[Dict[str, object]]:
+    rows: Iterable[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
     """Deduplicate order rows by ``order_id``, preferring a confirmed fill row.
 
     The same order can appear in more than one sibling CSV for a single manual
-    run -- e.g. both ``submitted_orders.csv`` and ``filled_orders.csv`` record
-    the same ``order_id`` -- and summing each file's rows independently would
+    run directory (e.g. ``orders.csv`` and ``filled_orders.csv``), and each
+    would contribute its own row to ``_prior_from_rows`` -- which would
     double-count that order's notional (Codex review: "Deduplicate orders
     repeated in sibling CSVs"). Rows with no usable ``order_id`` can't be
     matched to a duplicate and are kept as-is.
     """
-    by_order_id: Dict[str, Dict[str, object]] = {}
-    unkeyed: List[Dict[str, object]] = []
+    by_order_id: Dict[str, Dict[str, Any]] = {}
+    unkeyed: List[Dict[str, Any]] = []
     for row in rows:
         oid = (row.get("order_id") or "").strip()
         if not oid or oid == "-":
@@ -3318,8 +3320,8 @@ def _dedupe_rows_by_order_id(
 
 
 def _exclude_seen_order_ids(
-    rows: Iterable[Dict[str, object]], seen_order_ids: Set[str]
-) -> List[Dict[str, object]]:
+    rows: Iterable[Dict[str, Any]], seen_order_ids: Set[str]
+) -> List[Dict[str, Any]]:
     """Drop rows whose ``order_id`` was already counted by an earlier run directory.
 
     ``_dedupe_rows_by_order_id`` only dedupes within one run's sibling CSVs; a
@@ -3332,7 +3334,7 @@ def _exclude_seen_order_ids(
     it across run directories. Rows with no usable ``order_id`` can't be
     matched to a duplicate and are always kept.
     """
-    kept: List[Dict[str, object]] = []
+    kept: List[Dict[str, Any]] = []
     for row in rows:
         oid = (row.get("order_id") or "").strip()
         if oid and oid != "-":
@@ -3343,7 +3345,7 @@ def _exclude_seen_order_ids(
     return kept
 
 
-def _prior_from_rows(rows: Iterable[Dict[str, object]]) -> Dict[str, Dict[str, object]]:
+def _prior_from_rows(rows: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """Per-ticker {prior_usd, reference_price, order_ids} from deduplicated order rows.
 
     ``prior_usd`` sums every filled/submitted amount for the ticker (conservative:
@@ -3364,7 +3366,7 @@ def _prior_from_rows(rows: Iterable[Dict[str, object]]) -> Dict[str, Dict[str, o
     price for submitted manual orders"), preferring higher-priority price
     columns per :data:`_PRICE_COLS`.
     """
-    out: Dict[str, Dict[str, object]] = {}
+    out: Dict[str, Dict[str, Any]] = {}
     for row in rows:
         ticker = _row_ticker(row)
         if not ticker:
@@ -3414,7 +3416,7 @@ def _prior_from_rows(rows: Iterable[Dict[str, object]]) -> Dict[str, Dict[str, o
     return out
 
 
-def _state_generated_before(state: Dict[str, object], boundary_et: Optional[time]) -> bool:
+def _state_generated_before(state: Mapping[str, Any], boundary_et: Optional[time]) -> bool:
     """True when ``state['generated_at']`` (ET) is strictly before ``boundary_et``.
 
     Mirrors ``near_close_dca._prior_run_before_boundary``: a run with no
@@ -3452,7 +3454,7 @@ def _outside_core_loader_reach(run_dir: Path) -> bool:
 
 
 def _already_covered_by_prior_allocation_loader(
-    state: Dict[str, object], run_dir: Path
+    state: Mapping[str, Any], run_dir: Path
 ) -> bool:
     """True when ``near_close_dca.load_prior_same_day_allocations`` already reads this run.
 
@@ -3542,7 +3544,7 @@ _REFERENCE_TS_FLOOR = -1
 
 def _merge_prior(
     dst: Dict[str, PriorAllocation],
-    src: Dict[str, Dict[str, object]],
+    src: Dict[str, Dict[str, Any]],
     source_label: str,
     run_ts: Optional[int] = None,
 ) -> None:
@@ -3755,7 +3757,7 @@ def load_same_day_top_up_context(
                 continue
             rc = state.get("run_classification")
             label = (rc.get("run_id") if isinstance(rc, dict) else None) or str(path.parent)
-            all_rows: List[Dict[str, object]] = []
+            all_rows: List[Dict[str, Any]] = []
             # A RECOVERY state's CSV candidates are constrained to its own run
             # directory, matching near_close_dca's core loader and
             # collect_recovery_context_order_ids. _already_covered_... above
@@ -3848,7 +3850,7 @@ def incremental_top_up_amount(
 
 @dataclass
 class ScheduledSelection:
-    state: Optional[Dict[str, object]]
+    state: Optional[Mapping[str, Any]]
     state_path: Optional[str]
     order_ids: List[str]
     used_broker_fallback: bool

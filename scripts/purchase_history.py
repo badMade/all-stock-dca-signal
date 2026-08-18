@@ -83,7 +83,7 @@ from dataclasses import asdict, dataclass
 from datetime import date
 from itertools import chain
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 # This module is also a documented standalone entry point (see the module
 # docstring and docs/purchase_history.md's Usage section), and direct
@@ -315,9 +315,9 @@ def _infer_trading_day_from_path(path: Path) -> Optional[str]:
 
 
 def collect_purchase_records(
-    root: Optional[Path] = None,
+    root: Optional[Path | str] = None,
     *,
-    additional_roots: Sequence[Path] = (),
+    additional_roots: Sequence[Path | str] = (),
 ) -> tuple[List[PurchaseRecord], List[str]]:
     """Scan every run directory under ``root`` (default: the configured
     cron-tracking root) plus every root in ``additional_roots``, and return
@@ -363,15 +363,15 @@ def collect_purchase_records(
     # aliases of the same root produced two distinct keys and doubled
     # quantity/dollars/buy_count for it (Codex review: "Normalize scan roots
     # before deduplicating artifacts").
-    scan_roots: List[Path] = []
+    scan_roots_list: List[Path] = []
     seen_scan_roots: set = set()
     for candidate in (resolved_root, *(Path(r) for r in additional_roots)):
         normalized = candidate.resolve()
         if normalized in seen_scan_roots:
             continue
         seen_scan_roots.add(normalized)
-        scan_roots.append(normalized)
-    scan_roots = tuple(scan_roots)
+        scan_roots_list.append(normalized)
+    scan_roots: Tuple[Path, ...] = tuple(scan_roots_list)
     records: List[PurchaseRecord] = []
     warnings: List[str] = []
     seen: Dict[str, Dict[str, Any]] = {}
@@ -513,17 +513,17 @@ def collect_purchase_records(
             # picks which occurrence's identity metadata to credit;
             # ``completeness_rank`` (mirroring near_close_dca._fill_rank)
             # separately picks whose quantity/price/amount to trust.
-            attribution = {
+            attribution: Dict[str, Any] = {
                 "run_dir": run_dir,
                 "rank": _dedup_rank(run_origin),
-                "trading_day": str(trading_day) if trading_day else "",
+                "trading_day": trading_day if trading_day else "",
                 "stream": stream,
                 "run_origin": run_origin,
-                "run_id": str(run_id) if run_id else None,
+                "run_id": run_id if run_id else None,
                 "broker": broker,
                 "source_run_dir": str(run_dir),
             }
-            values = {
+            values: Dict[str, Any] = {
                 "run_dir": fill_source_dir,
                 "rank": 0 if fill.get("_partial_execution") else 1,
                 # A row with a resolved quantity is strictly more useful than
@@ -580,10 +580,10 @@ def collect_purchase_records(
                 )
                 continue
 
-            best_attribution = (
+            best_attribution: Dict[str, Any] = (
                 attribution if attribution["rank"] < incumbent["attribution"]["rank"] else incumbent["attribution"]
             )
-            best_values = (
+            best_values: Dict[str, Any] = (
                 values if _values_sort_key(values) > _values_sort_key(incumbent["values"]) else incumbent["values"]
             )
             # A directory carrying more than one run_state*.json (e.g.

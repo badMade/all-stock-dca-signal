@@ -17,15 +17,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import compute_schedule  # noqa: E402
 
 
-def _cadence_fn(schedule="0 3 * * *", rationale="High PR velocity (>50 commits/mo); running daily."):
-    calls = []
+class _CadenceFn:
+    def __init__(self, schedule: str, rationale: str) -> None:
+        self.schedule = schedule
+        self.rationale = rationale
+        self.calls: list[bool] = []
 
-    def _fn():
-        calls.append(True)
-        return schedule, rationale
+    def __call__(self) -> tuple[str, str]:
+        self.calls.append(True)
+        return self.schedule, self.rationale
 
-    _fn.calls = calls
-    return _fn
+
+def _cadence_fn(schedule="0 3 * * *", rationale="High PR velocity (>50 commits/mo); running daily.") -> _CadenceFn:
+    return _CadenceFn(schedule, rationale)
 
 
 def test_parse_schedule_file_missing_file_returns_defaults(tmp_path):

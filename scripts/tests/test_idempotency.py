@@ -90,7 +90,9 @@ def test_lossless_encoding_distinguishes_special_chars():
 
 def test_round_trip_parse_preserves_special_chars():
     key = _key(strategy_version="v2/a.b")
-    assert parse_idempotency_key(key)["strategy_version"] == "v2/a.b"
+    parsed = parse_idempotency_key(key)
+    assert parsed is not None
+    assert parsed["strategy_version"] == "v2/a.b"
 
 
 def test_parse_rejects_non_string_input():

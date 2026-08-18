@@ -19,6 +19,7 @@ import subprocess
 import sys
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from typing import Any, Sequence
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -153,9 +154,9 @@ def _run(
     config: StrategyConfig,
     *,
     slot: str = SLOT,
-    source_errors: tuple = (),
-    ticker_errors: dict = None,
-    already_covered_tickers: tuple = (),
+    source_errors: Sequence[str] = (),
+    ticker_errors: Any = None,
+    already_covered_tickers: Sequence[str] = (),
 ) -> list:
     now = datetime.combine(DAY, gbc.SLOT_SPECS[slot]["decision_time_et"], tzinfo=ET)
     return gbc.generate_candidates(

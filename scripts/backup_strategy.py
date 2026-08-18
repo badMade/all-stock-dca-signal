@@ -29,7 +29,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 # Tokens that look like tickers but are noise we never want in the universe.
 _TICKER_STOPWORDS = {
@@ -44,7 +44,7 @@ def _clean_symbol(sym: str) -> str:
     return sym.strip().upper().strip(".,;:")
 
 
-def extract_tickers(text: str) -> Dict[str, object]:
+def extract_tickers(text: str) -> Dict[str, Any]:
     """Extract active/excluded tickers and symbol corrections.
 
     Strategy: locate the "universe" line and read the comma-separated symbols
@@ -127,7 +127,7 @@ def _dedupe(items: List[str]) -> List[str]:
     return out
 
 
-def extract_sizing_ladder(text: str) -> Dict[str, object]:
+def extract_sizing_ladder(text: str) -> Dict[str, Any]:
     """Extract graded ladder tiers from lines like:
 
         drop <0.1% = 0x
@@ -248,7 +248,7 @@ _TIER_PATTERN = re.compile(
 )
 
 
-def extract_budget_tiers(text: str) -> List[Dict[str, object]]:
+def extract_budget_tiers(text: str) -> List[Dict[str, Any]]:
     """Extract tiered daily/weekly caps from lines naming a tier and its caps.
 
     The stress tier's capacity depends on the weekly rollover reserve, so when the
@@ -257,14 +257,14 @@ def extract_budget_tiers(text: str) -> List[Dict[str, object]]:
     any other existing per-tier metadata when merging into an existing config.
     """
     mentions_rollover_reserve = bool(re.search(r"rollover\s+reserve", text, re.IGNORECASE))
-    tiers: List[Dict[str, object]] = []
+    tiers: List[Dict[str, Any]] = []
     seen: set = set()
     for m in _TIER_PATTERN.finditer(text):
         name = re.sub(r"[- ]", "_", m.group(1).lower())
         if name in seen:
             continue
         seen.add(name)
-        tier: Dict[str, object] = {
+        tier: Dict[str, Any] = {
             "name": name,
             "daily_cap_usd": _to_float(m.group(2)),
             "weekly_cap_usd": _to_float(m.group(3)),
@@ -275,8 +275,8 @@ def extract_budget_tiers(text: str) -> List[Dict[str, object]]:
     return tiers
 
 
-def extract_budgets(text: str) -> Dict[str, object]:
-    out: Dict[str, object] = {}
+def extract_budgets(text: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
     base_amount_usd = _select_base_amount_usd(text)
     if base_amount_usd is not None:
         out["base_amount_usd"] = base_amount_usd
@@ -292,7 +292,7 @@ def extract_budgets(text: str) -> Dict[str, object]:
     return out
 
 
-def extract_schedule(text: str) -> Dict[str, object]:
+def extract_schedule(text: str) -> Dict[str, Any]:
     """Extract cron schedules and derive weekday-check ET times.
 
     Recognizes patterns like:
@@ -337,7 +337,7 @@ def _is_weekday_cron(cron: str) -> bool:
     return dow in {"1-5", "1,2,3,4,5", "mon-fri"}
 
 
-def extract_all(text: str) -> Dict[str, object]:
+def extract_all(text: str) -> Dict[str, Any]:
     return {
         "tickers": extract_tickers(text),
         "sizing_ladder": extract_sizing_ladder(text),
@@ -384,9 +384,9 @@ def _deep_merge(dst: dict, src: dict) -> None:
             dst[k] = v
 
 
-def _merge_into_file(path: Path, updates: Dict[str, object]) -> None:
+def _merge_into_file(path: Path, updates: Dict[str, Any]) -> None:
     """Merge extracted values into an existing config file, preserving keys."""
-    existing: Dict[str, object] = {}
+    existing: Dict[str, Any] = {}
     if path.exists():
         try:
             existing = json.loads(path.read_bytes())
@@ -397,7 +397,7 @@ def _merge_into_file(path: Path, updates: Dict[str, object]) -> None:
     path.write_text(json.dumps(existing, indent=2) + "\n")
 
 
-def write_configs(extracted: Dict[str, object], out_dir: Path, only: Optional[List[str]]) -> List[str]:
+def write_configs(extracted: Dict[str, Any], out_dir: Path, only: Optional[List[str]]) -> List[str]:
     written = []
     want = set(only) if only else {"tickers", "ladder", "budgets", "schedule"}
 

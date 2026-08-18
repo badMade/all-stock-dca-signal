@@ -131,7 +131,7 @@ def test_portable_lock_serializes_concurrent_appends(tmp_path, monkeypatch):
     for t in threads:
         t.join()
 
-    seqs = sorted(e.seq for e in ledger.read_all())
+    seqs = sorted(e.seq for e in ledger.read_all() if e.seq is not None)
     # No duplicated or skipped sequence numbers despite concurrent writers.
     assert seqs == list(range(1, workers + 1))
 

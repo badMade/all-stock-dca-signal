@@ -17,6 +17,7 @@ import sys
 import tempfile
 from datetime import datetime, time
 from pathlib import Path
+from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -612,6 +613,7 @@ def test_select_scheduled_falls_back_to_legacy_directory():
         sel_canonical = select_scheduled_state_for_reporting(TRADING_DAY, base=base)
         assert sel_canonical.ok
         assert sel_canonical.order_ids == ["SCHED-3"]
+        assert sel_canonical.state_path is not None
         assert "1530ET" in sel_canonical.state_path
 
 
@@ -3860,7 +3862,7 @@ def test_validate_recovery_classification_rejects_flag_violations():
     ):
         assert validate_recovery_classification(_recovery_classification(**override)) is False, override
     assert validate_recovery_classification(None) is False
-    assert validate_recovery_classification("nope") is False
+    assert validate_recovery_classification(cast(Any, "nope")) is False
 
 
 def test_recovery_contract_matches_its_schema():
@@ -4444,7 +4446,7 @@ def test_recovery_rerun_rejects_present_non_false_values():
     # schema permits only boolean false when the property is present.
     for value in (None, 0, 0.0, "false", "", [], {}, 1, True):
         rc = _recovery_classification()
-        rc["recovery_rerun"] = value
+        rc["recovery_rerun"] = cast(Any, value)
         assert validate_recovery_classification(rc) is False, value
     # Present-and-false and genuinely absent both remain valid.
     ok = _recovery_classification()

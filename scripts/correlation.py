@@ -27,7 +27,7 @@ _SEGMENT_UNSAFE = re.compile(r"[^A-Za-z0-9]+")
 
 def _segment(value: str) -> str:
     """Normalize one id segment: lowercase, non-alphanumerics collapsed to ``-``."""
-    cleaned = _SEGMENT_UNSAFE.sub("-", str(value).strip().lower()).strip("-")
+    cleaned = _SEGMENT_UNSAFE.sub("-", value.strip().lower()).strip("-")
     return cleaned or "na"
 
 
@@ -64,14 +64,14 @@ def new_correlation_id(stream: str = "adhoc") -> str:
     return "-".join([_PREFIX, _segment(stream), uuid.uuid4().hex[:12]])
 
 
-def parent_of(correlation_id: str) -> Optional[str]:
+def parent_of(correlation_id: Optional[str]) -> Optional[str]:
     """Return the scheduled-parent id for a child correlation id, else None."""
     if not correlation_id or "/" not in correlation_id:
         return None
     return correlation_id.split("/", 1)[0]
 
 
-def is_child(correlation_id: str) -> bool:
+def is_child(correlation_id: Optional[str]) -> bool:
     """True when ``correlation_id`` is a recovery/reconciliation child id."""
     return bool(correlation_id) and "/" in correlation_id
 

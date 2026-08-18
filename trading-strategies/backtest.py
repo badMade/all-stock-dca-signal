@@ -44,31 +44,36 @@ from typing import Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 import numpy as np
 import pandas as pd
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+try:
+    from alpaca.data.historical import StockHistoricalDataClient  # type: ignore
+    from alpaca.data.requests import StockBarsRequest  # type: ignore
+    from alpaca.data.timeframe import TimeFrame  # type: ignore
+except ImportError:
+    StockHistoricalDataClient = None
+    StockBarsRequest = None
+    TimeFrame = None
 
 # Suppress noisy deprecation warnings from vectorbt / pandas internals
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 try:
-    import pandas_ta as ta
+    import pandas_ta as ta  # type: ignore
 except ImportError:
     print("[ERROR] pandas-ta is not installed. Run: pip install pandas-ta")
     sys.exit(1)
 
 try:
-    import vectorbt as vbt
+    import vectorbt as vbt  # type: ignore
 except ImportError:
     print("[ERROR] vectorbt is not installed. Run: pip install vectorbt")
     sys.exit(1)
 
 # Optional rich for prettier console output
 try:
-    from rich import box
-    from rich.console import Console
-    from rich.table import Table
+    from rich import box  # type: ignore
+    from rich.console import Console  # type: ignore
+    from rich.table import Table  # type: ignore
     RICH_AVAILABLE = True
     console = Console()
 except ImportError:
@@ -401,9 +406,9 @@ def build_benchmark_portfolio(
     -------
     vbt.Portfolio
     """
-    entries = pd.Series(False, index=close.index)
-    exits   = pd.Series(False, index=close.index)
-    entries.iloc[0] = True  # Buy on day 1
+    entries = pd.Series(False, index=close.index, dtype=bool)
+    exits   = pd.Series(False, index=close.index, dtype=bool)
+    entries.iat[0] = True  # Buy on day 1
 
     portfolio = vbt.Portfolio.from_signals(
         close=close,

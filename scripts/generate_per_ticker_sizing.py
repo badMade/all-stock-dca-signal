@@ -10,6 +10,7 @@ import math
 import sys
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 from dca_fileio import atomic_write_text
 from dca_ticker_paths import configured_ticker_history_dir
@@ -34,7 +35,7 @@ GLOBAL_FALLBACK_TIERS = ((0.1, 1.0), (2.0, 1.5), (4.0, 2.0), (5.0, 2.5), (6.0, 3
 MINIMUM_ACTIVE_HISTORY_COVERAGE = 0.5
 
 
-def archive_unavailable_reason(history_dir: Path, ticker_config: Path) -> dict[str, object] | None:
+def archive_unavailable_reason(history_dir: Path, ticker_config: Path) -> dict[str, Any] | None:
     """``None`` when the archive has enough active-symbol coverage to trust a
     calibration built from it; otherwise a dict describing why publishing
     must be refused.
@@ -79,7 +80,7 @@ MAXIMUM_SESSION_COUNT_REGRESSION_FRACTION = 0.05
 
 
 def session_count_regressions(
-    new_tickers: dict[str, object], output: Path
+    new_tickers: dict[str, Any], output: Path
 ) -> dict[str, dict[str, int]]:
     """Return ``{ticker: {"previous": N, "new": M}}`` for every ticker whose
     ``sample_sessions`` collapsed by more than the allowed fraction versus
@@ -158,7 +159,7 @@ def build_sizing_payload(
     *,
     lookback_years: int = 3,
     as_of: date | None = None,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     """Build the complete active-universe calibration without writing it.
 
     The daily Claude-only refresh imports this function after it has verified

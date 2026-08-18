@@ -591,7 +591,7 @@ def test_collect_purchase_records_keeps_distinct_recovery_orders_separate(tmp_pa
     assert len(records) == 2
     order_ids = {r.order_id for r in records}
     assert order_ids == {"order-111", "order-222"}
-    assert sum(r.amount_usd for r in records) == pytest.approx(9.00)
+    assert sum(r.amount_usd or 0.0 for r in records) == pytest.approx(9.00)
 
 
 def test_collect_purchase_records_scopes_no_id_recovery_fills_to_their_root(tmp_path):
@@ -627,7 +627,7 @@ def test_collect_purchase_records_scopes_no_id_recovery_fills_to_their_root(tmp_
     records, _ = collect_purchase_records(root)
 
     assert len(records) == 2
-    assert sum(r.amount_usd for r in records) == pytest.approx(9.00)
+    assert sum(r.amount_usd or 0.0 for r in records) == pytest.approx(9.00)
 
 
 def test_collect_purchase_records_does_not_double_read_recorded_recovery_csv(tmp_path):
@@ -1986,7 +1986,7 @@ def test_collect_purchase_records_scopes_full_report_no_id_fills_to_their_file(t
 
     amd_records = [r for r in records if r.ticker == "AMD"]
     assert len(amd_records) == 2
-    quantities = sorted(r.quantity for r in amd_records)
+    quantities = sorted(r.quantity or 0.0 for r in amd_records)
     assert quantities == pytest.approx([0.03, 0.04])
 
 

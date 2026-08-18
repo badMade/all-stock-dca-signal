@@ -52,18 +52,27 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-# vectorbt – signal generation and portfolio simulation
-import vectorbt as vbt
-import yfinance as yf
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+try:
+    import vectorbt as vbt  # type: ignore
+    import yfinance as yf  # type: ignore
+    from alpaca.data.historical import StockHistoricalDataClient  # type: ignore
+    from alpaca.data.requests import StockBarsRequest  # type: ignore
+    from alpaca.data.timeframe import TimeFrame  # type: ignore
 
-# Jinja2 – HTML email templating
-from jinja2 import BaseLoader, Environment
+    # Jinja2 – HTML email templating
+    from jinja2 import BaseLoader, Environment  # type: ignore
 
-# scipy – beta/alpha linear regression
-from scipy import stats
+    # scipy – beta/alpha linear regression
+    from scipy import stats  # type: ignore
+except ImportError:
+    vbt = None  # type: ignore
+    yf = None  # type: ignore
+    StockHistoricalDataClient = None  # type: ignore
+    StockBarsRequest = None  # type: ignore
+    TimeFrame = None  # type: ignore
+    BaseLoader = None  # type: ignore
+    Environment = None  # type: ignore
+    stats = None  # type: ignore
 
 _ALPACA_KEY    = _os.environ.get("ALPACA_API_KEY", "")
 _ALPACA_SECRET = _os.environ.get("ALPACA_SECRET_KEY", "")
@@ -920,7 +929,7 @@ class MetricsCalculator:
         mdd  = self._max_drawdown(ret)
         if mdd == 0:
             return float("nan")
-        return float(cagr / abs(mdd))
+        return cagr / abs(mdd)
 
 
 # ===========================================================================

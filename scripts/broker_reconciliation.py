@@ -406,7 +406,7 @@ def _clean_order_ids(order_ids: Iterable[str]) -> List[str]:
         order_ids = [order_ids]
     seen: Dict[str, None] = {}
     for oid in order_ids or []:
-        text = str(oid).strip()
+        text = oid.strip()
         if text and text != "-":
             seen.setdefault(text, None)
     return list(seen)
@@ -767,7 +767,7 @@ def reconcile_effective_prior(
     result: Dict[str, EffectivePrior] = {}
     for symbol in symbols:
         alloc = _artifact_alloc(artifact_priors, symbol)
-        artifact_prior = float(alloc.prior_usd) if alloc else 0.0
+        artifact_prior = alloc.prior_usd if alloc else 0.0
         # Preserve insertion order for order_ids (matches _clean_order_ids).
         artifact_ids = _clean_order_ids(alloc.order_ids) if alloc else []
         order_ids = list(artifact_ids)
@@ -781,7 +781,7 @@ def reconcile_effective_prior(
         poisoned = False
         if alloc is not None:
             if alloc.reference_price is not None:
-                known_prices.append(float(alloc.reference_price))
+                known_prices.append(alloc.reference_price)
             elif artifact_prior > 0:
                 poisoned = True
 

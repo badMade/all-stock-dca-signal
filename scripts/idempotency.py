@@ -22,7 +22,7 @@ NOT change any live ref id on its own; a runner must adopt it explicitly.
 from __future__ import annotations
 
 import uuid
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 from urllib.parse import quote, unquote
 
 #: Namespace for deterministic UUIDv5 ref ids (a fixed, arbitrary UUID constant).
@@ -91,7 +91,7 @@ def deterministic_ref_id(key: str) -> str:
     return str(uuid.uuid5(_REF_ID_NAMESPACE, key))
 
 
-def parse_idempotency_key(key: str) -> Optional[Dict[str, str]]:
+def parse_idempotency_key(key: Any) -> Optional[Dict[str, str]]:
     """Parse a key string back into its fields, or None if it isn't one of ours."""
     if not isinstance(key, str):
         return None

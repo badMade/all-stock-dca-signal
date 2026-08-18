@@ -44,9 +44,16 @@ from typing import Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 import numpy as np
 import requests
-import torch
-from jinja2 import Environment
-from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
+try:
+    import torch  # type: ignore
+    from jinja2 import Environment  # type: ignore
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline  # type: ignore
+except ImportError:
+    torch = None  # type: ignore
+    Environment = None  # type: ignore
+    AutoModelForSequenceClassification = None  # type: ignore
+    AutoTokenizer = None  # type: ignore
+    pipeline = None  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -461,7 +468,7 @@ class SentimentAnalyzer:
             neu = score_map.get("neutral", 0.0)
 
             # Determine dominant label
-            dominant = max(score_map, key=score_map.get)
+            dominant = max(score_map, key=lambda k: score_map[k])
             confidence = score_map[dominant]
 
             # Composite score: direction * confidence
@@ -586,7 +593,7 @@ class NewsCollector:
             # rely on (codex review discussion_r3742559536).
             safe_exc = str(exc)
             if self.api_key:
-                safe_exc = safe_exc.replace(str(self.api_key), "***")
+                safe_exc = safe_exc.replace(self.api_key, "***")
             logger.error("NewsAPI error for %s: %s", ticker, safe_exc)
             return []
 
@@ -760,7 +767,7 @@ class HistoryManager:
         if std == 0:
             return 0.0, mean, 0.0
         z = (today_score - mean) / std
-        return float(z), mean, float(std)
+        return z, mean, std
 
     def get_history_scores(self, ticker: str) -> List[float]:
         """Return list of all stored scores for a ticker (for diagnostics)."""
@@ -916,7 +923,7 @@ class EmailBriefing:
         except smtplib.SMTPException as exc:
             safe_exc = str(exc)
             if self.smtp_password:
-                safe_exc = safe_exc.replace(str(self.smtp_password), "***")
+                safe_exc = safe_exc.replace(self.smtp_password, "***")
             logger.error("Failed to send email: %s", safe_exc)
             raise
 
