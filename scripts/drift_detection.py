@@ -36,32 +36,30 @@ from __future__ import annotations
 
 import argparse
 import csv
-import http.client
-import ipaddress
 import json
 import os
-import socket
 import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, cast
-from urllib.parse import urlsplit
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 # This module is a documented standalone CLI (``python scripts/drift_detection.py``),
 # and direct invocation puts only ``scripts/`` on sys.path -- so the repo root is
 # added here before the shared helpers below are imported. It previously carried a
-# private copy of dca_fileio.atomic_write_text to sidestep that, and the copy had
-# drifted: it omitted the parent-directory fsync that dca_fileio documents as
-# required ("without the directory fsync the rename itself could be lost on power
-# failure"), leaving this detector's own output strictly less durable than every
-# other artifact this repo writes. Importing the one implementation is what keeps
-# them from diverging again. Mirrors what scripts/tests/* already do.
+# private copy of dca_fileio.atomic_write_text and network safety checks to sidestep
+# that, which caused code duplication and drift. Importing the shared implementations
+# is what keeps them from diverging again. Mirrors what scripts/tests/* already do.
 _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from dca_alerts import (  # noqa: E402
+    _assert_safe_destination,
+    _sanitize_exception,
+    _UnsafeDestinationError,
+)
 from dca_fileio import atomic_write_text  # noqa: E402 - needs the sys.path setup above
 
 # --- Artifact file names -----------------------------------------------------
@@ -716,252 +714,6 @@ def resolve_webhook(webhook: Optional[str], env_var: str) -> Optional[str]:
     return os.environ.get(env_var) or None
 
 
-class _UnsafeWebhookDestinationError(Exception):
-    """Webhook URL scheme is not http(s), or its host resolves to a disallowed address."""
-
-
-def _resolve_ips(hostname: str) -> "set[ipaddress._BaseAddress]":
-    """Resolve ``hostname``'s IP addresses. A seam so tests can fake DNS."""
-    return {ipaddress.ip_address(info[4][0]) for info in socket.getaddrinfo(hostname, None)}
-
-
-def _is_disallowed_ip(ip: Any) -> bool:
-    """True if ``ip`` (an IPv4Address / IPv6Address) is not a safe destination.
-
-    Rejects loopback, link-local, private (RFC 1918 / RFC 4193), multicast,
-    reserved, and site-local addresses. A webhook destination resolved to one of
-    these would allow Server-Side Request Forgery (SSRF) against internal
-    infrastructure (e.g. cloud metadata endpoints at 169.254.169.254, or
-    internal services on localhost / 10.0.0.0/8).
-
-    Note ``ip.is_private`` is intentionally NOT used alone: Python's ipaddress
-    module treats Carrier-Grade NAT (100.64.0.0/10) as NOT private, even though
-    it can address services inside a VPC, Kubernetes cluster, or carrier
-    network. ``is_multicast`` and IPv6's deprecated site-local space
-    (``fec0::/10``) are checked explicitly because ``is_global`` reports
-    both of those as ``True``. Mirrors ``dca_alerts._is_disallowed_ip`` --
-    duplicated for the same reason as ``_assert_safe_webhook_destination``
-    below.
-    """
-    return (
-        not ip.is_global
-        or ip.is_multicast
-        or ip.is_reserved
-        or bool(getattr(ip, "is_site_local", False))
-    )
-
-
-def _proxy_configured_for(url: str) -> bool:
-    """True if an environment-configured forward proxy applies to ``url``.
-
-    Mirrors ``dca_alerts._proxy_configured_for`` -- see that docstring for
-    why a proxy-only deployment needs to skip local DNS resolution here.
-    """
-    parsed = urlsplit(url)
-    hostname = parsed.hostname
-    if not hostname:
-        return False
-    proxy = urllib.request.getproxies().get(parsed.scheme.lower())
-    if not proxy:
-        return False
-    return not urllib.request.proxy_bypass(hostname)
-
-
-def _assert_safe_webhook_destination(url: str) -> None:
-    """Raise :class:`_UnsafeWebhookDestinationError` unless ``url`` is http(s) and
-    every address its host resolves to is a public, routable address.
-
-    Restricting only the scheme (the pre-fix state) still lets an
-    attacker-influenced webhook value point at ``http://127.0.0.1:8080/`` or the
-    ``http://169.254.169.254/latest/meta-data/`` cloud-metadata endpoint. Every
-    resolved address is checked, not just the first, since a hostname can
-    resolve to a mix of public and private IPs. Mirrors
-    ``dca_alerts._assert_safe_destination`` -- duplicated rather than imported to
-    keep this module free of a dependency on the repo-root package (see the
-    ``atomic_write_text`` import note above for why that's already an exception,
-    not the rule).
-
-    This is a preflight check only -- see ``dca_alerts._assert_safe_destination``'s
-    docstring on the DNS-rebinding window a separate lookup here leaves open;
-    :class:`_PinnedHTTPConnection` below closes it for the actual request by
-    resolving, validating, and connecting in one step.
-    """
-    parsed = urlsplit(url)
-    if parsed.scheme.lower() not in {"http", "https"}:
-        raise _UnsafeWebhookDestinationError(f"unsupported scheme {parsed.scheme!r}")
-    hostname = parsed.hostname
-    if not hostname:
-        raise _UnsafeWebhookDestinationError("missing host")
-    try:
-        _ = parsed.port
-    except ValueError as exc:
-        raise _UnsafeWebhookDestinationError("malformed port") from exc
-    try:
-        literal_ip = ipaddress.ip_address(hostname)
-    except ValueError:
-        literal_ip = None
-    if literal_ip is not None:
-        # A literal address (e.g. "https://169.254.169.254/...") needs no DNS
-        # resolution at all -- checking it is free regardless of whether a
-        # proxy is configured, and skipping it (the proxy-bypass branch
-        # below) would let an attacker-controlled literal straight through
-        # in proxy-enabled deployments (codex review on this PR).
-        if _is_disallowed_ip(literal_ip):
-            raise _UnsafeWebhookDestinationError("disallowed address")
-        return
-    try:
-        ips = _resolve_ips(hostname)
-    except OSError as exc:
-        # Only a hostname that genuinely fails to resolve locally gets the
-        # proxy exemption -- that's the deployment this exists for (the
-        # proxy resolves it remotely). A hostname that DOES resolve locally
-        # is still checked below even when some proxy happens to be
-        # configured (e.g. a blanket corporate egress policy unrelated to
-        # this URL): unconditionally skipping validation whenever any proxy
-        # exists let an attacker-controlled hostname (as opposed to a
-        # literal IP, handled above) resolve via the proxy to a private/
-        # link-local address completely unchecked (codex review on this PR).
-        if _proxy_configured_for(url):
-            return
-        raise _UnsafeWebhookDestinationError("host does not resolve") from exc
-    if not ips or any(_is_disallowed_ip(ip) for ip in ips):
-        raise _UnsafeWebhookDestinationError("host resolves to a disallowed address")
-
-
-def _connect_pinned(conn: "http.client.HTTPConnection") -> None:
-    """Resolve ``conn.host``, validate every resolved address, and connect to
-    one of the validated addresses -- all in one step. Mirrors
-    ``dca_alerts._connect_pinned``; see that docstring for the DNS-rebinding
-    gap this closes (codex review discussion_r3679190498).
-    """
-    try:
-        ips = list(_resolve_ips(conn.host))
-    except OSError as exc:
-        raise _UnsafeWebhookDestinationError("host does not resolve") from exc
-    if not ips or any(_is_disallowed_ip(ip) for ip in ips):
-        raise _UnsafeWebhookDestinationError("host resolves to a disallowed address")
-    last_exc: Optional[OSError] = None
-    for ip in ips:
-        try:
-            conn.sock = socket.create_connection(
-                (str(ip), conn.port), conn.timeout, cast(Any, conn).source_address
-            )
-            return
-        except OSError as exc:
-            last_exc = exc
-    raise last_exc if last_exc is not None else OSError("no address to connect to")
-
-
-class _PinnedHTTPConnection(http.client.HTTPConnection):
-    """An HTTP connection pinned to a validated address (see :func:`_connect_pinned`)."""
-
-    def connect(self) -> None:
-        _connect_pinned(self)
-
-
-class _PinnedHTTPSConnection(http.client.HTTPSConnection):
-    """The HTTPS equivalent of :class:`_PinnedHTTPConnection` (see that class
-    and ``dca_alerts._PinnedHTTPSConnection`` for why only the raw connect
-    step is overridden)."""
-
-    def connect(self) -> None:
-        _connect_pinned(self)
-        server_hostname = cast(Any, self)._tunnel_host or self.host
-        self.sock = cast(Any, self)._context.wrap_socket(self.sock, server_hostname=server_hostname)
-
-
-def _request_is_proxied(req: "urllib.request.Request") -> bool:
-    """True if ``req`` is being routed through a forward proxy. Mirrors
-    ``dca_alerts._request_is_proxied`` -- see that docstring for why a
-    proxied request must fall back to the stock connection classes.
-    """
-    if getattr(req, "_tunnel_host", None):
-        return True
-    return req.selector.startswith(("http://", "https://"))
-
-
-class _PinnedHTTPHandler(urllib.request.HTTPHandler):
-    def http_open(self, req):
-        if _request_is_proxied(req):
-            return self.do_open(http.client.HTTPConnection, req)
-        return self.do_open(_PinnedHTTPConnection, req)
-
-
-class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
-    def https_open(self, req):
-        # Only pass context, not check_hostname: on Python 3.12+,
-        # HTTPSHandler.__init__ folds check_hostname into the SSL context
-        # and no longer sets self._check_hostname at all, and
-        # http.client.HTTPSConnection.__init__ no longer accepts a
-        # check_hostname argument either -- accessing/forwarding it here
-        # raised AttributeError/TypeError on every real HTTPS request under
-        # 3.12+ (Codex review on this PR). This handler is always
-        # constructed with no arguments (build_opener() below), so
-        # self._check_hostname is always the default None on 3.11 too,
-        # making this identical in practice to the stock 3.11 behavior.
-        ctx = cast(Any, self)._context
-        if _request_is_proxied(req):
-            return self.do_open(http.client.HTTPSConnection, req, context=ctx)
-        return self.do_open(_PinnedHTTPSConnection, req, context=ctx)
-
-
-class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Re-validate every redirect target the same way as the initial request.
-
-    ``urlopen``'s default redirect handling blindly follows ``Location``
-    headers, so an initially-allowed public webhook URL could 302 to
-    ``http://169.254.169.254/...`` and defeat
-    :func:`_assert_safe_webhook_destination` entirely. Each hop through this
-    handler re-runs the same scheme and resolved-address check before it is
-    followed.
-    """
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        try:
-            _assert_safe_webhook_destination(newurl)
-        except _UnsafeWebhookDestinationError as exc:
-            raise urllib.error.HTTPError(
-                newurl, code, f"blocked unsafe redirect destination: {exc}", headers, fp
-            ) from exc
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-
-# Installed once at import time so every urllib.request.urlopen() call in this
-# process -- not just the one in this module -- gets redirect validation and
-# pinned-address connections.
-urllib.request.install_opener(
-    urllib.request.build_opener(_SafeRedirectHandler, _PinnedHTTPHandler, _PinnedHTTPSHandler)
-)
-
-
-def _sanitize_exception(exc: BaseException) -> str:
-    """Render ``exc`` as its class name plus, only for known-safe cases, a
-    short reason -- never its full message.
-
-    A delivery failure can raise exceptions whose message embeds the
-    complete offending URL/path -- e.g. ``http.client.InvalidURL`` for a
-    webhook URL containing a space or control character quotes the whole
-    path back -- and webhook URLs commonly carry auth tokens in that path.
-    Logging ``str(exc)`` unconditionally would expose those tokens to stderr.
-    Mirrored identically from dca_alerts._sanitize_exception.
-    """
-    if isinstance(exc, urllib.error.HTTPError):
-        return f"{type(exc).__name__}: HTTP {exc.code}"
-    if isinstance(exc, urllib.error.URLError):
-        # ``reason`` can be a plain string OR an underlying exception object
-        # (e.g. a gaierror) constructed from arbitrary context -- stringifying
-        # it directly would risk reintroducing exactly the URL/path leak this
-        # function exists to prevent, so only its TYPE (plus, for an OSError-like
-        # reason, its numeric errno -- never its message) is reported.
-        reason = exc.reason
-        if isinstance(reason, OSError) and getattr(reason, "errno", None) is not None:
-            return f"{type(exc).__name__}: errno {reason.errno}"
-        if isinstance(reason, BaseException):
-            return f"{type(exc).__name__}: {type(reason).__name__}"
-        return type(exc).__name__
-    return type(exc).__name__
-
-
 def send_slack_alert(
     report: DriftReport,
     *,
@@ -984,8 +736,8 @@ def send_slack_alert(
         return False
 
     try:
-        _assert_safe_webhook_destination(url)
-    except _UnsafeWebhookDestinationError as exc:
+        _assert_safe_destination(url)
+    except _UnsafeDestinationError as exc:
         raise urllib.error.URLError(f"Invalid or unsafe webhook destination: {exc}") from exc
 
     payload = json.dumps(build_slack_payload(report)).encode("utf-8")

@@ -43,6 +43,8 @@ from drift_detection import (  # noqa: E402
     send_slack_alert,
 )
 
+import dca_alerts  # noqa: E402
+
 SIGNAL_FIELDS = [
     "ticker",
     "auto_buy_signal",
@@ -401,7 +403,7 @@ class SlackTests(unittest.TestCase):
     def test_send_slack_blocks_private_destination(self):
         report = detect_drift(self.run_dir)
         with patch.object(
-            drift_detection, "_resolve_ips", lambda hostname: {ipaddress.ip_address("127.0.0.1")}
+            dca_alerts, "_resolve_ips", lambda hostname: {ipaddress.ip_address("127.0.0.1")}
         ):
             with self.assertRaises(urllib.error.URLError):
                 send_slack_alert(report, webhook="https://hooks.example/alert")
@@ -409,7 +411,7 @@ class SlackTests(unittest.TestCase):
     def test_send_slack_blocks_cloud_metadata_destination(self):
         report = detect_drift(self.run_dir)
         with patch.object(
-            drift_detection,
+            dca_alerts,
             "_resolve_ips",
             lambda hostname: {ipaddress.ip_address("169.254.169.254")},
         ):
@@ -434,16 +436,16 @@ class SlackTests(unittest.TestCase):
             return _FakeResponse()
 
         with patch.object(
-            drift_detection, "_resolve_ips", lambda hostname: {ipaddress.ip_address("93.184.216.34")}
+            dca_alerts, "_resolve_ips", lambda hostname: {ipaddress.ip_address("93.184.216.34")}
         ), patch.object(urllib.request, "urlopen", fake_urlopen):
             self.assertTrue(send_slack_alert(report, webhook="https://hooks.example/alert"))
         self.assertEqual(len(calls), 1)
 
     def test_safe_redirect_handler_blocks_private_redirect_target(self):
-        handler = drift_detection._SafeRedirectHandler()
+        handler = dca_alerts._SafeRedirectHandler()
         req = urllib.request.Request("https://hooks.example/start")
         with patch.object(
-            drift_detection, "_resolve_ips", lambda hostname: {ipaddress.ip_address("127.0.0.1")}
+            dca_alerts, "_resolve_ips", lambda hostname: {ipaddress.ip_address("127.0.0.1")}
         ):
             with self.assertRaises(urllib.error.HTTPError):
                 handler.redirect_request(req, None, 302, "Found", {}, "https://internal.example/secret")
@@ -455,7 +457,7 @@ class SlackTests(unittest.TestCase):
         """
         report = detect_drift(self.run_dir)
         with patch.object(
-            drift_detection, "_resolve_ips", lambda hostname: {ipaddress.ip_address("100.64.0.1")}
+            dca_alerts, "_resolve_ips", lambda hostname: {ipaddress.ip_address("100.64.0.1")}
         ):
             with self.assertRaises(urllib.error.URLError):
                 send_slack_alert(report, webhook="https://hooks.example/alert")
@@ -463,7 +465,7 @@ class SlackTests(unittest.TestCase):
     def test_send_slack_blocks_deprecated_site_local_destination(self):
         report = detect_drift(self.run_dir)
         with patch.object(
-            drift_detection, "_resolve_ips", lambda hostname: {ipaddress.ip_address("fec0::1")}
+            dca_alerts, "_resolve_ips", lambda hostname: {ipaddress.ip_address("fec0::1")}
         ):
             with self.assertRaises(urllib.error.URLError):
                 send_slack_alert(report, webhook="https://hooks.example/alert")
@@ -500,7 +502,7 @@ class SlackTests(unittest.TestCase):
 
         os.environ["https_proxy"] = "http://proxy.internal:3128"
         self.addCleanup(os.environ.pop, "https_proxy", None)
-        with patch.object(drift_detection, "_resolve_ips", boom), patch.object(
+        with patch.object(dca_alerts, "_resolve_ips", boom), patch.object(
             urllib.request, "urlopen", fake_urlopen
         ):
             self.assertTrue(send_slack_alert(report, webhook="https://internal-only.example/alert"))
@@ -531,7 +533,7 @@ class SlackTests(unittest.TestCase):
         os.environ["https_proxy"] = "http://proxy.internal:3128"
         self.addCleanup(os.environ.pop, "https_proxy", None)
         with patch.object(
-            drift_detection, "_resolve_ips", lambda hostname: {ipaddress.ip_address("169.254.169.254")}
+            dca_alerts, "_resolve_ips", lambda hostname: {ipaddress.ip_address("169.254.169.254")}
         ):
             with self.assertRaises(urllib.error.URLError):
                 send_slack_alert(report, webhook="https://attacker.example/alert")
@@ -557,9 +559,9 @@ class SlackTests(unittest.TestCase):
 
         conn = _FakeConn()
         with patch.object(
-            drift_detection, "_resolve_ips", lambda hostname: {validated_ip}
-        ), patch.object(drift_detection.socket, "create_connection", fake_create_connection):
-            drift_detection._connect_pinned(conn)  # type: ignore[arg-type]
+            dca_alerts, "_resolve_ips", lambda hostname: {validated_ip}
+        ), patch.object(dca_alerts.socket, "create_connection", fake_create_connection):
+            dca_alerts._connect_pinned(conn)
         self.assertEqual(calls, [(str(validated_ip), 443)])
         self.assertIsNotNone(conn.sock)
 
@@ -581,10 +583,10 @@ class SlackTests(unittest.TestCase):
         def fake_request(self, *a, **kw):
             raise _ReachedConnection("construction succeeded")
 
-        handler = drift_detection._PinnedHTTPSHandler()
+        handler = dca_alerts._PinnedHTTPSHandler()
         req = urllib.request.Request("https://hooks.example/alert")
         req.timeout = 10.0  # normally set by OpenerDirector.open() before dispatch
-        with patch.object(drift_detection._PinnedHTTPSConnection, "request", fake_request):
+        with patch.object(dca_alerts._PinnedHTTPSConnection, "request", fake_request):
             with self.assertRaises(_ReachedConnection):
                 handler.https_open(req)
 
@@ -595,7 +597,7 @@ class SlackTests(unittest.TestCase):
         def fake_request(self, *a, **kw):
             raise _ReachedConnection("construction succeeded")
 
-        handler = drift_detection._PinnedHTTPSHandler()
+        handler = dca_alerts._PinnedHTTPSHandler()
         req = urllib.request.Request("https://hooks.example/alert")
         req.timeout = 10.0  # normally set by OpenerDirector.open() before dispatch
         cast(Any, req)._tunnel_host = "hooks.example"

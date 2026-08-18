@@ -67,6 +67,10 @@
 ## 2026-08-03 - Optimize local JSON parsing
 **Learning:** `json.loads` has optimized underlying C code that accepts bytes natively. When parsing local JSON files, `path.read_text(encoding="utf-8")` introduces unnecessary Python-level string decoding overhead. Calling `path.read_bytes()` directly and letting `json.loads` handle the byte stream is about 15% faster and maintains identical error handling behavior.
 **Action:** When reading local JSON files for parsing via `json.loads`, prefer `json.loads(path.read_bytes())` over `json.loads(path.read_text(encoding="utf-8"))` to skip intermediate string allocation.
+## 2026-08-14 - Removed duplicated webhook destination safety checks
+**Learning:** Duplicated network safety checks (e.g., SSRF prevention, proxy bypassing, and pinned connections) in CLI scripts can lead to code drift and missed fixes. It is better to rely on a central, authoritative module like `dca_alerts` even if it introduces a cross-package dependency, provided it is well-managed.
+**Action:** When encountering duplicated security/network code explicitly mirrored to avoid dependencies, evaluate whether the cost of duplication outweighs the dependency boundary, and prefer centralizing the logic into a shared utility.
+
 
 ## 2026-08-03 - Optimize large file line iteration
 **Learning:** Calling `path.read_text(encoding="utf-8").splitlines()` on large files (like JSONL or CSV logs) loads the entire file contents into memory at once, creating a large intermediate list of strings. Using a file generator (`with path.open("r", encoding="utf-8") as f: for line in f:`) streams the file line-by-line, drastically reducing memory bloat and improving parsing speed (by up to 64% in benchmarks) while preserving trailing whitespace behavior handled efficiently by `.strip()`.
