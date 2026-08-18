@@ -105,6 +105,12 @@ py-modules = [
     # by dca_config.load_inverse_martingale_config; without it here, both fail
     # with ModuleNotFoundError outside a source checkout.
     "dca_inverse_martingale",
+    # The 3D market-graph data layer and viewer emitter, imported by
+    # scripts/generate_market_graph.py and by analysis/market-graph-3d/. Its browser
+    # assets ship separately under [tool.setuptools.data-files] below -- both halves
+    # are required, since the module resolves viz/ at call time and raises a
+    # FileNotFoundError naming $DCA_VIZ_DIR when the assets are missing.
+    "dca_market_graph",
 ]
 # scripts/run_classification.py is the run-classification contract used by both
 # the live artifact writer (near_close_dca.build_run_artifacts) and readers
@@ -145,6 +151,31 @@ packages = ["scripts"]
     # to defaults (both modes fully off) for a checkout that intended them active.
     "config/inverse_martingale.json",
     "config/ml_sizing_adjustment.json",
+]
+
+# Browser assets for the 3D market graph, resolved at runtime by
+# dca_market_graph.viewer_asset_dir() -- the same $ENV -> checkout -> sys.prefix -> cwd
+# ladder dca_config.get_config_dir() uses. These are read as text and inlined into the
+# emitted HTML; nothing here is ever imported by Python, so the stdlib-only runtime
+# invariant is untouched (see viz/vendor/README.md for the vendoring rationale).
+# Omitting them leaves the module importable from an installed wheel but unable to
+# emit a page at all -- build_viewer_html() raises FileNotFoundError naming $DCA_VIZ_DIR.
+"share/all-stock-dca/viz" = [
+    "viz/market_graph.html.tmpl",
+    "viz/market_graph.css",
+    "viz/market_graph.js",
+]
+"share/all-stock-dca/viz/vendor" = [
+    "viz/vendor/three.min.js",
+    "viz/vendor/three.LICENSE",
+]
+
+# The combined OHLCV table is scripts/generate_market_graph.py's DEFAULT source, and
+# dca_market_graph.default_combined_csv() looks for it here in an installed layout.
+# Without this the documented default command works from a checkout and fails on every
+# wheel install, which is the same trap the config data-files above exist to avoid.
+"share/all-stock-dca/data" = [
+    "historical_stock_data.csv",
 ]
 
 [tool.pytest.ini_options]

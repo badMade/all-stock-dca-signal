@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<style>{{CSS}}</style>
+</head>
+<body>
+<div id="stage"></div>
+
+<div id="hud">
+  <header>
+    <h1>{{TITLE}}</h1>
+    <p id="subtitle"></p>
+  </header>
+
+  <section class="panel">
+    <div class="seg" id="mode-toggle" role="group" aria-label="Render mode">
+      <button data-mode="pulse" class="on">Pulse</button>
+      <button data-mode="wave">Wave</button>
+    </div>
+    <p class="hint" id="mode-hint"></p>
+  </section>
+
+  <section class="panel" id="playback">
+    <div class="transport">
+      <button id="play" aria-label="Play or pause">&#9654;</button>
+      <input id="scrub" type="range" min="0" max="0" value="0" aria-label="Trading day">
+    </div>
+    <div class="row">
+      <span id="frame-label">&mdash;</span>
+      <label class="speed">speed
+        <select id="speed">
+          <option value="120">0.5&times;</option>
+          <option value="60" selected>1&times;</option>
+          <option value="30">2&times;</option>
+          <option value="12">5&times;</option>
+        </select>
+      </label>
+    </div>
+    <label class="row"><span>trail</span>
+      <input id="trail" type="range" min="1" max="60" value="20">
+      <span id="trail-label">20</span>
+    </label>
+  </section>
+
+  <section class="panel">
+    <label class="check"><input type="checkbox" id="color-cluster"> colour by group</label>
+    <label class="check"><input type="checkbox" id="show-market" checked> show market centroid</label>
+  </section>
+
+  <section class="panel" id="legend-panel">
+    <h2>Groups</h2>
+    <p class="hint" id="grouping-source"></p>
+    <ul id="legend"></ul>
+  </section>
+
+  <section class="panel" id="axes-panel">
+    <h2>Axes</h2>
+    <ul class="axes">
+      <li><i class="swatch ax-x"></i><b>X</b> <span id="ax-x-desc">volume</span></li>
+      <li><i class="swatch ax-y"></i><b>Y</b> <span id="ax-y-desc">high / low</span></li>
+      <li><i class="swatch ax-z"></i><b>Z</b> <span id="ax-z-desc">open / close</span></li>
+    </ul>
+    <p class="hint" id="scale-note"></p>
+  </section>
+
+  <footer>
+    <p class="hint">drag to orbit &middot; wheel to zoom &middot; right-drag to pan &middot; <kbd>space</kbd> play/pause</p>
+  </footer>
+</div>
+
+<div id="tooltip" hidden></div>
+<div id="error" hidden></div>
+
+<script type="application/json" id="payload">{{PAYLOAD}}</script>
+<script>{{THREE_JS}}</script>
+<script>{{VIEWER_JS}}</script>
+</body>
+</html>

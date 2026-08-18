@@ -960,13 +960,31 @@ _NON_ACCOUNT_LITERALS = frozenset(
 # (Codex review, PR #219: "Scan test files for account literals").
 _SYNTHETIC_ACCOUNT_VALUES = frozenset({FIXTURE_ACCOUNT_NUMBER, "123456789"})
 
-# Files exempt from scanning entirely. Both are market-data tables whose volume
-# columns are full of nine-digit share counts -- genuine data, not identifiers.
+# Files exempt from scanning entirely. The first two are market-data tables whose
+# volume columns are full of nine-digit share counts -- genuine data, not identifiers.
 # They are named individually rather than exempting ".csv" as a class: an account
 # pasted into any OTHER csv must still be caught (Codex review, PR #219).
+#
+# The third is the vendored three.js bundle (viz/vendor/, the repository's only
+# third-party asset -- see its README for why it exists). Minified WebGL code is
+# thousands of bare integer literals: packed RGB colours (0xFFFFFF as a decimal),
+# bitmasks (0xFFFFFFFF), and shader constants. Every one is account-shaped to this
+# scan. Note those are written here in hex deliberately -- spelling them in decimal
+# would make this very comment an offender, which is a fair demonstration that the
+# guard does what it claims.
+#
+# Exempting a file from a secrets guard needs a better argument than "it is noisy",
+# and it has one: this file is not authored here, it is a pinned upstream artifact,
+# and test_dca_market_graph.py::test_vendored_three_js_matches_its_recorded_checksum
+# asserts its sha256 against the value recorded in viz/vendor/README.md. The exemption
+# therefore only ever applies to bytes that are provably identical to the published
+# npm tarball's -- edit the file to smuggle anything in, secret or otherwise, and the
+# checksum test fails. Named individually, not as a "viz/vendor/" prefix, so a second
+# vendored file cannot inherit the exemption without someone deciding it should.
 _ALLOWED = {
     "historical_stock_data.csv",
     "analysis/2026-06-29-revised-ladder/dca_revised_ladder_backtest_decisions.csv",
+    "viz/vendor/three.min.js",
 }
 
 # The scan is an EXCLUDE list, not an include list. It used to allowlist text
