@@ -6081,8 +6081,9 @@ def _orders_csv_fills(
     *,
     orders_csv_file: Optional[Path] = None,
     skip_sink: Optional[List[Path]] = None,
+    preserve_order_rows: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
-    """Map ticker -> {order_id, avg_fill_price, quantity_filled} for filled rows only.
+    """Return {order_id, avg_fill_price, quantity_filled} for filled CSV rows only.
 
     Used to reconcile a prior run's ``buy_candidates`` (whose status is fixed at
     order-submission time) against what the broker actually confirmed: a candidate
@@ -6100,6 +6101,12 @@ def _orders_csv_fills(
     failure caught mid-rewrite still gets recorded -- otherwise it is
     indistinguishable from a genuinely empty (zero-fills) day (Codex review:
     "Include referenced CSV failures in scan completeness").
+
+    ``preserve_order_rows`` is for order-level reporting consumers.  The
+    default ticker-keyed result intentionally aggregates the same-day guard's
+    view to one fill per ticker, but a historical ledger must retain distinct
+    retry orders for the same ticker.  In that mode each result receives an
+    internal unique key and carries its original ticker in ``_ticker``.
 
     When no explicit file is given the sibling ``orders.csv`` is used, falling back
     to ``filled_orders.csv`` -- the confirmed-fill record manual override reruns
@@ -6179,7 +6186,7 @@ def _orders_csv_fills(
         if skip_sink is not None:
             skip_sink.append(orders_csv)
         rows = rows[:-1]
-    for row in rows:
+    for row_number, row in enumerate(rows):
         ticker = row.get("ticker")
         if not ticker:
             continue
@@ -6277,7 +6284,9 @@ def _orders_csv_fills(
             # No usable price AND no usable amount_usd -- genuinely no
             # capital-movement information to preserve for this row.
             continue
-        fills[ticker] = {
+        fill_key = f"{ticker}#{row_number}" if preserve_order_rows else ticker
+        fills[fill_key] = {
+            **({"_ticker": ticker} if preserve_order_rows else {}),
             "order_id": row.get("order_id"),
             # A PARTIAL execution's notional is real and must count, but its
             # price is not a settled reference: the unexecuted remainder may
