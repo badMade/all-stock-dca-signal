@@ -131,6 +131,7 @@ def build_entry(
     if not cron_id and not task_id:
         raise ValueError("build_entry requires cron_id and/or task_id")
     identifier = task_id or cron_id
+    assert identifier is not None
 
     if task_name is None or scheduled_for_et is None or stream is None:
         directory = _load_task_directory(manifest_path)

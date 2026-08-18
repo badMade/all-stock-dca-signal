@@ -673,7 +673,6 @@ def _mask_account_number(value: Optional[str]) -> Optional[str]:
     """Mask all but the last 4 digits, per account_number_obfuscation_rule."""
     if not value:
         return None
-    value = str(value)
     if len(value) <= 4:
         return "*" * len(value)
     return "*" * (len(value) - 4) + value[-4:]
@@ -1250,17 +1249,16 @@ def _classify_chain_run(
 
     A persisted run_state with run_origin='scheduled', manual_run=False, and
     a matching identity (_identity_matches) -> valid_scheduled_evidence.
-    Anything manual -> manual_context_only. This report never asserts
     top_up_context_only itself (that is a same-day top-up guard's own
     determination, not something derivable generically here); callers with
     stream-specific top-up context may override.
     """
-    if not run_dir_exists:
-        return "failed_start_no_evidence" if attempt_markers else "did_not_run"
-    rc = run_state.get("run_classification") if isinstance(run_state, dict) else None
-    if not isinstance(rc, dict):
+    if not isinstance(run_state, dict):
         if not run_dir_has_files and not attempt_markers:
             return "did_not_run"
+        return "failed_start_no_evidence"
+    rc = run_state.get("run_classification")
+    if not isinstance(rc, dict):
         return "failed_start_no_evidence"
     if rc.get("manual_run") is True or rc.get("run_origin") == "manual":
         return "manual_context_only"
@@ -1908,8 +1906,9 @@ def _scan_recovery_runs(
             recovery_source = "repair_artifact"
 
         if recovery_source:
-            run_id = run_state.get("run_id") or NO_RUN_ID
-            recovery = run_state.get("recovery") if isinstance(run_state.get("recovery"), dict) else {}
+            rs = run_state if isinstance(run_state, dict) else {}
+            run_id = rs.get("run_id") or NO_RUN_ID
+            recovery = rs.get("recovery") if isinstance(rs.get("recovery"), dict) else {}
             # Redacted like every other free-text field republished here:
             # raw_persistence_error in particular is a str(exception) from a
             # live adapter and can embed a broker response or credential --
@@ -1917,7 +1916,7 @@ def _scan_recovery_runs(
             triggering_issue = _redact_secrets(
                 str(
                     recovery.get("trigger_reason")
-                    or run_state.get("raw_persistence_error")
+                    or rs.get("raw_persistence_error")
                     or f"{recovery_source} (reason not recorded)"
                 )
             )
@@ -1969,7 +1968,7 @@ def _scan_recovery_runs(
                     # rerun -- keying retry_count off source alone would drop it
                     # the moment the row is filed under the more specific type
                     # -- codex review discussion_r3659559675.
-                    "recovery_rerun_flagged": run_state.get("recovery_rerun") is True,
+                    "recovery_rerun_flagged": rs.get("recovery_rerun") is True,
                     # Never upgraded/downgraded here: keeps the underlying
                     # run's own classification (failure_recovery_policy keeps
                     # run_origin='scheduled' through a recovery), matching

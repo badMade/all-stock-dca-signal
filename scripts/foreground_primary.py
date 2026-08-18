@@ -558,10 +558,10 @@ def evaluate_scheduled_evidence_alert(
         foreground_artifact_paths=list(foreground.artifact_paths) if foreground else [],
     )
 
-    alert.escalation_reasons.extend(str(finding) for finding in blocking_findings)
+    alert.escalation_reasons.extend(blocking_findings)
 
     if not scheduled_evidence_ok:
-        reasons = [str(reason) for reason in scheduled_evidence_reasons] or [
+        reasons = list(scheduled_evidence_reasons) or [
             "background scheduled evidence is absent, incomplete, or "
             "valid_scheduled_evidence=false"
         ]

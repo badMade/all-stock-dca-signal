@@ -46,7 +46,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, cast
 from urllib.parse import urlsplit
 
 # This module is a documented standalone CLI (``python scripts/drift_detection.py``),
@@ -171,7 +171,7 @@ _BLOCK_TOKENS = (
 
 def _get(row: Mapping[str, Any], columns: Sequence[str]) -> Optional[Any]:
     """Return the first present, non-empty value among ``columns`` (case-insensitive keys)."""
-    lower = {str(k).strip().lower(): v for k, v in row.items()}
+    lower = {k.strip().lower(): v for k, v in row.items()}
     for col in columns:
         if col in lower:
             value = lower[col]
@@ -289,9 +289,9 @@ def _has_usable_header(path: Path) -> bool:
                 pass
     except (OSError, UnicodeDecodeError, csv.Error):
         return False
-    if not header or not any(str(column).strip() for column in header):
+    if not header or not any(column.strip() for column in header):
         return False
-    return bool({str(column).strip().lower() for column in header} & set(SYMBOL_COLUMNS))
+    return bool({column.strip().lower() for column in header} & set(SYMBOL_COLUMNS))
 
 
 def _first_usable(run_dir: Path, names: Sequence[str]) -> Optional[Path]:
@@ -725,13 +725,17 @@ def _resolve_ips(hostname: str) -> "set[ipaddress._BaseAddress]":
     return {ipaddress.ip_address(info[4][0]) for info in socket.getaddrinfo(hostname, None)}
 
 
-def _is_disallowed_ip(ip: "ipaddress._BaseAddress") -> bool:
-    """True unless ``ip`` is safe to open an outbound webhook connection to.
+def _is_disallowed_ip(ip: Any) -> bool:
+    """True if ``ip`` (an IPv4Address / IPv6Address) is not a safe destination.
 
-    ``is_global`` is documented as having "value opposite to is_private,
-    except for the 100.64.0.0/10 [carrier-grade NAT / shared address space]
-    range where they are both False" -- so checking only ``is_private`` (the
-    pre-fix state) let a resolved address in that range through even though
+    Rejects loopback, link-local, private (RFC 1918 / RFC 4193), multicast,
+    reserved, and site-local addresses. A webhook destination resolved to one of
+    these would allow Server-Side Request Forgery (SSRF) against internal
+    infrastructure (e.g. cloud metadata endpoints at 169.254.169.254, or
+    internal services on localhost / 10.0.0.0/8).
+
+    Note ``ip.is_private`` is intentionally NOT used alone: Python's ipaddress
+    module treats Carrier-Grade NAT (100.64.0.0/10) as NOT private, even though
     it can address services inside a VPC, Kubernetes cluster, or carrier
     network. ``is_multicast`` and IPv6's deprecated site-local space
     (``fec0::/10``) are checked explicitly because ``is_global`` reports
@@ -840,7 +844,7 @@ def _connect_pinned(conn: "http.client.HTTPConnection") -> None:
     for ip in ips:
         try:
             conn.sock = socket.create_connection(
-                (str(ip), conn.port), conn.timeout, conn.source_address
+                (str(ip), conn.port), conn.timeout, cast(Any, conn).source_address
             )
             return
         except OSError as exc:
@@ -862,8 +866,8 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
 
     def connect(self) -> None:
         _connect_pinned(self)
-        server_hostname = self._tunnel_host or self.host
-        self.sock = self._context.wrap_socket(self.sock, server_hostname=server_hostname)
+        server_hostname = cast(Any, self)._tunnel_host or self.host
+        self.sock = cast(Any, self)._context.wrap_socket(self.sock, server_hostname=server_hostname)
 
 
 def _request_is_proxied(req: "urllib.request.Request") -> bool:
@@ -895,9 +899,10 @@ class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
         # constructed with no arguments (build_opener() below), so
         # self._check_hostname is always the default None on 3.11 too,
         # making this identical in practice to the stock 3.11 behavior.
+        ctx = cast(Any, self)._context
         if _request_is_proxied(req):
-            return self.do_open(http.client.HTTPSConnection, req, context=self._context)
-        return self.do_open(_PinnedHTTPSConnection, req, context=self._context)
+            return self.do_open(http.client.HTTPSConnection, req, context=ctx)
+        return self.do_open(_PinnedHTTPSConnection, req, context=ctx)
 
 
 class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):

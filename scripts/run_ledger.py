@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, Iterator, List, Optional
+from typing import Any, Dict, FrozenSet, Generator, List, Optional
 
 from scripts.file_lock import cross_process_lock
 
@@ -202,13 +202,13 @@ class RunLedger:
         # before the chunk (or a corrupt lower-seq tail) cannot move seq backward.
         max_seq = tail_max or 0
         for event in self._existing_events():
-            seq = event.get("seq")
-            if _is_seq(seq) and seq > max_seq:
+            seq = event.seq
+            if seq is not None and seq > max_seq:
                 max_seq = seq
         return max_seq + 1
 
     @contextmanager
-    def _seq_lock(self) -> Iterator[None]:
+    def _seq_lock(self) -> Generator[None, None, None]:
         """Serialize sequence allocation + append across processes.
 
         The ledger is shared across every window, while scheduler leases only

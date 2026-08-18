@@ -177,14 +177,14 @@ def fetch_data(
     # -----------------------------------------------------------------------
     _print_section("Fetching price data via Alpaca")
 
-    client = StockHistoricalDataClient(api_key, secret_key)
+    client = StockHistoricalDataClient(api_key, secret_key)  # type: ignore
 
     start_dt = datetime.strptime(start, "%Y-%m-%d")
     end_dt   = datetime.strptime(end,   "%Y-%m-%d")
 
-    request = StockBarsRequest(
+    request = StockBarsRequest(  # type: ignore
         symbol_or_symbols=all_tickers,
-        timeframe=TimeFrame.Day,
+        timeframe=TimeFrame.Day,  # type: ignore
         start=start_dt,
         end=end_dt,
         adjustment="all",   # split + dividend adjusted (equivalent to yfinance auto_adjust=True)

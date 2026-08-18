@@ -148,7 +148,7 @@ def _resolve_minimum_order_usd(
             raise ValueError(
                 f"minimum_order_usd must be a positive number, got {minimum_order_usd!r}"
             )
-        return float(minimum_order_usd)
+        return minimum_order_usd
 
     try:
         from dca_config import DEFAULT_CONFIG_DIR, load_per_ticker_sizing
@@ -361,9 +361,9 @@ def evaluate_slot(
     Raises ``ValueError`` if ``account_number`` is empty: an order snapshot that
     is not pinned to the account being traded proves nothing about it.
     """
-    if not str(account_number or "").strip():
+    if not account_number.strip():
         raise ValueError("account_number is required (account pinning) to evaluate the top-up gate")
-    if not str(trading_day or "").strip():
+    if not trading_day.strip():
         raise ValueError("trading_day is required (day pinning) to evaluate the top-up gate")
 
     effective_minimum_order_usd = _resolve_minimum_order_usd(
@@ -385,8 +385,8 @@ def evaluate_slot(
     replayer = _PageReplayer(pages)
     snapshot = same_day_order_snapshot(
         replayer,
-        account_number=str(account_number).strip(),
-        created_at_gte=str(trading_day),
+        account_number=account_number.strip(),
+        created_at_gte=trading_day,
         max_pages=max(len(pages) + 1, 2),
     )
     if not replayer.fully_consumed:
@@ -441,7 +441,7 @@ def evaluate_slot(
             logged_reference_price is not None
             and logged_reference_order_id
             and broker_reference_order_id is not None
-            and str(logged_reference_order_id) == str(broker_reference_order_id)
+            and logged_reference_order_id == broker_reference_order_id
         ):
             # The caller's logged reference is proven to describe the SAME
             # order the broker itself identifies as the latest qualifying
@@ -560,9 +560,9 @@ def _bind_saved_pages(
     saved_day = str(payload.get("trading_day") or "").strip()
     if not saved_account or not saved_day:
         return None, "orders_pages_missing_query_metadata"
-    if saved_account != str(account_number).strip():
+    if saved_account != account_number.strip():
         return None, "orders_pages_account_mismatch"
-    if saved_day != str(trading_day).strip():
+    if saved_day != trading_day.strip():
         return None, "orders_pages_trading_day_mismatch"
     return pages, None
 
@@ -637,6 +637,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(json.dumps(_abort(BROKER_HISTORY_INCOMPLETE, candidates, [binding_error]), indent=2))
         return 2
 
+    assert pages is not None
     result = evaluate_slot(
         pages=pages,
         candidates=candidates,

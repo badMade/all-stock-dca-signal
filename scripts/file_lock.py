@@ -34,7 +34,7 @@ import os
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Union
+from typing import Generator, Union
 
 try:  # POSIX advisory file locking; absent on non-POSIX platforms.
     import fcntl
@@ -51,7 +51,7 @@ def cross_process_lock(
     *,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     poll_seconds: float = DEFAULT_POLL_SECONDS,
-) -> Iterator[None]:
+) -> Generator[None, None, None]:
     """Hold an exclusive cross-process lock on ``lock_path`` for the block's body.
 
     Uses ``fcntl.flock`` when available and a portable ``O_EXCL`` lock file
@@ -70,13 +70,14 @@ def cross_process_lock(
 
 
 @contextmanager
-def _flock(lock_path: Path, timeout_seconds: float, poll_seconds: float) -> Iterator[None]:
+def _flock(lock_path: Path, timeout_seconds: float, poll_seconds: float) -> Generator[None, None, None]:
     """POSIX critical section via ``fcntl.flock`` (kernel-released on crash).
 
     Acquired non-blocking (``LOCK_EX | LOCK_NB``) in a poll loop so a hung holder
     cannot block a waiter indefinitely; the blocking form would ignore
     ``timeout_seconds``. Uncontended acquisition succeeds on the first attempt.
     """
+    assert fcntl is not None
     start = time.monotonic()
     # Append mode: flock locks the file-table entry regardless of size, and "a"
     # avoids truncating the sidecar on every acquisition.
@@ -98,7 +99,7 @@ def _flock(lock_path: Path, timeout_seconds: float, poll_seconds: float) -> Iter
 
 
 @contextmanager
-def _portable_lock(lock_path: Path, timeout_seconds: float, poll_seconds: float) -> Iterator[None]:
+def _portable_lock(lock_path: Path, timeout_seconds: float, poll_seconds: float) -> Generator[None, None, None]:
     """Portable ``O_CREAT | O_EXCL`` lock. No reclaim: only the creator ever removes
     it, so no process can delete another's lock; a crashed holder makes waiters
     fail closed (``TimeoutError``) instead of risking a double writer."""

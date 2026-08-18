@@ -193,7 +193,7 @@ def build_preflight_run_classification(
         "valid_afternoon_evidence": False,
         "trading_day": trading_day,
         "same_day_required": True,
-        "valid_scheduled_evidence": bool(valid_scheduled_evidence),
+        "valid_scheduled_evidence": valid_scheduled_evidence,
     }
 
 
@@ -243,7 +243,7 @@ def build_morning_live_run_classification(
         "trading_day": trading_day,
         "same_day_required": True,
         "valid_afternoon_evidence": False,
-        "valid_scheduled_evidence": bool(valid_scheduled_evidence),
+        "valid_scheduled_evidence": valid_scheduled_evidence,
     }
     if resolved is not None and ACCOUNT_NUMBER_PATTERN.fullmatch(resolved):
         classification["account_number"] = resolved
@@ -298,7 +298,7 @@ def build_afternoon_live_run_classification(
     ``scheduled_YYYYMMDD_1530ET``.
     """
     if valid_afternoon_scheduled_evidence is None:
-        valid_afternoon_scheduled_evidence = bool(valid_scheduled_evidence)
+        valid_afternoon_scheduled_evidence = valid_scheduled_evidence
     return {
         "run_origin": "scheduled",
         "run_type": AFTERNOON_LIVE_RUN_TYPE,
@@ -314,8 +314,8 @@ def build_afternoon_live_run_classification(
         "state_schema_version": state_schema_version,
         "trading_day": trading_day,
         "same_day_required": True,
-        "valid_afternoon_scheduled_evidence": bool(valid_afternoon_scheduled_evidence),
-        "valid_scheduled_evidence": bool(valid_scheduled_evidence),
+        "valid_afternoon_scheduled_evidence": valid_afternoon_scheduled_evidence,
+        "valid_scheduled_evidence": valid_scheduled_evidence,
     }
 
 
@@ -755,13 +755,13 @@ def _signals_csv_errors(run_dir: Path) -> List[str]:
             # a safe rejection (Codex review).
             unusable.append(f"{path.name} is not readable: {exc}")
             continue
-        if not header or not any(str(column).strip() for column in header):
+        if not header or not any(column.strip() for column in header):
             unusable.append(
                 f"{path.name} has no header row (empty or corrupt file); the contract "
                 "requires a header even when no signal row was written"
             )
             continue
-        columns = {str(column).strip().lower() for column in header}
+        columns = {column.strip().lower() for column in header}
         if not (columns & set(SIGNAL_SYMBOL_COLUMNS)):
             # A header of arbitrary non-blank text would otherwise pass while the
             # drift detector reads no symbol from it, letting a malformed signals
@@ -1108,10 +1108,10 @@ def await_finalized_run_artifacts(
         contract = validate_run_artifacts(run_dir, **validate_kwargs)
         marker = completion_marker(read_run_state(run_dir))
         finalized = contract.ok and marker is not None
-        remaining = float(grace_seconds) - (monotonic() - started)
+        remaining = grace_seconds - (monotonic() - started)
         if finalized or remaining <= 0:
             break
-        sleep(min(float(poll_seconds), remaining))
+        sleep(min(poll_seconds, remaining))
     return FinalizationResult(
         contract=contract,
         finalized=finalized,

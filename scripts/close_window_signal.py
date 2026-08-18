@@ -81,7 +81,7 @@ def reported_multiplier(raw_multiplier: float) -> Tuple[float, Optional[str]]:
     """
     if raw_multiplier > REPORTED_MULTIPLIER_CAP:
         return (REPORTED_MULTIPLIER_CAP, LABEL_CAPPED)
-    return (float(raw_multiplier), None)
+    return (raw_multiplier, None)
 
 
 def ladder_multiplier_for_drop(drop_fraction: float, tiers: Sequence[Tuple[float, float]]) -> float:
@@ -95,7 +95,7 @@ def ladder_multiplier_for_drop(drop_fraction: float, tiers: Sequence[Tuple[float
     multiplier = 0.0
     for threshold, tier_multiplier in sorted(tiers):
         if drop_fraction >= threshold:
-            multiplier = float(tier_multiplier)
+            multiplier = tier_multiplier
     return multiplier
 
 

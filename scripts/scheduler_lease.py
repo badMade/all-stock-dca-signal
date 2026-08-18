@@ -40,7 +40,7 @@ _UNSAFE = re.compile(r"[^A-Za-z0-9]+")
 
 
 def _safe(value: str) -> str:
-    return _UNSAFE.sub("-", str(value).strip().lower()).strip("-") or "na"
+    return _UNSAFE.sub("-", value.strip().lower()).strip("-") or "na"
 
 
 def window_key(trading_day: str, stream: str, window: str) -> str:
@@ -232,7 +232,7 @@ class SchedulerLease:
             # runner could reclaim it while the first still believes it holds --
             # defeating same-window exclusion. Reject it up front.
             raise ValueError(f"ttl_seconds must be positive, got {ttl_seconds!r}")
-        if ttl_seconds != int(ttl_seconds):
+        if isinstance(ttl_seconds, float) and not ttl_seconds.is_integer():
             # A fractional TTL is truncated to whole seconds when the lease is read
             # back (Lease.from_json casts to int), so the persisted value and the
             # value a reclaimer computes disagree -- e.g. 0.5s is written but read

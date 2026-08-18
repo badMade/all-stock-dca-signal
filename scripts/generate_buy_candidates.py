@@ -1084,7 +1084,7 @@ def _decision_to_dict(ticker: str, decision: ReconciledDecision) -> Dict[str, An
         # both read 0 on a day a source genuinely failed, indistinguishable
         # from a real quiet tape with clean data (Codex review: "Surface
         # provider-error runs before zero-candidate exits").
-        "provider_error": bool(
+        "provider_error": (
             (decision.finance_signal is not None and decision.finance_signal.provider_error)
             or (decision.robinhood_signal is not None and decision.robinhood_signal.provider_error)
         ),

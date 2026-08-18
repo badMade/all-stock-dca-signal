@@ -420,12 +420,12 @@ class SentimentAnalyzer:
 
     def __init__(self, model_name: str = FINBERT_MODEL):
         logger.info("Loading FinBERT model '%s' — this may take a moment…", model_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)  # type: ignore
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_name)  # type: ignore
         self.model.eval()
         # Use GPU if available, otherwise CPU
-        self.device = 0 if torch.cuda.is_available() else -1
-        self._pipeline = pipeline(
+        self.device = 0 if (torch and torch.cuda.is_available()) else -1  # type: ignore
+        self._pipeline = pipeline(  # type: ignore
             "text-classification",
             model=self.model,
             tokenizer=self.tokenizer,
@@ -866,7 +866,7 @@ class EmailBriefing:
                 "is_significant": r.get("is_significant", False),
             })
 
-        template = Environment(autoescape=True).from_string(EMAIL_TEMPLATE)
+        template = Environment(autoescape=True).from_string(EMAIL_TEMPLATE)  # type: ignore
         html = template.render(
             report_date=today_str,
             tickers=tickers,

@@ -307,7 +307,7 @@ def build_pointer_metadata(
         "pointer_status": pointer_status,
         "same_day_required": True,
         "updated_at_utc": updated_at_utc or _utc_now_iso(),
-        "valid_scheduled_evidence": bool(valid_scheduled_evidence),
+        "valid_scheduled_evidence": valid_scheduled_evidence,
     }
     if extra:
         for key, value in extra.items():

@@ -574,10 +574,10 @@ class StrategyRunner:
         """Fetch OHLCV data and return {ticker: close pd.Series}."""
         logger.info("Data source: %s", "Alpaca" if _USE_ALPACA else "yfinance (fallback)")
         if _USE_ALPACA:
-            client = StockHistoricalDataClient(_ALPACA_KEY, _ALPACA_SECRET)
-            request = StockBarsRequest(
+            client = StockHistoricalDataClient(_ALPACA_KEY, _ALPACA_SECRET)  # type: ignore
+            request = StockBarsRequest(  # type: ignore
                 symbol_or_symbols=list(tickers),
-                timeframe=TimeFrame.Day,
+                timeframe=TimeFrame.Day,  # type: ignore
                 start=start,
                 end=end,
                 adjustment="all",
@@ -586,7 +586,7 @@ class StrategyRunner:
             bars_df = bars.df
             return self._extract_close_alpaca(bars_df, tickers)
         else:
-            raw = yf.download(
+            raw = yf.download(  # type: ignore
                 list(tickers),
                 start=start.strftime("%Y-%m-%d"),
                 end=end.strftime("%Y-%m-%d"),
@@ -665,7 +665,7 @@ class StrategyRunner:
         entries = (fast_ma > slow_ma) & (fast_ma.shift(1) <= slow_ma.shift(1))
         exits   = (fast_ma < slow_ma) & (fast_ma.shift(1) >= slow_ma.shift(1))
 
-        pf = vbt.Portfolio.from_signals(
+        pf = vbt.Portfolio.from_signals(  # type: ignore
             price, entries, exits,
             fees=self.cfg["FEES"], freq="1D", init_cash=10_000,
         )
@@ -689,7 +689,7 @@ class StrategyRunner:
         entries = (rsi < low_th)  & (rsi.shift(1) >= low_th)
         exits   = (rsi > high_th) & (rsi.shift(1) <= high_th)
 
-        pf = vbt.Portfolio.from_signals(
+        pf = vbt.Portfolio.from_signals(  # type: ignore
             price, entries, exits,
             fees=self.cfg["FEES"], freq="1D", init_cash=10_000,
         )
@@ -907,7 +907,7 @@ class MetricsCalculator:
         """OLS beta of strategy vs benchmark daily returns."""
         if len(ret) < 3:
             return float("nan")
-        slope, *_ = stats.linregress(bm.values, ret.values)
+        slope, *_ = stats.linregress(bm.values, ret.values)  # type: ignore
         return float(slope)
 
     def _alpha(self, ret: pd.Series, bm: pd.Series) -> float:
@@ -1150,7 +1150,7 @@ class EmailNotifier:
         self.cfg = config
 
         # Compile the Jinja2 template once at construction time
-        env = Environment(loader=BaseLoader(), autoescape=True)
+        env = Environment(loader=BaseLoader(), autoescape=True)  # type: ignore
 
         # Custom filters used in the template
         def fmt_num(v: float, decimals: int = 3) -> str:
