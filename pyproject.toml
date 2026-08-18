@@ -111,6 +111,11 @@ py-modules = [
     # are required, since the module resolves viz/ at call time and raises a
     # FileNotFoundError naming $DCA_VIZ_DIR when the assets are missing.
     "dca_market_graph",
+    # Shared top-up outcome constructor used by both near_close_dca and
+    # morning_dca. Without it here, those modules import cleanly from a
+    # source checkout but raise ModuleNotFoundError from an installed wheel
+    # (Copilot/Codex review: "Ship the extracted module in the wheel").
+    "dca_common",
 ]
 # scripts/run_classification.py is the run-classification contract used by both
 # the live artifact writer (near_close_dca.build_run_artifacts) and readers

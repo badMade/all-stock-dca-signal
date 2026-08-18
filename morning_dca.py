@@ -61,6 +61,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple
 
 from dca_alerts import GuardedRunConfig, artifact_freshness_probe, attempt_log_root_sibling_to, guarded_run
+from dca_common import build_top_up_outcome
 from dca_config import (
     ACCOUNT_NUMBER_SHAPE,
     READ_ONLY_ACCOUNT,
@@ -2780,19 +2781,17 @@ class MorningDCAExecutor(DCAExecutor):
             manual_review: bool = False,
             cumulative_credit_decline_usd: Optional[float] = None,
         ) -> TopUpOutcome:
-            return TopUpOutcome(
+            return build_top_up_outcome(
+                outcome_cls=TopUpOutcome,
                 ticker=signal.ticker,
                 desired_amount=desired,
                 decision_price=price,
-                prior_same_day_amount=round(prior.amount_usd, 2) if prior else 0.0,
-                prior_same_day_reference_price=prior.reference_price if prior else None,
-                prior_same_day_run_id=prior.run_id if prior else None,
-                prior_same_day_source=prior.source if prior else None,
-                incremental_order_amount=round(max(0.0, incremental), 2),
-                top_up_guard_result=result,
-                top_up_skipped=skipped,
-                top_up_manual_review=manual_review,
-                effective_base_amount_usd=effective_base,
+                prior=prior,
+                incremental=incremental,
+                result=result,
+                skipped=skipped,
+                effective_base=effective_base,
+                manual_review=manual_review,
                 cumulative_credit_decline_usd=cumulative_credit_decline_usd,
             )
 

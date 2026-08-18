@@ -74,6 +74,7 @@ from typing import (
 )
 from zoneinfo import ZoneInfo
 
+from dca_common import build_top_up_outcome
 from dca_cumulative import CumulativeCreditLedger, apply_cumulative_credit
 from dca_fileio import atomic_open_w, atomic_write_text, order_csv_covers
 from dca_intraday_archive import (
@@ -3184,18 +3185,16 @@ def evaluate_top_up_guard(
         manual_review: bool = False,
         cumulative_credit_decline_usd: Optional[float] = None,
     ) -> TopUpGuardOutcome:
-        return TopUpGuardOutcome(
+        return build_top_up_outcome(
+            outcome_cls=TopUpGuardOutcome,
             ticker=decision.ticker,
-            afternoon_desired_amount=desired,
-            afternoon_decision_price=afternoon_price,
-            prior_same_day_amount=round(prior.amount_usd, 2) if prior else 0.0,
-            prior_same_day_reference_price=prior.reference_price if prior else None,
-            prior_same_day_run_id=prior.run_id if prior else None,
-            prior_same_day_source=prior.source if prior else None,
-            incremental_order_amount=round(max(0.0, incremental), 2),
-            top_up_guard_result=result,
+            desired_amount=desired,
+            decision_price=afternoon_price,
+            prior=prior,
+            incremental=incremental,
+            result=result,
             skipped=skipped,
-            effective_base_amount_usd=effective_base,
+            effective_base=effective_base,
             manual_review=manual_review,
             cumulative_credit_decline_usd=cumulative_credit_decline_usd,
         )
