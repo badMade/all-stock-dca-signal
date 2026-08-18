@@ -23,6 +23,7 @@ def build_top_up_outcome(
     effective_base: float,
     manual_review: bool = False,
     cumulative_credit_decline_usd: Optional[float] = None,
+    discarded_pending_credit_usd: Optional[float] = None,
 ) -> T:
     """Construct a TopUpOutcome or TopUpGuardOutcome with common fields."""
 
@@ -43,6 +44,11 @@ def build_top_up_outcome(
         kwargs["afternoon_decision_price"] = decision_price
         kwargs["skipped"] = skipped
         kwargs["manual_review"] = manual_review
+        # Only TopUpGuardOutcome (near_close_dca's 15:30 final session) ever
+        # calls apply_cumulative_credit with final_session=True, so only it
+        # carries this field -- TopUpOutcome (morning_dca's regular-session
+        # streams) never produces a discard decision to report.
+        kwargs["discarded_pending_credit_usd"] = discarded_pending_credit_usd
     else:
         kwargs["desired_amount"] = desired_amount
         kwargs["decision_price"] = decision_price

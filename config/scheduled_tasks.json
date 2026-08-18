@@ -6,6 +6,47 @@
   "change_note_2026_07_20": "SUPERSEDED for the task list by change_note_2026_07_27 and canonical_schedule_reconciliation_2026_07_27; the cost-conscious model routing policy itself still applies. Consolidated the cost-conscious model-routing policy for daily DCA into the authoritative model_routing_policy section and reaffirmed it on every active daily task (9:00 pre-market dashboard, 9:45 volatility scan, 9:45 pre-flight, 10:30 morning live, 12:30 midday live, 3:05 monitor, 3:20 final live, 3:35 slippage/latest-run sync, 3:40 watchdog). Daily DCA uses cost-conscious/default model routing where available; premium models (e.g. ChatGPT 5.5) are reserved for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Documentation/cost-behavior only: preserves the $2.00 base amount, 0x-to-5x ladder, Finance-primary read-only market-data policy, GFUZ/TXN active universe, BYDDY/VCX/TRLV/RVI exclusions, same-day top-up guards, safety rules, and run-classification text unchanged.",
   "change_note_2026_07_27": "Aligned this manifest with the user's canonical DCA schedule verified on 2026-07-27. Added the three canonical tasks that were missing (2ba19526 market-open live at 9:35 AM, bb4f6ef1 morning watchlist early-warning scan at 9:45 AM, 7be82b97 intraday live at 11:30 AM / 1:30 PM / 2:30 PM). Retimed 10ce362c from 3:20 PM to the canonical 3:30 PM ET (cron 30 19 * * 1-5 in EDT) and moved current/future scheduled evidence to 15:30 and the YYYYMMDD_1530ET convention, keeping YYYYMMDD_1520ET as a legacy/historical pattern so existing artifacts stay valid and the artifact root stays under ce16ba6b for continuity. Paused e3e6f09e. Retired b7961407, cd45e95b, d72aa525, d1f7a2c0, and the repo-internal morning-dca-0945 alias from every active schedule table; they are status=disabled with in_live_scheduler=false and no cron_utc. The drift detector itself is NOT retired and the 9:45 pre-flight artifact contract is preserved because 42173154 still gates on it. See canonical_schedule_reconciliation_2026_07_27 for the authoritative table. Schedule/config/documentation only: preserves the canonical first-buy and same-day top-up rule, the 2026-07-24 2:30 PM ET intraday recovery fills, the $2.00 base amount, the 0x-to-5x ladder, the active universe and BYDDY/VCX/TRLV/RVI exclusions, the Finance-primary provider policy with yfinance fallback and GFUZ Robinhood-primary handling, Robinhood-only execution on account <ROBINHOOD_ACCOUNT_NUMBER>, the scheduled run artifact contract, cost-conscious model routing, and the account-number obfuscation policy. No orders are placed by this change.",
   "change_note_2026_08_03_pr_314": "PR #314 (commit d905769) documents and implements the same-day Perplexity-primary alias pointer fallback for 11:30 catch-up orchestration and other same-day pointer consumers. When the canonical latest pointer is missing, scripts/same_day_pointer.select_same_day_run_state() now checks date-specific run_state first, then the canonical latest pointer, then caller-supplied fallbacks, then a trading-day and stream-derived Perplexity-primary alias pointer. Alias fallback remains guarded by same-day date, stream, expected root containment, target run_state, scheduled non-manual evidence, and non-null run_classification validation before returning a state. Missing canonical pointers remain artifact-contract failures for diagnostics, but they are no longer terminal when a valid same-day alias pointer and complete artifacts exist. Schedule/config/documentation only: no trading rules, active universe, budget caps, broker policy, or task cadence changed.",
+  "change_note_2026_08_17_0915_pause": "CORRECTED 2026-08-18 (codex review discussion_r3796958124): the original note below claimed bb4f6ef1 was a distinct, purely-readiness 9:15 AM task safe to delete for a week. It is not -- every other section of this manifest (daily_compact_chain_et, canonical_schedule_reconciliation_2026_07_27's directory, and the artifact-contract sections) identifies bb4f6ef1 as the canonical 09:45 AM morning watchlist scan, which also runs the required pre-flight writer absorbed from morning-dca-0945 that MorningDCAExecutor._apply_preflight_gate() fails closed on. Deleting bb4f6ef1 therefore risks suppressing every 10:30 AM live buy (42173154) until 5cc41080 restores it on 2026-08-24, contradicting the original 'live_buy_tasks_affected: false' / 'must_not_gate_buy_tasks: true' claims below. The original text is preserved verbatim for audit history; see temporary_live_scheduler_overrides.pause_2026_08_17_0915_prevalidation.correction_2026_08_18 for the corrected status. No repository code change accompanies this correction -- it is a documentation fix. If a genuinely distinct 9:15 AM readiness task exists in the live scheduler under a different ID, this note must be updated with that ID instead of bb4f6ef1, and the 09:45/preflight risk noted here withdrawn.",
+  "temporary_live_scheduler_overrides": {
+    "pause_2026_08_17_0915_prevalidation": {
+      "requested_by_user_on_et": "2026-08-17 09:48",
+      "applied_on_et": "2026-08-17 09:49",
+      "scope": "Live scheduler only. Documentation of an operational pause, not a trading-rule change.",
+      "paused_task_id": "bb4f6ef1",
+      "paused_task_name": "Weekday 9:15 AM morning DCA pre-validation readiness scan",
+      "paused_task_type": "read_only_prevalidation",
+      "paused_from_et": "2026-08-17 09:49",
+      "restore_task_id": "5cc41080",
+      "restore_run_at_et": "2026-08-24 09:00",
+      "restore_action": "Recreate the recurring weekday 9:15 AM America/New_York read-only pre-validation task before the next 9:15 window.",
+      "live_buy_tasks_affected": false,
+      "live_buy_tasks_still_authorized_this_week": ["4412c3c4", "e028361e", "e3590042", "0c3cde00", "44b3975d"],
+      "must_not_gate_buy_tasks": true,
+      "buy_task_self_contained_checks_required": [
+        "account_access",
+        "buying_power",
+        "quote_availability",
+        "prior_close_or_low_reference",
+        "tradability",
+        "spread",
+        "data_confidence",
+        "same_day_topup_context",
+        "budget_caps",
+        "duplicate_protection",
+        "active_whitelist",
+        "buy_only",
+        "regular_hours"
+      ],
+      "notes": "The 9:15 task is readiness and diagnostics context only. During the pause, absence of a 9:15 artifact must not be treated as failed buy evidence or as a reason for 9:35 or later live buy tasks to skip. SUPERSEDED by correction_2026_08_18 below -- do not rely on live_buy_tasks_affected/must_not_gate_buy_tasks above without reading that correction first.",
+      "correction_2026_08_18": {
+        "reason": "codex review discussion_r3796958124 (P1): paused_task_id bb4f6ef1 is documented elsewhere in this manifest (daily_compact_chain_et, canonical_schedule_reconciliation_2026_07_27) as the canonical 09:45 AM morning watchlist scan that also runs the required pre-flight writer absorbed from morning-dca-0945, not a separate 9:15 AM task.",
+        "actual_risk": "MorningDCAExecutor._apply_preflight_gate() fails closed when the 09:45 pre-flight artifact bb4f6ef1 writes is missing, so deleting bb4f6ef1 can suppress the 10:30 AM live buy (42173154) for every weekday until 5cc41080 restores it on 2026-08-24.",
+        "live_buy_tasks_affected": "10:30 AM (42173154) is at risk; treat as affected, not false, until an operator confirms 42173154 is still gating correctly without bb4f6ef1's artifact.",
+        "corrected_must_not_gate_buy_tasks": false,
+        "required_action": "An operator must verify whether bb4f6ef1 was really the 9:15 task or the 9:45 preflight task before 2026-08-24, and either restore the preflight task immediately or confirm 42173154 has an alternate preflight source. Until confirmed, treat 10:30 AM buys as unverified this week."
+      }
+    }
+  },
   "operating_mode": {
     "mode": "cost_saving_daily_compact",
     "requested_on_et": "2026-07-16",
@@ -586,6 +627,23 @@
     "streams_covered": ["market_open", "morning", "midday", "intraday", "manual", "final_override"],
     "final_override_top_up": "The final override stream (final manual buy override) applies the same guard: for a ticker with same-day prior buy context, the comparison reference is that ticker's most recent valid same-day buy reference (ordered by generated_at). It buys again only when the final decision price is strictly lower than that most recent reference, and then buys only corrected_delta_usd = max(0, desired_usd - effective_prior_usd). A missing prior reference => no auto-top-up.",
     "manual_override_handling": "Manual override fills recorded under /home/user/workspace/cron_tracking/midday_dca/manual_reruns/**/run_state.json and filled_orders.csv, and under /home/user/workspace/cron_tracking/ce16ba6b/manual_runs/final_manual_override_*/ and /home/user/workspace/cron_tracking/final_manual_review/** (run_origin='manual', manual_run=true) are EXCLUDED from all scheduled evidence, slippage, reliability, fill counts, watchdog confirmation, and cost basis, and are used ONLY as prior-allocation context for the same-day top-up guard (they affect afternoon 3:30 PM top-up eligibility, no scheduled metric).",
+    "minimum_order_aggregate_topup_1530": {
+      "approved_on_et": "2026-08-14",
+      "applies_to": ["10ce362c (3:30 afternoon final live)"],
+      "applies_to_note_2026_08_18": "codex review discussion_r3785797977: task 44b3975d, previously listed here as a 'Perplexity-primary 15:30 final pass', has no task definition, cron, status, or other occurrence anywhere in this manifest or the repository, and the authoritative canonical_schedule_reconciliation_2026_07_27 table lists 10ce362c as the only active 15:30 task. Removed from scope until 44b3975d (or its real task ID) is registered in the canonical schedule with its own contracts; no repository-managed executor can discover this policy for an unregistered task ID.",
+      "summary": "The broker-minimum carry-forward behavior is part of the existing 3:30 PM final live pass, not a separate 3:33 PM task. At 15:30, after normal current-candidate evaluation and before final artifacts, aggregate same-day top-up remainders by ticker when they were not filled earlier only because Robinhood's $1 minimum order size blocked them.",
+      "known_gap_2026_08_18": "codex review discussion_r3785797985: the shipped implementation (near_close_dca.py's _process_buy_candidate, CumulativeCreditLedger.minimum_order_pending_tickers) discovers pending remainders ONLY through cumulative_dca_credits/<day>/ledger.json. It does not reconstruct an unfilled remainder from prior run artifacts (run_state.json/submitted_orders.csv under other streams) or Robinhood same-day order history the way effective_prior_usd_gap_2026_07_24 already does for the separate top-up-guard prior-allocation check. A remainder whose credit ledger entry was lost, corrupted, or never written (e.g. a run on a different artifact root, or a crash before the ledger write) is therefore invisible to this rule even though the underlying broker/artifact evidence may still exist. Documented as a known gap rather than implemented broker/artifact reconciliation for the ledger pool specifically, matching this repo's existing KNOWN GAP convention (see evaluate_top_up_guard's docstring); fixing it is future work, not part of this change.",
+      "rules": [
+        "For each active-whitelist ticker, aggregate qualifying same-day sub-dollar top-up remainders recorded in the cumulative sub-dollar credit ledger (cumulative_dca_credits/<day>/ledger.json via CumulativeCreditLedger). See known_gap_2026_08_18 above: this does not yet reconstruct remainders from other durable sources (prior run artifacts or broker order history) when the ledger entry itself is missing.",
+        "If the aggregate remainder for a ticker is greater than or equal to $1.00, buy the aggregate remainder amount, subject to the normal caps and safety checks.",
+        "If the aggregate remainder for a ticker is greater than or equal to $0.50 and less than $1.00, round up and buy exactly $1.00, subject to the normal caps and safety checks.",
+        "If the aggregate remainder for a ticker is less than $0.50, forget it for that trading day and place no order for that remainder.",
+        "Only remainders blocked by Robinhood's minimum order size qualify. Do not convert unrelated spread, confidence, budget, duplicate, tradability, or top-up price-reference blocks into minimum-order round-ups.",
+        "Continue enforcing active whitelist, tradability, account access, buying power, duplicate protection, daily cap, weekly cap, regular-hours-only, buy-only, max-per-order, no review_equity_order, and no per-order confirmation.",
+        "Record aggregate_minimum_topup_applied, aggregate_minimum_topup_remainder_usd, aggregate_minimum_topup_order_usd, and aggregate_minimum_topup_reason on the candidate outcome in 15:30 artifacts whenever this rule results in a submitted order (near_close_dca.py's _process_buy_candidate, gated on evaluate_top_up_guard's cumulative_credit_decline_usd; codex review discussion_r3785797973). These fields are only present on that submitted-order outcome; a remainder that stays pending or is discarded below $0.50 is not separately flagged with these fields."
+      ],
+      "artifact_contract": "These orders, when placed, are valid 15:30 final-pass orders and must be written under the normal 15:30 run_state.json, run_summary.json, signals.csv, submitted_orders.csv, filled_orders.csv, and raw-response contract. They are not a separate stream and do not create scheduled evidence for any other run. (codex review discussion_r3785797988: validation.csv removed from this list -- it belongs to the morning preflight flow and near_close_dca.py has no writer for it in the afternoon final-pass contract; listing it here made every conforming afternoon run look incomplete.)"
+    },
     "jul9_manual_override_examples": [
       { "ticker": "AMZN", "amount_usd": 3.0, "avg_fill_price": 242.1099, "trading_day": "2026-07-09" },
       { "ticker": "GOOG", "amount_usd": 4.5, "avg_fill_price": 352.1778, "trading_day": "2026-07-09" },

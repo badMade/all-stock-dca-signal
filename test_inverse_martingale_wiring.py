@@ -1003,29 +1003,18 @@ def test_prior_same_day_allocation_defers_fire_but_still_tracks_the_dip(tmp_path
     assert tracker["accumulated_usd"] == pytest.approx(3.0, abs=0.01)
 
 
-def test_pending_credit_flush_candidate_defers_fire_but_still_tracks_the_dip(tmp_path, monkeypatch):
-    """Regression test for "Track tiers despite a pending-credit flush
-    candidate". A ticker with a same-day pending cumulative credit (an
-    unrelated, older accumulation mechanism -- see dca_cumulative.py) gets
-    its own non-BUY decision appended to buy_candidates so that balance can
-    flush, which makes it appear in `already_included` for a completely
-    unrelated reason. The inverse-Martingale evaluation must still TRACK
-    this ticker's dip -- only fire-injection defers, exactly like a prior
-    same-day allocation (guard_active) already does. Previously the whole
-    evaluation was skipped whenever already_included matched, so a tier
-    crossing on the ticker's own final scheduled slot was silently,
-    permanently lost.
+def test_discarded_sub_threshold_credit_still_tracks_the_dip(tmp_path, monkeypatch):
+    """A final-pass credit below $0.50 is discarded without affecting tracking.
+
+    The inverse-Martingale evaluation remains independent of the cumulative
+    minimum-order ledger and must still record the ticker's dip.
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
     state = StrategyState()
 
-    # Seed a small (well under the $0.50 flush threshold) pending credit for
-    # AAPL on day 1, so the credit-ledger flush block appends AAPL's non-BUY
-    # decision to buy_candidates this run -- guard_active requires a non-None
-    # prior_same_day_allocations, passed as {} here (present, but with no
-    # entry for AAPL) so this test isolates the batch-occupied reason from
-    # the separate prior-same-day-allocation guard tested above.
+    # Seed a small credit that the final-pass policy must forget rather than
+    # turning into an order. guard_active requires a non-None allocations map.
     credit_ledger = CumulativeCreditLedger(root=tmp_path / "cron_tracking" / "cumulative_dca_credits")
     credit_ledger.record("AAPL", TEST_DATES[0].isoformat(), 0.20)
 
@@ -1033,11 +1022,8 @@ def test_pending_credit_flush_candidate_defers_fire_but_still_tracks_the_dip(tmp
         tmp_path, config, state, TEST_DATES[0], 99.0, "day1",
         prior_same_day_allocations={},
     )
-    # The flush candidate itself is a real (non-BUY, non-imart) entry --
-    # confirms already_included genuinely matched AAPL this run, not that
-    # the credit ledger silently failed to engage.
-    assert len(s1["buy_candidates"]) == 1
-    assert "imart" not in (s1["buy_candidates"][0].get("order_id") or "")
+    assert s1["buy_candidates"] == []
+    assert credit_ledger.minimum_order_pending_tickers(TEST_DATES[0].isoformat()) == {}
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
     tracker = json.loads(tracker_path.read_text())

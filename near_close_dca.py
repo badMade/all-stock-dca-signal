@@ -671,6 +671,23 @@ class TopUpGuardOutcome:
     # updates until the submitted amount is known") -- this field alone never
     # writes to the ledger.
     cumulative_credit_decline_usd: Optional[float] = None
+    # Set ONLY by the sub-dollar ladder-combination branch (the one branch
+    # _select_final_session_credit_flush_tickers's combination gate can ever
+    # route a deferred ticker into) when combining the existing pending
+    # broker-minimum remainder with THIS call's own qualifying decline still
+    # lands under the final-session discard threshold. apply_cumulative_
+    # credit's own final_session semantics already decided that combined
+    # total is forgotten for the day; this field lets the caller
+    # (_process_buy_candidate) durably discard it, since evaluate_top_up_guard
+    # itself performs no ledger I/O. Left None on the two flush-only branches
+    # (no prior context, or price recovered) on purpose: those can only
+    # reflect the EXISTING balance alone with no new decline to combine, so
+    # deferring them here was never possible in the first place (see
+    # _final_session_credit_could_combine_with_this_runs_decline) and their
+    # own pre-existing behavior of leaving the ledger untouched is
+    # unchanged (Codex review discussion on commit 0af4768: "Clear combined
+    # credits that remain below fifty cents").
+    discarded_pending_credit_usd: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -4155,6 +4172,7 @@ def evaluate_top_up_guard(
         skipped: bool,
         manual_review: bool = False,
         cumulative_credit_decline_usd: Optional[float] = None,
+        discarded_pending_credit_usd: Optional[float] = None,
     ) -> TopUpGuardOutcome:
         return build_top_up_outcome(
             outcome_cls=TopUpGuardOutcome,
@@ -4168,6 +4186,55 @@ def evaluate_top_up_guard(
             effective_base=effective_base,
             manual_review=manual_review,
             cumulative_credit_decline_usd=cumulative_credit_decline_usd,
+            discarded_pending_credit_usd=discarded_pending_credit_usd,
+        )
+
+    def _flush_or_discard_existing_credit(
+        fallback_incremental: float, fallback_result: str
+    ) -> Optional[TopUpGuardOutcome]:
+        """Shared final-session resolution for ``existing_pending_credit_usd``
+        at a point where THIS call's own decision contributes no further
+        incremental amount (no prior context, a recovered/flat price, or a
+        ladder target the prior allocation already exceeds).
+
+        Returns an outcome (order or discard) when there is a positive
+        existing balance to resolve, or ``None`` when the caller should fall
+        through to its own default ``fallback_incremental``/
+        ``fallback_result`` outcome untouched (``existing_pending_credit_usd``
+        is zero, so there is nothing here for the final session to resolve
+        either way).
+
+        Every zero-order return path in this function must end here rather
+        than a bare ``_outcome(...)`` once ``existing_pending_credit_usd`` is
+        positive: leaving it neither ordered nor marked
+        ``discarded_pending_credit_usd`` strands it in the ledger forever,
+        since this is always the final same-day session and
+        evaluate_top_up_guard performs no ledger I/O of its own (Codex
+        review discussion on commit 55e175d: "Recheck survivor balances
+        that shrink below the threshold" and "Flush qualifying credits
+        despite a negative ladder delta" -- a concurrent settlement can
+        shrink a deferred balance below $0.50 by the time this call reads
+        it fresh, and a prior/manual allocation already at or above today's
+        ladder target skipped straight past every other flush check
+        without ever looking at the remainder).
+        """
+        if existing_pending_credit_usd <= 0:
+            return None
+        flushed = apply_cumulative_credit(
+            existing_pending_credit_usd, 0.0, final_session=True
+        ).order_amount_usd
+        if flushed > 0:
+            return _outcome(
+                flushed,
+                TOP_UP_INCREMENTAL,
+                skipped=False,
+                cumulative_credit_decline_usd=0.0,
+            )
+        return _outcome(
+            fallback_incremental,
+            fallback_result,
+            skipped=True,
+            discarded_pending_credit_usd=existing_pending_credit_usd,
         )
 
     # No earlier same-day allocation: behave exactly like a normal scheduled run.
@@ -4187,17 +4254,10 @@ def evaluate_top_up_guard(
         # session's own contract is to close ANY positive pending balance
         # regardless of today's decision price, so flush it here using the
         # same final-session rounding as that later branch.
-        if desired <= 0 and existing_pending_credit_usd > 0:
-            flushed = apply_cumulative_credit(
-                existing_pending_credit_usd, 0.0, final_session=True
-            ).order_amount_usd
-            if flushed > 0:
-                return _outcome(
-                    flushed,
-                    TOP_UP_INCREMENTAL,
-                    skipped=False,
-                    cumulative_credit_decline_usd=0.0,
-                )
+        if desired <= 0:
+            flush_outcome = _flush_or_discard_existing_credit(desired, TOP_UP_NO_PRIOR_RUN)
+            if flush_outcome is not None:
+                return flush_outcome
         return _outcome(desired, TOP_UP_NO_PRIOR_RUN, skipped=desired <= 0)
 
     # Prior amount is known but its first-allocation base ($1 or $2) could not
@@ -4229,17 +4289,9 @@ def evaluate_top_up_guard(
     # silently stranded just because THIS call finds no further decline
     # (Codex review: "Accumulate credits instead of resetting pending state").
     if afternoon_price >= prior.reference_price:
-        if existing_pending_credit_usd > 0:
-            flushed = apply_cumulative_credit(
-                existing_pending_credit_usd, 0.0, final_session=True
-            ).order_amount_usd
-            if flushed > 0:
-                return _outcome(
-                    flushed,
-                    TOP_UP_INCREMENTAL,
-                    skipped=False,
-                    cumulative_credit_decline_usd=0.0,
-                )
+        flush_outcome = _flush_or_discard_existing_credit(0.0, TOP_UP_NOT_LOWER_OR_NO_DELTA)
+        if flush_outcome is not None:
+            return flush_outcome
         return _outcome(0.0, TOP_UP_NOT_LOWER_OR_NO_DELTA, skipped=True)
 
     price_step_incremental = cumulative_price_step_amount_usd(
@@ -4248,7 +4300,16 @@ def evaluate_top_up_guard(
     ladder_incremental = desired - round(prior.amount_usd, 2)
     # If prior already exceeds the computed desired amount, don't buy more even
     # with a further price decline — that would overshoot the day's target.
+    # existing_pending_credit_usd is unrelated money owed from an earlier
+    # broker-minimum block, though, not more of THIS ticker's own ladder
+    # target -- a qualifying (>= $0.50) remainder must still be flushed here
+    # even though the ladder itself has nothing further to contribute (Codex
+    # review discussion on commit 55e175d: "Flush qualifying credits despite
+    # a negative ladder delta").
     if ladder_incremental < 0:
+        flush_outcome = _flush_or_discard_existing_credit(0.0, TOP_UP_NOT_LOWER_OR_NO_DELTA)
+        if flush_outcome is not None:
+            return flush_outcome
         return _outcome(0.0, TOP_UP_NOT_LOWER_OR_NO_DELTA, skipped=True)
     # For sub-dollar ladder increments (< $1), the ladder and price-step
     # floors above can both land at zero even though the price is genuinely
@@ -4267,6 +4328,7 @@ def evaluate_top_up_guard(
     # could flush and clear a credit for an order that ends up blocked,
     # clamped, or never placed at all).
     cumulative_credit_decline_usd: Optional[float] = None
+    discarded_pending_credit_usd: Optional[float] = None
     if ladder_incremental < 1.0:
         # The final-session credit decision must consider the LADDER
         # increment itself, not just the rounded raw price decline: a
@@ -4289,16 +4351,72 @@ def evaluate_top_up_guard(
         )
         if cumulative_credit > 0:
             cumulative_credit_decline_usd = credit_amount_usd
+        elif existing_pending_credit_usd > 0:
+            # Even combined with this call's own qualifying decline, the
+            # total stayed below the final-session discard threshold --
+            # apply_cumulative_credit's own final_session semantics already
+            # decided this money is forgotten for the day. Only this ladder
+            # branch (never the two flush-only branches above, which have no
+            # new decline to combine at all) can reach this state, and only
+            # for a ticker _final_session_credit_could_combine_with_this_
+            # runs_decline judged worth deferring in the first place -- so
+            # this is exactly, and only, the gap that deferral could open
+            # (Codex review discussion on commit 0af4768: "Clear combined
+            # credits that remain below fifty cents").
+            discarded_pending_credit_usd = existing_pending_credit_usd
         incremental = cumulative_credit
     else:
         incremental = ladder_incremental
+        if existing_pending_credit_usd > 0:
+            # This candidate already qualifies for an ordinary >= $1 ladder
+            # order on its own, independent of any pending broker-minimum
+            # remainder. Without this, existing_pending_credit_usd is simply
+            # never looked at in this branch, so a ticker that also happens
+            # to carry a pending remainder gets its ladder order placed while
+            # the remainder is left completely untouched -- neither combined
+            # into this order nor flushed/discarded, silently stranded for
+            # the rest of the day (Codex review discussion on commit
+            # 58a536a: "Resolve pending credit on existing buy candidates" --
+            # e.g. a $0.75 minimum-order remainder alongside a $2 ladder
+            # increment). Fold it into this order: since a real order is
+            # happening for this ticker anyway this final session, there is
+            # no reason to leave the remainder for a later evaluation that
+            # will never come. cumulative_credit_decline_usd=0.0 (not the
+            # folded amount) matches the flush-only branches above -- it
+            # marks "this call settles existing_pending_credit_usd from the
+            # ledger" without misrepresenting it as a fresh decline that was
+            # needed to justify the order.
+            #
+            # But the manifest's own $0.50 discard threshold still applies
+            # to the remainder ITSELF first: "less than $0.50, forget it for
+            # that trading day" is unconditional, not just for a standalone
+            # remainder-only order. Folding every remainder into whatever
+            # ladder order happens to be running this session -- regardless
+            # of size -- would fold in amounts the policy explicitly says to
+            # forget (Codex review discussion on commit e385a54: "Discard
+            # sub-threshold credit before folding ladder orders"). Apply the
+            # same final-session threshold to the remainder ALONE before
+            # deciding whether to fold it in at all.
+            if apply_cumulative_credit(
+                existing_pending_credit_usd, 0.0, final_session=True
+            ).order_amount_usd > 0:
+                incremental = round(incremental + existing_pending_credit_usd, 2)
+                cumulative_credit_decline_usd = 0.0
+            else:
+                discarded_pending_credit_usd = existing_pending_credit_usd
     if incremental <= 0:
-        return _outcome(0.0, TOP_UP_NOT_LOWER_OR_NO_DELTA, skipped=True)
+        return _outcome(
+            0.0,
+            TOP_UP_NOT_LOWER_OR_NO_DELTA,
+            skipped=True,
+            discarded_pending_credit_usd=discarded_pending_credit_usd,
+        )
     return _outcome(
         incremental,
         TOP_UP_INCREMENTAL,
         skipped=False,
         cumulative_credit_decline_usd=cumulative_credit_decline_usd,
+        discarded_pending_credit_usd=discarded_pending_credit_usd,
     )
 
 
@@ -4616,6 +4734,27 @@ def _build_buy_candidates(
             "spread_ok": outcome.get("spread_ok"),
             "spread_pct": outcome.get("spread_pct"),
             "spread_status": outcome.get("spread_status", SPREAD_STATUS_NOT_EVALUATED),
+            # config/scheduled_tasks.json's minimum_order_aggregate_topup_1530
+            # requires these on the SERIALIZED artifact row, not just the
+            # intermediate candidate_outcome dict -- this function rebuilds
+            # each row from an explicit field list, so anything not copied
+            # here never reaches run_state.json/buy_candidates.csv (Codex
+            # review discussion on commit 58a536a: "Copy aggregate audit
+            # fields into artifact rows"). ALWAYS present (defaulted, not
+            # conditionally added) even though only the one ticker the
+            # aggregate rule actually applied to carries non-default values:
+            # _write_csv derives buy_candidates.csv's header from row 0 alone
+            # and raises if a LATER row carries a key row 0 lacks, and this
+            # aggregate-topup ticker is typically not row 0 among several
+            # ordinary candidates in the same guarded run.
+            "aggregate_minimum_topup_applied": outcome.get(
+                "aggregate_minimum_topup_applied", False
+            ),
+            "aggregate_minimum_topup_remainder_usd": outcome.get(
+                "aggregate_minimum_topup_remainder_usd"
+            ),
+            "aggregate_minimum_topup_order_usd": outcome.get("aggregate_minimum_topup_order_usd"),
+            "aggregate_minimum_topup_reason": outcome.get("aggregate_minimum_topup_reason"),
         }
         if guard is not None:  # noqa: SIM102 - kept flat to match the block below
             candidate_row.update(
@@ -4702,6 +4841,20 @@ def _build_buy_candidates(
                 "spread_ok": outcome.get("spread_ok"),
                 "spread_pct": outcome.get("spread_pct"),
                 "spread_status": outcome.get("spread_status", SPREAD_STATUS_NOT_EVALUATED),
+                # Same uniform-column reasoning as the main loop above -- a
+                # recovery row never carries the aggregate rule, but the
+                # column must still exist so a preceding aggregate-topup row
+                # doesn't crash _write_csv's fixed-from-row-0 fieldnames.
+                "aggregate_minimum_topup_applied": outcome.get(
+                    "aggregate_minimum_topup_applied", False
+                ),
+                "aggregate_minimum_topup_remainder_usd": outcome.get(
+                    "aggregate_minimum_topup_remainder_usd"
+                ),
+                "aggregate_minimum_topup_order_usd": outcome.get(
+                    "aggregate_minimum_topup_order_usd"
+                ),
+                "aggregate_minimum_topup_reason": outcome.get("aggregate_minimum_topup_reason"),
             }
         )
     return buy_candidates
@@ -8892,6 +9045,31 @@ def _same_stream_order_exists(
     return result
 
 
+def _same_stream_duplicate_check_or_assume_exists(
+    broker: BrokerAdapter, ticker: str, trading_day: date, stream: str
+) -> bool:
+    """``_same_stream_order_exists`` as a plain bool, fail-closed on error.
+
+    Used only by :func:`_select_final_session_credit_flush_tickers`'s
+    duplicate-order-exists check before an otherwise-immediate discard: a
+    discard is destructive (it erases the only ledger evidence of a
+    possibly-already-placed order), so an inconclusive broker check must
+    default to "assume a duplicate might exist" (routing the ticker to a
+    real candidate evaluation, which performs its own, authoritative
+    duplicate check) rather than silently discarding on uncertainty.
+    """
+    try:
+        return _same_stream_order_exists(broker, ticker, trading_day, stream) is not None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "same-stream duplicate check failed for %s during final-session "
+            "credit discard; assuming a duplicate may exist: %s",
+            ticker,
+            exc,
+        )
+        return True
+
+
 @dataclass(frozen=True)
 class ProcessCandidateContext:
     """Shared, per-run context for :func:`_process_buy_candidate` and
@@ -8949,6 +9127,13 @@ def _process_buy_candidate(
     errors_count_inc = 0
     order_reviews_attempted_inc = 0
     candidate_outcome: Dict[str, Any] = {}
+    # Initialized here (not just inside the `if ctx.guard_active:` block
+    # below) so the same-stream duplicate check further down can safely
+    # reference it even when this ticker has no prior allocation context at
+    # all -- see that check's own comment for why (Codex review discussion
+    # on commit f0b4177: "Recover duplicates for prior-less flush
+    # survivors").
+    existing_pending_credit_usd = 0.0
 
     def _block(reason: str, message: str) -> None:
         if ctx.run_result is not None:
@@ -9008,21 +9193,105 @@ def _process_buy_candidate(
         # records the real outcome once placement succeeds, so a missed
         # read here only means a rare pending balance is picked up on a
         # later retry instead of this pass.
-        try:
-            existing_pending_credit_usd = ctx.credit_ledger.pending_usd(
-                ticker, ctx.trading_day.isoformat()
-            )
-        except Exception as exc:  # noqa: BLE001
+        #
+        # Restricted to the afternoon stream only: evaluate_top_up_guard
+        # always applies final-session (apply_cumulative_credit(...,
+        # final_session=True)) discard/fold/round semantics whenever
+        # existing_pending_credit_usd is positive, regardless of which
+        # stream called it. Without this stream check, an ordinary 10:30/
+        # 12:30 BUY candidate would discard or fold a pending remainder --
+        # meant to accumulate through the whole day -- hours before the
+        # actual 3:30 PM final pass (Codex review discussion on commit
+        # f46f29c: "Restrict per-candidate credit resolution to the
+        # afternoon").
+        if ctx.stream == "afternoon":
+            try:
+                existing_pending_credit_usd = ctx.credit_ledger.minimum_order_pending_tickers(
+                    ctx.trading_day.isoformat()
+                ).get(ticker, 0.0)
+            except Exception as exc:  # noqa: BLE001
+                existing_pending_credit_usd = 0.0
+                logger.warning(
+                    "cumulative credit ledger pending-balance read failed for %s: %s", ticker, exc
+                )
+        else:
             existing_pending_credit_usd = 0.0
-            logger.warning(
-                "cumulative credit ledger pending-balance read failed for %s: %s", ticker, exc
-            )
         top_up_outcome = evaluate_top_up_guard(
             decision,
             effective_prior,
             ctx.config,
             existing_pending_credit_usd=existing_pending_credit_usd,
         )
+        # evaluate_top_up_guard is a pure computation (no ledger I/O). When
+        # its ladder-combination branch concludes the existing remainder,
+        # even combined with this call's own qualifying decline, stays below
+        # the final-session discard threshold, it reports that decision here
+        # rather than writing to the ledger itself. Durably reflect it now --
+        # this is the only branch that can ever set this field (see
+        # TopUpGuardOutcome.discarded_pending_credit_usd's docstring), so
+        # this narrowly closes the gap _select_final_session_credit_flush_
+        # tickers's deferral can otherwise leave open, without touching the
+        # two flush-only branches' pre-existing no-ledger-write behavior
+        # (Codex review discussion on commit 0af4768: "Clear combined
+        # credits that remain below fifty cents").
+        if top_up_outcome.discarded_pending_credit_usd is not None and ctx.config.dry_run:
+            discarded = True  # simulate success; never mutate the live-root
+            # ledger from a dry run -- see the matching guard and comment on
+            # _select_final_session_credit_flush_tickers's discard callback
+            # in _run_once_impl (Codex review discussion on commit e385a54:
+            # "Keep dry runs from discarding the live credit ledger").
+        elif top_up_outcome.discarded_pending_credit_usd is not None:
+            try:
+                discarded = ctx.credit_ledger.discard_minimum_order_pending(
+                    ticker, ctx.trading_day.isoformat()
+                )
+            except Exception as exc:  # noqa: BLE001
+                discarded = True  # do not retry on a ledger I/O failure
+                logger.warning(
+                    "cumulative credit ledger final discard failed for %s: %s",
+                    ticker,
+                    exc,
+                )
+            if discarded is False:
+                # A concurrent update raised the ledger's CURRENT balance to
+                # or above the discard threshold since existing_pending_
+                # credit_usd was read above -- e.g. a scanned $0.10 plus this
+                # call's own $0.10 decline computed a sub-$0.50 discard, but
+                # a concurrent stream's contribution landed in between and
+                # pushed the real balance to $0.50. The stale evaluation
+                # above must not stand: re-read the now-larger balance and
+                # re-evaluate so the now-qualifying order can actually be
+                # placed instead of leaving it stranded after the final pass
+                # (Codex review discussion on commit e385a54: "Route a
+                # concurrently qualified discard into evaluation", mirroring
+                # _select_final_session_credit_flush_tickers's equivalent
+                # concurrency handling for the same scenario one level up).
+                try:
+                    existing_pending_credit_usd = (
+                        ctx.credit_ledger.minimum_order_pending_tickers(
+                            ctx.trading_day.isoformat()
+                        ).get(ticker, 0.0)
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    existing_pending_credit_usd = 0.0
+                    logger.warning(
+                        "cumulative credit ledger pending-balance re-read failed for %s: %s",
+                        ticker,
+                        exc,
+                    )
+                top_up_outcome = evaluate_top_up_guard(
+                    decision,
+                    effective_prior,
+                    ctx.config,
+                    existing_pending_credit_usd=existing_pending_credit_usd,
+                )
+                # The re-evaluation's own discarded_pending_credit_usd (if
+                # any) is intentionally NOT re-applied here: apply_cumulative_
+                # credit's final-session semantics guarantee a positive
+                # existing_pending_credit_usd that failed the discard's own
+                # re-check (i.e. now qualifies) cannot recompute back to a
+                # discard decision, so a second concurrent-growth race in the
+                # same call is not worth an unbounded retry loop for.
 
     # A morning/manual run must NOT block the scheduled afternoon run: when the
     # top-up guard has a loaded prior allocation for this ticker, the earlier
@@ -9053,7 +9322,20 @@ def _process_buy_candidate(
     # cannot verify a real duplicate) block a harmless simulated candidate
     # for a risk that cannot occur in dry-run mode (Codex review, PR #231:
     # "Allow guarded Alpaca simulations through the duplicate hook").
-    if ticker_guarded and not ctx.config.dry_run:
+    #
+    # Also run for a credit-flush survivor with NO prior allocation entry
+    # (ticker_guarded False, existing_pending_credit_usd > 0): the final-
+    # session flush routes a ticker here specifically because a same-stream
+    # duplicate might exist (_select_final_session_credit_flush_tickers's
+    # duplicate_order_exists check), independent of whether this retry's
+    # own prior-allocation artifact happened to load. Without this, that
+    # ticker skips the duplicate lookup entirely -- an unsafe decision would
+    # then be blocked below without ever getting a chance to recover the
+    # accepted order, and a safe decision would fall through to evaluating
+    # a fresh order with no duplicate check at all (Codex review discussion
+    # on commit f0b4177: "Recover duplicates for prior-less flush
+    # survivors").
+    if (ticker_guarded or existing_pending_credit_usd > 0) and not ctx.config.dry_run:
         try:
             dup_order = _same_stream_order_exists(ctx.broker, ticker, ctx.trading_day, ctx.stream)
         except Exception as exc:  # noqa: BLE001
@@ -9217,8 +9499,57 @@ def _process_buy_candidate(
                 # incremental_order_amount (Codex review, PR #231: "Keep the
                 # broker notional when rebuilding duplicate artifacts").
                 "duplicate_preserved": True,
+                # Same aggregate-topup audit contract as the fresh-placement
+                # branch below: if THIS retry's own evaluate_top_up_guard
+                # call (above, before the duplicate check) shows the
+                # aggregate rule applied, the recovered real order deserves
+                # the same audit fields a fresh placement would carry --
+                # otherwise a crash-recovered aggregate order silently
+                # serializes aggregate_minimum_topup_applied=false forever
+                # (Codex review discussion on commit 8720cec: "Reconcile
+                # aggregate credits on duplicate recovery").
+                **(
+                    {
+                        "aggregate_minimum_topup_applied": True,
+                        "aggregate_minimum_topup_remainder_usd": existing_pending_credit_usd,
+                        "aggregate_minimum_topup_order_usd": dup_amount,
+                        "aggregate_minimum_topup_reason": (
+                            "aggregate_at_or_above_minimum"
+                            if round(
+                                existing_pending_credit_usd
+                                + top_up_outcome.cumulative_credit_decline_usd,
+                                2,
+                            )
+                            >= 1.0
+                            else "aggregate_rounded_up_to_minimum"
+                        ),
+                    }
+                    if top_up_outcome is not None
+                    and top_up_outcome.cumulative_credit_decline_usd is not None
+                    and existing_pending_credit_usd > 0
+                    else {}
+                ),
                 **spread_fields,
             }
+            # Settle the credit ledger for the SAME reason the fresh-
+            # placement branch below does: the earlier attempt that actually
+            # placed this order crashed before it could settle its own
+            # credit-ledger write, so this recovery is the only chance to
+            # durably clear it -- otherwise the remainder is left stranded
+            # even though the real order it was rolled into already exists
+            # at the broker.
+            if top_up_outcome is not None and top_up_outcome.cumulative_credit_decline_usd is not None:
+                try:
+                    ctx.credit_ledger.settle(
+                        ticker,
+                        ctx.trading_day.isoformat(),
+                        dup_amount,
+                        stream=ctx.stream,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "cumulative credit ledger settlement failed for %s: %s", ticker, exc
+                    )
             _publish_in_flight_outcome(ticker, candidate_outcome)
             logger.info(
                 "%s: same-stream broker order already exists; not re-submitting (order_id=%s)",
@@ -9248,6 +9579,39 @@ def _process_buy_candidate(
                 order_reviews_attempted_inc,
             )
 
+    # No same-stream duplicate was found above: everything from here on can
+    # place a genuinely NEW broker order. An ordinary buy_candidates entry is
+    # always Action.BUY (upstream confidence checks already enforced that),
+    # but a ticker reaching this function via the final-session credit
+    # flush's duplicate-recovery survivor path (Codex review discussion on
+    # commit be6b992: "Recover duplicates before filtering unsafe flush
+    # signals") can carry a MANUAL_REVIEW/NO_DATA decision -- injected
+    # specifically to let a CONFIRMED duplicate be recovered, not to
+    # authorize a fresh order from a provider error or Finance/Robinhood
+    # disagreement. _run_once_impl's injection loop no longer filters these
+    # out itself (that would also block the duplicate-recovery return path
+    # above), so this is the one remaining place that must refuse to place a
+    # new order once no duplicate has actually been confirmed -- the same
+    # policy _is_flush_safe_decision originally enforced, just applied after
+    # duplicate recovery gets its chance instead of before it.
+    if not _is_flush_safe_decision(decision):
+        candidate_outcome = {
+            "status": "blocked",
+            "skip_reason": "unreliable decision (manual review/no data); no duplicate order found to recover",
+            "deliberate_skip": True,
+        }
+        _block(
+            MISSING_FILL_DATA_ERROR,
+            f"{ticker}: unreliable decision and no recoverable duplicate order; skipping",
+        )
+        return (
+            candidate_outcome,
+            top_up_outcome,
+            running_deployed_7d,
+            errors_count_inc,
+            order_reviews_attempted_inc,
+        )
+
     if kill_switch_engaged(replace(ctx.config, deployed_last_7d_usd=running_deployed_7d)):
         # Cap at THIS candidate's own selected base ($1 or $2), not the fixed
         # config.base_buy_amount_usd ($2) -- a below-close-only candidate's 1x
@@ -9272,6 +9636,39 @@ def _process_buy_candidate(
             else decision.selected_base_amount_usd
         )
         order_amount = min(order_amount, kill_switch_base)
+        # A credit-only flush candidate (no prior context, non-BUY decision
+        # with selected_base_amount_usd == 0 -- see the "no prior" branch's
+        # ReconciledDecision, which was never assigned a base) clamps to
+        # exactly $0 here rather than a reduced-but-positive amount, since
+        # there is no base to fall back to at all. Nothing downstream checks
+        # for a non-positive order_amount before place_market_buy, so this
+        # would otherwise submit a genuine $0 broker order while the
+        # qualifying credit's settle() call clears nothing (pending_after =
+        # pending_before - 0), silently stranding it as though the final
+        # pass had already resolved it (Codex review discussion on commit
+        # db6ef02: "Keep recovered-price flushes above the kill-switch
+        # floor"). Block explicitly instead, leaving the ledger balance
+        # untouched for a later day's pass to resolve, rather than either
+        # placing a bad order or raising the kill switch's own cap to let a
+        # credit-only flush bypass the risk limit it exists to enforce.
+        if order_amount <= 0:
+            candidate_outcome = {
+                "status": "blocked",
+                "skip_reason": "kill switch engaged; no positive base to cap a credit-only flush",
+                "deliberate_skip": True,
+                "budget_blocked": True,
+            }
+            _block(
+                MISSING_FILL_BUDGET_CAPPED,
+                f"{ticker}: kill switch engaged with no positive base for this candidate; skipping",
+            )
+            return (
+                candidate_outcome,
+                top_up_outcome,
+                running_deployed_7d,
+                errors_count_inc,
+                order_reviews_attempted_inc,
+            )
 
     if ctx.guard_active:
         order_amount = min(top_up_outcome.incremental_order_amount, order_amount)
@@ -9684,6 +10081,46 @@ def _process_buy_candidate(
             # candidate row, and a failure artifact that schema-based reporting
             # rejects is not the complete record it claims to be (Codex review).
             "buy_multiplier": decision.buy_multiplier,
+            # config/scheduled_tasks.json's minimum_order_aggregate_topup_1530
+            # requires these four audit fields on every 15:30 order that
+            # closes an aggregated broker-minimum remainder (codex review
+            # discussion_r3785797973). top_up_outcome.cumulative_credit_decline_usd
+            # is set only by evaluate_top_up_guard's final-session aggregate
+            # branch, so its presence IS the "rule was applied" signal;
+            # existing_pending_credit_usd is the pre-existing minimum-order
+            # remainder read at the top of this function, before this run's own
+            # decline was combined in.
+            **(
+                {
+                    "aggregate_minimum_topup_applied": True,
+                    "aggregate_minimum_topup_remainder_usd": existing_pending_credit_usd,
+                    "aggregate_minimum_topup_order_usd": order_amount,
+                    "aggregate_minimum_topup_reason": (
+                        "aggregate_at_or_above_minimum"
+                        if round(
+                            existing_pending_credit_usd
+                            + top_up_outcome.cumulative_credit_decline_usd,
+                            2,
+                        )
+                        >= 1.0
+                        else "aggregate_rounded_up_to_minimum"
+                    ),
+                }
+                if top_up_outcome is not None
+                and top_up_outcome.cumulative_credit_decline_usd is not None
+                # A fresh sub-dollar decline with NO prior remainder
+                # (existing_pending_credit_usd == 0) still routes through
+                # this same final-session credit-combination branch and
+                # still sets cumulative_credit_decline_usd -- but it isn't
+                # an AGGREGATION of anything a broker-minimum block earlier
+                # carried forward, it's an ordinary final-session top-up.
+                # Gating on a genuinely positive carried remainder too keeps
+                # these audit fields identifying only the policy they exist
+                # to audit (Codex review discussion on commit bb3d494:
+                # "Require a carried remainder before marking aggregation").
+                and existing_pending_credit_usd > 0
+                else {}
+            ),
             **spread_fields,
         }
         # Publish the accepted order NOW, before any fallible follow-up
@@ -9924,6 +10361,23 @@ def _failure_candidate_row(ticker: str, outcome: Dict[str, Any]) -> Dict[str, An
         "buy_multiplier": outcome.get("buy_multiplier"),
         "planned_amount_usd": outcome.get("submitted_amount_usd"),
         "skip_reason": outcome.get("skip_reason"),
+        # Same audit contract as _build_buy_candidates's success-path rows:
+        # unconditionally present (defaulted), never conditionally added --
+        # _write_csv derives buy_candidates.csv's header from row 0's keys
+        # alone, so a later failure row carrying extra keys not in row 0
+        # would crash csv.DictWriter (Codex review discussion on commit
+        # 6e896c5: "Propagate aggregate fields into failure candidate
+        # rows" -- a submitted aggregate order that later hits a failure
+        # path via _write_afternoon_failure_artifacts previously lost all
+        # four fields, even though the real order already applied the rule).
+        "aggregate_minimum_topup_applied": outcome.get(
+            "aggregate_minimum_topup_applied", False
+        ),
+        "aggregate_minimum_topup_remainder_usd": outcome.get(
+            "aggregate_minimum_topup_remainder_usd"
+        ),
+        "aggregate_minimum_topup_order_usd": outcome.get("aggregate_minimum_topup_order_usd"),
+        "aggregate_minimum_topup_reason": outcome.get("aggregate_minimum_topup_reason"),
     }
 
 
@@ -10407,6 +10861,216 @@ def _book_recovered_lease_durably(
     return im_already_on_disk
 
 
+def _final_session_credit_could_combine_with_this_runs_decline(
+    ticker: str,
+    decisions_by_ticker: Dict[str, "ReconciledDecision"],
+    prior_same_day_allocations: Dict[str, "PriorSameDayAllocation"],
+) -> bool:
+    """True only when THIS ticker's own decision this run has a structural
+    chance of contributing a further decline that ``evaluate_top_up_guard``
+    could combine with its existing broker-minimum remainder.
+
+    Mirrors (without duplicating the money math of) the exact gates
+    ``evaluate_top_up_guard`` itself checks before it ever reaches its
+    sub-dollar ``apply_cumulative_credit`` combination branch: a known prior
+    allocation with a usable base and reference price, and this run's own
+    decision price strictly below that reference price. When any of these
+    does not hold, ``evaluate_top_up_guard`` takes one of its flush-only (or
+    fail-closed manual-review) paths instead, which never combines a further
+    decline with the existing remainder -- so there is nothing to gain by
+    deferring the discard decision for it.
+    """
+    decision = decisions_by_ticker.get(ticker)
+    if decision is None:
+        return False
+    # A structurally-combinable decision this predicate would otherwise defer
+    # is never actually reached: the caller's own flush-injection loop drops
+    # any decision _is_flush_safe_decision rejects (MANUAL_REVIEW/NO_DATA --
+    # a provider error or Finance/Robinhood disagreement, not a genuine
+    # recovered/flat price) before it ever appends to buy_candidates. Without
+    # this check here, a sub-$0.50 remainder paired with an unsafe decision
+    # is deferred for a combination that can never happen, stranding it
+    # pending instead of being discarded now (Codex review discussion on
+    # commit f2df714: "Discard unsafe sub-threshold remainders").
+    if not _is_flush_safe_decision(decision):
+        return False
+    prior = prior_same_day_allocations.get(ticker)
+    if (
+        prior is None
+        or prior.amount_usd <= 0
+        or prior.selected_base_amount_usd is None
+        or prior.selected_base_amount_usd <= 0
+        or prior.reference_price is None
+    ):
+        return False
+    afternoon_price = _afternoon_decision_price(decision)
+    if afternoon_price is None or afternoon_price >= prior.reference_price:
+        return False
+    # evaluate_top_up_guard returns TOP_UP_NOT_LOWER_OR_NO_DELTA (0.0, never
+    # touching existing_pending_credit_usd) BEFORE its combination branch
+    # whenever the day's target is already fully covered by the prior
+    # allocation -- ladder_incremental = desired - prior.amount_usd < 0.
+    # A lower afternoon price alone does not rule this out: prior/manual
+    # allocations can already exceed what today's ladder target would be.
+    # Replicate that exact gate here too, or a ticker in this state gets
+    # deferred for a "combination" that can never happen, leaving its
+    # sub-$0.50 remainder permanently stranded pending (Codex review
+    # discussion on commit bb3d494: "Check the remaining ladder delta
+    # before deferring discards").
+    desired, _effective_base = resolve_top_up_desired_amount_usd(
+        prior,
+        decision.buy_multiplier,
+        decision.suggested_amount_usd,
+        decision.selected_base_amount_usd,
+    )
+    ladder_incremental = desired - round(prior.amount_usd, 2)
+    return ladder_incremental >= 0
+
+
+def _is_flush_safe_decision(decision: "ReconciledDecision") -> bool:
+    """False for a decision the final-session credit flush must never place
+    an order from, even though its ticker carries a qualifying pending
+    remainder.
+
+    ``Action.MANUAL_REVIEW``/``Action.NO_DATA`` mean this ticker's OWN
+    signal this run hit a provider error, a Finance/Robinhood disagreement,
+    or missing data -- not a recovered/flat price. Before the final-session
+    flush injection, ``buy_candidates`` was filtered to ``Action.BUY`` only,
+    which is what enforced every normal data-confidence check upstream;
+    appending a MANUAL_REVIEW/NO_DATA decision to the flush list bypasses
+    that filter entirely and can let ``evaluate_top_up_guard`` turn an
+    unreliable/error decision into a real order with no separate confidence
+    gate at placement time (Codex review discussion on commit bb3d494:
+    "Keep failed-confidence decisions out of flush candidates"). Its
+    pending remainder stays in the ledger, unresolved, rather than being
+    forced through on unreliable data -- this is the final same-day
+    session, so nothing later today will revisit it either, same as any
+    other ticker this final pass cannot safely evaluate.
+    """
+    return decision.action not in (Action.MANUAL_REVIEW, Action.NO_DATA)
+
+
+def _select_final_session_credit_flush_tickers(
+    pending_by_ticker: Dict[str, float],
+    decisions_by_ticker: Dict[str, "ReconciledDecision"],
+    prior_same_day_allocations: Dict[str, "PriorSameDayAllocation"],
+    *,
+    discard,
+    duplicate_order_exists=lambda ticker: False,
+) -> List[str]:
+    """Decide, for each ticker with a broker-minimum-provenance pending
+    credit, whether the 3:30 PM final session should discard it now or route
+    it to a candidate evaluation that can still combine it with this
+    session's own decline.
+
+    A ticker is discarded here, immediately, unless
+    :func:`_final_session_credit_could_combine_with_this_runs_decline` says
+    its own decision this run has a real chance of contributing a further
+    decline that ``evaluate_top_up_guard`` could combine with the existing
+    remainder. Discarding a ticker that has no such chance immediately is not
+    just harmless but NECESSARY: ``evaluate_top_up_guard`` is a pure
+    computation with no ledger I/O (its own docstring), and
+    ``_process_buy_candidate`` durably writes to the ledger only via
+    ``settle()`` after a real order submission -- so a remainder routed to a
+    candidate evaluation that can only ever take a flush-only or fail-closed
+    path would never actually get cleared from the ledger, stranding it
+    unresolved instead of correctly forgetting it for the day.
+
+    Deferring is reserved for the one case where premature discarding is
+    itself the bug: a ticker whose own qualifying decline THIS run could
+    combine with its existing remainder to cross the $0.50/$1.00 thresholds
+    (Codex review discussion_r3793071614: "Aggregate current credit before
+    discarding the remainder" -- e.g. a pending $0.40 plus a new $0.20
+    decline should aggregate to $0.60 and place a $1 order, not be discarded
+    piecemeal). ``evaluate_top_up_guard``'s own final-session
+    ``apply_cumulative_credit`` call correctly discards a combined total that
+    still lands under $0.50 once it sees both amounts together; a remainder
+    left pending in that specific sub-case is an accepted, pre-existing
+    limitation (evaluate_top_up_guard performs no ledger I/O of its own), not
+    a regression introduced here.
+
+    ``duplicate_order_exists`` (ticker -> bool, defaults to always ``False``
+    for callers/tests with no broker access) lets the caller check for a
+    recoverable same-stream broker order before an otherwise-immediate
+    discard destroys the only ledger evidence of it -- see the in-loop
+    comment below.
+
+    Returns the tickers whose remainder should be flushed through a
+    candidate evaluation this run (i.e. every surviving key of
+    ``pending_by_ticker`` after any immediate discards above).
+    """
+    survivors: List[str] = []
+    for ticker, amount in list(pending_by_ticker.items()):
+        if amount < 0.50 and not _final_session_credit_could_combine_with_this_runs_decline(
+            ticker, decisions_by_ticker, prior_same_day_allocations
+        ):
+            # An earlier attempt this same stream may have already placed a
+            # real broker order that combined this remainder with a fresh
+            # decline (e.g. $0.30 pending + a $0.30 decline -> a $1 order),
+            # then crashed before settle()/artifact persistence ran -- the
+            # ledger still shows the pre-order $0.30 as pending. If this
+            # retry's own decision no longer looks combinable (e.g. the price
+            # recovered to a NO_ACTION decision), discarding here would erase
+            # the only ledger evidence before _process_buy_candidate's own
+            # same-stream duplicate lookup ever runs, permanently losing the
+            # accepted order from this run's artifacts and deployment history
+            # (Codex review discussion on commit 3d8df75: "Recover accepted
+            # orders before discarding their credit"). Route it to a
+            # candidate evaluation instead -- _process_buy_candidate's
+            # existing duplicate-recovery path already reconstructs the
+            # order, settles the ledger, and carries the aggregate audit
+            # fields once it finds the duplicate for real.
+            if duplicate_order_exists(ticker):
+                if ticker in decisions_by_ticker:
+                    survivors.append(ticker)
+                else:
+                    logger.warning(
+                        "cumulative credit ledger final discard skipped for %s: "
+                        "a same-stream broker order may already exist but no "
+                        "decision this run can route it through recovery",
+                        ticker,
+                    )
+                continue
+            try:
+                discarded = discard(ticker)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "cumulative credit ledger final discard failed for %s: %s",
+                    ticker,
+                    exc,
+                )
+                continue
+            if discarded is False:
+                # A concurrent update raised the ledger's CURRENT balance to
+                # or above the discard threshold between this scan and the
+                # discard call's own lock -- CumulativeCreditLedger.
+                # discard_minimum_order_pending() refused to clear it rather
+                # than silently losing real money. This ticker was NOT
+                # deferred above because no combination looked possible from
+                # the pre-lock scan's (now-stale) amount -- but the balance
+                # now genuinely qualifies for the required final-session
+                # order, so it must still reach a candidate evaluation this
+                # run rather than being left stranded after the day's last
+                # pass (Codex review discussion on commit bb3d494: "Route
+                # concurrently enlarged credits into the final pass").
+                # _process_buy_candidate re-reads the ledger balance fresh
+                # when it runs, so it will see the up-to-date, now-qualifying
+                # amount -- nothing stale is threaded through here.
+                logger.warning(
+                    "cumulative credit ledger final discard skipped for %s: "
+                    "balance grew above the discard threshold after the scan",
+                    ticker,
+                )
+                if ticker in decisions_by_ticker:
+                    survivors.append(ticker)
+                # No decision this run can route an un-enrolled/excluded
+                # ticker through a candidate evaluation regardless -- same
+                # reasoning as the immediate-discard branch above.
+            continue
+        survivors.append(ticker)
+    return survivors
+
+
 def _run_once_impl(
     ctx: RunContext,
 ) -> List[ReconciledDecision]:
@@ -10552,23 +11216,96 @@ def _run_once_impl(
     # computed by _evaluate_all_signals above (not synthesizing a BUY one)
     # keeps evaluate_top_up_guard's own price/prior comparison authoritative.
     credit_ledger = CumulativeCreditLedger()
-    if guard_active:
-        try:
-            pending_by_ticker = credit_ledger.pending_tickers(trading_day.isoformat())
-        except Exception as exc:  # noqa: BLE001
-            pending_by_ticker = {}
-            logger.warning(
-                "cumulative credit ledger pending-ticker scan failed: %s", exc
-            )
+    # Read regardless of stream: also feeds planned_spend's tier-selection
+    # estimate below for every scheduled stream, not just the afternoon
+    # final pass.
+    try:
+        pending_by_ticker = credit_ledger.minimum_order_pending_tickers(
+            trading_day.isoformat()
+        )
+    except Exception as exc:  # noqa: BLE001
+        pending_by_ticker = {}
+        logger.warning(
+            "cumulative credit ledger pending-ticker scan failed: %s", exc
+        )
+    # Everything below this point in the block is the FINAL-SESSION-only
+    # aggregate minimum top-up policy (config/scheduled_tasks.json's
+    # minimum_order_aggregate_topup_1530): it discards sub-$0.50 remainders
+    # outright and evaluates every qualifying one against evaluate_top_up_
+    # guard's final_session=True rounding, both meant to happen exactly
+    # once, at 3:30 PM. guard_active alone does NOT mean "this is the 15:30
+    # run" -- it is shared by every scheduled stream with prior-allocation
+    # context (market-open, morning, midday, intraday, afternoon all use the
+    # ordinary top-up guard). run_dca.run_slot() routes 1030ET
+    # (stream="morning") and 1230ET (stream="midday") through this SAME
+    # _run_once_impl with guard_active true, so without a stream check this
+    # final-session-only block was firing hours early -- discarding or
+    # force-flushing a 9:35 remainder at 10:30 instead of letting it
+    # accumulate through 3:30 as designed (Codex review discussion on commit
+    # 8720cec: "Restrict the final credit flush to the afternoon stream").
+    if guard_active and stream == "afternoon":
         if pending_by_ticker:
             already_included = {d.ticker for d in buy_candidates}
             decisions_by_ticker = {d.ticker: d for d in decisions}
-            for ticker in pending_by_ticker:
+            flush_tickers = _select_final_session_credit_flush_tickers(
+                pending_by_ticker,
+                decisions_by_ticker,
+                prior_same_day_allocations or {},
+                discard=(
+                    (lambda ticker: True)
+                    if config.dry_run
+                    # A dry run must never mutate the live-root credit
+                    # ledger -- CumulativeCreditLedger() always resolves the
+                    # SAME default root regardless of config.dry_run, and a
+                    # --demo/local invocation sharing that root with real
+                    # scheduled runs (the common case: only --artifacts-dir
+                    # is typically overridden, not $DCA_CRON_TRACKING_ROOT)
+                    # would otherwise permanently delete a live pending
+                    # credit a real run is still relying on. Simulate the
+                    # discard decision (`True`, matching the real method's
+                    # success return) without touching the ledger; the
+                    # settle() call inside _process_buy_candidate is already
+                    # gated the same way via its own dry-run early return
+                    # (Codex review discussion on commit e385a54: "Keep dry
+                    # runs from discarding the live credit ledger").
+                    else lambda ticker: credit_ledger.discard_minimum_order_pending(
+                        ticker, trading_day.isoformat()
+                    )
+                ),
+                # A dry run never places a real broker order, so there is
+                # nothing to recover and no live broker call to make here --
+                # same reasoning as the discard callback above. A real check
+                # failure is treated conservatively as "a duplicate might
+                # exist" (returns True) rather than silently discarding
+                # possibly-real ledger evidence of an accepted order.
+                duplicate_order_exists=(
+                    (lambda ticker: False)
+                    if config.dry_run
+                    else lambda ticker: _same_stream_duplicate_check_or_assume_exists(
+                        broker, ticker, trading_day, stream
+                    )
+                ),
+            )
+            for ticker in flush_tickers:
                 if ticker in already_included:
                     continue
                 flush_decision = decisions_by_ticker.get(ticker)
-                if flush_decision is not None:
-                    buy_candidates.append(flush_decision)
+                if flush_decision is None:
+                    continue
+                # _is_flush_safe_decision is NOT re-checked here: a ticker
+                # can reach flush_tickers via _select_final_session_credit_
+                # flush_tickers's duplicate-recovery path specifically
+                # BECAUSE its decision this run is unsafe (MANUAL_REVIEW/
+                # NO_DATA) -- filtering it out here would drop it before
+                # _process_buy_candidate's duplicate check ever runs,
+                # permanently losing a real accepted order (Codex review
+                # discussion on commit be6b992: "Recover duplicates before
+                # filtering unsafe flush signals"). _process_buy_candidate
+                # itself now enforces the equivalent policy AFTER its
+                # duplicate check: it only ever lets an unsafe decision
+                # through when a confirmed duplicate is recovered, never to
+                # authorize placing a genuinely new order.
+                buy_candidates.append(flush_decision)
             buy_candidates.sort(key=allocation_sort_key)
 
     # Opt-in inverse-Martingale deferred-accumulation sizing mode (off by
@@ -11297,8 +12034,18 @@ def _run_once_impl(
             # reflects that balance) into the estimate so a recovered pending
             # credit that would round up to a real $1 order at execution time
             # is not silently estimated at $0 for tier selection (Codex
-            # review: "Include pending flushes in planned spend").
-            existing_pending_credit_usd = pending_by_ticker.get(d.ticker, 0.0)
+            # review: "Include pending flushes in planned spend"). Restricted
+            # to the afternoon stream, matching the same restriction on
+            # _process_buy_candidate's own read below and the flush-injection
+            # block above: pending_by_ticker is populated for every scheduled
+            # stream (it feeds this same estimate), but folding it into a
+            # 10:30/12:30 tier estimate would apply final-session sizing to a
+            # remainder that has not reached its final session yet (Codex
+            # review discussion on commit f46f29c: "Restrict per-candidate
+            # credit resolution to the afternoon").
+            existing_pending_credit_usd = (
+                pending_by_ticker.get(d.ticker, 0.0) if stream == "afternoon" else 0.0
+            )
             planned_spend += evaluate_top_up_guard(
                 d, prior, config, existing_pending_credit_usd=existing_pending_credit_usd
             ).incremental_order_amount

@@ -2,9 +2,10 @@
 
 Broker orders must be at least one dollar, but the per-ticker model can produce
 an incremental top-up below that amount.  Those increments are *credits*, not
-orders: they accumulate within one trading day, never become negative, and the
-final 3:30 PM ET run closes any positive balance by rounding it up to a whole
-dollar order.
+orders: they accumulate within one trading day and never become negative.  At
+the final 3:30 PM ET run, totals below 50 cents are discarded, totals from 50
+cents through 99 cents become exactly $1, and larger totals retain cent
+precision.
 
 This module deliberately contains only deterministic math.  Stream executors
 remain responsible for their normal price, spread, budget, and broker checks
@@ -16,7 +17,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
-from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any, Optional
 
@@ -196,6 +197,16 @@ class CumulativeCreditLedger:
             decision = apply_cumulative_credit(
                 pending, incremental_credit_usd, final_session=final_session
             )
+            # Track the subset whose provenance is specifically the broker's
+            # minimum-order threshold.  preserve_pending() deliberately does
+            # not contribute here: it is used after spread, budget, duplicate,
+            # tradability, buying-power, review, and placement failures, none
+            # of which the 15:30 minimum-order policy may turn into a buy.
+            minimum_pending = state.setdefault("minimum_order_pending_usd_by_ticker", {})
+            qualifying_before = float(minimum_pending.get(symbol, 0.0))
+            qualifying_decision = apply_cumulative_credit(
+                qualifying_before, incremental_credit_usd, final_session=final_session
+            )
             if rebased and not final_session and decision.order_amount_usd > 0:
                 # The only production call site for the rebase branch above
                 # (morning_dca.py's stays-pending write) is reached ONLY
@@ -224,6 +235,29 @@ class CumulativeCreditLedger:
                     pending_after_usd=total,
                     final_session=final_session,
                 )
+                # The minimum-order-provenance pool must be rebased the exact
+                # same way as the main pending balance above: qualifying_decision
+                # was computed against the same rebase-vulnerable baseline as
+                # the original (now-overridden) `decision`, so leaving it
+                # un-rebased would still treat this call's qualifying
+                # contribution as consumed by an order that this override just
+                # decided will NOT happen (Codex review discussion_r3793071617:
+                # "Preserve minimum provenance after a rebased threshold
+                # crossing" -- e.g. an existing $0.30 plus two concurrently
+                # evaluated $0.10 credits leaves $0.50 pending but no
+                # qualifying ticker without this correction).
+                qualifying_total = round(qualifying_before + float(incremental_credit_usd), 2)
+                qualifying_decision = CumulativeCreditDecision(
+                    pending_before_usd=float(qualifying_before),
+                    incremental_credit_usd=float(incremental_credit_usd),
+                    order_amount_usd=0.0,
+                    pending_after_usd=qualifying_total,
+                    final_session=final_session,
+                )
+            if qualifying_decision.pending_after_usd > 0:
+                minimum_pending[symbol] = qualifying_decision.pending_after_usd
+            else:
+                minimum_pending.pop(symbol, None)
             if decision.pending_after_usd > 0:
                 state["pending_usd_by_ticker"][symbol] = decision.pending_after_usd
             else:
@@ -247,7 +281,13 @@ class CumulativeCreditLedger:
                     "incremental_credit_usd": decision.incremental_credit_usd,
                     "order_amount_usd": decision.order_amount_usd,
                     "pending_after_usd": decision.pending_after_usd,
-                    "decision": "order" if decision.order_amount_usd > 0 else "pending",
+                    "decision": (
+                        "order"
+                        if decision.order_amount_usd > 0
+                        else "discarded"
+                        if final_session and decision.pending_before_usd + decision.incremental_credit_usd > 0
+                        else "pending"
+                    ),
                 }
             )
             day_dir.mkdir(parents=True, exist_ok=True)
@@ -477,6 +517,87 @@ class CumulativeCreditLedger:
                 if float(amount) > 0
             }
 
+    def minimum_order_pending_tickers(self, trading_day: str) -> dict[str, float]:
+        """Return credits deferred solely because they were below broker minimum.
+
+        This provenance-filtered view is the only balance the 15:30 aggregate
+        top-up may flush.  Legacy ledgers without the field fail closed and
+        return no qualifying credits rather than reclassifying unrelated
+        placement blocks as broker-minimum blocks.
+        """
+        day_dir = self.root / trading_day
+        state_path = day_dir / "ledger.json"
+        lock_path = day_dir / "ledger.lock"
+        with cross_process_lock(lock_path):
+            state = self._read_state(state_path, trading_day)
+            return {
+                ticker: float(amount)
+                for ticker, amount in state.get("minimum_order_pending_usd_by_ticker", {}).items()
+                if float(amount) > 0
+            }
+
+    def discard_minimum_order_pending(self, ticker: str, trading_day: str) -> bool:
+        """Forget a sub-threshold minimum-order credit at the final session.
+
+        The caller typically decides to discard based on a balance it read
+        BEFORE acquiring this call's own lock (e.g. the 15:30 final pass's
+        pre-scan of every pending ticker). A concurrent stream can raise that
+        balance to or above the discard threshold in between -- e.g. a
+        stale-baseline ``record()`` retry landing after the scan but before
+        this call's lock. Blindly popping whatever is present under the lock
+        would then silently discard a balance that should have produced an
+        order instead (Codex review discussion on commit 0af4768: "Guard
+        final discards against concurrent credit updates"). Re-check the
+        CURRENT balance, under this call's own lock, against the same
+        final-session discard threshold before clearing it; refuse (and
+        leave the ledger untouched) if it no longer qualifies.
+
+        Returns True if the balance was discarded, False if a concurrent
+        update means the current balance no longer qualifies for discard
+        (nothing is changed in that case -- the balance is left pending for
+        a later, out-of-band reconciliation to resolve).
+        """
+        symbol = ticker.strip().upper()
+        day_dir = self.root / trading_day
+        state_path = day_dir / "ledger.json"
+        lock_path = day_dir / "ledger.lock"
+        with cross_process_lock(lock_path):
+            state = self._read_state(state_path, trading_day)
+            qualifying = state.setdefault("minimum_order_pending_usd_by_ticker", {})
+            amount = float(qualifying.get(symbol, 0.0))
+            if amount <= 0:
+                return True
+            if apply_cumulative_credit(amount, 0.0, final_session=True).order_amount_usd > 0:
+                # The current balance now qualifies for an order -- a
+                # concurrent update raised it since the caller's pre-lock
+                # scan. Do NOT discard; leave both pools untouched so the
+                # money is not silently lost, even though nothing in this
+                # final session will retry it.
+                return False
+            qualifying.pop(symbol, None)
+            pending_before = float(state["pending_usd_by_ticker"].get(symbol, 0.0))
+            pending_after = round(max(0.0, pending_before - amount), 2)
+            if pending_after > 0:
+                state["pending_usd_by_ticker"][symbol] = pending_after
+            else:
+                state["pending_usd_by_ticker"].pop(symbol, None)
+            state["events"].append(
+                {
+                    "ticker": symbol,
+                    "stream": "afternoon",
+                    "recorded_at": None,
+                    "final_session": True,
+                    "pending_before_usd": pending_before,
+                    "incremental_credit_usd": 0.0,
+                    "order_amount_usd": 0.0,
+                    "pending_after_usd": pending_after,
+                    "decision": "discarded",
+                }
+            )
+            day_dir.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
+        return True
+
     def settle(
         self,
         ticker: str,
@@ -533,6 +654,35 @@ class CumulativeCreditLedger:
                 state["pending_usd_by_ticker"][symbol] = pending_after
             else:
                 state["pending_usd_by_ticker"].pop(symbol, None)
+            # minimum_pending and the preserve: entries below are DISJOINT
+            # provenance views of the SAME underlying pending_usd_by_ticker
+            # balance (record() funds minimum_pending, preserve_pending()
+            # funds a preserve: entry -- never both for the same dollar).
+            # `submitted` is therefore one shared budget to partition between
+            # them, not a full independent budget each pool gets to spend on
+            # its own: letting each subtract the FULL submitted amount from
+            # itself, unpartitioned, can settle more total credit across the
+            # two views than was actually submitted (e.g. a $0.40 minimum
+            # credit plus an unrelated $0.80 preserved credit, settled by a
+            # single clamped $1.00 order, would otherwise fully clear BOTH
+            # the $0.40 minimum pool AND the entire $0.80 preserve entry --
+            # $1.20 of credit accounted for against only $1.00 actually
+            # submitted -- silently orphaning the real $0.20 remainder that
+            # stays in pending_usd_by_ticker with no provenance view left
+            # able to explain or retry it. Codex review discussion on commit
+            # 0af4768: "Allocate settlement once across provenance pools".
+            # Pay down minimum_pending FIRST from the shared budget (it is
+            # the pool whose provenance the 15:30 aggregate rule specifically
+            # reads), then spend whatever remains on the preserve entries.
+            minimum_pending = state.setdefault("minimum_order_pending_usd_by_ticker", {})
+            qualifying_before = float(minimum_pending.get(symbol, 0.0))
+            minimum_consumed = round(min(submitted, qualifying_before), 2)
+            qualifying_after = round(max(0.0, qualifying_before - minimum_consumed), 2)
+            if qualifying_after > 0:
+                minimum_pending[symbol] = qualifying_after
+            else:
+                minimum_pending.pop(symbol, None)
+            preserve_budget = round(max(0.0, submitted - minimum_consumed), 2)
             # Every UNCONSUMED preserve() entry for this ticker described a
             # contribution to the balance this settlement is paying out.
             # Mark as many as fit within the submitted amount as fully
@@ -576,12 +726,14 @@ class CumulativeCreditLedger:
             ]
             candidates.sort(key=lambda item: (item[0], item[1]))
             covered = 0.0
-            submitted_rounded = round(submitted, 2)
             for _sequence, _key, cached in candidates:
                 # Cent-precision tolerance: these are all round(x, 2) dollar
                 # amounts, but summing floats can land a hair past the
-                # target (e.g. 0.1 + 0.2 != 0.3 to the last bit).
-                available = round(submitted_rounded - covered, 2)
+                # target (e.g. 0.1 + 0.2 != 0.3 to the last bit). Budgeted
+                # from preserve_budget (submitted minus whatever minimum_
+                # pending already consumed above), not the full submitted
+                # amount -- see the partition comment above minimum_pending.
+                available = round(preserve_budget - covered, 2)
                 if available <= 0:
                     break
                 amount = float(cached.get("incremental_credit_usd", 0.0))
@@ -660,8 +812,10 @@ def apply_cumulative_credit(
     $1 are ordered exactly to the cent.  This permits $1.01, $2.99, and $4.50
     orders while ensuring Robinhood's $1 minimum is always met.
 
-    At the final 3:30 PM ET session, every positive pending total is rounded up
-    to the next whole dollar.  No negative remainder is ever retained.
+    The final 3:30 PM ET session uses the same thresholds: totals below 50
+    cents are discarded, totals below $1 round to exactly $1, and totals of at
+    least $1 are ordered exactly to the cent.  No negative remainder is ever
+    retained.
     """
     pending = _money(pending_usd)
     credit = _money(incremental_credit_usd)
@@ -670,12 +824,9 @@ def apply_cumulative_credit(
     if total == 0:
         order = Decimal("0")
         remaining = Decimal("0")
-    elif final_session:
-        order = total.quantize(Decimal("1"), rounding=ROUND_CEILING)
-        remaining = Decimal("0")
     elif total < ROUND_UP_THRESHOLD_USD:
         order = Decimal("0")
-        remaining = total
+        remaining = Decimal("0") if final_session else total
     elif total < MINIMUM_ORDER_USD:
         order = MINIMUM_ORDER_USD
         remaining = Decimal("0")

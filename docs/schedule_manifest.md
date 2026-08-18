@@ -129,6 +129,34 @@ Feb, Nov, Dec). Re-verify around DST transitions.
 > post-trade slippage / Notion sync runs at **5:00 PM ET daily** (moved
 > 2026-08-02 from 3:35 PM ET). These are two different tasks. Do not merge them
 > or move the live trade off 3:30 PM ET.
+>
+> **3:30 PM minimum-order aggregate top-up rule (added 2026-08-14):** the
+> broker-minimum carry-forward behavior is part of the existing **3:30 PM final
+> live pass**, not a separate 3:33 PM task. During the 15:30 final pass, after
+> normal current-candidate evaluation and before final artifacts, aggregate
+> same-day top-up remainders by ticker when they were not filled earlier only
+> because Robinhood's $1 minimum order size blocked them. If a ticker's
+> aggregate qualifying remainder is **$1.00 or greater**, buy the aggregate
+> remainder amount. If it is **$0.50 to less than $1.00**, round up and buy
+> exactly **$1.00**. If it is **less than $0.50**, forget it for that trading
+> day. This does not convert spread, confidence, budget, duplicate, tradability,
+> or price-reference blocks into buys. It still enforces active whitelist,
+> tradability, account access, buying power, duplicate protection, daily cap,
+> weekly cap, regular-hours-only, buy-only, max-per-order, no
+> `review_equity_order`, and no per-order confirmation. These orders, when
+> placed, are valid 15:30 final-pass orders and must be recorded in the normal
+> 15:30 artifact contract (`run_state.json`, `run_summary.json`, `signals.csv`,
+> `submitted_orders.csv`, `filled_orders.csv`, and raw responses — **not**
+> `validation.csv`, which belongs to the morning preflight flow only). Applies
+> only to `10ce362c`; see `config/scheduled_tasks.json`'s
+> `same_day_top_up_policy.minimum_order_aggregate_topup_1530` for the full rule
+> text, its audit-field contract (`aggregate_minimum_topup_applied` /
+> `_remainder_usd` / `_order_usd` / `_reason`, recorded only on a submitted
+> order), and a documented known gap: qualifying remainders are discovered only
+> through the cumulative sub-dollar credit ledger, not yet reconstructed from
+> other prior-run artifacts or broker order history when a ledger entry is
+> missing (codex review discussion_r3785797973, discussion_r3785797977,
+> discussion_r3785797985, discussion_r3785797988).
 
 > **3:30 PM state-file guarantee:** the live task (`10ce362c`) **always** writes
 > a scheduled `run_state.json` under
@@ -758,6 +786,31 @@ This is the authoritative live schedule. A task that is not in this table is not
 active. Machine-readable source:
 [`config/scheduled_tasks.json`](../config/scheduled_tasks.json) ->
 `canonical_schedule_reconciliation_2026_07_27`.
+
+Temporary live scheduler override, Aug 17 to Aug 24, 2026:
+
+> **CORRECTED 2026-08-18 (codex review discussion_r3796958124 and its
+> follow-up on discussion_r3804641603-series):** the bullets below originally
+> claimed `bb4f6ef1` was a distinct, purely-readiness 9:15 AM task safe to
+> remove for a week. It is not. The very next table row (9:45 AM) identifies
+> `bb4f6ef1` as the canonical morning DCA watchlist scan, which also runs
+> the required pre-flight writer `MorningDCAExecutor._apply_preflight_gate()`
+> fails closed on. Removing `bb4f6ef1` risks suppressing every 10:30 AM live
+> buy (`42173154`) until `5cc41080` restores it on Aug 24 -- the opposite of
+> "does not change or disable live buy tasks" below. See
+> `config/scheduled_tasks.json`'s
+> `temporary_live_scheduler_overrides.pause_2026_08_17_0915_prevalidation.correction_2026_08_18`
+> for the full corrected status and required operator action. The bullets
+> below are preserved verbatim for audit history; do not act on them as
+> written. If a genuinely distinct 9:15 AM readiness task exists in the live
+> scheduler under a different ID, this note must be updated with that ID
+> instead of `bb4f6ef1`, and the 09:45/preflight risk noted here withdrawn.
+
+- The read-only 9:15 AM morning DCA pre-validation readiness scan was paused for one week at the user's request after the Aug 17 morning run.
+- The recurring 9:15 task ID `bb4f6ef1` was removed from the live scheduler on Aug 17.
+- One-time restore task `5cc41080` is scheduled for Aug 24, 2026 at 9:00 AM ET to recreate the 9:15 read-only task before the next 9:15 window.
+- This does not change or disable live buy tasks. The 9:35, 10:30, 11:30, 12:30, 1:30, 2:30, and 3:30 buy tasks remain self-contained and must run their own account, quote, tradability, spread, data-confidence, top-up, budget, whitelist, buy-only, and regular-hours checks.
+- During the pause, missing 9:15 artifacts are readiness context only. They must not be treated as failed buy evidence or as a reason for the live buy tasks to skip.
 
 | ET | Task | ID | Cadence | Cron (UTC) | Trades | Status |
 |---|---|---|---|---|---|---|

@@ -36,18 +36,90 @@ def test_qualified_orders_keep_cent_precision_above_the_minimum(credit):
     assert decision.pending_after_usd == 0.0
 
 
-def test_final_330_pm_session_rounds_every_positive_pending_balance_up():
+def test_final_330_pm_session_keeps_exact_amount_above_minimum():
     decision = apply_cumulative_credit(3.30, 0.0, final_session=True)
 
-    assert decision.order_amount_usd == 4.0
+    assert decision.order_amount_usd == 3.30
     assert decision.pending_after_usd == 0.0
 
 
-def test_final_330_pm_session_flushes_even_a_tiny_positive_credit():
-    decision = apply_cumulative_credit(0.01, 0.0, final_session=True)
+@pytest.mark.parametrize("credit", [0.01, 0.30, 0.49])
+def test_final_330_pm_session_discards_sub_fifty_cent_credit(credit):
+    decision = apply_cumulative_credit(credit, 0.0, final_session=True)
+
+    assert decision.order_amount_usd == 0.0
+    assert decision.pending_after_usd == 0.0
+
+
+@pytest.mark.parametrize("credit", [0.50, 0.80, 0.99])
+def test_final_330_pm_session_rounds_only_sub_dollar_qualified_credit(credit):
+    decision = apply_cumulative_credit(credit, 0.0, final_session=True)
 
     assert decision.order_amount_usd == 1.0
     assert decision.pending_after_usd == 0.0
+
+
+def test_minimum_order_pending_view_excludes_unrelated_placement_blocks(tmp_path):
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.record("minimum", "2026-08-03", 0.30, idempotency_key="slot-1")
+    ledger.preserve_pending("spread", "2026-08-03", 0.80, idempotency_key="slot-1")
+
+    assert ledger.pending_tickers("2026-08-03") == {"MINIMUM": 0.30, "SPREAD": 0.80}
+    assert ledger.minimum_order_pending_tickers("2026-08-03") == {"MINIMUM": 0.30}
+
+
+def test_discard_minimum_order_pending_clears_a_genuinely_sub_threshold_balance(tmp_path):
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.record("XYZ", "2026-08-12", 0.20, stream="morning")
+
+    discarded = ledger.discard_minimum_order_pending("XYZ", "2026-08-12")
+
+    assert discarded is True
+    assert ledger.minimum_order_pending_tickers("2026-08-12") == {}
+    assert ledger.pending_usd("XYZ", "2026-08-12") == 0.0
+    assert ledger.events("2026-08-12")[-1]["decision"] == "discarded"
+
+
+def test_discard_minimum_order_pending_refuses_when_a_concurrent_update_qualifies_it(
+    tmp_path,
+):
+    # Codex review discussion on commit 0af4768 ("Guard final discards
+    # against concurrent credit updates"): the caller (the 15:30 final
+    # pass's pre-scan) can decide to discard a ticker based on a balance it
+    # read BEFORE acquiring this call's own lock. If a concurrent stream's
+    # record() call raises the CURRENT balance to or above the discard
+    # threshold in between, blindly popping whatever is present under the
+    # lock would silently discard real money that should have produced an
+    # order instead. This must re-check the current balance under its own
+    # lock and refuse to discard when it no longer qualifies.
+    # Reach a $0.50 minimum-pending balance the SAME way
+    # test_record_rebase_preserves_minimum_order_provenance_after_threshold_crossing
+    # does: a rebased record() call that crosses the order threshold but gets
+    # overridden back to "stays fully pending" because its caller already
+    # committed, from a staler baseline, to placing no order this call. That
+    # is precisely the kind of concurrent update that can land between the
+    # 15:30 final pass's pre-lock scan (which would have observed a smaller,
+    # sub-threshold amount) and this call's own lock.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.record("XYZ", "2026-08-13", 0.30, stream="s0")
+    stale_baseline = ledger.pending_usd("XYZ", "2026-08-13")
+    ledger.record("XYZ", "2026-08-13", 0.10, stream="s-concurrent")
+    ledger.record(
+        "XYZ",
+        "2026-08-13",
+        0.10,
+        idempotency_key="slot-b",
+        pending_baseline_usd=stale_baseline,
+        stream="s-b",
+    )
+    assert ledger.minimum_order_pending_tickers("2026-08-13") == {"XYZ": 0.50}
+
+    discarded = ledger.discard_minimum_order_pending("XYZ", "2026-08-13")
+
+    assert discarded is False
+    # Nothing was touched -- the now-qualifying $0.50 balance survives.
+    assert ledger.minimum_order_pending_tickers("2026-08-13") == {"XYZ": 0.50}
+    assert ledger.pending_usd("XYZ", "2026-08-13") == 0.50
 
 
 def test_ledger_persists_pending_balance_and_auditable_events(tmp_path):
@@ -59,7 +131,7 @@ def test_ledger_persists_pending_balance_and_auditable_events(tmp_path):
     )
 
     assert first.pending_after_usd == 0.49
-    assert final.order_amount_usd == 1.0
+    assert final.order_amount_usd == 0.0
     assert final.pending_after_usd == 0.0
     assert ledger.events("2026-08-03") == [
         {
@@ -80,9 +152,9 @@ def test_ledger_persists_pending_balance_and_auditable_events(tmp_path):
             "final_session": True,
             "pending_before_usd": 0.49,
             "incremental_credit_usd": 0.0,
-            "order_amount_usd": 1.0,
+            "order_amount_usd": 0.0,
             "pending_after_usd": 0.0,
-            "decision": "order",
+            "decision": "discarded",
         },
     ]
 
@@ -515,3 +587,86 @@ def test_record_rebase_never_crosses_the_order_threshold_on_its_own(tmp_path):
     assert decision.order_amount_usd == 0.0
     assert decision.pending_after_usd == 0.60
     assert ledger.pending_usd("xyz", "2026-08-03") == 0.60
+
+
+def test_record_rebase_preserves_minimum_order_provenance_after_threshold_crossing(
+    tmp_path,
+):
+    # Codex review discussion_r3793071617 ("Preserve minimum provenance after
+    # a rebased threshold crossing"): the broker-minimum-provenance pool
+    # (minimum_order_pending_tickers, the ONLY balance the 15:30 aggregate
+    # top-up rule may flush) must be rebased exactly like the main pending
+    # balance above it. Before the fix, the un-rebased qualifying_decision was
+    # computed against the SAME threshold-crossing baseline as the original
+    # (soon-to-be-overridden) decision, so it popped the ticker from
+    # minimum_pending as though an order had consumed it -- even though the
+    # override just decided no order will actually happen this call.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.record("XYZ", "2026-08-10", 0.30, stream="s0")
+    assert ledger.minimum_order_pending_tickers("2026-08-10") == {"XYZ": 0.30}
+
+    # slot-b's pre-lock snapshot of the balance, captured before the
+    # concurrent $0.10 update just below.
+    stale_baseline = ledger.pending_usd("XYZ", "2026-08-10")
+    assert stale_baseline == 0.30
+
+    # A concurrent, unrelated $0.10 broker-minimum-blocked credit lands for
+    # the same ticker after slot-b's snapshot but before slot-b's record()
+    # call below.
+    ledger.record("XYZ", "2026-08-10", 0.10, stream="s-concurrent")
+    assert ledger.pending_usd("XYZ", "2026-08-10") == 0.40
+    assert ledger.minimum_order_pending_tickers("2026-08-10") == {"XYZ": 0.40}
+
+    # slot-b retries with its own fresh $0.10 decline, using the now-stale
+    # pre-lock baseline. Rebased atomically inside the lock, the combined
+    # total ($0.40 + $0.10 = $0.50) crosses the round-up-to-$1 threshold on
+    # its own -- but slot-b's caller (morning_dca.py's stays-pending write)
+    # never inspects the return value, so record() must keep the full total
+    # pending instead of silently creating an order nobody will submit.
+    decision = ledger.record(
+        "XYZ",
+        "2026-08-10",
+        0.10,
+        idempotency_key="slot-b",
+        pending_baseline_usd=stale_baseline,
+        stream="s-b",
+    )
+
+    assert decision.order_amount_usd == 0.0
+    assert decision.pending_after_usd == 0.50
+    assert ledger.pending_usd("XYZ", "2026-08-10") == 0.50
+    # The $0.50 that stayed pending must still be visible through the
+    # broker-minimum-provenance pool -- not silently dropped as though an
+    # order had already consumed it -- since it is the ONLY balance the
+    # 15:30 final pass's aggregate top-up rule may flush.
+    assert ledger.minimum_order_pending_tickers("2026-08-10") == {"XYZ": 0.50}
+
+
+def test_settle_partitions_the_submitted_amount_across_provenance_pools(tmp_path):
+    # Codex review discussion on commit 0af4768 ("Allocate settlement once
+    # across provenance pools"): minimum_pending and a preserve: entry are
+    # DISJOINT provenance views of the SAME pending_usd_by_ticker balance.
+    # A $0.40 minimum-order credit plus an unrelated $0.80 preserved credit
+    # ($1.20 total pending) settled by a single clamped $1.00 order must
+    # partition that $1.00 between the two views, not let each independently
+    # subtract the full $1.00 from itself -- otherwise $1.20 of credit gets
+    # accounted for against only $1.00 actually submitted, and the genuinely
+    # outstanding $0.20 remainder becomes invisible to both provenance views
+    # even though it is still sitting in the main pending balance.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.record("XYZ", "2026-08-11", 0.40, stream="morning")
+    ledger.preserve_pending("XYZ", "2026-08-11", 0.80, idempotency_key="slot-1")
+    assert ledger.pending_usd("XYZ", "2026-08-11") == 1.20
+    assert ledger.minimum_order_pending_tickers("2026-08-11") == {"XYZ": 0.40}
+
+    ledger.settle("XYZ", "2026-08-11", 1.0, stream="afternoon")
+
+    # The main balance correctly retains the genuine $0.20 remainder.
+    assert ledger.pending_usd("XYZ", "2026-08-11") == 0.20
+    # The minimum pool is fully paid ($0.40 < the $1.00 budget) -- correct.
+    assert ledger.minimum_order_pending_tickers("2026-08-11") == {}
+    # Only $0.60 of the $1.00 budget remains after the minimum pool's $0.40,
+    # so the $0.80 preserved entry is only PARTIALLY consumed: $0.20 of it
+    # must remain genuinely outstanding and retriable, not fully consumed.
+    assert ledger.preserved_credit_for_slot("XYZ", "2026-08-11", "slot-1") == 0.20
+    assert ledger.recorded_decision("XYZ", "2026-08-11", "slot-1") is None
