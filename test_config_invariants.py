@@ -1387,6 +1387,40 @@ def _prompt_text(filename: str) -> str:
     return (PROMPTS_DIR / filename).read_text(encoding="utf-8")
 
 
+def _midday_live_mirror_text() -> str:
+    return (
+        PROMPTS_DIR / "live-mirror" / "1230ET-1230-pm-midday-buying-run.txt"
+    ).read_text(encoding="utf-8")
+
+
+def test_midday_live_mirror_opens_with_placement_off_fallback():
+    prefix = _midday_live_mirror_text()[:1_500]
+    assert prefix.startswith("STANDING GATE 5 OVERRIDE")
+    assert "Live placement (Gate 7) is OFF unconditionally" in prefix
+    assert "(1) IN-APP MESSAGE CENTER" in prefix
+    assert "(2) best-effort REPO ALERT FILE" in prefix
+    assert "(3) EMAIL DRAFT" in prefix
+
+
+def test_midday_live_mirror_normalizes_broker_notionals_before_orders():
+    text = _midday_live_mirror_text()
+    assert "def _to_notional(v):" in text
+
+    start = 0
+    found = 0
+    while True:
+        idx = text.find("r.BrokerOrder(", start)
+        if idx == -1:
+            break
+        window = text[idx : idx + 800]
+        assert "'dollar_amount': _to_notional(d['dollar_amount'])" in window
+        assert "'executed_dollar_amount': _to_notional(d['executed_dollar_amount'])" in window
+        found += 1
+        start = idx + 1
+
+    assert found >= 1
+
+
 def test_seven_executor_prompt_files_all_exist():
     missing = [f for f in _SLOT_FILES if not (PROMPTS_DIR / f).is_file()]
     assert not missing, f"missing executor prompt files: {missing}"

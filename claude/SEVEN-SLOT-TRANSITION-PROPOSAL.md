@@ -449,33 +449,26 @@ third-executor collision), while a ticker newly reclassified as `.compatible` si
 excluded from the candidate set the resubmitted plan is built from, letting the rest of the batch
 — cap-boundary promotions and all — proceed correctly.
 
-**A THIRD gap remains even with all of the above, and this one genuinely does need
+**A prior draft of this section claimed a THIRD gap here that genuinely needed
 `execute_plan()` itself to change (Codex review: "Filter fresh compatible orders inside
-execute_plan").** The caller's rebuild above runs BEFORE `execute_plan()` is called, against
-whatever `orders` snapshot the caller fetched. `execute_plan()`'s own internal Gate 4 rerun
-fetches `orders` freshly, immediately before submitting -- strictly later than the caller's
-snapshot. A compatible order that lands in exactly that gap (after the caller's rebuild, before
-`execute_plan()`'s internal fetch) is invisible to the caller's filtered `candidates`, so that
-ticker is still sitting in both the submitted `plan.to_place` and the `candidates` argument
-`execute_plan()` uses to rebuild `expected_plan`. `execute_plan()`'s internal
-`gate_sole_executor()` call correctly classifies the new row as `.compatible` rather than
-`.rogue` (with `compatible_placed_agent_values` threaded through, per above), so `__bool__` stays
-falsy and the whole-batch abort does not fire -- but nothing removes that newly-covered ticker
-from `expected_plan`'s own candidate set, because `expected_plan` is rebuilt from the SAME stale
-`candidates` the caller passed in, and the internal Gate 4 rerun's result is only ever checked for
-truthiness, never fed back into filtering. `plan.to_place` and `expected_plan.to_place` are
-therefore still equal -- both stale in the same way -- so the consistency check passes and the
-batch submits a duplicate order for a ticker `execute_plan()` itself just proved is covered. The
-caller-side rebuild in the two sections above closes the gap between the CALLER's own Gate 4
-snapshot and its own rebuild; it cannot close a gap that only exists BETWEEN the caller's snapshot
-and `execute_plan()`'s own later, internal fetch, because the caller has no way to act on
-information `execute_plan()` doesn't discover until after the caller has already returned control
-to it. Closing this for real needs `execute_plan()`'s internal Gate 4 rerun to feed its own
-`.compatible_tickers` back into the `candidates` it uses to build `expected_plan` (excluding them
-the same way the caller does above, using the SAME `plan_orders()` call), not merely to gate
-`__bool__`. That is a real, if narrow, code change to `execute_plan()` itself, contradicting this
-section's earlier claim that closing this scenario needs no such change -- this narrower race is
-the residual case that claim does not cover.
+execute_plan"). That claim rested on a false premise and has been corrected (Codex review: "Do
+not assume execute_plan refetches order history").** `execute_plan()` has no fetch callable of
+its own: its "internal Gate 4 rerun" only reruns `gate_sole_executor()` against whatever `orders`
+iterable the CALLER passes as the `orders` argument (materialized once via `orders = list(orders)`
+in `dca_runner.py`), the exact same object the caller already used for its own rebuild above --
+there is no independent, later fetch happening inside `execute_plan()` for a compatible order to
+land in the gap before. Consequently, no order that lands after the caller's own snapshot can ever
+appear inside `execute_plan()`'s rerun UNLESS the caller itself fetches a second, fresher snapshot
+and passes THAT to `execute_plan()` instead of the one it filtered `candidates` against. If the
+caller does exactly that -- re-fetches once more immediately before calling `execute_plan()` -- it
+can close this residual gap entirely on the caller's own side, with no `execute_plan()` code
+change required: repeat the SAME `.compatible`/`.rogue` filter-and-rebuild step (per the two
+sections above) against that final fetch, and pass that identical final `orders` snapshot to
+`execute_plan()` as well, so the caller's own `candidates`/`plan.to_place` and `execute_plan()`'s
+internally-rebuilt `expected_plan` are deterministic functions of the SAME data by construction.
+The residual risk this leaves is only the ordinary one already acknowledged elsewhere in this
+proposal: an order landing in the (bounded, freshness-checked) interval between that final fetch
+and the actual broker submission, not a distinct gap requiring new `execute_plan()` machinery.
 
 **Explicitly out of scope for this proposal:** migrating the six existing prompts from their
 working prose version to this new function parameter. They function correctly today; touching

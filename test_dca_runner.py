@@ -9217,3 +9217,206 @@ def test_assess_reports_the_count_cap_and_the_ticker_rule_in_its_verdict():
     assert r["budget"]["max_orders_per_day"] == dca_runner.MAX_ORDERS_PER_DAY
     assert r["budget"]["one_order_per_ticker_per_day"] is False
     assert r["budget"]["day_order_count"] == 0
+
+
+def test_plan_orders_accepts_complete_per_ticker_calibration():
+    """A valid calibrated tier must not be checked against the global curve."""
+    candidate = dca_runner.Candidate(
+        "TRIN", 5.0, multiplier=5.0, drop_pct=3.1,
+        sizing_base_usd=1.0, sizing_min_drop_pct=3.0727, sizing_max_drop_pct=None,
+    )
+    snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
+    plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
+    assert [(order.ticker, order.amount_usd) for order in plan.to_place] == [("TRIN", 5.0)]
+    assert plan.refused == []
+
+
+def test_plan_orders_refuses_partial_per_ticker_calibration():
+    candidate = dca_runner.Candidate("TRIN", 10.0, multiplier=5.0, drop_pct=3.1, sizing_base_usd=2.0)
+    snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
+    plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
+    assert plan.to_place == []
+    assert plan.refused == [("TRIN", dca_runner.REFUSED_INCONSISTENT_MULTIPLIER)]
+
+
+def test_plan_orders_refuses_calibration_not_bound_to_ticker_config():
+    candidate = dca_runner.Candidate(
+        "AAPL", 9.0, multiplier=3.0, drop_pct=3.0,
+        sizing_base_usd=3.0, sizing_min_drop_pct=2.0, sizing_max_drop_pct=4.0,
+    )
+    snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
+    plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
+    assert plan.to_place == []
+    assert plan.refused == [("AAPL", dca_runner.REFUSED_INCONSISTENT_MULTIPLIER)]
+
+
+def test_plan_orders_refuses_calibration_for_a_fallback_ticker():
+    """A ticker listed in per_ticker_sizing.json's fallback_tickers is sized
+    off the global ladder; its own (stale) tickers[] entry is not
+    authoritative and must not validate calibration evidence."""
+    sizing = dca_runner._read_config("per_ticker_sizing.json")
+    fallback_ticker = sizing["fallback_tickers"][0]
+    ticker_sizing = sizing["tickers"][fallback_ticker]
+    tier = ticker_sizing["tiers"][0]
+    candidate = dca_runner.Candidate(
+        fallback_ticker, ticker_sizing["base_amount_usd"] * tier["multiplier"],
+        multiplier=tier["multiplier"], drop_pct=tier["min_drop_pct"],
+        sizing_base_usd=ticker_sizing["base_amount_usd"],
+        sizing_min_drop_pct=tier["min_drop_pct"], sizing_max_drop_pct=None,
+    )
+    snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
+    plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
+    assert plan.to_place == []
+    assert plan.refused == [(fallback_ticker, dca_runner.REFUSED_INCONSISTENT_MULTIPLIER)]
+
+
+def test_plan_orders_refuses_oversized_calibration_integer_instead_of_crashing():
+    """math.isfinite(10**1000) raises OverflowError; a persisted JSON
+    integer can be arbitrarily large, and the per-candidate refusal must
+    survive that rather than aborting the whole plan_orders() call."""
+    candidate = dca_runner.Candidate(
+        "TRIN", 5.0, multiplier=5.0, drop_pct=3.1,
+        sizing_base_usd=10**1000, sizing_min_drop_pct=3.0727, sizing_max_drop_pct=None,
+    )
+    snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
+    plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
+    assert plan.to_place == []
+    assert plan.refused == [("TRIN", dca_runner.REFUSED_INCONSISTENT_MULTIPLIER)]
+
+
+def test_candidate_multiplier_notional_mismatch_refuses_an_oversized_amount_usd():
+    """math.isfinite(10**1000) raises OverflowError; an astronomically
+    large amount_usd must fail closed the same way an oversized
+    calibration value already does, rather than escaping uncaught."""
+    candidate = dca_runner.Candidate("AAPL", 10**1000, multiplier=1.0, drop_pct=1.0)
+    assert dca_runner._candidate_multiplier_notional_mismatch(candidate) is True
+
+
+def test_plan_orders_refuses_an_oversized_amount_usd_instead_of_crashing():
+    candidate = dca_runner.Candidate("AAPL", 10**1000, multiplier=1.0, drop_pct=1.0)
+    snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
+    plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
+    assert plan.to_place == []
+    assert len(plan.refused) == 1
+    assert plan.refused[0][0] == "AAPL"
+
+
+def test_plan_orders_keeps_kill_switch_capped_calibrated_candidate_eligible():
+    """dca_risk.apply_risk_guard can cap a deep-drop calibrated signal down
+    to the floor multiplier while the candidate keeps its real, deep
+    drop_pct -- the floor tier's own finite upper bound must not refuse it."""
+    candidate = dca_runner.Candidate(
+        "TRIN", 1.0, multiplier=1.0, drop_pct=5.0,
+        sizing_base_usd=1.0, sizing_min_drop_pct=0.1185, sizing_max_drop_pct=0.5585,
+    )
+    snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
+    plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
+    assert [(order.ticker, order.amount_usd) for order in plan.to_place] == [("TRIN", 1.0)]
+    assert plan.refused == []
+
+
+def test_plan_orders_refuses_a_sub_threshold_drop_for_a_capped_minimum_calibrated_multiplier():
+    """The floor's own LOWER bound is still enforced even for a capped
+    candidate -- the kill-switch only ever caps a genuine buy signal down to
+    the floor, it never fabricates one."""
+    candidate = dca_runner.Candidate(
+        "TRIN", 1.0, multiplier=1.0, drop_pct=0.05,
+        sizing_base_usd=1.0, sizing_min_drop_pct=0.1185, sizing_max_drop_pct=0.5585,
+    )
+    snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
+    plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
+    assert plan.to_place == []
+    assert plan.refused == [("TRIN", dca_runner.REFUSED_INCONSISTENT_MULTIPLIER)]
+
+
+def test_plan_orders_accepts_a_reduced_same_day_topup_calibrated_amount():
+    """scripts/same_day_top_up_gate.py (Gate 6.5) can shrink buy_usd below
+    the full calibrated allocation while the candidate still carries its
+    original sizing evidence; the full-allocation product is a ceiling, not
+    an exact target."""
+    candidate = dca_runner.Candidate(
+        "TRIN", 3.0, multiplier=5.0, drop_pct=3.5,
+        sizing_base_usd=1.0, sizing_min_drop_pct=3.0727, sizing_max_drop_pct=None,
+    )
+    snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
+    plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
+    assert [(order.ticker, order.amount_usd) for order in plan.to_place] == [("TRIN", 3.0)]
+    assert plan.refused == []
+
+
+def test_plan_orders_still_refuses_a_calibrated_amount_above_the_full_allocation_ceiling():
+    candidate = dca_runner.Candidate(
+        "TRIN", 6.0, multiplier=5.0, drop_pct=3.5,
+        sizing_base_usd=1.0, sizing_min_drop_pct=3.0727, sizing_max_drop_pct=None,
+    )
+    snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
+    plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
+    assert plan.to_place == []
+    assert plan.refused == [("TRIN", dca_runner.REFUSED_INCONSISTENT_MULTIPLIER)]
+
+
+def test_parse_candidate_rows_preserves_calibration_fields_on_a_prebuilt_candidate():
+    """_parse_candidate_rows() must carry sizing_base_usd/sizing_min_drop_pct/
+    sizing_max_drop_pct through, not just ticker/amount/multiplier/drop_pct --
+    both assess() and execute_plan() route Candidate rows through this
+    parser, so dropping the evidence there rejects the same calibrated
+    candidate plan_orders() accepts directly."""
+    candidate = dca_runner.Candidate(
+        "TRIN", 5.0, multiplier=5.0, drop_pct=3.1,
+        sizing_base_usd=1.0, sizing_min_drop_pct=3.0727, sizing_max_drop_pct=None,
+    )
+    parsed = dca_runner._parse_candidate_rows([candidate])
+    assert parsed == [candidate]
+
+
+def test_assess_accepts_a_calibrated_candidate_carried_through_parsing():
+    r = dca_runner.assess(**_clean_kwargs(
+        candidates=[dca_runner.Candidate(
+            "TRIN", 5.0, multiplier=5.0, drop_pct=3.1,
+            sizing_base_usd=1.0, sizing_min_drop_pct=3.0727, sizing_max_drop_pct=None,
+        )],
+    ))
+    assert r["verdict"] == "PROCEED"
+    assert [o["ticker"] for o in r["plan"]["to_place"]] == ["TRIN"]
+    assert not any(reason == dca_runner.REFUSED_INCONSISTENT_MULTIPLIER
+                   for _, reason in r["plan"]["refused"])
+
+
+def test_plan_orders_accepts_a_configured_ticker_with_complete_calibration_evidence():
+    """Same DFTX candidate as above, but with the real calibration evidence
+    supplied and an actually-qualifying drop, must still be accepted."""
+    candidate = dca_runner.Candidate(
+        "DFTX", 5.0, multiplier=5.0, drop_pct=11.5,
+        sizing_base_usd=1.0, sizing_min_drop_pct=11.0446, sizing_max_drop_pct=None,
+    )
+    snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
+    plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
+    assert [(order.ticker, order.amount_usd) for order in plan.to_place] == [("DFTX", 5.0)]
+    assert plan.refused == []
+
+
+def test_plan_orders_refuses_a_calibrated_topup_below_the_broker_minimum():
+    """config/per_ticker_sizing.json's minimum_order_usd is $1.00 --
+    docs/dca_operational_todos.md records Robinhood actually rejecting a
+    same-day top-up below the broker's own minimum order size. A reduced
+    top-up must be refused here, not forwarded to native placement."""
+    candidate = dca_runner.Candidate(
+        "TRIN", 0.50, multiplier=5.0, drop_pct=3.5,
+        sizing_base_usd=1.0, sizing_min_drop_pct=3.0727, sizing_max_drop_pct=None,
+    )
+    snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
+    plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
+    assert plan.to_place == []
+    assert plan.refused == [("TRIN", dca_runner.REFUSED_INCONSISTENT_MULTIPLIER)]
+
+
+def test_estimated_multiplier_trusts_a_reduced_calibrated_topup():
+    """A same-day top-up reduced below the full calibrated allocation (e.g.
+    a TRIN 5x buy shrunk from $5 to $3 by Gate 6.5) must still report its
+    real 5x multiplier for tier counting and allocation priority, not fall
+    back to a plain notional-division estimate that undercounts it."""
+    candidate = dca_runner.Candidate(
+        "TRIN", 3.0, multiplier=5.0, drop_pct=3.5,
+        sizing_base_usd=1.0, sizing_min_drop_pct=3.0727, sizing_max_drop_pct=None,
+    )
+    assert dca_runner._estimated_multiplier(candidate) == 5.0

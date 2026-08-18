@@ -13,7 +13,10 @@ one, so the history stays intact.
 | `2026-07-17-live-reliability/` | Reliability fixes applied 2026-07-17 to align the version-controlled schedule manifest with live scheduler state for the three pre-authorized live tasks. |
 | `2026-07-23-live-reliability-fixes/` | Supersedes the 2026-06-29 audit's schedule/stream assumptions: records the switch from the single `ce16ba6b` task to four Robinhood-only scheduled streams plus a read-only monitor, and a same-day recovery changelog. |
 
-None of these folders are on the live buy path — see `docs/reliability_spec.md` and
-`docs/run_classification.md` for the code that actually gates and classifies runs today. Per
-the AGENTS.md secrets policy, no analysis file names the live account number; redact it the
-same way if you add a new one.
+None of these folders are on the live buy path — see `docs/live_wiring.md` and
+`docs/run_classification.md` for the code that actually gates and classifies runs today.
+`docs/reliability_spec.md` documents a related set of reliability engines, but its own
+implementation-status matrix (§10) marks them "implemented, tested — engine only," not yet
+wired into the live decision path; treat it as a pending-integration design, not a description
+of what currently governs a run. Per the AGENTS.md secrets policy, no analysis file names the
+live account number; redact it the same way if you add a new one.

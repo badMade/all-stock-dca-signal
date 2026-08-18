@@ -1161,6 +1161,12 @@ class Candidate:
     # caller has it. Used only as the second-tier allocation priority (Codex
     # review: "Apply the configured allocation priority before cap checks").
     drop_pct: float | None = None
+    # Optional producer-supplied calibration evidence.  When present as a
+    # complete set, planner consistency is checked against this ticker's
+    # selected base and tier bounds rather than the global fallback ladder.
+    sizing_base_usd: float | None = None
+    sizing_min_drop_pct: float | None = None
+    sizing_max_drop_pct: float | None = None
 
 
 def _normalize_ticker(ticker: object) -> str:
@@ -1349,6 +1355,106 @@ def _candidate_drop_mismatches_claimed_multiplier(cand: Candidate) -> bool:
     return max_drop_pct is not None and cand.drop_pct >= max_drop_pct
 
 
+def _calibration_fields_well_formed(cand: Candidate) -> bool:
+    """True when ``cand``'s three calibration fields are individually
+    well-formed: present as a complete set, numeric (not bool), finite, and
+    internally ordered (``0 <= sizing_min_drop_pct < sizing_max_drop_pct``
+    when a max is given). Does NOT check ``cand.multiplier`` or bind the
+    evidence to any ticker's configured curve -- see
+    :func:`_configured_calibration_bounds` for that. Shared by
+    :func:`_candidate_multiplier_notional_mismatch` (refusal) and
+    :func:`_candidate_calibrated_multiplier_is_consistent` (tier-counting
+    trust) so the two never drift on what counts as well-formed evidence.
+    """
+    if cand.sizing_base_usd is None or cand.sizing_min_drop_pct is None:
+        return False
+    calibration = (cand.sizing_base_usd, cand.sizing_min_drop_pct, cand.sizing_max_drop_pct)
+    numeric = [value for value in calibration if value is not None]
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in numeric):
+        return False
+    try:
+        # A persisted JSON integer can be arbitrarily large, and
+        # math.isfinite(10**1000) raises OverflowError rather than
+        # returning False (Codex review: "Convert oversized calibration
+        # integers into a refusal").
+        if any(not math.isfinite(value) for value in numeric):
+            return False
+    except OverflowError:
+        return False
+    if cand.sizing_base_usd <= 0 or cand.sizing_min_drop_pct < 0:
+        return False
+    return not (cand.sizing_max_drop_pct is not None and cand.sizing_max_drop_pct <= cand.sizing_min_drop_pct)
+
+
+def _configured_calibration_bounds(
+    ticker: object, multiplier: float
+) -> tuple[set[float], float, float | None, float] | None:
+    """``(configured_bases, configured_min_drop_pct, configured_max_drop_pct,
+    minimum_order_usd)`` for ``ticker``'s active per-ticker curve at
+    ``multiplier``, or ``None`` if the ticker has no active calibrated curve
+    (unconfigured, listed in ``fallback_tickers``, or the config can't be
+    read/parsed) or ``multiplier`` doesn't match one of its configured
+    tiers. Candidate rows are external evidence, not configuration -- both
+    callers below bind a candidate's claimed sizing to THIS ticker's real,
+    active curve rather than trusting any internally-consistent-looking
+    value.
+    """
+    try:
+        sizing = _read_config("per_ticker_sizing.json")
+        normalized = _normalize_ticker(ticker)
+        if normalized in sizing.get("fallback_tickers", ()):
+            return None
+        ticker_sizing = sizing["tickers"][normalized]
+        configured_bases = {
+            float(ticker_sizing["base_amount_usd"]),
+            float(ticker_sizing["base_amount_below_close_usd"]),
+        }
+        tiers = ticker_sizing["tiers"]
+        configured_tier = next(tier for tier in tiers if float(tier["multiplier"]) == multiplier)
+        tier_index = tiers.index(configured_tier)
+        configured_min = float(configured_tier["min_drop_pct"])
+        configured_max = (
+            float(tiers[tier_index + 1]["min_drop_pct"])
+            if tier_index + 1 < len(tiers)
+            else None
+        )
+        minimum_order_usd = float(sizing["minimum_order_usd"])
+    except (KeyError, TypeError, ValueError, StopIteration, OSError, json.JSONDecodeError):
+        return None
+    return configured_bases, configured_min, configured_max, minimum_order_usd
+
+
+def _candidate_calibrated_multiplier_is_consistent(cand: Candidate) -> bool:
+    """True if ``cand``'s calibration evidence, when complete, makes
+    ``cand.multiplier`` trustworthy for tier counting and allocation
+    priority.
+
+    Mirrors :func:`_candidate_multiplier_notional_mismatch`'s calibrated
+    structural checks (complete well-formed fields, bound to the ticker's
+    active configured tier, notional at or below the full ceiling) but does
+    NOT require ``drop_pct`` consistency, matching
+    :func:`_candidate_multiplier_is_consistent`'s own notional-only trust
+    condition for the global ladder -- callers here (``_estimated_multiplier``)
+    need only a trustworthy MULTIPLIER, not full candidate validity (Codex
+    review: "Preserve calibrated multipliers for reduced top-ups").
+    """
+    if cand.multiplier is None or not math.isfinite(cand.multiplier) or cand.multiplier <= 0:
+        return False
+    if not _calibration_fields_well_formed(cand):
+        return False
+    if not math.isfinite(cand.amount_usd) or cand.amount_usd <= 0:
+        return False
+    bounds = _configured_calibration_bounds(cand.ticker, cand.multiplier)
+    if bounds is None:
+        return False
+    configured_bases, configured_min, configured_max, _minimum_order_usd = bounds
+    if cand.sizing_base_usd not in configured_bases:
+        return False
+    if cand.sizing_min_drop_pct != configured_min or cand.sizing_max_drop_pct != configured_max:
+        return False
+    return _cents(cand.amount_usd) <= _cents(cand.sizing_base_usd * cand.multiplier)
+
+
 def _candidate_multiplier_notional_mismatch(cand: Candidate) -> bool:
     """True when ``cand.amount_usd`` cannot be trusted as a real ladder allocation.
 
@@ -1388,8 +1494,85 @@ def _candidate_multiplier_notional_mismatch(cand: Candidate) -> bool:
     candidate outright over bad metadata alone would discard a real,
     correctly-sized buy.
     """
-    if not math.isfinite(cand.amount_usd):
-        return False
+    try:
+        # A persisted JSON integer can be arbitrarily large, and
+        # math.isfinite(10**1000) raises OverflowError rather than
+        # returning False -- an astronomically large amount_usd must fail
+        # closed the same way this function already treats an oversized
+        # calibration value, not escape uncaught and abort the whole
+        # plan_orders() call.
+        if not math.isfinite(cand.amount_usd):
+            return False
+    except OverflowError:
+        return True
+    calibration = (
+        cand.sizing_base_usd,
+        cand.sizing_min_drop_pct,
+        cand.sizing_max_drop_pct,
+    )
+    if any(value is not None for value in calibration):
+        # Partial or malformed calibration must not disable the global
+        # consistency guard.  A producer using a calibrated curve supplies
+        # the complete selected tier as evidence.
+        if not _calibration_fields_well_formed(cand):
+            return True
+        if cand.multiplier is None or not math.isfinite(cand.multiplier) or cand.multiplier <= 0:
+            return True
+        # Candidate rows are external evidence, not configuration. Bind the
+        # claimed base and interval to this ticker's ACTIVE configured tier
+        # -- a ticker listed in fallback_tickers has a stale/inactive
+        # tickers[] entry and is sized off the global ladder instead
+        # (config/per_ticker_sizing.json's own documented contract; see the
+        # midday live-mirror prompt's identical fallback_tickers exclusion),
+        # so calibration evidence for one is never authoritative here (Codex
+        # review: "Verify calibration evidence against the configured
+        # curve").
+        bounds = _configured_calibration_bounds(cand.ticker, cand.multiplier)
+        if bounds is None:
+            return True
+        configured_bases, configured_min, configured_max, minimum_order_usd = bounds
+        if cand.sizing_base_usd not in configured_bases:
+            return True
+        if cand.sizing_min_drop_pct != configured_min or cand.sizing_max_drop_pct != configured_max:
+            return True
+        # amount_usd may be strictly less than sizing_base_usd * multiplier:
+        # a same-day top-up (scripts/same_day_top_up_gate.py, Gate 6.5 in the
+        # midday live-mirror prompt) can shrink buy_usd below the full
+        # calibrated allocation while the candidate still carries its
+        # original sizing evidence. Treat that product as a CEILING, not an
+        # exact target, so a genuinely reduced, planner-approved top-up is
+        # not refused as inconsistent_multiplier_notional; amount_usd above
+        # the ceiling (an inflated/corrupted notional) is still refused
+        # (Codex review: "Allow planner-approved reduced top-ups to reach
+        # placement").
+        if cand.amount_usd <= 0 or _cents(cand.amount_usd) > _cents(cand.sizing_base_usd * cand.multiplier):
+            return True
+        # A same-day top-up can shrink to a residual below the broker's own
+        # configured minimum order size (config/per_ticker_sizing.json's
+        # minimum_order_usd) -- docs/dca_operational_todos.md records
+        # Robinhood actually rejecting such an order. The live-mirror flow
+        # forwards every buy_usd > 0.00 to placement, so this must be
+        # enforced here rather than trusted to a downstream broker error
+        # (Codex review: "Reject calibrated top-ups below the broker
+        # minimum").
+        if _cents(cand.amount_usd) < _cents(minimum_order_usd):
+            return True
+        if cand.drop_pct is None or not math.isfinite(cand.drop_pct):
+            return False
+        if cand.drop_pct < cand.sizing_min_drop_pct:
+            return True
+        if cand.multiplier == MIN_LADDER_MULTIPLIER:
+            # Mirrors _candidate_drop_mismatches_claimed_multiplier's own
+            # exemption for the global ladder: the risk-guard kill-switch
+            # (dca_risk.apply_risk_guard) can cap a deep-drop calibrated
+            # signal down to the floor multiplier while the candidate keeps
+            # its real, deep drop_pct. Enforcing the floor tier's own finite
+            # upper bound here would refuse a valid capped candidate, e.g.
+            # 1x at a 5% drop on a curve whose 1x tier only spans up to 2%
+            # (Codex review: "Keep kill-switch-capped calibrated candidates
+            # eligible").
+            return False
+        return cand.sizing_max_drop_pct is not None and cand.drop_pct >= cand.sizing_max_drop_pct
     if (
         cand.multiplier is not None
         and math.isfinite(cand.multiplier)
@@ -1439,9 +1622,24 @@ def _parse_candidate_rows(candidates) -> list[Candidate]:
             # boolean into a valid-looking $1 order or raising an uncaught
             # TypeError instead of the documented ABORT/refusal (Codex
             # review: "Validate fields on prebuilt Candidate rows").
+            # Calibration evidence (sizing_base_usd/sizing_min_drop_pct/
+            # sizing_max_drop_pct) is carried through here too: a prebuilt
+            # Candidate is the only row shape that can carry it (the tuple
+            # shapes below have no slots for it), and dropping it during
+            # reparsing would silently fall back to the global ladder for
+            # every caller that routes through assess()/execute_plan()
+            # instead of calling plan_orders() directly -- rejecting a
+            # calibrated candidate's real evidence as
+            # inconsistent_multiplier_notional even though the same
+            # candidate is accepted when plan_orders() is called with it
+            # unparsed (Codex review: "Preserve calibration fields while
+            # parsing Candidates").
             ticker, amount, multiplier, drop_pct = (
                 row.ticker, row.amount_usd, row.multiplier, row.drop_pct
             )
+            sizing_base_usd = row.sizing_base_usd
+            sizing_min_drop_pct = row.sizing_min_drop_pct
+            sizing_max_drop_pct = row.sizing_max_drop_pct
         elif not isinstance(row, (list, tuple)):
             # Generic iterable unpacking below (`ticker, amount = row`) does not
             # care WHAT it unpacks: a mapping row like {"AAPL": "ignored", 2.0:
@@ -1459,13 +1657,16 @@ def _parse_candidate_rows(candidates) -> list[Candidate]:
             )
         elif len(row) == 4:
             ticker, amount, multiplier, drop_pct = row
+            sizing_base_usd = sizing_min_drop_pct = sizing_max_drop_pct = None
         elif len(row) == 3:
             ticker, amount, multiplier = row
             drop_pct = None
+            sizing_base_usd = sizing_min_drop_pct = sizing_max_drop_pct = None
         else:
             ticker, amount = row
             multiplier = None
             drop_pct = None
+            sizing_base_usd = sizing_min_drop_pct = sizing_max_drop_pct = None
         cands.append(
             Candidate(
                 # Normalized once here so every downstream comparison (already-
@@ -1493,6 +1694,18 @@ def _parse_candidate_rows(candidates) -> list[Candidate]:
                 drop_pct=(
                     None if drop_pct is None
                     else _json_number(drop_pct, "candidate drop_pct")
+                ),
+                sizing_base_usd=(
+                    None if sizing_base_usd is None
+                    else _json_number(sizing_base_usd, "candidate sizing_base_usd")
+                ),
+                sizing_min_drop_pct=(
+                    None if sizing_min_drop_pct is None
+                    else _json_number(sizing_min_drop_pct, "candidate sizing_min_drop_pct")
+                ),
+                sizing_max_drop_pct=(
+                    None if sizing_max_drop_pct is None
+                    else _json_number(sizing_max_drop_pct, "candidate sizing_max_drop_pct")
                 ),
             )
         )
@@ -1612,8 +1825,21 @@ def _estimated_multiplier(cand: Candidate) -> float:
     first (against BOTH bases); it is used only if that specific multiplier
     also reproduces ``amount_usd`` exactly, so a drop that does not agree
     with the notional at all still falls through to the plain division.
+
+    A calibrated candidate (complete, config-bound ``sizing_*`` evidence) is
+    trusted the same way, via :func:`_candidate_calibrated_multiplier_is_consistent`:
+    without this, a same-day top-up that Gate 6.5 legitimately shrinks below
+    the full calibrated allocation (e.g. a TRIN 5x buy reduced from $5 to
+    $3) fails the global-ladder-only check above -- $3 matches neither a
+    $1 nor $2 base product at 5x -- and falls through to the plain-division
+    estimate (1.5x), undercounting high-multiplier signals in tier selection
+    and allocation priority (Codex review: "Preserve calibrated multipliers
+    for reduced top-ups").
     """
-    if cand.multiplier is not None and _candidate_multiplier_is_consistent(cand):
+    if cand.multiplier is not None and (
+        _candidate_multiplier_is_consistent(cand)
+        or _candidate_calibrated_multiplier_is_consistent(cand)
+    ):
         return cand.multiplier
     if not math.isfinite(cand.amount_usd):
         return MIN_LADDER_MULTIPLIER
