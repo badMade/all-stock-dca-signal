@@ -7,9 +7,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from dca_intraday_archive import (
     OBSERVATION_FIELDS,
     IntradayObservation,
+    _bool_or_none,
     _iso_or_blank,
     _slot_from_classification,
     append_observations,
@@ -21,6 +24,30 @@ from dca_intraday_archive import (
 )
 
 EASTERN = ZoneInfo("America/New_York")
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        (True, True),
+        (False, False),
+        (None, None),
+        ("", None),
+        ("true", True),
+        ("1", True),
+        ("yes", True),
+        ("TRUE", True),
+        (" True ", True),
+        ("false", False),
+        ("0", False),
+        ("no", False),
+        ("something_else", None),
+        (1, True),
+        (0, False),
+    ],
+)
+def test_bool_or_none(value, expected):
+    assert _bool_or_none(value) == expected
 
 
 def _classification(stream="morning", scheduled_for_et="10:30", **overrides):
