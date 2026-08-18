@@ -116,6 +116,12 @@ py-modules = [
     # source checkout but raise ModuleNotFoundError from an installed wheel
     # (Copilot/Codex review: "Ship the extracted module in the wheel").
     "dca_common",
+    # Weekly cross-account average-cost-basis snapshot builder/writer. No
+    # in-repo caller by design (see "Three entry points" in CLAUDE.md) --
+    # an external agent session fetches live Robinhood positions and calls
+    # this module to aggregate and write them. Without it here it only
+    # imports from a source checkout, not an installed wheel.
+    "dca_average_cost_snapshot",
 ]
 # scripts/run_classification.py is the run-classification contract used by both
 # the live artifact writer (near_close_dca.build_run_artifacts) and readers

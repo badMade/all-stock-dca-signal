@@ -22,6 +22,7 @@ environment (see the repository README).
 | [drift_detection.md](drift_detection.md) | Post-artifact signals-vs-submitted-orders drift detector + Slack alerting |
 | [intraday_archive.md](intraday_archive.md) | Per-poll price/timestamp/volume archive under `ticker_data/_intraday/`, supplementing the daily OHLCV history |
 | [purchase_history.md](purchase_history.md) | Consolidated buy-history ledger (`scripts/purchase_history.py`): every confirmed fill ever placed, at what price, across every stream and day |
+| [average_cost_snapshot.md](average_cost_snapshot.md) | Weekly cross-account average-cost-basis snapshot (`dca_average_cost_snapshot.py`): per-account and combined average cost per ticker, built from externally-fetched Robinhood positions |
 | [slack_webhook_injection.md](slack_webhook_injection.md) | How to inject the `DCA_DRIFT_SLACK_WEBHOOK` webhook across cron/systemd, agent/MCP scheduler, local shell, and GitHub Actions |
 | [market_graph.md](market_graph.md) | The 3D market graph ("The Ocean"): Pulse/Wave modes, the volume/high-low/open-close axes, and the two tiers of behavioural ticker grouping |
 | [reporting_workflow.md](reporting_workflow.md) | Daily/periodic artifact + Notion flow |
