@@ -305,6 +305,18 @@ def test_archive_failure_is_reported_not_raised(tmp_path):
     assert summary["rows_added"] == 0
 
 
+
+def test_archive_observations_safely_catches_append_exceptions(monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr("dca_intraday_archive.append_observations", boom)
+
+    summary = archive_observations_safely([])
+    assert summary["ok"] is False
+    assert "simulated failure" in summary["error"]
+
+
 def test_archive_success_reports_ok(tmp_path):
     summary = archive_observations_safely(
         _observations(tmp_path, [_morning_row()]), archive_dir=tmp_path

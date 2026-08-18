@@ -67,6 +67,9 @@
 ## 2026-08-03 - Optimize local JSON parsing
 **Learning:** `json.loads` has optimized underlying C code that accepts bytes natively. When parsing local JSON files, `path.read_text(encoding="utf-8")` introduces unnecessary Python-level string decoding overhead. Calling `path.read_bytes()` directly and letting `json.loads` handle the byte stream is about 15% faster and maintains identical error handling behavior.
 **Action:** When reading local JSON files for parsing via `json.loads`, prefer `json.loads(path.read_bytes())` over `json.loads(path.read_text(encoding="utf-8"))` to skip intermediate string allocation.
+## 2024-05-19 - Testing Exception Handling
+**Learning:** When mocking a function using monkeypatch that raises an exception, ensure the assertions match the exact dictionary structure returned by the function handling the exception.
+**Action:** Before writing test assertions, carefully review the `except` block of the target function to determine the precise keys and string formatting of the returned error state.
 ## 2026-08-14 - Removed duplicated webhook destination safety checks
 **Learning:** Duplicated network safety checks (e.g., SSRF prevention, proxy bypassing, and pinned connections) in CLI scripts can lead to code drift and missed fixes. It is better to rely on a central, authoritative module like `dca_alerts` even if it introduces a cross-package dependency, provided it is well-managed.
 **Action:** When encountering duplicated security/network code explicitly mirrored to avoid dependencies, evaluate whether the cost of duplication outweighs the dependency boundary, and prefer centralizing the logic into a shared utility.
