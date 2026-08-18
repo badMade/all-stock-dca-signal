@@ -27,7 +27,8 @@ from __future__ import annotations
 import logging
 import math
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
 
 from near_close_dca import (
     EASTERN,
@@ -64,6 +65,98 @@ RH_INTERVAL_BY_MINUTES: Dict[int, str] = {
 _LIVE_ORDER_STATES = frozenset(
     {"new", "queued", "confirmed", "unconfirmed", "partially_filled", "filled"}
 )
+
+# Ceiling on how many ``get_equity_orders`` pages one same-day lookup will follow.
+# A single ticker's same-day history is a handful of orders in practice, so this is
+# a runaway/cursor-loop backstop, not a real limit; hitting it raises rather than
+# returning a truncated history (see ``_iter_same_day_orders``).
+_MAX_ORDER_PAGES = 20
+
+
+def _next_order_cursor(data: Dict[str, Any], current_cursor: Optional[str] = None) -> Optional[str]:
+    """Extract the next-page cursor from an unwrapped orders page, or None on the last page.
+
+    Mirrors ``scripts/broker_reconciliation._next_cursor``: an explicit
+    ``next_cursor``, or the ``cursor`` query param of the MCP ``next`` URL
+    (``https://.../orders/?cursor=ABC``). A bare ``cursor`` field is read LAST
+    because some APIs echo the CURRENT page's cursor there, and a bare cursor
+    EQUAL to ``current_cursor`` (the cursor this very page was requested with)
+    is exactly that echo -- the end of the list, not a continuation. Reading it
+    as a continuation made the caller detect a repeated cursor and raise, so an
+    absence check over a paginated history failed closed on a perfectly good
+    final page, freezing crash leases and blocking valid buys (Codex review:
+    "Treat an echoed cursor as the end of pagination").
+    """
+    direct_next = data.get("next_cursor")
+    if isinstance(direct_next, str) and direct_next.strip():
+        return direct_next
+    next_url = data.get("next")
+    if isinstance(next_url, str) and next_url.strip():
+        cursor_values = parse_qs(urlparse(next_url).query).get("cursor")
+        if cursor_values and cursor_values[0].strip():
+            return cursor_values[0]
+        # A next URL with no cursor param -- or an empty/whitespace one, the
+        # same end-of-list convention checked for next_cursor/cursor above --
+        # is still a "there is more" signal we cannot follow deterministically;
+        # _has_continuation_pointer below turns it into a raise rather than
+        # letting a blank cursor be treated as a real continuation.
+        return None
+    direct = data.get("cursor")
+    if isinstance(direct, str) and direct.strip() and direct != current_cursor:
+        return direct
+    return None
+
+
+def _is_provable_orders_page(response: Any) -> bool:
+    """True when ``response`` is a LIST-mode orders page a caller may reason about.
+
+    Requires an actual ``orders`` list. A ``None``, a bare list, or a dict with
+    no ``orders`` list is unparseable and must never be read as a valid *empty*
+    history by a caller whose next step depends on absence being proven. An
+    explicit ``{"orders": []}`` is fine -- a genuine empty page.
+
+    A SINGLE-ORDER envelope (``{"order": {...}}``, or a bare order object) is
+    rejected too, matching ``scripts/broker_reconciliation``'s own
+    ``single_order_envelope_in_pagination`` rule. It is evidence about ONE order
+    and says nothing about whether the account list has ended -- and
+    ``_iter_same_day_orders`` only ever yields ``data["orders"]``, so such an
+    envelope would pass a laxer check while silently yielding nothing, which
+    crash recovery would read as "the claimed order was never submitted" and act
+    on by releasing the balance (Codex review: "Reject single-order envelopes
+    when proving history").
+    """
+    if not isinstance(response, dict):
+        return False
+    return isinstance(_unwrap(response).get("orders"), list)
+
+
+def _has_continuation_pointer(data: Dict[str, Any]) -> bool:
+    """True when a page advertises MORE results via ``next``/``next_cursor``.
+
+    Used only after :func:`_next_order_cursor` already failed to produce a usable
+    cursor, to distinguish "this was the last page" from "there is more history we
+    cannot reach" -- the latter must never be reported to callers as a complete
+    (and therefore absence-proving) history.
+
+    Mirrors ``scripts/broker_reconciliation._has_continuation`` exactly rather
+    than testing truthiness. A present but FALSEY non-string pointer --
+    ``next_cursor: 0``, ``next: []`` -- is one ``_next_order_cursor`` cannot
+    parse, so a truthiness test reported "no continuation" and the iterator
+    declared a truncated history complete. Crash recovery reads that as proof
+    the claimed order was never submitted, releases the lease and authorizes a
+    duplicate purchase (Codex review: "Reject falsey non-string continuation
+    pointers"). Any non-string value is an unusable continuation and fails
+    closed; only an absent pointer, or an empty/whitespace string (the
+    conventional end-of-list), means there is genuinely nothing more.
+    """
+    for key in ("next", "next_cursor"):
+        value = data.get(key)
+        if isinstance(value, str):
+            if value.strip():
+                return True
+        elif value is not None:
+            return True
+    return False
 
 
 def _unwrap(payload: Any) -> Dict[str, Any]:
@@ -600,25 +693,130 @@ class RobinhoodBroker:
             return 0.0
         return _to_float(result)
 
-    def _same_day_orders(self, ticker: str, trading_day: date) -> List[Dict[str, Any]]:
+    def _iter_same_day_orders(
+        self, ticker: str, trading_day: date, *, require_provable_history: bool = False
+    ) -> Iterator[Dict[str, Any]]:
+        """Yield every order for ``ticker`` from ``trading_day`` onward, page by page.
+
+        Lazy on purpose. ``get_equity_orders`` has a lower time bound
+        (``created_at_gte``) but no upper one, so a lease recovered several
+        trading days after its claim scans every order since -- and the
+        newest-first ordering puts the one we want last. Materializing the whole
+        result before searching it meant a long-enough history tripped the page
+        ceiling and raised even when the matching ref had already gone past,
+        which recovery then read as "cannot reconcile" and preserved the lease
+        indefinitely (Codex review: "Bound historical recovery queries to the
+        claim day"). Yielding lets a caller looking for ONE order stop the
+        moment it finds it, so a found ref never depends on how much history
+        sits behind it.
+
+        The ceiling still binds for callers that must consume everything --
+        proving absence, or summing notional -- which is the fail-closed
+        direction: those callers raise rather than conclude from a truncated
+        history.
+
+        ``require_provable_history`` raises, rather than yielding nothing, for
+        the two shapes that are indistinguishable from a genuinely empty history
+        but prove nothing: an adapter with no ``orders_fn`` wired at all, and a
+        response that is not a recognizable orders envelope. Silence from either
+        one let crash recovery conclude that a claimed order was never submitted
+        and release the balance for a duplicate purchase (Codex review:
+        "Preserve leases when order history is unavailable").
+
+        It is opt-in rather than the default because the ordinary duplicate-order
+        gate has the OPPOSITE established contract -- an unwired adapter reports
+        "no order today" and lets a buy proceed (see
+        ``test_robinhood_broker_same_day_lookup_without_orders_fn``, and
+        ``morning_dca.py``'s use of it as its sole duplicate gate). Flipping that
+        is a real improvement but a separate, broader change than this one.
+        """
         if self._orders_fn is None:
-            return []
-        response = self._orders_fn(
-            account_number=self._account,
-            symbol=ticker,
-            created_at_gte=trading_day.isoformat(),
+            if require_provable_history:
+                raise RuntimeError(
+                    f"same-day order lookup for {ticker} has no orders_fn wired; "
+                    "an unqueryable history cannot prove an order is absent"
+                )
+            return
+        seen_cursors: set[str] = set()
+        cursor: Optional[str] = None
+        for _ in range(_MAX_ORDER_PAGES):
+            kwargs: Dict[str, Any] = {
+                "account_number": self._account,
+                "symbol": ticker,
+                "created_at_gte": trading_day.isoformat(),
+            }
+            if cursor is not None:
+                kwargs["cursor"] = cursor
+            response = self._orders_fn(**kwargs)
+            error = _response_failure(response)
+            if error is not None:
+                # Fail closed: an error-shaped lookup ("no orders" by omission) must not let
+                # the one-order-per-ticker-per-day guard pass and allow a duplicate buy.
+                raise RuntimeError(f"same-day order lookup for {ticker} failed: {error}")
+            data = _unwrap(response)
+            if require_provable_history and not _is_provable_orders_page(response):
+                # A None, a bare list, a dict carrying no orders list, or a
+                # single-order envelope is not a list-mode page -- NOT a valid
+                # empty history.
+                raise RuntimeError(
+                    f"same-day order lookup for {ticker} returned an unrecognizable page"
+                )
+            orders = data.get("orders")
+            if orders is None:
+                orders = []
+            if not isinstance(orders, list):
+                raise RuntimeError(
+                    f"same-day order lookup for {ticker} returned orders in an unexpected shape"
+                )
+            yield from orders
+            cursor = _next_order_cursor(data, cursor)
+            if cursor is None:
+                if _has_continuation_pointer(data):
+                    # A next/next_cursor pointer we could not turn into a usable
+                    # cursor is "there is more we cannot reach", not "the list
+                    # ended" -- letting a caller prove absence from a truncated
+                    # history.
+                    raise RuntimeError(
+                        f"same-day order lookup for {ticker} returned an unusable pagination pointer"
+                    )
+                return
+            if cursor in seen_cursors:
+                raise RuntimeError(f"same-day order lookup for {ticker} repeated a pagination cursor")
+            seen_cursors.add(cursor)
+        raise RuntimeError(
+            f"same-day order lookup for {ticker} exceeded {_MAX_ORDER_PAGES} pages"
         )
-        error = _response_failure(response)
-        if error is not None:
-            # Fail closed: an error-shaped lookup ("no orders" by omission) must not let
-            # the one-order-per-ticker-per-day guard pass and allow a duplicate buy.
-            raise RuntimeError(f"same-day order lookup for {ticker} failed: {error}")
-        data = _unwrap(response)
-        return list(data.get("orders") or [])
+
+    def _same_day_orders(self, ticker: str, trading_day: date) -> List[Dict[str, Any]]:
+        """Return EVERY same-day order for ``ticker``, following pagination.
+
+        ``get_equity_orders`` is a paginated tool: a busy account's same-day
+        history spans several pages and the first one alone is not the whole
+        story. Reading only page one made every caller here fail OPEN --
+        ``same_day_strategy_order_exists`` would report "no order today" and
+        authorize a duplicate buy, and the crash-recovery lookup
+        ``strategy_order_with_ref_id`` would report the claimed fire order as
+        never submitted and release the lease for a second real purchase --
+        purely because the matching order sat on page two (Codex review:
+        "Page broker history before releasing the fire lease").
+        ``scripts/broker_reconciliation.paginate_same_day_orders`` is the
+        reference implementation of the cursor protocol; this is the same
+        contract narrowed to one symbol, and it fails CLOSED the same way:
+        an unfollowable continuation pointer, a cursor loop, or hitting the
+        page ceiling raises instead of returning a partial history that
+        callers would read as proof of absence.
+
+        The eager form, for callers that genuinely need the complete list.
+        Callers searching for ONE order should iterate ``_iter_same_day_orders``
+        and stop on the match instead.
+        """
+        return list(self._iter_same_day_orders(ticker, trading_day))
 
     def same_day_strategy_order_exists(self, ticker: str, trading_day: date) -> bool:
-        for order in self._same_day_orders(ticker, trading_day):
+        for order in self._iter_same_day_orders(ticker, trading_day):
             if str(order.get("state", "")).lower() in _LIVE_ORDER_STATES:
+                # Proving PRESENCE needs no further pages; only the negative
+                # answer below depends on having seen the whole history.
                 return True
         return False
 
@@ -633,7 +831,7 @@ class RobinhoodBroker:
         are fully-qualified exact strings, so a raw ``startswith`` check is unnecessary and
         unsafe.
         """
-        for order in self._same_day_orders(ticker, trading_day):
+        for order in self._iter_same_day_orders(ticker, trading_day):
             if str(order.get("state", "")).lower() not in _LIVE_ORDER_STATES:
                 continue
             ref_id = str(
@@ -644,6 +842,37 @@ class RobinhoodBroker:
                 or ""
             )
             if ref_id and ref_id in ref_id_prefixes:
+                return order
+        return None
+
+    def strategy_order_with_ref_id(
+        self, ticker: str, trading_day: date, ref_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return the matching historical order regardless of its current state.
+
+        Iterates lazily and returns on the first match, so a ref found anywhere
+        in the history never trips the page ceiling -- important for a crash
+        lease recovered days after its claim, where the query has no upper time
+        bound and the newest-first ordering puts the wanted order last.
+
+        Requires a PROVABLE history: this is crash reconciliation, where an
+        empty answer is taken as evidence the claimed order was never submitted
+        and the reserved balance is released. An unwired ``orders_fn`` or an
+        unrecognizable page therefore raises instead of returning ``None``, so
+        the caller preserves the lease rather than authorizing a duplicate
+        purchase on the strength of a lookup that never happened.
+        """
+        for order in self._iter_same_day_orders(
+            ticker, trading_day, require_provable_history=True
+        ):
+            candidate_ref = str(
+                order.get("ref_id")
+                or order.get("client_order_id")
+                or order.get("client_order_uuid")
+                or order.get("client_id")
+                or ""
+            )
+            if candidate_ref == ref_id:
                 return order
         return None
 

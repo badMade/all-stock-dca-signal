@@ -15,9 +15,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import pytest
-
 import publish
+import pytest
 
 ML_FORECASTER_DIR = Path(__file__).resolve().parent.parent
 
@@ -1189,6 +1188,116 @@ def test_guarded_publish_serializes_concurrent_attempts_through_the_config_lock(
     assert result["status"] == "published"
 
 
+def test_guarded_publish_rechecks_incumbent_after_a_better_concurrent_publish(tmp_path, monkeypatch):
+    """A queued, worse candidate must compare against the newly live model.
+
+    Both candidates improve on the original MAE of 2.0, but the 1.5 candidate
+    is a regression after the 1.0 candidate publishes.  Pause the first call
+    immediately after its incumbent read (while it owns the publish lock), then
+    start the second call.  The second call must remain outside the critical
+    section until the first atomic replacement completes and must consequently
+    reject itself against MAE 1.0 rather than the stale MAE 2.0.
+
+    The second attempt's own lock-acquisition attempt (not merely
+    `worse.start()` returning) is the release signal for the first attempt --
+    `Thread.start()` only schedules the thread, it doesn't prove the thread has
+    reached `guarded_publish`'s critical section yet. Without that second
+    synchronization point a regressed `guarded_publish` that reads the
+    incumbent outside the lock could still pass this test purely by scheduling
+    luck: if the "worse" thread doesn't get CPU time until *after* "better"
+    has already finished its whole read-compare-write and released the lock,
+    "worse" would read the already-published MAE 1.0 and correctly block even
+    under the broken implementation, so the regression would go undetected.
+
+    The lock-attempt signal is tied to the "worse" thread's OWN identity
+    (`threading.current_thread().name`), not to a raw ordinal count of every
+    `cross_process_lock` call. A count alone silently assumes exactly one
+    `cross_process_lock` call per `guarded_publish` attempt; a regression that
+    splits the critical section into two separate locked sections (one around
+    the read, a second later around the write -- the exact "lock covers only
+    the read" shape this test exists to catch) would make "better" itself
+    place the 2nd global call (its own write-lock attempt), firing the signal
+    early and letting "better" finish before "worse" ever reads. Naming the
+    threads and checking identity instead makes the signal fire only on
+    "worse"'s own first attempt, however many times "better" acquires the
+    lock.
+    """
+    import threading
+    from contextlib import contextmanager
+
+    config_path = tmp_path / "ml_sizing_adjustment.json"
+    previous = dict(
+        _PREVIOUS_PAYLOAD,
+        eval_metric={
+            **_PREVIOUS_PAYLOAD["eval_metric"],
+            "mae": 2.0,
+            "baseline_zero_mae": 3.0,
+            "baseline_mean_mae": 2.5,
+        },
+    )
+    config_path.write_text(json.dumps(previous), encoding="utf-8")
+
+    real_read = publish._read_current_config
+    real_lock = publish.cross_process_lock
+    first_read = threading.Event()
+    release_first = threading.Event()
+    worse_attempted_lock = threading.Event()
+    better_read_paused = threading.Event()
+
+    def pause_first_read(path):
+        current = real_read(path)
+        # Only the "better" thread's read is ever paused -- "worse" always
+        # reads for real, whenever its own execution reaches this call.
+        if threading.current_thread().name == "better" and not better_read_paused.is_set():
+            better_read_paused.set()
+            first_read.set()
+            assert release_first.wait(timeout=5.0)
+        return current
+
+    @contextmanager
+    def signal_worse_lock_attempt(path):
+        if threading.current_thread().name == "worse":
+            # "worse" has reached the point of trying to acquire the lock
+            # "better" holds (or, under a regressed implementation, is about
+            # to run unsynchronized) -- only now is it safe to let "better"
+            # proceed and complete its critical section.
+            worse_attempted_lock.set()
+        with real_lock(path):
+            yield
+
+    monkeypatch.setattr(publish, "_read_current_config", pause_first_read)
+    monkeypatch.setattr(publish, "cross_process_lock", signal_worse_lock_attempt)
+    results = {}
+
+    def attempt(name, mae):
+        results[name] = publish.guarded_publish(
+            adjustments={"AAPL": 1.05},
+            eval_summary=_eval_summary(mae, baseline_zero_mae=3.0, baseline_mean_mae=2.5),
+            model_version=name,
+            config_path=config_path,
+            evaluation_universe=["AAPL"],
+            generated_at=datetime(2026, 8, 8, tzinfo=timezone.utc),
+        )
+
+    better = threading.Thread(target=attempt, args=("better", 1.0), name="better")
+    worse = threading.Thread(target=attempt, args=("worse", 1.5), name="worse")
+    better.start()
+    assert first_read.wait(timeout=5.0)
+    worse.start()
+    assert worse_attempted_lock.wait(timeout=5.0)
+    release_first.set()
+    better.join(timeout=5.0)
+    worse.join(timeout=5.0)
+
+    assert not better.is_alive()
+    assert not worse.is_alive()
+    assert results["better"]["status"] == "published"
+    assert results["worse"]["status"] == "blocked_regression"
+    published = json.loads(config_path.read_text(encoding="utf-8"))
+    assert published["model_version"] == "better"
+    assert published["eval_metric"]["mae"] == pytest.approx(1.0)
+
+
 # --- incumbent re-scoring (score_incumbent_model / model_artifact_path) ----
 
 
@@ -1360,11 +1469,11 @@ def test_guarded_publish_does_not_rescore_across_a_horizon_mismatch(tmp_path):
     assert result["status"] == "published"
 
 
-def test_guarded_publish_falls_back_when_the_scorer_raises(tmp_path):
+def test_guarded_publish_fails_closed_when_the_scorer_raises(tmp_path):
     """A caller-supplied score_incumbent_model performs real I/O (loading a
-    model.json) on the other side of the callback -- any failure there must
-    fall back to the existing comparisons, never abort the whole publish
-    decision."""
+    model.json) on the other side of the callback. Once the shared-holdout
+    gate applies, any failure must retain the incumbent rather than silently
+    authorizing publication through a weaker comparison."""
     config_path = tmp_path / "ml_sizing_adjustment.json"
     previous = dict(
         _PREVIOUS_PAYLOAD,
@@ -1378,9 +1487,8 @@ def test_guarded_publish_falls_back_when_the_scorer_raises(tmp_path):
 
     result = publish.guarded_publish(
         adjustments={"AAPL": 1.05},
-        # Beats the incumbent's recorded MAE (1.5) via the fallback exact-
-        # window comparison -- proving the scorer's exception didn't abort
-        # the call, just skipped the re-score attempt.
+        # This would beat the incumbent via the weaker exact-window fallback,
+        # proving that the unavailable shared-holdout score is what blocks it.
         eval_summary=_eval_summary(model_mae=0.5, baseline_zero_mae=2.0, baseline_mean_mae=1.8),
         model_version="2026-08-08-ridge-v1",
         config_path=config_path,
@@ -1389,13 +1497,15 @@ def test_guarded_publish_falls_back_when_the_scorer_raises(tmp_path):
         score_incumbent_model=_score_incumbent,
     )
 
-    assert result["status"] == "published"
+    assert result["status"] == "blocked_regression"
+    assert any("shared out-of-sample holdout" in reason for reason in result["reasons"])
 
 
-def test_guarded_publish_falls_back_when_the_scorer_returns_none(tmp_path):
+def test_guarded_publish_fails_closed_when_the_scorer_returns_none(tmp_path):
     """The scorer's own documented "can't score it" signal (None -- e.g. the
-    model.json is missing or fails to parse) must fall back gracefully too,
-    the non-exceptional counterpart to the previous test."""
+    there are only five newly available sessions for a five-session target)
+    must retain the incumbent, the non-exceptional counterpart to the previous
+    test."""
     config_path = tmp_path / "ml_sizing_adjustment.json"
     previous = dict(
         _PREVIOUS_PAYLOAD,
@@ -1414,7 +1524,8 @@ def test_guarded_publish_falls_back_when_the_scorer_returns_none(tmp_path):
         score_incumbent_model=lambda _path: None,
     )
 
-    assert result["status"] == "published"
+    assert result["status"] == "blocked_regression"
+    assert any("shared out-of-sample holdout" in reason for reason in result["reasons"])
 
 
 @pytest.mark.parametrize(
@@ -1428,7 +1539,7 @@ def test_guarded_publish_falls_back_when_the_scorer_returns_none(tmp_path):
         (True, 0.5),  # bool is technically an int subclass -- must still be rejected
     ],
 )
-def test_guarded_publish_falls_back_when_the_scorer_returns_a_malformed_result(tmp_path, bad_result):
+def test_guarded_publish_fails_closed_when_the_scorer_returns_a_malformed_result(tmp_path, bad_result):
     config_path = tmp_path / "ml_sizing_adjustment.json"
     previous = dict(
         _PREVIOUS_PAYLOAD,
@@ -1447,7 +1558,8 @@ def test_guarded_publish_falls_back_when_the_scorer_returns_a_malformed_result(t
         score_incumbent_model=lambda _path: bad_result,
     )
 
-    assert result["status"] == "published"
+    assert result["status"] == "blocked_regression"
+    assert any("shared out-of-sample holdout" in reason for reason in result["reasons"])
 
 
 def test_default_config_path_honors_dca_config_dir():

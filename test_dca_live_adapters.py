@@ -722,6 +722,270 @@ def test_robinhood_broker_ref_id_prefix_ignores_non_live_states():
     assert order is None
 
 
+def test_robinhood_broker_history_ref_id_includes_terminal_states():
+    resp = {"data": {"orders": [{"state": "cancelled", "ref_id": "crashed-fire"}]}}
+    order = RobinhoodBroker(orders_fn=lambda **k: resp).strategy_order_with_ref_id(
+        "AAPL", datetime(2026, 7, 28).date(), "crashed-fire"
+    )
+    assert order == resp["data"]["orders"][0]
+
+
+def test_robinhood_broker_history_ref_id_follows_pagination():
+    """Regression test for "Page broker history before releasing the fire
+    lease". ``get_equity_orders`` is paginated; reading only page one made
+    every same-day lookup fail OPEN -- the crash-recovery path would report a
+    claimed fire order as never submitted and release its lease for a second
+    real purchase, purely because the order sat on page two.
+    """
+    pages = [
+        {"data": {"orders": [{"state": "filled", "ref_id": "other"}], "next_cursor": "PAGE2"}},
+        {"data": {"orders": [{"state": "cancelled", "ref_id": "crashed-fire"}]}},
+    ]
+    seen_cursors = []
+
+    def orders_fn(**kwargs):
+        seen_cursors.append(kwargs.get("cursor"))
+        return pages[len(seen_cursors) - 1]
+
+    order = RobinhoodBroker(orders_fn=orders_fn).strategy_order_with_ref_id(
+        "AAPL", datetime(2026, 7, 28).date(), "crashed-fire"
+    )
+    assert seen_cursors == [None, "PAGE2"]
+    assert order == pages[1]["data"]["orders"][0]
+
+
+def test_robinhood_broker_pagination_reads_the_cursor_from_a_next_url():
+    pages = [
+        {"data": {"orders": [], "next": "https://api.robinhood.com/orders/?cursor=ABC&page_size=10"}},
+        {"data": {"orders": [{"state": "filled", "ref_id": "crashed-fire"}]}},
+    ]
+    seen_cursors = []
+
+    def orders_fn(**kwargs):
+        seen_cursors.append(kwargs.get("cursor"))
+        return pages[len(seen_cursors) - 1]
+
+    order = RobinhoodBroker(orders_fn=orders_fn).strategy_order_with_ref_id(
+        "AAPL", datetime(2026, 7, 28).date(), "crashed-fire"
+    )
+    assert seen_cursors == [None, "ABC"]
+    assert order == pages[1]["data"]["orders"][0]
+
+
+@pytest.mark.parametrize("blank_cursor", ["", "%20", "+"])
+def test_robinhood_broker_pagination_fails_closed_on_a_blank_next_url_cursor(blank_cursor):
+    """Regression test for a Copilot review comment on PR #464: `_next_order_cursor`
+    read `cursor_values[0]` from a `next` URL's query string without stripping or
+    validating it, unlike the `next_cursor`/bare-`cursor` fields it checks first
+    (both require `.strip()` truth). A `next` URL whose `cursor` param is empty or
+    whitespace-only (`.../orders/?cursor=`) would be treated as a real, usable
+    continuation instead of the same end-of-list convention used everywhere else --
+    and a blank cursor sent back to the broker on retry risks a repeated-cursor
+    error or bogus pagination rather than a clean stop.
+
+    The fix normalizes it the same way: a blank cursor extracted from a `next` URL
+    yields no usable cursor, so `_has_continuation_pointer` (which still sees the
+    non-empty `next` URL string itself) reports "there is more we cannot reach" and
+    the lookup fails closed rather than silently following a hollow cursor.
+    """
+    page = {
+        "data": {
+            "orders": [{"state": "filled", "ref_id": "other"}],
+            "next": f"https://api.robinhood.com/orders/?cursor={blank_cursor}&page_size=10",
+        }
+    }
+    with pytest.raises(RuntimeError, match="unusable pagination pointer"):
+        RobinhoodBroker(orders_fn=lambda **k: page).strategy_order_with_ref_id(
+            "AAPL", datetime(2026, 7, 28).date(), "crashed-fire"
+        )
+
+
+def test_robinhood_broker_ref_lookup_stops_at_the_match_before_the_page_ceiling():
+    """Regression test for "Bound historical recovery queries to the claim day".
+    ``get_equity_orders`` has no upper time bound, so a lease recovered several
+    trading days after its claim scans everything since. Materializing the whole
+    result first meant a long history tripped the page ceiling and raised even
+    when the wanted ref had already gone past — which recovery reads as "cannot
+    reconcile" and preserves the lease indefinitely. The lookup now returns on
+    the match, so a found ref never depends on how much history sits behind it.
+    """
+    pages_fetched = []
+
+    def orders_fn(**kwargs):
+        pages_fetched.append(kwargs.get("cursor"))
+        if len(pages_fetched) == 2:
+            return {"data": {"orders": [{"state": "filled", "ref_id": "crashed-fire"}], "next_cursor": "MORE"}}
+        # Every other page advertises another page forever: consuming this
+        # history to the end would hit the ceiling and raise.
+        return {"data": {"orders": [], "next_cursor": f"P{len(pages_fetched)}"}}
+
+    order = RobinhoodBroker(orders_fn=orders_fn).strategy_order_with_ref_id(
+        "AAPL", datetime(2026, 7, 28).date(), "crashed-fire"
+    )
+    assert order is not None
+    assert len(pages_fetched) == 2  # stopped at the match, not at the ceiling
+
+
+def test_robinhood_broker_ref_lookup_raises_when_history_is_unwired():
+    """Regression test for "Preserve leases when order history is unavailable".
+    An adapter with no orders_fn yields nothing, which is indistinguishable from
+    a scanned-and-empty history. Crash recovery reads that emptiness as proof the
+    claimed order was never submitted and releases the balance for a duplicate
+    purchase, so the recovery lookup must raise instead.
+    """
+    with pytest.raises(RuntimeError, match="no orders_fn wired"):
+        RobinhoodBroker().strategy_order_with_ref_id(
+            "AAPL", datetime(2026, 7, 28).date(), "crashed-fire"
+        )
+
+
+@pytest.mark.parametrize("page", [{}, {"data": {}}, {"data": {"orders": "nope"}}, []])
+def test_robinhood_broker_ref_lookup_raises_on_an_unrecognizable_page(page):
+    # A response carrying no orders list and no pagination pointer is
+    # unparseable, not a valid empty history. (A bare list is rejected one step
+    # earlier, by the error-envelope check -- either way it raises rather than
+    # reporting an absence the caller would act on.)
+    with pytest.raises(RuntimeError, match="unrecognizable page|not a valid JSON object"):
+        RobinhoodBroker(orders_fn=lambda **k: page).strategy_order_with_ref_id(
+            "AAPL", datetime(2026, 7, 28).date(), "crashed-fire"
+        )
+
+
+@pytest.mark.parametrize(
+    "page",
+    [
+        {"data": {"order": {"state": "filled", "ref_id": "crashed-fire"}}},
+        {"data": {"id": "abc123", "state": "filled", "ref_id": "crashed-fire"}},
+    ],
+)
+def test_robinhood_broker_ref_lookup_rejects_a_single_order_envelope(page):
+    """Regression test for "Reject single-order envelopes when proving history".
+    _iter_same_day_orders only yields data["orders"], so a single-order envelope
+    would pass a laxer well-formedness check while yielding nothing -- and crash
+    recovery would read that as "never submitted" and release the balance, even
+    when the discarded order IS the claimed one.
+    """
+    with pytest.raises(RuntimeError, match="unrecognizable page"):
+        RobinhoodBroker(orders_fn=lambda **k: page).strategy_order_with_ref_id(
+            "AAPL", datetime(2026, 7, 28).date(), "crashed-fire"
+        )
+
+
+def test_robinhood_broker_pagination_stops_on_an_echoed_cursor():
+    """Regression test for "Treat an echoed cursor as the end of pagination".
+    A final page that echoes the cursor it was REQUESTED with is the end of the
+    list, not a continuation. Reading it as one tripped the repeated-cursor
+    guard and raised, failing an absence check closed on a perfectly good scan.
+    """
+    calls = []
+
+    def orders_fn(**kwargs):
+        calls.append(kwargs.get("cursor"))
+        if len(calls) == 1:
+            return {"data": {"orders": [], "next_cursor": "PAGE2"}}
+        # Last page: no next/next_cursor, but echoes its own request cursor.
+        return {"data": {"orders": [{"state": "filled", "ref_id": "other"}], "cursor": "PAGE2"}}
+
+    order = RobinhoodBroker(orders_fn=orders_fn).strategy_order_with_ref_id(
+        "AAPL", datetime(2026, 7, 28).date(), "crashed-fire"
+    )
+    assert calls == [None, "PAGE2"]
+    assert order is None  # a completed scan that genuinely found nothing
+
+
+@pytest.mark.parametrize("pointer", [0, [], {}, False, 0.0])
+def test_robinhood_broker_fails_closed_on_a_falsey_nonstring_continuation(pointer):
+    """Regression test for "Reject falsey non-string continuation pointers".
+
+    `_next_order_cursor` only understands STRING pointers, so a present but
+    falsey non-string one (`next_cursor: 0`, `next: []`) yields no cursor. The
+    old truthiness-based `_has_continuation_pointer` then reported "no
+    continuation", and the iterator declared a truncated history complete --
+    which crash recovery reads as proof the claimed order was never submitted,
+    releasing the lease and authorizing a duplicate purchase.
+    """
+    page = {"data": {"orders": [{"state": "filled", "ref_id": "other"}], "next_cursor": pointer}}
+    with pytest.raises(RuntimeError):
+        RobinhoodBroker(orders_fn=lambda **k: page).strategy_order_with_ref_id(
+            "AAPL", datetime(2026, 7, 28).date(), "crashed-fire"
+        )
+
+
+@pytest.mark.parametrize("pointer", ["", "   "])
+def test_robinhood_broker_treats_an_empty_string_pointer_as_the_end(pointer):
+    """The complement: an empty or whitespace string is the conventional
+    end-of-list, not an unusable continuation, and must still complete the scan
+    so a genuine absence can be proven."""
+    page = {"data": {"orders": [{"state": "filled", "ref_id": "other"}], "next_cursor": pointer}}
+    order = RobinhoodBroker(orders_fn=lambda **k: page).strategy_order_with_ref_id(
+        "AAPL", datetime(2026, 7, 28).date(), "crashed-fire"
+    )
+    assert order is None
+
+
+def test_robinhood_broker_pagination_still_follows_a_new_bare_cursor():
+    # A bare cursor DIFFERENT from the request's is still a real continuation.
+    calls = []
+
+    def orders_fn(**kwargs):
+        calls.append(kwargs.get("cursor"))
+        if len(calls) == 1:
+            return {"data": {"orders": [], "cursor": "NEXT"}}
+        return {"data": {"orders": [{"state": "filled", "ref_id": "crashed-fire"}]}}
+
+    order = RobinhoodBroker(orders_fn=orders_fn).strategy_order_with_ref_id(
+        "AAPL", datetime(2026, 7, 28).date(), "crashed-fire"
+    )
+    assert calls == [None, "NEXT"]
+    assert order is not None
+
+
+def test_robinhood_broker_ref_lookup_accepts_a_genuine_empty_page():
+    # An explicit {"orders": []} IS well-formed: a real, provable empty history.
+    order = RobinhoodBroker(orders_fn=lambda **k: {"data": {"orders": []}}).strategy_order_with_ref_id(
+        "AAPL", datetime(2026, 7, 28).date(), "crashed-fire"
+    )
+    assert order is None
+
+
+def test_robinhood_broker_duplicate_gate_still_tolerates_an_unwired_lookup():
+    # The ordinary duplicate gate keeps its established contract -- morning_dca.py
+    # uses it as its sole duplicate check, and an unwired adapter reports "no
+    # order today" rather than raising. Only the recovery lookup is stricter.
+    assert RobinhoodBroker().same_day_strategy_order_exists("AAPL", datetime(2026, 7, 28).date()) is False
+
+
+def test_robinhood_broker_absence_still_enforces_the_page_ceiling():
+    # Proving ABSENCE requires the whole history, so an endless one must raise
+    # rather than report "no such order" from a truncated scan.
+    def orders_fn(**kwargs):
+        return {"data": {"orders": [], "next_cursor": str(kwargs.get("cursor", "")) + "x"}}
+
+    with pytest.raises(RuntimeError, match="exceeded"):
+        RobinhoodBroker(orders_fn=orders_fn).strategy_order_with_ref_id(
+            "AAPL", datetime(2026, 7, 28).date(), "never-submitted"
+        )
+
+
+def test_robinhood_broker_pagination_fails_closed_on_an_unusable_pointer():
+    # A "there is more" pointer we cannot follow must never be reported as a
+    # complete history: callers read absence as proof and would authorize a
+    # duplicate buy (or release a fire lease) on a truncated page set.
+    resp = {"data": {"orders": [], "next": "https://api.robinhood.com/orders/?page_size=10"}}
+    with pytest.raises(RuntimeError, match="unusable pagination pointer"):
+        RobinhoodBroker(orders_fn=lambda **k: resp).same_day_strategy_order_exists(
+            "AAPL", datetime(2026, 7, 28).date()
+        )
+
+
+def test_robinhood_broker_pagination_fails_closed_on_a_cursor_loop():
+    resp = {"data": {"orders": [], "next_cursor": "SAME"}}
+    with pytest.raises(RuntimeError, match="repeated a pagination cursor"):
+        RobinhoodBroker(orders_fn=lambda **k: resp).same_day_strategy_order_exists(
+            "AAPL", datetime(2026, 7, 28).date()
+        )
+
+
 def test_robinhood_broker_ref_id_prefix_requires_an_exact_match():
     # A live order whose ref_id is not among the supplied prefixes is a
     # different stream's order, not this stream's retry.

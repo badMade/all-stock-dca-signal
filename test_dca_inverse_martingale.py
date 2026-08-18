@@ -15,6 +15,7 @@ from dca_inverse_martingale import (
     STATUS_NONE,
     CorruptedLedgerStateError,
     InverseMartingaleLedger,
+    archived_split_factor,
     evaluate_inverse_martingale_step,
     rolling_stddev,
     stddev_reference_for_ticker,
@@ -27,7 +28,8 @@ DAY1 = date(2026, 8, 3)
 
 def _step(state, *, decision_price, previous_close, trading_day=DAY1, tiers=PCT_TIERS,
           unit_usd=1.0, recovery_offset=1.0, max_cycle_days=30, max_fire_attempts=5,
-          basis="pct", stddev_reference=None, per_order_cap_usd=None, stream="afternoon"):
+          basis="pct", stddev_reference=None, per_order_cap_usd=None, stream="afternoon",
+          split_factor=None, split_cursor_day=None):
     new_state, step = evaluate_inverse_martingale_step(
         state,
         decision_price=decision_price,
@@ -42,6 +44,8 @@ def _step(state, *, decision_price, previous_close, trading_day=DAY1, tiers=PCT_
         stddev_reference=stddev_reference,
         per_order_cap_usd=per_order_cap_usd,
         stream=stream,
+        split_factor=split_factor,
+        split_cursor_day=split_cursor_day,
     )
     # Every call here models a whole separate scheduled run, and in production
     # near_close_dca.py's settlement block always clears settlement_pending
@@ -143,6 +147,11 @@ def test_recovery_at_or_above_offset_fires_full_amount_when_under_cap():
     assert state == {
         "status": STATUS_NONE, "last_evaluated_trading_day": DAY1.isoformat(),
         "last_evaluated_stream": "afternoon", "fired_floor_drop_metric": 5.0,
+        "rearm_reference_close": 100.0,
+        # Seeded alongside the latch so the split detector has a baseline from
+        # the very first post-resolution evaluation.
+        # The split window boundary: the day the latch was last evaluated.
+        "rearm_last_seen_day": DAY1.isoformat(),
         "fired_floor_price": pytest.approx(95.0),
     }
 
@@ -155,44 +164,66 @@ def test_recovery_gap_past_exact_offset_band_still_fires():
     assert step.fire_amount_usd == 15.0
 
 
-def test_fresh_recovery_fire_amount_is_floored_at_the_broker_minimum():
-    """Regression test for "Keep sub-dollar fires in the accumulator".
+def test_fresh_recovery_defers_a_sub_dollar_balance_instead_of_rounding_up():
+    """Regression test for "Defer sub-dollar balances instead of rounding them
+    up".
 
-    unit_usd=0.3 with a single 1-unit tier accumulates $0.30 -- the fire
-    amount itself must already be floored to the $1.00 broker minimum
-    (not just the candidate built from it downstream), with the remainder
-    clamped to 0 rather than going negative, so the ledger's own before/
-    after accounting stays internally consistent with what actually gets
-    submitted.
+    unit_usd=0.3 with a single 1-unit tier accumulates $0.30. Flooring that to
+    the $1.00 broker minimum placed more than three times the ladder amount the
+    accumulator exists to defer -- and magnified further the smaller the
+    configured unit -- then cleared the cycle as if the tracked balance had been
+    spent. Recovery must instead hold the balance: nothing is bought, which is
+    the accumulator's own contract for a descent it cannot act on.
     """
     small_tiers = ((1.0, 1.0),)
     state, step = _step({}, decision_price=99.0, previous_close=100.0, tiers=small_tiers, unit_usd=0.3)
     assert step.accumulated_usd_after == pytest.approx(0.3)
     state, step = _step(state, decision_price=100.0, previous_close=100.0, tiers=small_tiers, unit_usd=0.3)
-    assert step.fired
-    assert step.fire_amount_usd == pytest.approx(1.0)
-    assert step.accumulated_usd_after == pytest.approx(0.0)
-    assert state == {
-        "status": STATUS_NONE, "last_evaluated_trading_day": DAY1.isoformat(),
-        "last_evaluated_stream": "afternoon", "fired_floor_drop_metric": pytest.approx(1.0),
-        "fired_floor_price": pytest.approx(99.0),
-    }
+    assert not step.fired
+    assert step.fire_amount_usd == pytest.approx(0.0)
+    assert step.reason == "recovery_below_broker_minimum"
+    # The balance survives intact and the cycle stays active, so a deeper later
+    # dip can still grow it past the minimum.
+    assert step.accumulated_usd_after == pytest.approx(0.3)
+    assert state["status"] == STATUS_DIPPING
+    assert state["accumulated_usd"] == pytest.approx(0.3)
 
 
-def test_firing_continuation_fire_amount_is_also_floored_at_the_broker_minimum():
+def test_firing_continuation_also_defers_a_sub_dollar_remainder():
     small_tiers = ((1.0, 1.0),)
     state, step = _step({}, decision_price=99.0, previous_close=100.0, tiers=small_tiers, unit_usd=0.3)
     day2 = date(2026, 8, 4)
     # Force a continuation state directly (as if a prior run's per_order_cap
     # had already put this cycle into STATUS_FIRING with a sub-dollar
     # remainder) rather than relying on the fresh-recovery branch, to pin
-    # the SAME floor applies in the continuation branch too.
+    # that the SAME deferral applies in the continuation branch too.
     firing_state = dict(state, status=STATUS_FIRING, fire_attempts=1)
     state, step = _step(firing_state, decision_price=100.0, previous_close=100.0, trading_day=day2,
                          tiers=small_tiers, unit_usd=0.3)
+    assert not step.fired
+    assert step.fire_amount_usd == pytest.approx(0.0)
+    assert step.reason == "continuation_below_broker_minimum"
+    assert step.accumulated_usd_after == pytest.approx(0.3)
+    assert state["status"] == STATUS_FIRING
+    # No order was attempted, so the retry budget must not be consumed either.
+    assert state["fire_attempts"] == 1
+
+
+def test_the_broker_minimum_floor_still_beats_a_sub_dollar_per_order_cap():
+    """The floor is unchanged where it only raises the amount back toward money
+    the cycle really holds: a $7 balance with a $0.40 cap still places $1.00,
+    since a broker-rejected sub-dollar order is a harder constraint than a
+    self-imposed cap. Only a sub-dollar TRACKED balance now defers."""
+    tiers = ((1.0, 1.0), (2.0, 2.0), (4.0, 4.0))
+    state, _ = _step({}, decision_price=96.0, previous_close=100.0, tiers=tiers, unit_usd=1.0)
+    assert state["accumulated_usd"] == pytest.approx(7.0)
+    state, step = _step(
+        state, decision_price=97.0, previous_close=100.0, tiers=tiers, unit_usd=1.0,
+        per_order_cap_usd=0.4,
+    )
     assert step.fired
     assert step.fire_amount_usd == pytest.approx(1.0)
-    assert step.accumulated_usd_after == pytest.approx(0.0)
+    assert step.accumulated_usd_after == pytest.approx(6.0)
 
 
 def test_a_sub_cent_tier_credit_is_floored_to_one_cent_not_zero():
@@ -237,6 +268,81 @@ def test_fire_capped_at_per_order_cap_preserves_remainder():
     assert state["accumulated_usd"] == 5.0
 
 
+def test_a_capped_fire_never_leaves_a_sub_minimum_remainder():
+    """Regression test for "Keep capped fire remainders placeable". A
+    per_order_cap_usd tighter than the balance by less than the broker
+    minimum ($10.50 accumulated, $10.00 cap) previously fired exactly the
+    cap and left a $0.50 STATUS_FIRING remainder -- a status that bypasses
+    tier accumulation entirely, so that dust could never grow past the
+    broker minimum and was eventually discarded outright by max_cycle_days/
+    max_fire_attempts abandonment. The fire amount must instead shrink just
+    enough to leave a full broker-minimum remainder, which the very next
+    evaluation can actually place.
+    """
+    tiers = ((1.0, 1.0), (2.0, 2.0))
+    # A 2.5% dip crosses both tiers: 3.5 * (1 + 2) == accumulated_usd 10.5.
+    state, _ = _step({}, decision_price=97.5, previous_close=100.0, tiers=tiers, unit_usd=3.5)
+    assert state["accumulated_usd"] == pytest.approx(10.5)
+    # Recovery: 1% drop is 1.5 points off the 2.5% low, clearing the 1.0
+    # default recovery_offset.
+    state, step = _step(
+        state, decision_price=99.0, previous_close=100.0, tiers=tiers, unit_usd=3.5,
+        per_order_cap_usd=10.0,
+    )
+    assert step.fired
+    assert step.fire_amount_usd == pytest.approx(9.5)  # shrunk from the $10 cap
+    assert step.accumulated_usd_after == pytest.approx(1.0)  # a full, placeable broker minimum
+    assert step.status_after == STATUS_FIRING
+    assert state["accumulated_usd"] == pytest.approx(1.0)
+
+    # And the very next evaluation places that remainder in full -- it is
+    # never stuck below the broker minimum.
+    day2 = date(2026, 8, 4)
+    state, step2 = _step(
+        state, decision_price=50.0, previous_close=100.0, trading_day=day2, tiers=tiers, unit_usd=3.5,
+        per_order_cap_usd=10.0,
+    )
+    assert step2.fired
+    assert step2.fire_amount_usd == pytest.approx(1.0)
+    assert step2.accumulated_usd_after == pytest.approx(0.0)
+
+
+def test_a_cap_that_cannot_leave_a_placeable_remainder_is_overridden():
+    """Regression test for "Keep the adjusted fire amount above the broker
+    minimum". A balance between one and two broker minimums, capped at or
+    below the minimum -- a $1.50 balance capped at $1.00 -- previously
+    shrank the capped $1.00 down to a $0.50 remainder-zeroing fire that is
+    ITSELF below the broker minimum: both evaluation branches reject a
+    sub-dollar fire, so the balance became permanently unplaceable, exactly
+    the failure mode the shrink exists to prevent. No cap-respecting
+    partition of $1.50 leaves both halves placeable, so the cap must give
+    way: the fire places the FULL balance in one order instead.
+    """
+    tiers = ((1.5, 1.5),)
+    state, _ = _step({}, decision_price=98.5, previous_close=100.0, tiers=tiers, unit_usd=1.0)
+    assert state["accumulated_usd"] == pytest.approx(1.5)
+    state, step = _step(
+        state, decision_price=100.0, previous_close=100.0, tiers=tiers, unit_usd=1.0,
+        per_order_cap_usd=1.0,
+    )
+    assert step.fired
+    assert step.fire_amount_usd == pytest.approx(1.5)  # the cap is overridden, not honored
+    assert step.accumulated_usd_after == pytest.approx(0.0)
+
+
+def test_an_uncapped_fire_still_leaves_no_remainder():
+    """The adjustment in _capped_fire_amount must be a no-op when
+    per_order_cap_usd never actually capped anything -- firing the whole
+    balance already leaves a $0 remainder, which the shrink logic must not
+    disturb."""
+    state, _ = _step({}, decision_price=91.5, previous_close=100.0)  # accum = 15
+    state, step = _step(state, decision_price=97.0, previous_close=100.0)  # no cap
+    assert step.fired
+    assert step.fire_amount_usd == pytest.approx(15.0)
+    assert step.accumulated_usd_after == pytest.approx(0.0)
+    assert step.status_after == STATUS_NONE
+
+
 def test_firing_continuation_places_remainder_on_a_later_run():
     state, _ = _step({}, decision_price=91.5, previous_close=100.0, trading_day=DAY1)
     day2 = date(2026, 8, 4)
@@ -252,6 +358,12 @@ def test_firing_continuation_places_remainder_on_a_later_run():
     assert state == {
         "status": STATUS_NONE, "last_evaluated_trading_day": day3.isoformat(),
         "last_evaluated_stream": "afternoon", "fired_floor_drop_metric": pytest.approx(8.5),
+        "rearm_reference_close": pytest.approx(100.0),
+        # The split window boundary: the day cycle_reference_close's price
+        # SCALE was captured -- cycle start (DAY1), not today (day3) this
+        # multi-run continuation happens to resolve on (Codex review:
+        # "Retain the reference-scale cursor when a continuation resolves").
+        "rearm_last_seen_day": DAY1.isoformat(),
         "fired_floor_price": pytest.approx(91.5),
     }
 
@@ -459,16 +571,99 @@ def test_rearm_after_fire_starts_a_fresh_cycle():
     assert state == {
         "status": STATUS_NONE, "last_evaluated_trading_day": DAY1.isoformat(),
         "last_evaluated_stream": "afternoon", "fired_floor_drop_metric": pytest.approx(5.0),
+        "rearm_reference_close": pytest.approx(100.0),
+        # The split window boundary: the day the latch was last evaluated.
+        "rearm_last_seen_day": DAY1.isoformat(),
         "fired_floor_price": pytest.approx(95.0),
     }
-    # A brand-new dip on a LATER day after the reset behaves exactly like a
-    # fresh tracker (a same-day rearm is deliberately blocked -- see
-    # test_same_day_retry_after_full_fire_is_a_no_op; the fire floor also
-    # only ever applies on the SAME trading_day it was recorded).
+    # Merely reaching a later day does not make an unchanged descent fresh
+    # -- previous_close (99) is still strictly below the reference (100),
+    # so price has not yet actually recovered.
     day2 = date(2026, 8, 4)
-    state, step = _step(state, decision_price=99.0, previous_close=100.0, trading_day=day2)
+    state, step = _step(state, decision_price=99.0, previous_close=99.0, trading_day=day2)
+    assert step.reason == "awaiting_fresh_dip"
+    assert state["rearm_reference_close"] == pytest.approx(100.0)
+
+    # Rearm only after price exits the old dip, then allow a subsequent dip.
+    state, step = _step(state, decision_price=100.0, previous_close=100.0, trading_day=day2)
+    assert step.reason == "no_action"
+    assert state == {}
+    day3 = date(2026, 8, 5)
+    state, step = _step(state, decision_price=99.0, previous_close=100.0, trading_day=day3)
     assert step.status_after == STATUS_DIPPING
     assert step.accumulated_usd_after == 1.0
+
+
+def test_rearm_uses_previous_close_to_recognize_a_fresh_descent():
+    resolved = {
+        "status": STATUS_NONE,
+        "last_evaluated_trading_day": DAY1.isoformat(),
+        "last_evaluated_stream": "afternoon",
+        "rearm_reference_close": 100.0,
+    }
+
+    state, step = _step(
+        resolved,
+        decision_price=99.0,
+        previous_close=101.0,
+        trading_day=date(2026, 8, 4),
+    )
+
+    assert step.reason == "tier_crossed"
+    assert step.status_after == STATUS_DIPPING
+    assert state["cycle_reference_close"] == pytest.approx(101.0)
+
+
+def test_a_new_cycle_rearming_the_same_day_starts_its_age_at_one():
+    """Regression test for "Reset the age counter when rearming on the same
+    day".
+
+    When a completed cycle exits its latch and breaks the fire floor in a LATER
+    STREAM on the same trading day, that path deliberately preserves the
+    resolved marker's `last_evaluated_trading_day`. `trading_days_active` is
+    computed near function entry and its increment is suppressed when that
+    field already equals today, so the freshly armed cycle started at 0 instead
+    of 1 -- buying it one extra session beyond max_cycle_days, during which it
+    could still fire after the configured cutoff.
+    """
+    # Morning: a -10% dip fires and resolves, arming the latch at 100.
+    state, step = _step({}, decision_price=90.0, previous_close=100.0, stream="morning")
+    state, step = _step(state, decision_price=91.0, previous_close=100.0, stream="morning")
+    assert step.fired
+    assert state["status"] == STATUS_NONE
+    assert state["rearm_reference_close"] == pytest.approx(100.0)
+
+    # Afternoon, SAME trading day: previous_close (102) has risen above the
+    # latch reference, so the latch exits, AND the price breaks below the
+    # fire's own floor of 90 -- a genuinely new descent that re-arms rather
+    # than being suppressed by the same-day floor guard.
+    state, step = _step(state, decision_price=89.0, previous_close=102.0, stream="afternoon")
+    assert step.status_after == STATUS_DIPPING
+    # Its first trading day counts as one, not zero -- the old cycle's
+    # bookkeeping is not inherited.
+    assert state["cycle_start_trading_day"] == DAY1.isoformat()
+    assert state["trading_days_active"] == 1
+
+
+def test_a_previous_close_equal_to_the_rearm_reference_exits_the_latch():
+    """Regression test for "Treat an equal prior close as latch recovery".
+    An EQUAL previous_close counts as having exited the paid-for dip, same
+    as "at or above" everywhere else in this module -- not just a strictly
+    GREATER previous_close, which left the exact boundary reachable by
+    neither the latch nor the exit branch and permanently stuck."""
+    resolved = {
+        "status": STATUS_NONE,
+        "last_evaluated_trading_day": DAY1.isoformat(),
+        "last_evaluated_stream": "afternoon",
+        "rearm_reference_close": 100.0,
+    }
+
+    day2 = date(2026, 8, 4)
+    state, step = _step(resolved, decision_price=99.0, previous_close=100.0, trading_day=day2)
+
+    assert step.reason == "tier_crossed"
+    assert step.status_after == STATUS_DIPPING
+    assert "rearm_reference_close" not in state
 
 
 def test_same_day_retry_after_full_fire_is_a_no_op():
@@ -487,11 +682,12 @@ def test_same_day_retry_after_full_fire_is_a_no_op():
     assert not step.fired
     assert step.newly_crossed_tiers == ()
     assert state == resolved
-    # A genuinely LATER day's fresh dip is unaffected.
+    # A later day alone is not a fresh dip: price must first exit the old
+    # one (previous_close, 99, still strictly below the reference).
     day2 = date(2026, 8, 4)
-    state, step = _step(state, decision_price=99.0, previous_close=100.0, trading_day=day2)
-    assert step.status_after == STATUS_DIPPING
-    assert step.accumulated_usd_after == 1.0
+    state, step = _step(state, decision_price=99.0, previous_close=99.0, trading_day=day2)
+    assert step.reason == "awaiting_fresh_dip"
+    assert step.status_after == STATUS_NONE
 
 
 def test_same_day_fire_floor_blocks_a_shallow_rearm_from_a_different_stream():
@@ -510,19 +706,27 @@ def test_same_day_fire_floor_blocks_a_shallow_rearm_from_a_different_stream():
     resolved = dict(state)
 
     # A DIFFERENT stream, same day, at a SHALLOW -1% dip -- still below
-    # prior_close, but nowhere near the -5% floor -- must be a no-op.
+    # prior_close, but nowhere near the -5% floor -- must be a no-op. Note
+    # previous_close (100) equals the durable latch's own reference here,
+    # but it's an unchanged, REPEATED same-day observation (not a genuinely
+    # later day's close), so it does not by itself exit the durable latch --
+    # the still-armed latch is authoritative and blocks this directly,
+    # never even deferring to the separate (weaker) same-day floor guard
+    # (Codex review, third round: "Keep the durable latch authoritative
+    # over the same-day floor").
     state, step = _step(state, decision_price=99.0, previous_close=100.0, trading_day=DAY1, stream="midday")
-    assert step.reason == "same_day_fire_floor_not_broken"
+    assert step.reason == "awaiting_fresh_dip"
     assert not step.fired
     assert step.newly_crossed_tiers == ()
-    assert state == resolved
+    assert state["rearm_reference_close"] == pytest.approx(100.0)
+    assert state == {**resolved, "rearm_last_seen_day": DAY1.isoformat()}
 
-    # A DIFFERENT stream, same day, at a price that genuinely breaks BELOW
-    # the floor (-5.5%) is a real new descent and must be tracked.
+    # Even a deeper print is still part of the unresolved descent -- the
+    # durable latch (still armed, previous_close never having exited it)
+    # blocks it regardless of the same-day floor's own, narrower depth check.
     state, step = _step(state, decision_price=94.5, previous_close=100.0, trading_day=DAY1, stream="afternoon")
-    assert step.status_after == STATUS_DIPPING
-    assert step.newly_crossed_tiers == (1.0, 2.0, 4.0)
-    assert step.accumulated_usd_after == pytest.approx(7.0)
+    assert step.reason == "awaiting_fresh_dip"
+    assert step.status_after == STATUS_NONE
 
 
 def test_same_day_rearm_check_uses_the_frozen_reference_price_not_a_fresh_one():
@@ -571,7 +775,18 @@ def test_same_day_rearm_check_uses_the_frozen_reference_price_not_a_fresh_one():
     assert step.reason == "same_day_fire_floor_not_broken"
     assert not step.fired
     assert step.newly_crossed_tiers == ()
-    assert state == resolved
+    # The durable rearm latch itself also legitimately exits on this same
+    # call: previous_close (110) already exceeds the latch's own reference
+    # (100, the cycle's pre-descent price) -- unrelated to, and independent
+    # of, the same-day floor guard blocking the actual credit above.
+    assert "rearm_reference_close" not in state
+    # rearm_last_seen_day goes with it: the split window boundary is
+    # meaningless once there is no latch left for a rebase to correct.
+    assert "rearm_last_seen_day" not in state
+    assert state == {
+        k: v for k, v in resolved.items()
+        if k not in ("rearm_reference_close", "rearm_last_seen_day")
+    }
 
     # A price that genuinely breaks BELOW the true floor (90) is a real new
     # descent and must be tracked, even against that same fresh
@@ -703,18 +918,29 @@ def test_same_day_abandonment_floor_blocks_an_immediate_rearm_from_a_different_s
     resolved = dict(state)
 
     # A DIFFERENT stream, same day, at a SHALLOW -1% dip -- still below
-    # prior_close, but nowhere near the -5% floor -- must be a no-op.
+    # prior_close, but nowhere near the -5% floor -- must be a no-op. The
+    # abandonment now also carries the durable rearm_reference_close latch
+    # (Codex review, third round: "Preserve the latch when abandoning a
+    # partially paid fire"), which is authoritative and blocks this
+    # directly rather than deferring to the same-day floor.
     state, step = _step(state, decision_price=99.0, previous_close=100.0, trading_day=day2, stream="midday")
-    assert step.reason == "same_day_fire_floor_not_broken"
+    assert step.reason == "awaiting_fresh_dip"
     assert not step.fired
     assert step.newly_crossed_tiers == ()
+    # rearm_last_seen_day is untouched by this no-op re-evaluation (no
+    # split_cursor_day is supplied here) -- it stays at the cycle's own
+    # start day (DAY1), the day cycle_reference_close's price scale was
+    # actually captured on, matching the abandonment fix above (Codex
+    # review: "Retain the reference-scale cursor when a continuation
+    # resolves").
     assert state == resolved
 
-    # A DIFFERENT stream, same day, at a price that genuinely breaks BELOW
-    # the floor (-5.5%) is a real new descent and must be tracked.
+    # Even a deeper print (-5.5%) is still part of the unresolved descent --
+    # the durable latch has no depth consideration of its own and blocks
+    # regardless, same as the analogous fire-floor test above.
     state, step = _step(state, decision_price=94.5, previous_close=100.0, trading_day=day2, stream="afternoon")
-    assert step.status_after == STATUS_DIPPING
-    assert step.newly_crossed_tiers == (1.0, 2.0, 4.0)
+    assert step.reason == "awaiting_fresh_dip"
+    assert step.status_after == STATUS_NONE
 
 
 def _run_dipping_cycle_for_n_more_trading_days(state, n, *, start_day, max_cycle_days=30):
@@ -766,11 +992,19 @@ def test_max_cycle_days_abandons_a_stale_dipping_cycle():
     # review: "Prevent abandoned cycles from immediately rearming") -- the
     # price never moved from decision_price=99.0/previous_close=100.0
     # throughout this cycle, so both the persisted lowest_drop_seen and this
-    # final evaluation's own drop_metric are 1.0.
+    # final evaluation's own drop_metric are 1.0. The durable
+    # rearm_reference_close latch is now also carried (Codex review, third
+    # round: "Preserve the latch when abandoning a partially paid fire").
     assert state == {
         "status": STATUS_NONE, "last_evaluated_trading_day": abandon_day.isoformat(),
         "last_evaluated_stream": "afternoon", "fired_floor_drop_metric": 1.0,
         "fired_floor_price": pytest.approx(99.0),
+        "rearm_reference_close": pytest.approx(100.0),
+        # The split window boundary: the day cycle_reference_close's price
+        # SCALE was captured -- cycle start (DAY1), not the abandonment day
+        # 30 trading days later (Codex review: "Retain the reference-scale
+        # cursor when a continuation resolves").
+        "rearm_last_seen_day": DAY1.isoformat(),
     }
 
 
@@ -833,11 +1067,21 @@ def test_max_fire_attempts_abandons_a_stuck_firing_cycle():
     # review: "Prevent abandoned cycles from immediately rearming") -- the
     # cycle's persisted lowest_drop_seen (8.5, from the initial 91.5 dip
     # that triggered the fire) stays deeper than every constant-97.0
-    # continuation call's own drop_metric (3.0), so the floor is 8.5.
+    # continuation call's own drop_metric (3.0), so the floor is 8.5. The
+    # durable rearm_reference_close latch is now also carried, since this
+    # abandonment happened mid-STATUS_FIRING -- earlier continuations may
+    # already have placed real, settled partial chunks (Codex review, third
+    # round: "Preserve the latch when abandoning a partially paid fire").
     assert state == {
         "status": STATUS_NONE, "last_evaluated_trading_day": day.isoformat(),
         "last_evaluated_stream": "afternoon", "fired_floor_drop_metric": 8.5,
         "fired_floor_price": pytest.approx(91.5),
+        "rearm_reference_close": pytest.approx(100.0),
+        # The split window boundary: the day cycle_reference_close's price
+        # SCALE was captured -- cycle start (DAY1), not the abandonment day
+        # (Codex review: "Retain the reference-scale cursor when a
+        # continuation resolves").
+        "rearm_last_seen_day": DAY1.isoformat(),
     }
 
 
@@ -1002,6 +1246,537 @@ def _write_history_csv(history_dir, ticker, rows):
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
+
+
+def _write_split_history(history_dir, ticker, rows, dividends=None):
+    """An archive carrying the real ``Stock Splits`` (and ``Dividends``)
+    columns, as scripts/refresh_active_ticker_histories.py writes them.
+
+    ``dividends`` optionally maps a row's date to its per-share cash payout;
+    every other date defaults to "0.0", the ordinary-day value.
+    """
+    history_dir.mkdir(parents=True, exist_ok=True)
+    path = history_dir / f"{ticker}.csv"
+    fields = ["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume", "Dividends", "Stock Splits"]
+    dividends = dividends or {}
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for day, close, split in rows:
+            writer.writerow({
+                "Date": day.isoformat(), "Open": str(close), "High": str(close), "Low": str(close),
+                "Close": str(close), "Adj Close": str(close), "Volume": "1000",
+                "Dividends": str(dividends.get(day, 0.0)), "Stock Splits": str(split),
+            })
+
+
+def _write_split_history_missing_column(history_dir, ticker, rows, *, omit="Stock Splits"):
+    """An archive whose header is missing ``omit`` entirely -- a legacy or
+    partially generated file, not merely a column full of "0.0" rows."""
+    history_dir.mkdir(parents=True, exist_ok=True)
+    path = history_dir / f"{ticker}.csv"
+    fields = [f for f in
+              ["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume", "Dividends", "Stock Splits"]
+              if f != omit]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for day, close in rows:
+            row = {
+                "Date": day.isoformat(), "Open": str(close), "High": str(close), "Low": str(close),
+                "Close": str(close), "Adj Close": str(close), "Volume": "1000",
+                "Dividends": "0.0", "Stock Splits": "0.0",
+            }
+            row.pop(omit, None)
+            writer.writerow(row)
+
+
+def test_archived_split_factor_reports_the_recorded_ratio(tmp_path):
+    """Regression test for "Require corporate-action evidence before rebasing".
+
+    The two heuristics this replaced asked whether a close-to-close move LOOKED
+    like a split. Neither could tell one from an ordinary gap -- an 80 -> 120
+    news gap reads as a reverse 3-for-2 and a ~50% crash reads as a 2-for-1,
+    both entirely realistic for the volatile tickers this mode targets. The
+    archive records the real ratio, so an ordinary gap of any size reports
+    nothing.
+    """
+    history = tmp_path / "ticker_data"
+    as_of = date(2026, 8, 12)
+    _write_split_history(history, "AAPL", [
+        (date(2026, 8, 7), 100.0, 0.0),
+        (date(2026, 8, 10), 50.0, 2.0),   # a real 2-for-1, recorded as such
+        (date(2026, 8, 11), 51.0, 0.0),
+    ])
+    # The split falls inside the window.
+    factor, cursor = archived_split_factor(
+        "AAPL", since=date(2026, 8, 7), as_of=as_of, history_dir=history
+    )
+    assert factor == pytest.approx(2.0)
+    # The cursor is the newest row EXAMINED, never as_of -- stamping as_of
+    # would skip a split's own effective-day row forever.
+    assert cursor == date(2026, 8, 11)
+    # ...and outside it, the same archive confirms NO corporate action. That is
+    # 1.0 ("nothing happened"), which is a different answer from None.
+    assert archived_split_factor(
+        "AAPL", since=date(2026, 8, 10), as_of=as_of, history_dir=history
+    )[0] == pytest.approx(1.0)
+
+
+def test_archived_split_factor_ignores_an_ordinary_violent_gap(tmp_path):
+    """The case both heuristics got wrong: a huge single-session move with no
+    corporate action behind it. 80 -> 120 is a 1.5x jump the whole-factor rule
+    classified as a reverse 3-for-2; the archive records 0.0 and confirms
+    nothing happened."""
+    history = tmp_path / "ticker_data"
+    _write_split_history(history, "AAPL", [
+        (date(2026, 8, 7), 80.0, 0.0),
+        (date(2026, 8, 10), 120.0, 0.0),  # news gap, not a split
+        (date(2026, 8, 11), 40.0, 0.0),   # ~66% crash, also not a split
+    ])
+    assert archived_split_factor(
+        "AAPL", since=date(2026, 8, 7), as_of=date(2026, 8, 12), history_dir=history
+    )[0] == pytest.approx(1.0)
+
+
+def test_archived_split_factor_cannot_confirm_from_a_missing_or_stale_archive(tmp_path):
+    """``None`` means "cannot confirm", which the caller treats as "do not
+    rebase" -- the fail-closed direction. A stale archive's silence is
+    indistinguishable from a market with no splits, so it must not be read as
+    confirmation that none occurred."""
+    history = tmp_path / "ticker_data"
+    # Absent entirely.
+    assert archived_split_factor(
+        "AAPL", since=date(2026, 8, 7), as_of=date(2026, 8, 12), history_dir=history
+    ) is None
+    # Present but its most recent row predates as_of by more than the staleness
+    # budget -- a refresh that silently stopped.
+    _write_split_history(history, "AAPL", [(date(2026, 7, 1), 100.0, 0.0)])
+    assert archived_split_factor(
+        "AAPL", since=date(2026, 6, 1), as_of=date(2026, 8, 12), history_dir=history
+    ) is None
+    # A path-traversing symbol is refused outright, like trailing_daily_returns.
+    assert archived_split_factor(
+        "../ESCAPED", since=date(2026, 8, 7), as_of=date(2026, 8, 12), history_dir=history
+    ) is None
+
+
+def test_archived_split_factor_includes_a_split_effective_on_as_of(tmp_path):
+    """Regression test for "Include effective-day splits before evaluating the
+    latch". A split effective ON as_of (the day being evaluated) must be
+    confirmed by the SAME call, not the next one -- decision_price/
+    previous_close for that day already reflect the post-split scale, so
+    withholding confirmation until tomorrow leaves this evaluation comparing
+    a post-split price against a pre-split reference.
+    """
+    history = tmp_path / "ticker_data"
+    as_of = date(2026, 8, 12)
+    _write_split_history(history, "AAPL", [
+        (date(2026, 8, 11), 100.0, 0.0),
+        (as_of, 50.0, 2.0),  # the split's own effective day IS as_of
+    ])
+    factor, cursor = archived_split_factor(
+        "AAPL", since=date(2026, 8, 11), as_of=as_of, history_dir=history
+    )
+    assert factor == pytest.approx(2.0)
+    assert cursor == as_of
+    # A row strictly AFTER as_of is still genuine lookahead and excluded.
+    _write_split_history(history, "MSFT", [
+        (date(2026, 8, 11), 100.0, 0.0),
+        (as_of, 100.0, 0.0),
+        (as_of + timedelta(days=1), 50.0, 2.0),  # tomorrow's split
+    ])
+    factor2, cursor2 = archived_split_factor(
+        "MSFT", since=date(2026, 8, 11), as_of=as_of, history_dir=history
+    )
+    assert factor2 == pytest.approx(1.0)
+    assert cursor2 == as_of
+
+
+def test_archived_split_factor_rejects_a_malformed_split_cell(tmp_path):
+    """Regression test for "Reject malformed split cells before advancing
+    the cursor". A ``Stock Splits`` cell of unparseable text, NaN, or a
+    negative number reads back through plain float-and-check as ``None`` --
+    identical to the genuine ordinary-day value ``"0.0"`` -- so without
+    distinguishing the two, a fresh or partially written archive's malformed
+    row was confirmed as "no corporate action" and its date advanced past as
+    the durable cursor. A later archive correction is then excluded forever
+    by ``row_date <= since``, permanently missing a real split.
+    """
+    history = tmp_path / "ticker_data"
+    as_of = date(2026, 8, 12)
+    bad_date = date(2026, 8, 10)
+    history.mkdir(parents=True, exist_ok=True)
+    path = history / "AAPL.csv"
+    fields = ["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume", "Dividends", "Stock Splits"]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerow({
+            "Date": date(2026, 8, 9).isoformat(), "Open": "100", "High": "100", "Low": "100",
+            "Close": "100", "Adj Close": "100", "Volume": "1000", "Dividends": "0.0", "Stock Splits": "0.0",
+        })
+        writer.writerow({
+            "Date": bad_date.isoformat(), "Open": "50", "High": "50", "Low": "50",
+            "Close": "50", "Adj Close": "50", "Volume": "1000", "Dividends": "0.0", "Stock Splits": "not-a-ratio",
+        })
+        # A later, perfectly ordinary row -- proves the failure short-circuits
+        # the whole call rather than merely skipping the bad row.
+        writer.writerow({
+            "Date": date(2026, 8, 11).isoformat(), "Open": "50", "High": "50", "Low": "50",
+            "Close": "50", "Adj Close": "50", "Volume": "1000", "Dividends": "0.0", "Stock Splits": "0.0",
+        })
+    assert archived_split_factor(
+        "AAPL", since=date(2026, 8, 9), as_of=as_of, history_dir=history
+    ) is None
+
+
+def test_archived_split_factor_rejects_a_malformed_dividend_cell(tmp_path):
+    """Regression test for "Reject malformed dividend cells before advancing
+    the cursor". Same ambiguity as the Stock Splits cell, one column over: a
+    ``Dividends`` cell of unparseable text, NaN, or a negative number reads
+    back as ``None`` -- identical to the genuine ordinary-day value
+    ``"0.0"`` -- so a malformed row was confirmed as "no distribution" and
+    its date advanced past as the durable cursor, permanently excluding a
+    later correction via ``row_date <= since``.
+    """
+    history = tmp_path / "ticker_data"
+    as_of = date(2026, 8, 12)
+    bad_date = date(2026, 8, 10)
+    history.mkdir(parents=True, exist_ok=True)
+    path = history / "AAPL.csv"
+    fields = ["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume", "Dividends", "Stock Splits"]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerow({
+            "Date": date(2026, 8, 9).isoformat(), "Open": "100", "High": "100", "Low": "100",
+            "Close": "100", "Adj Close": "100", "Volume": "1000", "Dividends": "0.0", "Stock Splits": "0.0",
+        })
+        writer.writerow({
+            "Date": bad_date.isoformat(), "Open": "50", "High": "50", "Low": "50",
+            "Close": "50", "Adj Close": "50", "Volume": "1000", "Dividends": "-3.0", "Stock Splits": "0.0",
+        })
+        # A later, perfectly ordinary row -- proves the failure short-circuits
+        # the whole call rather than merely skipping the bad row.
+        writer.writerow({
+            "Date": date(2026, 8, 11).isoformat(), "Open": "50", "High": "50", "Low": "50",
+            "Close": "50", "Adj Close": "50", "Volume": "1000", "Dividends": "0.0", "Stock Splits": "0.0",
+        })
+    assert archived_split_factor(
+        "AAPL", since=date(2026, 8, 9), as_of=as_of, history_dir=history
+    ) is None
+
+
+def test_archived_split_factor_rejects_a_malformed_action_row_date(tmp_path):
+    """Regression test for "Reject malformed action-row dates before
+    advancing the cursor". A row with a Date present but unparseable could
+    be hiding a real split/dividend this call cannot examine -- silently
+    skipping it let a LATER, cleanly-dated row become the persisted cursor,
+    after which a corrected archive would exclude the malformed row's
+    actual date forever via ``row_date <= since``.
+    """
+    history = tmp_path / "ticker_data"
+    as_of = date(2026, 8, 12)
+    history.mkdir(parents=True, exist_ok=True)
+    path = history / "AAPL.csv"
+    fields = ["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume", "Dividends", "Stock Splits"]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerow({
+            "Date": date(2026, 8, 9).isoformat(), "Open": "100", "High": "100", "Low": "100",
+            "Close": "100", "Adj Close": "100", "Volume": "1000", "Dividends": "0.0", "Stock Splits": "0.0",
+        })
+        writer.writerow({
+            "Date": "not-a-date", "Open": "50", "High": "50", "Low": "50",
+            "Close": "50", "Adj Close": "50", "Volume": "1000", "Dividends": "0.0", "Stock Splits": "2.0",
+        })
+        # A later, perfectly ordinary, cleanly-dated row -- proves the
+        # failure short-circuits the whole call rather than merely skipping
+        # the malformed row and letting this one become the cursor.
+        writer.writerow({
+            "Date": date(2026, 8, 11).isoformat(), "Open": "50", "High": "50", "Low": "50",
+            "Close": "50", "Adj Close": "50", "Volume": "1000", "Dividends": "0.0", "Stock Splits": "0.0",
+        })
+    assert archived_split_factor(
+        "AAPL", since=date(2026, 8, 9), as_of=as_of, history_dir=history
+    ) is None
+
+
+def test_archived_split_factor_rejects_an_undated_corporate_action_row(tmp_path):
+    """Regression test for "Reject undated corporate-action rows before
+    advancing". A row with a genuinely BLANK Date but a nonzero Stock
+    Splits/Dividends value means the archive recorded a real corporate
+    action with nothing to place it on -- silently skipping it (as a
+    genuinely inert blank row is skipped) let a LATER, cleanly-dated row
+    become the persisted cursor, after which a corrected archive (the date
+    filled back in) would exclude this very row forever via
+    ``row_date <= since``.
+    """
+    history = tmp_path / "ticker_data"
+    as_of = date(2026, 8, 12)
+    history.mkdir(parents=True, exist_ok=True)
+    path = history / "AAPL.csv"
+    fields = ["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume", "Dividends", "Stock Splits"]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerow({
+            "Date": date(2026, 8, 9).isoformat(), "Open": "100", "High": "100", "Low": "100",
+            "Close": "100", "Adj Close": "100", "Volume": "1000", "Dividends": "0.0", "Stock Splits": "0.0",
+        })
+        writer.writerow({
+            "Date": "", "Open": "50", "High": "50", "Low": "50",
+            "Close": "50", "Adj Close": "50", "Volume": "1000", "Dividends": "0.0", "Stock Splits": "2.0",
+        })
+        # A later, perfectly ordinary, cleanly-dated row -- proves the
+        # failure short-circuits the whole call rather than merely skipping
+        # the undated row and letting this one become the cursor.
+        writer.writerow({
+            "Date": date(2026, 8, 11).isoformat(), "Open": "50", "High": "50", "Low": "50",
+            "Close": "50", "Adj Close": "50", "Volume": "1000", "Dividends": "0.0", "Stock Splits": "0.0",
+        })
+    assert archived_split_factor(
+        "AAPL", since=date(2026, 8, 9), as_of=as_of, history_dir=history
+    ) is None
+
+
+def test_archived_split_factor_rejects_an_archive_missing_the_splits_column(tmp_path):
+    """Regression test for "Reject archives that omit split metadata". A
+    header missing "Stock Splits" entirely reads back as None for every row --
+    identical to a genuine "0.0" -- so without a header check this falsely
+    confirms "no corporate action" and advances the cursor past rows the
+    archive never actually reported on.
+    """
+    history = tmp_path / "ticker_data"
+    _write_split_history_missing_column(
+        history, "AAPL",
+        [(date(2026, 8, 10), 100.0), (date(2026, 8, 11), 50.0)],  # a real 2x drop, unrecorded
+        omit="Stock Splits",
+    )
+    assert archived_split_factor(
+        "AAPL", since=date(2026, 8, 9), as_of=date(2026, 8, 12), history_dir=history
+    ) is None
+
+
+def test_archived_split_factor_rejects_an_archive_missing_the_dividends_column(tmp_path):
+    """The writer script always emits "Stock Splits" and "Dividends" together
+    (scripts/refresh_active_ticker_histories.py), so a file missing either one
+    is equally untrustworthy."""
+    history = tmp_path / "ticker_data"
+    _write_split_history_missing_column(
+        history, "AAPL",
+        [(date(2026, 8, 10), 100.0), (date(2026, 8, 11), 100.0)],
+        omit="Dividends",
+    )
+    assert archived_split_factor(
+        "AAPL", since=date(2026, 8, 9), as_of=date(2026, 8, 12), history_dir=history
+    ) is None
+
+
+def test_archived_split_factor_rejects_an_overflowed_cumulative_factor(tmp_path):
+    """Regression test for "Reject an unrepresentable cumulative split
+    factor". Two individually-finite split ratios whose product overflows to
+    inf must not be returned -- a caller that divides the latch reference by
+    infinity gets zero, reading every positive price as having exited the
+    latch and re-crediting an already-paid descent.
+    """
+    history = tmp_path / "ticker_data"
+    as_of = date(2026, 8, 12)
+    _write_split_history(history, "AAPL", [
+        (date(2026, 8, 9), 100.0, 1e308),
+        (date(2026, 8, 10), 100.0, 1e308),  # product overflows to inf
+        (date(2026, 8, 11), 100.0, 0.0),
+    ])
+    assert archived_split_factor(
+        "AAPL", since=date(2026, 8, 8), as_of=as_of, history_dir=history
+    ) is None
+
+
+def test_archived_split_factor_never_reports_a_cursor_older_than_since(tmp_path):
+    """Regression test for "Never move the split cursor backward". If the
+    archive is rolled back to an older-but-still-fresh snapshot, its newest
+    row can predate `since` (the previous call's own cursor). Reporting that
+    older date as the new cursor would let a caller persist a regression --
+    a split already folded into the reference on a later run would then be
+    re-examined and folded in a SECOND time once the complete archive
+    returns.
+    """
+    history = tmp_path / "ticker_data"
+    as_of = date(2026, 8, 12)
+    # The archive's newest row (Aug 9) is OLDER than `since` (Aug 10), but
+    # still within the staleness budget relative to as_of.
+    _write_split_history(history, "AAPL", [
+        (date(2026, 8, 8), 100.0, 0.0),
+        (date(2026, 8, 9), 100.0, 0.0),
+    ])
+    assert archived_split_factor(
+        "AAPL", since=date(2026, 8, 10), as_of=as_of, history_dir=history
+    ) is None
+
+
+def test_archived_split_factor_folds_in_a_confirmed_dividend(tmp_path):
+    """Regression test for "Rebase the durable latch across cash
+    distributions". A cash dividend mechanically drops the raw share price by
+    the payout amount, exactly like a split drops it by the split ratio -- an
+    armed latch spanning the ex-dividend date must rebase the same way or it
+    stays pinned to an economically unreachable pre-distribution reference.
+    """
+    history = tmp_path / "ticker_data"
+    as_of = date(2026, 8, 12)
+    ex_date = date(2026, 8, 10)
+    # A $20 special dividend on an ex-date close of $80 (already post-drop) --
+    # reconstructing the pre-drop scale gives (80 + 20) / 80 == 1.25, and
+    # dividing the reference by that scales it down to 0.8x, matching the
+    # real mechanical price drop.
+    _write_split_history(
+        history, "AAPL",
+        [(date(2026, 8, 9), 100.0, 0.0), (ex_date, 80.0, 0.0), (date(2026, 8, 11), 81.0, 0.0)],
+        dividends={ex_date: 20.0},
+    )
+    factor, cursor = archived_split_factor(
+        "AAPL", since=date(2026, 8, 9), as_of=as_of, history_dir=history
+    )
+    assert factor == pytest.approx(1.25)
+    assert cursor == date(2026, 8, 11)
+
+
+def test_archived_split_factor_cannot_confirm_a_dividend_with_no_usable_close(tmp_path):
+    """Regression test for "Preserve the cursor when a dividend cannot be
+    valued". A dividend row whose own Close is missing/unparseable cannot be
+    reconstructed into a ratio at all -- the whole call returns None (cannot
+    confirm) WITHOUT advancing the cursor past that row, exactly like the
+    missing-column and stale-archive guards. Reporting the row as examined
+    while silently omitting its adjustment would let a later run, once the
+    archive is fixed, never look at that date again.
+    """
+    history = tmp_path / "ticker_data"
+    as_of = date(2026, 8, 12)
+    bad_date = date(2026, 8, 10)
+    history.mkdir(parents=True, exist_ok=True)
+    path = history / "AAPL.csv"
+    fields = ["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume", "Dividends", "Stock Splits"]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerow({
+            "Date": date(2026, 8, 9).isoformat(), "Open": "100", "High": "100", "Low": "100",
+            "Close": "100", "Adj Close": "100", "Volume": "1000", "Dividends": "0.0", "Stock Splits": "0.0",
+        })
+        writer.writerow({
+            "Date": bad_date.isoformat(), "Open": "", "High": "", "Low": "",
+            "Close": "not-a-number", "Adj Close": "", "Volume": "1000", "Dividends": "1.0", "Stock Splits": "0.0",
+        })
+        # A later, perfectly usable row -- proves the failure short-circuits
+        # the whole call rather than merely skipping the bad row and
+        # continuing to examine (and report a cursor past) what follows it.
+        writer.writerow({
+            "Date": date(2026, 8, 11).isoformat(), "Open": "100", "High": "100", "Low": "100",
+            "Close": "100", "Adj Close": "100", "Volume": "1000", "Dividends": "0.0", "Stock Splits": "0.0",
+        })
+    assert archived_split_factor(
+        "AAPL", since=date(2026, 8, 9), as_of=as_of, history_dir=history
+    ) is None
+
+
+def test_a_failed_split_lookup_leaves_the_cursor_untouched():
+    """Regression test for "Retain the split cursor when lookup fails". A
+    prior version fell back to stamping today's date as the cursor whenever
+    split_cursor_day was None (the archive was temporarily missing,
+    unreadable, or stale) -- but that advanced the cursor past every row
+    between the OLD cursor and today even though none of them were actually
+    examined. Once the archive recovered, archived_split_factor's own
+    `row_date <= since` exclusion then permanently skipped that unexamined
+    window, missing any real split inside it.
+    """
+    resolved = {
+        "status": STATUS_NONE,
+        "last_evaluated_trading_day": DAY1.isoformat(),
+        "last_evaluated_stream": "afternoon",
+        "rearm_reference_close": 100.0,
+        "rearm_last_seen_day": DAY1.isoformat(),
+    }
+    day2 = date(2026, 8, 4)
+    # split_factor=None mirrors what a caller passes when archived_split_
+    # factor itself returned None (cannot confirm) -- split_cursor_day is
+    # also None in that case, since the two are always returned together.
+    state, step = _step(
+        resolved, decision_price=49.0, previous_close=50.0,
+        trading_day=day2, split_factor=None, split_cursor_day=None,
+    )
+    assert state["rearm_reference_close"] == pytest.approx(100.0)
+    assert state["rearm_last_seen_day"] == DAY1.isoformat()  # unchanged, not day2
+
+
+@pytest.mark.parametrize("factor", [1.5, 2.0, 3.0, 7.0, 20.0, 100.0])
+def test_a_confirmed_forward_split_rebases_the_latch(factor):
+    """A confirmed k-for-1 divides the reference down onto post-split prices, so
+    the latch keeps measuring the same real dip instead of stranding the ticker
+    below a reference it can never reach again."""
+    resolved = {
+        "status": STATUS_NONE,
+        "last_evaluated_trading_day": DAY1.isoformat(),
+        "last_evaluated_stream": "afternoon",
+        "rearm_reference_close": 100.0,
+        "rearm_last_seen_day": DAY1.isoformat(),
+    }
+    day2 = date(2026, 8, 4)
+    post_split = 90.0 / factor
+    # A real caller only ever gets a non-None split_factor alongside a
+    # non-None split_cursor_day -- archived_split_factor returns them
+    # together as one tuple -- so the cursor is supplied here too.
+    state, step = _step(
+        resolved, decision_price=post_split * 0.99, previous_close=post_split,
+        trading_day=day2, split_factor=factor, split_cursor_day=day2,
+    )
+    assert state["rearm_reference_close"] == pytest.approx(100.0 / factor)
+    assert state["rearm_last_seen_day"] == day2.isoformat()
+
+
+@pytest.mark.parametrize("factor", [2.0, 5.0, 20.0])
+def test_a_confirmed_reverse_split_rebases_instead_of_clearing(factor):
+    """A 1-for-k records 1/k, so the same division scales the reference UP.
+    Without it both closes jump above a pre-split reference, the latch reads
+    that as recovery and clears, and the same descent is credited again."""
+    resolved = {
+        "status": STATUS_NONE,
+        "last_evaluated_trading_day": DAY1.isoformat(),
+        "last_evaluated_stream": "afternoon",
+        "rearm_reference_close": 100.0,
+        "rearm_last_seen_day": DAY1.isoformat(),
+    }
+    day2 = date(2026, 8, 4)
+    post_split = 90.0 * factor
+    state, step = _step(
+        resolved, decision_price=post_split * 0.99, previous_close=post_split,
+        trading_day=day2, split_factor=1.0 / factor,
+    )
+    assert state["rearm_reference_close"] == pytest.approx(100.0 * factor)
+    # The latch survives rebased, so the descent is not bought twice.
+    assert step.reason == "awaiting_fresh_dip"
+    assert step.newly_crossed_tiers == ()
+
+
+@pytest.mark.parametrize("unconfirmed", [None, 1.0])
+def test_an_unconfirmed_split_leaves_the_reference_untouched(unconfirmed):
+    """``None`` (cannot confirm) and ``1.0`` (confirmed no corporate action)
+    both rebase nothing. A violent ordinary move must never move the reference,
+    which is what let a ~50% crash clear the latch under the old heuristic."""
+    resolved = {
+        "status": STATUS_NONE,
+        "last_evaluated_trading_day": DAY1.isoformat(),
+        "last_evaluated_stream": "afternoon",
+        "rearm_reference_close": 100.0,
+        "rearm_last_seen_day": DAY1.isoformat(),
+    }
+    day2 = date(2026, 8, 4)
+    state, step = _step(
+        resolved, decision_price=49.0, previous_close=50.0,
+        trading_day=day2, split_factor=unconfirmed,
+    )
+    assert state["rearm_reference_close"] == pytest.approx(100.0)
+    assert step.reason == "awaiting_fresh_dip"
 
 
 def test_trailing_daily_returns_missing_archive_is_empty(tmp_path):
@@ -1755,9 +2530,14 @@ def test_ledger_raises_on_a_nonpositive_lowest_drop_seen(tmp_path, status, bad_v
         ledger.read("GME")
 
 
-@pytest.mark.parametrize("field", ["accumulated_usd", "cycle_reference_close", "lowest_drop_seen", "fired_floor_drop_metric"])
+@pytest.mark.parametrize(
+    "field",
+    ["accumulated_usd", "cycle_reference_close", "lowest_drop_seen", "fired_floor_drop_metric", "fired_floor_price"],
+)
 def test_ledger_raises_on_an_oversized_integer_field_instead_of_crashing(tmp_path, field):
-    """Regression test for "Treat oversized ledger integers as corruption".
+    """Regression test for "Treat oversized ledger integers as corruption"
+    (and, for ``fired_floor_price`` specifically, "Convert oversized
+    fire-floor prices into ledger corruption").
 
     json.loads() parses an arbitrarily large JSON integer into an unbounded
     Python int -- it passes the isinstance(value, (int, float)) check in
@@ -1776,6 +2556,12 @@ def test_ledger_raises_on_an_oversized_integer_field_instead_of_crashing(tmp_pat
         "crossed_tier_thresholds": [1.0, 2.0, 4.0], "cycle_reference_close": 100.0, "lowest_drop_seen": 4.0,
         "cycle_start_trading_day": DAY1.isoformat(),
     }
+    if field == "fired_floor_price":
+        # fired_floor_price is only validated alongside a fired_floor_drop_
+        # metric evaluation date pairing -- see
+        # test_ledger_raises_on_fire_floor_metadata_missing_its_evaluation_date.
+        payload["fired_floor_drop_metric"] = 4.0
+        payload["last_evaluated_trading_day"] = DAY1.isoformat()
     payload[field] = huge_int
     (ticker_dir / "tracker.json").write_text(json.dumps(payload), encoding="utf-8")
     ledger = InverseMartingaleLedger(root=tmp_path)
@@ -2250,26 +3036,75 @@ def test_ledger_raises_on_a_non_boolean_settlement_pending(tmp_path, bad_value):
         ledger.read("GME")
 
 
+def _lease_fields(**overrides):
+    """The recoverable-lease metadata near_close_dca.py's fire claim writes
+    alongside settlement_pending=True. A pending flag is only valid when it
+    carries enough information for a later invocation to reconcile the claim
+    against broker order history -- see _validate_tracker_payload."""
+    fields = {
+        # The real deterministic format claim creation writes: "afternoon" is
+        # the legacy default stream and carries no token of its own -- see
+        # near_close_dca._graded_dca_ref_id_prefix and
+        # dca_inverse_martingale._expected_lease_ref_id.
+        "settlement_ref_id": f"graded-dca-imart-{DAY1.isoformat()}-GME",
+        "settlement_trading_day": DAY1.isoformat(),
+        "settlement_claimed_usd": 7.0,
+        "settlement_target_state": {"status": "none", "last_evaluated_trading_day": DAY1.isoformat()},
+        "settlement_live": True,
+        # A real fingerprint's shape: 32 lowercase hex characters, exactly what
+        # near_close_dca._broker_account_fingerprint produces. The 16-character
+        # value this replaced predated the switch to a keyed HMAC and is a shape
+        # no claim can write, so _validate_tracker_payload now rejects it.
+        "settlement_account": "a1b2c3d4e5f6071829304a5b6c7d8e9f",
+        # Which roster stream made the claim -- read back by recovery to decide
+        # whether the recovered dollars belong to the afternoon-only kill-switch
+        # figure.
+        "settlement_stream": "afternoon",
+    }
+    fields.update(overrides)
+    return fields
+
+
+@pytest.mark.parametrize("stream", [None, "morning", "midday", "afternoon"])
+def test_lease_ref_id_matches_the_claim_sites_own_prefix_builder(stream):
+    """Regression guard for "Validate the settlement ref against its lease
+    fields": _validate_tracker_payload rebuilds the deterministic ref id with
+    its OWN copy of near_close_dca._graded_dca_ref_id_prefix's format
+    (duplicated rather than imported, to avoid a circular import). A
+    validator that silently drifted from the real builder would reject every
+    future legitimate lease, not just damaged ones -- so this asserts
+    byte-for-byte agreement across every stream a claim can actually record,
+    including the legacy (stream absent -> "afternoon") case.
+    """
+    import near_close_dca as ncd
+    from dca_inverse_martingale import _expected_lease_ref_id
+
+    claim_day = date(2026, 8, 3)
+    real = f"{ncd._graded_dca_ref_id_prefix(stream or 'afternoon', 'imart')}-{claim_day.isoformat()}-GME"
+    assert _expected_lease_ref_id(stream, claim_day.isoformat(), "GME") == real
+
+
 @pytest.mark.parametrize("value", [True, False])
 def test_ledger_accepts_a_real_boolean_settlement_pending(tmp_path, value):
     ticker_dir = tmp_path / "GME"
     ticker_dir.mkdir()
     payload = {"version": 1, "ticker": "GME", "status": "none", "settlement_pending": value}
+    if value:
+        payload.update(_lease_fields())
     (ticker_dir / "tracker.json").write_text(json.dumps(payload), encoding="utf-8")
     ledger = InverseMartingaleLedger(root=tmp_path)
     assert ledger.read("GME")["settlement_pending"] is value
 
 
-def test_ledger_raises_on_a_settlement_lease_on_a_dipping_tracker(tmp_path):
-    """Regression test for "Reject leases on dipping trackers". Every
-    legitimate write of settlement_pending=True happens at exactly two
-    points in evaluate_inverse_martingale_step -- a fully-resolved fire's
-    STATUS_NONE marker, or a partial fire's STATUS_FIRING continuation --
-    never while status stays "dipping". A restored or hand-edited tracker
-    combining status="dipping" with settlement_pending=True would otherwise
-    pass validation, and every downstream call site's plain truthy
-    settlement_pending check would then return early before any age or
-    abandonment logic runs, permanently freezing the ticker's balance.
+def test_ledger_raises_on_a_bare_settlement_lease_with_no_recovery_metadata(tmp_path):
+    """Regression test for "Reject leases on dipping trackers", restated in
+    terms of the recoverable-lease schema that replaced its status-based
+    formulation (near_close_dca.py's fire claim now leases the untouched
+    PRE-fire state, which is routinely "dipping"). A restored or hand-edited
+    tracker carrying settlement_pending with NO settlement_target_state has
+    nothing to settle against, and every downstream call site's plain truthy
+    settlement_pending check returns early before any age or abandonment
+    logic runs -- permanently freezing the ticker's balance.
     """
     ticker_dir = tmp_path / "GME"
     ticker_dir.mkdir()
@@ -2284,23 +3119,162 @@ def test_ledger_raises_on_a_settlement_lease_on_a_dipping_tracker(tmp_path):
         ledger.read("GME")
 
 
-@pytest.mark.parametrize("status", ["none", "firing"])
-def test_ledger_accepts_a_settlement_lease_on_none_or_firing_trackers(tmp_path, status):
-    """The two statuses evaluate_inverse_martingale_step actually leases --
-    must remain accepted, unlike the "dipping" case above."""
+@pytest.mark.parametrize("status", ["none", "firing", "dipping"])
+def test_ledger_accepts_a_fully_specified_settlement_lease(tmp_path, status):
+    """Every status a real fire claim can lease -- including "dipping", the
+    pre-fire status the recoverable claim deliberately preserves."""
     ticker_dir = tmp_path / "GME"
     ticker_dir.mkdir()
     payload = {"version": 1, "ticker": "GME", "status": status, "settlement_pending": True}
-    if status == "firing":
+    payload.update(_lease_fields())
+    if status in ("firing", "dipping"):
         payload.update({
             "accumulated_usd": 2.0, "crossed_tier_thresholds": [1.0, 2.0, 4.0],
             "cycle_reference_close": 100.0, "lowest_drop_seen": 8.5,
-            "cycle_start_trading_day": DAY1.isoformat(), "fire_attempts": 1,
+            "cycle_start_trading_day": DAY1.isoformat(),
             "trading_days_active": 3,
         })
+    if status == "firing":
+        payload["fire_attempts"] = 1
     (ticker_dir / "tracker.json").write_text(json.dumps(payload), encoding="utf-8")
     ledger = InverseMartingaleLedger(root=tmp_path)
     assert ledger.read("GME")["settlement_pending"] is True
+
+
+@pytest.mark.parametrize(
+    "account",
+    [
+        "unknown",  # the sentinel a live claim writes when it cannot compute one
+        "a1b2c3d4e5f6071829304a5b6c7d8e9f",  # a real fingerprint's shape
+        "00000000000000000000000000000000",
+        "ffffffffffffffffffffffffffffffff",
+    ],
+)
+def test_ledger_accepts_every_account_shape_a_claim_can_write(tmp_path, account):
+    """The structural check must not over-tighten: rejecting a shape claim
+    creation really does produce would raise CorruptedLedgerStateError on a
+    perfectly healthy tracker and skip that ticker on every run -- trading one
+    silent freeze for a noisy one. Both writable shapes are pinned here
+    alongside the rejection cases below.
+    """
+    ticker_dir = tmp_path / "GME"
+    ticker_dir.mkdir()
+    payload = {"version": 1, "ticker": "GME", "status": "none", "settlement_pending": True}
+    payload.update(_lease_fields(settlement_account=account))
+    (ticker_dir / "tracker.json").write_text(json.dumps(payload), encoding="utf-8")
+    ledger = InverseMartingaleLedger(root=tmp_path)
+    assert ledger.read("GME")["settlement_account"] == account
+
+
+def test_a_real_fingerprint_always_satisfies_the_ledgers_own_check(tmp_path, monkeypatch):
+    """The writer and the validator must agree by construction, not by a
+    hand-copied format. Generates a fingerprint through the real code path and
+    asserts the ledger's own predicate accepts it.
+    """
+    import near_close_dca as ncd
+    from dca_inverse_martingale import _is_valid_lease_account
+
+    class _Broker:
+        def account_number(self):
+            return "999000111"
+
+    fingerprint = ncd._broker_account_fingerprint(_Broker(), tmp_path)
+    assert fingerprint is not None
+    assert _is_valid_lease_account(fingerprint)
+    assert _is_valid_lease_account(ncd._LEASE_ACCOUNT_UNKNOWN)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"settlement_ref_id": None},
+        {"settlement_ref_id": ""},
+        {"settlement_ref_id": 12345},
+        {"settlement_trading_day": "not-a-date"},
+        {"settlement_trading_day": "2026-02-30"},
+        {"settlement_trading_day": 20260629},
+        {"settlement_claimed_usd": "corrupt"},
+        {"settlement_claimed_usd": float("nan")},
+        {"settlement_claimed_usd": -1.0},
+        {"settlement_claimed_usd": True},
+        {"settlement_claimed_usd": 10**400},
+        {"settlement_target_state": "corrupt"},
+        {"settlement_target_state": {"status": "bogus"}},
+        {"settlement_target_state": {"status": "firing", "accumulated_usd": "corrupt"}},
+        {"settlement_live": "false"},
+        {"settlement_account": ""},
+        {"settlement_account": 12345},
+        # Regression cases for "Validate settlement account fingerprints
+        # structurally". A claim can only ever write the "unknown" sentinel or a
+        # 32-character lowercase hex HMAC, so every other nonempty string is
+        # damage -- and one that merely LOOKS plausible is the dangerous kind,
+        # since it compares unequal to a freshly computed fingerprint on every
+        # run and freezes the ticker's accumulator silently forever.
+        {"settlement_account": "garbage"},
+        {"settlement_account": "a1b2c3d4e5f60718"},  # a pre-HMAC 16-char digest
+        {"settlement_account": "A1B2C3D4E5F6071829304A5B6C7D8E9F"},  # uppercase
+        {"settlement_account": "a1b2c3d4e5f6071829304a5b6c7d8e9"},  # one short
+        {"settlement_account": "a1b2c3d4e5f6071829304a5b6c7d8e9ff"},  # one long
+        {"settlement_account": "g1b2c3d4e5f6071829304a5b6c7d8e9f"},  # non-hex
+        {"settlement_account": " a1b2c3d4e5f6071829304a5b6c7d8e9"},  # padded
+        {"settlement_account": "unknown "},  # not the sentinel
+        # Regression cases for "Reject unknown settlement stream values".
+        # near_close_dca decides kill-switch eligibility by asking whether the
+        # claim's stream is anything OTHER than morning or midday, so an
+        # unrecognized value reads as afternoon and injects capital the
+        # afternoon-only figure is defined to exclude.
+        {"settlement_stream": "garbage"},
+        {"settlement_stream": "Afternoon"},  # wrong case
+        {"settlement_stream": "afternoon "},  # padded
+        {"settlement_stream": ""},
+        {"settlement_stream": 12345},
+    ],
+)
+def test_ledger_raises_on_a_corrupted_settlement_lease_field(tmp_path, overrides):
+    """Regression test for "Validate the newly persisted settlement fields on
+    read". near_close_dca.py's recovery pass converts settlement_claimed_usd
+    with a bare float() outside any exception handler, applies
+    settlement_target_state verbatim as the ticker's next persisted state, and
+    lets settlement_trading_day decide whether an unmatched lease may be
+    released. Unvalidated, a damaged tracker aborted the whole scheduled run
+    instead of raising here and skipping only this ticker -- or released/wrote
+    an outright wrong balance.
+    """
+    ticker_dir = tmp_path / "GME"
+    ticker_dir.mkdir()
+    payload = {"version": 1, "ticker": "GME", "status": "none", "settlement_pending": True}
+    payload.update(_lease_fields(**overrides))
+    payload = {k: v for k, v in payload.items() if v is not None}
+    # NaN/Infinity are not valid JSON but json.dumps emits them by default; a
+    # restored tracker written by a non-strict encoder can genuinely carry one.
+    (ticker_dir / "tracker.json").write_text(json.dumps(payload), encoding="utf-8")
+    ledger = InverseMartingaleLedger(root=tmp_path)
+    with pytest.raises(CorruptedLedgerStateError):
+        ledger.read("GME")
+
+
+def test_ledger_raises_on_an_oversized_crossed_tier_threshold(tmp_path):
+    """Regression test for "Convert oversized crossed tiers into ledger
+    corruption". json.loads() parses an arbitrarily large JSON integer into an
+    unbounded Python int, which passes the isinstance() check but makes
+    math.isfinite() RAISE OverflowError rather than return False. Uncaught, that
+    escaped _validate_tracker_payload entirely instead of becoming
+    CorruptedLedgerStateError, so the per-ticker recovery boundary at
+    near_close_dca.py's injection site never caught it and one damaged tracker
+    aborted the WHOLE scheduled run.
+    """
+    ticker_dir = tmp_path / "GME"
+    ticker_dir.mkdir()
+    payload = {
+        "version": 1, "ticker": "GME", "status": "dipping", "accumulated_usd": 7.0,
+        "crossed_tier_thresholds": [10**400], "cycle_reference_close": 100.0,
+        "lowest_drop_seen": 1.0, "cycle_start_trading_day": DAY1.isoformat(),
+        "trading_days_active": 1,
+    }
+    (ticker_dir / "tracker.json").write_text(json.dumps(payload), encoding="utf-8")
+    ledger = InverseMartingaleLedger(root=tmp_path)
+    with pytest.raises(CorruptedLedgerStateError):
+        ledger.read("GME")
 
 
 @pytest.mark.parametrize("bad_value", ["not-a-date", "2026-02-30", "", 20260201, 20260201.0])
@@ -2474,7 +3448,22 @@ def test_ledger_paths_are_case_and_whitespace_normalized(tmp_path, ticker):
     assert ledger.read("AAPL")["accumulated_usd"] == 1.0
 
 
-# --- claim_fire (compare-and-swap) ---------------------------------------------
+# --- transition compare-and-swap / fire claims --------------------------------
+
+def test_compare_and_swap_transition_rejects_stale_non_fire_state(tmp_path):
+    ledger = InverseMartingaleLedger(root=tmp_path)
+    snapshot = ledger.read("AAPL")
+    winner, winner_step = _step(snapshot, decision_price=99.0, previous_close=100.0)
+    stale, stale_step = _step(snapshot, decision_price=98.0, previous_close=100.0)
+
+    assert ledger.compare_and_swap_transition(
+        "AAPL", expected_prior_state=snapshot, new_state=winner, step=winner_step
+    ) is True
+    assert ledger.compare_and_swap_transition(
+        "AAPL", expected_prior_state=snapshot, new_state=stale, step=stale_step
+    ) is False
+    assert ledger.read("AAPL") == winner
+
 
 def test_claim_fire_succeeds_when_prior_state_matches(tmp_path):
     ledger = InverseMartingaleLedger(root=tmp_path)
@@ -2623,6 +3612,67 @@ def test_missing_persisted_basis_under_a_stddev_config_resets_instead_of_brickin
 def test_cycle_persists_its_tier_config_fingerprint_at_start():
     state, step = _step({}, decision_price=99.0, previous_close=100.0)
     assert state["tier_config_fingerprint"] == [1.0, [[1.0, 1.0], [2.0, 2.0], [4.0, 4.0], [8.0, 8.0]]]
+
+
+def test_a_tier_config_change_preserves_a_partially_paid_fire_latch():
+    """Regression test for "Preserve the paid-fire latch across tier
+    configuration resets".
+
+    "A reset cycle never spent any real money" holds for a STATUS_DIPPING cycle
+    (see the two tests below) but NOT for a STATUS_FIRING one: a
+    per_order_cap_usd-capped continuation places real, settled chunks over
+    successive runs. Resetting that to a latch-free marker let a later stream
+    open a brand-new cycle while price was still inside the original descent and
+    credit the edited tiers again, duplicating exposure the earlier fills had
+    already covered.
+    """
+    # A capped fire leaves a STATUS_FIRING remainder -- real money is already out.
+    state, _ = _step({}, decision_price=91.5, previous_close=100.0)  # accum = $15
+    state, step = _step(state, decision_price=97.0, previous_close=100.0, per_order_cap_usd=10.0)
+    assert step.fired and state["status"] == STATUS_FIRING
+
+    # Operator edits the tier table while that remainder is still outstanding.
+    edited_tiers = ((1.1, 1.0), (2.0, 2.0), (4.0, 4.0), (8.0, 8.0))
+    day2 = date(2026, 8, 4)
+    state, step = _step(
+        state, decision_price=96.0, previous_close=100.0, trading_day=day2, tiers=edited_tiers,
+    )
+    assert step.reason == "cycle_reset_tier_config_changed"
+    assert step.status_after == STATUS_NONE
+    # The cycle is gone, but the descent it already paid for is still latched.
+    assert state["rearm_reference_close"] == pytest.approx(100.0)
+    assert state["fired_floor_price"] == pytest.approx(91.5)
+    assert state["fired_floor_drop_metric"] == pytest.approx(8.5)
+
+    # So a later day still inside that descent cannot re-credit the edited tiers.
+    day3 = date(2026, 8, 5)
+    state, step = _step(
+        state, decision_price=96.0, previous_close=97.0, trading_day=day3, tiers=edited_tiers,
+    )
+    assert step.status_after == STATUS_NONE
+    assert step.newly_crossed_tiers == ()
+
+
+def test_a_basis_change_preserves_a_paid_fire_floor_as_an_absolute_price():
+    """The same preservation across a BASIS change, where the persisted metric
+    is denominated in the units being abandoned. The absolute price carries the
+    floor instead -- re-persisting a percentage-point metric under a stddev
+    config would hand the next evaluation exactly the mismatched-units reading
+    the basis reset exists to prevent."""
+    state, _ = _step({}, decision_price=91.5, previous_close=100.0, basis="pct")
+    state, step = _step(state, decision_price=97.0, previous_close=100.0, basis="pct", per_order_cap_usd=10.0)
+    assert state["status"] == STATUS_FIRING
+
+    day2 = date(2026, 8, 4)
+    state, step = _step(
+        state, decision_price=96.0, previous_close=100.0, trading_day=day2,
+        basis="stddev", stddev_reference=0.01,
+    )
+    assert step.reason == "cycle_reset_basis_changed"
+    assert state["rearm_reference_close"] == pytest.approx(100.0)
+    assert state["fired_floor_price"] == pytest.approx(91.5)
+    # Deliberately absent: an old-basis metric would be misread under the new one.
+    assert "fired_floor_drop_metric" not in state
 
 
 def test_tier_threshold_change_mid_cycle_resets_instead_of_double_crediting():

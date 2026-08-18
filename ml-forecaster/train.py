@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -320,25 +321,152 @@ def _load_active_tickers(config_path: Path) -> list[str]:
     return [ticker for ticker in active if ticker not in excluded_set]
 
 
+def _portable_artifact_reference(model_json_path: Path) -> str:
+    """Return a reference to ``model_json_path`` that survives a change of
+    checkout, host, working directory, or ``$DCA_CRON_TRACKING_ROOT``, or
+    raise ``ValueError`` when no such reference exists.
+
+    ``str(path)`` recorded either an absolute path tied to the publishing
+    checkout's artifact root, or a relative one tied to that process's working
+    directory. This value is persisted into the version-controlled published
+    config, so the next retrain -- run from a different checkout, host or
+    configured root -- could not load the incumbent, and
+    :func:`_build_incumbent_scorer` silently fell back to the weaker skill-ratio
+    comparison, letting a model that fails the intended direct incumbent
+    comparison publish anyway (Codex review: "Store a portable incumbent model
+    reference"). It also wrote machine-specific state into a tracked file, which
+    ``AGENTS.md`` forbids.
+
+    The encoding is UNAMBIGUOUS, which is what makes
+    :func:`_resolve_artifact_reference` able to invert it: a RELATIVE reference
+    always means "under the configured ML artifact root". A path OUTSIDE the
+    root -- someone who passed ``--models-dir`` somewhere explicit -- has no
+    such reference at all: an absolute path is exactly as host-tied as the
+    original bug this function exists to fix, so it is REJECTED rather than
+    stored (Codex review: "Keep external model references portable"), and the
+    caller must not publish. This is stricter than an earlier version, which
+    stored the absolute path to at least preserve where THIS host meant --
+    but that config was then unusable from anywhere else, and the shared
+    incumbent-comparison gate now treats a load failure as blocking, so a
+    later retrain on a different host could never publish again until an
+    operator repaired the path by hand.
+
+    Returning an out-of-root path unchanged is what an even earlier version
+    did, and for an external directory given RELATIVELY (``--models-dir
+    ../models``) that produced a reference indistinguishable from a
+    root-relative one. The resolver rebases every relative reference onto the
+    root, so the next retrain looked under ``<ml artifact root>/../models``
+    instead of where the model was actually saved, failed to load the
+    incumbent, and silently fell back to the weaker skill-ratio comparison --
+    the very failure this function exists to prevent (Codex review: "Preserve
+    external relative model paths when publishing").
+    """
+    root = Path(stream_root("ml_forecaster"))
+    resolved = Path(model_json_path)
+    try:
+        resolved = resolved.resolve()
+    except OSError as exc:
+        # Unresolvable (a broken symlink component, an unreadable parent) --
+        # this path can never be made portable, so refuse to publish rather
+        # than write something unusable. See the ValueError branch below for
+        # why an out-of-root path is rejected rather than stored absolute.
+        raise ValueError(
+            f"cannot resolve model artifact path {model_json_path} for publishing: {exc}"
+        ) from exc
+    try:
+        # as_posix(), not str(): on Windows str() yields backslash separators
+        # ("models\\2026-08-17-abc\\model.json"), and a POSIX Path treats those
+        # as literal filename characters rather than separators -- so a config
+        # published on Windows and consumed on Linux could not locate the
+        # incumbent and silently fell back to the weaker skill-ratio
+        # comparison, defeating the cross-host portability this function exists
+        # for (Codex review: "Serialize relative artifact references
+        # portably"). Forward slashes round-trip on both platforms.
+        return resolved.relative_to(root.resolve()).as_posix()
+    except (OSError, ValueError) as exc:
+        # A --models-dir given OUTSIDE the configured ML artifact root has no
+        # portable reference at all: an absolute path is tied to the
+        # publishing host, and this value is persisted into the version-
+        # controlled published config where AGENTS.md forbids machine-
+        # specific state. A prior version stored it absolute anyway, so the
+        # NEXT retrain -- on another checkout/host -- could not load the
+        # incumbent and _build_incumbent_scorer silently fell back to the
+        # weaker skill-ratio comparison, letting a model that fails the
+        # intended direct incumbent comparison publish (Codex review: "Keep
+        # external model references portable"). Refusing to publish at all
+        # is the fail-closed direction: the operator gets an actionable error
+        # naming the two real fixes -- move --models-dir under the shared
+        # root, or publish that config manually -- rather than a config that
+        # silently degrades on every OTHER host.
+        raise ValueError(
+            f"model artifact {resolved} lies outside the ML artifact root {root.resolve()}; "
+            "a config referencing it cannot be loaded from another checkout/host. Pass "
+            "--models-dir under the configured artifact root, or move the model there before "
+            "publishing."
+        ) from exc
+
+
+def _resolve_artifact_reference(model_artifact_path: str) -> Path:
+    """Inverse of :func:`_portable_artifact_reference`.
+
+    A relative reference is resolved against the CURRENT ML artifact root, so a
+    model published from one checkout/host/root is loadable from another. An
+    absolute one is used as given -- that covers both a deliberately external
+    ``--models-dir`` and every legacy config written before this was stored
+    portably.
+
+    Rebasing relative references is why :func:`_portable_artifact_reference`
+    must store an out-of-root path absolutely: in a reference written by that
+    function, a relative path can only ever mean root-relative.
+
+    A config published by an EARLIER version carries no such guarantee. The old
+    code passed ``str(model_json_path)`` through unchanged, so an explicit
+    relative ``--models-dir`` recorded a path relative to that retrain's WORKING
+    DIRECTORY. Rebasing it unconditionally looks under the ML artifact root,
+    fails to find an incumbent that is really still there, and drops
+    :func:`_build_incumbent_scorer` to the weaker skill-ratio comparison --
+    exactly the silent downgrade this pair of functions exists to prevent
+    (Codex review: "Preserve pre-change relative artifact references"). So the
+    root-relative reading is TRIED FIRST and the legacy working-directory
+    reading is used only as a fallback, and only when it actually resolves to a
+    file. Existence is the disambiguator: the new contract wins wherever both
+    could apply, and no legacy config is silently downgraded while its model is
+    still loadable.
+
+    When neither exists the root-relative path is returned, so the caller's
+    failure refers to where the artifact was supposed to be rather than to a
+    stale working-directory guess.
+    """
+    # A stored reference always uses forward slashes (see
+    # _portable_artifact_reference), but a legacy config written on Windows by
+    # the previous version can carry backslashes. PurePosixPath-style parsing on
+    # Linux would treat those as one long filename, so normalize before
+    # resolving -- on Windows both separators already parse correctly.
+    path = Path(model_artifact_path.replace("\\", "/") if os.sep == "/" else model_artifact_path)
+    if path.is_absolute():
+        return path
+    rooted = Path(stream_root("ml_forecaster")) / path
+    if rooted.exists():
+        return rooted
+    if path.exists():
+        return path.resolve()
+    return rooted
+
+
 def _build_incumbent_scorer(dip_dataset, candidate_model: model_module.TrainedModel):
     """A `score_incumbent_model` callback for publish.guarded_publish() (see
     that function's own docstring): given the currently-published model's
     recorded `model_artifact_path`, loads it (plain JSON, no pickle -- see
-    model.TrainedModel's own docstring on why that's safe) and scores it,
-    alongside `candidate_model`, against THIS run's own `dip_dataset`
+    model.TrainedModel's own docstring on why that's safe), and compares it
+    with an aligned candidate against THIS run's own `dip_dataset`
     (evaluate.score_incumbent_on_folds()).
 
-    `candidate_model` is THIS run's own `final_model` -- the real model
-    about to be published, already fit on the full current dataset -- not
-    rebuilt here. An earlier version of this function passed only `alpha`
-    and let score_incumbent_on_folds() refit a throwaway "comparison
-    candidate" internally on the rows available by the incumbent's own
-    cutoff; on an ordinary retrain with unchanged alpha/universe that
-    reconstructs the incumbent's own weights almost exactly, so the two
-    sides always came out a near-tie and blocked every routine retrain --
-    the real final_model never participated in the comparison at all
-    (Codex review: "Avoid comparing the incumbent with its exact
-    reconstruction"). Passing the real model directly closes that gap.
+    `candidate_model` supplies the prospective final model's hyperparameters.
+    score_incumbent_on_folds() fits an aligned comparison model on the early
+    portion of post-incumbent history and scores both models on a later
+    holdout.  It deliberately does not score this final model directly: the
+    final model has already seen the complete current dataset, which would
+    make its holdout score in-sample and unfairly favor publication.
 
     Returns None on any load/parse failure, or if the resulting score isn't
     usable -- publish.blocking_reasons() falls back to its existing
@@ -349,7 +477,9 @@ def _build_incumbent_scorer(dip_dataset, candidate_model: model_module.TrainedMo
 
     def _score(model_artifact_path: str) -> tuple[float, float] | None:
         try:
-            incumbent_model = model_module.TrainedModel.load(Path(model_artifact_path))
+            incumbent_model = model_module.TrainedModel.load(
+                _resolve_artifact_reference(model_artifact_path)
+            )
         except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
             return None
         return evaluate_module.score_incumbent_on_folds(incumbent_model, candidate_model, dip_dataset)
@@ -820,7 +950,7 @@ def main(argv: list[str] | None = None) -> int:
         # "Compare models on the same evaluation sample").
         evaluation_universe=sorted(dip_dataset["ticker"].astype(str).str.upper().unique()),
         generated_at=real_now,
-        model_artifact_path=str(model_json_path),
+        model_artifact_path=_portable_artifact_reference(model_json_path),
         score_incumbent_model=_build_incumbent_scorer(dip_dataset, final_model),
     )
     report["status"] = result["status"]

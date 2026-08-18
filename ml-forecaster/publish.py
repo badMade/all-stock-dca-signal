@@ -321,7 +321,10 @@ def blocking_reasons(
     incumbent (see evaluate.score_incumbent_on_folds(), the intended
     implementation, for why that restriction matters and why both sides
     must be computed over the identical held-out rows) -- or None if it
-    can't be scored. This module deliberately stays pandas/numpy-free
+    can't be scored. Once this callback is applicable to a same-horizon
+    incumbent with a persisted artifact, an unavailable or invalid result
+    blocks publication rather than falling back to a weaker comparison.
+    This module deliberately stays pandas/numpy-free
     (see the module docstring) -- the actual model-loading and re-scoring
     work happens on the caller's side of this callback, exactly like this
     repo's broker/data-provider injection pattern elsewhere
@@ -371,21 +374,20 @@ def blocking_reasons(
         # computed for a DIFFERENT horizon compares two different scales
         # regardless of the rows being identical.
         rescored: tuple[float, float] | None = None
-        if (
+        rescoring_required = (
             score_incumbent_model is not None
             and isinstance(previous_artifact_path, str)
             and previous_artifact_path
             and previous_horizon == new_horizon_trading_days
-        ):
+        )
+        if rescoring_required:
             try:
                 rescored = score_incumbent_model(previous_artifact_path)
             except Exception:
-                # A caller-supplied scorer performs real I/O (loading a
-                # model.json, reconstructing a model, scoring rows) on the
-                # other side of this callback -- any failure there must fall
-                # back to the existing window/skill-ratio comparisons below,
-                # never abort the whole publish decision over an unreadable
-                # or corrupted incumbent artifact.
+                # Treat I/O and reconstruction failures like an unavailable
+                # holdout below.  Falling back would silently weaken the gate
+                # precisely when the shared out-of-sample comparison is
+                # required to protect the active incumbent.
                 rescored = None
             if rescored is not None and not (
                 isinstance(rescored, tuple)
@@ -404,6 +406,12 @@ def blocking_reasons(
                     "that same restricted row set (the incumbent's real persisted weights evaluated on "
                     "data it was not trained on)"
                 )
+        elif rescoring_required:
+            reasons.append(
+                "cannot compare the new model with the currently-published model on a shared "
+                "out-of-sample holdout; refusing to replace the incumbent until enough post-cutoff "
+                "history is available and both models can be scored"
+            )
         else:
             # A currently-published model trained on a DIFFERENT forward-return
             # horizon has an MAE on an incomparable scale -- a 1-day-return model

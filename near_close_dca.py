@@ -49,11 +49,14 @@ analysis/2026-07-23-live-reliability-fixes/live_task_reliability_update_2026-07-
 from __future__ import annotations
 
 import csv
+import hashlib
+import hmac
 import json
 import logging
 import math
 import os
 import re
+import secrets
 import statistics
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
@@ -83,11 +86,23 @@ from dca_intraday_archive import (
     write_run_snapshot,
 )
 from dca_inverse_martingale import (
+    # The account-fingerprint contract lives with the ledger's own payload
+    # validator so the value this module WRITES and the shape that validator
+    # ACCEPTS can never drift apart -- see _broker_account_fingerprint.
+    _LEASE_ACCOUNT_FINGERPRINT_LENGTH,
+    _LEASE_ACCOUNT_UNKNOWN,
+    BASIS_PCT,
     STATUS_FIRING,
     STATUS_NONE,
     CorruptedLedgerStateError,
     InverseMartingaleLedger,
     InverseMartingaleStep,
+    # Private on purpose, imported deliberately: the recovery path must invert a
+    # drop metric back to a price EXACTLY as the fire-resolution paths do, and a
+    # second copy of that basis math would be free to drift from this one. See
+    # the fired_floor_price argument in the lease-recovery resolver.
+    _drop_metric_to_price,
+    archived_split_factor,
     evaluate_inverse_martingale_step,
     resolved_marker,
     stddev_reference_for_ticker,
@@ -1110,6 +1125,40 @@ class StrategyState:
             trading_day
         ] = max(already_attempts, attempt_count)
 
+    def note_prior_allocation_baseline_is_disjoint(
+        self, ticker: str, trading_day: date
+    ) -> None:
+        """Declare that nothing in ``ticker``'s prior-allocation aggregate for
+        ``trading_day`` has been folded into this state yet, so the NEXT
+        :meth:`reconcile_prior_allocation` credits that aggregate in full.
+
+        For the one caller that books a real order this state has no other
+        record of: crash-lease recovery. A recovered order died before its
+        artifacts were written, so it is absent from the artifact scan the
+        aggregate is built from -- the two are provably disjoint, and the
+        aggregate's dollars and attempts belong to some OTHER order entirely
+        (a cross-stream or manual buy for the same ticker made after the
+        crash).
+
+        Without this, ``reconcile_prior_allocation``'s ambiguous branch would
+        see the ``buys_today()`` the recovery booking just raised, take it as
+        the baseline, assume the whole freshly-scanned aggregate was already
+        accounted for, and credit neither the other order's dollars nor its
+        attempt (Codex review: "Reconcile separate prior allocations after
+        booking a recovery"). That conservative default is right when the
+        overlap is genuinely unknown; here it is known to be zero.
+
+        Recorded via ``setdefault``, never an overwrite: a baseline already
+        tracked for this (ticker, day) came from a real earlier reconcile whose
+        dollars ARE credited, and resetting it to zero would re-credit them.
+        """
+        self.seeded_prior_context_amount_by_ticker_day.setdefault(ticker, {}).setdefault(
+            trading_day, 0.0
+        )
+        self.seeded_prior_context_attempts_by_ticker_day.setdefault(
+            ticker, {}
+        ).setdefault(trading_day, 0)
+
     def bump_week_notional_only(self, trading_day: date, amount_usd: float) -> None:
         """Add ``amount_usd`` to the shared weekly dollar bucket ONLY --
         touches no per-ticker, per-day, or attempt-count bucket at all.
@@ -1431,6 +1480,11 @@ class BrokerAdapter(Protocol):
         can still detect a retry of ITS OWN earlier same-day order.
         """
 
+    def strategy_order_with_ref_id(
+        self, ticker: str, trading_day: date, ref_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return a matching order from history, including terminal orders."""
+
     def same_day_ticker_notional_usd(self, ticker: str, trading_day: date) -> float:
         """Return the total dollar notional of every live same-day order for ticker.
 
@@ -1506,6 +1560,11 @@ class DryRunBroker:
 
     def same_day_strategy_order_exists_with_ref_id_prefix(
         self, ticker: str, trading_day: date, ref_id_prefixes: Tuple[str, ...]
+    ) -> Optional[Dict[str, Any]]:
+        return None
+
+    def strategy_order_with_ref_id(
+        self, ticker: str, trading_day: date, ref_id: str
     ) -> Optional[Dict[str, Any]]:
         return None
 
@@ -1895,6 +1954,14 @@ class AlpacaBroker:
             "AlpacaBroker cannot verify same-stream order duplicates: "
             "place_market_buy does not send a client order id the live "
             "connector could match against"
+        )
+
+    def strategy_order_with_ref_id(
+        self, ticker: str, trading_day: date, ref_id: str
+    ) -> Optional[Dict[str, Any]]:
+        raise RuntimeError(
+            "AlpacaBroker cannot reconcile order history by client id: "
+            "place_market_buy does not send a client order id"
         )
 
     def same_day_ticker_notional_usd(self, ticker: str, trading_day: date) -> float:
@@ -3025,6 +3092,18 @@ def _inverse_martingale_reset_if_disabled_mid_cycle(
     here (even with a clean resolved_marker) would still move the on-disk
     state out from under the owning process's own settlement compare-and-
     swap, silently discarding whatever it placed.
+
+    A resolved (``STATUS_NONE``) tracker is not necessarily inert either: a
+    completed fire now leaves behind a durable ``rearm_reference_close``
+    latch (see :func:`resolved_marker`) that keeps suppressing new cycles
+    until price exits the old dip. Disabling enrollment while that latch is
+    still armed and later re-enrolling the ticker must not inherit it --
+    the ticker should start genuinely fresh, not remain silently blocked by
+    a dip that happened entirely during the disabled interval (Codex
+    review: "Clear resolved latches when enrollment is disabled"). Only a
+    tracker actually carrying the latch is rewritten; a plain, latch-free
+    ``STATUS_NONE`` marker (or an entirely absent one) has nothing to clear
+    and is left alone, same as before.
     """
     try:
         tracker_state = ledger.read(ticker)
@@ -3032,8 +3111,10 @@ def _inverse_martingale_reset_if_disabled_mid_cycle(
         logger.error("inverse-Martingale ledger unreadable for %s: %s", ticker, exc)
         return
     status = tracker_state.get("status", STATUS_NONE) if tracker_state else STATUS_NONE
-    if not tracker_state or status == STATUS_NONE:
-        return  # nothing active to reset (already none, or never started)
+    if not tracker_state:
+        return  # nothing to reset -- never started
+    if status == STATUS_NONE and tracker_state.get("rearm_reference_close") is None:
+        return  # already none, and no durable rearm latch to clear either
     if tracker_state.get("settlement_pending"):
         return  # a pending settlement lease is never touched by this reset either
     ledger.claim_fire(
@@ -3051,6 +3132,896 @@ def _inverse_martingale_reset_if_disabled_mid_cycle(
             reason="cycle_reset_enrollment_disabled",
         ),
     )
+
+
+#: Broker order states that mean "this order moved no capital and never will".
+#: Mirrors scripts/broker_reconciliation._TERMINAL_ORDER_STATES, the repo's
+#: canonical terminal set. Robinhood reports both "cancelled" and "canceled"
+#: (and "voided"), so crash reconciliation must recognize every spelling:
+#: reading a zero-fill "canceled" order as non-terminal made it substitute the
+#: order's REQUESTED dollar_amount for the executed amount, which then matched
+#: the claim exactly and permanently discarded an accumulator balance no shares
+#: were ever bought with (Codex review: "Recognize every terminal spelling
+#: before settling the claim").
+#:
+#: A SUPERSET of the states dca_live_adapters.RobinhoodBroker.place_market_buy
+#: refuses on submission, and deliberately so: "expired" cannot come back from a
+#: placement call, but order HISTORY reports it, and omitting it here left an
+#: expired order looking indeterminate -- so its lease was preserved forever even
+#: though the order can no longer execute (Codex review: "Treat expired broker
+#: orders as settled").
+_TERMINAL_BROKER_ORDER_STATES = frozenset(
+    {"cancelled", "canceled", "rejected", "failed", "voided", "expired"}
+)
+
+#: Order states whose executed amount is FINAL and will not change again --
+#: the failure states above, plus a completed fill. Every other state
+#: (``new``/``queued``/``confirmed``/``unconfirmed``/``partially_filled``) is a
+#: working order that can still execute more, so its executed amount so far is
+#: not something a settlement decision may be based on. See
+#: :func:`_recovered_broker_notional`.
+_SETTLED_BROKER_ORDER_STATES = _TERMINAL_BROKER_ORDER_STATES | {"filled"}
+
+
+@dataclass(frozen=True)
+class InverseMartingaleLeaseRecovery:
+    """One resolved crash lease, returned by :func:`_inverse_martingale_recover_pending_leases`.
+
+    ``recovered_amount_usd`` is the capital the broker actually accepted for the
+    claimed fire (its filled notional, or its submitted notional for an order
+    still live). It is 0.0 when the lease expired with no order at all. The
+    caller books that amount into ``StrategyState``/the trailing-7-day
+    deployment figure and publishes a candidate outcome for it -- reconciling
+    the ledger alone would leave the restarted run computing its daily, weekly
+    and 7-day headroom as if the money had never been spent.
+    """
+
+    ticker: str
+    claim_trading_day: date
+    recovered_amount_usd: float
+    recovered_state: Dict[str, Any]
+    order_id: Optional[str]
+    #: The deterministic ref the claim submitted under. Kept alongside
+    #: ``order_id`` so deployment-history matching can recognize this order by
+    #: either identifier -- see _same_day_order_deployment_already_recorded.
+    claim_ref: Optional[str] = None
+    #: The roster stream that made the claim, from the lease's
+    #: ``settlement_stream``. ``None`` for a legacy lease written before the
+    #: field existed, which callers must treat as "provenance unknown" rather
+    #: than assuming this run's own stream -- deployment is accounted per
+    #: stream and a lease is routinely recovered by a LATER one.
+    claim_stream: Optional[str] = None
+
+
+def _finite_nonnegative_float(value: Any) -> Optional[float]:
+    """Parse ``value`` as a real, finite, non-negative float, or ``None``.
+
+    ``None`` covers every unusable shape a broker field can take -- absent,
+    non-numeric, ``NaN``/``Infinity`` (both of which ``float()`` accepts without
+    raising), or negative -- so callers can treat "cannot be valued" as one
+    case rather than letting a non-finite value flow into money arithmetic.
+
+    A Robinhood money value is either a scalar or a ``{"amount": ...}`` mapping;
+    both are accepted, matching ``scripts/broker_reconciliation._money``.
+    Rejecting the mapping form made a perfectly valuable fill read as unreadable
+    and preserved its lease indefinitely (Codex review: "Parse mapping-shaped
+    executed notionals").
+    """
+    if isinstance(value, Mapping):
+        value = value.get("amount")
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError alongside the usual conversion errors: json.loads()
+        # parses an arbitrarily large JSON integer into an unbounded Python
+        # int, and float() on one too large to represent RAISES rather than
+        # returning inf. Uncaught, that escaped this function (and
+        # _recovered_broker_notional's own try/except below it) entirely,
+        # aborting the whole scheduled run over one malformed broker-history
+        # response instead of treating that ticker's settlement as
+        # indeterminate and preserving its lease (Codex review: "Catch
+        # integer overflow while parsing broker amounts").
+        return None
+    if not math.isfinite(parsed) or parsed < 0:
+        return None
+    return parsed
+
+
+#: Filename of the local secret that keys lease account fingerprints. Lives
+#: BESIDE the accumulator ledger tree (``<cron root>/.lease_fingerprint_key``),
+#: never inside a tracker payload -- see :func:`_broker_account_fingerprint`.
+_LEASE_FINGERPRINT_KEY_FILENAME = ".lease_fingerprint_key"
+
+#: The exact shape ``secrets.token_hex(32)`` produces: 64 lowercase hex
+#: characters, i.e. 256 bits. A partially restored or truncated key file can
+#: contain valid UTF-8 that is still NOT this -- a one-character or
+#: truncated hex string -- which the plain "is there text" check in
+#: ``_published()`` accepted as the HMAC key. That silently keyed new
+#: fingerprints with far fewer than the promised 256 bits of material (a
+#: brute-forceable key that could expose the environment-only account
+#: number via the tracker) while making every existing lease's fingerprint
+#: permanently unmatchable against the real key once it is eventually
+#: regenerated correctly (Codex review: "Validate persisted fingerprint key
+#: material before use").
+_LEASE_FINGERPRINT_KEY_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _fsync_directory(path: Path) -> None:
+    """Best-effort fsync of a directory's own metadata (its entries), not its files.
+
+    ``os.link``/``os.replace`` are atomic, but the directory entry they create
+    can still be lost on power loss before the PARENT directory's own metadata
+    reaches stable storage -- an ordinary ext4/xfs behavior, not a bug in
+    either call. Called only after :func:`_lease_fingerprint_key` actually
+    publishes the key, so a host that loses power in that window cannot come
+    back up with the tracker write durable but the key gone, generating
+    different key material next time and permanently unmatchable against the
+    pending lease's ``settlement_account`` (Codex review: "Fsync the key
+    directory after publishing"). Failure here is deliberately swallowed: a
+    filesystem/platform that cannot open a directory for fsync (some
+    read-only or exotic mounts) must not turn a successful key publish into a
+    fatal error over a durability guarantee it cannot offer anyway.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _lease_fingerprint_key(key_dir: Path) -> Optional[bytes]:
+    """Return the local HMAC key for lease account fingerprints, creating it once.
+
+    A fresh 256-bit random value, stored 0600 and published atomically so two
+    concurrent streams cannot race two different keys into existence -- by hard
+    link where the filesystem supports it, otherwise by a lock-serialized
+    rename. Returns ``None`` when the key can neither be read nor created,
+    which callers treat as "record no account identity" rather than falling
+    back to something weaker.
+    """
+    path = Path(key_dir) / _LEASE_FINGERPRINT_KEY_FILENAME
+
+    def _published() -> Optional[bytes]:
+        try:
+            existing = path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            # A partially restored or corrupted key file can contain
+            # non-UTF-8 bytes, which read_text() raises on rather than
+            # returning as an OSError. Uncaught, that propagated out of
+            # _broker_account_fingerprint() during both live claim creation
+            # and pending-lease recovery, aborting the entire scheduled run
+            # instead of recording an unknown account identity (or
+            # preserving the affected lease) fail-closed like every other
+            # unusable-key case here (Codex review: "Treat an undecodable
+            # fingerprint key as unavailable").
+            return None
+        if not existing:
+            return None
+        if not _LEASE_FINGERPRINT_KEY_PATTERN.match(existing):
+            # Valid UTF-8 text that is not the exact 64-lowercase-hex shape
+            # publication always writes -- a truncated or hand-edited file,
+            # say. Trusting it as-is would key new fingerprints with
+            # whatever (possibly far weaker) material it contains, and
+            # accepting it as "the" key blocks this call from ever
+            # regenerating a correct one, since the create-if-absent path
+            # below only runs when nothing is already published.
+            return None
+        return existing.encode("utf-8")
+
+    already = _published()
+    if already is not None:
+        return already
+    # Write the material to a private temp file FIRST and publish it with a
+    # single atomic link. Creating the real path with O_EXCL and writing into it
+    # afterwards left a window where a concurrent first-time process saw the
+    # file exist, read it EMPTY, and gave up -- persisting a live claim as
+    # settlement_account="unknown", which recovery then refuses to release
+    # forever (Codex review: "Wait for the fingerprint key to be initialized").
+    # os.link fails with FileExistsError if another process published first,
+    # which is the whole point: exactly one key is ever published, and every
+    # process reads that same one back rather than trusting its own material.
+    material = secrets.token_hex(32)
+    # A RANDOM temp suffix, not the pid: two threads in one process share a pid,
+    # so a pid-named temp made every racer but the first fail its own O_EXCL
+    # create and give up with None -- the very outcome this atomic publish
+    # exists to prevent.
+    tmp = path.parent / f"{_LEASE_FINGERPRINT_KEY_FILENAME}.{secrets.token_hex(8)}.tmp"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(handle, "w", encoding="utf-8") as fh:
+            fh.write(material)
+            fh.flush()
+            os.fsync(fh.fileno())
+        # BOTH publication paths run under the SAME lock. os.link is itself
+        # no-clobber, but os.replace is not, and only the replace path used to
+        # take the lock -- so a process whose link failed could check
+        # _published(), see nothing, and then have its replace() overwrite a key
+        # a LINK-path process published in between. Any claim already
+        # fingerprinted under the overwritten key could never match the
+        # surviving one again, and recovery refuses to release a lease whose
+        # account it cannot confirm: the accumulator freezes permanently, which
+        # is the exact outcome every other guard here exists to prevent (Codex
+        # review: "Avoid overwriting a concurrently published fingerprint key").
+        #
+        # The tempting cheaper fix -- retry os.link inside the lock and keep the
+        # bare `if _published() is None: os.replace(...)` behind it -- rests on
+        # link failure being a filesystem CAPABILITY, identical for every
+        # process on the host, so that no unlocked fast-path caller could be
+        # succeeding at the very call this one just proved broken. That premise
+        # does not hold: a transient EIO/ENOSPC, an LSM denial that applies to
+        # one process, or two mounts of the same tree with different link
+        # support each put one racer on each path. The check-then-replace pair
+        # is then still non-atomic against a link-path publisher holding no
+        # lock, and the clobber survives -- see
+        # test_lease_fingerprint_key_survives_a_mixed_link_and_replace_race,
+        # which forces that interleaving and fails against exactly that variant.
+        # Only a lock BOTH paths take closes it.
+        #
+        # Cheap despite wrapping the common path, because this is only reached
+        # when no key exists yet -- the _published() fast path above returns on
+        # every subsequent call, so the lock is taken about once per artifact
+        # tree, ever. A waiter that cannot acquire within the timeout raises
+        # TimeoutError -- itself an OSError -- and falls through to the outer
+        # handler's _published(), the same fail-closed "record no account
+        # identity" outcome as before.
+        from scripts.file_lock import cross_process_lock
+
+        with cross_process_lock(path.with_name(f"{path.name}.lock")):
+            if _published() is None:
+                try:
+                    os.link(tmp, path)
+                except FileExistsError:
+                    pass  # another process published first; its key is the real one
+                except OSError:
+                    # The filesystem under $DCA_CRON_TRACKING_ROOT does not
+                    # support or does not permit hard links (a bind-mounted
+                    # share, some container overlays, exFAT/FAT). Without a
+                    # fallback the outer handler returned None and EVERY live
+                    # claim was persisted with settlement_account="unknown",
+                    # which recovery then refuses to release -- freezing the
+                    # accumulator permanently on those hosts (Codex review:
+                    # "Provide a fallback when hard-link publication is
+                    # unavailable"). os.replace() is atomic on every filesystem
+                    # that can host this tree at all, and holding the lock makes
+                    # the check-then-publish above atomic against every racer,
+                    # so exactly one key is still ever published.
+                    os.replace(tmp, path)
+        # Durability, not correctness: os.link/os.replace are already atomic,
+        # so the key is never observed half-written, but the directory ENTRY
+        # they create can still vanish on power loss before the parent
+        # directory's own metadata reaches stable storage. Unconditional --
+        # harmless (and cheap) to run again when another process published
+        # first, since it fsyncs the directory's current state either way.
+        _fsync_directory(path.parent)
+    except OSError:
+        return _published()
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    return _published()
+
+
+def _broker_account_fingerprint(broker: "BrokerAdapter", key_dir: Path) -> Optional[str]:
+    """Return a stable, non-reversible identity for the account ``broker`` trades in.
+
+    A **keyed** HMAC-SHA256, not a plain hash. The value is persisted into
+    `tracker.json`, and the brokerage account number is a hard secret here (it
+    lives only in ``$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER``, and
+    ``test_config_invariants.py`` greps source/config/docs/tests for
+    account-shaped literals). A plain ``sha256(account)`` would NOT keep it
+    secret: a Robinhood account is 6-12 decimal digits, so anyone holding the
+    digest can enumerate the whole space -- a million candidates at the short
+    end -- and recover the number exactly (Codex review: "Replace the reversible
+    account-number fingerprint"). Keying it with a local secret the tracker
+    never contains removes that offline-enumeration path.
+
+    The key lives beside the ledger tree rather than inside it (see
+    :func:`_lease_fingerprint_key`), so a tracker file shared, copied, or
+    accidentally committed on its own carries nothing enumerable. It is a local
+    secret, not a managed one: whoever copies the ENTIRE artifact root copies
+    the key with it, and this function protects the tracker payload, not that
+    root.
+
+    Returns ``None`` when the adapter exposes no account identity (the
+    dry-run/simulated brokers) or the key is unavailable, which callers treat as
+    "no constraint recorded" rather than falling back to an unkeyed digest.
+    """
+    accessor = getattr(broker, "account_number", None)
+    if not callable(accessor):
+        return None
+    try:
+        account = accessor()
+    except Exception:  # noqa: BLE001 - an identity probe must never break a run
+        return None
+    if not isinstance(account, str) or not account.strip():
+        return None
+    key = _lease_fingerprint_key(key_dir)
+    if key is None:
+        return None
+    digest = hmac.new(key, account.strip().encode("utf-8"), hashlib.sha256).hexdigest()
+    return digest[:_LEASE_ACCOUNT_FINGERPRINT_LENGTH]
+
+
+def _recovered_broker_notional(order: Dict[str, Any]) -> Optional[float]:
+    """Return the FINAL dollars ``order`` moved, or ``None`` when that is not yet
+    knowable.
+
+    Only a SETTLED order -- filled, or in one of the terminal failure states --
+    has a final executed amount: its ground truth is ``cumulative_quantity *
+    average_price``, and a terminal order with no fill moved nothing and
+    reports 0.0 so its claimed balance is restored rather than written off.
+
+    ``None`` -- "indeterminate, do not act" -- is returned for everything else,
+    and callers must preserve the lease rather than treat it as a zero:
+
+    * **A still-live order** (``new``/``queued``/``confirmed``/``unconfirmed``/
+      ``partially_filled``). Substituting a live partial fill's executed amount
+      here rebuilt an UNLEASED continuation for the currently-unfilled
+      remainder -- while the original broker order was still working and could
+      fill that very remainder itself. A later scheduled stream was then free
+      to fire the remainder a second time, since inverse-Martingale candidates
+      bypass the ordinary duplicate-order guard (Codex review: "Keep live
+      partial fills leased until the order is terminal"). The lease stays until
+      the order stops moving.
+    * **An unusable amount** -- a non-numeric execution field, or a non-finite
+      or negative result. Reading that as 0.0 made a genuinely live or filled
+      order look like an unplaced claim, releasing the whole balance for a
+      duplicate purchase on a later day, while an ``Infinity`` would instead be
+      booked into strategy state as real spend (Codex review: "Preserve the
+      lease when broker notional is unparseable").
+    """
+    state = str(order.get("state", "")).lower()
+    if state not in _SETTLED_BROKER_ORDER_STATES:
+        return None
+    # executed_notional FIRST, matching scripts/broker_reconciliation._executed_
+    # dollars: it is the broker's own cent-precise settled figure, while
+    # quantity*price is a reconstruction from two separately-rounded fields that
+    # lands a fraction of a cent off even for a genuine whole-cent fill. Ignoring
+    # it entirely meant a perfectly valid supported row -- executed_notional
+    # present, quantity or price absent -- reconstructed as $0.00, which
+    # recovery then read as a confirmed zero-fill and released the whole claim
+    # for a second purchase (Codex review: "Honor authoritative executed notional
+    # during recovery").
+    reported = _finite_nonnegative_float(order.get("executed_notional"))
+    if reported is not None and reported > 0:
+        return reported
+    # cumulative_quantity is the EXECUTED quantity. When it is genuinely absent
+    # a FILLED row's plain ``quantity`` is the executed amount too -- the same
+    # fallback scripts/broker_reconciliation._normalize_orders applies, and
+    # without it a real fill valued as $0.00 and released the whole claim for a
+    # duplicate purchase (Codex review: "Fall back to quantity when valuing
+    # filled orders"). Scoped to "filled" on purpose: on a CANCELLED order
+    # ``quantity`` is what was REQUESTED, not what executed, so using it there
+    # would write off a balance no shares were bought with.
+    quantity_field = "cumulative_quantity"
+    if order.get("cumulative_quantity") is None and state == "filled":
+        quantity_field = "quantity"
+    quantity = _finite_nonnegative_float(order.get(quantity_field))
+    price = _finite_nonnegative_float(order.get("average_price"))
+    if quantity is not None and price is not None and quantity > 0 and price > 0:
+        reconstructed = quantity * price
+        # quantity and price are each individually finite -- _finite_
+        # nonnegative_float guarantees that -- but their PRODUCT can still
+        # overflow to inf (e.g. two ~1e308 broker fields). Recovery would
+        # otherwise treat that infinity as real executed capital, clear the
+        # lease, and pass it into ledger events and StrategyState.record_buy(),
+        # corrupting budget totals (Codex review: "Reject overflowed
+        # reconstructed notionals"). Indeterminate, not zero -- the lease
+        # must be preserved rather than released or booked.
+        if not math.isfinite(reconstructed):
+            return None
+        return reconstructed
+    # No usable valuation. Distinguish "this order genuinely moved nothing" from
+    # "this order reports a fill we could not value" -- only the first is a
+    # confirmed zero. An unvalued fill is indeterminate and must keep the lease
+    # (the same distinction broker_reconciliation tracks as has_unvalued_fill).
+    if reported is None and order.get("executed_notional") is not None:
+        return None  # present but unusable
+    if quantity is None and order.get(quantity_field) is not None:
+        return None  # present but unusable
+    if quantity is not None and quantity > 0:
+        return None  # a real fill whose price we could not read
+    # A FILLED order that reached here has no positive valuation from any field
+    # -- and unlike a terminal failure state, the broker is telling us it
+    # executed. Returning 0.0 made recovery read it as a confirmed zero-fill,
+    # restore the entire accumulator balance and allow it to be submitted again,
+    # duplicating a purchase the broker says already happened (Codex review:
+    # "Treat filled orders without positive notional as indeterminate"). Zero is
+    # only ever a defensible answer for a CANCELLED/REJECTED/EXPIRED row, where
+    # "nothing executed" is exactly what the state means.
+    if state == "filled":
+        return None
+    return 0.0
+
+
+def _lease_outage_trading_days(claim_trading_day: date, trading_day: date) -> int:
+    """A conservative count of trading sessions a resolving lease was blind to.
+
+    `_inverse_martingale_advance_age_for_missing_data` deliberately never
+    touches a `settlement_pending` cycle's age fields -- see that function's
+    own docstring on why racing the owning process's settlement write is
+    unsafe. So while broker history stays unreachable and a lease sits
+    pending, `trading_days_active`/`last_evaluated_trading_day` are frozen
+    exactly as they were at claim time, no matter how many real sessions
+    pass. Restoring the pre-claim state UNCHANGED once the lease finally
+    resolves -- as every branch of `_inverse_martingale_recover_pending_
+    lease` used to -- left the very next real evaluation crediting only a
+    single `trading_days_active += 1` for the whole gap, so a cycle already
+    close to `max_cycle_days` at claim time could resume and fire a stale
+    balance well past its real age (Codex review: "Account for lease
+    outage days before restoring the cycle").
+
+    Calendar days, not trading days: this repo counts trading-day age by
+    real EVALUATION calls, not calendar math (see evaluate_inverse_
+    martingale_step's own comment on why `(trading_day - cycle_start).days`
+    over-abandons by ~30%) -- but no trading-calendar utility exists here to
+    count actual sessions in a date range, and the two failure directions are
+    not symmetric: undercounting resumes a genuinely stale cycle with real
+    money at risk, while overcounting only abandons a few sessions early,
+    an opportunity-cost-only mistake. Calendar days is a safe UPPER bound on
+    trading days elapsed, so it errs the cheap direction.
+
+    Never negative -- a same-day resolution contributes nothing extra,
+    since the claim day's own advance was already counted when the fire
+    was originally claimed.
+    """
+    return max(0, (trading_day - claim_trading_day).days)
+
+
+def _inverse_martingale_recover_pending_lease(
+    ledger: InverseMartingaleLedger,
+    ticker: str,
+    tracker_state: Dict[str, Any],
+    *,
+    broker: "BrokerAdapter",
+    dry_run: bool,
+    trading_day: date,
+    stream: str,
+) -> Optional[InverseMartingaleLeaseRecovery]:
+    """Resolve one ``settlement_pending`` crash lease, or preserve it untouched.
+
+    A fire claim deliberately keeps the PRE-fire balance on disk and records the
+    deterministic broker ref it is about to submit under, so a worker that dies
+    between claim and placement loses no accumulated dollars. This is the other
+    half of that contract: reconcile the ref against broker order history and
+    either apply the claimed target state (the order really landed), rebuild a
+    continuation for the unfilled remainder (a partial landed), or release the
+    lease intact (nothing was ever placed and the claiming day has ended).
+
+    Returns ``None`` -- leaving the lease exactly as found -- whenever the
+    answer cannot be established: during the claiming trading day with no
+    matching order (the original worker may still be between claim and submit),
+    when the broker lookup fails, or when this invocation cannot see broker
+    history at all. Preserving a lease costs one more session of a frozen
+    balance; releasing one wrongly duplicates a real purchase.
+    """
+    claim_ref = tracker_state.get("settlement_ref_id")
+    claim_day = tracker_state.get("settlement_trading_day")
+    target = tracker_state.get("settlement_target_state")
+    claimed_amount = float(tracker_state.get("settlement_claimed_usd", 0.0))
+    # settlement_live records whether the CLAIMING invocation was allowed to
+    # place real orders. A lease written before that field existed is assumed
+    # live -- the fail-closed direction.
+    lease_was_live = bool(tracker_state.get("settlement_live", True))
+    try:
+        claim_trading_day = date.fromisoformat(claim_day) if isinstance(claim_day, str) else None
+    except ValueError:
+        claim_trading_day = None
+    if not isinstance(claim_ref, str) or claim_trading_day is None or not isinstance(target, dict):
+        # A lease with unusable metadata cannot be reconciled OR safely
+        # released; leave it for manual recovery rather than guessing.
+        logger.warning("inverse-Martingale claim cannot be reconciled for %s", ticker)
+        return None
+    matched_order: Optional[Dict[str, Any]] = None
+    # Whether this run can prove it is looking in the SAME account the claim
+    # submitted into. Only the release branch depends on it: a positive match is
+    # always trustworthy (finding the order proves it exists), but an absence is
+    # meaningless unless the account is confirmed.
+    account_confirmed = True
+    if dry_run:
+        # A LIVE lease can never be resolved from a dry-run invocation: the
+        # dry-run broker has no order history, so an absent order proves
+        # nothing. Gating the lookup on the CURRENT run's mode alone used to
+        # release the whole pre-fire balance as "unplaced" once the claim day
+        # passed -- even though the live order existed -- and a later live run
+        # could then buy that balance a second time (Codex review: "Reconcile
+        # live leases even when the recovery run is dry-run"). A lease claimed
+        # by a dry-run invocation, by contrast, never reached a broker at all,
+        # so it needs no lookup and expires on the ordinary schedule below.
+        if lease_was_live:
+            logger.warning(
+                "inverse-Martingale claim for %s originated live; preserving it during a dry run",
+                ticker,
+            )
+            return None
+    elif not lease_was_live:
+        # settlement_live=False proves this claim never reached a broker, so no
+        # order history anywhere can contain it and there is nothing to look up.
+        # Requiring the lookup anyway froze such a lease forever behind an
+        # adapter that cannot query client ids at all -- AlpacaBroker refuses
+        # outright (Codex review: "Skip broker lookup for dry-run-origin
+        # leases"). It simply expires on the ordinary claim-day rule below.
+        pass
+    else:
+        checker = getattr(broker, "strategy_order_with_ref_id", None)
+        if checker is None:
+            logger.warning("inverse-Martingale claim cannot be reconciled for %s", ticker)
+            return None
+        # Broker history is scoped to ONE account. If this invocation is wired
+        # to a different account than the claim was, the claimed order can never
+        # appear in the results, so an empty answer says nothing about whether
+        # it was submitted -- and releasing on that silence frees a balance
+        # whose real order is sitting in the original account. Only a lease that
+        # recorded no account identity at all (a pre-existing lease, or an
+        # adapter that exposes none) is exempt, since there is nothing to
+        # contradict.
+        #
+        # Scoped to LIVE leases. A dry-run claim never reached a broker at all
+        # -- settlement_live proves it -- so no account anywhere holds an order
+        # for it and account identity is irrelevant. Comparing anyway froze such
+        # a lease forever the moment the account value changed, which is exactly
+        # what happens when a dry run fingerprints the unset placeholder and a
+        # later live run supplies the real environment value (Codex review: "Let
+        # live runs release leases created by dry runs").
+        # A live lease whose account cannot be CONFIRMED to match this run's is
+        # not reconcilable AT ALL -- neither a positive match nor an absence
+        # means anything. An earlier version withheld only the release branch,
+        # on the reasoning that finding the order proves it exists. That was
+        # wrong: the claim ref is built from stream + trading day + ticker and
+        # carries NO account, so two accounts running this strategy mint the
+        # identical ref. A match in the wrong account is then some other
+        # account's order, and settling on it would clear the original lease and
+        # book a fill that never happened here (Codex review: "Refuse positive
+        # matches from a different broker account"). Covers a genuine mismatch,
+        # an identity this run cannot compute, and the "unknown" sentinel a live
+        # claim records when it could not compute one either.
+        claim_account = tracker_state.get("settlement_account") if lease_was_live else None
+        if claim_account is None:
+            account_confirmed = True  # dry-run lease, or a legacy one: nothing to contradict
+        elif claim_account == _LEASE_ACCOUNT_UNKNOWN:
+            account_confirmed = False
+        else:
+            account_confirmed = claim_account == _broker_account_fingerprint(
+                broker, ledger.root.parent
+            )
+        if not account_confirmed:
+            logger.warning(
+                "inverse-Martingale claim for %s cannot be matched to the account it was made "
+                "against; preserving the lease without reconciling it",
+                ticker,
+            )
+            return None
+        try:
+            candidate = checker(ticker, claim_trading_day, claim_ref)
+            matched_order = candidate if isinstance(candidate, dict) and candidate else None
+        except Exception as exc:  # noqa: BLE001 - preserve the lease fail-closed
+            logger.warning("inverse-Martingale claim reconciliation failed for %s: %s", ticker, exc)
+            return None
+    recovered_amount = _recovered_broker_notional(matched_order) if matched_order else 0.0
+    if matched_order is not None and recovered_amount is None:
+        # The order exists but has no FINAL executed amount yet -- it is still
+        # working, or its execution fields are unusable. Either way this
+        # reconciliation is indeterminate, and an indeterminate answer must
+        # never release or rewrite a claim on real money.
+        logger.warning(
+            "inverse-Martingale claim for %s matched a non-terminal or unreadable order; preserving the lease",
+            ticker,
+        )
+        return None
+    if matched_order is not None and recovered_amount > 0:
+        if abs(recovered_amount - claimed_amount) < 0.005:
+            # The claimed fire landed in full: the target state the claim
+            # reserved is exactly right, minus its own lease flag.
+            recovered_state = {k: v for k, v in target.items() if k != "settlement_pending"}
+            if recovered_state.get("status") == STATUS_FIRING:
+                # target is itself a STATUS_FIRING continuation (a capped
+                # fire, exactly matched by this settlement) computed by
+                # evaluate_inverse_martingale_step() AT CLAIM TIME -- its
+                # trading_days_active is correct as of the claim day, but
+                # broker reconciliation can be delayed for many sessions
+                # (the same outage window the other resolving branches
+                # already fold in), and target does not stamp last_
+                # evaluated_trading_day to today either, so the next real
+                # evaluation's own +1 would otherwise be the only credit for
+                # however long that outage lasted -- letting a remainder
+                # already close to max_cycle_days resume and place another
+                # stale chunk (Codex review: "Age a fully reconciled capped
+                # continuation").
+                recovered_state["trading_days_active"] = int(
+                    target.get("trading_days_active", 0)
+                ) + _lease_outage_trading_days(claim_trading_day, trading_day)
+        else:
+            # A partial landed (most likely a kill-switch-capped order). Rebuild
+            # a STATUS_FIRING continuation for the remainder with the SAME retry
+            # bookkeeping ordinary deferred partial settlement stamps -- without
+            # last_evaluated_trading_day/last_evaluated_stream/fire_attempts,
+            # the evaluation that runs right after this would not recognize a
+            # retry of the same scheduled stream and could synthesize a SECOND
+            # fire in this very invocation, reusing the same deterministic ref
+            # id (Codex review: "Preserve retry metadata when recovering a
+            # partial order").
+            remainder = round(
+                float(tracker_state.get("accumulated_usd", 0.0)) - recovered_amount, 2
+            )
+            if remainder <= 0:
+                # The partial exhausted the balance. Writing STATUS_FIRING with
+                # accumulated_usd=0 here would be self-inflicted corruption: the
+                # validator rejects an active cycle with a nonpositive balance,
+                # so the very next read would raise and skip this ticker
+                # permanently. Reachable with the supported sub-dollar config,
+                # where a $0.30 balance is claimed at the $1 broker minimum and
+                # a $0.50 terminal partial differs from the claim while
+                # exhausting the real balance. Mirror ordinary deferred
+                # settlement and write a resolved marker instead (Codex review:
+                # "Resolve partial fills that exhaust the accumulator").
+                recovered_state = resolved_marker(
+                    trading_day,
+                    stream,
+                    fired_floor_drop_metric=tracker_state.get("lowest_drop_seen"),
+                    # The floor PRICE as well as the metric, exactly like every
+                    # ordinary fire-resolution path. With only the metric, the
+                    # same-day re-arm guard falls back to comparing it in
+                    # whatever reference frame the later stream happens to have
+                    # -- so once the durable rearm latch clears, a price still
+                    # above the already-paid floor can read as a fresh deeper
+                    # descent and re-credit tiers that were already bought
+                    # (Codex review: "Preserve the paid floor price on
+                    # recovered resolution"). Computed with the ledger's own
+                    # inversion rather than a local reimplementation: the two
+                    # must agree exactly, and a private-name import is a
+                    # smaller risk than a second copy of the basis math
+                    # drifting from it.
+                    fired_floor_price=_drop_metric_to_price(
+                        float(tracker_state.get("cycle_reference_close") or 0.0),
+                        float(tracker_state.get("lowest_drop_seen") or 0.0),
+                        str(tracker_state.get("basis") or BASIS_PCT),
+                        tracker_state.get("stddev_reference"),
+                    ),
+                    rearm_reference_close=tracker_state.get("cycle_reference_close"),
+                    # Carry forward the claim's own rearm_last_seen_day rather
+                    # than leaving it unset. Without it, the next evaluation's
+                    # split-rebase lookup (near_close_dca's isinstance(...,
+                    # str) gate on rearm_last_seen_day) never runs, so a real
+                    # corporate action between this claim and next-day
+                    # recovery can never be detected: the reference stays
+                    # pinned at its pre-split value while decision_price is
+                    # already post-split, and the latch can stay armed far
+                    # longer than the genuine recovery it is meant to detect
+                    # (Codex review: "Preserve the pre-split close in
+                    # recovered resolution"). ``target`` already carries the
+                    # correct value -- it was computed by this same
+                    # resolved_marker()/evaluate_inverse_martingale_step()
+                    # machinery at claim time from this exact tracker_state.
+                    rearm_last_seen_day=target.get("rearm_last_seen_day"),
+                )
+            else:
+                recovered_state = {
+                    k: v
+                    for k, v in tracker_state.items()
+                    if k != "settlement_pending" and not k.startswith("settlement_")
+                }
+                recovered_state["status"] = STATUS_FIRING
+                recovered_state["accumulated_usd"] = remainder
+                recovered_state["fire_attempts"] = (
+                    1
+                    if tracker_state.get("status") != STATUS_FIRING
+                    else int(tracker_state.get("fire_attempts", 0)) + 1
+                )
+                recovered_state["last_evaluated_trading_day"] = trading_day.isoformat()
+                recovered_state["last_evaluated_stream"] = stream
+                recovered_state["last_evaluated_is_real"] = True
+                # See _lease_outage_trading_days's own docstring: stamping
+                # last_evaluated_trading_day to today above means the ordinary
+                # per-ticker evaluation loop's own +1 age advance will NOT run
+                # for this ticker today (its date already matches), so this
+                # recovery step must fold the outage in itself.
+                recovered_state["trading_days_active"] = int(
+                    tracker_state.get("trading_days_active", 0)
+                ) + _lease_outage_trading_days(claim_trading_day, trading_day)
+        recovered_reason = "fire_reconciled_from_broker_ref"
+    elif matched_order is not None:
+        # A REAL order was submitted and came back terminal with nothing filled.
+        # That is a failed placement, not an abandoned reservation, and treating
+        # the two identically let the balance be submitted again with no attempt
+        # recorded -- so a repeating crash-then-terminal-failure cycle never
+        # reached max_fire_attempts (Codex review: "Count reconciled zero-fill
+        # orders as fire attempts"). Shaped exactly like deferred settlement's
+        # own failed-placement rollback: the full balance survives as a
+        # STATUS_FIRING continuation with the attempt counted and this stream
+        # stamped, so the retry guard also stops a second attempt inside this
+        # same run.
+        #
+        # Resolved on ANY day, including the claiming one. The next-day wait
+        # below exists because an ABSENT order might still be in flight -- but a
+        # matched terminal row proves submission happened and can never fill, so
+        # making a morning/midday crash wait until tomorrow only blocked later
+        # same-day streams from retrying the retained balance and deferred the
+        # attempt bookkeeping for no gain (Codex review: "Resolve matched
+        # terminal zero-fill orders on the claim day").
+        recovered_state = {
+            k: v for k, v in tracker_state.items() if not k.startswith("settlement_")
+        }
+        recovered_amount = 0.0
+        recovered_state["status"] = STATUS_FIRING
+        recovered_state["fire_attempts"] = (
+            1
+            if tracker_state.get("status") != STATUS_FIRING
+            else int(tracker_state.get("fire_attempts", 0)) + 1
+        )
+        recovered_state["last_evaluated_trading_day"] = trading_day.isoformat()
+        recovered_state["last_evaluated_stream"] = stream
+        recovered_state["last_evaluated_is_real"] = True
+        # See _lease_outage_trading_days's own docstring: last_evaluated_
+        # trading_day is stamped to today above, so no later real evaluation
+        # this run will supply its own +1 age advance for this ticker.
+        recovered_state["trading_days_active"] = int(
+            tracker_state.get("trading_days_active", 0)
+        ) + _lease_outage_trading_days(claim_trading_day, trading_day)
+        recovered_reason = "fire_reconciled_terminal_zero_fill"
+    elif claim_trading_day < trading_day:
+        # NO order exists under this ref and the claiming day has ended, so no
+        # same-day market order from it can still land: the pre-fire balance is
+        # safely claimable again. Reaching here at all means the account was
+        # confirmed above -- otherwise the silence could just mean we looked
+        # somewhere the order never was.
+        recovered_state = {
+            k: v for k, v in tracker_state.items() if not k.startswith("settlement_")
+        }
+        recovered_amount = 0.0
+        # Unlike the two branches above, this one does NOT stamp
+        # last_evaluated_trading_day to today -- it leaves the pre-claim
+        # value untouched, so the ordinary per-ticker evaluation loop may
+        # still supply its own natural +1 age advance later. Folding the
+        # outage in here anyway, on top of that eventual +1, is a harmless
+        # over-count of at most one session -- cheap next to the alternative
+        # of leaving a genuinely stale cycle able to resume and fire (Codex
+        # review: "Account for lease outage days before restoring the
+        # cycle").
+        recovered_state["trading_days_active"] = int(
+            tracker_state.get("trading_days_active", 0)
+        ) + _lease_outage_trading_days(claim_trading_day, trading_day)
+        recovered_reason = "expired_unplaced_fire_lease_released"
+    else:
+        return None  # still the claiming day -- the owning worker may yet submit
+    order_id = None
+    if matched_order is not None:
+        # Fall back to the deterministic claim ref: it is the identifier this
+        # order was submitted under, and an outcome row with no id at all is
+        # not counted as a placed order by build_usage_proxy.
+        order_id = matched_order.get("id") or matched_order.get("order_id") or claim_ref
+    last_recovery = None
+    if recovered_amount > 0:
+        # A durable attribution record. Written to TWO places, not one:
+        #
+        # 1. The TRACKER's own top-level state (below), so the most recent
+        #    recovery is visible on a plain read without scanning history --
+        #    but this is overwritten wholesale by resolved_marker() the next
+        #    time this cycle fires, is abandoned, or is reset, since that
+        #    function carries no such field forward (Codex review: "Persist
+        #    recovery attribution in the audit event").
+        # 2. recovery_step.recovery_metadata below, which
+        #    InverseMartingaleLedger._write_locked() folds into this
+        #    transition's own APPEND-ONLY event-log entry -- surviving every
+        #    later transition, unlike the top-level copy.
+        #
+        # Both exist because InverseMartingaleLedger._write_locked() itself
+        # serializes only statuses, amounts, crossed tiers, fired, and reason
+        # for every event by default, with no date, stream, order id, or
+        # claim ref at all -- so a caller that skips publishing this recovery
+        # into a run artifact (a cross-day or cross-stream claim; see the
+        # publication loop in _run_once_impl) had NO durable way to attribute
+        # the purchase back to its original claim (Codex review: "Persist
+        # claim metadata before suppressing cross-stream recovery rows").
+        # This is especially lossy for a partial reconciliation, which
+        # already strips every settlement_* field and stamps the recovered
+        # state with the RECONCILING run's own day/stream, not the claim's.
+        last_recovery = {
+            "claim_trading_day": claim_trading_day.isoformat(),
+            "claim_stream": tracker_state.get("settlement_stream"),
+            "claim_ref": claim_ref,
+            "order_id": str(order_id) if order_id else None,
+            "recovered_amount_usd": recovered_amount,
+            "reconciled_trading_day": trading_day.isoformat(),
+            "reconciled_stream": stream,
+        }
+        # A plain dict under a new key, not one of the validated
+        # settlement_*/rearm_* fields, so it survives _validate_tracker_
+        # payload without any schema change and is overwritten wholesale by
+        # the next recovery rather than accumulating.
+        recovered_state = dict(recovered_state)
+        recovered_state["last_recovery"] = last_recovery
+    recovery_step = InverseMartingaleStep(
+        status_before=str(tracker_state.get("status", STATUS_NONE)),
+        status_after=str(recovered_state.get("status", STATUS_NONE)),
+        accumulated_usd_before=float(tracker_state.get("accumulated_usd", 0.0)),
+        accumulated_usd_after=float(recovered_state.get("accumulated_usd", 0.0)),
+        newly_crossed_tiers=(),
+        fired=recovered_amount > 0,
+        fire_amount_usd=recovered_amount,
+        reason=recovered_reason,
+        recovery_metadata=last_recovery,
+    )
+    if not ledger.claim_fire(
+        ticker,
+        expected_prior_state=tracker_state,
+        new_state=recovered_state,
+        step=recovery_step,
+    ):
+        # A concurrent process resolved this lease first; its write wins.
+        return None
+    return InverseMartingaleLeaseRecovery(
+        ticker=ticker,
+        claim_trading_day=claim_trading_day,
+        recovered_amount_usd=recovered_amount,
+        recovered_state=recovered_state,
+        order_id=str(order_id) if order_id else None,
+        claim_ref=claim_ref,
+        claim_stream=(
+            claim_stream if isinstance(claim_stream := tracker_state.get("settlement_stream"), str) else None
+        ),
+    )
+
+
+def _inverse_martingale_recover_pending_leases(
+    ledger: InverseMartingaleLedger,
+    *,
+    broker: "BrokerAdapter",
+    dry_run: bool,
+    trading_day: date,
+    stream: str,
+) -> Dict[str, InverseMartingaleLeaseRecovery]:
+    """Reconcile every ``settlement_pending`` lease in the on-disk ledger tree.
+
+    Scoped to the LEDGER, not to ``tradable_tickers`` or to
+    ``config.inverse_martingale``, and run BEFORE any enrollment/market-data
+    gate. A crashed lease is a claim on real money that only broker-ref
+    reconciliation can settle -- it needs no current price and no active
+    enrollment. Reaching it only through the per-ticker evaluation loop meant
+    an operator who disabled inverse-Martingale after the crash (the cleanup
+    helper deliberately leaves ``settlement_pending`` untouched, and the
+    evaluation loop skips unenrolled tickers), or a ticker whose price data
+    simply went missing (the age helper also refuses pending leases), locked
+    the claimed balance indefinitely with no path back (Codex review:
+    "Reconcile leases before enrollment and market-data gates").
+    """
+    recoveries: Dict[str, InverseMartingaleLeaseRecovery] = {}
+    if not ledger.root.is_dir():
+        return recoveries
+    for ticker_dir in sorted(ledger.root.iterdir()):
+        if not ticker_dir.is_dir():
+            continue
+        ticker = ticker_dir.name
+        try:
+            tracker_state = ledger.read(ticker)
+        except CorruptedLedgerStateError as exc:
+            # Same "skip only this ticker, leave the file for manual recovery"
+            # contract every other ledger read site here follows.
+            logger.error("inverse-Martingale ledger unreadable for %s: %s", ticker, exc)
+            continue
+        if not tracker_state or not tracker_state.get("settlement_pending"):
+            continue
+        recovery = _inverse_martingale_recover_pending_lease(
+            ledger,
+            ticker,
+            tracker_state,
+            broker=broker,
+            dry_run=dry_run,
+            trading_day=trading_day,
+            stream=stream,
+        )
+        if recovery is not None:
+            recoveries[ticker] = recovery
+    return recoveries
 
 
 def _afternoon_decision_price(decision: ReconciledDecision) -> Optional[float]:
@@ -3547,6 +4518,16 @@ def _build_buy_candidates(
         # artifacts"). Only a non-BUY decision that never reached submission
         # is skipped, matching the pre-existing behavior for every ordinary
         # skipped/manual-review non-BUY ticker.
+        if outcome.get("recovered_inverse_martingale_lease"):
+            # A reconciled crash lease is not this run's placement at all, so it
+            # must not borrow this decision's reason/signal fields. Left here it
+            # matched the pending-credit-flush shape below (a non-BUY decision
+            # with a "submitted" outcome) and was published as a credit flush
+            # that never happened, with the wrong reason and amount (Codex
+            # review: "Mark covered recovery rows as recoveries"). The recovery
+            # pass at the end of this function emits its own row for it --
+            # whether or not a decision covers the ticker.
+            continue
         is_pending_credit_flush = decision.action != Action.BUY and outcome.get("status") in (
             "submitted",
             "dry_run",
@@ -3636,7 +4617,7 @@ def _build_buy_candidates(
             "spread_pct": outcome.get("spread_pct"),
             "spread_status": outcome.get("spread_status", SPREAD_STATUS_NOT_EVALUATED),
         }
-        if guard is not None:
+        if guard is not None:  # noqa: SIM102 - kept flat to match the block below
             candidate_row.update(
                 {
                     "afternoon_desired_amount_usd": round(
@@ -3669,6 +4650,60 @@ def _build_buy_candidates(
                 }
             )
         buy_candidates.append(candidate_row)
+
+    # A crash lease reconciled to a real broker order is booked and published
+    # through candidate_outcomes -- but this loop is keyed by DECISIONS, and the
+    # ledger-wide recovery pass deliberately reaches tickers that have none: its
+    # whole purpose is to settle a claim whose ticker was un-enrolled, removed
+    # from config.tickers, or excluded after the crash, none of which produce a
+    # decision this run. Those outcomes would therefore be silently dropped from
+    # buy_candidates.csv and orders_placed_count in exactly the scenario the
+    # recovery pass exists for (Codex review: "Emit recovered orders even when
+    # the ticker has no decision"). Synthesize an auditable row for them
+    # instead, from the outcome alone.
+    #
+    # Runs for EVERY recovery outcome, not only the uncovered ones. A ticker
+    # that is still enrolled does have a decision, and routing its recovery
+    # through the loop above published it as a pending-credit flush -- the
+    # decision's reason and signal fields attached to an order this run never
+    # placed. The loop now skips recovery outcomes outright and they all land
+    # here, so a recovery row means the same thing either way.
+    #
+    # The signal-derived fields a real candidate carries (multipliers, target
+    # price, previous close) are deliberately absent rather than fabricated:
+    # this row records a purchase reconstructed from broker history, not a
+    # decision this run made, and inventing plausible-looking signal values
+    # would corrupt the audit these artifacts exist to be. The row is marked by
+    # its "reason" rather than a new column, so buy_candidates.csv keeps its
+    # existing schema.
+    for outcome_key, outcome in candidate_outcomes.items():
+        if not outcome.get("recovered_inverse_martingale_lease"):
+            continue
+        buy_candidates.append(
+            {
+                # From the outcome, not the dict key -- a recovery is stored
+                # under a synthetic key so it cannot collide with this run's own
+                # outcome for the same ticker.
+                "ticker": outcome.get("ticker", outcome_key),
+                "reason": "recovered_inverse_martingale_lease",
+                "buy_multiplier": 0.0,
+                "ladder_multiplier": 0.0,
+                "is_pending_credit_flush": False,
+                "selected_base_amount_usd": None,
+                "planned_amount_usd": round(float(outcome.get("submitted_amount_usd") or 0.0), 2),
+                "target_price": None,
+                "target_price_missing": True,
+                "decision_bar_close": None,
+                "previous_close": None,
+                "order_id": outcome.get("order_id"),
+                "status": outcome.get("status", "not_submitted"),
+                "skip_reason": outcome.get("skip_reason"),
+                "reviewed_order": outcome.get("reviewed_order"),
+                "spread_ok": outcome.get("spread_ok"),
+                "spread_pct": outcome.get("spread_pct"),
+                "spread_status": outcome.get("spread_status", SPREAD_STATUS_NOT_EVALUATED),
+            }
+        )
     return buy_candidates
 
 
@@ -7417,6 +8452,118 @@ def _apply_deployment_history(
     return apply_risk_guard(config, deployed_by_day(prior_states), trading_day)
 
 
+def _within_kill_switch_window(claim_day: date, trading_day: date) -> bool:
+    """True when ``claim_day`` falls inside the trailing kill-switch window ending
+    on ``trading_day``.
+
+    The same bound :func:`_load_deployment_history_states` applies when it builds
+    ``config.deployed_last_7d_usd`` from disk, so a runtime addition to that
+    figure agrees with what the injected value already covers rather than
+    stretching it further back than the kill switch is defined over.
+    """
+    from dca_risk import KILL_SWITCH_WINDOW_DAYS
+
+    return timedelta(0) <= (trading_day - claim_day) < timedelta(days=KILL_SWITCH_WINDOW_DAYS)
+
+
+def _same_day_order_recorded_in_any_stream(
+    order_ids: Set[str], trading_day: date, deployment_history_root: str | Path
+) -> bool:
+    """True when ANY scheduled artifact for ``trading_day`` -- morning, midday or
+    afternoon -- already records a submitted order carrying one of ``order_ids``.
+
+    The idempotency counterpart of
+    :func:`_same_day_order_deployment_already_recorded`, which answers the
+    narrower KILL-SWITCH question and therefore filters to afternoon evidence.
+
+    Recovery must not reuse that narrower predicate. A morning or midday worker
+    that persisted both ``state.record_buy()`` and its submitted-order artifact
+    and then crashed before deferred settlement leaves a MORNING artifact, which
+    ``is_afternoon_scheduled_evidence`` explicitly rejects -- so the afternoon
+    recovery run saw "not on disk", recorded the same dollars and attempt into
+    ``StrategyState`` a second time and republished the order, overstating the
+    shared daily and weekly caps (Codex review: "Check every roster stream
+    before rebooking a recovery"). "Has this order already been booked?" is a
+    question about every stream; only "does it count toward the afternoon
+    kill-switch total?" is afternoon-scoped.
+    """
+    return _order_recorded_in_deployment_history(
+        order_ids, trading_day, deployment_history_root, afternoon_only=False
+    )
+
+
+def _same_day_order_deployment_already_recorded(
+    order_ids: Set[str], trading_day: date, deployment_history_root: str | Path
+) -> bool:
+    """True when a scheduled-afternoon artifact for ``trading_day`` already records
+    a submitted order carrying one of ``order_ids``.
+
+    The order-IDENTITY counterpart of
+    :func:`_same_day_ticker_deployment_already_recorded`. Crash-lease recovery
+    needs to know whether THIS reconciled order was already booked, and the
+    ticker-level question answers something weaker: any other submitted order
+    for the same ticker that day (an ordinary ladder buy from another stream,
+    say) made the ticker-level check true and suppressed booking for a recovered
+    order that has no artifact at all -- so the batch computed its daily, weekly
+    and kill-switch headroom without that spend and could exceed its caps (Codex
+    review: "Require the recovered order itself in deployment history").
+
+    Matches against a SET because a recovered order can be identified two ways:
+    the broker's own order id when history reported one, and the deterministic
+    claim ref it was submitted under. Checking both keeps a genuinely-booked
+    order recognizable whichever identifier the artifact happens to carry --
+    a false negative here re-books real money.
+
+    Afternoon-filtered because the kill-switch figure it guards is
+    afternoon-only. For the broader "was this order already booked at all?"
+    question, use :func:`_same_day_order_recorded_in_any_stream`.
+    """
+    return _order_recorded_in_deployment_history(
+        order_ids, trading_day, deployment_history_root, afternoon_only=True
+    )
+
+
+def _order_recorded_in_deployment_history(
+    order_ids: Set[str],
+    trading_day: date,
+    deployment_history_root: str | Path,
+    *,
+    afternoon_only: bool,
+) -> bool:
+    """Shared scan behind the two order-identity predicates above.
+
+    ``afternoon_only`` selects which question is being asked: kill-switch
+    accounting (afternoon evidence only) or plain booking idempotency (any
+    scheduled stream).
+    """
+    from dca_risk import STREAM_SCHEDULED, classify_stream, is_afternoon_scheduled_evidence
+
+    wanted = {str(i) for i in order_ids if i}
+    if not wanted:
+        return False
+    for state in _load_deployment_history_states(trading_day, deployment_history_root):
+        if afternoon_only:
+            if not is_afternoon_scheduled_evidence(state):
+                continue
+        elif classify_stream(state) != STREAM_SCHEDULED:
+            # Still scheduled-only: a manual run's artifact is deliberately
+            # excluded from every automated accounting path in this repo (see
+            # docs/run_classification.md), and reading one here would let a
+            # manual order suppress a real recovery booking.
+            continue
+        candidates = state.get("buy_candidates")
+        if not isinstance(candidates, list):
+            continue
+        for candidate in candidates:
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("status") == "submitted"
+                and str(candidate.get("order_id") or "") in wanted
+            ):
+                return True
+    return False
+
+
 def _same_day_ticker_deployment_already_recorded(
     ticker: str, trading_day: date, deployment_history_root: str | Path
 ) -> bool:
@@ -8756,9 +9903,22 @@ def _failure_candidate_row(ticker: str, outcome: Dict[str, Any]) -> Dict[str, An
 
     ``buy_multiplier`` is carried on the placement outcome; null only when an
     outcome predates that (schema-valid, and honest about not knowing).
+
+    ``ticker`` is the ``candidate_outcomes``/``broker_outcomes`` dict KEY, not
+    necessarily the real symbol: a recovered inverse-Martingale lease is
+    stored under a synthetic ``"<ticker>#imart-recovery"`` key so it cannot
+    collide with an ordinary same-run candidate for the same ticker (see the
+    lease-recovery publication block in ``_run_once_impl``), and carries its
+    real ticker INSIDE the outcome instead. Preferring
+    ``outcome.get("ticker", ticker)`` -- the same fallback
+    ``_build_buy_candidates`` already uses for its own success-path rows --
+    keeps a failure artifact honest about which symbol a row belongs to
+    rather than writing the synthetic key into ``buy_candidates`` as though
+    it were a real ticker (Codex review: "Preserve real tickers in recovery
+    failure artifacts").
     """
     return {
-        "ticker": ticker,
+        "ticker": outcome.get("ticker", ticker),
         "status": outcome.get("status", "not_submitted"),
         "order_id": outcome.get("order_id"),
         "buy_multiplier": outcome.get("buy_multiplier"),
@@ -9173,6 +10333,80 @@ def config_broker_name() -> str:
     return "robinhood"
 
 
+def _book_recovered_lease_durably(
+    im_recovery: "InverseMartingaleLeaseRecovery",
+    state: StrategyState,
+    trading_day: date,
+    deployment_history_root: Optional[str | Path],
+) -> bool:
+    """Durably book one reconciled inverse-Martingale lease's spend into
+    ``state``, unless it is already recorded. Returns whether the order was
+    already found on disk in ANY scheduled stream's artifact, for a caller
+    that also needs that fact to decide whether to republish a run-artifact
+    row for it.
+
+    Shared by both the ordinary (gate-passing) booking pass and the
+    date/holiday-gated early-return path in ``_run_once_impl``: a filled
+    claim reconciled on a date ``_check_execution_gates()`` blocks (a
+    weekend/holiday retry after a Friday crash, say) still needs its spend
+    folded into the DURABLE daily/weekly totals, or the next allowed run
+    computes headroom as if the money were never spent and can place orders
+    beyond the configured caps -- and once this reconciliation clears the
+    lease, no later run can ever rediscover it to book it retroactively
+    (Codex review: "Book recovered spend before clearing gated leases").
+
+    Idempotent against both an in-process retry (``state.own_orders_
+    recorded``) and a durable one (an on-disk artifact from an earlier
+    invocation that persisted ``record_buy()`` and then died before this one
+    reran) -- see ``_same_day_order_recorded_in_any_stream``'s own docstring
+    for why that check is scoped to every roster stream, not just this run's.
+
+    Deliberately narrower than the ordinary booking pass's own remaining
+    work: it does NOT touch ``config.deployed_last_7d_usd`` (ephemeral and
+    this-run-only -- meaningless for the gated path, which returns before
+    evaluating any candidate) and does NOT publish a ``candidate_outcomes``
+    row (no run artifact is written on the gated path either way).
+    """
+    # Keyed by the INDIVIDUAL claim (order_id/claim_ref/claim_stream), not
+    # just ticker+day: two distinct leases for the same ticker and claim day
+    # -- e.g. a morning partial-fire claim recovered before an afternoon
+    # continuation also crashes -- previously collapsed onto the identical
+    # (ticker, day) key. Once the first recovery's key landed in
+    # own_orders_recorded, the second recovery's own_orders_recorded check
+    # short-circuited its record_buy() even though its order/ref was absent
+    # from deployment history, so that batch computed daily/weekly/order-
+    # count headroom without the second broker order ever counted (Codex
+    # review: "Key recovery idempotency by the individual claim").
+    im_recovery_key = (
+        f"{im_recovery.ticker}#imart-recovery",
+        im_recovery.claim_trading_day,
+        im_recovery.order_id or "",
+        im_recovery.claim_ref or "",
+        im_recovery.claim_stream or "",
+    )
+    im_recovery_identifiers = {im_recovery.order_id or "", im_recovery.claim_ref or ""}
+    im_already_on_disk = (
+        deployment_history_root is not None
+        and _same_day_order_recorded_in_any_stream(
+            im_recovery_identifiers, im_recovery.claim_trading_day, deployment_history_root,
+        )
+    )
+    if im_recovery_key not in state.own_orders_recorded and not im_already_on_disk:
+        state.record_buy(
+            im_recovery.ticker, im_recovery.claim_trading_day, im_recovery.recovered_amount_usd
+        )
+        state.own_orders_recorded.add(im_recovery_key)
+        # See the identical comment at the ordinary booking pass's own call
+        # to this: only for a claim day the prior-allocation seeding pass
+        # actually visits (today's), and only clears the weekly reserve key
+        # when the claim lands on an earlier ISO week than today's.
+        if im_recovery.claim_trading_day == trading_day:
+            state.note_prior_allocation_baseline_is_disjoint(im_recovery.ticker, trading_day)
+        if iso_week_key(im_recovery.claim_trading_day) < iso_week_key(trading_day):
+            state.reserve_week_key = None
+    return im_already_on_disk
+
+
 def _run_once_impl(
     ctx: RunContext,
 ) -> List[ReconciledDecision]:
@@ -9218,6 +10452,52 @@ def _run_once_impl(
         classification_overrides=classification_overrides,
         correlation_id=correlation_id,
     ):
+        # A settlement_pending crash lease is a claim on real money that only
+        # broker-ref reconciliation can settle, and reconciliation needs
+        # neither a current price nor the rest of this run -- so it must not
+        # wait behind the date/holiday gate above. Without this, a fire
+        # claimed on the FINAL approved trading date (or the day before a
+        # holiday) crashed into a lease no later invocation could ever reach:
+        # every subsequent scheduled run returns right here, before the
+        # ordinary recovery pass further down even runs, permanently
+        # freezing that ticker's balance until an operator manually reopens
+        # the trading window (Codex review: "Reconcile leases before the
+        # date-gate return").
+        #
+        # The DURABLE half of booking -- state.record_buy() and its
+        # idempotency bookkeeping -- runs here too, via the same
+        # _book_recovered_lease_durably() helper the ordinary (gate-passing)
+        # booking pass below uses. A filled claim reconciled on a
+        # gate-blocked date (a Friday fire crashed after broker submission,
+        # reconciled by Saturday) must still be folded into the daily/weekly
+        # totals: once this pass clears settlement_pending, no LATER run can
+        # ever rediscover it to book it retroactively, and the next allowed
+        # run would otherwise compute headroom as if the money were never
+        # spent and could place orders beyond the configured caps (Codex
+        # review: "Book recovered spend before clearing gated leases").
+        #
+        # Only the EPHEMERAL half is skipped: config.deployed_last_7d_usd
+        # (this run's own in-memory 7-day kill-switch figure) and the
+        # candidate_outcomes/run-artifact row, both meaningful only for
+        # candidates THIS run is about to evaluate -- and a gate-blocked run
+        # evaluates none, and writes no run artifact at all. Running the
+        # reconciliation itself here still keeps every account-identity/
+        # live-lease/pagination safeguard (the same recovery resolver the
+        # passing-gate path uses), so a claim this pass cannot yet prove is
+        # simply left pending for whichever later run resolves it.
+        if scheduled:
+            for im_gated_recovery in _inverse_martingale_recover_pending_leases(
+                InverseMartingaleLedger(),
+                broker=broker,
+                dry_run=config.dry_run,
+                trading_day=trading_day,
+                stream=stream,
+            ).values():
+                if im_gated_recovery.recovered_amount_usd <= 0 and im_gated_recovery.order_id is None:
+                    continue  # a released lease: no capital moved, nothing to book
+                _book_recovered_lease_durably(
+                    im_gated_recovery, state, trading_day, deployment_history_root
+                )
         return []
 
     # Inject the trailing-7-day scheduled-live deployment from history so the
@@ -9301,6 +10581,198 @@ def _run_once_impl(
     # a fire this run is correctly reflected in tier selection -- exactly
     # like the credit-ledger flush above.
     #
+    # Crash-lease reconciliation pass. Runs FIRST -- before the enrollment
+    # cleanup below and before the per-ticker evaluation loop's own
+    # enrollment/tradability/market-data gates -- because a `settlement_pending`
+    # lease is a claim on real money that only broker-ref reconciliation can
+    # settle, and reconciliation needs neither a current price nor an active
+    # enrollment. Reached only from inside the evaluation loop (its original
+    # home), a crashed lease became permanently unrecoverable the moment the
+    # operator disabled inverse-Martingale for that ticker, or the moment its
+    # market data went missing: the cleanup helper below and the age-only
+    # helper both deliberately refuse to touch a pending lease, and the
+    # evaluation loop never reaches an unenrolled or price-less ticker at all
+    # (Codex review: "Reconcile leases before enrollment and market-data
+    # gates"). Placed before the cleanup pass specifically so a lease RELEASED
+    # here can then be cleaned up in the same run rather than waiting a session.
+    #
+    # Gated on `scheduled` like everything else in this feature (an ad hoc or
+    # --demo invocation must never resolve a real accumulator claim), but NOT
+    # on `config.inverse_martingale` being non-empty and NOT on `stream` --
+    # a lease outlives both the enrollment mapping that created it and the
+    # narrowed morning universe.
+    im_lease_recoveries: Dict[str, InverseMartingaleLeaseRecovery] = {}
+    #: Whether each recovery's own order was ALREADY recorded in an on-disk
+    #: artifact, keyed exactly like ``im_lease_recoveries``. Computed once
+    #: during the booking pass below and consulted again by the artifact
+    #: publication loop near the end of this function, which must not republish
+    #: an order the crashed worker already audited.
+    im_recovery_already_on_disk: Dict[str, bool] = {}
+    if scheduled:
+        im_lease_ledger = InverseMartingaleLedger()
+        im_lease_recoveries = _inverse_martingale_recover_pending_leases(
+            im_lease_ledger,
+            broker=broker,
+            dry_run=config.dry_run,
+            trading_day=trading_day,
+            stream=stream,
+        )
+        for im_recovery_lookup_key, im_recovery in im_lease_recoveries.items():
+            if im_recovery.recovered_amount_usd <= 0 and im_recovery.order_id is None:
+                # A RELEASED lease: the resolver proved no order was ever
+                # submitted under this claim's ref, so no capital moved and no
+                # order slot was consumed. Nothing to book.
+                #
+                # Discriminated on order_id, not on the amount alone. A matched
+                # TERMINAL ZERO-FILL recovery also carries $0 -- but a real
+                # order reached the broker and came back cancelled/rejected,
+                # and config/budgets.json counts exactly that as a buy ATTEMPT
+                # against max_orders_per_day. Conflating the two skipped
+                # record_buy entirely, leaving the roster-wide
+                # day_order_count() unincremented so within_caps() granted the
+                # rest of this batch an extra order beyond the shared daily
+                # circuit breaker, and left no artifact row preserving the
+                # attempt (Codex review: "Count recovered zero-fill orders
+                # toward the daily cap").
+                continue
+            # The claimed order reached the broker but the process died before
+            # its state transaction and artifacts were durably committed, so
+            # NOTHING in this restarted run knows that capital was spent.
+            # Reconciling only the inverse-Martingale ledger would leave the
+            # daily, weekly and trailing-7-day headroom computed as if the
+            # money were still available, letting later candidates in this very
+            # batch place orders beyond the configured caps, and would omit the
+            # recovered purchase from the run artifacts entirely (Codex review:
+            # "Book recovered broker orders into the strategy budget").
+            # Booked against the CLAIM day, not today: record_buy keys the
+            # daily/weekly buckets by the day passed in, and a lease recovered
+            # the morning after its crash spent yesterday's budget, not today's.
+            #
+            # Idempotency rests on a DURABLE signal, not only on the run-scoped
+            # own_orders_recorded set. StrategyState itself survives across
+            # invocations (state_transaction), and own_orders_recorded
+            # deliberately does not -- so a prior run that placed the order,
+            # recorded the buy, persisted its state and wrote its artifact, then
+            # died before deferred settlement, leaves the lease pending AND the
+            # spend already booked. Re-booking it here would double that
+            # ticker's day/week notional and attempt count and could block valid
+            # later buys (Codex review: "Avoid rebooking recovery spend already
+            # persisted in state"). The per-ticker artifact check is that
+            # durable signal, and it is the same one the deployment addition
+            # below already uses.
+            #
+            # It is not a total guarantee: a crash between the state write and
+            # the artifact write leaves no on-disk record, and re-booking is
+            # possible in that narrower window -- the same two-phase gap
+            # documented in docs/inverse_martingale.md's "Remaining
+            # limitations".
+            # Deliberately NOT the bare (ticker, trading_day) shape the rest of
+            # own_orders_recorded uses. _seed_prior_allocations() reads that set
+            # as "this stream already placed a real order for this ticker
+            # today, so its aggregate is already accounted for" and skips the
+            # ticker's ENTIRE prior-allocation aggregate. A recovered order is
+            # the one case where that inference is wrong: it is absent from the
+            # artifact scan the aggregate is built from (it died before its
+            # artifacts were written -- the very condition the booking below is
+            # gated on), so the aggregate describes some OTHER order, and
+            # suppressing it dropped that order's dollars and its attempt from
+            # StrategyState entirely, letting unrelated candidates run past the
+            # daily, weekly and shared order-count caps (Codex review:
+            # "Reconcile separate prior allocations after booking a recovery").
+            # A distinct namespace keeps this loop's own in-process retry
+            # idempotency without ever matching that gate.
+            # ANY scheduled stream's artifact, not just the afternoon's. A
+            # morning or midday worker that persisted record_buy() AND its
+            # artifact before dying leaves a MORNING artifact, which an
+            # afternoon-scoped predicate would reject outright -- so booking
+            # read "not on disk" and recorded the same dollars and attempt a
+            # second time (Codex review: "Check every roster stream before
+            # rebooking a recovery"). _book_recovered_lease_durably's own
+            # afternoon-agnostic check belongs to the kill-switch total
+            # below, not to the question of whether this order has already
+            # been booked at all.
+            im_already_on_disk = _book_recovered_lease_durably(
+                im_recovery, state, trading_day, deployment_history_root
+            )
+            im_recovery_already_on_disk[im_recovery_lookup_key] = im_already_on_disk
+            im_recovery_identifiers = {im_recovery.order_id or "", im_recovery.claim_ref or ""}
+            # Same per-ticker deployment-history check the same-stream
+            # duplicate-preserved retry path uses: _apply_deployment_history
+            # already summed every order recorded in an on-disk artifact into
+            # config.deployed_last_7d_usd, so adding a recovered order that IS
+            # on disk would double-count it against the kill-switch threshold.
+            # A crashed claim's order is precisely the case where nothing on
+            # disk has ever counted this capital.
+            #
+            # Bounded by the SAME trailing window the injected figure covers.
+            # _load_deployment_history_states deliberately sums only the
+            # KILL_SWITCH_WINDOW_DAYS days ending on trading_day, so a claim day
+            # older than that window is no longer part of the configured
+            # seven-day exposure at all. Adding it anyway -- reachable when
+            # reconciliation is delayed by a long history outage or an
+            # unverifiable account -- would inflate the figure with capital the
+            # kill switch is not supposed to be counting, spuriously engaging it
+            # and capping later candidates in this run (Codex review: "Exclude
+            # stale recoveries from the seven-day deployment total").
+            #
+            # Skipped outright for a terminal zero-fill recovery: it consumed
+            # an order slot (booked above) but moved no capital, and the
+            # kill-switch figure counts dollars deployed, not attempts.
+            #
+            # And scoped to a claim made by the AFTERNOON stream. Deployment is
+            # accounted per stream and never conflated: dca_risk's kill-switch
+            # figure counts only scheduled-afternoon capital, and
+            # is_afternoon_scheduled_evidence() explicitly rejects morning and
+            # midday runs. A lease outlives the run that claimed it, so the
+            # afternoon slot routinely recovers a MORNING claim -- adding those
+            # dollars here injected capital the kill switch is defined to
+            # exclude, inflating the figure and spuriously capping later
+            # candidates (Codex review: "Preserve the claiming stream when
+            # booking recovered spend"). A legacy lease carries no stream at
+            # all; its provenance is unknown, and the conservative reading of
+            # unknown provenance is to leave the afternoon figure alone rather
+            # than assume this run's own stream produced it. Note the ordinary
+            # budget booking above is deliberately NOT stream-scoped -- the
+            # daily and weekly caps are shared across the whole roster.
+            #
+            # The already-on-disk test here is the AFTERNOON-scoped one, not
+            # the all-stream predicate used for booking idempotency above: this
+            # guards against double-counting within _apply_deployment_history's
+            # own afternoon-only sum, so it has to ask the same question that
+            # sum asks.
+            # Mirrors is_afternoon_scheduled_evidence's own rule, which defines
+            # the afternoon stream NEGATIVELY -- everything scheduled that is
+            # not morning and not midday -- rather than by matching a literal
+            # "afternoon". Comparing against this run's own stream would be
+            # wrong: what matters is where the money came from, not who is
+            # reconciling it.
+            from dca_risk import STREAM_MIDDAY, STREAM_MORNING
+
+            im_claim_is_afternoon = im_recovery.claim_stream is not None and im_recovery.claim_stream not in (
+                STREAM_MORNING,
+                STREAM_MIDDAY,
+            )
+            im_deployment_already_counted = (
+                deployment_history_root is not None
+                and _same_day_order_deployment_already_recorded(
+                    im_recovery_identifiers,
+                    im_recovery.claim_trading_day,
+                    deployment_history_root,
+                )
+            )
+            if (
+                im_recovery.recovered_amount_usd > 0
+                and im_claim_is_afternoon
+                and deployment_history_root is not None
+                and _within_kill_switch_window(im_recovery.claim_trading_day, trading_day)
+                and not im_deployment_already_counted
+            ):
+                config = replace(
+                    config,
+                    deployed_last_7d_usd=config.deployed_last_7d_usd
+                    + im_recovery.recovered_amount_usd,
+                )
+
     # Cleanup pass for tickers whose accumulator cycle is no longer backed by
     # an active enrollment -- runs regardless of whether config.inverse_
     # martingale is non-empty, unlike the tracking/firing block below. If
@@ -9446,6 +10918,36 @@ def _run_once_impl(
                 # over one ticker's corrupted state.
                 logger.error("inverse-Martingale ledger unreadable for %s: %s", im_ticker, exc)
                 continue
+            if im_tracker_state.get("settlement_pending"):
+                # The crash-lease reconciliation pass above already had its
+                # chance at this ticker and deliberately preserved the lease
+                # (still the claiming trading day, an unreachable broker, or a
+                # live lease seen from a dry-run invocation). Evaluating a
+                # leased cycle is exactly what that reservation exists to
+                # prevent, so skip the ticker entirely this run.
+                continue
+            # Confirmed corporate-action evidence for the durable rearm latch,
+            # supplied the same way stddev_reference is: read from the archive
+            # here so evaluate_inverse_martingale_step stays a pure function of
+            # its inputs. Only meaningful while a latch is actually armed, and
+            # only over the window since it was last evaluated -- re-reading the
+            # whole history every run would re-apply a split already applied.
+            # None (no latch, no window, or an archive that cannot confirm)
+            # rebases nothing, which is the fail-closed direction.
+            im_split_factor = None
+            im_split_cursor_day = None
+            im_last_seen_day = im_tracker_state.get("rearm_last_seen_day")
+            if im_tracker_state.get("rearm_reference_close") is not None and isinstance(im_last_seen_day, str):
+                try:
+                    im_split_since = date.fromisoformat(im_last_seen_day)
+                except ValueError:
+                    im_split_since = None
+                if im_split_since is not None:
+                    im_split_lookup = archived_split_factor(
+                        im_ticker, since=im_split_since, as_of=trading_day
+                    )
+                    if im_split_lookup is not None:
+                        im_split_factor, im_split_cursor_day = im_split_lookup
             im_new_state, im_step = evaluate_inverse_martingale_step(
                 im_tracker_state,
                 decision_price=im_decision_price,
@@ -9458,6 +10960,8 @@ def _run_once_impl(
                 max_fire_attempts=config.inverse_martingale_max_fire_attempts,
                 basis=im_cfg["basis"],
                 stddev_reference=im_stddev_reference,
+                split_factor=im_split_factor,
+                split_cursor_day=im_split_cursor_day,
                 per_order_cap_usd=config.max_per_order_usd,
                 stream=stream,
             )
@@ -9523,7 +11027,7 @@ def _run_once_impl(
                 # same-day guard for the full rationale (Codex review:
                 # "Mark deferred-fire age updates as non-real").
                 im_aged_state["last_evaluated_is_real"] = False
-                im_ledger.claim_fire(
+                im_ledger.compare_and_swap_transition(
                     im_ticker,
                     expected_prior_state=im_tracker_state,
                     new_state=im_aged_state,
@@ -9556,10 +11060,91 @@ def _run_once_impl(
                 # another process already claimed this ticker this run;
                 # skip it entirely -- it is that OTHER process's candidate to
                 # carry to placement, not lost.
+                im_ref_id = (
+                    f"{_graded_dca_ref_id_prefix(stream, 'imart')}-"
+                    f"{trading_day.isoformat()}-{im_ticker}"
+                )
+                # Persist a recoverable lease, not the already-debited target
+                # state.  A crash before broker submission therefore leaves the
+                # entire accumulated balance present ON THE TRACKER ITSELF,
+                # while the target and exact broker ref provide enough
+                # information for a later invocation to distinguish a submitted
+                # order from an abandoned reservation.
+                #
+                # The pre-fire state is the PRIMARY on-disk state here, not a
+                # nested side field, and deliberately so: any reader that does
+                # not understand this lease -- the age-only and cleanup helpers,
+                # drift detection, an operator inspecting tracker.json -- still
+                # sees the real balance. Claiming with the debited target state
+                # and stashing the balance in a nested key would make the money
+                # read as already spent to every one of them, and would lose it
+                # outright if the lease can never be reconciled (an
+                # AlpacaBroker-driven roster, or a nested field dropped by a
+                # restore). The cost is that the leased status is routinely
+                # "dipping"; _validate_tracker_payload accommodates that by
+                # requiring a lease to carry its recovery metadata rather than
+                # by inferring legitimacy from status alone.
+                im_claim_state = dict(im_tracker_state)
+                im_claim_state.update(
+                    settlement_pending=True,
+                    settlement_ref_id=im_ref_id,
+                    settlement_trading_day=trading_day.isoformat(),
+                    settlement_claimed_usd=im_step.fire_amount_usd,
+                    settlement_target_state=im_new_state,
+                    # Whether THIS invocation could reach a real broker at all.
+                    # A later recovery run reads it to decide whether an absent
+                    # order proves anything: a dry-run invocation has no order
+                    # history, so it must never release a lease a LIVE run
+                    # claimed (Codex review: "Reconcile live leases even when
+                    # the recovery run is dry-run").
+                    settlement_live=not config.dry_run,
+                    # Which roster stream is making this claim. Deployment is
+                    # accounted PER STREAM and never conflated (dca_risk.py's
+                    # own "Stream hygiene" contract): only scheduled-afternoon
+                    # runs are the kill-switch trading stream, and
+                    # is_afternoon_scheduled_evidence() explicitly rejects
+                    # morning and midday capital. A lease outlives the run that
+                    # created it and is routinely recovered by a LATER stream,
+                    # which has no other way to know where the money came from
+                    # -- so without this the afternoon slot booked a morning
+                    # claim's dollars into the afternoon-only trailing-7-day
+                    # figure and published its row inside an afternoon artifact,
+                    # making every future deployed_by_day() scan count morning
+                    # capital as afternoon deployment and spuriously engage the
+                    # kill switch (Codex review: "Preserve the claiming stream
+                    # when booking recovered spend"). Absent on a legacy lease,
+                    # which recovery treats as "provenance unknown".
+                    settlement_stream=stream,
+                    # Which ACCOUNT this claim is about to submit into, as a
+                    # keyed, non-reversible fingerprint. Broker history is
+                    # queried per account, so a recovery run pointed at a
+                    # different account would search somewhere the order could
+                    # never be and read that absence as proof nothing was
+                    # submitted -- releasing a balance whose order sits in the
+                    # original account (Codex review: "Verify the claiming
+                    # broker account before releasing a lease"). Recorded only
+                    # for a LIVE claim: a dry-run claim submits nothing, so
+                    # there is no account for it to be found in and pinning one
+                    # would only freeze the lease if the value later changed.
+                    # A live claim ALWAYS records the field, falling back to the
+                    # explicit "unknown" sentinel when the identity cannot be
+                    # computed -- persisting None there would look exactly like
+                    # a legacy lease and be exempted from account matching, so a
+                    # later run on a different account could release it on that
+                    # account's empty history.
+                    settlement_account=(
+                        None
+                        if config.dry_run
+                        else (
+                            _broker_account_fingerprint(broker, im_ledger.root.parent)
+                            or _LEASE_ACCOUNT_UNKNOWN
+                        )
+                    ),
+                )
                 if not im_ledger.claim_fire(
                     im_ticker,
                     expected_prior_state=im_tracker_state,
-                    new_state=im_new_state,
+                    new_state=im_claim_state,
                     step=im_step,
                 ):
                     continue
@@ -9582,7 +11167,7 @@ def _run_once_impl(
                 # reference a stddev-basis cycle needs on its next
                 # evaluation (Codex review: "Retain the frozen sigma in
                 # partial-fire state").
-                im_pending_fires[im_ticker] = (im_tracker_state, im_new_state, im_step)
+                im_pending_fires[im_ticker] = (im_tracker_state, im_claim_state, im_step)
                 fire_decision = replace(
                     im_signal,
                     action=Action.BUY,
@@ -9667,7 +11252,7 @@ def _run_once_impl(
                 # state this evaluation started from; skip writing rather
                 # than clobber it -- the ticker is re-evaluated fresh from
                 # whatever that other process left on a later run.
-                im_ledger.claim_fire(
+                im_ledger.compare_and_swap_transition(
                     im_ticker,
                     expected_prior_state=im_tracker_state,
                     new_state=im_new_state,
@@ -9791,6 +11376,127 @@ def _run_once_impl(
     errors_count += err_inc
     order_reviews_attempted += rev_inc
 
+    # Publish a candidate outcome for every crash lease reconciled to a REAL
+    # broker order placed TODAY. Its capital is already booked into the budget
+    # counters above, but without an outcome row the recovered purchase is
+    # missing from buy_candidates.csv, orders_placed_count and the run audit
+    # entirely -- the run would report having placed nothing while a real order
+    # exists (Codex review: "Book recovered broker orders into the strategy
+    # budget"). Never overwrite an outcome this run produced for the same
+    # ticker: that one describes a placement THIS invocation actually attempted
+    # and is the authoritative record for it.
+    #
+    # Scoped to a claim day equal to THIS trading day. A run_state artifact
+    # carries one top-level trading day and its candidate rows carry no claim
+    # day of their own, so load_prior_same_day_allocations reads every submitted
+    # row in it as an allocation made TODAY. Emitting a prior-day recovery here
+    # would therefore charge yesterday's order against today's per-ticker and
+    # per-day caps in every later slot, and present it to the top-up guard as
+    # today's same-ticker allocation -- suppressing a legitimate buy (Codex
+    # review: "Keep prior-day recoveries out of today's submission context").
+    # A prior-day recovery is not unaudited: claim_fire() has already written a
+    # durable step event for it in the accumulator ledger's own audit log, with
+    # the reconciled dollar amount and the claim day it belongs to, which is the
+    # record that correctly carries the older date.
+    for im_recovery_lookup_key, im_recovery in im_lease_recoveries.items():
+        # Gated on order_id, NOT on the notional. A matched TERMINAL ZERO-FILL
+        # recovery carries $0 but a real order DID reach the broker, and
+        # config/budgets.json counts a cancelled or rejected buy as an attempt
+        # against the roster-wide max_orders_per_day. The in-memory
+        # record_buy(..., 0.0) above only protects THIS invocation: every later
+        # roster slot reconstructs that shared attempt count from artifact rows,
+        # so filtering the row out here let a genuine broker attempt vanish from
+        # the record and granted a later slot an extra order (Codex review:
+        # "Persist recovered zero-fill attempts in artifacts"). Only a RELEASED
+        # lease -- no order, no attempt -- has nothing to audit.
+        if im_recovery.order_id is None:
+            continue
+        # Already audited by the crashed worker itself. `im_already_on_disk`
+        # keeps this order out of StrategyState and the runtime seven-day
+        # total, but publishing the row anyway put a SECOND artifact carrying
+        # the same broker order on disk, and dca_risk.deployed_by_day sums
+        # deployed_usd(state) per artifact with no order-level deduplication --
+        # so the next invocation counted that one order twice against the
+        # kill-switch threshold and could suppress valid later purchases
+        # (Codex review: "Avoid republishing recovery spend already on disk").
+        # The original artifact is the authoritative record; this run adds
+        # nothing to it.
+        if im_recovery_already_on_disk.get(im_recovery_lookup_key):
+            logger.info(
+                "inverse-Martingale lease for %s reconciled an order already recorded on disk; "
+                "not republishing it in this run's candidates",
+                im_recovery.ticker,
+            )
+            continue
+        if im_recovery.claim_trading_day != trading_day:
+            logger.info(
+                "inverse-Martingale lease for %s reconciled $%.2f from %s; booked to that day's "
+                "budget and recorded in the accumulator audit log, not today's candidates",
+                im_recovery.ticker,
+                im_recovery.recovered_amount_usd,
+                im_recovery.claim_trading_day.isoformat(),
+            )
+            continue
+        # Scoped to a claim made by THIS stream, for the same reason the claim
+        # DAY is scoped just above: a run_state artifact carries one stream and
+        # its candidate rows carry no stream of their own, so every row inside
+        # it is read as this stream's deployment. Publishing a morning claim's
+        # recovery into an afternoon artifact therefore makes every future
+        # deployed_by_day() scan count morning capital as afternoon deployment
+        # -- exactly the conflation dca_risk's "Stream hygiene" contract and
+        # is_afternoon_scheduled_evidence() exist to prevent -- inflating the
+        # kill-switch total permanently, since the artifact is durable (Codex
+        # review: "Preserve the claiming stream when booking recovered spend").
+        # A legacy lease carrying no stream is treated the same way: unknown
+        # provenance must not be silently attributed to this stream.
+        #
+        # The cost is that a cross-stream recovery's ATTEMPT is not in this
+        # run's artifact, which is the accounting the sibling zero-fill fix
+        # above exists to preserve. It is the lesser error: an attempt missing
+        # from one artifact is recoverable from the accumulator ledger's own
+        # durable audit log (claim_fire() wrote a step event carrying the
+        # amount, the claim day and the stream), whereas capital misfiled into
+        # the wrong risk stream corrupts the kill switch for seven days with no
+        # way for a later reader to tell it apart from real afternoon
+        # deployment. Recorded in docs/inverse_martingale.md's "Remaining
+        # limitations".
+        if im_recovery.claim_stream != stream:
+            logger.info(
+                "inverse-Martingale lease for %s was claimed by the %s stream and reconciled by %s; "
+                "booked to the shared budget and recorded in the accumulator audit log, "
+                "not published into this stream's artifact",
+                im_recovery.ticker,
+                im_recovery.claim_stream or "unknown",
+                stream,
+            )
+            continue
+        # Stored under a SYNTHETIC key, not the plain ticker. candidate_outcomes
+        # is keyed by ticker and holds one entry each, so keying a recovery by
+        # its ticker made the two events collide: a run where the ticker also
+        # produced an ordinary candidate (reachable once enrollment is disabled
+        # after the crash) silently dropped one of them, and the artifact then
+        # under-reported real capital to every later same-day and
+        # deployment-history reader (Codex review: "Preserve recovery rows
+        # alongside current ticker outcomes"). A recovery is a distinct event
+        # from anything this run placed, so it gets its own entry.
+        #
+        # Safe against every consumer: the ticker-keyed lookups
+        # (`candidate_outcomes.get(decision.ticker)`, and deferred settlement's
+        # own `.get(im_ticker)`) can never resolve this key, while the
+        # `.values()` sweeps that matter -- orders_placed_count in particular --
+        # still see it. "#" cannot appear in a real symbol.
+        candidate_outcomes[f"{im_recovery.ticker}#imart-recovery"] = {
+            "status": "submitted",
+            "order_id": im_recovery.order_id,
+            "skip_reason": None,
+            "reviewed_order": None,
+            "submitted_amount_usd": im_recovery.recovered_amount_usd,
+            # Read by _build_buy_candidates to synthesize an auditable row. The
+            # ticker travels IN the outcome because the dict key is synthetic.
+            "recovered_inverse_martingale_lease": True,
+            "ticker": im_recovery.ticker,
+        }
+
     # Deferred inverse-Martingale settlement: now that _process_buy_candidates_batch
     # has actually attempted every candidate (including the synthetic fires
     # claimed above), resolve each claimed ticker's ledger using the REAL
@@ -9820,6 +11526,7 @@ def _run_once_impl(
     if im_pending_fires:
         im_settlement_ledger = InverseMartingaleLedger()
         for im_ticker, (im_pre_fire_state, im_fired_state, im_fired_step) in im_pending_fires.items():
+            im_target_state = im_fired_state.get("settlement_target_state", {})
             im_outcome = candidate_outcomes.get(im_ticker, {})
             im_placed_amount = (
                 im_outcome.get("submitted_amount_usd") if im_outcome.get("status") == "submitted" else 0.0
@@ -9843,7 +11550,9 @@ def _run_once_impl(
                 # the complete, minimal resolved_marker() shape claim_fire()
                 # wrote (status "none", last_evaluated_trading_day/stream) --
                 # neither needs any further reshaping here.
-                im_settlement_state = {k: v for k, v in im_fired_state.items() if k != "settlement_pending"}
+                im_settlement_state = {
+                    k: v for k, v in im_target_state.items() if k != "settlement_pending"
+                }
                 im_settlement_step = im_fired_step
             else:
                 # Either the placement was fully blocked/failed/dry-run
@@ -9853,7 +11562,52 @@ def _run_once_impl(
                 # the claim back to reflect however much was ACTUALLY placed.
                 im_adjusted_remainder = round(im_fired_step.accumulated_usd_before - im_placed_amount, 2)
                 if im_adjusted_remainder <= 0:
-                    im_adjusted_state = resolved_marker(trading_day, stream)
+                    im_adjusted_state = resolved_marker(
+                        trading_day,
+                        stream,
+                        fired_floor_drop_metric=im_pre_fire_state.get("lowest_drop_seen"),
+                        # The floor PRICE as well as the metric, exactly like
+                        # every other fire-resolution path (claim_fire's own
+                        # full-fire marker, and the crash-recovery resolver).
+                        # With only the metric, the same-day re-arm guard falls
+                        # back to comparing it in whatever reference frame the
+                        # later stream happens to have -- so once the durable
+                        # rearm latch clears, a price still above the
+                        # already-paid floor can read as a fresh deeper descent
+                        # and re-credit tiers that were already bought (Codex
+                        # review: "Preserve the absolute fire floor during
+                        # overpay settlement"). Computed with the ledger's own
+                        # inversion rather than a local reimplementation, from
+                        # im_pre_fire_state -- the frozen cycle_reference_close/
+                        # stddev_reference this fire actually resolved against,
+                        # not whatever the ticker's cycle happens to look like
+                        # by the time this settlement runs.
+                        fired_floor_price=_drop_metric_to_price(
+                            float(im_pre_fire_state.get("cycle_reference_close") or 0.0),
+                            float(im_pre_fire_state.get("lowest_drop_seen") or 0.0),
+                            str(im_pre_fire_state.get("basis") or BASIS_PCT),
+                            im_pre_fire_state.get("stddev_reference"),
+                        ),
+                        rearm_reference_close=im_pre_fire_state.get("cycle_reference_close"),
+                        # The split-window cursor. Seeded from
+                        # cycle_start_trading_day -- the day the frozen
+                        # cycle_reference_close above was actually captured on
+                        # -- not today: a multi-day cycle that spans a split or
+                        # dividend before this overpay settlement finally
+                        # resolves would otherwise have its cursor jump straight
+                        # to today, and the next archived_split_factor() lookup
+                        # excludes every archive row back to cycle start via
+                        # `row_date <= since`, permanently missing the
+                        # intervening action (Codex review: "Seed the overpay
+                        # latch cursor from the cycle reference day"). Falling
+                        # back to today only if a legacy/corrupted-then-repaired
+                        # pre-fire state somehow lacks the field, matching
+                        # dca_inverse_martingale.py's identical fallback at its
+                        # own resolution sites.
+                        rearm_last_seen_day=(
+                            im_pre_fire_state.get("cycle_start_trading_day") or trading_day.isoformat()
+                        ),
+                    )
                     im_adjusted_status_after = STATUS_NONE
                 else:
                     # Built from im_pre_fire_state (the state read BEFORE the

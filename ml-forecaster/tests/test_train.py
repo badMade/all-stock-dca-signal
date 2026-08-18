@@ -703,11 +703,17 @@ def test_main_publishes_with_the_real_wall_clock_generated_at_for_a_near_replay(
 
     monkeypatch.setattr(train_module.publish_module, "guarded_publish", spying_guarded_publish)
 
+    # --models-dir must stay under the configured ML artifact root: publishing
+    # now refuses a model artifact outside it (Codex review: "Keep external
+    # model references portable") -- irrelevant to what this test actually
+    # checks (generated_at), so simply keep it in-root here.
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    models_dir = Path(train_module.stream_root("ml_forecaster")) / "models"
     train_module.main(
         [
             "--history-dir", str(history_dir),
             "--tickers", "AAA", "BBB",
-            "--models-dir", str(tmp_path / "models"),
+            "--models-dir", str(models_dir),
             "--output", str(tmp_path / "ml_sizing_adjustment.json"),
             "--now", replay_now_dt.isoformat(),
         ]
@@ -761,11 +767,17 @@ def test_main_shortens_published_staleness_budget_by_the_snapshots_own_age(tmp_p
 
     monkeypatch.setattr(train_module.publish_module, "guarded_publish", spying_guarded_publish)
 
+    # --models-dir must stay under the configured ML artifact root: publishing
+    # now refuses a model artifact outside it (Codex review: "Keep external
+    # model references portable") -- irrelevant to what this test actually
+    # checks (the staleness budget), so simply keep it in-root here.
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    models_dir = Path(train_module.stream_root("ml_forecaster")) / "models"
     train_module.main(
         [
             "--history-dir", str(history_dir),
             "--tickers", "AAA", "BBB",
-            "--models-dir", str(tmp_path / "models"),
+            "--models-dir", str(models_dir),
             "--output", str(tmp_path / "ml_sizing_adjustment.json"),
             "--now", now_dt.isoformat(),
             "--max-staleness-hours", "240",
@@ -1254,7 +1266,12 @@ def test_main_passes_the_model_artifact_path_and_a_working_scorer_to_guarded_pub
 
     monkeypatch.setattr(train_module.publish_module, "guarded_publish", spying_guarded_publish)
 
-    models_dir = tmp_path / "models"
+    # --models-dir must stay under the configured ML artifact root: publishing
+    # now refuses a model artifact outside it (Codex review: "Keep external
+    # model references portable") -- irrelevant to what this test actually
+    # checks (the guarded_publish() kwargs), so simply keep it in-root here.
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    models_dir = Path(train_module.stream_root("ml_forecaster")) / "models"
     exit_code = train_module.main(
         [
             "--history-dir", str(history_dir),
@@ -1275,7 +1292,13 @@ def test_main_passes_the_model_artifact_path_and_a_working_scorer_to_guarded_pub
 
     run_dir = _find_run_dir(models_dir, "2024-06-01")
     model_json_path = run_dir / "model.json"
-    assert captured_kwargs["model_artifact_path"] == str(model_json_path)
+    # Whatever form it is stored in, it must resolve back to the real artifact
+    # (Codex review: "Store a portable incumbent model reference"). --models-dir
+    # is under the configured ML artifact root here, so it is stored root-
+    # relative; see test_an_external_relative_models_dir_is_refused_rather_
+    # than_published for the out-of-root case, which publishing now refuses.
+    stored = captured_kwargs["model_artifact_path"]
+    assert train_module._resolve_artifact_reference(stored) == model_json_path
 
     scorer = captured_kwargs["score_incumbent_model"]
     # Scoring this run's OWN just-saved artifact against itself must return
@@ -1330,12 +1353,9 @@ def test_build_incumbent_scorer_matches_evaluate_score_incumbent_on_folds(tmp_pa
     model_json_path = tmp_path / "incumbent" / "model.json"
     fitted.save(model_json_path)
 
-    # The candidate is THIS run's own real final_model -- fit on the full
-    # dip_dataset, deliberately a DIFFERENT alpha from the incumbent's own,
-    # so this test would fail if _build_incumbent_scorer silently refit its
-    # own candidate internally instead of scoring the one it was given
-    # (Codex review: "Avoid comparing the incumbent with its exact
-    # reconstruction").
+    # The candidate is this run's final model. Its alpha configures the
+    # leakage-free comparison model that evaluate fits before the holdout;
+    # the final model's own in-sample predictions are not used.
     candidate_model = model_module.fit(dip_dataset, alpha=model_module.DEFAULT_ALPHA * 2, model_version="candidate")
 
     scorer = train_module._build_incumbent_scorer(dip_dataset, candidate_model)
@@ -1343,3 +1363,151 @@ def test_build_incumbent_scorer_matches_evaluate_score_incumbent_on_folds(tmp_pa
 
     expected = train_module.evaluate_module.score_incumbent_on_folds(fitted, candidate_model, dip_dataset)
     assert result == pytest.approx(expected)
+
+
+def test_model_artifact_path_under_the_root_is_stored_relative(tmp_path, monkeypatch):
+    """Regression test for "Store a portable incumbent model reference".
+
+    `str(model_json_path)` recorded an absolute path tied to the publishing
+    checkout's artifact root (or a relative one tied to its working directory),
+    and that value is persisted into the version-controlled published config. A
+    retrain from another checkout, host, working directory or
+    $DCA_CRON_TRACKING_ROOT could then not load the incumbent, so
+    _build_incumbent_scorer silently fell back to the weaker skill-ratio
+    comparison and a model failing the intended direct comparison could publish.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    import importlib
+
+    import dca_paths
+
+    importlib.reload(dca_paths)
+    importlib.reload(train_module)
+
+    root = Path(train_module.stream_root("ml_forecaster"))
+    inside = root / "models" / "2026-08-17-abc" / "model.json"
+    inside.parent.mkdir(parents=True, exist_ok=True)
+    inside.write_text("{}", encoding="utf-8")
+
+    stored = train_module._portable_artifact_reference(inside)
+    assert not Path(stored).is_absolute()
+    assert stored == "models/2026-08-17-abc/model.json"
+    assert train_module._resolve_artifact_reference(stored) == inside.resolve()
+
+    # A path OUTSIDE the root has no portable reference at all -- an absolute
+    # path is exactly as host-tied as the original bug this function fixes,
+    # so publishing is refused rather than silently degraded (Codex review:
+    # "Keep external model references portable").
+    outside = tmp_path / "elsewhere" / "model.json"
+    with pytest.raises(ValueError, match="outside the ML artifact root"):
+        train_module._portable_artifact_reference(outside)
+
+
+def test_a_root_relative_reference_is_stored_with_forward_slashes(tmp_path, monkeypatch):
+    """Regression test for "Serialize relative artifact references portably".
+
+    On Windows `str(Path)` yields backslash separators, and a POSIX Path treats
+    those as literal filename characters rather than separators -- so a config
+    published on Windows and consumed on Linux could not locate the incumbent
+    and silently fell back to the weaker skill-ratio comparison, defeating the
+    cross-host portability this pair of functions exists for.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    import importlib
+
+    import dca_paths
+
+    importlib.reload(dca_paths)
+    importlib.reload(train_module)
+
+    root = Path(train_module.stream_root("ml_forecaster"))
+    inside = root / "models" / "2026-08-17-abc" / "model.json"
+    inside.parent.mkdir(parents=True, exist_ok=True)
+    inside.write_text("{}", encoding="utf-8")
+
+    stored = train_module._portable_artifact_reference(inside)
+    assert "\\" not in stored
+    assert stored == "models/2026-08-17-abc/model.json"
+
+    # A legacy Windows-written reference still resolves on a POSIX host rather
+    # than being read as one long filename.
+    windows_style = "models\\2026-08-17-abc\\model.json"
+    assert train_module._resolve_artifact_reference(windows_style) == inside
+
+
+def test_a_legacy_working_directory_relative_reference_still_loads(tmp_path, monkeypatch):
+    """Regression test for "Preserve pre-change relative artifact references".
+
+    A config published by the EARLIER version recorded `str(model_json_path)`
+    unchanged, so an explicit relative --models-dir stored a path relative to
+    that retrain's WORKING DIRECTORY. Rebasing every relative reference onto the
+    ML artifact root looks in the wrong place, fails to load an incumbent that
+    is really still there, and drops _build_incumbent_scorer to the weaker
+    skill-ratio comparison -- the silent downgrade this pair of functions exists
+    to prevent.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    import importlib
+
+    import dca_paths
+
+    importlib.reload(dca_paths)
+    importlib.reload(train_module)
+
+    # A legacy reference: relative, and meaningful only against the working
+    # directory it was published from.
+    legacy_dir = tmp_path / "legacy_models" / "2026-08-10-abc"
+    legacy_dir.mkdir(parents=True, exist_ok=True)
+    (legacy_dir / "model.json").write_text("{}", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    legacy_reference = "legacy_models/2026-08-10-abc/model.json"
+
+    resolved = train_module._resolve_artifact_reference(legacy_reference)
+    assert resolved == (legacy_dir / "model.json").resolve()
+
+    # The NEW contract still wins wherever both readings could apply: an
+    # identically-named artifact under the ML root takes precedence, so a
+    # portable reference is never diverted to a stale working-directory copy.
+    root = Path(train_module.stream_root("ml_forecaster"))
+    rooted = root / legacy_reference
+    rooted.parent.mkdir(parents=True, exist_ok=True)
+    rooted.write_text("{}", encoding="utf-8")
+    assert train_module._resolve_artifact_reference(legacy_reference) == rooted
+
+    # When neither exists the failure points at the intended location, not at
+    # a working-directory guess.
+    missing = train_module._resolve_artifact_reference("nowhere/model.json")
+    assert missing == root / "nowhere/model.json"
+
+
+def test_an_external_relative_models_dir_is_refused_rather_than_published(tmp_path, monkeypatch):
+    """Regression test for "Keep external model references portable".
+
+    `--models-dir ../models` puts the artifact outside the configured ML
+    root. An earlier version stored that as an absolute path so it would at
+    least round-trip on THIS host -- but that value is persisted into the
+    version-controlled published config, so the next retrain on any OTHER
+    checkout/host could not load the incumbent, and since the shared
+    holdout gate now treats scorer failure as blocking, no retrain could
+    publish again until an operator repaired the path by hand. Refusing to
+    publish at all, with an actionable message, is the fail-closed fix.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    import importlib
+
+    import dca_paths
+
+    importlib.reload(dca_paths)
+    importlib.reload(train_module)
+
+    external = tmp_path / "elsewhere" / "2026-08-17-abc"
+    external.mkdir(parents=True, exist_ok=True)
+    (external / "model.json").write_text("{}", encoding="utf-8")
+
+    # Name it RELATIVELY, exactly as an operator's --models-dir would.
+    monkeypatch.chdir(tmp_path)
+    relative = Path("elsewhere") / "2026-08-17-abc" / "model.json"
+    assert not relative.is_absolute()
+
+    with pytest.raises(ValueError, match="outside the ML artifact root"):
+        train_module._portable_artifact_reference(relative)

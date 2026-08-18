@@ -828,6 +828,13 @@ def test_load_strategy_config_threads_now_into_ml_sizing_staleness(tmp_path):
     config = load_strategy_config(tmp_path, now=stale_now)
     assert config.ml_sizing_adjustment == {}
 
+    # A replay before the publication must reject it as future data. Checking
+    # this through the aggregate loader (rather than only the leaf loader)
+    # protects the actual run_dca configuration path from look-ahead bias.
+    replay_before_publish = datetime(2026, 8, 9, 12, tzinfo=timezone.utc)
+    config = load_strategy_config(tmp_path, now=replay_before_publish)
+    assert config.ml_sizing_adjustment == {}
+
 
 def test_ml_sizing_adjustment_stale_file_is_a_no_op(tmp_path):
     _write(tmp_path, "ml_sizing_adjustment.json", _fresh_ml_payload())

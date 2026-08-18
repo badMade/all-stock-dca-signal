@@ -138,8 +138,8 @@ class TrainedModel:
 
     See module docstring for why prediction never touches scikit-learn or
     pickle: only `fit()` (a module-level function, not a method here) needs
-    scikit-learn installed; scoring an already-trained model.json needs only
-    numpy.
+    scikit-learn installed; scoring an already-trained model.json requires
+    only numpy + pandas.
     """
 
     model_version: str

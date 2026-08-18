@@ -11080,6 +11080,38 @@ def test_a_failure_synthesized_candidate_row_satisfies_the_schema():
     jsonschema.validate(row, item_schema)
 
 
+def test_a_failure_candidate_row_prefers_the_outcomes_own_ticker():
+    """Regression test for "Preserve real tickers in recovery failure
+    artifacts". A recovered inverse-Martingale lease is published into
+    candidate_outcomes under a synthetic "<ticker>#imart-recovery" key (see
+    the lease-recovery publication block in _run_once_impl) so it cannot
+    collide with an ordinary same-run candidate for the same ticker, and
+    carries its real ticker INSIDE the outcome instead. If a later step
+    raises before the run finishes, the failure writer reads the same
+    in-flight dict and must not write that synthetic key into buy_candidates
+    as though it were a real symbol.
+    """
+    from near_close_dca import _failure_candidate_row
+
+    row = _failure_candidate_row(
+        "AAPL#imart-recovery",
+        {
+            "status": "submitted",
+            "order_id": "o-1",
+            "submitted_amount_usd": 5.0,
+            "recovered_inverse_martingale_lease": True,
+            "ticker": "AAPL",
+        },
+    )
+
+    assert row["ticker"] == "AAPL"
+
+    # An ordinary outcome carries no "ticker" field of its own -- the dict
+    # key IS the real ticker -- so the fallback must still return it.
+    ordinary_row = _failure_candidate_row("MSFT", {"status": "submitted", "order_id": "o-2"})
+    assert ordinary_row["ticker"] == "MSFT"
+
+
 def test_a_placement_outcome_carries_the_multiplier_for_the_failure_path():
     """The failure handlers synthesize candidate rows from outcomes alone, so the
     real multiplier has to travel on the outcome to survive a raise."""

@@ -104,6 +104,49 @@ _MAX_PERSISTED_EVENTS = 50
 # sub-dollar fires in the accumulator").
 _BROKER_MINIMUM_ORDER_USD = 1.0
 
+#: Recorded as a live lease's ``settlement_account`` when the account identity
+#: could not be computed at claim time -- the key was unwritable, or the adapter
+#: refused the probe. Distinguishing that from "no key present at all" matters:
+#: an absent key means a LEGACY lease predating the field (nothing to
+#: contradict, so recovery may still release it), while this sentinel means a
+#: live claim whose account is unknown, which must never be released on the
+#: strength of some other account's empty history (Codex review: "Refuse live
+#: claims without an account fingerprint"). No real fingerprint can collide with
+#: it -- those are lowercase hex.
+#:
+#: Defined HERE rather than in near_close_dca (which writes it) so this module's
+#: payload validator and that writer share one definition of the contract; a
+#: validator that accepted a shape the writer never produces is how a damaged
+#: tracker froze silently instead of being reported.
+_LEASE_ACCOUNT_UNKNOWN = "unknown"
+
+#: Characters of the HMAC-SHA256 hex digest kept as the account fingerprint.
+#: near_close_dca._broker_account_fingerprint slices to exactly this, and
+#: :func:`_is_valid_lease_account` accepts exactly this.
+_LEASE_ACCOUNT_FINGERPRINT_LENGTH = 32
+
+_LEASE_ACCOUNT_HEX_CHARS = frozenset("0123456789abcdef")
+
+
+def _is_valid_lease_account(value: Any) -> bool:
+    """True for the only two shapes a claim can ever write into
+    ``settlement_account``: the ``"unknown"`` sentinel, or a lowercase hex HMAC
+    fingerprint of exactly :data:`_LEASE_ACCOUNT_FINGERPRINT_LENGTH` characters.
+
+    Anything else -- a truncated fingerprint, an uppercase copy, a hand-written
+    note -- can never equal a freshly computed fingerprint, so recovery would
+    withhold reconciliation forever and freeze the ticker's accumulator rather
+    than guard it.
+    """
+    if not isinstance(value, str):
+        return False
+    if value == _LEASE_ACCOUNT_UNKNOWN:
+        return True
+    return (
+        len(value) == _LEASE_ACCOUNT_FINGERPRINT_LENGTH
+        and set(value) <= _LEASE_ACCOUNT_HEX_CHARS
+    )
+
 
 @dataclass(frozen=True)
 class InverseMartingaleStep:
@@ -117,7 +160,11 @@ class InverseMartingaleStep:
     floored to ``_BROKER_MINIMUM_ORDER_USD`` -- in the pathological case of a
     ``per_order_cap_usd`` configured below that floor, the floor wins, since
     a broker-rejected sub-dollar order is a harder constraint than a
-    self-imposed spending cap.
+    self-imposed spending cap -- but never above the balance the cycle has
+    actually accumulated. When that balance is ITSELF below the minimum the
+    step does not fire at all (``reason`` ends ``_below_broker_minimum``) and
+    the balance is held for a later run, because placing more than was tracked
+    would spend money the accumulator never deferred.
     """
 
     status_before: str
@@ -128,6 +175,18 @@ class InverseMartingaleStep:
     fired: bool
     fire_amount_usd: float
     reason: str
+    #: Optional claim attribution for a crash-lease recovery step -- the
+    #: original claim's trading day/stream/ref/order id, distinct from the
+    #: fields above (which describe THIS reconciling evaluation, not the
+    #: claim it is resolving). ``_write_locked`` folds this into the
+    #: persisted event dict when present, so the attribution survives in the
+    #: ledger's append-only audit trail even once a LATER transition
+    #: replaces the tracker's top-level state via ``resolved_marker()``
+    #: (which carries no such field and drops whatever the top level had) --
+    #: see near_close_dca.py's recovery injection site, which is the only
+    #: place this is populated (Codex review: "Persist recovery attribution
+    #: in the audit event").
+    recovery_metadata: Optional[dict[str, Any]] = None
 
 
 def _sorted_tiers(tier_config: tuple[tuple[float, float], ...]) -> tuple[tuple[float, float], ...]:
@@ -158,12 +217,74 @@ def _drop_metric_to_price(
     return price if math.isfinite(price) and price > 0 else None
 
 
+def _preserved_latch_kwargs(
+    tracker_state: dict[str, Any],
+    persisted_basis: Optional[str],
+    status_before: str,
+    *,
+    carry_drop_metric: bool,
+) -> dict[str, Any]:
+    """The durable-latch fields a MID-CYCLE CONFIG RESET must carry into its
+    ``resolved_marker``, rebuilt from persisted state alone.
+
+    The two config-change resets (basis, and the tier table / ``unit_usd``
+    fingerprint) run before this call's own ``drop_metric`` and
+    ``reference_close`` exist, so unlike the abandonment path further down they
+    have only what is already on disk to work from.
+
+    Applies to a ``STATUS_FIRING`` cycle ONLY, and returns nothing otherwise.
+    That is the one status whose reset can discard money already spent: a
+    ``per_order_cap_usd``-capped continuation can have placed one or more real,
+    settled chunks over earlier runs, and writing a latch-free marker let a
+    later stream or trading day open a brand-new cycle while price was still
+    inside the original descent and credit the edited tiers again, duplicating
+    exposure those earlier fills already covered (Codex review: "Preserve the
+    paid-fire latch across tier configuration resets"). A ``STATUS_DIPPING``
+    cycle has banked tier credit but placed nothing, so it keeps resetting
+    cleanly -- latching it would strand the ticker behind a reference price the
+    operator's own edit was meant to move past, which the abandonment path can
+    afford to do (its cutoffs mean the cycle is over regardless) and a
+    deliberate config change cannot.
+
+    ``fired_floor_price`` is an absolute price, so it survives a basis change
+    intact as long as the metric is inverted through the basis it was RECORDED
+    under. ``fired_floor_drop_metric`` does not -- it is denominated in the old
+    basis's units, and re-persisting it across a basis change would hand the
+    next evaluation a sigma-valued floor to compare percentage points against.
+    That is the very misreading the basis reset exists to prevent, so
+    ``carry_drop_metric`` is False there and the absolute price carries the
+    floor alone.
+    """
+    if status_before != STATUS_FIRING:
+        return {}
+    reference_close = tracker_state.get("cycle_reference_close")
+    if not isinstance(reference_close, (int, float)) or not math.isfinite(reference_close) or reference_close <= 0:
+        return {}
+    reference_close = float(reference_close)
+    preserved: dict[str, Any] = {"rearm_reference_close": reference_close}
+    lowest_drop_seen = tracker_state.get("lowest_drop_seen")
+    if isinstance(lowest_drop_seen, (int, float)) and math.isfinite(lowest_drop_seen):
+        floor_price = _drop_metric_to_price(
+            reference_close,
+            float(lowest_drop_seen),
+            persisted_basis or BASIS_PCT,
+            tracker_state.get("stddev_reference"),
+        )
+        if floor_price is not None:
+            preserved["fired_floor_price"] = floor_price
+        if carry_drop_metric:
+            preserved["fired_floor_drop_metric"] = float(lowest_drop_seen)
+    return preserved
+
+
 def resolved_marker(
     trading_day: date,
     stream: str,
     *,
     fired_floor_drop_metric: Optional[float] = None,
     fired_floor_price: Optional[float] = None,
+    rearm_reference_close: Optional[float] = None,
+    rearm_last_seen_day: Optional[str] = None,
 ) -> dict[str, Any]:
     """The state persisted when a cycle fully resolves (fires completely) or
     is abandoned (max_cycle_days/max_fire_attempts).
@@ -171,10 +292,14 @@ def resolved_marker(
     Deliberately NOT an empty dict: ``last_evaluated_trading_day`` is a
     retry-idempotency marker, read by the ``status == "none"`` guard at the
     top of :func:`evaluate_inverse_martingale_step` (Codex review: "Require a
-    fresh dip before rearming a fired cycle"). No other per-cycle field
+    fresh dip before rearming a fired cycle"). No OTHER per-cycle field
     (crossed_tier_thresholds, cycle_reference_close, stddev_reference,
     fire_attempts) is carried forward -- a genuinely new cycle starting on a
-    later day must not inherit anything from the one that just resolved.
+    later day must not inherit the DOLLAR/TIER state of the one that just
+    resolved. ``rearm_reference_close`` (below) is the sole, deliberate
+    exception: it exists precisely to durably block a later cycle from
+    starting at all until price exits the paid-for dip, so unlike every
+    other field here it MUST survive the resolve.
 
     ``last_evaluated_stream`` is also persisted, alongside the date, so that
     same-day guard can tell a genuine RETRY of the run that produced this
@@ -249,6 +374,25 @@ def resolved_marker(
         marker["fired_floor_drop_metric"] = fired_floor_drop_metric
     if fired_floor_price is not None:
         marker["fired_floor_price"] = fired_floor_price
+    # A fire is not eligible to rearm merely because a new run/day starts.
+    # Retain the completed cycle's reference until price reaches it again;
+    # only a later descent after that recovery is conceptually fresh.
+    if rearm_reference_close is not None:
+        marker["rearm_reference_close"] = rearm_reference_close
+    # Seeded WITH the latch, from the close this resolving evaluation itself
+    # observed. The split detector compares two CONSECUTIVE closes, so it
+    # cannot run at all until some earlier STATUS_NONE evaluation has recorded
+    # one. A fire in the final slot before an OVERNIGHT split left no such
+    # record: the first post-split evaluation had nothing to compare against
+    # and simply stored the already-adjusted close, so every ratio from then on
+    # was ~1 and the discontinuity was never detectable. After a forward split
+    # the stale pre-split latch then suppressed purchases indefinitely, and
+    # after a reverse split the recovery check cleared it and re-credited the
+    # same descent (Codex review: "Seed the split detector before the first
+    # post-fire evaluation"). Only meaningful alongside an armed latch -- with
+    # no rearm_reference_close there is nothing for a rebase to correct.
+    if rearm_reference_close is not None and rearm_last_seen_day is not None:
+        marker["rearm_last_seen_day"] = rearm_last_seen_day
     return marker
 
 
@@ -271,6 +415,24 @@ def rolling_stddev(daily_returns: list[float], window_days: int) -> Optional[flo
 #: a single market holiday without over-tripping on routine non-trading days.
 _STDDEV_HISTORY_MAX_STALENESS_DAYS = 7
 
+# Corporate-action handling for the durable rearm latch. The marker is durable,
+# so unlike an active cycle it can survive long enough for its absolute
+# reference price to move onto a different corporate-action scale.
+#
+# Detection is NOT a price heuristic. Two earlier attempts were: first an
+# enumerated ratio list, then a "within tolerance of a whole factor" rule. Both
+# asked whether a close-to-close move LOOKED like a split, and neither could
+# tell one from an ordinary gap -- an 80 -> 120 news gap reads as a reverse
+# 3-for-2, a ~50% crash reads as a 2-for-1, and moves that large are entirely
+# realistic for the volatile tickers this mode targets (Codex review: "Require
+# corporate-action evidence before rebasing").
+#
+# The archive already carries the real thing: scripts/refresh_active_ticker_
+# histories.py writes a "Stock Splits" column holding the data source's own
+# reported ratio on each split's effective date. archived_split_factor() reads
+# it, the caller passes the result in as `split_factor` exactly as it passes
+# `stddev_reference`, and an unconfirmable archive rebases nothing.
+
 
 def _parse_positive_finite(raw_value: Optional[str]) -> Optional[float]:
     """A finite, positive float parsed from a CSV cell, or ``None`` if unusable."""
@@ -281,6 +443,35 @@ def _parse_positive_finite(raw_value: Optional[str]) -> Optional[float]:
     except (ValueError, TypeError):
         return None
     return candidate if math.isfinite(candidate) and candidate > 0 else None
+
+
+def _parse_corporate_action_cell(raw_value: Optional[str]) -> tuple[bool, Optional[float]]:
+    """Classify one archive cell (``Stock Splits`` or ``Dividends``) as
+    ordinary, a genuine positive value, or malformed.
+
+    Returns ``(usable, value)``. ``usable`` is ``False`` for unparseable
+    text, ``NaN``/``inf``, or a negative value -- exactly the cases
+    :func:`_parse_positive_finite` collapses onto the SAME ``None`` a
+    genuine ordinary-day ``"0.0"`` produces, making the two indistinguishable
+    to a caller that only checks "is there a value". :func:`archived_split_factor`
+    must reject a malformed cell outright rather than silently reading it as
+    "no corporate action" and advancing its cursor past a row the archive
+    never actually confirmed cleanly on (Codex review: "Reject malformed
+    split cells before advancing the cursor"; "Reject malformed dividend
+    cells before advancing the cursor"). ``value`` is the parsed positive
+    number when one was recorded, ``None`` for the ordinary "0.0" case.
+    """
+    if raw_value in (None, ""):
+        return False, None
+    try:
+        candidate = float(raw_value)
+    except (ValueError, TypeError):
+        return False, None
+    if not math.isfinite(candidate) or candidate < 0:
+        return False, None
+    if candidate == 0.0:
+        return True, None
+    return True, candidate
 
 
 def _interpolated_adjusted_closes(
@@ -508,6 +699,283 @@ def stddev_reference_for_ticker(
     return rolling_stddev(returns, window_days)
 
 
+def archived_split_factor(
+    ticker: str, *, since: date, as_of: date, history_dir: Optional[Path] = None
+) -> Optional[tuple[float, date]]:
+    """The cumulative split/dividend factor the ARCHIVE records for ``ticker``
+    on rows after ``since`` and at or before ``as_of``, or ``None`` when the
+    archive cannot answer.
+
+    Reads the ``Stock Splits`` and ``Dividends`` columns
+    ``scripts/refresh_active_ticker_histories.py`` writes -- the real
+    corporate-action ratio (``numerator/denominator``) and per-share cash
+    payout the data source reported on each event's effective/ex-dividend
+    date, ``"0.0"`` on every ordinary day. That script rewrites the COMPLETE
+    file on each refresh, so an event's own row is present and stable rather
+    than depending on when the archive was last appended to.
+
+    This exists because a price ratio is NOT evidence of a corporate action.
+    The heuristic it replaces classified any close-to-close gap near a whole
+    factor as a split, and gaps that large are entirely realistic for the
+    volatile tickers this mode is aimed at: an 80 -> 120 news gap read as a
+    reverse 3-for-2 and rebased a $100 latch to $150 instead of recognizing
+    that price had recovered past it, while a ~50% crash read as a 2-for-1,
+    rebased the reference down onto the crashed price and let the latch
+    clear -- crediting tiers from an already-paid-for descent a second time
+    (Codex review: "Require corporate-action evidence before rebasing").
+    Real metadata has no such failure mode: an ordinary gap, however large,
+    records ``0.0`` here.
+
+    A cash dividend is folded into the SAME cumulative factor a split is,
+    using the ratio ``(close + dividend) / close`` computed from that row's
+    own raw ``Close`` -- the EX-DATE close, which already reflects the
+    mechanical ex-dividend drop, so adding the dividend back reconstructs the
+    pre-drop price scale. Dividing ``rearm_reference_close`` by this ratio
+    (exactly like a split) scales it down by the same proportion the real
+    price just dropped. Without this, a durable latch spanning a large
+    special distribution stayed pinned to its pre-distribution reference even
+    though the total-return price had genuinely recovered past it,
+    indefinitely suppressing purchases on an enrolled ticker (Codex review:
+    "Rebase the durable latch across cash distributions"). A dividend row
+    with an unusable close makes the whole call return ``None`` without
+    advancing the cursor, rather than silently folding in a no-op and
+    reporting the row examined: the archive recorded a real distribution
+    this call cannot value, so treating the row as "examined" would let a
+    later run with a fixed/complete archive never re-look at it, exactly
+    the "cannot tell" case the missing-column and stale-archive guards
+    below already return ``None`` for (Codex review: "Preserve the cursor
+    when a dividend cannot be valued").
+
+    Both ``Stock Splits`` and ``Dividends`` must be present as ARCHIVE
+    COLUMNS, not merely absent on individual rows: the writer script always
+    emits both together, so a file missing either one is a legacy or
+    partially generated archive this function cannot trust. Reading a
+    missing column the same way as a genuine ``"0.0"`` (``DictReader``
+    returns ``None`` for both) would falsely confirm "no corporate action"
+    and advance the durable cursor past whatever rows the file actually
+    lacks metadata for (Codex review: "Reject archives that omit split
+    metadata").
+
+    Returns ``None`` -- "cannot confirm", which callers treat as "do not
+    rebase" -- for an absent, unreadable, symbol-invalid, or column-
+    incomplete archive; for one whose most recent row is more than
+    :data:`_STDDEV_HISTORY_MAX_STALENESS_DAYS` calendar days before ``as_of``
+    (a refresh that has silently stopped cannot be distinguished from a
+    market with no splits, and rebasing on a stale file's silence is exactly
+    the false negative that strands a latch); for one whose newest row is
+    OLDER than ``since`` (the archive has been rolled back to an
+    earlier-but-still-fresh snapshot -- reporting that older date as the new
+    cursor would let the caller persist a regression, and a split already
+    folded into the reference on a LATER run would then be re-examined and
+    folded in a second time once the complete archive returns (Codex review:
+    "Never move the split cursor backward")); and for a cumulative factor
+    that is not finite and positive (an extreme but individually-valid
+    archive row, e.g. two split ratios whose product overflows, must not
+    silently divide the reference by infinity or zero (Codex review: "Reject
+    an unrepresentable cumulative split factor")). A readable, fresh archive
+    with no event in the window returns a factor of ``1.0`` -- a confirmed
+    "no corporate action", which is a different answer from ``None`` and
+    lets the caller distinguish "nothing happened" from "cannot tell".
+
+    Returns ``(factor, cursor)``. The cursor is the newest archive date this
+    call actually EXAMINED -- ``as_of`` itself is INCLUDED (not excluded as
+    lookahead): a split or dividend effective ON ``as_of`` is exactly the
+    event the SAME evaluation's already-post-event ``decision_price``/
+    ``previous_close`` need confirmed to correctly rebase, and the archive
+    generally carries that day's own row by the time this mode evaluates it
+    (Codex review: "Include effective-day splits before evaluating the
+    latch"). Only a row strictly AFTER ``as_of`` is genuine lookahead. The
+    caller must persist the returned cursor, not ``as_of`` verbatim, as the
+    next query's ``since``: stamping a value newer than what was actually
+    examined -- or falling back to today when this call returned ``None`` --
+    both skip whatever lies in between forever, since every later run
+    excludes anything at or before its own ``since`` (Codex review: "Keep the
+    split cursor on the last examined archive day"; "Retain the split cursor
+    when lookup fails").
+    """
+    root = history_dir if history_dir is not None else configured_ticker_history_dir()
+    symbol = ticker.strip().upper()
+    # Same traversal guard trailing_daily_returns applies -- see its comment on
+    # why ".." must be excluded separately from the pattern match.
+    if not _TICKER_SYMBOL_PATTERN.match(symbol) or ".." in symbol:
+        return None
+    path = Path(root) / f"{symbol}.csv"
+    try:
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            # A missing column reads back as None for every row, identically
+            # to a genuine "0.0"/absent cell -- indistinguishable from "no
+            # corporate action" without checking the header itself first.
+            if reader.fieldnames is None or not {"Stock Splits", "Dividends"} <= set(reader.fieldnames):
+                return None
+            rows = list(reader)
+    except (FileNotFoundError, OSError, UnicodeDecodeError, csv.Error):
+        return None
+    factor = 1.0
+    latest_row_date: Optional[date] = None
+    saw_usable_row = False
+    for row in rows:
+        row_date_raw = row.get("Date")
+        if not row_date_raw:
+            # A blank Date is ordinary trailing-row noise UNLESS the row also
+            # carries a genuine nonzero Stock Splits or Dividends value --
+            # that combination means the archive recorded a real corporate
+            # action with no date to place it on, which this call cannot
+            # simply skip: skipping let a LATER, cleanly-dated row become
+            # latest_row_date and get persisted as the cursor, after which a
+            # corrected archive (the date filled back in) would exclude this
+            # very row forever via `row_date <= since` (Codex review: "Reject
+            # undated corporate-action rows before advancing"). Reuses the
+            # same malformed-vs-ordinary classification the dated branches
+            # below use, so "0.0"/blank still reads as inert.
+            _, undated_split = _parse_corporate_action_cell(row.get("Stock Splits"))
+            _, undated_dividend = _parse_corporate_action_cell(row.get("Dividends"))
+            if undated_split is not None or undated_dividend is not None:
+                return None
+            continue
+        try:
+            row_date = date.fromisoformat(row_date_raw[:10])
+        except ValueError:
+            # A row with a Date present but unparseable -- unlike a genuinely
+            # blank trailing row (the `not row_date_raw` case above, which is
+            # never itself evidence of anything) -- means this archive is
+            # damaged in a way that could be hiding a real split/dividend on
+            # that row. Silently skipping it let a LATER, cleanly-dated row
+            # become latest_row_date and get persisted as the cursor, after
+            # which a corrected archive would exclude the malformed row's
+            # actual date forever via `row_date <= since` -- the same
+            # "cannot tell" case the missing-column and stale-archive guards
+            # already return None for (Codex review: "Reject malformed
+            # action-row dates before advancing the cursor").
+            return None
+        if row_date > as_of:
+            continue
+        saw_usable_row = True
+        if latest_row_date is None or row_date > latest_row_date:
+            latest_row_date = row_date
+        if row_date <= since:
+            continue
+        split_ok, ratio = _parse_corporate_action_cell(row.get("Stock Splits"))
+        if not split_ok:
+            # Unparseable text, NaN, or a negative value reads back through
+            # plain float-and-check as indistinguishable from the ordinary
+            # "0.0" cell -- treating it that way would confirm "no split"
+            # for a row the archive never actually reported cleanly on, and
+            # a later correction is excluded forever by `row_date <= since`
+            # once this row's date becomes the persisted cursor.
+            return None
+        # A genuine positive ratio multiplies in; "0.0"/no ratio recorded is
+        # the ordinary-day value and leaves factor unchanged. A 1.0 recorded
+        # on a row is a no-op split and multiplies harmlessly.
+        if ratio is not None:
+            factor *= ratio
+        dividend_ok, dividend = _parse_corporate_action_cell(row.get("Dividends"))
+        if not dividend_ok:
+            # Same malformed-vs-ordinary ambiguity as the Stock Splits cell
+            # above: unparseable text, NaN, or a negative payout must not be
+            # read as "no distribution" and let the row's date become the
+            # persisted cursor -- a later archive correction would then be
+            # excluded forever by `row_date <= since`.
+            return None
+        if dividend is not None:
+            # This row's own Close is the EX-DATE close -- already past the
+            # mechanical ex-dividend drop, since the market prices it in the
+            # same session. Reconstructing the pre-drop price as
+            # ``close + dividend`` and dividing by the post-drop ``close``
+            # gives the same "how much larger was the reference's price
+            # scale" ratio a split's ``factor`` represents, so dividing
+            # ``rearm_reference_close`` by it (exactly like a split) scales
+            # the reference DOWN by the same proportion the real price just
+            # dropped.
+            close = _parse_positive_finite(row.get("Close"))
+            if close is None:
+                # Cannot value this distribution -- returning a factor that
+                # silently omits it, while still reporting this row's date
+                # as examined, would let the caller advance the durable
+                # cursor past it forever, even once a later archive refresh
+                # supplies a usable Close for the same row.
+                return None
+            factor *= (close + dividend) / close
+    if not saw_usable_row or latest_row_date is None:
+        return None
+    if (as_of - latest_row_date).days > _STDDEV_HISTORY_MAX_STALENESS_DAYS:
+        return None
+    if latest_row_date < since:
+        return None
+    if not math.isfinite(factor) or factor <= 0:
+        return None
+    return factor, latest_row_date
+
+
+def _capped_fire_amount(accumulated_before: float, per_order_cap_usd: Optional[float]) -> float:
+    """The dollar amount to fire this evaluation, capped and broker-minimum
+    floored, but never leaving an un-fireable sub-minimum remainder behind.
+
+    Shared by both fire-resolution call sites (a fresh recovery firing from
+    STATUS_NONE/STATUS_DIPPING, and a STATUS_FIRING continuation's retry) so
+    the two cannot drift apart on this guarantee.
+
+    Without the final adjustment below, a per_order_cap_usd tighter than the
+    accumulated balance by less than the broker minimum -- e.g. a $10.50
+    balance capped at $10.00 -- fires the capped $10.00 and leaves a $0.50
+    remainder as a STATUS_FIRING continuation. That status BYPASSES tier
+    accumulation entirely (only STATUS_DIPPING/STATUS_NONE evaluations credit
+    new tier crossings), so the remainder can never grow past the broker
+    minimum on its own; every later evaluation re-derives the identical
+    sub-minimum fire_amount and defers again, until max_cycle_days/
+    max_fire_attempts eventually abandons the cycle and discards it outright
+    (Codex review: "Keep capped fire remainders placeable").
+
+    That shrink must not itself drop below the broker minimum. A balance
+    between one and two times ``_BROKER_MINIMUM_ORDER_USD`` with a cap at or
+    below the minimum -- e.g. a $1.50 balance capped at $1.00 -- shrinks the
+    capped $1.00 down to $0.50 to zero out the remainder, an amount now
+    UNPLACEABLE itself; both evaluation branches then reject the sub-dollar
+    fire, and the balance is stuck exactly like the un-shrunk case this
+    function exists to prevent. When no partition of the balance leaves BOTH
+    halves placeable while respecting the cap, the cap is the constraint that
+    gives way: firing the full accumulated balance in one order is always
+    placeable and always terminates the cycle, whereas honoring an
+    unsatisfiable cap would strand money forever (Codex review: "Keep the
+    adjusted fire amount above the broker minimum").
+    """
+    fire_amount = accumulated_before
+    if per_order_cap_usd is not None:
+        fire_amount = min(fire_amount, per_order_cap_usd)
+    # Floor to the broker minimum, but NEVER above the balance actually
+    # tracked. `max(_BROKER_MINIMUM_ORDER_USD, ...)` alone turned a
+    # sub-dollar TRACKED balance into a larger real order -- a $0.30
+    # accumulation (schema-valid: unit_usd=0.30 with a single unit) was
+    # placed as $1 and the cycle then cleared, spending several times the
+    # ladder amount the accumulator exists to defer, and magnifying further
+    # the smaller the configured unit (Codex review: "Defer sub-dollar
+    # balances instead of rounding them up"). Clamping to
+    # `accumulated_before` keeps the pre-existing "floor beats a sub-dollar
+    # per_order_cap_usd" behaviour -- that only ever raises the amount back
+    # toward money the cycle really holds -- while making it impossible to
+    # place more than was accumulated.
+    fire_amount = min(max(_BROKER_MINIMUM_ORDER_USD, fire_amount), accumulated_before)
+    # If firing fire_amount would leave a NONZERO remainder below the broker
+    # minimum, shrink fire_amount just enough that the remainder is either
+    # exactly $0 or the full broker minimum instead -- always safe against
+    # per_order_cap_usd, since reducing an already-capped amount can only
+    # move further under a MAXIMUM constraint. When per_order_cap_usd never
+    # capped anything (fire_amount already equals accumulated_before), the
+    # prospective remainder is 0 and this is a no-op.
+    prospective_remainder = round(accumulated_before - fire_amount, 2)
+    if 0 < prospective_remainder < _BROKER_MINIMUM_ORDER_USD:
+        shrunk = round(fire_amount - (_BROKER_MINIMUM_ORDER_USD - prospective_remainder), 2)
+        if shrunk >= _BROKER_MINIMUM_ORDER_USD:
+            fire_amount = shrunk
+        else:
+            # No cap-respecting partition leaves both the fired amount and
+            # the remainder placeable -- shrinking would just trade one
+            # unplaceable amount for another. Fire the whole balance instead
+            # of honoring the cap, so the cycle always terminates.
+            fire_amount = accumulated_before
+    return fire_amount
+
+
 def evaluate_inverse_martingale_step(
     tracker_state: dict[str, Any],
     *,
@@ -523,6 +991,8 @@ def evaluate_inverse_martingale_step(
     stddev_reference: Optional[float] = None,
     per_order_cap_usd: Optional[float] = None,
     stream: str = "afternoon",
+    split_factor: Optional[float] = None,
+    split_cursor_day: Optional[date] = None,
 ) -> tuple[dict[str, Any], InverseMartingaleStep]:
     """Advance one ticker's accumulator by one evaluation, purely in memory.
 
@@ -531,8 +1001,12 @@ def evaluate_inverse_martingale_step(
     prices ``evaluate_source_signal`` already computed for this ticker this
     run -- no additional data-provider call is made here. ``previous_close``
     seeds ``cycle_reference_close`` only when a cycle starts; every later
-    step uses that persisted snapshot, so a changing daily previous close
-    cannot manufacture a recovery or move the cycle's tier thresholds.
+    step of that cycle uses the persisted snapshot, so a changing daily
+    previous close cannot manufacture a recovery or move the cycle's tier
+    thresholds. The one place a fresh ``previous_close`` is read on its own
+    is the post-fire ``rearm_reference_close`` latch below, where detecting
+    that price has left the old dip is precisely a question about TODAY's
+    close rather than about the resolved cycle's frozen reference.
 
     ``stream`` identifies which of the (up to three) canonical scheduled
     slots this evaluation belongs to -- "morning", "midday", or "afternoon"
@@ -808,7 +1282,21 @@ def evaluate_inverse_martingale_step(
         # Reset the cycle outright rather than attempt to interpret or
         # migrate mismatched units (Codex review: "Reset active cycles when
         # the configured basis changes").
-        return resolved_marker(trading_day, stream), InverseMartingaleStep(
+        return resolved_marker(
+            trading_day,
+            stream,
+            # The floor travels as an absolute PRICE only -- the persisted
+            # metric is denominated in the basis being abandoned. See
+            # _preserved_latch_kwargs.
+            **_preserved_latch_kwargs(tracker_state, persisted_basis, status_before, carry_drop_metric=False),
+            # Same cursor-vs-reference-scale mismatch as the fire-resolution
+            # sites (Codex review: "Retain the reference-scale cursor when a
+            # continuation resolves") -- harmless when _preserved_latch_kwargs
+            # returned no rearm_reference_close (resolved_marker only stores
+            # this alongside one), but correct whenever it did: that latch is
+            # cycle_reference_close, frozen on cycle_start_trading_day, not today.
+            rearm_last_seen_day=tracker_state.get("cycle_start_trading_day") or trading_day.isoformat(),
+        ), InverseMartingaleStep(
             status_before=status_before,
             status_after=STATUS_NONE,
             accumulated_usd_before=accumulated_before,
@@ -850,7 +1338,16 @@ def evaluate_inverse_martingale_step(
         and persisted_tier_fingerprint is not None
         and persisted_tier_fingerprint != current_tier_fingerprint
     ):
-        return resolved_marker(trading_day, stream), InverseMartingaleStep(
+        return resolved_marker(
+            trading_day,
+            stream,
+            # The basis is UNCHANGED here -- only the tier table/unit_usd moved
+            # -- so the persisted metric is still in the right units and travels
+            # alongside the absolute price.
+            **_preserved_latch_kwargs(tracker_state, persisted_basis, status_before, carry_drop_metric=True),
+            # See the identical comment at the basis-changed reset above.
+            rearm_last_seen_day=tracker_state.get("cycle_start_trading_day") or trading_day.isoformat(),
+        ), InverseMartingaleStep(
             status_before=status_before,
             status_after=STATUS_NONE,
             accumulated_usd_before=accumulated_before,
@@ -1025,6 +1522,25 @@ def evaluate_inverse_martingale_step(
             # lowest_drop_seen) covers the case where THIS very evaluation
             # -- the one that triggers abandonment -- is itself a new low.
             abandonment_floor = max(float(tracker_state.get("lowest_drop_seen", drop_metric)), drop_metric)
+            # Also carry the durable rearm_reference_close latch, exactly
+            # like the two real fire-resolution sites below. "An abandoned
+            # cycle never spent any real money" (the comment above) is true
+            # for a STATUS_DIPPING abandonment that never fired at all, but
+            # NOT for a STATUS_FIRING one: a per_order_cap_usd-capped
+            # continuation can have already placed one or more real,
+            # SETTLED partial chunks over prior runs before this evaluation
+            # finally exhausts max_fire_attempts/max_cycle_days on the
+            # remainder. Abandoning without the durable latch let a
+            # still-depressed price on the very next evaluation start a
+            # brand-new cycle and re-credit tiers that had already
+            # contributed to that earlier, real, already-placed spend
+            # (Codex review, third round: "Preserve the latch when
+            # abandoning a partially paid fire"). Setting it unconditionally
+            # here (covering the never-fired STATUS_DIPPING case too) is a
+            # harmless, strictly conservative over-application -- it only
+            # means a cycle that truly spent nothing also waits for price to
+            # reach the original reference before rearming, matching this
+            # module's fail-closed posture everywhere else.
             return resolved_marker(
                 trading_day,
                 stream,
@@ -1032,6 +1548,22 @@ def evaluate_inverse_martingale_step(
                 fired_floor_price=_drop_metric_to_price(
                     reference_close, abandonment_floor, basis, tracker_state.get("stddev_reference")
                 ),
+                rearm_reference_close=reference_close,
+                # The cursor must match the price SCALE the latch is
+                # actually armed at, not today. reference_close here is
+                # cycle_reference_close -- frozen on cycle_start_trading_day,
+                # potentially days or weeks before this abandonment fires --
+                # so stamping today as "last examined" would let the very
+                # next split lookup start its `since` from today and exclude
+                # every archive row between cycle start and today via
+                # `row_date <= since`, permanently missing a corporate
+                # action that occurred during the abandoned cycle (Codex
+                # review: "Retain the reference-scale cursor when a
+                # continuation resolves"). Falling back to today only if a
+                # legacy/corrupted-then-repaired tracker somehow lacks
+                # cycle_start_trading_day here, matching this function's
+                # existing fail-closed posture elsewhere.
+                rearm_last_seen_day=tracker_state.get("cycle_start_trading_day") or trading_day.isoformat(),
             ), InverseMartingaleStep(
                 status_before=status_before,
                 status_after=STATUS_NONE,
@@ -1053,10 +1585,31 @@ def evaluate_inverse_martingale_step(
         # fire amount is frozen at the moment recovery was first detected:
         # further price movement during an in-progress multi-run fire must
         # not grow or shrink the amount already decided.
-        fire_amount = accumulated_before
-        if per_order_cap_usd is not None:
-            fire_amount = min(fire_amount, per_order_cap_usd)
-        fire_amount = max(_BROKER_MINIMUM_ORDER_USD, fire_amount)
+        # Capped, broker-minimum-floored, and adjusted so a per_order_cap_usd
+        # tighter than the balance never strands a sub-minimum remainder --
+        # see _capped_fire_amount's own docstring.
+        fire_amount = _capped_fire_amount(accumulated_before, per_order_cap_usd)
+        if fire_amount < _BROKER_MINIMUM_ORDER_USD:
+            # The whole remaining balance is below what the broker will accept,
+            # so there is no placeable chunk this run. Hold it as an unchanged
+            # continuation rather than rounding up: no order is attempted, so
+            # fire_attempts is deliberately NOT incremented either. The cycle
+            # still ages normally and max_cycle_days remains its backstop if the
+            # balance never grows back above the minimum.
+            new_state["last_evaluated_trading_day"] = trading_day.isoformat()
+            new_state["last_evaluated_stream"] = stream
+            new_state["last_evaluated_is_real"] = True
+            new_state["trading_days_active"] = trading_days_active
+            return new_state, InverseMartingaleStep(
+                status_before=status_before,
+                status_after=STATUS_FIRING,
+                accumulated_usd_before=accumulated_before,
+                accumulated_usd_after=accumulated_before,
+                newly_crossed_tiers=(),
+                fired=False,
+                fire_amount_usd=0.0,
+                reason="continuation_below_broker_minimum",
+            )
         remainder = max(0.0, round(accumulated_before - fire_amount, 2))
         new_state["accumulated_usd"] = remainder
         new_state["fire_attempts"] = fire_attempts + 1
@@ -1098,6 +1651,18 @@ def evaluate_inverse_martingale_step(
                 )
                 if tracker_state.get("lowest_drop_seen") is not None
                 else None,
+                rearm_reference_close=tracker_state.get("cycle_reference_close"),
+                # cycle_reference_close is frozen from cycle_start_trading_day
+                # -- potentially several runs/days before this multi-run
+                # continuation finally resolves -- so stamping TODAY as
+                # "last examined" understates how far back the archive
+                # still needs re-checking from. The next split lookup's
+                # `since` would start at today and exclude every row back
+                # to cycle start via `row_date <= since`, permanently
+                # missing a corporate action that occurred anywhere during
+                # this continuation's lifetime (Codex review: "Retain the
+                # reference-scale cursor when a continuation resolves").
+                rearm_last_seen_day=tracker_state.get("cycle_start_trading_day") or trading_day.isoformat(),
             )
             new_state["settlement_pending"] = True
             status_after = STATUS_NONE
@@ -1119,6 +1684,175 @@ def evaluate_inverse_martingale_step(
         )
 
     if status_before == STATUS_NONE:
+        rearm_reference_close = tracker_state.get("rearm_reference_close")
+        if rearm_reference_close is not None:
+            # Rebase the latch across a CONFIRMED corporate action. ``split_factor``
+            # comes from :func:`archived_split_factor` -- the archive's own
+            # ``Stock Splits`` column, the real ratio the data source reported on
+            # the split's effective date -- computed by the caller exactly as
+            # ``stddev_reference`` is, so this function stays pure.
+            #
+            # It replaces a price-ratio heuristic that could not tell a corporate
+            # action from an ordinary gap. Any close-to-close move near a whole
+            # factor was classified as a split, and moves that large are entirely
+            # realistic for the volatile tickers this mode targets: an 80 -> 120
+            # news gap read as a reverse 3-for-2 and rebased a $100 latch to $150
+            # rather than recognizing price had recovered past it, while a ~50%
+            # crash read as a 2-for-1, rebased the reference onto the crashed
+            # price and let the latch clear -- re-crediting an already-paid-for
+            # descent (Codex review: "Require corporate-action evidence before
+            # rebasing"). Metadata has no such failure mode: an ordinary gap,
+            # however violent, records no split.
+            #
+            # Both directions are handled by one division. A k-for-1 FORWARD
+            # split records k and divides the reference down onto the smaller
+            # post-split prices; a 1-for-k REVERSE split records 1/k and divides
+            # it up. The reverse case specifically must be caught HERE, before
+            # the recovery check below -- both closes jump above a pre-split
+            # reference, which the latch would otherwise read as the dip having
+            # recovered, clear itself, and let the same descent be bought twice.
+            #
+            # ``None`` means the archive could not confirm anything (absent,
+            # unreadable, or stale) and is deliberately NOT treated as "no
+            # split": the reference is left exactly as it is. That is the
+            # fail-closed direction -- an unrebased latch suppresses buying,
+            # which costs opportunity, while a wrongly rebased one can authorize
+            # a duplicate purchase. A confirmed 1.0 (a fresh archive with no
+            # split in the window) divides by one and changes nothing.
+            if split_factor is not None and split_factor > 0 and split_factor != 1.0:
+                rearm_reference_close = rearm_reference_close / split_factor
+                tracker_state = dict(tracker_state)
+                tracker_state["rearm_reference_close"] = rearm_reference_close
+                new_state = dict(tracker_state)
+            # Recorded on EVERY evaluation while the latch is armed (not
+            # just when a split is detected) so the NEXT evaluation always
+            # has yesterday's real close to compare against -- two
+            # evaluations on the SAME trading day (a later scheduled
+            # stream) compare an unchanged previous_close to itself
+            # (ratio == 1.0), which never matches a split factor, so no
+            # special same-day case is needed here.
+            tracker_state = dict(tracker_state)
+            # The cursor is the newest archive day actually EXAMINED, not
+            # today. archived_split_factor excludes rows after as_of as
+            # lookahead, so stamping today skipped a split's own effective-day
+            # row forever: excluded as lookahead on the day itself, then
+            # excluded as `row_date <= since` on every later run (Codex review:
+            # "Keep the split cursor on the last examined archive day").
+            #
+            # Left UNCHANGED -- not stamped to today -- when the archive could
+            # not be consulted at all (temporarily missing, unreadable, or
+            # stale). A prior version fell back to today here, which advanced
+            # the cursor past every row between the OLD cursor and today even
+            # though none of them were actually examined: once the archive
+            # recovered, archived_split_factor's `row_date <= since` exclusion
+            # then skipped that entire unexamined window forever, permanently
+            # missing any split inside it -- stranding a forward-split latch
+            # at its pre-split reference, or letting a reverse split clear it
+            # and re-credit an already-paid descent (Codex review: "Retain the
+            # split cursor when lookup fails"). Leaving the field exactly as
+            # tracker_state already had it (absent, or the last CONFIRMED
+            # examined day) means the next evaluation retries from that same
+            # unexamined window instead of silently skipping it.
+            if split_cursor_day is not None:
+                tracker_state["rearm_last_seen_day"] = split_cursor_day.isoformat()
+            new_state = dict(tracker_state)
+        # previous_close is a PER-DAY value -- every evaluation of this
+        # ticker on the same trading day (morning/midday/afternoon streams)
+        # observes the exact same closing print, since it hasn't changed
+        # since yesterday. An EQUAL previous_close only carries genuinely NEW
+        # "price has recovered" information the first time a DIFFERENT
+        # trading day evaluates this latch -- on a repeat same-day
+        # observation it isn't "today's close recovering" at all, it's the
+        # SAME data point being read again (routine on the very day of the
+        # fire, since that fire's own reference usually WAS that day's
+        # previous close). A STRICTLY GREATER previous_close, by contrast, is
+        # unambiguous exit evidence regardless of which day observed it --
+        # even a repeated same-day value already above the reference means
+        # this ticker had already recovered before this latch was even worth
+        # consulting (see test_same_day_rearm_check_uses_the_frozen_
+        # reference_price_not_a_fresh_one, where the fire's OWN previous_close
+        # already exceeded the reference).
+        previous_close_is_fresh = tracker_state.get("last_evaluated_trading_day") != trading_day.isoformat()
+        latch_exited = rearm_reference_close is not None and (
+            decision_price >= rearm_reference_close
+            or previous_close > rearm_reference_close
+            or (previous_close_is_fresh and previous_close >= rearm_reference_close)
+        )
+        if rearm_reference_close is not None and not latch_exited:
+            # A completed fire remains latched while price is still in the
+            # descent that produced it.  In particular, do not discard this
+            # protection at the next trading-day boundary: scheduled-run
+            # retries deliberately do not discover their own prior order, so
+            # a date-scoped marker could credit the same tiers again merely
+            # because the unchanged dip was evaluated on a new day.
+            #
+            # The durable latch is AUTHORITATIVE over the separate same-day
+            # floor guard below -- it is never deferred to based on a
+            # metric-based shortcut. The floor's own drop_metric is computed
+            # from THIS call's fresh previous_close, which can differ
+            # substantially from the frozen reference the durable latch
+            # itself is measured against (e.g. a cycle referenced to $100
+            # that bottomed at $95 firing on a later day with
+            # previous_close=96 still below the $100 reference): a shallow
+            # metric relative to that fresh previous_close could satisfy the
+            # floor's own "<=" check while the ORIGINAL dip -- measured
+            # against the $100 reference the latch actually protects -- has
+            # never been exited at all, incorrectly re-arming and
+            # re-crediting tiers (Codex review, third round: "Keep the
+            # durable latch authoritative over the same-day floor"). The
+            # floor guard below only ever matters once the durable latch has
+            # itself cleared (latch_exited above, or no latch exists at
+            # all) -- as a strictly WEAKER, narrower protection than the
+            # latch's own "anything below the reference" block, it has
+            # nothing left to add while the latch is still armed.
+            return dict(tracker_state), InverseMartingaleStep(
+                status_before=status_before,
+                status_after=status_before,
+                accumulated_usd_before=accumulated_before,
+                accumulated_usd_after=accumulated_before,
+                newly_crossed_tiers=(),
+                fired=False,
+                fire_amount_usd=0.0,
+                reason="awaiting_fresh_dip",
+            )
+        if latch_exited:
+            # Price has exited the paid-for dip.  Clear the DURABLE latch
+            # before evaluating a subsequent descent.  A LATER day's close
+            # counts as that exit too: today's below-reference print is then
+            # precisely the fresh descent for which the latch was waiting.
+            # An EQUAL previous_close/decision_price counts as exit too --
+            # "at or above the reference", mirroring recovery's own "at or
+            # above the offset" semantics elsewhere in this function -- not
+            # merely ">" (Codex review, second round: "Treat an equal prior
+            # close as latch recovery") -- see latch_exited's own comment
+            # above for why an EQUAL previous_close specifically only
+            # participates when previous_close_is_fresh.
+            #
+            # fired_floor_drop_metric/fired_floor_price (and the
+            # last_evaluated_trading_day/last_evaluated_stream that gate
+            # them) are a SEPARATE, day-scoped protection against a later
+            # same-day slot re-crediting a descent a fire already covered
+            # TODAY (see the same-day floor check just below) -- unlike the
+            # durable latch above, they remain meaningful only through the
+            # END of the trading day the fire happened on, and stop applying
+            # naturally once the day rolls over (their own guard already
+            # requires last_evaluated_trading_day == trading_day). Preserve
+            # them here ONLY when still within that same day; wiping the
+            # whole tracker_state unconditionally discarded that protection
+            # on the very day of the fire whenever price also happened to
+            # close back above the ORIGINAL pre-descent reference the same
+            # day, letting a later same-day stream re-credit tiers within
+            # the range that fire already paid for. Once the day has moved
+            # on, those fields are already inert -- clear everything, same
+            # as before.
+            if tracker_state.get("last_evaluated_trading_day") == trading_day.isoformat():
+                tracker_state = dict(tracker_state)
+                tracker_state.pop("rearm_reference_close", None)
+                tracker_state.pop("rearm_last_seen_day", None)
+                new_state = dict(tracker_state)
+            else:
+                tracker_state = {}
+                new_state = {}
         same_day_fire_floor = tracker_state.get("fired_floor_drop_metric")
         fired_floor_price = tracker_state.get("fired_floor_price")
         # Two ways to decide "hasn't broken below the floor yet":
@@ -1256,6 +1990,11 @@ def evaluate_inverse_martingale_step(
     new_state["accumulated_usd"] = accumulated
     if newly_crossed:
         new_state["crossed_tier_thresholds"] = sorted(crossed_before | set(newly_crossed))
+    # Whether THIS evaluation is starting a brand-new cycle, decided before the
+    # setdefault below actually stamps the field. resolved_marker() never
+    # carries cycle_start_trading_day (nor trading_days_active), so its absence
+    # is exactly "no cycle is currently running".
+    starting_a_new_cycle = "cycle_start_trading_day" not in new_state
     new_state.setdefault("cycle_start_trading_day", trading_day.isoformat())
     new_state.setdefault("cycle_reference_close", reference_close)
     new_state.setdefault("basis", basis)
@@ -1278,7 +2017,19 @@ def evaluate_inverse_martingale_step(
     # advance's own False stamp never lingers past the next genuine
     # evaluation of any kind.
     new_state["last_evaluated_is_real"] = True
-    new_state["trading_days_active"] = trading_days_active
+    # A new cycle is on its FIRST trading day by definition, whatever the
+    # marker it replaced said. `trading_days_active` was computed near function
+    # entry from the state as found, and its increment is suppressed when
+    # last_evaluated_trading_day already equals today -- which is exactly the
+    # case when a completed cycle exits its latch and re-arms in a LATER STREAM
+    # on the same trading day, since that path deliberately preserves the
+    # resolved marker's own last_evaluated_trading_day. The freshly armed cycle
+    # then started at 0 instead of 1 and was allowed to stay active for one
+    # extra session past max_cycle_days, able to fire after the configured
+    # cutoff (Codex review: "Reset the age counter when rearming on the same
+    # day"). Initialize it independently instead of inheriting the old cycle's
+    # bookkeeping; a CONTINUING cycle keeps the computed value unchanged.
+    new_state["trading_days_active"] = 1 if starting_a_new_cycle else trading_days_active
 
     if newly_crossed:
         # A newly-crossed tier is never itself a recovery trigger (drop_metric
@@ -1297,10 +2048,30 @@ def evaluate_inverse_martingale_step(
     lowest_drop_seen = new_state["lowest_drop_seen"]
     recovered = (lowest_drop_seen - drop_metric) >= recovery_offset
     if recovered and accumulated_before > 0:
-        fire_amount = accumulated_before
-        if per_order_cap_usd is not None:
-            fire_amount = min(fire_amount, per_order_cap_usd)
-        fire_amount = max(_BROKER_MINIMUM_ORDER_USD, fire_amount)
+        # Capped, broker-minimum-floored, and adjusted so a per_order_cap_usd
+        # tighter than the balance never strands a sub-minimum remainder --
+        # see _capped_fire_amount's own docstring.
+        fire_amount = _capped_fire_amount(accumulated_before, per_order_cap_usd)
+        if fire_amount < _BROKER_MINIMUM_ORDER_USD:
+            # Recovery triggered, but the tracked balance is below the broker
+            # minimum. Defer rather than over-buy: the cycle stays DIPPING with
+            # its balance intact, so a deeper later dip can still grow it past
+            # the minimum, and max_cycle_days remains the backstop if it never
+            # does. Nothing is bought, which is the accumulator's own contract
+            # for a descent it cannot act on.
+            new_state["last_evaluated_trading_day"] = trading_day.isoformat()
+            new_state["last_evaluated_stream"] = stream
+            new_state["last_evaluated_is_real"] = True
+            return new_state, InverseMartingaleStep(
+                status_before=status_before,
+                status_after=STATUS_DIPPING,
+                accumulated_usd_before=accumulated_before,
+                accumulated_usd_after=accumulated_before,
+                newly_crossed_tiers=(),
+                fired=False,
+                fire_amount_usd=0.0,
+                reason="recovery_below_broker_minimum",
+            )
         remainder = max(0.0, round(accumulated_before - fire_amount, 2))
         if remainder <= 0:
             # Leased until settlement -- see the settlement_pending guard's
@@ -1317,6 +2088,17 @@ def evaluate_inverse_martingale_step(
                 fired_floor_price=_drop_metric_to_price(
                     reference_close, lowest_drop_seen, basis, tracker_state.get("stddev_reference")
                 ),
+                rearm_reference_close=reference_close,
+                # new_state's cycle_start_trading_day is trading_day itself
+                # for a cycle that just started this call (reference_close ==
+                # today's previous_close, so today IS correct), but the
+                # ORIGINAL, older start day for a continuing STATUS_DIPPING
+                # cycle firing here (reference_close == the old
+                # cycle_reference_close) -- exactly the day whose price scale
+                # produced whichever reference_close this call is using (Codex
+                # review: "Retain the reference-scale cursor when a
+                # continuation resolves").
+                rearm_last_seen_day=new_state.get("cycle_start_trading_day") or trading_day.isoformat(),
             )
             new_state["settlement_pending"] = True
             status_after = STATUS_NONE
@@ -1355,6 +2137,33 @@ _VALID_TRACKER_STATUSES = (STATUS_NONE, STATUS_DIPPING, STATUS_FIRING)
 #: and near_close_dca.py's run_dca.SLOT_MAP) -- the only values
 #: last_evaluated_stream should ever legitimately hold.
 _VALID_STREAMS = ("morning", "midday", "afternoon")
+
+
+def _expected_lease_ref_id(stream: Optional[str], claim_day_iso: str, ticker: str) -> str:
+    """Rebuild the deterministic ``settlement_ref_id`` a fire claim must have
+    written for ``(stream, claim_day_iso, ticker)``.
+
+    Deliberately duplicates ``near_close_dca._graded_dca_ref_id_prefix``'s
+    format rather than importing it: near_close_dca.py imports FROM this
+    module (claim_fire, resolved_marker, evaluate_inverse_martingale_step),
+    so importing back would be circular. Kept honest against drift by
+    test_lease_ref_id_matches_the_claim_sites_own_prefix_builder, which
+    asserts byte-for-byte agreement with the real builder across every
+    stream -- a validator that silently diverged from the format it is
+    checking would reject every future legitimate lease, not just damaged
+    ones (Codex review: "Validate the settlement ref against its lease
+    fields").
+
+    ``stream=None`` (a legacy lease predating ``settlement_stream``) maps to
+    the historical single-stream ``"afternoon"`` convention -- the only
+    format that era's claim sites ever wrote.
+    """
+    parts = ["graded-dca"]
+    effective_stream = stream if stream is not None else "afternoon"
+    if effective_stream != "afternoon":
+        parts.append(effective_stream)
+    parts.append("imart")
+    return f"{'-'.join(parts)}-{claim_day_iso}-{ticker}"
 
 
 def _validate_tracker_payload(data: dict[str, Any], state_path: Path) -> None:
@@ -1404,23 +2213,151 @@ def _validate_tracker_payload(data: dict[str, Any], state_path: Path) -> None:
     settlement_pending = data.get("settlement_pending")
     if settlement_pending is not None and not isinstance(settlement_pending, bool):
         raise _corrupted("settlement_pending", settlement_pending)
-    # Every legitimate write of settlement_pending=True happens at exactly
-    # two points in evaluate_inverse_martingale_step -- a fully-resolved
-    # fire's STATUS_NONE marker, or a partial fire's STATUS_FIRING
-    # continuation -- both leased pending near_close_dca.py's deferred
-    # settlement step. A STATUS_DIPPING tracker can never legitimately carry
-    # this lease: nothing in this cycle's own evaluation ever sets it while
-    # status stays "dipping". A restored or hand-edited tracker with this
-    # combination would otherwise pass validation, and every downstream call
-    # site's plain truthy `tracker_state.get("settlement_pending")` check
-    # (this module's own claim guard, and near_close_dca.py's age-only/
-    # disabled-enrollment cleanup passes) would then return early before any
-    # age or abandonment logic runs -- permanently freezing that ticker's
-    # balance and age, since nothing else ever clears a lease no real
-    # settlement step is actually pending against (Codex review: "Reject
-    # leases on dipping trackers").
-    if settlement_pending and status == STATUS_DIPPING:
+    # The danger a bare settlement_pending flag poses is that every downstream
+    # call site reads it with a plain truthy check (this module's own claim
+    # guard, and near_close_dca.py's age-only/disabled-enrollment cleanup
+    # passes) and returns early before any age or abandonment logic runs. A
+    # restored or hand-edited tracker carrying the flag with nothing real to
+    # settle against would therefore freeze that ticker's balance and age
+    # forever, immune to max_cycle_days, a disabled enrollment, or removal
+    # from the tradable universe (Codex review: "Reject leases on dipping
+    # trackers").
+    #
+    # That check was originally expressed as "a STATUS_DIPPING tracker can
+    # never carry this lease", on the premise that the only writers were
+    # evaluate_inverse_martingale_step's own resolved-marker and partial-
+    # continuation shapes. near_close_dca.py's fire claim now writes a
+    # RECOVERABLE lease instead -- deliberately the untouched PRE-fire state
+    # (routinely "dipping") plus the settlement_* metadata that lets a later
+    # invocation reconcile the claim against broker order history -- so
+    # status alone no longer separates a real lease from a bogus one. What
+    # does separate them is that metadata, so the rule below is stated
+    # directly in those terms: a lease is legitimate exactly when it carries
+    # everything needed to resolve it, whatever its status.
+    if settlement_pending and not isinstance(data.get("settlement_target_state"), dict):
         raise _corrupted("settlement_pending", settlement_pending)
+
+    # The crash-lease fields near_close_dca.py's claim site writes alongside
+    # settlement_pending. Its recovery pass reads them as FINANCIAL inputs:
+    # settlement_claimed_usd is converted with a bare float() outside any
+    # exception handler, settlement_target_state is applied verbatim as the
+    # ticker's next persisted state, and settlement_trading_day decides whether
+    # an unmatched lease may be released at all. Unvalidated, a syntactically
+    # valid but damaged/restored tracker such as `"settlement_claimed_usd":
+    # "corrupt"` aborted the WHOLE scheduled run instead of raising here and
+    # skipping only that ticker, and malformed target/day metadata could
+    # release or write an outright incorrect balance (Codex review: "Validate
+    # the newly persisted settlement fields on read"). Scoped to a lease that
+    # is actually pending -- a resolved tracker carries none of these keys.
+    if settlement_pending:
+        ref_id = data.get("settlement_ref_id")
+        if not isinstance(ref_id, str) or not ref_id.strip():
+            raise _corrupted("settlement_ref_id", ref_id)
+        claim_day = data.get("settlement_trading_day")
+        if not isinstance(claim_day, str):
+            raise _corrupted("settlement_trading_day", claim_day)
+        try:
+            date.fromisoformat(claim_day)
+        except ValueError:
+            raise _corrupted("settlement_trading_day", claim_day) from None
+        claimed_usd = data.get("settlement_claimed_usd")
+        if (
+            claimed_usd is None
+            or isinstance(claimed_usd, bool)
+            or not isinstance(claimed_usd, (int, float))
+        ):
+            raise _corrupted("settlement_claimed_usd", claimed_usd)
+        # Same OverflowError guard the generic numeric loop below uses: an
+        # oversized JSON integer raises out of math.isfinite() rather than
+        # returning False, and an uncaught OverflowError escapes the
+        # per-ticker CorruptedLedgerStateError boundary entirely.
+        try:
+            claimed_finite = math.isfinite(claimed_usd)
+        except OverflowError:
+            raise _corrupted("settlement_claimed_usd", claimed_usd) from None
+        if not claimed_finite or claimed_usd < 0:
+            raise _corrupted("settlement_claimed_usd", claimed_usd)
+        target_state = data.get("settlement_target_state")
+        if not isinstance(target_state, dict):
+            raise _corrupted("settlement_target_state", target_state)
+        # The target is a FUTURE persisted state -- applied wholesale when
+        # reconciliation proves the claimed order landed in full -- so it has
+        # to satisfy the same schema as any tracker read off disk. Validated
+        # recursively rather than trusted, since applying a corrupt target
+        # simply moves the corruption to the next read. Validated in exactly
+        # the shape it is APPLIED in: the target carries its own
+        # settlement_pending flag (evaluate_inverse_martingale_step sets it on
+        # both the resolved-marker and partial-continuation shapes) and every
+        # apply site strips that flag, so the recursion must strip it too --
+        # otherwise the target would be held to the lease schema above, whose
+        # ref/day/claim fields belong to the ENCLOSING tracker, not to it.
+        _validate_tracker_payload(
+            {k: v for k, v in target_state.items() if k != "settlement_pending" and not k.startswith("settlement_")},
+            state_path,
+        )
+        # settlement_live is read via bool(...) with a fail-closed default of
+        # True; a non-bool truthy value (the string "false", say) would be
+        # silently misread as a live lease, exactly like settlement_pending.
+        settlement_live = data.get("settlement_live")
+        if settlement_live is not None and not isinstance(settlement_live, bool):
+            raise _corrupted("settlement_live", settlement_live)
+        # settlement_account is a non-secret account fingerprint, compared with
+        # `!=` against the recovery run's own broker identity to refuse an
+        # absence-based release from the wrong account. A value that can never
+        # equal a real fingerprint silently freezes the lease forever instead of
+        # guarding it -- the same "a garbage value defeats the comparison it
+        # participates in" failure the retry-identity fields above are validated
+        # against.
+        #
+        # Checked STRUCTURALLY, not merely for non-emptiness. Claim creation can
+        # only ever write the "unknown" sentinel or a
+        # _LEASE_ACCOUNT_FINGERPRINT_LENGTH-character lowercase hex HMAC, so any
+        # other nonempty string ("garbage", a truncated copy, a hand-edited
+        # note) is damage. Accepting it let recovery compare a value that cannot
+        # match, withhold reconciliation on every run, and freeze that ticker's
+        # accumulator permanently and silently (Codex review: "Validate
+        # settlement account fingerprints structurally"). Raising instead
+        # surfaces the damaged tracker through the same CorruptedLedgerStateError
+        # boundary as every other field here, which the injection site catches
+        # per ticker -- one damaged ticker is skipped and logged rather than
+        # quietly stuck.
+        settlement_account = data.get("settlement_account")
+        if settlement_account is not None and not _is_valid_lease_account(settlement_account):
+            raise _corrupted("settlement_account", settlement_account)
+        # settlement_stream records which roster stream made the claim, so a
+        # later stream recovering the lease can tell whether those dollars
+        # belong to the afternoon-only kill-switch figure. A non-string value
+        # can never equal a real stream name, so it would silently make every
+        # cross-stream check fail closed forever rather than answer the
+        # question -- the same failure mode settlement_account is validated
+        # against just above.
+        # Checked against _VALID_STREAMS, the same set last_evaluated_stream is
+        # validated against below -- not merely for non-emptiness. near_close_dca
+        # decides whether a recovered claim belongs to the afternoon kill-switch
+        # figure by asking whether its stream is anything OTHER than morning or
+        # midday, so an unrecognized value like "garbage" reads as afternoon and
+        # injects capital the kill switch is defined to exclude, inflating the
+        # trailing total and spuriously capping later candidates (Codex review:
+        # "Reject unknown settlement stream values"). A legacy lease predating
+        # the field carries None and stays exempt -- that is genuinely unknown
+        # provenance, which the caller already treats as ineligible.
+        settlement_stream = data.get("settlement_stream")
+        if settlement_stream is not None and settlement_stream not in _VALID_STREAMS:
+            raise _corrupted("settlement_stream", settlement_stream)
+        # A nonblank ref_id alone is not enough: claim creation can only ever
+        # produce the ONE deterministic ref derived from settlement_stream,
+        # settlement_trading_day and this tracker's own ticker (see
+        # near_close_dca's claim site and _graded_dca_ref_id_prefix). A
+        # restored or damaged tracker carrying some OTHER order's ref for the
+        # same broker account would otherwise pass this check, and recovery
+        # would then treat that unrelated order's terminal fill as proof
+        # THIS claim landed -- clearing the lease and booking notional that
+        # was never this ticker's (Codex review: "Validate the settlement
+        # ref against its lease fields"). Checked last, once claim_day and
+        # settlement_stream are both known and already individually valid.
+        expected_ref_id = _expected_lease_ref_id(settlement_stream, claim_day, state_path.parent.name)
+        if ref_id != expected_ref_id:
+            raise _corrupted("settlement_ref_id", ref_id)
 
     # last_evaluated_is_real is compared via `.get(..., True)` (see the
     # STATUS_FIRING same-stream guard) -- a non-bool value would silently
@@ -1459,7 +2396,7 @@ def _validate_tracker_payload(data: dict[str, Any], state_path: Path) -> None:
         # already-paid-for tier rearm and re-credit instead of refusing
         # (Codex review: "Validate the persisted fire-floor metric before
         # comparing it").
-        "fired_floor_drop_metric",
+        "fired_floor_drop_metric", "rearm_reference_close",
     ):
         value = data.get(field)
         if value is not None:
@@ -1502,6 +2439,36 @@ def _validate_tracker_payload(data: dict[str, Any], state_path: Path) -> None:
     cycle_reference_close = data.get("cycle_reference_close")
     if cycle_reference_close is not None and cycle_reference_close <= 0:
         raise _corrupted("cycle_reference_close", cycle_reference_close)
+
+    # rearm_reference_close must also be POSITIVE, not merely finite -- like
+    # cycle_reference_close above, every legitimately persisted value is
+    # copied straight from a validated decision_price/previous_close (a
+    # completed fire's own frozen reference), so a persisted 0 or negative
+    # value can only be corruption. Left at "merely finite", a restored or
+    # manually damaged marker with such a value would make
+    # evaluate_inverse_martingale_step's `decision_price >=
+    # rearm_reference_close` exit check trivially true for every positive
+    # price, immediately clearing the durable rearm latch and letting an
+    # already-paid-for descent re-credit tiers instead of failing closed
+    # (Codex review: "Reject nonpositive rearm references").
+    rearm_reference_close = data.get("rearm_reference_close")
+    if rearm_reference_close is not None and rearm_reference_close <= 0:
+        raise _corrupted("rearm_reference_close", rearm_reference_close)
+
+    # rearm_last_seen_day is the ISO trading day the latch was last evaluated,
+    # and it bounds the archive window the caller queries for a confirmed split
+    # (see archived_split_factor). An unparseable value there would make the
+    # caller compute a nonsense window -- either missing a real split or
+    # re-applying one already applied -- so it is validated as a real date, the
+    # same way settlement_trading_day and last_evaluated_trading_day are.
+    rearm_last_seen_day = data.get("rearm_last_seen_day")
+    if rearm_last_seen_day is not None:
+        if not isinstance(rearm_last_seen_day, str):
+            raise _corrupted("rearm_last_seen_day", rearm_last_seen_day)
+        try:
+            date.fromisoformat(rearm_last_seen_day)
+        except ValueError:
+            raise _corrupted("rearm_last_seen_day", rearm_last_seen_day) from None
 
     # fired_floor_drop_metric must also be POSITIVE, not merely finite --
     # every legitimately produced value comes from a crossed tier's own
@@ -1550,13 +2517,27 @@ def _validate_tracker_payload(data: dict[str, Any], state_path: Path) -> None:
     # the floor look "not yet broken" -- the SAME fail-open failure mode
     # fired_floor_drop_metric's own validation exists to close).
     fired_floor_price = data.get("fired_floor_price")
-    if fired_floor_price is not None and (
-        isinstance(fired_floor_price, bool)
-        or not isinstance(fired_floor_price, (int, float))
-        or not math.isfinite(fired_floor_price)
-        or fired_floor_price <= 0
-    ):
-        raise _corrupted("fired_floor_price", fired_floor_price)
+    if fired_floor_price is not None:
+        fired_floor_price_invalid = isinstance(fired_floor_price, bool) or not isinstance(
+            fired_floor_price, (int, float)
+        )
+        if not fired_floor_price_invalid:
+            # An arbitrarily large JSON integer parses into an unbounded
+            # Python int, which passes the isinstance() check just above but
+            # makes math.isfinite() RAISE OverflowError rather than return
+            # False -- the same overflow crossed_tier_thresholds' own
+            # _is_finite_number guards against. Uncaught here, that escaped
+            # this function as a bare OverflowError instead of becoming
+            # CorruptedLedgerStateError, so the per-ticker recovery boundary
+            # at near_close_dca.py's injection site never caught it and one
+            # damaged tracker aborted the whole scheduled run (Codex review:
+            # "Convert oversized fire-floor prices into ledger corruption").
+            try:
+                fired_floor_price_invalid = not math.isfinite(fired_floor_price) or fired_floor_price <= 0
+            except OverflowError:
+                fired_floor_price_invalid = True
+        if fired_floor_price_invalid:
+            raise _corrupted("fired_floor_price", fired_floor_price)
 
     # Every legitimate fired_floor_drop_metric/fired_floor_price is written
     # by resolved_marker() together with last_evaluated_trading_day, in the
@@ -1699,19 +2680,35 @@ def _validate_tracker_payload(data: dict[str, Any], state_path: Path) -> None:
     if status == STATUS_FIRING and data.get("fire_attempts") is None:
         raise _corrupted("fire_attempts", None)
 
+    def _is_finite_number(value: Any) -> bool:
+        """True only for a real, finite int/float.
+
+        math.isfinite() alongside the type check: NaN/inf ARE real int/float
+        instances in Python, so the type check alone lets them through --
+        inconsistent with every other numeric field validated just above, which
+        all reject non-finite values explicitly (Antigravity review: "Non-Finite
+        Floats in _validate_tracker_payload() Tier Thresholds").
+
+        The OverflowError guard is the same one the generic numeric loop uses:
+        json.loads() parses an arbitrarily large JSON integer into an unbounded
+        Python int, which passes isinstance() but makes math.isfinite() RAISE
+        rather than return False. Uncaught, that escaped this function instead
+        of becoming CorruptedLedgerStateError, so the per-ticker recovery
+        boundary at near_close_dca.py's injection site never caught it and one
+        damaged tracker aborted the WHOLE scheduled run (Codex review: "Convert
+        oversized crossed tiers into ledger corruption").
+        """
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        try:
+            return math.isfinite(value)
+        except OverflowError:
+            return False
+
     crossed = data.get("crossed_tier_thresholds")
     if crossed is not None and (
-        not isinstance(crossed, list)
-        or any(
-            isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in crossed
-        )
+        not isinstance(crossed, list) or any(not _is_finite_number(v) for v in crossed)
     ):
-        # math.isfinite() alongside the type check: NaN/inf ARE real int/
-        # float instances in Python, so the type check alone lets them
-        # through -- inconsistent with every other numeric field validated
-        # just above, which all reject non-finite values explicitly
-        # (Antigravity review: "Non-Finite Floats in _validate_tracker_
-        # payload() Tier Thresholds").
         raise _corrupted("crossed_tier_thresholds", crossed)
 
     # An active tracker's cycle-identity fields are ALWAYS written together
@@ -2103,21 +3100,24 @@ class InverseMartingaleLedger:
         # history"). The most RECENT events are the ones actually useful
         # for debugging a live cycle; older ones are dropped once the cap
         # is exceeded.
-        payload["events"] = (
-            existing_events
-            + [
-                {
-                    "status_before": step.status_before,
-                    "status_after": step.status_after,
-                    "accumulated_usd_before": step.accumulated_usd_before,
-                    "accumulated_usd_after": step.accumulated_usd_after,
-                    "newly_crossed_tiers": list(step.newly_crossed_tiers),
-                    "fired": step.fired,
-                    "fire_amount_usd": step.fire_amount_usd,
-                    "reason": step.reason,
-                }
-            ]
-        )[-_MAX_PERSISTED_EVENTS:]
+        event = {
+            "status_before": step.status_before,
+            "status_after": step.status_after,
+            "accumulated_usd_before": step.accumulated_usd_before,
+            "accumulated_usd_after": step.accumulated_usd_after,
+            "newly_crossed_tiers": list(step.newly_crossed_tiers),
+            "fired": step.fired,
+            "fire_amount_usd": step.fire_amount_usd,
+            "reason": step.reason,
+        }
+        if step.recovery_metadata is not None:
+            # A crash-lease recovery's claim attribution -- see
+            # InverseMartingaleStep.recovery_metadata's own docstring. Kept
+            # under its own key rather than merged flat into the event, so it
+            # can never collide with a field above and is unambiguous to a
+            # reader of the raw event log.
+            event["recovery_metadata"] = step.recovery_metadata
+        payload["events"] = (existing_events + [event])[-_MAX_PERSISTED_EVENTS:]
         state_path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(state_path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
@@ -2143,6 +3143,29 @@ class InverseMartingaleLedger:
         with cross_process_lock(lock_path):
             self._write_locked(symbol, state_path, new_state, step)
 
+    def compare_and_swap_transition(
+        self,
+        ticker: str,
+        *,
+        expected_prior_state: dict[str, Any],
+        new_state: dict[str, Any],
+        step: InverseMartingaleStep,
+    ) -> bool:
+        """Atomically persist a transition when the prior snapshot still matches.
+
+        This primitive applies to every accumulator transition, not only fire
+        claims.  Callers that evaluated a stale snapshot must leave the newer
+        on-disk state untouched.
+        """
+        symbol = ticker.strip().upper()
+        state_path, lock_path = self._paths(ticker)
+        with cross_process_lock(lock_path):
+            current = self._read_locked(state_path, expected_symbol=symbol)
+            if current != expected_prior_state:
+                return False
+            self._write_locked(symbol, state_path, new_state, step)
+            return True
+
     def claim_fire(
         self,
         ticker: str,
@@ -2151,9 +3174,7 @@ class InverseMartingaleLedger:
         new_state: dict[str, Any],
         step: InverseMartingaleStep,
     ) -> bool:
-        """Atomically write ``new_state`` iff the on-disk state still equals
-        ``expected_prior_state`` -- a compare-and-swap that closes the gap
-        between an earlier :meth:`read` and this write.
+        """Atomically claim a fire when the prior snapshot still matches.
 
         Two overlapping scheduled-stream processes (e.g. a slow/retried
         earlier slot still running when a later slot starts) that both read
@@ -2167,14 +3188,12 @@ class InverseMartingaleLedger:
         (Codex review: "Reserve each fire atomically before broker
         placement").
         """
-        symbol = ticker.strip().upper()
-        state_path, lock_path = self._paths(ticker)
-        with cross_process_lock(lock_path):
-            current = self._read_locked(state_path, expected_symbol=symbol)
-            if current != expected_prior_state:
-                return False
-            self._write_locked(symbol, state_path, new_state, step)
-            return True
+        return self.compare_and_swap_transition(
+            ticker,
+            expected_prior_state=expected_prior_state,
+            new_state=new_state,
+            step=step,
+        )
 
     def events(self, ticker: str) -> list[dict[str, Any]]:
         state_path, _ = self._paths(ticker)

@@ -36,8 +36,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from features import TARGET_COLUMN
 import model as model_module
+from features import NUMERIC_FEATURE_COLUMNS, TARGET_COLUMN
 
 DEFAULT_N_SPLITS = 5
 
@@ -84,14 +84,42 @@ class FoldResult:
 
 
 def _row_fingerprint(frame: pd.DataFrame) -> str:
-    """SHA-256 hex digest of `frame`'s own (ticker, date) row identities,
-    order-independent. See FoldResult.test_row_fingerprint's own docstring
-    for why boundary dates alone are an incomplete fingerprint."""
+    """SHA-256 hex digest of `frame`'s scored CONTENT, order-independent. See
+    FoldResult.test_row_fingerprint's own docstring for why boundary dates alone
+    are an incomplete fingerprint.
+
+    Hashes the score-relevant values, not only the (ticker, date) identity. An
+    archive correction that rewrites OHLCV for a row that already exists --
+    changing its features and target without adding or removing the row --
+    leaves the identity set untouched, so an identity-only digest declared the
+    folds the same sample. `_evaluation_window()` then let `blocking_reasons()`
+    compare raw MAEs across genuinely different data whenever the incumbent
+    artifact could not be re-scored, and an easier corrected sample could
+    authorize a model that had actually regressed (Codex review: "Include score
+    values in the fold fingerprint").
+
+    Values are formatted at repr precision so a float that survives a round trip
+    unchanged hashes identically, while any real correction moves the digest.
+    Missing values render as the literal "nan", which is itself a meaningful
+    change of content when a correction fills or clears a cell.
+    """
+    scored_columns = [
+        column
+        for column in (*NUMERIC_FEATURE_COLUMNS, TARGET_COLUMN)
+        if column in frame.columns
+    ]
     identities = sorted(
-        f"{ticker}:{pd.Timestamp(date).date().isoformat()}"
-        for ticker, date in zip(frame["ticker"].astype(str), frame["date"], strict=True)
+        "|".join(
+            (
+                f"{ticker}:{pd.Timestamp(date).date().isoformat()}",
+                *(f"{column}={row[column]!r}" for column in scored_columns),
+            )
+        )
+        for ticker, date, (_, row) in zip(
+            frame["ticker"].astype(str), frame["date"], frame.iterrows(), strict=True
+        )
     )
-    return hashlib.sha256("|".join(identities).encode("utf-8")).hexdigest()
+    return hashlib.sha256("\u241f".join(identities).encode("utf-8")).hexdigest()
 
 
 def walk_forward_splits(
@@ -252,12 +280,15 @@ def score_incumbent_on_folds(
     candidate_model: model_module.TrainedModel,
     dataset: pd.DataFrame,
 ) -> tuple[float, float] | None:
-    """``(candidate_mae, incumbent_mae)``: both ``candidate_model`` and
-    ``incumbent_model`` scored on exactly the rows whose label only became
-    available AFTER the incumbent's own training cutoff
-    (``incumbent_model.trained_at``) -- information the incumbent could not
-    have seen at its own training time. Returns ``None`` if the cutoff can't
-    be determined, or either side of the cutoff split is empty.
+    """``(candidate_mae, incumbent_mae)`` on a shared, later holdout.
+
+    The comparison candidate uses the prospective final model's
+    hyperparameters, but is freshly fit only on rows whose labels are known
+    before the holdout starts.  The incumbent is frozen.  Consequently every
+    scored label is unseen by both models, while the comparison candidate can
+    still learn from rows that arrived after the incumbent's training cutoff
+    (``incumbent_model.trained_at``). Returns ``None`` if the cutoff can't be
+    determined, or either side of the cutoff split is empty.
 
     Four earlier, all unsound, versions of this function preceded this one:
 
@@ -284,25 +315,12 @@ def score_incumbent_on_folds(
        staler slice of history than what the incumbent itself was actually
        trained on (Codex review: "Train the comparison candidate through the
        incumbent cutoff").
-    4. Even after fixing (3) to fit ONE comparison candidate on every row
-       available by the cutoff (rather than a fold-bounded subset), this
-       function still built that candidate ITSELF, internally, on
-       ``dataset[dataset["label_end_date"] <= training_cutoff]`` -- under an
-       UNCHANGED alpha/universe and append-only history (the ordinary weekly
-       retrain case, not an exception), that row set is EXACTLY what the
-       incumbent itself was originally trained on, so a deterministic Ridge
-       fit on it reconstructs the incumbent's own weights almost exactly.
-       The comparison then always came out a near-tie -- not because the
-       real new model (the one actually about to be published, trained on
-       the FULL current dataset including rows added since the incumbent
-       trained) was no better, but because it never participated in this
-       comparison at all; a self-reconstruction was compared against
-       itself. This blocked every routine retrain, indefinitely, the moment
-       the published model's staleness window elapsed (Codex review: "Avoid
-       comparing the incumbent with its exact reconstruction"). The caller
-       now supplies the REAL candidate model directly -- already fit on
-       whatever data it was actually fit on -- and this function only
-       scores it, never refits anything.
+    4. Comparing the final candidate (fit on the complete current dataset)
+       directly on post-cutoff rows made its score in-sample while the
+       incumbent's was out-of-sample.  The later holdout below instead fits
+       an aligned comparison candidate through the start of that holdout;
+       the final publication model may be fit on all rows only after this
+       honest gate has been computed.
 
     Both the training-cutoff/held-out split above AND the target each row's
     target represents are keyed off ``label_end_date``, not ``date`` -- the
@@ -312,19 +330,8 @@ def score_incumbent_on_folds(
     before `training_cutoff` can still have a label that only became fully
     computable AFTER training happened.
 
-    Scoring ``candidate_model`` on rows it may itself have been (partly)
-    trained on is a deliberate, accepted trade-off, not an oversight: there
-    is no way to hold out rows that are simultaneously unseen by the
-    incumbent (which trained on everything through the cutoff) AND unseen
-    by a genuinely newer candidate (which, to represent real progress, must
-    be allowed to train on what's accumulated since) without holding out
-    nothing at all. The routine walk-forward evaluation elsewhere in this
-    module (``evaluate_walk_forward``, feeding ``new_mae``) remains the
-    honest out-of-sample estimate this repo publishes and gates on; this
-    comparison answers a narrower, complementary question -- did the
-    information gained since the incumbent trained actually help predict
-    what happened in that period -- not "does the candidate generalize to
-    literally unseen future data."
+    Returns ``None`` when there is not enough post-cutoff history to provide
+    both newer candidate-training observations and a nonempty holdout.
     """
     if not isinstance(incumbent_model.trained_at, str):
         return None
@@ -339,13 +346,29 @@ def score_incumbent_on_folds(
     if dataset.empty or "label_end_date" not in dataset.columns:
         return None
 
-    train = dataset[dataset["label_end_date"] <= training_cutoff]
-    test = dataset[dataset["label_end_date"] > training_cutoff]
-    if train.empty or test.empty:
+    dataset = dataset.sort_values("date", kind="stable").reset_index(drop=True)
+    if not (dataset["label_end_date"] <= training_cutoff).any():
+        return None
+    post_cutoff_dates = np.sort(dataset.loc[dataset["label_end_date"] > training_cutoff, "date"].unique())
+    if len(post_cutoff_dates) < 2:
         return None
 
+    test_start = post_cutoff_dates[len(post_cutoff_dates) // 2]
+    train = dataset[dataset["label_end_date"] < test_start]
+    test = dataset[(dataset["date"] >= test_start) & (dataset["label_end_date"] > training_cutoff)]
+    if train.empty or test.empty or not (train["label_end_date"] > training_cutoff).any():
+        return None
+
+    comparison_candidate = model_module.fit(
+        train,
+        alpha=candidate_model.alpha,
+        model_version="incumbent-comparison-candidate",
+        return_clip_pct=candidate_model.return_clip_pct,
+        horizon_trading_days=candidate_model.horizon_trading_days,
+    )
+
     actual = test[TARGET_COLUMN].to_numpy(dtype=float)
-    candidate_predicted = candidate_model.predict_return_pct(test)
+    candidate_predicted = comparison_candidate.predict_return_pct(test)
     candidate_mae = _mae(actual, candidate_predicted)
     if not math.isfinite(candidate_mae):
         return None

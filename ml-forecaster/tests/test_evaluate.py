@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import evaluate as evaluate_module
 import model as model_module
 from conftest import make_synthetic_ohlcv, write_ticker_csv
 from evaluate import DEFAULT_N_SPLITS, evaluate_walk_forward, score_incumbent_on_folds, walk_forward_splits
@@ -158,19 +159,9 @@ def test_evaluate_walk_forward_folds_never_include_a_train_row_whose_label_reach
 # --- score_incumbent_on_folds() ---------------------------------------------
 
 
-def test_score_incumbent_on_folds_scores_the_given_candidate_without_refitting(dip_dataset):
-    """Regression test for "Avoid comparing the incumbent with its exact
-    reconstruction". An earlier version fit a throwaway "comparison
-    candidate" INSIDE this function, on exactly the rows available by the
-    incumbent's own training cutoff -- under an unchanged alpha/universe and
-    append-only history (the ordinary weekly retrain case), that
-    reconstructs the incumbent's own weights almost exactly, so the two
-    sides always came out a near-tie and blocked every routine retrain. This
-    function must score the CALLER-SUPPLIED candidate model directly against
-    the incumbent, never refit anything itself -- pinned here with a
-    candidate fit at a deliberately different alpha from the incumbent's
-    own, which an internally-refitting version could never distinguish.
-    """
+def test_score_incumbent_on_folds_uses_a_holdout_unseen_by_both_models(dip_dataset, monkeypatch):
+    """The candidate passed here is already fit on every current row, but
+    its in-sample predictions must never be used by the regression gate."""
     dataset = dip_dataset.sort_values("date", kind="stable").reset_index(drop=True)
     unique_label_ends = sorted(dataset["label_end_date"].unique())
     assert len(unique_label_ends) > 1, "fixture needs more than one distinct label_end_date"
@@ -180,31 +171,42 @@ def test_score_incumbent_on_folds_scores_the_given_candidate_without_refitting(d
         dataset[dataset["label_end_date"] <= cutoff],
         model_version="incumbent-under-test", trained_at=cutoff.isoformat(),
     )
+    # Fit the comparison candidate through (and beyond) the incumbent cutoff,
+    # rather than at an arbitrary earlier walk-forward fold boundary.  This is
+    # the ordinary weekly-retrain shape that originally exposed the bug.
     candidate = model_module.fit(dataset, alpha=5.0, model_version="candidate-under-test")
 
+    real_fit = model_module.fit
+    captured_train = []
+
+    def recording_fit(frame, **kwargs):
+        captured_train.append(frame.copy())
+        return real_fit(frame, **kwargs)
+
+    monkeypatch.setattr(evaluate_module.model_module, "fit", recording_fit)
     result = score_incumbent_on_folds(incumbent, candidate, dataset)
     assert result is not None
     candidate_mae, incumbent_mae = result
 
-    test = dataset[dataset["label_end_date"] > cutoff]
-    assert not test.empty
+    assert len(captured_train) == 1
+    comparison_train = captured_train[0]
+    post_cutoff_dates = np.sort(dataset.loc[dataset["label_end_date"] > cutoff, "date"].unique())
+    test_start = post_cutoff_dates[len(post_cutoff_dates) // 2]
+    test = dataset[(dataset["date"] >= test_start) & (dataset["label_end_date"] > cutoff)]
+    assert comparison_train["label_end_date"].max() < test_start
+    assert (comparison_train["label_end_date"] > cutoff).any()
+    comparison = real_fit(comparison_train, alpha=candidate.alpha, model_version="expected")
     actual = test[TARGET_COLUMN].to_numpy(dtype=float)
-    expected_candidate_mae = float(np.mean(np.abs(actual - candidate.predict_return_pct(test))))
+    expected_candidate_mae = float(np.mean(np.abs(actual - comparison.predict_return_pct(test))))
     expected_incumbent_mae = float(np.mean(np.abs(actual - incumbent.predict_return_pct(test))))
     assert candidate_mae == pytest.approx(expected_candidate_mae)
     assert incumbent_mae == pytest.approx(expected_incumbent_mae)
     assert incumbent_mae != pytest.approx(candidate_mae)
 
 
-def test_score_incumbent_on_folds_a_genuine_improvement_escapes_a_reconstructed_tie(dip_dataset):
-    """The scenario this fix specifically unblocks. On a routine retrain
-    (unchanged alpha/universe, append-only history), the incumbent's own
-    exact reconstruction -- fit on only the rows it originally saw -- always
-    ties the incumbent when scored the same way. The REAL candidate (fit on
-    the FULL current dataset, including rows added since the incumbent
-    trained) is genuinely different and must not be trapped in that same
-    permanent tie.
-    """
+def test_score_incumbent_on_folds_does_not_use_final_candidates_predictions(dip_dataset, monkeypatch):
+    """Regression test for comparing in-sample candidate MAE with the
+    incumbent's out-of-sample MAE."""
     dataset = dip_dataset.sort_values("date", kind="stable").reset_index(drop=True)
     unique_label_ends = sorted(dataset["label_end_date"].unique())
     cutoff = pd.Timestamp(unique_label_ends[len(unique_label_ends) // 2])
@@ -212,22 +214,13 @@ def test_score_incumbent_on_folds_a_genuine_improvement_escapes_a_reconstructed_
 
     incumbent = model_module.fit(train, model_version="incumbent-under-test", trained_at=cutoff.isoformat())
 
-    # The old, unsound design in miniature: a reconstruction fit on the
-    # IDENTICAL train slice, same alpha -- this always ties the incumbent.
-    reconstruction = model_module.fit(train, model_version="reconstruction")
-    reconstruction_result = score_incumbent_on_folds(incumbent, reconstruction, dataset)
-    assert reconstruction_result is not None
-    reconstruction_mae, reconstruction_incumbent_mae = reconstruction_result
-    assert reconstruction_mae == pytest.approx(reconstruction_incumbent_mae)
-
-    # The real candidate: fit on the FULL dataset -- genuinely informed by
-    # more data than the incumbent, unlike the reconstruction above.
     real_candidate = model_module.fit(dataset, model_version="real-candidate")
-    real_result = score_incumbent_on_folds(incumbent, real_candidate, dataset)
-    assert real_result is not None
-    real_candidate_mae, real_incumbent_mae = real_result
-    assert real_incumbent_mae == pytest.approx(reconstruction_incumbent_mae)  # incumbent side unaffected
-    assert real_candidate_mae != pytest.approx(reconstruction_mae)  # NOT stuck at the reconstruction's tie
+    monkeypatch.setattr(
+        real_candidate,
+        "predict_return_pct",
+        lambda _frame: pytest.fail("the final candidate must not score its training rows"),
+    )
+    assert score_incumbent_on_folds(incumbent, real_candidate, dataset) is not None
 
 
 def test_score_incumbent_on_folds_includes_a_row_whose_date_precedes_cutoff_but_label_end_date_does_not(dip_dataset):
@@ -314,3 +307,44 @@ def test_predict_zero_baseline_hit_rate_matches_fraction_of_nonpositive_actuals(
     result = evaluate_walk_forward(dip_dataset, n_splits=2, alpha=1.0)
     for fold in result["folds"]:
         assert 0.0 <= fold["baseline_zero_hit_rate"] <= 1.0
+
+
+def test_row_fingerprint_changes_when_scored_values_change():
+    """Regression test for "Include score values in the fold fingerprint".
+
+    An archive correction that rewrites OHLCV for a row that ALREADY exists
+    changes that row's features and target without adding or removing the row.
+    An identity-only (ticker, date) digest was unchanged by that, so
+    `_evaluation_window()` declared the folds the same sample and
+    `blocking_reasons()` compared raw MAEs across genuinely different data
+    whenever the incumbent artifact could not be re-scored -- letting an easier
+    corrected sample authorize a model that had actually regressed.
+    """
+    from evaluate import _row_fingerprint
+    from features import NUMERIC_FEATURE_COLUMNS
+
+    feature = NUMERIC_FEATURE_COLUMNS[0]
+    base = pd.DataFrame(
+        {
+            "ticker": ["AAPL", "AAPL"],
+            "date": pd.to_datetime(["2026-08-10", "2026-08-11"]),
+            feature: [1.0, 2.0],
+            TARGET_COLUMN: [0.5, -0.25],
+        }
+    )
+    original = _row_fingerprint(base)
+
+    # Same rows, same identities -- one corrected feature value.
+    corrected = base.copy()
+    corrected.loc[0, feature] = 1.5
+    assert _row_fingerprint(corrected) != original
+
+    # Same rows, same identities -- one corrected target value.
+    retargeted = base.copy()
+    retargeted.loc[1, TARGET_COLUMN] = 0.75
+    assert _row_fingerprint(retargeted) != original
+
+    # Genuinely identical content still hashes identically, and row ORDER is
+    # still irrelevant -- the digest stays a set comparison, not a sequence one.
+    assert _row_fingerprint(base.copy()) == original
+    assert _row_fingerprint(base.iloc[::-1].reset_index(drop=True)) == original

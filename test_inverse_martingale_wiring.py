@@ -16,16 +16,24 @@ from datetime import date, datetime, time, timedelta
 import pytest
 
 from dca_cumulative import CumulativeCreditLedger
-from dca_inverse_martingale import STATUS_FIRING, InverseMartingaleLedger, InverseMartingaleStep
+from dca_inverse_martingale import (
+    STATUS_DIPPING,
+    STATUS_FIRING,
+    STATUS_NONE,
+    InverseMartingaleLedger,
+    InverseMartingaleStep,
+)
 from near_close_dca import (
     EASTERN,
     Bar,
     CompactRunOptions,
     DryRunBroker,
+    InverseMartingaleLeaseRecovery,
     PriorSameDayAllocation,
     SourceName,
     StrategyConfig,
     StrategyState,
+    _book_recovered_lease_durably,
     _inverse_martingale_advance_age_for_missing_data,
     _inverse_martingale_reset_if_disabled_mid_cycle,
     run_daily_compact,
@@ -94,16 +102,16 @@ def _base_config(**overrides):
 def _run_day(
     tmp_path, config, state, trading_day, decision_price, artifacts_label, scheduled=True,
     robinhood_price=None, broker_cash=500.0, prior_same_day_allocations=None, stream="afternoon",
-    now_time=time(15, 45),
+    now_time=time(15, 45), prev_close=100.0, broker=None, deployment_history_root=None,
 ):
     now = datetime.combine(trading_day, now_time, tzinfo=EASTERN)
-    fin = _FixedPriceData(prev_close=100.0, decision_price=decision_price, source=SourceName.FINANCE)
+    fin = _FixedPriceData(prev_close=prev_close, decision_price=decision_price, source=SourceName.FINANCE)
     rh = _FixedPriceData(
-        prev_close=100.0,
+        prev_close=prev_close,
         decision_price=robinhood_price if robinhood_price is not None else decision_price,
         source=SourceName.ROBINHOOD,
     )
-    broker = DryRunBroker(cash=broker_cash, reference_prices={"AAPL": decision_price})
+    broker = broker or DryRunBroker(cash=broker_cash, reference_prices={"AAPL": decision_price})
     result = run_daily_compact(
         now,
         config,
@@ -116,6 +124,7 @@ def _run_day(
             scheduled=scheduled,
             prior_same_day_allocations=prior_same_day_allocations,
             stream=stream,
+            deployment_history_root=deployment_history_root,
         ),
     )
     with open(result["run_state_path"], encoding="utf-8") as handle:
@@ -303,6 +312,7 @@ def test_kill_switch_capped_rollback_stamps_the_current_stream_not_a_stale_one(t
     assert tracker["status"] == "firing"
     assert tracker["accumulated_usd"] == pytest.approx(2.0, abs=0.01)
     assert tracker["fire_attempts"] == 1
+    assert tracker["last_evaluated_trading_day"] == TEST_DATES[2].isoformat()
     # The bug: before the fix, this stayed "morning" (im_pre_fire_state's
     # own stale stamp from the accumulation phase) instead of reflecting
     # THIS settlement's own actual stream, "midday".
@@ -610,6 +620,23 @@ def _pending_tracker_state() -> dict:
         "fire_attempts": 1,
         "trading_days_active": 1,
         "settlement_pending": True,
+        # The recoverable-lease metadata the claim site writes alongside the
+        # flag. A pending lease is only valid when it carries enough to
+        # reconcile the claim against broker order history -- see
+        # _validate_tracker_payload's "Validate the newly persisted settlement
+        # fields on read" block.
+        # The real deterministic format claim creation writes -- no explicit
+        # settlement_stream here, so recovery falls back to the historical
+        # "afternoon" default (no stream token of its own).
+        "settlement_ref_id": f"graded-dca-imart-{TEST_DATES[0].isoformat()}-AAPL",
+        "settlement_trading_day": TEST_DATES[0].isoformat(),
+        "settlement_claimed_usd": 5.0,
+        "settlement_target_state": {
+            "status": STATUS_NONE,
+            "last_evaluated_trading_day": TEST_DATES[0].isoformat(),
+            "last_evaluated_stream": "afternoon",
+        },
+        "settlement_live": True,
     }
 
 
@@ -748,12 +775,16 @@ def test_same_day_retry_after_full_fire_does_not_double_credit(tmp_path, monkeyp
     resolved_fields = {k: v for k, v in resolved.items() if k != "events"}
     assert state_fields == resolved_fields
 
-    # A genuinely LATER day's fresh dip still works normally.
-    r3, s3, _ = _run_day(tmp_path, config, state, TEST_DATES[2], 99.0, "day3")
+    # A later day does not by itself make the still-open descent fresh --
+    # prev_close (99) is genuinely below the reference on this NEW day (not
+    # merely a repeated same-day observation), so the durable latch is
+    # legitimately still tested and still armed.
+    r3, s3, _ = _run_day(tmp_path, config, state, TEST_DATES[2], 99.0, "day3", prev_close=99.0)
     assert s3["buy_candidates"] == []  # accumulates only, no fire yet
     later = json.loads(tracker_path.read_text())
-    assert later["status"] == "dipping"
-    assert later["accumulated_usd"] == pytest.approx(1.0, abs=0.01)
+    assert later["status"] == "none"
+    assert "accumulated_usd" not in later
+    assert later["rearm_reference_close"] == pytest.approx(100.0)
 
 
 def test_later_slot_the_same_day_still_blocked_by_the_fired_cycles_own_floor(tmp_path, monkeypatch):
@@ -805,22 +836,20 @@ def test_later_slot_the_same_day_still_blocked_by_the_fired_cycles_own_floor(tmp
     prior_fields = {k: v for k, v in after_shallow.items() if k != "events"}
     assert state_fields == prior_fields
 
-    # A genuinely LATER day's shallow dip is unaffected by yesterday's floor
-    # -- it only ever applies on the SAME trading_day it was recorded.
-    r3, s3, _ = _run_day(tmp_path, config, state, TEST_DATES[2], 99.0, "day3")
+    # The durable rearm latch, unlike the same-day floor, remains effective
+    # on later days until price exits the original descent -- prev_close
+    # (99) is genuinely below the reference on this NEW day, not a repeated
+    # same-day observation.
+    r3, s3, _ = _run_day(tmp_path, config, state, TEST_DATES[2], 99.0, "day3", prev_close=99.0)
     assert s3["buy_candidates"] == []
     later = json.loads(tracker_path.read_text())
-    assert later["status"] == "dipping"
-    assert later["accumulated_usd"] == pytest.approx(1.0, abs=0.01)
+    assert later["status"] == "none"
+    assert "accumulated_usd" not in later
+    assert later["rearm_reference_close"] == pytest.approx(100.0)
 
 
-def test_later_slot_the_same_day_breaks_below_the_fired_floor(tmp_path, monkeypatch):
-    """A later same-day slot's dip that genuinely falls BELOW the fired
-    cycle's own floor is a real, new descent and must still be tracked --
-    the floor blocks a shallow re-arm, not every same-day re-arm (Codex
-    review: "Distinguish later slots from retries before suppressing
-    rearming" combined with "Require a fresh descent before rearming in a
-    later slot")."""
+def test_later_slot_deeper_price_remains_latched_until_dip_exit(tmp_path, monkeypatch):
+    """A deeper print without an intervening recovery is still the same dip."""
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
     state = StrategyState()
@@ -834,13 +863,13 @@ def test_later_slot_the_same_day_breaks_below_the_fired_floor(tmp_path, monkeypa
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
 
-    # SAME day, midday slot: a genuinely DEEPER -5.5% dip -- past the -5%
-    # floor, a real new descent, not a re-visit of the morning's range.
+    # SAME day, midday slot: even a deeper -5.5% print remains part of the
+    # original descent until price first exits it.
     r2b, s2b, _ = _run_day(tmp_path, config, state, TEST_DATES[1], 94.5, "day2-midday-deep", stream="midday")
-    assert s2b["buy_candidates"] == []  # accumulates only, no fire yet
+    assert s2b["buy_candidates"] == []
     after_midday = json.loads(tracker_path.read_text())
-    assert after_midday["status"] == "dipping"
-    assert after_midday["accumulated_usd"] == pytest.approx(7.0, abs=0.01)  # crosses tiers 1/2/4 again
+    assert after_midday["status"] == "none"
+    assert "accumulated_usd" not in after_midday
 
 
 def test_dry_run_fire_does_not_settle_the_ledger(tmp_path, monkeypatch):
@@ -863,6 +892,27 @@ def test_dry_run_fire_does_not_settle_the_ledger(tmp_path, monkeypatch):
     assert tracker["status"] == "firing"  # claimed, but never settled
     assert tracker["accumulated_usd"] == pytest.approx(7.0, abs=0.01)  # nothing debited
 
+    # The dry-run claim must also release its settlement lease. Prove the
+    # balance is not merely present but actually available to the next live
+    # invocation: the same recovery submits the full deferred amount and
+    # resolves the tracker.
+    live_config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT}, dry_run=False)
+    _, live_state, _ = _run_day(
+        tmp_path,
+        live_config,
+        state,
+        TEST_DATES[2],
+        96.5,
+        "day3-live",
+    )
+    [live_candidate] = live_state["buy_candidates"]
+    assert live_candidate["status"] == "submitted"
+    assert live_candidate["planned_amount_usd"] == pytest.approx(7.0, abs=0.01)
+    assert "7.00" in live_candidate["order_id"]
+    resolved = json.loads(tracker_path.read_text())
+    assert resolved["status"] == "none"
+    assert "settlement_pending" not in resolved
+
 
 def test_dry_run_fire_attempts_do_not_consume_the_retry_budget(tmp_path, monkeypatch):
     """Regression test for "Do not count dry runs as fire attempts".
@@ -870,18 +920,17 @@ def test_dry_run_fire_attempts_do_not_consume_the_retry_budget(tmp_path, monkeyp
     A dry-run outcome never reaches a real broker -- im_placed_amount is
     unconditionally 0, identical to what a genuinely blocked live attempt
     reports -- but it must not consume the SAME max_fire_attempts retry
-    budget a live blocked attempt does. With max_fire_attempts=1 and a
+    budget a live blocked attempt does. With max_fire_attempts=2 and a
     per-order cap forcing a multi-run partial fire, THREE consecutive
     dry-run "fire" evaluations must not abandon the accumulated balance,
-    even though a single live blocked attempt already would with the same
-    budget (see test_blocked_placement_preserves_the_balance_and_counts_the_attempt).
+    or advance an existing pre-fire attempt count to the limit.
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     extended_dates = (date(2026, 6, 29), date(2026, 6, 30), date(2026, 7, 1), date(2026, 7, 2), date(2026, 7, 6))
     config = _base_config(
         inverse_martingale={"AAPL": PCT_ENROLLMENT},
         max_per_order_usd=5.0,
-        inverse_martingale_max_fire_attempts=1,
+        inverse_martingale_max_fire_attempts=2,
         dry_run=True,
         approved_test_dates=frozenset(extended_dates),
     )
@@ -891,11 +940,16 @@ def test_dry_run_fire_attempts_do_not_consume_the_retry_budget(tmp_path, monkeyp
     _run_day(tmp_path, config, state, extended_dates[1], 91.5, "day2")  # -8.5% -> +$14 -> $15 total
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    assert json.loads(tracker_path.read_text())["accumulated_usd"] == pytest.approx(15.0, abs=0.01)
+    pre_fire_tracker = json.loads(tracker_path.read_text())
+    assert pre_fire_tracker["accumulated_usd"] == pytest.approx(15.0, abs=0.01)
+    # Model a recovered cycle that has already spent one genuine production
+    # attempt. Dry-run rehearsals must preserve this count rather than consume
+    # its one remaining live retry.
+    pre_fire_tracker["fire_attempts"] = 1
+    tracker_path.write_text(json.dumps(pre_fire_tracker))
 
-    # Three consecutive dry-run "fires" -- max_fire_attempts=1 would abandon
-    # the cycle after just the first one if dry runs incorrectly consumed
-    # the same budget a live blocked attempt does.
+    # Three consecutive dry-run "fires" -- incrementing the existing count
+    # would cause the next evaluation to abandon the cycle at the limit.
     _run_day(tmp_path, config, state, extended_dates[2], 97.0, "day3")  # recovers -> dry-run "fires" $5 (capped)
     _run_day(tmp_path, config, state, extended_dates[3], 97.0, "day4")  # continuation, dry-run "fires" $5 again
     r5, s5, _ = _run_day(tmp_path, config, state, extended_dates[4], 97.0, "day5")
@@ -903,7 +957,7 @@ def test_dry_run_fire_attempts_do_not_consume_the_retry_budget(tmp_path, monkeyp
     tracker = json.loads(tracker_path.read_text())
     assert tracker["status"] == "firing"  # NOT abandoned back to "none"
     assert tracker["accumulated_usd"] == pytest.approx(15.0, abs=0.01)  # nothing lost across 3 dry runs
-    assert tracker["fire_attempts"] == 0  # dry runs never counted
+    assert tracker["fire_attempts"] == 1  # pre-fire production attempt preserved
 
     [candidate] = s5["buy_candidates"]
     assert candidate["status"] == "dry_run"
@@ -1044,10 +1098,1820 @@ def test_prior_same_day_allocation_defers_a_ready_to_fire_recovery(tmp_path, mon
     assert "imart" in (candidate.get("order_id") or "")
 
 
-def test_sub_dollar_fire_is_floored_to_the_broker_minimum(tmp_path, monkeypatch):
-    """A schema-valid unit_usd below $1 combined with a single-unit first
-    tier must not reach the broker as a sub-dollar order (Codex review:
-    "Prevent sub-dollar accumulator fires")."""
+def test_crash_after_fire_claim_keeps_balance_recoverable(tmp_path, monkeypatch):
+    """A reservation made before broker placement must not debit the ledger."""
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    _run_day(tmp_path, config, state, TEST_DATES[0], 95.0, "day1")
+
+    import near_close_dca as ncd
+
+    def crash_before_placement(**kwargs):
+        raise RuntimeError("simulated exit before broker placement")
+
+    monkeypatch.setattr(ncd, "_process_buy_candidates_batch", crash_before_placement)
+    with pytest.raises(RuntimeError, match="simulated exit"):
+        _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2")
+
+    tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
+    claimed = json.loads(tracker_path.read_text())
+    assert claimed["settlement_pending"] is True
+    assert claimed["settlement_ref_id"].endswith("-2026-06-30-AAPL")
+    # The balance stays on the tracker ITSELF, not in a nested side field: the
+    # whole point of a recoverable lease is that a reader who knows nothing
+    # about it still sees the real accumulated dollars.
+    assert claimed["accumulated_usd"] == pytest.approx(7.0)
+    assert claimed["settlement_claimed_usd"] == pytest.approx(7.0)
+
+
+def test_next_day_crash_recovery_reconciles_terminal_partial_order(tmp_path, monkeypatch):
+    """An old lease must query its claim day and retain only the unfilled remainder."""
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    _run_day(tmp_path, config, state, TEST_DATES[0], 95.0, "day1")
+
+    import near_close_dca as ncd
+
+    monkeypatch.setattr(
+        ncd,
+        "_process_buy_candidates_batch",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("simulated exit")),
+    )
+    with pytest.raises(RuntimeError, match="simulated exit"):
+        _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2")
+    monkeypatch.undo()
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+
+    tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
+    claim = json.loads(tracker_path.read_text())
+
+    class HistoricalBroker(DryRunBroker):
+        def __init__(self):
+            super().__init__(cash=500.0, reference_prices={"AAPL": 96.5})
+            self.queried_days = []
+
+        def strategy_order_with_ref_id(self, ticker, trading_day, ref_id):
+            self.queried_days.append(trading_day)
+            assert ref_id == claim["settlement_ref_id"]
+            return {
+                "state": "cancelled",
+                "ref_id": ref_id,
+                "dollar_amount": "7.00",
+                "cumulative_quantity": "0.03",
+                "average_price": "100.00",
+            }
+
+    broker = HistoricalBroker()
+    _, run_state, _ = _run_day(
+        tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker
+    )
+    recovered = json.loads(tracker_path.read_text())
+    assert broker.queried_days == [TEST_DATES[1]]
+    # This lease was claimed YESTERDAY, so its $3 must NOT appear among today's
+    # buy candidates: a run_state artifact carries one top-level trading day, so
+    # load_prior_same_day_allocations would read the row as an allocation made
+    # today and charge it against today's caps in every later slot (Codex
+    # review: "Keep prior-day recoveries out of today's submission context").
+    assert [row for row in run_state["buy_candidates"] if row["ticker"] == "AAPL"] == []
+    assert recovered["status"] == STATUS_FIRING
+    assert recovered["accumulated_usd"] == pytest.approx(4.0)
+    assert recovered["fire_attempts"] == 1
+    assert recovered["last_evaluated_trading_day"] == TEST_DATES[2].isoformat()
+    assert recovered["last_evaluated_stream"] == "afternoon"
+    assert "settlement_pending" not in recovered
+    # The recovered $3 also consumed real budget on the CLAIM day, not today:
+    # a lease recovered the morning after its crash spent yesterday's
+    # daily/weekly headroom, and record_buy keys those buckets by day.
+    assert state.day_notional(TEST_DATES[1]) == pytest.approx(3.0)
+    assert state.buys_today("AAPL", TEST_DATES[1]) == 1
+
+
+def test_an_expired_lease_release_folds_the_outage_into_trading_days_active(tmp_path):
+    """Regression test for "Account for lease outage days before restoring
+    the cycle".
+
+    `_inverse_martingale_advance_age_for_missing_data` deliberately never
+    touches a `settlement_pending` cycle's age fields (racing the owning
+    process's own settlement write is unsafe), so while broker history stays
+    unreachable and a lease sits pending, `trading_days_active` is frozen
+    exactly as it was at claim time. Restoring the pre-claim state UNCHANGED
+    once the lease finally resolves left the very next real evaluation
+    crediting only a single `trading_days_active += 1` for the whole gap --
+    however long broker history was actually unreachable -- letting a cycle
+    already close to `max_cycle_days` at claim time resume and fire a stale
+    balance well past its real age.
+
+    Calls `_inverse_martingale_recover_pending_lease` directly rather than
+    through the full `_run_day` harness, since the fixture's approved
+    trading window is only a few days wide and this scenario needs an
+    outage spanning many more than that.
+    """
+    import near_close_dca as ncd
+
+    claim_day = date(2026, 6, 1)
+    resolution_day = date(2026, 6, 20)  # a 19-calendar-day outage
+    tracker_state = {
+        "status": STATUS_FIRING,
+        "accumulated_usd": 5.0,
+        "cycle_start_trading_day": claim_day.isoformat(),
+        "last_evaluated_trading_day": claim_day.isoformat(),
+        "cycle_reference_close": 100.0,
+        "lowest_drop_seen": 2.0,
+        "fire_attempts": 1,
+        "trading_days_active": 5,
+        "settlement_pending": True,
+        "settlement_ref_id": f"graded-dca-imart-{claim_day.isoformat()}-AAPL",
+        "settlement_trading_day": claim_day.isoformat(),
+        "settlement_claimed_usd": 5.0,
+        "settlement_target_state": {
+            "status": STATUS_NONE,
+            "last_evaluated_trading_day": claim_day.isoformat(),
+            "last_evaluated_stream": "afternoon",
+        },
+        "settlement_live": True,
+    }
+
+    class _NoOrderBroker:
+        def strategy_order_with_ref_id(self, ticker, trading_day, ref_id):
+            return None
+
+    ledger = InverseMartingaleLedger(root=tmp_path)
+    ledger.record_step(
+        "AAPL", tracker_state,
+        InverseMartingaleStep(
+            status_before=STATUS_FIRING, status_after=STATUS_FIRING,
+            accumulated_usd_before=10.0, accumulated_usd_after=5.0,
+            newly_crossed_tiers=(), fired=True, fire_amount_usd=5.0,
+            reason="fire_continuation",
+        ),
+    )
+    persisted_tracker_state = ledger.read("AAPL")
+    recovery = ncd._inverse_martingale_recover_pending_lease(
+        ledger, "AAPL", persisted_tracker_state,
+        broker=_NoOrderBroker(), dry_run=False, trading_day=resolution_day, stream="afternoon",
+    )
+
+    assert recovery is not None
+    assert recovery.recovered_state["status"] == STATUS_FIRING
+    # 5 (the age at claim time) + 19 (the calendar-day outage, a safe upper
+    # bound on trading days actually missed) -- not 5 + 1, the single
+    # increment a naive "restore unchanged, let the next evaluation advance
+    # it" approach would produce regardless of how long the outage lasted.
+    assert recovery.recovered_state["trading_days_active"] == 5 + 19
+
+
+def test_an_exact_fill_reconciliation_ages_a_capped_continuation(tmp_path):
+    """Regression test for "Age a fully reconciled capped continuation".
+
+    When the claimed chunk fills EXACTLY (the amount abs-matches
+    settlement_claimed_usd within half a cent), reconciliation restores
+    ``settlement_target_state`` verbatim -- for a kill-switch-CAPPED fire,
+    that target is itself a STATUS_FIRING continuation, computed at claim
+    time with a correct-as-of-then trading_days_active. Restoring it
+    unchanged after a long broker-reconciliation outage left the next real
+    evaluation crediting only a single +1 for however long that outage
+    actually lasted -- the same gap the expired-lease-release branch above
+    already closes, just for the exact-fill branch instead.
+    """
+    import near_close_dca as ncd
+
+    claim_day = date(2026, 6, 1)
+    resolution_day = date(2026, 6, 20)  # a 19-calendar-day outage
+    tracker_state = {
+        "status": STATUS_FIRING,
+        "accumulated_usd": 15.0,
+        "cycle_start_trading_day": claim_day.isoformat(),
+        "last_evaluated_trading_day": claim_day.isoformat(),
+        "cycle_reference_close": 100.0,
+        "lowest_drop_seen": 2.0,
+        "fire_attempts": 1,
+        "trading_days_active": 5,
+        "settlement_pending": True,
+        "settlement_ref_id": f"graded-dca-imart-{claim_day.isoformat()}-AAPL",
+        "settlement_trading_day": claim_day.isoformat(),
+        "settlement_claimed_usd": 5.0,
+        # A capped partial fire's own target: still STATUS_FIRING, with the
+        # remainder ($10) and the trading_days_active correct AS OF THE
+        # CLAIM DAY.
+        "settlement_target_state": {
+            "status": STATUS_FIRING,
+            "accumulated_usd": 10.0,
+            "cycle_start_trading_day": claim_day.isoformat(),
+            "cycle_reference_close": 100.0,
+            "lowest_drop_seen": 2.0,
+            "fire_attempts": 1,
+            "trading_days_active": 5,
+            "last_evaluated_trading_day": claim_day.isoformat(),
+            "last_evaluated_stream": "afternoon",
+            "last_evaluated_is_real": True,
+        },
+        "settlement_live": True,
+    }
+
+    class _ExactFillBroker:
+        def strategy_order_with_ref_id(self, ticker, trading_day, ref_id):
+            return {"state": "filled", "ref_id": ref_id, "executed_notional": "5.00"}
+
+    ledger = InverseMartingaleLedger(root=tmp_path)
+    ledger.record_step(
+        "AAPL", tracker_state,
+        InverseMartingaleStep(
+            status_before=STATUS_FIRING, status_after=STATUS_FIRING,
+            accumulated_usd_before=15.0, accumulated_usd_after=15.0,
+            newly_crossed_tiers=(), fired=True, fire_amount_usd=5.0,
+            reason="fire_continuation",
+        ),
+    )
+    persisted_tracker_state = ledger.read("AAPL")
+    recovery = ncd._inverse_martingale_recover_pending_lease(
+        ledger, "AAPL", persisted_tracker_state,
+        broker=_ExactFillBroker(), dry_run=False, trading_day=resolution_day, stream="afternoon",
+    )
+
+    assert recovery is not None
+    assert recovery.recovered_state["status"] == STATUS_FIRING
+    assert recovery.recovered_state["accumulated_usd"] == pytest.approx(10.0)
+    # 5 (the age at claim time) + 19 (the calendar-day outage) -- not 5 + 1.
+    assert recovery.recovered_state["trading_days_active"] == 5 + 19
+
+
+def _crash_a_fire_claim(tmp_path, monkeypatch, config, state):
+    """Run day 1 (accumulate) then day 2 (recover, claim, die before placement),
+    returning the on-disk lease the crashed claim left behind."""
+    import near_close_dca as ncd
+
+    _run_day(tmp_path, config, state, TEST_DATES[0], 95.0, "day1")
+    monkeypatch.setattr(
+        ncd,
+        "_process_buy_candidates_batch",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("simulated exit")),
+    )
+    with pytest.raises(RuntimeError, match="simulated exit"):
+        _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2")
+    monkeypatch.undo()
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
+    return tracker_path, json.loads(tracker_path.read_text())
+
+
+class _HistoryBroker(DryRunBroker):
+    """A broker that reports one historical order for the claimed ref."""
+
+    def __init__(self, order, price=96.5):
+        super().__init__(cash=500.0, reference_prices={"AAPL": price})
+        self._order = order
+        self.queried = []
+
+    def strategy_order_with_ref_id(self, ticker, trading_day, ref_id):
+        self.queried.append((ticker, trading_day, ref_id))
+        if self._order is None:
+            return None
+        return {"ref_id": ref_id, **self._order}
+
+
+@pytest.mark.parametrize("terminal_state", ["cancelled", "canceled", "voided", "rejected", "failed"])
+def test_zero_fill_terminal_order_restores_the_whole_claimed_balance(
+    tmp_path, monkeypatch, terminal_state
+):
+    """Regression test for "Recognize every terminal spelling before settling
+    the claim". Robinhood reports both "cancelled" and "canceled" (and
+    "voided"). Reading any of them as nonterminal made reconciliation
+    substitute the order's REQUESTED dollar_amount for its executed amount --
+    which matches the claim exactly -- and permanently discard an accumulator
+    balance no shares were ever bought with.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    assert claim["settlement_claimed_usd"] == pytest.approx(7.0)
+
+    broker = _HistoryBroker(
+        {"state": terminal_state, "dollar_amount": "7.00", "cumulative_quantity": "0", "average_price": "0"}
+    )
+    _, run_state, _ = _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
+    recovered = json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in recovered
+    # No shares were ever bought, so nothing is booked against the claim day's
+    # budget for a purchase that never happened...
+    assert state.day_notional(TEST_DATES[1]) == pytest.approx(0.0)
+    # ...but a real order DID reach the broker, and config/budgets.json counts a
+    # cancelled or rejected buy as an attempt against max_orders_per_day, so the
+    # roster-wide order count for the claim day must still register it (Codex
+    # review: "Count recovered zero-fill orders toward the daily cap").
+    assert state.day_order_count(TEST_DATES[1]) == 1
+    assert state.buys_today("AAPL", TEST_DATES[1]) == 1
+    # ...and the whole $7 survives rather than being written off as spent.
+    assert recovered["accumulated_usd"] == pytest.approx(7.0)
+    # A real order WAS submitted and came back terminal with no fill, so this
+    # counts as a failed fire attempt -- otherwise a repeating crash-then-
+    # terminal-failure cycle would never reach max_fire_attempts.
+    assert recovered["status"] == STATUS_FIRING
+    assert recovered["fire_attempts"] == 1
+    assert recovered["last_evaluated_stream"] == "afternoon"
+    # Stamping this stream also stops a second attempt inside this same run.
+    assert [r for r in run_state["buy_candidates"] if r["ticker"] == "AAPL"] == []
+    assert state.day_notional(TEST_DATES[2]) == pytest.approx(0.0)
+
+
+def test_finite_nonnegative_float_catches_overflow_instead_of_raising():
+    """Regression test for "Catch integer overflow while parsing broker
+    amounts". json.loads() parses an arbitrarily large JSON integer into an
+    unbounded Python int, and float() on one too large to represent RAISES
+    OverflowError rather than returning inf. Uncaught, that escaped
+    _finite_nonnegative_float and _recovered_broker_notional entirely,
+    aborting the whole scheduled run over one malformed broker-history
+    response instead of treating that ticker's settlement as indeterminate
+    and preserving its lease.
+    """
+    import near_close_dca as ncd
+
+    assert ncd._finite_nonnegative_float(10**400) is None
+    assert ncd._finite_nonnegative_float({"amount": 10**400}) is None
+    # An order carrying an unparseable-by-overflow executed_notional must be
+    # treated as indeterminate (preserve the lease), not crash the caller.
+    assert ncd._recovered_broker_notional(
+        {"state": "filled", "executed_notional": 10**400}
+    ) is None
+
+
+def test_recovered_broker_notional_rejects_an_overflowed_product():
+    """Regression test for "Reject overflowed reconstructed notionals". Even
+    when cumulative_quantity and average_price are each individually finite,
+    their PRODUCT can overflow to inf (e.g. two ~1e308 broker fields).
+    Recovery must not treat that infinity as real executed capital -- it
+    would clear the lease and pass it into ledger events and
+    StrategyState.record_buy(), corrupting budget totals.
+    """
+    import near_close_dca as ncd
+
+    huge = 1e308
+    assert ncd._recovered_broker_notional(
+        {"state": "filled", "cumulative_quantity": huge, "average_price": huge}
+    ) is None
+    # A genuinely representable product is unaffected.
+    assert ncd._recovered_broker_notional(
+        {"state": "filled", "cumulative_quantity": 0.07, "average_price": 100.0}
+    ) == pytest.approx(7.0)
+
+
+@pytest.mark.parametrize(
+    "live_state", ["partially_filled", "new", "queued", "confirmed", "unconfirmed"]
+)
+def test_live_order_keeps_the_lease_until_it_is_terminal(tmp_path, monkeypatch, live_state):
+    """Regression test for "Keep live partial fills leased until the order is
+    terminal". A working order can still fill its own remainder. Rebuilding an
+    unleased continuation for the currently-unfilled amount let a later
+    scheduled stream fire that same remainder again -- inverse-Martingale
+    candidates bypass the ordinary duplicate-order guard, so nothing else would
+    have stopped it.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+
+    broker = _HistoryBroker(
+        {
+            "state": live_state,
+            "dollar_amount": "7.00",
+            "cumulative_quantity": "0.03",
+            "average_price": "100.00",
+        }
+    )
+    _, run_state, _ = _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
+
+    assert json.loads(tracker_path.read_text()) == claim  # untouched
+    assert [row for row in run_state["buy_candidates"] if row["ticker"] == "AAPL"] == []
+
+
+@pytest.mark.parametrize(
+    "bad_fields",
+    [
+        {"cumulative_quantity": "corrupt"},
+        {"average_price": "corrupt"},
+        {"cumulative_quantity": "NaN"},
+        {"average_price": "Infinity"},
+        {"cumulative_quantity": "-1"},
+    ],
+)
+def test_unparseable_broker_notional_keeps_the_lease(tmp_path, monkeypatch, bad_fields):
+    """Regression test for "Preserve the lease when broker notional is
+    unparseable". Reading an unusable execution field as $0 made a genuinely
+    live or filled order look like an unplaced claim, releasing the whole
+    balance for a duplicate purchase; an `Infinity` would instead have been
+    booked into strategy state as real spend.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+
+    order = {
+        "state": "filled",
+        "dollar_amount": "7.00",
+        "cumulative_quantity": "0.07",
+        "average_price": "100.00",
+    }
+    order.update(bad_fields)
+    broker = _HistoryBroker(order)
+    _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
+
+    assert json.loads(tracker_path.read_text()) == claim  # untouched
+    assert state.day_notional(TEST_DATES[1]) == pytest.approx(0.0)
+    assert state.day_notional(TEST_DATES[2]) == pytest.approx(0.0)
+
+
+def test_recovery_against_a_different_broker_account_keeps_the_lease(tmp_path, monkeypatch):
+    """Regression test for "Verify the claiming broker account before releasing
+    a lease". Broker history is scoped to one account, so an empty result from a
+    DIFFERENT account says nothing about whether the claim was submitted --
+    releasing on that silence frees a balance whose real order sits in the
+    original account.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    # Built from repeated digits rather than written out, so no account-shaped
+    # literal appears in this file (see test_config_invariants.py's standing
+    # grep for the secrets policy).
+    claiming_account = "1" * 9
+    other_account = "2" * 9
+
+    class _AccountBroker(_HistoryBroker):
+        def __init__(self, account, order=None):
+            super().__init__(order)
+            self._account = account
+
+        def account_number(self):
+            return self._account
+
+    config = _base_config(
+        inverse_martingale={"AAPL": PCT_ENROLLMENT}, target_account_number=claiming_account
+    )
+    state = StrategyState()
+    claiming = _AccountBroker(claiming_account)
+    _run_day(tmp_path, config, state, TEST_DATES[0], 95.0, "day1", broker=claiming)
+    import near_close_dca as ncd
+
+    monkeypatch.setattr(
+        ncd,
+        "_process_buy_candidates_batch",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("simulated exit")),
+    )
+    with pytest.raises(RuntimeError, match="simulated exit"):
+        _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2", broker=claiming)
+    monkeypatch.undo()
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+
+    tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
+    claim = json.loads(tracker_path.read_text())
+    # A non-secret fingerprint, never the account number itself.
+    assert claim["settlement_account"] and claiming_account not in json.dumps(claim)
+
+    # A later run wired to a different account must not release the lease on the
+    # strength of that account's (necessarily empty) history.
+    other_config = _base_config(
+        inverse_martingale={"AAPL": PCT_ENROLLMENT}, target_account_number=other_account
+    )
+    other = _AccountBroker(other_account, order=None)
+    _run_day(tmp_path, other_config, state, TEST_DATES[2], 96.5, "day3", broker=other)
+    # The lookup still runs -- a positive match would be trustworthy however the
+    # accounts line up, since finding the order proves it exists. What is
+    # withheld is the RELEASE: this account's empty history says nothing about
+    # an order submitted into the other one.
+    assert json.loads(tracker_path.read_text()) == claim
+
+
+def test_executed_notional_values_a_fill_with_no_quantity_or_price(tmp_path, monkeypatch):
+    """Regression test for "Honor authoritative executed notional during
+    recovery". `executed_notional` is the broker's own cent-precise settled
+    figure and the field `scripts/broker_reconciliation._executed_dollars`
+    prefers. Ignoring it meant a valid supported row that omits quantity or
+    price reconstructed as $0.00, which recovery read as a confirmed zero-fill
+    and released the entire claim for a second purchase.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    assert claim["settlement_claimed_usd"] == pytest.approx(7.0)
+
+    broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
+    _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
+
+    recovered = json.loads(tracker_path.read_text())
+    # Recognized as a full fill: the claim settles to its target and the $7 is
+    # booked against the claim day, instead of the balance being released as
+    # unplaced and bought a second time today.
+    assert "settlement_pending" not in recovered
+    assert state.day_notional(TEST_DATES[1]) == pytest.approx(7.0)
+    assert state.day_notional(TEST_DATES[2]) == pytest.approx(0.0)
+
+
+def test_terminal_fill_with_no_usable_price_keeps_the_lease(tmp_path, monkeypatch):
+    """A reported fill nobody can value is indeterminate, not a confirmed zero
+    -- the distinction `broker_reconciliation` tracks as `has_unvalued_fill`."""
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+
+    # A real fill (quantity > 0) with no price and no executed_notional.
+    broker = _HistoryBroker({"state": "cancelled", "cumulative_quantity": "0.03"})
+    _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
+    assert json.loads(tracker_path.read_text()) == claim
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        {"state": "filled"},  # no valuation fields at all
+        {"state": "filled", "executed_notional": "0"},
+        {"state": "filled", "cumulative_quantity": "0", "average_price": "0"},
+    ],
+)
+def test_a_filled_order_with_no_positive_valuation_keeps_the_lease(tmp_path, monkeypatch, order):
+    """Regression test for "Treat filled orders without positive notional as
+    indeterminate".
+
+    A `state="filled"` row with no positive valuation from any field fell
+    through to 0.0, so recovery read it as a confirmed zero-fill, restored the
+    entire accumulator balance and allowed it to be submitted again -- even
+    though the broker is saying the original order executed. Zero is only ever
+    defensible for a terminal FAILURE state, where "nothing executed" is what
+    the state itself means.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+
+    broker = _HistoryBroker(order)
+    _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
+    # Indeterminate: the lease survives exactly as the crash left it, and no
+    # balance is released for a second purchase.
+    assert json.loads(tracker_path.read_text()) == claim
+    assert state.day_notional(TEST_DATES[1]) == pytest.approx(0.0)
+
+
+def test_live_run_releases_an_expired_dry_run_lease(tmp_path, monkeypatch):
+    """Regression test for "Let live runs release leases created by dry runs".
+    `settlement_live=False` proves no broker order could exist, so no account
+    holds one and account identity is irrelevant. Comparing anyway froze such a
+    lease forever once the configured account value changed — exactly what
+    happens when a dry run fingerprints a placeholder and a live run later
+    supplies the real value.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    dry = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT}, dry_run=True)
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, dry, state)
+    assert claim["settlement_live"] is False
+    # A dry-run claim pins no account: there is no order for one to be found in.
+    assert claim.get("settlement_account") is None
+
+    live = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    broker = _HistoryBroker(None)
+    _run_day(tmp_path, live, StrategyState(), TEST_DATES[2], 96.5, "day3", broker=broker)
+
+    released = json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in released
+    # The balance was never spent, so it survives the release intact.
+    assert released.get("accumulated_usd", 0.0) > 0 or released["status"] == STATUS_NONE
+
+
+def test_same_day_recovery_of_a_removed_ticker_is_still_published(tmp_path, monkeypatch):
+    """Regression test for "Emit recovered orders even when the ticker has no
+    decision". `_build_buy_candidates` iterates decisions, and the ledger-wide
+    recovery pass deliberately reaches tickers that have none — an un-enrolled
+    or removed ticker. Its recovered purchase was therefore dropped from
+    `buy_candidates` and `orders_placed_count` in exactly the scenario the pass
+    exists to support.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+
+    # SAME trading day as the claim, but the ticker is gone from the universe,
+    # so this run produces no decision for it at all.
+    removed = _base_config(inverse_martingale={}, tickers=("MSFT",))
+    broker = _HistoryBroker(
+        {"state": "filled", "executed_notional": "7.00"}, price=96.5
+    )
+    _, run_state, _ = _run_day(
+        tmp_path, removed, state, TEST_DATES[1], 96.5, "day2b", broker=broker
+    )
+
+    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    rows = [row for row in run_state["buy_candidates"] if row["ticker"] == "AAPL"]
+    assert len(rows) == 1
+    assert rows[0]["reason"] == "recovered_inverse_martingale_lease"
+    assert rows[0]["status"] == "submitted"
+    assert float(rows[0]["planned_amount_usd"]) == pytest.approx(7.0)
+    # Signal-derived fields are absent rather than fabricated: this row records a
+    # purchase reconstructed from broker history, not a decision this run made.
+    assert rows[0]["target_price"] is None
+    # Per-ticker, not day_notional: this run also buys MSFT through the ordinary
+    # ladder, and the day aggregate sums every ticker.
+    assert state.buys_today("AAPL", TEST_DATES[1]) == 1
+
+
+def test_live_claim_without_a_fingerprint_is_never_released_on_absence(tmp_path, monkeypatch):
+    """Regression test for "Refuse live claims without an account fingerprint".
+    When the identity cannot be computed -- an unwritable key, a refused probe --
+    persisting no account at all made the lease indistinguishable from a legacy
+    one, which recovery exempts from account matching. A later run wired to a
+    different account could then release the balance on that account's empty
+    history.
+    """
+    import near_close_dca as ncd
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    # Simulate a fingerprint that cannot be computed at claim time.
+    monkeypatch.setattr(ncd, "_broker_account_fingerprint", lambda *a, **k: None)
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    # Recorded explicitly as unknown, NOT omitted -- omission reads as "legacy
+    # lease, nothing to contradict" and would permit the release below.
+    assert claim["settlement_live"] is True
+    assert claim["settlement_account"] == ncd._LEASE_ACCOUNT_UNKNOWN
+
+    monkeypatch.setattr(ncd, "_broker_account_fingerprint", lambda *a, **k: None)
+    broker = _HistoryBroker(None)
+    _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
+    assert json.loads(tracker_path.read_text()) == claim  # preserved, not released
+
+
+def test_mapping_shaped_executed_notional_is_valued(tmp_path, monkeypatch):
+    """Regression test for "Parse mapping-shaped executed notionals". A Robinhood
+    money value is a scalar OR a {"amount": ...} mapping (see
+    scripts/broker_reconciliation._money). Rejecting the mapping made a
+    perfectly valuable fill read as unreadable and froze its lease.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+
+    broker = _HistoryBroker({"state": "filled", "executed_notional": {"amount": "7.00"}})
+    _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
+
+    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert state.day_notional(TEST_DATES[1]) == pytest.approx(7.0)
+
+
+def test_dry_run_lease_expires_without_a_broker_lookup(tmp_path, monkeypatch):
+    """Regression test for "Skip broker lookup for dry-run-origin leases".
+    settlement_live=False proves no order was ever submitted, so no history can
+    contain it. Requiring the lookup anyway froze such a lease behind an adapter
+    that cannot query client ids at all.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    dry = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT}, dry_run=True)
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, dry, state)
+    assert claim["settlement_live"] is False
+
+    class _NoHistoryBroker(DryRunBroker):
+        """An adapter that cannot reconcile by client id at all (AlpacaBroker-like)."""
+
+        def __init__(self):
+            super().__init__(cash=500.0, reference_prices={"AAPL": 96.5})
+
+        strategy_order_with_ref_id = None
+
+    live = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    _run_day(
+        tmp_path, live, StrategyState(), TEST_DATES[2], 96.5, "day3", broker=_NoHistoryBroker()
+    )
+    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+
+
+def test_partial_fill_that_exhausts_the_balance_resolves_the_cycle(tmp_path, monkeypatch):
+    """Regression test for "Resolve partial fills that exhaust the accumulator".
+    A recovered amount below the claim but at or above the pre-fire balance left
+    STATUS_FIRING with accumulated_usd=0 -- which the validator rejects as
+    corruption on the very next read, permanently skipping the ticker.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    assert claim["accumulated_usd"] == pytest.approx(7.0)
+
+    # Differs from the $7 claim, but consumes the whole $7 balance.
+    broker = _HistoryBroker({"state": "cancelled", "executed_notional": "7.50"})
+    _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
+
+    recovered = json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in recovered
+    # The paid floor PRICE is persisted alongside the metric, exactly as every
+    # ordinary fire-resolution path does. With only the metric, the same-day
+    # re-arm guard compares it in whatever reference frame a later stream has,
+    # and a price still above the already-paid floor can read as a fresh deeper
+    # descent and re-credit tiers that were already bought (Codex review:
+    # "Preserve the paid floor price on recovered resolution").
+    assert recovered.get("fired_floor_price") is not None
+    assert recovered["fired_floor_price"] > 0
+    # A resolved marker, never an active cycle holding a zero balance.
+    assert not (
+        recovered.get("status") == STATUS_FIRING
+        and float(recovered.get("accumulated_usd", 0.0)) <= 0
+    )
+    # And it must still be readable -- the corruption this guards against showed
+    # up only on the NEXT load.
+    InverseMartingaleLedger(
+        root=tmp_path / "cron_tracking" / "inverse_martingale_dca"
+    ).read("AAPL")
+    # The claim's own rearm_last_seen_day must survive into the recovered
+    # marker (Codex review: "Preserve the pre-split close in recovered
+    # resolution"). Without it, the split-rebase lookup on the next
+    # evaluation never runs -- isinstance(rearm_last_seen_day, str) is its
+    # gate -- so a real corporate action between this claim and the next
+    # evaluation can never be detected.
+    assert recovered["rearm_last_seen_day"] == claim["settlement_target_state"]["rearm_last_seen_day"]
+
+
+def test_stale_recovery_is_not_added_to_the_seven_day_deployment(tmp_path, monkeypatch):
+    """Regression test for "Exclude stale recoveries from the seven-day deployment
+    total". _load_deployment_history_states sums only the trailing kill-switch
+    window, so a claim day outside it is no longer part of the configured
+    exposure and must not inflate the runtime figure."""
+    from datetime import date as _date
+
+    from near_close_dca import _within_kill_switch_window
+
+    today = _date(2026, 6, 30)
+    assert _within_kill_switch_window(today, today)
+    assert _within_kill_switch_window(today - timedelta(days=6), today)
+    assert not _within_kill_switch_window(today - timedelta(days=7), today)
+    assert not _within_kill_switch_window(today - timedelta(days=30), today)
+    # A future claim day is not in the trailing window either.
+    assert not _within_kill_switch_window(today + timedelta(days=1), today)
+
+
+def test_filled_order_without_cumulative_quantity_uses_quantity(tmp_path, monkeypatch):
+    """Regression test for "Fall back to quantity when valuing filled orders".
+    scripts/broker_reconciliation._normalize_orders falls back to `quantity`
+    when `cumulative_quantity` is genuinely absent; without the same fallback a
+    real fill valued as $0.00 and the whole claim was released for a duplicate
+    purchase.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+
+    broker = _HistoryBroker({"state": "filled", "quantity": "0.07", "average_price": "100.00"})
+    _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
+
+    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert state.day_notional(TEST_DATES[1]) == pytest.approx(7.0)
+
+
+def test_cancelled_order_never_treats_requested_quantity_as_executed(tmp_path, monkeypatch):
+    """The fallback is scoped to "filled": on a cancelled order `quantity` is
+    what was REQUESTED, so using it would write off a balance no shares bought."""
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+
+    broker = _HistoryBroker({"state": "cancelled", "quantity": "0.07", "average_price": "100.00"})
+    _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
+    # Zero executed -> nothing is booked, and the balance survives intact as a
+    # failed fire attempt rather than being written off.
+    recovered = json.loads(tracker_path.read_text())
+    assert state.day_notional(TEST_DATES[1]) == pytest.approx(0.0)
+    assert state.day_notional(TEST_DATES[2]) == pytest.approx(0.0)
+    assert recovered["accumulated_usd"] == pytest.approx(7.0)
+
+
+def test_same_day_recovery_of_an_enrolled_ticker_is_not_a_credit_flush(tmp_path, monkeypatch):
+    """Regression test for "Mark covered recovery rows as recoveries". An
+    enrolled ticker still has a (non-BUY) decision, so a recovered outcome
+    matched the pending-credit-flush shape and was published with that
+    decision's reason and signal fields — a credit flush that never happened.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+
+    # SAME trading day as the claim, ticker still enrolled -> it has a decision.
+    broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"}, price=96.5)
+    _, run_state, _ = _run_day(
+        tmp_path, config, state, TEST_DATES[1], 96.5, "day2b", broker=broker
+    )
+    rows = [r for r in run_state["buy_candidates"] if r["ticker"] == "AAPL"]
+    assert len(rows) == 1
+    assert rows[0]["reason"] == "recovered_inverse_martingale_lease"
+    assert rows[0]["is_pending_credit_flush"] is False
+    assert float(rows[0]["planned_amount_usd"]) == pytest.approx(7.0)
+
+
+def test_recovery_does_not_rebook_spend_already_on_disk(tmp_path, monkeypatch):
+    """Regression test for "Avoid rebooking recovery spend already persisted in
+    state". own_orders_recorded is run-scoped and deliberately not persisted,
+    while StrategyState is -- so a prior run that booked the buy, persisted, and
+    wrote its artifact before dying would have its spend counted twice.
+    """
+    import near_close_dca as ncd
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+
+    # Model the durable evidence: an on-disk artifact already records this
+    # ticker/day submission, exactly as the failure handler would have written.
+    monkeypatch.setattr(
+        ncd, "_same_day_order_recorded_in_any_stream", lambda *a, **k: True
+    )
+    # A fresh StrategyState carrying the already-persisted spend, and an EMPTY
+    # own_orders_recorded -- the post-restart shape.
+    restored = StrategyState()
+    restored.record_buy("AAPL", TEST_DATES[1], 7.0)
+    assert restored.day_notional(TEST_DATES[1]) == pytest.approx(7.0)
+
+    broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
+    _run_day(
+        tmp_path, config, restored, TEST_DATES[2], 96.5, "day3", broker=broker,
+        deployment_history_root=tmp_path / "runs",
+    )
+
+    # Still $7, not $14.
+    assert restored.day_notional(TEST_DATES[1]) == pytest.approx(7.0)
+    assert restored.buys_today("AAPL", TEST_DATES[1]) == 1
+
+
+def test_prior_week_recovery_forces_the_rollover_reserve_to_recompute(tmp_path, monkeypatch):
+    """Regression test for "Recompute rollover reserve after prior-week
+    recovery". The reserve is computed once per week and keyed by
+    reserve_week_key, so a run earlier in the week may have rolled it from a
+    prior-week total that omitted the pending order; roll_weekly_reserve() would
+    then early-return and leave it overstated forever.
+    """
+    import near_close_dca as ncd
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    claim_day = date.fromisoformat(claim["settlement_trading_day"])
+
+    # Recover a full week later, so the claim day sits in an earlier ISO week.
+    later = claim_day + timedelta(days=7)
+    monkeypatch.setattr(ncd, "_within_kill_switch_window", lambda *a, **k: True)
+    config = _base_config(
+        inverse_martingale={"AAPL": PCT_ENROLLMENT},
+        approved_test_dates=frozenset({*TEST_DATES, later}),
+    )
+    fresh = StrategyState()
+    # An earlier run this week already rolled the reserve for this week.
+    fresh.reserve_week_key = ncd.iso_week_key(later)
+
+    broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
+    _run_day(tmp_path, config, fresh, later, 96.5, "wk2", broker=broker)
+
+    # The stale key was cleared so the roll recomputed from the corrected total.
+    assert fresh.reserve_week_key == ncd.iso_week_key(later)
+    assert fresh.day_notional(claim_day) == pytest.approx(7.0)
+
+
+def test_expired_order_is_settled_not_left_indeterminate(tmp_path, monkeypatch):
+    """Regression test for "Treat expired broker orders as settled". The repo's
+    canonical terminal set (scripts/broker_reconciliation._TERMINAL_ORDER_STATES)
+    includes "expired"; omitting it here made an expired order look
+    indeterminate, so its lease was preserved forever even though the order can
+    no longer execute.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+
+    # Expired with a real partial fill: it must settle, not hang.
+    broker = _HistoryBroker({"state": "expired", "executed_notional": "3.00"})
+    _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
+
+    recovered = json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in recovered
+    assert state.day_notional(TEST_DATES[1]) == pytest.approx(3.0)
+
+
+def test_lease_fingerprint_key_is_published_atomically(tmp_path):
+    """Regression test for "Wait for the fingerprint key to be initialized".
+    Creating the real path with O_EXCL and writing afterwards left a window
+    where a concurrent first-time process saw the file exist, read it EMPTY and
+    gave up -- persisting a live claim as settlement_account="unknown", which
+    recovery then refuses to release forever.
+    """
+    import threading
+
+    from near_close_dca import _LEASE_FINGERPRINT_KEY_FILENAME, _lease_fingerprint_key
+
+    key_dir = tmp_path / "keys"
+    results = []
+    barrier = threading.Barrier(8)
+
+    def _race():
+        barrier.wait()
+        results.append(_lease_fingerprint_key(key_dir))
+
+    threads = [threading.Thread(target=_race) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Every racer gets the SAME non-empty key -- never None, never a private one.
+    assert None not in results
+    assert len(set(results)) == 1
+    assert results[0] == (key_dir / _LEASE_FINGERPRINT_KEY_FILENAME).read_bytes().strip()
+    # No temp files left behind. The publish lock's own file is expected: both
+    # publication paths now serialize on it, so it is created on the way to the
+    # key rather than being leftover scratch.
+    leftover = sorted(
+        p.name for p in key_dir.iterdir()
+        if p.name != f"{_LEASE_FINGERPRINT_KEY_FILENAME}.lock"
+    )
+    assert leftover == [_LEASE_FINGERPRINT_KEY_FILENAME]
+
+
+def test_lease_fingerprint_key_survives_a_mixed_link_and_replace_race(tmp_path, monkeypatch):
+    """Regression test for "Avoid overwriting a concurrently published
+    fingerprint key".
+
+    ``os.link`` is no-clobber; ``os.replace`` is not. Only the replace path used
+    to take the lock, so a process whose link failed could check ``_published()``,
+    see nothing, and then have its replace overwrite a key a LINK-path process
+    published in between. Any claim already fingerprinted under the overwritten
+    key could never match the surviving one, and recovery refuses to release a
+    lease whose account it cannot confirm -- the accumulator freezes permanently.
+
+    The two paths are not as mutually exclusive as "the filesystem either
+    supports hard links or it does not" suggests: a transient EIO/ENOSPC, an LSM
+    denial hitting one process, or two mounts of the same tree with different
+    link support all put one racer on each path. That mix is what this models.
+
+    The interleaving is FORCED rather than raced for, so this fails
+    deterministically against the old code instead of depending on scheduling.
+    """
+    import errno
+    import threading
+
+    import near_close_dca as ncd
+    from near_close_dca import _LEASE_FINGERPRINT_KEY_FILENAME, _lease_fingerprint_key
+
+    real_link = ncd.os.link
+    real_replace = ncd.os.replace
+    at_replace = threading.Event()
+    release_replace = threading.Event()
+
+    def _split_link(src, dst, **kwargs):
+        """The replace-path thread's link fails transiently; the link-path
+        thread's succeeds."""
+        if threading.current_thread().name == "replace-path":
+            raise OSError(errno.EIO, "transient I/O error")
+        return real_link(src, dst, **kwargs)
+
+    def _blocking_replace(src, dst, **kwargs):
+        """Pin the replace-path thread at the exact moment after its
+        _published() check saw nothing, and hold it there until the driver says
+        go."""
+        at_replace.set()
+        release_replace.wait(timeout=10.0)
+        return real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(ncd.os, "link", _split_link)
+    monkeypatch.setattr(ncd.os, "replace", _blocking_replace)
+
+    key_dir = tmp_path / "keys"
+    results: dict[str, object] = {}
+
+    def _publish():
+        results[threading.current_thread().name] = _lease_fingerprint_key(key_dir)
+
+    replace_thread = threading.Thread(target=_publish, name="replace-path")
+    link_thread = threading.Thread(target=_publish, name="link-path")
+
+    replace_thread.start()
+    assert at_replace.wait(timeout=10.0), "replace path never reached os.replace"
+    # Release the link path only now -- after the replace path is past its
+    # _published() check. That ordering IS the bug.
+    link_thread.start()
+    # Let the link path RETURN before the replace lands. Returning is what makes
+    # the clobber harmful: the caller goes on to fingerprint live claims with
+    # the key it was handed, and _lease_fingerprint_key re-reads the file on
+    # every call, so a clobber after that point orphans those claims forever.
+    #
+    # Under the OLD code the link path takes no lock, so it completes here.
+    # Under the FIXED code it is waiting on the same lock the replace path
+    # holds, so this join times out -- and the replace is released below, which
+    # is what lets it finish.
+    link_thread.join(timeout=2.0)
+    release_replace.set()
+    replace_thread.join(timeout=20.0)
+    link_thread.join(timeout=20.0)
+    assert not replace_thread.is_alive() and not link_thread.is_alive()
+
+    # Every caller must still hold the key that is on disk at the end. The
+    # clobber's signature is precisely a caller whose returned key stopped
+    # matching the surviving file -- its already-fingerprinted leases could
+    # never be confirmed again, and recovery refuses to release those.
+    on_disk = (key_dir / _LEASE_FINGERPRINT_KEY_FILENAME).read_bytes().strip()
+    assert None not in results.values()
+    assert set(results.values()) == {on_disk}
+
+
+def test_lease_fingerprint_key_falls_back_when_hard_links_are_unavailable(tmp_path, monkeypatch):
+    """Regression test for "Provide a fallback when hard-link publication is
+    unavailable".
+
+    On a filesystem that does not support or permit hard links (a bind-mounted
+    share, some container overlays, exFAT/FAT), ``os.link`` raises OSError, the
+    outer handler returned ``_published()`` as None, and every live claim was
+    persisted with ``settlement_account="unknown"`` -- which recovery then
+    refuses to release, freezing the accumulator permanently on that host.
+    """
+    import errno
+    import threading
+
+    import near_close_dca as ncd
+    from near_close_dca import _LEASE_FINGERPRINT_KEY_FILENAME, _lease_fingerprint_key
+
+    def _no_hard_links(src, dst, **kwargs):
+        raise OSError(errno.EPERM, "hard links not permitted")
+
+    monkeypatch.setattr(ncd.os, "link", _no_hard_links)
+
+    key_dir = tmp_path / "keys"
+    results = []
+    barrier = threading.Barrier(8)
+
+    def _race():
+        barrier.wait()
+        results.append(_lease_fingerprint_key(key_dir))
+
+    threads = [threading.Thread(target=_race) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # The lock-serialized rename gives the same guarantee the link publish did:
+    # a real key for everyone, and exactly ONE of them -- never None, so no
+    # claim is written as settlement_account="unknown" on these hosts.
+    assert None not in results
+    assert len(set(results)) == 1
+    assert results[0] == (key_dir / _LEASE_FINGERPRINT_KEY_FILENAME).read_bytes().strip()
+    # No temp files left behind; the sidecar lock file is expected.
+    leftovers = {p.name for p in key_dir.iterdir()} - {
+        _LEASE_FINGERPRINT_KEY_FILENAME, f"{_LEASE_FINGERPRINT_KEY_FILENAME}.lock"
+    }
+    assert leftovers == set()
+
+
+def test_lease_fingerprint_key_treats_undecodable_bytes_as_unavailable(tmp_path):
+    """Regression test for "Treat an undecodable fingerprint key as
+    unavailable". A partially restored or corrupted key file can contain
+    non-UTF-8 bytes; ``Path.read_text()`` raises ``UnicodeDecodeError`` on
+    those, which is NOT an ``OSError`` and previously propagated straight out
+    of ``_lease_fingerprint_key`` (and therefore out of
+    ``_broker_account_fingerprint``), aborting the entire scheduled run
+    instead of failing closed to "record no account identity" like every
+    other unusable-key case here.
+    """
+    from near_close_dca import _LEASE_FINGERPRINT_KEY_FILENAME, _lease_fingerprint_key
+
+    key_dir = tmp_path / "keys"
+    key_dir.mkdir(parents=True)
+    (key_dir / _LEASE_FINGERPRINT_KEY_FILENAME).write_bytes(b"\xff\xfe\x00corrupted")
+
+    # Must not raise. A corrupted key that already occupies the path can't
+    # be overwritten by the ordinary "create if absent" publish path either
+    # (that would reintroduce the exact empty-file race the atomic os.link
+    # publish exists to close), so this fails closed to None -- "record no
+    # account identity" -- exactly like every other unusable-key case here,
+    # instead of aborting the caller with an uncaught UnicodeDecodeError.
+    assert _lease_fingerprint_key(key_dir) is None
+
+
+def test_lease_fingerprint_key_rejects_material_that_is_not_full_length_hex(tmp_path):
+    """Regression test for "Validate persisted fingerprint key material
+    before use". A partially restored or truncated key file can hold valid
+    UTF-8 that is still not the 64-lowercase-hex shape ``secrets.token_hex(32)``
+    always publishes -- a one-character or truncated hex string, say.
+    Trusting it as-is keyed new fingerprints with far weaker material than
+    the documented 256 bits, and made every existing lease's fingerprint
+    permanently unmatchable once a correct key was eventually regenerated.
+    """
+    from near_close_dca import _LEASE_FINGERPRINT_KEY_FILENAME, _lease_fingerprint_key
+
+    key_dir = tmp_path / "keys"
+    key_dir.mkdir(parents=True)
+    (key_dir / _LEASE_FINGERPRINT_KEY_FILENAME).write_text("ab", encoding="utf-8")
+
+    # Must not accept the truncated material as the key -- same fail-closed
+    # "record no account identity" outcome as every other unusable-key case.
+    assert _lease_fingerprint_key(key_dir) is None
+
+
+def test_lease_fingerprint_key_directory_is_fsynced_after_publishing(tmp_path, monkeypatch):
+    """Regression test for "Fsync the key directory after publishing".
+
+    ``os.link``/``os.replace`` are already atomic, so the key is never
+    observed half-written -- but the directory ENTRY they create can still be
+    lost on power loss before the parent directory's own metadata reaches
+    stable storage. A next process that lost the entry would generate
+    different key material, permanently unable to match the account
+    fingerprint a pending lease already recorded.
+    """
+    import near_close_dca as ncd
+    from near_close_dca import _lease_fingerprint_key
+
+    fsynced_dirs = []
+    real_fsync_directory = ncd._fsync_directory
+
+    def _spy(path):
+        fsynced_dirs.append(path)
+        real_fsync_directory(path)
+
+    monkeypatch.setattr(ncd, "_fsync_directory", _spy)
+
+    key_dir = tmp_path / "keys"
+    key = _lease_fingerprint_key(key_dir)
+
+    assert key is not None
+    assert fsynced_dirs == [key_dir]
+
+
+def test_lease_fingerprint_key_directory_is_fsynced_on_the_fallback_path(tmp_path, monkeypatch):
+    """The same durability guarantee applies to the lock-serialized os.replace
+    fallback used when the filesystem does not support hard links."""
+    import errno
+
+    import near_close_dca as ncd
+    from near_close_dca import _lease_fingerprint_key
+
+    def _no_hard_links(src, dst, **kwargs):
+        raise OSError(errno.EPERM, "hard links not permitted")
+
+    monkeypatch.setattr(ncd.os, "link", _no_hard_links)
+
+    fsynced_dirs = []
+    real_fsync_directory = ncd._fsync_directory
+
+    def _spy(path):
+        fsynced_dirs.append(path)
+        real_fsync_directory(path)
+
+    monkeypatch.setattr(ncd, "_fsync_directory", _spy)
+
+    key_dir = tmp_path / "keys"
+    key = _lease_fingerprint_key(key_dir)
+
+    assert key is not None
+    assert fsynced_dirs == [key_dir]
+
+
+def test_lease_fingerprint_key_adopts_a_publish_that_landed_before_the_lock(tmp_path, monkeypatch):
+    """Regression test for "Avoid overwriting a concurrently published
+    fingerprint key".
+
+    The fallback branch only runs after an ``os.link`` call has failed for a
+    non-EEXIST reason. That failure can be a one-off transient error rather than
+    "this filesystem has no hard links at all" -- so a concurrent caller can
+    still land a real ``os.link`` publish around the same time. The old fallback
+    did a plain ``_published() is None`` check and then an UNCONDITIONAL
+    ``os.replace``, a non-atomic check-then-act pair: a publish landing in that
+    window was silently overwritten with different material, handing two callers
+    two different keys for what must be one durable fingerprint secret.
+
+    Both publication paths now take the same lock, so the only way another
+    publish can exist by the time this one looks is if it completed BEFORE the
+    lock was acquired -- which is exactly what this simulates. The winner's
+    material must be adopted, never replaced.
+
+    See test_lease_fingerprint_key_survives_a_mixed_link_and_replace_race for
+    the concurrent, two-thread version that forces the interleaving itself.
+    """
+    import contextlib
+    import errno
+
+    import near_close_dca as ncd
+    import scripts.file_lock as file_lock_module
+    from near_close_dca import _LEASE_FINGERPRINT_KEY_FILENAME, _lease_fingerprint_key
+
+    # Must be the real 64-lowercase-hex shape _lease_fingerprint_key
+    # publishes and validates -- see "Validate persisted fingerprint key
+    # material before use" -- or this concurrent-publisher simulation gets
+    # rejected by that same validation instead of exercising the race.
+    _CONCURRENT_PUBLISHER_MATERIAL = "c0" * 32
+
+    key_dir = tmp_path / "keys"
+    key_path = key_dir / _LEASE_FINGERPRINT_KEY_FILENAME
+
+    def _transient_link_failure(src, dst, **kwargs):
+        raise OSError(errno.EIO, "transient link failure")
+
+    real_lock = file_lock_module.cross_process_lock
+
+    @contextlib.contextmanager
+    def _lock_that_loses_the_race(*args, **kwargs):
+        """Acquire normally, but have a concurrent publisher win just before we
+        do -- the one ordering that can still put another key on disk now that
+        every publisher is serialized on this lock."""
+        with real_lock(*args, **kwargs):
+            key_path.write_text(_CONCURRENT_PUBLISHER_MATERIAL, encoding="utf-8")
+            yield
+
+    monkeypatch.setattr(ncd.os, "link", _transient_link_failure)
+    monkeypatch.setattr(file_lock_module, "cross_process_lock", _lock_that_loses_the_race)
+
+    key = _lease_fingerprint_key(key_dir)
+
+    # The winner's material survives untouched, and is what this caller is
+    # handed -- not this call's own (different) random material.
+    assert key == _CONCURRENT_PUBLISHER_MATERIAL.encode("utf-8")
+    assert key_path.read_text(encoding="utf-8") == _CONCURRENT_PUBLISHER_MATERIAL
+
+
+def _write_morning_deployment_artifact(root, trading_day, order_id):
+    """A real, VALID morning-stream scheduled run_state carrying one submitted order.
+
+    Built from scripts.run_classification's own morning-slot constants rather
+    than hand-written strings: validate_classification() requires the whole
+    morning identity tuple to be coherent (cron id, window, run id, no
+    afternoon lineage), and a block that fails it classifies as STREAM_OTHER --
+    which every deployment predicate ignores, so the artifact would prove
+    nothing about the stream filtering under test.
+    """
+    from scripts.run_classification import (
+        MORNING_SLOT_CRON_ID,
+        MORNING_SLOT_SCHEDULED_FOR_ET,
+        MORNING_SLOT_SCHEDULED_WINDOW_END_ET,
+        MORNING_SLOT_SCHEDULED_WINDOW_START_ET,
+        MORNING_SLOT_STREAM,
+        build_scheduled_classification,
+        validate_classification,
+    )
+
+    day = trading_day.isoformat()
+    generated_at = f"{day}T10:30:00Z"
+    classification = build_scheduled_classification(
+        day,
+        generated_at,
+        stream=MORNING_SLOT_STREAM,
+        cron_id=MORNING_SLOT_CRON_ID,
+        supersedes_cron_id=None,
+        scheduled_for_et=MORNING_SLOT_SCHEDULED_FOR_ET,
+        scheduled_window_start_et=MORNING_SLOT_SCHEDULED_WINDOW_START_ET,
+        scheduled_window_end_et=MORNING_SLOT_SCHEDULED_WINDOW_END_ET,
+        run_id=f"scheduled_{day.replace('-', '')}_1030ET",
+        valid_afternoon_scheduled_evidence=False,
+    )
+    verdict = validate_classification(classification)
+    assert verdict.ok, verdict
+
+    run_dir = root / f"{day}-morning"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "run_id": classification["run_id"],
+                "generated_at": generated_at,
+                "trading_day": day,
+                "broker": "robinhood",
+                "budget": {"budget_tier": "normal", "daily_cap_usd": 180, "weekly_cap_usd": 900},
+                "counts": {"submitted": 1},
+                "run_classification": classification,
+                "buy_candidates": [
+                    {
+                        "ticker": "AAPL", "buy_multiplier": 1.0, "planned_amount_usd": 7.0,
+                        "status": "submitted", "order_id": order_id,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return run_dir
+
+
+def test_recovery_idempotency_sees_a_morning_artifact_the_kill_switch_ignores(tmp_path):
+    """Regression test for "Check every roster stream before rebooking a
+    recovery".
+
+    The order-identity predicate introduced for recovery idempotency filtered
+    through `is_afternoon_scheduled_evidence`, which explicitly rejects morning
+    and midday artifacts. A morning or midday worker that persisted BOTH
+    `record_buy()` and its submitted-order artifact and then crashed before
+    deferred settlement therefore looked un-booked to the afternoon recovery
+    run, which recorded the same dollars and attempt a second time and
+    republished the order, overstating the shared daily and weekly caps.
+
+    "Has this order already been booked?" is a question about every stream;
+    only "does it count toward the afternoon kill-switch total?" is
+    afternoon-scoped. This pins both halves against a REAL on-disk artifact
+    rather than a monkeypatched predicate.
+    """
+    from near_close_dca import (
+        _same_day_order_deployment_already_recorded,
+        _same_day_order_recorded_in_any_stream,
+    )
+
+    root = tmp_path / "runs"
+    trading_day = TEST_DATES[1]
+    _write_morning_deployment_artifact(root, trading_day, "MORNING-ORDER-1")
+    wanted = {"MORNING-ORDER-1"}
+
+    # Booking idempotency must SEE the morning artifact...
+    assert _same_day_order_recorded_in_any_stream(wanted, trading_day, root) is True
+    # ...while kill-switch accounting must still ignore it, because morning
+    # capital is deliberately excluded from that stream.
+    assert _same_day_order_deployment_already_recorded(wanted, trading_day, root) is False
+
+    # An unrelated order id matches nothing under either question.
+    assert _same_day_order_recorded_in_any_stream({"OTHER"}, trading_day, root) is False
+
+
+def test_a_morning_claim_recovered_by_the_afternoon_stays_out_of_that_stream(tmp_path, monkeypatch):
+    """Regression test for "Preserve the claiming stream when booking recovered
+    spend".
+
+    A lease outlives the run that claimed it, so the afternoon slot routinely
+    recovers a MORNING claim. Deployment is accounted per stream and never
+    conflated -- dca_risk's kill-switch figure counts only scheduled-afternoon
+    capital, and `is_afternoon_scheduled_evidence` explicitly rejects morning
+    and midday runs. Adding a morning claim's dollars to the runtime
+    seven-day figure, and publishing its row inside an afternoon artifact, made
+    every future `deployed_by_day()` scan read morning capital as afternoon
+    deployment -- permanently, since the artifact is durable -- inflating the
+    kill-switch total and spuriously capping later candidates.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+
+    # Claim on the MORNING stream, then crash before placement.
+    import near_close_dca as ncd
+
+    _run_day(tmp_path, config, state, TEST_DATES[0], 95.0, "day1", stream="morning")
+    monkeypatch.setattr(
+        ncd,
+        "_process_buy_candidates_batch",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("simulated exit")),
+    )
+    with pytest.raises(RuntimeError, match="simulated exit"):
+        _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2", stream="morning")
+    monkeypatch.undo()
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+
+    tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
+    claim = json.loads(tracker_path.read_text())
+    # The lease records where the money came from, so a later stream can tell.
+    assert claim["settlement_stream"] == "morning"
+
+    # The AFTERNOON slot recovers it the same day.
+    baseline_7d = config.deployed_last_7d_usd
+    broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
+    result, run_state, _ = _run_day(
+        tmp_path, config, state, TEST_DATES[1], 96.5, "day2-afternoon", broker=broker,
+        stream="afternoon", deployment_history_root=tmp_path / "runs",
+    )
+
+    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    # The shared daily/weekly budget IS charged -- those caps span the roster.
+    assert state.day_notional(TEST_DATES[1]) == pytest.approx(7.0)
+    # But the afternoon-only kill-switch figure is untouched, and no row lands
+    # in this afternoon artifact to be re-read as afternoon deployment later.
+    assert config.deployed_last_7d_usd == pytest.approx(baseline_7d)
+    assert [
+        r for r in run_state["buy_candidates"]
+        if r["reason"] == "recovered_inverse_martingale_lease"
+    ] == []
+    # Regression assertion for "Persist claim metadata before suppressing
+    # cross-stream recovery rows": since no run artifact carries this
+    # recovery, the tracker itself must durably record which claim it
+    # resolved -- the ledger's own generic step-event log carries no date,
+    # stream, order id, or claim ref at all.
+    last_recovery = json.loads(tracker_path.read_text())["last_recovery"]
+    assert last_recovery["claim_trading_day"] == claim["settlement_trading_day"]
+    assert last_recovery["claim_stream"] == "morning"
+    assert last_recovery["claim_ref"] == claim["settlement_ref_id"]
+    assert last_recovery["recovered_amount_usd"] == pytest.approx(7.0)
+    assert last_recovery["reconciled_trading_day"] == TEST_DATES[1].isoformat()
+    assert last_recovery["reconciled_stream"] == "afternoon"
+
+    # Regression assertion for "Persist recovery attribution in the audit
+    # event": the top-level last_recovery field above is overwritten
+    # wholesale the next time this cycle resolves (fires, is abandoned, or
+    # is reset) -- resolved_marker() carries no such field forward. The
+    # SAME attribution must also live in the ledger's own append-only event
+    # log, which survives that replacement.
+    events = json.loads(tracker_path.read_text())["events"]
+    recovery_events = [e for e in events if e.get("recovery_metadata")]
+    assert len(recovery_events) == 1
+    recovery_event_metadata = recovery_events[0]["recovery_metadata"]
+    assert recovery_event_metadata == last_recovery
+
+
+def test_a_same_day_zero_fill_recovery_still_publishes_an_attempt_row(tmp_path, monkeypatch):
+    """Regression test for "Persist recovered zero-fill attempts in artifacts".
+
+    The artifact loop filtered on notional, so a terminal cancelled/rejected
+    order recovered on its own claim day was omitted from buy_candidates
+    entirely. `record_buy(..., 0.0)` only protects the recovering invocation's
+    in-memory count: every later roster slot reconstructs the shared
+    max_orders_per_day attempt count from artifact rows, so a genuine broker
+    attempt vanished from the record and a later slot could be granted an
+    extra order.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    assert claim["settlement_claimed_usd"] == pytest.approx(7.0)
+
+    # Recovered on the SAME day it was claimed -- a matched terminal row proves
+    # submission happened and can never fill, so it resolves immediately.
+    broker = _HistoryBroker(
+        {"state": "cancelled", "dollar_amount": "7.00", "cumulative_quantity": "0", "average_price": "0"}
+    )
+    _, run_state, _ = _run_day(
+        tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover", broker=broker
+    )
+
+    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    recoveries = [
+        r for r in run_state["buy_candidates"]
+        if r["reason"] == "recovered_inverse_martingale_lease"
+    ]
+    # The attempt is preserved as a ZERO-notional row: a real order reached the
+    # broker (so it carries its id) but bought nothing.
+    assert len(recoveries) == 1
+    assert recoveries[0]["ticker"] == "AAPL"
+    assert float(recoveries[0]["planned_amount_usd"]) == pytest.approx(0.0)
+    assert recoveries[0]["order_id"]
+
+
+def test_a_recovery_already_recorded_on_disk_is_not_republished(tmp_path, monkeypatch):
+    """Regression test for "Avoid republishing recovery spend already on disk".
+
+    When the original worker persisted its submitted-order artifact but crashed
+    before clearing the lease, `im_already_on_disk` correctly keeps the order
+    out of StrategyState and the runtime seven-day total -- but the artifact
+    publication was unconditional, putting a SECOND artifact carrying the same
+    broker order on disk. `dca_risk.deployed_by_day` sums per artifact with no
+    order-level deduplication, so the next invocation counted that one order
+    twice against the kill-switch threshold and could suppress valid later
+    purchases.
+    """
+    import near_close_dca as ncd
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, _ = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+
+    # The crashed worker's own artifact already records this exact order.
+    monkeypatch.setattr(
+        ncd, "_same_day_order_recorded_in_any_stream", lambda *a, **k: True
+    )
+    broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
+    _, run_state, _ = _run_day(
+        tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover", broker=broker,
+        deployment_history_root=tmp_path / "runs",
+    )
+
+    # The lease is still resolved -- reconciliation is the point of the pass...
+    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    # ...but nothing is re-booked into state...
+    assert state.day_notional(TEST_DATES[1]) == pytest.approx(0.0)
+    # ...and no second artifact row carries the already-audited order.
+    assert [
+        r for r in run_state["buy_candidates"]
+        if r["reason"] == "recovered_inverse_martingale_lease"
+    ] == []
+
+
+def test_recovery_row_survives_alongside_a_same_ticker_candidate(tmp_path, monkeypatch):
+    """Regression test for "Preserve recovery rows alongside current ticker
+    outcomes". candidate_outcomes is keyed by ticker, so keying a recovery by
+    its ticker made the two events collide and one was silently dropped --
+    under-reporting real capital to every later same-day and deployment-history
+    reader.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+
+    # Same trading day as the claim, enrollment now disabled -> AAPL produces an
+    # ordinary ladder candidate of its own AND carries a recovery.
+    reopened = _base_config(inverse_martingale={}, tickers=("AAPL",))
+    broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"}, price=96.5)
+    _, run_state, _ = _run_day(
+        tmp_path, reopened, state, TEST_DATES[1], 90.0, "day2b", broker=broker
+    )
+
+    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    rows = [r for r in run_state["buy_candidates"] if r["ticker"] == "AAPL"]
+    recoveries = [r for r in rows if r["reason"] == "recovered_inverse_martingale_lease"]
+    # The recovery is present in its own right, not displaced by the ordinary
+    # candidate the same ticker produced this run.
+    assert len(recoveries) == 1
+    assert float(recoveries[0]["planned_amount_usd"]) == pytest.approx(7.0)
+    assert len(rows) > len(recoveries), "the ordinary candidate must survive too"
+
+
+def test_another_same_ticker_order_does_not_suppress_recovery_booking(tmp_path, monkeypatch):
+    """Regression test for "Require the recovered order itself in deployment
+    history". The old ticker-level predicate answered a weaker question: ANY
+    submitted order for the ticker that day. An ordinary ladder buy from another
+    stream therefore suppressed booking for a recovered order with no artifact
+    at all, and the batch computed its headroom without that spend.
+    """
+    import near_close_dca as ncd
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+
+    # The TICKER has a submitted order on the claim day, but not THIS order.
+    monkeypatch.setattr(
+        ncd, "_same_day_ticker_deployment_already_recorded", lambda *a, **k: True
+    )
+    broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
+    _run_day(
+        tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker,
+        deployment_history_root=tmp_path / "runs",
+    )
+
+    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    # Booked: the ticker-level evidence is about a different order.
+    assert state.day_notional(TEST_DATES[1]) == pytest.approx(7.0)
+
+
+def test_recovery_booking_still_seeds_a_separate_prior_allocation(tmp_path, monkeypatch):
+    """Regression test for "Reconcile separate prior allocations after booking
+    a recovery".
+
+    A same-day recovered order used to be recorded in ``own_orders_recorded``
+    under the bare ``(ticker, trading_day)`` key that ``_seed_prior_allocations``
+    reads as "this stream already bought this ticker today, its aggregate is
+    accounted for". That inference is exactly wrong for a recovery: the
+    recovered order died before its artifacts were written, so it is absent from
+    the scan the aggregate is built from, and the aggregate describes some OTHER
+    order -- a cross-stream or manual buy made after the crash. Suppressing it
+    dropped that order's dollars AND its attempt from StrategyState, so
+    unrelated candidates could run past the daily, weekly and shared
+    order-count caps.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    assert claim["settlement_claimed_usd"] == pytest.approx(7.0)
+
+    # A genuinely separate $5 order for the same ticker, placed by another
+    # stream after the crash -- and therefore present in the artifact scan the
+    # recovered order is missing from.
+    separate = PriorSameDayAllocation(
+        "AAPL", amount_usd=5.0, reference_price=100.0, run_id="morning",
+        source="scheduled", selected_base_amount_usd=2.0, attempt_count=1,
+    )
+    # Resolved on the SAME day it was claimed (a matched, filled order settles
+    # immediately) so the recovery and the seeding pass address the same day --
+    # the only arrangement in which the old key could collide at all.
+    broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
+    _run_day(
+        tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover", broker=broker,
+        prior_same_day_allocations={"AAPL": separate},
+    )
+
+    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    # BOTH orders are accounted for: the recovered $7 and the separate $5.
+    assert state.day_notional(TEST_DATES[1]) == pytest.approx(12.0)
+    # And both consumed one of the shared max_orders_per_day slots.
+    assert state.day_order_count(TEST_DATES[1]) == 2
+
+
+def test_book_recovered_lease_durably_keys_idempotency_by_the_individual_claim():
+    """Regression test for "Key recovery idempotency by the individual
+    claim". Two DISTINCT recovered leases for the same ticker and claim day
+    -- e.g. a morning partial-fire claim recovered before an afternoon
+    continuation also crashes -- previously mapped to the identical
+    ``(ticker, claim_trading_day)`` key in ``state.own_orders_recorded``.
+    Once the first recovery's key landed there, the second recovery's own
+    idempotency check short-circuited and its ``record_buy`` was skipped
+    entirely, so a batch that recovered both leases only ever booked one of
+    them into the durable daily/weekly totals.
+    """
+    state = StrategyState()
+    day = date(2026, 7, 1)
+    morning = InverseMartingaleLeaseRecovery(
+        ticker="AAPL", claim_trading_day=day, recovered_amount_usd=7.0,
+        recovered_state={}, order_id="order-morning", claim_ref="ref-morning",
+        claim_stream="morning",
+    )
+    afternoon = InverseMartingaleLeaseRecovery(
+        ticker="AAPL", claim_trading_day=day, recovered_amount_usd=5.0,
+        recovered_state={}, order_id="order-afternoon", claim_ref="ref-afternoon",
+        claim_stream="afternoon",
+    )
+
+    _book_recovered_lease_durably(morning, state, day, deployment_history_root=None)
+    _book_recovered_lease_durably(afternoon, state, day, deployment_history_root=None)
+
+    # Both orders' dollars are booked -- neither was silently skipped as an
+    # apparent re-run of the other.
+    assert state.day_notional(day) == pytest.approx(12.0)
+
+    # Replaying the SAME recovery again (the actual in-process-retry case
+    # this idempotency guard exists for) must still be a no-op.
+    _book_recovered_lease_durably(morning, state, day, deployment_history_root=None)
+    assert state.day_notional(day) == pytest.approx(12.0)
+
+
+def test_account_mismatch_refuses_a_positive_match_too(tmp_path, monkeypatch):
+    """Regression test for "Refuse positive matches from a different broker
+    account". The claim ref is built from stream + trading day + ticker and
+    carries no account, so two accounts mint the identical ref: a match in the
+    wrong account is some other account's order, and settling on it would clear
+    the original lease and book a fill that never happened here.
+    """
+    import near_close_dca as ncd
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    assert claim["settlement_account"]
+
+    # This run computes a DIFFERENT fingerprint than the claim recorded.
+    monkeypatch.setattr(ncd, "_broker_account_fingerprint", lambda *a, **k: "0" * 32)
+    # ...and the broker would happily return a matching ref for its own account.
+    broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
+    _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
+
+    # Neither settled nor released: nothing about this claim is knowable here.
+    assert json.loads(tracker_path.read_text()) == claim
+    assert broker.queried == []
+    assert state.day_notional(TEST_DATES[1]) == pytest.approx(0.0)
+
+
+def test_matched_terminal_zero_fill_resolves_on_the_claim_day(tmp_path, monkeypatch):
+    """Regression test for "Resolve matched terminal zero-fill orders on the
+    claim day". The next-day wait exists because an ABSENT order might still be
+    in flight; a matched terminal row proves submission happened and can never
+    fill, so waiting only blocked later same-day streams from retrying.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    claim_day = date.fromisoformat(claim["settlement_trading_day"])
+
+    broker = _HistoryBroker(
+        {"state": "cancelled", "cumulative_quantity": "0", "average_price": "0"}, price=96.5
+    )
+    # SAME trading day as the claim -- a later stream on the crash day.
+    _run_day(tmp_path, config, state, claim_day, 96.5, "day2b", broker=broker)
+
+    recovered = json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in recovered
+    assert recovered["accumulated_usd"] == pytest.approx(7.0)
+    assert recovered["fire_attempts"] == 1
+
+
+def test_absent_order_still_waits_for_the_claim_day_to_end(tmp_path, monkeypatch):
+    """The counterpart: with NO matching order the next-day requirement stands,
+    because the owning worker may still be between claim and submit."""
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    claim_day = date.fromisoformat(claim["settlement_trading_day"])
+
+    broker = _HistoryBroker(None, price=96.5)
+    _run_day(tmp_path, config, state, claim_day, 96.5, "day2b", broker=broker)
+    assert json.loads(tracker_path.read_text()) == claim  # still leased
+
+
+def test_lease_recovery_runs_even_after_enrollment_is_disabled(tmp_path, monkeypatch):
+    """Regression test for "Reconcile leases before enrollment and market-data
+    gates". Broker-ref reconciliation needs no current price and no active
+    enrollment. Reached only from inside the per-ticker evaluation loop, a
+    crashed lease became permanently unrecoverable the moment an operator
+    disabled inverse-Martingale for that ticker: the cleanup helper
+    deliberately leaves settlement_pending untouched and the evaluation loop
+    never reaches an unenrolled ticker at all.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    assert claim["settlement_pending"] is True
+
+    # The operator disables enrollment entirely before the recovery run.
+    disabled = _base_config(inverse_martingale={})
+    broker = _HistoryBroker(
+        {"state": "filled", "dollar_amount": "7.00", "cumulative_quantity": "0.07", "average_price": "100.00"}
+    )
+    _run_day(tmp_path, disabled, state, TEST_DATES[2], 96.5, "day3", broker=broker)
+
+    assert broker.queried == [("AAPL", TEST_DATES[1], claim["settlement_ref_id"])]
+    recovered = json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in recovered
+    # The claimed fire landed in full, so the lease settles to its target
+    # rather than sitting frozen forever, and the $7 is booked as real spend.
+    assert recovered["status"] == STATUS_NONE
+    assert state.day_notional(TEST_DATES[1]) == pytest.approx(7.0)
+
+
+def test_lease_recovery_runs_even_when_the_date_gate_blocks_the_run(tmp_path, monkeypatch):
+    """Regression test for "Reconcile leases before the date-gate return".
+    Before this fix, every scheduled invocation on or after a date outside
+    config.approved_test_dates returned from _check_execution_gates before
+    the ordinary lease-recovery pass further down ever ran -- so a fire
+    claimed on the final approved trading date crashed into a lease no LATER
+    run could ever reach, permanently freezing the balance until an operator
+    manually widened the trading window.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    assert claim["settlement_pending"] is True
+
+    # The trading window closed before a retry ever ran: TEST_DATES[2] is not
+    # in this config's approved_test_dates, so _check_execution_gates blocks
+    # the whole run.
+    gated = _base_config(
+        inverse_martingale={"AAPL": PCT_ENROLLMENT},
+        approved_test_dates=frozenset(TEST_DATES[:2]),
+    )
+    broker = _HistoryBroker(
+        {"state": "filled", "dollar_amount": "7.00", "cumulative_quantity": "0.07", "average_price": "100.00"}
+    )
+    result, run_state, _ = _run_day(tmp_path, gated, state, TEST_DATES[2], 96.5, "day3", broker=broker)
+
+    assert result["blocked"] is True
+    assert run_state["buy_candidates"] == []
+    # The lease was still reconciled against the broker despite the run
+    # returning immediately after the date gate.
+    assert broker.queried == [("AAPL", TEST_DATES[1], claim["settlement_ref_id"])]
+    recovered = json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in recovered
+    assert recovered["status"] == STATUS_NONE
+    # Regression assertion for "Book recovered spend before clearing gated
+    # leases": the DURABLE half of booking (state.record_buy against the
+    # claim day) must still happen even though the gate blocks this run from
+    # evaluating any candidates -- once this pass clears settlement_pending,
+    # no later run can ever rediscover the lease to book it retroactively,
+    # and the next allowed run would otherwise compute headroom as if the
+    # money were never spent.
+    assert state.day_notional(TEST_DATES[1]) == pytest.approx(7.0)
+
+
+def test_dry_run_recovery_never_releases_a_live_lease(tmp_path, monkeypatch):
+    """Regression test for "Reconcile live leases even when the recovery run is
+    dry-run". A dry-run invocation has no broker order history, so an absent
+    order proves nothing. Gating the lookup on the CURRENT run's mode alone
+    released the whole pre-fire balance as "unplaced" once the claim day
+    passed -- even though the live order existed -- and a later live run could
+    then buy that balance a second time.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    assert claim["settlement_live"] is True
+
+    dry = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT}, dry_run=True)
+    broker = _HistoryBroker(None)
+    _run_day(tmp_path, dry, StrategyState(), TEST_DATES[2], 96.5, "day3", broker=broker)
+
+    preserved = json.loads(tracker_path.read_text())
+    assert broker.queried == []  # never even asked -- a dry run cannot answer
+    assert preserved == claim  # the lease is left exactly as the crash left it
+
+
+def test_sub_dollar_balance_is_deferred_not_rounded_up_to_the_broker_minimum(tmp_path, monkeypatch):
+    """A schema-valid unit_usd below $1 combined with a single-unit first tier
+    must never reach the broker at all -- not as a sub-dollar order, and not
+    rounded UP into an order several times the tracked balance (Codex review:
+    "Defer sub-dollar balances instead of rounding them up"). The accumulator's
+    contract is that it defers a descent it cannot act on; buying more than it
+    tracked breaks that in the expensive direction.
+    """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     small_unit_enrollment = {
         "basis": "pct",
@@ -1061,29 +2925,56 @@ def test_sub_dollar_fire_is_floored_to_the_broker_minimum(tmp_path, monkeypatch)
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
     assert json.loads(tracker_path.read_text())["accumulated_usd"] == pytest.approx(0.3, abs=0.01)
 
-    r2, s2, _ = _run_day(tmp_path, config, state, TEST_DATES[1], 100.0, "day2")  # fully recovers -> fires
-    [candidate] = s2["buy_candidates"]
-    assert candidate["status"] == "submitted"
-    assert candidate["planned_amount_usd"] == pytest.approx(1.0, abs=0.01)  # floored, not $0.30
+    _, s2, _ = _run_day(tmp_path, config, state, TEST_DATES[1], 100.0, "day2")  # recovers
+    # Nothing is placed: not $0.30 (below the broker minimum) and emphatically
+    # not $1.00 (more than three times what the ladder deferred).
+    assert s2["buy_candidates"] == []
+    assert state.day_notional(TEST_DATES[1]) == pytest.approx(0.0)
 
-    # Regression test for "Keep sub-dollar fires in the accumulator": the
-    # ledger's own settlement must agree that the FULL $1.00 broker minimum
-    # was claimed/settled (not just $0.30), since that is what was actually
-    # placed -- the earlier fix floored only the candidate's order amount,
-    # leaving the step's own fire_amount_usd (what settlement compares
-    # against) understated at $0.30, so settlement saw "more placed than
-    # accumulated" and silently absorbed the extra $0.70 as a clean
-    # resolution instead of it ever being properly claimed from the ledger.
     tracker = json.loads(tracker_path.read_text())
-    assert tracker["status"] == "none"  # cleanly resolved, no phantom remainder
-    # Both the injection-site claim and settlement's confirmation append
-    # their own audit event (claim, then confirm) -- both must agree the
-    # ledger claimed/settled the FULL floored $1.00, not the raw $0.30.
-    fire_events = [e for e in tracker["events"] if e["fired"]]
-    assert fire_events
-    for event in fire_events:
-        assert event["fire_amount_usd"] == pytest.approx(1.0, abs=0.01)
-        assert event["accumulated_usd_after"] == pytest.approx(0.0, abs=0.01)
+    # The cycle stays active with its balance intact, so a deeper later dip can
+    # still grow it past the minimum; max_cycle_days remains the backstop.
+    assert tracker["status"] == STATUS_DIPPING
+    assert tracker["accumulated_usd"] == pytest.approx(0.3, abs=0.01)
+    assert not [e for e in tracker["events"] if e["fired"]]
+
+
+def test_the_broker_minimum_floor_never_places_past_a_tighter_per_order_cap(tmp_path, monkeypatch):
+    """The broker-minimum floor raises a fire back to $1.00 whenever the cycle
+    genuinely holds that much (see test_dca_inverse_martingale.py's
+    test_the_broker_minimum_floor_still_beats_a_sub_dollar_per_order_cap), but
+    it must never do so by spending PAST an operator's own per-order cap. With
+    max_per_order_usd below the broker minimum the two constraints are
+    irreconcilable, and the fail-closed outcome is to place nothing at all
+    rather than to let the floor quietly override the tighter limit.
+
+    The ledger's accounting is the part that matters here: a blocked placement
+    is money that was never spent, so the claim must roll all the way back and
+    leave the full $3.00 balance intact for a later evaluation to fire once the
+    cap allows it.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(
+        inverse_martingale={"AAPL": PCT_ENROLLMENT},
+        max_per_order_usd=0.4,  # below the broker minimum -- irreconcilable
+    )
+    state = StrategyState()
+
+    _run_day(tmp_path, config, state, TEST_DATES[0], 99.0, "day1")  # +$1
+    _run_day(tmp_path, config, state, TEST_DATES[1], 97.0, "day2")  # +$2 -> $3 total
+    tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
+    assert json.loads(tracker_path.read_text())["accumulated_usd"] == pytest.approx(3.0, abs=0.01)
+
+    _, s3, _ = _run_day(tmp_path, config, state, TEST_DATES[2], 100.0, "day3")  # recovers
+    [candidate] = s3["buy_candidates"]
+    assert candidate["status"] == "blocked"
+    assert state.day_notional(TEST_DATES[2]) == pytest.approx(0.0)
+
+    # Nothing was placed, so the rollback must restore the balance in full --
+    # the cycle keeps carrying its $3.00 rather than silently losing the
+    # claimed slice to a placement that never happened.
+    tracker = json.loads(tracker_path.read_text())
+    assert tracker["accumulated_usd"] == pytest.approx(3.0, abs=0.01)
 
 
 def test_settlement_skips_rather_than_overwrites_a_concurrently_advanced_ledger(tmp_path, monkeypatch):
@@ -1180,7 +3071,7 @@ def test_non_fire_transition_is_also_compare_and_swap_protected(tmp_path, monkey
 
     import near_close_dca as ncd
 
-    real_claim_fire = ncd.InverseMartingaleLedger.claim_fire
+    real_compare_and_swap = ncd.InverseMartingaleLedger.compare_and_swap_transition
     call_count = {"n": 0}
     intruder_marker = {
         "status": "dipping", "accumulated_usd": 42.0, "intruder": True,
@@ -1195,21 +3086,23 @@ def test_non_fire_transition_is_also_compare_and_swap_protected(tmp_path, monkey
         "cycle_start_trading_day": "2026-06-25", "trading_days_active": 1,
     }
 
-    def spying_claim_fire(self, ticker, *, expected_prior_state, new_state, step):
+    def spying_compare_and_swap(self, ticker, *, expected_prior_state, new_state, step):
         call_count["n"] += 1
         if call_count["n"] == 1:
             # A fully independent second process races in and successfully
             # advances the ledger from the SAME starting state this run is
             # about to write from -- called directly against the UNPATCHED
             # original method so it is not itself counted as one of this
-            # run's own claim_fire calls.
+            # run's own transition writes.
             intruder = ncd.InverseMartingaleLedger()
-            real_claim_fire(
+            real_compare_and_swap(
                 intruder, ticker, expected_prior_state=expected_prior_state, new_state=intruder_marker, step=step
             )
-        return real_claim_fire(self, ticker, expected_prior_state=expected_prior_state, new_state=new_state, step=step)
+        return real_compare_and_swap(
+            self, ticker, expected_prior_state=expected_prior_state, new_state=new_state, step=step
+        )
 
-    monkeypatch.setattr(ncd.InverseMartingaleLedger, "claim_fire", spying_claim_fire)
+    monkeypatch.setattr(ncd.InverseMartingaleLedger, "compare_and_swap_transition", spying_compare_and_swap)
 
     # Day 1: a 1% dip crosses tier 1 -- a plain, non-fire tier-crossing
     # transition, exactly the code path under test (no cycle exists yet, so
@@ -1258,3 +3151,100 @@ def test_corrupted_tracker_file_is_skipped_not_silently_reset(tmp_path, monkeypa
     # a fresh {"status": "dipping", ...} cycle starting from a fabricated {}.
     assert (tracker_dir / "tracker.json").read_text(encoding="utf-8") == corrupted_content
     assert any("unreadable" in record.message for record in caplog.records)
+
+
+def test_lease_account_fingerprint_is_keyed_not_a_bare_digest(tmp_path):
+    """Regression test for "Replace the reversible account-number fingerprint".
+
+    A Robinhood account is 6-12 decimal digits, so a plain ``sha256(account)``
+    persisted in a tracker is not a secret at all: anyone holding the digest can
+    enumerate the whole space -- a million candidates at the short end -- and
+    recover the number exactly. The fingerprint must be a KEYED HMAC whose key
+    lives outside the tracker payload.
+    """
+    import hashlib
+
+    from near_close_dca import _LEASE_FINGERPRINT_KEY_FILENAME, _broker_account_fingerprint
+
+    class _Broker:
+        def __init__(self, account):
+            self._account = account
+
+        def account_number(self):
+            return self._account
+
+    account = "1" * 9
+    first = _broker_account_fingerprint(_Broker(account), tmp_path / "keys_a")
+    assert first
+    # Not derivable from the account alone.
+    assert first != hashlib.sha256(account.encode()).hexdigest()[: len(first)]
+    # Stable for the same account under the same key...
+    assert _broker_account_fingerprint(_Broker(account), tmp_path / "keys_a") == first
+    # ...and unlinkable across key domains, so a copied tracker reveals nothing.
+    assert _broker_account_fingerprint(_Broker(account), tmp_path / "keys_b") != first
+    # A different account under the same key still differs.
+    assert _broker_account_fingerprint(_Broker("2" * 9), tmp_path / "keys_a") != first
+
+    key_path = tmp_path / "keys_a" / _LEASE_FINGERPRINT_KEY_FILENAME
+    assert key_path.is_file()
+    assert key_path.stat().st_mode & 0o077 == 0  # owner-only
+
+
+def test_a_settlement_overpay_that_exhausts_the_balance_resolves_cleanly(tmp_path, monkeypatch):
+    """Regression test for "Pass the resolved marker's supported date keyword".
+
+    When settlement reports an amount differing from the claimed fire by at
+    least half a cent but still covering the accumulated balance, deferred
+    settlement takes its rollback branch and writes a `resolved_marker()`. That
+    call passed a keyword the marker's signature no longer accepted, raising
+    TypeError *after* placement processing -- aborting the scheduled run and
+    leaving the fire's `settlement_pending` claim uncleared, so the balance
+    stayed frozen behind a lease nothing would ever settle.
+
+    Nothing else in this suite reaches that branch, which is exactly why a
+    signature change could break it silently: the whole test suite stayed green.
+    """
+    import near_close_dca as ncd
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+
+    # Day 1: -5% dip accumulates $7. Day 2: recovery fires the whole balance.
+    _run_day(tmp_path, config, state, TEST_DATES[0], 95.0, "day1")
+
+    # Report a placement a cent ABOVE the claim: far enough from the claimed
+    # amount to miss the "matched exactly" branch, and large enough that the
+    # rollback's remainder lands at or below zero.
+    real_batch = ncd._process_buy_candidates_batch
+
+    def overpaying_batch(**kwargs):
+        outcomes, top_ups, deployed, errs, revs = real_batch(**kwargs)
+        for outcome in outcomes.values():
+            if outcome.get("status") == "submitted" and outcome.get("submitted_amount_usd"):
+                outcome["submitted_amount_usd"] = round(outcome["submitted_amount_usd"] + 0.01, 2)
+        return outcomes, top_ups, deployed, errs, revs
+
+    monkeypatch.setattr(ncd, "_process_buy_candidates_batch", overpaying_batch)
+    _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2")
+
+    tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
+    resolved = json.loads(tracker_path.read_text())
+    # The run completed and the lease is cleared rather than stranded.
+    assert "settlement_pending" not in resolved
+    assert resolved["status"] == "none"
+    # The marker carries the split-window cursor under its supported keyword,
+    # seeded from the cycle-start day (TEST_DATES[0]) -- the day
+    # cycle_reference_close's price scale was actually captured on -- not
+    # today's settlement day (Codex review: "Seed the overpay latch cursor
+    # from the cycle reference day").
+    assert resolved["rearm_last_seen_day"] == TEST_DATES[0].isoformat()
+    # Regression assertion for "Preserve the absolute fire floor during
+    # overpay settlement": the marker must carry fired_floor_price alongside
+    # fired_floor_drop_metric, exactly like every other fire-resolution path
+    # -- without it, the same-day re-arm guard falls back to comparing the
+    # metric in whatever reference frame a later stream happens to have, and
+    # a price still above the already-paid floor can re-credit tiers that
+    # were already bought.
+    assert resolved.get("fired_floor_price") is not None
+    assert resolved["fired_floor_price"] > 0
