@@ -554,7 +554,8 @@ def _count_csv_data_rows(csv_path: Path) -> Optional[int]:
     if not csv_path.is_file():
         return None
     try:
-        rows = [line for line in csv_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        with csv_path.open("r", encoding="utf-8") as f:
+            rows = [line for line in f if line.strip()]
     except (OSError, UnicodeDecodeError):
         # UnicodeDecodeError is a ValueError, NOT an OSError, so a partially
         # written or non-UTF-8 CSV escaped an OSError-only handler and
@@ -810,21 +811,22 @@ def _load_model_usage_entries(model_usage_path: Path) -> Optional[List[Dict[str,
         return None
     entries: List[Dict[str, Any]] = []
     try:
-        for line in model_usage_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                parsed = json.loads(line)
-            except json.JSONDecodeError:
-                return None
-            if not isinstance(parsed, dict):
-                return None
-            if not isinstance(parsed.get("run_id"), str) or not parsed["run_id"]:
-                return None
-            if parsed.get("model_routing_mode") not in MODEL_ROUTING_MODE_VALUES:
-                return None
-            entries.append(parsed)
+        with model_usage_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    return None
+                if not isinstance(parsed, dict):
+                    return None
+                if not isinstance(parsed.get("run_id"), str) or not parsed["run_id"]:
+                    return None
+                if parsed.get("model_routing_mode") not in MODEL_ROUTING_MODE_VALUES:
+                    return None
+                entries.append(parsed)
     except (OSError, UnicodeDecodeError):
         # UnicodeDecodeError is a ValueError, NOT an OSError, so a partially
         # written or non-UTF-8 monthly log escaped this handler and aborted
@@ -918,19 +920,20 @@ def _read_all_attempt_markers(cron_root: Path, trading_day: str, stream: str) ->
     history_path = day_dir / f"{stream}{ATTEMPT_LOG_HISTORY_SUFFIX}"
     if history_path.is_file():
         try:
-            for line in history_path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    parsed = json.loads(line)
-                except json.JSONDecodeError:
-                    corrupted = True
-                    continue
-                if isinstance(parsed, dict):
-                    markers.append(parsed)
-                else:
-                    corrupted = True
+            with history_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        parsed = json.loads(line)
+                    except json.JSONDecodeError:
+                        corrupted = True
+                        continue
+                    if isinstance(parsed, dict):
+                        markers.append(parsed)
+                    else:
+                        corrupted = True
         except (OSError, UnicodeDecodeError):
             markers = []
             corrupted = True
