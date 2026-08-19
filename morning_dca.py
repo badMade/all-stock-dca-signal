@@ -49,6 +49,7 @@ as prior-allocation context for the afternoon same-day top-up guard.
 
 from __future__ import annotations
 
+import copy
 import csv
 import json
 import logging
@@ -988,6 +989,19 @@ def _bar_from_raw(value: Any) -> Bar:
     )
 
 
+def _raw_envelope_reports_failure(envelope: Dict[str, Any]) -> bool:
+    """Mirror ``dca_live_adapters._is_error_response`` for the raw-persist round trip.
+
+    A connector wrapper can surface an outage as data (``{"error": ...}`` /
+    ``{"success": false}`` / ``{"ok": false}``) rather than raising. That failure flag
+    must not be discarded by ``_RawInputRecorder.persist()``'s envelope unwrapping --
+    downstream broker safeguards check for it on the returned payload.
+    """
+    if envelope.get("error"):
+        return True
+    return any(envelope.get(flag) is False for flag in ("success", "ok"))
+
+
 class _RawInputRecorder:
     """Persists connector responses used by a scheduled live run under ``raw/``.
 
@@ -1037,11 +1051,18 @@ class _RawInputRecorder:
             # save_raw_input() may wrap payloads in one or more {"data": ...} envelopes.
             # Unwrap the normalize_connector_payload envelope (normalized true/false) and
             # any nested carrier {"data": {...}} layers so computation sees the archived shape.
+            # But an envelope that reports failure (e.g. {"success": false, "data": {"order":
+            # {"id": "..."}}}) must keep that outer flag: RobinhoodBroker._response_failure()
+            # inspects the round-tripped payload for it, and discarding it in favor of the
+            # inner "data" would let a failed placement/lookup with an inner id or empty
+            # orders list read back as success. Stop unwrapping at the first envelope that
+            # reports failure instead.
             if (
                 isinstance(persisted, dict)
                 and "results" not in persisted
                 and "data" in persisted
                 and "normalized" in persisted
+                and not _raw_envelope_reports_failure(persisted)
             ):
                 persisted = persisted["data"]
             seen_ids: set[int] = set()
@@ -1049,6 +1070,7 @@ class _RawInputRecorder:
                 isinstance(persisted, dict)
                 and "results" not in persisted
                 and isinstance(persisted.get("data"), dict)
+                and not _raw_envelope_reports_failure(persisted)
             ):
                 if id(persisted) in seen_ids:
                     break
@@ -1074,10 +1096,51 @@ class _PersistingMarketDataProvider:
     def __init__(self, inner: Any, recorder: _RawInputRecorder):
         self._inner = inner
         self._recorder = recorder
+        self._raw_connectors_wrapped = self._wrap_raw_connectors()
+
+    def _wrap_raw_connectors(self) -> bool:
+        """Intercept Robinhood-style connector callables before adapter parsing.
+
+        Wraps a private *copy* of ``self._inner`` rather than mutating the caller-
+        supplied adapter in place: the caller may reuse that same
+        ``RobinhoodDataProvider``/``RobinhoodBroker`` instance for a later manual or
+        watchlist run, and a wrapper left bound to this run's (short-lived)
+        ``_RawInputRecorder`` would then archive that later run's responses into this
+        run's ``raw/`` directory -- or return ``None`` for a perfectly valid response
+        if that directory has since become unwritable.
+        """
+        wrapped = False
+        copied = False
+        for attribute, kind in (("_historicals_fn", "historicals"), ("_quotes_fn", "quotes")):
+            connector = getattr(self._inner, attribute, None)
+            if not callable(connector) or getattr(connector, "_raw_recorder", None) is self._recorder:
+                continue
+            connector = getattr(connector, "_raw_connector_original", connector)
+            if not copied:
+                self._inner = copy.copy(self._inner)
+                copied = True
+
+            def persisted_connector(*args: Any, _connector=connector, _kind=kind, **kwargs: Any) -> Any:
+                symbols = kwargs.get("symbols") or (args[0] if args else ["unknown"])
+                key = "-".join(str(symbol) for symbol in symbols) if isinstance(symbols, (list, tuple)) else str(symbols)
+                try:
+                    payload = _connector(*args, **kwargs)
+                    return self._recorder.persist(_kind, key, payload)
+                except Exception as exc:  # noqa: BLE001 - connectors raise arbitrary errors
+                    self._recorder.record_error(_kind, key, exc)
+                    raise
+
+            persisted_connector._raw_recorder = self._recorder  # type: ignore[attr-defined]
+            persisted_connector._raw_connector_original = connector  # type: ignore[attr-defined]
+            setattr(self._inner, attribute, persisted_connector)
+            wrapped = True
+        return wrapped
 
     def get_previous_close_bar(self, ticker: str, as_of: datetime) -> Optional[Bar]:
         try:
             bar = self._inner.get_previous_close_bar(ticker, as_of)
+            if self._raw_connectors_wrapped:
+                return bar
             persisted = self._recorder.persist("prior_close", ticker, bar)
             return _bar_from_raw(persisted) if persisted is not None else None
         except Exception as exc:  # noqa: BLE001 - connectors raise arbitrary errors
@@ -1091,6 +1154,8 @@ class _PersistingMarketDataProvider:
             bars = self._inner.get_intraday_bars(
                 ticker=ticker, start=start, end=end, interval_minutes=interval_minutes
             )
+            if self._raw_connectors_wrapped:
+                return bars
             persisted = self._recorder.persist("intraday_bars", ticker, list(bars))
             return [_bar_from_raw(item) for item in persisted] if persisted is not None else []
         except Exception as exc:  # noqa: BLE001 - connectors raise arbitrary errors
@@ -1103,6 +1168,8 @@ class _PersistingMarketDataProvider:
             return None
         try:
             quote = get_quote(ticker, as_of)
+            if self._raw_connectors_wrapped:
+                return quote
             persisted = self._recorder.persist("quote", ticker, quote)
             return _restore_raw_datetimes(persisted)
         except Exception as exc:  # noqa: BLE001 - connectors raise arbitrary errors
@@ -1115,6 +1182,8 @@ class _PersistingMarketDataProvider:
             return None
         try:
             result = get_bid_ask(ticker, as_of)
+            if self._raw_connectors_wrapped:
+                return result
             persisted = self._recorder.persist("bid_ask", ticker, result)
             return _restore_raw_datetimes(persisted)
         except Exception as exc:  # noqa: BLE001 - connectors raise arbitrary errors
@@ -1136,10 +1205,9 @@ class _PersistingBrokerAdapter:
     ``is_tradable_for_fractional_buy``/``same_day_strategy_order_exists`` --
     the broker-side inputs a live run consults before placing an order -- so
     portfolio/buying-power/tradability/same-day-order-existence responses are
-    captured under ``raw/``. ``review_market_buy``/``place_market_buy``/
-    ``get_order_fill``/``get_raw_placement_responses`` pass straight through:
-    those are order actions and fill evidence, not inputs the persist-before-
-    compute contract covers.
+    captured under ``raw/``. For adapters exposing injected connector callables,
+    all connector results (including order actions and fill evidence) are
+    intercepted before the adapter selects or converts values from them.
     """
 
     def __init__(self, inner: BrokerAdapter, recorder: _RawInputRecorder):
@@ -1147,6 +1215,59 @@ class _PersistingBrokerAdapter:
         self._recorder = recorder
         self._account_persisted = False
         self._buying_power_persisted = False
+        self._wrapped_connector_attributes = self._wrap_raw_connectors()
+
+    def _wrap_raw_connectors(self) -> set[str]:
+        """Persist injected broker connector responses before broker parsing.
+
+        Wraps a private *copy* of ``self._inner`` rather than mutating the caller-
+        supplied adapter in place: see ``_PersistingMarketDataProvider._wrap_raw_connectors``
+        for why a wrapper bound to this run's short-lived ``_RawInputRecorder`` must
+        never leak onto an adapter instance the caller may reuse for a later run.
+        """
+        kinds = {
+            "_buying_power_fn": "buying_power",
+            "_orders_fn": "orders_since_midnight",
+            "_tradability_fn": "tradability",
+            "_review_fn": "review",
+            "_place_fn": "place",
+            "_order_fill_fn": "order_fill",
+        }
+        wrapped: set[str] = set()
+        copied = False
+        for attribute, kind in kinds.items():
+            connector = getattr(self._inner, attribute, None)
+            if not callable(connector) or getattr(connector, "_raw_recorder", None) is self._recorder:
+                continue
+            connector = getattr(connector, "_raw_connector_original", connector)
+            if not copied:
+                self._inner = copy.copy(self._inner)
+                copied = True
+
+            def persisted_connector(*args: Any, _connector=connector, _kind=kind, **kwargs: Any) -> Any:
+                key = kwargs.get("symbol") or kwargs.get("order_id") or "account"
+                try:
+                    payload = _connector(*args, **kwargs)
+                except Exception as exc:  # noqa: BLE001 - connectors raise arbitrary errors
+                    self._recorder.record_error(_kind, str(key), exc)
+                    raise
+                persisted = self._recorder.persist(_kind, str(key), payload)
+                if persisted is None and payload is not None and _kind == "place":
+                    # The connector already submitted a real order -- self._recorder.error
+                    # is now set (the run still fails closed on it below), but returning
+                    # None here would also erase the only record of that already-completed
+                    # broker-side action, letting place_market_buy report "no order id" for
+                    # an order that in fact went through. Fall back to the in-memory
+                    # response so the id still reaches _place_broker_orders and gets
+                    # recorded as submitted before the run blocks.
+                    return payload
+                return persisted
+
+            persisted_connector._raw_recorder = self._recorder  # type: ignore[attr-defined]
+            persisted_connector._raw_connector_original = connector  # type: ignore[attr-defined]
+            setattr(self._inner, attribute, persisted_connector)
+            wrapped.add(attribute)
+        return wrapped
 
     def account_number(self) -> str:
         value = self._inner.account_number()
@@ -1157,18 +1278,19 @@ class _PersistingBrokerAdapter:
 
     def available_buying_power(self) -> float:
         value = self._inner.available_buying_power()
-        if not self._buying_power_persisted:
+        if not self._buying_power_persisted and "_buying_power_fn" not in self._wrapped_connector_attributes:
             self._recorder.persist("buying_power", "account", {"available_buying_power": value})
             self._buying_power_persisted = True
         return value
 
     def same_day_strategy_order_exists(self, ticker: str, trading_day: date) -> bool:
         value = self._inner.same_day_strategy_order_exists(ticker, trading_day)
-        self._recorder.persist(
-            "orders_since_midnight",
-            ticker,
-            {"ticker": ticker, "trading_day": trading_day.isoformat(), "same_day_order_exists": value},
-        )
+        if "_orders_fn" not in self._wrapped_connector_attributes:
+            self._recorder.persist(
+                "orders_since_midnight",
+                ticker,
+                {"ticker": ticker, "trading_day": trading_day.isoformat(), "same_day_order_exists": value},
+            )
         return value
 
     def same_day_strategy_order_exists_with_ref_id_prefix(
@@ -1179,21 +1301,23 @@ class _PersistingBrokerAdapter:
         if not callable(checker):
             raise RuntimeError("broker does not support same-stream ref-id duplicate checks for guarded top-ups")
         value = checker(ticker, trading_day, ref_id_prefixes)
-        self._recorder.persist(
-            "orders_since_midnight",
-            ticker,
-            {
-                "ticker": ticker,
-                "trading_day": trading_day.isoformat(),
-                "ref_id_prefixes": list(ref_id_prefixes),
-                "same_stream_order": value,
-            },
-        )
+        if "_orders_fn" not in self._wrapped_connector_attributes:
+            self._recorder.persist(
+                "orders_since_midnight",
+                ticker,
+                {
+                    "ticker": ticker,
+                    "trading_day": trading_day.isoformat(),
+                    "ref_id_prefixes": list(ref_id_prefixes),
+                    "same_stream_order": value,
+                },
+            )
         return value
 
     def is_tradable_for_fractional_buy(self, ticker: str) -> bool:
         value = self._inner.is_tradable_for_fractional_buy(ticker)
-        self._recorder.persist("tradability", ticker, {"ticker": ticker, "tradable": value})
+        if "_tradability_fn" not in self._wrapped_connector_attributes:
+            self._recorder.persist("tradability", ticker, {"ticker": ticker, "tradable": value})
         return value
 
     def review_market_buy(self, ticker: str, notional_usd: float):

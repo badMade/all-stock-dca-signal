@@ -30,6 +30,7 @@ from pathlib import Path
 
 import pytest
 
+from dca_live_adapters import RobinhoodBroker, RobinhoodDataProvider
 from morning_dca import (
     DEFAULT_MORNING_LIVE_STATE_ROOT,
     DEFAULT_MORNING_PREFLIGHT_STATE_ROOT,
@@ -4867,6 +4868,133 @@ def test_persisting_market_data_provider_computes_from_round_tripped_payload(tmp
     assert isinstance(quote, list)
     assert quote[0] == 99.0
     assert isinstance(quote[1], datetime)
+
+
+def test_persisting_robinhood_provider_normalizes_pointer_before_parsing(tmp_path):
+    missing = tmp_path / "missing-historicals.json"
+    provider = RobinhoodDataProvider(historicals_fn=lambda **kwargs: {"output_path": str(missing)})
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingMarketDataProvider(provider, recorder)
+    now = _now_live()
+
+    bars = wrapped.get_intraday_bars(
+        ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10
+    )
+
+    assert bars == []
+    assert recorder.saved_filenames == []
+    assert recorder.error is not None
+    assert "could not read output_path" in recorder.error
+
+
+def test_persisting_robinhood_adapters_archive_connector_envelopes_before_parsing(tmp_path):
+    quote_payload = {"results": [{"quote": {"symbol": "AAPL", "last_trade_price": "99.00"}}]}
+    buying_power_payload = {"data": {"buying_power": "137.00", "unparsed": "evidence"}}
+    provider = RobinhoodDataProvider(
+        historicals_fn=lambda **kwargs: {"results": []}, quotes_fn=lambda **kwargs: quote_payload
+    )
+    broker = RobinhoodBroker(buying_power_fn=lambda **kwargs: buying_power_payload)
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+
+    assert _PersistingMarketDataProvider(provider, recorder).get_quote("AAPL", _now_live())[0] == 99.0
+    assert _PersistingBrokerAdapter(broker, recorder).available_buying_power() == 137.0
+
+    payloads = [json.loads((tmp_path / "raw" / name).read_text(encoding="utf-8")) for name in recorder.saved_filenames]
+    assert quote_payload in payloads
+    assert buying_power_payload in payloads
+
+
+def test_persisting_broker_adapter_preserves_outer_failure_flag_on_place(tmp_path):
+    # A connector can report failure as data (rather than raising) while still carrying
+    # an inner order id -- the outer "success": false must survive the raw-persist round
+    # trip so RobinhoodBroker.place_market_buy() raises instead of treating the id as a
+    # submitted order (see PR #560 review discussion r3816204627).
+    failed_placement = {"success": False, "data": {"order": {"id": "order-123", "state": "confirmed"}}}
+    broker = RobinhoodBroker(
+        place_fn=lambda **kwargs: failed_placement,
+        enable_live_orders=True,
+    )
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingBrokerAdapter(broker, recorder)
+
+    with pytest.raises(RuntimeError, match="failed"):
+        wrapped.place_market_buy("AAPL", 10.0, "ref-1")
+
+    assert recorder.error is None
+    payloads = [json.loads((tmp_path / "raw" / name).read_text(encoding="utf-8")) for name in recorder.saved_filenames]
+    assert failed_placement in payloads
+
+
+def test_persisting_broker_adapter_preserves_outer_failure_flag_on_orders_lookup(tmp_path):
+    # An unsuccessful order-history response with an empty inner "orders" list must not
+    # be read as "no same-day orders exist"; the outer failure flag has to survive so the
+    # duplicate-order guard fails closed instead of silently passing.
+    failed_lookup = {"success": False, "data": {"orders": []}}
+    broker = RobinhoodBroker(orders_fn=lambda **kwargs: failed_lookup)
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingBrokerAdapter(broker, recorder)
+
+    with pytest.raises(RuntimeError, match="failed"):
+        wrapped.same_day_strategy_order_exists("AAPL", date(2026, 7, 8))
+
+    assert recorder.error is None
+
+
+def test_persisting_broker_adapter_preserves_submitted_order_when_persist_write_fails(tmp_path, monkeypatch):
+    # If the connector call itself succeeds (a real order was submitted) but writing
+    # the raw archive fails afterward, the in-memory response must still reach
+    # place_market_buy so the submitted order id is not lost -- only the raw-persist
+    # write failure (recorder.error) should trip the run to fail closed, not the
+    # already-completed broker action being treated as if it never happened (see PR
+    # #560 review discussion r3816306601).
+    placed = {"order": {"id": "order-456", "state": "confirmed"}}
+    broker = RobinhoodBroker(place_fn=lambda **kwargs: placed, enable_live_orders=True)
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingBrokerAdapter(broker, recorder)
+
+    # Make the raw archive directory unwritable so save_raw_input() raises inside persist().
+    (tmp_path / "raw").mkdir(parents=True, exist_ok=True)
+    original_write_text = Path.write_text
+
+    def _failing_write_text(self, *args, **kwargs):
+        if self.parent == tmp_path / "raw":
+            raise OSError("disk full")
+        return original_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", _failing_write_text)
+    order_id = wrapped.place_market_buy("AAPL", 10.0, "ref-1")
+
+    assert order_id == "order-456"
+    assert recorder.error is not None
+    assert "failed to persist" in recorder.error
+
+
+def test_persisting_adapters_do_not_mutate_caller_owned_broker_or_provider(tmp_path):
+    # The wrappers must not leave a recorder-bound connector callable installed on the
+    # caller's RobinhoodDataProvider/RobinhoodBroker instance after wrapping: a later
+    # manual/watchlist run reusing the same instance must see the ORIGINAL connector,
+    # not one bound to this (short-lived, possibly since-deleted) run's raw/ directory
+    # (see PR #560 review discussion r3816306593).
+    provider = RobinhoodDataProvider(
+        historicals_fn=lambda **kwargs: {"results": []}, quotes_fn=lambda **kwargs: {"results": []}
+    )
+    broker = RobinhoodBroker(buying_power_fn=lambda **kwargs: {"buying_power": "1.00"})
+    original_historicals_fn = provider._historicals_fn
+    original_quotes_fn = provider._quotes_fn
+    original_buying_power_fn = broker._buying_power_fn
+
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped_provider = _PersistingMarketDataProvider(provider, recorder)
+    wrapped_broker = _PersistingBrokerAdapter(broker, recorder)
+    wrapped_provider.get_quote("AAPL", _now_live())
+    wrapped_broker.available_buying_power()
+
+    assert provider._historicals_fn is original_historicals_fn
+    assert provider._quotes_fn is original_quotes_fn
+    assert broker._buying_power_fn is original_buying_power_fn
+    # The decorators still operate on wrapped connectors internally.
+    assert wrapped_provider._inner is not provider
+    assert wrapped_broker._inner is not broker
 
 
 def test_scheduled_live_run_blocks_all_orders_when_one_market_fetch_raises(tmp_path):
