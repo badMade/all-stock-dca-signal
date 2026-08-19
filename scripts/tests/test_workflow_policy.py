@@ -21,28 +21,16 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-try:
-    from scripts.workflow_policy import (  # noqa: E402
-        PolicyException,
-        _exceptions_for,
-        _is_exempt,
-        _normalize_on_key,
-        check_concurrency,
-        check_persist_credentials,
-        check_timeout_minutes,
-        load_workflows,
-    )
-except ImportError:  # pragma: no cover - fallback when running directly in scripts/
-    from workflow_policy import (  # type: ignore # noqa: E402
-        PolicyException,
-        _exceptions_for,
-        _is_exempt,
-        _normalize_on_key,
-        check_concurrency,
-        check_persist_credentials,
-        check_timeout_minutes,
-        load_workflows,
-    )
+from scripts.workflow_policy import (  # noqa: E402
+    PolicyException,
+    _exceptions_for,
+    _is_exempt,
+    _normalize_on_key,
+    check_concurrency,
+    check_persist_credentials,
+    check_timeout_minutes,
+    load_workflows,
+)
 
 REAL_DOCS = load_workflows()
 
@@ -306,10 +294,7 @@ def test_yaml_extension_files_are_also_loaded(tmp_path, monkeypatch):
     is monkeypatched to tmp_path's parent for this one call -- otherwise a
     directory outside the real repo would make that relativization raise.
     """
-    try:
-        from scripts import workflow_policy
-    except ImportError:  # pragma: no cover
-        import workflow_policy  # type: ignore
+    from scripts import workflow_policy
 
     monkeypatch.setattr(workflow_policy, "REPO_ROOT", tmp_path)
     (tmp_path / "a.yml").write_text("name: a\non: push\njobs: {}\n")
