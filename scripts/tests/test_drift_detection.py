@@ -20,7 +20,9 @@ import tempfile
 import unittest
 import urllib.error
 import urllib.request
+from email.message import Message
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -554,12 +556,13 @@ class SlackTests(unittest.TestCase):
             port = 443
             timeout = 10.0
             source_address = None
+            sock: Any = None
 
         conn = _FakeConn()
         with patch.object(
             dca_net_utils, "resolve_ips", lambda hostname: {validated_ip}
         ), patch.object(dca_net_utils.socket, "create_connection", fake_create_connection):
-            dca_net_utils.connect_pinned(conn)
+            dca_net_utils.connect_pinned(cast(Any, conn))
         self.assertEqual(calls, [(str(validated_ip), 443)])
         self.assertIsNotNone(conn.sock)
 
@@ -598,7 +601,7 @@ class SlackTests(unittest.TestCase):
         handler = dca_net_utils.PinnedHTTPSHandler()
         req = urllib.request.Request("https://hooks.example/alert")
         req.timeout = 10.0  # normally set by OpenerDirector.open() before dispatch
-        req._tunnel_host = "hooks.example"
+        cast(Any, req)._tunnel_host = "hooks.example"
         with patch.object(http.client.HTTPSConnection, "request", fake_request):
             with self.assertRaises(_ReachedConnection):
                 handler.https_open(req)
@@ -648,6 +651,8 @@ class LoadRunArtifactsSignalSelectionTest(unittest.TestCase):
 
             artifacts = load_run_artifacts(run_dir)
 
+            self.assertIsNotNone(artifacts.signals_path)
+            assert artifacts.signals_path is not None
             self.assertEqual(artifacts.signals_path.name, "morning_signals.csv")
             self.assertEqual(len(artifacts.signal_rows), 1)
 
@@ -668,6 +673,8 @@ class LoadRunArtifactsSignalSelectionTest(unittest.TestCase):
 
             artifacts = load_run_artifacts(run_dir)
 
+            self.assertIsNotNone(artifacts.signals_path)
+            assert artifacts.signals_path is not None
             self.assertEqual(artifacts.signals_path.name, "morning_signals.csv")
             self.assertEqual(len(artifacts.signal_rows), 1)
 
@@ -681,7 +688,10 @@ class LoadRunArtifactsSignalSelectionTest(unittest.TestCase):
                 "ticker,auto_buy_signal\nBBB,true\n", encoding="utf-8"
             )
 
-            self.assertEqual(load_run_artifacts(run_dir).signals_path.name, "signals.csv")
+            artifacts = load_run_artifacts(run_dir)
+            self.assertIsNotNone(artifacts.signals_path)
+            assert artifacts.signals_path is not None
+            self.assertEqual(artifacts.signals_path.name, "signals.csv")
 
     def test_falls_back_to_the_first_existing_when_none_are_usable(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -690,6 +700,8 @@ class LoadRunArtifactsSignalSelectionTest(unittest.TestCase):
 
             artifacts = load_run_artifacts(run_dir)
 
+            self.assertIsNotNone(artifacts.signals_path)
+            assert artifacts.signals_path is not None
             self.assertEqual(artifacts.signals_path.name, "signals.csv")
             self.assertEqual(artifacts.signal_rows, [])
 
@@ -728,7 +740,7 @@ class SanitizeExceptionTests(unittest.TestCase):
 
     def test_http_error_reports_status_only(self):
         exc = urllib.error.HTTPError(
-            "https://hooks.example/secret-token", 503, "blocked", {}, None
+            "https://hooks.example/secret-token", 503, "blocked", Message(), None
         )
         rendered = dca_net_utils.sanitize_exception(exc)
         assert "secret-token" not in rendered

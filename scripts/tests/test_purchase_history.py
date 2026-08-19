@@ -27,9 +27,9 @@ def _write_run(
     run_dir_name: str,
     *,
     trading_day: str,
-    run_id: str,
-    stream: str,
-    run_origin: str,
+    run_id: str | None = None,
+    stream: str | None = None,
+    run_origin: str = "scheduled",
     filled_orders_csv: str,
     broker: object = None,
 ) -> Path:
@@ -633,7 +633,7 @@ def test_collect_purchase_records_keeps_distinct_recovery_orders_separate(tmp_pa
     assert len(records) == 2
     order_ids = {r.order_id for r in records}
     assert order_ids == {"order-111", "order-222"}
-    assert sum(r.amount_usd for r in records) == pytest.approx(9.00)
+    assert sum(r.amount_usd for r in records if r.amount_usd is not None) == pytest.approx(9.00)
 
 
 def test_collect_purchase_records_keeps_same_ticker_orders_in_one_csv(tmp_path):
@@ -656,7 +656,7 @@ def test_collect_purchase_records_keeps_same_ticker_orders_in_one_csv(tmp_path):
     records, _ = collect_purchase_records(root)
 
     assert {record.order_id for record in records} == {"order-111", "order-222"}
-    assert sum(record.amount_usd for record in records) == pytest.approx(9.00)
+    assert sum(record.amount_usd for record in records if record.amount_usd is not None) == pytest.approx(9.00)
     assert build_ticker_rollup(records)["CRM"]["buy_count"] == 2
 
 
@@ -693,7 +693,7 @@ def test_collect_purchase_records_scopes_no_id_recovery_fills_to_their_root(tmp_
     records, _ = collect_purchase_records(root)
 
     assert len(records) == 2
-    assert sum(r.amount_usd for r in records) == pytest.approx(9.00)
+    assert sum(r.amount_usd for r in records if r.amount_usd is not None) == pytest.approx(9.00)
 
 
 def test_collect_purchase_records_does_not_double_read_recorded_recovery_csv(tmp_path):
@@ -974,7 +974,7 @@ def test_collect_purchase_records_no_id_rows_scoped_to_distinct_shared_report_fi
     records, _ = collect_purchase_records(root)
 
     assert len(records) == 2
-    amounts = sorted(r.amount_usd for r in records)
+    amounts = sorted(r.amount_usd for r in records if r.amount_usd is not None)
     assert amounts == [pytest.approx(4.00), pytest.approx(9.00)]
 
 
@@ -3824,7 +3824,7 @@ def test_collect_purchase_records_scopes_full_report_no_id_fills_to_their_file(t
 
     amd_records = [r for r in records if r.ticker == "AMD"]
     assert len(amd_records) == 2
-    quantities = sorted(r.quantity for r in amd_records)
+    quantities = sorted(r.quantity for r in amd_records if r.quantity is not None)
     assert quantities == pytest.approx([0.03, 0.04])
 
 
