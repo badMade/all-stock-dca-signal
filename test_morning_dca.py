@@ -5206,6 +5206,38 @@ def test_scheduled_live_run_fails_closed_on_pre_placement_broker_raw_error(tmp_p
     assert broker.place_calls == []
 
 
+class _BuyingPowerFailureBroker(FakeLiveBroker):
+    def available_buying_power(self):
+        raise ConnectionError("broker temporarily unavailable")
+
+
+def test_scheduled_live_run_persists_block_when_buying_power_lookup_fails(tmp_path):
+    """A transient account lookup failure must leave durable scheduled evidence."""
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    live_root = tmp_path / "live"
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    res = ex.run(_now_live(), data, broker=_BuyingPowerFailureBroker())
+
+    artifacts = res["artifacts"]
+    assert artifacts["status"] == "blocked"
+    assert artifacts["block_reason"] == (
+        "failed to retrieve broker buying power: broker temporarily unavailable"
+    )
+    assert artifacts["error_class"] == "buying_power_lookup_failed"
+    assert artifacts["broker_outcomes"] == {}
+    assert Path(res["paths"]["run_state"]).exists()
+    pointer = json.loads((live_root / ex.latest_pointer_name).read_text(encoding="utf-8"))
+    assert pointer["run_state_path"] == res["paths"]["run_state"]
+
+
 if __name__ == "__main__":
     import sys
     import tempfile

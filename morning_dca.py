@@ -1125,6 +1125,10 @@ class _PersistingMarketDataProvider:
         return getattr(self._inner, name)
 
 
+class _BuyingPowerLookupError(RuntimeError):
+    """Signal a broker buying-power lookup failure to the run orchestrator."""
+
+
 class _PersistingBrokerAdapter:
     """``BrokerAdapter`` decorator that persists the read-only queries it serves.
 
@@ -3047,7 +3051,12 @@ class MorningDCAExecutor(DCAExecutor):
                 outcomes[ticker] = {"status": "blocked", "skip_reason": "not tradable for fractional buy", "deliberate_skip": True}
                 continue
             if batch_buying_power is None:
-                batch_buying_power = broker.available_buying_power()
+                try:
+                    batch_buying_power = broker.available_buying_power()
+                except Exception as exc:  # noqa: BLE001 - adapters raise arbitrary connector errors
+                    if manual:
+                        raise
+                    raise _BuyingPowerLookupError(str(exc)) from exc
             if raw_persistence_failed():
                 break
             if batch_buying_power - reserved_buying_power < notional:
@@ -3282,17 +3291,26 @@ class MorningDCAExecutor(DCAExecutor):
                 if not manual:
                     return self._blocked_live_result(now, mismatch, signals, source)
                 raise RuntimeError(mismatch)
-            broker_outcomes = self._place_broker_orders(
-                auto_buy_candidates,
-                trading_day,
-                broker,
-                top_up_outcomes,
-                remaining_daily=pre_run_remaining_daily,
-                remaining_weekly=pre_run_remaining_weekly,
-                manual=manual,
-                data=data,
-                now=now,
-            )
+            try:
+                broker_outcomes = self._place_broker_orders(
+                    auto_buy_candidates,
+                    trading_day,
+                    broker,
+                    top_up_outcomes,
+                    remaining_daily=pre_run_remaining_daily,
+                    remaining_weekly=pre_run_remaining_weekly,
+                    manual=manual,
+                    data=data,
+                    now=now,
+                )
+            except _BuyingPowerLookupError as exc:
+                return self._blocked_live_result(
+                    now,
+                    f"failed to retrieve broker buying power: {exc}",
+                    signals,
+                    source,
+                    error_class="buying_power_lookup_failed",
+                )
             if raw_recorder is not None and raw_recorder.error:
                 # _place_broker_orders checks after every persisted broker or
                 # market-data input and stops before the next submission.
