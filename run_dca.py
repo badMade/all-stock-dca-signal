@@ -659,6 +659,14 @@ def _resolve_cross_stream_prior_allocation_roots(
     return tuple(resolved)
 
 
+def _parse_raw_json(path):
+    import json
+    try:
+        return path.name, json.loads(path.read_bytes()), None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        return path.name, None, e
+
+
 def _build_frozen_providers_from_raw(
     original_finance: "MarketDataProvider",
     original_robinhood: "MarketDataProvider",
@@ -699,11 +707,18 @@ def _build_frozen_providers_from_raw(
     finance_files_seen = False
 
     if raw_dir.is_dir():
-        for path in sorted(raw_dir.iterdir()):
-            name = path.name
-            try:
-                payload = json.loads(path.read_bytes())
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        # Serial on purpose: a scheduled run parses a handful to low hundreds of
+        # small archived JSON snapshots, where ProcessPoolExecutor startup and
+        # inter-process pickling dominate over the tiny per-file parse cost
+        # (benchmarked slower than the plain loop below). A process pool also
+        # raises AssertionError when this runs inside a daemonic multiprocessing
+        # worker, which some scheduling hosts require -- see .jules/bolt.md's
+        # "Parallelize JSON loading in frozen providers (reverted)" entry.
+        paths = sorted(raw_dir.iterdir())
+
+        for path in paths:
+            name, payload, error = _parse_raw_json(path)
+            if error is not None:
                 continue
             # Unwrap the data envelope so both save paths read the same way:
             # (a) normalize_connector_payload() resolves output_path pointers and

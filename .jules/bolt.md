@@ -67,6 +67,9 @@
 ## 2026-08-03 - Optimize local JSON parsing
 **Learning:** `json.loads` has optimized underlying C code that accepts bytes natively. When parsing local JSON files, `path.read_text(encoding="utf-8")` introduces unnecessary Python-level string decoding overhead. Calling `path.read_bytes()` directly and letting `json.loads` handle the byte stream is about 15% faster and maintains identical error handling behavior.
 **Action:** When reading local JSON files for parsing via `json.loads`, prefer `json.loads(path.read_bytes())` over `json.loads(path.read_text(encoding="utf-8"))` to skip intermediate string allocation.
+## 2026-08-14 - Parallelize JSON loading in frozen providers (reverted)
+**Learning:** `ProcessPoolExecutor` was tried for parallelizing `json.loads` across archived raw-data files to dodge the GIL. Benchmarked against the actual workload (a handful to low hundreds of small JSON snapshots per scheduled run) it was slower than the serial loop: process-pool startup and pickling dominate over the tiny parse cost per file. It also raises `AssertionError: daemonic processes are not allowed to have children` when `run_pipeline()` executes inside a daemonic multiprocessing worker, which this repo must support.
+**Action:** Keep small/medium raw-snapshot loading on the serial `json.loads` path. Only consider a process pool if a measured workload is large enough for parsing cost to dominate startup/pickling overhead, and even then keep a serial fallback for hosts that cannot spawn child processes.
 ## 2024-05-19 - Testing Exception Handling
 **Learning:** When mocking a function using monkeypatch that raises an exception, ensure the assertions match the exact dictionary structure returned by the function handling the exception.
 **Action:** Before writing test assertions, carefully review the `except` block of the target function to determine the precise keys and string formatting of the returned error state.
