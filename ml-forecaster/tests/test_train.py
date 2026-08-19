@@ -306,6 +306,48 @@ def test_load_active_tickers_raises_value_error_not_type_error_on_a_malformed_ex
         train_module._load_active_tickers(tickers_config)
 
 
+def test_load_active_tickers_includes_whole_share_tickers(tmp_path):
+    """Codex review ("Train and publish ML sizing for whole-share
+    symbols"): a whole-share ticker (e.g. BYDDY, not fractional-tradable)
+    lives in its own "whole_share" category, not "active" -- omitting it
+    here silently starved that symbol of a published sizing adjustment.
+    _load_active_tickers() must include it, still honoring "excluded" and
+    avoiding a duplicate for a symbol already present in "active".
+    """
+    tickers_config = tmp_path / "tickers.json"
+    tickers_config.write_text(
+        json.dumps(
+            {
+                "active": ["AAA", "BBB"],
+                "excluded": ["CCC"],
+                "whole_share": ["DDD", "BBB", "CCC"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert train_module._load_active_tickers(tickers_config) == ["AAA", "BBB", "DDD"]
+
+
+def test_load_active_tickers_defaults_whole_share_to_empty_when_absent(tmp_path):
+    """"whole_share" is optional -- its absence must not raise, and must
+    behave exactly like an empty list."""
+    tickers_config = tmp_path / "tickers.json"
+    tickers_config.write_text(json.dumps({"active": ["AAA", "BBB"]}), encoding="utf-8")  # no "whole_share" key
+
+    assert train_module._load_active_tickers(tickers_config) == ["AAA", "BBB"]
+
+
+def test_load_active_tickers_raises_value_error_on_a_malformed_whole_share_member(tmp_path):
+    tickers_config = tmp_path / "tickers.json"
+    tickers_config.write_text(
+        json.dumps({"active": ["AAPL"], "whole_share": ["byddy"]}), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError):
+        train_module._load_active_tickers(tickers_config)
+
+
 def test_main_excludes_a_ticker_listed_in_both_active_and_excluded(tmp_path):
     """End-to-end counterpart to test_load_active_tickers_excludes_a_ticker_
     present_in_both_lists: a default (no --tickers, no

@@ -29,12 +29,26 @@ USER_AGENT = "Mozilla/5.0 (compatible; AllStockDCAHistoryRefresh/1.0)"
 
 
 def active_symbols(config_path: Path) -> list[str]:
-    """Return the configured active symbols in their declared order."""
+    """Return the configured active-plus-whole-share symbols in declared order.
+
+    Includes ``whole_share`` alongside ``active``: a whole-share ticker (e.g.
+    BYDDY) is evaluated by the identical graded ladder and calibrated by
+    generate_per_ticker_sizing.py's build_sizing_payload() (see
+    docs/whole_share_accumulation.md), so its history must be refreshed here
+    too -- otherwise this refresh utility, the repository's own documented
+    "restore missing histories" tool, would never create BYDDY's missing
+    history file at all (Codex review: "Include whole-share symbols in
+    history-update events"). Whole-share symbols not already in ``active``
+    are appended after it, mirroring build_sizing_payload's own dedup order.
+    """
     data = json.loads(config_path.read_bytes())
     active = data.get("active")
     if not isinstance(active, list) or not all(isinstance(symbol, str) for symbol in active):
         raise ValueError(f"{config_path} must contain an 'active' list of symbols")
-    return active
+    whole_share = data.get("whole_share", [])
+    if not isinstance(whole_share, list) or not all(isinstance(symbol, str) for symbol in whole_share):
+        raise ValueError(f"{config_path}'s 'whole_share' list, if present, must be a list of symbols")
+    return list(active) + [symbol for symbol in whole_share if symbol not in active]
 
 
 def fetch_chart(symbol: str) -> dict[str, Any]:

@@ -160,20 +160,32 @@ def build_sizing_payload(
     lookback_years: int = 3,
     as_of: date | None = None,
 ) -> dict[str, Any]:
-    """Build the complete active-universe calibration without writing it.
+    """Build the complete active-plus-whole-share-universe calibration without
+    writing it.
 
     The daily Claude-only refresh imports this function after it has verified
     that every history file refreshed successfully.  Separating calculation
     from file output prevents it from publishing a partial model.
     """
-    active = json.loads(ticker_config.read_bytes())["active"]
+    ticker_data = json.loads(ticker_config.read_bytes())
+    # A whole-share ticker (e.g. BYDDY) is still evaluated by the SAME graded
+    # ladder as the active universe (see docs/whole_share_accumulation.md) and
+    # must never fall back to config.base_buy_amount_usd's $2 default -- every
+    # other ticker's calibration deliberately floors both base amounts at $1
+    # (see this module's build_sizing_payload docstring above). Include it in
+    # the universe this generator calibrates so a routine regen never drops
+    # its entry and silently doubles its sizing (Codex review: "Give BYDDY
+    # the configured one-dollar sizing base").
+    universe = list(ticker_data["active"]) + [
+        ticker for ticker in ticker_data.get("whole_share", []) if ticker not in ticker_data["active"]
+    ]
     effective_date = as_of or date.today()
     start_date = (
         f"{effective_date.year - lookback_years:04d}-{effective_date.month:02d}-{effective_date.day:02d}"
     )
     tickers = {}
     fallback = []
-    for ticker in active:
+    for ticker in universe:
         path = history_dir / f"{ticker}.csv"
         drops = adjusted_low_drops(path, start_date) if path.exists() else []
         if len(drops) >= MINIMUM_HISTORY_SESSIONS:

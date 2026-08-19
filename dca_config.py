@@ -23,7 +23,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from near_close_dca import StrategyConfig
+from near_close_dca import WHOLE_SHARE_TICKERS, StrategyConfig
 
 logger = logging.getLogger("near_close_dca.config")
 
@@ -55,6 +55,29 @@ DEFAULT_CONFIG_DIR = get_config_dir()
 # only the explicit braced form is recognised, so a literal ``$`` in a note or a
 # Windows-style path can never be mistaken for a variable reference.
 _ENV_PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+# Same canonical ticker-symbol shape schemas/tickers.schema.json enforces and
+# dca_whole_share_accumulator.py's own _SYMBOL_PATTERN validates against
+# before ever using a ticker as a filesystem path component. A supported
+# alternate $DCA_CONFIG_DIR is not schema-validated at all (that only
+# happens for the bundled config/tickers.json, via a separate CI/test
+# check) -- without validating here too, a noncanonical entry like
+# "byddy" would pass straight through into StrategyConfig.whole_share_tickers
+# verbatim, and the afternoon evaluator would then request market data using
+# that lowercase value while RobinhoodDataProvider's own quote/bar lookups
+# compare the broker's canonical UPPERCASE response symbol exactly -- so the
+# configured ticker silently receives no Robinhood data and never reaches
+# accumulation or placement at all (Codex review: "Reject noncanonical
+# whole-share symbols at config load").
+# Requires at least one letter (the positive lookahead), matching
+# dca_whole_share_accumulator._SYMBOL_PATTERN's own identical hardening --
+# a dots-only value like "." or ".." otherwise still passes (both this
+# regex and schemas/tickers.schema.json's own pattern) even though the
+# ledger itself now rejects it, and ".."  in particular resolves as a
+# path-traversal-risky filesystem component once used as a ticker
+# directory name (Codex review: "Reject dot-only whole-share symbols at
+# config load").
+_WHOLE_SHARE_SYMBOL_PATTERN = re.compile(r"^(?=.*[A-Z])[A-Z.]{1,6}$")
 
 
 class MissingConfigEnvError(ValueError):
@@ -180,7 +203,17 @@ def _read_json(path: Path) -> Optional[Dict[str, Any]]:
 
 
 def load_tickers(config_dir: Path) -> Dict[str, Any]:
-    """Return ``{'tickers': (...), 'excluded_tickers': frozenset(...)}`` from tickers.json."""
+    """Return ``{'tickers': (...), 'excluded_tickers': frozenset(...),
+    'whole_share_tickers': frozenset(...)}`` from tickers.json.
+
+    ``whole_share_tickers`` (see ``near_close_dca.WHOLE_SHARE_TICKERS`` and
+    ``docs/whole_share_accumulation.md``) is a ticker category distinct from
+    both ``tickers``/``excluded_tickers``: a whole-share ticker IS evaluated
+    by the graded ladder and actively bought, just via a quantity-based
+    whole-share order instead of the normal dollar-amount one. Overlaid from
+    tickers.json's ``"whole_share"`` array exactly like ``"active"``/
+    ``"excluded"`` overlay ``tickers``/``excluded_tickers``.
+    """
     data = _read_json(config_dir / "tickers.json")
     if data is None:
         return {}
@@ -191,6 +224,86 @@ def load_tickers(config_dir: Path) -> Dict[str, Any]:
     excluded = data.get("excluded")
     if isinstance(excluded, list):
         out["excluded_tickers"] = frozenset(str(t) for t in excluded)
+    whole_share = data.get("whole_share")
+    if whole_share is not None:
+        # Unlike "active"/"excluded" above, a present-but-malformed
+        # "whole_share" value must be rejected outright rather than silently
+        # skipped: silently ignoring it leaves whole_share_tickers at
+        # StrategyConfig's empty-set default, so the afternoon run starts
+        # successfully but never evaluates or accumulates the intended
+        # whole-share ticker, with no configuration error explaining the
+        # omission. Mirrors the same validation the whole-share-aware
+        # maintenance and ML loaders (ticker-advisor, ml-forecaster,
+        # dca_market_graph) already apply to this same field (Codex review:
+        # "Reject a malformed whole-share collection at config load").
+        if not isinstance(whole_share, list):
+            raise ValueError(
+                f"tickers.json's 'whole_share' field must be a list, got {type(whole_share).__name__}"
+            )
+        invalid_whole_share = [
+            item for item in whole_share if not isinstance(item, str) or not _WHOLE_SHARE_SYMBOL_PATTERN.match(item)
+        ]
+        if invalid_whole_share:
+            raise ValueError(
+                f"tickers.json's 'whole_share' field contains invalid ticker symbol(s): {invalid_whole_share!r}"
+            )
+        out["whole_share_tickers"] = frozenset(str(t) for t in whole_share)
+    # active/excluded/whole_share are a THREE-WAY DISJOINT partition of the
+    # universe (see docs/whole_share_accumulation.md) -- a symbol in more
+    # than one category leaves near_close_dca._run_once_impl's ticker-list
+    # construction and _process_buy_candidate's dispatch ambiguous, and can
+    # silently evaluate/submit the SAME ticker twice in one run, one copy
+    # overwriting the other's candidate_outcomes entry. test_config_invariants.py
+    # only checks the bundled config/tickers.json; a caller pointing
+    # DCA_CONFIG_DIR at an alternate config directory got no such guarantee
+    # (Codex review: "Reject overlapping ticker categories at config load").
+    # Compared case-insensitively (not just verbatim): the categories are
+    # stored as-is elsewhere (existing convention -- entries are expected to
+    # already be uppercase in tickers.json), but a symbol differing only in
+    # case (e.g. "AAPL" active, "aapl" whole_share) is still the SAME
+    # instrument to every consumer here -- near_close_dca.WHOLE_SHARE_TICKERS
+    # membership, broker calls, etc. all normalize a ticker before use. A
+    # verbatim-only comparison would let that exact collision slip through
+    # (Codex review: "Normalize symbols before checking category overlap").
+    active_set = {str(t).upper() for t in out.get("tickers", ())}
+    excluded_set = {str(t).upper() for t in out.get("excluded_tickers", frozenset())}
+    whole_share_list = list(out.get("whole_share_tickers", frozenset()))
+    whole_share_set = {str(t).upper() for t in whole_share_list}
+    # A case-folded duplicate WITHIN whole_share (e.g. ["BYDDY", "byddy"]) is
+    # invisible to the cross-category overlap check below -- both spellings
+    # collapse to one entry in whole_share_set, so the set-difference math
+    # never sees a collision, but BOTH spellings remain in
+    # whole_share_tickers (a frozenset built verbatim, not case-insensitively).
+    # Unlike "active"/"excluded" -- whose own downstream non-canonical checks
+    # in scripts/generate_buy_candidates.py already catch a lower-case entry
+    # (it never even reaches a duplicate-count check) -- nothing downstream
+    # validates whole_share tickers at all (it is not part of that script's
+    # universe; see docs/whole_share_accumulation.md's "Scope" section on the
+    # Gate 5 entry point gap), so a case-folded duplicate here would silently
+    # reach near_close_dca._run_once_impl's whole-share evaluation twice:
+    # both spellings normalize to the SAME WholeShareAccumulationLedger entry,
+    # so the accumulator's contribution gets recorded twice in one run,
+    # inflating the balance twice as fast as the graded ladder actually
+    # intends (Codex review: "Reject case-folded duplicates within each
+    # ticker category").
+    if len(whole_share_set) != len(whole_share_list):
+        dupes = sorted({t for t in whole_share_list if sum(1 for u in whole_share_list if u.upper() == t.upper()) > 1})
+        raise ValueError(
+            f"tickers.json's whole_share list contains a case-folded duplicate symbol: {dupes} "
+            "(e.g. 'BYDDY' and 'byddy' are the same instrument)"
+        )
+    overlaps = {
+        "active/excluded": active_set & excluded_set,
+        "active/whole_share": active_set & whole_share_set,
+        "excluded/whole_share": excluded_set & whole_share_set,
+    }
+    conflicting = {pair: tickers for pair, tickers in overlaps.items() if tickers}
+    if conflicting:
+        details = "; ".join(f"{pair}: {sorted(tickers)}" for pair, tickers in conflicting.items())
+        raise ValueError(
+            f"tickers.json's active/excluded/whole_share categories must be pairwise disjoint "
+            f"(case-insensitive): {details}"
+        )
     return out
 
 
@@ -884,6 +997,10 @@ def load_strategy_config(
     ML staleness against the run timestamp").
     """
     config_dir = Path(config_dir)
+    # Whether the CALLER supplied an explicit `base` -- decides below whether
+    # the canonical WHOLE_SHARE_TICKERS fallback applies at all (see that
+    # branch's own comment, after `merged` is known).
+    explicit_base_given = base is not None
     base = base or StrategyConfig()
 
     # Surface the fallback-to-defaults case loudly. If the strategy is installed as a
@@ -906,6 +1023,57 @@ def load_strategy_config(
     merged.update(load_ml_sizing_adjustment(config_dir, now=now))
     merged.update(load_approved_dates(config_dir))
     merged.update(load_near_close_overrides(config_dir))
+
+    # StrategyConfig()'s own bare class default deliberately leaves
+    # whole_share_tickers at frozenset() (see that field's own docstring) --
+    # unlike tickers/excluded_tickers, which default to the real
+    # ACTIVE_TICKERS/EXCLUDED_TICKERS constants, defaulting this field
+    # non-empty on the CLASS itself would silently evaluate BYDDY against
+    # every bare `StrategyConfig(tickers=(...))` construction throughout the
+    # test suite, most of which never provision a broker/data double for it.
+    # But a CALLER of THIS loader who passed no `base` and whose config
+    # never declared its own "whole_share" key (load_tickers's own merge
+    # above left "whole_share_tickers" out of `merged` entirely) should get
+    # the canonical WHOLE_SHARE_TICKERS membership here, exactly like it
+    # already gets ACTIVE_TICKERS/EXCLUDED_TICKERS from StrategyConfig()'s
+    # own defaults -- without this, the documented installed-wheel/missing-
+    # config-dir fallback (see the warning above), or simply an existing
+    # tickers.json that omits the optional "whole_share" key, silently
+    # stopped evaluating and accumulating BYDDY, while the active/excluded
+    # universes kept their real hardcoded fallback (Codex review: "Preserve
+    # whole-share defaults when config is absent"). Subtracts whatever this
+    # config's FINAL excluded_tickers turns out to be (from `merged` if the
+    # config declared its own "excluded", else `base`'s) first: a config
+    # that explicitly excludes BYDDY (a supported, safer do-not-buy state
+    # that never mentions "whole_share" at all) must not have this implicit
+    # default inject BYDDY into whole_share_tickers, overlapping
+    # excluded_tickers and failing the disjointness validation just below
+    # for a config that never asked for BYDDY to be evaluated in ANY
+    # category (Codex review: "Honor explicit exclusions when applying
+    # whole-share defaults"). A caller that DOES pass an explicit `base`
+    # (e.g. a test isolating a small ad hoc universe), or whose config
+    # explicitly declares its own "whole_share" list, is unaffected.
+    if not explicit_base_given and "whole_share_tickers" not in merged:
+        # `overrides` (the caller's own explicit keyword arguments) is the
+        # HIGHEST-precedence layer -- applied via merged.update(overrides)
+        # below, AFTER this default is computed. Deriving final_excluded_tickers
+        # from `merged` alone (the config-file layer) missed a caller-supplied
+        # `excluded_tickers=` override entirely: a caller explicitly excluding
+        # BYDDY via that documented override, on a tickers.json that omits
+        # "whole_share", would still get BYDDY injected into
+        # whole_share_tickers here (computed from the lower-precedence
+        # merged/base exclusions), which merged.update(overrides) cannot
+        # retroactively undo -- the final partition validation then raised
+        # for an excluded/whole-share overlap the caller's own override was
+        # trying to avoid (Codex review: "Apply exclusion overrides before
+        # deriving whole-share defaults"). Check `overrides` first, exactly
+        # matching the precedence order `dataclasses.replace(base, **merged)`
+        # itself applies.
+        final_excluded_tickers = overrides.get(
+            "excluded_tickers", merged.get("excluded_tickers", base.excluded_tickers)
+        )
+        merged["whole_share_tickers"] = frozenset(WHOLE_SHARE_TICKERS) - final_excluded_tickers
+
     merged.update(overrides)
 
     valid_fields = {f.name for f in dataclasses.fields(StrategyConfig)}
@@ -913,4 +1081,69 @@ def load_strategy_config(
     if unknown:
         raise ValueError(f"unknown StrategyConfig fields from config/overrides: {sorted(unknown)}")
 
-    return dataclasses.replace(base, **merged)
+    result = dataclasses.replace(base, **merged)
+
+    # load_tickers's own pairwise-disjointness check only sees the categories a
+    # PARTIAL tickers.json explicitly provides -- a config defining only
+    # "whole_share": ["aapl"] passes that check (its own "tickers"/"excluded"
+    # sets are empty, so there is nothing to overlap with), but the merge
+    # above never touches `base.tickers`, whose DEFAULT active universe
+    # (ACTIVE_TICKERS) still contains "AAPL". The resulting StrategyConfig
+    # then has the SAME instrument in both `tickers` and `whole_share_tickers`,
+    # which near_close_dca._process_buy_candidate has no defined behavior for
+    # -- both the notional and whole-share paths would evaluate/act on it in
+    # the same run. Re-validate disjointness here, after every base/JSON/
+    # override layer has been applied, using the FINAL resolved sets rather
+    # than just what one partial config file happened to declare (Codex
+    # review: "Validate the final overlaid ticker partition").
+    final_active = {str(t).upper() for t in result.tickers}
+    final_excluded = {str(t).upper() for t in result.excluded_tickers}
+    final_whole_share_list = list(result.whole_share_tickers)
+    final_whole_share = {str(t).upper() for t in final_whole_share_list}
+    # A case-folded duplicate supplied directly through `base` or an explicit
+    # keyword override (e.g. whole_share_tickers=frozenset({"BYDDY", "byddy"}))
+    # bypasses load_tickers/tickers.json entirely, so its own case-folded-
+    # duplicate check (dca_config.load_tickers) never runs against it. Both
+    # spellings survive as distinct entries in the frozenset (frozenset only
+    # dedupes exact matches), and normalizing here to check overlaps collapses
+    # them into ONE entry -- silently hiding the duplicate from the overlap
+    # check above, exactly like the tickers.json case this mirrors (Codex
+    # review: "Reject case-folded duplicates after applying overlays").
+    if len(final_whole_share) != len(final_whole_share_list):
+        final_whole_share_dupes = sorted(
+            {t for t in final_whole_share_list if sum(1 for u in final_whole_share_list if u.upper() == t.upper()) > 1}
+        )
+        raise ValueError(
+            "the final resolved StrategyConfig's whole_share_tickers contains a case-folded "
+            f"duplicate symbol: {final_whole_share_dupes} (e.g. 'BYDDY' and 'byddy' are the same instrument)"
+        )
+    # load_tickers's _WHOLE_SHARE_SYMBOL_PATTERN check only runs against
+    # tickers.json's own "whole_share" list -- a symbol supplied through
+    # `base` or the documented `whole_share_tickers=` keyword override
+    # bypasses that loader entirely and reaches here unchecked. A lowercase
+    # symbol (e.g. "byddy") survives every check above (it does not collide
+    # with anything, and nothing here case-folds membership before use), but
+    # near_close_dca's signal lookup and RobinhoodDataProvider._quote_for()/
+    # _parse_bars() compare the broker's canonical UPPERCASE response
+    # verbatim, so the ticker silently never matches and never accumulates
+    # (Codex review: "Validate final whole-share symbols after overrides").
+    invalid_final_whole_share = [t for t in final_whole_share_list if not _WHOLE_SHARE_SYMBOL_PATTERN.match(str(t))]
+    if invalid_final_whole_share:
+        raise ValueError(
+            "the final resolved StrategyConfig's whole_share_tickers contains invalid ticker "
+            f"symbol(s): {sorted(invalid_final_whole_share)!r}"
+        )
+    final_overlaps = {
+        "active/excluded": final_active & final_excluded,
+        "active/whole_share": final_active & final_whole_share,
+        "excluded/whole_share": final_excluded & final_whole_share,
+    }
+    final_conflicting = {pair: tickers for pair, tickers in final_overlaps.items() if tickers}
+    if final_conflicting:
+        details = "; ".join(f"{pair}: {sorted(tickers)}" for pair, tickers in final_conflicting.items())
+        raise ValueError(
+            "the final resolved StrategyConfig's active/excluded/whole_share categories "
+            f"must be pairwise disjoint (case-insensitive): {details}"
+        )
+
+    return result

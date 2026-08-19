@@ -20,7 +20,7 @@ adding the same-day top-up guard.
 
 Uses **Robinhood account `<ROBINHOOD_ACCOUNT_NUMBER>`** as the sole execution broker (Alpaca stays
 read-only for validation/context), the **$2 base afternoon 0x-to-5x ladder**, the
-same active universe (excludes BYDDY/VCX/TRLV/RVI), and its own `midday` budget
+same active universe, and its own `midday` budget
 ledger. Writes under `.../cron_tracking/midday_dca/YYYYMMDD_1230ET/`
 (`run_id='midday_live_YYYYMMDD_1230ET'`) and updates that root's
 `latest_midday_run.json`. The 12:30 PM decision time gives a real intraday trend
@@ -219,11 +219,12 @@ first-allocation base (**$2** below prior close *and* prior low, **$1** below
 prior close only) — not a flat $2 (actual order size, subject to the top-up
 guard offset).
 
-> **This shared table is the fallback, not the live curve.** As of 2026-08-04
+> **This shared table is the fallback, not the live curve.** As of 2026-08-16
 > `config/per_ticker_sizing.json` is `status: active` and carries an entry for
-> all 53 active symbols. 46 of them are volatility-calibrated from history; the
-> 7 listed in `fallback_tickers` (SPCX, DRAM, CBRS, FLKR, SATA, GFUZ, VT) have
-> too little history and carry a copy of the global fallback ladder instead.
+> all 58 active symbols. 47 of them are volatility-calibrated from history; the
+> 11 listed in `fallback_tickers` (SPCX, DRAM, CBRS, SATA, GFUZ, VT, QBUT,
+> RVII, RVI, VCX, TRLV) have too little history and carry a copy of the global
+> fallback ladder instead.
 > `near_close_dca.graded_buy_multiplier` reads a ticker's calibrated tiers first
 > and falls back to the table above only for symbols with no entry — currently
 > none. See [strategy.md](strategy.md#sizing-ladder-latest-active).

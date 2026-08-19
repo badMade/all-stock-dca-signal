@@ -25,6 +25,7 @@ from dca_config import (
 )
 from near_close_dca import (
     EASTERN,
+    WHOLE_SHARE_TICKERS,
     Action,
     Bar,
     SourceName,
@@ -755,10 +756,152 @@ def test_inverse_martingale_non_bool_enabled_raises(tmp_path):
         load_inverse_martingale_config(tmp_path)
 
 
+def test_load_strategy_config_preserves_whole_share_defaults_when_config_dir_is_absent(tmp_path):
+    """Codex review ("Preserve whole-share defaults when config is absent"):
+    the documented installed-wheel/missing-config-dir fallback (see the
+    "config dir not found" warning) constructs load_strategy_config's own
+    default `base` when the caller passes none. tickers/excluded_tickers
+    survive that fallback via StrategyConfig()'s own real ACTIVE_TICKERS/
+    EXCLUDED_TICKERS class defaults, but whole_share_tickers deliberately
+    defaults to an EMPTY frozenset on the class itself (to avoid silently
+    evaluating BYDDY against every bare ad hoc StrategyConfig() test
+    construction) -- so without this fix, BYDDY silently stopped being
+    evaluated/accumulated the moment config/tickers.json was unavailable,
+    unlike the active/excluded universes.
+    """
+    missing_dir = tmp_path / "does-not-exist"
+    assert not missing_dir.exists()
+
+    config = load_strategy_config(missing_dir)
+
+    assert config.whole_share_tickers == frozenset(WHOLE_SHARE_TICKERS)
+    assert tuple(config.tickers) == tuple(StrategyConfig().tickers)
+    assert config.excluded_tickers == StrategyConfig().excluded_tickers
+
+
+def test_load_strategy_config_omitted_whole_share_key_falls_back_to_the_default(tmp_path):
+    """Companion to the missing-directory case above: an EXISTING config
+    directory whose tickers.json simply omits the optional "whole_share"
+    key (valid per schema) must ALSO fall back to the real
+    WHOLE_SHARE_TICKERS default, exactly like an absent "excluded" key
+    already falls back to the real EXCLUDED_TICKERS default -- not silently
+    evaluating an empty whole-share universe just because this one
+    optional key wasn't declared.
+    """
+    _write(tmp_path, "tickers.json", {"active": ["AAPL"]})
+
+    config = load_strategy_config(tmp_path)
+
+    assert config.whole_share_tickers == frozenset(WHOLE_SHARE_TICKERS)
+
+
+def test_load_strategy_config_whole_share_default_honors_an_explicit_exclusion(tmp_path):
+    """Codex review ("Honor explicit exclusions when applying whole-share
+    defaults"): a supported legacy/alternate config that explicitly
+    excludes BYDDY -- a safer do-not-buy state -- without ever mentioning
+    "whole_share" at all must NOT have the implicit WHOLE_SHARE_TICKERS
+    fallback inject BYDDY into whole_share_tickers anyway: that would
+    overlap the explicit excluded_tickers and fail the disjointness
+    validation at startup for a config that never asked for BYDDY to be
+    evaluated in ANY category.
+    """
+    _write(tmp_path, "tickers.json", {"active": ["AAPL"], "excluded": ["BYDDY"]})
+
+    config = load_strategy_config(tmp_path)
+
+    assert "BYDDY" not in config.whole_share_tickers
+    assert "BYDDY" in config.excluded_tickers
+    # Any other canonical whole-share ticker (none exist today besides
+    # BYDDY, but the fallback logic itself must not blanket-empty the set)
+    # is still exactly WHOLE_SHARE_TICKERS minus the excluded symbols.
+    assert config.whole_share_tickers == frozenset(WHOLE_SHARE_TICKERS) - {"BYDDY"}
+
+
+def test_load_strategy_config_whole_share_default_honors_an_explicit_override_exclusion(tmp_path):
+    """Codex review ("Apply exclusion overrides before deriving whole-share
+    defaults"): a caller-supplied `excluded_tickers=` OVERRIDE -- the
+    highest-precedence layer, applied via `**overrides` -- must also be
+    honored by the implicit whole-share default, not just a JSON-file-level
+    "excluded" entry. Deriving the default from the lower-precedence
+    merged/base layers alone injected BYDDY into whole_share_tickers
+    anyway, which the later `merged.update(overrides)` call cannot undo --
+    tripping the disjointness validation for a caller explicitly trying to
+    exclude BYDDY via the documented override.
+    """
+    _write(tmp_path, "tickers.json", {"active": ["AAPL"]})
+
+    config = load_strategy_config(tmp_path, excluded_tickers=frozenset({"BYDDY"}))
+
+    assert "BYDDY" not in config.whole_share_tickers
+    assert "BYDDY" in config.excluded_tickers
+    assert config.whole_share_tickers == frozenset(WHOLE_SHARE_TICKERS) - {"BYDDY"}
+
+
+def test_load_strategy_config_an_explicit_base_is_not_overridden(tmp_path):
+    """A caller passing an explicit `base` (e.g. a test isolating a small ad
+    hoc universe) must be unaffected by the missing-config-dir fallback
+    default -- only the IMPLICIT default (no `base` passed at all) should
+    fill in WHOLE_SHARE_TICKERS.
+    """
+    missing_dir = tmp_path / "does-not-exist"
+    explicit_base = StrategyConfig(whole_share_tickers=frozenset())
+
+    config = load_strategy_config(missing_dir, base=explicit_base)
+
+    assert config.whole_share_tickers == frozenset()
+
+
 def test_load_strategy_config_leaves_inverse_martingale_off_by_default(tmp_path):
     config = load_strategy_config(tmp_path)
     assert config.inverse_martingale_enabled_default is False
     assert config.inverse_martingale == {}
+
+
+def test_load_strategy_config_rejects_an_overlap_hidden_by_a_partial_tickers_json(tmp_path):
+    """Codex review ("Validate the final overlaid ticker partition"):
+    load_tickers's own pairwise-disjointness check only sees the categories a
+    PARTIAL tickers.json explicitly provides -- a config defining only
+    "whole_share" has an empty "tickers"/"excluded" set of its own, so
+    load_tickers sees no overlap. But load_strategy_config merges that
+    partial result onto `base` (default StrategyConfig()), whose default
+    `tickers` field (ACTIVE_TICKERS) already contains "AAPL" -- the merge
+    never touches `tickers` since load_tickers didn't return that key at
+    all. The FINAL resolved StrategyConfig then has "AAPL" in both
+    `tickers` and `whole_share_tickers`, which load_tickers's own check,
+    scoped to one file's declared categories, never catches.
+    """
+    _write(tmp_path, "tickers.json", {"whole_share": ["AAPL"]})
+
+    with pytest.raises(ValueError, match="pairwise disjoint"):
+        load_strategy_config(tmp_path)
+
+
+def test_load_strategy_config_rejects_a_case_folded_duplicate_supplied_via_override(tmp_path):
+    """Codex review ("Reject case-folded duplicates after applying
+    overlays"): a case-folded duplicate supplied directly through an
+    explicit override bypasses load_tickers/tickers.json entirely, so its
+    own within-category duplicate check never runs against it. Both
+    spellings survive as distinct frozenset entries; normalizing to check
+    overlaps must not silently collapse them without detecting the
+    duplicate first.
+    """
+    with pytest.raises(ValueError, match="case-folded duplicate"):
+        load_strategy_config(tmp_path, whole_share_tickers=frozenset({"BYDDY", "byddy"}))
+
+
+def test_load_strategy_config_rejects_a_lowercase_whole_share_symbol_supplied_via_override(tmp_path):
+    """Codex review ("Validate final whole-share symbols after overrides"):
+    load_tickers's _WHOLE_SHARE_SYMBOL_PATTERN check only runs against
+    tickers.json's own "whole_share" list -- a symbol supplied directly
+    through the documented `whole_share_tickers=` override bypasses that
+    loader entirely. A lowercase symbol collides with nothing and survives
+    every disjointness/duplicate check, but near_close_dca's signal lookup
+    and RobinhoodDataProvider compare the broker's canonical UPPERCASE
+    response verbatim, so it would silently never match and never
+    accumulate. The final overlaid collection must be validated too.
+    """
+    with pytest.raises(ValueError, match="invalid ticker symbol"):
+        load_strategy_config(tmp_path, whole_share_tickers=frozenset({"byddy"}))
 
 
 def test_ml_sizing_adjustment_missing_file_is_a_no_op(tmp_path):
@@ -1461,3 +1604,160 @@ def test_the_midday_loader_rejects_a_malformed_account(monkeypatch):
     monkeypatch.setenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "12")
     with pytest.raises(InvalidAccountNumberError):
         load_midday_config()
+
+
+# --- load_tickers's whole_share_tickers ---------------------------------------
+# BYDDY's category (near_close_dca.WHOLE_SHARE_TICKERS, docs/whole_share_accumulation.md)
+# is sourced from tickers.json's "whole_share" array -- a single source of
+# truth alongside "active"/"excluded", not a separate opt-in config file.
+
+
+def test_load_tickers_missing_whole_share_key_is_a_no_op(tmp_path):
+    _write(tmp_path, "tickers.json", {"active": ["AAPL"], "excluded": []})
+    assert "whole_share_tickers" not in load_tickers(tmp_path)
+
+
+def test_load_tickers_returns_whole_share_tickers(tmp_path):
+    _write(tmp_path, "tickers.json", {"active": ["AAPL"], "excluded": [], "whole_share": ["BYDDY"]})
+    assert load_tickers(tmp_path)["whole_share_tickers"] == frozenset({"BYDDY"})
+
+
+def test_load_tickers_rejects_a_non_list_whole_share(tmp_path):
+    """Codex review ("Reject a malformed whole-share collection at config
+    load"): unlike "active"/"excluded" above, a present-but-malformed
+    "whole_share" value must be rejected outright, not silently ignored --
+    silently skipping it leaves whole_share_tickers at StrategyConfig's
+    empty-set default, so the afternoon run starts successfully but never
+    evaluates or accumulates the intended whole-share ticker, with no
+    configuration error explaining the omission. Mirrors the same
+    validation the whole-share-aware maintenance and ML loaders already
+    apply to this same field.
+    """
+    _write(tmp_path, "tickers.json", {"active": ["AAPL"], "excluded": [], "whole_share": "BYDDY"})
+    with pytest.raises(ValueError):
+        load_tickers(tmp_path)
+
+
+def test_load_tickers_whole_share_tickers_preserved_verbatim(tmp_path):
+    # Matches tickers/excluded_tickers' own convention: entries are taken
+    # verbatim (already expected to be uppercase in tickers.json), not
+    # normalized here.
+    _write(tmp_path, "tickers.json", {"active": ["AAPL"], "excluded": [], "whole_share": ["BYDDY"]})
+    assert load_tickers(tmp_path)["whole_share_tickers"] == frozenset({"BYDDY"})
+
+
+def test_shipped_tickers_json_enrolls_byddy_as_whole_share():
+    """The checked-in config/tickers.json's "whole_share" array enrolls
+    BYDDY -- the ticker this category was built for -- and "excluded" is
+    empty (no ticker has NO buying mechanism today)."""
+    loaded = load_tickers(get_config_dir())
+    assert loaded["whole_share_tickers"] == frozenset({"BYDDY"})
+    assert loaded["excluded_tickers"] == frozenset()
+    assert "BYDDY" not in loaded["tickers"]
+
+
+# --- load_tickers rejects overlapping categories --------------------------
+# active/excluded/whole_share must be pairwise disjoint (Codex review: "Reject
+# overlapping ticker categories at config load") -- test_config_invariants.py
+# only checks the bundled config/tickers.json, so load_tickers itself must
+# fail closed for any OTHER $DCA_CONFIG_DIR too.
+
+
+def test_load_tickers_rejects_a_symbol_in_both_active_and_whole_share(tmp_path):
+    _write(
+        tmp_path,
+        "tickers.json",
+        {"active": ["AAPL", "BYDDY"], "excluded": [], "whole_share": ["BYDDY"]},
+    )
+    with pytest.raises(ValueError, match="pairwise disjoint"):
+        load_tickers(tmp_path)
+
+
+def test_load_tickers_rejects_a_case_only_overlap(tmp_path):
+    """Codex review ("Normalize symbols before checking category overlap"):
+    "aapl" active and "AAPL" whole_share are the SAME instrument to every
+    consumer (near_close_dca normalizes tickers before use), so a
+    case-insensitive collision must be rejected even though the raw
+    strings differ. The lowercase spelling lives in "active" here (not
+    itself symbol-validated) rather than "whole_share": since "Reject
+    noncanonical whole-share symbols at config load" made whole_share
+    entries themselves canonical-uppercase-only, a lowercase whole_share
+    entry is now rejected earlier by that check instead of ever reaching
+    this overlap comparison.
+    """
+    _write(
+        tmp_path,
+        "tickers.json",
+        {"active": ["aapl"], "excluded": [], "whole_share": ["AAPL"]},
+    )
+    with pytest.raises(ValueError, match="pairwise disjoint"):
+        load_tickers(tmp_path)
+
+
+def test_load_tickers_rejects_a_noncanonical_whole_share_symbol(tmp_path):
+    """Codex review ("Reject noncanonical whole-share symbols at config
+    load"): a supported alternate $DCA_CONFIG_DIR is not schema-validated,
+    so a lowercase entry like "byddy" would otherwise pass straight through
+    into StrategyConfig.whole_share_tickers verbatim -- RobinhoodDataProvider's
+    quote/bar lookups compare the broker's canonical UPPERCASE response
+    symbol exactly, so the configured ticker would silently receive no
+    Robinhood data and never reach accumulation or placement at all.
+    """
+    _write(
+        tmp_path,
+        "tickers.json",
+        {"active": [], "excluded": [], "whole_share": ["byddy"]},
+    )
+    with pytest.raises(ValueError, match="invalid ticker symbol"):
+        load_tickers(tmp_path)
+
+
+def test_load_tickers_rejects_a_dots_only_whole_share_symbol(tmp_path):
+    """Codex review ("Reject dot-only whole-share symbols at config
+    load"): dca_whole_share_accumulator._SYMBOL_PATTERN was hardened to
+    require at least one letter (rejecting a dots-only value like "..",
+    path-traversal-risky as a filesystem component), but this loader's own
+    _WHOLE_SHARE_SYMBOL_PATTERN still accepted it -- a value that would
+    later fail only at ledger use, past the intended fail-closed config
+    boundary, for an alternate $DCA_CONFIG_DIR not covered by the bundled
+    schema check.
+    """
+    _write(
+        tmp_path,
+        "tickers.json",
+        {"active": [], "excluded": [], "whole_share": [".."]},
+    )
+    with pytest.raises(ValueError, match="invalid ticker symbol"):
+        load_tickers(tmp_path)
+
+
+def test_load_tickers_rejects_a_symbol_in_both_active_and_excluded(tmp_path):
+    _write(
+        tmp_path,
+        "tickers.json",
+        {"active": ["AAPL"], "excluded": ["AAPL"], "whole_share": []},
+    )
+    with pytest.raises(ValueError, match="pairwise disjoint"):
+        load_tickers(tmp_path)
+
+
+def test_load_tickers_rejects_a_symbol_in_both_excluded_and_whole_share(tmp_path):
+    _write(
+        tmp_path,
+        "tickers.json",
+        {"active": ["AAPL"], "excluded": ["BYDDY"], "whole_share": ["BYDDY"]},
+    )
+    with pytest.raises(ValueError, match="pairwise disjoint"):
+        load_tickers(tmp_path)
+
+
+def test_load_tickers_accepts_disjoint_categories(tmp_path):
+    _write(
+        tmp_path,
+        "tickers.json",
+        {"active": ["AAPL"], "excluded": ["DEAD"], "whole_share": ["BYDDY"]},
+    )
+    loaded = load_tickers(tmp_path)
+    assert loaded["tickers"] == ("AAPL",)
+    assert loaded["excluded_tickers"] == frozenset({"DEAD"})
+    assert loaded["whole_share_tickers"] == frozenset({"BYDDY"})

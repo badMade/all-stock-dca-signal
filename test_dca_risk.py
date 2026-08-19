@@ -22,6 +22,7 @@ from dca_risk import (
     classify_stream,
     deployed_by_day,
     deployed_usd,
+    deployed_usd_by_claim_date,
     is_afternoon_scheduled_evidence,
     kill_switch_active,
     main,
@@ -550,6 +551,82 @@ def test_deployed_usd_invalid_budget():
 
     state_no_budget = {}
     assert deployed_usd(state_no_budget) == 0.0
+
+
+def test_deployed_usd_by_claim_date_attributes_a_reconciled_row_to_its_own_date():
+    """Codex review ("Attribute reconciled deployment to the claim date"):
+    a whole-share row recovered by cross-day reconciliation carries
+    whole_share_claim_breakdown -- the claim's TRUE execution date, which
+    can differ from this artifact's own trading_day by days or weeks. That
+    row's dollars must bucket under the claim's own date, not today's.
+    """
+    state = {
+        "trading_day": "2026-08-16",
+        "buy_candidates": [
+            {
+                "status": "submitted",
+                "planned_amount_usd": 10.0,
+                "whole_share_claim_breakdown": [{"trading_day": "2026-08-01", "amount_usd": 10.0}],
+            },
+        ],
+    }
+    assert deployed_usd_by_claim_date(state) == {date(2026, 8, 1): 10.0}
+
+
+def test_deployed_usd_by_claim_date_splits_an_aggregated_row_across_two_dates():
+    """A single row can aggregate a reconciled claim from one day with
+    today's own fresh contribution (or two reconciled claims from two
+    different days) -- the breakdown may not account for the row's whole
+    planned_amount_usd, and whatever remainder it leaves uncovered must
+    still land on this artifact's own trading_day, exactly like an
+    ordinary candidate with no breakdown at all.
+    """
+    state = {
+        "trading_day": "2026-08-16",
+        "buy_candidates": [
+            {
+                "status": "submitted",
+                "planned_amount_usd": 25.0,
+                "whole_share_claim_breakdown": [{"trading_day": "2026-08-01", "amount_usd": 10.0}],
+            },
+        ],
+    }
+    assert deployed_usd_by_claim_date(state) == {
+        date(2026, 8, 1): 10.0,
+        date(2026, 8, 16): 15.0,
+    }
+
+
+def test_deployed_usd_by_claim_date_falls_back_to_the_artifact_day_without_a_breakdown():
+    state = {
+        "trading_day": "2026-08-16",
+        "buy_candidates": [
+            {"status": "submitted", "planned_amount_usd": 40.0},
+            {"status": "skipped", "planned_amount_usd": 999.0},
+        ],
+    }
+    assert deployed_usd_by_claim_date(state) == {date(2026, 8, 16): 40.0}
+
+
+def test_deployed_usd_by_claim_date_falls_back_to_deployed_usd_without_candidates():
+    state = {"trading_day": "2026-08-16", "budget": {"day_notional_usd": 75.0}}
+    assert deployed_usd_by_claim_date(state) == {date(2026, 8, 16): 75.0}
+
+
+def test_deployed_by_day_buckets_a_reconciled_claim_under_its_own_trading_day():
+    """Integration check: deployed_by_day (the function apply_risk_guard's
+    kill-switch seeding actually calls) must reflect the SAME claim-date
+    attribution deployed_usd_by_claim_date computes per-state.
+    """
+    old_claim_state = _scheduled_state("2026-08-16", 10.0)
+    old_claim_state["buy_candidates"][0]["whole_share_claim_breakdown"] = [
+        {"trading_day": "2026-08-01", "amount_usd": 10.0}
+    ]
+    per_day = deployed_by_day([old_claim_state], stream=STREAM_SCHEDULED)
+    assert per_day == {date(2026, 8, 1): 10.0}
+    # A claim dated 2026-08-01 must not appear as trailing 7-day deployment
+    # for a kill-switch evaluation on 2026-08-16.
+    assert seven_day_deployed(per_day, date(2026, 8, 16)) == 0.0
 
 
 # --- CLI: main() -------------------------------------------------------------

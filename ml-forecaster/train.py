@@ -247,8 +247,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _load_active_tickers(config_path: Path) -> list[str]:
-    """The "active" ticker list from config/tickers.json, minus "excluded" --
-    the live, TRADABLE DCA universe.
+    """The "active" ticker list from config/tickers.json, minus "excluded"
+    and plus "whole_share" -- the live, TRADABLE DCA universe.
 
     This is the default training ticker set when both --tickers and
     --all-tickers-in-archive are omitted (see main()'s own comment on why
@@ -318,7 +318,33 @@ def _load_active_tickers(config_path: Path) -> list[str]:
     if invalid_excluded:
         raise ValueError(f"{config_path}'s 'excluded' field contains invalid ticker symbol(s): {invalid_excluded!r}")
     excluded_set = set(excluded)
-    return [ticker for ticker in active if ticker not in excluded_set]
+    # "whole_share" (see docs/whole_share_accumulation.md) is a THIRD category,
+    # distinct from both "active" and "excluded" -- a whole-share ticker (e.g.
+    # BYDDY) is actively purchased by the SAME graded ladder, just via a
+    # quantity-based order once its accumulated contributions cross one
+    # share's price, rather than a normal fractional buy. Omitting it here
+    # would leave it out of every default pooled retrain and default
+    # per-ticker `adjustments` publish, permanently falling back to an ML
+    # factor of 1.0 in graded_buy_multiplier for a ticker the live strategy
+    # genuinely trades (Codex review: "Train and publish ML sizing for
+    # whole-share symbols"). Validated the SAME way "active"/"excluded" are.
+    whole_share = payload.get("whole_share", [])
+    if not isinstance(whole_share, list):
+        raise ValueError(f"{config_path}'s 'whole_share' field must be a list, got {type(whole_share).__name__}")
+    invalid_whole_share = [
+        item for item in whole_share if not isinstance(item, str) or not _TICKER_SYMBOL_PATTERN.match(item)
+    ]
+    if invalid_whole_share:
+        raise ValueError(
+            f"{config_path}'s 'whole_share' field contains invalid ticker symbol(s): {invalid_whole_share!r}"
+        )
+    tickers = [ticker for ticker in active if ticker not in excluded_set]
+    seen = set(tickers)
+    for ticker in whole_share:
+        if ticker not in seen and ticker not in excluded_set:
+            tickers.append(ticker)
+            seen.add(ticker)
+    return tickers
 
 
 def _portable_artifact_reference(model_json_path: Path) -> str:

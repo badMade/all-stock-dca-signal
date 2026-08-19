@@ -5254,6 +5254,9 @@ def test_run_slot_1030et_evaluates_full_universe_when_no_preflight_artifact_exis
     )
     assert result.get("blocked") is not True
     run_state = json.loads(Path(result["run_state_path"]).read_bytes())
+    # Whole-share tickers (BYDDY; see near_close_dca.WHOLE_SHARE_TICKERS,
+    # docs/whole_share_accumulation.md) are evaluated only on the afternoon
+    # stream, so the 1030ET/morning slot's evaluated count is config.tickers only.
     assert run_state["counts"]["evaluated"] == len(config.tickers)
     assert run_state["run_classification"]["stream"] == "morning"
     assert run_state["run_classification"]["valid_afternoon_scheduled_evidence"] is False
@@ -5381,7 +5384,12 @@ def test_run_slot_1230et_and_1530et_are_unaffected_by_a_missing_preflight_artifa
             artifacts_dir=tmp_path / f"artifacts_{slot}",
         )
         run_state = json.loads(Path(result["run_state_path"]).read_bytes())
-        assert run_state["counts"]["evaluated"] == len(config.tickers), slot
+        # Whole-share tickers (BYDDY) are only evaluated on the afternoon
+        # stream (1530ET); 1230ET/midday sees config.tickers only.
+        expected_evaluated = len(config.tickers) + (
+            len(config.whole_share_tickers) if slot == "1530ET" else 0
+        )
+        assert run_state["counts"]["evaluated"] == expected_evaluated, slot
 
 
 def test_run_slot_without_a_guarded_prior_allocation_still_blocks_a_same_day_repeat(tmp_path):

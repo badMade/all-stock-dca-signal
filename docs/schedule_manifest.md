@@ -67,7 +67,7 @@ Feb, Nov, Dec). Re-verify around DST transitions.
 > it and regenerates `config/per_ticker_sizing.json`), so the gap is
 > registration only. **Practical consequence:** unless someone runs these by
 > hand, `config/per_ticker_sizing.json` — which governs live per-ticker order
-> sizing for all 53 symbols — goes stale, silently. Read the times below as
+> sizing for all 58 symbols — goes stale, silently. Read the times below as
 > "should run at", not "runs at".
 >
 > **Nightly ticker update and per-ticker recalculation:**
@@ -232,7 +232,7 @@ Feb, Nov, Dec). Re-verify around DST transitions.
 > mode changes cost/reporting behavior only — **all trading safety rules are
 > preserved** (Robinhood-only execution on `<ROBINHOOD_ACCOUNT_NUMBER>`; Alpaca/Yahoo/Finance
 > read-only; buy-only, no options/crypto/margin; active universe includes IBM and GFUZ
-> and excludes BYDDY/VCX/TRLV/RVI; manual/morning/midday/final streams stay
+> (BYDDY is a whole-share ticker, not excluded -- see docs/whole_share_accumulation.md); manual/morning/midday/final streams stay
 > separated; prior-run fills are same-day top-up context only, never scheduled
 > evidence). See [cost_tracking.md](cost_tracking.md).
 
@@ -570,7 +570,7 @@ Feb, Nov, Dec). Re-verify around DST transitions.
 > (`run_id='midday_live_YYYYMMDD_1230ET'`). It reuses the **afternoon 0x-to-5x
 > ladder** and the same $2 base (the shared live ladder used by all streams as
 > of Jul 10 2026), the same
-> active universe (excluding BYDDY/VCX/TRLV/RVI), the same confidence rule, and
+> active universe, the same confidence rule, and
 > its own `midday` budget ledger. It carries `stream='midday'` and
 > `valid_afternoon_evidence=false`, never updates `latest_scheduled_run.json`,
 > and is never afternoon scheduled evidence. Morning/manual same-day fills are
@@ -1374,7 +1374,7 @@ never estimated, inferred, or defaulted.
 ### `a6239dae`: Weekday 12:30 PM midday DCA live Robinhood execution (`MiddayDCAExecutor`)
 - **Live trading** (executor mode `live`). Runs **12:30 PM ET weekdays** (window 12:25–12:35 PM ET).
 - Uses the shared **$2 base 0x-to-5x live ladder** (`config/midday_dca.json`, the same ladder used by all live streams as of Jul 10 2026) and its own `midday` budget ledger. **Robinhood account <ROBINHOOD_ACCOUNT_NUMBER> only**; Alpaca is read-only for validation/context.
-- Same active universe (excludes BYDDY/VCX/TRLV/RVI). **Confidence rule:** if a candidate's price/drop passes the ladder but the **intraday trend cannot be validated** (fewer than `trend_min_bars` usable intraday bars at/before 12:30), the run does **not** auto-buy; it classifies the candidate as `execution_status='manual_review_candidate'`.
+- Same active universe. **Confidence rule:** if a candidate's price/drop passes the ladder but the **intraday trend cannot be validated** (fewer than `trend_min_bars` usable intraday bars at/before 12:30), the run does **not** auto-buy; it classifies the candidate as `execution_status='manual_review_candidate'`.
 - Writes live artifacts under `/home/user/workspace/cron_tracking/midday_dca/YYYYMMDD_1230ET/` (`run_id='midday_live_YYYYMMDD_1230ET'`) and updates its own `latest_midday_run.json` pointer.
 - `stream='midday'`, `run_type='midday_dca_live'`, `state_schema_version='midday-live-v1'`, `cron_id='a6239dae'`, `supersedes_cron_id=null`, `valid_afternoon_evidence=false`. Never writes into the morning or afternoon (`ce16ba6b`) trees or updates `latest_scheduled_run.json`.
 - **Automatic failure recovery:** if the run fails on internal persistence, parsing, wrapper-normalization, transient connector throttling, or raw-file write problems **after data was fetched**, it is a recovery trigger, not a terminal stop. The task reruns the required read-only inputs **once**, **persists all raw responses first**, **recomputes only from the persisted files**, and continues through the same pre-authorized guarded path if every safeguard still passes. The recovery reuses the same `midday_dca/YYYYMMDD_1230ET/` scheduled run directory with `recovery_rerun=true` and stays `stream='midday'` scheduled (**never** reclassified as manual — distinct from the `manual_reruns/` override tree). If the recovery attempt also fails or a safety/account/order rejection occurs, it writes `run_state.json` with the blocking reason and escalates.
@@ -1667,15 +1667,20 @@ never estimated, inferred, or defaulted.
   America/New_York date is the final eligible market day of the month. If it is
   **not**, the run ends **silently** — no notification, no market-data pulls, no
   Notion updates, and no reporting.
-- **Active universe (53 symbols):** DFTX, TRIN, AAAU, SPCX, EVR, LUNR, IRDM, DXYZ,
+- **Active universe (58 symbols):** DFTX, TRIN, AAAU, SPCX, EVR, LUNR, IRDM, DXYZ,
   LITE, ASML, DRAM, STX, MSFT, AAPL, AMAT, AMD, CBRS, MRVL, BTX, STM, SNDK, WDC,
   TSM, AVGO, NVDA, QBTS, FLKR, INTC, GOOGL, GOOG, AMZN, GLW, MA, GS, MU, NFLX, XLG,
   TOPT, QTOP, SATA, RGTI, IBM, GFUZ, TXN, RKLB, GE, VRT, CAT, QQQ, QCOM, ABBV, JPM,
-  VT (GE through JPM added 2026-08-02; VT added 2026-08-04 **without** a broker
-  instrument search — treat it as unverified until its first live run resolves
-  it). **Excluded:** BYDDY, VCX, TRLV, RVI.
+  VT, QBUT, RVII, RVI, VCX, TRLV (GE through JPM added 2026-08-02; VT added 2026-08-04;
+  QBUT, RVII, RVI, VCX, TRLV added 2026-08-16 — all five **without** a broker
+  instrument search — treat them as unverified until their first live run
+  resolves them; QBUT, RVII, RVI, VCX, and TRLV also fully reverse the
+  2026-08-05 exclusion decision below). **Excluded:** none. **Whole-share ticker:**
+  BYDDY -- not tradable for fractional/notional buys on Robinhood, so it is evaluated
+  by the same graded ladder but bought via whole-share accumulation instead; see
+  [whole_share_accumulation.md](whole_share_accumulation.md).
   **Corrections:** IRDMI→IRDM, GLWR→GLW. IBM, GFUZ, TXN, RKLB, and the
-  2026-08-02 and 2026-08-04 additions remain included unless later removed. Source of truth:
+  2026-08-02, 2026-08-04, and 2026-08-16 additions remain included unless later removed. Source of truth:
   [`config/tickers.json`](../config/tickers.json).
 - **Data source policy:** Finance connector is **primary** for historical market
   data. **Alpaca and Robinhood are read-only** validation/context. **yfinance is a

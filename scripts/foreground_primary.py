@@ -504,11 +504,26 @@ def reconcile_foreground_orders(
         for candidate in candidates:
             if not isinstance(candidate, Mapping):
                 continue
-            order_id = candidate.get("order_id")
-            if order_id is None or not str(order_id).strip():
-                continue
-            if str(order_id) not in fill_ids:
-                return [FINDING_FOREGROUND_DRIFT]
+            # A row that aggregates multiple recovered whole-share claims
+            # (see near_close_dca._merge_whole_share_submission_outcomes)
+            # keeps "order_id" as a SINGLE exact broker id -- the NEWER of
+            # the two -- while every distinct id the row actually
+            # represents lives in "whole_share_order_ids" instead. Checking
+            # only "order_id" here can pass while an OLDER aggregated id is
+            # absent from the broker's own fill records: the newer id
+            # matches, so this loop reported success, even though a real
+            # discrepancy existed for the older claim (Codex review:
+            # "Reconcile every ID in aggregated whole-share outcomes").
+            # Validate every id the row claims, not just the scalar one.
+            claimed_order_ids = [candidate.get("order_id")]
+            whole_share_order_ids = candidate.get("whole_share_order_ids")
+            if isinstance(whole_share_order_ids, list):
+                claimed_order_ids.extend(whole_share_order_ids)
+            for order_id in claimed_order_ids:
+                if order_id is None or not str(order_id).strip():
+                    continue
+                if str(order_id) not in fill_ids:
+                    return [FINDING_FOREGROUND_DRIFT]
     return []
 
 

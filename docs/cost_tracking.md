@@ -145,7 +145,7 @@ day from 3:35 PM ET to 5:00 PM ET daily. See
 
 This policy is **additive**: it preserves the **$2.00** base amount, the
 **0x-to-5x** graded ladder, the **Finance-primary** read-only market-data policy,
-the **GFUZ/TXN** active universe with `BYDDY`/`VCX`/`TRLV`/`RVI` exclusions, the
+the **GFUZ/TXN** active universe, `BYDDY`'s whole-share accumulation category, the
 same-day top-up guards, all safety/circuit-breaker rules, and the
 run-classification text unchanged.
 

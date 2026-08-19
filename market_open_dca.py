@@ -24,7 +24,7 @@ Key properties (see ``config/market_open_dca.json`` and
       committed); Alpaca/Finance/Yahoo stay read-only.
     - Uses the **shared 0x -> 5x sizing ladder** and the dynamic $1/$2 base
       every live stream uses, the same active universe (excluding
-      BYDDY/VCX/TRLV/RVI), and the same shared $180/$900 Normal-tier ceiling.
+      BYDDY), and the same shared $180/$900 Normal-tier ceiling.
     - **Trend validation is exempted for this slot only** (user-confirmed
       2026-07-27, ``config/scheduled_tasks.json:2ba19526.trend_validation_exemption``):
       at 9:35 only five minutes of regular-session data exist, so a completed
