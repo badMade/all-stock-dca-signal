@@ -194,13 +194,14 @@ def test_markdown_no_components():
 def test_generate_cost_tracker_writes_files(tmp_path):
     _write_runs(tmp_path, [_run_state("2026-06-29"), _run_state("2026-06-30")])
     out_dir = tmp_path / "cost"
-    paths = generate_cost_tracker(tmp_path, 2026, 6, out_dir)
+    paths = generate_cost_tracker(tmp_path, 2026, 6, out_dir, page_id="NOTION_PAGE")
 
     assert Path(paths["markdown"]).exists()
     assert Path(paths["payload"]).exists()
     payload = json.loads(Path(paths["payload"]).read_bytes())
     assert payload["month_label"] == "2026-06"
     assert payload["aggregate"]["run_count"] == 2
+    assert payload["page_id"] == "NOTION_PAGE"
 
 
 def test_num():
