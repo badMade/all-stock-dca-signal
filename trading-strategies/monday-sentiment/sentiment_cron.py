@@ -40,7 +40,7 @@ from zoneinfo import ZoneInfo  # Python 3.9+; use pytz if < 3.9
 # ---------------------------------------------------------------------------
 # Third-party (installed via pip install transformers torch newsapi-python requests)
 # ---------------------------------------------------------------------------
-import aiohttp
+import aiohttp  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Module-level logger — configured in main() so callers that import this

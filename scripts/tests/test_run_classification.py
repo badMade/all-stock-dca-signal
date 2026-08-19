@@ -28,7 +28,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # cannot resolve from scripts/ alone.
 sys.path.insert(1, str(Path(__file__).resolve().parents[2]))
 
-from run_classification import (  # noqa: E402
+try:
+    from scripts.run_classification import (  # noqa: E402
     ACCEPTED_STATE_SCHEMA_VERSIONS,
     COMPLETION_REASON_BLOCKED_BEFORE_SPREAD_GATE,
     COMPLETION_REASON_NO_LADDER_CANDIDATES,
@@ -108,7 +109,89 @@ from run_classification import (  # noqa: E402
     validate_classification,
     validate_recovery_classification,
     write_run_artifacts,
-)
+    )
+except ImportError:  # pragma: no cover - fallback when running directly in scripts/
+    from run_classification import (  # type: ignore # noqa: E402
+    ACCEPTED_STATE_SCHEMA_VERSIONS,
+    COMPLETION_REASON_BLOCKED_BEFORE_SPREAD_GATE,
+    COMPLETION_REASON_NO_LADDER_CANDIDATES,
+    COMPLETION_REASON_NO_QUALIFYING_ORDERS,
+    ERROR_CLASS_DEGRADED_MARKET_DATA,
+    ERROR_CLASS_MISSING_SPREAD_DATA,
+    FINAL_MANUAL_OVERRIDE_RUN_TYPE,
+    INTRADAY_RECOVERY_SLOTS,
+    ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED,
+    ORDER_SUBMIT_STATUS_ERROR,
+    ORDER_SUBMIT_STATUS_NO_ORDERS,
+    RECOVERY_RUN_TYPES,
+    RECOVERY_STATE_SCHEMA_VERSIONS,
+    RECOVERY_STREAM_CONTRACTS,
+    RECOVERY_STREAMS,
+    RECOVERY_TRIGGER_REASONS,
+    RUN_CLASSIFICATION_COMPLETED_NO_ORDERS,
+    RUN_CLASSIFICATION_PLACEMENT_FAILED,
+    RUN_ORIGIN_SCHEDULED_RECOVERY,
+    SPREAD_STATUS_MISSING_BID_ASK,
+    SPREAD_STATUS_NOT_EVALUATED,
+    SPREAD_STATUS_NOT_OK,
+    SPREAD_STATUS_OK,
+    SPREAD_STATUS_UNAVAILABLE,
+    STATE_SCHEMA_VERSION,
+    STATE_SCHEMA_VERSION_V2,
+    _already_covered_by_prior_allocation_loader,
+    _dedupe_rows_by_order_id,
+    _merge_prior,
+    _order_ids_from_state,
+    _prior_from_rows,
+    _read_csv_rows,
+    _referenced_orders_csvs,
+    _referenced_orders_csvs_within,
+    _rows_from_buy_candidates,
+    build_final_manual_override_classification,
+    build_manual_classification,
+    build_raw_persistence_state,
+    build_recovery_state,
+    build_scheduled_classification,
+    classify_no_order_run,
+    classify_non_scheduled_order_ids,
+    collect_earlier_scheduled_order_ids,
+    collect_manual_order_ids,
+    collect_recovery_context_order_ids,
+    cron_tracking_root,
+    exclude_manual_orders,
+    historicals_batch_filename,
+    incremental_top_up_amount,
+    is_confirmation_blocked,
+    is_manual_state,
+    is_preauthorized_v2,
+    is_scheduled_state,
+    is_top_up_context_state,
+    is_valid_recovery_context_state,
+    latest_scheduled_run_path,
+    legacy_scheduled_run_dir,
+    list_raw_inputs_saved,
+    load_same_day_top_up_context,
+    manual_exclusion_roots,
+    manual_run_id,
+    normalize_connector_payload,
+    order_submit_status,
+    place_filename,
+    quotes_batch_filename,
+    raw_input_dir,
+    raw_persistence_failure_run_state,
+    recovery_context_roots,
+    recovery_escalation_run_state,
+    recovery_root_for,
+    row_blocked_for_missing_spread,
+    save_raw_input,
+    scheduled_run_id,
+    select_scheduled_state_for_reporting,
+    spread_gate_fields,
+    top_up_context_roots,
+    validate_classification,
+    validate_recovery_classification,
+    write_run_artifacts,
+    )
 
 TRADING_DAY = "2026-07-06"
 
@@ -418,7 +501,10 @@ def test_update_latest_scheduled_run_pointer_uses_given_path():
     # to its own artifacts_dir can update the pointer to point at that exact path
     # without update_latest_scheduled_run_pointer recomputing/rewriting a second
     # copy anywhere else.
-    from run_classification import update_latest_scheduled_run_pointer
+    try:
+        from scripts.run_classification import update_latest_scheduled_run_pointer
+    except ImportError:
+        from run_classification import update_latest_scheduled_run_pointer  # type: ignore
 
     with tempfile.TemporaryDirectory() as d:
         base = Path(d)
@@ -445,7 +531,10 @@ def test_update_latest_scheduled_run_pointer_uses_the_classifications_own_stream
     # rejected a freshly written pointer for a 10:30/12:30 roster run as
     # wrong_stream -- the pointer-based watchdog could never observe those
     # slots, including one blocked before placement.
-    from run_classification import update_latest_scheduled_run_pointer
+    try:
+        from scripts.run_classification import update_latest_scheduled_run_pointer
+    except ImportError:
+        from run_classification import update_latest_scheduled_run_pointer  # type: ignore
 
     with tempfile.TemporaryDirectory() as d:
         base = Path(d)
@@ -499,7 +588,10 @@ def test_update_latest_scheduled_run_pointer_rejects_incomplete_classification()
     # An incomplete run_classification that says run_origin=scheduled but omits
     # manual_run entirely must not be treated as valid scheduled evidence --
     # manual_run must be the explicit boolean False, not merely "not True".
-    from run_classification import update_latest_scheduled_run_pointer
+    try:
+        from scripts.run_classification import update_latest_scheduled_run_pointer
+    except ImportError:
+        from run_classification import update_latest_scheduled_run_pointer  # type: ignore
 
     with tempfile.TemporaryDirectory() as d:
         base = Path(d)
@@ -2110,7 +2202,10 @@ def test_mtime_matches_trading_day_is_on_or_after_not_strict_equality():
     # race, but its mtime can never equal Monday -- a strict equality check
     # silently dropped that failure from skip_sink. A file genuinely older
     # than trading_day (real historical garbage) must still be excluded.
-    from run_classification import _mtime_matches_trading_day
+    try:
+        from scripts.run_classification import _mtime_matches_trading_day
+    except ImportError:
+        from run_classification import _mtime_matches_trading_day  # type: ignore
 
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "run_state.json"
@@ -3018,7 +3113,10 @@ def test_no_data_errors_leaves_the_error_class_null():
 def test_completed_no_order_status_suppresses_the_broker_window_fallback():
     """A run that submitted nothing by design must never absorb unrelated broker
     orders from the attribution window (Codex review)."""
-    import run_classification as rc_module
+    try:
+        import scripts.run_classification as rc_module
+    except ImportError:
+        import run_classification as rc_module  # type: ignore
 
     assert ORDER_SUBMIT_STATUS_NO_ORDERS in _no_submit_statuses_in_fallback_guard(rc_module)
 
@@ -3886,7 +3984,10 @@ def test_all_three_consumers_share_one_contract():
     # The guard, the pointer validator, and is_top_up_context_state must agree
     # on every artifact: three hand-rolled copies had already drifted apart.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from same_day_pointer import derive_valid_recovery_context
+    try:
+        from scripts.same_day_pointer import derive_valid_recovery_context
+    except ImportError:
+        from same_day_pointer import derive_valid_recovery_context  # type: ignore
 
     from near_close_dca import _is_scheduled_recovery_context
 
@@ -4684,7 +4785,10 @@ def test_a_denied_state_with_orders_is_still_attributable_for_reporting():
     state, so the preserved fills vanished from scheduled fill and slippage
     reporting (Codex review).
     """
-    from same_day_pointer import derive_valid_scheduled_evidence
+    try:
+        from scripts.same_day_pointer import derive_valid_scheduled_evidence
+    except ImportError:
+        from same_day_pointer import derive_valid_scheduled_evidence  # type: ignore
 
     state = {
         "run_classification": build_scheduled_classification(TRADING_DAY, "2026-07-06T19:20:01Z"),
@@ -4701,7 +4805,10 @@ def test_a_denied_state_with_orders_is_still_attributable_for_reporting():
 def test_a_denied_state_with_no_orders_is_rejected():
     """The date/holiday-gated stub this check was added for: it says outright
     that the slot never executed and has nothing to attribute."""
-    from same_day_pointer import derive_valid_scheduled_evidence
+    try:
+        from scripts.same_day_pointer import derive_valid_scheduled_evidence
+    except ImportError:
+        from same_day_pointer import derive_valid_scheduled_evidence  # type: ignore
 
     state = {
         "run_classification": build_scheduled_classification(TRADING_DAY, "2026-07-06T19:20:01Z"),

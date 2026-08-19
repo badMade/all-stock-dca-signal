@@ -174,12 +174,22 @@ class CumulativeCreditLedger:
                 cached = recorded_keys[dedup_key]
                 return CumulativeCreditDecision(**_decision_fields(cached))
             rebased = False
-            if pending_baseline_usd is None:
-                pending = state["pending_usd_by_ticker"].get(symbol, 0.0)
-            elif idempotency_key:
+            if idempotency_key:
                 # Rebase atomically against the state just loaded under this
                 # call's own lock instead of trusting the caller's pre-lock
-                # snapshot (see the docstring above).
+                # snapshot (see the docstring above). This netting applies
+                # whenever an idempotency_key is present and the ledger holds
+                # a matching unconsumed preserve_pending() entry for it --
+                # NOT only when the caller also happened to pass
+                # pending_baseline_usd. Skipping the netting whenever the
+                # (optional) baseline was omitted was a regression versus the
+                # pre-PR parent behavior, which always netted the matching
+                # preserved contribution for the same idempotency key: a
+                # retry that calls record() without recomputing its own
+                # baseline would otherwise double-count its earlier
+                # preserve_pending() contribution against the ledger's raw
+                # balance (Codex review: "Rebase retries even without an
+                # explicit pending_baseline_usd").
                 rebased = True
                 preserve_key = f"preserve:{symbol}:{idempotency_key}"
                 cached_preserve = recorded_keys.get(preserve_key)
@@ -192,8 +202,12 @@ class CumulativeCreditLedger:
                     0.0,
                     round(state["pending_usd_by_ticker"].get(symbol, 0.0) - own_contribution, 2),
                 )
-            else:
+            elif pending_baseline_usd is not None:
+                # No idempotency_key to rebase against: the caller-supplied
+                # baseline is used verbatim, exactly as documented.
                 pending = float(pending_baseline_usd)
+            else:
+                pending = state["pending_usd_by_ticker"].get(symbol, 0.0)
             decision = apply_cumulative_credit(
                 pending, incremental_credit_usd, final_session=final_session
             )

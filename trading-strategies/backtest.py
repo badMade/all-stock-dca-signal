@@ -48,7 +48,9 @@ try:
     from alpaca.data.historical import StockHistoricalDataClient  # type: ignore
     from alpaca.data.requests import StockBarsRequest  # type: ignore
     from alpaca.data.timeframe import TimeFrame  # type: ignore
+    ALPACA_AVAILABLE = True
 except ImportError:
+    ALPACA_AVAILABLE = False
     StockHistoricalDataClient = None
     StockBarsRequest = None
     TimeFrame = None
@@ -132,11 +134,14 @@ def fetch_data(
     api_key    = os.environ.get("ALPACA_API_KEY")
     secret_key = os.environ.get("ALPACA_SECRET_KEY")
 
-    if not api_key or not secret_key:
-        print("  [WARN] ALPACA_API_KEY / ALPACA_SECRET_KEY not set — falling back to yfinance.")
+    if not ALPACA_AVAILABLE or not api_key or not secret_key:
+        if not ALPACA_AVAILABLE:
+            print("  [WARN] alpaca-py not installed — falling back to yfinance.")
+        else:
+            print("  [WARN] ALPACA_API_KEY / ALPACA_SECRET_KEY not set — falling back to yfinance.")
         _print_section("Fetching price data via yfinance (fallback)")
 
-        import yfinance as yf
+        import yfinance as yf  # type: ignore
 
         raw = yf.download(
             tickers=all_tickers,

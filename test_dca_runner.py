@@ -1734,6 +1734,42 @@ def test_assess_gate4_grace_period_allows_proceed_despite_collision():
     assert [o["ticker"] for o in r["plan"]["to_place"]] == ["MSFT"]
 
 
+@pytest.mark.parametrize("placed_agent", [None, "unknown-executor", "user"])
+def test_assess_gate4_grace_period_does_not_override_non_agentic_collision(placed_agent):
+    """The grace override is scoped to the recognized compatible executor."""
+    colliding = _order(
+        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45), placed_agent=placed_agent
+    )
+    r = dca_runner.assess(
+        **_clean_kwargs(
+            orders=[colliding],
+            candidates=[("MSFT", 2.0)],
+            sole_executor_grace_period_active=True,
+        )
+    )
+    assert r["verdict"] == "ABORT"
+    assert r["colliding_orders"] == ["AAPL"]
+    assert "gate4_grace_period_applied" not in r
+
+
+def test_assess_gate4_grace_period_aborts_mixed_compatible_and_rogue_window():
+    """Any rogue signal wins even when a compatible executor is also present."""
+    orders = [
+        _order("AAPL", 2.0, _utc(2026, 7, 28, 13, 45), placed_agent="agentic"),
+        _order("MSFT", 2.0, _utc(2026, 7, 28, 13, 46), placed_agent="rogue"),
+    ]
+    r = dca_runner.assess(
+        **_clean_kwargs(
+            orders=orders,
+            candidates=[("NVDA", 2.0)],
+            sole_executor_grace_period_active=True,
+        )
+    )
+    assert r["verdict"] == "ABORT"
+    assert r["colliding_orders"] == ["AAPL", "MSFT"]
+    assert "gate4_grace_period_applied" not in r
+
+
 def test_assess_gate4_grace_period_flag_alone_does_not_fabricate_a_collision():
     """The grace-period fields must only appear when Gate 4 actually found a
     collision -- a run with the flag set but an empty window must look

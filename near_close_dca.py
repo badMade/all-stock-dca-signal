@@ -5987,10 +5987,34 @@ def _archive_intraday_observations(
     if run_state_path is not None:
         try:
             try:
+                pre_write_stat = run_state_path.stat()
                 on_disk = json.loads(run_state_path.read_bytes())
             except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                pre_write_stat = None
                 on_disk = None
-            target = on_disk if isinstance(on_disk, dict) else artifacts
+            if not isinstance(on_disk, dict):
+                # A missing, unreadable, or non-object run_state.json is not
+                # a blank slate to fill in from the in-memory `artifacts` --
+                # it means contract validation (or an earlier writer) could
+                # not attach whatever failure marker it needed to, and this
+                # function has no way to tell an innocent "file not written
+                # yet" apart from a genuinely rejected/unusable state.
+                # Silently substituting the pre-validation in-memory copy
+                # here would materialize a run_state.json that LOOKS like
+                # valid scheduled evidence even though contract validation
+                # never actually approved it -- the opposite of fail-closed
+                # (Codex review: "Never synthesize run_state from in-memory
+                # artifacts when the on-disk file is unusable"). Leave the
+                # on-disk file exactly as it is; only the in-memory
+                # `artifacts` dict (already annotated with
+                # ``intraday_archive`` above) reflects this summary.
+                logger.warning(
+                    "run_state at %s is missing or unreadable; skipping intraday "
+                    "archive annotation rather than overwriting it",
+                    run_state_path,
+                )
+                return snapshot_path
+            target = on_disk
             target["intraday_archive"] = summary
             usage = target.get("usage_proxy")
             if isinstance(usage, dict):
@@ -6000,6 +6024,28 @@ def _archive_intraday_observations(
                 serialized = _settle_usage_bytes(target, usage, csv_bytes)
             else:
                 serialized = _serialize_run_state(target)
+            # Guard against a lost-update race with a concurrent retry of
+            # this same slot also read-modify-writing run_state.json:
+            # atomic_write_text prevents torn bytes, but not this invocation
+            # silently clobbering a newer retry's completed state with a
+            # stale read taken before that retry ran. Re-stat immediately
+            # before writing and skip (rather than overwrite) if the file
+            # changed since the read above -- the annotation is best-effort
+            # and must never cost a genuinely newer on-disk state (Codex
+            # review: "Guard the archive annotation's read-modify-write
+            # against a concurrent retry").
+            post_read_stat = run_state_path.stat()
+            if (
+                pre_write_stat is None
+                or post_read_stat.st_mtime_ns != pre_write_stat.st_mtime_ns
+                or post_read_stat.st_size != pre_write_stat.st_size
+            ):
+                logger.warning(
+                    "run_state at %s changed concurrently; skipping intraday "
+                    "archive annotation to avoid clobbering a newer retry's state",
+                    run_state_path,
+                )
+                return snapshot_path
             atomic_write_text(run_state_path, serialized)
         except (OSError, TypeError, ValueError) as exc:  # noqa: BLE001
             logger.warning(

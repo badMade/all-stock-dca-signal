@@ -2887,7 +2887,7 @@ try:  # pragma: no cover - import path varies with how the module is loaded
     from scripts.broker_reconciliation import _TERMINAL_ORDER_STATES as _BROKER_TERMINAL
 except ImportError:  # pragma: no cover
     try:
-        from broker_reconciliation import _TERMINAL_ORDER_STATES as _BROKER_TERMINAL
+        from broker_reconciliation import _TERMINAL_ORDER_STATES as _BROKER_TERMINAL  # type: ignore
     except ImportError:
         _BROKER_TERMINAL = frozenset(
             {"cancelled", "canceled", "rejected", "failed", "voided", "expired"}

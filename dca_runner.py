@@ -2886,6 +2886,7 @@ def execute_plan(
     orders_fetched_at: datetime | None = None,
     now_fn: Callable[[], datetime] | None = None,
     candidates=None,
+    sole_executor_grace_period_active: bool = False,
 ) -> ExecutionResult:
     """Submit the plan one order at a time, buys only, stopping on first error.
 
@@ -3107,6 +3108,19 @@ def execute_plan(
     mutually exclusive (that needs an atomic run/slot lease this module has
     no mechanism to provide) -- it closes the "history already shows a
     collision" case, not a true race between two simultaneous submissions.
+
+    ``sole_executor_grace_period_active`` mirrors ``assess()``'s own
+    same-named Gate 4 argument exactly, including its fail-closed exact-
+    ``True`` check and its ``placed_agent == "agentic"`` compatible-executor
+    scoping. A caller that received a ``PROCEED`` from ``assess()`` because
+    the grace period cleared a compatible collision would otherwise have
+    that same collision unconditionally re-rejected here -- this function's
+    own Gate 4 rerun (above) previously had no way to know a grace override
+    had already been evaluated and accepted, making ``assess()``'s PROCEED
+    verdict impossible to actually execute during the grace window (Codex
+    review: "Thread the grace-period policy through execute_plan"). Leaving
+    this at its default ``False`` reproduces the original always-reject
+    behavior for every caller that does not pass it explicitly.
     """
     # Literal booleans, not truthiness: a common wiring mistake like
     # enable_live_orders="false" (a nonempty, truthy string) combined with a
@@ -3444,10 +3458,21 @@ def execute_plan(
             f"timestamp: {exc}"
         ) from exc
     if collisions:
-        raise ValueError(
-            f"execute_plan refuses to place: orders already present in the {slot_id!r} ET "
-            "window, a second executor may be live"
-        )
+        # Mirror assess()'s Gate 4 grace-period policy exactly: only a
+        # collision whose provenance is the recognized compatible executor
+        # ("agentic") may be let through, and only when the flag is the
+        # exact literal ``True`` (fail closed against a stringly-typed or
+        # otherwise truthy-but-wrong value). Any rogue collision -- missing,
+        # manual, or unknown provenance -- continues to refuse placement
+        # even during an active grace window, matching assess()'s own
+        # "one rogue row cannot be hidden by a compatible row" rule.
+        grace_active = sole_executor_grace_period_active is True
+        rogue_collisions = [o for o in collisions if o.placed_agent != "agentic"]
+        if not grace_active or rogue_collisions:
+            raise ValueError(
+                f"execute_plan refuses to place: orders already present in the {slot_id!r} ET "
+                "window, a second executor may be live"
+            )
     try:
         bought_today = {
             _normalize_ticker(o.symbol)
@@ -4606,7 +4631,22 @@ def assess(
             else f"<non-string symbol, type={type(o.symbol).__name__}>"
             for o in collisions
         ]
-        if not sole_executor_grace_period_active:
+        # The temporary grace period recognizes only the executor provenance
+        # it was introduced for.  Missing, manual, and otherwise unknown
+        # provenance must continue to fail closed; in particular, one rogue
+        # row alongside an ``agentic`` row cannot be hidden by the compatible
+        # row.  Classify the complete window before deciding so result order
+        # cannot affect the interlock.
+        rogue_collisions = [o for o in collisions if o.placed_agent != "agentic"]
+        # ``sole_executor_grace_period_active`` is an external scheduler/
+        # tool-calling surface: a caller could pass the string "false" or the
+        # integer 1 rather than a real boolean, and plain truthiness would
+        # treat both as "grace active", incorrectly bypassing the Gate 4
+        # safety interlock. Require the exact literal ``True`` so anything
+        # else -- including truthy non-bool values -- fails closed (Codex
+        # review: "Require an exact boolean for the grace-period flag").
+        grace_active = sole_executor_grace_period_active is True
+        if not grace_active or rogue_collisions:
             return out(
                 "ABORT",
                 f"orders already present in the {slot_id} ET window, a second executor may be live",
@@ -4621,31 +4661,56 @@ def assess(
             "gate4_grace_period_applied": True,
             "gate4_collisions": collision_symbols,
         }
+        # The compatible collision tickers must not also be planned again by
+        # Gate 6: config/budgets.json's one_order_per_ticker_per_day is False
+        # by default, so plan_orders() would otherwise happily plan a SECOND
+        # same-window order for a ticker the grace-compatible executor
+        # already bought moments ago (Codex review: "Exclude grace-period
+        # collision tickers from the candidate set"). Only tickers that
+        # actually collided are excluded; every other candidate is untouched.
+        _gate4_grace_collision_tickers = {
+            o.symbol for o in collisions if isinstance(o.symbol, str)
+        }
     else:
         _gate4_grace_extra = {}
+        _gate4_grace_collision_tickers = set()
+
+    def out_with_grace(verdict: str, reason: str, **extra) -> dict:
+        # Every verdict returned from here on (Gate 6's various ABORTs as
+        # well as the final PROCEED) must carry the grace-period evidence
+        # collected above, not just the PROCEED path -- otherwise a Gate 6
+        # ABORT (unavailable buying power, a malformed budget snapshot,
+        # invalid candidates, bought-today, ...) silently drops the fact
+        # that Gate 4 already found and overrode a collision, leaving
+        # persisted run artifacts unable to show a grace override applied
+        # (Codex review: "Attach grace-period evidence to every verdict
+        # after Gate 4, not just PROCEED").
+        merged = dict(_gate4_grace_extra)
+        merged.update(extra)
+        return out(verdict, reason, **merged)
 
     # Gate 6 -- budget from broker history
     buying_power_error = _check_buying_power(buying_power_usd)
     if buying_power_error is not None:
-        return out("ABORT", buying_power_error)
+        return out_with_grace("ABORT", buying_power_error)
 
     snapshot, snapshot_error = _build_budget_snapshot(orders, trading_day)
     if snapshot_error is not None:
-        return out("ABORT", snapshot_error)
+        return out_with_grace("ABORT", snapshot_error)
     if snapshot is None:
-        return out("ABORT", "budget snapshot could not be built")
+        return out_with_grace("ABORT", "budget snapshot could not be built")
 
     cands, cands_error = _parse_and_validate_candidates(candidates)
     if cands_error is not None:
-        return out("ABORT", cands_error)
+        return out_with_grace("ABORT", cands_error)
     if cands is None:
-        return out("ABORT", "candidate rows could not be parsed")
+        return out_with_grace("ABORT", "candidate rows could not be parsed")
 
     bought_today, bought_today_error = _get_bought_today_tickers(orders, trading_day)
     if bought_today_error is not None:
-        return out("ABORT", bought_today_error)
+        return out_with_grace("ABORT", bought_today_error)
     if bought_today is None:
-        return out("ABORT", "broker order history could not be evaluated")
+        return out_with_grace("ABORT", "broker order history could not be evaluated")
     # Whether a same-day repeat is refused outright is a CONFIG decision, not a
     # hardcoded one: config/budgets.json order_rules.one_order_per_ticker_per_day.
     # True  -> first slot to buy a ticker wins it for the day (original behaviour).
@@ -4661,6 +4726,11 @@ def assess(
     else:
         already_bought_refusals = []
         fresh_cands = list(cands)
+
+    # See the grace-period collision-exclusion comment above Gate 6: a
+    # compatible collision ticker must not be planned again this call.
+    if _gate4_grace_collision_tickers:
+        fresh_cands = [c for c in fresh_cands if c.ticker not in _gate4_grace_collision_tickers]
 
     _valid_cands, planned_spend, high_mult = _tier_selection_inputs(fresh_cands)
     tier = select_budget_tier(planned_spend, high_mult)
@@ -4683,10 +4753,9 @@ def assess(
     )
     plan.refused = already_bought_refusals + plan.refused
 
-    return out(
+    return out_with_grace(
         "PROCEED",
         "gates passed",
-        **_gate4_grace_extra,
         budget={
             "day_notional_usd": snapshot.day_notional_usd,
             "week_notional_usd": snapshot.week_notional_usd,

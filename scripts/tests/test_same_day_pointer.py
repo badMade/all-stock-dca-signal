@@ -23,22 +23,40 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # cannot resolve from scripts/ alone.
 sys.path.insert(1, str(Path(__file__).resolve().parents[2]))
 
-import same_day_pointer as same_day_pointer_module  # noqa: E402
-from same_day_pointer import (  # noqa: E402
-    STATUS_FUTURE_DATE,
-    STATUS_MALFORMED,
-    STATUS_MISSING,
-    STATUS_OUTSIDE_ROOT,
-    STATUS_PENDING,
-    STATUS_PRIOR_DATE,
-    STATUS_VALID,
-    STATUS_WRONG_STREAM,
-    build_pointer_metadata,
-    derive_valid_scheduled_evidence,
-    refresh_latest_pointer,
-    select_same_day_run_state,
-    validate_pointer,
-)
+try:
+    import scripts.same_day_pointer as same_day_pointer_module  # noqa: E402
+    from scripts.same_day_pointer import (  # noqa: E402
+        STATUS_FUTURE_DATE,
+        STATUS_MALFORMED,
+        STATUS_MISSING,
+        STATUS_OUTSIDE_ROOT,
+        STATUS_PENDING,
+        STATUS_PRIOR_DATE,
+        STATUS_VALID,
+        STATUS_WRONG_STREAM,
+        build_pointer_metadata,
+        derive_valid_scheduled_evidence,
+        refresh_latest_pointer,
+        select_same_day_run_state,
+        validate_pointer,
+    )
+except ImportError:  # pragma: no cover - fallback when running directly in scripts/
+    import same_day_pointer as same_day_pointer_module  # type: ignore # noqa: E402
+    from same_day_pointer import (  # type: ignore # noqa: E402
+        STATUS_FUTURE_DATE,
+        STATUS_MALFORMED,
+        STATUS_MISSING,
+        STATUS_OUTSIDE_ROOT,
+        STATUS_PENDING,
+        STATUS_PRIOR_DATE,
+        STATUS_VALID,
+        STATUS_WRONG_STREAM,
+        build_pointer_metadata,
+        derive_valid_scheduled_evidence,
+        refresh_latest_pointer,
+        select_same_day_run_state,
+        validate_pointer,
+    )
 
 TODAY = "2026-07-21"
 
@@ -661,7 +679,10 @@ def _recovery_state(trading_day=TODAY, stream="midday_recovery", **overrides):
 
 
 def _recovery_pointer(state_path, trading_day=TODAY, stream="midday_recovery", status=None):
-    from same_day_pointer import STATUS_VALID_RECOVERY_CONTEXT
+    try:
+        from scripts.same_day_pointer import STATUS_VALID_RECOVERY_CONTEXT
+    except ImportError:
+        from same_day_pointer import STATUS_VALID_RECOVERY_CONTEXT  # type: ignore
 
     return {
         "run_id": "midday_recovery_20260721_1305ET",
@@ -676,13 +697,19 @@ def _recovery_pointer(state_path, trading_day=TODAY, stream="midday_recovery", s
 
 
 def test_derive_valid_recovery_context_accepts_recovery_state():
-    from same_day_pointer import derive_valid_recovery_context
+    try:
+        from scripts.same_day_pointer import derive_valid_recovery_context
+    except ImportError:
+        from same_day_pointer import derive_valid_recovery_context  # type: ignore
 
     assert derive_valid_recovery_context(_recovery_state()) is True
 
 
 def test_derive_valid_recovery_context_rejects_scheduled_and_manual():
-    from same_day_pointer import derive_valid_recovery_context
+    try:
+        from scripts.same_day_pointer import derive_valid_recovery_context
+    except ImportError:
+        from same_day_pointer import derive_valid_recovery_context  # type: ignore
 
     assert derive_valid_recovery_context(_scheduled_state()) is False
     assert derive_valid_recovery_context(_scheduled_state(manual=True)) is False
@@ -694,7 +721,10 @@ def test_derive_valid_recovery_context_requires_positive_assertions():
     # Merely omitting the scheduled flags is not enough -- the artifact must
     # positively assert recovery context AND disclaim scheduled evidence, so a
     # half-written classification can never be folded into a later run's guard.
-    from same_day_pointer import derive_valid_recovery_context
+    try:
+        from scripts.same_day_pointer import derive_valid_recovery_context
+    except ImportError:
+        from same_day_pointer import derive_valid_recovery_context  # type: ignore
 
     assert derive_valid_recovery_context(_recovery_state(valid_recovery_context=None)) is False
     assert derive_valid_recovery_context(_recovery_state(valid_scheduled_evidence=True)) is False
@@ -705,13 +735,19 @@ def test_derive_valid_recovery_context_rejects_contract_rejected_state():
     state = _recovery_state()
     state["artifact_contract_failure"] = {"reason": "missing artifact"}
 
-    from same_day_pointer import derive_valid_recovery_context
+    try:
+        from scripts.same_day_pointer import derive_valid_recovery_context
+    except ImportError:
+        from same_day_pointer import derive_valid_recovery_context  # type: ignore
 
     assert derive_valid_recovery_context(state) is False
 
 
 def test_validate_recovery_pointer_accepts_recovery_artifact(tmp_path):
-    from same_day_pointer import STATUS_VALID_RECOVERY_CONTEXT, validate_recovery_pointer
+    try:
+        from scripts.same_day_pointer import STATUS_VALID_RECOVERY_CONTEXT, validate_recovery_pointer
+    except ImportError:
+        from same_day_pointer import STATUS_VALID_RECOVERY_CONTEXT, validate_recovery_pointer  # type: ignore
 
     root = tmp_path / "midday_dca"
     state_path = _write_state(root, "20260721_1230ET_recovery_1305ET", _recovery_state())
@@ -729,7 +765,10 @@ def test_validate_recovery_pointer_accepts_recovery_artifact(tmp_path):
 
 
 def test_validate_recovery_pointer_rejects_non_recovery_stream(tmp_path):
-    from same_day_pointer import STATUS_WRONG_STREAM, validate_recovery_pointer
+    try:
+        from scripts.same_day_pointer import STATUS_WRONG_STREAM, validate_recovery_pointer
+    except ImportError:
+        from same_day_pointer import STATUS_WRONG_STREAM, validate_recovery_pointer  # type: ignore
 
     root = tmp_path / "midday_dca"
     state_path = _write_state(root, "20260721_1230ET", _scheduled_state(stream="midday"))
@@ -747,7 +786,10 @@ def test_validate_recovery_pointer_rejects_non_recovery_stream(tmp_path):
 
 def test_validate_recovery_pointer_rejects_scheduled_target(tmp_path):
     # A scheduled artifact must not be discoverable through the recovery path.
-    from same_day_pointer import STATUS_PENDING, validate_recovery_pointer
+    try:
+        from scripts.same_day_pointer import STATUS_PENDING, validate_recovery_pointer
+    except ImportError:
+        from same_day_pointer import STATUS_PENDING, validate_recovery_pointer  # type: ignore
 
     root = tmp_path / "midday_dca"
     state_path = _write_state(
@@ -766,7 +808,10 @@ def test_validate_recovery_pointer_rejects_scheduled_target(tmp_path):
 
 
 def test_validate_recovery_pointer_enforces_same_day(tmp_path):
-    from same_day_pointer import STATUS_PRIOR_DATE, validate_recovery_pointer
+    try:
+        from scripts.same_day_pointer import STATUS_PRIOR_DATE, validate_recovery_pointer
+    except ImportError:
+        from same_day_pointer import STATUS_PRIOR_DATE, validate_recovery_pointer  # type: ignore
 
     root = tmp_path / "midday_dca"
     state_path = _write_state(
@@ -787,7 +832,10 @@ def test_validate_recovery_pointer_enforces_same_day(tmp_path):
 def test_scheduled_validate_pointer_still_rejects_recovery_pointer(tmp_path):
     # The scheduled path must be unchanged by the new status: a recovery
     # pointer is never scheduled evidence, whichever stream it is asked about.
-    from same_day_pointer import STATUS_VALID_RECOVERY_CONTEXT
+    try:
+        from scripts.same_day_pointer import STATUS_VALID_RECOVERY_CONTEXT
+    except ImportError:
+        from same_day_pointer import STATUS_VALID_RECOVERY_CONTEXT  # type: ignore
 
     root = tmp_path / "midday_dca"
     state_path = _write_state(root, "20260721_1230ET_recovery_1305ET", _recovery_state())
@@ -806,11 +854,18 @@ def test_scheduled_validate_pointer_still_rejects_recovery_pointer(tmp_path):
 
 
 def test_recovery_status_is_rejected_for_scheduled_consumers():
-    from same_day_pointer import (
+    try:
+        from scripts.same_day_pointer import (
         REJECTED_STATUSES,
         STATUS_VALID_RECOVERY_CONTEXT,
         is_recovery_context_status,
     )
+    except ImportError:
+        from same_day_pointer import (  # type: ignore
+            REJECTED_STATUSES,
+            STATUS_VALID_RECOVERY_CONTEXT,
+            is_recovery_context_status,
+        )
 
     assert STATUS_VALID_RECOVERY_CONTEXT in REJECTED_STATUSES
     assert is_recovery_context_status(STATUS_VALID_RECOVERY_CONTEXT) is True
@@ -822,7 +877,10 @@ def test_derive_valid_recovery_context_requires_full_contract():
     # four flags would let a partial or truncated artifact -- right booleans, no
     # stream or run identity -- be trusted as usable context, contradicting
     # schemas/recovery_run_classification.schema.json.
-    from same_day_pointer import derive_valid_recovery_context
+    try:
+        from scripts.same_day_pointer import derive_valid_recovery_context
+    except ImportError:
+        from same_day_pointer import derive_valid_recovery_context  # type: ignore
 
     # The four-field subset that used to pass.
     assert derive_valid_recovery_context({
@@ -853,7 +911,10 @@ def test_recovery_validation_result_is_truthy():
     # Codex review: "Expose a truthy recovery-validation result". A recovery
     # consumer using the class's `if validate_...(...)` idiom must not discard
     # every valid recovery pointer.
-    from same_day_pointer import validate_recovery_pointer
+    try:
+        from scripts.same_day_pointer import validate_recovery_pointer
+    except ImportError:
+        from same_day_pointer import validate_recovery_pointer  # type: ignore
 
     with tempfile.TemporaryDirectory() as d:
         root = Path(d) / "midday_dca"
@@ -896,7 +957,10 @@ def test_recovery_pointer_requires_explicit_status():
     # Codex review: "Require the recovery pointer status discriminator". The
     # missing-status allowance exists only for legacy SCHEDULED pointers; a
     # recovery pointer cannot predate a status introduced alongside it.
-    from same_day_pointer import STATUS_MALFORMED, validate_recovery_pointer
+    try:
+        from scripts.same_day_pointer import STATUS_MALFORMED, validate_recovery_pointer
+    except ImportError:
+        from same_day_pointer import STATUS_MALFORMED, validate_recovery_pointer  # type: ignore
 
     with tempfile.TemporaryDirectory() as d:
         root = Path(d) / "midday_dca"
@@ -939,7 +1003,10 @@ def test_legacy_scheduled_pointer_without_status_still_accepted():
 def test_recovery_pointer_rejects_bogus_identity_values():
     # The pointer path delegates to the canonical contract, so arbitrary
     # run_type / state_schema_version values are rejected here too.
-    from same_day_pointer import STATUS_PENDING, validate_recovery_pointer
+    try:
+        from scripts.same_day_pointer import STATUS_PENDING, validate_recovery_pointer
+    except ImportError:
+        from same_day_pointer import STATUS_PENDING, validate_recovery_pointer  # type: ignore
 
     for override in ({"run_type": "bogus"}, {"state_schema_version": "bogus"}):
         with tempfile.TemporaryDirectory() as d:
@@ -960,7 +1027,10 @@ def test_recovery_pointer_rejects_bogus_identity_values():
 def test_recovery_pointer_requires_same_day_classification():
     # The target's CLASSIFICATION trading_day must match the ET day, not just
     # the pointer's and the state's top-level day.
-    from same_day_pointer import STATUS_PENDING, validate_recovery_pointer
+    try:
+        from scripts.same_day_pointer import STATUS_PENDING, validate_recovery_pointer
+    except ImportError:
+        from same_day_pointer import STATUS_PENDING, validate_recovery_pointer  # type: ignore
 
     with tempfile.TemporaryDirectory() as d:
         root = Path(d) / "midday_dca"
@@ -983,7 +1053,10 @@ def test_recovery_pointer_rejects_contradictory_metadata():
     # Codex review: "Reject contradictory recovery pointer metadata". Both of
     # these are rejected by latest_pointer.schema.json, so the helper must
     # reject them too or schema and helper validation disagree.
-    from same_day_pointer import STATUS_MALFORMED, validate_recovery_pointer
+    try:
+        from scripts.same_day_pointer import STATUS_MALFORMED, validate_recovery_pointer
+    except ImportError:
+        from same_day_pointer import STATUS_MALFORMED, validate_recovery_pointer  # type: ignore
 
     for override in (
         {"valid_scheduled_evidence": True},
@@ -1014,7 +1087,10 @@ def test_recovery_pointer_helper_agrees_with_its_schema():
     # latest_pointer.schema.json, and the contradictory cases must fail both.
     jsonschema = pytest.importorskip("jsonschema")
 
-    from same_day_pointer import validate_recovery_pointer
+    try:
+        from scripts.same_day_pointer import validate_recovery_pointer
+    except ImportError:
+        from same_day_pointer import validate_recovery_pointer  # type: ignore
 
     repo_root = Path(__file__).resolve().parents[2]
     schema = json.loads(
@@ -1060,7 +1136,10 @@ def test_recovery_pointer_requires_boolean_evidence_and_same_day_fields():
     # same_day_required to true, so an omitted field or a non-boolean like the
     # STRING "false" is schema-invalid -- rejecting only literal True/False
     # would leave the helper trusting pointers a schema consumer refuses.
-    from same_day_pointer import STATUS_MALFORMED, validate_recovery_pointer
+    try:
+        from scripts.same_day_pointer import STATUS_MALFORMED, validate_recovery_pointer
+    except ImportError:
+        from same_day_pointer import STATUS_MALFORMED, validate_recovery_pointer  # type: ignore
 
     bad_variants = [
         {"valid_scheduled_evidence": "false"},
@@ -1102,7 +1181,10 @@ def test_recovery_pointer_requires_updated_at_utc():
     # Codex review: "Require recovery pointer update timestamps". The schema
     # marks updated_at_utc required with format date-time, and a recovery
     # pointer cannot be a legacy artifact, so the helper must enforce it too.
-    from same_day_pointer import STATUS_MALFORMED, validate_recovery_pointer
+    try:
+        from scripts.same_day_pointer import STATUS_MALFORMED, validate_recovery_pointer
+    except ImportError:
+        from same_day_pointer import STATUS_MALFORMED, validate_recovery_pointer  # type: ignore
 
     bad = [{"updated_at_utc": "not-a-timestamp"}, {"updated_at_utc": ""},
            {"updated_at_utc": None}, {"updated_at_utc": 1730000000}, "drop"]
@@ -1131,7 +1213,10 @@ def test_recovery_pointer_requires_updated_at_utc():
 
 
 def test_recovery_pointer_accepts_both_utc_spellings():
-    from same_day_pointer import STATUS_VALID_RECOVERY_CONTEXT, validate_recovery_pointer
+    try:
+        from scripts.same_day_pointer import STATUS_VALID_RECOVERY_CONTEXT, validate_recovery_pointer
+    except ImportError:
+        from same_day_pointer import STATUS_VALID_RECOVERY_CONTEXT, validate_recovery_pointer  # type: ignore
 
     for stamp in ("2026-07-21T17:05:00Z", "2026-07-21T17:05:00+00:00"):
         with tempfile.TemporaryDirectory() as d:
@@ -1155,7 +1240,10 @@ def test_recovery_pointer_accepts_both_utc_spellings():
 def test_recovery_pointer_rejects_contract_failed_target():
     # The state-level marker: a valid-looking classification does not rescue an
     # artifact the contract rejected.
-    from same_day_pointer import STATUS_PENDING, validate_recovery_pointer
+    try:
+        from scripts.same_day_pointer import STATUS_PENDING, validate_recovery_pointer
+    except ImportError:
+        from same_day_pointer import STATUS_PENDING, validate_recovery_pointer  # type: ignore
 
     with tempfile.TemporaryDirectory() as d:
         root = Path(d) / "midday_dca"
@@ -1179,7 +1267,10 @@ def test_recovery_timestamp_requires_a_timezone_bearing_datetime():
     # date and a naive timestamp, neither of which is an RFC 3339 date-time or
     # establishes a UTC instant, so the helper trusted pointers the schema
     # rejects.
-    from same_day_pointer import _is_iso_utc_timestamp
+    try:
+        from scripts.same_day_pointer import _is_iso_utc_timestamp
+    except ImportError:
+        from same_day_pointer import _is_iso_utc_timestamp  # type: ignore
 
     for good in ("2026-07-21T17:05:00Z", "2026-07-21T17:05:00+00:00", "2026-07-21T13:05:00-04:00"):
         assert _is_iso_utc_timestamp(good) is True, good
@@ -1193,7 +1284,10 @@ def test_recovery_pointer_run_ids_are_compared_exactly():
     # ' run-1 ' and 'run-1' are each schema-valid but are DIFFERENT persisted
     # strings. A stripped comparison let this validator promise an identity
     # match while audit metadata named two different runs.
-    from same_day_pointer import STATUS_MALFORMED, validate_recovery_pointer
+    try:
+        from scripts.same_day_pointer import STATUS_MALFORMED, validate_recovery_pointer
+    except ImportError:
+        from same_day_pointer import STATUS_MALFORMED, validate_recovery_pointer  # type: ignore
 
     for padded in (" midday_recovery_20260721_1305ET",
                    "midday_recovery_20260721_1305ET ",
@@ -1237,7 +1331,10 @@ def test_recovery_pointer_rejects_padded_stream_names():
     # it -- the stream enum is exact. Validation must not repair malformed
     # metadata; rejecting reports wrong_stream, which is the fail-closed
     # direction.
-    from same_day_pointer import STATUS_WRONG_STREAM, validate_recovery_pointer
+    try:
+        from scripts.same_day_pointer import STATUS_WRONG_STREAM, validate_recovery_pointer
+    except ImportError:
+        from same_day_pointer import STATUS_WRONG_STREAM, validate_recovery_pointer  # type: ignore
 
     for padded in (" midday_recovery", "midday_recovery ", " midday_recovery ",
                    "\tmidday_recovery", "midday_recovery\n"):
@@ -1277,7 +1374,10 @@ def test_recovery_timestamp_requires_full_rfc3339_syntax():
     # fromisoformat accepts several ISO 8601 spellings that RFC 3339 -- and
     # therefore the schema's `format: date-time` -- does not, so the helper
     # still returned truthy for pointers a schema-aware consumer refuses.
-    from same_day_pointer import _is_iso_utc_timestamp
+    try:
+        from scripts.same_day_pointer import _is_iso_utc_timestamp
+    except ImportError:
+        from same_day_pointer import _is_iso_utc_timestamp  # type: ignore
 
     for bad in (
         "20260721T170500+00:00",      # basic format, no separators
@@ -1305,7 +1405,10 @@ def test_recovery_timestamp_requires_full_rfc3339_syntax():
 
 
 def test_recovery_pointer_rejects_naive_or_date_only_timestamps():
-    from same_day_pointer import STATUS_MALFORMED, validate_recovery_pointer
+    try:
+        from scripts.same_day_pointer import STATUS_MALFORMED, validate_recovery_pointer
+    except ImportError:
+        from same_day_pointer import STATUS_MALFORMED, validate_recovery_pointer  # type: ignore
 
     for stamp in ("2026-07-21", "2026-07-21T17:05:00"):
         with tempfile.TemporaryDirectory() as d:
@@ -1331,7 +1434,10 @@ def test_recovery_pointer_run_id_must_match_its_target():
     # Codex review discussion_r3660101895: a mismatched or null pointer run_id
     # attributes discovered recovery context to one run while run_state_path
     # resolves to another.
-    from same_day_pointer import STATUS_MALFORMED, validate_recovery_pointer
+    try:
+        from scripts.same_day_pointer import STATUS_MALFORMED, validate_recovery_pointer
+    except ImportError:
+        from same_day_pointer import STATUS_MALFORMED, validate_recovery_pointer  # type: ignore
 
     for bad_run_id in ("some_other_run", None, "", "   "):
         with tempfile.TemporaryDirectory() as d:
@@ -1354,7 +1460,10 @@ def test_recovery_pointer_run_id_must_match_its_target():
 
 
 def test_recovery_pointer_accepts_a_matching_run_id():
-    from same_day_pointer import STATUS_VALID_RECOVERY_CONTEXT, validate_recovery_pointer
+    try:
+        from scripts.same_day_pointer import STATUS_VALID_RECOVERY_CONTEXT, validate_recovery_pointer
+    except ImportError:
+        from same_day_pointer import STATUS_VALID_RECOVERY_CONTEXT, validate_recovery_pointer  # type: ignore
 
     with tempfile.TemporaryDirectory() as d:
         root = Path(d) / "midday_dca"

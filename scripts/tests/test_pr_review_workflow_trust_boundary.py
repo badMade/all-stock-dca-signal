@@ -19,7 +19,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from workflow_policy import load_workflows  # noqa: E402
+try:
+    from scripts.workflow_policy import load_workflows  # noqa: E402
+except ImportError:  # pragma: no cover - fallback when running directly in scripts/
+    from workflow_policy import load_workflows  # type: ignore # noqa: E402
 
 ANALYZE_FILE = ".github/workflows/antigravity-pr-review.yml"
 POST_FILE = ".github/workflows/antigravity-pr-review-post.yml"

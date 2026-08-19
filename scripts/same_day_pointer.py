@@ -243,9 +243,9 @@ def _validate_recovery_state(state: Optional[Mapping[str, object]], trading_day:
     sys.path), and only one of the two spellings resolves in each case.
     """
     try:
-        from run_classification import is_valid_recovery_context_state
-    except ImportError:  # pragma: no cover - exercised via the package path
         from scripts.run_classification import is_valid_recovery_context_state
+    except ImportError:  # pragma: no cover - exercised via un-packaged scripts execution
+        from run_classification import is_valid_recovery_context_state  # type: ignore
     return is_valid_recovery_context_state(state, trading_day)
 
 

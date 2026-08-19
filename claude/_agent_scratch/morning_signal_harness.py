@@ -34,7 +34,10 @@ own -- it only reads the ``run()`` return value and prints/serializes it.
 This script performs no network I/O. All market data comes from the JSON file
 passed via --data-file, which the caller must populate with real (or synthetic,
 for smoke-testing) raw ``get_equity_historicals`` / ``get_equity_quotes`` MCP
-tool responses.
+tool responses. Although the executor's manual path writes artifacts and may
+record cumulative top-up credit, both its artifact root and ticker-history
+archive are forcibly redirected to a temporary directory for this process.
+Inherited production path environment variables are never used.
 
 ------------------------------------------------------------------------------
 --data-file JSON schema
@@ -92,7 +95,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
@@ -105,16 +110,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import os  # noqa: E402
-
-# Default cron_tracking_root() (dca_paths.DEFAULT_CRON_TRACKING_ROOT) is already
-# "<repo>/cron_tracking", which is writable in any checkout -- see dca_paths.py.
-# Only set DCA_CRON_TRACKING_ROOT if the environment doesn't already point
-# somewhere writable, so a real live-session environment that already exports it
-# (e.g. to the production tree) is left alone.
-os.environ.setdefault(
-    "DCA_CRON_TRACKING_ROOT", str(REPO_ROOT / "cron_tracking")
-)
+# Manual evaluation still writes run artifacts, observations, and cumulative
+# top-up credits.  Redirect every persistent root before importing the DCA
+# modules so synthetic harness input can never contaminate a production tree
+# inherited through the caller's environment.  Keep the temporary directory
+# alive until interpreter shutdown.
+_HARNESS_STATE = tempfile.TemporaryDirectory(prefix="morning-signal-harness-")
+_HARNESS_ROOT = Path(_HARNESS_STATE.name)
+(_HARNESS_ROOT / "ticker_data").mkdir()
+os.environ["DCA_CRON_TRACKING_ROOT"] = str(_HARNESS_ROOT / "cron_tracking")
+os.environ["DCA_TICKER_HISTORY_DIR"] = str(_HARNESS_ROOT / "ticker_data")
 
 from dca_live_adapters import RobinhoodDataProvider  # noqa: E402
 from morning_dca import MORNING_LIVE_MODE, MorningDCAExecutor  # noqa: E402

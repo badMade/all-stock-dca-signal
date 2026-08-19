@@ -21,6 +21,10 @@ provably unreachable (the only call site is gated on ``broker is not None``),
 and ``manual=True`` skips the separate scheduled-run-with-no-broker early return.
 This harness contains no order-placement code of its own.
 
+The executor's remaining manual-run writes (including observation archives and
+cumulative top-up credits) are forcibly redirected to a temporary directory;
+the harness never uses persistent roots inherited from its environment.
+
 This script performs no network I/O. All market data comes from the JSON file
 passed via --data-file (see morning_signal_harness.py's module docstring for the
 exact schema: {"historicals": [...], "quotes": [...]}, both raw MCP responses).
@@ -36,7 +40,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
@@ -46,11 +52,14 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import os  # noqa: E402
-
-os.environ.setdefault(
-    "DCA_CRON_TRACKING_ROOT", str(REPO_ROOT / "cron_tracking")
-)
+# ``manual=True`` prevents broker placement but not artifact, observation, or
+# cumulative-credit writes.  Override inherited production roots before any
+# DCA import and retain the isolated tree for the interpreter's lifetime.
+_HARNESS_STATE = tempfile.TemporaryDirectory(prefix="midday-signal-harness-")
+_HARNESS_ROOT = Path(_HARNESS_STATE.name)
+(_HARNESS_ROOT / "ticker_data").mkdir()
+os.environ["DCA_CRON_TRACKING_ROOT"] = str(_HARNESS_ROOT / "cron_tracking")
+os.environ["DCA_TICKER_HISTORY_DIR"] = str(_HARNESS_ROOT / "ticker_data")
 
 from dca_live_adapters import RobinhoodDataProvider  # noqa: E402
 from midday_dca import MIDDAY_LIVE_MODE, MiddayDCAExecutor  # noqa: E402

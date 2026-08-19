@@ -6312,6 +6312,109 @@ def test_archive_intraday_observations_without_run_state_path_does_not_persist(
     assert not (tmp_path / "run_state.json").exists()
 
 
+def test_archive_intraday_observations_does_not_synthesize_missing_run_state(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Never synthesize run_state from in-memory artifacts when
+    # the on-disk file is unusable"): if run_state.json is missing entirely --
+    # e.g. because contract validation could not attach its failure marker
+    # to it -- this function must not fabricate one from the pre-validation
+    # in-memory `artifacts` dict. Doing so would create on-disk evidence that
+    # LOOKS like a valid scheduled run even though it never actually passed
+    # contract validation, defeating the fail-closed contract.
+    import near_close_dca as m
+
+    monkeypatch.setattr(m, "write_run_snapshot", lambda out, observations: None)
+    monkeypatch.setattr(
+        m, "archive_observations_safely", lambda observations: {"ok": True}
+    )
+
+    run_state_path = tmp_path / "run_state.json"
+    assert not run_state_path.exists()
+    artifacts = {"run_id": "r1", "signal_rows": [], "trading_day": "2026-08-03"}
+
+    result = m._archive_intraday_observations(
+        artifacts, tmp_path, run_state_path=run_state_path
+    )
+
+    assert result is None
+    # The in-memory copy is still annotated for this call's own return value...
+    assert artifacts["intraday_archive"]["ok"] is True
+    # ...but nothing was ever written to disk in its place.
+    assert not run_state_path.exists()
+
+
+def test_archive_intraday_observations_does_not_clobber_unreadable_run_state(
+    tmp_path, monkeypatch
+):
+    # Same fail-closed rule as above, but for a run_state.json that exists
+    # on disk yet cannot be parsed (malformed JSON) -- also must be left
+    # untouched rather than overwritten with the in-memory artifacts.
+    import near_close_dca as m
+
+    monkeypatch.setattr(m, "write_run_snapshot", lambda out, observations: None)
+    monkeypatch.setattr(
+        m, "archive_observations_safely", lambda observations: {"ok": True}
+    )
+
+    run_state_path = tmp_path / "run_state.json"
+    run_state_path.write_text("not valid json{{{")
+    artifacts = {"run_id": "r1", "signal_rows": [], "trading_day": "2026-08-03"}
+
+    result = m._archive_intraday_observations(
+        artifacts, tmp_path, run_state_path=run_state_path
+    )
+
+    assert result is None
+    assert run_state_path.read_text() == "not valid json{{{"
+
+
+def test_archive_intraday_observations_skips_write_on_concurrent_run_state_change(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Guard the archive annotation's read-modify-write against
+    # a concurrent retry"): a read-modify-write of run_state.json with no
+    # coordination against a concurrent retry writing the same file can lose
+    # that retry's newer, completed state. Simulate the race by mutating the
+    # file (advancing both mtime and size) from inside the read hook this
+    # test monkeypatches in, mimicking a concurrent writer finishing between
+    # this function's own read and its later write.
+    import near_close_dca as m
+
+    monkeypatch.setattr(m, "write_run_snapshot", lambda out, observations: None)
+    monkeypatch.setattr(
+        m, "archive_observations_safely", lambda observations: {"ok": True}
+    )
+
+    run_state_path = tmp_path / "run_state.json"
+    original = {"run_id": "r1", "signal_rows": [], "status": "ok"}
+    run_state_path.write_text(json.dumps(original))
+
+    real_read_bytes = pathlib.Path.read_bytes
+
+    def racing_read_bytes(self):
+        data = real_read_bytes(self)
+        if self == run_state_path:
+            # A "concurrent retry" finishes and rewrites the file right after
+            # this function's own read, changing both mtime and size.
+            self.write_text(json.dumps({"run_id": "r1", "signal_rows": [], "status": "retry-completed"}))
+        return data
+
+    monkeypatch.setattr(pathlib.Path, "read_bytes", racing_read_bytes)
+
+    artifacts = {"run_id": "r1", "signal_rows": [], "trading_day": "2026-08-03"}
+    result = m._archive_intraday_observations(
+        artifacts, tmp_path, run_state_path=run_state_path
+    )
+
+    assert result is None
+    # The concurrent retry's newer state must survive untouched -- not be
+    # overwritten by this invocation's stale read-then-write.
+    persisted = json.loads(run_state_path.read_bytes())
+    assert persisted["status"] == "retry-completed"
+    assert "intraday_archive" not in persisted
+
+
 def test_select_reconciled_signal_rows_picks_the_buy_winning_provider(tmp_path):
     # Codex review ("Archive one reconciled near-close observation per
     # ticker"): at 15:30 signal_rows carries two rows per ticker (Finance
@@ -9619,13 +9722,10 @@ def test_terminal_non_fill_states_match_the_canonical_broker_set():
     # unknown context and forced its ticker onto the $0 manual-review path.
     # Both readers now source the canonical set, so a future addition to the
     # broker normalizer reaches them without a third edit.
-    import sys
 
     from near_close_dca import _TERMINAL_NON_FILL_STATES
     from scripts.broker_reconciliation import _TERMINAL_ORDER_STATES
-
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts"))
-    from run_classification import _TERMINAL_NON_FILL_STATES as rc_terminal
+    from scripts.run_classification import _TERMINAL_NON_FILL_STATES as rc_terminal
 
     assert _TERMINAL_NON_FILL_STATES == frozenset(_TERMINAL_ORDER_STATES)
     assert rc_terminal == frozenset(_TERMINAL_ORDER_STATES)

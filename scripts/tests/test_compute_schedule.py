@@ -14,7 +14,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import compute_schedule  # noqa: E402
+try:
+    import scripts.compute_schedule as compute_schedule  # noqa: E402
+except ImportError:  # pragma: no cover - fallback when running directly in scripts/
+    import compute_schedule  # type: ignore # noqa: E402
 
 
 class _CadenceFn:

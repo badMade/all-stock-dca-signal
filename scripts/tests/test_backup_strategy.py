@@ -14,15 +14,26 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from backup_strategy import (  # noqa: E402
-    extract_all,
-    extract_budgets,
-    extract_schedule,
-    extract_sizing_ladder,
-    extract_tickers,
-    main,
-    write_configs,
-)
+try:
+    from scripts.backup_strategy import (  # noqa: E402
+        extract_all,
+        extract_budgets,
+        extract_schedule,
+        extract_sizing_ladder,
+        extract_tickers,
+        main,
+        write_configs,
+    )
+except ImportError:  # pragma: no cover - fallback when running directly in scripts/
+    from backup_strategy import (  # type: ignore # noqa: E402
+        extract_all,
+        extract_budgets,
+        extract_schedule,
+        extract_sizing_ladder,
+        extract_tickers,
+        main,
+        write_configs,
+    )
 
 SAMPLE = """
 Notes from the DCA thread (messy paste).

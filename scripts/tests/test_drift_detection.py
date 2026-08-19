@@ -26,22 +26,40 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import drift_detection  # noqa: E402
-from drift_detection import (  # noqa: E402
-    CAUSE_ORDERS_EMPTY,
-    CAUSE_RAW_MISSING,
-    CAUSE_ROW_BLOCK,
-    DEFAULT_SLACK_WEBHOOK_ENV,
-    _sanitize_exception,
-    build_slack_payload,
-    detect_drift,
-    load_run_artifacts,
-    main,
-    parse_amount,
-    parse_bool,
-    resolve_webhook,
-    send_slack_alert,
-)
+try:
+    import scripts.drift_detection as drift_detection  # noqa: E402
+    from scripts.drift_detection import (  # noqa: E402
+        CAUSE_ORDERS_EMPTY,
+        CAUSE_RAW_MISSING,
+        CAUSE_ROW_BLOCK,
+        DEFAULT_SLACK_WEBHOOK_ENV,
+        _sanitize_exception,
+        build_slack_payload,
+        detect_drift,
+        load_run_artifacts,
+        main,
+        parse_amount,
+        parse_bool,
+        resolve_webhook,
+        send_slack_alert,
+    )
+except ImportError:  # pragma: no cover - fallback when running directly in scripts/
+    import drift_detection  # type: ignore # noqa: E402
+    from drift_detection import (  # type: ignore # noqa: E402
+        CAUSE_ORDERS_EMPTY,
+        CAUSE_RAW_MISSING,
+        CAUSE_ROW_BLOCK,
+        DEFAULT_SLACK_WEBHOOK_ENV,
+        _sanitize_exception,
+        build_slack_payload,
+        detect_drift,
+        load_run_artifacts,
+        main,
+        parse_amount,
+        parse_bool,
+        resolve_webhook,
+        send_slack_alert,
+    )
 
 import dca_alerts  # noqa: E402
 
