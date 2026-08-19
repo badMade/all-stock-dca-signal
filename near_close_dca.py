@@ -16827,6 +16827,10 @@ def _run_once_impl(
                     # kill-switch cap for synthetic fires").
                     selected_base_amount_usd=max(1.0, config.inverse_martingale_unit_usd),
                     synthetic_source="inverse_martingale",
+                    # this branch could ever be reached -- so it's safe to
+                    # source the target fields from it directly, matching
+                    # reconcile_signals()'s own finance-preferred convention.
+                    **_target_fields(im_signal.finance_signal),
                 )
                 buy_candidates.append(fire_decision)
                 already_included.add(im_ticker)
