@@ -2034,7 +2034,7 @@ def row_blocked_for_missing_spread(row: Optional[Mapping[str, Any]]) -> bool:
 # --- Writing artifacts -------------------------------------------------------
 
 def update_latest_scheduled_run_pointer(
-    run_state: Dict[str, Any], run_state_path: str | Path, base: Optional[Path] = None
+    run_state: Dict[str, Any], run_state_path: str | Path, base: Optional[Path | str] = None
 ) -> Path:
     """Write/refresh latest_scheduled_run.json to point at an already-written scheduled run_state.
 

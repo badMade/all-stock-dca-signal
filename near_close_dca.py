@@ -2895,7 +2895,7 @@ def evaluate_source_signal(
     )
 
 
-def _target_fields(signal: SourceSignal) -> Dict[str, object]:
+def _target_fields(signal: SourceSignal) -> Dict[str, Any]:
     """Derive execution-target fields from the source signal that drives the buy.
 
     target_price defaults to the signal-time quote (SourceSignal.quote_price), while
@@ -3072,7 +3072,7 @@ def _quote_bid_ask(
 
 
 def quote_spread_pct(
-    data: MarketDataProvider, ticker: str, as_of: datetime
+    data: Optional[MarketDataProvider], ticker: str, as_of: datetime
 ) -> Optional[float]:
     """Return bid/ask spread as a percent of quote midpoint, if available."""
     bid_ask = _quote_bid_ask(data, ticker, as_of)
@@ -4262,7 +4262,7 @@ def _inverse_martingale_recover_pending_lease(
         accumulated_usd_after=float(recovered_state.get("accumulated_usd", 0.0)),
         newly_crossed_tiers=(),
         fired=recovered_amount is not None and recovered_amount > 0,
-        fire_amount_usd=float(recovered_amount or 0.0),
+        fire_amount_usd=recovered_amount or 0.0,
         reason=recovered_reason,
         recovery_metadata=last_recovery,
     )
@@ -4277,7 +4277,7 @@ def _inverse_martingale_recover_pending_lease(
     return InverseMartingaleLeaseRecovery(
         ticker=ticker,
         claim_trading_day=claim_trading_day,
-        recovered_amount_usd=float(recovered_amount or 0.0),
+        recovered_amount_usd=recovered_amount or 0.0,
         recovered_state=recovered_state,
         order_id=str(order_id) if order_id else None,
         claim_ref=claim_ref,
@@ -6912,8 +6912,19 @@ def _combined_fill(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     amount = sum(x for x in amounts if x) or None
     quantity = sum(x for x in qtys if x) or None
     price = None
-    if all(p and p > 0 for p in prices) and all(q and q > 0 for q in qtys):
-        price = (prices[0] * qtys[0] + prices[1] * qtys[1]) / (qtys[0] + qtys[1])
+    p0, p1 = prices[0], prices[1]
+    q0, q1 = qtys[0], qtys[1]
+    if (
+        p0 is not None
+        and p0 > 0
+        and p1 is not None
+        and p1 > 0
+        and q0 is not None
+        and q0 > 0
+        and q1 is not None
+        and q1 > 0
+    ):
+        price = (p0 * q0 + p1 * q1) / (q0 + q1)
     return {
         # No single order_id describes the pair; the aggregate is what matters
         # downstream, and a wrong single ID would be worse than none.
@@ -8549,7 +8560,7 @@ def build_execution_record(
 def _log_execution(
     run_result: "RunResult",
     decision: ReconciledDecision,
-    order_id: str,
+    order_id: Optional[str],
     broker: BrokerAdapter,
     *,
     notional_usd: Optional[float] = None,
@@ -8655,7 +8666,7 @@ class ReportResult:
     ranked_slippage: List[OrderExecutionRecord]
     top_slippage_tickers: List[str]
     missing_fills: Dict[str, str]
-    metrics: Dict[str, object]
+    metrics: Dict[str, Any]
     report_path: Optional[str] = None
     csv_path: Optional[str] = None
 
@@ -9364,7 +9375,7 @@ def _order_recorded_in_deployment_history(
     """
     from dca_risk import STREAM_SCHEDULED, classify_stream, is_afternoon_scheduled_evidence
 
-    wanted = {str(i) for i in order_ids if i}
+    wanted = {i for i in order_ids if i}
     if not wanted:
         return False
     for state in _load_deployment_history_states(trading_day, deployment_history_root):
@@ -9701,7 +9712,9 @@ def _finalize_and_write_artifacts(
         result = validate_classification(rc if isinstance(rc, dict) else {})
         if result and contract_ok:
             update_latest_scheduled_run_pointer(
-                artifacts, paths["run_state"], classification_state_root
+                artifacts,
+                paths["run_state"],
+                base=Path(classification_state_root) if classification_state_root is not None else None,
             )
         elif not contract_ok:
             # A run that breached the artifact contract (e.g. the compute-only
@@ -13929,7 +13942,7 @@ def _process_buy_candidate(
                 order_reviews_attempted_inc,
             )
 
-    if ctx.guard_active:
+    if ctx.guard_active and top_up_outcome is not None:
         order_amount = min(top_up_outcome.incremental_order_amount, order_amount)
         if top_up_outcome.skipped:
             candidate_outcome = {
@@ -15057,13 +15070,15 @@ def _write_afternoon_failure_artifacts(
     # failure state exactly as the no-file branch does, rather than being wrapped
     # in fresh companions around a broken root (Codex review).
     existing_is_usable = False
-    state_was_mutated = False
+    _loaded: Optional[Dict[str, Any]] = None
     if state_path.exists():
         try:
-            _loaded = json.loads(state_path.read_bytes())
+            parsed = json.loads(state_path.read_bytes())
+            if isinstance(parsed, dict):
+                _loaded = parsed
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             _loaded = None
-        existing_is_usable = isinstance(_loaded, dict)
+        existing_is_usable = _loaded is not None
         if not existing_is_usable:
             logger.warning(
                 "replacing an unreadable run_state.json at %s with the failure state",
@@ -15135,6 +15150,7 @@ def _write_afternoon_failure_artifacts(
             "afternoon run failed after run_state.json was written; preserving it "
             "and completing any missing companion artifacts"
         )
+        assert _loaded is not None
         run_state = _loaded
         # The preserved file can belong to an EARLIER invocation at this slot, so
         # fold in whatever THIS one placed. Discarding it would hide an accepted
@@ -15966,6 +15982,8 @@ def _run_once_impl(
         # preference order, purely for consistency with a normal BUY
         # decision's provenance fields.
         signal = decision.finance_signal or decision.robinhood_signal
+        if signal is None:
+            continue
         # Splice in a COPY carrying the derived target_price/decision_bar_close
         # -- _process_whole_share_candidate reads those fields directly, and
         # the original NO_ACTION decision object must not be mutated in
@@ -16554,7 +16572,10 @@ def _run_once_impl(
                 per_order_cap_usd=config.max_per_order_usd,
                 stream=stream,
             )
-            im_guarded = guard_active and prior_same_day_allocations.get(im_ticker) is not None
+            im_guarded = (
+                guard_active
+                and bool(prior_same_day_allocations and prior_same_day_allocations.get(im_ticker) is not None)
+            )
             if im_step.fired and im_step.fire_amount_usd > 0 and (im_guarded or im_batch_occupied):
                 # This ticker cannot safely carry a fire candidate this run,
                 # for one of two independent reasons:
@@ -16784,6 +16805,7 @@ def _run_once_impl(
                     # this branch could ever be reached -- so it's safe to
                     # source the target fields from it directly, matching
                     # reconcile_signals()'s own finance-preferred convention.
+                    assert im_signal.finance_signal is not None
                     **_target_fields(im_signal.finance_signal),
                     # evaluate_inverse_martingale_step() itself already floors
                     # fire_amount_usd to the broker minimum (Codex review:
@@ -17025,7 +17047,7 @@ def _run_once_impl(
                 high_multiplier_signals += 1
             continue
         if guard_active:
-            prior = prior_same_day_allocations.get(d.ticker)
+            prior = prior_same_day_allocations.get(d.ticker) if prior_same_day_allocations is not None else None
             # Carry each candidate's enumerated pending balance (including a
             # flush-only candidate appended above solely because it has a
             # pending credit, whose own suggested_amount_usd/action never
@@ -17097,7 +17119,7 @@ def _run_once_impl(
                 pre_same_day_seed_week_notional=pre_same_day_seed_week_notional,
             )
 
-    ctx = ProcessCandidateContext(
+    process_ctx = ProcessCandidateContext(
         config=config,
         state=state,
         broker=broker,
@@ -17115,7 +17137,7 @@ def _run_once_impl(
     candidate_outcomes, top_up_outcomes, running_deployed_7d, err_inc, rev_inc = (
         _process_buy_candidates_batch(
             buy_candidates=buy_candidates,
-            ctx=ctx,
+            ctx=process_ctx,
         )
     )
     errors_count += err_inc
@@ -17651,7 +17673,7 @@ def run_daily_compact(
     robinhood_data: MarketDataProvider,
     broker: BrokerAdapter,
     options: Optional[CompactRunOptions] = None,
-    **legacy_options: object,
+    **legacy_options: Any,
 ) -> Dict[str, Any]:
     """Run one DCA scan and write only compact, structured daily artifacts.
 
