@@ -283,6 +283,29 @@ def test_overlapping_call_for_an_unresolved_fire_does_not_get_the_same_actionabl
     assert ledger.shares_purchased_total("BYDDY") == 0
 
 
+def test_overlapping_call_with_the_same_recorded_at_cannot_share_the_fire_claim(tmp_path):
+    """Scheduler attempts can share an exact slot timestamp.
+
+    Claim ownership is established by the first locked write, not by seeing a
+    different ``recorded_at`` value.  A second process presenting the same
+    timestamp must therefore still receive a non-actionable cached decision.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+    overlapping = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+
+    assert first.shares_to_buy == 1
+    assert overlapping.shares_to_buy == 0
+    assert overlapping.order_notional_usd == 0.0
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+
 def test_a_stale_unresolved_claim_is_reclaimed_by_a_later_retry(tmp_path):
     """A genuinely abandoned claim (e.g. the original caller crashed before
     settling) must not permanently strand the deducted pending balance -- a
@@ -1457,6 +1480,39 @@ def test_preserve_pending_refuses_to_credit_an_already_resolved_fire(tmp_path):
 
     assert restored == 0.0
     assert ledger.pending_usd("BYDDY") == 0.0
+
+
+def test_only_reclaiming_caller_can_preserve_and_resolve_a_stale_fire(tmp_path):
+    """A stale owner cannot restore funds or resolve the retry's claim."""
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    original_recorded_at = "2026-08-16T15:30:00-04:00"
+    retry_recorded_at = "2026-08-16T15:40:00-04:00"
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=original_recorded_at
+    )
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=retry_recorded_at
+    )
+
+    stale_result = ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="slot-1", recorded_at=original_recorded_at
+    )
+    assert stale_result == 0.0
+    assert ledger.still_claimed("BYDDY", "2026-08-16", "slot-1", retry_recorded_at) is True
+
+    retry_result = ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="slot-1", recorded_at=retry_recorded_at
+    )
+    assert retry_result == 10.0
+    assert ledger.still_claimed("BYDDY", "2026-08-16", "slot-1", retry_recorded_at) is False
+
+    # Resolution cannot be replayed to restore the deduction a second time.
+    assert (
+        ledger.preserve_pending(
+            "BYDDY", "2026-08-16", 10.0, idempotency_key="slot-1", recorded_at=retry_recorded_at
+        )
+        == 10.0
+    )
 
 
 def test_settle_bumps_shares_purchased_total(tmp_path):

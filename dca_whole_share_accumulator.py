@@ -245,6 +245,11 @@ def _claim_is_stale(claimed_at: Optional[str], now: Optional[str]) -> bool:
     return elapsed >= UNRESOLVED_CLAIM_STALE_SECONDS
 
 
+def _claim_can_resolve(cached: dict[str, object], recorded_at: Optional[str]) -> bool:
+    """Return whether this caller owns an unresolved cached fire claim."""
+    return not bool(cached.get("resolved")) and cached.get("claimed_at") == recorded_at
+
+
 class WholeShareAccumulationLedger:
     """Durably retain a ticker's cross-day pending accumulation balance.
 
@@ -684,9 +689,7 @@ class WholeShareAccumulationLedger:
             if dedup_key is not None:
                 recorded_keys = state.setdefault("recorded_idempotency_keys", {})
                 cached = recorded_keys.get(dedup_key)
-                if cached is not None and (
-                    cached.get("resolved") or cached.get("claimed_at") != recorded_at
-                ):
+                if cached is not None and not _claim_can_resolve(cached, recorded_at):
                     # Already resolved by someone else, or this caller no
                     # longer holds the claim -- the deduction being
                     # "restored" here belongs to a different fire attempt
@@ -856,9 +859,7 @@ class WholeShareAccumulationLedger:
             cached = state.get("recorded_idempotency_keys", {}).get(dedup_key)
         if cached is None:
             return True
-        if cached.get("resolved"):
-            return False
-        return cached.get("claimed_at") == recorded_at
+        return _claim_can_resolve(cached, recorded_at)
 
     def settle(
         self,
@@ -966,9 +967,7 @@ class WholeShareAccumulationLedger:
             if dedup_key is not None:
                 recorded_keys = state.setdefault("recorded_idempotency_keys", {})
                 cached = recorded_keys.get(dedup_key)
-                if cached is not None and not (
-                    cached.get("resolved") or cached.get("claimed_at") != recorded_at
-                ):
+                if cached is not None and _claim_can_resolve(cached, recorded_at):
                     planned_shares = int(cached.get("shares_to_buy", 0))
                     cached_price = float(cached.get("current_share_price_usd", 0.0))
                     unbought_shares = max(0, planned_shares - int(shares_purchased))
