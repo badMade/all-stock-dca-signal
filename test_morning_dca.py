@@ -216,6 +216,22 @@ class FakeLiveBroker:
     def get_order_fill(self, order_id) -> Any:
         return None
 
+    def same_day_order_with_ref_id_prefix_any_state(
+        self, ticker, trading_day, ref_id_prefixes
+    ) -> Optional[Dict[str, Any]]:
+        return self.same_day_strategy_order_exists_with_ref_id_prefix(
+            ticker, trading_day, ref_id_prefixes
+        )
+
+    def is_tradable_for_whole_share_buy(self, ticker) -> bool:
+        return True
+
+    def review_whole_share_buy(self, ticker, quantity) -> Tuple[bool, str]:
+        return True, "ok"
+
+    def place_whole_share_buy(self, ticker, quantity, ref_id) -> str:
+        return f"ORDER-WS-{ticker}"
+
     def get_raw_placement_responses(self) -> list:
         return []
 
@@ -1310,7 +1326,7 @@ def test_morning_run_reviews_places_and_records_orders_csv(tmp_path):
     assert "SMALL" in orders_csv_text
 
 
-class RecordingLiveBroker:
+class RecordingLiveBroker(FakeLiveBroker):
     supports_concurrent_fill_lookup: bool = False
 
     def __init__(self, account, reference_prices=None):
@@ -3640,7 +3656,7 @@ def test_scheduled_live_run_without_broker_fails_closed(tmp_path):
 
 
 def test_scheduled_live_run_with_wrong_broker_account_fails_closed_before_ordering(tmp_path):
-    class _WrongAccountBroker:
+    class _WrongAccountBroker(FakeLiveBroker):
         def __init__(self):
             self.placed = False
 
@@ -3682,7 +3698,7 @@ def test_scheduled_live_run_with_wrong_broker_account_fails_closed_before_orderi
     assert Path(res["paths"]["latest_morning_run"]).exists()
 
 
-class _AnyAccountBroker:
+class _AnyAccountBroker(FakeLiveBroker):
     """Broker whose account_number() must never be trusted to pin a live run."""
 
     def __init__(self, account="whatever-account-the-adapter-was-wired-to"):
@@ -3765,7 +3781,7 @@ def test_manual_live_run_without_a_pinned_account_raises(tmp_path, unpinned):
 def test_manual_live_run_with_wrong_broker_account_raises_before_ordering(tmp_path):
     import pytest
 
-    class _WrongAccountBroker:
+    class _WrongAccountBroker(FakeLiveBroker):
         def __init__(self):
             self.buying_power_checked = False
             self.placed = False
@@ -3805,7 +3821,7 @@ def test_scheduled_live_run_with_broker_account_number_error_fails_closed(tmp_pa
     # connector network/API error). Left uncaught this crashes the process
     # with a raw traceback instead of producing the durable run_state.json a
     # scheduled retry depends on.
-    class _RaisingAccountBroker:
+    class _RaisingAccountBroker(FakeLiveBroker):
         def __init__(self):
             self.placed = False
 
@@ -3842,7 +3858,7 @@ def test_scheduled_live_run_with_broker_account_number_error_fails_closed(tmp_pa
 def test_manual_live_run_with_broker_account_number_error_raises_runtime_error(tmp_path):
     import pytest
 
-    class _RaisingAccountBroker:
+    class _RaisingAccountBroker(FakeLiveBroker):
         def __init__(self):
             self.placed = False
 
@@ -3936,7 +3952,7 @@ def test_blocked_live_retry_does_not_preserve_stale_non_submitted_block(tmp_path
     # Second scheduled attempt at the SAME slot: broker present but wrong
     # account. This is a DIFFERENT failure and must be recorded, not masked by
     # the stale first block_reason.
-    class _WrongAccountBroker:
+    class _WrongAccountBroker(FakeLiveBroker):
         def account_number(self):
             return "not-the-approved-account"
 
@@ -4166,7 +4182,7 @@ def test_auto_buy_candidates_prioritized_by_multiplier_when_cap_hit(tmp_path):
     # happened to be evaluated first.
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
-    class _FakeLiveBroker:
+    class _FakeLiveBroker(FakeLiveBroker):
         """Returns real-looking order IDs so submitted_today accumulates."""
         def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
         def available_buying_power(self): return 500.0
@@ -4431,7 +4447,7 @@ def test_morning_top_up_guard_buys_incremental_when_prior_fill_exists(tmp_path):
     # $2.00.
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, TOP_UP_INCREMENTAL
 
-    class _Broker:
+    class _Broker(FakeLiveBroker):
         def __init__(self): self.placed = {}
         def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
         def available_buying_power(self): return 500.0
@@ -4440,7 +4456,7 @@ def test_morning_top_up_guard_buys_incremental_when_prior_fill_exists(tmp_path):
             # Guarded top-ups use the narrower same-stream ref-id duplicate check;
             # this fixture never has prior broker orders on file, so it always
             # proceeds as a fresh placement.
-            return False
+            return None
         def is_tradable_for_fractional_buy(self, ticker): return True
         def review_market_buy(self, ticker, notional_usd): return True, "ok"
         def place_market_buy(self, ticker, notional_usd, ref_id):
@@ -4486,7 +4502,7 @@ def test_morning_place_broker_orders_settles_credit_ledger_after_confirmed_submi
     from dca_cumulative import CumulativeCreditLedger
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, TOP_UP_INCREMENTAL
 
-    class _Broker:
+    class _Broker(FakeLiveBroker):
         def __init__(self):
             self.placed = {}
 
@@ -4502,7 +4518,7 @@ def test_morning_place_broker_orders_settles_credit_ledger_after_confirmed_submi
         def same_day_strategy_order_exists_with_ref_id_prefix(
             self, ticker, trading_day, ref_id_prefixes
         ):
-            return False
+            return None
 
         def is_tradable_for_fractional_buy(self, ticker):
             return True
@@ -4566,7 +4582,7 @@ def test_morning_top_up_guard_skips_when_price_not_below_reference(tmp_path):
     # ABOVE $96.0 → TOP_UP_PRICE_NOT_BELOW → $0 order, broker not called.
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, TOP_UP_PRICE_NOT_BELOW
 
-    class _Broker:
+    class _Broker(FakeLiveBroker):
         def __init__(self): self.placed = {}
         def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
         def available_buying_power(self): return 500.0
@@ -4634,7 +4650,7 @@ def test_morning_top_up_guard_seeds_ledger_from_prior_fills(tmp_path):
     # just the per-ticker incremental offset.
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
-    class _Broker:
+    class _Broker(FakeLiveBroker):
         def __init__(self): self.placed = {}
         def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
         def available_buying_power(self): return 500.0
@@ -4751,7 +4767,7 @@ def test_morning_top_up_guard_afternoon_fills_do_not_reduce_morning_cap(tmp_path
     # TOPUP at $7.50 is below the $90 cap and should be placed.
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
-    class _Broker:
+    class _Broker(FakeLiveBroker):
         def __init__(self): self.placed = {}
         def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
         def available_buying_power(self): return 500.0
@@ -4796,7 +4812,7 @@ def test_morning_top_up_guard_inactive_in_manual_live_run(tmp_path):
     # gate, rather than the incremental path submitting a second order.
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
-    class _Broker:
+    class _Broker(FakeLiveBroker):
         def __init__(self):
             self.placed = {}
             self.dup_checked = {}
@@ -4847,7 +4863,7 @@ def test_morning_cap_seeding_is_idempotent_across_multiple_runs(tmp_path):
     # must also pick up a NEW fill that appears between the two runs.
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
-    class _Broker:
+    class _Broker(FakeLiveBroker):
         def __init__(self):
             self.placed = {}
         def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
@@ -4923,7 +4939,7 @@ def test_cap_seed_scan_failure_poison_clears_on_a_recovered_rescan(tmp_path, mon
     import morning_dca as _md
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
-    class _Broker:
+    class _Broker(FakeLiveBroker):
         def __init__(self): self.placed = {}
         def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
         def available_buying_power(self): return 500.0
@@ -5252,7 +5268,7 @@ def test_morning_cap_seeding_does_not_double_count_own_manual_submission(tmp_pat
     #      even though only $7.50 of the cap has been genuinely spent.
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
-    class _DupBlockingBroker:
+    class _DupBlockingBroker(FakeLiveBroker):
         """First call places; subsequent calls for same ticker return dup=True."""
         def __init__(self):
             self.placed = {}
@@ -5324,7 +5340,7 @@ def test_morning_cap_seeding_watermark_exclusive_of_own_recorded(tmp_path):
 
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
-    class _SimpleBroker:
+    class _SimpleBroker(FakeLiveBroker):
         def __init__(self):
             self.placed = {}
             self._placed_tickers = set()
@@ -5428,7 +5444,7 @@ def test_morning_cap_seeding_does_not_double_count_own_scheduled_submission(tmp_
     # scope -- unlike the narrower manual_runs/-only roots used above.
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
-    class _DupBlockingBroker:
+    class _DupBlockingBroker(FakeLiveBroker):
         """First call places; subsequent calls for same ticker return dup=True."""
         def __init__(self):
             self.placed = {}
@@ -5498,7 +5514,7 @@ def test_morning_cap_seeding_picks_up_external_fill_after_own_retry_overwrite(tm
 
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
-    class _DupBlockingBroker:
+    class _DupBlockingBroker(FakeLiveBroker):
         def __init__(self):
             self.placed = {}
         def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
@@ -5578,7 +5594,7 @@ def test_shadow_run_suppresses_drift_check(tmp_path, monkeypatch):
     import morning_dca as _md
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
-    class _Broker:
+    class _Broker(FakeLiveBroker):
         def account_number(self):
             return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
@@ -5694,13 +5710,13 @@ def test_morning_top_up_guard_no_prior_run_when_default_roots_empty(tmp_path):
     # (Use prior_allocation_roots=() to fully disable the guard instead.)
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, TOP_UP_NO_PRIOR_RUN
 
-    class _Broker:
+    class _Broker(FakeLiveBroker):
         def __init__(self): self.placed = {}
         def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
         def available_buying_power(self): return 500.0
         def same_day_strategy_order_exists(self, ticker, trading_day): return False
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
-            return False
+            return None
         def is_tradable_for_fractional_buy(self, ticker): return True
         def review_market_buy(self, ticker, notional_usd): return True, "ok"
         def place_market_buy(self, ticker, notional_usd, ref_id):
@@ -5765,7 +5781,7 @@ def _seed_prior(
     return root
 
 
-class _TopUpBroker:
+class _TopUpBroker(FakeLiveBroker):
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER as _acct
     supports_concurrent_fill_lookup: bool = False
 
@@ -5810,7 +5826,7 @@ def test_morning_live_applies_prior_manual_offset_incremental(tmp_path):
     assert rows["NVDA"]["top_up_guard_result"] == "incremental_top_up"
 
 
-class _RefIdTrackingBroker:
+class _RefIdTrackingBroker(FakeLiveBroker):
     """Broker double that actually remembers placed ref_ids, so the same-stream
     duplicate check (same_day_strategy_order_exists_with_ref_id_prefix) reflects
     real prior placements instead of a fixture that always returns False.
@@ -6472,7 +6488,7 @@ def test_morning_cap_seeding_runs_even_when_per_ticker_guard_disabled(tmp_path):
     # the daily cap even when the per-ticker offset guard is opted out.
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
-    class _Broker:
+    class _Broker(FakeLiveBroker):
         def __init__(self): self.placed = {}
         def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
         def available_buying_power(self): return 500.0
@@ -6523,7 +6539,7 @@ def test_morning_cap_seeding_own_amount_scoped_to_cap_roots(tmp_path):
 
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
-    class _SimpleBroker:
+    class _SimpleBroker(FakeLiveBroker):
         def __init__(self):
             self.placed = {}
             self._placed_tickers: set = set()
@@ -6641,11 +6657,11 @@ def test_morning_cap_seeding_ignores_own_amount_from_no_broker_manual_run(tmp_pa
     # by the earlier no-broker manual invocation.
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
-    class _Broker:
+    class _Broker(FakeLiveBroker):
         def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
         def available_buying_power(self): return 500.0
         def same_day_strategy_order_exists(self, ticker, trading_day): return False
-        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes): return False
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes): return None
         def is_tradable_for_fractional_buy(self, ticker): return True
         def review_market_buy(self, ticker, notional_usd): return True, "ok"
         def place_market_buy(self, ticker, notional_usd, ref_id): return f"ORDER-{ticker}"
@@ -6667,7 +6683,7 @@ def test_per_order_cap_blocks_without_any_broker_call(tmp_path):
     # must never be touched at all.
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
-    class _NoBuyingPowerCallBroker:
+    class _NoBuyingPowerCallBroker(FakeLiveBroker):
         def account_number(self):
             return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
@@ -6727,7 +6743,7 @@ def test_spread_breaker_blocks_wide_spread_before_placement(tmp_path):
     # quote.
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
-    class _FakeLiveBroker:
+    class _FakeLiveBroker(FakeLiveBroker):
         def account_number(self):
             return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
@@ -6762,7 +6778,7 @@ def test_spread_breaker_blocks_wide_spread_before_placement(tmp_path):
 def test_spread_breaker_allows_tight_spread(tmp_path):
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
-    class _FakeLiveBroker:
+    class _FakeLiveBroker(FakeLiveBroker):
         def account_number(self):
             return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
@@ -6805,7 +6821,7 @@ def test_same_stream_order_exists_normalizes_legacy_boolean_adapters(tmp_path):
     # treat a legitimate False as a duplicate (skipping place_market_buy and
     # recording a phantom submission), and a legacy True would reach later
     # .get(...) calls on a bool and raise.
-    class _LegacyBoolBroker:
+    class _LegacyBoolBroker(FakeLiveBroker):
         def __init__(self, result):
             self._result = result
 
@@ -7049,7 +7065,7 @@ class _Unserializable:
 
 
 class _BadTradabilityBroker(FakeLiveBroker):
-    def is_tradable_for_fractional_buy(self, ticker):
+    def is_tradable_for_fractional_buy(self, ticker) -> Any:
         return _Unserializable()
 
 
