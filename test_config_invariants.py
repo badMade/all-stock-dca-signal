@@ -487,6 +487,11 @@ def test_pyproject_ships_every_live_stream_module_and_config():
     )
 
     for module in (
+        # dca_alerts imports the shared outbound-network validation module at
+        # import time, so omitting it prevents installed entry points such as
+        # run-dca from starting (Codex review: "Ship the extracted network
+        # module in the wheel").
+        "dca_net_utils",
         "market_open_dca",
         "intraday_dca",
         "dca_cumulative",

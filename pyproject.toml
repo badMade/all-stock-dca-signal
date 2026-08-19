@@ -63,6 +63,9 @@ py-modules = [
     "morning_dca",
     "midday_dca",
     "dca_alerts",
+    # Shared outbound-network validation imported by dca_alerts; it must be
+    # present for packaged entry points to import outside a source checkout.
+    "dca_net_utils",
     "dca_config",
     "dca_fileio",
     # Imported by morning/midday/alerts and by scripts/*, so it must ship with

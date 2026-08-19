@@ -21,47 +21,27 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, cast
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-try:
-    import scripts.drift_detection as drift_detection  # noqa: E402
-    from scripts.drift_detection import (  # noqa: E402
-        CAUSE_ORDERS_EMPTY,
-        CAUSE_RAW_MISSING,
-        CAUSE_ROW_BLOCK,
-        DEFAULT_SLACK_WEBHOOK_ENV,
-        _sanitize_exception,
-        build_slack_payload,
-        detect_drift,
-        load_run_artifacts,
-        main,
-        parse_amount,
-        parse_bool,
-        resolve_webhook,
-        send_slack_alert,
-    )
-except ImportError:  # pragma: no cover - fallback when running directly in scripts/
-    import drift_detection  # type: ignore # noqa: E402
-    from drift_detection import (  # type: ignore # noqa: E402
-        CAUSE_ORDERS_EMPTY,
-        CAUSE_RAW_MISSING,
-        CAUSE_ROW_BLOCK,
-        DEFAULT_SLACK_WEBHOOK_ENV,
-        _sanitize_exception,
-        build_slack_payload,
-        detect_drift,
-        load_run_artifacts,
-        main,
-        parse_amount,
-        parse_bool,
-        resolve_webhook,
-        send_slack_alert,
-    )
+import drift_detection  # noqa: E402
+from drift_detection import (  # noqa: E402
+    CAUSE_ORDERS_EMPTY,
+    CAUSE_RAW_MISSING,
+    CAUSE_ROW_BLOCK,
+    DEFAULT_SLACK_WEBHOOK_ENV,
+    build_slack_payload,
+    detect_drift,
+    load_run_artifacts,
+    main,
+    parse_amount,
+    parse_bool,
+    resolve_webhook,
+    send_slack_alert,
+)
 
-import dca_alerts  # noqa: E402
+import dca_net_utils
 
 SIGNAL_FIELDS = [
     "ticker",
@@ -421,7 +401,7 @@ class SlackTests(unittest.TestCase):
     def test_send_slack_blocks_private_destination(self):
         report = detect_drift(self.run_dir)
         with patch.object(
-            dca_alerts, "_resolve_ips", lambda hostname: {ipaddress.ip_address("127.0.0.1")}
+            dca_net_utils, "resolve_ips", lambda hostname: {ipaddress.ip_address("127.0.0.1")}
         ):
             with self.assertRaises(urllib.error.URLError):
                 send_slack_alert(report, webhook="https://hooks.example/alert")
@@ -429,8 +409,8 @@ class SlackTests(unittest.TestCase):
     def test_send_slack_blocks_cloud_metadata_destination(self):
         report = detect_drift(self.run_dir)
         with patch.object(
-            dca_alerts,
-            "_resolve_ips",
+            dca_net_utils,
+            "resolve_ips",
             lambda hostname: {ipaddress.ip_address("169.254.169.254")},
         ):
             with self.assertRaises(urllib.error.URLError):
@@ -454,16 +434,16 @@ class SlackTests(unittest.TestCase):
             return _FakeResponse()
 
         with patch.object(
-            dca_alerts, "_resolve_ips", lambda hostname: {ipaddress.ip_address("93.184.216.34")}
+            dca_net_utils, "resolve_ips", lambda hostname: {ipaddress.ip_address("93.184.216.34")}
         ), patch.object(urllib.request, "urlopen", fake_urlopen):
             self.assertTrue(send_slack_alert(report, webhook="https://hooks.example/alert"))
         self.assertEqual(len(calls), 1)
 
     def test_safe_redirect_handler_blocks_private_redirect_target(self):
-        handler = dca_alerts._SafeRedirectHandler()
+        handler = dca_net_utils.SafeRedirectHandler()
         req = urllib.request.Request("https://hooks.example/start")
         with patch.object(
-            dca_alerts, "_resolve_ips", lambda hostname: {ipaddress.ip_address("127.0.0.1")}
+            dca_net_utils, "resolve_ips", lambda hostname: {ipaddress.ip_address("127.0.0.1")}
         ):
             with self.assertRaises(urllib.error.HTTPError):
                 handler.redirect_request(req, None, 302, "Found", {}, "https://internal.example/secret")
@@ -475,7 +455,7 @@ class SlackTests(unittest.TestCase):
         """
         report = detect_drift(self.run_dir)
         with patch.object(
-            dca_alerts, "_resolve_ips", lambda hostname: {ipaddress.ip_address("100.64.0.1")}
+            dca_net_utils, "resolve_ips", lambda hostname: {ipaddress.ip_address("100.64.0.1")}
         ):
             with self.assertRaises(urllib.error.URLError):
                 send_slack_alert(report, webhook="https://hooks.example/alert")
@@ -483,7 +463,7 @@ class SlackTests(unittest.TestCase):
     def test_send_slack_blocks_deprecated_site_local_destination(self):
         report = detect_drift(self.run_dir)
         with patch.object(
-            dca_alerts, "_resolve_ips", lambda hostname: {ipaddress.ip_address("fec0::1")}
+            dca_net_utils, "resolve_ips", lambda hostname: {ipaddress.ip_address("fec0::1")}
         ):
             with self.assertRaises(urllib.error.URLError):
                 send_slack_alert(report, webhook="https://hooks.example/alert")
@@ -520,7 +500,7 @@ class SlackTests(unittest.TestCase):
 
         os.environ["https_proxy"] = "http://proxy.internal:3128"
         self.addCleanup(os.environ.pop, "https_proxy", None)
-        with patch.object(dca_alerts, "_resolve_ips", boom), patch.object(
+        with patch.object(dca_net_utils, "resolve_ips", boom), patch.object(
             urllib.request, "urlopen", fake_urlopen
         ):
             self.assertTrue(send_slack_alert(report, webhook="https://internal-only.example/alert"))
@@ -551,7 +531,7 @@ class SlackTests(unittest.TestCase):
         os.environ["https_proxy"] = "http://proxy.internal:3128"
         self.addCleanup(os.environ.pop, "https_proxy", None)
         with patch.object(
-            dca_alerts, "_resolve_ips", lambda hostname: {ipaddress.ip_address("169.254.169.254")}
+            dca_net_utils, "resolve_ips", lambda hostname: {ipaddress.ip_address("169.254.169.254")}
         ):
             with self.assertRaises(urllib.error.URLError):
                 send_slack_alert(report, webhook="https://attacker.example/alert")
@@ -569,17 +549,17 @@ class SlackTests(unittest.TestCase):
             return object()
 
         class _FakeConn:
+            _create_connection = staticmethod(fake_create_connection)
             host = "hooks.example"
             port = 443
             timeout = 10.0
             source_address = None
-            sock: Any = None
 
         conn = _FakeConn()
         with patch.object(
-            dca_alerts, "_resolve_ips", lambda hostname: {validated_ip}
-        ), patch.object(dca_alerts.socket, "create_connection", fake_create_connection):
-            dca_alerts._connect_pinned(cast(Any, conn))
+            dca_net_utils, "resolve_ips", lambda hostname: {validated_ip}
+        ), patch.object(dca_net_utils.socket, "create_connection", fake_create_connection):
+            dca_net_utils.connect_pinned(conn)
         self.assertEqual(calls, [(str(validated_ip), 443)])
         self.assertIsNotNone(conn.sock)
 
@@ -601,10 +581,10 @@ class SlackTests(unittest.TestCase):
         def fake_request(self, *a, **kw):
             raise _ReachedConnection("construction succeeded")
 
-        handler = dca_alerts._PinnedHTTPSHandler()
+        handler = dca_net_utils.PinnedHTTPSHandler()
         req = urllib.request.Request("https://hooks.example/alert")
         req.timeout = 10.0  # normally set by OpenerDirector.open() before dispatch
-        with patch.object(dca_alerts._PinnedHTTPSConnection, "request", fake_request):
+        with patch.object(dca_net_utils.PinnedHTTPSConnection, "request", fake_request):
             with self.assertRaises(_ReachedConnection):
                 handler.https_open(req)
 
@@ -615,10 +595,10 @@ class SlackTests(unittest.TestCase):
         def fake_request(self, *a, **kw):
             raise _ReachedConnection("construction succeeded")
 
-        handler = dca_alerts._PinnedHTTPSHandler()
+        handler = dca_net_utils.PinnedHTTPSHandler()
         req = urllib.request.Request("https://hooks.example/alert")
         req.timeout = 10.0  # normally set by OpenerDirector.open() before dispatch
-        cast(Any, req)._tunnel_host = "hooks.example"
+        req._tunnel_host = "hooks.example"
         with patch.object(http.client.HTTPSConnection, "request", fake_request):
             with self.assertRaises(_ReachedConnection):
                 handler.https_open(req)
@@ -668,7 +648,6 @@ class LoadRunArtifactsSignalSelectionTest(unittest.TestCase):
 
             artifacts = load_run_artifacts(run_dir)
 
-            assert artifacts.signals_path is not None
             self.assertEqual(artifacts.signals_path.name, "morning_signals.csv")
             self.assertEqual(len(artifacts.signal_rows), 1)
 
@@ -689,7 +668,6 @@ class LoadRunArtifactsSignalSelectionTest(unittest.TestCase):
 
             artifacts = load_run_artifacts(run_dir)
 
-            assert artifacts.signals_path is not None
             self.assertEqual(artifacts.signals_path.name, "morning_signals.csv")
             self.assertEqual(len(artifacts.signal_rows), 1)
 
@@ -703,9 +681,7 @@ class LoadRunArtifactsSignalSelectionTest(unittest.TestCase):
                 "ticker,auto_buy_signal\nBBB,true\n", encoding="utf-8"
             )
 
-            signals_path = load_run_artifacts(run_dir).signals_path
-            assert signals_path is not None
-            self.assertEqual(signals_path.name, "signals.csv")
+            self.assertEqual(load_run_artifacts(run_dir).signals_path.name, "signals.csv")
 
     def test_falls_back_to_the_first_existing_when_none_are_usable(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -714,7 +690,6 @@ class LoadRunArtifactsSignalSelectionTest(unittest.TestCase):
 
             artifacts = load_run_artifacts(run_dir)
 
-            assert artifacts.signals_path is not None
             self.assertEqual(artifacts.signals_path.name, "signals.csv")
             self.assertEqual(artifacts.signal_rows, [])
 
@@ -729,39 +704,39 @@ class LoadRunArtifactsSignalSelectionTest(unittest.TestCase):
 
 
 class SanitizeExceptionTests(unittest.TestCase):
-    """_sanitize_exception never exposes webhook tokens or URL-derived content."""
+    """dca_net_utils.sanitize_exception never exposes webhook tokens or URL-derived content."""
 
     def test_plain_string_reason_hides_content(self):
         exc = urllib.error.URLError("connection to https://hooks.example/secret-token failed")
-        rendered = _sanitize_exception(exc)
+        rendered = dca_net_utils.sanitize_exception(exc)
         assert "secret-token" not in rendered
         assert "URLError" in rendered
 
     def test_oserror_reason_reports_errno_only(self):
         exc = urllib.error.URLError(OSError(111, "connection refused"))
-        rendered = _sanitize_exception(exc)
+        rendered = dca_net_utils.sanitize_exception(exc)
         assert "URLError" in rendered
         assert "111" in rendered
         assert "connection refused" not in rendered
 
     def test_base_exception_reason_without_errno_reports_type_only(self):
         exc = urllib.error.URLError(ValueError("unexpected scheme https://hooks.example/secret-token"))
-        rendered = _sanitize_exception(exc)
+        rendered = dca_net_utils.sanitize_exception(exc)
         assert "secret-token" not in rendered
         assert "URLError" in rendered
         assert "ValueError" in rendered
 
     def test_http_error_reports_status_only(self):
         exc = urllib.error.HTTPError(
-            "https://hooks.example/secret-token", 503, "blocked", cast(Any, {}), None
+            "https://hooks.example/secret-token", 503, "blocked", {}, None
         )
-        rendered = _sanitize_exception(exc)
+        rendered = dca_net_utils.sanitize_exception(exc)
         assert "secret-token" not in rendered
         assert "503" in rendered
 
     def test_generic_exception_reports_type_only(self):
         exc = RuntimeError("contains https://hooks.example/secret-token in message")
-        rendered = _sanitize_exception(exc)
+        rendered = dca_net_utils.sanitize_exception(exc)
         assert "secret-token" not in rendered
         assert "RuntimeError" in rendered
 

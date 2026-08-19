@@ -28,12 +28,9 @@ mask the original run failure (it is logged instead).
 
 from __future__ import annotations
 
-import http.client
-import ipaddress
 import json
 import logging
 import os
-import socket
 import traceback
 import urllib.error
 import urllib.request
@@ -41,9 +38,20 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional, TypeVar
-from urllib.parse import urlsplit
 
 from dca_fileio import atomic_write_text
+from dca_net_utils import (
+    UnsafeDestinationError as _UnsafeDestinationError,
+)
+from dca_net_utils import (
+    assert_safe_destination as _assert_safe_destination,
+)
+from dca_net_utils import (
+    redact_url as _redact_url,
+)
+from dca_net_utils import (
+    sanitize_exception as _sanitize_exception,
+)
 from dca_paths import stream_root
 
 logger = logging.getLogger("near_close_dca.alerts")
@@ -116,311 +124,6 @@ def ensure_log_handler(level: int = logging.INFO) -> None:
         level=level,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
-
-
-class _UnsafeDestinationError(Exception):
-    """URL scheme is not http(s), or its host resolves to a disallowed address."""
-
-
-def _resolve_ips(hostname: str) -> "set[ipaddress._BaseAddress]":
-    """Resolve ``hostname``'s IP addresses. A seam so tests can fake DNS."""
-    return {ipaddress.ip_address(info[4][0]) for info in socket.getaddrinfo(hostname, None)}
-
-
-def _is_disallowed_ip(ip: "ipaddress._BaseAddress") -> bool:
-    """True unless ``ip`` is safe to open an outbound webhook/heartbeat connection to.
-
-    ``is_global`` is documented as having "value opposite to is_private,
-    except for the 100.64.0.0/10 [carrier-grade NAT / shared address space]
-    range where they are both False" -- so checking only ``is_private`` (the
-    pre-fix state) let a resolved address in that range through even though
-    it can address services inside a VPC, Kubernetes cluster, or carrier
-    network. ``is_multicast`` and IPv6's deprecated site-local space
-    (``fec0::/10``) are checked explicitly because ``is_global`` reports
-    both of those as ``True``.
-    """
-    return (
-        not ip.is_global
-        or ip.is_multicast
-        or ip.is_reserved
-        or bool(getattr(ip, "is_site_local", False))
-    )
-
-
-def _proxy_configured_for(url: str) -> bool:
-    """True if an environment-configured forward proxy applies to ``url``.
-
-    Mirrors the same resolution :class:`urllib.request.ProxyHandler` performs
-    (``getproxies()`` plus a ``no_proxy``-aware bypass check) so the safety
-    checks below can recognize a proxy-only deployment before running local
-    DNS resolution: in that mode the proxy -- not this process -- resolves
-    and connects to the destination, so requiring a local, successful
-    ``getaddrinfo()`` here would reject an otherwise-legitimate destination
-    whose host intentionally does not resolve on this host (chatgpt-codex-connector
-    review discussion_r3679190507).
-    """
-    parsed = urlsplit(url)
-    hostname = parsed.hostname
-    if not hostname:
-        return False
-    proxy = urllib.request.getproxies().get(parsed.scheme.lower())
-    if not proxy:
-        return False
-    return not urllib.request.proxy_bypass(hostname)
-
-
-def _assert_safe_destination(url: str) -> None:
-    """Raise :class:`_UnsafeDestinationError` unless ``url`` is http(s) and every
-    address its host resolves to is a public, routable address.
-
-    Restricting only the scheme (the pre-fix state) still lets an
-    attacker-influenced webhook/heartbeat value point at ``http://127.0.0.1:8080/``
-    or the ``http://169.254.169.254/latest/meta-data/`` cloud-metadata endpoint.
-    Every resolved address is checked, not just the first, since a hostname can
-    resolve to a mix of public and private IPs.
-
-    This is a preflight check only: it resolves ``hostname`` in a separate
-    lookup from the one the eventual connection makes, which -- for an
-    attacker who controls the destination host's DNS -- leaves a window to
-    answer this lookup with a public address and a later one (made when the
-    connection is actually opened) with a private/loopback address (DNS
-    rebinding). :class:`_PinnedHTTPConnection` below closes that gap for the
-    actual request by resolving, validating, and connecting in one step;
-    this function still runs first so callers get an early, clear rejection
-    (e.g. :func:`_validated_url`'s config-time warning) without attempting a
-    connection at all.
-    """
-    parsed = urlsplit(url)
-    if parsed.scheme.lower() not in {"http", "https"}:
-        raise _UnsafeDestinationError(f"unsupported scheme {parsed.scheme!r}")
-    hostname = parsed.hostname
-    if not hostname:
-        raise _UnsafeDestinationError("missing host")
-    try:
-        _ = parsed.port
-    except ValueError as exc:
-        # e.g. "https://example.com:notaport/..." -- .hostname parses fine but
-        # .port raises ValueError; left unchecked, that same access later (in
-        # _redact_url's failure-log path) raises again out of an exception
-        # handler that must never itself raise (codex review
-        # discussion_r3679190501). Reject it here instead.
-        raise _UnsafeDestinationError("malformed port") from exc
-    try:
-        literal_ip = ipaddress.ip_address(hostname)
-    except ValueError:
-        literal_ip = None
-    if literal_ip is not None:
-        # A literal address (e.g. "https://169.254.169.254/...") needs no DNS
-        # resolution at all -- checking it is free regardless of whether a
-        # proxy is configured, and skipping it (the proxy-bypass branch
-        # below) would let an attacker-controlled literal straight through
-        # in proxy-enabled deployments (codex review on this PR).
-        if _is_disallowed_ip(literal_ip):
-            raise _UnsafeDestinationError("disallowed address")
-        return
-    try:
-        ips = _resolve_ips(hostname)
-    except OSError as exc:
-        # Only a hostname that genuinely fails to resolve locally gets the
-        # proxy exemption -- that's the deployment this exists for (the
-        # proxy resolves it remotely). A hostname that DOES resolve locally
-        # is still checked below even when some proxy happens to be
-        # configured (e.g. a blanket corporate egress policy unrelated to
-        # this URL): unconditionally skipping validation whenever any proxy
-        # exists let an attacker-controlled hostname (as opposed to a
-        # literal IP, handled above) resolve via the proxy to a private/
-        # link-local address completely unchecked (codex review on this PR).
-        if _proxy_configured_for(url):
-            return
-        raise _UnsafeDestinationError("host does not resolve") from exc
-    if not ips or any(_is_disallowed_ip(ip) for ip in ips):
-        raise _UnsafeDestinationError("host resolves to a disallowed address")
-
-
-def _connect_pinned(conn: "http.client.HTTPConnection") -> None:
-    """Resolve ``conn.host``, validate every resolved address, and connect to
-    one of the validated addresses -- all in one step.
-
-    :func:`_assert_safe_destination` performs its own ``getaddrinfo()`` call
-    well before a connection is opened; letting ``HTTPConnection.connect()``
-    independently re-resolve the same hostname afterwards leaves a DNS
-    rebinding window for an attacker who controls the destination host's DNS
-    to answer the preflight lookup with a public address and this later one
-    with a private/loopback/link-local address (codex review
-    discussion_r3679190498). Connecting to the exact address this function
-    just validated -- instead of handing the hostname to a fresh lookup --
-    closes that gap. The hostname itself is left untouched on ``conn``, so
-    the HTTP ``Host`` header and (for HTTPS, via ``HTTPSConnection.connect()``
-    calling this through ``super().connect()``) the TLS SNI value are
-    unaffected.
-    """
-    try:
-        ips = list(_resolve_ips(conn.host))
-    except OSError as exc:
-        raise _UnsafeDestinationError("host does not resolve") from exc
-    if not ips or any(_is_disallowed_ip(ip) for ip in ips):
-        raise _UnsafeDestinationError("host resolves to a disallowed address")
-    last_exc: Optional[OSError] = None
-    for ip in ips:
-        try:
-            conn.sock = socket.create_connection(
-                (str(ip), conn.port), conn.timeout, conn.source_address
-            )
-            return
-        except OSError as exc:
-            last_exc = exc
-    raise last_exc if last_exc is not None else OSError("no address to connect to")
-
-
-class _PinnedHTTPConnection(http.client.HTTPConnection):
-    """An HTTP connection that pins its socket to a validated address (see
-    :func:`_connect_pinned`) instead of independently re-resolving ``host``.
-    """
-
-    def connect(self) -> None:
-        _connect_pinned(self)
-
-
-class _PinnedHTTPSConnection(http.client.HTTPSConnection):
-    """The HTTPS equivalent of :class:`_PinnedHTTPConnection`.
-
-    ``HTTPSConnection.connect()`` calls ``super().connect()`` to obtain the
-    raw socket and then wraps it for TLS using ``self.host`` (unchanged here)
-    as the SNI ``server_hostname`` -- so overriding only the raw connect step
-    keeps TLS verification and SNI targeting the real hostname, not the
-    pinned IP.
-    """
-
-    def connect(self) -> None:
-        _connect_pinned(self)
-        server_hostname = self._tunnel_host or self.host
-        self.sock = self._context.wrap_socket(self.sock, server_hostname=server_hostname)
-
-
-def _request_is_proxied(req: "urllib.request.Request") -> bool:
-    """True if ``req`` is being routed through a forward proxy.
-
-    ``urllib.request.ProxyHandler`` rewrites the request before our handlers
-    below see it: for a CONNECT-tunneled (typically HTTPS) proxy it sets
-    ``req._tunnel_host`` to the real target and points ``req.host`` at the
-    proxy; for a plain-HTTP proxy it points ``req.host`` at the proxy and
-    rewrites ``req.selector`` to the full original URL (normally just a
-    path). Either way, ``req.host`` at that point is the *proxy's* address,
-    not the destination's -- pinning/validating it against the
-    private-address denylist would reject the (often private-range) proxy
-    itself and break proxy-only deployments (codex review
-    discussion_r3679190507), so those requests fall back to the stock,
-    unpinned connection classes and let the configured proxy do the
-    resolving and connecting.
-    """
-    if getattr(req, "_tunnel_host", None):
-        return True
-    return req.selector.startswith(("http://", "https://"))
-
-
-class _PinnedHTTPHandler(urllib.request.HTTPHandler):
-    def http_open(self, req):
-        if _request_is_proxied(req):
-            return self.do_open(http.client.HTTPConnection, req)
-        return self.do_open(_PinnedHTTPConnection, req)
-
-
-class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
-    def https_open(self, req):
-        # Only pass context, not check_hostname: on Python 3.12+,
-        # HTTPSHandler.__init__ folds check_hostname into the SSL context
-        # and no longer sets self._check_hostname at all, and
-        # http.client.HTTPSConnection.__init__ no longer accepts a
-        # check_hostname argument either -- accessing/forwarding it here
-        # raised AttributeError/TypeError on every real HTTPS request under
-        # 3.12+ (Codex review on this PR). This handler is always
-        # constructed with no arguments (build_opener() below), so
-        # self._check_hostname is always the default None on 3.11 too,
-        # making this identical in practice to the stock 3.11 behavior.
-        if _request_is_proxied(req):
-            return self.do_open(http.client.HTTPSConnection, req, context=self._context)
-        return self.do_open(_PinnedHTTPSConnection, req, context=self._context)
-
-
-class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Re-validate every redirect target the same way as the initial request.
-
-    ``urlopen``'s default redirect handling blindly follows ``Location``
-    headers, so an initially-allowed public URL could 302 to
-    ``http://169.254.169.254/...`` and defeat :func:`_assert_safe_destination`
-    entirely. Each hop through this handler re-runs the same scheme and
-    resolved-address check before it is followed.
-    """
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: PLR0913
-        try:
-            _assert_safe_destination(newurl)
-        except _UnsafeDestinationError as exc:
-            raise urllib.error.HTTPError(
-                newurl, code, f"blocked unsafe redirect destination: {exc}", headers, fp
-            ) from exc
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-
-# Installed once at import time so every urllib.request.urlopen() call in this
-# process -- not just the ones in this module -- gets redirect validation and
-# pinned-address connections.
-urllib.request.install_opener(
-    urllib.request.build_opener(_SafeRedirectHandler, _PinnedHTTPHandler, _PinnedHTTPSHandler)
-)
-
-
-def _redact_url(url: str) -> str:
-    """Reduce ``url`` to ``scheme://host[:port]``, dropping path/query/fragment.
-
-    Healthcheck-style heartbeat URLs commonly carry their auth token in the
-    path (e.g. ``https://hc.example/<token>``), so anything logged about a
-    delivery failure must not include it.
-    """
-    parsed = urlsplit(url)
-    netloc = parsed.hostname or ""
-    try:
-        port = parsed.port
-    except ValueError:
-        # A malformed port (e.g. "https://example.com:notaport/...") is
-        # rejected by _assert_safe_destination before delivery is ever
-        # attempted, but this helper must not raise regardless -- it's called
-        # from an exception handler that itself must never raise (codex
-        # review discussion_r3679190501).
-        port = None
-    if port:
-        netloc = f"{netloc}:{port}"
-    return f"{parsed.scheme}://{netloc}" if netloc else "(unknown)"
-
-
-def _sanitize_exception(exc: BaseException) -> str:
-    """Render ``exc`` as its class name plus, only for known-safe cases, a
-    short reason -- never its full message.
-
-    A delivery failure can raise exceptions whose message embeds the
-    complete offending URL/path -- e.g. ``http.client.InvalidURL`` for a
-    heartbeat/webhook URL containing a space or control character quotes the
-    whole path back -- and healthcheck-style URLs commonly carry their auth
-    token in that path. Logging ``str(exc)`` unconditionally would undo
-    :func:`_redact_url`'s redaction for exactly the malformed-URL case where
-    it matters most (codex review discussion_r3679190511).
-    """
-    if isinstance(exc, urllib.error.HTTPError):
-        return f"{type(exc).__name__}: HTTP {exc.code}"
-    if isinstance(exc, urllib.error.URLError):
-        # ``reason`` can be a plain string OR an underlying exception object
-        # (e.g. a gaierror) constructed from arbitrary context -- stringifying
-        # it directly would risk reintroducing exactly the URL/path leak this
-        # function exists to prevent (Copilot review on this PR), so only its
-        # TYPE (plus, for an OSError-like reason, its numeric errno -- never
-        # its message) is reported.
-        reason = exc.reason
-        if isinstance(reason, OSError) and getattr(reason, "errno", None) is not None:
-            return f"{type(exc).__name__}: errno {reason.errno}"
-        if isinstance(reason, BaseException):
-            return f"{type(exc).__name__}: {type(reason).__name__}"
-        return type(exc).__name__
-    return type(exc).__name__
 
 
 def _validated_url(url: Optional[str], purpose: str) -> Optional[str]:

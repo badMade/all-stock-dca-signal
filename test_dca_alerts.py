@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 import dca_alerts
+import dca_net_utils
 from dca_alerts import GuardedRunConfig, alert_failure, guarded_run, heartbeat_url, send_heartbeat
 
 _PUBLIC_IP = ipaddress.ip_address("93.184.216.34")
@@ -48,7 +49,7 @@ def _fake_public_dns(monkeypatch):
     public address for every hostname here; tests exercising the SSRF-blocking
     path itself override this per-test.
     """
-    monkeypatch.setattr(dca_alerts, "_resolve_ips", lambda hostname: {_PUBLIC_IP})
+    monkeypatch.setattr(dca_net_utils, "resolve_ips", lambda hostname: {_PUBLIC_IP})
 
 
 @pytest.fixture(autouse=True)
@@ -137,8 +138,9 @@ def test_send_heartbeat_redacts_url_on_delivery_failure(monkeypatch, caplog):
 def test_send_heartbeat_blocks_private_destination(monkeypatch, captured_requests, private_ip):
     _clear_alert_env(monkeypatch)
     monkeypatch.setenv("DCA_HEARTBEAT_URL", "https://hc.example/check")
+    import dca_net_utils
     monkeypatch.setattr(
-        dca_alerts, "_resolve_ips", lambda hostname: {ipaddress.ip_address(private_ip)}
+        dca_net_utils, "resolve_ips", lambda hostname: {ipaddress.ip_address(private_ip)}
     )
     assert send_heartbeat("morning") is False
     assert captured_requests == []
@@ -147,9 +149,10 @@ def test_send_heartbeat_blocks_private_destination(monkeypatch, captured_request
 def test_send_heartbeat_blocks_destination_with_any_disallowed_resolved_ip(monkeypatch, captured_requests):
     _clear_alert_env(monkeypatch)
     monkeypatch.setenv("DCA_HEARTBEAT_URL", "https://hc.example/check")
+    import dca_net_utils
     monkeypatch.setattr(
-        dca_alerts,
-        "_resolve_ips",
+            dca_net_utils,
+            "resolve_ips",
         lambda hostname: {_PUBLIC_IP, ipaddress.ip_address("127.0.0.1")},
     )
     assert send_heartbeat("morning") is False
@@ -163,7 +166,7 @@ def test_send_heartbeat_blocks_unresolvable_host(monkeypatch, captured_requests)
     def boom(hostname):
         raise OSError("name resolution failed")
 
-    monkeypatch.setattr(dca_alerts, "_resolve_ips", boom)
+    monkeypatch.setattr(dca_net_utils, "resolve_ips", boom)
     assert send_heartbeat("morning") is False
     assert captured_requests == []
 
@@ -172,17 +175,18 @@ def test_send_heartbeat_blocks_unresolvable_host(monkeypatch, captured_requests)
 
 
 def test_safe_redirect_handler_blocks_private_redirect_target(monkeypatch):
+    import dca_net_utils
     monkeypatch.setattr(
-        dca_alerts, "_resolve_ips", lambda hostname: {ipaddress.ip_address("127.0.0.1")}
+        dca_net_utils, "resolve_ips", lambda hostname: {ipaddress.ip_address("127.0.0.1")}
     )
-    handler = dca_alerts._SafeRedirectHandler()
+    handler = dca_net_utils.SafeRedirectHandler()
     req = urllib.request.Request("https://hc.example/start")
     with pytest.raises(urllib.error.HTTPError):
         handler.redirect_request(req, None, 302, "Found", {}, "https://internal.example/secret")
 
 
 def test_safe_redirect_handler_allows_public_redirect_target(monkeypatch):
-    handler = dca_alerts._SafeRedirectHandler()
+    handler = dca_net_utils.SafeRedirectHandler()
     req = urllib.request.Request("https://hc.example/start")
     new_req = handler.redirect_request(req, None, 302, "Found", {}, "https://hc.example/elsewhere")
     assert new_req.full_url == "https://hc.example/elsewhere"
@@ -204,8 +208,9 @@ def test_send_heartbeat_blocks_shared_and_site_local_destination(
     """
     _clear_alert_env(monkeypatch)
     monkeypatch.setenv("DCA_HEARTBEAT_URL", "https://hc.example/check")
+    import dca_net_utils
     monkeypatch.setattr(
-        dca_alerts, "_resolve_ips", lambda hostname: {ipaddress.ip_address(disallowed_ip)}
+        dca_net_utils, "resolve_ips", lambda hostname: {ipaddress.ip_address(disallowed_ip)}
     )
     assert send_heartbeat("morning") is False
     assert captured_requests == []
@@ -307,18 +312,18 @@ def test_sanitize_exception_reports_http_error_status_only():
 
 def test_proxy_configured_for_true_when_scheme_proxy_set(monkeypatch):
     monkeypatch.setenv("https_proxy", "http://proxy.internal:3128")
-    assert dca_alerts._proxy_configured_for("https://hc.example/check") is True
+    assert dca_net_utils.proxy_configured_for("https://hc.example/check") is True
 
 
 def test_proxy_configured_for_false_when_only_other_scheme_proxied(monkeypatch):
     monkeypatch.setenv("http_proxy", "http://proxy.internal:3128")
-    assert dca_alerts._proxy_configured_for("https://hc.example/check") is False
+    assert dca_net_utils.proxy_configured_for("https://hc.example/check") is False
 
 
 def test_proxy_configured_for_respects_no_proxy(monkeypatch):
     monkeypatch.setenv("https_proxy", "http://proxy.internal:3128")
     monkeypatch.setenv("no_proxy", "hc.example")
-    assert dca_alerts._proxy_configured_for("https://hc.example/check") is False
+    assert dca_net_utils.proxy_configured_for("https://hc.example/check") is False
 
 
 def test_send_heartbeat_skips_local_resolution_behind_a_proxy(monkeypatch, captured_requests):
@@ -334,7 +339,7 @@ def test_send_heartbeat_skips_local_resolution_behind_a_proxy(monkeypatch, captu
     def boom(hostname):
         raise OSError("name resolution failed")
 
-    monkeypatch.setattr(dca_alerts, "_resolve_ips", boom)
+    monkeypatch.setattr(dca_net_utils, "resolve_ips", boom)
     assert send_heartbeat("morning") is True
     assert captured_requests == ["https://internal-only.example/check"]
 
@@ -368,8 +373,9 @@ def test_heartbeat_url_still_blocks_resolvable_disallowed_hostname_behind_a_prox
     """
     monkeypatch.setenv("DCA_HEARTBEAT_URL", "https://attacker.example/check")
     monkeypatch.setenv("https_proxy", "http://proxy.internal:3128")
+    import dca_net_utils
     monkeypatch.setattr(
-        dca_alerts, "_resolve_ips", lambda hostname: {ipaddress.ip_address("169.254.169.254")}
+        dca_net_utils, "resolve_ips", lambda hostname: {ipaddress.ip_address("169.254.169.254")}
     )
     assert heartbeat_url("morning") is None
 
@@ -383,30 +389,33 @@ def test_connect_pinned_connects_to_the_validated_address(monkeypatch):
     that could answer differently (DNS rebinding).
     """
     validated_ip = ipaddress.ip_address("93.184.216.34")
-    monkeypatch.setattr(dca_alerts, "_resolve_ips", lambda hostname: {validated_ip})
+    monkeypatch.setattr(dca_net_utils, "resolve_ips", lambda hostname: {validated_ip})
     calls = []
 
     def fake_create_connection(address, timeout, source_address):
         calls.append(address)
         return object()
 
-    monkeypatch.setattr(dca_alerts.socket, "create_connection", fake_create_connection)
+    import socket
+    monkeypatch.setattr(socket, "create_connection", fake_create_connection)
 
     class _FakeConn:
+        _create_connection = staticmethod(fake_create_connection)
         host = "hc.example"
         port = 443
         timeout = 10.0
         source_address = None
 
     conn = _FakeConn()
-    dca_alerts._connect_pinned(conn)
+    dca_net_utils.connect_pinned(conn)
     assert calls == [(str(validated_ip), 443)]
     assert conn.sock is not None
 
 
 def test_connect_pinned_rejects_disallowed_resolved_address(monkeypatch):
+    import dca_net_utils
     monkeypatch.setattr(
-        dca_alerts, "_resolve_ips", lambda hostname: {ipaddress.ip_address("127.0.0.1")}
+        dca_net_utils, "resolve_ips", lambda hostname: {ipaddress.ip_address("127.0.0.1")}
     )
 
     class _FakeConn:
@@ -415,22 +424,22 @@ def test_connect_pinned_rejects_disallowed_resolved_address(monkeypatch):
         timeout = 10.0
         source_address = None
 
-    with pytest.raises(dca_alerts._UnsafeDestinationError):
-        dca_alerts._connect_pinned(_FakeConn())
+    with pytest.raises(dca_net_utils.UnsafeDestinationError):
+        dca_net_utils.connect_pinned(_FakeConn())
 
 
 def test_request_is_proxied_detects_tunnel_and_plain_proxy_forms():
     tunneled = urllib.request.Request("https://hc.example/check")
     tunneled._tunnel_host = "hc.example"
-    assert dca_alerts._request_is_proxied(tunneled) is True
+    assert dca_net_utils.request_is_proxied(tunneled) is True
 
     plain_proxied = urllib.request.Request("http://hc.example/check")
     plain_proxied.selector = "http://hc.example/check"
-    assert dca_alerts._request_is_proxied(plain_proxied) is True
+    assert dca_net_utils.request_is_proxied(plain_proxied) is True
 
     direct = urllib.request.Request("https://hc.example/check")
     direct.selector = "/check"
-    assert dca_alerts._request_is_proxied(direct) is False
+    assert dca_net_utils.request_is_proxied(direct) is False
 
 
 # -- handler construction (not exercised by tests that mock urlopen directly) -----
@@ -453,8 +462,8 @@ def test_pinned_https_handler_constructs_connection_without_crashing(monkeypatch
     def fake_request(self, *a, **kw):
         raise _ReachedConnection("construction succeeded")
 
-    monkeypatch.setattr(dca_alerts._PinnedHTTPSConnection, "request", fake_request)
-    handler = dca_alerts._PinnedHTTPSHandler()
+    monkeypatch.setattr(dca_net_utils.PinnedHTTPSConnection, "request", fake_request)
+    handler = dca_net_utils.PinnedHTTPSHandler()
     req = urllib.request.Request("https://hc.example/check")
     req.timeout = 10.0  # normally set by OpenerDirector.open() before dispatch
     with pytest.raises(_ReachedConnection):
@@ -469,7 +478,7 @@ def test_pinned_https_handler_proxied_branch_constructs_connection_without_crash
         raise _ReachedConnection("construction succeeded")
 
     monkeypatch.setattr(http.client.HTTPSConnection, "request", fake_request)
-    handler = dca_alerts._PinnedHTTPSHandler()
+    handler = dca_net_utils.PinnedHTTPSHandler()
     req = urllib.request.Request("https://hc.example/check")
     req.timeout = 10.0  # normally set by OpenerDirector.open() before dispatch
     req._tunnel_host = "hc.example"
@@ -484,8 +493,8 @@ def test_pinned_http_handler_constructs_connection_without_crashing(monkeypatch)
     def fake_request(self, *a, **kw):
         raise _ReachedConnection("construction succeeded")
 
-    monkeypatch.setattr(dca_alerts._PinnedHTTPConnection, "request", fake_request)
-    handler = dca_alerts._PinnedHTTPHandler()
+    monkeypatch.setattr(dca_net_utils.PinnedHTTPConnection, "request", fake_request)
+    handler = dca_net_utils.PinnedHTTPHandler()
     req = urllib.request.Request("http://hc.example/check")
     req.timeout = 10.0  # normally set by OpenerDirector.open() before dispatch
     with pytest.raises(_ReachedConnection):
@@ -517,8 +526,9 @@ def test_alert_failure_posts_stream_and_exception(monkeypatch, captured_requests
 def test_alert_failure_blocks_private_destination(monkeypatch, captured_requests):
     _clear_alert_env(monkeypatch)
     monkeypatch.setenv("DCA_ALERT_SLACK_WEBHOOK", "https://hooks.example/alert")
+    import dca_net_utils
     monkeypatch.setattr(
-        dca_alerts, "_resolve_ips", lambda hostname: {ipaddress.ip_address("169.254.169.254")}
+        dca_net_utils, "resolve_ips", lambda hostname: {ipaddress.ip_address("169.254.169.254")}
     )
     assert alert_failure("morning", RuntimeError("boom")) is False
     assert captured_requests == []

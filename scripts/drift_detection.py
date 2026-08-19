@@ -55,12 +55,16 @@ _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from dca_alerts import (  # noqa: E402
-    _assert_safe_destination,
-    _sanitize_exception,
-    _UnsafeDestinationError,
-)
 from dca_fileio import atomic_write_text  # noqa: E402 - needs the sys.path setup above
+from dca_net_utils import (  # noqa: E402
+    UnsafeDestinationError as _UnsafeDestinationError,
+)
+from dca_net_utils import (  # noqa: E402
+    assert_safe_destination as _assert_safe_destination,
+)
+from dca_net_utils import (  # noqa: E402
+    sanitize_exception as _sanitize_exception,
+)
 
 # --- Artifact file names -----------------------------------------------------
 
