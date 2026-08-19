@@ -19,6 +19,7 @@ Runnable with ``pytest`` or ``python test_intraday_dca.py``.
 import json
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from typing import Any, Optional
 
 import pytest
 
@@ -51,30 +52,46 @@ def _now_slot(slot):
 
 
 class _Broker:
+    supports_concurrent_fill_lookup: bool = False
+
     def __init__(self):
         self.placed = {}
 
-    def account_number(self):
+    def account_number(self) -> str:
         return FIXTURE_ACCOUNT_NUMBER
 
-    def available_buying_power(self):
+    def available_buying_power(self) -> float:
         return 500.0
 
-    def same_day_strategy_order_exists(self, ticker, trading_day):
+    def same_day_strategy_order_exists(self, ticker, trading_day) -> bool:
         return False
 
-    def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, prefixes):
-        return False
+    def same_day_strategy_order_exists_with_ref_id_prefix(
+        self, ticker: str, trading_day: date, ref_id_prefixes: tuple[str, ...]
+    ) -> Optional[dict[str, Any]]:
+        return None
 
-    def is_tradable_for_fractional_buy(self, ticker):
+    def strategy_order_with_ref_id(self, ticker, trading_day, ref_id) -> Optional[dict]:
+        return None
+
+    def same_day_ticker_notional_usd(self, ticker, trading_day) -> float:
+        return 0.0
+
+    def is_tradable_for_fractional_buy(self, ticker) -> bool:
         return True
 
-    def review_market_buy(self, ticker, notional_usd):
+    def review_market_buy(self, ticker, notional_usd) -> tuple[bool, str]:
         return True, "ok"
 
-    def place_market_buy(self, ticker, notional_usd, ref_id):
+    def place_market_buy(self, ticker, notional_usd, ref_id) -> str:
         self.placed[ticker] = notional_usd
         return f"ORDER-{ticker}"
+
+    def get_order_fill(self, order_id) -> Any:
+        return None
+
+    def get_raw_placement_responses(self) -> list:
+        return []
 
 
 def test_missing_config_file_fails_closed_to_shadow_mode(tmp_path):
@@ -143,36 +160,54 @@ class _DecliningBarsProvider:
 
 class _RefIdTrackingBroker:
     """Broker double that remembers placed ref_ids for real duplicate checks."""
+    supports_concurrent_fill_lookup: bool = False
 
     def __init__(self):
         self.placed = {}
         self._ref_ids = []
 
-    def account_number(self):
+    def account_number(self) -> str:
         return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
-    def available_buying_power(self):
+    def available_buying_power(self) -> float:
         return 1000.0
 
-    def same_day_strategy_order_exists(self, ticker, trading_day):
+    def same_day_strategy_order_exists(self, ticker, trading_day) -> bool:
         return any(t == ticker for t, _ in self._ref_ids)
 
-    def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
-        return any(
-            t == ticker and any(rid.startswith(p) for p in ref_id_prefixes)
-            for t, rid in self._ref_ids
-        )
+    def same_day_strategy_order_exists_with_ref_id_prefix(
+        self, ticker: str, trading_day: date, ref_id_prefixes: tuple[str, ...]
+    ) -> Optional[dict[str, Any]]:
+        for t, rid in self._ref_ids:
+            if t == ticker and any(rid.startswith(p) for p in ref_id_prefixes):
+                return {"id": f"ORDER-{ticker}", "dollar_amount": self.placed.get(ticker, 0.0)}
+        return None
 
-    def is_tradable_for_fractional_buy(self, ticker):
+    def strategy_order_with_ref_id(self, ticker, trading_day, ref_id) -> Optional[dict]:
+        for t, rid in self._ref_ids:
+            if t == ticker and rid == ref_id:
+                return {"id": f"ORDER-{ticker}", "dollar_amount": self.placed.get(ticker, 0.0)}
+        return None
+
+    def same_day_ticker_notional_usd(self, ticker, trading_day) -> float:
+        return sum(amt for t, amt in self.placed.items() if t == ticker)
+
+    def is_tradable_for_fractional_buy(self, ticker) -> bool:
         return True
 
-    def review_market_buy(self, ticker, notional_usd):
+    def review_market_buy(self, ticker, notional_usd) -> tuple[bool, str]:
         return True, "ok"
 
-    def place_market_buy(self, ticker, notional_usd, ref_id):
+    def place_market_buy(self, ticker, notional_usd, ref_id) -> str:
         self.placed[ticker] = notional_usd
         self._ref_ids.append((ticker, ref_id))
         return f"ORDER-{ticker}-{len(self._ref_ids)}"
+
+    def get_order_fill(self, order_id) -> Any:
+        return None
+
+    def get_raw_placement_responses(self) -> list:
+        return []
 
 
 def _cfg(tmp_path, **overrides):

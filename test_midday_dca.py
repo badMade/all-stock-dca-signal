@@ -15,6 +15,7 @@ import subprocess
 import sys
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from typing import Any, Tuple, cast
 
 import pytest
 
@@ -58,6 +59,8 @@ def _now_midday():
 class FakeLiveBroker:
     """Minimal successful broker for scheduled midday live tests."""
 
+    supports_concurrent_fill_lookup: bool = False
+
     def account_number(self):
         from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
@@ -74,14 +77,26 @@ class FakeLiveBroker:
         # guarded top-ups always proceed as fresh placements.
         return None
 
-    def is_tradable_for_fractional_buy(self, ticker):
+    def strategy_order_with_ref_id(self, ticker, trading_day, ref_id):
+        return None
+
+    def same_day_ticker_notional_usd(self, ticker, trading_day):
+        return 0.0
+
+    def is_tradable_for_fractional_buy(self, ticker) -> bool:
         return True
 
-    def review_market_buy(self, ticker, notional_usd):
-        return True, "ok"
+    def review_market_buy(self, ticker, notional_usd) -> Tuple[bool, str]:
+        return (True, "ok")
 
     def place_market_buy(self, ticker, notional_usd, ref_id):
         return f"ORDER-{ticker}"
+
+    def get_order_fill(self, order_id):
+        return None
+
+    def get_raw_placement_responses(self):
+        return []
 
 
 class FixedDropProvider:
@@ -335,7 +350,7 @@ def test_midday_run_state_path_and_classification(tmp_path):
     cfg = MiddayConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
     ex = MiddayDCAExecutor(cfg)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
-    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
+    res = ex.run(_now_midday(), data, broker=cast(Any, FakeLiveBroker()))
 
     run_state_path = Path(res["paths"]["run_state"])
     assert run_state_path.parent.name == "20260708_1230ET"
@@ -377,7 +392,7 @@ def test_midday_refreshes_only_its_own_pointer_with_guard_fields(tmp_path):
     cfg = MiddayConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
     ex = MiddayDCAExecutor(cfg)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
-    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
+    res = ex.run(_now_midday(), data, broker=cast(Any, FakeLiveBroker()))
 
     assert (Path(tmp_path) / "latest_midday_run.json").exists()
     assert not (Path(tmp_path) / "latest_morning_live.json").exists()
@@ -424,6 +439,9 @@ def test_midday_cap_ledger_seeded_from_cross_stream_morning_fill(tmp_path):
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None
 
+        def strategy_order_with_ref_id(self, ticker, trading_day, ref_id):
+            return None
+
         def is_tradable_for_fractional_buy(self, ticker):
             return True
 
@@ -456,7 +474,7 @@ def test_midday_cap_ledger_seeded_from_cross_stream_morning_fill(tmp_path):
     # with no seeding at all would ALSO have allowed this by coincidence, so the
     # cap-exceeded case below is the one that actually proves seeding occurred).
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.03})
-    res = ex.run(_now_midday(), data, broker=broker)
+    res = ex.run(_now_midday(), data, broker=cast(Any, broker))
     broker_outcomes = res["artifacts"].get("broker_outcomes", {})
     assert broker_outcomes.get("TOPUP", {}).get("status") == "submitted"
     assert broker.placed.get("TOPUP") == pytest.approx(4.50)
@@ -476,7 +494,7 @@ def test_midday_cap_ledger_seeded_from_cross_stream_morning_fill(tmp_path):
     )
     ex2 = MiddayDCAExecutor(cfg2, mode="live")
     broker2 = _Broker()
-    res2 = ex2.run(_now_midday(), data, broker=broker2)
+    res2 = ex2.run(_now_midday(), data, broker=cast(Any, broker2))
     broker_outcomes2 = res2["artifacts"].get("broker_outcomes", {})
     assert broker_outcomes2.get("TOPUP", {}).get("status") == "cap_exceeded", (
         "TOPUP ($4.50 desired) should be cap-gated once a $177 prior MORNING fill, "
@@ -532,7 +550,7 @@ def test_midday_confidence_rule_withholds_when_trend_unvalidated(tmp_path):
     assert sig.trend_validated is False
     assert sig.execution_status == EXEC_MANUAL_REVIEW_CANDIDATE
 
-    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
+    res = ex.run(_now_midday(), data, broker=cast(Any, FakeLiveBroker()))
     art = res["artifacts"]
     assert art["counts"]["manual_review_candidates"] == 1
     assert art["manual_review_tickers"] == ["BIG"]
@@ -548,7 +566,7 @@ def test_top_up_no_prior_buys_full_amount(tmp_path):
     )
     ex = MiddayDCAExecutor(cfg)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
-    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
+    res = ex.run(_now_midday(), data, broker=cast(Any, FakeLiveBroker()))
     row = res["artifacts"]["buy_candidates"][0]
     assert row["top_up_guard_result"] == TOP_UP_NO_PRIOR_RUN
     assert row["incremental_order_amount"] == 10.0
@@ -572,7 +590,7 @@ def test_top_up_incremental_when_price_below_prior(tmp_path):
     ex = MiddayDCAExecutor(cfg)
     # Midday price 90.0 is strictly below the 95.0 morning reference.
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
-    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
+    res = ex.run(_now_midday(), data, broker=cast(Any, FakeLiveBroker()))
     row = res["artifacts"]["buy_candidates"][0]
     assert row["top_up_guard_result"] == TOP_UP_INCREMENTAL
     assert row["prior_same_day_amount"] == 2.0
@@ -630,7 +648,7 @@ def test_top_up_loads_manual_csv_only_context(tmp_path):
     ex = MiddayDCAExecutor(cfg)
     # Midday price 90.0 is strictly below the 95.0 manual reference.
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
-    res = ex.run(now, data, broker=FakeLiveBroker())
+    res = ex.run(now, data, broker=cast(Any, FakeLiveBroker()))
     row = res["artifacts"]["buy_candidates"][0]
     assert row["top_up_guard_result"] == TOP_UP_MISSING_PRIOR_BASE
     assert row["prior_same_day_amount"] == 2.0
@@ -678,7 +696,7 @@ def test_top_up_manual_csv_context_respects_explicit_prior_allocation_roots(tmp_
     )
     ex = MiddayDCAExecutor(cfg)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
-    res = ex.run(now, data, broker=FakeLiveBroker())
+    res = ex.run(now, data, broker=cast(Any, FakeLiveBroker()))
     row = res["artifacts"]["buy_candidates"][0]
     # Isolation honored: the leaked fill under final_manual_review must not
     # offset the guard just because it happens to sit next to state_root.
@@ -710,7 +728,7 @@ def test_midday_spread_breaker_blocks_wide_spread(tmp_path):
     )
     ex = MiddayDCAExecutor(cfg)
     data = _WideSpreadProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10}, spread_pct=5.0)
-    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
+    res = ex.run(_now_midday(), data, broker=cast(Any, FakeLiveBroker()))
     row = res["artifacts"]["buy_candidates"][0]
     assert row["status"] == "blocked"
     outcome = res["artifacts"]["broker_outcomes"]["BIG"]
@@ -748,6 +766,9 @@ class _TopUpDuplicateBroker:
             }
         return None
 
+    def strategy_order_with_ref_id(self, ticker, trading_day, ref_id):
+        return None
+
     def is_tradable_for_fractional_buy(self, ticker):
         return True
 
@@ -775,7 +796,7 @@ def test_guarded_midday_top_up_checks_same_stream_duplicate_before_placing(tmp_p
     broker = _TopUpDuplicateBroker(duplicate=True)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
 
-    res = ex.run(_now_midday(), data, broker=broker)
+    res = ex.run(_now_midday(), data, broker=cast(Any, broker))
 
     assert broker.broad_duplicate_calls == 0
     assert broker.same_stream_calls == 1
@@ -811,7 +832,7 @@ def test_manual_retry_of_guarded_top_up_duplicate_is_skipped_not_submitted(tmp_p
     broker = _TopUpDuplicateBroker(duplicate=True)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
 
-    res = ex.run(_now_midday(), data, broker=broker, manual=True)
+    res = ex.run(_now_midday(), data, broker=cast(Any, broker), manual=True)
 
     assert broker.same_stream_calls == 1
     assert broker.placed == []
@@ -822,8 +843,31 @@ def test_manual_retry_of_guarded_top_up_duplicate_is_skipped_not_submitted(tmp_p
     assert res["artifacts"]["buy_candidates"][0]["status"] == "skipped"
 
 
-class _TopUpBrokerWithoutSameStreamCheck(_TopUpDuplicateBroker):
-    same_day_strategy_order_exists_with_ref_id_prefix = None
+class _TopUpBrokerWithoutSameStreamCheck:
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER as _acct
+    same_day_strategy_order_exists_with_ref_id_prefix: Any = None
+
+    def __init__(self, duplicate=False):
+        self.placed = []
+
+    def account_number(self) -> str:
+        return self._acct
+
+    def available_buying_power(self) -> float:
+        return 500.0
+
+    def same_day_strategy_order_exists(self, ticker, trading_day) -> bool:
+        return False
+
+    def is_tradable_for_fractional_buy(self, ticker) -> bool:
+        return True
+
+    def review_market_buy(self, ticker, notional_usd) -> Tuple[bool, str]:
+        return True, "ok"
+
+    def place_market_buy(self, ticker, notional_usd, ref_id) -> str:
+        self.placed.append((ticker, notional_usd, ref_id))
+        return f"ORDER-{ticker}"
 
 
 def test_guarded_midday_top_up_blocks_when_same_stream_checker_unavailable(tmp_path):
@@ -842,7 +886,7 @@ def test_guarded_midday_top_up_blocks_when_same_stream_checker_unavailable(tmp_p
     broker = _TopUpBrokerWithoutSameStreamCheck(duplicate=False)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
 
-    res = ex.run(_now_midday(), data, broker=broker)
+    res = ex.run(_now_midday(), data, broker=cast(Any, broker))
 
     outcome = res["artifacts"]["broker_outcomes"]["BIG"]
     assert broker.placed == []
@@ -866,7 +910,7 @@ def test_guarded_midday_top_up_ignores_cross_stream_duplicate_for_incremental_or
     broker = _TopUpDuplicateBroker(duplicate=False)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
 
-    res = ex.run(_now_midday(), data, broker=broker)
+    res = ex.run(_now_midday(), data, broker=cast(Any, broker))
 
     assert broker.broad_duplicate_calls == 0
     assert broker.same_stream_calls == 1
@@ -893,7 +937,7 @@ def test_top_up_zero_when_price_not_below_prior(tmp_path):
     # manual_review_candidates. broker=FakeLiveBroker() satisfies the newer
     # "missing broker adapter" gate for scheduled live runs.
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
-    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
+    res = ex.run(_now_midday(), data, broker=cast(Any, FakeLiveBroker()))
     row = res["artifacts"]["buy_candidates"][0]
     assert row["top_up_guard_result"] == TOP_UP_PRICE_NOT_BELOW
     assert row["incremental_order_amount"] == 0.0
@@ -917,7 +961,7 @@ def test_top_up_manual_review_when_prior_price_unknown(tmp_path):
     ex = MiddayDCAExecutor(cfg)
     # Same trend-validated-provider + broker rationale as the test above.
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
-    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
+    res = ex.run(_now_midday(), data, broker=cast(Any, FakeLiveBroker()))
     row = res["artifacts"]["buy_candidates"][0]
     assert row["top_up_guard_result"] == TOP_UP_MISSING_PRIOR_PRICE
     assert row["incremental_order_amount"] == 0.0
@@ -991,7 +1035,7 @@ def test_manual_review_candidate_row_keeps_top_up_context_when_trend_unvalidated
     # has a resolvable prior fill at $95.0, current price $90.0 is below that
     # reference, so _compute_top_up still produces a real TOP_UP_INCREMENTAL outcome.
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
-    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
+    res = ex.run(_now_midday(), data, broker=cast(Any, FakeLiveBroker()))
 
     assert res["artifacts"]["buy_candidates"] == []
     [row] = res["artifacts"]["manual_review_candidates"]
@@ -1023,7 +1067,7 @@ def test_midday_does_not_write_afternoon_or_morning_artifacts(tmp_path):
                        prior_allocation_roots=(str(tmp_path / "nonexistent_morning"),))
     ex = MiddayDCAExecutor(cfg)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
-    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
+    res = ex.run(_now_midday(), data, broker=cast(Any, FakeLiveBroker()))
 
     assert latest.read_text(encoding="utf-8") == before
     assert list(afternoon_root.rglob("run_state*.json")) == []
@@ -1308,7 +1352,7 @@ def test_midday_ledger_namespace_isolated_from_morning_and_afternoon(tmp_path):
     ex = MiddayDCAExecutor(cfg)
     assert ex.ledger.namespace == "midday"
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
-    ex.run(_now_midday(), data, broker=FakeLiveBroker())
+    ex.run(_now_midday(), data, broker=cast(Any, FakeLiveBroker()))
     assert afternoon.day_notional(day) == 0.0
     assert ex.ledger.day_planned(day) > 0.0
 
@@ -1381,7 +1425,7 @@ def test_manual_midday_run_with_wrong_broker_account_raises_before_ordering(tmp_
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
 
     with pytest.raises(RuntimeError, match="broker account mismatch: expected 999000111, got not-the-approved-account"):
-        ex.run(_now_midday(), data, manual=True, broker=broker)
+        ex.run(_now_midday(), data, manual=True, broker=cast(Any, broker))
 
     assert broker.buying_power_checked is False
     assert broker.placed is False
@@ -1407,7 +1451,7 @@ def test_midday_scheduled_live_run_persists_raw_inputs(tmp_path):
     cfg = MiddayConfig(tickers=("BIG",), base_buy_amount_usd=2.0, morning_run_state_root=str(tmp_path))
     ex = MiddayDCAExecutor(cfg)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
-    res = ex.run(_now_midday(), data, broker=FakeLiveBroker())
+    res = ex.run(_now_midday(), data, broker=cast(Any, FakeLiveBroker()))
     artifacts = res["artifacts"]
     assert artifacts.get("status") != "blocked"
     raw_dir = Path(artifacts["raw_input_dir"])
@@ -1457,7 +1501,7 @@ def _a_valid_midday_live_classification():
 
 def test_a_blocked_midday_classification_is_schema_valid():
     jsonschema = pytest.importorskip("jsonschema")
-    cfg = MiddayConfig(tickers=("SMALL",), target_account_number=None)
+    cfg = MiddayConfig(**cast(Any, {"tickers": ("SMALL",), "target_account_number": None}))
     rc = MiddayDCAExecutor(cfg).run_classification(_now_midday(), manual=False)
     assert rc["account_pinning_failed"] is True
     assert "account_number" not in rc
@@ -1491,7 +1535,7 @@ def test_a_pinning_failed_document_asserting_valid_scheduled_evidence_is_rejecte
     as valid scheduled evidence for a run that never traded (Codex review,
     PR #219: "Deny scheduled evidence when account pinning fails")."""
     jsonschema = pytest.importorskip("jsonschema")
-    cfg = MiddayConfig(tickers=("SMALL",), target_account_number=None)
+    cfg = MiddayConfig(**cast(Any, {"tickers": ("SMALL",), "target_account_number": None}))
     rc = MiddayDCAExecutor(cfg).run_classification(_now_midday(), manual=False)
     assert rc["account_pinning_failed"] is True
     jsonschema.validate(rc, _midday_schema())  # the real value still passes
@@ -1506,7 +1550,7 @@ def test_a_pinning_failed_document_asserting_valid_scheduled_evidence_is_rejecte
 
 def test_a_blocked_midday_document_still_requires_the_broker():
     jsonschema = pytest.importorskip("jsonschema")
-    cfg = MiddayConfig(tickers=("SMALL",), target_account_number=None)
+    cfg = MiddayConfig(**cast(Any, {"tickers": ("SMALL",), "target_account_number": None}))
     rc = MiddayDCAExecutor(cfg).run_classification(_now_midday(), manual=False)
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(

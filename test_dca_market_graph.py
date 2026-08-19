@@ -16,6 +16,7 @@ import random
 import re
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -141,6 +142,7 @@ def test_parse_timestamp_reads_a_naive_instant_as_eastern_not_as_utc():
 def test_parse_timestamp_returns_naive_utc_so_sorting_never_raises():
     aware = mg._parse_timestamp("2024-04-01T11:30:00-04:00")
     naive = mg._parse_timestamp("2024-04-01")
+    assert aware is not None and naive is not None
     assert aware.tzinfo is None and naive.tzinfo is None
     assert sorted([aware, naive])  # would raise if one were tz-aware
 
@@ -154,11 +156,13 @@ def test_bar_from_values_treats_zero_low_as_unknown_not_as_a_crash_to_zero():
     # dca_live_adapters stamps quote-derived prior-close bars with low=0.0 meaning
     # "unknown". Taking that literally would draw a wick down to -100%.
     bar = mg._bar_from_values("2024-04-01", 100, 0, 0, 101, 5)
+    assert bar is not None
     assert bar.low == 100 and bar.high == 101
 
 
 def test_bar_from_values_repairs_inverted_high_low():
     bar = mg._bar_from_values("2024-04-01", 100, 90, 110, 105, 5)
+    assert bar is not None
     assert bar.low <= min(bar.open, bar.close)
     assert bar.high >= max(bar.open, bar.close)
 
@@ -181,6 +185,7 @@ def test_finalize_sorts_and_dedupes_by_timestamp_last_write_wins():
         Bar(timestamp=when, open=2, high=2, low=2, close=2, volume=1),
     ]
     result = mg._finalize("T", bars, "test")
+    assert result is not None
     assert [b.timestamp for b in result.bars] == [when, datetime(2024, 1, 3)]
     assert result.bars[0].close == 2
 
@@ -735,7 +740,7 @@ def test_provider_loader_from_run_dir_unwraps_connector_envelopes(tmp_path, dept
          "low_price": "9", "close_price": str(10 + i * 0.1), "volume": "100"}
         for i in range(5)
     ]}]}
-    payload = inner
+    payload: Any = inner
     for _ in range(depth):
         payload = {"data": payload}
     raw.joinpath("historicals_batch1.json").write_text(json.dumps(payload), encoding="utf-8")
@@ -1649,7 +1654,9 @@ def test_resolve_universe_defaults_only_the_archive():
     assert mg.resolve_universe("csv", None) is None
     assert mg.resolve_universe("intraday", None) is None
     assert mg.resolve_universe("run-dir", None) is None
-    assert "AAPL" in mg.resolve_universe("archive", None)
+    archive_univ = mg.resolve_universe("archive", None)
+    assert archive_univ is not None
+    assert "AAPL" in archive_univ
 
 
 def test_resolve_universe_respects_the_opt_out_and_explicit_requests():

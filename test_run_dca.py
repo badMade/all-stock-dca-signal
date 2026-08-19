@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
@@ -26,13 +27,13 @@ from run_dca import (
 
 
 def _now(day=(2026, 7, 6)):
-    return datetime.combine(datetime(*day).date(), time(15, 45), tzinfo=EASTERN)
+    return datetime.combine(datetime(*day).date(), time(15, 45), tzinfo=cast(Any, EASTERN))
 
 
 def _now_for_slot(slot, day=(2026, 7, 6)):
     """``now`` at exactly ``slot``'s own scheduled ET time, so a run_slot() call
     under test passes _validate_slot_schedule's +/-5-minute window check."""
-    return datetime.combine(datetime(*day).date(), _slot_time_et(slot), tzinfo=EASTERN)
+    return datetime.combine(datetime(*day).date(), _slot_time_et(slot), tzinfo=cast(Any, EASTERN))
 
 
 def _demo_config():
@@ -3110,7 +3111,7 @@ def test_refresh_fills_from_broker(tmp_path):
                 return OrderFill(avg_fill_price=100.0, quantity_filled=0.5)
             return None
 
-    fills = _refresh_fills_from_broker(csv_path, _Broker(), [])
+    fills = _refresh_fills_from_broker(csv_path, cast(Any, _Broker()), [])
     assert len(fills) == 1
     assert fills[0]["ticker"] == "AAPL"
     assert fills[0]["fill_price"] == 100.0
@@ -3143,7 +3144,7 @@ def test_refresh_fills_from_broker_recovers_a_filled_row_missing_execution_detai
             assert order_id == "O1"
             return OrderFill(avg_fill_price=101.5, quantity_filled=0.3)
 
-    fills = _refresh_fills_from_broker(csv_path, _Broker(), initial_fills)
+    fills = _refresh_fills_from_broker(csv_path, cast(Any, _Broker()), initial_fills)
     assert len(fills) == 1
     assert fills[0]["ticker"] == "AAPL"
     assert fills[0]["order_id"] == "O1"
@@ -3175,7 +3176,7 @@ def test_refresh_fills_from_broker_skips_a_genuinely_complete_filled_row(tmp_pat
             calls.append(order_id)
             raise AssertionError("must not re-query an already-complete fill")
 
-    fills = _refresh_fills_from_broker(csv_path, _Broker(), initial_fills)
+    fills = _refresh_fills_from_broker(csv_path, cast(Any, _Broker()), initial_fills)
     assert calls == []
     assert fills == initial_fills
 
@@ -3213,7 +3214,7 @@ def test_refresh_fills_from_broker_dedupes_and_preserves_order(tmp_path):
             time_module.sleep(delays[order_id])
             return OrderFill(avg_fill_price=100.0, quantity_filled=1.0)
 
-    fills = _refresh_fills_from_broker(csv_path, _Broker(), [])
+    fills = _refresh_fills_from_broker(csv_path, cast(Any, _Broker()), [])
 
     # The duplicate O1 row must not trigger a second broker call.
     assert call_order.count("O1") == 1
@@ -3256,7 +3257,7 @@ def test_refresh_fills_from_broker_defaults_to_sequential(tmp_path):
                 in_flight -= 1
             return OrderFill(avg_fill_price=100.0, quantity_filled=1.0)
 
-    fills = _refresh_fills_from_broker(csv_path, _Broker(), [])
+    fills = _refresh_fills_from_broker(csv_path, cast(Any, _Broker()), [])
 
     assert max_in_flight == 1
     assert len(fills) == 3
@@ -3328,12 +3329,12 @@ def test_cli_demo_does_not_touch_the_real_cron_tracking_root(tmp_path, monkeypat
     real_temporary_directory = run_dca.tempfile.TemporaryDirectory
 
     class _NonCleaningTemporaryDirectory(real_temporary_directory):
-        def __exit__(self, *exc_info):
+        def __exit__(self, exc_type=None, exc_val=None, exc_tb=None):
             # TemporaryDirectory also registers a weakref.finalize at
             # construction time that deletes the directory on garbage
             # collection, independent of __exit__ -- detach it too, or the
             # directory vanishes the moment this object is collected.
-            self._finalizer.detach()
+            cast(Any, self)._finalizer.detach()
             captured_isolated_root.append(self.name)
             # Deliberately skip cleanup so the test can inspect it afterward.
 
@@ -3485,7 +3486,7 @@ def test_a_failed_replay_validation_restores_the_prior_raw_snapshot(tmp_path):
     first = run_pipeline(
         _now(), config, StrategyState(),
         DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        broker, artifacts_dir=scheduled_dir,
+        cast(Any, broker), artifacts_dir=scheduled_dir,
         raw_connector_inputs=good_inputs,
     )
     assert "raw_persistence_error" not in first
@@ -3504,7 +3505,7 @@ def test_a_failed_replay_validation_restores_the_prior_raw_snapshot(tmp_path):
     second = run_pipeline(
         _now(), config, StrategyState(),
         DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        broker, artifacts_dir=scheduled_dir,
+        cast(Any, broker), artifacts_dir=scheduled_dir,
         raw_connector_inputs=finance_only_inputs,
     )
 
@@ -4057,7 +4058,7 @@ def test_a_fail_closed_builder_denies_its_own_scheduled_evidence(which):
         )
 
     assert state["scheduled_evidence_denied"] is True
-    assert state["run_classification"]["valid_scheduled_evidence"] is False
+    assert cast(dict, state["run_classification"])["valid_scheduled_evidence"] is False
     assert derive_valid_scheduled_evidence(state) is False
 
 
@@ -4129,7 +4130,7 @@ def test_run_pipeline_live_run_missing_raw_inputs_writes_error_state(tmp_path):
     result = run_pipeline(
         _now(), config, StrategyState(),
         DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        broker, artifacts_dir=scheduled_dir,
+        cast(Any, broker), artifacts_dir=scheduled_dir,
         raw_connector_inputs=None,
     )
     assert "raw_persistence_error" in result
@@ -4150,7 +4151,7 @@ def test_run_pipeline_live_run_empty_raw_inputs_writes_error_state(tmp_path):
     result = run_pipeline(
         _now(), config, StrategyState(),
         DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        broker, artifacts_dir=scheduled_dir,
+        cast(Any, broker), artifacts_dir=scheduled_dir,
         raw_connector_inputs={},
     )
     assert "raw_persistence_error" in result
@@ -4173,7 +4174,7 @@ def test_run_pipeline_live_run_partial_raw_inputs_writes_error_state(tmp_path):
     result = run_pipeline(
         _now(), config, StrategyState(),
         DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        broker, artifacts_dir=scheduled_dir,
+        cast(Any, broker), artifacts_dir=scheduled_dir,
         raw_connector_inputs={"quotes_batch1.json": {"output_path": str(quotes_file)}},
         required_raw_filenames=frozenset({"quotes_batch1.json", "historicals_batch1.json"}),
     )
@@ -4216,7 +4217,7 @@ def test_run_pipeline_late_failure_after_run_artifact_written_is_not_a_failed_st
         run_pipeline(
             _now(), config, StrategyState(),
             DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-            broker, artifacts_dir=artifacts_dir, generate_full_reports=True,
+            cast(Any, broker), artifacts_dir=artifacts_dir, generate_full_reports=True,
             model_usage_log_root=model_usage_log_root,
         )
 
@@ -4263,7 +4264,7 @@ def test_run_pipeline_stale_run_artifact_is_not_credited_to_a_later_failed_invoc
         run_pipeline(
             _now(), config, StrategyState(),
             DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-            broker, artifacts_dir=artifacts_dir, generate_full_reports=True,
+            cast(Any, broker), artifacts_dir=artifacts_dir, generate_full_reports=True,
             model_usage_log_root=model_usage_log_root,
         )
 
@@ -4296,7 +4297,7 @@ def test_build_frozen_providers_strict_finance_raises_on_live_run(tmp_path):
     result = run_pipeline(
         _now(), config, StrategyState(),
         DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        broker, artifacts_dir=scheduled_dir,
+        cast(Any, broker), artifacts_dir=scheduled_dir,
         raw_connector_inputs=rh_only_inputs,
     )
     assert "raw_persistence_error" in result, (
@@ -4331,7 +4332,7 @@ def test_build_frozen_providers_strict_robinhood_raises_on_live_run(tmp_path):
     result = run_pipeline(
         _now(), config, StrategyState(),
         DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        broker, artifacts_dir=scheduled_dir,
+        cast(Any, broker), artifacts_dir=scheduled_dir,
         raw_connector_inputs=finance_only_inputs,
     )
     assert "raw_persistence_error" in result, (
@@ -4375,12 +4376,12 @@ def test_build_frozen_providers_keeps_bid_ask_live(tmp_path):
     _finance, robinhood = _build_frozen_providers_from_raw(
         DemoDataProvider(SourceName.FINANCE), LiveStub(SourceName.ROBINHOOD), raw_dir,
     )
-    assert robinhood.get_bid_ask("AAPL", _now()) == (50.0, 51.0)
+    assert cast(Any, robinhood).get_bid_ask("AAPL", _now()) == (50.0, 51.0)
 
     _finance_no_live, robinhood_no_live = _build_frozen_providers_from_raw(
         DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD), raw_dir,
     )
-    assert robinhood_no_live.get_bid_ask("AAPL", _now()) is None
+    assert cast(Any, robinhood_no_live).get_bid_ask("AAPL", _now()) is None
 
 
 def test_build_frozen_providers_unwraps_doubly_nested_pointer_data(tmp_path):
@@ -4441,7 +4442,7 @@ def test_build_frozen_providers_skips_unreadable_raw_files(tmp_path):
     _finance, robinhood = _build_frozen_providers_from_raw(
         DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD), raw_dir,
     )
-    assert robinhood.get_bid_ask("AAPL", _now()) is None
+    assert cast(Any, robinhood).get_bid_ask("AAPL", _now()) is None
 
 
 def test_run_pipeline_retry_preserves_orders_after_place(tmp_path):
@@ -4524,7 +4525,7 @@ def test_run_pipeline_partial_retry_merges_orders_after_place(tmp_path):
     run_pipeline(
         _now(), config, StrategyState(),
         DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
-        broker, artifacts_dir=scheduled_dir,
+        cast(Any, broker), artifacts_dir=scheduled_dir,
         raw_connector_inputs={
             "quotes_batch1.json": {"output_path": str(quotes_file)},
             "finance_bars_batch1.json": {"output_path": str(finance_bars_file)},
@@ -4871,7 +4872,7 @@ def test_run_slot_refuses_a_disabled_slot_and_places_nothing(slot, tmp_path):
             state=StrategyState(),
             finance_data=DemoDataProvider(SourceName.FINANCE),
             robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
-            broker=broker,
+            broker=cast(Any, broker),
             artifacts_dir=tmp_path,
         )
     # The error has to say WHY, so the executor's alert is actionable rather
@@ -4896,7 +4897,7 @@ def test_run_slot_rejects_an_unknown_slot_label(tmp_path):
             state=StrategyState(),
             finance_data=DemoDataProvider(SourceName.FINANCE),
             robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
-            broker=DryRunBroker(account=config.target_account_number),
+            broker=cast(Any, DryRunBroker(account=config.target_account_number)),
             artifacts_dir=tmp_path,
         )
 
@@ -5350,7 +5351,7 @@ def test_run_slot_1030et_still_runs_account_pinning_with_no_preflight_artifact(
             state=StrategyState(),
             finance_data=DemoDataProvider(SourceName.FINANCE),
             robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
-            broker=mismatched_broker,
+            broker=cast(Any, mismatched_broker),
             artifacts_dir=tmp_path / "artifacts",
         )
     run_state = json.loads((tmp_path / "artifacts" / "run_state.json").read_bytes())
@@ -5410,7 +5411,7 @@ def test_run_slot_without_a_guarded_prior_allocation_still_blocks_a_same_day_rep
         state=StrategyState(),
         finance_data=DemoDataProvider(SourceName.FINANCE),
         robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
-        broker=_RecordingBroker(account=config.target_account_number),
+        broker=cast(Any, _RecordingBroker(account=config.target_account_number)),
         artifacts_dir=tmp_path,
     )
 
@@ -5512,7 +5513,7 @@ def test_run_slot_allows_a_guarded_top_up_the_old_forced_flag_used_to_block(tmp_
         state=StrategyState(),
         finance_data=DemoDataProvider(SourceName.FINANCE),
         robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
-        broker=_RecordingBroker(account=config.target_account_number),
+        broker=cast(Any, _RecordingBroker(account=config.target_account_number)),
         artifacts_dir=tmp_path,
         prior_same_day_allocations=prior,
     )
@@ -5637,7 +5638,7 @@ def test_run_slot_does_not_construct_its_own_broker(tmp_path):
 
     config = _demo_config()
     with pytest.raises(TypeError):
-        run_slot(
+        run_slot(  # type: ignore[call-arg]
             "1530ET",
             now=_now(),
             config=config,

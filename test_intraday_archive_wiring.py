@@ -14,6 +14,7 @@ import json
 import os
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from typing import Any
 
 os.environ.setdefault("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "999000111")
 
@@ -49,7 +50,7 @@ class RichProvider:
         self._drop = drop
         self._quote = quote
 
-    def get_previous_close_bar(self, ticker, as_of):
+    def get_previous_close_bar(self, ticker, as_of) -> Any:
         ts = datetime.combine(
             as_of.astimezone(EASTERN).date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN
         )
@@ -168,7 +169,7 @@ def test_rejected_quote_is_still_archived_beside_the_bar_price(tmp_path):
 
 def test_ticker_with_no_data_is_archived_as_a_polled_row(tmp_path):
     class NoDataProvider(RichProvider):
-        def get_previous_close_bar(self, ticker, as_of):
+        def get_previous_close_bar(self, ticker, as_of) -> Any:
             return None
 
     cfg = MorningConfig(tickers=("GFUZ",), morning_run_state_root=str(tmp_path / "runs"))

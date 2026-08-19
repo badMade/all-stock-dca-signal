@@ -74,6 +74,7 @@ from typing import (
     Sequence,
     Set,
     Tuple,
+    cast,
 )
 from zoneinfo import ZoneInfo
 
@@ -965,7 +966,7 @@ class StrategyState:
     # restarted process's never-recorded afternoon order as already booked
     # (Codex review, PR #231: "Record the recovered buy separately from seeded
     # prior context").
-    own_orders_recorded: Set[Tuple[str, date]] = field(default_factory=set)
+    own_orders_recorded: Set[Tuple[Any, ...]] = field(default_factory=set)
     # How much prior-context has already been folded in via
     # reconcile_prior_allocation, per (ticker, trading_day) -- so a LATER
     # invocation's fresh scan discovering MORE evidence for a ticker already
@@ -1565,6 +1566,7 @@ class DryRunBroker:
         self._reference_prices = dict(reference_prices or {})
         self._simulated_slippage_pct = simulated_slippage_pct
         self._fills: Dict[str, OrderFill] = {}
+        self.supports_concurrent_fill_lookup: bool = False
 
     def account_number(self) -> str:
         return self._account
@@ -1906,6 +1908,8 @@ class AlpacaBroker:
     Inject callables to connect it to the live connector without changing the strategy.
     """
 
+    supports_concurrent_fill_lookup: bool = False
+
     def __init__(
         self,
         config: Optional[AlpacaConfig] = None,
@@ -1932,7 +1936,8 @@ class AlpacaBroker:
             info = self._account_info_fn(
                 build_alpaca_account_info_payload(self.config.is_paper_api)
             )
-            return float(info.get("buying_power", info.get("cash", 0.0)))
+            bp = info.get("buying_power") if info.get("buying_power") is not None else info.get("cash", 0.0)
+            return float(bp or 0.0)
         return self.config.simulated_buying_power_usd
 
     def same_day_strategy_order_exists(self, ticker: str, trading_day: date) -> bool:
@@ -2067,6 +2072,9 @@ class AlpacaBroker:
         executed before the terminal state), which is a real answer, not
         malformed data.
         """
+        if self._order_fill_fn is None:
+            return None
+
         seen_ids = {order_id}
         current_id = order_id
         total_qty = 0.0
@@ -2717,24 +2725,25 @@ def reconcile_signals(
         # -- e.g. finance $2*2.5x=$5 vs. Robinhood $1*3.5x=$3.50: amount is
         # Robinhood's $3.50, so both its base ($1) and multiplier (3.5x) must
         # be used together, not finance's mismatched 2.5x.
-        winning_signal = (
-            finance_signal
-            if finance_signal.suggested_amount_usd
-            <= robinhood_signal.suggested_amount_usd
-            else robinhood_signal
-        )
-        return ReconciledDecision(
-            ticker=ticker,
-            action=Action.BUY,
-            reason="finance and Robinhood agree on BUY",
-            finance_signal=finance_signal,
-            robinhood_signal=robinhood_signal,
-            buy_multiplier=winning_signal.buy_multiplier,
-            ladder_multiplier=winning_signal.ladder_multiplier,
-            suggested_amount_usd=winning_signal.suggested_amount_usd,
-            selected_base_amount_usd=winning_signal.selected_base_amount_usd,
-            **_target_fields(winning_signal),
-        )
+        if finance_signal is not None and robinhood_signal is not None:
+            winning_signal = (
+                finance_signal
+                if finance_signal.suggested_amount_usd
+                <= robinhood_signal.suggested_amount_usd
+                else robinhood_signal
+            )
+            return ReconciledDecision(
+                ticker=ticker,
+                action=Action.BUY,
+                reason="finance and Robinhood agree on BUY",
+                finance_signal=finance_signal,
+                robinhood_signal=robinhood_signal,
+                buy_multiplier=winning_signal.buy_multiplier,
+                ladder_multiplier=winning_signal.ladder_multiplier,
+                suggested_amount_usd=winning_signal.suggested_amount_usd,
+                selected_base_amount_usd=winning_signal.selected_base_amount_usd,
+                **cast(Any, _target_fields(winning_signal)),
+            )
 
     if finance_action == Action.BUY and robinhood_action != Action.BUY:
         return ReconciledDecision(
@@ -2746,18 +2755,19 @@ def reconcile_signals(
         )
 
     if robinhood_action == Action.BUY and finance_action == Action.NO_DATA:
-        return ReconciledDecision(
-            ticker=ticker,
-            action=Action.BUY,
-            reason="Robinhood-only BUY because finance source is unavailable",
-            finance_signal=finance_signal,
-            robinhood_signal=robinhood_signal,
-            buy_multiplier=robinhood_signal.buy_multiplier,
-            ladder_multiplier=robinhood_signal.ladder_multiplier,
-            suggested_amount_usd=robinhood_signal.suggested_amount_usd,
-            selected_base_amount_usd=robinhood_signal.selected_base_amount_usd,
-            **_target_fields(robinhood_signal),
-        )
+        if robinhood_signal is not None:
+            return ReconciledDecision(
+                ticker=ticker,
+                action=Action.BUY,
+                reason="Robinhood-only BUY because finance source is unavailable",
+                finance_signal=finance_signal,
+                robinhood_signal=robinhood_signal,
+                buy_multiplier=robinhood_signal.buy_multiplier,
+                ladder_multiplier=robinhood_signal.ladder_multiplier,
+                suggested_amount_usd=robinhood_signal.suggested_amount_usd,
+                selected_base_amount_usd=robinhood_signal.selected_base_amount_usd,
+                **cast(Any, _target_fields(robinhood_signal)),
+            )
 
     if robinhood_action == Action.BUY and finance_action != Action.BUY:
         return ReconciledDecision(
@@ -3735,7 +3745,7 @@ def _inverse_martingale_recover_pending_lease(
             ticker,
         )
         return None
-    if matched_order is not None and recovered_amount > 0:
+    if matched_order is not None and recovered_amount is not None and recovered_amount > 0:
         if abs(recovered_amount - claimed_amount) < 0.005:
             # The claimed fire landed in full: the target state the claim
             # reserved is exactly right, minus its own lease flag.
@@ -3917,7 +3927,7 @@ def _inverse_martingale_recover_pending_lease(
         # not counted as a placed order by build_usage_proxy.
         order_id = matched_order.get("id") or matched_order.get("order_id") or claim_ref
     last_recovery = None
-    if recovered_amount > 0:
+    if recovered_amount is not None and recovered_amount > 0:
         # A durable attribution record. Written to TWO places, not one:
         #
         # 1. The TRACKER's own top-level state (below), so the most recent
@@ -3963,8 +3973,8 @@ def _inverse_martingale_recover_pending_lease(
         accumulated_usd_before=float(tracker_state.get("accumulated_usd", 0.0)),
         accumulated_usd_after=float(recovered_state.get("accumulated_usd", 0.0)),
         newly_crossed_tiers=(),
-        fired=recovered_amount > 0,
-        fire_amount_usd=recovered_amount,
+        fired=recovered_amount is not None and recovered_amount > 0,
+        fire_amount_usd=float(recovered_amount or 0.0),
         reason=recovered_reason,
         recovery_metadata=last_recovery,
     )
@@ -3979,7 +3989,7 @@ def _inverse_martingale_recover_pending_lease(
     return InverseMartingaleLeaseRecovery(
         ticker=ticker,
         claim_trading_day=claim_trading_day,
-        recovered_amount_usd=recovered_amount,
+        recovered_amount_usd=float(recovered_amount or 0.0),
         recovered_state=recovered_state,
         order_id=str(order_id) if order_id else None,
         claim_ref=claim_ref,
@@ -5112,7 +5122,7 @@ def build_run_artifacts(
     }
     _apply_no_order_classification(artifacts, candidate_outcomes, scheduled=not run_context.manual)
     if run_context.raw_persistence_state is not None:
-        artifacts.update(run_context.raw_persistence_state)
+        artifacts.update(cast(Any, run_context.raw_persistence_state))
     if not run_context.manual:
         # Derive valid_scheduled_evidence from the completed state rather than
         # asserting it: a scheduled (non-manual) run is same-day scheduled
@@ -5122,7 +5132,7 @@ def build_run_artifacts(
         except ImportError:
             from same_day_pointer import derive_valid_scheduled_evidence  # type: ignore
         run_classification["valid_scheduled_evidence"] = (
-            derive_valid_scheduled_evidence(artifacts)
+            derive_valid_scheduled_evidence(cast(Any, artifacts))
         )
     return artifacts
 
@@ -5580,6 +5590,8 @@ def _candidate_logged_reference_price(candidate: Dict[str, Any]) -> Optional[flo
     """
     for key in ("target_price", "decision_price", "decision_bar_close"):
         raw = candidate.get(key)
+        if raw is None:
+            continue
         try:
             value = float(raw)
         except (TypeError, ValueError):
@@ -6029,7 +6041,7 @@ def _has_executed_quantity(row: Mapping[str, object]) -> bool:
         if value in (None, "", "-"):
             continue
         try:
-            executed = float(value)
+            executed = float(cast(Any, value))
         except (TypeError, ValueError):
             return False
         return math.isfinite(executed) and executed > 0
@@ -6037,7 +6049,7 @@ def _has_executed_quantity(row: Mapping[str, object]) -> bool:
     if raw in (None, "", "-"):
         return False
     try:
-        qty = float(raw)
+        qty = float(cast(Any, raw))
     except (TypeError, ValueError):
         return False
     return math.isfinite(qty) and qty > 0
@@ -6060,7 +6072,7 @@ def _executed_quantity_is_explicit_zero(row: Mapping[str, object]) -> bool:
         if value in (None, "", "-"):
             continue
         try:
-            executed = float(value)
+            executed = float(cast(Any, value))
         except (TypeError, ValueError):
             return False
         return math.isfinite(executed) and executed == 0
@@ -6342,7 +6354,7 @@ def _combined_fill(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
 
     def _num(value):
         try:
-            out = float(value)
+            out = float(cast(Any, value))
         except (TypeError, ValueError):
             return None
         return out if math.isfinite(out) else None
@@ -7343,17 +7355,17 @@ def load_prior_same_day_allocations(
             # with no reference price (see below), which routes the guard to its
             # conservative manual-review $0 path rather than a blind top-up.
             fill = fills.get(ticker)
-            amount = candidate.get("incremental_order_amount")
-            if amount is None:
-                amount = candidate.get("planned_amount_usd")
+            amount_raw = candidate.get("incremental_order_amount")
+            if amount_raw is None:
+                amount_raw = candidate.get("planned_amount_usd")
             try:
-                amount = float(amount)
+                amount = float(cast(Any, amount_raw))
             except (TypeError, ValueError):
                 continue
             if fill is not None and fill.get("amount_usd"):
                 # Prefer the actual filled notional over the planned amount so a
                 # manual override or partial fill doesn't overstate prior allocation.
-                amount = fill["amount_usd"]
+                amount = float(cast(Any, fill["amount_usd"]))
             elif (
                 fill is not None
                 and fill["quantity_filled"]
@@ -7364,7 +7376,7 @@ def load_prior_same_day_allocations(
                 # confirmed price -- a quantity-only fill with no usable price
                 # carries no way to derive a dollar amount and must not be
                 # multiplied against a missing (None) price.
-                amount = fill["avg_fill_price"] * fill["quantity_filled"]
+                amount = float(cast(Any, fill["avg_fill_price"])) * float(cast(Any, fill["quantity_filled"]))
             if amount <= 0:
                 continue
 
@@ -7381,12 +7393,12 @@ def load_prior_same_day_allocations(
             if (status == "filled" or fill is not None) and not fill_is_partial:
                 reference_price = _candidate_logged_reference_price(candidate)
                 if reference_price is None and fill is not None:
-                    reference_price = fill["avg_fill_price"]
+                    reference_price = cast(Any, fill["avg_fill_price"])
                 # Same confirmed-capital-movement gate as reference_price: an
                 # unconfirmed submitted candidate's base is not trusted as the
                 # day's fixed first-allocation base either.
                 try:
-                    base_amount_usd = float(candidate.get("selected_base_amount_usd"))
+                    base_amount_usd = float(cast(Any, candidate.get("selected_base_amount_usd")))
                 except (TypeError, ValueError):
                     base_amount_usd = None
                 if base_amount_usd is not None and not (

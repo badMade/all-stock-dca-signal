@@ -6,6 +6,7 @@ import dataclasses
 import json
 import sys
 from datetime import date
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -396,8 +397,10 @@ def test_rolling_30day_burn_rate_window_and_average():
 # --- classify_stream coverage ------------------------------------------------
 
 def test_classify_stream_non_dict_state():
-    assert classify_stream(None) == STREAM_OTHER
-    assert classify_stream([]) == STREAM_OTHER
+    state_none: Any = None
+    state_list: Any = []
+    assert classify_stream(state_none) == STREAM_OTHER
+    assert classify_stream(state_list) == STREAM_OTHER
 
 
 def test_classify_stream_accepts_the_seven_slot_rosters_morning_identity():

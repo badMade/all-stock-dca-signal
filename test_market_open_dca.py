@@ -19,6 +19,7 @@ Runnable with ``pytest`` or ``python test_market_open_dca.py``.
 import json
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from typing import Any, Optional
 
 import pytest
 
@@ -50,31 +51,44 @@ def _now_market_open():
 
 class _Broker:
     """Minimal successful broker that records every placement."""
+    supports_concurrent_fill_lookup: bool = False
 
     def __init__(self):
         self.placed = {}
 
-    def account_number(self):
+    def account_number(self) -> str:
         return FIXTURE_ACCOUNT_NUMBER
 
-    def available_buying_power(self):
+    def available_buying_power(self) -> float:
         return 500.0
 
-    def same_day_strategy_order_exists(self, ticker, trading_day):
+    def same_day_strategy_order_exists(self, ticker, trading_day) -> bool:
         return False
 
-    def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, prefixes):
-        return False
+    def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes) -> Optional[dict]:
+        return None
 
-    def is_tradable_for_fractional_buy(self, ticker):
+    def strategy_order_with_ref_id(self, ticker, trading_day, ref_id) -> Optional[dict]:
+        return None
+
+    def same_day_ticker_notional_usd(self, ticker, trading_day) -> float:
+        return 0.0
+
+    def is_tradable_for_fractional_buy(self, ticker) -> bool:
         return True
 
-    def review_market_buy(self, ticker, notional_usd):
+    def review_market_buy(self, ticker, notional_usd) -> tuple[bool, str]:
         return True, "ok"
 
-    def place_market_buy(self, ticker, notional_usd, ref_id):
+    def place_market_buy(self, ticker, notional_usd, ref_id) -> str:
         self.placed[ticker] = notional_usd
         return f"ORDER-{ticker}"
+
+    def get_order_fill(self, order_id) -> Any:
+        return None
+
+    def get_raw_placement_responses(self) -> list:
+        return []
 
 
 def _cfg(tmp_path, **overrides):
@@ -364,7 +378,7 @@ def test_default_roots_include_market_opens_own_manual_run_tree(tmp_path):
 
 def test_default_market_open_prior_allocation_roots_includes_own_root():
     roots = default_market_open_prior_allocation_roots()
-    assert any(str(r).rstrip("/").endswith("market_open_dca") for r in roots)
+    assert any(r.rstrip("/").endswith("market_open_dca") for r in roots)
 
 
 def test_bundled_config_prior_allocation_roots_includes_own_root():

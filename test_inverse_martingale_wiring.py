@@ -12,6 +12,7 @@ from __future__ import annotations
 import csv
 import json
 from datetime import date, datetime, time, timedelta
+from typing import Any, cast
 
 import pytest
 
@@ -111,7 +112,7 @@ def _run_day(
         decision_price=robinhood_price if robinhood_price is not None else decision_price,
         source=SourceName.ROBINHOOD,
     )
-    broker = broker or DryRunBroker(cash=broker_cash, reference_prices={"AAPL": decision_price})
+    broker = cast(Any, broker) or DryRunBroker(cash=broker_cash, reference_prices={"AAPL": decision_price})
     result = run_daily_compact(
         now,
         config,
@@ -127,7 +128,7 @@ def _run_day(
             deployment_history_root=deployment_history_root,
         ),
     )
-    with open(result["run_state_path"], encoding="utf-8") as handle:
+    with open(cast(str, result["run_state_path"]), encoding="utf-8") as handle:
         run_state = json.load(handle)
     return result, run_state, broker
 
@@ -192,7 +193,7 @@ def test_enrolled_ticker_fires_a_single_order_on_recovery(tmp_path, monkeypatch)
 
     # signals.csv's auto_buy_signal reconciliation reads the SAME decisions
     # list -- both source rows for AAPL must reflect the real fire too.
-    with open(r3["signals_path"], encoding="utf-8") as handle:
+    with open(cast(str, r3["signals_path"]), encoding="utf-8") as handle:
         signal_rows = [row for row in csv.DictReader(handle) if row.get("ticker") == "AAPL"]
     assert len(signal_rows) == 2  # finance + robinhood
     assert all(row["auto_buy_signal"] == "True" for row in signal_rows)
@@ -205,7 +206,7 @@ def test_enrolled_ticker_fires_a_single_order_on_recovery(tmp_path, monkeypatch)
     assert tracker["status"] == "none"
     assert tracker["last_evaluated_trading_day"] == TEST_DATES[2].isoformat()
 
-    with open(r3["orders_csv_path"], encoding="utf-8") as handle:
+    with open(cast(str, r3["orders_csv_path"]), encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     imart_rows = [row for row in rows if "imart" in (row.get("order_id") or "")]
     assert len(imart_rows) == 1
@@ -1220,6 +1221,8 @@ def test_an_expired_lease_release_folds_the_outage_into_trading_days_active(tmp_
     }
 
     class _NoOrderBroker:
+        account_number = "mock"
+
         def strategy_order_with_ref_id(self, ticker, trading_day, ref_id):
             return None
 
@@ -1236,7 +1239,7 @@ def test_an_expired_lease_release_folds_the_outage_into_trading_days_active(tmp_
     persisted_tracker_state = ledger.read("AAPL")
     recovery = ncd._inverse_martingale_recover_pending_lease(
         ledger, "AAPL", persisted_tracker_state,
-        broker=_NoOrderBroker(), dry_run=False, trading_day=resolution_day, stream="afternoon",
+        broker=cast(Any, _NoOrderBroker()), dry_run=False, trading_day=resolution_day, stream="afternoon",
     )
 
     assert recovery is not None
@@ -1297,6 +1300,8 @@ def test_an_exact_fill_reconciliation_ages_a_capped_continuation(tmp_path):
     }
 
     class _ExactFillBroker:
+        account_number = "mock"
+
         def strategy_order_with_ref_id(self, ticker, trading_day, ref_id):
             return {"state": "filled", "ref_id": ref_id, "executed_notional": "5.00"}
 
@@ -1313,7 +1318,7 @@ def test_an_exact_fill_reconciliation_ages_a_capped_continuation(tmp_path):
     persisted_tracker_state = ledger.read("AAPL")
     recovery = ncd._inverse_martingale_recover_pending_lease(
         ledger, "AAPL", persisted_tracker_state,
-        broker=_ExactFillBroker(), dry_run=False, trading_day=resolution_day, stream="afternoon",
+        broker=cast(Any, _ExactFillBroker()), dry_run=False, trading_day=resolution_day, stream="afternoon",
     )
 
     assert recovery is not None
@@ -1767,7 +1772,8 @@ def test_dry_run_lease_expires_without_a_broker_lookup(tmp_path, monkeypatch):
         def __init__(self):
             super().__init__(cash=500.0, reference_prices={"AAPL": 96.5})
 
-        strategy_order_with_ref_id = None
+        def strategy_order_with_ref_id(self, ticker: str, trading_day: date, ref_id: str) -> Any:
+            return None
 
     live = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
     _run_day(
@@ -3153,6 +3159,8 @@ def test_lease_account_fingerprint_is_keyed_not_a_bare_digest(tmp_path):
     from near_close_dca import _LEASE_FINGERPRINT_KEY_FILENAME, _broker_account_fingerprint
 
     class _Broker:
+        available_buying_power = 1000.0
+
         def __init__(self, account):
             self._account = account
 
@@ -3160,16 +3168,16 @@ def test_lease_account_fingerprint_is_keyed_not_a_bare_digest(tmp_path):
             return self._account
 
     account = "1" * 9
-    first = _broker_account_fingerprint(_Broker(account), tmp_path / "keys_a")
+    first = _broker_account_fingerprint(cast(Any, _Broker(account)), tmp_path / "keys_a")
     assert first
     # Not derivable from the account alone.
     assert first != hashlib.sha256(account.encode()).hexdigest()[: len(first)]
     # Stable for the same account under the same key...
-    assert _broker_account_fingerprint(_Broker(account), tmp_path / "keys_a") == first
+    assert _broker_account_fingerprint(cast(Any, _Broker(account)), tmp_path / "keys_a") == first
     # ...and unlinkable across key domains, so a copied tracker reveals nothing.
-    assert _broker_account_fingerprint(_Broker(account), tmp_path / "keys_b") != first
+    assert _broker_account_fingerprint(cast(Any, _Broker(account)), tmp_path / "keys_b") != first
     # A different account under the same key still differs.
-    assert _broker_account_fingerprint(_Broker("2" * 9), tmp_path / "keys_a") != first
+    assert _broker_account_fingerprint(cast(Any, _Broker("2" * 9)), tmp_path / "keys_a") != first
 
     key_path = tmp_path / "keys_a" / _LEASE_FINGERPRINT_KEY_FILENAME
     assert key_path.is_file()

@@ -915,6 +915,7 @@ def test_a_second_runner_cannot_hold_the_same_window(tmp_path):
     assert scheduled.acquire("scheduled-runner", now=1000.0).acquired is True
     blocked = recovery.acquire("recovery-runner", now=1001.0)
     assert blocked.acquired is False
+    assert blocked.current_holder is not None
     assert blocked.current_holder.holder_id == "scheduled-runner"
 
 
@@ -994,6 +995,7 @@ def test_a_token_shaped_secret_in_a_broker_error_is_redacted():
     result = _execute(plan, _live_broker(place_fn), candidates=cands)
 
     assert result.halted_on == plan.to_place[0].ticker
+    assert result.failure_reason is not None
     assert token not in result.failure_reason
     assert "[REDACTED-TOKEN]" in result.failure_reason
 
@@ -1006,6 +1008,7 @@ def test_the_account_number_is_redacted_from_failure_evidence():
     plan = dca_runner.plan_orders(cands, dca_runner.budget_snapshot([], TRADING_DAY), NORMAL_TIER)
     result = _execute(plan, _live_broker(place_fn), candidates=cands)
 
+    assert result.failure_reason is not None
     assert ACCOUNT not in result.failure_reason
     assert "[REDACTED-ACCOUNT]" in result.failure_reason
 
@@ -1016,6 +1019,7 @@ def test_a_structured_broker_error_object_is_never_serialized_verbatim():
     reason = dca_runner._redacted_envelope_error(
         {"error": {"token": "sk-live-AbCdEf0123456789XyZwVu", "headers": {}}}
     )
+    assert reason is not None
     assert "sk-live" not in reason
     assert "non-string error field" in reason
 

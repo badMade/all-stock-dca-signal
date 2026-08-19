@@ -6,6 +6,7 @@ Notion markdown builder, and weekly dashboard section generation. Runnable with
 """
 
 import json
+from typing import Any, cast
 
 from dca_notion_sync import (
     COMPACT_SYNC_TITLE,
@@ -1235,7 +1236,7 @@ def test_is_manual_run_state():
         ("not_a_dict", False),
     ]
     for run_state, expected in cases:
-        assert _is_manual_run_state(run_state) is expected
+        assert _is_manual_run_state(cast(Any, run_state)) is expected
 
 
 def test_load_run_state(tmp_path):

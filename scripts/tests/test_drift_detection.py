@@ -561,7 +561,7 @@ class SlackTests(unittest.TestCase):
         with patch.object(
             dca_alerts, "_resolve_ips", lambda hostname: {validated_ip}
         ), patch.object(dca_alerts.socket, "create_connection", fake_create_connection):
-            dca_alerts._connect_pinned(conn)
+            dca_alerts._connect_pinned(cast(Any, conn))
         self.assertEqual(calls, [(str(validated_ip), 443)])
         self.assertIsNotNone(conn.sock)
 

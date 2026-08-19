@@ -13,6 +13,7 @@ import pathlib
 import tempfile
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta, timezone
+from typing import Any, cast
 
 import pytest
 
@@ -562,7 +563,7 @@ def test_run_daily_compact_prior_allocation_scoped_to_its_own_ticker(tmp_path):
     )
 
     assert result["blocked"] is False
-    with open(result["run_state_path"], encoding="utf-8") as handle:
+    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
         run_state = json.load(handle)
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
 
@@ -634,7 +635,7 @@ def test_budget_tier_is_selected_from_post_topup_spend_not_pre_topup_desired(tmp
     )
 
     assert result["blocked"] is False
-    with open(result["run_state_path"], encoding="utf-8") as handle:
+    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
         run_state = json.load(handle)
     [candidate] = run_state["buy_candidates"]
     assert candidate["top_up_guard_result"] == TOP_UP_INCREMENTAL
@@ -681,7 +682,7 @@ def test_merge_manual_top_up_context_poisons_base_to_unknown():
             ticker="AAPL", prior_usd=1.0, reference_price=99.0, sources=["manual_csv"]
         ),
     }
-    merge_manual_top_up_context(prior_same_day_allocations, manual_context)
+    merge_manual_top_up_context(prior_same_day_allocations, cast(Any, manual_context))
     merged = prior_same_day_allocations["AAPL"]
     assert merged.amount_usd == 3.0
     assert merged.selected_base_amount_usd is None
@@ -706,7 +707,7 @@ def test_merge_manual_top_up_context_new_allocation_uses_attempt_count_not_sourc
             attempt_count=3,
         ),
     }
-    merge_manual_top_up_context(prior_same_day_allocations, manual_context)
+    merge_manual_top_up_context(prior_same_day_allocations, cast(Any, manual_context))
     assert prior_same_day_allocations["AAPL"].attempt_count == 3
 
 
@@ -730,7 +731,7 @@ def test_merge_manual_top_up_context_merge_path_sums_attempt_count_not_sources()
             attempt_count=3,
         ),
     }
-    merge_manual_top_up_context(prior_same_day_allocations, manual_context)
+    merge_manual_top_up_context(prior_same_day_allocations, cast(Any, manual_context))
     assert prior_same_day_allocations["AAPL"].attempt_count == 4
 
 
@@ -764,7 +765,7 @@ def test_merge_manual_top_up_context_retains_base_when_manual_fill_is_later():
             reference_ts=14 * 3600,
         ),
     }
-    merge_manual_top_up_context(prior_same_day_allocations, manual_context)
+    merge_manual_top_up_context(prior_same_day_allocations, cast(Any, manual_context))
     merged = prior_same_day_allocations["AAPL"]
     assert merged.amount_usd == 2.0
     assert merged.selected_base_amount_usd == 1.0
@@ -797,7 +798,7 @@ def test_merge_manual_top_up_context_poisons_base_when_manual_fill_may_be_earlie
             reference_ts=9 * 3600,
         ),
     }
-    merge_manual_top_up_context(prior_same_day_allocations, manual_context)
+    merge_manual_top_up_context(prior_same_day_allocations, cast(Any, manual_context))
     merged = prior_same_day_allocations["AAPL"]
     assert merged.selected_base_amount_usd is None
     assert merged.selected_base_amount_usd_at is None
@@ -831,7 +832,7 @@ def test_merge_manual_top_up_context_uses_most_recent_reference_not_merge_order(
             reference_ts=9 * 3600,
         ),
     }
-    merge_manual_top_up_context(prior_same_day_allocations, manual_context)
+    merge_manual_top_up_context(prior_same_day_allocations, cast(Any, manual_context))
     merged = prior_same_day_allocations["AAPL"]
     assert merged.reference_price == 90.0
     assert merged.run_id == "run1"
@@ -864,7 +865,7 @@ def test_merge_manual_top_up_context_manual_wins_when_actually_more_recent():
             reference_ts=15 * 3600 + 5 * 60,
         ),
     }
-    merge_manual_top_up_context(prior_same_day_allocations, manual_context)
+    merge_manual_top_up_context(prior_same_day_allocations, cast(Any, manual_context))
     merged = prior_same_day_allocations["AAPL"]
     assert merged.reference_price == 93.0
     assert merged.run_id == "manual_csv"
@@ -896,7 +897,7 @@ def test_merge_manual_top_up_context_sub_minute_precision():
             reference_ts=12 * 3600 + 30 * 60 + 5,
         ),
     }
-    merge_manual_top_up_context(prior_same_day_allocations, manual_context)
+    merge_manual_top_up_context(prior_same_day_allocations, cast(Any, manual_context))
     merged = prior_same_day_allocations["AAPL"]
     assert merged.reference_price == 90.0
 
@@ -1141,6 +1142,7 @@ def test_kill_switch_caps_guarded_top_up_at_preserved_base():
     )
     # The guard's own $4 delta (($1 * 5x) - $1 already bought) must be capped
     # at the preserved $1 base, not this run's fresh $2 base.
+    assert top_up_outcome is not None
     assert top_up_outcome.incremental_order_amount == 4.0
     assert candidate_outcome["submitted_amount_usd"] == 1.0
 
@@ -1174,6 +1176,14 @@ class _RefIdTrackingBroker:
     ):
         for t, rid, amt, order_id in self._orders:
             if t == ticker and rid in ref_id_prefixes:
+                return {"id": order_id, "dollar_amount": amt}
+        return None
+
+    supports_concurrent_fill_lookup: bool = False
+
+    def strategy_order_with_ref_id(self, ticker, trading_day, ref_id):
+        for t, rid, amt, order_id in self._orders:
+            if t == ticker and rid == ref_id:
                 return {"id": order_id, "dollar_amount": amt}
         return None
 
@@ -3177,6 +3187,7 @@ def test_guarded_top_up_corrects_an_understated_artifact_prior_against_the_broke
         running_deployed_7d=0.0,
     )
 
+    assert top_up_outcome is not None
     assert top_up_outcome.top_up_guard_result == "incremental_top_up"
     assert top_up_outcome.incremental_order_amount == 1.0
     assert outcome["status"] == "submitted"
@@ -3463,6 +3474,9 @@ def test_slippage_calculations_unfavorable_buy():
         avg_fill_price=101.0,
         quantity_filled=2.0,
     )
+    assert record.slippage_abs is not None
+    assert record.slippage_pct is not None
+    assert record.slippage_cost is not None
     assert record.status == "filled"
     assert abs(record.slippage_abs - 1.0) < 1e-9
     assert abs(record.slippage_pct - 1.0) < 1e-9  # 1 / 100 * 100
@@ -3481,6 +3495,8 @@ def test_slippage_favorable_and_quality_buckets():
         avg_fill_price=199.9,  # filled below target -> favorable (negative)
         quantity_filled=1.0,
     )
+    assert record.slippage_abs is not None
+    assert record.slippage_pct is not None
     assert record.slippage_abs < 0
     assert abs(record.slippage_pct - (-0.05)) < 1e-9
     assert record.execution_quality == "excellent"
@@ -3604,7 +3620,7 @@ def test_build_report_metrics_and_ranking():
     assert report.metrics["missing_fill_count"] == 2
     assert report.missing_fills["C"] == MISSING_FILL_DATA_ERROR
     assert report.missing_fills["D"] == MISSING_FILL_FAILED_TRIGGER
-    assert report.metrics["missing_fill_reasons"][MISSING_FILL_DATA_ERROR] == 1
+    assert cast(dict, report.metrics["missing_fill_reasons"])[MISSING_FILL_DATA_ERROR] == 1
     for key in [
         "mean_abs_slippage_pct",
         "median_abs_slippage_pct",
@@ -3645,14 +3661,14 @@ def test_generate_report_and_state_artifacts(tmp_path=None):
         scheduled=False,
     )
 
-    assert os.path.exists(result["slippage_report_path"])
-    assert os.path.exists(result["orders_csv_path"])
-    assert os.path.exists(result["state_path"])
+    assert os.path.exists(str(result["slippage_report_path"]))
+    assert os.path.exists(str(result["orders_csv_path"]))
+    assert os.path.exists(str(result["state_path"]))
 
-    report_text = open(result["slippage_report_path"], encoding="utf-8").read()
+    report_text = open(str(result["slippage_report_path"]), encoding="utf-8").read()
     assert "DCA Manual Run Slippage and Coverage Report" in report_text
 
-    with open(result["state_path"], encoding="utf-8") as handle:
+    with open(str(result["state_path"]), encoding="utf-8") as handle:
         payload = json.load(handle)
     assert (
         payload["artifacts"]["slippage_report_path"] == result["slippage_report_path"]
@@ -3675,7 +3691,7 @@ def test_generate_report_and_state_artifacts(tmp_path=None):
     assert metrics["filled_order_count"] >= 1
 
     # CSV carries the durable per-order slippage fields.
-    csv_text = open(result["orders_csv_path"], encoding="utf-8").read()
+    csv_text = open(str(result["orders_csv_path"]), encoding="utf-8").read()
     header = csv_text.splitlines()[0]
     for column in [
         "target_price",
@@ -4657,7 +4673,7 @@ def test_contract_failure_blocks_scheduled_pointer_update(tmp_path, monkeypatch)
     )
     # run_state.json is still written, but the invalid run is not pointed at.
     assert Path(artifacts_dir, "run_state.json").exists()
-    assert not latest_scheduled_run_path(classification_root).exists()
+    assert not latest_scheduled_run_path(Path(classification_root)).exists()
 
 
 def test_scheduled_run_updates_latest_scheduled_run_pointer(tmp_path):
@@ -4682,7 +4698,7 @@ def test_scheduled_run_updates_latest_scheduled_run_pointer(tmp_path):
         ),
     )
 
-    pointer = latest_scheduled_run_path(classification_root)
+    pointer = latest_scheduled_run_path(Path(classification_root))
     assert pointer.exists()
     ptr = json.loads(pointer.read_bytes())
     # Points at the run_state.json this run actually wrote to artifacts_dir, not
@@ -5658,7 +5674,7 @@ def _now_et():
     return datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
 
 
-def _preserved_state():
+def _preserved_state() -> dict[str, Any]:
     return {
         "run_id": "earlier",
         "trading_day": "2026-06-29",
@@ -6077,7 +6093,7 @@ def test_scheduled_finalize_archives_only_after_the_contract_is_written(tmp_path
 
 
 def test_manual_finalize_archives_right_after_write_run_artifacts(tmp_path, monkeypatch):
-    # A manual run has no scheduled contract step to wait for -- archiving
+    # A manual path has no scheduled contract step to wait for -- archiving
     # should proceed right after write_run_artifacts, and the contract
     # helper must never be invoked at all.
     import near_close_dca as m
@@ -6147,8 +6163,8 @@ def test_archive_intraday_observations_persists_failure_to_run_state(tmp_path, m
     )
 
     assert result is None
-    assert artifacts["intraday_archive"]["ok"] is False
-    assert artifacts["intraday_archive"]["error"] == "archive unavailable"
+    assert cast(dict, artifacts["intraday_archive"])["ok"] is False
+    assert cast(dict, artifacts["intraday_archive"])["error"] == "archive unavailable"
     persisted = json.loads(run_state_path.read_bytes())
     assert persisted["intraday_archive"]["ok"] is False
     assert persisted["intraday_archive"]["error"] == "archive unavailable"
@@ -6744,6 +6760,7 @@ def test_cumulative_credit_settles_ledger_only_after_confirmed_submission(tmp_pa
         running_deployed_7d=0.0,
     )
 
+    assert top_up_outcome is not None
     assert top_up_outcome.cumulative_credit_decline_usd == 1.0
     assert candidate_outcome["status"] == "submitted"
     assert candidate_outcome["submitted_amount_usd"] == 1.0
@@ -6820,6 +6837,7 @@ def test_cumulative_credit_discards_a_combined_total_still_below_fifty_cents(tmp
         running_deployed_7d=0.0,
     )
 
+    assert top_up_outcome is not None
     assert top_up_outcome.cumulative_credit_decline_usd is None
     assert top_up_outcome.discarded_pending_credit_usd == 0.10
     assert candidate_outcome["status"] == "skipped"
@@ -9606,6 +9624,8 @@ def test_load_prior_same_day_sums_two_distinct_orders_for_one_ticker(tmp_path):
 
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
 
+    assert allocations["GFUZ"].amount_usd is not None
+    assert allocations["GFUZ"].reference_price is not None
     # Both orders count: $4.00 + $6.00.
     assert abs(allocations["GFUZ"].amount_usd - 10.00) < 1e-9
     # Quantity-weighted average of 4.00 x 1 and 2.00 x 3 = 10/4 = 2.50.
@@ -11628,6 +11648,8 @@ def test_load_prior_same_day_reads_full_report_run_state_via_orders_csv(tmp_path
         "AAPL" in allocations
     ), "full-report run_state without buy_candidates must produce an AAPL allocation via orders_csv_path"
     alloc = allocations["AAPL"]
+    assert alloc.reference_price is not None
+    assert alloc.amount_usd is not None
     assert abs(alloc.reference_price - 99.0) < 0.001
     assert abs(alloc.amount_usd - 99.0 * 0.0303) < 0.001
 

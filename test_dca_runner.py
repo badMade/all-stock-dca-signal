@@ -37,6 +37,7 @@ import threading
 import time as time_module
 import types
 from datetime import date, datetime, time, timedelta, timezone
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -1302,7 +1303,7 @@ def _fake_msvcrt(locking_side_effects):
             raise effect
         return effect
 
-    fake = types.ModuleType("msvcrt")
+    fake: Any = types.ModuleType("msvcrt")
     fake.locking = locking
     fake.LK_LOCK = 1
     fake.LK_UNLCK = 0

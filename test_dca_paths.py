@@ -19,6 +19,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -160,7 +161,7 @@ def test_rebase_walks_nested_config_structures(monkeypatch):
         },
         "trend_min_bars": 6,
     }
-    out = rebase_bundled_roots_in(doc)
+    out = cast(dict[str, Any], rebase_bundled_roots_in(doc))
     assert out["artifact_paths"]["live_run_state_root"] == "/srv/dca/midday_dca"
     assert out["artifact_paths"]["prior_allocation_roots"] == [
         "/srv/dca/morning_dca",
