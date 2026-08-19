@@ -8,16 +8,19 @@ The self-heal system is composed of several components:
 
 1. **`scripts/healthcheck.py`**: A deterministic gate script that verifies codebase health. It mirrors ci.yml's checks: `ruff check` for linting, `pytest` (coverage-gated) for tests, the dry-run demo smoke test, and `pip-audit`. It does not run `ruff format --check` -- there is no formatting gate. It exits with code 0 if healthy, 1 if not.
 2. **`scripts/self_heal.py`**: The repair pipeline. It executes a sequence of idempotent steps (dependency installation, linting auto-fixes, etc.) and re-evaluates health after each step.
-3. **`scripts/compute_schedule.py`**: Telemetry engine. It analyzes commit frequency to compute a suggested cron cadence and writes it to `.github/self-heal-schedule.yml`. **Currently a no-op in practice:** `self-heal.yml` has no `schedule:` trigger for it to sync against (see Triggers below), so this only updates the metadata file today.
-4. **`.github/workflows/self-heal.yml`**: The primary GitHub Actions workflow. It triggers reactively on CI failure only (see Triggers below). It runs the repair and automatically creates a PR if a fix is found.
+3. **`scripts/compute_schedule.py`**: Telemetry engine. It analyzes commit frequency to compute a suggested cron cadence and writes it both to `.github/self-heal-schedule.yml` and to the `# AUTO-UPDATED` cron line in `.github/workflows/self-heal.yml` (see Triggers below).
+4. **`.github/workflows/self-heal.yml`**: The primary GitHub Actions workflow. It triggers on its own telemetry-computed schedule and reactively on CI failure (see Triggers below). It runs the repair and automatically creates a PR if a fix is found.
 5. **`.github/workflows/compute-schedule.yml`**: A secondary workflow that periodically runs the telemetry engine to update the schedule.
 6. **`.github/self-heal-schedule.yml`**: The metadata file holding the current schedule and the rationale behind it.
 
 ## Triggers
 
-`.github/workflows/self-heal.yml` (the repair workflow) triggers only one way:
+`.github/workflows/self-heal.yml` (the repair workflow) triggers two ways:
 
-*   **Reactive (CI failure):** Runs when the `CI` workflow (`ci.yml`) completes with a failure on a `push` event. It deliberately has no `workflow_dispatch` and no `schedule` trigger -- see that file's own header comment for the trust-boundary reasoning (a `workflow_dispatch` run would execute an arbitrary ref's own copy of this file with a `contents: write`/`pull-requests: write` token).
+*   **Scheduled:** Runs on the cron cadence recorded in the `# AUTO-UPDATED` line under its `schedule:` trigger, which `compute-schedule.yml` keeps in sync with the telemetry-computed (or manually overridden) value in `.github/self-heal-schedule.yml`.
+*   **Reactive (CI failure):** Runs when the `CI` workflow (`ci.yml`) completes with a failure on `main`. It only proceeds past the "Check reactive trigger scope" step when the failing job is one `scripts/healthcheck.py` can actually validate (the core lint/test/audit job) -- a failure isolated to an independent sibling suite (production-safe-agent-loop, ticker-advisor, ml-forecaster, wondrous-octopus) is skipped, since the repair pipeline has no way to install or fix those.
+
+It deliberately has no `workflow_dispatch` trigger -- see that file's own header comment for the trust-boundary reasoning (a `workflow_dispatch` run would execute an arbitrary ref's own copy of this file with a `contents: write`/`pull-requests: write` token).
 
 `.github/workflows/compute-schedule.yml` (the separate schedule-telemetry updater) also triggers only one way, for the same trust-boundary reason (see its own header comment):
 
@@ -39,3 +42,5 @@ If you want to manually set the scheduled cadence and have it stick, bypassing t
 2.  Update the `schedule:` and `rationale:` values, and set `override: true`.
 3.  Commit and push the changes.
 4.  With `override: true` set, `compute_schedule.py` skips the telemetry recompute on every subsequent run and only re-syncs `self-heal.yml`'s cron to your override value -- so the value you chose is never silently replaced by the next scheduled run of `compute-schedule.yml`. Set `override: false` (or remove the line) to hand control back to the telemetry engine.
+
+Without an override, `compute-schedule.yml` recomputes the cadence monthly from `git log` commit counts over the trailing 30 days (see `scripts/compute_schedule.py`'s `compute_cadence()`).

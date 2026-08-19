@@ -1,0 +1,341 @@
+name: Self-Heal Repair Pipeline
+
+# TRUST BOUNDARY -- there is deliberately no `workflow_dispatch` trigger here.
+# `schedule` and `workflow_run` always run the workflow file AND check out the
+# code as they exist on the default branch, never a dispatch-selected ref.
+# `workflow_dispatch` does not have that property: GitHub runs the version of
+# THIS FILE that lives on whatever ref the dispatcher selects, so a
+# `github.ref == 'refs/heads/main'` job-level check could simply be edited out
+# in that same dispatched copy -- it isn't a real defense. This job holds
+# `contents: write` and `pull-requests: write`, so a dispatch-selected ref
+# could use those to open/modify PRs with a token that ref's own author might
+# not otherwise hold. compute-schedule.yml and drift-check.yml document and
+# apply the identical rule (Codex review, PR #477).
+on:
+  schedule:
+    - cron: '0 3 * * 1' # AUTO-UPDATED
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
+
+concurrency:
+  group: selfheal-${{ github.ref }}
+  # Every run this job's `if:` actually allows through targets main (see
+  # below), so cancel-in-progress must be false here, matching ci.yml's
+  # rule and scripts/workflow_policy.py's documented convention: main runs
+  # are the audit record and are never canceled. Canceling mid-run risks
+  # killing a repair after its branch is pushed but before `gh pr create`,
+  # leaving an orphaned branch and discarding a valid fix (Codex review,
+  # PR #477).
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+  # `gh label create`/`gh label list` in "Create PR" write/read repository
+  # labels, which GitHub authorizes under the Issues permission (PRs are
+  # issues for labeling purposes) -- without this, the first label command
+  # 403s after the branch has already been pushed, leaving an orphaned
+  # branch with no PR (same failure mode compute-schedule.yml documents and
+  # fixes; Codex review, PR #477).
+  issues: write
+
+jobs:
+  repair:
+    if: >-
+      !startsWith(github.ref_name, 'selfheal-') &&
+      (
+        (github.event_name == 'schedule' && github.ref == 'refs/heads/main') ||
+        (
+          github.event_name == 'workflow_run' &&
+          github.event.workflow_run.conclusion == 'failure' &&
+          github.event.workflow_run.head_branch == 'main'
+        )
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # The `workflow_run` trigger reacts to the aggregate `CI` workflow
+      # conclusion, but healthcheck.py only re-runs the root lint/test/audit
+      # suite -- it has no way to install or check the independent
+      # production-safe-agent-loop/, ticker-advisor/, ml-forecaster/, or
+      # wondrous-octopus/ suites (each has its own heavy/optional deps). If
+      # one of those sibling jobs is what actually failed, running the repair
+      # pipeline here can't fix it and a "clean" post-healthcheck would be
+      # misleading. Narrow reactive runs to the CI jobs this healthcheck
+      # actually covers (Codex review, PR #477). Runs before "Set up Python"
+      # so its python_version output (below) can pick the interpreter that
+      # actually failed.
+      - name: Check reactive trigger scope
+        id: scope_check
+        if: github.event_name == 'workflow_run'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          FAILED_JOBS=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}/jobs" --jq '.jobs[] | select(.conclusion=="failure") | .name')
+          echo "Failed jobs in triggering run: ${FAILED_JOBS:-<none>}"
+          if echo "$FAILED_JOBS" | grep -qE '^(Lint & test \(core DCA\)|Dependency & secret audit)'; then
+            echo "in_scope=true" >> $GITHUB_OUTPUT
+          else
+            echo "in_scope=false" >> $GITHUB_OUTPUT
+          fi
+          # ci.yml's core-DCA job is a "3.11"/"3.12" matrix, so GitHub names
+          # each run "Lint & test (core DCA) (3.11)"/"(3.12)". Reproducing a
+          # failure isolated to one of those requires setting up that same
+          # interpreter below -- a hardcoded 3.11 runner can't observe or fix
+          # a 3.12-only failure (Codex review, PR #477).
+          # `|| true`: under this runner's default `bash -eo pipefail` shell, a
+          # grep with no match (e.g. the failure was audit-only, no "(3.x)"
+          # suffix in any job name) exits 1 and pipefail propagates that to
+          # the whole pipeline, aborting this step before the `${PY_VERSION:-
+          # 3.11}` default below ever runs -- turning a normal "no matrix
+          # suffix" case into a failed workflow (Codex review, PR #477).
+          PY_VERSION=$(echo "$FAILED_JOBS" | grep -oE '\(3\.[0-9]+\)' | tr -d '()' | head -1 || true)
+          echo "python_version=${PY_VERSION:-3.11}" >> $GITHUB_OUTPUT
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ steps.scope_check.outputs.python_version || '3.11' }}
+
+      # healthcheck.py invokes ruff, pytest/pytest-cov, and pip-audit; none of
+      # those are on a bare hosted runner, and `pip install -e .` alone
+      # installs nothing extra since the project's runtime dependency list is
+      # empty. Without this, the pre-healthcheck (and every subsequent
+      # healthcheck) always fails for reasons unrelated to actual repo health,
+      # and the guard step aborts before any repair PR can be created (Codex
+      # review, PR #477).
+      - name: Install health-check tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install pip-audit
+
+      - name: Cleanup stale PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Restrict to PRs this workflow itself opened: the github-actions[bot]
+          # author and the `selfheal-repair-` branch prefix used by the "Create
+          # PR" step below. Without this, any unrelated PR that merely carries
+          # the `self-heal` label for 7+ days gets closed -- and `--delete-branch`
+          # makes that destructive for a same-repo PR that was mislabeled by a
+          # human (Codex review, PR #477).
+          # Compare as Unix epoch seconds, not raw ISO-8601 strings -- string
+          # comparison is fragile across timezone/format variants (Antigravity
+          # review, PR #477). Keyed on updatedAt, not createdAt: "Create PR"
+          # can push a newer fix onto an already-open repair PR's branch, and
+          # createdAt never changes when that happens, so an actively updated
+          # PR could otherwise get closed and its branch deleted out from
+          # under it (Codex review, PR #477).
+          STALE_PRS=$(gh pr list --label self-heal --state open \
+            --json number,updatedAt,headRefName,author \
+            -q '.[] | select(.author.login == "github-actions[bot]" and (.headRefName | startswith("selfheal-repair-")) and (.updatedAt | fromdateiso8601) < (now - (7 * 86400))) | .number')
+          for PR in $STALE_PRS; do
+            gh pr close "$PR" --comment "Auto-closing stale self-heal PR" --delete-branch
+          done
+
+      - name: Pre-healthcheck
+        id: pre_healthcheck
+        if: github.event_name != 'workflow_run' || steps.scope_check.outputs.in_scope == 'true'
+        run: |
+          if ./scripts/healthcheck.py > pre_healthcheck.log 2>&1; then
+            echo "pre_healthcheck_code=0" >> $GITHUB_OUTPUT
+          else
+            echo "pre_healthcheck_code=1" >> $GITHUB_OUTPUT
+          fi
+          cat pre_healthcheck.log || true
+
+      - name: Run repair pipeline
+        id: repair
+        if: github.event_name != 'workflow_run' || steps.scope_check.outputs.in_scope == 'true'
+        run: |
+          if ./scripts/self_heal.py > repair.log 2>&1; then
+            echo "fixed=true" >> $GITHUB_OUTPUT
+          else
+            echo "fixed=false" >> $GITHUB_OUTPUT
+          fi
+          cat repair.log || true
+
+      - name: Post-healthcheck
+        id: post_healthcheck
+        if: github.event_name != 'workflow_run' || steps.scope_check.outputs.in_scope == 'true'
+        run: |
+          if ./scripts/healthcheck.py > post_healthcheck.log 2>&1; then
+            echo "post_healthcheck_code=0" >> $GITHUB_OUTPUT
+          else
+            echo "post_healthcheck_code=1" >> $GITHUB_OUTPUT
+          fi
+          cat post_healthcheck.log || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: self-heal-logs
+          path: |
+            pre_healthcheck.log
+            repair.log
+            post_healthcheck.log
+          retention-days: 14
+
+      - name: Guard conditions
+        id: guards
+        if: github.event_name != 'workflow_run' || steps.scope_check.outputs.in_scope == 'true'
+        run: |
+          # Use the shell's own `exit`, not `python3 -c "...sys.exit(N)"`: the
+          # latter only sets the exit code of a throwaway child process and
+          # does not stop this script, so every "abort" below would silently
+          # fall through to the next check and the step's final exit status
+          # would end up being whatever the *last* check happened to produce
+          # (Codex review, PR #477).
+          if [ "${{ steps.post_healthcheck.outputs.post_healthcheck_code }}" != "0" ]; then
+            echo "Post-healthcheck failed, aborting PR."
+            exit 1
+          fi
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "No diff; nothing to PR. Exiting successfully."
+            exit 0
+          fi
+
+          # Intent-to-add every untracked path so `git diff`/`git diff --name-only`
+          # below see newly created files' full content as an addition instead of
+          # skipping them entirely. Without this, a repair step that creates a new
+          # file (e.g. a generated script) bypasses both the secret scan and the
+          # forbidden-path/allowed-scope checks below, even though the later
+          # `git add .` in "Create PR" stages and commits it regardless (Codex
+          # review, PR #477).
+          git add -N .
+
+          if git diff | grep -iE 'api_key|token|password|secret|bearer'; then
+             echo "Potential secrets in diff, aborting PR."
+             exit 1
+          fi
+
+          if git diff --name-only | grep -E '(\.github/workflows/ci\.yml|\.env|secrets/|src/.*/migrations/)'; then
+             echo "Forbidden files modified, aborting PR."
+             exit 1
+          fi
+
+          # file_changes_only_in check
+          if git diff --name-only | grep -vE '^(src/|tests/|schemas/|config/|requirements.*\.txt|package\.json|go\.sum|scripts/|pyproject\.toml|\.github/|[^/]+\.py)$'; then
+             echo "Files modified outside allowed scope, aborting PR."
+             exit 1
+          fi
+
+          # meaningful_diff check
+          if [ "${{ steps.pre_healthcheck.outputs.pre_healthcheck_code }}" = "0" ]; then
+             if [ -z "$(git diff -w)" ]; then
+                echo "Diff is whitespace-only and pre_healthcheck passed. Not a meaningful diff, aborting PR."
+                exit 1
+             fi
+          fi
+
+      - name: Check duplicates
+        id: check_duplicates
+        if: github.event_name != 'workflow_run' || steps.scope_check.outputs.in_scope == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Same author/branch-prefix filter as "Cleanup stale PRs": an unrelated
+          # PR that merely carries the `self-heal` label would otherwise count as
+          # "existing" forever (Codex review, PR #477). Record its branch name
+          # (if any) rather than just a count -- "Create PR" below pushes onto
+          # that branch instead of skipping outright, so a second, different
+          # fix isn't silently discarded just because an earlier repair PR is
+          # still open (Codex review, PR #477).
+          EXISTING_BRANCH=$(gh pr list --label self-heal --state open \
+            --json headRefName,author \
+            -q '[.[] | select(.author.login == "github-actions[bot]" and (.headRefName | startswith("selfheal-repair-")))][0].headRefName // empty')
+          if [ -n "$EXISTING_BRANCH" ]; then
+            echo "Existing selfheal PR found on branch $EXISTING_BRANCH; will push this fix there."
+          fi
+          echo "existing_branch=${EXISTING_BRANCH}" >> $GITHUB_OUTPUT
+
+      - name: Create PR
+        if: steps.repair.outputs.fixed == 'true' && success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          gh auth setup-git
+
+          EXISTING_BRANCH="${{ steps.check_duplicates.outputs.existing_branch }}"
+          if [ -n "$EXISTING_BRANCH" ]; then
+            BRANCH="$EXISTING_BRANCH"
+            IS_UPDATE=true
+          else
+            BRANCH="selfheal-repair-$(date +%s)"
+            IS_UPDATE=false
+          fi
+          git checkout -b "$BRANCH"
+          git add .
+          git commit -m "[Self-Heal] Auto-repair drift"
+
+          if [ "$IS_UPDATE" = "true" ]; then
+            # Push onto the already-open repair PR's branch (this workflow's
+            # own disposable branch) rather than opening a second PR.
+            git push --force-with-lease origin "$BRANCH"
+            echo "Pushed an additional fix to the existing repair PR ($BRANCH)."
+            exit 0
+          fi
+
+          git push --set-upstream origin "$BRANCH"
+
+          TITLE="[Self-Heal Repair] Drift fixes"
+          if [ "${{ github.event_name }}" == "workflow_run" ]; then
+            TITLE="[Self-Heal Reactive] CI fix"
+          elif [ "${{ github.event_name }}" == "schedule" ]; then
+            TITLE="[Self-Heal Scheduled] Drift fixes"
+          fi
+
+          SCHEDULE=$(grep "^schedule:" .github/self-heal-schedule.yml | awk -F"'" '{print $2}' || echo "N/A")
+          RATIONALE=$(grep "^rationale:" .github/self-heal-schedule.yml | awk -F"'" '{print $2}' || echo "N/A")
+
+          # AGENTS.md's "Pull request expectations" requires a summary, the
+          # exact checks run, known limitations, and a secrets confirmation --
+          # the previous body left reviewers to reconstruct all of that from
+          # workflow logs (Codex review, PR #477).
+          PR_BODY="## Self-Heal Repair
+
+          **Trigger Reason:** ${{ github.event_name }}
+          **Current Schedule:** \`${SCHEDULE}\` (${RATIONALE})
+
+          **Summary:**
+          The automated self-heal pipeline detected and fixed drift in the repository. See the diff for the exact files changed.
+
+          **Checks run (scripts/healthcheck.py, before and after the repair):**
+          - \`ruff check .\`
+          - \`pytest --cov=. --cov-report=term-missing:skip-covered --cov-fail-under=90\`
+          - \`python run_dca.py --demo --report --now 2026-08-03T15:45 --artifacts-dir <tmp dir>\`
+          - \`pip-audit --requirement requirements-dev.txt --strict\`
+
+          **Known limitations:**
+          - This PR was generated without human judgment -- verify the diff matches the drift it claims to fix before merging.
+          - The reactive trigger only validates the core lint/test/audit surface; an independent sibling suite (production-safe-agent-loop, ticker-advisor, ml-forecaster, wondrous-octopus) failure would not be caught or fixed here.
+
+          **Secrets:** The guard step scanned the diff (tracked and newly-created files) for secret-shaped strings (\`api_key\`, \`token\`, \`password\`, \`secret\`, \`bearer\`) before this PR was opened; no matches were found. Human review is still required per this repo's PR expectations.
+
+          **Logs:**
+          - [View Artifact Logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+
+          # Ensure required labels exist (mirrors compute-schedule.yml’s first-run hardening)
+          gh label create self-heal --description "Automated self-heal repair PR, needs human review" --color ededed --force >/dev/null
+          if ! gh label list --search automation --json name --jq '.[].name' | grep -qx automation; then
+            gh label create automation --description "Automated repository maintenance" --color ededed >/dev/null
+          fi
+
+          gh pr create --title "$TITLE" \
+            --body "$PR_BODY" \
+            --label "automation,self-heal" \
+            --head "$BRANCH"
