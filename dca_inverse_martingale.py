@@ -532,20 +532,27 @@ def _interpolated_adjusted_closes(
         anchor_date = ordered_dates[anchor_idx]
         anchor_raw = raw_by_date.get(anchor_date)
         day_raw = raw_by_date.get(day)
-        if anchor_raw is not None and anchor_raw > 0 and day_raw is not None:
-            return adjusted[anchor_idx] / anchor_raw * day_raw
-        return adjusted[anchor_idx]  # this date's own raw Close is unusable -- fall back to the flat anchor value
+        anchor_adj = adjusted[anchor_idx]
+        if anchor_adj is not None and anchor_raw is not None and anchor_raw > 0 and day_raw is not None:
+            return anchor_adj / anchor_raw * day_raw
+        if anchor_adj is not None:
+            return anchor_adj  # this date's own raw Close is unusable -- fall back to the flat anchor value
+        return day_raw if day_raw is not None else 0.0
 
     result: dict[date, float] = {}
     for i, day in enumerate(ordered_dates):
-        if adjusted[i] is not None:
-            result[day] = adjusted[i]
+        adj_val = adjusted[i]
+        if adj_val is not None:
+            result[day] = adj_val
             continue
         before_idx, after_idx = nearest_before[i], nearest_after[i]
         if before_idx is not None and after_idx is not None:
-            span = after_idx - before_idx
-            weight = (i - before_idx) / span
-            result[day] = adjusted[before_idx] + weight * (adjusted[after_idx] - adjusted[before_idx])
+            adj_before = adjusted[before_idx]
+            adj_after = adjusted[after_idx]
+            if adj_before is not None and adj_after is not None:
+                span = after_idx - before_idx
+                weight = (i - before_idx) / span
+                result[day] = adj_before + weight * (adj_after - adj_before)
         elif before_idx is not None:
             result[day] = _scaled_by_anchor_ratio(before_idx, day)  # trailing edge
         elif after_idx is not None:
@@ -3153,7 +3160,7 @@ class InverseMartingaleLedger:
         # history"). The most RECENT events are the ones actually useful
         # for debugging a live cycle; older ones are dropped once the cap
         # is exceeded.
-        event = {
+        event: dict[str, Any] = {
             "status_before": step.status_before,
             "status_after": step.status_after,
             "accumulated_usd_before": step.accumulated_usd_before,

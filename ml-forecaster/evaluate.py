@@ -31,7 +31,7 @@ import hashlib
 import math
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -226,8 +226,8 @@ def evaluate_walk_forward(
 
     folds: list[FoldResult] = []
     for fold_number, (train_idx, test_idx) in enumerate(splits, start=1):
-        train = dataset.iloc[train_idx]
-        test = dataset.iloc[test_idx]
+        train = cast(pd.DataFrame, dataset.iloc[train_idx])
+        test = cast(pd.DataFrame, dataset.iloc[test_idx])
 
         fitted = model_module.fit(train, alpha=alpha, model_version=f"walkforward-fold-{fold_number}")
         actual = test[TARGET_COLUMN].to_numpy(dtype=float)

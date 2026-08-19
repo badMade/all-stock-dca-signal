@@ -270,7 +270,13 @@ select = ["E", "F", "I", "B"]
 ignore = ["E501"]
 
 [tool.pyright]
-extraPaths = ["scripts"]
+extraPaths = [
+    "scripts",
+    "ml-forecaster",
+    "ticker-advisor",
+    "production-safe-agent-loop",
+    "wondrous-octopus",
+]
 typeCheckingMode = "basic"
 reportGeneralTypeIssues = false
 

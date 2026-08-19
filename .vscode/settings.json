@@ -1,5 +1,9 @@
 {
   "python.analysis.extraPaths": [
-    "${workspaceFolder}/scripts"
+    "${workspaceFolder}/scripts",
+    "${workspaceFolder}/ml-forecaster",
+    "${workspaceFolder}/ticker-advisor",
+    "${workspaceFolder}/production-safe-agent-loop",
+    "${workspaceFolder}/wondrous-octopus"
   ]
 }

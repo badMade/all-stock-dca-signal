@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
@@ -26,14 +26,14 @@ from run_dca import (
 )
 
 
-def _now(day=(2026, 7, 6)):
-    return datetime.combine(datetime(*day).date(), time(15, 45), tzinfo=cast(Any, EASTERN))
+def _now(day: tuple[int, int, int] = (2026, 7, 6)):
+    return datetime.combine(date(*day), time(15, 45), tzinfo=cast(Any, EASTERN))
 
 
-def _now_for_slot(slot, day=(2026, 7, 6)):
+def _now_for_slot(slot, day: tuple[int, int, int] = (2026, 7, 6)):
     """``now`` at exactly ``slot``'s own scheduled ET time, so a run_slot() call
     under test passes _validate_slot_schedule's +/-5-minute window check."""
-    return datetime.combine(datetime(*day).date(), _slot_time_et(slot), tzinfo=cast(Any, EASTERN))
+    return datetime.combine(date(*day), _slot_time_et(slot), tzinfo=cast(Any, EASTERN))
 
 
 def _demo_config():
@@ -3329,7 +3329,7 @@ def test_cli_demo_does_not_touch_the_real_cron_tracking_root(tmp_path, monkeypat
     real_temporary_directory = run_dca.tempfile.TemporaryDirectory
 
     class _NonCleaningTemporaryDirectory(real_temporary_directory):
-        def __exit__(self, exc_type=None, exc_val=None, exc_tb=None):
+        def __exit__(self, exc=None, value=None, tb=None):
             # TemporaryDirectory also registers a weakref.finalize at
             # construction time that deletes the directory on garbage
             # collection, independent of __exit__ -- detach it too, or the
