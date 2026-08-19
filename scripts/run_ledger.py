@@ -202,8 +202,8 @@ class RunLedger:
         # before the chunk (or a corrupt lower-seq tail) cannot move seq backward.
         max_seq = tail_max or 0
         for event in self._existing_events():
-            seq = event.seq
-            if seq is not None and seq > max_seq:
+            seq = event.get("seq")
+            if _is_seq(seq) and seq > max_seq:
                 max_seq = seq
         return max_seq + 1
 
