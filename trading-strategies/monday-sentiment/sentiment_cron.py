@@ -257,7 +257,7 @@ async def fetch_news_headlines(session: aiohttp.ClientSession, ticker: str, api_
         # never in the URL/params) -- redact it directly rather than
         # collapsing to _sanitize_exception's class-name-only fallback,
         # which would erase useful diagnostic detail for no security gain.
-        safe_exc = str(exc).replace(str(api_key), "***") if api_key else str(exc)
+        safe_exc = str(exc).replace(api_key, "***") if api_key else str(exc)
         log.warning("NewsAPI request failed for %s: %s", ticker, safe_exc)
         return []
     except json.JSONDecodeError:
@@ -1005,17 +1005,17 @@ def send_email(
     except smtplib.SMTPAuthenticationError as exc:
         safe_exc = str(exc)
         if smtp_password:
-            safe_exc = safe_exc.replace(str(smtp_password), "***")
+            safe_exc = safe_exc.replace(smtp_password, "***")
         log.error("SMTP authentication failed: %s", safe_exc)
     except smtplib.SMTPException as exc:
         safe_exc = str(exc)
         if smtp_password:
-            safe_exc = safe_exc.replace(str(smtp_password), "***")
+            safe_exc = safe_exc.replace(smtp_password, "***")
         log.error("SMTP error: %s", safe_exc)
     except OSError as exc:
         safe_exc = str(exc)
         if smtp_password:
-            safe_exc = safe_exc.replace(str(smtp_password), "***")
+            safe_exc = safe_exc.replace(smtp_password, "***")
         log.error("Network error sending email: %s", safe_exc)
     return False
 
@@ -1102,7 +1102,7 @@ def run(args: argparse.Namespace) -> int:
     scored_results = asyncio.run(process_all_tickers())
 
     for ticker, score_res in zip(tickers, scored_results):
-        if isinstance(score_res, Exception):
+        if isinstance(score_res, BaseException):
             safe_exc = _sanitize_exception(score_res)
             # Stack frames only (traceback.format_tb), never format_exception
             # -- the latter's final line is the exception's own str(), which
@@ -1180,7 +1180,7 @@ def run(args: argparse.Namespace) -> int:
     smtp_host   = os.environ.get("SMTP_HOST", "smtp.gmail.com")
     smtp_port_s = os.environ.get("SMTP_PORT", "587")
 
-    if not all([smtp_user, smtp_pass, recipient]):
+    if not (smtp_user and smtp_pass and recipient):
         log.error(
             "Missing SMTP environment variables. "
             "Set SMTP_USER, SMTP_PASSWORD, RECIPIENT_EMAIL."
