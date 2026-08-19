@@ -957,6 +957,37 @@ def _raw_json_safe(value: Any) -> Any:
     return value
 
 
+def _restore_raw_datetimes(value: Any) -> Any:
+    """Restore datetime values after a persisted JSON payload is read back."""
+    if isinstance(value, list):
+        return [_restore_raw_datetimes(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _restore_raw_datetimes(item) for key, item in value.items()}
+    if isinstance(value, str) and "T" in value:
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            pass
+    return value
+
+
+def _bar_from_raw(value: Any) -> Bar:
+    """Build a strategy bar exclusively from its persisted representation."""
+    if not isinstance(value, dict):
+        raise ValueError("persisted bar is not an object")
+    timestamp = _restore_raw_datetimes(value.get("timestamp"))
+    if not isinstance(timestamp, datetime):
+        raise ValueError("persisted bar has no valid timestamp")
+    return Bar(
+        timestamp=timestamp,
+        open=float(value["open"]),
+        high=float(value["high"]),
+        low=float(value["low"]),
+        close=float(value["close"]),
+        volume=float(value["volume"]),
+    )
+
+
 class _RawInputRecorder:
     """Persists connector responses used by a scheduled live run under ``raw/``.
 
@@ -985,22 +1016,50 @@ class _RawInputRecorder:
         self.error: Optional[str] = None
         self._seq = 0
 
-    def persist(self, kind: str, key: str, payload: Any) -> None:
+    def record_error(self, kind: str, key: str, exc: Exception) -> None:
+        """Record a connector/normalization failure as a raw-input failure."""
+        if self.error is None:
+            self.error = f"failed to fetch or normalize {kind} for {key}: {exc}"
+
+    def persist(self, kind: str, key: str, payload: Any) -> Any:
+        """Persist *payload* and return the representation read back from disk."""
         self._seq += 1
         safe_key = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in str(key))
         filename = f"{kind}_{safe_key}_{self._seq}.json"
         try:
-            save_raw_input(
+            path = save_raw_input(
                 self.trading_day_iso,
                 filename,
                 _raw_json_safe(payload),
                 raw_dir=self.raw_dir,
             )
+            persisted = json.loads(Path(path).read_text(encoding="utf-8"))
+            # save_raw_input() may wrap payloads in one or more {"data": ...} envelopes.
+            # Unwrap the normalize_connector_payload envelope (normalized true/false) and
+            # any nested carrier {"data": {...}} layers so computation sees the archived shape.
+            if (
+                isinstance(persisted, dict)
+                and "results" not in persisted
+                and "data" in persisted
+                and "normalized" in persisted
+            ):
+                persisted = persisted["data"]
+            seen_ids: set[int] = set()
+            while (
+                isinstance(persisted, dict)
+                and "results" not in persisted
+                and isinstance(persisted.get("data"), dict)
+            ):
+                if id(persisted) in seen_ids:
+                    break
+                seen_ids.add(id(persisted))
+                persisted = persisted["data"]
         except (OSError, ValueError, TypeError) as exc:
             if self.error is None:
                 self.error = f"failed to persist {filename}: {exc}"
-            return
+            return None
         self.saved_filenames.append(filename)
+        return persisted
 
 
 class _PersistingMarketDataProvider:
@@ -1017,34 +1076,50 @@ class _PersistingMarketDataProvider:
         self._recorder = recorder
 
     def get_previous_close_bar(self, ticker: str, as_of: datetime) -> Optional[Bar]:
-        bar = self._inner.get_previous_close_bar(ticker, as_of)
-        self._recorder.persist("prior_close", ticker, bar)
-        return bar
+        try:
+            bar = self._inner.get_previous_close_bar(ticker, as_of)
+            persisted = self._recorder.persist("prior_close", ticker, bar)
+            return _bar_from_raw(persisted) if persisted is not None else None
+        except Exception as exc:  # noqa: BLE001 - connectors raise arbitrary errors
+            self._recorder.record_error("prior_close", ticker, exc)
+            raise
 
     def get_intraday_bars(
         self, *, ticker: str, start: datetime, end: datetime, interval_minutes: int
     ) -> Sequence[Bar]:
-        bars = self._inner.get_intraday_bars(
-            ticker=ticker, start=start, end=end, interval_minutes=interval_minutes
-        )
-        self._recorder.persist("intraday_bars", ticker, list(bars))
-        return bars
+        try:
+            bars = self._inner.get_intraday_bars(
+                ticker=ticker, start=start, end=end, interval_minutes=interval_minutes
+            )
+            persisted = self._recorder.persist("intraday_bars", ticker, list(bars))
+            return [_bar_from_raw(item) for item in persisted] if persisted is not None else []
+        except Exception as exc:  # noqa: BLE001 - connectors raise arbitrary errors
+            self._recorder.record_error("intraday_bars", ticker, exc)
+            raise
 
     def get_quote(self, ticker: str, as_of: datetime) -> Any:
         get_quote = getattr(self._inner, "get_quote", None)
         if not callable(get_quote):
             return None
-        quote = get_quote(ticker, as_of)
-        self._recorder.persist("quote", ticker, quote)
-        return quote
+        try:
+            quote = get_quote(ticker, as_of)
+            persisted = self._recorder.persist("quote", ticker, quote)
+            return _restore_raw_datetimes(persisted)
+        except Exception as exc:  # noqa: BLE001 - connectors raise arbitrary errors
+            self._recorder.record_error("quote", ticker, exc)
+            raise
 
     def get_bid_ask(self, ticker: str, as_of: datetime) -> Any:
         get_bid_ask = getattr(self._inner, "get_bid_ask", None)
         if not callable(get_bid_ask):
             return None
-        result = get_bid_ask(ticker, as_of)
-        self._recorder.persist("bid_ask", ticker, result)
-        return result
+        try:
+            result = get_bid_ask(ticker, as_of)
+            persisted = self._recorder.persist("bid_ask", ticker, result)
+            return _restore_raw_datetimes(persisted)
+        except Exception as exc:  # noqa: BLE001 - connectors raise arbitrary errors
+            self._recorder.record_error("bid_ask", ticker, exc)
+            raise
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)

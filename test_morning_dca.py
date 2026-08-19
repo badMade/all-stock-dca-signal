@@ -4851,6 +4851,57 @@ def test_persisting_market_data_provider_records_bar_and_quote_responses(tmp_pat
     assert wrapped.source == data.source
 
 
+def test_persisting_market_data_provider_computes_from_round_tripped_payload(tmp_path):
+    class _MutableProvider(DecliningBarsProvider):
+        def get_quote(self, ticker, as_of):
+            return (99.0, as_of)
+
+    data = _MutableProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.03})
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingMarketDataProvider(data, recorder)
+    quote = wrapped.get_quote("AAPL", _now_live())
+
+    # JSON round-tripping changes the connector tuple to a list. Returning
+    # that persisted shape proves computation does not retain the connector's
+    # original in-memory object; datetime restoration keeps the provider API.
+    assert isinstance(quote, list)
+    assert quote[0] == 99.0
+    assert isinstance(quote[1], datetime)
+
+
+def test_scheduled_live_run_blocks_all_orders_when_one_market_fetch_raises(tmp_path):
+    class _PartialOutageProvider(DecliningBarsProvider):
+        def get_previous_close_bar(self, ticker, as_of):
+            if ticker == "BBB":
+                raise RuntimeError("connector outage")
+            return super().get_previous_close_bar(ticker, as_of)
+
+    class _RecordingBroker(FakeLiveBroker):
+        def __init__(self):
+            self.place_calls = []
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.place_calls.append((ticker, notional_usd, ref_id))
+            return super().place_market_buy(ticker, notional_usd, ref_id)
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA", "BBB"))
+    cfg = MorningConfig(
+        tickers=("AAA", "BBB"),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    broker = _RecordingBroker()
+    data = _PartialOutageProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05, "BBB": 0.05})
+
+    result = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE).run(_now_live(), data, broker=broker)
+
+    assert result["artifacts"]["status"] == "blocked"
+    assert result["artifacts"]["error_class"] == "missing_or_invalid_raw_inputs"
+    assert "connector outage" in result["artifacts"]["raw_persistence_error"]
+    assert broker.place_calls == []
+
+
 def test_persisting_broker_adapter_records_buying_power_and_tradability(tmp_path):
     broker = FakeLiveBroker()
     recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
@@ -5026,6 +5077,8 @@ def test_blocked_live_run_preserves_earlier_submission_on_later_raw_failure(tmp_
     assert artifacts["broker_outcomes"]["AAA"]["status"] == "submitted"
     submitted_rows = [c for c in artifacts["buy_candidates"] if c.get("status") == "submitted"]
     assert {c["ticker"] for c in submitted_rows} == {"AAA"}
+    trading_day = _now_live().astimezone(EASTERN).date()
+    assert ex.ledger.day_planned(trading_day) == artifacts["broker_outcomes"]["AAA"]["submitted_amount_usd"]
     on_disk = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
     assert on_disk["broker_outcomes"]["AAA"]["status"] == "submitted"
 
