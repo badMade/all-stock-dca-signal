@@ -1215,6 +1215,27 @@ class _RefIdTrackingBroker:
         self._orders.append((ticker, ref_id, notional_usd, order_id))
         return order_id
 
+    def same_day_order_with_ref_id_prefix_any_state(
+        self, ticker, trading_day, ref_id_prefixes
+    ):
+        return self.same_day_strategy_order_exists_with_ref_id_prefix(
+            ticker, trading_day, ref_id_prefixes
+        )
+
+    def is_tradable_for_whole_share_buy(self, ticker):
+        return True
+
+    def review_whole_share_buy(self, ticker, quantity):
+        return True, "ok"
+
+    def place_whole_share_buy(self, ticker, quantity, ref_id):
+        order_id = f"ORDER-WS-{ticker}-{len(self._orders) + 1}"
+        self._orders.append((ticker, ref_id, quantity, order_id))
+        return order_id
+
+    def get_raw_placement_responses(self):
+        return []
+
 
 def _graded_decision(
     ticker="AAPL",
@@ -1857,12 +1878,9 @@ def test_guarded_top_up_retry_blocks_when_broker_returns_no_order_id():
     # must not be published as status="submitted" with a null order_id --
     # that row would be untraceable in submitted_orders.csv and
     # reconciliation could never match it to a broker fill.
-    class _NoIdDupBroker:
-        def account_number(self):
-            return FIXTURE_ACCOUNT_NUMBER
-
-        def available_buying_power(self):
-            return 1000.0
+    class _NoIdDupBroker(DryRunBroker):
+        def __init__(self):
+            super().__init__(cash=1000.0, account=FIXTURE_ACCOUNT_NUMBER)
 
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return True
@@ -1871,6 +1889,11 @@ def test_guarded_top_up_retry_blocks_when_broker_returns_no_order_id():
             self, ticker, trading_day, ref_id_prefixes
         ):
             return {"dollar_amount": 5.0}  # no id / order_id
+
+        def same_day_order_with_ref_id_prefix_any_state(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return {"dollar_amount": 5.0}
 
         def is_tradable_for_fractional_buy(self, ticker):
             return True
@@ -3083,7 +3106,7 @@ def test_same_stream_duplicate_check_or_assume_exists_fails_closed():
     trading_day = date(2026, 6, 29)
     assert (
         _same_stream_duplicate_check_or_assume_exists(
-            _RaisingBroker(), "AAPL", trading_day, "afternoon"
+            cast(Any, _RaisingBroker()), "AAPL", trading_day, "afternoon"
         )
         is True
     )
@@ -3142,6 +3165,7 @@ def test_guarded_top_up_across_canonical_slots_places_a_new_order_not_a_duplicat
 
     assert outcome["status"] == "submitted"
     assert outcome.get("duplicate_preserved") is not True
+    assert top_up_outcome is not None
     assert top_up_outcome.top_up_guard_result == "incremental_top_up"
     # $10 desired (2.0 base * 5.0 multiplier) - $1.0 already bought = $9.0 incremental.
     assert broker.placed["AAPL"] == 9.0
@@ -3264,7 +3288,7 @@ def test_same_stream_order_exists_fails_closed_when_broker_unsupported():
         pass
 
     with pytest.raises(RuntimeError):
-        _same_stream_order_exists(_LegacyBroker(), "AAPL", date(2026, 6, 29))
+        _same_stream_order_exists(cast(Any, _LegacyBroker()), "AAPL", date(2026, 6, 29))
 
 
 def test_insufficient_buying_power_blocks_before_placement():
@@ -4740,7 +4764,7 @@ def test_manual_run_does_not_touch_latest_scheduled_run_pointer(tmp_path):
         ),
     )
 
-    assert not latest_scheduled_run_path(classification_root).exists()
+    assert not latest_scheduled_run_path(pathlib.Path(classification_root)).exists()
 
 
 def test_confirmation_required_broker_response_recorded_distinctly(tmp_path):
@@ -5671,6 +5695,8 @@ def _afternoon_merge(preserved, placed, exc=None, tmp_path=None):
 
     if exc is None:
         exc = RuntimeError("boom")
+    if tmp_path is None:
+        tmp_path = tempfile.mkdtemp()
 
     out = pathlib.Path(tmp_path) / "slot"
     out.mkdir(parents=True, exist_ok=True)
@@ -6303,7 +6329,7 @@ def test_archive_intraday_observations_without_run_state_path_does_not_persist(
         "archive_observations_safely",
         lambda observations: {"ok": False, "error": "archive unavailable"},
     )
-    artifacts = {"run_id": "r1", "signal_rows": [], "trading_day": "2026-08-03"}
+    artifacts: dict[str, Any] = {"run_id": "r1", "signal_rows": [], "trading_day": "2026-08-03"}
 
     result = m._archive_intraday_observations(artifacts, tmp_path)
 
@@ -6331,7 +6357,7 @@ def test_archive_intraday_observations_does_not_synthesize_missing_run_state(
 
     run_state_path = tmp_path / "run_state.json"
     assert not run_state_path.exists()
-    artifacts = {"run_id": "r1", "signal_rows": [], "trading_day": "2026-08-03"}
+    artifacts: dict[str, Any] = {"run_id": "r1", "signal_rows": [], "trading_day": "2026-08-03"}
 
     result = m._archive_intraday_observations(
         artifacts, tmp_path, run_state_path=run_state_path
@@ -7044,6 +7070,7 @@ def test_ordinary_ladder_order_folds_in_a_qualifying_existing_remainder(tmp_path
     # $5.00 ladder increment (desired 6.00, reusing the preserved $3 base at
     # buy_multiplier 2.0 -- prior 1.00) plus the qualifying $0.50 remainder
     # folded in.
+    assert top_up_outcome is not None
     assert top_up_outcome.incremental_order_amount == 5.50
     assert candidate_outcome["status"] == "submitted"
     assert candidate_outcome["submitted_amount_usd"] == 5.50
@@ -7108,6 +7135,7 @@ def test_ordinary_ladder_order_discards_a_sub_threshold_existing_remainder(tmp_p
     )
 
     # The plain $5.00 ladder increment, with NO remainder folded in.
+    assert top_up_outcome is not None
     assert top_up_outcome.incremental_order_amount == 5.0
     assert top_up_outcome.discarded_pending_credit_usd == 0.30
     assert candidate_outcome["status"] == "submitted"
@@ -7184,6 +7212,7 @@ def test_process_buy_candidate_ignores_pending_credit_outside_the_afternoon_stre
     )
 
     # The plain $5.00 ladder increment -- no fold, no discard, no rounding.
+    assert top_up_outcome is not None
     assert top_up_outcome.incremental_order_amount == 5.0
     assert top_up_outcome.discarded_pending_credit_usd is None
     assert candidate_outcome["status"] == "submitted"
@@ -7250,6 +7279,7 @@ def test_cumulative_credit_discards_small_pending_balance_with_no_new_decline(tm
         running_deployed_7d=0.0,
     )
 
+    assert top_up_outcome is not None
     assert top_up_outcome.top_up_guard_result == TOP_UP_NOT_LOWER_OR_NO_DELTA
     assert top_up_outcome.cumulative_credit_decline_usd is None
     assert top_up_outcome.discarded_pending_credit_usd == 0.20
@@ -7308,6 +7338,7 @@ def test_cumulative_credit_ledger_untouched_when_order_is_blocked(tmp_path):
         running_deployed_7d=0.0,
     )
 
+    assert top_up_outcome is not None
     assert top_up_outcome.cumulative_credit_decline_usd == 1.0
     assert candidate_outcome["status"] == "blocked"
     events = ledger.events(trading_day.isoformat())
@@ -7994,6 +8025,7 @@ def test_dry_run_never_discards_the_live_credit_ledger(tmp_path):
         running_deployed_7d=0.0,
     )
 
+    assert top_up_outcome is not None
     assert top_up_outcome.discarded_pending_credit_usd == 0.10
     assert candidate_outcome["status"] == "skipped"
     # The ledger balance and its event log must be exactly as seeded --
@@ -8153,13 +8185,14 @@ def test_process_buy_candidate_re_evaluates_a_concurrently_enlarged_discard(tmp_
             prior_same_day_allocations={"AAPL": prior},
             scheduled=False,
             run_result=None,
-            credit_ledger=ledger,
+            credit_ledger=cast(Any, ledger),
         ),
         running_deployed_7d=0.0,
     )
 
     # $0.60 (enlarged) + $0.05 decline crosses the $0.50 threshold and
     # rounds up to the broker's $1.00 minimum -- a real order, not a skip.
+    assert top_up_outcome is not None
     assert top_up_outcome.discarded_pending_credit_usd is None
     assert top_up_outcome.cumulative_credit_decline_usd is not None
     assert candidate_outcome["status"] == "submitted"
@@ -8226,7 +8259,7 @@ def test_credit_ledger_settlement_failure_does_not_lose_the_placed_order():
                 prior_same_day_allocations={"AAPL": prior},
                 scheduled=False,
                 run_result=None,
-                credit_ledger=_RaisingSettleLedger(),
+                credit_ledger=cast(Any, _RaisingSettleLedger()),
             ),
             running_deployed_7d=0.0,
         )
@@ -8234,6 +8267,7 @@ def test_credit_ledger_settlement_failure_does_not_lose_the_placed_order():
     finally:
         _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
+    assert top_up_outcome is not None
     assert top_up_outcome.cumulative_credit_decline_usd == 1.0
     assert candidate_outcome["status"] == "submitted"
     assert candidate_outcome["submitted_amount_usd"] == 1.0
@@ -13360,12 +13394,9 @@ def test_robinhood_still_requires_the_digit_shape():
 # (Codex review, PR #219).
 
 
-class _InjectedBroker:
+class _InjectedBroker(DryRunBroker):
     def __init__(self, account: str) -> None:
-        self._account = account
-
-    def account_number(self) -> str:
-        return self._account
+        super().__init__(account=account)
 
 
 def _an_approved_day(config):

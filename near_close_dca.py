@@ -2104,7 +2104,9 @@ class AlpacaBroker:
         list_orders_fn: Optional[
             Callable[[Dict[str, Any]], List[Dict[str, Any]]]
         ] = None,
-        order_fill_fn: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        order_fill_fn: Optional[
+            Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
+        ] = None,
     ) -> None:
         self.config = config or AlpacaConfig()
         self._account = account
@@ -2410,6 +2412,9 @@ class AlpacaBroker:
             order_submitted_at=submitted_at,
             order_filled_at=filled_at,
         )
+
+    def get_raw_placement_responses(self) -> List[Dict[str, Any]]:
+        return []
 
 
 def account_pinning_failure(
@@ -17647,7 +17652,7 @@ def run_daily_compact(
     broker: BrokerAdapter,
     options: Optional[CompactRunOptions] = None,
     **legacy_options: object,
-) -> Dict[str, object]:
+) -> Dict[str, Any]:
     """Run one DCA scan and write only compact, structured daily artifacts.
 
     This is the token/credit-lean daily live path. It deliberately does NOT:
