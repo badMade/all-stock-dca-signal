@@ -1525,14 +1525,15 @@ def validate_classification(rc: Optional[Mapping[str, Any]]) -> ValidationResult
                     "intraday scheduled run must not carry supersedes_cron_id "
                     "(that names the afternoon task's lineage)"
                 )
-            slot_identity = INTRADAY_SLOT_IDENTITIES.get(scheduled_for_et) if isinstance(scheduled_for_et, str) else None
-            if slot_identity is None:
+            if not isinstance(scheduled_for_et, str) or scheduled_for_et not in INTRADAY_SLOT_IDENTITIES:
                 errors.append(
                     "intraday scheduled_for_et must be one of "
                     f"{sorted(INTRADAY_SLOT_IDENTITIES)!r}, got {scheduled_for_et!r}"
                 )
             else:
-                expected_window_start_et, expected_window_end_et, slot_run_id_re = slot_identity
+                expected_window_start_et, expected_window_end_et, slot_run_id_re = INTRADAY_SLOT_IDENTITIES[
+                    scheduled_for_et
+                ]
                 if rc.get("scheduled_window_end_et") != expected_window_end_et:
                     errors.append(
                         f"intraday scheduled_window_end_et must be {expected_window_end_et!r} "
