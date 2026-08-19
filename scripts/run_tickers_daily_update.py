@@ -45,12 +45,29 @@ def _history_mtimes(history_dir: Path) -> dict[str, int]:
 
 
 def _active_tickers(ticker_config: Path) -> set[str]:
-    """Read the active DCA symbols without making the archive depend on DCA code."""
+    """Read the calibrated DCA symbols without making the archive depend on DCA code.
+
+    Includes ``whole_share`` alongside ``active``: generate_per_ticker_sizing.py's
+    build_sizing_payload() calibrates that SAME active-plus-whole-share universe
+    (a whole-share ticker like BYDDY is evaluated by the identical graded ladder --
+    see docs/whole_share_accumulation.md), but this function feeds
+    changed_active_tickers, which gates whether a history-update event even
+    triggers daily_per_ticker_calibration.py's rebuild at all. Without this, a
+    BYDDY-only history update event could never trigger recalibration, and
+    scripts/refresh_active_ticker_histories.py's active_symbols() (this
+    function's own sibling for the OTHER maintenance path) would never even
+    fetch its missing history in the first place -- leaving whole-share sizing
+    permanently on the $1 fallback with no documented manual path to fix it
+    (Codex review: "Include whole-share symbols in history-update events").
+    """
     data = json.loads(ticker_config.read_bytes())
     active = data.get("active")
     if not isinstance(active, list) or not all(isinstance(ticker, str) for ticker in active):
         raise ValueError(f"{ticker_config} must contain an active ticker list")
-    return {ticker.upper() for ticker in active}
+    whole_share = data.get("whole_share", [])
+    if not isinstance(whole_share, list) or not all(isinstance(ticker, str) for ticker in whole_share):
+        raise ValueError(f"{ticker_config}'s whole_share list, if present, must be a list of strings")
+    return {ticker.upper() for ticker in active} | {ticker.upper() for ticker in whole_share}
 
 
 #: Default ceiling on one updater subprocess invocation. The external updater

@@ -252,6 +252,81 @@ def _trading_day(state: Dict[str, Any]) -> Optional[date]:
         return None
 
 
+def deployed_usd_by_claim_date(state: Dict[str, Any]) -> Dict[date, float]:
+    """Like :func:`deployed_usd`, but buckets each submitted candidate's own
+    ``planned_amount_usd`` under its TRUE execution date(s) rather than
+    collapsing everything into this one artifact's own ``trading_day``.
+
+    A whole-share candidate row recovered by a cross-day reconciliation pass
+    (see ``near_close_dca._book_reconciled_whole_share_order``) carries
+    ``whole_share_claim_breakdown`` -- a list of ``{"trading_day",
+    "amount_usd"}`` entries, one per reconciled claim the row aggregates
+    (a single row can combine MULTIPLE claims from DIFFERENT trading days,
+    or a reconciled claim plus today's own fresh submission -- see
+    ``near_close_dca._merge_whole_share_submission_outcomes``). Attributing
+    the row's WHOLE amount to this artifact's own date instead (the
+    pre-existing behavior) made a claim recovered well outside the trailing
+    kill-switch window look like fresh deployment on the very next run, and
+    even an in-window claim's effective window stretched by however many
+    days separated the claim date from the artifact's own date (Codex
+    review: "Attribute reconciled deployment to the claim date", "Preserve
+    the claim date for in-window recoveries"). Each breakdown entry is
+    bucketed under its own ``trading_day``; whatever portion of
+    ``planned_amount_usd`` the breakdown does NOT account for (e.g. today's
+    own fresh contribution aggregated onto the same row) is attributed to
+    this artifact's own ``trading_day``, exactly like an ordinary candidate
+    with no breakdown at all.
+
+    Falls back to a single ``{trading_day: deployed_usd(state)}`` bucket
+    (matching :func:`deployed_usd`'s own fallback) when ``buy_candidates``
+    is absent -- there is no per-candidate detail to split by date in that
+    case.
+    """
+    artifact_day = _trading_day(state)
+    candidates = state.get("buy_candidates")
+    if not isinstance(candidates, list):
+        if artifact_day is None:
+            return {}
+        return {artifact_day: deployed_usd(state)}
+    per_date: Dict[date, float] = {}
+    for c in candidates:
+        if not isinstance(c, dict) or c.get("status") != "submitted":
+            continue
+        try:
+            amount = float(c.get("planned_amount_usd") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        breakdown = c.get("whole_share_claim_breakdown")
+        if not isinstance(breakdown, list) or not breakdown:
+            if artifact_day is None:
+                continue
+            per_date[artifact_day] = round(per_date.get(artifact_day, 0.0) + amount, 2)
+            continue
+        accounted_usd = 0.0
+        for entry in breakdown:
+            if not isinstance(entry, dict):
+                continue
+            raw_day = entry.get("trading_day")
+            try:
+                entry_amount = float(entry.get("amount_usd") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            entry_day = artifact_day
+            if isinstance(raw_day, str):
+                try:
+                    entry_day = date.fromisoformat(raw_day[:10])
+                except ValueError:
+                    entry_day = artifact_day
+            accounted_usd += entry_amount
+            if entry_day is None:
+                continue
+            per_date[entry_day] = round(per_date.get(entry_day, 0.0) + entry_amount, 2)
+        remainder = round(amount - accounted_usd, 2)
+        if remainder and artifact_day is not None:
+            per_date[artifact_day] = round(per_date.get(artifact_day, 0.0) + remainder, 2)
+    return per_date
+
+
 # --- Deployment accounting (stream-aware) ------------------------------------
 
 def deployed_by_day(
@@ -291,10 +366,8 @@ def deployed_by_day(
             and not is_afternoon_scheduled_evidence(state)
         ):
             continue
-        day = _trading_day(state)
-        if day is None:
-            continue
-        per_day[day] = round(per_day.get(day, 0.0) + deployed_usd(state), 2)
+        for claim_day, amount in deployed_usd_by_claim_date(state).items():
+            per_day[claim_day] = round(per_day.get(claim_day, 0.0) + amount, 2)
     return per_day
 
 

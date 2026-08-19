@@ -1,7 +1,7 @@
 {
   "policy_id": "market-open-dca-live-v1",
   "version": "2026-08-02",
-  "purpose": "Configuration and separation policy for the MARKET-OPEN graded-DCA stream: a single 9:35 AM ET live Robinhood execution (cron 2ba19526, run_type='market_open_dca_live', trades=true) on account <ROBINHOOD_ACCOUNT_NUMBER>. It uses the SAME shared 0x-to-5x ladder and dynamic $1/$2 base, the same active universe (excluding BYDDY/VCX/TRLV/RVI), and the same shared $180/$900 Normal-tier ceiling as every other live stream. It is INDEPENDENT of, and never valid evidence for, the morning (42173154), midday (a6239dae), intraday (7be82b97), or afternoon (10ce362c) streams.",
+  "purpose": "Configuration and separation policy for the MARKET-OPEN graded-DCA stream: a single 9:35 AM ET live Robinhood execution (cron 2ba19526, run_type='market_open_dca_live', trades=true) on account <ROBINHOOD_ACCOUNT_NUMBER>. It uses the SAME shared 0x-to-5x ladder and dynamic $1/$2 base, the same active universe (excluding BYDDY), and the same shared $180/$900 Normal-tier ceiling as every other live stream. It is INDEPENDENT of, and never valid evidence for, the morning (42173154), midday (a6239dae), intraday (7be82b97), or afternoon (10ce362c) streams.",
   "stream": "market_open",
   "added_on_et": "2026-08-02",
   "added_reason": "Until now this slot had no in-repo Python entry point (config/scheduled_tasks.json:2ba19526 no_python_entry_point=true): an external scheduler/agent ran it directly from the task manifest's prose, so NONE of this repo's code enforced its trading-window cutoff, budget ledger, per-order ceiling, or same-day top-up guard. market_open_dca.py closes that gap by reusing the same MorningDCAExecutor pipeline the 10:30 and 12:30 streams already run on.",

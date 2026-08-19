@@ -26,6 +26,7 @@ from near_close_dca import (
     DryRunBroker,
     OrderFill,
     StrategyConfig,
+    WholeSharePlacementTerminalError,
     build_broker,
 )
 
@@ -558,11 +559,336 @@ def test_broker_review_permissive_without_callable():
     assert ok is True
 
 
+# -- RobinhoodBroker whole-share (quantity-based) orders -----------------------
+# See dca_whole_share_accumulator.py / docs/whole_share_accumulation.md -- these
+# mirror place_market_buy/review_market_buy's tests exactly, but through the
+# quantity= argument path instead of dollar_amount=.
+
+
+def test_broker_whole_share_place_raises_when_live_gate_disabled():
+    calls = []
+    broker = RobinhoodBroker(
+        account="999000111", place_fn=lambda **k: calls.append(k) or {"data": {"order": {"id": "X"}}}
+    )
+    with pytest.raises(RuntimeError, match="live gate disabled"):
+        broker.place_whole_share_buy("BYDDY", 1, "ref1")
+    assert calls == []
+
+
+def test_broker_whole_share_place_live_when_gated_on():
+    calls = []
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: calls.append(k) or {"data": {"order": {"id": "ORD-42"}}},
+    )
+    assert broker.place_whole_share_buy("BYDDY", 1, "ref1") == "ORD-42"
+    assert calls[0]["quantity"] == "1"
+    assert "dollar_amount" not in calls[0]
+
+
+def test_broker_whole_share_place_live_multiple_shares_passes_quantity():
+    calls = []
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: calls.append(k) or {"data": {"order": {"id": "ORD-43"}}},
+    )
+    assert broker.place_whole_share_buy("BYDDY", 3, "ref2") == "ORD-43"
+    assert calls[0]["quantity"] == "3"
+
+
+def test_broker_whole_share_place_raises_terminal_error_when_outer_failure_has_an_inner_order_id():
+    """Codex review ("Preserve accepted nonterminal orders in failure
+    envelopes"): an inner order with a usable id is real evidence of a
+    broker attempt regardless of its (possibly absent) state -- it must be
+    preserved via WholeSharePlacementTerminalError, not discarded as a bare
+    RuntimeError, so the caller's own terminal-vs-live discrimination can
+    see it.
+    """
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {"success": False, "data": {"order": {"id": "ORD-9"}}},
+    )
+    with pytest.raises(WholeSharePlacementTerminalError, match="real broker attempt") as exc_info:
+        broker.place_whole_share_buy("BYDDY", 1, "ref1")
+    assert exc_info.value.order == {"id": "ORD-9"}
+
+
+def test_broker_whole_share_place_raises_plain_error_on_outer_failure_with_no_inner_order():
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {"success": False, "error": "insufficient buying power"},
+    )
+    with pytest.raises(RuntimeError, match="failed"):
+        broker.place_whole_share_buy("BYDDY", 1, "ref1")
+
+
+def test_broker_whole_share_place_live_raises_on_terminal_state():
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {"data": {"order": {"id": "ORD-7", "state": "rejected"}}},
+    )
+    with pytest.raises(RuntimeError, match="terminal state"):
+        broker.place_whole_share_buy("BYDDY", 1, "ref1")
+
+
+def test_broker_whole_share_place_live_raises_on_expired_state():
+    """Codex review ("Reject expired whole-share placement responses"):
+    "expired" is a terminal, non-live state exactly like rejected/failed/
+    cancelled/voided (see _LIVE_ORDER_STATES's own comment, which already
+    excludes it from the live-order set). Without rejecting it here too,
+    the caller would treat this response as a successful full submission
+    and settle the claim for the entire requested quantity even if no
+    shares actually executed.
+    """
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {"data": {"order": {"id": "ORD-8", "state": "expired"}}},
+    )
+    with pytest.raises(RuntimeError, match="terminal state"):
+        broker.place_whole_share_buy("BYDDY", 1, "ref1")
+
+
+def test_broker_whole_share_place_live_terminal_error_carries_the_order_payload():
+    """Codex review ("Reconcile terminal fills from the placement
+    response"): a terminal placement response is already authoritative
+    evidence of what executed (state + cumulative_quantity + average_price)
+    -- discarding it in favor of a bare RuntimeError forces the caller to
+    depend exclusively on a SEPARATE, later order-history lookup that can
+    itself be eventually consistent and report a clean "no match" for an
+    order this very response already proved landed, silently restoring
+    credit for shares that actually executed. The raised exception must
+    carry the raw order payload so the caller can settle directly from it.
+    """
+    order_payload = {
+        "id": "ORD-CANCELED-WITH-FILL",
+        "state": "cancelled",
+        "cumulative_quantity": "1",
+        "average_price": "10.25",
+    }
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {"data": {"order": order_payload}},
+    )
+    with pytest.raises(WholeSharePlacementTerminalError, match="terminal state") as exc_info:
+        broker.place_whole_share_buy("BYDDY", 1, "ref1")
+    assert exc_info.value.order == order_payload
+
+
+def test_broker_whole_share_place_live_preserves_an_inner_order_from_an_outer_failure():
+    """Codex review ("Preserve inner orders from failure envelopes"): an
+    outer {"success": false, ...} envelope can still carry an inner order
+    that reached the broker and reports its own terminal state and
+    cumulative_quantity -- e.g. a partially filled order that was then
+    cancelled, with the cancellation surfaced as the outer failure. The old
+    behavior raised a bare RuntimeError as soon as the outer envelope
+    failed, discarding that inner order entirely: if the separate
+    order-history endpoint had not yet indexed the order, the caller's
+    placement-failure reconciliation found nothing and restored the full
+    reservation, making the already-executed share's credit reusable. The
+    inner order must be surfaced via WholeSharePlacementTerminalError, just
+    like a terminal order found in a SUCCESSFUL outer envelope already is.
+    """
+    order_payload = {
+        "id": "ORD-OUTER-FAILURE-WITH-FILL",
+        "state": "cancelled",
+        "cumulative_quantity": "1",
+        "average_price": "10.25",
+    }
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {"success": False, "error": "order rejected downstream", "data": {"order": order_payload}},
+    )
+    with pytest.raises(WholeSharePlacementTerminalError, match="real broker attempt") as exc_info:
+        broker.place_whole_share_buy("BYDDY", 1, "ref1")
+    assert exc_info.value.order == order_payload
+
+
+def test_broker_whole_share_place_live_preserves_a_bare_order_from_an_outer_failure():
+    """Codex review ("Preserve bare orders in outer failure envelopes"): the
+    unwrapped response's "data" can itself BE the bare order object -- no
+    nested "order" key at all -- exactly the shape the normal success path
+    already handles via `data.get("order") or data`. Checking only for a
+    nested "order" key missed this shape entirely: an outer failure like
+    {"success": false, "data": {"id": ..., "state": "cancelled",
+    "cumulative_quantity": ...}} still fell through to a bare RuntimeError,
+    discarding the terminal fill evidence.
+    """
+    order_payload = {
+        "id": "ORD-BARE-OUTER-FAILURE",
+        "state": "cancelled",
+        "cumulative_quantity": "1",
+        "average_price": "10.25",
+    }
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {"success": False, "error": "order rejected downstream", "data": order_payload},
+    )
+    with pytest.raises(WholeSharePlacementTerminalError, match="real broker attempt") as exc_info:
+        broker.place_whole_share_buy("BYDDY", 1, "ref1")
+    assert exc_info.value.order == order_payload
+
+
+def test_broker_whole_share_place_live_preserves_a_still_live_inner_order_from_an_outer_failure():
+    """Codex review ("Preserve accepted nonterminal orders in failure
+    envelopes"): an inner order that is still LIVE/working (e.g. "new" or
+    "confirmed"), not yet terminal, is just as real a broker acceptance as
+    a terminal one -- discarding it (an earlier version of this fix did,
+    only preserving TERMINAL inner states) forced the caller to rely
+    exclusively on its own separate order-history lookups, which can BOTH
+    independently miss a just-accepted, not-yet-indexed order and restore
+    the full reservation while it is still live at the broker.
+    """
+    order_payload = {"id": "ORD-STILL-LIVE", "state": "confirmed"}
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {"success": False, "error": "connector timeout", "data": {"order": order_payload}},
+    )
+    with pytest.raises(WholeSharePlacementTerminalError, match="real broker attempt") as exc_info:
+        broker.place_whole_share_buy("BYDDY", 1, "ref1")
+    assert exc_info.value.order == order_payload
+
+
+def test_broker_whole_share_place_live_raises_plain_error_when_outer_failure_has_no_inner_order():
+    """Companion to the preservation test above: an outer failure with NO
+    usable inner order (e.g. a bare validation error, no order ever
+    attempted) must still raise a plain RuntimeError -- there is nothing to
+    preserve.
+    """
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {"success": False, "error": "invalid symbol"},
+    )
+    with pytest.raises(RuntimeError, match="invalid symbol") as exc_info:
+        broker.place_whole_share_buy("BYDDY", 1, "ref1")
+    assert not isinstance(exc_info.value, WholeSharePlacementTerminalError)
+
+
+def test_broker_whole_share_place_live_raises_on_missing_order_id():
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {"data": {"order": {"status": "rejected"}}},
+    )
+    with pytest.raises(RuntimeError, match="no order id"):
+        broker.place_whole_share_buy("BYDDY", 1, "ref1")
+
+
+@pytest.mark.parametrize("bad_quantity", [0, -1])
+def test_broker_whole_share_place_rejects_nonpositive_quantity(bad_quantity):
+    broker = RobinhoodBroker(account="999000111", enable_live_orders=True, place_fn=lambda **k: {})
+    with pytest.raises(ValueError):
+        broker.place_whole_share_buy("BYDDY", bad_quantity, "ref1")
+
+
+def test_broker_whole_share_review_fails_closed_when_live_without_review_fn():
+    live = RobinhoodBroker(enable_live_orders=True)
+    ok, reason = live.review_whole_share_buy("BYDDY", 1)
+    assert ok is False and "no review callable" in reason
+    assert RobinhoodBroker(enable_live_orders=False).review_whole_share_buy("BYDDY", 1)[0] is True
+
+
+def test_broker_whole_share_review_blocks_on_error_alert():
+    resp = {"data": {"alerts": [{"severity": "error", "message": "insufficient buying power"}]}}
+    broker = RobinhoodBroker(review_fn=lambda **k: resp)
+    ok, reason = broker.review_whole_share_buy("BYDDY", 1)
+    assert ok is False and "insufficient" in reason
+
+
+def test_broker_whole_share_review_passes_on_warning_only():
+    resp = {"data": {"alerts": [{"severity": "warning", "message": "wide spread"}]}}
+    broker = RobinhoodBroker(review_fn=lambda **k: resp)
+    ok, _ = broker.review_whole_share_buy("BYDDY", 1)
+    assert ok is True
+
+
+def test_broker_whole_share_review_permissive_without_callable():
+    broker = RobinhoodBroker()
+    ok, _ = broker.review_whole_share_buy("BYDDY", 1)
+    assert ok is True
+
+
+def test_broker_whole_share_review_passes_quantity_not_dollar_amount():
+    calls = []
+    broker = RobinhoodBroker(review_fn=lambda **k: calls.append(k) or {"data": {}})
+    broker.review_whole_share_buy("BYDDY", 2)
+    assert calls[0]["quantity"] == "2"
+    assert "dollar_amount" not in calls[0]
+
+
+@pytest.mark.parametrize("bad_quantity", [0, -1])
+def test_broker_whole_share_review_rejects_nonpositive_quantity(bad_quantity):
+    broker = RobinhoodBroker()
+    with pytest.raises(ValueError):
+        broker.review_whole_share_buy("BYDDY", bad_quantity)
+
+
 def test_broker_tradability_parsing():
     tradable = {"data": {"results": [{"symbol": "AAPL", "tradeable": True, "state": "active", "fractional_tradability": "tradable"}]}}
     untradable = {"data": {"results": [{"symbol": "AAPL", "tradeable": False, "state": "active", "fractional_tradability": "tradable"}]}}
     assert RobinhoodBroker(tradability_fn=lambda **k: tradable).is_tradable_for_fractional_buy("AAPL") is True
     assert RobinhoodBroker(tradability_fn=lambda **k: untradable).is_tradable_for_fractional_buy("AAPL") is False
+
+
+def test_broker_whole_share_tradability_ignores_fractional_tradability():
+    """Codex review ("Verify whole-share tradability before scheduled
+    placement"): a whole-share ticker (e.g. BYDDY) is in that category
+    PRECISELY because it fails fractional_tradability, so
+    is_tradable_for_whole_share_buy must not require it the way
+    is_tradable_for_fractional_buy does -- only tradeable + active.
+    """
+    not_fractional_but_tradeable = {
+        "data": {
+            "results": [
+                {"symbol": "BYDDY", "tradeable": True, "state": "active", "fractional_tradability": "untradable"}
+            ]
+        }
+    }
+    assert (
+        RobinhoodBroker(tradability_fn=lambda **k: not_fractional_but_tradeable).is_tradable_for_fractional_buy(
+            "BYDDY"
+        )
+        is False
+    )
+    assert (
+        RobinhoodBroker(
+            tradability_fn=lambda **k: not_fractional_but_tradeable
+        ).is_tradable_for_whole_share_buy("BYDDY")
+        is True
+    )
+
+
+def test_broker_whole_share_tradability_still_requires_tradeable_and_active():
+    halted = {"data": {"results": [{"symbol": "BYDDY", "tradeable": False, "state": "halted"}]}}
+    assert RobinhoodBroker(tradability_fn=lambda **k: halted).is_tradable_for_whole_share_buy("BYDDY") is False
+    assert RobinhoodBroker().is_tradable_for_whole_share_buy("BYDDY") is True  # no callable wired -> permissive
+
+
+def test_broker_whole_share_tradability_matches_the_response_symbol_case_insensitively():
+    """Codex review ("Require canonical symbols for whole-share tickers"):
+    unlike "active", "whole_share" had no schema-enforced uppercase pattern,
+    so a config-authored lowercase entry (e.g. "byddy") reaches this call
+    verbatim, while the broker's real API response uses its own canonical
+    (uppercase) casing regardless of what was requested. An exact-match
+    comparison would silently treat every real, tradeable response as
+    "symbol not found" -> not tradable, restoring every fire's deduction
+    instead of ever placing an order.
+    """
+    uppercase_response = {"data": {"results": [{"symbol": "BYDDY", "tradeable": True, "state": "active"}]}}
+    assert (
+        RobinhoodBroker(tradability_fn=lambda **k: uppercase_response).is_tradable_for_whole_share_buy("byddy")
+        is True
+    )
 
 
 def test_broker_same_day_order_detection():
@@ -869,6 +1195,38 @@ def test_robinhood_broker_ref_lookup_rejects_a_single_order_envelope(page):
         RobinhoodBroker(orders_fn=lambda **k: page).strategy_order_with_ref_id(
             "AAPL", datetime(2026, 7, 28).date(), "crashed-fire"
         )
+
+
+def test_robinhood_broker_any_state_ref_lookup_raises_when_history_is_unwired():
+    """Codex review ("Require provable order history before releasing
+    claims"): same_day_order_with_ref_id_prefix_any_state used to iterate
+    the eager _same_day_orders (require_provable_history=False), so an
+    unwired orders_fn returned a clean empty list -- indistinguishable from
+    a scanned-and-empty history. Whole-share reconciliation reads a clean
+    None from this method as permission to restore a stale/placement-
+    failure claim, so an unprovable history must raise here too, exactly
+    like strategy_order_with_ref_id already does for the same purpose.
+    """
+    with pytest.raises(RuntimeError, match="no orders_fn wired"):
+        RobinhoodBroker().same_day_order_with_ref_id_prefix_any_state(
+            "AAPL", datetime(2026, 7, 28).date(), ("crashed-fire",)
+        )
+
+
+def test_robinhood_broker_any_state_ref_lookup_raises_on_an_unrecognizable_page():
+    with pytest.raises(RuntimeError, match="unrecognizable page"):
+        RobinhoodBroker(orders_fn=lambda **k: {"data": {}}).same_day_order_with_ref_id_prefix_any_state(
+            "AAPL", datetime(2026, 7, 28).date(), ("crashed-fire",)
+        )
+
+
+def test_robinhood_broker_any_state_ref_lookup_finds_a_cancelled_order():
+    page = {"data": {"orders": [{"state": "cancelled", "ref_id": "crashed-fire"}]}}
+    order = RobinhoodBroker(orders_fn=lambda **k: page).same_day_order_with_ref_id_prefix_any_state(
+        "AAPL", datetime(2026, 7, 28).date(), ("crashed-fire",)
+    )
+    assert order is not None
+    assert order["state"] == "cancelled"
 
 
 def test_robinhood_broker_pagination_stops_on_an_echoed_cursor():

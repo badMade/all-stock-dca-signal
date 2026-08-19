@@ -42,6 +42,7 @@ from close_window_signal import (  # noqa: E402
 )
 from foreground_primary import (  # noqa: E402
     FINDING_BROKER_MISMATCH,
+    FINDING_FOREGROUND_DRIFT,
     FINDING_SAFETY_FAILURE,
     FOREGROUND_PRIMARY_MARKER,
     REASON_NO_ARTIFACTS,
@@ -52,6 +53,7 @@ from foreground_primary import (  # noqa: E402
     detect_foreground_primary_context,
     evaluate_scheduled_evidence_alert,
     find_foreground_primary_markers,
+    reconcile_foreground_orders,
 )
 
 TODAY = "2026-07-30"
@@ -516,6 +518,46 @@ def test_close_window_summary_is_pure_and_writes_nothing(tmp_path, monkeypatch):
         trading_day=TODAY,
     )
     assert set(tmp_path.iterdir()) == before
+
+
+def test_reconcile_foreground_orders_passes_when_the_single_order_id_matches():
+    artifact = {"buy_candidates": [{"ticker": "AAPL", "order_id": "RH-1"}]}
+    assert reconcile_foreground_orders([artifact], fills=[{"order_id": "RH-1"}]) == []
+
+
+def test_reconcile_foreground_orders_flags_a_mismatched_single_order_id():
+    artifact = {"buy_candidates": [{"ticker": "AAPL", "order_id": "RH-GHOST"}]}
+    assert reconcile_foreground_orders([artifact], fills=[{"order_id": "RH-1"}]) == [FINDING_FOREGROUND_DRIFT]
+
+
+def test_reconcile_foreground_orders_checks_every_aggregated_whole_share_id():
+    """Codex review ("Reconcile every ID in aggregated whole-share
+    outcomes"): a row aggregating two recovered whole-share claims (see
+    near_close_dca._merge_whole_share_submission_outcomes) keeps "order_id"
+    as a single scalar -- the NEWER of the two ids -- while
+    "whole_share_order_ids" carries every distinct id the row actually
+    represents. Checking only the scalar "order_id" can pass while an
+    OLDER aggregated id is absent from the broker's own fill records,
+    hiding a real discrepancy.
+    """
+    artifact = {
+        "buy_candidates": [
+            {
+                "ticker": "BYDDY",
+                "order_id": "RH-NEWER",
+                "whole_share_order_ids": ["RH-OLDER", "RH-NEWER"],
+            }
+        ]
+    }
+    # The scalar order_id matches broker fills, but the older aggregated id
+    # does not -- this must still be flagged as drift.
+    assert reconcile_foreground_orders(
+        [artifact], fills=[{"order_id": "RH-NEWER"}]
+    ) == [FINDING_FOREGROUND_DRIFT]
+    # With BOTH aggregated ids backed by broker fills, no drift.
+    assert reconcile_foreground_orders(
+        [artifact], fills=[{"order_id": "RH-NEWER"}, {"order_id": "RH-OLDER"}]
+    ) == []
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -480,6 +480,27 @@ def test_load_current_universe_reads_active_and_excluded(tmp_path):
     assert excluded == frozenset({"BANNED"})
 
 
+def test_load_current_universe_folds_whole_share_into_active(tmp_path):
+    # config/tickers.json's third category, `whole_share` (tickers not
+    # tradable for fractional buys, accumulated toward a whole share
+    # instead -- see docs/whole_share_accumulation.md), is disjoint from
+    # `active` and `excluded` by the schema's own invariant. Without
+    # folding it into the returned "active" set here, a whole-share
+    # symbol like BYDDY would be neither active nor excluded from this
+    # advisor's perspective and could be scored and proposed as a
+    # duplicate ADD, skewing every other candidate's z-score
+    # normalization (Codex review: "Exclude whole-share symbols from
+    # ticker-advisor candidates").
+    (tmp_path / "config").mkdir()
+    payload = {"active": ["AAPL", "MSFT"], "excluded": ["BANNED"], "whole_share": ["BYDDY"]}
+    (tmp_path / "config" / "tickers.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    active, excluded = _load_current_universe(tmp_path)
+
+    assert active == frozenset({"AAPL", "MSFT", "BYDDY"})
+    assert excluded == frozenset({"BANNED"})
+
+
 def test_load_current_universe_uppercases_entries(tmp_path):
     # Candidates are normalized to uppercase (_load_candidates()'s
     # .strip().upper()) -- a lowercase/mixed-case entry in

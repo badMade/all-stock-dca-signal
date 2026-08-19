@@ -38,6 +38,7 @@ from near_close_dca import (
     TOP_UP_NO_PRIOR_RUN,
     TOP_UP_NOT_LOWER_OR_NO_DELTA,
     USAGE_PROXY_FIELDS,
+    WHOLE_SHARE_TICKERS,
     Action,
     AlpacaBroker,
     AlpacaConfig,
@@ -262,11 +263,23 @@ def test_ticker_universe():
     assert "GLW" in ACTIVE_TICKERS
     assert "IRDMI" not in ACTIVE_TICKERS
     assert "GLWR" not in ACTIVE_TICKERS
-    assert "BYDDY" in EXCLUDED_TICKERS
+    # Nothing is categorically excluded (no buying mechanism at all) today.
+    assert EXCLUDED_TICKERS == frozenset()
+    # BYDDY is not tradable for fractional/notional buys on Robinhood, so it
+    # lives in its own WHOLE_SHARE_TICKERS category (see
+    # config/tickers.json's exclusion_reasons/whole_share and
+    # docs/whole_share_accumulation.md) instead of ACTIVE_TICKERS or
+    # EXCLUDED_TICKERS.
+    assert WHOLE_SHARE_TICKERS == frozenset({"BYDDY"})
     assert "BYDDY" not in ACTIVE_TICKERS
-    for excluded in ("VCX", "TRLV"):
-        assert excluded in EXCLUDED_TICKERS
-        assert excluded not in ACTIVE_TICKERS
+    assert "BYDDY" not in EXCLUDED_TICKERS
+    # RVI, VCX, and TRLV were excluded 2026-08-05, then re-added 2026-08-16 at
+    # the owner's explicit request (see config/tickers.json notes).
+    for reinstated in ("RVI", "VCX", "TRLV"):
+        assert reinstated in ACTIVE_TICKERS
+        assert reinstated not in EXCLUDED_TICKERS
+    for added in ("QBUT", "RVII"):
+        assert added in ACTIVE_TICKERS
 
 
 # --- Target price selection --------------------------------------------------
@@ -8336,6 +8349,262 @@ def test_load_prior_same_day_counts_a_failed_attempt_with_zero_amount(tmp_path):
     assert allocations["AAPL"].reference_price is None
 
 
+def test_load_prior_same_day_excludes_a_cross_day_whole_share_recovery_from_attempt_count(tmp_path):
+    """Codex review ("Keep recovered attempts on their original claim
+    dates"): a whole-share candidate row whose ENTIRE
+    whole_share_claim_breakdown points at a trading day strictly BEFORE
+    this artifact's own trading_day is a cross-day RECOVERY of an order
+    that was actually attempted (and already counted toward
+    max_orders_per_day) on that earlier day, not a new attempt made today.
+    Counting it again here would seed a later same-day retry's own attempt
+    count as if the historical order were a fresh same-day attempt,
+    potentially blocking a legitimate new order today.
+    """
+    root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    _write_prior_run(
+        root,
+        "20260629_1230ET",
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T12:30:00-04:00",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "run_type": "midday_dca_live",
+                "stream": "midday",
+                "run_id": "midday_live_20260629_1230ET",
+            },
+            "buy_candidates": [
+                {
+                    "ticker": "BYDDY",
+                    "status": "submitted",
+                    "planned_amount_usd": 10.0,
+                    "whole_share_claim_breakdown": [
+                        {"trading_day": "2026-06-27", "amount_usd": 10.0},
+                    ],
+                },
+            ],
+        },
+    )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["BYDDY"].attempt_count == 0
+
+
+def test_load_prior_same_day_excludes_a_cross_day_zero_fill_recovery_from_attempt_count(tmp_path):
+    """Codex review ("Keep recovered zero-fill attempts on the claim
+    day"): a confirmed zero-fill recovery (see
+    _book_reconciled_whole_share_order's own zero_fill_attempt branch)
+    used to record the claim's original trading day only inside the
+    free-text skip_reason, with no whole_share_claim_breakdown at all --
+    the SAME cross-day exclusion this file already covers for a real
+    settled recovery (see the sibling test just above) evaluated False for
+    a zero-fill row, since the exclusion check reads ONLY the
+    machine-readable breakdown, never skip_reason text. A cross-day
+    zero-fill attempt was therefore double counted: once via
+    ctx.state.record_buy(..., claim_trading_day_date, 0.0) at recovery
+    time, and again here when a LATER run reloaded the artifact.
+    """
+    root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    _write_prior_run(
+        root,
+        "20260629_1230ET",
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T12:30:00-04:00",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "run_type": "midday_dca_live",
+                "stream": "midday",
+                "run_id": "midday_live_20260629_1230ET",
+            },
+            "buy_candidates": [
+                {
+                    "ticker": "BYDDY",
+                    "status": "failed",
+                    "planned_amount_usd": 0.0,
+                    "skip_reason": (
+                        "whole-share: confirmed zero-fill terminal order reconciled cross-day "
+                        "(trading_day=2026-06-27)"
+                    ),
+                    "whole_share_zero_fill_attempt": True,
+                    "whole_share_claim_breakdown": [
+                        {"trading_day": "2026-06-27", "amount_usd": 0.0},
+                    ],
+                },
+            ],
+        },
+    )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["BYDDY"].attempt_count == 0
+
+
+def test_load_prior_same_day_counts_a_whole_share_row_whose_breakdown_includes_today(tmp_path):
+    """Companion to the cross-day-exclusion test above: a whole-share row
+    whose breakdown includes TODAY's own trading day (e.g. a recovered
+    older claim aggregated with today's own fresh contribution) still
+    counts as a real attempt made today.
+    """
+    root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    _write_prior_run(
+        root,
+        "20260629_1230ET",
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T12:30:00-04:00",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "run_type": "midday_dca_live",
+                "stream": "midday",
+                "run_id": "midday_live_20260629_1230ET",
+            },
+            "buy_candidates": [
+                {
+                    "ticker": "BYDDY",
+                    "status": "submitted",
+                    "planned_amount_usd": 20.0,
+                    "whole_share_claim_breakdown": [
+                        {"trading_day": "2026-06-27", "amount_usd": 10.0},
+                        {"trading_day": "2026-06-29", "amount_usd": 10.0},
+                    ],
+                },
+            ],
+        },
+    )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["BYDDY"].attempt_count == 1
+
+
+def test_load_prior_same_day_omits_a_cross_day_whole_share_recovery_from_todays_amount(tmp_path):
+    """Codex review ("Bucket recovered notional by its claim date"): a
+    whole-share candidate row whose ENTIRE whole_share_claim_breakdown
+    points at an earlier trading day is a cross-day RECOVERY -- its
+    dollars already contributed to THAT day's own allocation on the
+    earlier run that recorded it. Counting the row's full
+    planned_amount_usd again under TODAY's own bucket would double-count
+    it, and since _compute_earlier_week_cross_stream_notional() reuses
+    this loader to seed the shared weekly cap, that misattributes a prior
+    week's already-spent recovery as current-week spend.
+    """
+    root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    _write_prior_run(
+        root,
+        "20260629_1230ET",
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T12:30:00-04:00",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "run_type": "midday_dca_live",
+                "stream": "midday",
+                "run_id": "midday_live_20260629_1230ET",
+            },
+            "buy_candidates": [
+                {
+                    "ticker": "BYDDY",
+                    "status": "submitted",
+                    "planned_amount_usd": 10.0,
+                    "whole_share_claim_breakdown": [
+                        {"trading_day": "2026-06-27", "amount_usd": 10.0},
+                    ],
+                },
+            ],
+        },
+    )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert "BYDDY" not in allocations or allocations["BYDDY"].amount_usd == 0.0
+
+
+def test_load_prior_same_day_splits_a_mixed_whole_share_breakdown_by_claim_date(tmp_path):
+    """Companion to the cross-day-omission test above: a whole-share row
+    whose breakdown mixes an older recovered claim with today's own fresh
+    contribution attributes only TODAY's own portion to today's bucket,
+    not the row's full combined amount.
+    """
+    root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    _write_prior_run(
+        root,
+        "20260629_1230ET",
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T12:30:00-04:00",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "run_type": "midday_dca_live",
+                "stream": "midday",
+                "run_id": "midday_live_20260629_1230ET",
+            },
+            "buy_candidates": [
+                {
+                    "ticker": "BYDDY",
+                    "status": "submitted",
+                    "planned_amount_usd": 20.0,
+                    "whole_share_claim_breakdown": [
+                        {"trading_day": "2026-06-27", "amount_usd": 10.0},
+                        {"trading_day": "2026-06-29", "amount_usd": 10.0},
+                    ],
+                },
+            ],
+        },
+    )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["BYDDY"].amount_usd == pytest.approx(10.0)
+
+
+def test_load_prior_same_day_preserves_a_fresh_contribution_merged_with_an_older_recovery(tmp_path):
+    """Codex review ("Preserve fresh notional in mixed recovery rows"): a
+    row can merge an OLDER recovered claim (which DOES carry its own
+    whole_share_claim_breakdown entry) with a genuinely FRESH order placed
+    TODAY (which does NOT -- only a reconciled recovery ever gets a
+    breakdown entry; see _merge_whole_share_submission_outcomes). Summing
+    only the breakdown entries matching today would then attribute $0 to
+    that fresh order entirely, dropping real submitted capital from
+    same-day/weekly-cap reconstruction.
+    """
+    root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    _write_prior_run(
+        root,
+        "20260629_1230ET",
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T12:30:00-04:00",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "run_type": "midday_dca_live",
+                "stream": "midday",
+                "run_id": "midday_live_20260629_1230ET",
+            },
+            "buy_candidates": [
+                {
+                    "ticker": "BYDDY",
+                    "status": "submitted",
+                    # $30 total: $10 from the older recovered claim (carries
+                    # its own breakdown entry) + $20 from a fresh order
+                    # placed today (no breakdown entry of its own).
+                    "planned_amount_usd": 30.0,
+                    "whole_share_claim_breakdown": [
+                        {"trading_day": "2026-06-27", "amount_usd": 10.0},
+                    ],
+                },
+            ],
+        },
+    )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    # Only the fresh $20 (the row's $30 total minus the $10 already
+    # attributed to the older claim's own day) is attributed to today.
+    assert allocations["BYDDY"].amount_usd == pytest.approx(20.0)
+
+
 def test_load_prior_same_day_counts_every_attempt_for_one_ticker(tmp_path):
     """A ticker bought once and re-attempted-and-failed twice in the same
     earlier run is 3 attempts, not 1 -- even though only one of them
@@ -12420,6 +12689,186 @@ def test_a_failure_synthesized_candidate_row_satisfies_the_schema():
     # are gated (importorskip: a real SKIP, never a false PASS).
     jsonschema = pytest.importorskip("jsonschema")
     jsonschema.validate(row, item_schema)
+
+
+def test_a_failure_synthesized_candidate_row_preserves_whole_share_fields():
+    """Codex review ("Preserve whole-share fields in failure candidate
+    rows"): when an accepted whole-share order is followed by an exception
+    while a LATER candidate is processed, the failure writer rebuilds
+    run_state.json's canonical buy_candidates through _failure_candidate_row,
+    which must carry the whole_share_pending_usd/whole_share_contribution_usd/
+    whole_share_quantity fields _build_buy_candidates's own success path sets
+    -- otherwise downstream reporting silently loses the whole-share
+    settlement details specifically on failed-after-submission runs.
+    """
+    from near_close_dca import _failure_candidate_row
+
+    row = _failure_candidate_row(
+        "BYDDY",
+        {
+            "status": "submitted",
+            "order_id": "o-1",
+            "submitted_amount_usd": 10.0,
+            "buy_multiplier": 1.0,
+            "skip_reason": None,
+            "whole_share_pending_usd": 5.0,
+            "whole_share_contribution_usd": 15.0,
+            "whole_share_quantity": 1,
+            "whole_share_settlement_reconciliation_needed": True,
+            "whole_share_settlement_shortfall_usd": 8.0,
+        },
+    )
+
+    assert row["whole_share_pending_usd"] == 5.0
+    assert row["whole_share_contribution_usd"] == 15.0
+    assert row["whole_share_quantity"] == 1
+    # Codex review ("Preserve clamped shortfalls when settlement fails"):
+    # the failure-path row builder must carry this pair through too.
+    assert row["whole_share_settlement_reconciliation_needed"] is True
+    assert row["whole_share_settlement_shortfall_usd"] == 8.0
+
+
+def test_a_failure_synthesized_candidate_row_preserves_claim_metadata():
+    """Codex review ("Preserve claim metadata in failure candidate rows"):
+    this failure-path rebuild is a SEPARATE artifact-construction path from
+    _build_buy_candidates's normal one. If a cross-day fill was recovered
+    and published (carrying whole_share_claim_breakdown/
+    whole_share_order_ids) and a LATER candidate then raises, the failure
+    writer rebuilds run_state.json's buy_candidates through
+    _failure_candidate_row -- which must carry those two fields too, or
+    dca_risk.deployed_usd_by_claim_date() attributes the recovered amount
+    to THIS run's own trading_day (extending its kill-switch window) and
+    the additional broker order id(s) are lost from the artifact entirely.
+    """
+    from near_close_dca import _failure_candidate_row
+
+    row = _failure_candidate_row(
+        "BYDDY",
+        {
+            "status": "submitted",
+            "order_id": "o-2",
+            "submitted_amount_usd": 20.0,
+            "buy_multiplier": 1.0,
+            "skip_reason": None,
+            "whole_share_order_ids": ["o-1", "o-2"],
+            "whole_share_claim_breakdown": [{"trading_day": "2026-08-01", "amount_usd": 10.0}],
+        },
+    )
+
+    assert row["whole_share_order_ids"] == ["o-1", "o-2"]
+    assert row["whole_share_claim_breakdown"] == [{"trading_day": "2026-08-01", "amount_usd": 10.0}]
+
+
+def test_build_buy_candidates_emits_a_row_for_a_whole_share_recovery_with_no_decision():
+    """Codex review ("Persist recovered outcomes for orphaned whole-share
+    tickers"): the orphaned-ledger discovery pass (see
+    WholeShareAccumulationLedger.discover_symbols()) can reconcile a
+    ticker no longer in config.whole_share_tickers, which therefore never
+    gets evaluated into `decisions` at all. Without an explicit fallback,
+    such an outcome is invisible to BOTH the main decision-keyed loop
+    (nothing in `decisions` to key off) and the inverse-Martingale
+    recovery loop (a different marker) -- the reconciled fill would never
+    reach buy_candidates.csv/run_state.json, and because the ledger claim
+    is now resolved, no LATER run could ever rediscover the spend either.
+    """
+    from near_close_dca import _build_buy_candidates
+
+    decisions = []  # BYDDY has no decision -- it isn't enrolled anywhere.
+    candidate_outcomes = {
+        "BYDDY": {
+            "status": "submitted",
+            "order_id": "RH-ORPHANED-RECOVERY-1",
+            "submitted_amount_usd": 10.0,
+            "whole_share_quantity": 1,
+            "whole_share_claim_breakdown": [{"trading_day": "2026-08-15", "amount_usd": 10.0}],
+        },
+    }
+
+    rows = _build_buy_candidates(decisions, candidate_outcomes, top_up_outcomes=None)
+
+    assert len(rows) == 1
+    assert rows[0]["ticker"] == "BYDDY"
+    assert rows[0]["reason"] == "recovered_whole_share_claim"
+    assert rows[0]["status"] == "submitted"
+    assert rows[0]["order_id"] == "RH-ORPHANED-RECOVERY-1"
+    assert rows[0]["planned_amount_usd"] == pytest.approx(10.0)
+    assert rows[0]["whole_share_claim_breakdown"] == [{"trading_day": "2026-08-15", "amount_usd": 10.0}]
+
+
+def test_build_buy_candidates_emits_a_row_for_an_orphaned_zero_fill_recovery():
+    """Codex review ("Persist orphaned zero-fill recoveries"): a confirmed
+    zero-fill recovery for a ticker removed from config.whole_share_tickers
+    (see _book_reconciled_whole_share_order's own zero_fill_attempt
+    branch) publishes "status": "failed" with a whole_share_
+    zero_fill_attempt marker instead of "submitted" -- nothing was
+    purchased, but it's still a REAL broker attempt, already counted via
+    ctx.state.record_buy(..., 0.0). The orphaned-ticker fallback used to
+    require "submitted" plus one of three submission-shaped fields, so
+    this outcome fell through both checks and was never persisted -- the
+    ledger claim was already released, so no LATER run could rediscover
+    the attempt either, permanently undercounting max_orders_per_day.
+    """
+    from near_close_dca import _build_buy_candidates
+
+    decisions = []  # BYDDY has no decision -- it isn't enrolled anywhere.
+    candidate_outcomes = {
+        "BYDDY": {
+            "status": "failed",
+            "order_id": "RH-ORPHANED-ZERO-FILL-1",
+            "skip_reason": "whole-share: confirmed zero-fill terminal order reconciled cross-day (trading_day=2026-08-15)",
+            "whole_share_zero_fill_attempt": True,
+            "whole_share_claim_breakdown": [{"trading_day": "2026-08-15", "amount_usd": 0.0}],
+        },
+    }
+
+    rows = _build_buy_candidates(decisions, candidate_outcomes, top_up_outcomes=None)
+
+    assert len(rows) == 1
+    assert rows[0]["ticker"] == "BYDDY"
+    assert rows[0]["reason"] == "recovered_whole_share_claim"
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["order_id"] == "RH-ORPHANED-ZERO-FILL-1"
+    assert rows[0]["planned_amount_usd"] == pytest.approx(0.0)
+    assert rows[0]["whole_share_claim_breakdown"] == [{"trading_day": "2026-08-15", "amount_usd": 0.0}]
+
+
+def test_build_buy_candidates_keeps_recovery_only_rows_on_one_schema(tmp_path):
+    """Codex review ("Keep recovery-only CSV rows on one schema"): when a
+    run has NO decisions at all but recovers both an inverse-Martingale
+    lease AND an orphaned whole-share claim, the inverse recovery row
+    (dict-iteration order can put it first) previously carried no
+    whole_share_* keys at all, while the whole-share recovery row carried
+    eight extra ones. _write_csv derives fieldnames solely from row 0 and
+    uses the default extrasaction="raise", so writing buy_candidates.csv
+    would raise ValueError the moment the OTHER row's extra keys showed
+    up. Both recovery-only row shapes must carry the identical column set.
+    """
+    from near_close_dca import _build_buy_candidates, _write_csv
+
+    decisions = []  # Neither ticker has a decision -- both are recoveries only.
+    candidate_outcomes = {
+        "AAPL#imart-recovery": {
+            "status": "submitted",
+            "order_id": "RH-IMART-1",
+            "submitted_amount_usd": 5.0,
+            "recovered_inverse_martingale_lease": True,
+            "ticker": "AAPL",
+        },
+        "BYDDY": {
+            "status": "submitted",
+            "order_id": "RH-ORPHANED-RECOVERY-2",
+            "submitted_amount_usd": 10.0,
+            "whole_share_quantity": 1,
+            "whole_share_claim_breakdown": [{"trading_day": "2026-08-15", "amount_usd": 10.0}],
+        },
+    }
+
+    rows = _build_buy_candidates(decisions, candidate_outcomes, top_up_outcomes=None)
+
+    assert len(rows) == 2
+    assert set(rows[0].keys()) == set(rows[1].keys())
+    # Must not raise -- the real assertion this test exists for.
+    _write_csv(tmp_path / "buy_candidates.csv", rows)
 
 
 def test_a_failure_candidate_row_prefers_the_outcomes_own_ticker():

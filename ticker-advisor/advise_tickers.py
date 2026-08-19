@@ -270,7 +270,7 @@ def _load_current_universe(repo_root: Path) -> tuple[frozenset[str], frozenset[s
         # a duplicate addition, while the report gave no indication the
         # universe-filtering check had failed (Antigravity review on PR
         # #403: "Warn on malformed active and excluded collections").
-        for key in ("active", "excluded"):
+        for key in ("active", "excluded", "whole_share"):
             if key in payload and not isinstance(payload[key], list):
                 raise TypeError(f'config/tickers.json\'s "{key}" must be a list, got {type(payload[key]).__name__}')
         # "active" is schema-REQUIRED (schemas/tickers.schema.json's own
@@ -288,6 +288,7 @@ def _load_current_universe(repo_root: Path) -> tuple[frozenset[str], frozenset[s
             raise TypeError('config/tickers.json is missing its required "active" key')
         active = payload.get("active")
         excluded = payload.get("excluded")
+        whole_share = payload.get("whole_share")
         # Uppercased (and non-string entries dropped) to match how
         # candidates are normalized (_load_candidates()'s
         # .strip().upper()) -- a lowercase/mixed-case entry in
@@ -296,8 +297,28 @@ def _load_current_universe(repo_root: Path) -> tuple[frozenset[str], frozenset[s
         # excluded symbol through _split_ineligible_universe_symbols()
         # undetected (Antigravity review on PR #403: "Case Normalization
         # in _load_current_universe").
+        active_set = (
+            frozenset(t.upper() for t in active if isinstance(t, str)) if isinstance(active, list) else frozenset()
+        )
+        # config/tickers.json's third category, `whole_share` (tickers not
+        # tradable for fractional buys, accumulated toward a whole share
+        # instead -- see docs/whole_share_accumulation.md), is disjoint
+        # from `active` by the schema's own invariant. It is folded into
+        # the returned "active" set here (not surfaced as its own bucket)
+        # because from this advisor's perspective a whole-share ticker is
+        # just as ineligible for a fresh ADD proposal as anything already
+        # in `active` -- without this, a whole-share symbol (e.g. BYDDY)
+        # would be scored and proposed as a "new" addition, skewing every
+        # other candidate's z-score normalization and duplicating a symbol
+        # already in the live universe (Codex review: "Exclude whole-share
+        # symbols from ticker-advisor candidates").
+        whole_share_set = (
+            frozenset(t.upper() for t in whole_share if isinstance(t, str))
+            if isinstance(whole_share, list)
+            else frozenset()
+        )
         return (
-            frozenset(t.upper() for t in active if isinstance(t, str)) if isinstance(active, list) else frozenset(),
+            active_set | whole_share_set,
             frozenset(t.upper() for t in excluded if isinstance(t, str))
             if isinstance(excluded, list)
             else frozenset(),

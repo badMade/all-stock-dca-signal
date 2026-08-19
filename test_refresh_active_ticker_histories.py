@@ -11,6 +11,38 @@ def _ticker_config(path):
     path.write_text(json.dumps({"active": ["ABC"]}), encoding="utf-8")
 
 
+def test_active_symbols_includes_whole_share_tickers(tmp_path):
+    """Codex review ("Include whole-share symbols in history-update
+    events"): a whole-share ticker (e.g. BYDDY) is evaluated by the same
+    graded ladder and calibrated by generate_per_ticker_sizing.py's
+    build_sizing_payload() alongside the active universe -- this refresh
+    utility must fetch its history too, or it can never create BYDDY's
+    missing history file in the first place.
+    """
+    config_path = tmp_path / "tickers.json"
+    config_path.write_text(
+        json.dumps({"active": ["ABC", "DEF"], "whole_share": ["BYDDY"]}), encoding="utf-8"
+    )
+
+    assert refresh.active_symbols(config_path) == ["ABC", "DEF", "BYDDY"]
+
+
+def test_active_symbols_dedups_a_whole_share_ticker_already_in_active(tmp_path):
+    config_path = tmp_path / "tickers.json"
+    config_path.write_text(
+        json.dumps({"active": ["ABC", "BYDDY"], "whole_share": ["BYDDY"]}), encoding="utf-8"
+    )
+
+    assert refresh.active_symbols(config_path) == ["ABC", "BYDDY"]
+
+
+def test_active_symbols_without_whole_share_key_is_just_active(tmp_path):
+    config_path = tmp_path / "tickers.json"
+    _ticker_config(config_path)
+
+    assert refresh.active_symbols(config_path) == ["ABC"]
+
+
 def test_default_history_dir_refuses_to_run_when_the_archive_is_missing(tmp_path, monkeypatch):
     # Codex review ("Do not create a replacement ticker_data tree"): ticker_data/
     # is a gitignored symlink/mount to the managed Google Drive archive.

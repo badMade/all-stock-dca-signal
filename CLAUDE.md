@@ -77,7 +77,7 @@ deliberately.
 | Orchestration | `run_dca.py` — `run_pipeline()`, `run_slot()`, `main()` (CLI); `dca_runner.py` — the gate-sequence live runner (Gate 0 market day → Gate 1 time sanity → Gate 3 window → Gate 4 sole-executor → Gate 6 budget → Gate 7 placement → Gate 9 evidence) |
 | Config & paths | `dca_config.py` (discovery, `expand_config_env`, fail-closed loading), `dca_paths.py` (`cron_tracking_root()`, `stream_root()`), `dca_ticker_paths.py` |
 | Broker/data | `dca_live_adapters.py` — `RobinhoodDataProvider`, `FinanceDataProvider`, `RobinhoodBroker`, all built from **injected callables** that map 1:1 to Robinhood MCP tools |
-| Money & risk | `dca_risk.py`, `dca_cumulative.py` (cumulative sub-dollar credit ledger), `dca_cost_tracker.py`, `dca_inverse_martingale.py` (opt-in deferred-accumulation sizing mode, off by default — see `docs/inverse_martingale.md`) |
+| Money & risk | `dca_risk.py`, `dca_cumulative.py` (cumulative sub-dollar credit ledger), `dca_cost_tracker.py`, `dca_inverse_martingale.py` (opt-in deferred-accumulation sizing mode, off by default — see `docs/inverse_martingale.md`), `dca_whole_share_accumulator.py` (whole-share accumulation for tickers not tradable for fractional buys, e.g. BYDDY; wired into `near_close_dca._run_once_impl` — the 3:30 PM canonical stream only — see `docs/whole_share_accumulation.md`) |
 | Output | `dca_reporting.py`, `dca_alerts.py`, `dca_fileio.py`, `dca_notion_sync.py`, `dca_weekly_dashboard.py` |
 | Visualization | `dca_market_graph.py` + `viz/` (the 3D market graph, "The Ocean" — the only pixel output here; `viz/vendor/three.min.js` is the repo's only vendored third-party asset, browser-side only, never imported by Python — see `docs/market_graph.md`) |
 | Reliability engines | `scripts/broker_reconciliation.py`, `run_state_machine.py`, `run_ledger.py`, `idempotency.py`, `scheduler_lease.py`, `reason_codes.py`, `correlation.py`, `same_day_pointer.py`, `same_day_top_up_gate.py`, `file_lock.py` |
@@ -99,8 +99,11 @@ Consequences to internalize before changing anything:
 - **Duplicated logic drifts silently.** `run_slot()` carries its own copy of the morning
   preflight gate. Fixing `_apply_preflight_gate()` will not reach `run_slot()`, or vice versa.
 - **"No in-repo caller" ≠ dead code.** The executor classes, `dca_runner.py`,
-  `dca_cost_tracker.py`, `dca_weekly_dashboard.py`, and `scripts/same_day_top_up_gate.py` have
-  zero in-repo callers *by design*. Deleting them breaks live automation this repo cannot see.
+  `dca_cost_tracker.py`, `dca_weekly_dashboard.py`, and `scripts/same_day_top_up_gate.py`
+  have zero in-repo callers *by design*. Deleting them breaks live automation this repo
+  cannot see. (`dca_whole_share_accumulator.py` used to be an example here too, until it
+  was wired into `near_close_dca._run_once_impl` — see `docs/whole_share_accumulation.md`'s
+  "Scope" section for exactly which of the three entry points that covers.)
 - **Consolidating is a decision, not a cleanup.** Making `run_slot()` delegate to the executor
   classes changes the live 3:30 PM path and needs its own review and acceptance run.
 
@@ -192,6 +195,7 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 | `docs/strategy.md` | Strategy overview, ticker universe, sizing ladder, budgets |
 | `docs/ticker_advisory.md` | The `ticker-advisor/` tool: scores candidate tickers, proposes universe additions for manual review |
 | `docs/inverse_martingale.md` | Opt-in deferred-accumulation sizing mode: tracks dip-tier amounts instead of buying into a decline, fires once on recovery |
+| `docs/whole_share_accumulation.md` | Whole-share accumulation for tickers not tradable for fractional buys (built for BYDDY): tracks would-be graded-ladder buys, fires one whole-share purchase once they sum to a share's price. Wired into the 3:30 PM canonical stream only |
 | `docs/market_graph.md` | The 3D market graph: axis mapping, Pulse/Wave modes, the four data-source loaders, and the two tiers of behavioural ticker grouping |
 | `docs/wondrous_octopus.md` | The `wondrous-octopus/` tool: walk-forward, online-updated next-day OHLC forecasting across the whole archive; research artifacts only, never wired into live sizing |
 | `docs/drift_detection.md`, `docs/reporting_workflow.md`, `docs/cost_tracking.md` | Post-run detection, reporting, and cost policy |

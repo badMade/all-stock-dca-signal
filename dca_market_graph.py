@@ -1868,6 +1868,17 @@ def active_tickers_from_config() -> List[str]:
     ``ml-forecaster/train.py::_load_active_tickers`` omits it. A chart that drew a name
     the strategy refuses to buy would be describing a market the operator cannot act on,
     and would also disagree with the grouping export that skipped it.
+
+    ``whole_share`` is INCLUDED (appended, not subtracted) -- a whole-share ticker (see
+    ``docs/whole_share_accumulation.md``) is evaluated by the SAME graded ladder and
+    actively purchased by the afternoon stream, just via a quantity-based order once its
+    accumulated contributions cross one share's price, rather than a normal fractional
+    buy. Omitting it here would silently drop a ticker the strategy genuinely trades from
+    the default archive graph, contradicting this function's own "active, TRADABLE
+    universe" purpose and disagreeing with every other whole-share-aware consumer
+    (``ticker-advisor``, ``scripts/refresh_active_ticker_histories.py``,
+    ``scripts/run_tickers_daily_update.py``) (Codex review: "Include whole-share symbols
+    in market-graph config defaults").
     """
     from dca_config import get_config_dir
 
@@ -1884,13 +1895,21 @@ def active_tickers_from_config() -> List[str]:
         raise ValueError(f"{path} must contain a JSON object, got {type(data).__name__}")
     active = data.get("active", [])
     excluded_raw = data.get("excluded", [])
-    for key, value in (("active", active), ("excluded", excluded_raw)):
+    whole_share_raw = data.get("whole_share", [])
+    for key, value in (("active", active), ("excluded", excluded_raw), ("whole_share", whole_share_raw)):
         # `str` is excluded explicitly: it is iterable, so a bare "AAPL" would silently
         # become the four tickers A, A, P, L rather than raising.
         if not isinstance(value, list):
             raise ValueError(f"{path}'s {key!r} field must be a list, got {type(value).__name__}")
     excluded = {str(t).upper() for t in excluded_raw}
-    return [str(t).upper() for t in active if str(t).upper() not in excluded]
+    tickers = [str(t).upper() for t in active if str(t).upper() not in excluded]
+    seen = set(tickers)
+    for t in whole_share_raw:
+        symbol = str(t).upper()
+        if symbol not in seen and symbol not in excluded:
+            tickers.append(symbol)
+            seen.add(symbol)
+    return tickers
 
 
 def resolve_universe(

@@ -15,7 +15,7 @@ Key properties (see ``config/midday_dca.json`` and
       committed); Alpaca stays read-only.
     - Uses the **afternoon 0x -> 5x sizing ladder** (NOT the morning 0x -> 3x
       ladder) and the same $2 base amount.
-    - Same active universe (excludes BYDDY/VCX/TRLV/RVI) and the same confidence
+    - Same active universe (excludes BYDDY) and the same confidence
       rule: a candidate whose price/drop qualifies but whose intraday trend
       cannot be validated is flagged ``manual_review_candidate`` and NOT
       auto-bought.

@@ -1574,13 +1574,18 @@ def test_active_tickers_from_config_subtracts_excluded():
     """A chart must not draw a name the live strategy refuses to trade.
 
     The ticker config permits a symbol in both lists, and ml-forecaster/train.py's
-    _load_active_tickers subtracts `excluded` for exactly this reason.
+    _load_active_tickers subtracts `excluded` for exactly this reason. The bundled
+    config's own `excluded` list is empty at the moment (BYDDY moved to the separate
+    `whole_share` category instead of a fractional-buy exclusion -- see
+    docs/whole_share_accumulation.md), so this only checks the real config never
+    regresses the invariant, not that it currently exercises it; the overlap behavior
+    itself is covered unconditionally by
+    test_active_tickers_from_config_honours_an_overlap below.
     """
     from dca_config import get_config_dir
 
     data = json.loads((Path(get_config_dir()) / "tickers.json").read_text(encoding="utf-8"))
     excluded = {str(t).upper() for t in data.get("excluded", [])}
-    assert excluded, "fixture assumption: config/tickers.json lists exclusions"
     assert not (set(mg.active_tickers_from_config()) & excluded)
 
 
@@ -1590,6 +1595,37 @@ def test_active_tickers_from_config_honours_an_overlap(tmp_path, monkeypatch):
         json.dumps({"active": ["AAA", "BBB", "CCC"], "excluded": ["bbb"]}), encoding="utf-8"
     )
     assert mg.active_tickers_from_config() == ["AAA", "CCC"]
+
+
+def test_active_tickers_from_config_includes_whole_share_tickers(tmp_path, monkeypatch):
+    """Codex review ("Include whole-share symbols in market-graph config
+    defaults"): a whole-share ticker (e.g. BYDDY, not fractional-tradable)
+    lives in its own "whole_share" category, not "active" -- the graph must
+    still draw it, since it is a real part of the live DCA universe. It
+    must also respect "excluded" and avoid duplicating a symbol already
+    present in "active".
+    """
+    monkeypatch.setenv("DCA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "tickers.json").write_text(
+        json.dumps(
+            {
+                "active": ["AAA", "BBB"],
+                "excluded": ["CCC"],
+                "whole_share": ["DDD", "bbb", "ccc"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert mg.active_tickers_from_config() == ["AAA", "BBB", "DDD"]
+
+
+def test_active_tickers_from_config_rejects_a_non_list_whole_share(tmp_path, monkeypatch):
+    monkeypatch.setenv("DCA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "tickers.json").write_text(
+        json.dumps({"active": ["AAA"], "whole_share": "DDD"}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError):
+        mg.active_tickers_from_config()
 
 
 @pytest.mark.parametrize(

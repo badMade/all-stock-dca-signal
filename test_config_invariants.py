@@ -41,6 +41,7 @@ from near_close_dca import (
     EXCLUDED_TICKERS,
     TIER_HIGH_MULTIPLIER_SIGNAL_THRESHOLDS,
     TIER_SPEND_THRESHOLDS_USD,
+    WHOLE_SHARE_TICKERS,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -734,6 +735,58 @@ def test_no_ticker_is_both_active_and_excluded():
 
 def test_active_tickers_have_no_duplicates():
     assert len(ACTIVE_TICKERS) == len(set(ACTIVE_TICKERS))
+
+
+def test_whole_share_tickers_match_config_tickers_json():
+    documented = _load("tickers.json")["whole_share"]
+    assert set(documented) == set(WHOLE_SHARE_TICKERS), (
+        "the whole-share ticker list drifted between near_close_dca.WHOLE_SHARE_TICKERS "
+        "and config/tickers.json"
+    )
+
+
+def test_whole_share_tickers_are_disjoint_from_active_and_excluded():
+    # A whole-share ticker is a THIRD, distinct category (see
+    # docs/whole_share_accumulation.md) -- membership in more than one of
+    # active/excluded/whole_share would leave near_close_dca._run_once_impl's
+    # ticker-list construction and _process_buy_candidate's dispatch
+    # ambiguous about which path a symbol takes.
+    assert not (set(ACTIVE_TICKERS) & set(WHOLE_SHARE_TICKERS))
+    assert not (set(EXCLUDED_TICKERS) & set(WHOLE_SHARE_TICKERS))
+
+
+def test_whole_share_tickers_have_a_one_dollar_per_ticker_sizing_entry():
+    # A whole-share ticker (see near_close_dca.WHOLE_SHARE_TICKERS) is evaluated
+    # by the SAME select_first_allocation_base_usd as the active universe. Every
+    # active symbol's config/per_ticker_sizing.json entry deliberately floors
+    # both base amounts at $1 rather than falling back to
+    # StrategyConfig.base_buy_amount_usd's $2 default; a whole-share ticker with
+    # no entry at all would silently fall back to that $2 default and
+    # contribute double what every other ticker does at the same multiplier
+    # (Codex review: "Give BYDDY the configured one-dollar sizing base").
+    sizing = _load("per_ticker_sizing.json")
+    for ticker in WHOLE_SHARE_TICKERS:
+        entry = sizing["tickers"].get(ticker)
+        assert entry is not None, f"{ticker} is missing a config/per_ticker_sizing.json entry"
+        assert entry["base_amount_usd"] == 1.0, ticker
+        assert entry["base_amount_below_close_usd"] == 1.0, ticker
+
+
+def test_whole_share_tickers_are_not_excluded_from_month_end_risk_reporting():
+    # config/scheduled_tasks.json's month_end_volatility_risk_policy.universe
+    # documents a SEPARATE ticker-exclusion list (consumed by an external
+    # agent session, not repo code -- see that policy's own "universe" block)
+    # that must mirror config/tickers.json's true `excluded` category, never
+    # its `whole_share` one. A whole-share ticker is actively purchased by the
+    # graded ladder (see docs/whole_share_accumulation.md) -- it belongs in
+    # this report's 30-day drop/3x-event/recovery-risk table alongside every
+    # other active/whole-share holding, not silently omitted from it as if it
+    # were a true exclusion (Codex review: "Include whole-share tickers in
+    # month-end risk reporting").
+    policy_excluded = set(_load("scheduled_tasks.json")["month_end_volatility_risk_policy"]["universe"]["excluded"])
+    assert not (policy_excluded & set(WHOLE_SHARE_TICKERS)), (
+        "month_end_volatility_risk_policy.universe.excluded must not list a whole-share ticker"
+    )
 
 
 # --- Secrets policy ----------------------------------------------------------

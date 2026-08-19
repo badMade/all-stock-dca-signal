@@ -41,7 +41,7 @@ Other key properties (see ``config/intraday_dca.json``):
       ``$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`` (supplied by the environment, never
       committed); Alpaca/Finance/Yahoo stay read-only.
     - Uses the **shared 0x -> 5x sizing ladder** and dynamic $1/$2 base, the same
-      active universe (excluding BYDDY/VCX/TRLV/RVI), and the same shared
+      active universe (excluding BYDDY), and the same shared
       $180/$900 Normal-tier ceiling -- pooled across all three slots combined,
       not $180/$900 each.
     - **Trend validation applies to all three slots**, unlike the 9:35

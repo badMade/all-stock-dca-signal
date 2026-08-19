@@ -119,6 +119,44 @@ def test_updated_active_ticker_is_published_for_calibration(tmp_path):
     assert event["changed_active_tickers"] == ["ABC"]
 
 
+def test_updated_whole_share_ticker_is_also_published_for_calibration(tmp_path):
+    """Codex review ("Include whole-share symbols in history-update
+    events"): a BYDDY-only history update must still land in
+    changed_active_tickers, or daily_per_ticker_calibration.py's
+    event-driven rebuild (gated on that list being non-empty) can never
+    fire for it -- even though generate_per_ticker_sizing.py's own
+    build_sizing_payload() already calibrates the active-plus-whole-share
+    universe.
+    """
+    history_dir = tmp_path / "histories"
+    history_dir.mkdir()
+    history = history_dir / "BYDDY.csv"
+    history.write_text("Date,Close\n2026-08-01,10\n", encoding="utf-8")
+    ticker_config = tmp_path / "tickers.json"
+    ticker_config.write_text(
+        '{"active": ["ABC"], "excluded": [], "whole_share": ["BYDDY"]}', encoding="utf-8"
+    )
+    updater = tmp_path / "incremental_update.py"
+    _write_updater(
+        updater,
+        "from pathlib import Path\n"
+        f"history = Path({str(history)!r})\n"
+        "history.write_text('Date,Close\\n2026-08-02,11\\n')\n"
+        "print('ALL_DONE')\n",
+    )
+
+    events_dir = tmp_path / "events"
+    result = run_incremental_update(
+        updater_script=updater,
+        history_dir=history_dir,
+        ticker_config=ticker_config,
+        artifacts_dir=events_dir,
+    )
+
+    assert result["changed_tickers"] == ["BYDDY"]
+    assert result["changed_active_tickers"] == ["BYDDY"]
+
+
 def test_wrapper_passes_the_shared_history_dir_to_the_external_updater(tmp_path):
     history_dir = tmp_path / "histories"
     history_dir.mkdir()

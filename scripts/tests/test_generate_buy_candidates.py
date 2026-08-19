@@ -2383,7 +2383,14 @@ def test_config_dir_with_non_canonical_excluded_ticker_aborts(tmp_path):
     canonical active "TEST" and the exclusion would silently become a
     no-op: the ticker is scored, and can be bought, despite the config
     author's intent to exclude it (Codex review: "Reject non-canonical
-    excluded tickers")."""
+    excluded tickers").
+
+    dca_config.load_tickers itself now catches this case earlier and more
+    generally, as a case-insensitive active/excluded/whole_share overlap
+    (Codex review: "Normalize symbols before checking category overlap"),
+    so the abort now happens (and is asserted) at that layer rather than
+    this module's own dedicated non-canonical-excluded check further down.
+    """
     data = _market_data("TEST", early_price=100.0, late_price=96.0, previous_close=100.0, previous_low=97.0)
     market_data_path = tmp_path / "market_data.json"
     market_data_path.write_text(json.dumps(data), encoding="utf-8")
@@ -2394,7 +2401,7 @@ def test_config_dir_with_non_canonical_excluded_ticker_aborts(tmp_path):
         json.dumps({"active": ["TEST"], "excluded": ["test"]}), encoding="utf-8"
     )
 
-    with pytest.raises(ValueError, match="'excluded' list has non-canonical"):
+    with pytest.raises(ValueError, match="pairwise disjoint"):
         gbc.main(
             [
                 "--slot", SLOT,

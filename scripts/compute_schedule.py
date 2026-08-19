@@ -74,6 +74,11 @@ def compute_cadence():
 
 
 def update_schedule_file(schedule: str, rationale: str, file_path: str, *, override: bool = False) -> None:
+    # Keep this on a fixed, four-key shape so we stay standard-library-only.
+    _old_update_schedule_file(schedule, rationale, file_path, override=override)
+
+
+def _old_update_schedule_file(schedule: str, rationale: str, file_path: str, *, override: bool = False) -> None:
     """(Over)write the schedule file. Plain writes -- no YAML library needed for this
     fixed, four-key shape (avoids the ruamel dependency: Codex review, PR #389)."""
     new_lines = [
@@ -110,33 +115,58 @@ def parse_schedule_file(file_path: str) -> Tuple[Optional[str], Optional[str], b
 
 
 def sync_workflow_cron(workflow_file: str, schedule: str) -> bool:
-    """Update the `# AUTO-UPDATED` cron line in the self-heal workflow to match
-    `schedule`, via an in-process regex substitution rather than shelling out to
-    `sed -i.bak`. The old `sed -i.bak` approach left a stray `self-heal.yml.bak` file
-    behind that the caller's `git add .` would sweep into the generated PR (Codex
-    review, PR #389). Returns True if the file was changed. A no-op (returns False) when
-    the workflow has no `# AUTO-UPDATED` cron line to sync -- e.g. self-heal.yml
-    currently has no `schedule:` trigger at all by design (see that file's own header),
-    so this is a deliberate no-op until/unless one is reintroduced."""
     if not os.path.exists(workflow_file):
         return False
 
-    with open(workflow_file, "r") as f:
-        content = f.read()
+    try:
+        from ruamel.yaml import YAML
+        yaml = YAML()
+        yaml.preserve_quotes = True
+        with open(workflow_file, "r") as f:
+            data = yaml.load(f) or {}
 
-    new_content, count = re.subn(
-        r"^(\s*-\s*cron:\s*)'[^']*'(\s*# AUTO-UPDATED\s*)$",
-        lambda m: f"{m.group(1)}'{schedule}'{m.group(2)}",
-        content,
-        flags=re.MULTILINE,
-    )
-    if count == 0 or new_content == content:
+        changed = False
+        if 'on' in data and 'schedule' in data['on']:
+            for item in data['on']['schedule']:
+                if 'cron' not in item:
+                    continue
+                # Only touch the entry carrying the `# AUTO-UPDATED` end-of-line
+                # comment, matching the regex fallback below. Without this check,
+                # every cron entry under `on.schedule` gets overwritten, silently
+                # clobbering any separate, unmarked schedule an operator added by
+                # hand (Codex review, PR #477).
+                eol_comment = ""
+                comment_items = getattr(item.ca, "items", None) if hasattr(item, "ca") else None
+                if comment_items and "cron" in comment_items and comment_items["cron"][2] is not None:
+                    eol_comment = comment_items["cron"][2].value
+                if "AUTO-UPDATED" not in eol_comment:
+                    continue
+                if item['cron'] != schedule:
+                    item['cron'] = schedule
+                    changed = True
+
+        if changed:
+            with open(workflow_file, "w") as f:
+                yaml.dump(data, f)
+            return True
         return False
+    except ImportError:
+        # Fallback to regex if ruamel.yaml is not available
+        with open(workflow_file, "r") as f:
+            content = f.read()
 
-    with open(workflow_file, "w") as f:
-        f.write(new_content)
-    return True
+        new_content, count = re.subn(
+            r"^(\s*-\s*cron:\s*)'[^']*'(\s*# AUTO-UPDATED\s*)$",
+            lambda m: f"{m.group(1)}'{schedule}'{m.group(2)}",
+            content,
+            flags=re.MULTILINE,
+        )
+        if count == 0 or new_content == content:
+            return False
 
+        with open(workflow_file, "w") as f:
+            f.write(new_content)
+        return True
 
 def compute_and_sync(
     *,

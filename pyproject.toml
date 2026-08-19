@@ -105,6 +105,11 @@ py-modules = [
     # by dca_config.load_inverse_martingale_config; without it here, both fail
     # with ModuleNotFoundError outside a source checkout.
     "dca_inverse_martingale",
+    # The whole-share accumulation module (docs/whole_share_accumulation.md),
+    # built for BYDDY. Imported unconditionally by near_close_dca
+    # (_process_buy_candidate's whole-share dispatch); without it here,
+    # import fails with ModuleNotFoundError outside a source checkout.
+    "dca_whole_share_accumulator",
     # The 3D market-graph data layer and viewer emitter, imported by
     # scripts/generate_market_graph.py and by analysis/market-graph-3d/. Its browser
     # assets ship separately under [tool.setuptools.data-files] below -- both halves

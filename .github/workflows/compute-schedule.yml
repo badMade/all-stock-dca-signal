@@ -61,6 +61,15 @@ jobs:
             echo "diff=false" >> $GITHUB_OUTPUT
           fi
 
+
+      - name: File guard
+        if: steps.check_diff.outputs.diff == 'true'
+        run: |
+          if git diff --name-only | grep -vE '^\.github/(workflows/self-heal\.yml|self-heal-schedule\.yml)$'; then
+            echo "Forbidden files modified in schedule update PR, aborting."
+            sh -c "exit 1"
+          fi
+
       - name: Close stale schedule PR if cadence already matches main
         if: steps.check_diff.outputs.diff == 'false'
         env:

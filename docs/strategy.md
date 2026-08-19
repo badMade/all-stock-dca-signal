@@ -64,16 +64,17 @@ spread, whitelist, or circuit-breaker requirements.
 
 ## Active ticker universe
 
-53 active symbols (see [`config/tickers.json`](../config/tickers.json)):
+58 active symbols (see [`config/tickers.json`](../config/tickers.json)):
 
 ```
 DFTX TRIN AAAU SPCX EVR LUNR IRDM DXYZ LITE ASML DRAM STX
 MSFT AAPL AMAT AMD CBRS MRVL BTX STM SNDK WDC TSM AVGO NVDA QBTS FLKR
 INTC GOOGL GOOG AMZN GLW MA GS MU NFLX XLG TOPT QTOP SATA RGTI IBM GFUZ TXN RKLB
-GE VRT CAT QQQ QCOM ABBV JPM VT
+GE VRT CAT QQQ QCOM ABBV JPM VT QBUT RVII RVI VCX TRLV
 ```
 
-- **Excluded:** `BYDDY`, `VCX`, `TRLV`, `RVI`
+- **Excluded:** none today.
+- **Whole-share ticker:** `BYDDY` -- not tradable for fractional/notional buys on Robinhood, so it is evaluated by the same ladder but bought via whole-share accumulation instead (see [whole_share_accumulation.md](whole_share_accumulation.md)).
 - **Symbol corrections applied:** `IRDMI -> IRDM`, `GLWR -> GLW`
 - **`GFUZ` (General Fusion Group Ltd.)** added 2026-07-15 (user-approved). Uses
   **Robinhood primary data** (resolved active, tradeable, `fractional_tradability='tradable'`,
@@ -127,6 +128,42 @@ GE VRT CAT QQQ QCOM ABBV JPM VT
 > safety, pre-authorization, top-up, run-classification, budget,
 > cost-conscious, manual-exclusion, and recovery text.
 
+> **TICKER UNIVERSE UPDATE AUG 16 2026 (user-requested):** `QBUT` and `RVII`
+> are added to the active DCA universe as new symbols. `RVI` and `VCX` are
+> also added, **reversing the AUG 5 2026 exclusion decision** above at the
+> owner's explicit request (confirmed interactively when this session
+> flagged the conflict with that decision), taking the active universe to
+> **57 symbols**. As with `VT`, no Robinhood instrument search was run
+> in-repo for any of the four — this session had no broker access — so
+> their state, tradability, fractional tradability, and prior-close
+> availability are **unverified**; the run-time preflight and
+> data-confidence gates admit or gate each out fail-closed exactly as they
+> would any other symbol. None of the four are in `tickers.txt` (the
+> history-fetch universe), so they have no calibrated sizing and use the
+> global fallback ladder until history is fetched and
+> `scripts/generate_per_ticker_sizing.py` is re-run. `TRLV` remains
+> excluded; `BYDDY` remains excluded separately for its ADR wind-down
+> status.
+
+> **TICKER UNIVERSE UPDATE AUG 16 2026, SECOND UPDATE (user-requested):**
+> `TRLV` is added to the active DCA universe, reversing the last piece of
+> the AUG 5 2026 exclusion decision above and leaving `BYDDY` as the
+> **only** excluded symbol, taking the active universe to **58 symbols**.
+> As with the first AUG 16 2026 update, no Robinhood instrument search was
+> run in-repo for `TRLV`; it is unverified and admitted or gated out
+> fail-closed by the run-time preflight/data-confidence gates. `TRLV` is
+> not in `tickers.txt`, so it uses the global fallback sizing ladder until
+> history is fetched and `scripts/generate_per_ticker_sizing.py` is
+> re-run. Separately, `BYDDY`'s documented exclusion reason is now
+> **fractional-tradability** — Robinhood resolves it as not tradable for
+> fractional/notional buys, so its normal graded-ladder buy would always
+> be blocked at the `is_tradable_for_fractional_buy` gate — per explicit
+> user instruction. See
+> [`config/tickers.json`](../config/tickers.json)'s `exclusion_reasons`
+> and [whole_share_accumulation.md](whole_share_accumulation.md) for the
+> opt-in path built to track `BYDDY`'s would-be buys and fire a single
+> whole-share purchase instead.
+
 ## Sizing ladder (latest, active)
 
 Maps the drop vs. previous close to a buy multiplier, applied to the selected
@@ -155,12 +192,12 @@ effect worth tracking: budget-tier selection counts **3x-or-greater** signals,
 and 3x now needs a 6% drop rather than 4%, so escalation to
 Elevated/High-volatility/Stress is less frequent for the same market conditions.
 
-> **This table is the fallback, not the live curve.** As of 2026-08-04
+> **This table is the fallback, not the live curve.** As of 2026-08-16
 > [`config/per_ticker_sizing.json`](../config/per_ticker_sizing.json) is
-> `status: active` and carries an entry for all 53 active symbols. 47 are
+> `status: active` and carries an entry for all 58 active symbols. 47 are
 > **per-ticker, volatility-calibrated** (percentile-derived,
-> 1x/1.5x/2.5x/4x/5x, $1.00 base); the 6 in `fallback_tickers` (SPCX, DRAM,
-> CBRS, SATA, GFUZ, VT) lack the 252 sessions of history the calibration
+> 1x/1.5x/2.5x/4x/5x, $1.00 base); the 11 in `fallback_tickers` (SPCX, DRAM,
+> CBRS, SATA, GFUZ, VT, QBUT, RVII, RVI, VCX, TRLV) lack the 252 sessions of history the calibration
 > requires and carry a copy of the global fallback ladder instead.
 > `graded_buy_multiplier` reads a ticker's calibrated tiers first and falls back
 > to the shared table above only for symbols with no entry — currently none. The

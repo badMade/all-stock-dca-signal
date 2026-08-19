@@ -36,6 +36,7 @@ from near_close_dca import (
     Bar,
     OrderFill,
     SourceName,
+    WholeSharePlacementTerminalError,
 )
 
 logger = logging.getLogger("near_close_dca.live_adapters")
@@ -642,6 +643,21 @@ class RobinhoodBroker:
     bound to a single connection/event loop that is not safe to invoke from multiple threads
     at once. Only pass ``True`` once the wired ``order_fill_fn`` has been verified safe for
     concurrent calls (e.g. it opens an independent connection per call).
+
+    ``review_fn``/``place_fn`` are reused (not duplicated) for whole-share,
+    quantity-based orders -- see :meth:`review_whole_share_buy` and
+    :meth:`place_whole_share_buy`, built for
+    ``dca_whole_share_accumulator.py`` -- by passing ``quantity=`` instead of
+    ``dollar_amount=``. This assumes the wired Robinhood
+    ``review_equity_order``/``place_equity_order`` MCP tools accept a
+    ``quantity`` argument as an alternative order-sizing method to
+    ``dollar_amount``, matching how Robinhood's real order API supports both.
+    **Unverified in this repo**: no session that has written this module has
+    had live Robinhood MCP access to confirm it. A live agent session with
+    real broker access should confirm the tool accepts ``quantity`` (and
+    what it returns for a non-fractional instrument) before the whole-share
+    path is trusted with a real order -- see
+    ``docs/whole_share_accumulation.md``.
     """
 
     def __init__(
@@ -845,6 +861,52 @@ class RobinhoodBroker:
                 return order
         return None
 
+    def same_day_order_with_ref_id_prefix_any_state(
+        self, ticker: str, trading_day: date, ref_id_prefixes: Tuple[str, ...]
+    ) -> Optional[Dict[str, Any]]:
+        """Same exact-ref-id match as
+        :meth:`same_day_strategy_order_exists_with_ref_id_prefix`, but WITHOUT
+        the ``_LIVE_ORDER_STATES`` filter -- also returns a genuinely
+        terminal (``cancelled``/``rejected``/``expired``/etc.) order.
+
+        The live-only method exists to answer "does an order still occupy
+        this idempotency slot" and deliberately excludes a cancelled/
+        rejected order (it "never consumed capacity", see
+        ``_LIVE_ORDER_STATES``'s own comment). That is the wrong question
+        for whole-share reconciliation of an AMBIGUOUS placement: an order
+        that partially filled and was THEN cancelled is real, already-
+        executed capital the ledger must still record, and the live-only
+        method would report it as a clean "no match" indistinguishable from
+        one that never reached the broker at all -- silently releasing
+        credit for shares that already executed (Codex review: "Reconcile
+        partial fills before releasing canceled claims"). Exposes the raw
+        order (any state) so the caller can inspect its own
+        ``cumulative_quantity``/``state`` directly.
+
+        Iterates with ``require_provable_history=True``, the same posture
+        :meth:`strategy_order_with_ref_id` already uses for the same
+        recovery-sensitive lookup: an unwired ``orders_fn`` or an
+        unrecognizable page is indistinguishable from a genuinely empty
+        history, but proves nothing. Every caller of this method is
+        whole-share reconciliation, which reads a clean ``None`` as
+        permission to restore a stale or placement-failure claim -- if that
+        "found nothing" were actually "could not prove anything", an order
+        that genuinely reached the broker could have its already-spent
+        credit released and reused (Codex review: "Require provable order
+        history before releasing claims").
+        """
+        for order in self._iter_same_day_orders(ticker, trading_day, require_provable_history=True):
+            ref_id = str(
+                order.get("ref_id")
+                or order.get("client_order_id")
+                or order.get("client_order_uuid")
+                or order.get("client_id")
+                or ""
+            )
+            if ref_id and ref_id in ref_id_prefixes:
+                return order
+        return None
+
     def strategy_order_with_ref_id(
         self, ticker: str, trading_day: date, ref_id: str
     ) -> Optional[Dict[str, Any]]:
@@ -910,6 +972,39 @@ class RobinhoodBroker:
             return str(result.get("fractional_tradability", "")) == "tradable"
         return False
 
+    def is_tradable_for_whole_share_buy(self, ticker: str) -> bool:
+        """Same tradeable/active check as :meth:`is_tradable_for_fractional_buy`,
+        WITHOUT the ``fractional_tradability`` requirement -- a whole-share
+        ticker (e.g. BYDDY) is in that category precisely because it fails
+        that requirement, so reusing the fractional check verbatim would
+        block every whole-share order outright. Checked unconditionally
+        (both scheduled and manual whole-share candidates), unlike
+        :meth:`review_whole_share_buy`, which mirrors :meth:`review_market_buy`
+        in only running on a manual run (Codex review: "Verify whole-share
+        tradability before scheduled placement" -- without this, a scheduled
+        run could reach ``place_whole_share_buy`` for an instrument that
+        went halted/inactive/non-tradeable while quote data remained
+        available, with no pre-placement tradability check at all).
+        """
+        if self._tradability_fn is None:
+            return True
+        data = _unwrap(self._tradability_fn(account_number=self._account, symbols=[ticker]))
+        # Compared case-insensitively: unlike "active" (schema-enforced
+        # uppercase), "whole_share" has no such schema constraint, so a
+        # config-authored lowercase entry (e.g. "byddy") reaches this call
+        # verbatim. The broker's real API response uses its own canonical
+        # (typically uppercase) casing regardless of what was requested, so
+        # an exact-match comparison would silently treat every real,
+        # tradeable response as "symbol not found" -> not tradable,
+        # restoring every fire's deduction instead of ever placing an order
+        # (Codex review: "Require canonical symbols for whole-share
+        # tickers").
+        for result in data.get("results") or []:
+            if str(result.get("symbol", "")).upper() != ticker.upper():
+                continue
+            return bool(result.get("tradeable", False)) and result.get("state") == "active"
+        return False
+
     def review_market_buy(self, ticker: str, notional_usd: float) -> Tuple[bool, str]:
         if self._review_fn is None:
             # Fail closed on the live path: a real order must never be placed without a
@@ -969,6 +1064,160 @@ class RobinhoodBroker:
             raise RuntimeError(f"live placement for {ticker} came back in terminal state {state}; response={data}")
         # Accumulate raw broker response for orders_after_place.json so fill data
         # is replayable from durable storage without a live broker re-query.
+        self._raw_placement_responses.append({
+            "ticker": ticker,
+            "order_id": str(order_id),
+            **order,
+        })
+        return str(order_id)
+
+    def review_whole_share_buy(self, ticker: str, quantity: int) -> Tuple[bool, str]:
+        """Quantity-based counterpart to :meth:`review_market_buy`.
+
+        For :mod:`dca_whole_share_accumulator`'s fire decisions: ``ticker``
+        is not tradable for fractional/notional buys, so a dollar-amount
+        review would be reviewing the wrong kind of order entirely. See the
+        class docstring's note on the ``quantity=`` assumption.
+        """
+        if quantity <= 0:
+            raise ValueError("quantity must be positive for a whole-share buy review")
+        if self._review_fn is None:
+            if self.enable_live_orders:
+                return False, "live orders enabled but no review callable wired; refusing to place unreviewed order"
+            return True, "no review callable wired; skipping broker-side review (dry-run)"
+        response = self._review_fn(
+            account_number=self._account,
+            symbol=ticker,
+            side="buy",
+            type="market",
+            quantity=str(quantity),
+        )
+        return _interpret_review(response)
+
+    def place_whole_share_buy(self, ticker: str, quantity: int, ref_id: str) -> str:
+        """Quantity-based counterpart to :meth:`place_market_buy`.
+
+        Places a whole-share (non-fractional) market buy for exactly
+        ``quantity`` shares, for a ticker not tradable for fractional/notional
+        buys -- see :mod:`dca_whole_share_accumulator`. Every fail-closed
+        check :meth:`place_market_buy` applies (live gate + place_fn wired,
+        failure envelope, missing order id, terminal rejection state) applies
+        identically here; only the order-sizing argument differs.
+        """
+        if quantity <= 0:
+            raise ValueError("quantity must be positive for a whole-share buy")
+        if not (self.enable_live_orders and self._place_fn is not None):
+            raise RuntimeError(
+                f"place_whole_share_buy called for {ticker} with the live gate disabled "
+                f"(enable_live_orders={self.enable_live_orders}, "
+                f"place_fn={'set' if self._place_fn else 'None'}); use dry_run=True for simulated runs"
+            )
+        response = self._place_fn(
+            account_number=self._account,
+            symbol=ticker,
+            side="buy",
+            type="market",
+            quantity=str(quantity),
+            time_in_force=self._time_in_force,
+            ref_id=ref_id,
+        )
+        outer_failure = _response_failure(response)
+        if outer_failure is not None:
+            logger.error("place_equity_order (whole-share) for %s reported failure: %s", ticker, response)
+            # An outer failure envelope (e.g. {"success": false, "data":
+            # {"order": {...}}}) can still carry an inner order that reached
+            # the broker and reports its own terminal state and
+            # cumulative_quantity -- for example, a partially filled order
+            # that was then cancelled, with the cancellation itself surfaced
+            # as the outer "success: false". Discarding that inner payload
+            # and raising a bare RuntimeError forces the caller to rely
+            # exclusively on a SEPARATE, later order-history lookup that can
+            # itself be eventually consistent and report a clean "no match"
+            # for an order this very response already proved landed --
+            # restoring the full reservation and making already-spent
+            # credit reusable (Codex review: "Preserve inner orders from
+            # failure envelopes"). Mirrors the terminal-state branch below:
+            # an inner order in a genuinely terminal state is authoritative
+            # evidence regardless of the outer envelope's own verdict.
+            outer_failure_data = _unwrap(response)
+            # Mirrors the normal success path's own `data.get("order") or
+            # data` fallback just below: _unwrap(response) can itself BE the
+            # bare order object (no nested "order" key at all), a shape the
+            # success path already treats as equally valid. Checking only
+            # `.get("order")` missed that shape entirely, so an outer
+            # failure like {"success": false, "data": {"id": ..., "state":
+            # "cancelled", "cumulative_quantity": ...}} still fell through to
+            # a bare RuntimeError, discarding the very evidence this branch
+            # exists to preserve (Codex review: "Preserve bare orders in
+            # outer failure envelopes").
+            inner_order = None
+            if isinstance(outer_failure_data, dict):
+                nested = outer_failure_data.get("order")
+                inner_order = nested if isinstance(nested, dict) else outer_failure_data
+            if isinstance(inner_order, dict):
+                inner_order_id = inner_order.get("id") or inner_order.get("order_id")
+                inner_state = str(inner_order.get("state", "")).lower()
+                # Not gated on inner_state being in a TERMINAL set -- an
+                # inner order still LIVE/working (e.g. "new"/"confirmed"/
+                # "partially_filled") is just as real a broker acceptance as
+                # a terminal one, and discarding it here (an earlier version
+                # of this fix did) forced the caller to rely exclusively on
+                # its own separate live/terminal-inclusive lookups, which can
+                # BOTH independently miss the very order this response
+                # already proved was accepted (an eventually-consistent
+                # order-history endpoint) -- restoring the full reservation
+                # and making already-committed credit reusable while the
+                # order remains live at the broker (Codex review: "Preserve
+                # accepted nonterminal orders in failure envelopes"). The
+                # caller's own exc.order handling already discriminates
+                # terminal vs. still-live states correctly (see its "Verify
+                # terminal state after the any-state fallback" branch), so
+                # passing ANY inner order with a usable id through this same
+                # exception -- regardless of state -- is safe: it is treated
+                # exactly like the any-state fallback's own result.
+                if inner_order_id:
+                    raise WholeSharePlacementTerminalError(
+                        f"live whole-share placement for {ticker} reported an outer failure "
+                        f"({outer_failure}), but its inner order carries evidence of a real "
+                        f"broker attempt (state={inner_state or 'unknown'}); response={outer_failure_data}",
+                        order=inner_order,
+                    )
+            raise RuntimeError(f"live whole-share placement for {ticker} failed: {outer_failure}")
+        data = _unwrap(response)
+        order = data.get("order") or data
+        order_id = order.get("id") or order.get("order_id")
+        if not order_id:
+            logger.error("place_equity_order (whole-share) returned no order id for %s: %s", ticker, data)
+            raise RuntimeError(f"live whole-share placement for {ticker} returned no order id; response={data}")
+        state = str(order.get("state", "")).lower()
+        # "expired" is a terminal, non-live state exactly like the others
+        # here (see _LIVE_ORDER_STATES's own comment above, which already
+        # excludes it) -- without rejecting it too, the caller would treat
+        # this response as a successful full submission and settle the
+        # claim for the ENTIRE requested quantity even if no shares
+        # actually executed (Codex review: "Reject expired whole-share
+        # placement responses"). Raising here (rather than returning the
+        # order id) routes this through the SAME ambiguous-placement
+        # reconciliation the caller already applies to any other raised
+        # exception, which inspects the real cumulative fill via the
+        # terminal-inclusive lookup before restoring or settling credit.
+        if state in {"rejected", "failed", "cancelled", "canceled", "voided", "expired"}:
+            logger.error(
+                "place_equity_order (whole-share) for %s returned terminal state %s: %s", ticker, state, data
+            )
+            # Carries the order payload rather than a bare RuntimeError --
+            # this response is ALREADY authoritative terminal evidence
+            # (state + cumulative_quantity + average_price), and discarding
+            # it before raising would force the caller to depend
+            # exclusively on a SEPARATE, later order-history lookup that can
+            # itself be eventually consistent and report a clean "no match"
+            # for an order this very response already proved landed (Codex
+            # review: "Reconcile terminal fills from the placement
+            # response").
+            raise WholeSharePlacementTerminalError(
+                f"live whole-share placement for {ticker} came back in terminal state {state}; response={data}",
+                order=order,
+            )
         self._raw_placement_responses.append({
             "ticker": ticker,
             "order_id": str(order_id),
