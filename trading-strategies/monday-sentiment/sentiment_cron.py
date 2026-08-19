@@ -441,7 +441,7 @@ async def compute_ticker_score(
     prob_results = score_texts(pipe, texts)
 
     scored_items = []
-    for item, probs in zip(items, prob_results):
+    for item, probs in zip(items, prob_results, strict=True):
         scored = make_scored_item(
             item,
             probs["positive"],
@@ -1101,7 +1101,7 @@ def run(args: argparse.Namespace) -> int:
 
     scored_results = asyncio.run(process_all_tickers())
 
-    for ticker, score_res in zip(tickers, scored_results):
+    for ticker, score_res in zip(tickers, scored_results, strict=True):
         if isinstance(score_res, BaseException):
             safe_exc = _sanitize_exception(score_res)
             # Stack frames only (traceback.format_tb), never format_exception
