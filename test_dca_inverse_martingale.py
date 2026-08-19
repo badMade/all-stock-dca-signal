@@ -15,6 +15,7 @@ from dca_inverse_martingale import (
     STATUS_NONE,
     CorruptedLedgerStateError,
     InverseMartingaleLedger,
+    InverseMartingaleStep,
     archived_split_factor,
     evaluate_inverse_martingale_step,
     rolling_stddev,
@@ -1542,6 +1543,80 @@ def test_archived_split_factor_rejects_an_undated_corporate_action_row(tmp_path)
     ) is None
 
 
+def test_archived_split_factor_rejects_a_malformed_undated_corporate_action(tmp_path):
+    """Regression test for "Reject malformed actions even when the row is
+    undated". A blank-date row with a malformed (unparseable, NaN, or
+    negative) Stock Splits/Dividends value parses back to the SAME ``None``
+    ``_parse_corporate_action_cell`` returns for a genuinely ordinary "0.0"
+    cell -- checking only the parsed value (and discarding the usability
+    flag) would let this row be treated as inert, letting a LATER,
+    cleanly-dated row become the persisted cursor and permanently excluding
+    a corrected version of this row via ``row_date <= since``.
+    """
+    history = tmp_path / "ticker_data"
+    as_of = date(2026, 8, 12)
+    history.mkdir(parents=True, exist_ok=True)
+    path = history / "AAPL.csv"
+    fields = ["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume", "Dividends", "Stock Splits"]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerow({
+            "Date": date(2026, 8, 9).isoformat(), "Open": "100", "High": "100", "Low": "100",
+            "Close": "100", "Adj Close": "100", "Volume": "1000", "Dividends": "0.0", "Stock Splits": "0.0",
+        })
+        writer.writerow({
+            "Date": "", "Open": "50", "High": "50", "Low": "50",
+            "Close": "50", "Adj Close": "50", "Volume": "1000", "Dividends": "0.0", "Stock Splits": "NaN",
+        })
+        # A later, perfectly ordinary, cleanly-dated row -- proves the
+        # failure short-circuits the whole call rather than reading the
+        # malformed undated cell as inert and letting this one become the
+        # cursor.
+        writer.writerow({
+            "Date": date(2026, 8, 11).isoformat(), "Open": "50", "High": "50", "Low": "50",
+            "Close": "50", "Adj Close": "50", "Volume": "1000", "Dividends": "0.0", "Stock Splits": "0.0",
+        })
+    assert archived_split_factor(
+        "AAPL", since=date(2026, 8, 9), as_of=as_of, history_dir=history
+    ) is None
+
+
+def test_archived_split_factor_keeps_a_genuinely_blank_undated_row_inert(tmp_path):
+    """Regression test for "Keep blank undated rows inert". A trailing
+    CSV row with a blank Date AND blank Stock Splits/Dividends cells (a
+    comma-only spreadsheet artifact) is exactly the ordinary trailing-row
+    noise the undated-row branch exists to permit -- distinct from the
+    malformed-nonblank case covered by
+    test_archived_split_factor_rejects_a_malformed_undated_corporate_action.
+    ``_parse_corporate_action_cell("")`` returns the SAME ``(False, None)``
+    a malformed nonblank cell does, so checking the usability flag alone
+    (without first distinguishing "blank" from "nonblank but unparseable")
+    would reject this archive too, breaking every split lookup over it
+    until the blank row is removed.
+    """
+    history = tmp_path / "ticker_data"
+    as_of = date(2026, 8, 12)
+    history.mkdir(parents=True, exist_ok=True)
+    path = history / "AAPL.csv"
+    fields = ["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume", "Dividends", "Stock Splits"]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerow({
+            "Date": date(2026, 8, 9).isoformat(), "Open": "100", "High": "100", "Low": "100",
+            "Close": "100", "Adj Close": "100", "Volume": "1000", "Dividends": "0.0", "Stock Splits": "0.0",
+        })
+        # A genuinely blank trailing row -- every field empty, not just Date.
+        writer.writerow({
+            "Date": "", "Open": "", "High": "", "Low": "",
+            "Close": "", "Adj Close": "", "Volume": "", "Dividends": "", "Stock Splits": "",
+        })
+    assert archived_split_factor(
+        "AAPL", since=date(2026, 8, 8), as_of=as_of, history_dir=history
+    ) == (1.0, date(2026, 8, 9))
+
+
 def test_archived_split_factor_rejects_an_archive_missing_the_splits_column(tmp_path):
     """Regression test for "Reject archives that omit split metadata". A
     header missing "Stock Splits" entirely reads back as None for every row --
@@ -1707,6 +1782,46 @@ def test_a_failed_split_lookup_leaves_the_cursor_untouched():
     )
     assert state["rearm_reference_close"] == pytest.approx(100.0)
     assert state["rearm_last_seen_day"] == DAY1.isoformat()  # unchanged, not day2
+
+
+def test_a_cycle_resolving_on_its_own_start_day_seeds_the_cursor_before_it():
+    """Regression test for "Seed the latch cursor before a split-day cycle
+    starts". When a cycle's ``cycle_start_trading_day`` is missing (a
+    legacy/corrupted-then-repaired tracker -- the same fail-closed fallback
+    the abandonment and tier/basis-reset resolution sites already use), this
+    call treats the resolution as though the cycle just started today:
+    ``cycle_reference_close``/``reference_close`` falls back to THIS call's
+    ``previous_close``, which belongs to the PRECEDING session. Seeding
+    ``rearm_last_seen_day`` at ``trading_day`` itself -- rather than the day
+    before it -- would let a split or distribution effective ON
+    ``trading_day`` be excluded from every future ``archived_split_factor``
+    lookup via `row_date <= since`, permanently rebasing the latch against a
+    pre-action reference.
+    """
+    trading_day = date(2026, 8, 4)
+    tracker_state = {
+        "status": STATUS_DIPPING,
+        "accumulated_usd": 15.0,
+        "lowest_drop_seen": 8.0,
+        "crossed_tier_thresholds": [1.0, 2.0, 4.0, 8.0],
+        # A trading day well before `trading_day`, and no cycle_start_trading_day
+        # at all -- so the same-day retry guard does not intercept this call,
+        # and starting_a_new_cycle reads True from cycle_start_trading_day's
+        # absence.
+        "last_evaluated_trading_day": date(2020, 1, 1).isoformat(),
+        "last_evaluated_stream": "afternoon",
+    }
+    # decision_price=95 against a reference_close/previous_close of 100 is a
+    # 3pt recovery from the persisted 8.0 lowest_drop_seen -- comfortably past
+    # the 1.0 recovery_offset -- an uncapped, broker-minimum-cleared full fire
+    # that resolves this same call.
+    state, step = _step(
+        tracker_state, decision_price=95.0, previous_close=100.0,
+        trading_day=trading_day, stream="afternoon",
+    )
+    assert step.fired
+    assert step.reason != "tier_crossed"
+    assert state["rearm_last_seen_day"] == (trading_day - timedelta(days=1)).isoformat()
 
 
 @pytest.mark.parametrize("factor", [1.5, 2.0, 3.0, 7.0, 20.0, 100.0])
@@ -2209,6 +2324,47 @@ def test_write_locked_tolerates_an_unreadable_existing_file_when_preserving_even
     written = json.loads((ticker_dir / "tracker.json").read_text(encoding="utf-8"))
     assert written["status"] == STATUS_DIPPING
     assert len(written["events"]) == 1  # prior (unreadable) history discarded, not preserved or crashed on
+
+
+def test_write_locked_discards_non_dict_event_entries_instead_of_raising(tmp_path):
+    """Regression test for "Validate event entries before filtering them".
+    _validate_tracker_payload() (see _read_locked) never validates the
+    SHAPE of individual audit events -- they are best-effort, not trusted
+    state a caller makes financial decisions from -- so a restored or
+    hand-edited tracker can carry a syntactically valid ``events`` list
+    with a non-object entry (e.g. a bare number) in it. The recovery-event
+    eviction-exemption logic tests ``"recovery_metadata" not in
+    candidate_event`` against every entry once the list reaches the cap,
+    which raises TypeError for a non-dict value; that exception escaping
+    this best-effort write would abort the ledger write (and, via
+    record_step's caller, potentially the whole scheduled run) over a
+    single malformed audit entry.
+    """
+    ticker_dir = tmp_path / "GME"
+    ticker_dir.mkdir()
+    # Enough dict events to reach the cap (the recovery-eviction-exemption
+    # membership test only runs once combined_events exceeds
+    # _MAX_PERSISTED_EVENTS), plus a few non-dict entries mixed in -- the
+    # exact shape a restored/hand-edited tracker could carry.
+    # The non-dict entries sit at the FRONT of the list -- the eviction loop
+    # walks front-to-back and only tests "recovery_metadata" not in
+    # candidate_event while it still needs to drop entries to reach the cap,
+    # so a malformed entry must be among the earliest candidates considered
+    # to actually reach that membership test.
+    original = {
+        "version": 1, "ticker": "GME", "status": "none",
+        "last_evaluated_trading_day": DAY1.isoformat(),
+        "events": [42, "not-an-event", None] + [{"reason": "no_action"}] * _MAX_PERSISTED_EVENTS,
+    }
+    (ticker_dir / "tracker.json").write_text(json.dumps(original), encoding="utf-8")
+    ledger = InverseMartingaleLedger(root=tmp_path)
+    state, step = _step({}, decision_price=99.0, previous_close=100.0, trading_day=DAY1)
+    ledger.record_step("GME", state, step)  # must not raise TypeError
+    written = json.loads((ticker_dir / "tracker.json").read_text(encoding="utf-8"))
+    # The malformed entries are silently dropped before the cap is ever
+    # applied, so the surviving list is bounded and entirely dict events.
+    assert len(written["events"]) == _MAX_PERSISTED_EVENTS
+    assert all(isinstance(e, dict) for e in written["events"])
 
 
 def test_ledger_raises_on_unsupported_version_instead_of_resetting(tmp_path):
@@ -3426,6 +3582,104 @@ def test_ledger_caps_the_persisted_event_history(tmp_path):
 
     raw = json.loads((tmp_path / "AAPL" / "tracker.json").read_text(encoding="utf-8"))
     assert len(raw["events"]) == _MAX_PERSISTED_EVENTS
+
+
+def test_ledger_retains_a_recovery_event_past_the_ordinary_event_cap(tmp_path):
+    """Regression test for "Keep recovery attribution past the event cap". A
+    prior-day or cross-stream crash-lease recovery's event is the ONLY
+    durable claim-aware audit record left once a later resolved_marker()
+    transition overwrites the top-level last_recovery field with something
+    else -- see InverseMartingaleStep.recovery_metadata's own docstring.
+    Evicting it the same way ordinary events are, once _MAX_PERSISTED_EVENTS
+    ordinary evaluations have since been recorded, would silently lose the
+    claim day, stream, ref, and order ID exactly as the pre-audit-event bug
+    did. The recovery event must survive indefinitely; only ordinary events
+    are evicted to make room for it.
+    """
+    ledger = InverseMartingaleLedger(root=tmp_path)
+    state: dict = {}
+    day = DAY1
+    state, step = _step(state, decision_price=99.0, previous_close=100.0, trading_day=day)
+    recovery_step = InverseMartingaleStep(
+        status_before=step.status_before,
+        status_after=step.status_after,
+        accumulated_usd_before=step.accumulated_usd_before,
+        accumulated_usd_after=step.accumulated_usd_after,
+        newly_crossed_tiers=step.newly_crossed_tiers,
+        fired=step.fired,
+        fire_amount_usd=step.fire_amount_usd,
+        reason=step.reason,
+        recovery_metadata={
+            "claim_trading_day": day.isoformat(),
+            "claim_stream": "morning",
+            "claim_ref": "abc123",
+            "order_id": "order-1",
+        },
+    )
+    ledger.record_step("AAPL", state, recovery_step)
+    day = date.fromordinal(day.toordinal() + 1)
+    # More than _MAX_PERSISTED_EVENTS further ordinary (non-recovery)
+    # evaluations -- enough to evict the recovery event under the old,
+    # unconditional [-_MAX_PERSISTED_EVENTS:] slice.
+    for _ in range(_MAX_PERSISTED_EVENTS + 20):
+        state, step = _step(state, decision_price=99.0, previous_close=100.0, trading_day=day)
+        ledger.record_step("AAPL", state, step)
+        day = date.fromordinal(day.toordinal() + 1)
+
+    raw = json.loads((tmp_path / "AAPL" / "tracker.json").read_text(encoding="utf-8"))
+    recovery_events = [e for e in raw["events"] if "recovery_metadata" in e]
+    assert len(recovery_events) == 1
+    assert recovery_events[0]["recovery_metadata"]["order_id"] == "order-1"
+    # The overall list stays bounded at the cap -- the recovery event is
+    # exempt from EVICTION, not from counting toward the total -- so it is
+    # ordinary events that give up a slot to keep it, not the cap itself
+    # growing without bound.
+    assert len(raw["events"]) == _MAX_PERSISTED_EVENTS
+
+
+def test_ledger_caps_the_event_history_even_when_all_events_are_recoveries(tmp_path):
+    """Regression test for "Keep recovery retention bounded". A ticker with
+    more crash-lease recoveries than _MAX_PERSISTED_EVENTS itself (repeated
+    recovery failures) leaves every candidate carrying recovery_metadata --
+    the "drop oldest ordinary event" loop alone can never find one to evict,
+    so an unconditional exemption would let the persisted events list grow
+    without bound, defeating the cap and making every read-modify-write
+    progressively more expensive. Once ordinary events are exhausted, the
+    OLDEST recovery events must give way too, keeping only the most recent
+    _MAX_PERSISTED_EVENTS overall.
+    """
+    ticker_dir = tmp_path / "AAPL"
+    ticker_dir.mkdir()
+    day = DAY1
+    recovery_events = []
+    for i in range(_MAX_PERSISTED_EVENTS + 10):
+        recovery_events.append({
+            "status_before": "none", "status_after": "none",
+            "accumulated_usd_before": 0.0, "accumulated_usd_after": 0.0,
+            "newly_crossed_tiers": [], "fired": False, "fire_amount_usd": 0.0,
+            "reason": "recovered",
+            "recovery_metadata": {"claim_ref": f"claim-{i}"},
+        })
+        day = date.fromordinal(day.toordinal() + 1)
+    original = {
+        "version": 1, "ticker": "AAPL", "status": "none",
+        "last_evaluated_trading_day": day.isoformat(),
+        "events": recovery_events,
+    }
+    (ticker_dir / "tracker.json").write_text(json.dumps(original), encoding="utf-8")
+
+    ledger = InverseMartingaleLedger(root=tmp_path)
+    day = date.fromordinal(day.toordinal() + 1)
+    state, step = _step({}, decision_price=99.0, previous_close=100.0, trading_day=day)
+    ledger.record_step("AAPL", state, step)  # must not grow the list unbounded
+
+    raw = json.loads((ticker_dir / "tracker.json").read_text(encoding="utf-8"))
+    assert len(raw["events"]) == _MAX_PERSISTED_EVENTS
+    # The newest recovery attribution (highest claim_ref index) survives
+    # over the oldest -- the same most-recent-wins policy ordinary events get.
+    recovery_refs = [e["recovery_metadata"]["claim_ref"] for e in raw["events"] if "recovery_metadata" in e]
+    assert f"claim-{_MAX_PERSISTED_EVENTS + 9}" in recovery_refs
+    assert "claim-0" not in recovery_refs
 
 
 def test_ledger_persists_across_simulated_day_boundary(tmp_path):

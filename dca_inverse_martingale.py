@@ -34,7 +34,7 @@ import math
 import re
 import statistics
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -827,10 +827,35 @@ def archived_split_factor(
             # very row forever via `row_date <= since` (Codex review: "Reject
             # undated corporate-action rows before advancing"). Reuses the
             # same malformed-vs-ordinary classification the dated branches
-            # below use, so "0.0"/blank still reads as inert.
-            _, undated_split = _parse_corporate_action_cell(row.get("Stock Splits"))
-            _, undated_dividend = _parse_corporate_action_cell(row.get("Dividends"))
-            if undated_split is not None or undated_dividend is not None:
+            # below use, so "0.0"/blank still reads as inert. Both the
+            # usability flag and the value must be checked: a malformed cell
+            # (unparseable text, NaN, or negative) parses back to the SAME
+            # None value as the ordinary "0.0" case, so checking only the
+            # value would let a malformed-but-undated row slip through as if
+            # it were inert (Codex review: "Reject malformed actions even
+            # when the row is undated"). But a genuinely BLANK cell also
+            # parses to that same (False, None) via
+            # _parse_corporate_action_cell's own `raw_value in (None, "")`
+            # branch, indistinguishable from a malformed nonblank one by the
+            # usability flag alone -- an all-blank trailing CSV row (a
+            # comma-only spreadsheet artifact, no action recorded at all) is
+            # exactly the ordinary noise this whole branch exists to permit,
+            # and treating its blank cells as malformed would reject every
+            # split lookup over the archive until that row is removed (Codex
+            # review: "Keep blank undated rows inert"). Only a NONBLANK cell
+            # that still fails to parse counts as malformed.
+            raw_undated_split = row.get("Stock Splits")
+            raw_undated_dividend = row.get("Dividends")
+            undated_split_ok, undated_split = _parse_corporate_action_cell(raw_undated_split)
+            undated_dividend_ok, undated_dividend = _parse_corporate_action_cell(raw_undated_dividend)
+            undated_split_malformed = raw_undated_split not in (None, "") and not undated_split_ok
+            undated_dividend_malformed = raw_undated_dividend not in (None, "") and not undated_dividend_ok
+            if (
+                undated_split_malformed
+                or undated_dividend_malformed
+                or undated_split is not None
+                or undated_dividend is not None
+            ):
                 return None
             continue
         try:
@@ -2089,16 +2114,27 @@ def evaluate_inverse_martingale_step(
                     reference_close, lowest_drop_seen, basis, tracker_state.get("stddev_reference")
                 ),
                 rearm_reference_close=reference_close,
-                # new_state's cycle_start_trading_day is trading_day itself
-                # for a cycle that just started this call (reference_close ==
-                # today's previous_close, so today IS correct), but the
-                # ORIGINAL, older start day for a continuing STATUS_DIPPING
-                # cycle firing here (reference_close == the old
-                # cycle_reference_close) -- exactly the day whose price scale
-                # produced whichever reference_close this call is using (Codex
-                # review: "Retain the reference-scale cursor when a
-                # continuation resolves").
-                rearm_last_seen_day=new_state.get("cycle_start_trading_day") or trading_day.isoformat(),
+                # For a continuing STATUS_DIPPING cycle firing here,
+                # cycle_start_trading_day is the ORIGINAL, older start day --
+                # exactly the day whose price scale produced the persisted
+                # cycle_reference_close this call is using (Codex review:
+                # "Retain the reference-scale cursor when a continuation
+                # resolves"). But for a cycle that just started THIS call,
+                # reference_close is copied from previous_close, which
+                # belongs to the PRECEDING session, not trading_day itself --
+                # seeding the cursor at trading_day would let a split or
+                # distribution effective ON trading_day be excluded from
+                # every future lookup via `row_date <= since`, leaving the
+                # latch permanently rebased against a pre-action reference
+                # (Codex review: "Seed the latch cursor before a split-day
+                # cycle starts"). Seed one calendar day before trading_day
+                # instead, so an effective-day action still satisfies
+                # `row_date > since` on the next lookup.
+                rearm_last_seen_day=(
+                    (trading_day - timedelta(days=1)).isoformat()
+                    if starting_a_new_cycle
+                    else new_state.get("cycle_start_trading_day") or trading_day.isoformat()
+                ),
             )
             new_state["settlement_pending"] = True
             status_after = STATUS_NONE
@@ -3070,7 +3106,24 @@ class InverseMartingaleLedger:
         try:
             existing = json.loads(state_path.read_text(encoding="utf-8"))
             if isinstance(existing, dict) and isinstance(existing.get("events"), list):
-                existing_events = existing["events"]
+                # _validate_tracker_payload() (see _read_locked) never
+                # validates the shape of individual audit events -- they are
+                # best-effort, not trusted state a caller makes financial
+                # decisions from -- so a restored or hand-edited tracker can
+                # reach here with a syntactically valid but non-object entry
+                # (e.g. a bare number) still in its events list. The
+                # recovery-eviction-exemption logic just below tests
+                # `"recovery_metadata" not in candidate_event` against every
+                # entry, which raises TypeError for a non-dict value; letting
+                # that exception escape this best-effort write would abort
+                # the whole write (and, via record_step's caller, potentially
+                # the scheduled run) over a single malformed audit entry the
+                # ledger was never contractually obligated to preserve
+                # (Codex review: "Validate event entries before filtering
+                # them"). Drop non-dict entries here, before they ever reach
+                # that logic, the same way this whole except-block already
+                # discards an unreadable prior file outright.
+                existing_events = [item for item in existing["events"] if isinstance(item, dict)]
         except (FileNotFoundError, json.JSONDecodeError, OSError, UnicodeDecodeError):
             # Unlike _read_locked (which must fail closed with
             # CorruptedLedgerStateError, since it hands back trusted state a
@@ -3117,7 +3170,42 @@ class InverseMartingaleLedger:
             # can never collide with a field above and is unambiguous to a
             # reader of the raw event log.
             event["recovery_metadata"] = step.recovery_metadata
-        payload["events"] = (existing_events + [event])[-_MAX_PERSISTED_EVENTS:]
+        combined_events = existing_events + [event]
+        # A prior-day or cross-stream recovery's event is the ONLY durable
+        # claim-aware audit record left once a later resolved_marker()
+        # transition overwrites the top-level last_recovery field (see
+        # near_close_dca.py's recovered_state["last_recovery"] assignment).
+        # Slicing this list down to the most recent _MAX_PERSISTED_EVENTS
+        # entries -- as ordinary events are, further above -- would evict
+        # that record after as few as ~17 trading days at three scheduled
+        # streams/day, silently losing the claim day, stream, ref, and order
+        # ID the exact same way the pre-audit-event bug did (Codex review:
+        # "Keep recovery attribution past the event cap"). Prefer dropping
+        # the oldest ORDINARY events first, in place, so relative
+        # chronological order is preserved and a recovery event only gives
+        # up its slot once no ordinary event is left to evict instead.
+        if len(combined_events) > _MAX_PERSISTED_EVENTS:
+            ordinary_to_drop = len(combined_events) - _MAX_PERSISTED_EVENTS
+            trimmed_events: list[dict[str, Any]] = []
+            for candidate_event in combined_events:
+                if ordinary_to_drop > 0 and "recovery_metadata" not in candidate_event:
+                    ordinary_to_drop -= 1
+                    continue
+                trimmed_events.append(candidate_event)
+            # A ticker with more crash-lease recoveries than
+            # _MAX_PERSISTED_EVENTS itself (repeated recovery failures) has
+            # no ordinary event left to evict -- every remaining candidate
+            # carries recovery_metadata, so the loop above alone would let
+            # combined_events grow without bound, defeating the whole point
+            # of the cap and making every read-modify-write progressively
+            # more expensive (Codex review: "Keep recovery retention
+            # bounded"). Fall back to the same most-recent-N slice ordinary
+            # events already get, keeping the newest recovery attribution
+            # (still the most useful for live debugging) over the oldest.
+            if len(trimmed_events) > _MAX_PERSISTED_EVENTS:
+                trimmed_events = trimmed_events[-_MAX_PERSISTED_EVENTS:]
+            combined_events = trimmed_events
+        payload["events"] = combined_events
         state_path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(state_path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
