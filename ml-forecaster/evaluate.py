@@ -354,8 +354,11 @@ def score_incumbent_on_folds(
         return None
 
     test_start = post_cutoff_dates[len(post_cutoff_dates) // 2]
-    train = dataset[dataset["label_end_date"] < test_start]
-    test = dataset[(dataset["date"] >= test_start) & (dataset["label_end_date"] > training_cutoff)]
+    train = cast(pd.DataFrame, dataset[dataset["label_end_date"] < test_start])
+    test = cast(
+        pd.DataFrame,
+        dataset[(dataset["date"] >= test_start) & (dataset["label_end_date"] > training_cutoff)],
+    )
     if train.empty or test.empty or not (train["label_end_date"] > training_cutoff).any():
         return None
 
