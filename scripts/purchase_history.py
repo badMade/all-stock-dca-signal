@@ -84,7 +84,7 @@ from dataclasses import asdict, dataclass
 from datetime import date
 from itertools import chain
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
 
 # This module is also a documented standalone entry point (see the module
 # docstring and docs/purchase_history.md's Usage section), and direct
@@ -968,7 +968,7 @@ def collect_purchase_records(
         return fills, resolved_orders_csv_file
 
     def _record_fills(
-        fill_sources: Iterator[tuple[Path, str, Dict[str, Any]]],
+        fill_sources: Iterable[tuple[Path, str, Dict[str, Any]]],
         *,
         run_dir: Path,
         trading_day: Optional[str],
@@ -1120,10 +1120,10 @@ def collect_purchase_records(
             attribution: Dict[str, Any] = {
                 "run_dir": run_dir,
                 "rank": _dedup_rank(run_origin),
-                "trading_day": str(trading_day) if trading_day else "",
+                "trading_day": trading_day or "",
                 "stream": stream,
                 "run_origin": run_origin,
-                "run_id": str(run_id) if run_id else None,
+                "run_id": run_id or None,
                 "broker": broker,
                 "source_run_dir": str(run_dir),
             }
@@ -1571,6 +1571,7 @@ def collect_purchase_records(
             (
                 (resolved_recovery_csv_file, ticker, fill)
                 for ticker, fill in _order_fill_items(recovery_fills)
+                if resolved_recovery_csv_file is not None
             ),
         )
         _record_fills(
