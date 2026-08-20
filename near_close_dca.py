@@ -15079,6 +15079,7 @@ def _write_afternoon_failure_artifacts(
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             _loaded = None
         existing_is_usable = _loaded is not None
+        state_was_mutated = False
         if not existing_is_usable:
             logger.warning(
                 "replacing an unreadable run_state.json at %s with the failure state",
@@ -16778,6 +16779,9 @@ def _run_once_impl(
                 # evaluation (Codex review: "Retain the frozen sigma in
                 # partial-fire state").
                 im_pending_fires[im_ticker] = (im_tracker_state, im_claim_state, im_step)
+                finance_signal = im_signal.finance_signal
+                if finance_signal is None:
+                    raise RuntimeError("inverse_martingale_fire requires a finance signal")
                 fire_decision = replace(
                     im_signal,
                     action=Action.BUY,
@@ -16805,8 +16809,7 @@ def _run_once_impl(
                     # this branch could ever be reached -- so it's safe to
                     # source the target fields from it directly, matching
                     # reconcile_signals()'s own finance-preferred convention.
-                    assert im_signal.finance_signal is not None
-                    **_target_fields(im_signal.finance_signal),
+                    **_target_fields(finance_signal),
                     # evaluate_inverse_martingale_step() itself already floors
                     # fire_amount_usd to the broker minimum (Codex review:
                     # "Keep sub-dollar fires in the accumulator" -- the floor

@@ -46,7 +46,7 @@ PCT_ENROLLMENT = {
     "recovery_offset": 1.0,
 }
 
-TEST_DATES = (date(2026, 6, 29), date(2026, 6, 30), date(2026, 7, 1))
+TEST_DATES = (date(2026, 6, 29), date(2026, 6, 30), date(2026, 7, 1), date(2026, 7, 2))
 
 
 class _FixedPriceData:
@@ -871,6 +871,66 @@ def test_later_slot_deeper_price_remains_latched_until_dip_exit(tmp_path, monkey
     after_midday = json.loads(tracker_path.read_text())
     assert after_midday["status"] == "none"
     assert "accumulated_usd" not in after_midday
+
+
+def test_split_during_an_active_cycle_is_found_after_resolution(tmp_path, monkeypatch):
+    """A verified split that lands WHILE a cycle is still active -- before
+    the cycle resolves -- must still be found: the injection site seeds
+    ``rearm_last_seen_day`` from the cycle's own start day
+    (``cycle_start_trading_day``), not the day the cycle happened to
+    resolve, so ``archived_split_factor``'s search window covers a split
+    dated anywhere after the cycle started, not only after resolution."""
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    monkeypatch.setenv("DCA_TICKER_HISTORY_DIR", str(tmp_path / "ticker_data"))
+    (tmp_path / "ticker_data").mkdir()
+    # A 2-for-1 split dated while a capped fire continuation is still active,
+    # strictly between cycle start and final resolution. Both the Stock Splits
+    # and Dividends columns must be present -- archived_split_factor() treats
+    # an archive missing either one as untrustworthy.
+    (tmp_path / "ticker_data" / "AAPL.csv").write_text(
+        "Date,Close,Adj Close,Stock Splits,Dividends\n"
+        "2026-06-30,50,50,2.0,0.0\n",
+        encoding="utf-8",
+    )
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+
+    # Day 1 (2026-06-29): a -9% dip crosses all four tiers and banks $15.
+    _run_day(tmp_path, config, state, TEST_DATES[0], 91.0, "day1")
+    # Day 2 (2026-06-30): recovery starts firing, but the $10 per-order cap
+    # leaves a $5 continuation active across the split day.
+    r2, s2, _ = _run_day(tmp_path, config, state, TEST_DATES[1], 93.0, "day2")
+    [candidate] = s2["buy_candidates"]
+    assert "imart" in (candidate.get("order_id") or "")
+
+    tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
+    continuing = json.loads(tracker_path.read_text())
+    assert continuing["status"] == "firing"
+
+    # Day 3: the continuation settles and only now resolves the cycle. The
+    # durable latch must retain day 1 as the boundary of its reference scale,
+    # rather than recording this resolution day as the archive cursor.
+    r3, s3, _ = _run_day(tmp_path, config, state, TEST_DATES[2], 49.0, "day3", prev_close=49.0)
+    [candidate] = s3["buy_candidates"]
+    assert "imart" in (candidate.get("order_id") or "")
+    resolved = json.loads(tracker_path.read_text())
+    assert resolved["rearm_reference_close"] == pytest.approx(100.0)
+    assert resolved["rearm_last_seen_day"] == TEST_DATES[0].isoformat()
+
+    # Day 4 (2026-07-02): the first evaluation after resolution. A price of
+    # 49 is far below the OLD (pre-split) reference of 100, but the archive
+    # already carries the verified split from day 2 -- the seeded search
+    # window (since the cycle's start day) finds it, rebasing the durable
+    # latch to 50 instead of leaving it latched against the stale, unsplit
+    # reference indefinitely.
+    r4, s4, _ = _run_day(tmp_path, config, state, TEST_DATES[3], 49.0, "day4", prev_close=49.0)
+    assert s4["buy_candidates"] == []
+    after_split = json.loads(tracker_path.read_text())
+    assert after_split["rearm_reference_close"] == pytest.approx(50.0)
+    # The cursor advances to the newest archive row actually EXAMINED (day
+    # 2, the split's own row -- the only row present), not trading_day
+    # itself, per archived_split_factor()'s own documented cursor contract.
+    assert after_split["rearm_last_seen_day"] == TEST_DATES[1].isoformat()
 
 
 def test_dry_run_fire_does_not_settle_the_ledger(tmp_path, monkeypatch):
