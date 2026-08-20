@@ -4,6 +4,7 @@ Deterministic gate script that verifies codebase health.
 It runs linting, tests, smoke test, and pip-audit.
 Exits 0 if healthy, 1 if not. Silent unless error.
 """
+
 import os
 import subprocess
 import sys
@@ -25,6 +26,7 @@ def run_cmd(cmd):
         print(f"Command '{cmd[0]}' not found")
         return False
 
+
 def main():
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.chdir(repo_root)
@@ -41,6 +43,9 @@ def main():
 
     # Smoke test (Dry run)
     # Use a fixed, known market-day near-close timestamp so this check is deterministic across environments.
+    # Write demo artifacts to a tempdir outside the worktree, not a repo path -- otherwise a clean hosted
+    # runner's `git add --all` in self-heal.yml's guard step stages them, and the allowed-scope check then
+    # rejects that unignored path and aborts every successful repair before PR creation (Codex review, PR #507).
     near_close = "2026-08-03T15:45"
     with tempfile.TemporaryDirectory(prefix="dca-demo-artifacts-") as artifacts_dir:
         if not run_cmd([
@@ -63,6 +68,7 @@ def main():
         sys.exit(1)
 
     sys.exit(0)
+
 
 if __name__ == "__main__":
     main()
