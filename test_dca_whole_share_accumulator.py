@@ -256,6 +256,41 @@ def test_retry_after_preserve_pending_returns_zero_shares_not_the_original_fire(
     assert retry.contribution_usd == 0.0
 
 
+def test_retry_after_settle_returns_zero_shares_not_the_original_fire(tmp_path):
+    """A settled fire is final, so its cached decision is not actionable.
+
+    This is the successful-order counterpart to the preserve_pending()
+    regression above: replaying the original positive decision after settle()
+    would tell a scheduler retry to submit the same whole-share purchase again.
+    """
+    # Codex review ("Make the retry distinguish settled from unresolved
+    # claims"): all three calls previously omitted recorded_at, so this test
+    # passed even if settle() failed to mark the cached fire resolved -- an
+    # unresolved entry with claimed_at=None also returns zero shares because
+    # _claim_is_stale(None, None) is always false. Pin the initial claim and
+    # settle() to the same timestamp, then retry well past
+    # UNRESOLVED_CLAIM_STALE_SECONDS so a stale-but-unresolved claim (which
+    # would be reclaimed as actionable) cannot produce the same zero-share
+    # result as a genuinely settled one -- only settle() having resolved the
+    # claim explains the assertions below.
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-17", 13.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-17T15:30:00-04:00"
+    )
+    assert first.shares_to_buy == 1
+    ledger.settle("BYDDY", "2026-08-17", 1, 10.0, idempotency_key="slot-1", recorded_at="2026-08-17T15:30:00-04:00")
+
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-17", 13.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-17T15:36:00-04:00"
+    )
+
+    assert retry.shares_to_buy == 0
+    assert retry.order_notional_usd == 0.0
+    assert retry.pending_after_usd == 3.0
+    assert ledger.pending_usd("BYDDY") == 3.0  # unchanged by the retry
+    assert ledger.shares_purchased_total("BYDDY") == 1
+
+
 def test_overlapping_call_for_an_unresolved_fire_does_not_get_the_same_actionable_decision(tmp_path):
     """Codex review ("Claim unresolved fires before returning cached
     decisions"): two overlapping scheduler attempts for the SAME
