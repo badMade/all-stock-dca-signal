@@ -1099,11 +1099,11 @@ class _PersistingMarketDataProvider:
         self._raw_connectors_wrapped = self._wrap_raw_connectors()
 
     def _wrap_raw_connectors(self) -> bool:
-        """Intercept Robinhood-style connector callables before adapter parsing.
+        """Intercept Robinhood and Finance connector callables before adapter parsing.
 
         Wraps a private *copy* of ``self._inner`` rather than mutating the caller-
         supplied adapter in place: the caller may reuse that same
-        ``RobinhoodDataProvider``/``RobinhoodBroker`` instance for a later manual or
+        data-provider instance for a later manual or
         watchlist run, and a wrapper left bound to this run's (short-lived)
         ``_RawInputRecorder`` would then archive that later run's responses into this
         run's ``raw/`` directory -- or return ``None`` for a perfectly valid response
@@ -1111,7 +1111,12 @@ class _PersistingMarketDataProvider:
         """
         wrapped = False
         copied = False
-        for attribute, kind in (("_historicals_fn", "historicals"), ("_quotes_fn", "quotes")):
+        for attribute, kind in (
+            ("_historicals_fn", "historicals"),
+            ("_quotes_fn", "quotes"),
+            ("_bars_fn", "intraday_bars"),
+            ("_previous_close_fn", "prior_close"),
+        ):
             connector = getattr(self._inner, attribute, None)
             if not callable(connector) or getattr(connector, "_raw_recorder", None) is self._recorder:
                 continue

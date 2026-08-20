@@ -30,7 +30,7 @@ from pathlib import Path
 
 import pytest
 
-from dca_live_adapters import RobinhoodBroker, RobinhoodDataProvider
+from dca_live_adapters import FinanceDataProvider, RobinhoodBroker, RobinhoodDataProvider
 from morning_dca import (
     DEFAULT_MORNING_LIVE_STATE_ROOT,
     DEFAULT_MORNING_PREFLIGHT_STATE_ROOT,
@@ -4885,6 +4885,65 @@ def test_persisting_robinhood_provider_normalizes_pointer_before_parsing(tmp_pat
     assert recorder.saved_filenames == []
     assert recorder.error is not None
     assert "could not read output_path" in recorder.error
+
+
+def test_raw_input_recorder_rejects_missing_current_session_context_pointer(tmp_path):
+    missing = tmp_path / "missing-context.json"
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+
+    persisted = recorder.persist("historicals", "AAPL", {"current_session_context": str(missing)})
+
+    assert persisted is None
+    assert recorder.saved_filenames == []
+    assert recorder.error is not None
+    assert "could not read output_path" in recorder.error
+
+
+def test_raw_input_recorder_normalizes_current_session_context_pointer(tmp_path):
+    context = tmp_path / "context.json"
+    context.write_text(json.dumps({"results": [{"symbol": "AAPL"}]}), encoding="utf-8")
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+
+    persisted = recorder.persist("historicals", "AAPL", {"current_session_context": str(context)})
+
+    assert persisted == {"results": [{"symbol": "AAPL"}]}
+    archived = json.loads((tmp_path / "raw" / recorder.saved_filenames[0]).read_text(encoding="utf-8"))
+    assert archived["current_session_context"] == str(context)
+    assert archived["output_path"] == str(context)
+    assert archived["normalized"] is True
+
+
+def test_persisting_finance_provider_archives_connectors_before_parsing(tmp_path):
+    bars_payload = [
+        {
+            "timestamp": "2026-07-08T10:20:00-04:00",
+            "open": 99.0,
+            "high": 100.0,
+            "low": 98.0,
+            "close": 99.5,
+            "volume": 10,
+            "vendor_trace_id": "bars-raw-evidence",
+        }
+    ]
+    close_payload = {"price": "101.25", "vendor_trace_id": "close-raw-evidence"}
+    provider = FinanceDataProvider(
+        bars_fn=lambda *args: bars_payload,
+        previous_close_fn=lambda *args: close_payload,
+    )
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingMarketDataProvider(provider, recorder)
+    now = _now_live()
+
+    bars = wrapped.get_intraday_bars(
+        ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10
+    )
+    previous_close = wrapped.get_previous_close_bar("AAPL", now)
+
+    assert len(bars) == 1
+    assert previous_close is not None and previous_close.close == 101.25
+    payloads = [json.loads((tmp_path / "raw" / name).read_text(encoding="utf-8")) for name in recorder.saved_filenames]
+    assert any(payload.get("data") == bars_payload for payload in payloads)
+    assert close_payload in payloads
 
 
 def test_persisting_robinhood_adapters_archive_connector_envelopes_before_parsing(tmp_path):
